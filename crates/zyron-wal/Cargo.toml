@@ -1,0 +1,17 @@
+[package]
+name = "zyron-wal"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+zyron-common = { path = "../zyron-common" }
+thiserror.workspace = true
+serde.workspace = true
+crc32fast.workspace = true
+parking_lot.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+serde_json = "1.0"
+tempfile = "3.15"

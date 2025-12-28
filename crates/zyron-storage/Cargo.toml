@@ -1,0 +1,15 @@
+[package]
+name = "zyron-storage"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+zyron-common = { path = "../zyron-common" }
+zyron-buffer = { path = "../zyron-buffer" }
+parking_lot.workspace = true
+bytes.workspace = true
+crc32fast.workspace = true
+
+[dev-dependencies]
+tempfile = "3.15"

@@ -1,0 +1,12 @@
+[package]
+name = "zyron-buffer"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+zyron-common = { path = "../zyron-common" }
+parking_lot.workspace = true
+
+[dev-dependencies]
+tempfile = "3.15"

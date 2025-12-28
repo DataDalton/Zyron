@@ -1,0 +1,9 @@
+[build]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+avx2,+bmi2"]
+
+[alias]
+zyron = "run --release --bin zyrondb-server --"
+cli = "run --release --bin zyrondb-cli --"
