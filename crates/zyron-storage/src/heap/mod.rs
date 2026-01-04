@@ -7,5 +7,5 @@
 mod file;
 mod page;
 
-pub use file::{HeapFile, HeapFileConfig, HeapScan};
+pub use file::{HeapFile, HeapFileConfig};
 pub use page::{HeapPage, HeapPageHeader, HeapPageIterator, SlotId, TupleSlot};

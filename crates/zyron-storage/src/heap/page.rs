@@ -250,10 +250,11 @@ impl HeapPage {
         // Check for a deleted slot we can reuse
         let mut reuse_slot: Option<SlotId> = None;
         for i in 0..header.slot_count {
-            let slot = self.get_slot(SlotId(i)).unwrap();
-            if slot.is_empty() {
-                reuse_slot = Some(SlotId(i));
-                break;
+            if let Some(slot) = self.get_slot(SlotId(i)) {
+                if slot.is_empty() {
+                    reuse_slot = Some(SlotId(i));
+                    break;
+                }
             }
         }
 

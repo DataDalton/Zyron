@@ -16,12 +16,12 @@ pub struct WalReader {
 
 impl WalReader {
     /// Creates a new WAL reader.
-    pub fn new(wal_dir: &Path) -> Result<Self> {
+    pub async fn new(wal_dir: &Path) -> Result<Self> {
         let mut segments = BTreeMap::new();
 
         if wal_dir.exists() {
-            for entry in std::fs::read_dir(wal_dir)? {
-                let entry = entry?;
+            let mut dir = tokio::fs::read_dir(wal_dir).await?;
+            while let Some(entry) = dir.next_entry().await? {
                 let path = entry.path();
 
                 if path.extension().map(|e| e == "wal").unwrap_or(false) {
@@ -57,7 +57,7 @@ impl WalReader {
     }
 
     /// Opens a segment by ID.
-    pub fn open_segment(&self, segment_id: SegmentId) -> Result<LogSegment> {
+    pub async fn open_segment(&self, segment_id: SegmentId) -> Result<LogSegment> {
         let path = self.segments.get(&segment_id).ok_or_else(|| {
             ZyronError::WalCorrupted {
                 lsn: 0,
@@ -65,31 +65,72 @@ impl WalReader {
             }
         })?;
 
-        LogSegment::open(path)
+        LogSegment::open(path).await
     }
 
-    /// Creates an iterator over all records starting from the given LSN.
-    pub fn scan_from(&self, start_lsn: Lsn) -> Result<WalIterator<'_>> {
-        WalIterator::new(self, start_lsn)
+    /// Scans all records starting from the given LSN.
+    ///
+    /// Returns a vector of all records from start_lsn onwards.
+    pub async fn scan_from(&self, start_lsn: Lsn) -> Result<Vec<LogRecord>> {
+        let mut results = Vec::new();
+        let segment_id = SegmentId(start_lsn.segment_id());
+        let mut offset = start_lsn.offset();
+
+        // Find starting segment
+        let mut current_segment_id = Some(segment_id);
+
+        while let Some(seg_id) = current_segment_id {
+            if !self.segments.contains_key(&seg_id) {
+                break;
+            }
+
+            let mut segment = self.open_segment(seg_id).await?;
+
+            // Read records from this segment
+            while offset < segment.write_offset() {
+                match segment.read_at(offset).await {
+                    Ok(record) => {
+                        offset += record.size_on_disk() as u32;
+                        results.push(record);
+                    }
+                    Err(e) => {
+                        // If corrupted, try to skip to next segment
+                        if matches!(e, ZyronError::WalCorrupted { .. }) {
+                            break;
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+
+            segment.close().await?;
+
+            // Move to next segment
+            current_segment_id = Some(seg_id.next());
+            offset = SegmentHeader::SIZE as u32;
+        }
+
+        Ok(results)
     }
 
-    /// Creates an iterator over all records.
-    pub fn scan_all(&self) -> Result<WalIterator<'_>> {
+    /// Scans all records in the WAL.
+    ///
+    /// Returns a vector of all records.
+    pub async fn scan_all(&self) -> Result<Vec<LogRecord>> {
         let start_lsn = if let Some(first_id) = self.first_segment_id() {
             Lsn::new(first_id.0, SegmentHeader::SIZE as u32)
         } else {
             Lsn::FIRST
         };
 
-        self.scan_from(start_lsn)
+        self.scan_from(start_lsn).await
     }
 
     /// Finds the last checkpoint in the WAL.
-    pub fn find_last_checkpoint(&self) -> Result<Option<(Lsn, LogRecord)>> {
+    pub async fn find_last_checkpoint(&self) -> Result<Option<(Lsn, LogRecord)>> {
         let mut last_checkpoint: Option<(Lsn, LogRecord)> = None;
 
-        for record in self.scan_all()? {
-            let record = record?;
+        for record in self.scan_all().await? {
             if record.record_type == LogRecordType::CheckpointEnd {
                 last_checkpoint = Some((record.lsn, record));
             }
@@ -99,12 +140,10 @@ impl WalReader {
     }
 
     /// Collects all active transactions at the given LSN.
-    pub fn find_active_transactions(&self, at_lsn: Lsn) -> Result<Vec<u32>> {
+    pub async fn find_active_transactions(&self, at_lsn: Lsn) -> Result<Vec<u32>> {
         let mut active = std::collections::HashSet::new();
 
-        for record in self.scan_all()? {
-            let record = record?;
-
+        for record in self.scan_all().await? {
             if record.lsn > at_lsn {
                 break;
             }
@@ -124,11 +163,11 @@ impl WalReader {
     }
 
     /// Refreshes the list of segment files.
-    pub fn refresh(&mut self) -> Result<()> {
+    pub async fn refresh(&mut self) -> Result<()> {
         self.segments.clear();
 
-        for entry in std::fs::read_dir(&self.wal_dir)? {
-            let entry = entry?;
+        let mut dir = tokio::fs::read_dir(&self.wal_dir).await?;
+        while let Some(entry) = dir.next_entry().await? {
             let path = entry.path();
 
             if path.extension().map(|e| e == "wal").unwrap_or(false) {
@@ -144,100 +183,6 @@ impl WalReader {
     }
 }
 
-/// Iterator over WAL records across multiple segments.
-pub struct WalIterator<'a> {
-    reader: &'a WalReader,
-    current_segment: Option<LogSegment>,
-    current_segment_id: Option<SegmentId>,
-    current_offset: u32,
-}
-
-impl<'a> WalIterator<'a> {
-    /// Creates a new iterator starting from the given LSN.
-    fn new(reader: &'a WalReader, start_lsn: Lsn) -> Result<Self> {
-        let segment_id = SegmentId(start_lsn.segment_id());
-        let offset = start_lsn.offset();
-
-        let current_segment = if reader.segments.contains_key(&segment_id) {
-            Some(reader.open_segment(segment_id)?)
-        } else {
-            None
-        };
-
-        Ok(Self {
-            reader,
-            current_segment,
-            current_segment_id: Some(segment_id),
-            current_offset: offset,
-        })
-    }
-
-    /// Advances to the next segment.
-    fn advance_segment(&mut self) -> Result<bool> {
-        // Close current segment
-        if let Some(ref mut segment) = self.current_segment {
-            segment.close()?;
-        }
-
-        // Find next segment
-        let next_id = self.current_segment_id.map(|id| id.next());
-
-        if let Some(id) = next_id {
-            if self.reader.segments.contains_key(&id) {
-                self.current_segment = Some(self.reader.open_segment(id)?);
-                self.current_segment_id = Some(id);
-                self.current_offset = SegmentHeader::SIZE as u32;
-                return Ok(true);
-            }
-        }
-
-        self.current_segment = None;
-        self.current_segment_id = None;
-        Ok(false)
-    }
-}
-
-impl Iterator for WalIterator<'_> {
-    type Item = Result<LogRecord>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let segment = match self.current_segment.as_mut() {
-                Some(s) => s,
-                None => return None,
-            };
-
-            // Check if we've reached the end of this segment
-            if self.current_offset >= segment.write_offset() {
-                match self.advance_segment() {
-                    Ok(true) => continue,
-                    Ok(false) => return None,
-                    Err(e) => return Some(Err(e)),
-                }
-            }
-
-            // Try to read a record
-            match segment.read_at(self.current_offset) {
-                Ok(record) => {
-                    self.current_offset += record.size_on_disk() as u32;
-                    return Some(Ok(record));
-                }
-                Err(e) => {
-                    // If we hit a corrupted record, try to skip to next segment
-                    if matches!(e, ZyronError::WalCorrupted { .. }) {
-                        match self.advance_segment() {
-                            Ok(true) => continue,
-                            Ok(false) => return None,
-                            Err(e) => return Some(Err(e)),
-                        }
-                    }
-                    return Some(Err(e));
-                }
-            }
-        }
-    }
-}
-
 /// Recovery manager for replaying WAL during startup.
 pub struct RecoveryManager {
     reader: WalReader,
@@ -245,15 +190,15 @@ pub struct RecoveryManager {
 
 impl RecoveryManager {
     /// Creates a new recovery manager.
-    pub fn new(wal_dir: &Path) -> Result<Self> {
-        let reader = WalReader::new(wal_dir)?;
+    pub async fn new(wal_dir: &Path) -> Result<Self> {
+        let reader = WalReader::new(wal_dir).await?;
         Ok(Self { reader })
     }
 
     /// Performs recovery, returning the redo and undo information.
-    pub fn recover(&self) -> Result<RecoveryResult> {
+    pub async fn recover(&self) -> Result<RecoveryResult> {
         // Find the last checkpoint
-        let checkpoint = self.reader.find_last_checkpoint()?;
+        let checkpoint = self.reader.find_last_checkpoint().await?;
 
         let start_lsn = if let Some((lsn, _)) = checkpoint {
             lsn
@@ -269,8 +214,7 @@ impl RecoveryManager {
         let mut committed_txns = std::collections::HashSet::new();
         let mut aborted_txns = std::collections::HashSet::new();
 
-        for record in self.reader.scan_from(start_lsn)? {
-            let record = record?;
+        for record in self.reader.scan_from(start_lsn).await? {
             let txn_id = record.txn_id;
 
             match record.record_type {
@@ -346,7 +290,7 @@ mod tests {
     use bytes::Bytes;
     use tempfile::tempdir;
 
-    fn create_test_wal() -> (WalWriter, tempfile::TempDir) {
+    async fn create_test_wal() -> (WalWriter, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let config = WalWriterConfig {
             wal_dir: dir.path().to_path_buf(),
@@ -354,116 +298,116 @@ mod tests {
             fsync_enabled: true,
             group_commit_size: 1,
         };
-        let writer = WalWriter::new(config).unwrap();
+        let writer = WalWriter::new(config).await.unwrap();
         (writer, dir)
     }
 
-    #[test]
-    fn test_wal_reader_empty() {
+    #[tokio::test]
+    async fn test_wal_reader_empty() {
         let dir = tempdir().unwrap();
-        let reader = WalReader::new(dir.path()).unwrap();
+        let reader = WalReader::new(dir.path()).await.unwrap();
         assert_eq!(reader.segment_count(), 0);
         assert!(reader.first_segment_id().is_none());
     }
 
-    #[test]
-    fn test_wal_reader_with_segments() {
-        let (writer, dir) = create_test_wal();
+    #[tokio::test]
+    async fn test_wal_reader_with_segments() {
+        let (writer, dir) = create_test_wal().await;
 
         // Write some records
-        writer.log_begin(1).unwrap();
-        writer.log_commit(1, Lsn::INVALID).unwrap();
-        writer.close().unwrap();
+        writer.log_begin(1).await.unwrap();
+        writer.log_commit(1, Lsn::INVALID).await.unwrap();
+        writer.close().await.unwrap();
 
         // Read back
-        let reader = WalReader::new(dir.path()).unwrap();
+        let reader = WalReader::new(dir.path()).await.unwrap();
         assert_eq!(reader.segment_count(), 1);
         assert_eq!(reader.first_segment_id(), Some(SegmentId::FIRST));
     }
 
-    #[test]
-    fn test_wal_reader_scan_all() {
-        let (writer, dir) = create_test_wal();
+    #[tokio::test]
+    async fn test_wal_reader_scan_all() {
+        let (writer, dir) = create_test_wal().await;
 
         // Write multiple transactions
         for i in 1..=5 {
-            let begin = writer.log_begin(i).unwrap();
-            writer.log_insert(i, begin, Bytes::from(format!("data{}", i))).unwrap();
-            writer.log_commit(i, Lsn::INVALID).unwrap();
+            let begin = writer.log_begin(i).await.unwrap();
+            writer.log_insert(i, begin, Bytes::from(format!("data{}", i))).await.unwrap();
+            writer.log_commit(i, Lsn::INVALID).await.unwrap();
         }
-        writer.close().unwrap();
+        writer.close().await.unwrap();
 
         // Scan all records
-        let reader = WalReader::new(dir.path()).unwrap();
-        let records: Vec<_> = reader.scan_all().unwrap().collect();
+        let reader = WalReader::new(dir.path()).await.unwrap();
+        let records = reader.scan_all().await.unwrap();
 
         // Should have 15 records (3 per transaction * 5 transactions)
         assert_eq!(records.len(), 15);
     }
 
-    #[test]
-    fn test_wal_reader_find_active_transactions() {
-        let (writer, dir) = create_test_wal();
+    #[tokio::test]
+    async fn test_wal_reader_find_active_transactions() {
+        let (writer, dir) = create_test_wal().await;
 
         // Transaction 1: committed
-        let lsn1 = writer.log_begin(1).unwrap();
-        let lsn2 = writer.log_insert(1, lsn1, Bytes::new()).unwrap();
-        writer.log_commit(1, lsn2).unwrap();
+        let lsn1 = writer.log_begin(1).await.unwrap();
+        let lsn2 = writer.log_insert(1, lsn1, Bytes::new()).await.unwrap();
+        writer.log_commit(1, lsn2).await.unwrap();
 
         // Transaction 2: started but not committed
-        let lsn3 = writer.log_begin(2).unwrap();
-        let lsn4 = writer.log_insert(2, lsn3, Bytes::new()).unwrap();
+        let lsn3 = writer.log_begin(2).await.unwrap();
+        let lsn4 = writer.log_insert(2, lsn3, Bytes::new()).await.unwrap();
 
-        writer.close().unwrap();
+        writer.close().await.unwrap();
 
         // Find active transactions at the end
-        let reader = WalReader::new(dir.path()).unwrap();
-        let active = reader.find_active_transactions(lsn4).unwrap();
+        let reader = WalReader::new(dir.path()).await.unwrap();
+        let active = reader.find_active_transactions(lsn4).await.unwrap();
 
         assert_eq!(active.len(), 1);
         assert!(active.contains(&2));
     }
 
-    #[test]
-    fn test_wal_reader_find_checkpoint() {
-        let (writer, dir) = create_test_wal();
+    #[tokio::test]
+    async fn test_wal_reader_find_checkpoint() {
+        let (writer, dir) = create_test_wal().await;
 
-        writer.log_begin(1).unwrap();
-        writer.log_checkpoint_begin().unwrap();
-        writer.log_checkpoint_end(Bytes::from_static(b"checkpoint")).unwrap();
-        writer.log_commit(1, Lsn::INVALID).unwrap();
-        writer.close().unwrap();
+        writer.log_begin(1).await.unwrap();
+        writer.log_checkpoint_begin().await.unwrap();
+        writer.log_checkpoint_end(Bytes::from_static(b"checkpoint")).await.unwrap();
+        writer.log_commit(1, Lsn::INVALID).await.unwrap();
+        writer.close().await.unwrap();
 
-        let reader = WalReader::new(dir.path()).unwrap();
-        let checkpoint = reader.find_last_checkpoint().unwrap();
+        let reader = WalReader::new(dir.path()).await.unwrap();
+        let checkpoint = reader.find_last_checkpoint().await.unwrap();
 
         assert!(checkpoint.is_some());
         let (_, record) = checkpoint.unwrap();
         assert_eq!(record.record_type, LogRecordType::CheckpointEnd);
     }
 
-    #[test]
-    fn test_recovery_manager_empty() {
+    #[tokio::test]
+    async fn test_recovery_manager_empty() {
         let dir = tempdir().unwrap();
-        let recovery = RecoveryManager::new(dir.path()).unwrap();
-        let result = recovery.recover().unwrap();
+        let recovery = RecoveryManager::new(dir.path()).await.unwrap();
+        let result = recovery.recover().await.unwrap();
 
         assert!(result.is_empty());
     }
 
-    #[test]
-    fn test_recovery_manager_committed_txns() {
-        let (writer, dir) = create_test_wal();
+    #[tokio::test]
+    async fn test_recovery_manager_committed_txns() {
+        let (writer, dir) = create_test_wal().await;
 
         // Committed transaction
-        let begin = writer.log_begin(1).unwrap();
-        let insert = writer.log_insert(1, begin, Bytes::from_static(b"data")).unwrap();
-        writer.log_commit(1, insert).unwrap();
-        writer.close().unwrap();
+        let begin = writer.log_begin(1).await.unwrap();
+        let insert = writer.log_insert(1, begin, Bytes::from_static(b"data")).await.unwrap();
+        writer.log_commit(1, insert).await.unwrap();
+        writer.close().await.unwrap();
 
         // Recover
-        let recovery = RecoveryManager::new(dir.path()).unwrap();
-        let result = recovery.recover().unwrap();
+        let recovery = RecoveryManager::new(dir.path()).await.unwrap();
+        let result = recovery.recover().await.unwrap();
 
         // Should have 1 redo record (the insert)
         assert_eq!(result.redo_records.len(), 1);
@@ -471,19 +415,19 @@ mod tests {
         assert!(result.undo_txns.is_empty());
     }
 
-    #[test]
-    fn test_recovery_manager_uncommitted_txn() {
-        let (writer, dir) = create_test_wal();
+    #[tokio::test]
+    async fn test_recovery_manager_uncommitted_txn() {
+        let (writer, dir) = create_test_wal().await;
 
         // Uncommitted transaction
-        let begin = writer.log_begin(1).unwrap();
-        writer.log_insert(1, begin, Bytes::from_static(b"data")).unwrap();
+        let begin = writer.log_begin(1).await.unwrap();
+        writer.log_insert(1, begin, Bytes::from_static(b"data")).await.unwrap();
         // No commit!
-        writer.close().unwrap();
+        writer.close().await.unwrap();
 
         // Recover
-        let recovery = RecoveryManager::new(dir.path()).unwrap();
-        let result = recovery.recover().unwrap();
+        let recovery = RecoveryManager::new(dir.path()).await.unwrap();
+        let result = recovery.recover().await.unwrap();
 
         // The insert should NOT be in redo (transaction not committed)
         assert!(result.redo_records.is_empty());

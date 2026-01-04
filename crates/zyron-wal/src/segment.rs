@@ -2,9 +2,9 @@
 
 use crate::record::{LogRecord, Lsn};
 use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use tokio::fs::{File, OpenOptions};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use zyron_common::{Result, ZyronError};
 
 /// Unique identifier for a WAL segment file.
@@ -167,7 +167,7 @@ impl LogSegment {
     pub const DEFAULT_SIZE: u32 = 16 * 1024 * 1024;
 
     /// Creates a new segment file.
-    pub fn create(
+    pub async fn create(
         wal_dir: &Path,
         segment_id: SegmentId,
         first_lsn: Lsn,
@@ -181,11 +181,12 @@ impl LogSegment {
             .read(true)
             .write(true)
             .truncate(true)
-            .open(&path)?;
+            .open(&path)
+            .await?;
 
         // Write header
-        file.write_all(&header.to_bytes())?;
-        file.sync_all()?;
+        file.write_all(&header.to_bytes()).await?;
+        file.sync_all().await?;
 
         Ok(Self {
             path,
@@ -196,17 +197,21 @@ impl LogSegment {
     }
 
     /// Opens an existing segment file.
-    pub fn open(path: &Path) -> Result<Self> {
-        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    pub async fn open(path: &Path) -> Result<Self> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .await?;
 
         // Read and validate header
         let mut header_bytes = [0u8; SegmentHeader::SIZE];
-        file.read_exact(&mut header_bytes)?;
+        file.read_exact(&mut header_bytes).await?;
         let header = SegmentHeader::from_bytes(&header_bytes);
         header.validate()?;
 
         // Find current write position by seeking to end
-        let file_size = file.seek(SeekFrom::End(0))?;
+        let file_size = file.seek(std::io::SeekFrom::End(0)).await?;
         let write_offset = file_size as u32;
 
         Ok(Self {
@@ -248,7 +253,7 @@ impl LogSegment {
     }
 
     /// Appends a record to this segment.
-    pub fn append(&mut self, record: &LogRecord) -> Result<Lsn> {
+    pub async fn append(&mut self, record: &LogRecord) -> Result<Lsn> {
         let data = record.serialize();
         let record_size = data.len() as u32;
 
@@ -262,8 +267,8 @@ impl LogSegment {
             ZyronError::WalWriteFailed("segment not open for writing".to_string())
         })?;
 
-        file.seek(SeekFrom::Start(self.write_offset as u64))?;
-        file.write_all(&data)?;
+        file.seek(std::io::SeekFrom::Start(self.write_offset as u64)).await?;
+        file.write_all(&data).await?;
 
         let lsn = Lsn::new(self.header.segment_id.0, self.write_offset);
         self.write_offset += record_size;
@@ -272,23 +277,23 @@ impl LogSegment {
     }
 
     /// Syncs the segment to disk.
-    pub fn sync(&mut self) -> Result<()> {
+    pub async fn sync(&mut self) -> Result<()> {
         if let Some(ref file) = self.file {
-            file.sync_all()?;
+            file.sync_all().await?;
         }
         Ok(())
     }
 
     /// Closes the segment.
-    pub fn close(&mut self) -> Result<()> {
+    pub async fn close(&mut self) -> Result<()> {
         if let Some(file) = self.file.take() {
-            file.sync_all()?;
+            file.sync_all().await?;
         }
         Ok(())
     }
 
     /// Reads a record at the given offset.
-    pub fn read_at(&mut self, offset: u32) -> Result<LogRecord> {
+    pub async fn read_at(&mut self, offset: u32) -> Result<LogRecord> {
         let file = self.file.as_mut().ok_or_else(|| {
             ZyronError::WalCorrupted {
                 lsn: 0,
@@ -296,58 +301,21 @@ impl LogSegment {
             }
         })?;
 
-        file.seek(SeekFrom::Start(offset as u64))?;
+        file.seek(std::io::SeekFrom::Start(offset as u64)).await?;
 
         // Read header first to get payload length
         let mut header_buf = [0u8; LogRecord::HEADER_SIZE];
-        file.read_exact(&mut header_buf)?;
+        file.read_exact(&mut header_buf).await?;
 
         let payload_len = u16::from_le_bytes([header_buf[22], header_buf[23]]) as usize;
         let total_size = LogRecord::HEADER_SIZE + payload_len + LogRecord::CHECKSUM_SIZE;
 
         // Read full record
         let mut record_buf = vec![0u8; total_size];
-        file.seek(SeekFrom::Start(offset as u64))?;
-        file.read_exact(&mut record_buf)?;
+        file.seek(std::io::SeekFrom::Start(offset as u64)).await?;
+        file.read_exact(&mut record_buf).await?;
 
         LogRecord::deserialize(&record_buf)
-    }
-}
-
-/// Iterator over records in a segment.
-pub struct SegmentIterator<'a> {
-    segment: &'a mut LogSegment,
-    offset: u32,
-    end_offset: u32,
-}
-
-impl<'a> SegmentIterator<'a> {
-    /// Creates a new iterator starting from the given offset.
-    pub fn new(segment: &'a mut LogSegment, start_offset: u32) -> Self {
-        let end_offset = segment.write_offset;
-        Self {
-            segment,
-            offset: start_offset,
-            end_offset,
-        }
-    }
-}
-
-impl Iterator for SegmentIterator<'_> {
-    type Item = Result<LogRecord>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.offset >= self.end_offset {
-            return None;
-        }
-
-        match self.segment.read_at(self.offset) {
-            Ok(record) => {
-                self.offset += record.size_on_disk() as u32;
-                Some(Ok(record))
-            }
-            Err(e) => Some(Err(e)),
-        }
     }
 }
 
@@ -400,8 +368,8 @@ mod tests {
         assert!(header.validate().is_err());
     }
 
-    #[test]
-    fn test_segment_create_and_open() {
+    #[tokio::test]
+    async fn test_segment_create_and_open() {
         let dir = tempdir().unwrap();
         let segment_id = SegmentId::FIRST;
         let first_lsn = Lsn::new(1, SegmentHeader::SIZE as u32);
@@ -413,24 +381,24 @@ mod tests {
                 segment_id,
                 first_lsn,
                 LogSegment::DEFAULT_SIZE,
-            ).unwrap();
+            ).await.unwrap();
 
             assert_eq!(segment.segment_id(), segment_id);
             assert_eq!(segment.first_lsn(), first_lsn);
-            segment.close().unwrap();
+            segment.close().await.unwrap();
         }
 
         // Reopen segment
         {
             let path = dir.path().join(segment_id.filename());
-            let segment = LogSegment::open(&path).unwrap();
+            let segment = LogSegment::open(&path).await.unwrap();
             assert_eq!(segment.segment_id(), segment_id);
             assert_eq!(segment.first_lsn(), first_lsn);
         }
     }
 
-    #[test]
-    fn test_segment_append_and_read() {
+    #[tokio::test]
+    async fn test_segment_append_and_read() {
         let dir = tempdir().unwrap();
         let segment_id = SegmentId::FIRST;
 
@@ -439,7 +407,7 @@ mod tests {
             segment_id,
             Lsn::new(1, SegmentHeader::SIZE as u32),
             LogSegment::DEFAULT_SIZE,
-        ).unwrap();
+        ).await.unwrap();
 
         // Append a record
         let record = LogRecord::new(
@@ -450,18 +418,18 @@ mod tests {
             Bytes::from_static(b"test"),
         );
 
-        let lsn = segment.append(&record).unwrap();
-        segment.sync().unwrap();
+        let lsn = segment.append(&record).await.unwrap();
+        segment.sync().await.unwrap();
 
         // Read it back
-        let read_record = segment.read_at(lsn.offset()).unwrap();
+        let read_record = segment.read_at(lsn.offset()).await.unwrap();
         assert_eq!(read_record.txn_id, 1);
         assert_eq!(read_record.record_type, LogRecordType::Begin);
         assert_eq!(read_record.payload, Bytes::from_static(b"test"));
     }
 
-    #[test]
-    fn test_segment_remaining_space() {
+    #[tokio::test]
+    async fn test_segment_remaining_space() {
         let dir = tempdir().unwrap();
         let small_size = 1024u32;
 
@@ -470,14 +438,14 @@ mod tests {
             SegmentId::FIRST,
             Lsn::FIRST,
             small_size,
-        ).unwrap();
+        ).await.unwrap();
 
         let expected_remaining = small_size - SegmentHeader::SIZE as u32;
         assert_eq!(segment.remaining_space(), expected_remaining);
     }
 
-    #[test]
-    fn test_segment_full() {
+    #[tokio::test]
+    async fn test_segment_full() {
         let dir = tempdir().unwrap();
         let small_size = 128u32; // Very small segment
 
@@ -486,7 +454,7 @@ mod tests {
             SegmentId::FIRST,
             Lsn::FIRST,
             small_size,
-        ).unwrap();
+        ).await.unwrap();
 
         // Try to write a record larger than remaining space
         let large_payload = Bytes::from(vec![0u8; 200]);
@@ -498,7 +466,7 @@ mod tests {
             large_payload,
         );
 
-        let result = segment.append(&record);
+        let result = segment.append(&record).await;
         assert!(result.is_err());
     }
 }

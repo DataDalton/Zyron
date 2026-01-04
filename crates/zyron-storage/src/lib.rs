@@ -24,7 +24,6 @@ pub use freespace::{
     ENTRIES_PER_FSM_PAGE,
 };
 pub use heap::{
-    HeapFile, HeapFileConfig, HeapPage, HeapPageHeader, HeapPageIterator, HeapScan, SlotId,
-    TupleSlot,
+    HeapFile, HeapFileConfig, HeapPage, HeapPageHeader, HeapPageIterator, SlotId, TupleSlot,
 };
 pub use tuple::{Tuple, TupleFlags, TupleHeader, TupleId};

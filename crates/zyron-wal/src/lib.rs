@@ -10,5 +10,5 @@ pub mod reader;
 
 pub use record::{LogRecord, LogRecordType, Lsn};
 pub use segment::{LogSegment, SegmentId};
-pub use writer::WalWriter;
-pub use reader::WalReader;
+pub use writer::{TxnWalHandle, WalWriter, WalWriterConfig};
+pub use reader::{RecoveryManager, RecoveryResult, WalReader};

@@ -44,7 +44,7 @@ pub enum TypeId {
     // Binary types
     Binary = 60,
     Varbinary = 61,
-    Blob = 62,
+    Bytea = 62,
 
     // Date/Time types
     Date = 70,
@@ -93,7 +93,7 @@ impl TypeId {
             | TypeId::Text
             | TypeId::Binary
             | TypeId::Varbinary
-            | TypeId::Blob
+            | TypeId::Bytea
             | TypeId::Json
             | TypeId::Jsonb
             | TypeId::Array
@@ -155,7 +155,7 @@ impl TypeId {
 
     /// Returns true if this type is a binary type.
     pub fn is_binary(&self) -> bool {
-        matches!(self, TypeId::Binary | TypeId::Varbinary | TypeId::Blob)
+        matches!(self, TypeId::Binary | TypeId::Varbinary | TypeId::Bytea)
     }
 
     /// Returns true if this type is a temporal type.
@@ -194,7 +194,7 @@ impl std::fmt::Display for TypeId {
             TypeId::Text => "TEXT",
             TypeId::Binary => "BINARY",
             TypeId::Varbinary => "VARBINARY",
-            TypeId::Blob => "BLOB",
+            TypeId::Bytea => "BYTEA",
             TypeId::Date => "DATE",
             TypeId::Time => "TIME",
             TypeId::Timestamp => "TIMESTAMP",
@@ -259,7 +259,7 @@ mod tests {
         assert_eq!(TypeId::Text.fixed_size(), None);
         assert_eq!(TypeId::Binary.fixed_size(), None);
         assert_eq!(TypeId::Varbinary.fixed_size(), None);
-        assert_eq!(TypeId::Blob.fixed_size(), None);
+        assert_eq!(TypeId::Bytea.fixed_size(), None);
         assert_eq!(TypeId::Json.fixed_size(), None);
         assert_eq!(TypeId::Jsonb.fixed_size(), None);
         assert_eq!(TypeId::Array.fixed_size(), None);
@@ -341,7 +341,7 @@ mod tests {
     fn test_is_binary() {
         assert!(TypeId::Binary.is_binary());
         assert!(TypeId::Varbinary.is_binary());
-        assert!(TypeId::Blob.is_binary());
+        assert!(TypeId::Bytea.is_binary());
 
         assert!(!TypeId::Text.is_binary());
         assert!(!TypeId::Jsonb.is_binary());
@@ -447,7 +447,7 @@ mod tests {
             TypeId::Text,
             TypeId::Binary,
             TypeId::Varbinary,
-            TypeId::Blob,
+            TypeId::Bytea,
             TypeId::Date,
             TypeId::Time,
             TypeId::Timestamp,

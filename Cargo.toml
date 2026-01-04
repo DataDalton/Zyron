@@ -9,8 +9,9 @@ edition = "2024"
 rust-version = "1.94"
 
 [workspace.dependencies]
-# Async runtime
+# Async runtime and transport
 tokio = { version = "1.45", features = ["full"] }
+tokio-quiche = "0.12"
 async-trait = "0.1"
 
 # Serialization
