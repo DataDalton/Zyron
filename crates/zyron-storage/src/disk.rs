@@ -41,9 +41,6 @@ pub struct DiskManager {
 struct FileHandle {
     /// The file handle.
     file: File,
-    /// Path to the file.
-    #[allow(dead_code)]
-    path: PathBuf,
     /// Number of pages in the file.
     num_pages: u32,
 }
@@ -91,7 +88,6 @@ impl DiskManager {
             file_id,
             FileHandle {
                 file,
-                path,
                 num_pages,
             },
         );

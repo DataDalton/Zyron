@@ -1,0 +1,11 @@
+//! Heap storage implementation.
+//!
+//! This module provides heap-based tuple storage with:
+//! - HeapPage: Slotted page format for variable-length tuples
+//! - HeapFile: High-level API coordinating pages, FSM, and disk I/O
+
+mod file;
+mod page;
+
+pub use file::{HeapFile, HeapFileConfig, HeapScan};
+pub use page::{HeapPage, HeapPageHeader, HeapPageIterator, SlotId, TupleSlot};

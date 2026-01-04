@@ -3,6 +3,7 @@
 //! This crate provides:
 //! - Disk manager for page-level file I/O
 //! - Heap pages for variable-length tuple storage
+//! - HeapFile manager for coordinating storage operations
 //! - Tuple representation and serialization
 //! - B+ tree index implementation
 //! - Free space map for space management
@@ -22,5 +23,8 @@ pub use freespace::{
     category_to_min_space, space_to_category, FreeSpaceMap, FsmHeader, FsmPage,
     ENTRIES_PER_FSM_PAGE,
 };
-pub use heap::{HeapPage, HeapPageHeader, SlotId, TupleSlot};
+pub use heap::{
+    HeapFile, HeapFileConfig, HeapPage, HeapPageHeader, HeapPageIterator, HeapScan, SlotId,
+    TupleSlot,
+};
 pub use tuple::{Tuple, TupleFlags, TupleHeader, TupleId};
