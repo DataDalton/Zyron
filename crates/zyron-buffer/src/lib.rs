@@ -11,5 +11,5 @@ mod pool;
 mod replacer;
 
 pub use frame::{BufferFrame, FrameId};
-pub use pool::{BufferPool, BufferPoolConfig};
+pub use pool::{BufferPool, BufferPoolConfig, EvictedPage};
 pub use replacer::{ClockReplacer, Replacer};

@@ -173,9 +173,9 @@ async fn test_buffer_pool_eviction() {
     for i in 0..NUM_PAGES {
         let page_id = PageId::new(0, i as u32);
 
-        let (frame, was_evicted_dirty) = pool.new_page(page_id).unwrap();
+        let (frame, evicted) = pool.new_page(page_id).unwrap();
 
-        if was_evicted_dirty {
+        if evicted.is_some() {
             dirty_evictions += 1;
         }
 

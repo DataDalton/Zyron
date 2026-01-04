@@ -10,42 +10,42 @@ rust-version = "1.94"
 
 [workspace.dependencies]
 # Async runtime and transport
-tokio = { version = "1.45", features = ["full"] }
+tokio = { version = "1.49", features = ["full"] }
 tokio-quiche = "0.12"
-async-trait = "0.1"
+async-trait = "0.1.89"
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
 bincode = "2.0"
 
 # Data structures
-bytes = { version = "1.9", features = ["serde"] }
-hashbrown = "0.15"
-crossbeam = "0.8"
-parking_lot = "0.12"
+bytes = { version = "1.11", features = ["serde"] }
+hashbrown = "0.16"
+crossbeam = "0.8.4"
+parking_lot = "0.12.5"
 
 # Error handling
-thiserror = "2.0"
-anyhow = "1.0"
+thiserror = "2.0.17"
+anyhow = "1.0.100"
 
 # Logging
-tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.22"
 
 # Compression
-lz4_flex = "0.11"
-zstd = "0.13"
+lz4_flex = "0.12"
+zstd = "0.13.3"
 
 # Checksums
-crc32fast = "1.4"
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
+crc32fast = "1.5"
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 
 # System info
-sysinfo = "0.32"
+sysinfo = "0.37"
 
 # Arrow ecosystem
-arrow = "55"
-parquet = "55"
+arrow = "57"
+parquet = "57"
 
 [profile.release]
 opt-level = 3

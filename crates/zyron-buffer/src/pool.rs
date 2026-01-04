@@ -8,6 +8,14 @@ use sysinfo::System;
 use zyron_common::page::{PageId, PAGE_SIZE};
 use zyron_common::{Result, ZyronError};
 
+/// Information about a dirty page that was evicted from the buffer pool.
+/// Caller must write this to disk to prevent data loss.
+#[derive(Debug)]
+pub struct EvictedPage {
+    pub page_id: PageId,
+    pub data: Box<[u8; PAGE_SIZE]>,
+}
+
 /// Configuration for the buffer pool.
 #[derive(Debug, Clone)]
 pub struct BufferPoolConfig {
@@ -121,27 +129,41 @@ impl BufferPool {
     /// Allocates a frame for a new page.
     ///
     /// Tries to get a free frame first, then evicts if necessary.
-    /// Returns the frame ID and whether the frame was dirty (needs flush).
-    fn allocate_frame(&self) -> Result<(FrameId, bool)> {
+    /// Returns the frame ID and any evicted dirty page that must be flushed.
+    fn allocate_frame(&self) -> Result<(FrameId, Option<EvictedPage>)> {
         // Try free list first
         {
             let mut free_list = self.free_list.lock();
             if let Some(frame_id) = free_list.pop() {
-                return Ok((frame_id, false));
+                return Ok((frame_id, None));
             }
         }
 
         // Try to evict
         if let Some(victim_id) = self.replacer.evict() {
             let frame = &self.frames[victim_id.0 as usize];
-            let was_dirty = frame.is_dirty();
+
+            // Capture evicted page data if dirty
+            let evicted = if frame.is_dirty() {
+                if let Some(page_id) = frame.page_id() {
+                    let data_guard = frame.read_data();
+                    let mut data = Box::new([0u8; PAGE_SIZE]);
+                    data.copy_from_slice(&**data_guard);
+                    drop(data_guard);
+                    Some(EvictedPage { page_id, data })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
             // Remove old page from page table
             if let Some(old_page_id) = frame.page_id() {
                 self.page_table.write().remove(&old_page_id);
             }
 
-            return Ok((victim_id, was_dirty));
+            return Ok((victim_id, evicted));
         }
 
         Err(ZyronError::BufferPoolFull)
@@ -152,9 +174,9 @@ impl BufferPool {
     /// If the page already exists, returns the existing frame.
     /// The page is pinned before being returned.
     ///
-    /// Returns (frame, was_evicted_dirty) where was_evicted_dirty indicates
-    /// if a dirty page was evicted to make room.
-    pub fn new_page(&self, page_id: PageId) -> Result<(&BufferFrame, bool)> {
+    /// Returns (frame, evicted) where evicted contains any dirty page that was
+    /// evicted to make room. Caller must write evicted pages to disk.
+    pub fn new_page(&self, page_id: PageId) -> Result<(&BufferFrame, Option<EvictedPage>)> {
         // Check if page already exists
         {
             let page_table = self.page_table.read();
@@ -163,12 +185,12 @@ impl BufferPool {
                 frame.pin();
                 self.replacer.record_access(frame_id);
                 self.replacer.set_evictable(frame_id, false);
-                return Ok((frame, false));
+                return Ok((frame, None));
             }
         }
 
         // Allocate a frame
-        let (frame_id, was_dirty) = self.allocate_frame()?;
+        let (frame_id, evicted) = self.allocate_frame()?;
 
         // Set up the frame
         let frame = &self.frames[frame_id.0 as usize];
@@ -182,16 +204,17 @@ impl BufferPool {
         // Mark as not evictable (pinned)
         self.replacer.set_evictable(frame_id, false);
 
-        Ok((frame, was_dirty))
+        Ok((frame, evicted))
     }
 
     /// Loads page data into the buffer pool.
     ///
     /// This is used when reading a page from disk.
-    pub fn load_page(&self, page_id: PageId, data: &[u8]) -> Result<(&BufferFrame, bool)> {
-        let (frame, was_dirty) = self.new_page(page_id)?;
+    /// Returns the frame and any evicted dirty page that must be flushed.
+    pub fn load_page(&self, page_id: PageId, data: &[u8]) -> Result<(&BufferFrame, Option<EvictedPage>)> {
+        let (frame, evicted) = self.new_page(page_id)?;
         frame.copy_from(data);
-        Ok((frame, was_dirty))
+        Ok((frame, evicted))
     }
 
     /// Unpins a page in the buffer pool.
@@ -426,9 +449,9 @@ mod tests {
         let pool = create_test_pool(10);
         let page_id = PageId::new(0, 1);
 
-        let (frame, was_dirty) = pool.new_page(page_id).unwrap();
+        let (frame, evicted) = pool.new_page(page_id).unwrap();
 
-        assert!(!was_dirty);
+        assert!(evicted.is_none());
         assert_eq!(frame.page_id(), Some(page_id));
         assert!(frame.is_pinned());
         assert_eq!(pool.free_count(), 9);
@@ -497,9 +520,9 @@ mod tests {
 
         // Add one more page, should evict
         let new_page_id = PageId::new(0, 99);
-        let (_, was_dirty) = pool.new_page(new_page_id).unwrap();
+        let (_, evicted) = pool.new_page(new_page_id).unwrap();
 
-        assert!(!was_dirty);
+        assert!(evicted.is_none()); // Evicted page was clean
         assert_eq!(pool.page_count(), 3);
         assert!(pool.contains(new_page_id));
     }
@@ -509,15 +532,19 @@ mod tests {
         let pool = create_test_pool(1);
         let page_id1 = PageId::new(0, 1);
 
-        // Add dirty page
-        pool.new_page(page_id1).unwrap();
+        // Add dirty page with some data
+        let (frame, _) = pool.new_page(page_id1).unwrap();
+        frame.write_data()[0] = 0xAB;
         pool.unpin_page(page_id1, true);
 
         // Add another page, should evict dirty page
         let page_id2 = PageId::new(0, 2);
-        let (_, was_dirty) = pool.new_page(page_id2).unwrap();
+        let (_, evicted) = pool.new_page(page_id2).unwrap();
 
-        assert!(was_dirty);
+        // Verify evicted page info is captured
+        let evicted = evicted.expect("dirty page should be returned on eviction");
+        assert_eq!(evicted.page_id, page_id1);
+        assert_eq!(evicted.data[0], 0xAB);
     }
 
     #[test]
@@ -689,9 +716,9 @@ mod tests {
         pool.unpin_page(page_id, false);
 
         // Adding same page again should return existing frame
-        let (frame, was_dirty) = pool.new_page(page_id).unwrap();
+        let (frame, evicted) = pool.new_page(page_id).unwrap();
 
-        assert!(!was_dirty);
+        assert!(evicted.is_none()); // No eviction when page already exists
         assert_eq!(frame.page_id(), Some(page_id));
         assert_eq!(pool.page_count(), 1);
     }

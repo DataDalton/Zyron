@@ -143,6 +143,8 @@ impl DiskManager {
     /// Allocates a new page in the specified file.
     ///
     /// Returns the PageId of the newly allocated page.
+    /// Lazy allocation - only reserves the page number.
+    /// Actual disk write happens when write_page is called.
     pub async fn allocate_page(&self, file_id: u32) -> Result<PageId> {
         self.open_file(file_id).await?;
 
@@ -154,15 +156,8 @@ impl DiskManager {
         let page_num = handle.num_pages;
         let page_id = PageId::new(file_id, page_num);
 
-        // Write an empty page to extend the file
-        let offset = (page_num as u64) * (PAGE_SIZE as u64);
-        handle.file.seek(std::io::SeekFrom::Start(offset)).await?;
-        handle.file.write_all(&[0u8; PAGE_SIZE]).await?;
-
-        if self.config.fsync_enabled {
-            handle.file.sync_all().await?;
-        }
-
+        // Lazy allocation - just increment counter
+        // Actual disk write deferred to write_page
         handle.num_pages = page_num + 1;
 
         Ok(page_id)

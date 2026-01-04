@@ -31,7 +31,7 @@ use crate::disk::DiskManager;
 use crate::tuple::TupleId;
 use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
-use zyron_buffer::BufferPool;
+use zyron_buffer::{BufferPool, EvictedPage};
 use zyron_common::page::{PageHeader, PageId, PageType, PAGE_SIZE};
 use zyron_common::{Result, ZyronError};
 
@@ -446,13 +446,119 @@ impl BTreeLeafPage {
 
     /// Gets the value for a key.
     pub fn get(&self, key: &[u8]) -> Option<TupleId> {
-        match self.search(key) {
-            Ok(idx) => {
-                let entries = self.entries();
-                Some(entries[idx].tuple_id)
+        Self::get_in_slice(&*self.data, key)
+    }
+
+    /// Gets the value for a key directly from raw page data.
+    /// Zero-copy version that avoids allocations.
+    pub fn get_in_slice(data: &[u8], key: &[u8]) -> Option<TupleId> {
+        // Parse header
+        let header_offset = LeafPageHeader::OFFSET;
+        let num_keys = u16::from_le_bytes([data[header_offset], data[header_offset + 1]]) as usize;
+
+        // Binary search through entries
+        let mut offset = Self::DATA_START;
+        for _ in 0..num_keys {
+            // Parse entry: key_len (2) + key (var) + page_id (8) + slot_id (2)
+            let key_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+            let entry_key = &data[offset + 2..offset + 2 + key_len];
+
+            match key.cmp(entry_key) {
+                std::cmp::Ordering::Equal => {
+                    // Found it - parse tuple_id
+                    let tuple_offset = offset + 2 + key_len;
+                    let page_id = PageId::from_u64(u64::from_le_bytes([
+                        data[tuple_offset], data[tuple_offset + 1],
+                        data[tuple_offset + 2], data[tuple_offset + 3],
+                        data[tuple_offset + 4], data[tuple_offset + 5],
+                        data[tuple_offset + 6], data[tuple_offset + 7],
+                    ]));
+                    let slot_id = u16::from_le_bytes([
+                        data[tuple_offset + 8], data[tuple_offset + 9],
+                    ]);
+                    return Some(TupleId::new(page_id, slot_id));
+                }
+                std::cmp::Ordering::Less => {
+                    // Key would be before this entry, so not found (entries are sorted ascending)
+                    return None;
+                }
+                std::cmp::Ordering::Greater => {
+                    // Key is after this entry, continue searching
+                    offset += 2 + key_len + 10; // key_len + key + page_id(8) + slot_id(2)
+                }
             }
-            Err(_) => None,
         }
+        None
+    }
+
+    /// Inserts a key-value pair directly into raw page data.
+    /// Returns Ok(()) on success, Err(NodeFull) if page is full, Err(DuplicateKey) if key exists.
+    pub fn insert_in_slice(data: &mut [u8], key: &[u8], tuple_id: TupleId) -> Result<()> {
+        // Parse header
+        let header_offset = LeafPageHeader::OFFSET;
+        let num_keys = u16::from_le_bytes([data[header_offset], data[header_offset + 1]]) as usize;
+        let raw_free_offset = u16::from_le_bytes([data[header_offset + 2], data[header_offset + 3]]) as usize;
+
+        // Handle uninitialized pages (free_space_offset == 0 means page was never written)
+        let free_space_offset = if raw_free_offset < Self::DATA_START {
+            Self::DATA_START
+        } else {
+            raw_free_offset
+        };
+
+        // Entry size: key_len(2) + key + page_id(8) + slot_id(2)
+        let entry_size = 2 + key.len() + 10;
+        let free_space = PAGE_SIZE - free_space_offset;
+
+        if free_space < entry_size {
+            return Err(ZyronError::NodeFull);
+        }
+
+        // Find insertion point and check for duplicates
+        let mut insert_offset = Self::DATA_START;
+        let mut offset = Self::DATA_START;
+
+        for _ in 0..num_keys {
+            let key_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+            let entry_key = &data[offset + 2..offset + 2 + key_len];
+            let entry_total = 2 + key_len + 10;
+
+            match key.cmp(entry_key) {
+                std::cmp::Ordering::Equal => return Err(ZyronError::DuplicateKey),
+                std::cmp::Ordering::Less => {
+                    insert_offset = offset;
+                    break;
+                }
+                std::cmp::Ordering::Greater => {
+                    offset += entry_total;
+                    insert_offset = offset;
+                }
+            }
+        }
+
+        // Shift existing entries to make room
+        let bytes_to_shift = free_space_offset - insert_offset;
+        if bytes_to_shift > 0 {
+            data.copy_within(insert_offset..free_space_offset, insert_offset + entry_size);
+        }
+
+        // Write the new entry
+        let mut write_offset = insert_offset;
+        data[write_offset..write_offset + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
+        write_offset += 2;
+        data[write_offset..write_offset + key.len()].copy_from_slice(key);
+        write_offset += key.len();
+        data[write_offset..write_offset + 8].copy_from_slice(&tuple_id.page_id.as_u64().to_le_bytes());
+        write_offset += 8;
+        data[write_offset..write_offset + 2].copy_from_slice(&tuple_id.slot_id.to_le_bytes());
+
+        // Update header
+        let new_num_keys = (num_keys + 1) as u16;
+        let new_free_offset = (free_space_offset + entry_size) as u16;
+        data[header_offset..header_offset + 2].copy_from_slice(&new_num_keys.to_le_bytes());
+        data[header_offset + 2..header_offset + 4].copy_from_slice(&new_free_offset.to_le_bytes());
+
+        Ok(())
     }
 
     /// Deletes a key from the leaf. Returns DeleteResult indicating outcome.
@@ -708,33 +814,61 @@ impl BTreeInternalPage {
 
     /// Finds the child page for a given key.
     pub fn find_child(&self, key: &[u8]) -> PageId {
-        let entries = self.entries();
+        Self::find_child_in_slice(&*self.data, key)
+    }
 
-        for entry in &entries {
-            if key < entry.key.as_ref() {
-                // Key is less than this entry, go to previous child
-                // For first entry, that's leftmost_child
-                // Otherwise, it's the previous entry's child
-                break;
+    /// Finds the child page for a given key directly from raw page data.
+    /// Zero-copy version that avoids Box allocation and page struct creation.
+    pub fn find_child_in_slice(data: &[u8], key: &[u8]) -> PageId {
+        // Parse header to get num_keys
+        let header_offset = InternalPageHeader::OFFSET;
+        let num_keys = u16::from_le_bytes([data[header_offset], data[header_offset + 1]]) as usize;
+
+        // Leftmost child pointer
+        let leftmost_offset = Self::DATA_START;
+        let leftmost = PageId::from_u64(u64::from_le_bytes([
+            data[leftmost_offset],
+            data[leftmost_offset + 1],
+            data[leftmost_offset + 2],
+            data[leftmost_offset + 3],
+            data[leftmost_offset + 4],
+            data[leftmost_offset + 5],
+            data[leftmost_offset + 6],
+            data[leftmost_offset + 7],
+        ]));
+
+        if num_keys == 0 {
+            return leftmost;
+        }
+
+        // Scan through entries to find correct child
+        let mut offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
+        let mut prev_child = leftmost;
+
+        for _ in 0..num_keys {
+            // Parse entry: key_len (2) + key (var) + child_page_id (8)
+            let key_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+            let entry_key = &data[offset + 2..offset + 2 + key_len];
+            let child_offset = offset + 2 + key_len;
+            let child = PageId::from_u64(u64::from_le_bytes([
+                data[child_offset],
+                data[child_offset + 1],
+                data[child_offset + 2],
+                data[child_offset + 3],
+                data[child_offset + 4],
+                data[child_offset + 5],
+                data[child_offset + 6],
+                data[child_offset + 7],
+            ]));
+
+            if key < entry_key {
+                return prev_child;
             }
+            prev_child = child;
+            offset = child_offset + 8;
         }
 
-        // Binary search to find the correct child
-        for (i, entry) in entries.iter().enumerate() {
-            if key < entry.key.as_ref() {
-                if i == 0 {
-                    return self.leftmost_child();
-                } else {
-                    return entries[i - 1].child_page_id;
-                }
-            }
-        }
-
-        // Key is >= all keys, return rightmost child
-        match entries.last() {
-            Some(entry) => entry.child_page_id,
-            None => self.leftmost_child(),
-        }
+        prev_child
     }
 
     /// Inserts a key and right child pointer.
@@ -1022,7 +1156,7 @@ pub struct BTreeIndex {
 impl BTreeIndex {
     /// Creates a new B+ tree index.
     ///
-    /// Creates an empty root leaf page on disk and caches it in the buffer pool.
+    /// Creates an empty root leaf page and caches it in the buffer pool.
     pub async fn create(
         disk: Arc<DiskManager>,
         pool: Arc<BufferPool>,
@@ -1031,12 +1165,15 @@ impl BTreeIndex {
         // Allocate root page
         let root_page_id = disk.allocate_page(file_id).await?;
 
-        // Create empty leaf as root
+        // Create empty leaf as root and add to buffer pool
         let root_page = BTreeLeafPage::new(root_page_id);
-        disk.write_page(root_page_id, root_page.as_bytes()).await?;
+        let (_, evicted) = pool.load_page(root_page_id, root_page.as_bytes())?;
+        pool.unpin_page(root_page_id, true); // Mark dirty for eventual disk write
 
-        // Load root page into buffer pool
-        let _ = pool.load_page(root_page_id, root_page.as_bytes());
+        // Flush any evicted dirty page
+        if let Some(evicted) = evicted {
+            disk.write_page(evicted.page_id, &*evicted.data).await?;
+        }
 
         let tree = BTree::new(root_page_id, file_id);
         Ok(Self { tree, disk, pool })
@@ -1082,6 +1219,11 @@ impl BTreeIndex {
     // Cached Page Access Helpers
     // =========================================================================
 
+    /// Flushes an evicted dirty page to disk.
+    async fn flush_evicted(&self, evicted: EvictedPage) -> Result<()> {
+        self.disk.write_page(evicted.page_id, &*evicted.data).await
+    }
+
     /// Reads a page, checking buffer pool first, loading from disk on miss.
     async fn read_cached_page(&self, page_id: PageId) -> Result<[u8; PAGE_SIZE]> {
         // Check buffer pool first
@@ -1095,23 +1237,34 @@ impl BTreeIndex {
 
         // Cache miss - load from disk
         let data = self.disk.read_page(page_id).await?;
-        let _ = self.pool.load_page(page_id, &data);
+        let (_, evicted) = self.pool.load_page(page_id, &data)?;
+
+        // Flush evicted dirty page if any
+        if let Some(evicted) = evicted {
+            self.flush_evicted(evicted).await?;
+        }
+
         self.pool.unpin_page(page_id, false);
         Ok(data)
     }
 
-    /// Writes a page to buffer pool (marks dirty) and disk.
+    /// Writes a page to buffer pool only (marks dirty). Disk write deferred until eviction.
     async fn write_cached_page(&self, page_id: PageId, data: &[u8; PAGE_SIZE]) -> Result<()> {
-        // Write to disk first for durability
-        self.disk.write_page(page_id, data).await?;
-
-        // Update or load into buffer pool
+        // Write to buffer pool only - disk write happens on eviction or flush
         if let Some(frame) = self.pool.fetch_page(page_id) {
             frame.copy_from(data);
-            self.pool.unpin_page(page_id, false); // Clean since we wrote to disk
+            frame.set_dirty(true);
+            self.pool.unpin_page(page_id, true);
         } else {
-            let _ = self.pool.load_page(page_id, data);
-            self.pool.unpin_page(page_id, false);
+            // Page not in pool - load it and mark dirty
+            let (_, evicted) = self.pool.load_page(page_id, data)?;
+
+            // Flush evicted dirty page if any
+            if let Some(evicted) = evicted {
+                self.flush_evicted(evicted).await?;
+            }
+
+            self.pool.unpin_page(page_id, true);
         }
 
         Ok(())
@@ -1154,12 +1307,28 @@ impl BTreeIndex {
     /// Returns the TupleId if found, None otherwise.
     pub async fn search(&self, key: &[u8]) -> Result<Option<TupleId>> {
         let leaf_page_id = self.find_leaf(key).await?;
-        let page_data = self.read_cached_page(leaf_page_id).await?;
-        let leaf = BTreeLeafPage::from_bytes(page_data);
-        Ok(leaf.get(key))
+
+        // Try buffer pool first (zero-copy path)
+        if let Some(guard) = self.pool.read_page(leaf_page_id) {
+            let data = guard.data();
+            return Ok(BTreeLeafPage::get_in_slice(&**data, key));
+        }
+
+        // Cache miss - load from disk
+        let page_data = self.disk.read_page(leaf_page_id).await?;
+        let (frame, evicted) = self.pool.load_page(leaf_page_id, &page_data)?;
+        if let Some(evicted) = evicted {
+            self.flush_evicted(evicted).await?;
+        }
+        let data = frame.read_data();
+        let result = BTreeLeafPage::get_in_slice(&**data, key);
+        drop(data);
+        self.pool.unpin_page(leaf_page_id, false);
+        Ok(result)
     }
 
     /// Finds the leaf page that should contain the given key.
+    /// Uses zero-copy access to buffer pool frames for internal node traversal.
     async fn find_leaf(&self, key: &[u8]) -> Result<PageId> {
         let mut current_page_id = self.tree.root_page_id();
 
@@ -1168,11 +1337,26 @@ impl BTreeIndex {
             return Ok(current_page_id);
         }
 
-        // Traverse internal nodes
+        // Traverse internal nodes using zero-copy access
         for _ in 0..(self.tree.height() - 1) {
-            let page_data = self.read_cached_page(current_page_id).await?;
-            let internal = BTreeInternalPage::from_bytes(page_data);
-            current_page_id = internal.find_child(key);
+            let next_child = if let Some(guard) = self.pool.read_page(current_page_id) {
+                let data = guard.data();
+                BTreeInternalPage::find_child_in_slice(&**data, key)
+            } else {
+                // Cache miss - load from disk
+                let page_data = self.disk.read_page(current_page_id).await?;
+                let (frame, evicted) = self.pool.load_page(current_page_id, &page_data)?;
+                if let Some(evicted) = evicted {
+                    self.flush_evicted(evicted).await?;
+                }
+                // Use frame directly (already pinned by load_page)
+                let data = frame.read_data();
+                let result = BTreeInternalPage::find_child_in_slice(&**data, key);
+                drop(data);
+                self.pool.unpin_page(current_page_id, false);
+                result
+            };
+            current_page_id = next_child;
         }
 
         Ok(current_page_id)
@@ -1180,6 +1364,7 @@ impl BTreeIndex {
 
     /// Inserts a key-value pair into the B+ tree.
     ///
+    /// Uses in-place operations on buffer pool frames to avoid data copying.
     /// Handles page splits as needed.
     pub async fn insert(&mut self, key: Bytes, tuple_id: TupleId) -> Result<()> {
         if key.len() > MAX_KEY_SIZE {
@@ -1192,23 +1377,39 @@ impl BTreeIndex {
         // Find the path from root to the target leaf
         let path = self.find_path(&key).await?;
 
-        // Read the leaf page
+        // Get the leaf page ID
         let leaf_page_id = *path.last().ok_or_else(|| {
             ZyronError::BTreeCorrupted("empty path".to_string())
         })?;
 
-        let page_data = self.read_cached_page(leaf_page_id).await?;
-        let mut leaf = BTreeLeafPage::from_bytes(page_data);
-
-        // Try to insert into the leaf
-        match leaf.insert(key.clone(), tuple_id) {
-            Ok(()) => {
-                // Write updated leaf
-                self.write_cached_page(leaf_page_id, leaf.as_bytes()).await?;
-                Ok(())
+        // Try in-place insert via buffer pool
+        let insert_result = if let Some(guard) = self.pool.write_page(leaf_page_id) {
+            // Cache hit - insert directly into buffer pool frame
+            let mut data = guard.data_mut();
+            let result = BTreeLeafPage::insert_in_slice(&mut **data, key.as_ref(), tuple_id);
+            if result.is_ok() {
+                guard.set_dirty();
             }
+            result
+        } else {
+            // Cache miss - load page then insert in place
+            let page_data = self.disk.read_page(leaf_page_id).await?;
+            let (frame, evicted) = self.pool.load_page(leaf_page_id, &page_data)?;
+            if let Some(evicted) = evicted {
+                self.flush_evicted(evicted).await?;
+            }
+            let mut data = frame.write_data();
+            let result = BTreeLeafPage::insert_in_slice(&mut **data, key.as_ref(), tuple_id);
+            let is_ok = result.is_ok();
+            drop(data);
+            self.pool.unpin_page(leaf_page_id, is_ok);
+            result
+        };
+
+        match insert_result {
+            Ok(()) => Ok(()),
             Err(ZyronError::NodeFull) => {
-                // Need to split
+                // Need to split - fall back to copying path for split handling
                 self.insert_with_split(key, tuple_id, path).await
             }
             Err(e) => Err(e),
@@ -1216,6 +1417,7 @@ impl BTreeIndex {
     }
 
     /// Finds the path from root to the leaf containing the key.
+    /// Uses zero-copy access to buffer pool frames for internal node traversal.
     async fn find_path(&self, key: &[u8]) -> Result<Vec<PageId>> {
         let mut path = Vec::with_capacity(self.tree.height() as usize);
         let mut current_page_id = self.tree.root_page_id();
@@ -1227,11 +1429,28 @@ impl BTreeIndex {
             return Ok(path);
         }
 
-        // Traverse internal nodes
+        // Traverse internal nodes using zero-copy access
         for _ in 0..(self.tree.height() - 1) {
-            let page_data = self.read_cached_page(current_page_id).await?;
-            let internal = BTreeInternalPage::from_bytes(page_data);
-            current_page_id = internal.find_child(key);
+            // Try buffer pool first (zero-copy path)
+            let next_child = if let Some(guard) = self.pool.read_page(current_page_id) {
+                let data = guard.data();
+                BTreeInternalPage::find_child_in_slice(&**data, key)
+            } else {
+                // Cache miss - load from disk
+                let page_data = self.disk.read_page(current_page_id).await?;
+                let (frame, evicted) = self.pool.load_page(current_page_id, &page_data)?;
+                if let Some(evicted) = evicted {
+                    self.flush_evicted(evicted).await?;
+                }
+                // Use frame directly (already pinned by load_page)
+                let data = frame.read_data();
+                let result = BTreeInternalPage::find_child_in_slice(&**data, key);
+                drop(data);
+                self.pool.unpin_page(current_page_id, false);
+                result
+            };
+
+            current_page_id = next_child;
             path.push(current_page_id);
         }
 
