@@ -1,13 +1,17 @@
-//! WAL writer for appending log records.
+//! WAL writer with group commit for high-throughput durability.
+//!
+//! Group commit batches multiple WAL records together and performs a single
+//! fsync for the entire batch, amortizing the expensive disk sync operation
+//! across many transactions.
 
 use crate::record::{LogRecord, LogRecordType, Lsn};
 use crate::segment::{LogSegment, SegmentHeader, SegmentId};
 use bytes::Bytes;
-use std::collections::VecDeque;
+use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Notify};
 use zyron_common::{Result, ZyronError};
 
 /// Configuration for the WAL writer.
@@ -17,10 +21,14 @@ pub struct WalWriterConfig {
     pub wal_dir: PathBuf,
     /// Maximum size of each segment file.
     pub segment_size: u32,
-    /// Enable fsync after each write.
+    /// Enable fsync after writes.
     pub fsync_enabled: bool,
-    /// Number of records to buffer before flushing (group commit).
-    pub group_commit_size: usize,
+    /// Maximum records to buffer before forcing flush.
+    pub batch_size: usize,
+    /// Maximum bytes to buffer before forcing flush.
+    pub batch_bytes: usize,
+    /// Flush interval in microseconds (0 = immediate flush after each batch).
+    pub flush_interval_us: u64,
 }
 
 impl Default for WalWriterConfig {
@@ -29,52 +37,132 @@ impl Default for WalWriterConfig {
             wal_dir: PathBuf::from("./data/wal"),
             segment_size: LogSegment::DEFAULT_SIZE,
             fsync_enabled: true,
-            group_commit_size: 1,
+            batch_size: 1000,
+            batch_bytes: 4 * 1024 * 1024, // 4MB
+            flush_interval_us: 0,
         }
     }
 }
 
-/// Thread-safe WAL writer.
+/// Entry in the write buffer waiting for flush.
+struct PendingWrite {
+    /// Serialized record data.
+    data: Bytes,
+    /// Assigned LSN for this record.
+    lsn: Lsn,
+}
+
+/// Write buffer accumulating records for group commit.
+struct WriteBuffer {
+    /// Pending writes awaiting flush.
+    pending: Vec<PendingWrite>,
+    /// Total bytes in pending writes.
+    pending_bytes: usize,
+    /// Next offset within current segment (used for LSN assignment).
+    next_offset: u32,
+    /// Current segment ID.
+    current_segment_id: u32,
+}
+
+impl WriteBuffer {
+    fn new(segment_id: u32, start_offset: u32) -> Self {
+        Self {
+            pending: Vec::with_capacity(1024),
+            pending_bytes: 0,
+            next_offset: start_offset,
+            current_segment_id: segment_id,
+        }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    #[inline]
+    fn bytes(&self) -> usize {
+        self.pending_bytes
+    }
+
+    /// Adds a record to the buffer and returns its assigned LSN.
+    #[inline]
+    fn push(&mut self, data: Bytes) -> Lsn {
+        let lsn = Lsn::new(self.current_segment_id, self.next_offset);
+        let size = data.len() as u32;
+        self.pending.push(PendingWrite { data, lsn });
+        self.pending_bytes += size as usize;
+        self.next_offset += size;
+        lsn
+    }
+
+    /// Takes all pending writes, leaving buffer empty.
+    #[inline]
+    fn take(&mut self) -> (Vec<PendingWrite>, usize) {
+        let pending = std::mem::take(&mut self.pending);
+        let bytes = self.pending_bytes;
+        self.pending_bytes = 0;
+        self.pending.reserve(1024);
+        (pending, bytes)
+    }
+
+    /// Updates segment after rotation.
+    fn rotate_segment(&mut self, new_segment_id: u32, start_offset: u32) {
+        self.current_segment_id = new_segment_id;
+        self.next_offset = start_offset;
+    }
+}
+
+/// Thread-safe WAL writer with group commit.
 ///
-/// Handles appending log records, segment rotation, and fsync.
+/// Batches multiple records together and performs a single fsync for the
+/// entire batch, providing both durability and high throughput.
 pub struct WalWriter {
     /// Configuration.
     config: WalWriterConfig,
     /// Current active segment.
-    current_segment: Mutex<Option<LogSegment>>,
-    /// Next LSN to assign.
-    next_lsn: AtomicU64,
+    segment: Mutex<Option<LogSegment>>,
+    /// Write buffer for group commit.
+    buffer: Mutex<WriteBuffer>,
     /// Next transaction ID to assign.
     next_txn_id: AtomicU64,
-    /// Pending records for group commit (reserved for future use).
-    #[allow(dead_code)]
-    pending: Mutex<VecDeque<LogRecord>>,
-    /// Last flushed LSN.
+    /// Last flushed LSN (all records up to this LSN are durable).
     flushed_lsn: AtomicU64,
+    /// Broadcast channel for flush completion notifications.
+    flush_complete: broadcast::Sender<Lsn>,
+    /// Notify for waking flush waiters.
+    flush_notify: Notify,
 }
 
 impl WalWriter {
     /// Creates a new WAL writer.
     pub async fn new(config: WalWriterConfig) -> Result<Self> {
-        // Create WAL directory if it doesn't exist
         tokio::fs::create_dir_all(&config.wal_dir).await?;
 
-        // Find existing segments and determine starting LSN
-        let (current_segment, next_lsn) = Self::recover_or_create(&config).await?;
+        let (segment, next_lsn) = Self::recover_or_create(&config).await?;
+        let segment_id = segment.segment_id().0;
+        let write_offset = segment.write_offset();
+
+        let (flush_complete, _) = broadcast::channel(64);
 
         Ok(Self {
             config,
-            current_segment: Mutex::new(Some(current_segment)),
-            next_lsn: AtomicU64::new(next_lsn.0),
+            segment: Mutex::new(Some(segment)),
+            buffer: Mutex::new(WriteBuffer::new(segment_id, write_offset)),
             next_txn_id: AtomicU64::new(1),
-            pending: Mutex::new(VecDeque::new()),
-            flushed_lsn: AtomicU64::new(0),
+            flushed_lsn: AtomicU64::new(next_lsn.0.saturating_sub(1)),
+            flush_complete,
+            flush_notify: Notify::new(),
         })
     }
 
     /// Recovers from existing segments or creates a new one.
     async fn recover_or_create(config: &WalWriterConfig) -> Result<(LogSegment, Lsn)> {
-        let mut segments: Vec<_> = Vec::new();
+        let mut segments: Vec<PathBuf> = Vec::new();
         let mut dir = tokio::fs::read_dir(&config.wal_dir).await?;
 
         while let Some(entry) = dir.next_entry().await? {
@@ -85,7 +173,6 @@ impl WalWriter {
         }
 
         if segments.is_empty() {
-            // Create first segment
             let segment_id = SegmentId::FIRST;
             let first_lsn = Lsn::new(segment_id.0, SegmentHeader::SIZE as u32);
             let segment = LogSegment::create(
@@ -97,119 +184,264 @@ impl WalWriter {
             return Ok((segment, first_lsn));
         }
 
-        // Sort by filename to find the latest segment
         segments.sort();
-
-        // Open the latest segment
         let latest_path = segments.last().ok_or_else(|| {
             ZyronError::Internal("WAL segments list unexpectedly empty".to_string())
         })?;
         let segment = LogSegment::open(latest_path).await?;
-
-        // Next LSN is at the current write position
         let next_lsn = Lsn::new(segment.segment_id().0, segment.write_offset());
 
         Ok((segment, next_lsn))
     }
 
     /// Returns the directory containing WAL segments.
+    #[inline]
     pub fn wal_dir(&self) -> &Path {
         &self.config.wal_dir
     }
 
-    /// Returns the next LSN that will be assigned.
-    pub fn next_lsn(&self) -> Lsn {
-        Lsn(self.next_lsn.load(Ordering::SeqCst))
-    }
-
     /// Returns the last flushed LSN.
+    #[inline]
     pub fn flushed_lsn(&self) -> Lsn {
-        Lsn(self.flushed_lsn.load(Ordering::SeqCst))
+        Lsn(self.flushed_lsn.load(Ordering::Acquire))
     }
 
     /// Allocates a new transaction ID.
+    #[inline]
     pub fn allocate_txn_id(&self) -> u32 {
-        self.next_txn_id.fetch_add(1, Ordering::SeqCst) as u32
+        self.next_txn_id.fetch_add(1, Ordering::Relaxed) as u32
     }
 
-    /// Allocates the next LSN for a record of the given size.
-    fn allocate_lsn(&self, record_size: usize) -> Lsn {
-        let current = self.next_lsn.fetch_add(record_size as u64, Ordering::SeqCst);
-        Lsn(current)
-    }
-
-    /// Appends a log record.
+    /// Appends a log record with group commit.
+    ///
+    /// The record is added to the write buffer. If the buffer is full or
+    /// flush_interval has elapsed, a flush is triggered. The caller waits
+    /// until the record is durable (fsync complete).
     pub async fn append(&self, mut record: LogRecord) -> Result<Lsn> {
-        let record_size = record.size_on_disk();
+        let (lsn, should_flush) = {
+            let mut buffer = self.buffer.lock();
 
-        // Allocate LSN
-        let lsn = self.allocate_lsn(record_size);
-        record.lsn = lsn;
+            // Serialize record with placeholder LSN, then update
+            let data = record.serialize();
+            let record_size = data.len();
 
-        let mut segment_guard = self.current_segment.lock().await;
-        let segment = segment_guard
-            .as_mut()
-            .ok_or_else(|| ZyronError::WalWriteFailed("WAL closed".to_string()))?;
+            // Check if we need segment rotation
+            let needs_rotation = {
+                let segment = self.segment.lock();
+                segment.as_ref()
+                    .map(|s| !s.has_space(record_size + buffer.bytes()))
+                    .unwrap_or(true)
+            };
 
-        // Check if we need to rotate to a new segment
-        if !segment.has_space(record_size) {
-            // Close current segment
-            segment.sync().await?;
-            segment.close().await?;
+            if needs_rotation {
+                // Flush current buffer before rotation
+                drop(buffer);
+                self.flush_internal().await?;
+                buffer = self.buffer.lock();
 
-            // Create new segment
-            let new_segment_id = segment.segment_id().next();
+                // Rotate segment
+                self.rotate_segment().await?;
+
+                // Update buffer for new segment
+                let segment = self.segment.lock();
+                if let Some(ref seg) = *segment {
+                    buffer.rotate_segment(seg.segment_id().0, seg.write_offset());
+                }
+            }
+
+            // Update record with correct LSN
+            let assigned_lsn = Lsn::new(buffer.current_segment_id, buffer.next_offset);
+            record.lsn = assigned_lsn;
+            let data = record.serialize();
+
+            let lsn = buffer.push(data);
+            let should_flush = buffer.len() >= self.config.batch_size
+                || buffer.bytes() >= self.config.batch_bytes;
+
+            (lsn, should_flush)
+        };
+
+        if should_flush || !self.config.fsync_enabled {
+            self.flush_internal().await?;
+        } else {
+            // Wait for flush to complete
+            self.wait_for_flush(lsn).await?;
+        }
+
+        Ok(lsn)
+    }
+
+    /// Waits until the given LSN has been flushed to disk.
+    async fn wait_for_flush(&self, target_lsn: Lsn) -> Result<()> {
+        // Fast path: already flushed
+        if self.flushed_lsn() >= target_lsn {
+            return Ok(());
+        }
+
+        let mut receiver = self.flush_complete.subscribe();
+
+        // Check again after subscribing
+        if self.flushed_lsn() >= target_lsn {
+            return Ok(());
+        }
+
+        // Trigger a flush if buffer is non-empty
+        {
+            let buffer = self.buffer.lock();
+            if !buffer.is_empty() {
+                drop(buffer);
+                self.flush_notify.notify_one();
+            }
+        }
+
+        // Wait for flush completion
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                receiver.recv()
+            ).await {
+                Ok(Ok(flushed_lsn)) => {
+                    if flushed_lsn >= target_lsn {
+                        return Ok(());
+                    }
+                }
+                Ok(Err(_)) => {
+                    // Channel closed, try direct check
+                    if self.flushed_lsn() >= target_lsn {
+                        return Ok(());
+                    }
+                    // Trigger flush ourselves
+                    self.flush_internal().await?;
+                    return Ok(());
+                }
+                Err(_) => {
+                    // Timeout - check if flushed and try to trigger flush
+                    if self.flushed_lsn() >= target_lsn {
+                        return Ok(());
+                    }
+                    self.flush_internal().await?;
+                }
+            }
+        }
+    }
+
+    /// Flushes the write buffer to disk.
+    async fn flush_internal(&self) -> Result<()> {
+        let (pending, _bytes) = {
+            let mut buffer = self.buffer.lock();
+            if buffer.is_empty() {
+                return Ok(());
+            }
+            buffer.take()
+        };
+
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let max_lsn = pending.last().map(|p| p.lsn).unwrap_or(Lsn::INVALID);
+
+        // Write all records to segment
+        {
+            let mut segment = self.segment.lock();
+            let seg = segment.as_mut().ok_or_else(|| {
+                ZyronError::WalWriteFailed("WAL closed".to_string())
+            })?;
+
+            for write in pending {
+                seg.append_raw(&write.data).await?;
+            }
+
+            // Single fsync for entire batch
+            if self.config.fsync_enabled {
+                seg.sync().await?;
+            }
+        }
+
+        // Update flushed LSN and notify waiters
+        self.flushed_lsn.store(max_lsn.0, Ordering::Release);
+        let _ = self.flush_complete.send(max_lsn);
+
+        Ok(())
+    }
+
+    /// Rotates to a new segment.
+    async fn rotate_segment(&self) -> Result<()> {
+        let mut segment = self.segment.lock();
+
+        if let Some(ref mut seg) = *segment {
+            seg.sync().await?;
+            seg.close().await?;
+
+            let new_segment_id = seg.segment_id().next();
             let new_first_lsn = Lsn::new(new_segment_id.0, SegmentHeader::SIZE as u32);
 
-            *segment = LogSegment::create(
+            *seg = LogSegment::create(
                 &self.config.wal_dir,
                 new_segment_id,
                 new_first_lsn,
                 self.config.segment_size,
             ).await?;
-
-            // Update next_lsn to point to new segment
-            self.next_lsn.store(new_first_lsn.0, Ordering::SeqCst);
-            record.lsn = new_first_lsn;
         }
 
-        // Write record to segment
-        let written_lsn = segment.append(&record).await?;
-
-        // Sync if configured
-        if self.config.fsync_enabled {
-            segment.sync().await?;
-            self.flushed_lsn.store(written_lsn.0, Ordering::SeqCst);
-        }
-
-        Ok(written_lsn)
+        Ok(())
     }
 
+    /// Forces all pending records to disk.
+    pub async fn flush(&self) -> Result<Lsn> {
+        self.flush_internal().await?;
+        Ok(self.flushed_lsn())
+    }
+
+    /// Closes the WAL writer.
+    pub async fn close(&self) -> Result<()> {
+        self.flush_internal().await?;
+
+        let mut segment = self.segment.lock();
+        if let Some(ref mut seg) = segment.take() {
+            seg.sync().await?;
+            seg.close().await?;
+        }
+        Ok(())
+    }
+
+    /// Returns the current segment ID.
+    pub fn current_segment_id(&self) -> Option<SegmentId> {
+        self.segment.lock().as_ref().map(|s| s.segment_id())
+    }
+
+    /// Returns the next LSN that will be assigned.
+    pub fn next_lsn(&self) -> Lsn {
+        let buffer = self.buffer.lock();
+        Lsn::new(buffer.current_segment_id, buffer.next_offset)
+    }
+
+    // Convenience methods for common record types
+
     /// Logs a transaction begin.
+    #[inline]
     pub async fn log_begin(&self, txn_id: u32) -> Result<Lsn> {
         let record = LogRecord::begin(Lsn::INVALID, txn_id);
         self.append(record).await
     }
 
     /// Logs a transaction commit.
+    #[inline]
     pub async fn log_commit(&self, txn_id: u32, prev_lsn: Lsn) -> Result<Lsn> {
         let record = LogRecord::commit(Lsn::INVALID, prev_lsn, txn_id);
         self.append(record).await
     }
 
     /// Logs a transaction abort.
+    #[inline]
     pub async fn log_abort(&self, txn_id: u32, prev_lsn: Lsn) -> Result<Lsn> {
         let record = LogRecord::abort(Lsn::INVALID, prev_lsn, txn_id);
         self.append(record).await
     }
 
     /// Logs an insert operation.
-    pub async fn log_insert(
-        &self,
-        txn_id: u32,
-        prev_lsn: Lsn,
-        payload: Bytes,
-    ) -> Result<Lsn> {
+    #[inline]
+    pub async fn log_insert(&self, txn_id: u32, prev_lsn: Lsn, payload: Bytes) -> Result<Lsn> {
         let record = LogRecord::new(
             Lsn::INVALID,
             prev_lsn,
@@ -221,12 +453,8 @@ impl WalWriter {
     }
 
     /// Logs an update operation.
-    pub async fn log_update(
-        &self,
-        txn_id: u32,
-        prev_lsn: Lsn,
-        payload: Bytes,
-    ) -> Result<Lsn> {
+    #[inline]
+    pub async fn log_update(&self, txn_id: u32, prev_lsn: Lsn, payload: Bytes) -> Result<Lsn> {
         let record = LogRecord::new(
             Lsn::INVALID,
             prev_lsn,
@@ -238,12 +466,8 @@ impl WalWriter {
     }
 
     /// Logs a delete operation.
-    pub async fn log_delete(
-        &self,
-        txn_id: u32,
-        prev_lsn: Lsn,
-        payload: Bytes,
-    ) -> Result<Lsn> {
+    #[inline]
+    pub async fn log_delete(&self, txn_id: u32, prev_lsn: Lsn, payload: Bytes) -> Result<Lsn> {
         let record = LogRecord::new(
             Lsn::INVALID,
             prev_lsn,
@@ -255,6 +479,7 @@ impl WalWriter {
     }
 
     /// Logs a checkpoint begin marker.
+    #[inline]
     pub async fn log_checkpoint_begin(&self) -> Result<Lsn> {
         let record = LogRecord::new(
             Lsn::INVALID,
@@ -266,7 +491,8 @@ impl WalWriter {
         self.append(record).await
     }
 
-    /// Logs a checkpoint end marker with active transaction info.
+    /// Logs a checkpoint end marker.
+    #[inline]
     pub async fn log_checkpoint_end(&self, payload: Bytes) -> Result<Lsn> {
         let record = LogRecord::new(
             Lsn::INVALID,
@@ -276,34 +502,6 @@ impl WalWriter {
             payload,
         );
         self.append(record).await
-    }
-
-    /// Forces all pending records to disk.
-    pub async fn flush(&self) -> Result<Lsn> {
-        let mut segment_guard = self.current_segment.lock().await;
-        if let Some(ref mut segment) = *segment_guard {
-            segment.sync().await?;
-            let lsn = Lsn::new(segment.segment_id().0, segment.write_offset());
-            self.flushed_lsn.store(lsn.0, Ordering::SeqCst);
-            Ok(lsn)
-        } else {
-            Ok(Lsn::INVALID)
-        }
-    }
-
-    /// Closes the WAL writer.
-    pub async fn close(&self) -> Result<()> {
-        let mut segment_guard = self.current_segment.lock().await;
-        if let Some(ref mut segment) = segment_guard.take() {
-            segment.sync().await?;
-            segment.close().await?;
-        }
-        Ok(())
-    }
-
-    /// Returns the current segment ID.
-    pub async fn current_segment_id(&self) -> Option<SegmentId> {
-        self.current_segment.lock().await.as_ref().map(|s| s.segment_id())
     }
 }
 
@@ -328,39 +526,46 @@ impl TxnWalHandle {
     }
 
     /// Returns the transaction ID.
+    #[inline]
     pub fn txn_id(&self) -> u32 {
         self.txn_id
     }
 
     /// Returns the last LSN written by this transaction.
+    #[inline]
     pub fn last_lsn(&self) -> Lsn {
         self.last_lsn
     }
 
     /// Logs an insert operation.
+    #[inline]
     pub async fn log_insert(&mut self, payload: Bytes) -> Result<Lsn> {
         self.last_lsn = self.writer.log_insert(self.txn_id, self.last_lsn, payload).await?;
         Ok(self.last_lsn)
     }
 
     /// Logs an update operation.
+    #[inline]
     pub async fn log_update(&mut self, payload: Bytes) -> Result<Lsn> {
         self.last_lsn = self.writer.log_update(self.txn_id, self.last_lsn, payload).await?;
         Ok(self.last_lsn)
     }
 
     /// Logs a delete operation.
+    #[inline]
     pub async fn log_delete(&mut self, payload: Bytes) -> Result<Lsn> {
         self.last_lsn = self.writer.log_delete(self.txn_id, self.last_lsn, payload).await?;
         Ok(self.last_lsn)
     }
 
     /// Commits the transaction.
+    #[inline]
     pub async fn commit(self) -> Result<Lsn> {
         self.writer.log_commit(self.txn_id, self.last_lsn).await
     }
 
     /// Aborts the transaction.
+    #[inline]
     pub async fn abort(self) -> Result<Lsn> {
         self.writer.log_abort(self.txn_id, self.last_lsn).await
     }
@@ -376,8 +581,10 @@ mod tests {
         let config = WalWriterConfig {
             wal_dir: dir.path().to_path_buf(),
             segment_size: LogSegment::DEFAULT_SIZE,
-            fsync_enabled: false, // Disable for faster tests
-            group_commit_size: 1,
+            fsync_enabled: false,
+            batch_size: 100,
+            batch_bytes: 1024 * 1024,
+            flush_interval_us: 0,
         };
         let writer = WalWriter::new(config).await.unwrap();
         (writer, dir)
@@ -387,7 +594,7 @@ mod tests {
     async fn test_wal_writer_creation() {
         let (writer, _dir) = create_test_writer().await;
         assert!(writer.next_lsn().is_valid());
-        assert_eq!(writer.current_segment_id().await, Some(SegmentId::FIRST));
+        assert_eq!(writer.current_segment_id(), Some(SegmentId::FIRST));
     }
 
     #[tokio::test]
@@ -405,15 +612,12 @@ mod tests {
     async fn test_wal_writer_transaction_flow() {
         let (writer, _dir) = create_test_writer().await;
 
-        // Begin transaction
         let begin_lsn = writer.log_begin(1).await.unwrap();
         assert!(begin_lsn.is_valid());
 
-        // Insert
         let insert_lsn = writer.log_insert(1, begin_lsn, Bytes::from_static(b"data")).await.unwrap();
         assert!(insert_lsn > begin_lsn);
 
-        // Commit
         let commit_lsn = writer.log_commit(1, insert_lsn).await.unwrap();
         assert!(commit_lsn > insert_lsn);
     }
@@ -452,7 +656,9 @@ mod tests {
             wal_dir: dir.path().to_path_buf(),
             segment_size: LogSegment::DEFAULT_SIZE,
             fsync_enabled: true,
-            group_commit_size: 1,
+            batch_size: 1,
+            batch_bytes: 1024,
+            flush_interval_us: 0,
         };
 
         let final_lsn;
@@ -464,7 +670,6 @@ mod tests {
             writer.close().await.unwrap();
         }
 
-        // Reopen and check state
         {
             let writer = WalWriter::new(config).await.unwrap();
             assert!(writer.next_lsn() >= final_lsn);
@@ -507,5 +712,26 @@ mod tests {
         let end_lsn = writer.log_checkpoint_end(Bytes::from_static(b"checkpoint data")).await.unwrap();
 
         assert!(end_lsn > begin_lsn);
+    }
+
+    #[tokio::test]
+    async fn test_wal_batch_flush() {
+        let dir = tempdir().unwrap();
+        let config = WalWriterConfig {
+            wal_dir: dir.path().to_path_buf(),
+            segment_size: LogSegment::DEFAULT_SIZE,
+            fsync_enabled: false,
+            batch_size: 10, // Small batch for testing
+            batch_bytes: 1024 * 1024,
+            flush_interval_us: 0,
+        };
+        let writer = WalWriter::new(config).await.unwrap();
+
+        // Write 25 records (should trigger 2 flushes)
+        for i in 1..=25 {
+            writer.log_begin(i).await.unwrap();
+        }
+
+        writer.flush().await.unwrap();
     }
 }

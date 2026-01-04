@@ -71,7 +71,9 @@ async fn test_wal_write_replay_10k_records() {
         wal_dir: dir.path().to_path_buf(),
         segment_size: 1024 * 1024, // 1MB segments to force rotation
         fsync_enabled: false, // Disable fsync for performance test
-        group_commit_size: 1,
+        batch_size: 1,
+        batch_bytes: 64 * 1024,
+        flush_interval_us: 1000,
     };
 
     // Phase 1: Write 10,000 records with timing
@@ -178,11 +180,13 @@ async fn test_wal_segment_rotation() {
         wal_dir: dir.path().to_path_buf(),
         segment_size: 64 * 1024, // 64KB segments for faster rotation
         fsync_enabled: false,
-        group_commit_size: 1,
+        batch_size: 1,
+        batch_bytes: 64 * 1024,
+        flush_interval_us: 1000,
     };
 
     let writer = WalWriter::new(config).await.unwrap();
-    let initial_segment = writer.current_segment_id().await.unwrap();
+    let initial_segment = writer.current_segment_id().unwrap();
 
     // Write enough data to trigger rotation
     for _ in 0..1000 {
@@ -190,7 +194,7 @@ async fn test_wal_segment_rotation() {
         writer.log_insert(1, Lsn::INVALID, payload).await.unwrap();
     }
 
-    let final_segment = writer.current_segment_id().await.unwrap();
+    let final_segment = writer.current_segment_id().unwrap();
     writer.close().await.unwrap();
 
     // Verify multiple segments were created
@@ -357,7 +361,8 @@ async fn test_heap_file_100k_tuples() {
         fsync_enabled: false,
     };
     let disk = Arc::new(DiskManager::new(config).await.unwrap());
-    let heap = HeapFile::with_defaults(disk).unwrap();
+    let pool = Arc::new(BufferPool::auto_sized());
+    let heap = HeapFile::with_defaults(disk, pool).unwrap();
 
     let mut rng = rand::thread_rng();
     let mut tuple_ids: Vec<TupleId> = Vec::with_capacity(TUPLE_COUNT);
@@ -438,7 +443,8 @@ async fn test_heap_file_delete_and_scan() {
         fsync_enabled: false,
     };
     let disk = Arc::new(DiskManager::new(config).await.unwrap());
-    let heap = HeapFile::with_defaults(disk).unwrap();
+    let pool = Arc::new(BufferPool::auto_sized());
+    let heap = HeapFile::with_defaults(disk, pool).unwrap();
 
     let mut tuple_ids: Vec<TupleId> = Vec::with_capacity(TUPLE_COUNT);
 
@@ -496,7 +502,8 @@ async fn test_heap_file_space_reuse() {
         fsync_enabled: false,
     };
     let disk = Arc::new(DiskManager::new(config).await.unwrap());
-    let heap = HeapFile::with_defaults(disk).unwrap();
+    let pool = Arc::new(BufferPool::auto_sized());
+    let heap = HeapFile::with_defaults(disk, pool).unwrap();
 
     // Insert large tuples to create multiple pages
     let mut tuple_ids = Vec::new();
@@ -730,7 +737,9 @@ async fn test_wal_heap_recovery() {
             wal_dir: wal_dir.clone(),
             segment_size: 16 * 1024 * 1024,
             fsync_enabled: true,
-            group_commit_size: 1,
+            batch_size: 1,
+            batch_bytes: 64 * 1024,
+            flush_interval_us: 1000,
         };
         let writer = Arc::new(WalWriter::new(wal_config).await.unwrap());
 
@@ -739,7 +748,8 @@ async fn test_wal_heap_recovery() {
             fsync_enabled: true,
         };
         let disk = Arc::new(DiskManager::new(disk_config).await.unwrap());
-        let heap = HeapFile::with_defaults(disk).unwrap();
+        let pool = Arc::new(BufferPool::auto_sized());
+        let heap = HeapFile::with_defaults(disk, pool).unwrap();
 
         // Write transactions
         for i in 0..TUPLE_COUNT {
@@ -817,7 +827,9 @@ async fn test_wal_recovery_with_uncommitted() {
         wal_dir: dir.path().to_path_buf(),
         segment_size: 16 * 1024 * 1024,
         fsync_enabled: true,
-        group_commit_size: 1,
+        batch_size: 1,
+        batch_bytes: 64 * 1024,
+        flush_interval_us: 1000,
     };
 
     // Write mix of committed and uncommitted transactions

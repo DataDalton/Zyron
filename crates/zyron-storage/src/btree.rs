@@ -402,26 +402,10 @@ impl BTreeLeafPage {
     }
 
     /// Inserts a key-value pair into the leaf. Returns error if page is full.
+    /// Uses single-pass in-place insertion for efficiency.
+    #[inline]
     pub fn insert(&mut self, key: Bytes, tuple_id: TupleId) -> Result<()> {
-        let entry = LeafEntry { key, tuple_id };
-        let entry_size = entry.size_on_disk();
-
-        if self.free_space() < entry_size {
-            return Err(ZyronError::NodeFull);
-        }
-
-        // Find insertion point
-        let insert_pos = match self.search(&entry.key) {
-            Ok(_) => return Err(ZyronError::DuplicateKey),
-            Err(pos) => pos,
-        };
-
-        // Read existing entries
-        let mut entries = self.entries();
-        entries.insert(insert_pos, entry);
-
-        // Rewrite all entries
-        self.write_entries(&entries)
+        Self::insert_in_slice(&mut *self.data, &key, tuple_id)
     }
 
     /// Writes entries to the page.
@@ -818,7 +802,8 @@ impl BTreeInternalPage {
     }
 
     /// Finds the child page for a given key directly from raw page data.
-    /// Zero-copy version that avoids Box allocation and page struct creation.
+    /// Uses binary search with offset indexing for O(log n) lookup.
+    #[inline]
     pub fn find_child_in_slice(data: &[u8], key: &[u8]) -> PageId {
         // Parse header to get num_keys
         let header_offset = InternalPageHeader::OFFSET;
@@ -841,16 +826,45 @@ impl BTreeInternalPage {
             return leftmost;
         }
 
-        // Scan through entries to find correct child
+        // Build offset index for binary search (one scan to locate entry positions)
+        // Max entries: PAGE_SIZE / min_entry_size = 16384 / 12 ≈ 1365
+        // Using 1024 covers all practical cases with reasonable key sizes
+        let mut offsets = [0usize; 1024];
+        let limit = num_keys.min(1024);
         let mut offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
-        let mut prev_child = leftmost;
 
-        for _ in 0..num_keys {
-            // Parse entry: key_len (2) + key (var) + child_page_id (8)
+        for i in 0..limit {
+            offsets[i] = offset;
             let key_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
-            let entry_key = &data[offset + 2..offset + 2 + key_len];
-            let child_offset = offset + 2 + key_len;
-            let child = PageId::from_u64(u64::from_le_bytes([
+            offset += 2 + key_len + 8; // key_len + key + child_page_id
+        }
+
+        // Binary search for the key
+        let mut low = 0usize;
+        let mut high = limit;
+
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let entry_offset = offsets[mid];
+            let key_len = u16::from_le_bytes([data[entry_offset], data[entry_offset + 1]]) as usize;
+            let entry_key = &data[entry_offset + 2..entry_offset + 2 + key_len];
+
+            if key < entry_key {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+
+        // low is now the index of first key > search key
+        // Return child pointer to the left of that key
+        if low == 0 {
+            leftmost
+        } else {
+            let entry_offset = offsets[low - 1];
+            let key_len = u16::from_le_bytes([data[entry_offset], data[entry_offset + 1]]) as usize;
+            let child_offset = entry_offset + 2 + key_len;
+            PageId::from_u64(u64::from_le_bytes([
                 data[child_offset],
                 data[child_offset + 1],
                 data[child_offset + 2],
@@ -859,16 +873,8 @@ impl BTreeInternalPage {
                 data[child_offset + 5],
                 data[child_offset + 6],
                 data[child_offset + 7],
-            ]));
-
-            if key < entry_key {
-                return prev_child;
-            }
-            prev_child = child;
-            offset = child_offset + 8;
+            ]))
         }
-
-        prev_child
     }
 
     /// Inserts a key and right child pointer.

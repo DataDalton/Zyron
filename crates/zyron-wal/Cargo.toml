@@ -6,11 +6,12 @@ rust-version.workspace = true
 
 [dependencies]
 zyron-common = { path = "../zyron-common" }
-tokio.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "rt"] }
 thiserror.workspace = true
 serde.workspace = true
 crc32fast.workspace = true
 bytes.workspace = true
+parking_lot = "0.12"
 
 [dev-dependencies]
 serde_json = "1.0"

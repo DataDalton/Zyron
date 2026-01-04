@@ -258,6 +258,12 @@ impl LogSegment {
     /// Appends a record to this segment.
     pub async fn append(&mut self, record: &LogRecord) -> Result<Lsn> {
         let data = record.serialize();
+        self.append_raw(&data).await
+    }
+
+    /// Appends raw bytes to this segment (for pre-serialized records).
+    #[inline]
+    pub async fn append_raw(&mut self, data: &[u8]) -> Result<Lsn> {
         let record_size = data.len() as u32;
 
         if !self.has_space(data.len()) {
@@ -271,7 +277,7 @@ impl LogSegment {
         })?;
 
         file.seek(std::io::SeekFrom::Start(self.write_offset as u64)).await?;
-        file.write_all(&data).await?;
+        file.write_all(data).await?;
 
         let lsn = Lsn::new(self.header.segment_id.0, self.write_offset);
         self.write_offset += record_size;

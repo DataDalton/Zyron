@@ -114,13 +114,14 @@ impl BufferPool {
     ///
     /// If the page is not in the pool, returns None.
     /// The page is pinned before being returned.
+    #[inline]
     pub fn fetch_page(&self, page_id: PageId) -> Option<&BufferFrame> {
         let page_table = self.page_table.read();
         if let Some(&frame_id) = page_table.get(&page_id) {
             let frame = &self.frames[frame_id.0 as usize];
             frame.pin();
-            self.replacer.record_access(frame_id);
-            self.replacer.set_evictable(frame_id, false);
+            // Combined operation: single lock acquisition
+            self.replacer.access_and_pin(frame_id);
             return Some(frame);
         }
         None
@@ -176,6 +177,7 @@ impl BufferPool {
     ///
     /// Returns (frame, evicted) where evicted contains any dirty page that was
     /// evicted to make room. Caller must write evicted pages to disk.
+    #[inline]
     pub fn new_page(&self, page_id: PageId) -> Result<(&BufferFrame, Option<EvictedPage>)> {
         // Check if page already exists
         {
@@ -183,8 +185,8 @@ impl BufferPool {
             if let Some(&frame_id) = page_table.get(&page_id) {
                 let frame = &self.frames[frame_id.0 as usize];
                 frame.pin();
-                self.replacer.record_access(frame_id);
-                self.replacer.set_evictable(frame_id, false);
+                // Combined operation: single lock acquisition
+                self.replacer.access_and_pin(frame_id);
                 return Ok((frame, None));
             }
         }
@@ -201,7 +203,7 @@ impl BufferPool {
         // Update page table
         self.page_table.write().insert(page_id, frame_id);
 
-        // Mark as not evictable (pinned)
+        // Mark as not evictable (pinned) - new frame has no access history to record
         self.replacer.set_evictable(frame_id, false);
 
         Ok((frame, evicted))
@@ -211,6 +213,7 @@ impl BufferPool {
     ///
     /// This is used when reading a page from disk.
     /// Returns the frame and any evicted dirty page that must be flushed.
+    #[inline]
     pub fn load_page(&self, page_id: PageId, data: &[u8]) -> Result<(&BufferFrame, Option<EvictedPage>)> {
         let (frame, evicted) = self.new_page(page_id)?;
         frame.copy_from(data);
@@ -220,6 +223,7 @@ impl BufferPool {
     /// Unpins a page in the buffer pool.
     ///
     /// If the page becomes unpinned (pin count = 0), it becomes evictable.
+    #[inline]
     pub fn unpin_page(&self, page_id: PageId, is_dirty: bool) -> bool {
         let page_table = self.page_table.read();
         if let Some(&frame_id) = page_table.get(&page_id) {

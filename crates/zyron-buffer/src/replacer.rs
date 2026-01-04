@@ -12,6 +12,10 @@ pub trait Replacer: Send + Sync {
     /// Marks a frame as evictable (unpinned).
     fn set_evictable(&self, frame_id: FrameId, evictable: bool);
 
+    /// Combined operation: records access and pins the frame (sets non-evictable).
+    /// Single lock acquisition instead of two separate calls.
+    fn access_and_pin(&self, frame_id: FrameId);
+
     /// Selects a victim frame for eviction.
     ///
     /// Returns None if no frames are evictable.
@@ -68,6 +72,7 @@ impl ClockReplacer {
 }
 
 impl Replacer for ClockReplacer {
+    #[inline]
     fn record_access(&self, frame_id: FrameId) {
         let mut inner = self.inner.lock();
         if (frame_id.0 as usize) < inner.num_frames {
@@ -75,6 +80,7 @@ impl Replacer for ClockReplacer {
         }
     }
 
+    #[inline]
     fn set_evictable(&self, frame_id: FrameId, evictable: bool) {
         let mut inner = self.inner.lock();
         if (frame_id.0 as usize) >= inner.num_frames {
@@ -84,6 +90,16 @@ impl Replacer for ClockReplacer {
         if evictable {
             inner.evictable.insert(frame_id);
         } else {
+            inner.evictable.remove(&frame_id);
+        }
+    }
+
+    #[inline]
+    fn access_and_pin(&self, frame_id: FrameId) {
+        let mut inner = self.inner.lock();
+        let idx = frame_id.0 as usize;
+        if idx < inner.num_frames {
+            inner.reference_bits[idx] = true;
             inner.evictable.remove(&frame_id);
         }
     }

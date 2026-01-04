@@ -20,26 +20,31 @@ impl Lsn {
     pub const FIRST: Lsn = Lsn(1);
 
     /// Creates a new LSN from segment ID and offset.
+    #[inline]
     pub fn new(segment_id: u32, offset: u32) -> Self {
         Self(((segment_id as u64) << 32) | (offset as u64))
     }
 
     /// Returns the segment ID portion of this LSN.
+    #[inline]
     pub fn segment_id(&self) -> u32 {
         (self.0 >> 32) as u32
     }
 
     /// Returns the offset within the segment.
+    #[inline]
     pub fn offset(&self) -> u32 {
         self.0 as u32
     }
 
     /// Returns true if this is a valid LSN.
+    #[inline]
     pub fn is_valid(&self) -> bool {
         self.0 > 0
     }
 
     /// Returns the next LSN after advancing by the given number of bytes.
+    #[inline]
     pub fn advance(&self, bytes: u32) -> Self {
         Self(self.0 + bytes as u64)
     }
@@ -140,6 +145,7 @@ impl LogRecord {
     pub const MAX_PAYLOAD_SIZE: usize = 64 * 1024;
 
     /// Creates a new log record.
+    #[inline]
     pub fn new(
         lsn: Lsn,
         prev_lsn: Lsn,
@@ -158,26 +164,31 @@ impl LogRecord {
     }
 
     /// Creates a transaction begin record.
+    #[inline]
     pub fn begin(lsn: Lsn, txn_id: u32) -> Self {
         Self::new(lsn, Lsn::INVALID, txn_id, LogRecordType::Begin, Bytes::new())
     }
 
     /// Creates a transaction commit record.
+    #[inline]
     pub fn commit(lsn: Lsn, prev_lsn: Lsn, txn_id: u32) -> Self {
         Self::new(lsn, prev_lsn, txn_id, LogRecordType::Commit, Bytes::new())
     }
 
     /// Creates a transaction abort record.
+    #[inline]
     pub fn abort(lsn: Lsn, prev_lsn: Lsn, txn_id: u32) -> Self {
         Self::new(lsn, prev_lsn, txn_id, LogRecordType::Abort, Bytes::new())
     }
 
     /// Returns the total size of this record on disk.
+    #[inline]
     pub fn size_on_disk(&self) -> usize {
         Self::HEADER_SIZE + self.payload.len() + Self::CHECKSUM_SIZE
     }
 
     /// Serializes this record to bytes.
+    #[inline]
     pub fn serialize(&self) -> Bytes {
         let total_size = self.size_on_disk();
         let mut buf = BytesMut::with_capacity(total_size);
@@ -193,15 +204,17 @@ impl LogRecord {
         // Write payload
         buf.put_slice(&self.payload);
 
-        // Compute and write checksum
+        // Compute and write checksum over header + payload
         let checksum = crc32fast::hash(&buf);
         buf.put_u32_le(checksum);
 
         buf.freeze()
     }
 
-    /// Deserializes a record from bytes.
-    pub fn deserialize(mut data: &[u8]) -> Result<Self> {
+    /// Deserializes a record from bytes with checksum verification.
+    /// Verifies checksum directly from input bytes without re-serialization.
+    #[inline]
+    pub fn deserialize(data: &[u8]) -> Result<Self> {
         if data.len() < Self::HEADER_SIZE + Self::CHECKSUM_SIZE {
             return Err(ZyronError::WalCorrupted {
                 lsn: 0,
@@ -209,13 +222,17 @@ impl LogRecord {
             });
         }
 
-        // Read header
-        let lsn = Lsn(data.get_u64_le());
-        let prev_lsn = Lsn(data.get_u64_le());
-        let txn_id = data.get_u32_le();
-        let record_type = LogRecordType::try_from(data.get_u8())?;
-        let flags = data.get_u8();
-        let payload_len = data.get_u16_le() as usize;
+        // Parse header fields directly from slice
+        let lsn = Lsn(u64::from_le_bytes([
+            data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]
+        ]));
+        let prev_lsn = Lsn(u64::from_le_bytes([
+            data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15]
+        ]));
+        let txn_id = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+        let record_type = LogRecordType::try_from(data[20])?;
+        let flags = data[21];
+        let payload_len = u16::from_le_bytes([data[22], data[23]]) as usize;
 
         if payload_len > Self::MAX_PAYLOAD_SIZE {
             return Err(ZyronError::WalCorrupted {
@@ -224,31 +241,23 @@ impl LogRecord {
             });
         }
 
-        if data.len() < payload_len + Self::CHECKSUM_SIZE {
+        let total_size = Self::HEADER_SIZE + payload_len + Self::CHECKSUM_SIZE;
+        if data.len() < total_size {
             return Err(ZyronError::WalCorrupted {
                 lsn: lsn.0,
                 reason: "truncated record".to_string(),
             });
         }
 
-        // Read payload
-        let payload = Bytes::copy_from_slice(&data[..payload_len]);
-        data.advance(payload_len);
-
-        // Read and verify checksum
-        let stored_checksum = data.get_u32_le();
-        let record = Self {
-            lsn,
-            prev_lsn,
-            txn_id,
-            record_type,
-            flags,
-            payload,
-        };
-
-        // Recompute checksum for verification
-        let serialized = record.serialize();
-        let computed_checksum = (&serialized[serialized.len() - 4..]).get_u32_le();
+        // Verify checksum directly on raw bytes (header + payload)
+        let checksum_offset = Self::HEADER_SIZE + payload_len;
+        let stored_checksum = u32::from_le_bytes([
+            data[checksum_offset],
+            data[checksum_offset + 1],
+            data[checksum_offset + 2],
+            data[checksum_offset + 3],
+        ]);
+        let computed_checksum = crc32fast::hash(&data[..checksum_offset]);
 
         if stored_checksum != computed_checksum {
             return Err(ZyronError::WalCorrupted {
@@ -260,7 +269,17 @@ impl LogRecord {
             });
         }
 
-        Ok(record)
+        // Extract payload
+        let payload = Bytes::copy_from_slice(&data[Self::HEADER_SIZE..Self::HEADER_SIZE + payload_len]);
+
+        Ok(Self {
+            lsn,
+            prev_lsn,
+            txn_id,
+            record_type,
+            flags,
+            payload,
+        })
     }
 }
 
