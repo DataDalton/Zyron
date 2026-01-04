@@ -34,6 +34,22 @@ pub enum ZyronError {
     #[error("Page size mismatch: expected {expected}, got {actual}")]
     PageSizeMismatch { expected: usize, actual: usize },
 
+    // B+ tree errors
+    #[error("Key not found")]
+    KeyNotFound,
+
+    #[error("Duplicate key")]
+    DuplicateKey,
+
+    #[error("B+ tree node full")]
+    NodeFull,
+
+    #[error("B+ tree node underflow")]
+    NodeUnderflow,
+
+    #[error("Invalid node type")]
+    InvalidNodeType,
+
     // WAL errors
     #[error("WAL write failed: {0}")]
     WalWriteFailed(String),

@@ -4,11 +4,23 @@
 //! - Disk manager for page-level file I/O
 //! - Heap pages for variable-length tuple storage
 //! - Tuple representation and serialization
+//! - B+ tree index implementation
+//! - Free space map for space management
 
+mod btree;
 mod disk;
+mod freespace;
 mod heap;
 mod tuple;
 
+pub use btree::{
+    BTree, BTreeInternalPage, BTreeLeafPage, DeleteResult, InternalEntry, InternalPageHeader,
+    LeafEntry, LeafPageHeader, MAX_KEY_SIZE, MIN_FILL_FACTOR,
+};
 pub use disk::{DiskManager, DiskManagerConfig};
-pub use heap::{HeapPage, SlotId, TupleSlot};
-pub use tuple::{Tuple, TupleId};
+pub use freespace::{
+    category_to_min_space, space_to_category, FreeSpaceMap, FsmHeader, FsmPage,
+    ENTRIES_PER_FSM_PAGE,
+};
+pub use heap::{HeapPage, HeapPageHeader, SlotId, TupleSlot};
+pub use tuple::{Tuple, TupleFlags, TupleHeader, TupleId};
