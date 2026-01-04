@@ -27,8 +27,10 @@
 //! +------------------+
 //! ```
 
+use crate::disk::DiskManager;
 use crate::tuple::TupleId;
 use bytes::{Bytes, BytesMut};
+use std::sync::Arc;
 use zyron_common::page::{PageHeader, PageId, PageType, PAGE_SIZE};
 use zyron_common::{Result, ZyronError};
 
@@ -999,6 +1001,367 @@ impl BTree {
     /// Increments the tree height (used after root split).
     pub fn increment_height(&mut self) {
         self.height += 1;
+    }
+}
+
+/// B+ tree index with disk I/O operations.
+///
+/// Provides tree-level operations (search, insert, delete, range_scan)
+/// that coordinate page-level operations with disk I/O through DiskManager.
+pub struct BTreeIndex {
+    /// Tree metadata.
+    tree: BTree,
+    /// Disk manager for page I/O.
+    disk: Arc<DiskManager>,
+}
+
+impl BTreeIndex {
+    /// Creates a new B+ tree index.
+    ///
+    /// Creates an empty root leaf page on disk.
+    pub async fn create(disk: Arc<DiskManager>, file_id: u32) -> Result<Self> {
+        // Allocate root page
+        let root_page_id = disk.allocate_page(file_id).await?;
+
+        // Create empty leaf as root
+        let root_page = BTreeLeafPage::new(root_page_id);
+        disk.write_page(root_page_id, root_page.as_bytes()).await?;
+
+        let tree = BTree::new(root_page_id, file_id);
+        Ok(Self { tree, disk })
+    }
+
+    /// Opens an existing B+ tree index.
+    ///
+    /// Reads the root page to verify the index exists.
+    pub async fn open(
+        disk: Arc<DiskManager>,
+        file_id: u32,
+        root_page_id: PageId,
+        height: u32,
+    ) -> Result<Self> {
+        // Verify root page exists by reading it
+        disk.read_page(root_page_id).await?;
+
+        let mut tree = BTree::new(root_page_id, file_id);
+        for _ in 1..height {
+            tree.increment_height();
+        }
+
+        Ok(Self { tree, disk })
+    }
+
+    /// Returns the root page ID.
+    pub fn root_page_id(&self) -> PageId {
+        self.tree.root_page_id()
+    }
+
+    /// Returns the file ID.
+    pub fn file_id(&self) -> u32 {
+        self.tree.file_id()
+    }
+
+    /// Returns the tree height.
+    pub fn height(&self) -> u32 {
+        self.tree.height()
+    }
+
+    /// Searches for a key in the B+ tree.
+    ///
+    /// Returns the TupleId if found, None otherwise.
+    pub async fn search(&self, key: &[u8]) -> Result<Option<TupleId>> {
+        let leaf_page_id = self.find_leaf(key).await?;
+        let page_data = self.disk.read_page(leaf_page_id).await?;
+        let leaf = BTreeLeafPage::from_bytes(page_data);
+        Ok(leaf.get(key))
+    }
+
+    /// Finds the leaf page that should contain the given key.
+    async fn find_leaf(&self, key: &[u8]) -> Result<PageId> {
+        let mut current_page_id = self.tree.root_page_id();
+
+        // If tree height is 1, root is a leaf
+        if self.tree.height() == 1 {
+            return Ok(current_page_id);
+        }
+
+        // Traverse internal nodes
+        for _ in 0..(self.tree.height() - 1) {
+            let page_data = self.disk.read_page(current_page_id).await?;
+            let internal = BTreeInternalPage::from_bytes(page_data);
+            current_page_id = internal.find_child(key);
+        }
+
+        Ok(current_page_id)
+    }
+
+    /// Inserts a key-value pair into the B+ tree.
+    ///
+    /// Handles page splits as needed.
+    pub async fn insert(&mut self, key: Bytes, tuple_id: TupleId) -> Result<()> {
+        if key.len() > MAX_KEY_SIZE {
+            return Err(ZyronError::KeyTooLarge {
+                size: key.len(),
+                max: MAX_KEY_SIZE,
+            });
+        }
+
+        // Find the path from root to the target leaf
+        let path = self.find_path(&key).await?;
+
+        // Read the leaf page
+        let leaf_page_id = *path.last().ok_or_else(|| {
+            ZyronError::BTreeCorrupted("empty path".to_string())
+        })?;
+
+        let page_data = self.disk.read_page(leaf_page_id).await?;
+        let mut leaf = BTreeLeafPage::from_bytes(page_data);
+
+        // Try to insert into the leaf
+        match leaf.insert(key.clone(), tuple_id) {
+            Ok(()) => {
+                // Write updated leaf
+                self.disk.write_page(leaf_page_id, leaf.as_bytes()).await?;
+                Ok(())
+            }
+            Err(ZyronError::NodeFull) => {
+                // Need to split
+                self.insert_with_split(key, tuple_id, path).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Finds the path from root to the leaf containing the key.
+    async fn find_path(&self, key: &[u8]) -> Result<Vec<PageId>> {
+        let mut path = Vec::with_capacity(self.tree.height() as usize);
+        let mut current_page_id = self.tree.root_page_id();
+
+        path.push(current_page_id);
+
+        // If tree height is 1, root is a leaf
+        if self.tree.height() == 1 {
+            return Ok(path);
+        }
+
+        // Traverse internal nodes
+        for _ in 0..(self.tree.height() - 1) {
+            let page_data = self.disk.read_page(current_page_id).await?;
+            let internal = BTreeInternalPage::from_bytes(page_data);
+            current_page_id = internal.find_child(key);
+            path.push(current_page_id);
+        }
+
+        Ok(path)
+    }
+
+    /// Inserts with split handling.
+    async fn insert_with_split(
+        &mut self,
+        key: Bytes,
+        tuple_id: TupleId,
+        path: Vec<PageId>,
+    ) -> Result<()> {
+        let leaf_page_id = *path.last().ok_or_else(|| {
+            ZyronError::BTreeCorrupted("empty path".to_string())
+        })?;
+
+        // Read and split the leaf
+        let page_data = self.disk.read_page(leaf_page_id).await?;
+        let mut leaf = BTreeLeafPage::from_bytes(page_data);
+
+        // Allocate new page for right sibling
+        let new_page_id = self.disk.allocate_page(self.tree.file_id()).await?;
+        let (split_key, mut right_leaf) = leaf.split(new_page_id);
+
+        // Insert the new key into appropriate leaf
+        if key.as_ref() < split_key.as_ref() {
+            leaf.insert(key, tuple_id)?;
+        } else {
+            right_leaf.insert(key, tuple_id)?;
+        }
+
+        // Write both leaves
+        self.disk.write_page(leaf_page_id, leaf.as_bytes()).await?;
+        self.disk.write_page(new_page_id, right_leaf.as_bytes()).await?;
+
+        // Propagate the split up the tree
+        self.insert_into_parent(split_key, new_page_id, &path, path.len() - 2).await
+    }
+
+    /// Inserts a separator key and child pointer into parent nodes.
+    /// Uses iteration instead of recursion to avoid async boxing.
+    async fn insert_into_parent(
+        &mut self,
+        key: Bytes,
+        right_child: PageId,
+        path: &[PageId],
+        start_parent_idx: usize,
+    ) -> Result<()> {
+        let mut current_key = key;
+        let mut current_child = right_child;
+        let mut parent_idx = start_parent_idx;
+
+        loop {
+            // If we've reached above the root, create a new root
+            if parent_idx >= path.len() {
+                return self.create_new_root(current_key, current_child).await;
+            }
+
+            let parent_page_id = path[parent_idx];
+            let page_data = self.disk.read_page(parent_page_id).await?;
+            let mut parent = BTreeInternalPage::from_bytes(page_data);
+
+            // Try to insert into parent
+            match parent.insert(current_key.clone(), current_child) {
+                Ok(()) => {
+                    self.disk.write_page(parent_page_id, parent.as_bytes()).await?;
+                    return Ok(());
+                }
+                Err(ZyronError::NodeFull) => {
+                    // Split the internal node
+                    let new_page_id = self.disk.allocate_page(self.tree.file_id()).await?;
+                    let (promoted_key, right_internal) = parent.split(new_page_id);
+
+                    // Insert into appropriate side
+                    if current_key.as_ref() < promoted_key.as_ref() {
+                        parent.insert(current_key, current_child)?;
+                    } else {
+                        let mut right_internal = right_internal;
+                        right_internal.insert(current_key, current_child)?;
+                        self.disk.write_page(new_page_id, right_internal.as_bytes()).await?;
+                    }
+
+                    self.disk.write_page(parent_page_id, parent.as_bytes()).await?;
+
+                    // Continue propagating up
+                    if parent_idx == 0 {
+                        return self.create_new_root(promoted_key, new_page_id).await;
+                    }
+
+                    // Set up for next iteration
+                    current_key = promoted_key;
+                    current_child = new_page_id;
+                    parent_idx -= 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Creates a new root when the current root splits.
+    async fn create_new_root(&mut self, key: Bytes, right_child: PageId) -> Result<()> {
+        let new_root_id = self.disk.allocate_page(self.tree.file_id()).await?;
+        let old_root_id = self.tree.root_page_id();
+
+        let mut new_root = BTreeInternalPage::new(new_root_id, self.tree.height() as u16);
+        new_root.set_leftmost_child(old_root_id);
+        new_root.insert(key, right_child)?;
+
+        self.disk.write_page(new_root_id, new_root.as_bytes()).await?;
+
+        self.tree.set_root_page_id(new_root_id);
+        self.tree.increment_height();
+
+        Ok(())
+    }
+
+    /// Deletes a key from the B+ tree.
+    ///
+    /// Returns true if the key was found and deleted.
+    pub async fn delete(&mut self, key: &[u8]) -> Result<bool> {
+        let path = self.find_path(key).await?;
+
+        let leaf_page_id = *path.last().ok_or_else(|| {
+            ZyronError::BTreeCorrupted("empty path".to_string())
+        })?;
+
+        let page_data = self.disk.read_page(leaf_page_id).await?;
+        let mut leaf = BTreeLeafPage::from_bytes(page_data);
+
+        match leaf.delete(key) {
+            DeleteResult::Ok => {
+                self.disk.write_page(leaf_page_id, leaf.as_bytes()).await?;
+                Ok(true)
+            }
+            DeleteResult::Underfull => {
+                self.disk.write_page(leaf_page_id, leaf.as_bytes()).await?;
+                // For simplicity, we don't rebalance on delete in this implementation.
+                // A production implementation would handle underflow here.
+                Ok(true)
+            }
+            DeleteResult::NotFound => Ok(false),
+        }
+    }
+
+    /// Performs a range scan from start_key to end_key (inclusive).
+    ///
+    /// Returns all matching (key, tuple_id) pairs in sorted order.
+    pub async fn range_scan(
+        &self,
+        start_key: Option<&[u8]>,
+        end_key: Option<&[u8]>,
+    ) -> Result<Vec<(Bytes, TupleId)>> {
+        let mut results = Vec::new();
+
+        // Find starting leaf
+        let start_leaf_id = match start_key {
+            Some(key) => self.find_leaf(key).await?,
+            None => self.find_leftmost_leaf().await?,
+        };
+
+        let mut current_page_id = Some(start_leaf_id);
+
+        while let Some(page_id) = current_page_id {
+            let page_data = self.disk.read_page(page_id).await?;
+            let leaf = BTreeLeafPage::from_bytes(page_data);
+
+            for entry in leaf.entries() {
+                // Check start bound
+                if let Some(start) = start_key {
+                    if entry.key.as_ref() < start {
+                        continue;
+                    }
+                }
+
+                // Check end bound
+                if let Some(end) = end_key {
+                    if entry.key.as_ref() > end {
+                        return Ok(results);
+                    }
+                }
+
+                results.push((entry.key.clone(), entry.tuple_id));
+            }
+
+            current_page_id = leaf.next_leaf();
+        }
+
+        Ok(results)
+    }
+
+    /// Finds the leftmost leaf page (for full scans).
+    async fn find_leftmost_leaf(&self) -> Result<PageId> {
+        let mut current_page_id = self.tree.root_page_id();
+
+        // If tree height is 1, root is a leaf
+        if self.tree.height() == 1 {
+            return Ok(current_page_id);
+        }
+
+        // Traverse leftmost path
+        for _ in 0..(self.tree.height() - 1) {
+            let page_data = self.disk.read_page(current_page_id).await?;
+            let internal = BTreeInternalPage::from_bytes(page_data);
+            current_page_id = internal.leftmost_child();
+        }
+
+        Ok(current_page_id)
+    }
+
+    /// Returns an iterator over all entries in key order.
+    pub async fn scan_all(&self) -> Result<Vec<(Bytes, TupleId)>> {
+        self.range_scan(None, None).await
     }
 }
 

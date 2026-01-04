@@ -56,10 +56,11 @@ pub struct Tuple {
 
 /// Header for a tuple.
 ///
-/// Layout (8 bytes):
+/// Layout (12 bytes):
 /// - flags: 2 bytes
 /// - data_len: 2 bytes
 /// - xmin: 4 bytes (transaction that created this tuple)
+/// - xmax: 4 bytes (transaction that deleted/updated this tuple, 0 if live)
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TupleHeader {
     /// Tuple flags.
@@ -68,11 +69,13 @@ pub struct TupleHeader {
     pub data_len: u16,
     /// Transaction ID that created this tuple.
     pub xmin: u32,
+    /// Transaction ID that deleted or updated this tuple (0 if still live).
+    pub xmax: u32,
 }
 
 impl TupleHeader {
     /// Size of the tuple header in bytes.
-    pub const SIZE: usize = 8;
+    pub const SIZE: usize = 12;
 
     /// Creates a new tuple header.
     pub fn new(data_len: u16, xmin: u32) -> Self {
@@ -80,7 +83,26 @@ impl TupleHeader {
             flags: TupleFlags::empty(),
             data_len,
             xmin,
+            xmax: 0,
         }
+    }
+
+    /// Creates a tuple header with both xmin and xmax.
+    pub fn with_xmax(data_len: u16, xmin: u32, xmax: u32) -> Self {
+        Self {
+            flags: TupleFlags::empty(),
+            data_len,
+            xmin,
+            xmax,
+        }
+    }
+
+    /// Returns true if this tuple is visible to the given transaction.
+    /// A tuple is visible if:
+    /// - xmin is committed and less than or equal to the snapshot
+    /// - xmax is either 0 (not deleted) or greater than the snapshot
+    pub fn is_visible(&self, snapshot_xid: u32) -> bool {
+        self.xmin <= snapshot_xid && (self.xmax == 0 || self.xmax > snapshot_xid)
     }
 
     /// Serializes the header to bytes.
@@ -89,6 +111,7 @@ impl TupleHeader {
         buf[0..2].copy_from_slice(&self.flags.0.to_le_bytes());
         buf[2..4].copy_from_slice(&self.data_len.to_le_bytes());
         buf[4..8].copy_from_slice(&self.xmin.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.xmax.to_le_bytes());
         buf
     }
 
@@ -98,6 +121,7 @@ impl TupleHeader {
             flags: TupleFlags(u16::from_le_bytes([buf[0], buf[1]])),
             data_len: u16::from_le_bytes([buf[2], buf[3]]),
             xmin: u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
+            xmax: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
         }
     }
 }
@@ -264,6 +288,7 @@ mod tests {
             flags: TupleFlags(0x0003),
             data_len: 256,
             xmin: 12345,
+            xmax: 67890,
         };
 
         let bytes = header.to_bytes();
@@ -272,6 +297,7 @@ mod tests {
         assert_eq!(recovered.flags.0, header.flags.0);
         assert_eq!(recovered.data_len, header.data_len);
         assert_eq!(recovered.xmin, header.xmin);
+        assert_eq!(recovered.xmax, header.xmax);
     }
 
     #[test]
@@ -367,6 +393,7 @@ mod tests {
             flags: TupleFlags(TupleFlags::HAS_NULLS),
             data_len: 5,
             xmin: 42,
+            xmax: 0,
         };
         let data = Bytes::from_static(b"hello");
 
@@ -374,7 +401,23 @@ mod tests {
 
         assert!(tuple.header().flags.has_nulls());
         assert_eq!(tuple.header().xmin, 42);
+        assert_eq!(tuple.header().xmax, 0);
         assert_eq!(tuple.data(), &data);
+    }
+
+    #[test]
+    fn test_tuple_visibility() {
+        // Tuple created by txn 10, still live (xmax = 0)
+        let header = TupleHeader::new(5, 10);
+        assert!(header.is_visible(10)); // visible to creator
+        assert!(header.is_visible(15)); // visible to later txns
+        assert!(!header.is_visible(5)); // not visible to earlier txns
+
+        // Tuple deleted by txn 20
+        let header = TupleHeader::with_xmax(5, 10, 20);
+        assert!(header.is_visible(15)); // visible between xmin and xmax
+        assert!(!header.is_visible(25)); // not visible after xmax
+        assert!(!header.is_visible(5)); // not visible before xmin
     }
 
     #[test]

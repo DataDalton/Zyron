@@ -50,6 +50,12 @@ pub enum ZyronError {
     #[error("Invalid node type")]
     InvalidNodeType,
 
+    #[error("Key too large: {size} bytes (max {max})")]
+    KeyTooLarge { size: usize, max: usize },
+
+    #[error("B+ tree corrupted: {0}")]
+    BTreeCorrupted(String),
+
     // WAL errors
     #[error("WAL write failed: {0}")]
     WalWriteFailed(String),
