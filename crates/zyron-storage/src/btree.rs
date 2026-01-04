@@ -728,10 +728,9 @@ impl BTreeInternalPage {
         }
 
         // Key is >= all keys, return rightmost child
-        if entries.is_empty() {
-            self.leftmost_child()
-        } else {
-            entries.last().unwrap().child_page_id
+        match entries.last() {
+            Some(entry) => entry.child_page_id,
+            None => self.leftmost_child(),
         }
     }
 

@@ -140,12 +140,15 @@ impl SegmentHeader {
 
         Self {
             magic,
-            version: u32::from_le_bytes(data[4..8].try_into().unwrap()),
-            segment_id: SegmentId(u32::from_le_bytes(data[8..12].try_into().unwrap())),
-            segment_size: u32::from_le_bytes(data[12..16].try_into().unwrap()),
-            first_lsn: Lsn(u64::from_le_bytes(data[16..24].try_into().unwrap())),
-            flags: u32::from_le_bytes(data[24..28].try_into().unwrap()),
-            checksum: u32::from_le_bytes(data[28..32].try_into().unwrap()),
+            version: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
+            segment_id: SegmentId(u32::from_le_bytes([data[8], data[9], data[10], data[11]])),
+            segment_size: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
+            first_lsn: Lsn(u64::from_le_bytes([
+                data[16], data[17], data[18], data[19],
+                data[20], data[21], data[22], data[23],
+            ])),
+            flags: u32::from_le_bytes([data[24], data[25], data[26], data[27]]),
+            checksum: u32::from_le_bytes([data[28], data[29], data[30], data[31]]),
         }
     }
 }
