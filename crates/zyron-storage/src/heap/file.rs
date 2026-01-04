@@ -83,11 +83,19 @@ impl HeapFile {
         let _lock = self.alloc_lock.write().await;
 
         // Try to find a page with enough space
-        if let Some(page_id) = self.find_page_with_space(tuple_size).await? {
-            return self.insert_into_page(page_id, tuple).await;
+        // Add slot overhead to space requirement for accurate FSM lookup
+        let space_needed = tuple_size + crate::heap::page::TupleSlot::SIZE;
+        if let Some(page_id) = self.find_page_with_space(space_needed).await? {
+            match self.insert_into_page(page_id, tuple).await {
+                Ok(tuple_id) => return Ok(tuple_id),
+                Err(ZyronError::PageFull) => {
+                    // FSM estimate was slightly off, fall through to allocate new page
+                }
+                Err(e) => return Err(e),
+            }
         }
 
-        // No suitable page found, allocate a new one
+        // No suitable page found or FSM estimate was off, allocate a new one
         let page_id = self.allocate_new_page().await?;
         self.insert_into_page(page_id, tuple).await
     }

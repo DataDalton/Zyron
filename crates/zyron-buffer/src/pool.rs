@@ -4,6 +4,7 @@ use crate::frame::{BufferFrame, FrameId};
 use crate::replacer::{ClockReplacer, Replacer};
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
+use sysinfo::System;
 use zyron_common::page::{PageId, PAGE_SIZE};
 use zyron_common::{Result, ZyronError};
 
@@ -60,6 +61,25 @@ impl BufferPool {
             free_list: Mutex::new(free_list),
             replacer: ClockReplacer::new(num_frames),
         }
+    }
+
+    /// Creates a buffer pool sized to 25% of available system RAM.
+    ///
+    /// Queries the system for available memory and allocates 25% of it
+    /// for the buffer pool. Minimum 1,000 frames to ensure useful caching
+    /// even on low-memory systems. No upper limit - systems with terabytes
+    /// of RAM can use it all.
+    ///
+    /// For a system with 16GB RAM, this allocates ~4GB (~250k frames).
+    pub fn auto_sized() -> Self {
+        let mut sys = System::new_all();
+        sys.refresh_memory();
+
+        let available_bytes = sys.available_memory() as usize;
+        let target_bytes = available_bytes / 4; // 25% of available RAM
+        let num_frames = (target_bytes / PAGE_SIZE).max(1_000);
+
+        Self::new(BufferPoolConfig { num_frames })
     }
 
     /// Returns the number of frames in the pool.

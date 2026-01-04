@@ -31,6 +31,7 @@ use crate::disk::DiskManager;
 use crate::tuple::TupleId;
 use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
+use zyron_buffer::BufferPool;
 use zyron_common::page::{PageHeader, PageId, PageType, PAGE_SIZE};
 use zyron_common::{Result, ZyronError};
 
@@ -1007,19 +1008,26 @@ impl BTree {
 /// B+ tree index with disk I/O operations.
 ///
 /// Provides tree-level operations (search, insert, delete, range_scan)
-/// that coordinate page-level operations with disk I/O through DiskManager.
+/// that coordinate page-level operations with disk I/O through BufferPool.
+/// Pages are cached in the buffer pool for fast repeated access.
 pub struct BTreeIndex {
     /// Tree metadata.
     tree: BTree,
     /// Disk manager for page I/O.
     disk: Arc<DiskManager>,
+    /// Buffer pool for page caching.
+    pool: Arc<BufferPool>,
 }
 
 impl BTreeIndex {
     /// Creates a new B+ tree index.
     ///
-    /// Creates an empty root leaf page on disk.
-    pub async fn create(disk: Arc<DiskManager>, file_id: u32) -> Result<Self> {
+    /// Creates an empty root leaf page on disk and caches it in the buffer pool.
+    pub async fn create(
+        disk: Arc<DiskManager>,
+        pool: Arc<BufferPool>,
+        file_id: u32,
+    ) -> Result<Self> {
         // Allocate root page
         let root_page_id = disk.allocate_page(file_id).await?;
 
@@ -1027,8 +1035,11 @@ impl BTreeIndex {
         let root_page = BTreeLeafPage::new(root_page_id);
         disk.write_page(root_page_id, root_page.as_bytes()).await?;
 
+        // Load root page into buffer pool
+        let _ = pool.load_page(root_page_id, root_page.as_bytes());
+
         let tree = BTree::new(root_page_id, file_id);
-        Ok(Self { tree, disk })
+        Ok(Self { tree, disk, pool })
     }
 
     /// Opens an existing B+ tree index.
@@ -1036,6 +1047,7 @@ impl BTreeIndex {
     /// Reads the root page to verify the index exists.
     pub async fn open(
         disk: Arc<DiskManager>,
+        pool: Arc<BufferPool>,
         file_id: u32,
         root_page_id: PageId,
         height: u32,
@@ -1048,7 +1060,7 @@ impl BTreeIndex {
             tree.increment_height();
         }
 
-        Ok(Self { tree, disk })
+        Ok(Self { tree, disk, pool })
     }
 
     /// Returns the root page ID.
@@ -1066,12 +1078,83 @@ impl BTreeIndex {
         self.tree.height()
     }
 
+    // =========================================================================
+    // Cached Page Access Helpers
+    // =========================================================================
+
+    /// Reads a page, checking buffer pool first, loading from disk on miss.
+    async fn read_cached_page(&self, page_id: PageId) -> Result<[u8; PAGE_SIZE]> {
+        // Check buffer pool first
+        if let Some(frame) = self.pool.fetch_page(page_id) {
+            let data = frame.read_data();
+            let mut result = [0u8; PAGE_SIZE];
+            result.copy_from_slice(&**data);
+            self.pool.unpin_page(page_id, false);
+            return Ok(result);
+        }
+
+        // Cache miss - load from disk
+        let data = self.disk.read_page(page_id).await?;
+        let _ = self.pool.load_page(page_id, &data);
+        self.pool.unpin_page(page_id, false);
+        Ok(data)
+    }
+
+    /// Writes a page to buffer pool (marks dirty) and disk.
+    async fn write_cached_page(&self, page_id: PageId, data: &[u8; PAGE_SIZE]) -> Result<()> {
+        // Write to disk first for durability
+        self.disk.write_page(page_id, data).await?;
+
+        // Update or load into buffer pool
+        if let Some(frame) = self.pool.fetch_page(page_id) {
+            frame.copy_from(data);
+            self.pool.unpin_page(page_id, false); // Clean since we wrote to disk
+        } else {
+            let _ = self.pool.load_page(page_id, data);
+            self.pool.unpin_page(page_id, false);
+        }
+
+        Ok(())
+    }
+
+    /// Allocates a new page via disk manager and adds to buffer pool.
+    async fn allocate_cached_page(&self) -> Result<PageId> {
+        let page_id = self.disk.allocate_page(self.tree.file_id()).await?;
+        // New pages will be added to pool when first written
+        Ok(page_id)
+    }
+
+    /// Flushes all dirty pages belonging to this tree's file to disk.
+    pub async fn flush(&self) -> Result<()> {
+        let file_id = self.tree.file_id();
+        let disk = self.disk.clone();
+
+        self.pool.flush_all(|page_id, data| {
+            if page_id.file_id == file_id {
+                // Synchronous write - flush_all expects sync callback
+                // For async, we'd need a different approach
+                let data_copy: [u8; PAGE_SIZE] = data.try_into().map_err(|_| {
+                    ZyronError::IoError("invalid page size".to_string())
+                })?;
+                // Use blocking for now - proper async flush would need redesign
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        disk.write_page(page_id, &data_copy).await
+                    })
+                })?;
+            }
+            Ok(())
+        })?;
+
+        Ok(())
+    }
+
     /// Searches for a key in the B+ tree.
     ///
     /// Returns the TupleId if found, None otherwise.
     pub async fn search(&self, key: &[u8]) -> Result<Option<TupleId>> {
         let leaf_page_id = self.find_leaf(key).await?;
-        let page_data = self.disk.read_page(leaf_page_id).await?;
+        let page_data = self.read_cached_page(leaf_page_id).await?;
         let leaf = BTreeLeafPage::from_bytes(page_data);
         Ok(leaf.get(key))
     }
@@ -1087,7 +1170,7 @@ impl BTreeIndex {
 
         // Traverse internal nodes
         for _ in 0..(self.tree.height() - 1) {
-            let page_data = self.disk.read_page(current_page_id).await?;
+            let page_data = self.read_cached_page(current_page_id).await?;
             let internal = BTreeInternalPage::from_bytes(page_data);
             current_page_id = internal.find_child(key);
         }
@@ -1114,14 +1197,14 @@ impl BTreeIndex {
             ZyronError::BTreeCorrupted("empty path".to_string())
         })?;
 
-        let page_data = self.disk.read_page(leaf_page_id).await?;
+        let page_data = self.read_cached_page(leaf_page_id).await?;
         let mut leaf = BTreeLeafPage::from_bytes(page_data);
 
         // Try to insert into the leaf
         match leaf.insert(key.clone(), tuple_id) {
             Ok(()) => {
                 // Write updated leaf
-                self.disk.write_page(leaf_page_id, leaf.as_bytes()).await?;
+                self.write_cached_page(leaf_page_id, leaf.as_bytes()).await?;
                 Ok(())
             }
             Err(ZyronError::NodeFull) => {
@@ -1146,7 +1229,7 @@ impl BTreeIndex {
 
         // Traverse internal nodes
         for _ in 0..(self.tree.height() - 1) {
-            let page_data = self.disk.read_page(current_page_id).await?;
+            let page_data = self.read_cached_page(current_page_id).await?;
             let internal = BTreeInternalPage::from_bytes(page_data);
             current_page_id = internal.find_child(key);
             path.push(current_page_id);
@@ -1167,11 +1250,11 @@ impl BTreeIndex {
         })?;
 
         // Read and split the leaf
-        let page_data = self.disk.read_page(leaf_page_id).await?;
+        let page_data = self.read_cached_page(leaf_page_id).await?;
         let mut leaf = BTreeLeafPage::from_bytes(page_data);
 
         // Allocate new page for right sibling
-        let new_page_id = self.disk.allocate_page(self.tree.file_id()).await?;
+        let new_page_id = self.allocate_cached_page().await?;
         let (split_key, mut right_leaf) = leaf.split(new_page_id);
 
         // Insert the new key into appropriate leaf
@@ -1182,11 +1265,16 @@ impl BTreeIndex {
         }
 
         // Write both leaves
-        self.disk.write_page(leaf_page_id, leaf.as_bytes()).await?;
-        self.disk.write_page(new_page_id, right_leaf.as_bytes()).await?;
+        self.write_cached_page(leaf_page_id, leaf.as_bytes()).await?;
+        self.write_cached_page(new_page_id, right_leaf.as_bytes()).await?;
 
         // Propagate the split up the tree
-        self.insert_into_parent(split_key, new_page_id, &path, path.len() - 2).await
+        // When path.len() is 1, the root is a leaf and we need to create a new root
+        if path.len() < 2 {
+            self.create_new_root(split_key, new_page_id).await
+        } else {
+            self.insert_into_parent(split_key, new_page_id, &path, path.len() - 2).await
+        }
     }
 
     /// Inserts a separator key and child pointer into parent nodes.
@@ -1209,30 +1297,30 @@ impl BTreeIndex {
             }
 
             let parent_page_id = path[parent_idx];
-            let page_data = self.disk.read_page(parent_page_id).await?;
+            let page_data = self.read_cached_page(parent_page_id).await?;
             let mut parent = BTreeInternalPage::from_bytes(page_data);
 
             // Try to insert into parent
             match parent.insert(current_key.clone(), current_child) {
                 Ok(()) => {
-                    self.disk.write_page(parent_page_id, parent.as_bytes()).await?;
+                    self.write_cached_page(parent_page_id, parent.as_bytes()).await?;
                     return Ok(());
                 }
                 Err(ZyronError::NodeFull) => {
                     // Split the internal node
-                    let new_page_id = self.disk.allocate_page(self.tree.file_id()).await?;
-                    let (promoted_key, right_internal) = parent.split(new_page_id);
+                    let new_page_id = self.allocate_cached_page().await?;
+                    let (promoted_key, mut right_internal) = parent.split(new_page_id);
 
                     // Insert into appropriate side
                     if current_key.as_ref() < promoted_key.as_ref() {
                         parent.insert(current_key, current_child)?;
                     } else {
-                        let mut right_internal = right_internal;
                         right_internal.insert(current_key, current_child)?;
-                        self.disk.write_page(new_page_id, right_internal.as_bytes()).await?;
                     }
 
-                    self.disk.write_page(parent_page_id, parent.as_bytes()).await?;
+                    // Write both pages - split creates new right page
+                    self.write_cached_page(new_page_id, right_internal.as_bytes()).await?;
+                    self.write_cached_page(parent_page_id, parent.as_bytes()).await?;
 
                     // Continue propagating up
                     if parent_idx == 0 {
@@ -1251,14 +1339,14 @@ impl BTreeIndex {
 
     /// Creates a new root when the current root splits.
     async fn create_new_root(&mut self, key: Bytes, right_child: PageId) -> Result<()> {
-        let new_root_id = self.disk.allocate_page(self.tree.file_id()).await?;
+        let new_root_id = self.allocate_cached_page().await?;
         let old_root_id = self.tree.root_page_id();
 
         let mut new_root = BTreeInternalPage::new(new_root_id, self.tree.height() as u16);
         new_root.set_leftmost_child(old_root_id);
         new_root.insert(key, right_child)?;
 
-        self.disk.write_page(new_root_id, new_root.as_bytes()).await?;
+        self.write_cached_page(new_root_id, new_root.as_bytes()).await?;
 
         self.tree.set_root_page_id(new_root_id);
         self.tree.increment_height();
@@ -1276,16 +1364,16 @@ impl BTreeIndex {
             ZyronError::BTreeCorrupted("empty path".to_string())
         })?;
 
-        let page_data = self.disk.read_page(leaf_page_id).await?;
+        let page_data = self.read_cached_page(leaf_page_id).await?;
         let mut leaf = BTreeLeafPage::from_bytes(page_data);
 
         match leaf.delete(key) {
             DeleteResult::Ok => {
-                self.disk.write_page(leaf_page_id, leaf.as_bytes()).await?;
+                self.write_cached_page(leaf_page_id, leaf.as_bytes()).await?;
                 Ok(true)
             }
             DeleteResult::Underfull => {
-                self.disk.write_page(leaf_page_id, leaf.as_bytes()).await?;
+                self.write_cached_page(leaf_page_id, leaf.as_bytes()).await?;
                 // For simplicity, we don't rebalance on delete in this implementation.
                 // A production implementation would handle underflow here.
                 Ok(true)
@@ -1313,7 +1401,7 @@ impl BTreeIndex {
         let mut current_page_id = Some(start_leaf_id);
 
         while let Some(page_id) = current_page_id {
-            let page_data = self.disk.read_page(page_id).await?;
+            let page_data = self.read_cached_page(page_id).await?;
             let leaf = BTreeLeafPage::from_bytes(page_data);
 
             for entry in leaf.entries() {
@@ -1351,7 +1439,7 @@ impl BTreeIndex {
 
         // Traverse leftmost path
         for _ in 0..(self.tree.height() - 1) {
-            let page_data = self.disk.read_page(current_page_id).await?;
+            let page_data = self.read_cached_page(current_page_id).await?;
             let internal = BTreeInternalPage::from_bytes(page_data);
             current_page_id = internal.leftmost_child();
         }

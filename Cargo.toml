@@ -40,6 +40,9 @@ zstd = "0.13"
 crc32fast = "1.4"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
+# System info
+sysinfo = "0.32"
+
 # Arrow ecosystem
 arrow = "55"
 parquet = "55"
