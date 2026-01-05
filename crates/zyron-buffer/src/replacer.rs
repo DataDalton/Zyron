@@ -3,6 +3,7 @@
 use crate::frame::FrameId;
 use parking_lot::Mutex;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Trait for page replacement algorithms.
 pub trait Replacer: Send + Sync {
@@ -30,22 +31,18 @@ pub trait Replacer: Send + Sync {
 
 /// Clock replacement algorithm implementation.
 ///
-/// The clock algorithm maintains a circular buffer of frames with reference bits.
-/// When selecting a victim:
-/// 1. Check if current frame's reference bit is 0 and evictable
-/// 2. If yes, select it as victim
-/// 3. If no, clear reference bit and advance clock hand
-/// 4. Repeat until victim found or full circle completed
+/// Uses atomic reference bits for lock-free access recording.
+/// Only takes the mutex lock for evictable set modifications.
 pub struct ClockReplacer {
-    /// Internal state protected by mutex.
+    /// Number of frames.
+    num_frames: usize,
+    /// Reference bits for each frame (atomic for lock-free access).
+    reference_bits: Vec<AtomicBool>,
+    /// Internal state protected by mutex (evictable set and clock hand).
     inner: Mutex<ClockReplacerInner>,
 }
 
 struct ClockReplacerInner {
-    /// Total number of frames.
-    num_frames: usize,
-    /// Reference bits for each frame.
-    reference_bits: Vec<bool>,
     /// Set of evictable frame IDs.
     evictable: HashSet<FrameId>,
     /// Current clock hand position.
@@ -55,10 +52,14 @@ struct ClockReplacerInner {
 impl ClockReplacer {
     /// Creates a new clock replacer with the given number of frames.
     pub fn new(num_frames: usize) -> Self {
+        let reference_bits: Vec<AtomicBool> = (0..num_frames)
+            .map(|_| AtomicBool::new(false))
+            .collect();
+
         Self {
+            num_frames,
+            reference_bits,
             inner: Mutex::new(ClockReplacerInner {
-                num_frames,
-                reference_bits: vec![false; num_frames],
                 evictable: HashSet::new(),
                 clock_hand: 0,
             }),
@@ -66,27 +67,29 @@ impl ClockReplacer {
     }
 
     /// Returns the total capacity.
+    #[inline]
     pub fn capacity(&self) -> usize {
-        self.inner.lock().num_frames
+        self.num_frames
     }
 }
 
 impl Replacer for ClockReplacer {
     #[inline]
     fn record_access(&self, frame_id: FrameId) {
-        let mut inner = self.inner.lock();
-        if (frame_id.0 as usize) < inner.num_frames {
-            inner.reference_bits[frame_id.0 as usize] = true;
+        let idx = frame_id.0 as usize;
+        if idx < self.num_frames {
+            // Lock-free atomic write
+            self.reference_bits[idx].store(true, Ordering::Relaxed);
         }
     }
 
     #[inline]
     fn set_evictable(&self, frame_id: FrameId, evictable: bool) {
-        let mut inner = self.inner.lock();
-        if (frame_id.0 as usize) >= inner.num_frames {
+        if (frame_id.0 as usize) >= self.num_frames {
             return;
         }
 
+        let mut inner = self.inner.lock();
         if evictable {
             inner.evictable.insert(frame_id);
         } else {
@@ -96,11 +99,12 @@ impl Replacer for ClockReplacer {
 
     #[inline]
     fn access_and_pin(&self, frame_id: FrameId) {
-        let mut inner = self.inner.lock();
         let idx = frame_id.0 as usize;
-        if idx < inner.num_frames {
-            inner.reference_bits[idx] = true;
-            inner.evictable.remove(&frame_id);
+        if idx < self.num_frames {
+            // Lock-free atomic write for reference bit
+            self.reference_bits[idx].store(true, Ordering::Relaxed);
+            // Only take lock for evictable set
+            self.inner.lock().evictable.remove(&frame_id);
         }
     }
 
@@ -111,8 +115,7 @@ impl Replacer for ClockReplacer {
             return None;
         }
 
-        let start = inner.clock_hand;
-        let num_frames = inner.num_frames;
+        let num_frames = self.num_frames;
 
         // Make at most 2 full rotations to find a victim
         for _ in 0..(2 * num_frames) {
@@ -120,24 +123,19 @@ impl Replacer for ClockReplacer {
             let frame_id = FrameId(hand as u32);
 
             if inner.evictable.contains(&frame_id) {
-                if !inner.reference_bits[hand] {
+                if !self.reference_bits[hand].load(Ordering::Relaxed) {
                     // Found victim: evictable and reference bit is 0
                     inner.evictable.remove(&frame_id);
                     inner.clock_hand = (hand + 1) % num_frames;
                     return Some(frame_id);
                 } else {
                     // Clear reference bit and continue
-                    inner.reference_bits[hand] = false;
+                    self.reference_bits[hand].store(false, Ordering::Relaxed);
                 }
             }
 
             inner.clock_hand = (hand + 1) % num_frames;
 
-            // If we've completed a full rotation and found nothing with ref bit 0,
-            // on second rotation we should find one
-            if inner.clock_hand == start && inner.evictable.is_empty() {
-                return None;
-            }
         }
 
         // If we still haven't found one, just pick any evictable frame
@@ -150,10 +148,10 @@ impl Replacer for ClockReplacer {
     }
 
     fn remove(&self, frame_id: FrameId) {
-        let mut inner = self.inner.lock();
-        if (frame_id.0 as usize) < inner.num_frames {
-            inner.evictable.remove(&frame_id);
-            inner.reference_bits[frame_id.0 as usize] = false;
+        let idx = frame_id.0 as usize;
+        if idx < self.num_frames {
+            self.inner.lock().evictable.remove(&frame_id);
+            self.reference_bits[idx].store(false, Ordering::Relaxed);
         }
     }
 

@@ -15,7 +15,7 @@ mod heap;
 mod tuple;
 
 pub use btree::{
-    BTree, BTreeIndex, BTreeInternalPage, BTreeLeafPage, DeleteResult, InternalEntry,
+    BTreeIndex, BTreeInternalPage, BTreeLeafPage, DeleteResult, InternalEntry,
     InternalPageHeader, LeafEntry, LeafPageHeader, MAX_KEY_SIZE, MIN_FILL_FACTOR,
 };
 pub use disk::{DiskManager, DiskManagerConfig};

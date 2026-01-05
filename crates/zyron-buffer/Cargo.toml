@@ -8,6 +8,7 @@ rust-version.workspace = true
 zyron-common = { path = "../zyron-common" }
 parking_lot.workspace = true
 sysinfo.workspace = true
+dashmap = "6.1"
 
 [dev-dependencies]
 tempfile = "3.15"

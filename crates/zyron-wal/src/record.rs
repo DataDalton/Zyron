@@ -281,6 +281,76 @@ impl LogRecord {
             payload,
         })
     }
+
+    /// Parses all records from a contiguous Bytes buffer with checksum verification.
+    /// Uses zero-copy slicing for payload data to avoid per-record allocation.
+    #[inline]
+    pub fn parse_all(data: Bytes) -> Result<Vec<Self>> {
+        let mut records = Vec::with_capacity(data.len() / 64); // Estimate record count
+        let mut offset = 0;
+        let data_len = data.len();
+
+        while offset + Self::HEADER_SIZE + Self::CHECKSUM_SIZE <= data_len {
+            // Read payload length from header (offset 22-23)
+            let payload_len = u16::from_le_bytes([
+                data[offset + 22],
+                data[offset + 23],
+            ]) as usize;
+
+            let record_size = Self::HEADER_SIZE + payload_len + Self::CHECKSUM_SIZE;
+            if offset + record_size > data_len {
+                break; // Partial record at end
+            }
+
+            // Verify checksum over header + payload
+            let checksum_offset = offset + Self::HEADER_SIZE + payload_len;
+            let stored_checksum = u32::from_le_bytes([
+                data[checksum_offset],
+                data[checksum_offset + 1],
+                data[checksum_offset + 2],
+                data[checksum_offset + 3],
+            ]);
+            let computed_checksum = crc32fast::hash(&data[offset..checksum_offset]);
+            if stored_checksum != computed_checksum {
+                break; // Checksum mismatch - stop parsing
+            }
+
+            // Parse header fields
+            let lsn = Lsn(u64::from_le_bytes([
+                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7]
+            ]));
+            let prev_lsn = Lsn(u64::from_le_bytes([
+                data[offset + 8], data[offset + 9], data[offset + 10], data[offset + 11],
+                data[offset + 12], data[offset + 13], data[offset + 14], data[offset + 15]
+            ]));
+            let txn_id = u32::from_le_bytes([
+                data[offset + 16], data[offset + 17], data[offset + 18], data[offset + 19]
+            ]);
+            let record_type = match LogRecordType::try_from(data[offset + 20]) {
+                Ok(rt) => rt,
+                Err(_) => break,
+            };
+            let flags = data[offset + 21];
+
+            // Zero-copy slice for payload (shares underlying buffer via Arc)
+            let payload_start = offset + Self::HEADER_SIZE;
+            let payload = data.slice(payload_start..payload_start + payload_len);
+
+            records.push(Self {
+                lsn,
+                prev_lsn,
+                txn_id,
+                record_type,
+                flags,
+                payload,
+            });
+
+            offset += record_size;
+        }
+
+        Ok(records)
+    }
 }
 
 /// Payload for insert/update/delete operations.

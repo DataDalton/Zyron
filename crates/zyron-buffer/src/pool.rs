@@ -2,8 +2,8 @@
 
 use crate::frame::{BufferFrame, FrameId};
 use crate::replacer::{ClockReplacer, Replacer};
-use parking_lot::{Mutex, RwLock};
-use std::collections::HashMap;
+use dashmap::DashMap;
+use parking_lot::Mutex;
 use sysinfo::System;
 use zyron_common::page::{PageId, PAGE_SIZE};
 use zyron_common::{Result, ZyronError};
@@ -32,7 +32,7 @@ impl Default for BufferPoolConfig {
 /// Buffer pool manager.
 ///
 /// Manages a fixed-size pool of page frames with:
-/// - Page ID to frame ID mapping
+/// - Page ID to frame ID mapping (lock-free concurrent HashMap)
 /// - Free frame list for new pages
 /// - Clock replacement for eviction
 /// - Pin counting for concurrent access
@@ -41,8 +41,8 @@ pub struct BufferPool {
     config: BufferPoolConfig,
     /// Array of buffer frames.
     frames: Vec<BufferFrame>,
-    /// Page ID to frame ID mapping.
-    page_table: RwLock<HashMap<PageId, FrameId>>,
+    /// Page ID to frame ID mapping (concurrent, lock-free reads).
+    page_table: DashMap<PageId, FrameId>,
     /// List of free frame IDs.
     free_list: Mutex<Vec<FrameId>>,
     /// Page replacement policy.
@@ -65,7 +65,7 @@ impl BufferPool {
         Self {
             config,
             frames,
-            page_table: RwLock::new(HashMap::new()),
+            page_table: DashMap::with_capacity(num_frames),
             free_list: Mutex::new(free_list),
             replacer: ClockReplacer::new(num_frames),
         }
@@ -102,12 +102,12 @@ impl BufferPool {
 
     /// Returns the number of pages currently in the pool.
     pub fn page_count(&self) -> usize {
-        self.page_table.read().len()
+        self.page_table.len()
     }
 
     /// Checks if a page is in the buffer pool.
     pub fn contains(&self, page_id: PageId) -> bool {
-        self.page_table.read().contains_key(&page_id)
+        self.page_table.contains_key(&page_id)
     }
 
     /// Fetches a page from the buffer pool.
@@ -116,12 +116,16 @@ impl BufferPool {
     /// The page is pinned before being returned.
     #[inline]
     pub fn fetch_page(&self, page_id: PageId) -> Option<&BufferFrame> {
-        let page_table = self.page_table.read();
-        if let Some(&frame_id) = page_table.get(&page_id) {
+        if let Some(frame_id_ref) = self.page_table.get(&page_id) {
+            let frame_id = *frame_id_ref;
+            drop(frame_id_ref); // Release DashMap guard immediately
             let frame = &self.frames[frame_id.0 as usize];
-            frame.pin();
-            // Combined operation: single lock acquisition
-            self.replacer.access_and_pin(frame_id);
+            let prev_pin = frame.pin();
+            // Only update replacer if frame was unpinned (prev_pin == 0).
+            // If already pinned, it's not in evictable set, so skip the lock.
+            if prev_pin == 0 {
+                self.replacer.access_and_pin(frame_id);
+            }
             return Some(frame);
         }
         None
@@ -161,7 +165,7 @@ impl BufferPool {
 
             // Remove old page from page table
             if let Some(old_page_id) = frame.page_id() {
-                self.page_table.write().remove(&old_page_id);
+                self.page_table.remove(&old_page_id);
             }
 
             return Ok((victim_id, evicted));
@@ -180,15 +184,16 @@ impl BufferPool {
     #[inline]
     pub fn new_page(&self, page_id: PageId) -> Result<(&BufferFrame, Option<EvictedPage>)> {
         // Check if page already exists
-        {
-            let page_table = self.page_table.read();
-            if let Some(&frame_id) = page_table.get(&page_id) {
-                let frame = &self.frames[frame_id.0 as usize];
-                frame.pin();
-                // Combined operation: single lock acquisition
+        if let Some(frame_id_ref) = self.page_table.get(&page_id) {
+            let frame_id = *frame_id_ref;
+            drop(frame_id_ref);
+            let frame = &self.frames[frame_id.0 as usize];
+            let prev_pin = frame.pin();
+            // Only update replacer if frame was unpinned (prev_pin == 0).
+            if prev_pin == 0 {
                 self.replacer.access_and_pin(frame_id);
-                return Ok((frame, None));
             }
+            return Ok((frame, None));
         }
 
         // Allocate a frame
@@ -198,13 +203,13 @@ impl BufferPool {
         let frame = &self.frames[frame_id.0 as usize];
         frame.reset();
         frame.set_page_id(Some(page_id));
+        // New frame: pin() returns 0 since reset() clears pin_count.
+        // Frame is not in evictable set (free_list frames never were,
+        // evicted frames were removed by evict()).
         frame.pin();
 
         // Update page table
-        self.page_table.write().insert(page_id, frame_id);
-
-        // Mark as not evictable (pinned) - new frame has no access history to record
-        self.replacer.set_evictable(frame_id, false);
+        self.page_table.insert(page_id, frame_id);
 
         Ok((frame, evicted))
     }
@@ -225,8 +230,9 @@ impl BufferPool {
     /// If the page becomes unpinned (pin count = 0), it becomes evictable.
     #[inline]
     pub fn unpin_page(&self, page_id: PageId, is_dirty: bool) -> bool {
-        let page_table = self.page_table.read();
-        if let Some(&frame_id) = page_table.get(&page_id) {
+        if let Some(frame_id_ref) = self.page_table.get(&page_id) {
+            let frame_id = *frame_id_ref;
+            drop(frame_id_ref); // Release DashMap guard immediately
             let frame = &self.frames[frame_id.0 as usize];
 
             if is_dirty {
@@ -250,8 +256,9 @@ impl BufferPool {
     where
         F: FnMut(PageId, &[u8]) -> Result<()>,
     {
-        let page_table = self.page_table.read();
-        if let Some(&frame_id) = page_table.get(&page_id) {
+        if let Some(frame_id_ref) = self.page_table.get(&page_id) {
+            let frame_id = *frame_id_ref;
+            drop(frame_id_ref);
             let frame = &self.frames[frame_id.0 as usize];
 
             if frame.is_dirty() {
@@ -273,9 +280,11 @@ impl BufferPool {
         F: FnMut(PageId, &[u8]) -> Result<()>,
     {
         let mut flushed = 0;
-        let page_table = self.page_table.read();
 
-        for (&page_id, &frame_id) in page_table.iter() {
+        for entry in self.page_table.iter() {
+            let page_id = *entry.key();
+            let frame_id = *entry.value();
+            drop(entry); // Release DashMap guard before frame operations
             let frame = &self.frames[frame_id.0 as usize];
 
             if frame.is_dirty() {
@@ -294,14 +303,12 @@ impl BufferPool {
     /// Returns true if the page was deleted.
     /// Returns false if the page is pinned or not in the pool.
     pub fn delete_page(&self, page_id: PageId) -> bool {
-        let mut page_table = self.page_table.write();
-
-        if let Some(frame_id) = page_table.remove(&page_id) {
+        if let Some((_, frame_id)) = self.page_table.remove(&page_id) {
             let frame = &self.frames[frame_id.0 as usize];
 
-            // Cannot delete pinned page
+            // Cannot delete pinned page - re-insert if pinned
             if frame.is_pinned() {
-                page_table.insert(page_id, frame_id);
+                self.page_table.insert(page_id, frame_id);
                 return false;
             }
 
@@ -337,11 +344,11 @@ impl BufferPool {
 
     /// Returns statistics about the buffer pool.
     pub fn stats(&self) -> BufferPoolStats {
-        let page_table = self.page_table.read();
         let mut pinned_count = 0;
         let mut dirty_count = 0;
 
-        for &frame_id in page_table.values() {
+        for entry in self.page_table.iter() {
+            let frame_id = *entry.value();
             let frame = &self.frames[frame_id.0 as usize];
             if frame.is_pinned() {
                 pinned_count += 1;
@@ -354,7 +361,7 @@ impl BufferPool {
         BufferPoolStats {
             total_frames: self.config.num_frames,
             free_frames: self.free_count(),
-            used_frames: page_table.len(),
+            used_frames: self.page_table.len(),
             pinned_frames: pinned_count,
             dirty_frames: dirty_count,
         }

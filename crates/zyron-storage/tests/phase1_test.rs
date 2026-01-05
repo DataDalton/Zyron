@@ -71,9 +71,9 @@ async fn test_wal_write_replay_10k_records() {
         wal_dir: dir.path().to_path_buf(),
         segment_size: 1024 * 1024, // 1MB segments to force rotation
         fsync_enabled: false, // Disable fsync for performance test
-        batch_size: 1,
-        batch_bytes: 64 * 1024,
-        flush_interval_us: 1000,
+        batch_size: 1000, // Group commit: batch up to 1000 records
+        batch_bytes: 256 * 1024, // Or 256KB of data
+        flush_interval_us: 5000, // Flush every 5ms max
     };
 
     // Phase 1: Write 10,000 records with timing

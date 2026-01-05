@@ -217,13 +217,13 @@ impl WalWriter {
     /// The record is added to the write buffer. If the buffer is full or
     /// flush_interval has elapsed, a flush is triggered. The caller waits
     /// until the record is durable (fsync complete).
+    #[inline]
     pub async fn append(&self, mut record: LogRecord) -> Result<Lsn> {
+        // Calculate size without serializing (avoids double serialization)
+        let record_size = record.size_on_disk();
+
         let (lsn, should_flush) = {
             let mut buffer = self.buffer.lock();
-
-            // Serialize record with placeholder LSN, then update
-            let data = record.serialize();
-            let record_size = data.len();
 
             // Check if we need segment rotation
             let needs_rotation = {
@@ -249,7 +249,7 @@ impl WalWriter {
                 }
             }
 
-            // Update record with correct LSN
+            // Assign LSN and serialize once
             let assigned_lsn = Lsn::new(buffer.current_segment_id, buffer.next_offset);
             record.lsn = assigned_lsn;
             let data = record.serialize();
@@ -261,12 +261,14 @@ impl WalWriter {
             (lsn, should_flush)
         };
 
-        if should_flush || !self.config.fsync_enabled {
+        // Only flush when batch thresholds are reached
+        if should_flush {
             self.flush_internal().await?;
-        } else {
-            // Wait for flush to complete
+        } else if self.config.fsync_enabled {
+            // With fsync enabled, wait for flush to ensure durability
             self.wait_for_flush(lsn).await?;
         }
+        // When fsync disabled and batch not full, let writes accumulate
 
         Ok(lsn)
     }
@@ -327,7 +329,7 @@ impl WalWriter {
 
     /// Flushes the write buffer to disk.
     async fn flush_internal(&self) -> Result<()> {
-        let (pending, _bytes) = {
+        let (pending, total_bytes) = {
             let mut buffer = self.buffer.lock();
             if buffer.is_empty() {
                 return Ok(());
@@ -340,17 +342,22 @@ impl WalWriter {
         }
 
         let max_lsn = pending.last().map(|p| p.lsn).unwrap_or(Lsn::INVALID);
+        let batch_count = pending.len();
 
-        // Write all records to segment
+        // Concatenate all records into single buffer for batch write
+        let mut batch_data = Vec::with_capacity(total_bytes);
+        for write in pending {
+            batch_data.extend_from_slice(&write.data);
+        }
+
+        // Single write for entire batch
         {
             let mut segment = self.segment.lock();
             let seg = segment.as_mut().ok_or_else(|| {
                 ZyronError::WalWriteFailed("WAL closed".to_string())
             })?;
 
-            for write in pending {
-                seg.append_raw(&write.data).await?;
-            }
+            seg.append_batch(&batch_data, batch_count).await?;
 
             // Single fsync for entire batch
             if self.config.fsync_enabled {

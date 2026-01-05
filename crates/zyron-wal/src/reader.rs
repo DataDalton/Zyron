@@ -74,10 +74,11 @@ impl WalReader {
     pub async fn scan_from(&self, start_lsn: Lsn) -> Result<Vec<LogRecord>> {
         let mut results = Vec::new();
         let segment_id = SegmentId(start_lsn.segment_id());
-        let mut offset = start_lsn.offset();
+        let start_offset = start_lsn.offset();
 
         // Find starting segment
         let mut current_segment_id = Some(segment_id);
+        let mut is_first_segment = true;
 
         while let Some(seg_id) = current_segment_id {
             if !self.segments.contains_key(&seg_id) {
@@ -86,28 +87,34 @@ impl WalReader {
 
             let mut segment = self.open_segment(seg_id).await?;
 
-            // Read records from this segment
-            while offset < segment.write_offset() {
-                match segment.read_at(offset).await {
-                    Ok(record) => {
-                        offset += record.size_on_disk() as u32;
-                        results.push(record);
-                    }
-                    Err(e) => {
-                        // If corrupted, try to skip to next segment
-                        if matches!(e, ZyronError::WalCorrupted { .. }) {
-                            break;
+            // Bulk read entire segment data into memory
+            let data = segment.read_all_data().await?;
+            segment.close().await?;
+
+            if !data.is_empty() {
+                // Parse all records from memory buffer (zero-copy via Bytes slicing)
+                let segment_records = LogRecord::parse_all(data)?;
+
+                // For first segment, skip records before start_offset
+                if is_first_segment && start_offset > SegmentHeader::SIZE as u32 {
+                    let skip_bytes = (start_offset - SegmentHeader::SIZE as u32) as usize;
+                    let mut byte_offset = 0;
+                    for record in segment_records {
+                        if byte_offset >= skip_bytes {
+                            results.push(record);
+                        } else {
+                            byte_offset += record.size_on_disk();
                         }
-                        return Err(e);
                     }
+                } else {
+                    results.extend(segment_records);
                 }
             }
 
-            segment.close().await?;
+            is_first_segment = false;
 
             // Move to next segment
             current_segment_id = Some(seg_id.next());
-            offset = SegmentHeader::SIZE as u32;
         }
 
         Ok(results)
@@ -115,15 +122,39 @@ impl WalReader {
 
     /// Scans all records in the WAL.
     ///
-    /// Returns a vector of all records.
+    /// Returns a vector of all records with checksum verification.
     pub async fn scan_all(&self) -> Result<Vec<LogRecord>> {
-        let start_lsn = if let Some(first_id) = self.first_segment_id() {
-            Lsn::new(first_id.0, SegmentHeader::SIZE as u32)
-        } else {
-            Lsn::FIRST
+        let mut results = Vec::new();
+
+        let first_id = match self.first_segment_id() {
+            Some(id) => id,
+            None => return Ok(results),
         };
 
-        self.scan_from(start_lsn).await
+        let mut current_segment_id = Some(first_id);
+
+        while let Some(seg_id) = current_segment_id {
+            if !self.segments.contains_key(&seg_id) {
+                break;
+            }
+
+            let mut segment = self.open_segment(seg_id).await?;
+
+            // Bulk read entire segment data into memory
+            let data = segment.read_all_data().await?;
+            segment.close().await?;
+
+            if !data.is_empty() {
+                // Parse all records from memory buffer (zero-copy via Bytes slicing)
+                let segment_records = LogRecord::parse_all(data)?;
+                results.extend(segment_records);
+            }
+
+            // Move to next segment
+            current_segment_id = Some(seg_id.next());
+        }
+
+        Ok(results)
     }
 
     /// Finds the last checkpoint in the WAL.
@@ -180,6 +211,142 @@ impl WalReader {
         }
 
         Ok(())
+    }
+}
+
+/// Synchronous WAL reader for replay without async overhead.
+///
+/// Uses standard library I/O for maximum throughput during recovery.
+/// All file reads are performed synchronously with no await points.
+pub struct SyncWalReader {
+    segments: BTreeMap<SegmentId, PathBuf>,
+}
+
+impl SyncWalReader {
+    /// Creates a new synchronous WAL reader.
+    pub fn new_sync(wal_dir: &Path) -> Result<Self> {
+        let mut segments = BTreeMap::new();
+
+        if wal_dir.exists() {
+            for entry in std::fs::read_dir(wal_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+
+                if path.extension().map(|e| e == "wal").unwrap_or(false) {
+                    if let Some(stem) = path.file_stem() {
+                        if let Ok(id) = stem.to_string_lossy().parse::<u32>() {
+                            segments.insert(SegmentId(id), path);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(Self { segments })
+    }
+
+    /// Returns the number of segment files.
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Returns the first segment ID, if any.
+    pub fn first_segment_id(&self) -> Option<SegmentId> {
+        self.segments.keys().next().copied()
+    }
+
+    /// Returns the last segment ID, if any.
+    pub fn last_segment_id(&self) -> Option<SegmentId> {
+        self.segments.keys().last().copied()
+    }
+
+    /// Scans all records in the WAL synchronously.
+    ///
+    /// Bulk reads entire segments and parses all records without async overhead.
+    /// Returns a vector of all records with checksum verification.
+    #[inline]
+    pub fn scan_all_sync(&self) -> Result<Vec<LogRecord>> {
+        use crate::segment::SyncLogSegment;
+
+        let mut results = Vec::new();
+
+        let first_id = match self.first_segment_id() {
+            Some(id) => id,
+            None => return Ok(results),
+        };
+
+        let mut current_segment_id = Some(first_id);
+
+        while let Some(seg_id) = current_segment_id {
+            if let Some(path) = self.segments.get(&seg_id) {
+                let mut segment = SyncLogSegment::open_sync(path)?;
+
+                // Bulk read entire segment data into memory
+                let data = segment.read_all_data_sync()?;
+
+                if !data.is_empty() {
+                    // Parse all records from memory buffer
+                    let segment_records = LogRecord::parse_all(data)?;
+                    results.extend(segment_records);
+                }
+
+                // Move to next segment
+                current_segment_id = Some(seg_id.next());
+            } else {
+                break;
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Scans records starting from the given LSN synchronously.
+    #[inline]
+    pub fn scan_from_sync(&self, start_lsn: Lsn) -> Result<Vec<LogRecord>> {
+        use crate::segment::SyncLogSegment;
+
+        let mut results = Vec::new();
+        let segment_id = SegmentId(start_lsn.segment_id());
+        let start_offset = start_lsn.offset();
+
+        let mut current_segment_id = Some(segment_id);
+        let mut is_first_segment = true;
+
+        while let Some(seg_id) = current_segment_id {
+            if let Some(path) = self.segments.get(&seg_id) {
+                let mut segment = SyncLogSegment::open_sync(path)?;
+
+                // Bulk read entire segment data into memory
+                let data = segment.read_all_data_sync()?;
+
+                if !data.is_empty() {
+                    // Parse all records from memory buffer
+                    let segment_records = LogRecord::parse_all(data)?;
+
+                    // For first segment, skip records before start_offset
+                    if is_first_segment && start_offset > SegmentHeader::SIZE as u32 {
+                        let skip_bytes = (start_offset - SegmentHeader::SIZE as u32) as usize;
+                        let mut byte_offset = 0;
+                        for record in segment_records {
+                            if byte_offset >= skip_bytes {
+                                results.push(record);
+                            } else {
+                                byte_offset += record.size_on_disk();
+                            }
+                        }
+                    } else {
+                        results.extend(segment_records);
+                    }
+                }
+
+                is_first_segment = false;
+                current_segment_id = Some(seg_id.next());
+            } else {
+                break;
+            }
+        }
+
+        Ok(results)
     }
 }
 

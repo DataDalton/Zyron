@@ -1,5 +1,6 @@
 //! WAL segment management.
 
+use bytes::Bytes;
 use crate::record::{LogRecord, Lsn};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -285,6 +286,34 @@ impl LogSegment {
         Ok(lsn)
     }
 
+    /// Appends multiple pre-serialized records as a single batch write.
+    /// Returns the LSN of the first record in the batch.
+    #[inline]
+    pub async fn append_batch(&mut self, data: &[u8], batch_size: usize) -> Result<Lsn> {
+        if batch_size == 0 || data.is_empty() {
+            return Ok(Lsn::new(self.header.segment_id.0, self.write_offset));
+        }
+
+        if !self.has_space(data.len()) {
+            return Err(ZyronError::WalWriteFailed(
+                "segment full".to_string(),
+            ));
+        }
+
+        let file = self.file.as_mut().ok_or_else(|| {
+            ZyronError::WalWriteFailed("segment not open for writing".to_string())
+        })?;
+
+        // Single seek + single write for entire batch
+        file.seek(std::io::SeekFrom::Start(self.write_offset as u64)).await?;
+        file.write_all(data).await?;
+
+        let lsn = Lsn::new(self.header.segment_id.0, self.write_offset);
+        self.write_offset += data.len() as u32;
+
+        Ok(lsn)
+    }
+
     /// Syncs the segment to disk.
     pub async fn sync(&mut self) -> Result<()> {
         if let Some(ref file) = self.file {
@@ -325,6 +354,89 @@ impl LogSegment {
         file.read_exact(&mut record_buf).await?;
 
         LogRecord::deserialize(&record_buf)
+    }
+
+    /// Reads all data from header offset to current write position.
+    /// Returns the raw bytes for bulk parsing as a Bytes buffer for zero-copy slicing.
+    #[inline]
+    pub async fn read_all_data(&mut self) -> Result<Bytes> {
+        let data_start = SegmentHeader::SIZE as u64;
+        let data_len = (self.write_offset as u64).saturating_sub(data_start);
+
+        if data_len == 0 {
+            return Ok(Bytes::new());
+        }
+
+        let file = self.file.as_mut().ok_or_else(|| {
+            ZyronError::WalCorrupted {
+                lsn: 0,
+                reason: "segment not open".to_string(),
+            }
+        })?;
+
+        file.seek(std::io::SeekFrom::Start(data_start)).await?;
+        let mut buf = vec![0u8; data_len as usize];
+        file.read_exact(&mut buf).await?;
+
+        Ok(Bytes::from(buf))
+    }
+}
+
+/// Synchronous segment reader for WAL replay without async overhead.
+pub struct SyncLogSegment {
+    header: SegmentHeader,
+    write_offset: u32,
+    file: std::fs::File,
+}
+
+impl SyncLogSegment {
+    /// Opens an existing segment file synchronously.
+    pub fn open_sync(path: &Path) -> Result<Self> {
+        use std::io::{Read, Seek};
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(path)?;
+
+        // Read and validate header
+        let mut header_bytes = [0u8; SegmentHeader::SIZE];
+        file.read_exact(&mut header_bytes)?;
+        let header = SegmentHeader::from_bytes(&header_bytes);
+        header.validate()?;
+
+        // Find current write position by seeking to end
+        let file_size = file.seek(std::io::SeekFrom::End(0))?;
+        let write_offset = file_size as u32;
+
+        Ok(Self {
+            header,
+            write_offset,
+            file,
+        })
+    }
+
+    /// Returns the segment ID.
+    pub fn segment_id(&self) -> SegmentId {
+        self.header.segment_id
+    }
+
+    /// Reads all data from header offset to current write position synchronously.
+    #[inline]
+    pub fn read_all_data_sync(&mut self) -> Result<Bytes> {
+        use std::io::{Read, Seek};
+
+        let data_start = SegmentHeader::SIZE as u64;
+        let data_len = (self.write_offset as u64).saturating_sub(data_start);
+
+        if data_len == 0 {
+            return Ok(Bytes::new());
+        }
+
+        self.file.seek(std::io::SeekFrom::Start(data_start))?;
+        let mut buf = vec![0u8; data_len as usize];
+        self.file.read_exact(&mut buf)?;
+
+        Ok(Bytes::from(buf))
     }
 }
 

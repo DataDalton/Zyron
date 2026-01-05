@@ -109,11 +109,13 @@ impl BufferFrame {
         self.pin_count.load(Ordering::Acquire)
     }
 
-    /// Increments the pin count.
+    /// Increments the pin count and returns the previous pin count.
+    /// Returns 0 if the frame was unpinned before this call.
     #[inline]
-    pub fn pin(&self) {
-        self.pin_count.fetch_add(1, Ordering::AcqRel);
+    pub fn pin(&self) -> u32 {
+        let prev = self.pin_count.fetch_add(1, Ordering::AcqRel);
         self.reference_bit.store(true, Ordering::Relaxed);
+        prev
     }
 
     /// Decrements the pin count.

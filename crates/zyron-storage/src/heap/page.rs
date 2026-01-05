@@ -190,6 +190,109 @@ impl HeapPage {
         }
     }
 
+    // =========================================================================
+    // Static In-Slice Methods (for zero-copy operations)
+    // =========================================================================
+
+    /// Reads the heap header from a slice.
+    #[inline]
+    fn heap_header_from_slice(data: &[u8]) -> HeapPageHeader {
+        let offset = HeapPageHeader::OFFSET;
+        HeapPageHeader::from_bytes(&data[offset..offset + HeapPageHeader::SIZE])
+    }
+
+    /// Writes the heap header to a slice.
+    #[inline]
+    fn set_heap_header_in_slice(data: &mut [u8], header: HeapPageHeader) {
+        let offset = HeapPageHeader::OFFSET;
+        data[offset..offset + HeapPageHeader::SIZE].copy_from_slice(&header.to_bytes());
+    }
+
+    /// Returns free space from a slice.
+    #[inline]
+    pub fn free_space_in_slice(data: &[u8]) -> usize {
+        Self::heap_header_from_slice(data).free_space()
+    }
+
+    /// Reads a slot from a slice.
+    #[inline]
+    fn get_slot_from_slice(data: &[u8], slot_id: SlotId, slot_count: u16) -> Option<TupleSlot> {
+        if slot_id.0 >= slot_count {
+            return None;
+        }
+        let offset = Self::DATA_START + (slot_id.0 as usize) * TupleSlot::SIZE;
+        Some(TupleSlot::from_bytes(&data[offset..offset + TupleSlot::SIZE]))
+    }
+
+    /// Writes a slot to a slice.
+    #[inline]
+    fn set_slot_in_slice(data: &mut [u8], slot_id: SlotId, slot: TupleSlot) {
+        let offset = Self::DATA_START + (slot_id.0 as usize) * TupleSlot::SIZE;
+        data[offset..offset + TupleSlot::SIZE].copy_from_slice(&slot.to_bytes());
+    }
+
+    /// Inserts a tuple into a page slice.
+    ///
+    /// Returns (slot_id, free_space_after) on success.
+    pub fn insert_tuple_in_slice(data: &mut [u8], tuple: &Tuple) -> Result<(SlotId, usize)> {
+        let tuple_size = tuple.size_on_disk();
+
+        let mut header = Self::heap_header_from_slice(data);
+
+        // Check for a deleted slot we can reuse
+        let mut reuse_slot: Option<SlotId> = None;
+        for i in 0..header.slot_count {
+            if let Some(slot) = Self::get_slot_from_slice(data, SlotId(i), header.slot_count) {
+                if slot.is_empty() {
+                    reuse_slot = Some(SlotId(i));
+                    break;
+                }
+            }
+        }
+
+        // Calculate required space
+        let need_new_slot = reuse_slot.is_none();
+        let space_needed = if need_new_slot {
+            tuple_size + TupleSlot::SIZE
+        } else {
+            tuple_size
+        };
+
+        if header.free_space() < space_needed {
+            return Err(ZyronError::PageFull);
+        }
+
+        // Allocate tuple space (grows upward from end)
+        header.free_space_end -= tuple_size as u16;
+        let tuple_offset = header.free_space_end;
+
+        // Write tuple data
+        let tuple_bytes = tuple.serialize();
+        data[tuple_offset as usize..tuple_offset as usize + tuple_size]
+            .copy_from_slice(&tuple_bytes);
+
+        // Get or create slot
+        let slot_id = if let Some(sid) = reuse_slot {
+            sid
+        } else {
+            let sid = SlotId(header.slot_count);
+            header.slot_count += 1;
+            header.free_space_start += TupleSlot::SIZE as u16;
+            sid
+        };
+
+        // Write slot
+        let slot = TupleSlot::new(tuple_offset, tuple_size as u16);
+        Self::set_slot_in_slice(data, slot_id, slot);
+
+        let free_space = header.free_space();
+
+        // Update header
+        Self::set_heap_header_in_slice(data, header);
+
+        Ok((slot_id, free_space))
+    }
+
     /// Returns the raw page data.
     pub fn as_bytes(&self) -> &[u8; PAGE_SIZE] {
         &self.data

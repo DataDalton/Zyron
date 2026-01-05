@@ -56,6 +56,9 @@ pub enum ZyronError {
     #[error("B+ tree corrupted: {0}")]
     BTreeCorrupted(String),
 
+    #[error("Page not in buffer pool cache")]
+    CacheMiss,
+
     // WAL errors
     #[error("WAL write failed: {0}")]
     WalWriteFailed(String),

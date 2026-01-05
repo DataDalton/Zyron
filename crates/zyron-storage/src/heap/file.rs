@@ -30,6 +30,12 @@ impl Default for HeapFileConfig {
     }
 }
 
+/// Pending FSM update entry.
+struct PendingFsmUpdate {
+    heap_page_num: u32,
+    free_space: usize,
+}
+
 /// HeapFile manages tuple storage with buffer pool caching.
 ///
 /// All page accesses go through the buffer pool for memory efficiency.
@@ -43,11 +49,20 @@ pub struct HeapFile {
     fsm: FreeSpaceMap,
     /// Configuration.
     config: HeapFileConfig,
+    /// Cached heap page count (avoids repeated disk.num_pages calls).
+    cached_heap_pages: std::sync::atomic::AtomicU32,
+    /// Cached FSM page count.
+    cached_fsm_pages: std::sync::atomic::AtomicU32,
+    /// Last page with space hint (speeds up sequential inserts).
+    last_page_hint: std::sync::atomic::AtomicU32,
+    /// Pending FSM updates for batched writes.
+    pending_fsm_updates: parking_lot::Mutex<Vec<PendingFsmUpdate>>,
 }
 
 impl HeapFile {
     /// Creates a new HeapFile with buffer pool integration.
     pub fn new(disk: Arc<DiskManager>, pool: Arc<BufferPool>, config: HeapFileConfig) -> Result<Self> {
+        use std::sync::atomic::AtomicU32;
         let fsm = FreeSpaceMap::new(config.heap_file_id, PageId::new(config.fsm_file_id, 0));
 
         Ok(Self {
@@ -55,7 +70,49 @@ impl HeapFile {
             pool,
             fsm,
             config,
+            cached_heap_pages: AtomicU32::new(0),
+            cached_fsm_pages: AtomicU32::new(0),
+            last_page_hint: AtomicU32::new(u32::MAX), // Invalid hint initially
+            pending_fsm_updates: parking_lot::Mutex::new(Vec::with_capacity(64)),
         })
+    }
+
+    /// Initializes page count caches from disk (call once at startup).
+    pub async fn init_cache(&self) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let heap_pages = self.disk.num_pages(self.config.heap_file_id).await?;
+        let fsm_pages = self.disk.num_pages(self.config.fsm_file_id).await?;
+        self.cached_heap_pages.store(heap_pages, Ordering::Relaxed);
+        self.cached_fsm_pages.store(fsm_pages, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Returns cached heap page count.
+    #[inline]
+    fn heap_page_count(&self) -> u32 {
+        use std::sync::atomic::Ordering;
+        self.cached_heap_pages.load(Ordering::Relaxed)
+    }
+
+    /// Returns cached FSM page count.
+    #[inline]
+    fn fsm_page_count(&self) -> u32 {
+        use std::sync::atomic::Ordering;
+        self.cached_fsm_pages.load(Ordering::Relaxed)
+    }
+
+    /// Increments cached heap page count.
+    #[inline]
+    fn increment_heap_pages(&self) {
+        use std::sync::atomic::Ordering;
+        self.cached_heap_pages.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increments cached FSM page count.
+    #[inline]
+    fn increment_fsm_pages(&self) {
+        use std::sync::atomic::Ordering;
+        self.cached_fsm_pages.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Creates a HeapFile with default configuration.
@@ -126,18 +183,92 @@ impl HeapFile {
         Ok(())
     }
 
+    // =========================================================================
+    // Synchronous Fast Path Operations
+    // =========================================================================
+
+    /// Synchronous insert for cached pages only.
+    ///
+    /// Tries to insert into the hint page if it's in the buffer pool.
+    /// Returns CacheMiss if no suitable cached page is available.
+    /// Returns PageFull if the hint page doesn't have enough space.
+    #[inline]
+    pub fn insert_sync(&self, tuple: &Tuple) -> Result<TupleId> {
+        use std::sync::atomic::Ordering;
+
+        // Only try hint page for sync path
+        let hint = self.last_page_hint.load(Ordering::Relaxed);
+        if hint == u32::MAX || hint >= self.heap_page_count() {
+            return Err(ZyronError::CacheMiss);
+        }
+
+        let hint_page_id = PageId::new(self.config.heap_file_id, hint);
+
+        // Try to get write access to the page in buffer pool
+        if let Some(guard) = self.pool.write_page(hint_page_id) {
+            let mut data = guard.data_mut();
+
+            // Try to insert using in-slice method
+            match HeapPage::insert_tuple_in_slice(&mut **data, tuple) {
+                Ok((slot_id, free_space)) => {
+                    guard.set_dirty();
+                    // Defer FSM update for batching
+                    self.defer_fsm_update(hint_page_id.page_num, free_space);
+                    return Ok(TupleId::new(hint_page_id, slot_id.0));
+                }
+                Err(ZyronError::PageFull) => {
+                    // Clear hint since page is full
+                    self.last_page_hint.store(u32::MAX, Ordering::Relaxed);
+                    return Err(ZyronError::PageFull);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(ZyronError::CacheMiss)
+    }
+
     /// Inserts a tuple into the heap file.
     ///
-    /// Finds a page with sufficient space using the FSM, or allocates
+    /// Finds a page with sufficient space using a hint or FSM, or allocates
     /// a new page if needed. Returns the TupleId of the inserted tuple.
+    /// Tries sync fast path first to avoid async overhead when pages are cached.
     pub async fn insert(&self, tuple: &Tuple) -> Result<TupleId> {
+        use std::sync::atomic::Ordering;
+
+        // Try sync fast path first
+        match self.insert_sync(tuple) {
+            Ok(tuple_id) => return Ok(tuple_id),
+            Err(ZyronError::CacheMiss) => { /* fall through to async path */ }
+            Err(ZyronError::PageFull) => { /* fall through to find new page */ }
+            Err(e) => return Err(e),
+        }
+
         let tuple_size = tuple.size_on_disk();
         let space_needed = tuple_size + crate::heap::page::TupleSlot::SIZE;
 
-        // Try to find a page with enough space
+        // Try last page hint first (fast path for sequential inserts)
+        let hint = self.last_page_hint.load(Ordering::Relaxed);
+        if hint != u32::MAX && hint < self.heap_page_count() {
+            let hint_page_id = PageId::new(self.config.heap_file_id, hint);
+            match self.insert_into_page(hint_page_id, tuple).await {
+                Ok(tuple_id) => return Ok(tuple_id),
+                Err(ZyronError::PageFull) => {
+                    // Hint page is full, clear hint
+                    self.last_page_hint.store(u32::MAX, Ordering::Relaxed);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Try to find a page with enough space via FSM
         if let Some(page_id) = self.find_page_with_space(space_needed).await? {
             match self.insert_into_page(page_id, tuple).await {
-                Ok(tuple_id) => return Ok(tuple_id),
+                Ok(tuple_id) => {
+                    // Update hint for next insert
+                    self.last_page_hint.store(page_id.page_num, Ordering::Relaxed);
+                    return Ok(tuple_id);
+                }
                 Err(ZyronError::PageFull) => {
                     // FSM estimate was slightly off, fall through to allocate new page
                 }
@@ -147,7 +278,10 @@ impl HeapFile {
 
         // No suitable page found or FSM estimate was off, allocate a new one
         let page_id = self.allocate_new_page().await?;
-        self.insert_into_page(page_id, tuple).await
+        let tuple_id = self.insert_into_page(page_id, tuple).await?;
+        // Update hint to newly allocated page
+        self.last_page_hint.store(page_id.page_num, Ordering::Relaxed);
+        Ok(tuple_id)
     }
 
     /// Retrieves a tuple by its TupleId.
@@ -201,12 +335,27 @@ impl HeapFile {
     /// Scans all tuples in the heap file.
     ///
     /// Returns a vector of all (TupleId, Tuple) pairs.
+    /// Uses sync path for cached pages to minimize async overhead.
     pub async fn scan(&self) -> Result<Vec<(TupleId, Tuple)>> {
-        let num_pages = self.disk.num_pages(self.config.heap_file_id).await?;
-        let mut results = Vec::new();
+        let num_pages = self.heap_page_count();
+        // Pre-allocate with estimated capacity (~60 tuples per page)
+        let mut results = Vec::with_capacity((num_pages as usize) * 60);
 
         for page_num in 0..num_pages {
             let page_id = PageId::new(self.config.heap_file_id, page_num);
+
+            // Try sync path first for cached pages
+            if let Some(guard) = self.pool.read_page(page_id) {
+                let data = guard.data();
+                let page = HeapPage::from_bytes(**data);
+                for (slot_id, tuple) in page.iter() {
+                    let tuple_id = TupleId::new(page_id, slot_id.0);
+                    results.push((tuple_id, tuple));
+                }
+                continue;
+            }
+
+            // Async fallback for uncached pages
             let page_data = self.fetch_page(page_id).await?;
             let page = HeapPage::from_bytes(page_data);
 
@@ -221,7 +370,7 @@ impl HeapFile {
 
     /// Returns the number of pages in the heap file.
     pub async fn num_pages(&self) -> Result<u32> {
-        self.disk.num_pages(self.config.heap_file_id).await
+        Ok(self.heap_page_count())
     }
 
     /// Flushes all dirty heap pages to disk.
@@ -245,12 +394,12 @@ impl HeapFile {
 
     /// Finds a page with at least the specified amount of free space.
     async fn find_page_with_space(&self, min_space: usize) -> Result<Option<PageId>> {
-        let num_heap_pages = self.disk.num_pages(self.config.heap_file_id).await?;
+        let num_heap_pages = self.heap_page_count();
         if num_heap_pages == 0 {
             return Ok(None);
         }
 
-        let num_fsm_pages = self.disk.num_pages(self.config.fsm_file_id).await?;
+        let num_fsm_pages = self.fsm_page_count();
 
         for fsm_page_num in 0..num_fsm_pages {
             let fsm_page_id = PageId::new(self.config.fsm_file_id, fsm_page_num);
@@ -267,7 +416,7 @@ impl HeapFile {
         Ok(None)
     }
 
-    /// Inserts a tuple into a specific page.
+    /// Inserts a tuple into a specific page with FSM update.
     async fn insert_into_page(&self, page_id: PageId, tuple: &Tuple) -> Result<TupleId> {
         let page_data = self.fetch_page(page_id).await?;
         let mut page = HeapPage::from_bytes(page_data);
@@ -283,6 +432,7 @@ impl HeapFile {
     /// Allocates a new heap page.
     async fn allocate_new_page(&self) -> Result<PageId> {
         let page_id = self.disk.allocate_page(self.config.heap_file_id).await?;
+        self.increment_heap_pages();
 
         // Initialize as heap page
         let page = HeapPage::new(page_id);
@@ -299,8 +449,8 @@ impl HeapFile {
         let fsm_page_num = self.fsm.fsm_page_for(heap_page_num);
         let fsm_page_id = PageId::new(self.config.fsm_file_id, fsm_page_num);
 
-        // Check if FSM page exists
-        let num_fsm_pages = self.disk.num_pages(self.config.fsm_file_id).await?;
+        // Use cached FSM page count
+        let num_fsm_pages = self.fsm_page_count();
 
         let mut fsm_page = if fsm_page_num < num_fsm_pages {
             let fsm_data = self.fetch_page(fsm_page_id).await?;
@@ -310,6 +460,7 @@ impl HeapFile {
             let first_tracked = fsm_page_num * ENTRIES_PER_FSM_PAGE as u32;
             let new_fsm_page = FsmPage::new(fsm_page_id, first_tracked);
             self.disk.allocate_page(self.config.fsm_file_id).await?;
+            self.increment_fsm_pages();
             new_fsm_page
         };
 
@@ -318,6 +469,168 @@ impl HeapFile {
         self.write_page(fsm_page_id, fsm_page.as_bytes()).await?;
 
         Ok(())
+    }
+
+    // =========================================================================
+    // Batched FSM Operations
+    // =========================================================================
+    // For high-throughput inserts, FSM updates can be deferred and batched.
+
+    /// Queues an FSM update for later batch processing.
+    #[inline]
+    fn defer_fsm_update(&self, heap_page_num: u32, free_space: usize) {
+        self.pending_fsm_updates.lock().push(PendingFsmUpdate {
+            heap_page_num,
+            free_space,
+        });
+    }
+
+    /// Flushes all pending FSM updates in a single batch.
+    ///
+    /// Groups updates by FSM page to minimize I/O. Each FSM page is
+    /// read once, updated with all pending entries, and written once.
+    pub async fn flush_fsm_updates(&self) -> Result<usize> {
+        // Take all pending updates
+        let updates: Vec<PendingFsmUpdate> = {
+            let mut pending = self.pending_fsm_updates.lock();
+            std::mem::take(&mut *pending)
+        };
+
+        if updates.is_empty() {
+            return Ok(0);
+        }
+
+        // Group updates by FSM page number
+        let mut by_fsm_page: std::collections::HashMap<u32, Vec<(u32, usize)>> =
+            std::collections::HashMap::new();
+
+        for update in &updates {
+            let fsm_page_num = self.fsm.fsm_page_for(update.heap_page_num);
+            by_fsm_page
+                .entry(fsm_page_num)
+                .or_default()
+                .push((update.heap_page_num, update.free_space));
+        }
+
+        let num_fsm_pages = self.fsm_page_count();
+
+        // Process each FSM page once with all its updates
+        for (fsm_page_num, page_updates) in by_fsm_page {
+            let fsm_page_id = PageId::new(self.config.fsm_file_id, fsm_page_num);
+
+            let mut fsm_page = if fsm_page_num < num_fsm_pages {
+                let fsm_data = self.fetch_page(fsm_page_id).await?;
+                FsmPage::from_bytes(fsm_data)
+            } else {
+                // Allocate new FSM page
+                let first_tracked = fsm_page_num * ENTRIES_PER_FSM_PAGE as u32;
+                let new_fsm_page = FsmPage::new(fsm_page_id, first_tracked);
+                self.disk.allocate_page(self.config.fsm_file_id).await?;
+                self.increment_fsm_pages();
+                new_fsm_page
+            };
+
+            // Apply all updates to this FSM page
+            for (heap_page_num, free_space) in page_updates {
+                let category = space_to_category(free_space);
+                fsm_page.set_space(heap_page_num, category)?;
+            }
+
+            self.write_page(fsm_page_id, fsm_page.as_bytes()).await?;
+        }
+
+        Ok(updates.len())
+    }
+
+    /// Batch insert multiple tuples with deferred FSM updates.
+    ///
+    /// Inserts tuples sequentially into pages, deferring FSM updates
+    /// until the end for better performance. Returns the TupleIds of
+    /// all inserted tuples.
+    pub async fn insert_batch(&self, tuples: &[Tuple]) -> Result<Vec<TupleId>> {
+        use std::sync::atomic::Ordering;
+
+        if tuples.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut results = Vec::with_capacity(tuples.len());
+        let mut current_page_id: Option<PageId> = None;
+        let mut current_page: Option<HeapPage> = None;
+
+        for tuple in tuples {
+            let tuple_size = tuple.size_on_disk();
+            let space_needed = tuple_size + crate::heap::page::TupleSlot::SIZE;
+
+            // Check if current page has space
+            let use_current = if let Some(ref page) = current_page {
+                page.free_space() >= space_needed
+            } else {
+                false
+            };
+
+            if !use_current {
+                // Flush current page if any
+                if let (Some(page_id), Some(page)) = (current_page_id, &current_page) {
+                    self.write_page(page_id, page.as_bytes()).await?;
+                    self.defer_fsm_update(page_id.page_num, page.free_space());
+                }
+
+                // Try hint page first
+                let hint = self.last_page_hint.load(Ordering::Relaxed);
+                let hint_page_id = if hint != u32::MAX && hint < self.heap_page_count() {
+                    Some(PageId::new(self.config.heap_file_id, hint))
+                } else {
+                    None
+                };
+
+                // Find or allocate a page with space
+                let found_page = if let Some(hint_id) = hint_page_id {
+                    let page_data = self.fetch_page(hint_id).await?;
+                    let page = HeapPage::from_bytes(page_data);
+                    if page.free_space() >= space_needed {
+                        Some((hint_id, page))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let (page_id, page) = if let Some((id, p)) = found_page {
+                    (id, p)
+                } else if let Some(id) = self.find_page_with_space(space_needed).await? {
+                    let page_data = self.fetch_page(id).await?;
+                    (id, HeapPage::from_bytes(page_data))
+                } else {
+                    // Allocate new page
+                    let id = self.disk.allocate_page(self.config.heap_file_id).await?;
+                    self.increment_heap_pages();
+                    (id, HeapPage::new(id))
+                };
+
+                current_page_id = Some(page_id);
+                current_page = Some(page);
+                self.last_page_hint.store(page_id.page_num, Ordering::Relaxed);
+            }
+
+            // Insert into current page
+            if let Some(ref mut page) = current_page {
+                let slot_id = page.insert_tuple(tuple)?;
+                results.push(TupleId::new(current_page_id.unwrap(), slot_id.0));
+            }
+        }
+
+        // Flush final page
+        if let (Some(page_id), Some(page)) = (current_page_id, &current_page) {
+            self.write_page(page_id, page.as_bytes()).await?;
+            self.defer_fsm_update(page_id.page_num, page.free_space());
+        }
+
+        // Batch flush all FSM updates
+        self.flush_fsm_updates().await?;
+
+        Ok(results)
     }
 }
 
