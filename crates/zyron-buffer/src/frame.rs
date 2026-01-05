@@ -106,27 +106,29 @@ impl BufferFrame {
     /// Returns the current pin count.
     #[inline]
     pub fn pin_count(&self) -> u32 {
-        self.pin_count.load(Ordering::Acquire)
+        // Relaxed: only used for statistics and debugging
+        self.pin_count.load(Ordering::Relaxed)
     }
 
     /// Increments the pin count and returns the previous pin count.
     /// Returns 0 if the frame was unpinned before this call.
-    #[inline]
+    /// Uses Relaxed ordering - replacer lock provides synchronization when needed.
+    #[inline(always)]
     pub fn pin(&self) -> u32 {
-        let prev = self.pin_count.fetch_add(1, Ordering::AcqRel);
+        let prev = self.pin_count.fetch_add(1, Ordering::Relaxed);
         self.reference_bit.store(true, Ordering::Relaxed);
         prev
     }
 
     /// Decrements the pin count.
-    ///
     /// Returns the new pin count.
-    #[inline]
+    /// Uses Relaxed ordering - replacer lock provides synchronization when needed.
+    #[inline(always)]
     pub fn unpin(&self) -> u32 {
-        let prev = self.pin_count.fetch_sub(1, Ordering::AcqRel);
+        let prev = self.pin_count.fetch_sub(1, Ordering::Relaxed);
         if prev == 0 {
             // Underflow protection: restore to 0
-            self.pin_count.store(0, Ordering::Release);
+            self.pin_count.store(0, Ordering::Relaxed);
             return 0;
         }
         prev - 1
@@ -135,7 +137,8 @@ impl BufferFrame {
     /// Returns true if this frame is pinned.
     #[inline]
     pub fn is_pinned(&self) -> bool {
-        self.pin_count.load(Ordering::Acquire) > 0
+        // Relaxed: eviction correctness ensured by replacer lock
+        self.pin_count.load(Ordering::Relaxed) > 0
     }
 
     /// Returns true if this frame is dirty.

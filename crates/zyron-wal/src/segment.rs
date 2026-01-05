@@ -420,6 +420,12 @@ impl SyncLogSegment {
         self.header.segment_id
     }
 
+    /// Returns the data size in bytes (write_offset - header size).
+    #[inline]
+    pub fn data_size(&self) -> u32 {
+        self.write_offset.saturating_sub(SegmentHeader::SIZE as u32)
+    }
+
     /// Reads all data from header offset to current write position synchronously.
     #[inline]
     pub fn read_all_data_sync(&mut self) -> Result<Bytes> {

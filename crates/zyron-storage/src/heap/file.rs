@@ -36,6 +36,86 @@ struct PendingFsmUpdate {
     free_space: usize,
 }
 
+/// LRU cache of page hints for fast insert page lookup.
+/// Stores up to 8 recently used pages with their free space category.
+const PAGE_HINT_CACHE_SIZE: usize = 8;
+
+struct PageHintCache {
+    /// Array of (page_num, free_space_category) pairs. u32::MAX = empty slot.
+    hints: [(u32, u8); PAGE_HINT_CACHE_SIZE],
+    /// Number of valid entries.
+    count: usize,
+}
+
+impl PageHintCache {
+    fn new() -> Self {
+        Self {
+            hints: [(u32::MAX, 0); PAGE_HINT_CACHE_SIZE],
+            count: 0,
+        }
+    }
+
+    /// Finds a page with at least the required space category.
+    #[inline]
+    fn find_page(&self, required_category: u8) -> Option<u32> {
+        for i in 0..self.count {
+            let (page_num, category) = self.hints[i];
+            if page_num != u32::MAX && category >= required_category {
+                return Some(page_num);
+            }
+        }
+        None
+    }
+
+    /// Adds or updates a page hint. Moves to front (MRU position).
+    #[inline]
+    fn update(&mut self, page_num: u32, category: u8) {
+        // Check if already present
+        for i in 0..self.count {
+            if self.hints[i].0 == page_num {
+                // Move to front (update category in case it changed)
+                for j in (1..=i).rev() {
+                    self.hints[j] = self.hints[j - 1];
+                }
+                self.hints[0] = (page_num, category);
+                return;
+            }
+        }
+
+        // Not present, add to front
+        if self.count < PAGE_HINT_CACHE_SIZE {
+            // Shift existing entries
+            for i in (1..=self.count).rev() {
+                self.hints[i] = self.hints[i - 1];
+            }
+            self.hints[0] = (page_num, category);
+            self.count += 1;
+        } else {
+            // Cache full, evict LRU (last entry)
+            for i in (1..PAGE_HINT_CACHE_SIZE).rev() {
+                self.hints[i] = self.hints[i - 1];
+            }
+            self.hints[0] = (page_num, category);
+        }
+    }
+
+    /// Removes a page from the cache (when full).
+    #[inline]
+    fn remove(&mut self, page_num: u32) {
+        for i in 0..self.count {
+            if self.hints[i].0 == page_num {
+                // Shift remaining entries
+                for j in i..self.count - 1 {
+                    self.hints[j] = self.hints[j + 1];
+                }
+                self.hints[self.count - 1] = (u32::MAX, 0);
+                self.count -= 1;
+                return;
+            }
+        }
+    }
+}
+
 /// HeapFile manages tuple storage with buffer pool caching.
 ///
 /// All page accesses go through the buffer pool for memory efficiency.
@@ -53,6 +133,8 @@ pub struct HeapFile {
     cached_heap_pages: std::sync::atomic::AtomicU32,
     /// Cached FSM page count.
     cached_fsm_pages: std::sync::atomic::AtomicU32,
+    /// LRU cache of pages with space (speeds up inserts).
+    page_hint_cache: parking_lot::Mutex<PageHintCache>,
     /// Last page with space hint (speeds up sequential inserts).
     last_page_hint: std::sync::atomic::AtomicU32,
     /// Pending FSM updates for batched writes.
@@ -72,6 +154,7 @@ impl HeapFile {
             config,
             cached_heap_pages: AtomicU32::new(0),
             cached_fsm_pages: AtomicU32::new(0),
+            page_hint_cache: parking_lot::Mutex::new(PageHintCache::new()),
             last_page_hint: AtomicU32::new(u32::MAX), // Invalid hint initially
             pending_fsm_updates: parking_lot::Mutex::new(Vec::with_capacity(64)),
         })
@@ -246,6 +329,7 @@ impl HeapFile {
 
         let tuple_size = tuple.size_on_disk();
         let space_needed = tuple_size + crate::heap::page::TupleSlot::SIZE;
+        let required_category = space_to_category(space_needed);
 
         // Try last page hint first (fast path for sequential inserts)
         let hint = self.last_page_hint.load(Ordering::Relaxed);
@@ -254,8 +338,24 @@ impl HeapFile {
             match self.insert_into_page(hint_page_id, tuple).await {
                 Ok(tuple_id) => return Ok(tuple_id),
                 Err(ZyronError::PageFull) => {
-                    // Hint page is full, clear hint
+                    // Hint page is full, clear hint and remove from cache
                     self.last_page_hint.store(u32::MAX, Ordering::Relaxed);
+                    self.page_hint_cache.lock().remove(hint);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Try page hint cache (LRU of recently used pages)
+        if let Some(cached_page_num) = self.page_hint_cache.lock().find_page(required_category) {
+            let cached_page_id = PageId::new(self.config.heap_file_id, cached_page_num);
+            match self.insert_into_page(cached_page_id, tuple).await {
+                Ok(tuple_id) => {
+                    self.last_page_hint.store(cached_page_num, Ordering::Relaxed);
+                    return Ok(tuple_id);
+                }
+                Err(ZyronError::PageFull) => {
+                    self.page_hint_cache.lock().remove(cached_page_num);
                 }
                 Err(e) => return Err(e),
             }
@@ -265,7 +365,7 @@ impl HeapFile {
         if let Some(page_id) = self.find_page_with_space(space_needed).await? {
             match self.insert_into_page(page_id, tuple).await {
                 Ok(tuple_id) => {
-                    // Update hint for next insert
+                    // Update hints for next insert
                     self.last_page_hint.store(page_id.page_num, Ordering::Relaxed);
                     return Ok(tuple_id);
                 }
@@ -279,7 +379,7 @@ impl HeapFile {
         // No suitable page found or FSM estimate was off, allocate a new one
         let page_id = self.allocate_new_page().await?;
         let tuple_id = self.insert_into_page(page_id, tuple).await?;
-        // Update hint to newly allocated page
+        // Update hints to newly allocated page
         self.last_page_hint.store(page_id.page_num, Ordering::Relaxed);
         Ok(tuple_id)
     }
@@ -479,6 +579,15 @@ impl HeapFile {
     /// Queues an FSM update for later batch processing.
     #[inline]
     fn defer_fsm_update(&self, heap_page_num: u32, free_space: usize) {
+        // Update page hint cache with the current free space category
+        let category = space_to_category(free_space);
+        if category > 0 {
+            self.page_hint_cache.lock().update(heap_page_num, category);
+        } else {
+            // Page is full, remove from cache
+            self.page_hint_cache.lock().remove(heap_page_num);
+        }
+
         self.pending_fsm_updates.lock().push(PendingFsmUpdate {
             heap_page_num,
             free_space,

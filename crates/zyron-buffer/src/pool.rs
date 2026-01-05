@@ -114,7 +114,7 @@ impl BufferPool {
     ///
     /// If the page is not in the pool, returns None.
     /// The page is pinned before being returned.
-    #[inline]
+    #[inline(always)]
     pub fn fetch_page(&self, page_id: PageId) -> Option<&BufferFrame> {
         if let Some(frame_id_ref) = self.page_table.get(&page_id) {
             let frame_id = *frame_id_ref;

@@ -264,16 +264,26 @@ impl SyncWalReader {
     ///
     /// Bulk reads entire segments and parses all records without async overhead.
     /// Returns a vector of all records with checksum verification.
+    /// Pre-allocates result vector based on estimated record count from segment sizes.
     #[inline]
     pub fn scan_all_sync(&self) -> Result<Vec<LogRecord>> {
         use crate::segment::SyncLogSegment;
 
-        let mut results = Vec::new();
-
         let first_id = match self.first_segment_id() {
             Some(id) => id,
-            None => return Ok(results),
+            None => return Ok(Vec::new()),
         };
+
+        // Pre-calculate total data size to estimate record count
+        // Average record is ~64 bytes (header + small payload)
+        let mut total_bytes: usize = 0;
+        for path in self.segments.values() {
+            if let Ok(metadata) = std::fs::metadata(path) {
+                total_bytes += metadata.len() as usize;
+            }
+        }
+        let estimated_records = total_bytes / 64;
+        let mut results = Vec::with_capacity(estimated_records);
 
         let mut current_segment_id = Some(first_id);
 
@@ -301,13 +311,25 @@ impl SyncWalReader {
     }
 
     /// Scans records starting from the given LSN synchronously.
+    /// Pre-allocates result vector based on estimated record count.
     #[inline]
     pub fn scan_from_sync(&self, start_lsn: Lsn) -> Result<Vec<LogRecord>> {
         use crate::segment::SyncLogSegment;
 
-        let mut results = Vec::new();
         let segment_id = SegmentId(start_lsn.segment_id());
         let start_offset = start_lsn.offset();
+
+        // Estimate records from remaining segments
+        let mut total_bytes: usize = 0;
+        for (&seg_id, path) in &self.segments {
+            if seg_id.0 >= segment_id.0 {
+                if let Ok(metadata) = std::fs::metadata(path) {
+                    total_bytes += metadata.len() as usize;
+                }
+            }
+        }
+        let estimated_records = total_bytes / 64;
+        let mut results = Vec::with_capacity(estimated_records);
 
         let mut current_segment_id = Some(segment_id);
         let mut is_first_segment = true;
