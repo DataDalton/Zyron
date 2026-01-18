@@ -37,7 +37,7 @@ use tempfile::tempdir;
 
 use zyron_buffer::{BufferPool, BufferPoolConfig};
 use zyron_common::page::{PageId, PAGE_SIZE};
-use zyron_storage::{BTreeArenaIndex, DiskManager, DiskManagerConfig, HeapFile, Tuple, TupleId};
+use zyron_storage::{BufferedBTreeIndex, DiskManager, DiskManagerConfig, HeapFile, Tuple, TupleId};
 use zyron_wal::{LogRecordType, Lsn, RecoveryManager, WalReader, WalWriter, WalWriterConfig};
 
 // =============================================================================
@@ -505,13 +505,13 @@ async fn test_heap_file_100k_tuples() {
         let pool = Arc::new(BufferPool::auto_sized());
         let heap = HeapFile::with_defaults(disk, pool).unwrap();
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut tuple_ids: Vec<TupleId> = Vec::with_capacity(TUPLE_COUNT);
 
         // Insert phase
         let insert_start = Instant::now();
         for i in 0..TUPLE_COUNT {
-            let size = rng.gen_range(10..=500);
+            let size = rng.random_range(10..=500);
             let data: Vec<u8> = (0..size).map(|j| ((i + j) % 256) as u8).collect();
             let tuple = Tuple::new(Bytes::from(data), i as u32);
 
@@ -709,15 +709,16 @@ fn test_btree_1m_keys() {
     for run in 0..VALIDATION_RUNS {
         println!("\n--- Run {}/{} ---", run + 1, VALIDATION_RUNS);
 
-        // Arena-based B+Tree: 8192 nodes × 4KB = 32MB capacity (enough for 2M keys)
-        let mut btree = BTreeArenaIndex::new(8192);
+        // Buffered B+Tree: write buffer + 32KB nodes for HTAP workloads
+        // 1024 nodes × 32KB = 32MB capacity (enough for 2M keys)
+        let mut btree = BufferedBTreeIndex::new(1024);
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut keys: Vec<i64> = (0..KEY_COUNT as i64).collect();
 
         // Shuffle for random insertion order
         for i in (1..keys.len()).rev() {
-            let j = rng.gen_range(0..=i);
+            let j = rng.random_range(0..=i);
             keys.swap(i, j);
         }
 
@@ -730,6 +731,9 @@ fn test_btree_1m_keys() {
         }
         let insert_duration = insert_start.elapsed();
 
+        // Flush buffer to B+Tree before measuring lookup latency
+        btree.flush().unwrap();
+
         let final_height = btree.height();
         assert!(
             final_height <= 5,
@@ -739,15 +743,28 @@ fn test_btree_1m_keys() {
             KEY_COUNT
         );
 
-        // Lookup phase
+        // Lookup phase (measures B+Tree performance after flush)
+        // Uses production search() path which checks buffer first
+
+        // Warmup pass to prime caches and CPU frequency
+        for i in (0..KEY_COUNT).step_by(KEY_COUNT / 1000) {
+            let key = i as i64;
+            let key_bytes = key.to_be_bytes();
+            std::hint::black_box(btree.search(&key_bytes));
+        }
+
+        let mut found_count = 0usize;
         let lookup_start = Instant::now();
         for i in (0..KEY_COUNT).step_by(KEY_COUNT / LOOKUP_SAMPLE) {
             let key = i as i64;
             let key_bytes = key.to_be_bytes();
-            let result = btree.search(&key_bytes);
-            assert!(result.is_some(), "Run {}: Key {} should be found", run + 1, key);
+            // black_box prevents compiler from optimizing away the search
+            if std::hint::black_box(btree.search(&key_bytes)).is_some() {
+                found_count += 1;
+            }
         }
         let lookup_duration = lookup_start.elapsed();
+        assert_eq!(found_count, LOOKUP_SAMPLE, "Run {}: Expected {} found", run + 1, LOOKUP_SAMPLE);
 
         // Range scan phase
         let range_start = Instant::now();
@@ -768,9 +785,21 @@ fn test_btree_1m_keys() {
         let lookup_ns = lookup_duration.as_nanos() as f64 / LOOKUP_SAMPLE as f64;
         let range_ops_sec = range_results_data.len() as f64 / range_duration.as_secs_f64();
 
+        // Get flush stats for profiling
+        let stats = btree.stats();
+        let hash_table_time_ns = insert_duration.as_nanos() as u64 - stats.flush_time_ns;
+
         println!(
             "  Insert: {:.0} ops/sec ({:?}), height={}",
             insert_ops_sec, insert_duration, final_height
+        );
+        println!(
+            "    Breakdown: hash_table={:.1}ms, flush={:.1}ms (drain={:.1}ms, btree={:.1}ms), flushes={}",
+            hash_table_time_ns as f64 / 1_000_000.0,
+            stats.flush_time_ns as f64 / 1_000_000.0,
+            stats.drain_time_ns as f64 / 1_000_000.0,
+            stats.btree_insert_time_ns as f64 / 1_000_000.0,
+            stats.flush_count
         );
         println!("  Lookup: {:.2} ns/op ({:?})", lookup_ns, lookup_duration);
         println!(

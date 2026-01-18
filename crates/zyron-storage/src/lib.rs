@@ -1,3 +1,5 @@
+#![feature(portable_simd)]
+
 //! Storage engine for ZyronDB.
 //!
 //! This crate provides:
@@ -15,8 +17,9 @@ mod heap;
 mod tuple;
 
 pub use btree::{
-    BTreeArenaIndex, BTreeIndex, BTreeInternalPage, BTreeLeafPage, DeleteResult, InternalEntry,
-    InternalPageHeader, LeafEntry, LeafPageHeader, MAX_KEY_SIZE, MIN_FILL_FACTOR,
+    BTreeArenaIndex, BTreeIndex, BTreeInternalPage, BTreeLeafPage, BufferedBTreeIndex,
+    DeleteResult, InternalEntry, InternalPageHeader, LeafEntry, LeafPageHeader, MAX_KEY_SIZE,
+    MIN_FILL_FACTOR,
 };
 pub use disk::{DiskManager, DiskManagerConfig};
 pub use freespace::{
