@@ -7,9 +7,9 @@
 //! A hybrid structure combining a write buffer with a read-optimized B+Tree:
 //!
 //! ```text
-//! Writes → [WriteBuffer (sorted, 64K entries)] → merge → [B+Tree (32KB nodes)]
+//! Writes -> [WriteBuffer (sorted, 64K entries)] -> merge -> [B+Tree (32KB nodes)]
 //!                                                              ↑
-//! Reads → check buffer first, then ───────────────────────────┘
+//! Reads -> check buffer first, then ───────────────────────────┘
 //! ```
 //!
 //! Performance characteristics:

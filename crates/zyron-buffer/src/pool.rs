@@ -1,8 +1,8 @@
 //! Buffer pool manager.
 
 use crate::frame::{BufferFrame, FrameId};
+use crate::page_table::PageTable;
 use crate::replacer::{ClockReplacer, Replacer};
-use scc::HashMap as SccHashMap;
 use parking_lot::Mutex;
 use sysinfo::System;
 use zyron_common::page::{PageId, PAGE_SIZE};
@@ -32,7 +32,7 @@ impl Default for BufferPoolConfig {
 /// Buffer pool manager.
 ///
 /// Manages a fixed-size pool of page frames with:
-/// - Page ID to frame ID mapping (lock-free concurrent HashMap)
+/// - Page ID to frame ID mapping (lock-free page table)
 /// - Free frame list for new pages
 /// - Clock replacement for eviction
 /// - Pin counting for concurrent access
@@ -41,8 +41,8 @@ pub struct BufferPool {
     config: BufferPoolConfig,
     /// Array of buffer frames.
     frames: Vec<BufferFrame>,
-    /// Page ID to frame ID mapping (concurrent, lock-free reads).
-    page_table: SccHashMap<PageId, FrameId>,
+    /// Page ID to frame ID mapping (lock-free reads).
+    page_table: PageTable,
     /// List of free frame IDs.
     free_list: Mutex<Vec<FrameId>>,
     /// Page replacement policy.
@@ -65,7 +65,7 @@ impl BufferPool {
         Self {
             config,
             frames,
-            page_table: SccHashMap::with_capacity(num_frames),
+            page_table: PageTable::new(num_frames),
             free_list: Mutex::new(free_list),
             replacer: ClockReplacer::new(num_frames),
         }
@@ -107,7 +107,7 @@ impl BufferPool {
 
     /// Checks if a page is in the buffer pool.
     pub fn contains(&self, page_id: PageId) -> bool {
-        self.page_table.contains_sync(&page_id)
+        self.page_table.contains(page_id)
     }
 
     /// Fetches a page from the buffer pool.
@@ -116,15 +116,11 @@ impl BufferPool {
     /// The page is pinned before being returned.
     #[inline(always)]
     pub fn fetch_page(&self, page_id: PageId) -> Option<&BufferFrame> {
-        // Use read_sync() with callback to get frame_id
-        let frame_id = self.page_table.read_sync(&page_id, |_, v| *v)?;
+        let frame_id = self.page_table.get(page_id)?;
         let frame = &self.frames[frame_id.0 as usize];
-        let prev_pin = frame.pin();
-        // Only update replacer if frame was unpinned (prev_pin == 0).
-        // If already pinned, it's not in evictable set, so skip the lock.
-        if prev_pin == 0 {
-            self.replacer.access_and_pin(frame_id);
-        }
+        frame.pin();
+        // Record access for clock algorithm (sets reference bit)
+        self.replacer.record_access(frame_id);
         Some(frame)
     }
 
@@ -141,8 +137,12 @@ impl BufferPool {
             }
         }
 
-        // Try to evict
-        if let Some(victim_id) = self.replacer.evict() {
+        // Try to evict - check pin_count directly for each candidate frame
+        let victim_id = self.replacer.evict(|fid| {
+            self.frames[fid.0 as usize].pin_count() == 0
+        });
+
+        if let Some(victim_id) = victim_id {
             let frame = &self.frames[victim_id.0 as usize];
 
             // Capture evicted page data if dirty
@@ -162,7 +162,7 @@ impl BufferPool {
 
             // Remove old page from page table
             if let Some(old_page_id) = frame.page_id() {
-                self.page_table.remove_sync(&old_page_id);
+                self.page_table.remove(old_page_id);
             }
 
             return Ok((victim_id, evicted));
@@ -181,13 +181,10 @@ impl BufferPool {
     #[inline]
     pub fn new_page(&self, page_id: PageId) -> Result<(&BufferFrame, Option<EvictedPage>)> {
         // Check if page already exists
-        if let Some(frame_id) = self.page_table.read_sync(&page_id, |_, v| *v) {
+        if let Some(frame_id) = self.page_table.get(page_id) {
             let frame = &self.frames[frame_id.0 as usize];
-            let prev_pin = frame.pin();
-            // Only update replacer if frame was unpinned (prev_pin == 0).
-            if prev_pin == 0 {
-                self.replacer.access_and_pin(frame_id);
-            }
+            frame.pin();
+            self.replacer.record_access(frame_id);
             return Ok((frame, None));
         }
 
@@ -203,8 +200,8 @@ impl BufferPool {
         // evicted frames were removed by evict()).
         frame.pin();
 
-        // Update page table (insert_sync returns Err if key exists, but we checked above)
-        let _ = self.page_table.insert_sync(page_id, frame_id);
+        // Update page table
+        self.page_table.insert(page_id, frame_id);
 
         Ok((frame, evicted))
     }
@@ -223,19 +220,18 @@ impl BufferPool {
     /// Unpins a page in the buffer pool.
     ///
     /// If the page becomes unpinned (pin count = 0), it becomes evictable.
+    /// Evictability is determined by pin_count during eviction, not tracked separately.
     #[inline]
     pub fn unpin_page(&self, page_id: PageId, is_dirty: bool) -> bool {
-        if let Some(frame_id) = self.page_table.read_sync(&page_id, |_, v| *v) {
+        if let Some(frame_id) = self.page_table.get(page_id) {
             let frame = &self.frames[frame_id.0 as usize];
 
             if is_dirty {
                 frame.set_dirty(true);
             }
 
-            let new_pin_count = frame.unpin();
-            if new_pin_count == 0 {
-                self.replacer.set_evictable(frame_id, true);
-            }
+            frame.unpin();
+            // No need to update replacer - evict() checks pin_count directly
             return true;
         }
         false
@@ -249,7 +245,7 @@ impl BufferPool {
     where
         F: FnMut(PageId, &[u8]) -> Result<()>,
     {
-        if let Some(frame_id) = self.page_table.read_sync(&page_id, |_, v| *v) {
+        if let Some(frame_id) = self.page_table.get(page_id) {
             let frame = &self.frames[frame_id.0 as usize];
 
             if frame.is_dirty() {
@@ -275,8 +271,8 @@ impl BufferPool {
 
         // Collect dirty pages first to avoid holding guards during flush
         let mut dirty_pages = Vec::new();
-        self.page_table.iter_sync(|page_id, frame_id| {
-            dirty_pages.push((*page_id, *frame_id));
+        self.page_table.for_each(|page_id, frame_id| {
+            dirty_pages.push((page_id, frame_id));
             true // continue iteration
         });
 
@@ -304,12 +300,12 @@ impl BufferPool {
     /// Returns true if the page was deleted.
     /// Returns false if the page is pinned or not in the pool.
     pub fn delete_page(&self, page_id: PageId) -> bool {
-        if let Some((_, frame_id)) = self.page_table.remove_sync(&page_id) {
+        if let Some(frame_id) = self.page_table.remove(page_id) {
             let frame = &self.frames[frame_id.0 as usize];
 
             // Cannot delete pinned page - re-insert if pinned
             if frame.is_pinned() {
-                let _ = self.page_table.insert_sync(page_id, frame_id);
+                self.page_table.insert(page_id, frame_id);
                 return false;
             }
 
@@ -348,7 +344,7 @@ impl BufferPool {
         let mut pinned_count = 0;
         let mut dirty_count = 0;
 
-        self.page_table.iter_sync(|_, frame_id| {
+        self.page_table.for_each(|_, frame_id| {
             let frame = &self.frames[frame_id.0 as usize];
             if frame.is_pinned() {
                 pinned_count += 1;

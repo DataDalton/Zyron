@@ -7,6 +7,7 @@
 //! - Dirty page tracking for write-back
 
 mod frame;
+mod page_table;
 mod pool;
 mod replacer;
 

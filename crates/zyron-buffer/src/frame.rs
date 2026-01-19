@@ -112,11 +112,13 @@ impl BufferFrame {
 
     /// Increments the pin count and returns the previous pin count.
     /// Returns 0 if the frame was unpinned before this call.
-    /// Uses Relaxed ordering - replacer lock provides synchronization when needed.
+    /// Only sets reference bit on 0->1 transition to reduce atomic stores.
     #[inline(always)]
     pub fn pin(&self) -> u32 {
         let prev = self.pin_count.fetch_add(1, Ordering::Relaxed);
-        self.reference_bit.store(true, Ordering::Relaxed);
+        if prev == 0 {
+            self.reference_bit.store(true, Ordering::Relaxed);
+        }
         prev
     }
 
