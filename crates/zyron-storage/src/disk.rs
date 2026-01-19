@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
-use zyron_common::page::{PageId, PAGE_SIZE};
+use zyron_common::page::{PAGE_SIZE, PageId};
 use zyron_common::{Result, ZyronError};
 
 /// Configuration for the disk manager.
@@ -95,9 +95,9 @@ impl DiskManager {
         self.open_file(page_id.file_id).await?;
 
         let mut files = self.files.lock().await;
-        let handle = files.get_mut(&page_id.file_id).ok_or_else(|| {
-            ZyronError::IoError(format!("file {} not open", page_id.file_id))
-        })?;
+        let handle = files
+            .get_mut(&page_id.file_id)
+            .ok_or_else(|| ZyronError::IoError(format!("file {} not open", page_id.file_id)))?;
 
         if page_id.page_num >= handle.num_pages {
             return Err(ZyronError::IoError(format!(
@@ -120,9 +120,9 @@ impl DiskManager {
         self.open_file(page_id.file_id).await?;
 
         let mut files = self.files.lock().await;
-        let handle = files.get_mut(&page_id.file_id).ok_or_else(|| {
-            ZyronError::IoError(format!("file {} not open", page_id.file_id))
-        })?;
+        let handle = files
+            .get_mut(&page_id.file_id)
+            .ok_or_else(|| ZyronError::IoError(format!("file {} not open", page_id.file_id)))?;
 
         let offset = (page_id.page_num as u64) * (PAGE_SIZE as u64);
         handle.file.seek(std::io::SeekFrom::Start(offset)).await?;
@@ -149,9 +149,9 @@ impl DiskManager {
         self.open_file(file_id).await?;
 
         let mut files = self.files.lock().await;
-        let handle = files.get_mut(&file_id).ok_or_else(|| {
-            ZyronError::IoError(format!("file {} not open", file_id))
-        })?;
+        let handle = files
+            .get_mut(&file_id)
+            .ok_or_else(|| ZyronError::IoError(format!("file {} not open", file_id)))?;
 
         let page_num = handle.num_pages;
         let page_id = PageId::new(file_id, page_num);
@@ -168,9 +168,9 @@ impl DiskManager {
         self.open_file(file_id).await?;
 
         let files = self.files.lock().await;
-        let handle = files.get(&file_id).ok_or_else(|| {
-            ZyronError::IoError(format!("file {} not open", file_id))
-        })?;
+        let handle = files
+            .get(&file_id)
+            .ok_or_else(|| ZyronError::IoError(format!("file {} not open", file_id)))?;
 
         Ok(handle.num_pages)
     }
@@ -185,18 +185,25 @@ impl DiskManager {
     }
 
     /// Closes a specific file.
+    /// Extends file to match num_pages to persist lazy-allocated pages.
     pub async fn close_file(&self, file_id: u32) -> Result<()> {
         let mut files = self.files.lock().await;
         if let Some(handle) = files.remove(&file_id) {
+            // Extend file to match lazy-allocated page count
+            let expected_size = (handle.num_pages as u64) * (PAGE_SIZE as u64);
+            handle.file.set_len(expected_size).await?;
             handle.file.sync_all().await?;
         }
         Ok(())
     }
 
     /// Closes all open files.
+    /// Extends files to match num_pages to persist lazy-allocated pages.
     pub async fn close_all(&self) -> Result<()> {
         let mut files = self.files.lock().await;
         for (_, handle) in files.drain() {
+            let expected_size = (handle.num_pages as u64) * (PAGE_SIZE as u64);
+            handle.file.set_len(expected_size).await?;
             handle.file.sync_all().await?;
         }
         Ok(())
