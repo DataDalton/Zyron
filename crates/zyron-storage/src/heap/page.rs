@@ -16,6 +16,7 @@
 //! +------------------+
 //! ```
 
+use super::constants::{DATA_START, HEAP_HEADER_OFFSET, HEAP_HEADER_SIZE, TUPLE_SLOT_SIZE};
 use crate::tuple::Tuple;
 use zyron_common::page::{PageHeader, PageId, PageType, PAGE_SIZE};
 use zyron_common::{Result, ZyronError};
@@ -55,7 +56,7 @@ pub struct TupleSlot {
 
 impl TupleSlot {
     /// Size of a slot entry in bytes.
-    pub const SIZE: usize = 4;
+    pub const SIZE: usize = TUPLE_SLOT_SIZE;
 
     /// Creates a new slot.
     pub fn new(offset: u16, length: u16) -> Self {
@@ -106,10 +107,10 @@ pub struct HeapPageHeader {
 
 impl HeapPageHeader {
     /// Size of the heap page header in bytes.
-    pub const SIZE: usize = 8;
+    pub const SIZE: usize = HEAP_HEADER_SIZE;
 
     /// Offset of heap header in page (after PageHeader).
-    pub const OFFSET: usize = PageHeader::SIZE;
+    pub const OFFSET: usize = HEAP_HEADER_OFFSET;
 
     /// Creates a new heap page header.
     pub fn new() -> Self {
@@ -164,8 +165,8 @@ pub struct HeapPage {
 }
 
 impl HeapPage {
-    /// Minimum data offset after headers.
-    const DATA_START: usize = PageHeader::SIZE + HeapPageHeader::SIZE;
+    /// Offset where slot array begins (after PageHeader + HeapPageHeader).
+    pub const DATA_START: usize = DATA_START;
 
     /// Creates a new empty heap page.
     pub fn new(page_id: PageId) -> Self {
@@ -196,7 +197,7 @@ impl HeapPage {
 
     /// Reads the heap header from a slice.
     #[inline]
-    fn heap_header_from_slice(data: &[u8]) -> HeapPageHeader {
+    pub fn heap_header_from_slice(data: &[u8]) -> HeapPageHeader {
         let offset = HeapPageHeader::OFFSET;
         HeapPageHeader::from_bytes(&data[offset..offset + HeapPageHeader::SIZE])
     }
@@ -229,6 +230,34 @@ impl HeapPage {
     fn set_slot_in_slice(data: &mut [u8], slot_id: SlotId, slot: TupleSlot) {
         let offset = Self::DATA_START + (slot_id.0 as usize) * TupleSlot::SIZE;
         data[offset..offset + TupleSlot::SIZE].copy_from_slice(&slot.to_bytes());
+    }
+
+    /// Counts active tuples in a page slice without allocation.
+    #[inline]
+    pub fn tuple_count_in_slice(data: &[u8]) -> usize {
+        let header = Self::heap_header_from_slice(data);
+        let mut count = 0;
+        for i in 0..header.slot_count {
+            if let Some(slot) = Self::get_slot_from_slice(data, SlotId(i), header.slot_count) {
+                if !slot.is_empty() {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    /// Reads a tuple from a slice at the given slot.
+    #[inline]
+    pub fn get_tuple_from_slice(data: &[u8], slot_id: SlotId) -> Option<Tuple> {
+        let header = Self::heap_header_from_slice(data);
+        let slot = Self::get_slot_from_slice(data, slot_id, header.slot_count)?;
+        if slot.is_empty() {
+            return None;
+        }
+        let start = slot.offset as usize;
+        let end = start + slot.length as usize;
+        Tuple::deserialize(&data[start..end])
     }
 
     /// Inserts a tuple into a page slice.
@@ -369,8 +398,15 @@ impl HeapPage {
             tuple_size
         };
 
+        // If not enough contiguous space, try compaction
         if header.free_space() < space_needed {
-            return Err(ZyronError::PageFull);
+            // Check if compaction would help
+            if self.total_usable_space() >= space_needed {
+                self.compact();
+                header = self.heap_header();
+            } else {
+                return Err(ZyronError::PageFull);
+            }
         }
 
         // Allocate tuple space (grows upward from end)
@@ -489,6 +525,72 @@ impl HeapPage {
         // Need space for both slot and tuple
         header.free_space() >= tuple_size + TupleSlot::SIZE
     }
+
+    /// Calculates space that can be reclaimed by compaction.
+    /// This is the total space used by deleted tuple data.
+    pub fn reclaimable_space(&self) -> usize {
+        let header = self.heap_header();
+        let mut active_tuple_space = 0usize;
+
+        for i in 0..header.slot_count {
+            if let Some(slot) = self.get_slot(SlotId(i)) {
+                if !slot.is_empty() {
+                    active_tuple_space += slot.length as usize;
+                }
+            }
+        }
+
+        // Total tuple area = page end - free_space_end
+        let tuple_area_size = (PAGE_SIZE as u16 - header.free_space_end) as usize;
+        // Reclaimable = tuple area - active tuples
+        tuple_area_size.saturating_sub(active_tuple_space)
+    }
+
+    /// Compacts the page by moving all active tuples together.
+    /// Eliminates holes from deleted tuples and maximizes contiguous free space.
+    pub fn compact(&mut self) {
+        let header = self.heap_header();
+
+        // Collect active tuples: (slot_id, tuple_data)
+        let mut active_tuples: Vec<(SlotId, Vec<u8>)> = Vec::new();
+        for i in 0..header.slot_count {
+            let slot_id = SlotId(i);
+            if let Some(slot) = self.get_slot(slot_id) {
+                if !slot.is_empty() {
+                    let start = slot.offset as usize;
+                    let end = start + slot.length as usize;
+                    let data = self.data[start..end].to_vec();
+                    active_tuples.push((slot_id, data));
+                }
+            }
+        }
+
+        // Rewrite tuple data from the end of the page
+        let mut new_free_space_end = PAGE_SIZE as u16;
+
+        for (slot_id, tuple_data) in &active_tuples {
+            let tuple_len = tuple_data.len() as u16;
+            new_free_space_end -= tuple_len;
+
+            // Copy tuple data to new location
+            let new_offset = new_free_space_end as usize;
+            self.data[new_offset..new_offset + tuple_data.len()].copy_from_slice(tuple_data);
+
+            // Update slot with new offset
+            let new_slot = TupleSlot::new(new_free_space_end, tuple_len);
+            self.set_slot(*slot_id, new_slot);
+        }
+
+        // Update header with new free_space_end
+        let mut new_header = header;
+        new_header.free_space_end = new_free_space_end;
+        self.set_heap_header(new_header);
+    }
+
+    /// Returns total usable space including reclaimable space from deleted tuples.
+    pub fn total_usable_space(&self) -> usize {
+        self.free_space() + self.reclaimable_space()
+    }
 }
 
 /// Iterator over tuples in a heap page.
@@ -518,7 +620,6 @@ impl<'a> Iterator for HeapPageIterator<'a> {
 mod tests {
     use super::*;
     use crate::tuple::TupleHeader;
-    use bytes::Bytes;
 
     fn create_test_page() -> HeapPage {
         HeapPage::new(PageId::new(0, 0))
@@ -563,7 +664,7 @@ mod tests {
     #[test]
     fn test_heap_page_insert_tuple() {
         let mut page = create_test_page();
-        let data = Bytes::from_static(b"hello world");
+        let data = b"hello world".to_vec();
         let tuple = Tuple::new(data, 1);
 
         let slot_id = page.insert_tuple(&tuple).unwrap();
@@ -574,7 +675,7 @@ mod tests {
     #[test]
     fn test_heap_page_get_tuple() {
         let mut page = create_test_page();
-        let data = Bytes::from_static(b"test data");
+        let data = b"test data".to_vec();
         let tuple = Tuple::new(data.clone(), 42);
 
         let slot_id = page.insert_tuple(&tuple).unwrap();
@@ -589,7 +690,7 @@ mod tests {
         let mut page = create_test_page();
 
         for i in 0..10 {
-            let data = Bytes::from(format!("tuple {}", i));
+            let data = format!("tuple {}", i).into_bytes();
             let tuple = Tuple::new(data, i);
             page.insert_tuple(&tuple).unwrap();
         }
@@ -605,7 +706,7 @@ mod tests {
     #[test]
     fn test_heap_page_delete_tuple() {
         let mut page = create_test_page();
-        let data = Bytes::from_static(b"to be deleted");
+        let data = b"to be deleted".to_vec();
         let tuple = Tuple::new(data, 1);
 
         let slot_id = page.insert_tuple(&tuple).unwrap();
@@ -620,13 +721,13 @@ mod tests {
         let mut page = create_test_page();
 
         // Insert and delete
-        let data1 = Bytes::from_static(b"first");
+        let data1 = b"first".to_vec();
         let tuple1 = Tuple::new(data1, 1);
         let slot1 = page.insert_tuple(&tuple1).unwrap();
         page.delete_tuple(slot1);
 
         // Insert again - should reuse slot
-        let data2 = Bytes::from_static(b"second");
+        let data2 = b"second".to_vec();
         let tuple2 = Tuple::new(data2.clone(), 2);
         let slot2 = page.insert_tuple(&tuple2).unwrap();
 
@@ -642,12 +743,12 @@ mod tests {
         let mut page = create_test_page();
 
         // Insert a tuple
-        let data1 = Bytes::from(vec![0u8; 100]);
+        let data1 = vec![0u8; 100];
         let tuple1 = Tuple::new(data1, 1);
         let slot_id = page.insert_tuple(&tuple1).unwrap();
 
         // Update with smaller tuple (should succeed)
-        let data2 = Bytes::from(vec![1u8; 50]);
+        let data2 = vec![1u8; 50];
         let tuple2 = Tuple::new(data2.clone(), 2);
         page.update_tuple(slot_id, &tuple2).unwrap();
 
@@ -660,12 +761,12 @@ mod tests {
         let mut page = create_test_page();
 
         // Insert a small tuple
-        let data1 = Bytes::from(vec![0u8; 10]);
+        let data1 = vec![0u8; 10];
         let tuple1 = Tuple::new(data1, 1);
         let slot_id = page.insert_tuple(&tuple1).unwrap();
 
         // Try to update with larger tuple (should fail)
-        let data2 = Bytes::from(vec![1u8; 100]);
+        let data2 = vec![1u8; 100];
         let tuple2 = Tuple::new(data2, 2);
         let result = page.update_tuple(slot_id, &tuple2);
 
@@ -677,7 +778,7 @@ mod tests {
         let mut page = create_test_page();
 
         for i in 0..5 {
-            let data = Bytes::from(format!("tuple {}", i));
+            let data = format!("tuple {}", i).into_bytes();
             let tuple = Tuple::new(data, i);
             page.insert_tuple(&tuple).unwrap();
         }
@@ -703,7 +804,7 @@ mod tests {
 
         // Fill the page with large tuples
         while page.can_fit(1000) {
-            let data = Bytes::from(vec![0u8; 1000 - TupleHeader::SIZE]);
+            let data = vec![0u8; 1000 - TupleHeader::SIZE];
             let tuple = Tuple::new(data, 1);
             page.insert_tuple(&tuple).unwrap();
         }
@@ -717,7 +818,7 @@ mod tests {
         let mut page = create_test_page();
 
         // Try to insert a tuple larger than page
-        let huge_data = Bytes::from(vec![0u8; PAGE_SIZE]);
+        let huge_data = vec![0u8; PAGE_SIZE];
         let huge_tuple = Tuple::new(huge_data, 1);
         let result = page.insert_tuple(&huge_tuple);
 
@@ -727,7 +828,7 @@ mod tests {
     #[test]
     fn test_heap_page_from_bytes() {
         let mut page = create_test_page();
-        let data = Bytes::from_static(b"persistent data");
+        let data = b"persistent data".to_vec();
         let tuple = Tuple::new(data.clone(), 999);
         let slot_id = page.insert_tuple(&tuple).unwrap();
 
@@ -759,11 +860,91 @@ mod tests {
     #[test]
     fn test_heap_page_delete_already_deleted() {
         let mut page = create_test_page();
-        let data = Bytes::from_static(b"data");
+        let data = b"data".to_vec();
         let tuple = Tuple::new(data, 1);
         let slot_id = page.insert_tuple(&tuple).unwrap();
 
         assert!(page.delete_tuple(slot_id));
         assert!(!page.delete_tuple(slot_id)); // Already deleted
+    }
+
+    #[test]
+    fn test_heap_page_compact() {
+        let mut page = create_test_page();
+
+        // Insert 3 tuples
+        let data1 = vec![1u8; 1000];
+        let data2 = vec![2u8; 1000];
+        let data3 = vec![3u8; 1000];
+        let slot1 = page.insert_tuple(&Tuple::new(data1.clone(), 1)).unwrap();
+        let slot2 = page.insert_tuple(&Tuple::new(data2.clone(), 2)).unwrap();
+        let slot3 = page.insert_tuple(&Tuple::new(data3.clone(), 3)).unwrap();
+
+        let free_space_before = page.free_space();
+
+        // Delete middle tuple
+        page.delete_tuple(slot2);
+
+        // Free space should not change (just slot marked empty)
+        assert_eq!(page.free_space(), free_space_before);
+
+        // But reclaimable space should be > 0
+        assert!(page.reclaimable_space() > 0);
+
+        // Compact the page
+        page.compact();
+
+        // After compaction, free space should increase by reclaimable amount
+        assert!(page.free_space() > free_space_before);
+        assert_eq!(page.reclaimable_space(), 0);
+
+        // Remaining tuples should still be accessible
+        let t1 = page.get_tuple(slot1).unwrap();
+        let t3 = page.get_tuple(slot3).unwrap();
+        assert_eq!(t1.data(), &data1);
+        assert_eq!(t3.data(), &data3);
+
+        // Deleted tuple should still be None
+        assert!(page.get_tuple(slot2).is_none());
+    }
+
+    #[test]
+    fn test_heap_page_compact_insert_after_delete() {
+        let mut page = create_test_page();
+
+        // Fill page with large tuples (2KB each)
+        let tuple_size = 2000;
+        let mut slots = Vec::new();
+        while page.can_fit(tuple_size + TupleSlot::SIZE) {
+            let data = vec![slots.len() as u8; tuple_size - TupleHeader::SIZE];
+            let slot = page.insert_tuple(&Tuple::new(data, slots.len() as u32)).unwrap();
+            slots.push(slot);
+        }
+
+        // Page should be nearly full
+        let initial_slot_count = slots.len();
+        assert!(initial_slot_count >= 3);
+
+        // Delete all tuples
+        for slot in &slots {
+            page.delete_tuple(*slot);
+        }
+
+        // Free space is still small (data not reclaimed)
+        let _free_space_after_delete = page.free_space();
+
+        // But total usable space should be high
+        let total_usable = page.total_usable_space();
+        assert!(total_usable > tuple_size);
+
+        // Insert should succeed (compaction happens automatically)
+        let new_data = vec![99u8; tuple_size - TupleHeader::SIZE];
+        let result = page.insert_tuple(&Tuple::new(new_data.clone(), 99));
+        assert!(result.is_ok());
+
+        // Verify the new tuple is accessible
+        let new_slot = result.unwrap();
+        let retrieved = page.get_tuple(new_slot).unwrap();
+        assert_eq!(retrieved.data(), &new_data);
     }
 }

@@ -36,7 +36,7 @@ use std::time::Instant;
 use tempfile::tempdir;
 
 use zyron_buffer::{BufferPool, BufferPoolConfig};
-use zyron_common::page::{PageId, PAGE_SIZE};
+use zyron_common::page::PageId;
 use zyron_storage::{BufferedBTreeIndex, DiskManager, DiskManagerConfig, HeapFile, Tuple, TupleId};
 use zyron_wal::{LogRecordType, Lsn, RecoveryManager, WalReader, WalWriter, WalWriterConfig};
 
@@ -69,7 +69,27 @@ struct ValidationResult {
     average: f64,
 }
 
-fn validate_metric(name: &str, runs: Vec<f64>, target: f64, higher_is_better: bool) -> ValidationResult {
+/// Formats a number with comma separators for readability.
+fn format_with_commas(n: f64) -> String {
+    let s = format!("{:.0}", n);
+    let bytes: Vec<char> = s.chars().collect();
+    let mut result = String::new();
+    let len = bytes.len();
+    for (i, c) in bytes.iter().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            result.push(',');
+        }
+        result.push(*c);
+    }
+    result
+}
+
+fn validate_metric(
+    name: &str,
+    runs: Vec<f64>,
+    target: f64,
+    higher_is_better: bool,
+) -> ValidationResult {
     let average = runs.iter().sum::<f64>() / runs.len() as f64;
     let min = runs.iter().cloned().fold(f64::INFINITY, f64::min);
     let max = runs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -105,17 +125,17 @@ fn validate_metric(name: &str, runs: Vec<f64>, target: f64, higher_is_better: bo
     println!(
         "    Runs: [{}]",
         runs.iter()
-            .map(|x| format!("{:.2}", x))
+            .map(|x| format_with_commas(*x))
             .collect::<Vec<_>>()
             .join(", ")
     );
     println!(
-        "    Average: {:.2} {} {:.2} (target)",
-        average, comparison, target
+        "    Average: {} {} {} (target)",
+        format_with_commas(average), comparison, format_with_commas(target)
     );
     println!(
-        "    Min/Max: {:.2} / {:.2}, StdDev: {:.2}",
-        min, max, std_dev
+        "    Min/Max: {} / {}, StdDev: {}",
+        format_with_commas(min), format_with_commas(max), format_with_commas(std_dev)
     );
 
     ValidationResult {
@@ -134,8 +154,8 @@ fn check_performance(name: &str, actual: f64, target: f64, higher_is_better: boo
     let status = if passed { "PASS" } else { "FAIL" };
     let comparison = if higher_is_better { ">=" } else { "<=" };
     println!(
-        "  {} [{}]: {:.2} {} {:.2} (target)",
-        name, status, actual, comparison, target
+        "  {} [{}]: {} {} {} (target)",
+        name, status, format_with_commas(actual), comparison, format_with_commas(target)
     );
     passed
 }
@@ -223,12 +243,12 @@ async fn test_wal_write_replay_10k_records() {
         let replay_ops_sec = RECORD_COUNT as f64 / replay_duration.as_secs_f64();
 
         println!(
-            "  Write: {:.0} ops/sec ({:?})",
-            write_ops_sec, write_duration
+            "  Write: {} ops/sec ({:?})",
+            format_with_commas(write_ops_sec), write_duration
         );
         println!(
-            "  Replay: {:.0} ops/sec ({:?})",
-            replay_ops_sec, replay_duration
+            "  Replay: {} ops/sec ({:?})",
+            format_with_commas(replay_ops_sec), replay_duration
         );
 
         write_results.push(write_ops_sec);
@@ -252,8 +272,7 @@ async fn test_wal_write_replay_10k_records() {
     assert!(
         write_result.passed,
         "WAL write avg {:.0} < target {:.0}",
-        write_result.average,
-        WAL_WRITE_TARGET_OPS_SEC
+        write_result.average, WAL_WRITE_TARGET_OPS_SEC
     );
     assert!(
         !write_result.regression_detected,
@@ -262,8 +281,7 @@ async fn test_wal_write_replay_10k_records() {
     assert!(
         replay_result.passed,
         "WAL replay avg {:.0} < target {:.0}",
-        replay_result.average,
-        WAL_REPLAY_TARGET_OPS_SEC
+        replay_result.average, WAL_REPLAY_TARGET_OPS_SEC
     );
     assert!(
         !replay_result.regression_detected,
@@ -396,7 +414,10 @@ async fn test_buffer_pool_cache_hit_rate() {
     const ACCESS_ROUNDS: usize = 1000;
 
     println!("\n=== Buffer Pool Performance Test ===");
-    println!("Frames: {}, Pages: {}, Rounds: {}", NUM_FRAMES, NUM_PAGES, ACCESS_ROUNDS);
+    println!(
+        "Frames: {}, Pages: {}, Rounds: {}",
+        NUM_FRAMES, NUM_PAGES, ACCESS_ROUNDS
+    );
     println!("Validation runs: {}", VALIDATION_RUNS);
 
     let mut fetch_results = Vec::with_capacity(VALIDATION_RUNS);
@@ -461,8 +482,7 @@ async fn test_buffer_pool_cache_hit_rate() {
     assert!(
         fetch_result.passed,
         "Buffer pool fetch {:.2} ns > target {:.2} ns",
-        fetch_result.average,
-        BUFFER_POOL_FETCH_TARGET_NS
+        fetch_result.average, BUFFER_POOL_FETCH_TARGET_NS
     );
     assert!(
         !fetch_result.regression_detected,
@@ -471,8 +491,7 @@ async fn test_buffer_pool_cache_hit_rate() {
     assert!(
         hit_result.passed,
         "Buffer pool hit rate {:.4} < target {:.4}",
-        hit_result.average,
-        BUFFER_POOL_HIT_RATE_TARGET
+        hit_result.average, BUFFER_POOL_HIT_RATE_TARGET
     );
 }
 
@@ -506,18 +525,19 @@ async fn test_heap_file_100k_tuples() {
         let heap = HeapFile::with_defaults(disk, pool).unwrap();
 
         let mut rng = rand::rng();
-        let mut tuple_ids: Vec<TupleId> = Vec::with_capacity(TUPLE_COUNT);
 
-        // Insert phase
+        // Build all tuples first for batch insert
+        let tuples: Vec<Tuple> = (0..TUPLE_COUNT)
+            .map(|i| {
+                let size = rng.random_range(10..=500);
+                let data: Vec<u8> = (0..size).map(|j| ((i + j) % 256) as u8).collect();
+                Tuple::new(data, i as u32)
+            })
+            .collect();
+
+        // Batch insert for better performance
         let insert_start = Instant::now();
-        for i in 0..TUPLE_COUNT {
-            let size = rng.random_range(10..=500);
-            let data: Vec<u8> = (0..size).map(|j| ((i + j) % 256) as u8).collect();
-            let tuple = Tuple::new(Bytes::from(data), i as u32);
-
-            let tuple_id = heap.insert(&tuple).await.unwrap();
-            tuple_ids.push(tuple_id);
-        }
+        let _tuple_ids = heap.insert_batch(&tuples).await.unwrap();
         let insert_duration = insert_start.elapsed();
 
         // Scan phase
@@ -537,10 +557,10 @@ async fn test_heap_file_100k_tuples() {
         let scan_ops_sec = TUPLE_COUNT as f64 / scan_duration.as_secs_f64();
 
         println!(
-            "  Insert: {:.0} ops/sec ({:?})",
-            insert_ops_sec, insert_duration
+            "  Insert: {} ops/sec ({:?})",
+            format_with_commas(insert_ops_sec), insert_duration
         );
-        println!("  Scan: {:.0} ops/sec ({:?})", scan_ops_sec, scan_duration);
+        println!("  Scan: {} ops/sec ({:?})", format_with_commas(scan_ops_sec), scan_duration);
 
         insert_results.push(insert_ops_sec);
         scan_results.push(scan_ops_sec);
@@ -563,8 +583,7 @@ async fn test_heap_file_100k_tuples() {
     assert!(
         insert_result.passed,
         "Heap insert avg {:.0} < target {:.0}",
-        insert_result.average,
-        HEAP_INSERT_TARGET_OPS_SEC
+        insert_result.average, HEAP_INSERT_TARGET_OPS_SEC
     );
     assert!(
         !insert_result.regression_detected,
@@ -573,8 +592,7 @@ async fn test_heap_file_100k_tuples() {
     assert!(
         scan_result.passed,
         "Heap scan avg {:.0} < target {:.0}",
-        scan_result.average,
-        HEAP_SCAN_TARGET_OPS_SEC
+        scan_result.average, HEAP_SCAN_TARGET_OPS_SEC
     );
     assert!(
         !scan_result.regression_detected,
@@ -597,13 +615,13 @@ async fn test_heap_file_delete_and_scan() {
     let pool = Arc::new(BufferPool::auto_sized());
     let heap = HeapFile::with_defaults(disk, pool).unwrap();
 
-    let mut tuple_ids: Vec<TupleId> = Vec::with_capacity(TUPLE_COUNT);
-
-    for i in 0..TUPLE_COUNT {
-        let data = Bytes::from(format!("tuple_{}", i));
-        let tuple = Tuple::new(data, i as u32);
-        tuple_ids.push(heap.insert(&tuple).await.unwrap());
-    }
+    let tuples: Vec<Tuple> = (0..TUPLE_COUNT)
+        .map(|i| {
+            let data = format!("tuple_{}", i).into_bytes();
+            Tuple::new(data, i as u32)
+        })
+        .collect();
+    let tuple_ids = heap.insert_batch(&tuples).await.unwrap();
 
     let mut deleted_ids: HashSet<TupleId> = HashSet::new();
     for i in 0..DELETE_COUNT {
@@ -639,9 +657,15 @@ async fn test_heap_file_delete_and_scan() {
     );
 }
 
-/// Tests free space reuse after deletes.
+/// Tests free space reuse after deletes with performance benchmarks.
+/// Target: Delete throughput >= 500k ops/sec, Reinsert throughput >= 1M ops/sec
 #[tokio::test]
 async fn test_heap_file_space_reuse() {
+    const TUPLE_COUNT: usize = 10_000;
+    const TUPLE_DATA_SIZE: usize = 100;
+    const DELETE_TARGET_OPS_SEC: f64 = 500_000.0;
+    const REINSERT_TARGET_OPS_SEC: f64 = 1_000_000.0;
+
     let dir = tempdir().unwrap();
     let config = DiskManagerConfig {
         data_dir: dir.path().to_path_buf(),
@@ -651,38 +675,69 @@ async fn test_heap_file_space_reuse() {
     let pool = Arc::new(BufferPool::auto_sized());
     let heap = HeapFile::with_defaults(disk, pool).unwrap();
 
-    let mut tuple_ids = Vec::new();
-    for i in 0..20 {
-        let data = Bytes::from(vec![i as u8; PAGE_SIZE / 4]);
-        let tuple = Tuple::new(data, i);
-        tuple_ids.push(heap.insert(&tuple).await.unwrap());
-    }
+    // Initial insert batch
+    let tuples: Vec<Tuple> = (0..TUPLE_COUNT)
+        .map(|i| {
+            let data = vec![i as u8; TUPLE_DATA_SIZE];
+            Tuple::new(data, i as u32)
+        })
+        .collect();
+
+    let insert_start = Instant::now();
+    let tuple_ids = heap.insert_batch(&tuples).await.unwrap();
+    let insert_duration = insert_start.elapsed();
+    let insert_ops_sec = TUPLE_COUNT as f64 / insert_duration.as_secs_f64();
 
     let pages_after_insert = heap.num_pages().await.unwrap();
+    println!("Initial insert: {} ops/sec ({} tuples)", format_with_commas(insert_ops_sec), format_with_commas(TUPLE_COUNT as f64));
+    println!("Pages after insert: {}", pages_after_insert);
 
-    for tuple_id in &tuple_ids {
-        heap.delete(*tuple_id).await.unwrap();
-    }
+    // Batch delete all tuples
+    let delete_start = Instant::now();
+    let deleted_count = heap.delete_batch(&tuple_ids).await.unwrap();
+    let delete_duration = delete_start.elapsed();
+    assert_eq!(deleted_count, TUPLE_COUNT);
+    let delete_ops_sec = TUPLE_COUNT as f64 / delete_duration.as_secs_f64();
+    println!("Delete: {} ops/sec (target: {})", format_with_commas(delete_ops_sec), format_with_commas(DELETE_TARGET_OPS_SEC));
 
-    for i in 0..20 {
-        let data = Bytes::from(vec![(i + 100) as u8; PAGE_SIZE / 4]);
-        let tuple = Tuple::new(data, i + 100);
-        heap.insert(&tuple).await.unwrap();
-    }
+    // Reinsert batch (triggers compaction)
+    let tuples2: Vec<Tuple> = (0..TUPLE_COUNT)
+        .map(|i| {
+            let data = vec![(i + 100) as u8; TUPLE_DATA_SIZE];
+            Tuple::new(data, (i + TUPLE_COUNT) as u32)
+        })
+        .collect();
+
+    let reinsert_start = Instant::now();
+    let _new_ids = heap.insert_batch(&tuples2).await.unwrap();
+    let reinsert_duration = reinsert_start.elapsed();
+    let reinsert_ops_sec = TUPLE_COUNT as f64 / reinsert_duration.as_secs_f64();
+    println!("Reinsert (with compaction): {} ops/sec (target: {})", format_with_commas(reinsert_ops_sec), format_with_commas(REINSERT_TARGET_OPS_SEC));
 
     let pages_after_reinsert = heap.num_pages().await.unwrap();
 
+    // Verify space was reused
     assert!(
         pages_after_reinsert <= pages_after_insert * 2,
         "Expected space reuse: {} pages after reinsert vs {} after initial insert",
         pages_after_reinsert,
         pages_after_insert
     );
+    println!("Space reuse: {} pages (was {})", pages_after_reinsert, pages_after_insert);
 
-    println!(
-        "Heap File Space Reuse: PASSED - {} pages after reinsert (was {})",
-        pages_after_reinsert, pages_after_insert
+    // Performance assertions
+    assert!(
+        delete_ops_sec >= DELETE_TARGET_OPS_SEC,
+        "Delete throughput {:.0} below target {:.0} ops/sec",
+        delete_ops_sec, DELETE_TARGET_OPS_SEC
     );
+    assert!(
+        reinsert_ops_sec >= REINSERT_TARGET_OPS_SEC,
+        "Reinsert throughput {:.0} below target {:.0} ops/sec",
+        reinsert_ops_sec, REINSERT_TARGET_OPS_SEC
+    );
+
+    println!("Heap File Space Reuse: PASSED");
 }
 
 // =============================================================================
@@ -764,7 +819,13 @@ fn test_btree_1m_keys() {
             }
         }
         let lookup_duration = lookup_start.elapsed();
-        assert_eq!(found_count, LOOKUP_SAMPLE, "Run {}: Expected {} found", run + 1, LOOKUP_SAMPLE);
+        assert_eq!(
+            found_count,
+            LOOKUP_SAMPLE,
+            "Run {}: Expected {} found",
+            run + 1,
+            LOOKUP_SAMPLE
+        );
 
         // Range scan phase
         let range_start = Instant::now();
@@ -790,8 +851,8 @@ fn test_btree_1m_keys() {
         let hash_table_time_ns = insert_duration.as_nanos() as u64 - stats.flush_time_ns;
 
         println!(
-            "  Insert: {:.0} ops/sec ({:?}), height={}",
-            insert_ops_sec, insert_duration, final_height
+            "  Insert: {} ops/sec ({:?}), height={}",
+            format_with_commas(insert_ops_sec), insert_duration, final_height
         );
         println!(
             "    Breakdown: hash_table={:.1}ms, flush={:.1}ms (drain={:.1}ms, btree={:.1}ms), flushes={}",
@@ -803,8 +864,8 @@ fn test_btree_1m_keys() {
         );
         println!("  Lookup: {:.2} ns/op ({:?})", lookup_ns, lookup_duration);
         println!(
-            "  Range: {:.0} ops/sec ({:?})",
-            range_ops_sec, range_duration
+            "  Range: {} ops/sec ({:?})",
+            format_with_commas(range_ops_sec), range_duration
         );
 
         insert_results.push(insert_ops_sec);
@@ -835,8 +896,7 @@ fn test_btree_1m_keys() {
     assert!(
         insert_result.passed,
         "B+Tree insert avg {:.0} < target {:.0}",
-        insert_result.average,
-        BTREE_INSERT_TARGET_OPS_SEC
+        insert_result.average, BTREE_INSERT_TARGET_OPS_SEC
     );
     assert!(
         !insert_result.regression_detected,
@@ -845,8 +905,7 @@ fn test_btree_1m_keys() {
     assert!(
         lookup_result.passed,
         "B+Tree lookup avg {:.2} ns > target {:.2} ns",
-        lookup_result.average,
-        BTREE_LOOKUP_TARGET_NS
+        lookup_result.average, BTREE_LOOKUP_TARGET_NS
     );
     assert!(
         !lookup_result.regression_detected,
@@ -855,15 +914,13 @@ fn test_btree_1m_keys() {
     assert!(
         range_result.passed,
         "B+Tree range avg {:.0} < target {:.0}",
-        range_result.average,
-        BTREE_RANGE_TARGET_OPS_SEC
+        range_result.average, BTREE_RANGE_TARGET_OPS_SEC
     );
     assert!(
         !range_result.regression_detected,
         "B+Tree range regression detected"
     );
 }
-
 
 // =============================================================================
 // Test 5: Integration Test - WAL + Heap Recovery
@@ -910,8 +967,8 @@ async fn test_wal_heap_recovery() {
 
             let begin_lsn = writer.log_begin(txn_id).await.unwrap();
 
-            let tuple = Tuple::new(Bytes::from(data.clone()), txn_id);
-            let tuple_id = heap.insert(&tuple).await.unwrap();
+            let tuple = Tuple::new(data.clone().into_bytes(), txn_id);
+            let tuple_id = heap.insert_batch(&[tuple]).await.unwrap().remove(0);
 
             let payload = format!(
                 "{}:{}:{}",
@@ -974,7 +1031,12 @@ async fn test_wal_heap_recovery() {
     println!("\n=== Recovery Performance ===");
     println!("  WAL size: {:.2} MB", wal_size_mb);
     println!("  Recovery time: {:?}", recovery_duration);
-    let recovery_pass = check_performance("Recovery time (ms/MB)", ms_per_mb, RECOVERY_TARGET_MS_PER_MB, false);
+    let recovery_pass = check_performance(
+        "Recovery time (ms/MB)",
+        ms_per_mb,
+        RECOVERY_TARGET_MS_PER_MB,
+        false,
+    );
 
     println!(
         "WAL+Heap Recovery: {} - {} committed transactions recovered",

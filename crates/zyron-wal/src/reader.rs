@@ -58,12 +58,13 @@ impl WalReader {
 
     /// Opens a segment by ID.
     pub async fn open_segment(&self, segment_id: SegmentId) -> Result<LogSegment> {
-        let path = self.segments.get(&segment_id).ok_or_else(|| {
-            ZyronError::WalCorrupted {
+        let path = self
+            .segments
+            .get(&segment_id)
+            .ok_or_else(|| ZyronError::WalCorrupted {
                 lsn: 0,
                 reason: format!("segment {} not found", segment_id),
-            }
-        })?;
+            })?;
 
         LogSegment::open(path).await
     }
@@ -485,7 +486,9 @@ mod tests {
             wal_dir: dir.path().to_path_buf(),
             segment_size: LogSegment::DEFAULT_SIZE,
             fsync_enabled: true,
-            group_commit_size: 1,
+            batch_size: 1,
+            batch_bytes: 64 * 1024,
+            flush_interval_us: 0,
         };
         let writer = WalWriter::new(config).await.unwrap();
         (writer, dir)
@@ -521,7 +524,10 @@ mod tests {
         // Write multiple transactions
         for i in 1..=5 {
             let begin = writer.log_begin(i).await.unwrap();
-            writer.log_insert(i, begin, Bytes::from(format!("data{}", i))).await.unwrap();
+            writer
+                .log_insert(i, begin, Bytes::from(format!("data{}", i)))
+                .await
+                .unwrap();
             writer.log_commit(i, Lsn::INVALID).await.unwrap();
         }
         writer.close().await.unwrap();
@@ -563,7 +569,10 @@ mod tests {
 
         writer.log_begin(1).await.unwrap();
         writer.log_checkpoint_begin().await.unwrap();
-        writer.log_checkpoint_end(Bytes::from_static(b"checkpoint")).await.unwrap();
+        writer
+            .log_checkpoint_end(Bytes::from_static(b"checkpoint"))
+            .await
+            .unwrap();
         writer.log_commit(1, Lsn::INVALID).await.unwrap();
         writer.close().await.unwrap();
 
@@ -590,7 +599,10 @@ mod tests {
 
         // Committed transaction
         let begin = writer.log_begin(1).await.unwrap();
-        let insert = writer.log_insert(1, begin, Bytes::from_static(b"data")).await.unwrap();
+        let insert = writer
+            .log_insert(1, begin, Bytes::from_static(b"data"))
+            .await
+            .unwrap();
         writer.log_commit(1, insert).await.unwrap();
         writer.close().await.unwrap();
 
@@ -610,7 +622,10 @@ mod tests {
 
         // Uncommitted transaction
         let begin = writer.log_begin(1).await.unwrap();
-        writer.log_insert(1, begin, Bytes::from_static(b"data")).await.unwrap();
+        writer
+            .log_insert(1, begin, Bytes::from_static(b"data"))
+            .await
+            .unwrap();
         // No commit!
         writer.close().await.unwrap();
 

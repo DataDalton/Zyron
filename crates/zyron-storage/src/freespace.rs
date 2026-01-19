@@ -219,10 +219,17 @@ impl FsmPage {
     ///
     /// Returns the page number of a suitable page, or None if no page has enough space.
     pub fn find_page_with_space(&self, min_space: usize) -> Option<u32> {
+        self.find_page_with_space_from(min_space, 0)
+    }
+
+    /// Finds a page with at least the requested free space, starting from a given entry index.
+    ///
+    /// Returns the page number of a suitable page, or None if no page has enough space.
+    pub fn find_page_with_space_from(&self, min_space: usize, start_entry: usize) -> Option<u32> {
         let header = self.fsm_header();
         let min_category = space_to_category(min_space);
 
-        for i in 0..header.num_entries as usize {
+        for i in start_entry..header.num_entries as usize {
             let category = self.data[Self::DATA_START + i];
             if category >= min_category {
                 return Some(header.first_page_num + i as u32);

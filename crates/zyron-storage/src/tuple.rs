@@ -1,6 +1,5 @@
 //! Tuple representation and serialization.
 
-use bytes::{Bytes, BytesMut};
 use zyron_common::page::PageId;
 
 /// Unique identifier for a tuple within the database.
@@ -51,7 +50,7 @@ pub struct Tuple {
     /// Tuple header.
     header: TupleHeader,
     /// Tuple data.
-    data: Bytes,
+    data: Vec<u8>,
 }
 
 /// Header for a tuple.
@@ -190,13 +189,13 @@ impl TupleFlags {
 
 impl Tuple {
     /// Creates a new tuple from raw data.
-    pub fn new(data: Bytes, xmin: u32) -> Self {
+    pub fn new(data: Vec<u8>, xmin: u32) -> Self {
         let header = TupleHeader::new(data.len() as u16, xmin);
         Self { header, data }
     }
 
     /// Creates a tuple with a specific header.
-    pub fn with_header(header: TupleHeader, data: Bytes) -> Self {
+    pub fn with_header(header: TupleHeader, data: Vec<u8>) -> Self {
         Self { header, data }
     }
 
@@ -211,7 +210,7 @@ impl Tuple {
     }
 
     /// Returns the tuple data.
-    pub fn data(&self) -> &Bytes {
+    pub fn data(&self) -> &[u8] {
         &self.data
     }
 
@@ -231,14 +230,15 @@ impl Tuple {
     }
 
     /// Serializes the tuple to bytes.
-    pub fn serialize(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(self.size_on_disk());
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.size_on_disk());
         buf.extend_from_slice(&self.header.to_bytes());
         buf.extend_from_slice(&self.data);
-        buf.freeze()
+        buf
     }
 
     /// Deserializes a tuple from bytes.
+    #[inline]
     pub fn deserialize(buf: &[u8]) -> Option<Self> {
         if buf.len() < TupleHeader::SIZE {
             return None;
@@ -251,7 +251,7 @@ impl Tuple {
             return None;
         }
 
-        let data = Bytes::copy_from_slice(&buf[TupleHeader::SIZE..data_end]);
+        let data = buf[TupleHeader::SIZE..data_end].to_vec();
         Some(Self { header, data })
     }
 }
@@ -324,7 +324,7 @@ mod tests {
 
     #[test]
     fn test_tuple_new() {
-        let data = Bytes::from_static(b"hello world");
+        let data = b"hello world".to_vec();
         let tuple = Tuple::new(data.clone(), 100);
 
         assert_eq!(tuple.data(), &data);
@@ -335,7 +335,7 @@ mod tests {
 
     #[test]
     fn test_tuple_size_on_disk() {
-        let data = Bytes::from(vec![0u8; 100]);
+        let data = vec![0u8; 100];
         let tuple = Tuple::new(data, 1);
 
         assert_eq!(tuple.size_on_disk(), TupleHeader::SIZE + 100);
@@ -343,7 +343,7 @@ mod tests {
 
     #[test]
     fn test_tuple_serialize_deserialize() {
-        let data = Bytes::from_static(b"test data 123");
+        let data = b"test data 123".to_vec();
         let tuple = Tuple::new(data.clone(), 999);
 
         let serialized = tuple.serialize();
@@ -356,7 +356,7 @@ mod tests {
 
     #[test]
     fn test_tuple_delete_flag() {
-        let data = Bytes::from_static(b"data");
+        let data = b"data".to_vec();
         let mut tuple = Tuple::new(data, 1);
 
         assert!(!tuple.is_deleted());
@@ -378,7 +378,7 @@ mod tests {
 
     #[test]
     fn test_tuple_deserialize_truncated_data() {
-        let data = Bytes::from_static(b"data");
+        let data = b"data".to_vec();
         let tuple = Tuple::new(data, 1);
         let serialized = tuple.serialize();
 
@@ -395,7 +395,7 @@ mod tests {
             xmin: 42,
             xmax: 0,
         };
-        let data = Bytes::from_static(b"hello");
+        let data = b"hello".to_vec();
 
         let tuple = Tuple::with_header(header, data.clone());
 
@@ -422,7 +422,7 @@ mod tests {
 
     #[test]
     fn test_tuple_header_mut() {
-        let data = Bytes::from_static(b"data");
+        let data = b"data".to_vec();
         let mut tuple = Tuple::new(data, 1);
 
         tuple.header_mut().xmin = 999;

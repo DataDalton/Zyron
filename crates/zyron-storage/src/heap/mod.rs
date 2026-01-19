@@ -4,6 +4,7 @@
 //! - HeapPage: Slotted page format for variable-length tuples
 //! - HeapFile: High-level API coordinating pages, FSM, and disk I/O
 
+pub mod constants;
 mod file;
 mod page;
 

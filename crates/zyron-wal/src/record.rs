@@ -1,5 +1,9 @@
 //! WAL log record format.
 
+use crate::constants::{
+    CHECKSUM_SIZE, HEADER_SIZE, MAX_PAYLOAD_SIZE, OFF_FLAGS, OFF_LSN, OFF_PAYLOAD_LEN,
+    OFF_PREV_LSN, OFF_RECORD_TYPE, OFF_TXN_ID,
+};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use zyron_common::{PageId, Result, ZyronError};
@@ -9,7 +13,9 @@ use zyron_common::{PageId, Result, ZyronError};
 /// LSN is a monotonically increasing 64-bit value that identifies
 /// the position of a record in the WAL. It encodes both the segment
 /// ID and offset within the segment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 pub struct Lsn(pub u64);
 
 impl Lsn {
@@ -137,12 +143,10 @@ pub struct LogRecord {
 }
 
 impl LogRecord {
-    /// Size of the record header in bytes.
-    pub const HEADER_SIZE: usize = 24;
-    /// Size of the checksum in bytes.
-    pub const CHECKSUM_SIZE: usize = 4;
-    /// Maximum payload size (64 KB).
-    pub const MAX_PAYLOAD_SIZE: usize = 64 * 1024;
+    // Re-export constants for API compatibility
+    pub const HEADER_SIZE: usize = HEADER_SIZE;
+    pub const CHECKSUM_SIZE: usize = CHECKSUM_SIZE;
+    pub const MAX_PAYLOAD_SIZE: usize = MAX_PAYLOAD_SIZE;
 
     /// Creates a new log record.
     #[inline]
@@ -166,7 +170,13 @@ impl LogRecord {
     /// Creates a transaction begin record.
     #[inline]
     pub fn begin(lsn: Lsn, txn_id: u32) -> Self {
-        Self::new(lsn, Lsn::INVALID, txn_id, LogRecordType::Begin, Bytes::new())
+        Self::new(
+            lsn,
+            Lsn::INVALID,
+            txn_id,
+            LogRecordType::Begin,
+            Bytes::new(),
+        )
     }
 
     /// Creates a transaction commit record.
@@ -184,7 +194,7 @@ impl LogRecord {
     /// Returns the total size of this record on disk.
     #[inline]
     pub fn size_on_disk(&self) -> usize {
-        Self::HEADER_SIZE + self.payload.len() + Self::CHECKSUM_SIZE
+        HEADER_SIZE + self.payload.len() + CHECKSUM_SIZE
     }
 
     /// Serializes this record to bytes.
@@ -215,7 +225,7 @@ impl LogRecord {
     /// Verifies checksum directly from input bytes without re-serialization.
     #[inline]
     pub fn deserialize(data: &[u8]) -> Result<Self> {
-        if data.len() < Self::HEADER_SIZE + Self::CHECKSUM_SIZE {
+        if data.len() < HEADER_SIZE + CHECKSUM_SIZE {
             return Err(ZyronError::WalCorrupted {
                 lsn: 0,
                 reason: "record too short".to_string(),
@@ -224,24 +234,24 @@ impl LogRecord {
 
         // Parse header fields directly from slice
         let lsn = Lsn(u64::from_le_bytes([
-            data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]
+            data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
         ]));
         let prev_lsn = Lsn(u64::from_le_bytes([
-            data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15]
+            data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
         ]));
         let txn_id = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
         let record_type = LogRecordType::try_from(data[20])?;
         let flags = data[21];
         let payload_len = u16::from_le_bytes([data[22], data[23]]) as usize;
 
-        if payload_len > Self::MAX_PAYLOAD_SIZE {
+        if payload_len > MAX_PAYLOAD_SIZE {
             return Err(ZyronError::WalCorrupted {
                 lsn: lsn.0,
                 reason: format!("payload too large: {}", payload_len),
             });
         }
 
-        let total_size = Self::HEADER_SIZE + payload_len + Self::CHECKSUM_SIZE;
+        let total_size = HEADER_SIZE + payload_len + CHECKSUM_SIZE;
         if data.len() < total_size {
             return Err(ZyronError::WalCorrupted {
                 lsn: lsn.0,
@@ -250,7 +260,7 @@ impl LogRecord {
         }
 
         // Verify checksum directly on raw bytes (header + payload)
-        let checksum_offset = Self::HEADER_SIZE + payload_len;
+        let checksum_offset = HEADER_SIZE + payload_len;
         let stored_checksum = u32::from_le_bytes([
             data[checksum_offset],
             data[checksum_offset + 1],
@@ -270,7 +280,7 @@ impl LogRecord {
         }
 
         // Extract payload
-        let payload = Bytes::copy_from_slice(&data[Self::HEADER_SIZE..Self::HEADER_SIZE + payload_len]);
+        let payload = Bytes::copy_from_slice(&data[HEADER_SIZE..HEADER_SIZE + payload_len]);
 
         Ok(Self {
             lsn,
@@ -284,62 +294,70 @@ impl LogRecord {
 
     /// Parses all records from a contiguous Bytes buffer with checksum verification.
     /// Uses zero-copy slicing for payload data to avoid per-record allocation.
+    /// Pointer-based parsing eliminates bounds checks after initial validation.
     #[inline]
     pub fn parse_all(data: Bytes) -> Result<Vec<Self>> {
-        let mut records = Vec::with_capacity(data.len() / 64); // Estimate record count
+        let mut records = Vec::with_capacity(data.len() / 64);
         let mut offset = 0;
         let data_len = data.len();
+        let base_ptr = data.as_ptr();
 
-        while offset + Self::HEADER_SIZE + Self::CHECKSUM_SIZE <= data_len {
-            // Read payload length from header (offset 22-23)
-            let payload_len = u16::from_le_bytes([
-                data[offset + 22],
-                data[offset + 23],
-            ]) as usize;
+        while offset + HEADER_SIZE + CHECKSUM_SIZE <= data_len {
+            // SAFETY: bounds check above ensures we can read HEADER_SIZE bytes
+            let (lsn_raw, prev_lsn_raw, txn_id, record_type_byte, flags, payload_len) = unsafe {
+                let ptr = base_ptr.add(offset);
+                let lsn_raw = std::ptr::read_unaligned(ptr.add(OFF_LSN) as *const u64);
+                let prev_lsn_raw = std::ptr::read_unaligned(ptr.add(OFF_PREV_LSN) as *const u64);
+                let txn_id = std::ptr::read_unaligned(ptr.add(OFF_TXN_ID) as *const u32);
+                let record_type_byte = *ptr.add(OFF_RECORD_TYPE);
+                let flags = *ptr.add(OFF_FLAGS);
+                let payload_len =
+                    std::ptr::read_unaligned(ptr.add(OFF_PAYLOAD_LEN) as *const u16) as usize;
+                (
+                    u64::from_le(lsn_raw),
+                    u64::from_le(prev_lsn_raw),
+                    u32::from_le(txn_id),
+                    record_type_byte,
+                    flags,
+                    payload_len,
+                )
+            };
 
-            let record_size = Self::HEADER_SIZE + payload_len + Self::CHECKSUM_SIZE;
+            let record_size = HEADER_SIZE + payload_len + CHECKSUM_SIZE;
             if offset + record_size > data_len {
-                break; // Partial record at end
+                break;
             }
 
             // Verify checksum over header + payload
-            let checksum_offset = offset + Self::HEADER_SIZE + payload_len;
-            let stored_checksum = u32::from_le_bytes([
-                data[checksum_offset],
-                data[checksum_offset + 1],
-                data[checksum_offset + 2],
-                data[checksum_offset + 3],
-            ]);
-            let computed_checksum = crc32fast::hash(&data[offset..checksum_offset]);
+            let checksum_offset = offset + HEADER_SIZE + payload_len;
+            // SAFETY: bounds check above ensures checksum_offset + 4 <= data_len
+            let stored_checksum = unsafe {
+                let ptr = base_ptr.add(checksum_offset);
+                u32::from_le(std::ptr::read_unaligned(ptr as *const u32))
+            };
+            // SAFETY: bounds check ensures valid slice
+            let computed_checksum = unsafe {
+                crc32fast::hash(std::slice::from_raw_parts(
+                    base_ptr.add(offset),
+                    checksum_offset - offset,
+                ))
+            };
             if stored_checksum != computed_checksum {
-                break; // Checksum mismatch - stop parsing
+                break;
             }
 
-            // Parse header fields
-            let lsn = Lsn(u64::from_le_bytes([
-                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
-                data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7]
-            ]));
-            let prev_lsn = Lsn(u64::from_le_bytes([
-                data[offset + 8], data[offset + 9], data[offset + 10], data[offset + 11],
-                data[offset + 12], data[offset + 13], data[offset + 14], data[offset + 15]
-            ]));
-            let txn_id = u32::from_le_bytes([
-                data[offset + 16], data[offset + 17], data[offset + 18], data[offset + 19]
-            ]);
-            let record_type = match LogRecordType::try_from(data[offset + 20]) {
+            let record_type = match LogRecordType::try_from(record_type_byte) {
                 Ok(rt) => rt,
                 Err(_) => break,
             };
-            let flags = data[offset + 21];
 
             // Zero-copy slice for payload (shares underlying buffer via Arc)
-            let payload_start = offset + Self::HEADER_SIZE;
+            let payload_start = offset + HEADER_SIZE;
             let payload = data.slice(payload_start..payload_start + payload_len);
 
             records.push(Self {
-                lsn,
-                prev_lsn,
+                lsn: Lsn(lsn_raw),
+                prev_lsn: Lsn(prev_lsn_raw),
                 txn_id,
                 record_type,
                 flags,
