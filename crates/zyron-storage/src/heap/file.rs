@@ -5,8 +5,9 @@
 
 use crate::disk::DiskManager;
 use crate::freespace::{ENTRIES_PER_FSM_PAGE, FreeSpaceMap, FsmPage, space_to_category};
+use crate::heap::constants::{DATA_START, HEAP_HEADER_OFFSET, TUPLE_HEADER_SIZE, TUPLE_SLOT_SIZE};
 use crate::heap::page::{HeapPage, SlotId};
-use crate::tuple::{Tuple, TupleId};
+use crate::tuple::{Tuple, TupleHeader, TupleId, TupleView};
 use std::sync::Arc;
 use zyron_buffer::BufferPool;
 use zyron_common::page::{PAGE_SIZE, PageId};
@@ -380,97 +381,25 @@ impl HeapFile {
         Ok(())
     }
 
-    /// Scans all tuples in the heap file using parallel threads.
+    /// Zero-copy scan of all tuples in the heap file.
     ///
-    /// Returns a vector of all (TupleId, Tuple) pairs.
-    pub async fn scan(&self) -> Result<Vec<(TupleId, Tuple)>> {
+    /// Returns a guard that holds pinned pages. Use `.iter()` to iterate
+    /// over tuples as borrowed `TupleView` references. Pages are automatically
+    /// unpinned when the guard is dropped.
+    pub fn scan(&self) -> Result<ScanGuard<'_>> {
         let num_pages = self.heap_page_count();
-        if num_pages == 0 {
-            return Ok(Vec::new());
-        }
-
-        let num_tasks = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .min(num_pages as usize);
-
-        let pages_per_task = (num_pages as usize + num_tasks - 1) / num_tasks;
         let file_id = self.config.heap_file_id;
 
-        let mut handles = Vec::with_capacity(num_tasks);
+        let page_ids: Vec<PageId> = (0..num_pages)
+            .map(|n| PageId::new(file_id, n))
+            .collect();
 
-        for task_id in 0..num_tasks {
-            let start_page = task_id * pages_per_task;
-            let end_page = ((task_id + 1) * pages_per_task).min(num_pages as usize);
+        self.pool.batch_pin(&page_ids);
 
-            if start_page >= num_pages as usize {
-                break;
-            }
-
-            let pool = Arc::clone(&self.pool);
-            handles.push(tokio::task::spawn_blocking(move || {
-                use crate::heap::constants::{DATA_START, HEAP_HEADER_OFFSET, TUPLE_HEADER_SIZE, TUPLE_SLOT_SIZE};
-
-                // Pre-allocate for worst case ~200 tuples per 16KB page
-                let mut local_results = Vec::with_capacity((end_page - start_page) * 200);
-
-                for page_num in start_page..end_page {
-                    let page_id = PageId::new(file_id, page_num as u32);
-
-                    if let Some(guard) = pool.read_page(page_id) {
-                        let data = guard.data();
-                        let data = &**data;
-
-                        // Parse heap header once
-                        let slot_count = u16::from_le_bytes(
-                            [data[HEAP_HEADER_OFFSET], data[HEAP_HEADER_OFFSET + 1]],
-                        ) as usize;
-
-                        // Process all slots with inlined parsing
-                        for i in 0..slot_count {
-                            let slot_base = DATA_START + i * TUPLE_SLOT_SIZE;
-                            let tuple_offset = u16::from_le_bytes(
-                                [data[slot_base], data[slot_base + 1]],
-                            ) as usize;
-                            let tuple_length = u16::from_le_bytes(
-                                [data[slot_base + 2], data[slot_base + 3]],
-                            ) as usize;
-
-                            if tuple_length == 0 {
-                                continue; // Deleted slot
-                            }
-
-                            // Parse tuple header inline
-                            let header = crate::tuple::TupleHeader::from_bytes(
-                                &data[tuple_offset..tuple_offset + TUPLE_HEADER_SIZE],
-                            );
-                            let data_len = header.data_len as usize;
-                            let data_start = tuple_offset + TUPLE_HEADER_SIZE;
-
-                            // Copy tuple data directly
-                            let tuple_data = data[data_start..data_start + data_len].to_vec();
-                            let tuple = Tuple::with_header(header, tuple_data);
-
-                            local_results.push((TupleId::new(page_id, i as u16), tuple));
-                        }
-                    }
-                }
-
-                local_results
-            }));
-        }
-
-        // Await all tasks and merge results
-        // Pre-allocate for worst case ~200 tuples per 16KB page
-        let mut results = Vec::with_capacity(num_pages as usize * 200);
-        for handle in handles {
-            let mut local = handle
-                .await
-                .map_err(|e| ZyronError::Internal(format!("Scan task join error: {}", e)))?;
-            results.append(&mut local);
-        }
-
-        Ok(results)
+        Ok(ScanGuard {
+            pool: &self.pool,
+            page_ids,
+        })
     }
 
     /// Returns the number of pages in the heap file.
@@ -743,6 +672,100 @@ impl HeapFile {
     }
 }
 
+/// Guard that holds pinned pages during zero-copy scan iteration.
+///
+/// Pages remain pinned for the lifetime of this guard, allowing safe
+/// borrowing of tuple data directly from page buffers.
+pub struct ScanGuard<'a> {
+    pool: &'a BufferPool,
+    page_ids: Vec<PageId>,
+}
+
+impl<'a> ScanGuard<'a> {
+    /// Returns a zero-copy iterator over all tuples.
+    ///
+    /// Each tuple is returned as a `TupleView` borrowing directly from
+    /// the pinned page buffers. No allocations or copies occur.
+    pub fn iter(&self) -> impl Iterator<Item = (TupleId, TupleView<'_>)> + '_ {
+        self.page_ids.iter().flat_map(move |&page_id| {
+            PageTupleIter::new(self.pool, page_id)
+        })
+    }
+}
+
+impl Drop for ScanGuard<'_> {
+    fn drop(&mut self) {
+        self.pool.batch_unpin(&self.page_ids);
+    }
+}
+
+/// Iterator over tuples in a single page.
+struct PageTupleIter<'a> {
+    data: &'a [u8; PAGE_SIZE],
+    page_id: PageId,
+    slot_idx: usize,
+    slot_count: usize,
+}
+
+impl<'a> PageTupleIter<'a> {
+    fn new(pool: &'a BufferPool, page_id: PageId) -> Self {
+        let ptr = unsafe { pool.frame_data_ptr(page_id) };
+        match ptr {
+            Some(p) => {
+                let data = unsafe { &*p };
+                let slot_count = u16::from_le_bytes(
+                    [data[HEAP_HEADER_OFFSET], data[HEAP_HEADER_OFFSET + 1]]
+                ) as usize;
+                Self { data, page_id, slot_idx: 0, slot_count }
+            }
+            None => {
+                // Empty page - use static empty array
+                static EMPTY_PAGE: [u8; PAGE_SIZE] = [0u8; PAGE_SIZE];
+                Self {
+                    data: &EMPTY_PAGE,
+                    page_id,
+                    slot_idx: 0,
+                    slot_count: 0,
+                }
+            }
+        }
+    }
+}
+
+impl<'a> Iterator for PageTupleIter<'a> {
+    type Item = (TupleId, TupleView<'a>);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.slot_idx < self.slot_count {
+            let i = self.slot_idx;
+            self.slot_idx += 1;
+
+            let slot_base = DATA_START + i * TUPLE_SLOT_SIZE;
+            let tuple_offset = u16::from_le_bytes(
+                [self.data[slot_base], self.data[slot_base + 1]]
+            ) as usize;
+            let tuple_length = u16::from_le_bytes(
+                [self.data[slot_base + 2], self.data[slot_base + 3]]
+            ) as usize;
+
+            if tuple_length == 0 { continue; }
+
+            let header = TupleHeader::from_bytes(
+                &self.data[tuple_offset..tuple_offset + TUPLE_HEADER_SIZE]
+            );
+            let data_start = tuple_offset + TUPLE_HEADER_SIZE;
+            let data_end = data_start + header.data_len as usize;
+
+            return Some((
+                TupleId::new(self.page_id, i as u16),
+                TupleView::new(header, &self.data[data_start..data_end])
+            ));
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -889,11 +912,12 @@ mod tests {
             heap.insert_batch(&[tuple]).await.unwrap().remove(0);
         }
 
-        let tuples = heap.scan().await.unwrap();
+        let guard = heap.scan().unwrap();
+        let tuples: Vec<_> = guard.iter().collect();
         assert_eq!(tuples.len(), 10);
 
         for (i, (_, tuple)) in tuples.iter().enumerate() {
-            assert_eq!(tuple.header().xmin, i as u32);
+            assert_eq!(tuple.header.xmin, i as u32);
         }
     }
 
@@ -913,7 +937,8 @@ mod tests {
             heap.delete(ids[i]).await.unwrap();
         }
 
-        let tuples = heap.scan().await.unwrap();
+        let guard = heap.scan().unwrap();
+        let tuples: Vec<_> = guard.iter().collect();
         assert_eq!(tuples.len(), 5);
     }
 
@@ -931,7 +956,8 @@ mod tests {
 
         assert!(heap.num_pages().await.unwrap() > 1);
 
-        let tuples = heap.scan().await.unwrap();
+        let guard = heap.scan().unwrap();
+        let tuples: Vec<_> = guard.iter().collect();
         assert_eq!(tuples.len(), 20);
     }
 

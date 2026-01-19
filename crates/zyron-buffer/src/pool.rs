@@ -329,6 +329,47 @@ impl BufferPool {
         })
     }
 
+    /// Returns raw pointer to frame data for a pinned page without acquiring RwLock.
+    ///
+    /// # Safety
+    /// Caller must ensure:
+    /// - Page is pinned before calling and stays pinned during use
+    /// - No concurrent writers exist
+    /// - Pointer is not dereferenced after unpin
+    #[inline(always)]
+    pub unsafe fn frame_data_ptr(&self, page_id: PageId) -> Option<*const [u8; PAGE_SIZE]> {
+        let frame_id = self.page_table.get(page_id)?;
+        let frame = &self.frames[frame_id.0 as usize];
+        Some(unsafe { frame.data_ptr() })
+    }
+
+    /// Pins multiple pages at once for batch read operations.
+    ///
+    /// Returns the number of pages successfully pinned.
+    /// Use with `batch_unpin` after processing.
+    #[inline]
+    pub fn batch_pin(&self, page_ids: &[PageId]) -> usize {
+        let mut pinned = 0;
+        for &pid in page_ids {
+            if let Some(frame_id) = self.page_table.get(pid) {
+                self.frames[frame_id.0 as usize].pin();
+                self.replacer.record_access(frame_id);
+                pinned += 1;
+            }
+        }
+        pinned
+    }
+
+    /// Unpins multiple pages at once after batch read operations.
+    #[inline]
+    pub fn batch_unpin(&self, page_ids: &[PageId]) {
+        for &pid in page_ids {
+            if let Some(frame_id) = self.page_table.get(pid) {
+                self.frames[frame_id.0 as usize].unpin();
+            }
+        }
+    }
+
     /// Returns a write guard for page data.
     pub fn write_page(&self, page_id: PageId) -> Option<PageWriteGuard<'_>> {
         let frame = self.fetch_page(page_id)?;

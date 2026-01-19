@@ -542,7 +542,8 @@ async fn test_heap_file_100k_tuples() {
 
         // Scan phase
         let scan_start = Instant::now();
-        let scanned = heap.scan().await.unwrap();
+        let guard = heap.scan().unwrap();
+        let scanned: Vec<_> = guard.iter().collect();
         let scan_duration = scan_start.elapsed();
 
         assert_eq!(
@@ -629,7 +630,8 @@ async fn test_heap_file_delete_and_scan() {
         deleted_ids.insert(tuple_ids[i]);
     }
 
-    let scanned = heap.scan().await.unwrap();
+    let guard = heap.scan().unwrap();
+    let scanned: Vec<_> = guard.iter().collect();
     assert_eq!(
         scanned.len(),
         TUPLE_COUNT - DELETE_COUNT,

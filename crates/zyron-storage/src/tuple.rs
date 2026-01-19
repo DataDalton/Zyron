@@ -256,6 +256,50 @@ impl Tuple {
     }
 }
 
+/// Zero-copy view into tuple data stored in a page buffer.
+///
+/// Holds a borrowed reference to tuple data, avoiding heap allocation.
+/// The lifetime is tied to the page buffer that holds the data.
+#[derive(Debug, Clone, Copy)]
+pub struct TupleView<'a> {
+    /// Tuple header (copied, 12 bytes).
+    pub header: TupleHeader,
+    /// Reference to tuple data in the page buffer.
+    pub data: &'a [u8],
+}
+
+impl<'a> TupleView<'a> {
+    /// Creates a new tuple view.
+    #[inline]
+    pub fn new(header: TupleHeader, data: &'a [u8]) -> Self {
+        Self { header, data }
+    }
+
+    /// Converts this view to an owned Tuple by copying the data.
+    #[inline]
+    pub fn to_owned(&self) -> Tuple {
+        Tuple::with_header(self.header, self.data.to_vec())
+    }
+
+    /// Returns the tuple data length.
+    #[inline]
+    pub fn data_len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Returns total size on disk (header + data).
+    #[inline]
+    pub fn size_on_disk(&self) -> usize {
+        TupleHeader::SIZE + self.data.len()
+    }
+
+    /// Returns true if this tuple is marked as deleted.
+    #[inline]
+    pub fn is_deleted(&self) -> bool {
+        self.header.flags.is_deleted()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

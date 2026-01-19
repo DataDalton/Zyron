@@ -201,6 +201,21 @@ impl BufferFrame {
         dst[..len].copy_from_slice(&data[..len]);
     }
 
+    /// Returns raw pointer to data buffer without acquiring lock.
+    ///
+    /// # Safety
+    /// Caller must ensure:
+    /// - Page is pinned before calling and stays pinned during use
+    /// - No concurrent writers modify the data
+    /// - Pointer is not dereferenced after unpin
+    #[inline(always)]
+    pub unsafe fn data_ptr(&self) -> *const [u8; PAGE_SIZE] {
+        // data_ptr() returns *mut Box<[u8; PAGE_SIZE]>
+        // Dereference twice: first to get the Box, then to get the inner array
+        let box_ptr = self.data.data_ptr();
+        unsafe { &**box_ptr as *const [u8; PAGE_SIZE] }
+    }
+
     /// Resets the frame to empty state.
     #[inline]
     pub fn reset(&self) {
