@@ -123,6 +123,35 @@ impl TupleHeader {
             xmax: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
         }
     }
+
+    /// Deserializes the header from bytes without bounds checks.
+    ///
+    /// # Safety
+    /// Caller must ensure buf has at least SIZE (12) bytes.
+    #[inline(always)]
+    pub unsafe fn from_bytes_unchecked(buf: &[u8]) -> Self {
+        unsafe {
+            Self {
+                flags: TupleFlags(u16::from_le_bytes([
+                    *buf.get_unchecked(0),
+                    *buf.get_unchecked(1),
+                ])),
+                data_len: u16::from_le_bytes([*buf.get_unchecked(2), *buf.get_unchecked(3)]),
+                xmin: u32::from_le_bytes([
+                    *buf.get_unchecked(4),
+                    *buf.get_unchecked(5),
+                    *buf.get_unchecked(6),
+                    *buf.get_unchecked(7),
+                ]),
+                xmax: u32::from_le_bytes([
+                    *buf.get_unchecked(8),
+                    *buf.get_unchecked(9),
+                    *buf.get_unchecked(10),
+                    *buf.get_unchecked(11),
+                ]),
+            }
+        }
+    }
 }
 
 /// Flags for tuple state.

@@ -131,11 +131,15 @@ fn validate_metric(
     );
     println!(
         "    Average: {} {} {} (target)",
-        format_with_commas(average), comparison, format_with_commas(target)
+        format_with_commas(average),
+        comparison,
+        format_with_commas(target)
     );
     println!(
         "    Min/Max: {} / {}, StdDev: {}",
-        format_with_commas(min), format_with_commas(max), format_with_commas(std_dev)
+        format_with_commas(min),
+        format_with_commas(max),
+        format_with_commas(std_dev)
     );
 
     ValidationResult {
@@ -155,7 +159,11 @@ fn check_performance(name: &str, actual: f64, target: f64, higher_is_better: boo
     let comparison = if higher_is_better { ">=" } else { "<=" };
     println!(
         "  {} [{}]: {} {} {} (target)",
-        name, status, format_with_commas(actual), comparison, format_with_commas(target)
+        name,
+        status,
+        format_with_commas(actual),
+        comparison,
+        format_with_commas(target)
     );
     passed
 }
@@ -244,11 +252,13 @@ async fn test_wal_write_replay_10k_records() {
 
         println!(
             "  Write: {} ops/sec ({:?})",
-            format_with_commas(write_ops_sec), write_duration
+            format_with_commas(write_ops_sec),
+            write_duration
         );
         println!(
             "  Replay: {} ops/sec ({:?})",
-            format_with_commas(replay_ops_sec), replay_duration
+            format_with_commas(replay_ops_sec),
+            replay_duration
         );
 
         write_results.push(write_ops_sec);
@@ -540,14 +550,18 @@ async fn test_heap_file_100k_tuples() {
         let _tuple_ids = heap.insert_batch(&tuples).await.unwrap();
         let insert_duration = insert_start.elapsed();
 
-        // Scan phase
+        // Scan phase using for_each (no allocation overhead)
         let scan_start = Instant::now();
         let guard = heap.scan().unwrap();
-        let scanned: Vec<_> = guard.iter().collect();
+        let mut scan_count = 0usize;
+        guard.for_each(|_tid, _tuple| {
+            scan_count += 1;
+            std::hint::black_box(&_tuple);
+        });
         let scan_duration = scan_start.elapsed();
 
         assert_eq!(
-            scanned.len(),
+            scan_count,
             TUPLE_COUNT,
             "Run {}: Scan should return all {} tuples",
             run + 1,
@@ -559,9 +573,14 @@ async fn test_heap_file_100k_tuples() {
 
         println!(
             "  Insert: {} ops/sec ({:?})",
-            format_with_commas(insert_ops_sec), insert_duration
+            format_with_commas(insert_ops_sec),
+            insert_duration
         );
-        println!("  Scan: {} ops/sec ({:?})", format_with_commas(scan_ops_sec), scan_duration);
+        println!(
+            "  Scan: {} ops/sec ({:?})",
+            format_with_commas(scan_ops_sec),
+            scan_duration
+        );
 
         insert_results.push(insert_ops_sec);
         scan_results.push(scan_ops_sec);
@@ -631,16 +650,19 @@ async fn test_heap_file_delete_and_scan() {
     }
 
     let guard = heap.scan().unwrap();
-    let scanned: Vec<_> = guard.iter().collect();
+    let mut scanned_ids: Vec<TupleId> = Vec::new();
+    guard.for_each(|tuple_id, _| {
+        scanned_ids.push(tuple_id);
+    });
     assert_eq!(
-        scanned.len(),
+        scanned_ids.len(),
         TUPLE_COUNT - DELETE_COUNT,
         "Scan should return {} tuples after {} deletions",
         TUPLE_COUNT - DELETE_COUNT,
         DELETE_COUNT
     );
 
-    for (tuple_id, _) in &scanned {
+    for tuple_id in &scanned_ids {
         assert!(
             !deleted_ids.contains(tuple_id),
             "Deleted tuple {} should not appear in scan",
@@ -691,7 +713,11 @@ async fn test_heap_file_space_reuse() {
     let insert_ops_sec = TUPLE_COUNT as f64 / insert_duration.as_secs_f64();
 
     let pages_after_insert = heap.num_pages().await.unwrap();
-    println!("Initial insert: {} ops/sec ({} tuples)", format_with_commas(insert_ops_sec), format_with_commas(TUPLE_COUNT as f64));
+    println!(
+        "Initial insert: {} ops/sec ({} tuples)",
+        format_with_commas(insert_ops_sec),
+        format_with_commas(TUPLE_COUNT as f64)
+    );
     println!("Pages after insert: {}", pages_after_insert);
 
     // Batch delete all tuples
@@ -700,7 +726,11 @@ async fn test_heap_file_space_reuse() {
     let delete_duration = delete_start.elapsed();
     assert_eq!(deleted_count, TUPLE_COUNT);
     let delete_ops_sec = TUPLE_COUNT as f64 / delete_duration.as_secs_f64();
-    println!("Delete: {} ops/sec (target: {})", format_with_commas(delete_ops_sec), format_with_commas(DELETE_TARGET_OPS_SEC));
+    println!(
+        "Delete: {} ops/sec (target: {})",
+        format_with_commas(delete_ops_sec),
+        format_with_commas(DELETE_TARGET_OPS_SEC)
+    );
 
     // Reinsert batch (triggers compaction)
     let tuples2: Vec<Tuple> = (0..TUPLE_COUNT)
@@ -714,7 +744,11 @@ async fn test_heap_file_space_reuse() {
     let _new_ids = heap.insert_batch(&tuples2).await.unwrap();
     let reinsert_duration = reinsert_start.elapsed();
     let reinsert_ops_sec = TUPLE_COUNT as f64 / reinsert_duration.as_secs_f64();
-    println!("Reinsert (with compaction): {} ops/sec (target: {})", format_with_commas(reinsert_ops_sec), format_with_commas(REINSERT_TARGET_OPS_SEC));
+    println!(
+        "Reinsert (with compaction): {} ops/sec (target: {})",
+        format_with_commas(reinsert_ops_sec),
+        format_with_commas(REINSERT_TARGET_OPS_SEC)
+    );
 
     let pages_after_reinsert = heap.num_pages().await.unwrap();
 
@@ -725,18 +759,23 @@ async fn test_heap_file_space_reuse() {
         pages_after_reinsert,
         pages_after_insert
     );
-    println!("Space reuse: {} pages (was {})", pages_after_reinsert, pages_after_insert);
+    println!(
+        "Space reuse: {} pages (was {})",
+        pages_after_reinsert, pages_after_insert
+    );
 
     // Performance assertions
     assert!(
         delete_ops_sec >= DELETE_TARGET_OPS_SEC,
         "Delete throughput {:.0} below target {:.0} ops/sec",
-        delete_ops_sec, DELETE_TARGET_OPS_SEC
+        delete_ops_sec,
+        DELETE_TARGET_OPS_SEC
     );
     assert!(
         reinsert_ops_sec >= REINSERT_TARGET_OPS_SEC,
         "Reinsert throughput {:.0} below target {:.0} ops/sec",
-        reinsert_ops_sec, REINSERT_TARGET_OPS_SEC
+        reinsert_ops_sec,
+        REINSERT_TARGET_OPS_SEC
     );
 
     println!("Heap File Space Reuse: PASSED");
@@ -854,7 +893,9 @@ fn test_btree_1m_keys() {
 
         println!(
             "  Insert: {} ops/sec ({:?}), height={}",
-            format_with_commas(insert_ops_sec), insert_duration, final_height
+            format_with_commas(insert_ops_sec),
+            insert_duration,
+            final_height
         );
         println!(
             "    Breakdown: hash_table={:.1}ms, flush={:.1}ms (drain={:.1}ms, btree={:.1}ms), flushes={}",
@@ -867,7 +908,8 @@ fn test_btree_1m_keys() {
         println!("  Lookup: {:.2} ns/op ({:?})", lookup_ns, lookup_duration);
         println!(
             "  Range: {} ops/sec ({:?})",
-            format_with_commas(range_ops_sec), range_duration
+            format_with_commas(range_ops_sec),
+            range_duration
         );
 
         insert_results.push(insert_ops_sec);

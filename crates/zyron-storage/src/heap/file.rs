@@ -104,6 +104,18 @@ impl PageHintCache {
         }
     }
 
+    /// Finds a page with at least the given free space category.
+    /// Returns the page number if found in cache.
+    #[inline]
+    fn find_page(&self, min_category: u8) -> Option<u32> {
+        for i in 0..self.count {
+            let (page_num, category) = self.hints[i];
+            if page_num != u32::MAX && category >= min_category {
+                return Some(page_num);
+            }
+        }
+        None
+    }
 }
 
 /// Combined state for FSM operations (single lock for hint cache + pending updates).
@@ -390,9 +402,7 @@ impl HeapFile {
         let num_pages = self.heap_page_count();
         let file_id = self.config.heap_file_id;
 
-        let page_ids: Vec<PageId> = (0..num_pages)
-            .map(|n| PageId::new(file_id, n))
-            .collect();
+        let page_ids: Vec<PageId> = (0..num_pages).map(|n| PageId::new(file_id, n)).collect();
 
         self.pool.batch_pin(&page_ids);
 
@@ -634,6 +644,29 @@ impl HeapFile {
                     None
                 };
 
+                // Try hint cache if last_page_hint failed (fast path avoiding FSM)
+                let found_page = if found_page.is_some() {
+                    found_page
+                } else {
+                    let space_category = space_to_category(space_needed);
+                    let hint_page_num = {
+                        let state = self.fsm_state.lock();
+                        state.hint_cache.find_page(space_category)
+                    };
+                    if let Some(page_num) = hint_page_num {
+                        let page_id = PageId::new(self.config.heap_file_id, page_num);
+                        let page_data = self.fetch_page(page_id).await?;
+                        let page = HeapPage::from_bytes(page_data);
+                        if page.total_usable_space() >= space_needed {
+                            Some((page_id, page))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+
                 let (page_id, page) = if let Some((id, p)) = found_page {
                     (id, p)
                 } else if let Some((id, page)) = self.find_page_with_space(space_needed).await? {
@@ -682,87 +715,92 @@ pub struct ScanGuard<'a> {
 }
 
 impl<'a> ScanGuard<'a> {
-    /// Returns a zero-copy iterator over all tuples.
-    ///
-    /// Each tuple is returned as a `TupleView` borrowing directly from
-    /// the pinned page buffers. No allocations or copies occur.
-    pub fn iter(&self) -> impl Iterator<Item = (TupleId, TupleView<'_>)> + '_ {
-        self.page_ids.iter().flat_map(move |&page_id| {
-            PageTupleIter::new(self.pool, page_id)
-        })
+    /// Direct callback iteration over all tuples.
+    /// Uses raw pointer access and unchecked indexing for maximum throughput.
+    #[inline]
+    pub fn for_each<F>(&self, mut f: F)
+    where
+        F: FnMut(TupleId, TupleView<'_>),
+    {
+        for &page_id in &self.page_ids {
+            if let Some(p) = unsafe { self.pool.frame_data_ptr(page_id) } {
+                // Safety: page is pinned and frame_data_ptr returned valid pointer
+                let data = unsafe { &*p };
+                let slot_count =
+                    u16::from_le_bytes([data[HEAP_HEADER_OFFSET], data[HEAP_HEADER_OFFSET + 1]])
+                        as usize;
+
+                for i in 0..slot_count {
+                    // Safety: slot_base is within page bounds (slot_count from page header)
+                    let slot_base = DATA_START + i * TUPLE_SLOT_SIZE;
+                    let tuple_length = unsafe {
+                        u16::from_le_bytes([
+                            *data.get_unchecked(slot_base + 2),
+                            *data.get_unchecked(slot_base + 3),
+                        ])
+                    } as usize;
+
+                    if tuple_length == 0 {
+                        continue;
+                    }
+
+                    let tuple_offset = unsafe {
+                        u16::from_le_bytes([
+                            *data.get_unchecked(slot_base),
+                            *data.get_unchecked(slot_base + 1),
+                        ])
+                    } as usize;
+
+                    // Safety: tuple_offset validated by page format, header fits in page
+                    let header = unsafe {
+                        TupleHeader::from_bytes_unchecked(
+                            &data[tuple_offset..tuple_offset + TUPLE_HEADER_SIZE],
+                        )
+                    };
+                    let data_start = tuple_offset + TUPLE_HEADER_SIZE;
+                    let data_end = data_start + header.data_len as usize;
+
+                    f(
+                        TupleId::new(page_id, i as u16),
+                        TupleView::new(header, &data[data_start..data_end]),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Fast tuple count without constructing TupleView for each tuple.
+    #[inline]
+    pub fn count(&self) -> usize {
+        let mut total = 0;
+        for &page_id in &self.page_ids {
+            if let Some(p) = unsafe { self.pool.frame_data_ptr(page_id) } {
+                let data = unsafe { &*p };
+                let slot_count =
+                    u16::from_le_bytes([data[HEAP_HEADER_OFFSET], data[HEAP_HEADER_OFFSET + 1]])
+                        as usize;
+
+                for i in 0..slot_count {
+                    let slot_base = DATA_START + i * TUPLE_SLOT_SIZE;
+                    let tuple_length = unsafe {
+                        u16::from_le_bytes([
+                            *data.get_unchecked(slot_base + 2),
+                            *data.get_unchecked(slot_base + 3),
+                        ])
+                    } as usize;
+                    if tuple_length != 0 {
+                        total += 1;
+                    }
+                }
+            }
+        }
+        total
     }
 }
 
 impl Drop for ScanGuard<'_> {
     fn drop(&mut self) {
         self.pool.batch_unpin(&self.page_ids);
-    }
-}
-
-/// Iterator over tuples in a single page.
-struct PageTupleIter<'a> {
-    data: &'a [u8; PAGE_SIZE],
-    page_id: PageId,
-    slot_idx: usize,
-    slot_count: usize,
-}
-
-impl<'a> PageTupleIter<'a> {
-    fn new(pool: &'a BufferPool, page_id: PageId) -> Self {
-        let ptr = unsafe { pool.frame_data_ptr(page_id) };
-        match ptr {
-            Some(p) => {
-                let data = unsafe { &*p };
-                let slot_count = u16::from_le_bytes(
-                    [data[HEAP_HEADER_OFFSET], data[HEAP_HEADER_OFFSET + 1]]
-                ) as usize;
-                Self { data, page_id, slot_idx: 0, slot_count }
-            }
-            None => {
-                // Empty page - use static empty array
-                static EMPTY_PAGE: [u8; PAGE_SIZE] = [0u8; PAGE_SIZE];
-                Self {
-                    data: &EMPTY_PAGE,
-                    page_id,
-                    slot_idx: 0,
-                    slot_count: 0,
-                }
-            }
-        }
-    }
-}
-
-impl<'a> Iterator for PageTupleIter<'a> {
-    type Item = (TupleId, TupleView<'a>);
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        while self.slot_idx < self.slot_count {
-            let i = self.slot_idx;
-            self.slot_idx += 1;
-
-            let slot_base = DATA_START + i * TUPLE_SLOT_SIZE;
-            let tuple_offset = u16::from_le_bytes(
-                [self.data[slot_base], self.data[slot_base + 1]]
-            ) as usize;
-            let tuple_length = u16::from_le_bytes(
-                [self.data[slot_base + 2], self.data[slot_base + 3]]
-            ) as usize;
-
-            if tuple_length == 0 { continue; }
-
-            let header = TupleHeader::from_bytes(
-                &self.data[tuple_offset..tuple_offset + TUPLE_HEADER_SIZE]
-            );
-            let data_start = tuple_offset + TUPLE_HEADER_SIZE;
-            let data_end = data_start + header.data_len as usize;
-
-            return Some((
-                TupleId::new(self.page_id, i as u16),
-                TupleView::new(header, &self.data[data_start..data_end])
-            ));
-        }
-        None
     }
 }
 
@@ -913,11 +951,16 @@ mod tests {
         }
 
         let guard = heap.scan().unwrap();
-        let tuples: Vec<_> = guard.iter().collect();
-        assert_eq!(tuples.len(), 10);
+        let mut count = 0;
+        let mut xmins = Vec::new();
+        guard.for_each(|_, tuple| {
+            count += 1;
+            xmins.push(tuple.header.xmin);
+        });
+        assert_eq!(count, 10);
 
-        for (i, (_, tuple)) in tuples.iter().enumerate() {
-            assert_eq!(tuple.header.xmin, i as u32);
+        for (i, xmin) in xmins.iter().enumerate() {
+            assert_eq!(*xmin, i as u32);
         }
     }
 
@@ -938,8 +981,7 @@ mod tests {
         }
 
         let guard = heap.scan().unwrap();
-        let tuples: Vec<_> = guard.iter().collect();
-        assert_eq!(tuples.len(), 5);
+        assert_eq!(guard.count(), 5);
     }
 
     #[tokio::test]
@@ -957,8 +999,7 @@ mod tests {
         assert!(heap.num_pages().await.unwrap() > 1);
 
         let guard = heap.scan().unwrap();
-        let tuples: Vec<_> = guard.iter().collect();
-        assert_eq!(tuples.len(), 20);
+        assert_eq!(guard.count(), 20);
     }
 
     #[tokio::test]
