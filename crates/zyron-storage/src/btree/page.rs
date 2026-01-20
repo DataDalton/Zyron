@@ -3,7 +3,7 @@
 use bytes::Bytes;
 use crate::tuple::TupleId;
 use super::constants::MIN_FILL_FACTOR;
-use super::types::{compare_keys_fast, DeleteResult, InternalEntry, InternalPageHeader, LeafEntry, LeafPageHeader};
+use super::types::{compare_keys, DeleteResult, InternalEntry, InternalPageHeader, LeafEntry, LeafPageHeader};
 use zyron_common::page::{PageHeader, PageId, PageType, PAGE_SIZE};
 use zyron_common::{Result, ZyronError};
 
@@ -112,7 +112,7 @@ impl BTreeLeafPage {
     /// Binary search for a key. Returns Ok(index) if found, Err(index) for insertion point.
     pub fn search(&self, key: &[u8]) -> std::result::Result<usize, usize> {
         let entries = self.entries();
-        entries.binary_search_by(|e| compare_keys_fast(e.key.as_ref(), key))
+        entries.binary_search_by(|e| compare_keys(e.key.as_ref(), key))
     }
 
     /// Inserts a key-value pair into the leaf. Returns error if page is full.
@@ -197,7 +197,7 @@ impl BTreeLeafPage {
             let key_len = u16::from_le_bytes([data[entry_off], data[entry_off + 1]]) as usize;
             let entry_key = &data[entry_off + 2..entry_off + 2 + key_len];
 
-            match compare_keys_fast(key, entry_key) {
+            match compare_keys(key, entry_key) {
                 std::cmp::Ordering::Equal => {
                     let tuple_offset = entry_off + 2 + key_len;
                     // Read page_id as u64 directly
@@ -272,7 +272,7 @@ impl BTreeLeafPage {
             let key_len = u16::from_le_bytes([data[entry_off], data[entry_off + 1]]) as usize;
             let entry_key = &data[entry_off + 2..entry_off + 2 + key_len];
 
-            match compare_keys_fast(key, entry_key) {
+            match compare_keys(key, entry_key) {
                 std::cmp::Ordering::Equal => return Err(ZyronError::DuplicateKey),
                 std::cmp::Ordering::Less => high = mid,
                 std::cmp::Ordering::Greater => low = mid + 1,
@@ -610,7 +610,7 @@ impl BTreeInternalPage {
                 let key_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
                 let entry_key = &data[offset + 2..offset + 2 + key_len];
 
-                if compare_keys_fast(key, entry_key).is_lt() {
+                if compare_keys(key, entry_key).is_lt() {
                     return last_child;
                 }
 
@@ -653,7 +653,7 @@ impl BTreeInternalPage {
             let key_len = u16::from_le_bytes([data[entry_offset], data[entry_offset + 1]]) as usize;
             let entry_key = &data[entry_offset + 2..entry_offset + 2 + key_len];
 
-            if compare_keys_fast(key, entry_key).is_lt() {
+            if compare_keys(key, entry_key).is_lt() {
                 high = mid;
             } else {
                 low = mid + 1;
@@ -720,7 +720,7 @@ impl BTreeInternalPage {
             let entry_key = &data[offset + 2..offset + 2 + key_len];
             let entry_total = 2 + key_len + 8;
 
-            if compare_keys_fast(key, entry_key).is_lt() {
+            if compare_keys(key, entry_key).is_lt() {
                 insert_offset = offset;
                 break;
             }

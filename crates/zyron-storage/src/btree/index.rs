@@ -8,7 +8,7 @@ use crate::tuple::TupleId;
 use super::constants::MAX_KEY_SIZE;
 use super::page::{BTreeInternalPage, BTreeLeafPage};
 use super::store::InMemoryPageStore;
-use super::types::{compare_keys_fast, DeleteResult};
+use super::types::{compare_keys, DeleteResult};
 use zyron_buffer::BufferPool;
 use zyron_common::page::PageId;
 use zyron_common::{Result, ZyronError};
@@ -612,13 +612,13 @@ impl BTreeIndex {
 
                 for entry in leaf.entries() {
                     if let Some(start) = start_key {
-                        if compare_keys_fast(entry.key.as_ref(), start).is_lt() {
+                        if compare_keys(entry.key.as_ref(), start).is_lt() {
                             continue;
                         }
                     }
 
                     if let Some(end) = end_key {
-                        if compare_keys_fast(entry.key.as_ref(), end).is_gt() {
+                        if compare_keys(entry.key.as_ref(), end).is_gt() {
                             return results;
                         }
                     }

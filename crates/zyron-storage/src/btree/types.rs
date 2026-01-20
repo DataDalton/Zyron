@@ -4,10 +4,10 @@ use crate::tuple::TupleId;
 use bytes::{Bytes, BytesMut};
 use zyron_common::page::{PAGE_SIZE, PageHeader, PageId};
 
-/// Fast key comparison using u64 prefix for 8+ byte keys.
+/// Key comparison using u64 prefix for 8+ byte keys.
 /// Falls back to slice comparison for shorter keys or when prefix matches.
 #[inline(always)]
-pub fn compare_keys_fast(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+pub fn compare_keys(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     // For 8+ byte keys, compare first 8 bytes as u64 (big-endian for sort order)
     if a.len() >= 8 && b.len() >= 8 {
         let a_prefix = u64::from_be_bytes([a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]]);

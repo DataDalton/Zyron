@@ -27,7 +27,6 @@ pub use freespace::{
     space_to_category,
 };
 pub use heap::{
-    BufferedHeapWriter, HeapFile, HeapFileConfig, HeapPage, HeapPageHeader, HeapPageIterator,
-    SlotId, TupleSlot, WriteBufferStats,
+    HeapFile, HeapFileConfig, HeapPage, HeapPageHeader, HeapPageIterator, SlotId, TupleSlot,
 };
 pub use tuple::{Tuple, TupleFlags, TupleHeader, TupleId};
