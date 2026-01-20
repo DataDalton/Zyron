@@ -5,7 +5,7 @@ use crate::page_table::PageTable;
 use crate::replacer::{ClockReplacer, Replacer};
 use parking_lot::Mutex;
 use sysinfo::System;
-use zyron_common::page::{PageId, PAGE_SIZE};
+use zyron_common::page::{PAGE_SIZE, PageId};
 use zyron_common::{Result, ZyronError};
 
 /// Information about a dirty page that was evicted from the buffer pool.
@@ -138,9 +138,9 @@ impl BufferPool {
         }
 
         // Try to evict - check pin_count directly for each candidate frame
-        let victim_id = self.replacer.evict(|fid| {
-            self.frames[fid.0 as usize].pin_count() == 0
-        });
+        let victim_id = self
+            .replacer
+            .evict(|fid| self.frames[fid.0 as usize].pin_count() == 0);
 
         if let Some(victim_id) = victim_id {
             let frame = &self.frames[victim_id.0 as usize];
@@ -211,7 +211,11 @@ impl BufferPool {
     /// This is used when reading a page from disk.
     /// Returns the frame and any evicted dirty page that must be flushed.
     #[inline]
-    pub fn load_page(&self, page_id: PageId, data: &[u8]) -> Result<(&BufferFrame, Option<EvictedPage>)> {
+    pub fn load_page(
+        &self,
+        page_id: PageId,
+        data: &[u8],
+    ) -> Result<(&BufferFrame, Option<EvictedPage>)> {
         let (frame, evicted) = self.new_page(page_id)?;
         frame.copy_from(data);
         Ok((frame, evicted))
@@ -343,6 +347,19 @@ impl BufferPool {
         Some(unsafe { frame.data_ptr() })
     }
 
+    /// Returns mutable raw pointer to frame data for a pinned page.
+    ///
+    /// # Safety
+    /// - Page must be pinned before calling and stay pinned during use
+    /// - Caller must ensure exclusive write access (no concurrent readers/writers)
+    /// - Pointer must not be dereferenced after unpin
+    #[inline(always)]
+    pub unsafe fn frame_data_ptr_mut(&self, page_id: PageId) -> Option<*mut [u8; PAGE_SIZE]> {
+        let frame_id = self.page_table.get(page_id)?;
+        let frame = &self.frames[frame_id.0 as usize];
+        Some(unsafe { frame.data_ptr_mut() })
+    }
+
     /// Pins multiple pages at once for batch read operations.
     ///
     /// Returns the number of pages successfully pinned.
@@ -368,6 +385,36 @@ impl BufferPool {
                 self.frames[frame_id.0 as usize].unpin();
             }
         }
+    }
+
+    /// Unpins multiple pages and marks them dirty for batch write operations.
+    #[inline]
+    pub fn batch_unpin_dirty(&self, page_ids: &[PageId]) {
+        for &pid in page_ids {
+            self.unpin_page(pid, true);
+        }
+    }
+
+    /// Allocates frames for multiple new pages in batch.
+    ///
+    /// Returns frames and any evicted dirty pages that need flushing.
+    /// Single pass through allocation - reduces lock contention.
+    pub fn batch_new_pages(
+        &self,
+        page_ids: &[PageId],
+    ) -> Result<(Vec<&BufferFrame>, Vec<EvictedPage>)> {
+        let mut frames = Vec::with_capacity(page_ids.len());
+        let mut evicted = Vec::new();
+
+        for &page_id in page_ids {
+            let (frame, ev) = self.new_page(page_id)?;
+            frames.push(frame);
+            if let Some(e) = ev {
+                evicted.push(e);
+            }
+        }
+
+        Ok((frames, evicted))
     }
 
     /// Returns a write guard for page data.

@@ -509,13 +509,13 @@ async fn test_buffer_pool_cache_hit_rate() {
 // Test 3: Heap File Test (5-run validation)
 // =============================================================================
 
-/// Inserts 100,000 tuples with varying sizes.
-/// Target: 2M inserts/sec, 20M scan/sec
+/// Inserts 100,000 tuples with varying sizes using BufferedHeapWriter.
+/// Target: 10M inserts/sec, 100M scan/sec
 #[tokio::test]
 async fn test_heap_file_100k_tuples() {
     const TUPLE_COUNT: usize = 100_000;
 
-    println!("\n=== Heap File Performance Test ===");
+    println!("\n=== Heap File Performance Test (BufferedHeapWriter) ===");
     println!("Tuples per run: {}", TUPLE_COUNT);
     println!("Validation runs: {}", VALIDATION_RUNS);
 
@@ -536,7 +536,7 @@ async fn test_heap_file_100k_tuples() {
 
         let mut rng = rand::rng();
 
-        // Build all tuples first for batch insert
+        // Build all tuples first
         let tuples: Vec<Tuple> = (0..TUPLE_COUNT)
             .map(|i| {
                 let size = rng.random_range(10..=500);
@@ -545,9 +545,9 @@ async fn test_heap_file_100k_tuples() {
             })
             .collect();
 
-        // Batch insert for better performance
+        // Batch insert using fast bulk load method
         let insert_start = Instant::now();
-        let _tuple_ids = heap.insert_batch(&tuples).await.unwrap();
+        let _tuple_ids = heap.insert_batch_fast(&tuples).await.unwrap();
         let insert_duration = insert_start.elapsed();
 
         // Scan phase using for_each (no allocation overhead)

@@ -2,7 +2,7 @@
 
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use zyron_common::page::{PageId, PAGE_SIZE};
+use zyron_common::page::{PAGE_SIZE, PageId};
 
 /// Sentinel value indicating no page is loaded in the frame.
 const NO_PAGE: u64 = u64::MAX;
@@ -214,6 +214,19 @@ impl BufferFrame {
         // Dereference twice: first to get the Box, then to get the inner array
         let box_ptr = self.data.data_ptr();
         unsafe { &**box_ptr as *const [u8; PAGE_SIZE] }
+    }
+
+    /// Returns mutable raw pointer to data buffer without acquiring lock.
+    ///
+    /// # Safety
+    /// Caller must ensure:
+    /// - Page is pinned before calling and stays pinned during use
+    /// - Caller has exclusive write access (no concurrent readers or writers)
+    /// - Pointer is not dereferenced after unpin
+    #[inline(always)]
+    pub unsafe fn data_ptr_mut(&self) -> *mut [u8; PAGE_SIZE] {
+        let box_ptr = self.data.data_ptr();
+        unsafe { &mut **box_ptr as *mut [u8; PAGE_SIZE] }
     }
 
     /// Resets the frame to empty state.

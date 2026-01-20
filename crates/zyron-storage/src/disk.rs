@@ -163,6 +163,32 @@ impl DiskManager {
         Ok(page_id)
     }
 
+    /// Allocates multiple pages in a single operation.
+    ///
+    /// Single lock acquisition for all pages - eliminates sequential await overhead.
+    /// Lazy allocation - only reserves page numbers.
+    pub async fn allocate_pages_batch(&self, file_id: u32, count: u32) -> Result<Vec<PageId>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+
+        self.open_file(file_id).await?;
+
+        let mut files = self.files.lock().await;
+        let handle = files
+            .get_mut(&file_id)
+            .ok_or_else(|| ZyronError::IoError(format!("file {} not open", file_id)))?;
+
+        let mut pages = Vec::with_capacity(count as usize);
+        let start_page = handle.num_pages;
+        for i in 0..count {
+            pages.push(PageId::new(file_id, start_page + i));
+        }
+        handle.num_pages = start_page + count;
+
+        Ok(pages)
+    }
+
     /// Returns the number of pages in a file.
     pub async fn num_pages(&self, file_id: u32) -> Result<u32> {
         self.open_file(file_id).await?;

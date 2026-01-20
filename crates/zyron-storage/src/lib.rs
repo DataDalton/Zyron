@@ -23,10 +23,11 @@ pub use btree::{
 };
 pub use disk::{DiskManager, DiskManagerConfig};
 pub use freespace::{
-    category_to_min_space, space_to_category, FreeSpaceMap, FsmHeader, FsmPage,
-    ENTRIES_PER_FSM_PAGE,
+    ENTRIES_PER_FSM_PAGE, FreeSpaceMap, FsmHeader, FsmPage, category_to_min_space,
+    space_to_category,
 };
 pub use heap::{
-    HeapFile, HeapFileConfig, HeapPage, HeapPageHeader, HeapPageIterator, SlotId, TupleSlot,
+    BufferedHeapWriter, HeapFile, HeapFileConfig, HeapPage, HeapPageHeader, HeapPageIterator,
+    SlotId, TupleSlot, WriteBufferStats,
 };
 pub use tuple::{Tuple, TupleFlags, TupleHeader, TupleId};

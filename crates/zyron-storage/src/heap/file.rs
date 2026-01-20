@@ -7,6 +7,7 @@ use crate::disk::DiskManager;
 use crate::freespace::{ENTRIES_PER_FSM_PAGE, FreeSpaceMap, FsmPage, space_to_category};
 use crate::heap::constants::{DATA_START, HEAP_HEADER_OFFSET, TUPLE_HEADER_SIZE, TUPLE_SLOT_SIZE};
 use crate::heap::page::{HeapPage, SlotId};
+use crate::heap::writer::BufferedHeapWriter;
 use crate::tuple::{Tuple, TupleHeader, TupleId, TupleView};
 use std::sync::Arc;
 use zyron_buffer::BufferPool;
@@ -231,6 +232,40 @@ impl HeapFile {
     #[inline]
     pub fn fsm_file_id(&self) -> u32 {
         self.config.fsm_file_id
+    }
+
+    /// Returns a reference to the buffer pool.
+    #[inline]
+    pub(crate) fn pool(&self) -> &Arc<BufferPool> {
+        &self.pool
+    }
+
+    /// Returns a reference to the disk manager.
+    #[inline]
+    pub(crate) fn disk(&self) -> &Arc<DiskManager> {
+        &self.disk
+    }
+
+    /// Increments heap page count and returns the new count.
+    #[inline]
+    pub(crate) fn increment_heap_page_count(&self) {
+        self.increment_heap_pages();
+    }
+
+    /// Creates a buffered writer for high-throughput inserts.
+    ///
+    /// The writer stages tuples in memory and flushes them in batches
+    /// using zero-copy parallel writes for maximum performance.
+    pub fn buffered_writer(self: &Arc<Self>) -> BufferedHeapWriter {
+        BufferedHeapWriter::new(Arc::clone(self))
+    }
+
+    /// Creates a buffered writer with specified buffer capacity.
+    pub fn buffered_writer_with_capacity(
+        self: &Arc<Self>,
+        capacity_bytes: usize,
+    ) -> BufferedHeapWriter {
+        BufferedHeapWriter::with_capacity(Arc::clone(self), capacity_bytes)
     }
 
     /// Fetches a page from the buffer pool, loading from disk if needed.
@@ -513,7 +548,7 @@ impl HeapFile {
 
     /// Queues an FSM update for later batch processing.
     #[inline]
-    fn defer_fsm_update(&self, heap_page_num: u32, free_space: usize) {
+    pub(crate) fn defer_fsm_update(&self, heap_page_num: u32, free_space: usize) {
         let category = space_to_category(free_space);
         let mut state = self.fsm_state.lock();
 
@@ -696,6 +731,76 @@ impl HeapFile {
         if let (Some(page_id), Some(page)) = (current_page_id, &current_page) {
             self.write_page(page_id, page.as_bytes()).await?;
             self.defer_fsm_update(page_id.page_num, page.total_usable_space());
+        }
+
+        // Batch flush all FSM updates
+        self.flush_fsm_updates().await?;
+
+        Ok(results)
+    }
+
+    /// Fast batch insert for bulk loading.
+    ///
+    /// Optimized for inserting large numbers of tuples into an empty or sparse heap.
+    /// Uses batch page allocation to minimize async overhead.
+    pub async fn insert_batch_fast(&self, tuples: &[Tuple]) -> Result<Vec<TupleId>> {
+        use crate::heap::page::TupleSlot;
+
+        if tuples.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Estimate pages needed (overestimate by 10% to handle fragmentation)
+        let total_bytes: usize = tuples
+            .iter()
+            .map(|t| t.size_on_disk() + TupleSlot::SIZE)
+            .sum();
+        let usable_per_page = PAGE_SIZE - HeapPage::DATA_START;
+        let base_estimate = (total_bytes / usable_per_page) + 1;
+        let pages_estimate = base_estimate + base_estimate / 10 + 5;
+
+        // Pre-allocate pages in batch (single async call)
+        let allocated_pages = self
+            .disk
+            .allocate_pages_batch(self.config.heap_file_id, pages_estimate as u32)
+            .await?;
+
+        // Track which pages have been used and flushed
+        let mut current_page_idx = 0;
+        let mut current_page = HeapPage::new(allocated_pages[0]);
+        let mut results = Vec::with_capacity(tuples.len());
+        let mut pages_used = 0;
+
+        for tuple in tuples {
+            let space_needed = tuple.size_on_disk() + TupleSlot::SIZE;
+
+            // Move to next page if current doesn't have space
+            if current_page.free_space() < space_needed {
+                // Flush current page
+                let page_id = allocated_pages[current_page_idx];
+                self.write_page(page_id, current_page.as_bytes()).await?;
+                self.defer_fsm_update(page_id.page_num, current_page.free_space());
+                pages_used += 1;
+
+                // Move to next page
+                current_page_idx += 1;
+                current_page = HeapPage::new(allocated_pages[current_page_idx]);
+            }
+
+            // Insert tuple
+            let slot_id = current_page.insert_tuple(tuple)?;
+            results.push(TupleId::new(allocated_pages[current_page_idx], slot_id.0));
+        }
+
+        // Flush final page
+        let page_id = allocated_pages[current_page_idx];
+        self.write_page(page_id, current_page.as_bytes()).await?;
+        self.defer_fsm_update(page_id.page_num, current_page.free_space());
+        pages_used += 1;
+
+        // Update heap page count
+        for _ in 0..pages_used {
+            self.increment_heap_pages();
         }
 
         // Batch flush all FSM updates

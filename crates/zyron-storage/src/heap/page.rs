@@ -18,7 +18,7 @@
 
 use super::constants::{DATA_START, HEAP_HEADER_OFFSET, HEAP_HEADER_SIZE, TUPLE_SLOT_SIZE};
 use crate::tuple::Tuple;
-use zyron_common::page::{PageHeader, PageId, PageType, PAGE_SIZE};
+use zyron_common::page::{PAGE_SIZE, PageHeader, PageId, PageType};
 use zyron_common::{Result, ZyronError};
 
 /// Slot identifier within a page.
@@ -222,7 +222,9 @@ impl HeapPage {
             return None;
         }
         let offset = Self::DATA_START + (slot_id.0 as usize) * TupleSlot::SIZE;
-        Some(TupleSlot::from_bytes(&data[offset..offset + TupleSlot::SIZE]))
+        Some(TupleSlot::from_bytes(
+            &data[offset..offset + TupleSlot::SIZE],
+        ))
     }
 
     /// Writes a slot to a slice.
@@ -322,9 +324,80 @@ impl HeapPage {
         Ok((slot_id, free_space))
     }
 
+    /// Inserts pre-serialized tuple bytes directly into a page slice.
+    ///
+    /// This avoids the serialization step for higher throughput.
+    /// Returns (slot_id, free_space_after) on success.
+    #[inline]
+    pub fn insert_tuple_bytes_in_slice(
+        data: &mut [u8],
+        tuple_bytes: &[u8],
+    ) -> Result<(SlotId, usize)> {
+        let tuple_size = tuple_bytes.len();
+
+        let mut header = Self::heap_header_from_slice(data);
+
+        // Check for a deleted slot we can reuse
+        let mut reuse_slot: Option<SlotId> = None;
+        for i in 0..header.slot_count {
+            if let Some(slot) = Self::get_slot_from_slice(data, SlotId(i), header.slot_count) {
+                if slot.is_empty() {
+                    reuse_slot = Some(SlotId(i));
+                    break;
+                }
+            }
+        }
+
+        // Calculate required space
+        let need_new_slot = reuse_slot.is_none();
+        let space_needed = if need_new_slot {
+            tuple_size + TupleSlot::SIZE
+        } else {
+            tuple_size
+        };
+
+        if header.free_space() < space_needed {
+            return Err(ZyronError::PageFull);
+        }
+
+        // Allocate tuple space (grows upward from end)
+        header.free_space_end -= tuple_size as u16;
+        let tuple_offset = header.free_space_end;
+
+        // Write tuple data directly (no serialization needed)
+        data[tuple_offset as usize..tuple_offset as usize + tuple_size]
+            .copy_from_slice(tuple_bytes);
+
+        // Get or create slot
+        let slot_id = if let Some(sid) = reuse_slot {
+            sid
+        } else {
+            let sid = SlotId(header.slot_count);
+            header.slot_count += 1;
+            header.free_space_start += TupleSlot::SIZE as u16;
+            sid
+        };
+
+        // Write slot
+        let slot = TupleSlot::new(tuple_offset, tuple_size as u16);
+        Self::set_slot_in_slice(data, slot_id, slot);
+
+        let free_space = header.free_space();
+
+        // Update header
+        Self::set_heap_header_in_slice(data, header);
+
+        Ok((slot_id, free_space))
+    }
+
     /// Returns the raw page data.
     pub fn as_bytes(&self) -> &[u8; PAGE_SIZE] {
         &self.data
+    }
+
+    /// Returns mutable raw page data.
+    pub fn as_bytes_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
+        &mut self.data
     }
 
     /// Returns the heap header.
@@ -362,7 +435,9 @@ impl HeapPage {
         }
 
         let offset = Self::slot_offset(slot_id);
-        Some(TupleSlot::from_bytes(&self.data[offset..offset + TupleSlot::SIZE]))
+        Some(TupleSlot::from_bytes(
+            &self.data[offset..offset + TupleSlot::SIZE],
+        ))
     }
 
     /// Writes a slot to the slot array.
@@ -471,12 +546,15 @@ impl HeapPage {
 
     /// Updates a tuple in place if it fits, otherwise returns error.
     pub fn update_tuple(&mut self, slot_id: SlotId, tuple: &Tuple) -> Result<()> {
-        let old_slot = self.get_slot(slot_id).ok_or_else(|| {
-            ZyronError::TupleNotFound(format!("slot {} not found", slot_id))
-        })?;
+        let old_slot = self
+            .get_slot(slot_id)
+            .ok_or_else(|| ZyronError::TupleNotFound(format!("slot {} not found", slot_id)))?;
 
         if old_slot.is_empty() {
-            return Err(ZyronError::TupleNotFound(format!("slot {} is empty", slot_id)));
+            return Err(ZyronError::TupleNotFound(format!(
+                "slot {} is empty",
+                slot_id
+            )));
         }
 
         let new_size = tuple.size_on_disk();
@@ -917,7 +995,9 @@ mod tests {
         let mut slots = Vec::new();
         while page.can_fit(tuple_size + TupleSlot::SIZE) {
             let data = vec![slots.len() as u8; tuple_size - TupleHeader::SIZE];
-            let slot = page.insert_tuple(&Tuple::new(data, slots.len() as u32)).unwrap();
+            let slot = page
+                .insert_tuple(&Tuple::new(data, slots.len() as u32))
+                .unwrap();
             slots.push(slot);
         }
 
