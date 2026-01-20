@@ -226,10 +226,10 @@ async fn test_wal_write_replay_10k_records() {
         // Replay phase
         let replay_duration;
         {
-            let reader = WalReader::new(dir.path()).await.unwrap();
+            let reader = WalReader::new(dir.path()).unwrap();
 
             let start = Instant::now();
-            let records = reader.scan_all().await.unwrap();
+            let records = reader.scan_all().unwrap();
             replay_duration = start.elapsed();
 
             let insert_records: Vec<_> = records
@@ -330,8 +330,8 @@ async fn test_wal_segment_rotation() {
         final_segment
     );
 
-    let reader = WalReader::new(dir.path()).await.unwrap();
-    let records = reader.scan_all().await.unwrap();
+    let reader = WalReader::new(dir.path()).unwrap();
+    let records = reader.scan_all().unwrap();
     assert_eq!(records.len(), 1000);
 
     println!(
@@ -868,24 +868,38 @@ fn test_btree_1m_keys() {
             LOOKUP_SAMPLE
         );
 
-        // Range scan phase
-        let range_start = Instant::now();
+        // Range scan phase (multiple iterations, take median for stable timing)
         let start_key = 1000i64.to_be_bytes();
         let end_key = (1000 + RANGE_SIZE as i64).to_be_bytes();
-        let range_results_data = btree.range_scan(Some(&start_key), Some(&end_key));
-        let range_duration = range_start.elapsed();
+
+        // Warmup
+        let _ = btree.range_scan(Some(&start_key), Some(&end_key));
+
+        // Multiple timed iterations
+        const RANGE_ITERATIONS: usize = 10;
+        let mut range_times = Vec::with_capacity(RANGE_ITERATIONS);
+        let mut last_len = 0;
+        for _ in 0..RANGE_ITERATIONS {
+            let range_start = Instant::now();
+            let range_results_data = btree.range_scan(Some(&start_key), Some(&end_key));
+            range_times.push(range_start.elapsed());
+            last_len = range_results_data.len();
+        }
+        range_times.sort();
+        let range_duration = range_times[RANGE_ITERATIONS / 2]; // Median
 
         assert!(
-            range_results_data.len() >= RANGE_SIZE - 10,
+            last_len >= RANGE_SIZE - 10,
             "Run {}: Expected ~{} keys in range, got {}",
             run + 1,
             RANGE_SIZE,
-            range_results_data.len()
+            last_len
         );
+        let range_results_len = last_len;
 
         let insert_ops_sec = KEY_COUNT as f64 / insert_duration.as_secs_f64();
         let lookup_ns = lookup_duration.as_nanos() as f64 / LOOKUP_SAMPLE as f64;
-        let range_ops_sec = range_results_data.len() as f64 / range_duration.as_secs_f64();
+        let range_ops_sec = range_results_len as f64 / range_duration.as_secs_f64();
 
         // Get flush stats for profiling
         let stats = btree.stats();
@@ -1037,8 +1051,8 @@ async fn test_wal_heap_recovery() {
     // Phase 2: Recovery with timing
     let recovery_start = Instant::now();
     {
-        let recovery = RecoveryManager::new(&wal_dir).await.unwrap();
-        let result = recovery.recover().await.unwrap();
+        let recovery = RecoveryManager::new(&wal_dir).unwrap();
+        let result = recovery.recover().unwrap();
 
         assert!(
             result.undo_txns.is_empty(),
@@ -1127,8 +1141,8 @@ async fn test_wal_recovery_with_uncommitted() {
         drop(writer);
     }
 
-    let recovery = RecoveryManager::new(dir.path()).await.unwrap();
-    let result = recovery.recover().await.unwrap();
+    let recovery = RecoveryManager::new(dir.path()).unwrap();
+    let result = recovery.recover().unwrap();
 
     let committed_txns: HashSet<u32> = (1..=10).collect();
     let redo_txns: HashSet<u32> = result.redo_records.iter().map(|r| r.txn_id).collect();
