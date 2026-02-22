@@ -136,6 +136,14 @@ impl RingBuffer {
         self.committed_cursor.load(Ordering::Acquire) == self.read_cursor.load(Ordering::Acquire)
     }
 
+    /// Returns the number of committed bytes not yet drained.
+    #[inline]
+    pub fn pending_bytes(&self) -> usize {
+        let committed = self.committed_cursor.load(Ordering::Relaxed);
+        let read = self.read_cursor.load(Ordering::Relaxed);
+        committed.saturating_sub(read) as usize
+    }
+
     /// Spins until all claimed write space is committed.
     ///
     /// Called before a rotation drain to ensure in-flight writes (write_record

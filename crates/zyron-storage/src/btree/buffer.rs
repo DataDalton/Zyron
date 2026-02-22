@@ -1,10 +1,12 @@
 //! Write buffer with Swiss Tables hash table for B+Tree.
 
-use std::simd::prelude::*;
-use crate::tuple::TupleId;
 use super::arena_index::BTreeArenaIndex;
-use super::constants::{CTRL_DELETED, CTRL_EMPTY, GROUP_SIZE, HASH_TABLE_SIZE, WRITE_BUFFER_CAPACITY};
+use super::constants::{
+    CTRL_DELETED, CTRL_EMPTY, GROUP_SIZE, HASH_TABLE_SIZE, WRITE_BUFFER_CAPACITY,
+};
 use super::types::InsertStats;
+use crate::tuple::TupleId;
+use std::simd::prelude::*;
 use zyron_common::Result;
 
 /// LSD radix sort on (key, value) pairs by key, using 8-bit passes.
@@ -229,15 +231,41 @@ impl SwissTable {
     /// Drains all occupied slots into output, sorted by key using LSD radix sort.
     /// Resets ctrl bytes to CTRL_EMPTY and len to 0.
     /// output and scratch are reused across calls to avoid per-flush allocation.
+    ///
+    /// Uses 32-wide SIMD to scan control bytes, checking 32 slots at once.
+    /// For 131K slots this reduces the scan from 131K scalar comparisons to
+    /// ~4K SIMD operations plus a handful of scalar extractions per group.
     fn drain_sorted_into(&mut self, output: &mut Vec<(u64, u64)>, scratch: &mut Vec<(u64, u64)>) {
         output.clear();
 
-        for i in 0..HASH_TABLE_SIZE {
-            let ctrl = self.ctrl[i];
-            if ctrl != CTRL_EMPTY && ctrl != CTRL_DELETED {
-                output.push(self.entries[i]);
-                self.ctrl[i] = CTRL_EMPTY;
+        let empty_vec: Simd<u8, GROUP_SIZE> = Simd::splat(CTRL_EMPTY);
+        let deleted_vec: Simd<u8, GROUP_SIZE> = Simd::splat(CTRL_DELETED);
+
+        let mut i = 0;
+        while i < HASH_TABLE_SIZE {
+            let ctrl_slice = &self.ctrl[i..i + GROUP_SIZE];
+            let ctrl_vec = Simd::from_slice(ctrl_slice);
+
+            // A slot is occupied when it is neither EMPTY nor DELETED.
+            let empty_mask = ctrl_vec.simd_eq(empty_vec);
+            let deleted_mask = ctrl_vec.simd_eq(deleted_vec);
+            let vacant_mask = empty_mask | deleted_mask;
+            let occupied_bits = (!vacant_mask).to_bitmask();
+
+            if occupied_bits != 0 {
+                let mut bits = occupied_bits;
+                while bits != 0 {
+                    let lane = bits.trailing_zeros() as usize;
+                    let slot = i + lane;
+                    output.push(self.entries[slot]);
+                    bits &= bits - 1;
+                }
+
+                // Bulk-reset this group's ctrl bytes to EMPTY.
+                empty_vec.copy_to_slice(&mut self.ctrl[i..i + GROUP_SIZE]);
             }
+
+            i += GROUP_SIZE;
         }
 
         self.len = 0;
@@ -452,7 +480,8 @@ impl BufferedBTreeIndex {
         // Drain and radix-sort entries for sequential B+Tree insertion.
         // drain_buf and drain_scratch are reused (no heap allocation after first flush).
         let drain_start = std::time::Instant::now();
-        self.buffer.drain_sorted_into(&mut self.drain_buf, &mut self.drain_scratch);
+        self.buffer
+            .drain_sorted_into(&mut self.drain_buf, &mut self.drain_scratch);
         let drain_elapsed = drain_start.elapsed();
 
         // Bulk insert into arena. When no deletes are pending, pass sorted entries
@@ -462,7 +491,8 @@ impl BufferedBTreeIndex {
             let entries = &self.drain_buf;
             self.btree.insert_bulk_sorted(entries)?;
         } else {
-            let filtered: Vec<(u64, u64)> = self.drain_buf
+            let filtered: Vec<(u64, u64)> = self
+                .drain_buf
                 .iter()
                 .filter(|(k, _)| !self.deleted.contains(k))
                 .copied()
@@ -513,15 +543,16 @@ impl BufferedBTreeIndex {
         // Get results from buffer that fall in range (exclude tombstoned), then sort.
         // Skip the full table scan if the buffer's key range does not overlap [start, end].
         // buffer.min_key and buffer.max_key are maintained on every insert and reset on drain.
-        let mut buffer_results: Vec<_> = if self.buffer.min_key <= end && self.buffer.max_key >= start {
-            self.buffer
-                .iter()
-                .filter(|(k, _)| *k >= start && *k <= end && !self.deleted.contains(k))
-                .map(|(k, v)| (k, BTreeArenaIndex::unpack_tuple_id(v)))
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let mut buffer_results: Vec<_> =
+            if self.buffer.min_key <= end && self.buffer.max_key >= start {
+                self.buffer
+                    .iter()
+                    .filter(|(k, _)| *k >= start && *k <= end && !self.deleted.contains(k))
+                    .map(|(k, v)| (k, BTreeArenaIndex::unpack_tuple_id(v)))
+                    .collect()
+            } else {
+                Vec::new()
+            };
         buffer_results.sort_unstable_by_key(|(k, _)| *k);
 
         // Merge sorted results (buffer entries override B+Tree for same key)
@@ -582,12 +613,14 @@ impl BufferedBTreeIndex {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::page::{BTreeInternalPage, BTreeLeafPage};
-    use super::super::types::{DeleteResult, InternalEntry, InternalPageHeader, LeafEntry, LeafPageHeader};
+    use super::super::types::{
+        DeleteResult, InternalEntry, InternalPageHeader, LeafEntry, LeafPageHeader,
+    };
+    use super::*;
     use bytes::Bytes;
-    use zyron_common::page::{PageId, PAGE_SIZE};
     use zyron_common::ZyronError;
+    use zyron_common::page::{PAGE_SIZE, PageId};
 
     #[test]
     fn test_leaf_header_roundtrip() {

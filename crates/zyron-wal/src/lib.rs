@@ -7,6 +7,7 @@
 //! ring buffer for high-throughput concurrent writes. A dedicated flush thread
 //! batches writes to disk with group commit for amortized fsync cost.
 
+pub mod checksum;
 pub mod constants;
 pub mod reader;
 pub mod record;

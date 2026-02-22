@@ -28,7 +28,6 @@
 //! - Individual runs logged for variance analysis
 //! - Test FAILS if any single run is >2x worse than target
 
-use bytes::Bytes;
 use rand::Rng;
 use std::collections::HashSet;
 use std::io::Write as _;
@@ -45,13 +44,13 @@ use zyron_wal::{LogRecordType, Lsn, RecoveryManager, WalReader, WalWriter, WalWr
 // Performance Target Constants (Industry-Leading)
 // =============================================================================
 
-const WAL_WRITE_TARGET_OPS_SEC: f64 = 3_000_000.0;
-const WAL_REPLAY_TARGET_OPS_SEC: f64 = 6_000_000.0;
+const WAL_WRITE_TARGET_OPS_SEC: f64 = 8_000_000.0;
+const WAL_REPLAY_TARGET_OPS_SEC: f64 = 12_000_000.0;
 const BUFFER_POOL_FETCH_TARGET_NS: f64 = 15.0;
 const BUFFER_POOL_HIT_RATE_TARGET: f64 = 1.0; // 100%
-const HEAP_INSERT_TARGET_OPS_SEC: f64 = 2_000_000.0;
+const HEAP_INSERT_TARGET_OPS_SEC: f64 = 8_000_000.0;
 const HEAP_SCAN_TARGET_OPS_SEC: f64 = 20_000_000.0;
-const BTREE_INSERT_TARGET_OPS_SEC: f64 = 8_000_000.0;
+const BTREE_INSERT_TARGET_OPS_SEC: f64 = 10_000_000.0;
 const BTREE_LOOKUP_TARGET_NS: f64 = 40.0;
 const BTREE_RANGE_TARGET_OPS_SEC: f64 = 40_000_000.0;
 const BTREE_DELETE_TARGET_OPS_SEC: f64 = 8_000_000.0;
@@ -704,24 +703,32 @@ async fn test_wal_write_replay_10k_records() {
         let write_duration;
         let mut written_payloads: Vec<String> = Vec::with_capacity(RECORD_COUNT);
         {
-            let writer = WalWriter::new(config.clone()).await.unwrap();
+            let writer = WalWriter::new(config.clone()).unwrap();
+
+            // Pre-allocate a reusable buffer for payload construction.
+            // write! into a cleared String reuses its heap allocation across
+            // iterations, eliminating per-record alloc overhead.
+            let mut payload_buf = String::with_capacity(128);
+            let x_pad: String = "x".repeat(99); // pre-build padding
 
             let start = Instant::now();
             for i in 0..RECORD_COUNT {
                 let txn_id = (i % 100 + 1) as u32;
-                let payload = format!("record_{}_{}", i, "x".repeat(i % 100));
-                let payload_bytes = Bytes::from(payload.clone());
+                payload_buf.clear();
+                use std::fmt::Write;
+                let pad_len = i % 100;
+                write!(payload_buf, "record_{}_{}", i, &x_pad[..pad_len]).unwrap();
 
                 let lsn = writer
-                    .log_insert(txn_id, Lsn::INVALID, payload_bytes)
+                    .log_insert(txn_id, Lsn::INVALID, payload_buf.as_bytes())
                     .unwrap();
 
                 written_lsns.push(lsn);
-                written_payloads.push(payload);
+                written_payloads.push(payload_buf.clone());
             }
             write_duration = start.elapsed();
             // Flush to ensure data reaches disk, then drop without clean shutdown.
-            writer.flush().await.unwrap();
+            writer.flush().unwrap();
             drop(writer);
         }
 
@@ -835,16 +842,15 @@ async fn test_wal_segment_rotation() {
         ring_buffer_capacity: 1024 * 1024, // 1MB
     };
 
-    let writer = WalWriter::new(config).await.unwrap();
+    let writer = WalWriter::new(config).unwrap();
     let initial_segment = writer.current_segment_id().unwrap();
 
     for _ in 0..1000 {
-        let payload = Bytes::from(vec![0u8; 200]);
-        writer.log_insert(1, Lsn::INVALID, payload).unwrap();
+        writer.log_insert(1, Lsn::INVALID, &[0u8; 200]).unwrap();
     }
 
     let final_segment = writer.current_segment_id().unwrap();
-    writer.close().await.unwrap();
+    writer.close().unwrap();
 
     assert!(
         final_segment.0 > initial_segment.0,
@@ -1626,7 +1632,7 @@ async fn test_wal_heap_recovery() {
             fsync_enabled: true,
             ring_buffer_capacity: 1024 * 1024, // 1MB
         };
-        let writer = Arc::new(WalWriter::new(wal_config).await.unwrap());
+        let writer = Arc::new(WalWriter::new(wal_config).unwrap());
 
         let disk_config = DiskManagerConfig {
             data_dir: heap_dir.clone(),
@@ -1650,7 +1656,7 @@ async fn test_wal_heap_recovery() {
                 tuple_id.page_id.page_num, tuple_id.slot_id, data
             );
             let insert_lsn = writer
-                .log_insert(txn_id, begin_lsn, Bytes::from(payload))
+                .log_insert(txn_id, begin_lsn, payload.as_bytes())
                 .unwrap();
 
             writer.log_commit(txn_id, insert_lsn).unwrap();
@@ -1658,8 +1664,8 @@ async fn test_wal_heap_recovery() {
             committed_data.push((txn_id, data.into_bytes()));
         }
 
-        writer.flush().await.unwrap();
-        writer.close().await.unwrap();
+        writer.flush().unwrap();
+        writer.close().unwrap();
         drop(heap);
 
         // Measure actual bytes on disk (segments grow as data is written, not pre-allocated).
@@ -1741,24 +1747,24 @@ async fn test_wal_recovery_with_uncommitted() {
     };
 
     {
-        let writer = WalWriter::new(config.clone()).await.unwrap();
+        let writer = WalWriter::new(config.clone()).unwrap();
 
         for i in 1..=10 {
             let begin = writer.log_begin(i).unwrap();
+            let data = format!("data_{}", i);
             let insert = writer
-                .log_insert(i, begin, Bytes::from(format!("data_{}", i)))
+                .log_insert(i, begin, data.as_bytes())
                 .unwrap();
             writer.log_commit(i, insert).unwrap();
         }
 
         for i in 11..=15 {
             let begin = writer.log_begin(i).unwrap();
-            writer
-                .log_insert(i, begin, Bytes::from(format!("uncommitted_{}", i)))
-                .unwrap();
+            let data = format!("uncommitted_{}", i);
+            writer.log_insert(i, begin, data.as_bytes()).unwrap();
         }
 
-        writer.close().await.unwrap();
+        writer.close().unwrap();
     }
 
     let recovery = RecoveryManager::new(dir.path()).unwrap();

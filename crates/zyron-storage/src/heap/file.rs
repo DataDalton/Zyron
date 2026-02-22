@@ -535,15 +535,35 @@ impl HeapFile {
 
     /// Batch insert multiple tuples.
     ///
-    /// Checks the hint cache for existing pages with free space before allocating
-    /// new pages. Allocates one page at a time as needed, so cached_heap_pages
-    /// stays in sync with the number of pages actually allocated on disk.
+    /// Pre-allocates pages in bulk based on total tuple data size, reducing
+    /// per-page mutex acquisition from N calls to 1. Falls back to single
+    /// allocation when the pre-allocated pool runs out (rare, only when
+    /// tuple sizes vary significantly from the estimate).
     pub async fn insert_batch(&self, tuples: &[Tuple]) -> Result<Vec<TupleId>> {
         use crate::heap::page::TupleSlot;
 
         if tuples.is_empty() {
             return Ok(Vec::new());
         }
+
+        // Estimate pages needed from total data size. Each tuple needs
+        // size_on_disk + slot overhead. Usable space per fresh page is
+        // PAGE_SIZE minus page header and heap header.
+        let usable_per_page = PAGE_SIZE - DATA_START;
+        let total_bytes: usize = tuples
+            .iter()
+            .map(|t| t.size_on_disk() + TupleSlot::SIZE)
+            .sum();
+        let estimated_pages = (total_bytes / usable_per_page + 1) as u32;
+
+        // Pre-allocate pages in one mutex acquisition.
+        let pre_alloc = self
+            .disk
+            .allocate_pages_batch(self.config.heap_file_id, estimated_pages)
+            .await?;
+        self.cached_heap_pages
+            .fetch_add(estimated_pages, std::sync::atomic::Ordering::Relaxed);
+        let mut pre_alloc_idx: usize = 0;
 
         let mut results = Vec::with_capacity(tuples.len());
         let mut current_page_id: Option<PageId> = None;
@@ -582,17 +602,31 @@ impl HeapFile {
                     if page.total_usable_space() >= space_needed {
                         current_page_id = Some(pid);
                         current_page = Some(page);
-                        // No increment: reusing an already-counted page.
                     } else {
-                        // Hint was stale, allocate a new page.
-                        let pid = self.disk.allocate_page(self.config.heap_file_id).await?;
-                        self.increment_heap_pages();
+                        // Hint was stale, use pre-allocated page or allocate single.
+                        let pid = if pre_alloc_idx < pre_alloc.len() {
+                            let p = pre_alloc[pre_alloc_idx];
+                            pre_alloc_idx += 1;
+                            p
+                        } else {
+                            let p = self.disk.allocate_page(self.config.heap_file_id).await?;
+                            self.increment_heap_pages();
+                            p
+                        };
                         current_page_id = Some(pid);
                         current_page = Some(HeapPage::new(pid));
                     }
                 } else {
-                    let pid = self.disk.allocate_page(self.config.heap_file_id).await?;
-                    self.increment_heap_pages();
+                    // Use next pre-allocated page or fall back to single allocation.
+                    let pid = if pre_alloc_idx < pre_alloc.len() {
+                        let p = pre_alloc[pre_alloc_idx];
+                        pre_alloc_idx += 1;
+                        p
+                    } else {
+                        let p = self.disk.allocate_page(self.config.heap_file_id).await?;
+                        self.increment_heap_pages();
+                        p
+                    };
                     current_page_id = Some(pid);
                     current_page = Some(HeapPage::new(pid));
                 }

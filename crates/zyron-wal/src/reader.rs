@@ -57,6 +57,10 @@ impl WalReader {
     }
 
     /// Scans all records in the WAL.
+    ///
+    /// Pre-sizes the result vector based on total segment data size to reduce
+    /// re-allocation during extend(). Each record averages ~50 bytes (header +
+    /// small payload + checksum), so data_bytes / 48 is a reasonable estimate.
     #[inline]
     pub fn scan_all(&self) -> Result<Vec<LogRecord>> {
         let first_id = match self.first_segment_id() {
@@ -64,7 +68,15 @@ impl WalReader {
             None => return Ok(Vec::new()),
         };
 
-        let mut results = Vec::new();
+        // Estimate total data bytes across all segments for pre-allocation.
+        let total_bytes: u64 = self
+            .segments
+            .values()
+            .filter_map(|p| p.metadata().ok())
+            .map(|m| m.len())
+            .sum();
+        let estimated_records = (total_bytes as usize / 48).max(64);
+        let mut results = Vec::with_capacity(estimated_records);
 
         let mut current_segment_id = Some(first_id);
 
@@ -341,10 +353,9 @@ mod tests {
     use super::*;
     use crate::segment::LogSegment;
     use crate::writer::{WalWriter, WalWriterConfig};
-    use bytes::Bytes;
     use tempfile::tempdir;
 
-    async fn create_test_wal() -> (WalWriter, tempfile::TempDir) {
+    fn create_test_wal() -> (WalWriter, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let config = WalWriterConfig {
             wal_dir: dir.path().to_path_buf(),
@@ -352,43 +363,42 @@ mod tests {
             fsync_enabled: true,
             ring_buffer_capacity: 1024 * 1024, // 1MB
         };
-        let writer = WalWriter::new(config).await.unwrap();
+        let writer = WalWriter::new(config).unwrap();
         (writer, dir)
     }
 
-    #[tokio::test]
-    async fn test_wal_reader_empty() {
+    #[test]
+    fn test_wal_reader_empty() {
         let dir = tempdir().unwrap();
         let reader = WalReader::new(dir.path()).unwrap();
         assert_eq!(reader.segment_count(), 0);
         assert!(reader.first_segment_id().is_none());
     }
 
-    #[tokio::test]
-    async fn test_wal_reader_with_segments() {
-        let (writer, dir) = create_test_wal().await;
+    #[test]
+    fn test_wal_reader_with_segments() {
+        let (writer, dir) = create_test_wal();
 
         writer.log_begin(1).unwrap();
         writer.log_commit(1, Lsn::INVALID).unwrap();
-        writer.close().await.unwrap();
+        writer.close().unwrap();
 
         let reader = WalReader::new(dir.path()).unwrap();
         assert_eq!(reader.segment_count(), 1);
         assert_eq!(reader.first_segment_id(), Some(SegmentId::FIRST));
     }
 
-    #[tokio::test]
-    async fn test_wal_reader_scan_all() {
-        let (writer, dir) = create_test_wal().await;
+    #[test]
+    fn test_wal_reader_scan_all() {
+        let (writer, dir) = create_test_wal();
 
         for i in 1..=5 {
             let begin = writer.log_begin(i).unwrap();
-            writer
-                .log_insert(i, begin, Bytes::from(format!("data{}", i)))
-                .unwrap();
+            let data = format!("data{}", i);
+            writer.log_insert(i, begin, data.as_bytes()).unwrap();
             writer.log_commit(i, Lsn::INVALID).unwrap();
         }
-        writer.close().await.unwrap();
+        writer.close().unwrap();
 
         let reader = WalReader::new(dir.path()).unwrap();
         let records = reader.scan_all().unwrap();
@@ -396,18 +406,18 @@ mod tests {
         assert_eq!(records.len(), 15);
     }
 
-    #[tokio::test]
-    async fn test_wal_reader_find_active_transactions() {
-        let (writer, dir) = create_test_wal().await;
+    #[test]
+    fn test_wal_reader_find_active_transactions() {
+        let (writer, dir) = create_test_wal();
 
         let lsn1 = writer.log_begin(1).unwrap();
-        let lsn2 = writer.log_insert(1, lsn1, Bytes::new()).unwrap();
+        let lsn2 = writer.log_insert(1, lsn1, &[]).unwrap();
         writer.log_commit(1, lsn2).unwrap();
 
         let lsn3 = writer.log_begin(2).unwrap();
-        let lsn4 = writer.log_insert(2, lsn3, Bytes::new()).unwrap();
+        let lsn4 = writer.log_insert(2, lsn3, &[]).unwrap();
 
-        writer.close().await.unwrap();
+        writer.close().unwrap();
 
         let reader = WalReader::new(dir.path()).unwrap();
         let active = reader.find_active_transactions(lsn4).unwrap();
@@ -416,17 +426,15 @@ mod tests {
         assert!(active.contains(&2));
     }
 
-    #[tokio::test]
-    async fn test_wal_reader_find_checkpoint() {
-        let (writer, dir) = create_test_wal().await;
+    #[test]
+    fn test_wal_reader_find_checkpoint() {
+        let (writer, dir) = create_test_wal();
 
         writer.log_begin(1).unwrap();
         writer.log_checkpoint_begin().unwrap();
-        writer
-            .log_checkpoint_end(Bytes::from_static(b"checkpoint"))
-            .unwrap();
+        writer.log_checkpoint_end(b"checkpoint").unwrap();
         writer.log_commit(1, Lsn::INVALID).unwrap();
-        writer.close().await.unwrap();
+        writer.close().unwrap();
 
         let reader = WalReader::new(dir.path()).unwrap();
         let checkpoint = reader.find_last_checkpoint().unwrap();
@@ -436,8 +444,8 @@ mod tests {
         assert_eq!(record.record_type, LogRecordType::CheckpointEnd);
     }
 
-    #[tokio::test]
-    async fn test_recovery_manager_empty() {
+    #[test]
+    fn test_recovery_manager_empty() {
         let dir = tempdir().unwrap();
         let recovery = RecoveryManager::new(dir.path()).unwrap();
         let result = recovery.recover().unwrap();
@@ -445,16 +453,14 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_recovery_manager_committed_txns() {
-        let (writer, dir) = create_test_wal().await;
+    #[test]
+    fn test_recovery_manager_committed_txns() {
+        let (writer, dir) = create_test_wal();
 
         let begin = writer.log_begin(1).unwrap();
-        let insert = writer
-            .log_insert(1, begin, Bytes::from_static(b"data"))
-            .unwrap();
+        let insert = writer.log_insert(1, begin, b"data").unwrap();
         writer.log_commit(1, insert).unwrap();
-        writer.close().await.unwrap();
+        writer.close().unwrap();
 
         let recovery = RecoveryManager::new(dir.path()).unwrap();
         let result = recovery.recover().unwrap();
@@ -464,15 +470,13 @@ mod tests {
         assert!(result.undo_txns.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_recovery_manager_uncommitted_txn() {
-        let (writer, dir) = create_test_wal().await;
+    #[test]
+    fn test_recovery_manager_uncommitted_txn() {
+        let (writer, dir) = create_test_wal();
 
         let begin = writer.log_begin(1).unwrap();
-        writer
-            .log_insert(1, begin, Bytes::from_static(b"data"))
-            .unwrap();
-        writer.close().await.unwrap();
+        writer.log_insert(1, begin, b"data").unwrap();
+        writer.close().unwrap();
 
         let recovery = RecoveryManager::new(dir.path()).unwrap();
         let result = recovery.recover().unwrap();
