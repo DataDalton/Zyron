@@ -1,0 +1,177 @@
+WAL Segment Rotation: PASSED - rotated from segment 00000001 to 00000004
+
+=== Heap File Performance Test ===
+
+============================================================
+
+=== WAL Write/Replay Performance Test ===
+
+=== B+ Tree Arena Performance Test ===
+Keys per run: 1000000
+Lookup sample: 10000
+Validation runs: 5
+Buffer Pool Eviction: PASSED - 400 dirty evictions with 500/100 pages
+
+=== Buffer Pool Performance Test ===
+Buffer Pool Pin Test: PASSED - pin prevents eviction
+WAL Recovery with Uncommitted: PASSED - 10 redo, 5 undo
+Tuples per run: 100000
+ZyronDB Phase 1: Storage Foundation Validation Complete
+Records per run: 10000
+Frames: 50, Pages: 30, Rounds: 1000
+Validation runs: 5
+Validation runs: 5
+============================================================
+
+Run: cargo test -p zyron-storage --test phase1_test --release -- --nocapture
+Validation runs: 5
+
+--- Run 1/5 ---
+
+--- Run 1/5 ---
+
+--- Run 1/5 ---
+
+--- Run 1/5 ---
+  Fetch latency: 7.52 ns
+  Hit rate: 1.0000
+
+--- Run 2/5 ---
+  Fetch latency: 7.59 ns
+  Hit rate: 1.0000
+
+--- Run 3/5 ---
+  Fetch latency: 7.43 ns
+  Hit rate: 1.0000
+
+--- Run 4/5 ---
+  Fetch latency: 7.33 ns
+  Hit rate: 1.0000
+
+--- Run 5/5 ---
+  Fetch latency: 7.35 ns
+  Hit rate: 1.0000
+  Write: 3,933,910 ops/sec (2.542ms)
+  Replay: 7,996,801 ops/sec (1.2505ms)
+
+--- Run 2/5 ---
+  Write: 4,088,475 ops/sec (2.4459ms)
+  Replay: 7,605,141 ops/sec (1.3149ms)
+
+--- Run 3/5 ---
+  Write: 3,670,264 ops/sec (2.7246ms)
+  Replay: 8,489,685 ops/sec (1.1779ms)
+
+--- Run 4/5 ---
+  Write: 3,144,951 ops/sec (3.1797ms)
+  Replay: 9,358,039 ops/sec (1.0686ms)
+
+--- Run 5/5 ---
+  Write: 3,403,676 ops/sec (2.938ms)
+  Replay: 8,091,924 ops/sec (1.2358ms)
+  Delete [PASS]: 35,130,862 ops/sec (2.8465ms, 100000 keys, target: 8,000,000)
+  All 100000 deleted keys verified not found
+  Delete throughput (ops/sec) [PASS]: 35,130,862 >= 8,000,000 (target)
+Initial insert: 9,611,688 ops/sec (10,000 tuples)
+Pages after insert: 72
+Delete: 16,260,163 ops/sec (target: 500,000)
+Reinsert (with compaction): 16,398,819 ops/sec (target: 1,000,000)
+Space reuse: 136 pages (was 72)
+Heap File Space Reuse: PASSED
+Heap File Delete/Scan: PASSED - deleted 1000/10000 tuples
+
+=== WAL Validation Results ===
+  Write throughput (ops/sec) [PASS/OK]:
+    Runs: [3,933,910, 4,088,475, 3,670,264, 3,144,951, 3,403,676]
+    Average: 3,648,255 >= 3,000,000 (target)
+    Min/Max: 3,144,951 / 4,088,475, StdDev: 343,223
+  Replay throughput (ops/sec) [PASS/OK]:
+    Runs: [7,996,801, 7,605,141, 8,489,685, 9,358,039, 8,091,924]
+    Average: 8,308,318 >= 6,000,000 (target)
+    Min/Max: 7,605,141 / 9,358,039, StdDev: 595,505
+  Insert: 10,142,327 ops/sec (98.5967ms), height=2
+    Breakdown: hash_table=1.4ms, flush=97.2ms (drain=7.1ms, btree=90.1ms), flushes=16
+  Lookup: 24.27 ns/op (242.7µs)
+  Range: 400,400,000 ops/sec (2.5µs)
+
+=== Buffer Pool Validation Results ===
+  Avg fetch latency (ns) [PASS/OK]:
+    Runs: [8, 8, 7, 7, 7]
+    Average: 7 <= 15 (target)
+    Min/Max: 7 / 8, StdDev: 0
+  Cache hit rate [PASS/OK]:
+    Runs: [1, 1, 1, 1, 1]
+    Average: 1 >= 1 (target)
+    Min/Max: 1 / 1, StdDev: 0
+
+--- Run 2/5 ---
+  Insert: 10,806,792 ops/sec (92.5344ms), height=2
+    Breakdown: hash_table=1.2ms, flush=91.4ms (drain=6.2ms, btree=85.1ms), flushes=16
+  Lookup: 13.59 ns/op (135.9µs)
+  Range: 1,608,032 ops/sec (622.5µs)
+
+--- Run 3/5 ---
+  Insert: 10,644,537 ops/sec (93.9449ms), height=2
+    Breakdown: hash_table=1.9ms, flush=92.0ms (drain=6.8ms, btree=85.2ms), flushes=16
+  Lookup: 19.47 ns/op (194.7µs)
+  Range: 227,500,000 ops/sec (4.4µs)
+
+--- Run 4/5 ---
+  Insert: 917,488 ops/sec (108.9932ms)
+  Scan: 17,819,594 ops/sec (5.6118ms)
+  Insert: 5,628,374 ops/sec (177.6712ms), height=2
+    Breakdown: hash_table=3.6ms, flush=174.1ms (drain=11.2ms, btree=162.9ms), flushes=16
+  Lookup: 26.20 ns/op (262µs)
+  Range: 286,000,000 ops/sec (3.5µs)
+
+--- Run 5/5 ---
+  Insert: 6,679,514 ops/sec (149.7115ms), height=2
+    Breakdown: hash_table=3.3ms, flush=146.4ms (drain=10.0ms, btree=136.4ms), flushes=16
+  Lookup: 27.72 ns/op (277.2µs)
+  Range: 175,614,035 ops/sec (5.7µs)
+
+=== B+ Tree Validation Results ===
+  Insert throughput (ops/sec) [PASS/OK]:
+    Runs: [10,142,327, 10,806,792, 10,644,537, 5,628,374, 6,679,514]
+    Average: 8,780,309 >= 8,000,000 (target)
+    Min/Max: 5,628,374 / 10,806,792, StdDev: 2,181,060
+  Lookup latency (ns/op) [PASS/OK]:
+    Runs: [24, 14, 19, 26, 28]
+    Average: 22 <= 40 (target)
+    Min/Max: 14 / 28, StdDev: 5
+  Range throughput (ops/sec) [PASS/REGR!]:
+    Runs: [400,400,000, 1,608,032, 227,500,000, 286,000,000, 175,614,035]
+    Average: 218,224,413 >= 40,000,000 (target)
+    Min/Max: 1,608,032 / 400,400,000, StdDev: 131,609,887
+
+--- Run 2/5 ---
+  Insert: 2,236,706 ops/sec (44.7086ms)
+  Scan: 46,019,328 ops/sec (2.173ms)
+
+=== Recovery Performance ===
+  WAL size: 106.1 KB
+  Recovery time: 982.8µs
+  Recovery time (us/KB) [PASS]: 9 <= 10 (target)
+WAL+Heap Recovery: PASSED - 1000 committed transactions recovered (106.1 KB WAL, 982.8µs)
+
+--- Run 3/5 ---
+  Insert: 4,341,936 ops/sec (23.0312ms)
+  Scan: 36,643,459 ops/sec (2.729ms)
+
+--- Run 4/5 ---
+  Insert: 4,202,281 ops/sec (23.7966ms)
+  Scan: 56,879,586 ops/sec (1.7581ms)
+
+--- Run 5/5 ---
+  Insert: 3,620,761 ops/sec (27.6185ms)
+  Scan: 57,263,929 ops/sec (1.7463ms)
+
+=== Heap File Validation Results ===
+  Insert throughput (ops/sec) [PASS/REGR!]:
+    Runs: [917,488, 2,236,706, 4,341,936, 4,202,281, 3,620,761]
+    Average: 3,063,835 >= 2,000,000 (target)
+    Min/Max: 917,488 / 4,341,936, StdDev: 1,306,194
+  Scan throughput (ops/sec) [PASS/OK]:
+    Runs: [17,819,594, 46,019,328, 36,643,459, 56,879,586, 57,263,929]
+    Average: 42,925,179 >= 20,000,000 (target)
+    Min/Max: 17,819,594 / 57,263,929, StdDev: 14,694,553

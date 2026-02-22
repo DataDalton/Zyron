@@ -170,6 +170,21 @@ impl BTreeArenaIndex {
         }
     }
 
+    /// Read the separator key at position key_idx from an internal node.
+    /// key[key_idx] is the separator to the right of child[key_idx].
+    #[inline(always)]
+    fn read_separator_key(&self, node_offset: u64, key_idx: usize) -> u64 {
+        unsafe {
+            let key_stride = ARENA_KEY_SIZE + ARENA_CHILD_SIZE;
+            let ptr = self
+                .arena
+                .node_ptr(node_offset)
+                .add(ARENA_INTERNAL_HEADER_SIZE + ARENA_CHILD_SIZE + key_idx * key_stride)
+                as *const u64;
+            std::ptr::read_unaligned(ptr)
+        }
+    }
+
     /// Read child pointer at given index from internal node.
     #[inline(always)]
     fn read_child_ptr(&self, node_offset: u64, idx: usize) -> u64 {
@@ -713,6 +728,8 @@ impl BTreeArenaIndex {
 
     /// Range scan from start_key to end_key (inclusive).
     /// Relaxed ordering is safe since writes are exclusive.
+    /// Pre-allocates results to avoid allocator contention under concurrent load.
+    /// Binary searches the first leaf to skip entries below start_key.
     pub fn range_scan(
         &self,
         start_key: Option<&[u8]>,
@@ -721,7 +738,9 @@ impl BTreeArenaIndex {
         let start = start_key.map(|k| self.key_to_u64(k)).unwrap_or(0);
         let end = end_key.map(|k| self.key_to_u64(k)).unwrap_or(u64::MAX);
 
-        let mut results = Vec::new();
+        // Pre-allocate to avoid repeated reallocation under concurrent allocator contention.
+        let capacity = ((end.saturating_sub(start) + 1) as usize).min(8192);
+        let mut results = Vec::with_capacity(capacity);
 
         // Find starting leaf
         let height = self.height.load(Ordering::Relaxed);
@@ -733,19 +752,41 @@ impl BTreeArenaIndex {
             current = self.read_child_ptr(current, child_idx);
         }
 
-        // Scan leaves
+        // Scan leaves. Binary search the first leaf for start position.
+        let mut first_leaf = true;
         loop {
             unsafe {
                 let header = self.arena.read_leaf_header(current);
+                let num_entries = header.num_entries as usize;
                 let base = self.arena.node_ptr(current).add(ARENA_LEAF_HEADER_SIZE);
 
-                for i in 0..header.num_entries as usize {
+                // Binary search for the first entry >= start in the first leaf.
+                // Subsequent leaves are fully in range (all entries >= start).
+                let scan_start = if first_leaf && start > 0 {
+                    first_leaf = false;
+                    let mut lo = 0usize;
+                    let mut hi = num_entries;
+                    while lo < hi {
+                        let mid = lo + (hi - lo) / 2;
+                        let mid_key = std::ptr::read_unaligned(
+                            base.add(mid * ARENA_LEAF_ENTRY_SIZE) as *const u64,
+                        );
+                        if mid_key < start {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    lo
+                } else {
+                    first_leaf = false;
+                    0
+                };
+
+                for i in scan_start..num_entries {
                     let entry_ptr = base.add(i * ARENA_LEAF_ENTRY_SIZE) as *const u64;
                     let entry_key = std::ptr::read_unaligned(entry_ptr);
 
-                    if entry_key < start {
-                        continue;
-                    }
                     if entry_key > end {
                         return results;
                     }
@@ -849,29 +890,31 @@ impl BTreeArenaIndex {
         let mut batch_leaf: u64 = u64::MAX;
         let mut batch_version: u64 = 0;
         let mut batch_active = false;
-        let mut batch_max_key: u64 = 0; // Maximum key that belongs in current batch leaf
+        let mut batch_max_key: u64 = 0; // Upper bound key for the current batch leaf (separator from parent)
         let mut last_insert_pos: usize = 0;
         let mut path = [0u64; 16];
         let mut path_len: usize;
 
-        for &(key, packed_tuple_id) in entries {
-            // Try to stay in current leaf batch
-            if batch_active {
-                let header = self.arena.read_leaf_header(batch_leaf);
+        // Cached raw pointer to the current batch leaf node. Avoids repeated node_ptr_mut
+        // calls in the fast append path. Valid only when batch_active == true.
+        let mut batch_leaf_ptr: *mut u8 = std::ptr::null_mut();
+        // Cached num_entries for the current batch leaf. Avoids read_leaf_header per append.
+        let mut cached_num_entries: u16 = 0;
 
-                // Check if leaf has space AND key belongs to this leaf
-                // Key belongs if it's <= the boundary key for this leaf
+        for &(key, packed_tuple_id) in entries {
+            // Try to stay in current leaf batch.
+            // cached_num_entries and batch_leaf_ptr avoid header reads and pointer recomputation.
+            if batch_active {
                 let key_belongs = key <= batch_max_key || batch_max_key == u64::MAX;
-                if key_belongs && (header.num_entries as usize) < ARENA_MAX_LEAF_ENTRIES {
+                if key_belongs && (cached_num_entries as usize) < ARENA_MAX_LEAF_ENTRIES {
                     // Determine insertion position using sorted property
-                    let insert_pos = if last_insert_pos + 1 >= header.num_entries as usize {
+                    let insert_pos = if last_insert_pos + 1 >= cached_num_entries as usize {
                         // Append at end (common case for ascending inserts)
-                        header.num_entries as usize
+                        cached_num_entries as usize
                     } else {
                         // Check if key fits at last_insert_pos + 1
                         let next_key = unsafe {
-                            let base =
-                                self.arena.node_ptr(batch_leaf).add(ARENA_LEAF_HEADER_SIZE);
+                            let base = (batch_leaf_ptr as *const u8).add(ARENA_LEAF_HEADER_SIZE);
                             let ptr = base.add((last_insert_pos + 1) * ARENA_LEAF_ENTRY_SIZE)
                                 as *const u64;
                             std::ptr::read_unaligned(ptr)
@@ -884,37 +927,30 @@ impl BTreeArenaIndex {
                                 batch_leaf,
                                 key,
                                 last_insert_pos + 1,
-                                header.num_entries,
+                                cached_num_entries,
                             )
                         }
                     };
 
-                    // Insert with shift
+                    // Insert with shift. Uses cached batch_leaf_ptr: no repeated node_ptr_mut.
                     unsafe {
-                        let base =
-                            self.arena.node_ptr_mut(batch_leaf).add(ARENA_LEAF_HEADER_SIZE);
-                        if insert_pos < header.num_entries as usize {
+                        let base = batch_leaf_ptr.add(ARENA_LEAF_HEADER_SIZE);
+                        if insert_pos < cached_num_entries as usize {
                             let src = base.add(insert_pos * ARENA_LEAF_ENTRY_SIZE);
                             let dst = base.add((insert_pos + 1) * ARENA_LEAF_ENTRY_SIZE);
                             let count =
-                                (header.num_entries as usize - insert_pos) * ARENA_LEAF_ENTRY_SIZE;
+                                (cached_num_entries as usize - insert_pos) * ARENA_LEAF_ENTRY_SIZE;
                             std::ptr::copy(src, dst, count);
                         }
                         let entry_ptr = base.add(insert_pos * ARENA_LEAF_ENTRY_SIZE) as *mut u64;
                         std::ptr::write_unaligned(entry_ptr, key);
                         std::ptr::write_unaligned(entry_ptr.add(1), packed_tuple_id);
 
-                        let header_ptr =
-                            self.arena.node_ptr_mut(batch_leaf) as *mut ArenaLeafNodeHeader;
-                        (*header_ptr).num_entries = header.num_entries + 1;
-
-                        // Update batch_max_key: read last key after insert
-                        let new_count = header.num_entries + 1;
-                        let last_ptr =
-                            base.add((new_count as usize - 1) * ARENA_LEAF_ENTRY_SIZE) as *const u64;
-                        batch_max_key = std::ptr::read_unaligned(last_ptr);
+                        let header_ptr = batch_leaf_ptr as *mut ArenaLeafNodeHeader;
+                        (*header_ptr).num_entries = cached_num_entries + 1;
                     }
 
+                    cached_num_entries += 1;
                     last_insert_pos = insert_pos;
                     continue;
                 }
@@ -923,25 +959,33 @@ impl BTreeArenaIndex {
             // End current batch and start new tree traversal
             if batch_active {
                 unsafe {
-                    let header_ptr =
-                        self.arena.node_ptr_mut(batch_leaf) as *mut ArenaLeafNodeHeader;
+                    let header_ptr = batch_leaf_ptr as *mut ArenaLeafNodeHeader;
                     std::sync::atomic::fence(Ordering::Release);
                     std::ptr::write_volatile(&mut (*header_ptr).version, batch_version + 2);
                 }
                 // batch_active will be set by the branch below (true or false)
             }
 
-            // Tree traversal to find correct leaf
+            // Tree traversal to find correct leaf, tracking separator key for batch bound
             let height = self.height.load(Ordering::Relaxed);
             let mut current_offset = self.root_offset.load(Ordering::Relaxed);
             path_len = 0;
             path[path_len] = current_offset;
             path_len += 1;
 
+            // leaf_separator: upper bound of the target leaf (from direct parent separator key).
+            // u64::MAX when the leaf is the rightmost child at that level.
+            let mut leaf_separator = u64::MAX;
+
             for _ in 0..(height - 1) {
                 let header = self.arena.read_internal_header(current_offset);
                 let child_idx =
                     self.find_child_idx_branchless(current_offset, key, header.num_keys);
+                leaf_separator = if (child_idx as u16) < header.num_keys {
+                    self.read_separator_key(current_offset, child_idx)
+                } else {
+                    u64::MAX
+                };
                 let child_offset = self.read_child_ptr(current_offset, child_idx);
                 current_offset = child_offset;
                 path[path_len] = current_offset;
@@ -952,15 +996,15 @@ impl BTreeArenaIndex {
             let header = self.arena.read_leaf_header(leaf_offset);
 
             if (header.num_entries as usize) < ARENA_MAX_LEAF_ENTRIES {
-                // Start new batch on this leaf
+                // Start new batch on this leaf. Cache pointer and count for hot-path use.
                 batch_leaf = leaf_offset;
                 batch_version = header.version;
                 batch_active = true;
+                batch_leaf_ptr = self.arena.node_ptr_mut(leaf_offset);
 
                 // Bump version (odd = write in progress)
                 unsafe {
-                    let header_ptr =
-                        self.arena.node_ptr_mut(batch_leaf) as *mut ArenaLeafNodeHeader;
+                    let header_ptr = batch_leaf_ptr as *mut ArenaLeafNodeHeader;
                     std::ptr::write_volatile(&mut (*header_ptr).version, batch_version + 1);
                     std::sync::atomic::fence(Ordering::Release);
                 }
@@ -970,7 +1014,7 @@ impl BTreeArenaIndex {
 
                 // Insert with shift
                 unsafe {
-                    let base = self.arena.node_ptr_mut(leaf_offset).add(ARENA_LEAF_HEADER_SIZE);
+                    let base = batch_leaf_ptr.add(ARENA_LEAF_HEADER_SIZE);
                     if insert_pos < header.num_entries as usize {
                         let src = base.add(insert_pos * ARENA_LEAF_ENTRY_SIZE);
                         let dst = base.add((insert_pos + 1) * ARENA_LEAF_ENTRY_SIZE);
@@ -982,17 +1026,14 @@ impl BTreeArenaIndex {
                     std::ptr::write_unaligned(entry_ptr, key);
                     std::ptr::write_unaligned(entry_ptr.add(1), packed_tuple_id);
 
-                    let header_ptr =
-                        self.arena.node_ptr_mut(leaf_offset) as *mut ArenaLeafNodeHeader;
+                    let header_ptr = batch_leaf_ptr as *mut ArenaLeafNodeHeader;
                     (*header_ptr).num_entries = header.num_entries + 1;
-
-                    // Update batch_max_key: read last key after insert
-                    let new_count = header.num_entries + 1;
-                    let last_ptr =
-                        base.add((new_count as usize - 1) * ARENA_LEAF_ENTRY_SIZE) as *const u64;
-                    batch_max_key = std::ptr::read_unaligned(last_ptr);
                 }
 
+                // Upper bound for this leaf comes from the separator in its parent.
+                // Stays constant for the entire batch on this leaf.
+                batch_max_key = leaf_separator;
+                cached_num_entries = header.num_entries + 1;
                 last_insert_pos = insert_pos;
             } else {
                 // Leaf full - split (no batch active after this)
@@ -1015,7 +1056,7 @@ impl BTreeArenaIndex {
         // Finalize last batch
         if batch_active {
             unsafe {
-                let header_ptr = self.arena.node_ptr_mut(batch_leaf) as *mut ArenaLeafNodeHeader;
+                let header_ptr = batch_leaf_ptr as *mut ArenaLeafNodeHeader;
                 std::sync::atomic::fence(Ordering::Release);
                 std::ptr::write_volatile(&mut (*header_ptr).version, batch_version + 2);
             }

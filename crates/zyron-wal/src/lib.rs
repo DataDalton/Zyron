@@ -2,11 +2,17 @@
 //!
 //! Provides durability by logging all modifications before they are applied.
 //! Supports crash recovery through log replay.
+//!
+//! The `WalWriter` uses lock-free atomic operations for LSN assignment and a
+//! ring buffer for high-throughput concurrent writes. A dedicated flush thread
+//! batches writes to disk with group commit for amortized fsync cost.
 
 pub mod constants;
 pub mod reader;
 pub mod record;
+pub mod ring_buffer;
 pub mod segment;
+pub mod sequencer;
 pub mod writer;
 
 pub use reader::{RecoveryManager, RecoveryResult, WalReader};

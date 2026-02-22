@@ -1,7 +1,7 @@
 //! WAL segment management.
 
-use bytes::Bytes;
 use crate::record::{LogRecord, Lsn};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::fs::{File, OpenOptions};
@@ -145,8 +145,7 @@ impl SegmentHeader {
             segment_id: SegmentId(u32::from_le_bytes([data[8], data[9], data[10], data[11]])),
             segment_size: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
             first_lsn: Lsn(u64::from_le_bytes([
-                data[16], data[17], data[18], data[19],
-                data[20], data[21], data[22], data[23],
+                data[16], data[17], data[18], data[19], data[20], data[21], data[22], data[23],
             ])),
             flags: u32::from_le_bytes([data[24], data[25], data[26], data[27]]),
             checksum: u32::from_le_bytes([data[28], data[29], data[30], data[31]]),
@@ -202,11 +201,7 @@ impl LogSegment {
 
     /// Opens an existing segment file.
     pub async fn open(path: &Path) -> Result<Self> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .await?;
+        let mut file = OpenOptions::new().read(true).write(true).open(path).await?;
 
         // Read and validate header
         let mut header_bytes = [0u8; SegmentHeader::SIZE];
@@ -268,16 +263,15 @@ impl LogSegment {
         let record_size = data.len() as u32;
 
         if !self.has_space(data.len()) {
-            return Err(ZyronError::WalWriteFailed(
-                "segment full".to_string(),
-            ));
+            return Err(ZyronError::WalWriteFailed("segment full".to_string()));
         }
 
         let file = self.file.as_mut().ok_or_else(|| {
             ZyronError::WalWriteFailed("segment not open for writing".to_string())
         })?;
 
-        file.seek(std::io::SeekFrom::Start(self.write_offset as u64)).await?;
+        file.seek(std::io::SeekFrom::Start(self.write_offset as u64))
+            .await?;
         file.write_all(data).await?;
 
         let lsn = Lsn::new(self.header.segment_id.0, self.write_offset);
@@ -289,15 +283,13 @@ impl LogSegment {
     /// Appends multiple pre-serialized records as a single batch write.
     /// Returns the LSN of the first record in the batch.
     #[inline]
-    pub async fn append_batch(&mut self, data: &[u8], batch_size: usize) -> Result<Lsn> {
-        if batch_size == 0 || data.is_empty() {
+    pub async fn append_batch(&mut self, data: &[u8]) -> Result<Lsn> {
+        if data.is_empty() {
             return Ok(Lsn::new(self.header.segment_id.0, self.write_offset));
         }
 
         if !self.has_space(data.len()) {
-            return Err(ZyronError::WalWriteFailed(
-                "segment full".to_string(),
-            ));
+            return Err(ZyronError::WalWriteFailed("segment full".to_string()));
         }
 
         let file = self.file.as_mut().ok_or_else(|| {
@@ -305,7 +297,8 @@ impl LogSegment {
         })?;
 
         // Single seek + single write for entire batch
-        file.seek(std::io::SeekFrom::Start(self.write_offset as u64)).await?;
+        file.seek(std::io::SeekFrom::Start(self.write_offset as u64))
+            .await?;
         file.write_all(data).await?;
 
         let lsn = Lsn::new(self.header.segment_id.0, self.write_offset);
@@ -332,11 +325,9 @@ impl LogSegment {
 
     /// Reads a record at the given offset.
     pub async fn read_at(&mut self, offset: u32) -> Result<LogRecord> {
-        let file = self.file.as_mut().ok_or_else(|| {
-            ZyronError::WalCorrupted {
-                lsn: 0,
-                reason: "segment not open".to_string(),
-            }
+        let file = self.file.as_mut().ok_or_else(|| ZyronError::WalCorrupted {
+            lsn: 0,
+            reason: "segment not open".to_string(),
         })?;
 
         file.seek(std::io::SeekFrom::Start(offset as u64)).await?;
@@ -367,11 +358,9 @@ impl LogSegment {
             return Ok(Bytes::new());
         }
 
-        let file = self.file.as_mut().ok_or_else(|| {
-            ZyronError::WalCorrupted {
-                lsn: 0,
-                reason: "segment not open".to_string(),
-            }
+        let file = self.file.as_mut().ok_or_else(|| ZyronError::WalCorrupted {
+            lsn: 0,
+            reason: "segment not open".to_string(),
         })?;
 
         file.seek(std::io::SeekFrom::Start(data_start)).await?;
@@ -390,29 +379,48 @@ pub struct SyncLogSegment {
 }
 
 impl SyncLogSegment {
+    /// Opens and reads an entire segment file in 3 syscalls: open, fstat, read.
+    ///
+    /// Returns only the data bytes after the header via zero-copy Bytes::slice.
+    /// Use this instead of open_sync + read_all_data_sync for replay and recovery.
+    pub fn read_all(path: &Path) -> Result<Bytes> {
+        use std::io::Read;
+
+        let mut file = std::fs::OpenOptions::new().read(true).open(path)?;
+        let file_size = file.metadata()?.len() as usize;
+
+        if file_size < SegmentHeader::SIZE {
+            return Ok(Bytes::new());
+        }
+
+        let mut buf = Vec::with_capacity(file_size);
+        // SAFETY: read_exact fills the entire buffer. Skipping zeroing saves ~6µs per 100KB.
+        unsafe { buf.set_len(file_size); }
+        file.read_exact(&mut buf)?;
+
+        let header = SegmentHeader::from_bytes(buf[..SegmentHeader::SIZE].try_into().unwrap());
+        header.validate()?;
+
+        // Zero-copy: Bytes::slice increments the Arc refcount, no data copy.
+        Ok(Bytes::from(buf).slice(SegmentHeader::SIZE..))
+    }
+
     /// Opens an existing segment file synchronously.
     pub fn open_sync(path: &Path) -> Result<Self> {
-        use std::io::{Read, Seek};
+        use std::io::Read;
 
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .open(path)?;
+        let mut file = std::fs::OpenOptions::new().read(true).open(path)?;
 
-        // Read and validate header
         let mut header_bytes = [0u8; SegmentHeader::SIZE];
         file.read_exact(&mut header_bytes)?;
         let header = SegmentHeader::from_bytes(&header_bytes);
         header.validate()?;
 
-        // Find current write position by seeking to end
-        let file_size = file.seek(std::io::SeekFrom::End(0))?;
+        // fstat on the already-open fd: no seek, cursor stays at SegmentHeader::SIZE.
+        let file_size = file.metadata()?.len();
         let write_offset = file_size as u32;
 
-        Ok(Self {
-            header,
-            write_offset,
-            file,
-        })
+        Ok(Self { header, write_offset, file })
     }
 
     /// Returns the segment ID.
@@ -427,18 +435,20 @@ impl SyncLogSegment {
     }
 
     /// Reads all data from header offset to current write position synchronously.
+    ///
+    /// Requires the file cursor to be at SegmentHeader::SIZE (i.e., immediately
+    /// after open_sync, which leaves the cursor there after reading the header).
     #[inline]
     pub fn read_all_data_sync(&mut self) -> Result<Bytes> {
-        use std::io::{Read, Seek};
+        use std::io::Read;
 
-        let data_start = SegmentHeader::SIZE as u64;
-        let data_len = (self.write_offset as u64).saturating_sub(data_start);
+        let data_len = (self.write_offset as u64).saturating_sub(SegmentHeader::SIZE as u64);
 
         if data_len == 0 {
             return Ok(Bytes::new());
         }
 
-        self.file.seek(std::io::SeekFrom::Start(data_start))?;
+        // Cursor is already at SegmentHeader::SIZE from open_sync. No seek needed.
         let mut buf = vec![0u8; data_len as usize];
         self.file.read_exact(&mut buf)?;
 
@@ -449,8 +459,8 @@ impl SyncLogSegment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use crate::record::LogRecordType;
+    use bytes::Bytes;
     use tempfile::tempdir;
 
     #[test]
@@ -462,11 +472,7 @@ mod tests {
 
     #[test]
     fn test_segment_header_roundtrip() {
-        let header = SegmentHeader::new(
-            SegmentId(1),
-            LogSegment::DEFAULT_SIZE,
-            Lsn::new(1, 0),
-        );
+        let header = SegmentHeader::new(SegmentId(1), LogSegment::DEFAULT_SIZE, Lsn::new(1, 0));
 
         let bytes = header.to_bytes();
         let recovered = SegmentHeader::from_bytes(&bytes);
@@ -481,11 +487,7 @@ mod tests {
 
     #[test]
     fn test_segment_header_validation() {
-        let mut header = SegmentHeader::new(
-            SegmentId(1),
-            LogSegment::DEFAULT_SIZE,
-            Lsn::new(1, 0),
-        );
+        let mut header = SegmentHeader::new(SegmentId(1), LogSegment::DEFAULT_SIZE, Lsn::new(1, 0));
 
         // Valid header
         assert!(header.validate().is_ok());
@@ -503,12 +505,10 @@ mod tests {
 
         // Create segment
         {
-            let mut segment = LogSegment::create(
-                dir.path(),
-                segment_id,
-                first_lsn,
-                LogSegment::DEFAULT_SIZE,
-            ).await.unwrap();
+            let mut segment =
+                LogSegment::create(dir.path(), segment_id, first_lsn, LogSegment::DEFAULT_SIZE)
+                    .await
+                    .unwrap();
 
             assert_eq!(segment.segment_id(), segment_id);
             assert_eq!(segment.first_lsn(), first_lsn);
@@ -534,7 +534,9 @@ mod tests {
             segment_id,
             Lsn::new(1, SegmentHeader::SIZE as u32),
             LogSegment::DEFAULT_SIZE,
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         // Append a record
         let record = LogRecord::new(
@@ -560,12 +562,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let small_size = 1024u32;
 
-        let segment = LogSegment::create(
-            dir.path(),
-            SegmentId::FIRST,
-            Lsn::FIRST,
-            small_size,
-        ).await.unwrap();
+        let segment = LogSegment::create(dir.path(), SegmentId::FIRST, Lsn::FIRST, small_size)
+            .await
+            .unwrap();
 
         let expected_remaining = small_size - SegmentHeader::SIZE as u32;
         assert_eq!(segment.remaining_space(), expected_remaining);
@@ -576,12 +575,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let small_size = 128u32; // Very small segment
 
-        let mut segment = LogSegment::create(
-            dir.path(),
-            SegmentId::FIRST,
-            Lsn::FIRST,
-            small_size,
-        ).await.unwrap();
+        let mut segment = LogSegment::create(dir.path(), SegmentId::FIRST, Lsn::FIRST, small_size)
+            .await
+            .unwrap();
 
         // Try to write a record larger than remaining space
         let large_payload = Bytes::from(vec![0u8; 200]);

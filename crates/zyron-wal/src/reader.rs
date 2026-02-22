@@ -64,22 +64,13 @@ impl WalReader {
             None => return Ok(Vec::new()),
         };
 
-        // Pre-calculate total data size to estimate record count
-        let mut total_bytes: usize = 0;
-        for path in self.segments.values() {
-            if let Ok(metadata) = std::fs::metadata(path) {
-                total_bytes += metadata.len() as usize;
-            }
-        }
-        let estimated_records = total_bytes / 64;
-        let mut results = Vec::with_capacity(estimated_records);
+        let mut results = Vec::new();
 
         let mut current_segment_id = Some(first_id);
 
         while let Some(seg_id) = current_segment_id {
             if let Some(path) = self.segments.get(&seg_id) {
-                let mut segment = SyncLogSegment::open_sync(path)?;
-                let data = segment.read_all_data_sync()?;
+                let data = SyncLogSegment::read_all(path)?;
 
                 if !data.is_empty() {
                     let segment_records = LogRecord::parse_all(data)?;
@@ -101,24 +92,14 @@ impl WalReader {
         let segment_id = SegmentId(start_lsn.segment_id());
         let start_offset = start_lsn.offset();
 
-        let mut total_bytes: usize = 0;
-        for (&seg_id, path) in &self.segments {
-            if seg_id.0 >= segment_id.0 {
-                if let Ok(metadata) = std::fs::metadata(path) {
-                    total_bytes += metadata.len() as usize;
-                }
-            }
-        }
-        let estimated_records = total_bytes / 64;
-        let mut results = Vec::with_capacity(estimated_records);
+        let mut results = Vec::new();
 
         let mut current_segment_id = Some(segment_id);
         let mut is_first_segment = true;
 
         while let Some(seg_id) = current_segment_id {
             if let Some(path) = self.segments.get(&seg_id) {
-                let mut segment = SyncLogSegment::open_sync(path)?;
-                let data = segment.read_all_data_sync()?;
+                let data = SyncLogSegment::read_all(path)?;
 
                 if !data.is_empty() {
                     let segment_records = LogRecord::parse_all(data)?;
@@ -146,6 +127,52 @@ impl WalReader {
         }
 
         Ok(results)
+    }
+
+    /// Calls f for each record at or after start_lsn, in segment order.
+    ///
+    /// Avoids building an intermediate Vec<LogRecord> — each record is processed
+    /// as it is parsed, which reduces allocations and struct copies for callers
+    /// that only need to accumulate a filtered subset.
+    #[inline]
+    pub(crate) fn for_each_record_from<F>(&self, start_lsn: Lsn, mut f: F) -> Result<()>
+    where
+        F: FnMut(LogRecord),
+    {
+        let segment_id = SegmentId(start_lsn.segment_id());
+        let start_offset = start_lsn.offset();
+
+        let mut current_segment_id = Some(segment_id);
+        let mut is_first_segment = true;
+
+        while let Some(seg_id) = current_segment_id {
+            if let Some(path) = self.segments.get(&seg_id) {
+                let data = SyncLogSegment::read_all(path)?;
+
+                if !data.is_empty() {
+                    if is_first_segment && start_offset > SegmentHeader::SIZE as u32 {
+                        let skip_bytes = (start_offset - SegmentHeader::SIZE as u32) as usize;
+                        let mut byte_offset = 0;
+                        LogRecord::for_each(data, |record| {
+                            if byte_offset >= skip_bytes {
+                                f(record);
+                            } else {
+                                byte_offset += record.size_on_disk();
+                            }
+                        });
+                    } else {
+                        LogRecord::for_each(data, &mut f);
+                    }
+                }
+
+                is_first_segment = false;
+                current_segment_id = Some(seg_id.next());
+            } else {
+                break;
+            }
+        }
+
+        Ok(())
     }
 
     /// Finds the last checkpoint in the WAL.
@@ -218,26 +245,42 @@ impl RecoveryManager {
     }
 
     /// Performs recovery, returning redo and undo information.
+    ///
+    /// Single-pass scan: checkpoint detection and transaction classification happen
+    /// in one read of the WAL, avoiding the double-scan of calling find_last_checkpoint
+    /// followed by scan_from.
     pub fn recover(&self) -> Result<RecoveryResult> {
-        let checkpoint = self.reader.find_last_checkpoint()?;
-
-        let start_lsn = if let Some((lsn, _)) = checkpoint {
-            lsn
-        } else if let Some(first_id) = self.reader.first_segment_id() {
-            Lsn::new(first_id.0, SegmentHeader::SIZE as u32)
-        } else {
-            return Ok(RecoveryResult::empty());
+        let start_id = match self.reader.first_segment_id() {
+            Some(id) => id,
+            None => return Ok(RecoveryResult::empty()),
         };
+        let start_lsn = Lsn::new(start_id.0, SegmentHeader::SIZE as u32);
 
-        let mut redo_records = Vec::new();
-        let mut active_txns = std::collections::HashMap::new();
-        let mut committed_txns = std::collections::HashSet::new();
-        let mut aborted_txns = std::collections::HashSet::new();
+        let mut redo_records = Vec::with_capacity(1024);
+        let mut active_txns = std::collections::HashMap::with_capacity(256);
+        let mut committed_txns = std::collections::HashSet::with_capacity(1024);
+        let mut aborted_txns = std::collections::HashSet::with_capacity(64);
 
-        for record in self.reader.scan_from(start_lsn)? {
+        // Track the last checkpoint encountered. When a CheckpointEnd is found,
+        // clear accumulated state so only post-checkpoint work remains.
+        let mut last_checkpoint_lsn: Option<Lsn> = None;
+
+        // for_each_record_from avoids the intermediate Vec<LogRecord> that scan_from
+        // would build, eliminating the struct copies from extend() and the intermediate
+        // allocation for records that are not committed data records.
+        self.reader.for_each_record_from(start_lsn, |record| {
             let txn_id = record.txn_id;
 
             match record.record_type {
+                LogRecordType::CheckpointEnd => {
+                    // State before this checkpoint is already durable. Reset accumulators
+                    // so only post-checkpoint work drives redo/undo.
+                    last_checkpoint_lsn = Some(record.lsn);
+                    redo_records.clear();
+                    active_txns.clear();
+                    committed_txns.clear();
+                    aborted_txns.clear();
+                }
                 LogRecordType::Begin => {
                     active_txns.insert(txn_id, record.lsn);
                 }
@@ -257,15 +300,14 @@ impl RecoveryManager {
                 }
                 _ => {}
             }
-        }
+        })?;
 
-        // Only redo committed transactions
-        let redo_records: Vec<_> = redo_records
-            .into_iter()
-            .filter(|r| committed_txns.contains(&r.txn_id))
-            .collect();
+        // Only redo committed transactions. retain() filters in-place
+        // without allocating a second Vec or touching Bytes Arc refcounts.
+        redo_records.retain(|r| committed_txns.contains(&r.txn_id));
 
         let undo_txns: Vec<_> = active_txns.keys().copied().collect();
+        let _ = last_checkpoint_lsn;
 
         Ok(RecoveryResult {
             redo_records,
@@ -314,9 +356,7 @@ mod tests {
             wal_dir: dir.path().to_path_buf(),
             segment_size: LogSegment::DEFAULT_SIZE,
             fsync_enabled: true,
-            batch_size: 1,
-            batch_bytes: 64 * 1024,
-            flush_interval_us: 0,
+            ring_buffer_capacity: 1024 * 1024, // 1MB
         };
         let writer = WalWriter::new(config).await.unwrap();
         (writer, dir)
@@ -334,8 +374,8 @@ mod tests {
     async fn test_wal_reader_with_segments() {
         let (writer, dir) = create_test_wal().await;
 
-        writer.log_begin(1).await.unwrap();
-        writer.log_commit(1, Lsn::INVALID).await.unwrap();
+        writer.log_begin(1).unwrap();
+        writer.log_commit(1, Lsn::INVALID).unwrap();
         writer.close().await.unwrap();
 
         let reader = WalReader::new(dir.path()).unwrap();
@@ -348,12 +388,11 @@ mod tests {
         let (writer, dir) = create_test_wal().await;
 
         for i in 1..=5 {
-            let begin = writer.log_begin(i).await.unwrap();
+            let begin = writer.log_begin(i).unwrap();
             writer
                 .log_insert(i, begin, Bytes::from(format!("data{}", i)))
-                .await
                 .unwrap();
-            writer.log_commit(i, Lsn::INVALID).await.unwrap();
+            writer.log_commit(i, Lsn::INVALID).unwrap();
         }
         writer.close().await.unwrap();
 
@@ -367,12 +406,12 @@ mod tests {
     async fn test_wal_reader_find_active_transactions() {
         let (writer, dir) = create_test_wal().await;
 
-        let lsn1 = writer.log_begin(1).await.unwrap();
-        let lsn2 = writer.log_insert(1, lsn1, Bytes::new()).await.unwrap();
-        writer.log_commit(1, lsn2).await.unwrap();
+        let lsn1 = writer.log_begin(1).unwrap();
+        let lsn2 = writer.log_insert(1, lsn1, Bytes::new()).unwrap();
+        writer.log_commit(1, lsn2).unwrap();
 
-        let lsn3 = writer.log_begin(2).await.unwrap();
-        let lsn4 = writer.log_insert(2, lsn3, Bytes::new()).await.unwrap();
+        let lsn3 = writer.log_begin(2).unwrap();
+        let lsn4 = writer.log_insert(2, lsn3, Bytes::new()).unwrap();
 
         writer.close().await.unwrap();
 
@@ -387,13 +426,12 @@ mod tests {
     async fn test_wal_reader_find_checkpoint() {
         let (writer, dir) = create_test_wal().await;
 
-        writer.log_begin(1).await.unwrap();
-        writer.log_checkpoint_begin().await.unwrap();
+        writer.log_begin(1).unwrap();
+        writer.log_checkpoint_begin().unwrap();
         writer
             .log_checkpoint_end(Bytes::from_static(b"checkpoint"))
-            .await
             .unwrap();
-        writer.log_commit(1, Lsn::INVALID).await.unwrap();
+        writer.log_commit(1, Lsn::INVALID).unwrap();
         writer.close().await.unwrap();
 
         let reader = WalReader::new(dir.path()).unwrap();
@@ -417,12 +455,11 @@ mod tests {
     async fn test_recovery_manager_committed_txns() {
         let (writer, dir) = create_test_wal().await;
 
-        let begin = writer.log_begin(1).await.unwrap();
+        let begin = writer.log_begin(1).unwrap();
         let insert = writer
             .log_insert(1, begin, Bytes::from_static(b"data"))
-            .await
             .unwrap();
-        writer.log_commit(1, insert).await.unwrap();
+        writer.log_commit(1, insert).unwrap();
         writer.close().await.unwrap();
 
         let recovery = RecoveryManager::new(dir.path()).unwrap();
@@ -437,10 +474,9 @@ mod tests {
     async fn test_recovery_manager_uncommitted_txn() {
         let (writer, dir) = create_test_wal().await;
 
-        let begin = writer.log_begin(1).await.unwrap();
+        let begin = writer.log_begin(1).unwrap();
         writer
             .log_insert(1, begin, Bytes::from_static(b"data"))
-            .await
             .unwrap();
         writer.close().await.unwrap();
 

@@ -7,9 +7,61 @@ use super::constants::{CTRL_DELETED, CTRL_EMPTY, GROUP_SIZE, HASH_TABLE_SIZE, WR
 use super::types::InsertStats;
 use zyron_common::Result;
 
-struct WriteBufferEntry {
-    key: u64,
-    packed_tuple_id: u64,
+/// LSD radix sort on (key, value) pairs by key, using 8-bit passes.
+/// For N=65536 elements: O(8N) work with 256-entry (1KB) count arrays that stay in L1.
+/// Roughly 10x faster than comparison sort for this workload.
+///
+/// After sorting, pairs are in output. scratch is used as auxiliary storage.
+/// Both buffers must have at least n slots available (len >= n).
+#[inline]
+fn radix_sort_pairs(output: &mut Vec<(u64, u64)>, scratch: &mut Vec<(u64, u64)>) {
+    let n = output.len();
+    if n <= 1 {
+        return;
+    }
+
+    scratch.resize(n, (0, 0));
+
+    // Detect how many 8-bit passes are needed based on the maximum key.
+    // Skips high-byte passes when keys fit in fewer bytes (common case: keys < 16M = 3 bytes).
+    let max_key = output.iter().map(|&(k, _)| k).max().unwrap_or(0);
+    let passes = if max_key == 0 {
+        1
+    } else {
+        let bits = 64 - max_key.leading_zeros() as usize;
+        (bits + 7) / 8
+    };
+
+    let mut counts = [0u32; 256];
+
+    for pass in 0..passes {
+        let shift = pass * 8;
+
+        // Count occurrences of each byte value at this position.
+        counts.fill(0);
+        for &(k, _) in output.iter() {
+            counts[((k >> shift) & 0xFF) as usize] += 1;
+        }
+
+        // Convert counts to start offsets (prefix sum).
+        let mut offset = 0u32;
+        for c in counts.iter_mut() {
+            let tmp = *c;
+            *c = offset;
+            offset += tmp;
+        }
+
+        // Scatter elements into scratch in stable sorted order for this byte.
+        for &entry in output.iter() {
+            let bucket = ((entry.0 >> shift) & 0xFF) as usize;
+            scratch[counts[bucket] as usize] = entry;
+            counts[bucket] += 1;
+        }
+
+        // Swap: scratch becomes the new output for the next pass.
+        // After each swap, output always holds the most recently sorted data.
+        std::mem::swap(output, scratch);
+    }
 }
 
 /// Swiss Tables-style hash table with control bytes.
@@ -17,18 +69,16 @@ struct WriteBufferEntry {
 ///
 /// Memory layout:
 /// - ctrl: 1 byte per slot (h2 hash or empty/deleted marker)
-/// - keys: u64 per slot
-/// - values: u64 per slot
+/// - entries: (key, value) pair per slot, co-located in memory
 ///
-/// Probe control bytes first (cache-friendly), compare full keys on match.
+/// AoS layout: key and value share a cache line, so a single cache miss
+/// loads both. Probe control bytes first, compare full key+value on match.
 #[repr(C, align(32))]
 struct SwissTable {
     /// Control bytes: h2 (7-bit hash) or CTRL_EMPTY/CTRL_DELETED.
     ctrl: Box<[u8]>,
-    /// Keys array.
-    keys: Box<[u64]>,
-    /// Values array (packed tuple IDs).
-    values: Box<[u64]>,
+    /// (key, packed_tuple_id) pairs. AoS keeps key and value in the same cache line.
+    entries: Box<[(u64, u64)]>,
     /// Number of entries.
     len: usize,
 }
@@ -38,8 +88,7 @@ impl SwissTable {
     fn new() -> Self {
         Self {
             ctrl: vec![CTRL_EMPTY; HASH_TABLE_SIZE].into_boxed_slice(),
-            keys: vec![0u64; HASH_TABLE_SIZE].into_boxed_slice(),
-            values: vec![0u64; HASH_TABLE_SIZE].into_boxed_slice(),
+            entries: vec![(0u64, 0u64); HASH_TABLE_SIZE].into_boxed_slice(),
             len: 0,
         }
     }
@@ -106,9 +155,10 @@ impl SwissTable {
                 let lane = bits.trailing_zeros() as usize;
                 let slot = group_idx + lane;
 
-                // Compare full key only on h2 match
-                if self.keys[slot] == key {
-                    return Some(self.values[slot]);
+                // Compare full key only on h2 match. AoS: key and value load together.
+                let (k, v) = self.entries[slot];
+                if k == key {
+                    return Some(v);
                 }
 
                 bits &= bits - 1; // Clear lowest set bit
@@ -153,8 +203,8 @@ impl SwissTable {
             while bits != 0 {
                 let lane = bits.trailing_zeros() as usize;
                 let slot = group_idx + lane;
-                if self.keys[slot] == key {
-                    self.values[slot] = value;
+                if self.entries[slot].0 == key {
+                    self.entries[slot].1 = value;
                     return;
                 }
                 bits &= bits - 1;
@@ -167,8 +217,7 @@ impl SwissTable {
                 let lane = bits.trailing_zeros() as usize;
                 let slot = group_idx + lane;
                 self.ctrl[slot] = h2;
-                self.keys[slot] = key;
-                self.values[slot] = value;
+                self.entries[slot] = (key, value);
                 self.len += 1;
                 return;
             }
@@ -177,34 +226,29 @@ impl SwissTable {
         }
     }
 
-    /// Drains all entries sorted by key (for merging into B+Tree).
-    fn drain_sorted(&mut self) -> Vec<WriteBufferEntry> {
-        let mut entries = Vec::with_capacity(self.len);
+    /// Drains all occupied slots into output, sorted by key using LSD radix sort.
+    /// Resets ctrl bytes to CTRL_EMPTY and len to 0.
+    /// output and scratch are reused across calls to avoid per-flush allocation.
+    fn drain_sorted_into(&mut self, output: &mut Vec<(u64, u64)>, scratch: &mut Vec<(u64, u64)>) {
+        output.clear();
 
         for i in 0..HASH_TABLE_SIZE {
             let ctrl = self.ctrl[i];
             if ctrl != CTRL_EMPTY && ctrl != CTRL_DELETED {
-                entries.push(WriteBufferEntry {
-                    key: self.keys[i],
-                    packed_tuple_id: self.values[i],
-                });
+                output.push(self.entries[i]);
                 self.ctrl[i] = CTRL_EMPTY;
             }
         }
 
         self.len = 0;
-        entries.sort_unstable_by_key(|e| e.key);
-        entries
+        radix_sort_pairs(output, scratch);
     }
 
-    /// Returns an iterator over entries (unsorted).
-    fn iter(&self) -> impl Iterator<Item = WriteBufferEntry> + '_ {
+    /// Returns an iterator over (key, packed_tuple_id) pairs (unsorted).
+    fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
         (0..HASH_TABLE_SIZE)
             .filter(move |&i| self.ctrl[i] != CTRL_EMPTY && self.ctrl[i] != CTRL_DELETED)
-            .map(move |i| WriteBufferEntry {
-                key: self.keys[i],
-                packed_tuple_id: self.values[i],
-            })
+            .map(move |i| self.entries[i])
     }
 }
 
@@ -212,6 +256,10 @@ impl SwissTable {
 /// Provides O(1) insert and lookup with 32-way parallel control byte comparison.
 struct WriteBuffer {
     table: SwissTable,
+    /// Minimum key currently in the buffer. u64::MAX when empty.
+    min_key: u64,
+    /// Maximum key currently in the buffer. 0 when empty.
+    max_key: u64,
 }
 
 impl WriteBuffer {
@@ -219,6 +267,8 @@ impl WriteBuffer {
     fn new() -> Self {
         Self {
             table: SwissTable::new(),
+            min_key: u64::MAX,
+            max_key: 0,
         }
     }
 
@@ -240,19 +290,28 @@ impl WriteBuffer {
         self.table.search(key)
     }
 
-    /// O(1) insert a key-value pair.
+    /// O(1) insert a key-value pair. Updates min/max key bounds.
     #[inline(always)]
     fn insert(&mut self, key: u64, packed_tuple_id: u64) {
+        if key < self.min_key {
+            self.min_key = key;
+        }
+        if key > self.max_key {
+            self.max_key = key;
+        }
         self.table.insert(key, packed_tuple_id);
     }
 
-    /// Returns entries sorted by key (for merging into B+Tree).
-    fn drain_sorted(&mut self) -> Vec<WriteBufferEntry> {
-        self.table.drain_sorted()
+    /// Drains into caller-provided buffers, sorted by key. Resets min/max key bounds.
+    /// output receives sorted entries, scratch is used as auxiliary storage.
+    fn drain_sorted_into(&mut self, output: &mut Vec<(u64, u64)>, scratch: &mut Vec<(u64, u64)>) {
+        self.min_key = u64::MAX;
+        self.max_key = 0;
+        self.table.drain_sorted_into(output, scratch);
     }
 
-    /// Returns an iterator over entries (unsorted, for range scans).
-    fn iter(&self) -> impl Iterator<Item = WriteBufferEntry> + '_ {
+    /// Returns an iterator over (key, packed_tuple_id) pairs (unsorted, for range scans).
+    fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
         self.table.iter()
     }
 }
@@ -278,6 +337,12 @@ pub struct BufferedBTreeIndex {
     buffer_has_data: bool,
     /// Performance statistics for profiling.
     stats: InsertStats,
+    /// Tombstone set for deleted keys. Keys added here are invisible to search and range_scan.
+    deleted: std::collections::HashSet<u64>,
+    /// Reusable drain output buffer. Pre-allocated to WRITE_BUFFER_CAPACITY to eliminate per-flush allocation.
+    drain_buf: Vec<(u64, u64)>,
+    /// Reusable radix sort scratch buffer. Same capacity as drain_buf.
+    drain_scratch: Vec<(u64, u64)>,
 }
 
 impl BufferedBTreeIndex {
@@ -289,6 +354,9 @@ impl BufferedBTreeIndex {
             buffer: WriteBuffer::new(),
             buffer_has_data: false,
             stats: InsertStats::default(),
+            deleted: std::collections::HashSet::new(),
+            drain_buf: Vec::with_capacity(WRITE_BUFFER_CAPACITY),
+            drain_scratch: Vec::with_capacity(WRITE_BUFFER_CAPACITY),
         }
     }
 
@@ -314,13 +382,19 @@ impl BufferedBTreeIndex {
         self.buffer.len()
     }
 
-    /// Search for a key. Checks write buffer first, then B+Tree.
+    /// Search for a key. Checks tombstone set, then write buffer, then B+Tree.
     #[inline(always)]
     pub fn search(&self, key: &[u8]) -> Option<TupleId> {
+        let search_key = self.key_to_u64(key);
+
+        // Tombstone check: deleted keys are invisible regardless of where they are stored.
+        if !self.deleted.is_empty() && self.deleted.contains(&search_key) {
+            return None;
+        }
+
         // Fast path: skip buffer check when empty (common after flush)
         // Uses bool flag instead of HashMap.len() for ~15ns savings
         if self.buffer_has_data {
-            let search_key = self.key_to_u64(key);
             if let Some(packed) = self.buffer.search(search_key) {
                 return Some(BTreeArenaIndex::unpack_tuple_id(packed));
             }
@@ -332,6 +406,7 @@ impl BufferedBTreeIndex {
 
     /// Insert a key-value pair.
     /// Goes to write buffer first; flushes to B+Tree when buffer is full.
+    /// Clears any tombstone for this key so re-inserted keys become visible.
     #[inline(always)]
     pub fn insert(&mut self, key: &[u8], tuple_id: TupleId) -> Result<()> {
         // Check if buffer is full and needs flush (rare case)
@@ -343,14 +418,30 @@ impl BufferedBTreeIndex {
         let search_key = self.key_to_u64(key);
         let packed = BTreeArenaIndex::pack_tuple_id(tuple_id);
 
+        // Remove tombstone if this key was previously deleted.
+        if !self.deleted.is_empty() {
+            self.deleted.remove(&search_key);
+        }
+
         // Insert into buffer and mark as non-empty
         self.buffer.insert(search_key, packed);
         self.buffer_has_data = true;
         Ok(())
     }
 
+    /// Delete a key by adding it to the tombstone set.
+    ///
+    /// Tombstoned keys are invisible to search and range_scan. The underlying
+    /// arena node is not modified; space is reclaimed when the index is rebuilt.
+    /// Returns true if the key was newly tombstoned (false if already deleted).
+    pub fn delete(&mut self, key: &[u8]) -> bool {
+        let search_key = self.key_to_u64(key);
+        self.deleted.insert(search_key)
+    }
+
     /// Flush write buffer to B+Tree.
-    /// Drains and sorts buffer entries, then bulk inserts into the tree.
+    /// Drains and radix-sorts buffer entries, then bulk inserts into the tree.
+    /// drain_buf and drain_scratch are reused across flushes to avoid per-flush allocation.
     fn flush_buffer(&mut self) -> Result<()> {
         if !self.buffer_has_data {
             return Ok(());
@@ -358,18 +449,26 @@ impl BufferedBTreeIndex {
 
         let flush_start = std::time::Instant::now();
 
-        // Drain and sort entries for sequential B+Tree insertion
+        // Drain and radix-sort entries for sequential B+Tree insertion.
+        // drain_buf and drain_scratch are reused (no heap allocation after first flush).
         let drain_start = std::time::Instant::now();
-        let entries = self.buffer.drain_sorted();
+        self.buffer.drain_sorted_into(&mut self.drain_buf, &mut self.drain_scratch);
         let drain_elapsed = drain_start.elapsed();
 
-        // Bulk insert using cursor-based API (passes u64 directly, no conversion)
+        // Bulk insert into arena. When no deletes are pending, pass sorted entries
+        // directly from drain_buf. Only allocate a filtered copy when needed.
         let btree_start = std::time::Instant::now();
-        let bulk_entries: Vec<(u64, u64)> = entries
-            .iter()
-            .map(|e| (e.key, e.packed_tuple_id))
-            .collect();
-        self.btree.insert_bulk_sorted(&bulk_entries)?;
+        if self.deleted.is_empty() {
+            let entries = &self.drain_buf;
+            self.btree.insert_bulk_sorted(entries)?;
+        } else {
+            let filtered: Vec<(u64, u64)> = self.drain_buf
+                .iter()
+                .filter(|(k, _)| !self.deleted.contains(k))
+                .copied()
+                .collect();
+            self.btree.insert_bulk_sorted(&filtered)?;
+        }
         let btree_elapsed = btree_start.elapsed();
 
         // Update stats
@@ -389,7 +488,7 @@ impl BufferedBTreeIndex {
     }
 
     /// Range scan from start_key to end_key (inclusive).
-    /// Merges results from write buffer and B+Tree.
+    /// Merges results from write buffer and B+Tree, filtering tombstoned keys.
     #[inline]
     pub fn range_scan(
         &self,
@@ -398,7 +497,11 @@ impl BufferedBTreeIndex {
     ) -> Vec<(u64, TupleId)> {
         // Fast path: skip merge when buffer is empty (common after flush)
         if !self.buffer_has_data {
-            return self.btree.range_scan(start_key, end_key);
+            let mut results = self.btree.range_scan(start_key, end_key);
+            if !self.deleted.is_empty() {
+                results.retain(|(k, _)| !self.deleted.contains(k));
+            }
+            return results;
         }
 
         let start = start_key.map(|k| self.key_to_u64(k)).unwrap_or(0);
@@ -407,13 +510,18 @@ impl BufferedBTreeIndex {
         // Get results from B+Tree (already sorted)
         let btree_results = self.btree.range_scan(start_key, end_key);
 
-        // Get results from buffer that fall in range, then sort
-        let mut buffer_results: Vec<_> = self
-            .buffer
-            .iter()
-            .filter(|e| e.key >= start && e.key <= end)
-            .map(|e| (e.key, BTreeArenaIndex::unpack_tuple_id(e.packed_tuple_id)))
-            .collect();
+        // Get results from buffer that fall in range (exclude tombstoned), then sort.
+        // Skip the full table scan if the buffer's key range does not overlap [start, end].
+        // buffer.min_key and buffer.max_key are maintained on every insert and reset on drain.
+        let mut buffer_results: Vec<_> = if self.buffer.min_key <= end && self.buffer.max_key >= start {
+            self.buffer
+                .iter()
+                .filter(|(k, _)| *k >= start && *k <= end && !self.deleted.contains(k))
+                .map(|(k, v)| (k, BTreeArenaIndex::unpack_tuple_id(v)))
+                .collect()
+        } else {
+            Vec::new()
+        };
         buffer_results.sort_unstable_by_key(|(k, _)| *k);
 
         // Merge sorted results (buffer entries override B+Tree for same key)
@@ -442,6 +550,11 @@ impl BufferedBTreeIndex {
                 }
                 (None, None) => break,
             }
+        }
+
+        // Filter tombstoned entries from B+Tree results that made it into the merge.
+        if !self.deleted.is_empty() {
+            merged.retain(|(k, _)| !self.deleted.contains(k));
         }
 
         merged

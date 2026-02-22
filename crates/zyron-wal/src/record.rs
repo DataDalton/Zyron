@@ -221,6 +221,68 @@ impl LogRecord {
         buf.freeze()
     }
 
+    /// Serializes record directly into a raw buffer with the given LSN.
+    /// This is the zero-allocation fast path for high-throughput writes.
+    ///
+    /// # Safety
+    /// Caller must ensure `buf` has at least `size_on_disk()` bytes available.
+    #[inline]
+    pub unsafe fn serialize_into(&self, buf: *mut u8, lsn: Lsn) -> usize {
+        let mut offset = 0;
+
+        // Write header (24 bytes)
+        unsafe { std::ptr::copy_nonoverlapping(lsn.0.to_le_bytes().as_ptr(), buf, 8) };
+        offset += 8;
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.prev_lsn.0.to_le_bytes().as_ptr(),
+                buf.add(offset),
+                8,
+            )
+        };
+        offset += 8;
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.txn_id.to_le_bytes().as_ptr(), buf.add(offset), 4)
+        };
+        offset += 4;
+
+        unsafe { *buf.add(offset) = self.record_type as u8 };
+        offset += 1;
+
+        unsafe { *buf.add(offset) = self.flags };
+        offset += 1;
+
+        let payload_len = self.payload.len() as u16;
+        unsafe {
+            std::ptr::copy_nonoverlapping(payload_len.to_le_bytes().as_ptr(), buf.add(offset), 2)
+        };
+        offset += 2;
+
+        // Write payload
+        if !self.payload.is_empty() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.payload.as_ptr(),
+                    buf.add(offset),
+                    self.payload.len(),
+                )
+            };
+            offset += self.payload.len();
+        }
+
+        // Compute and write CRC32 checksum
+        let data_slice = unsafe { std::slice::from_raw_parts(buf, offset) };
+        let checksum = crc32fast::hash(data_slice);
+        unsafe {
+            std::ptr::copy_nonoverlapping(checksum.to_le_bytes().as_ptr(), buf.add(offset), 4)
+        };
+        offset += 4;
+
+        offset
+    }
+
     /// Deserializes a record from bytes with checksum verification.
     /// Verifies checksum directly from input bytes without re-serialization.
     #[inline]
@@ -368,6 +430,83 @@ impl LogRecord {
         }
 
         Ok(records)
+    }
+
+    /// Parses records from a contiguous Bytes buffer, calling f for each valid record.
+    ///
+    /// Same parsing and checksum logic as parse_all but with no intermediate Vec.
+    /// Each record is handed to the callback immediately after parsing.
+    #[inline]
+    pub fn for_each<F>(data: Bytes, mut f: F)
+    where
+        F: FnMut(LogRecord),
+    {
+        let mut offset = 0;
+        let data_len = data.len();
+        let base_ptr = data.as_ptr();
+
+        while offset + HEADER_SIZE + CHECKSUM_SIZE <= data_len {
+            // SAFETY: bounds check above ensures we can read HEADER_SIZE bytes.
+            let (lsn_raw, prev_lsn_raw, txn_id, record_type_byte, flags, payload_len) = unsafe {
+                let ptr = base_ptr.add(offset);
+                let lsn_raw = std::ptr::read_unaligned(ptr.add(OFF_LSN) as *const u64);
+                let prev_lsn_raw = std::ptr::read_unaligned(ptr.add(OFF_PREV_LSN) as *const u64);
+                let txn_id = std::ptr::read_unaligned(ptr.add(OFF_TXN_ID) as *const u32);
+                let record_type_byte = *ptr.add(OFF_RECORD_TYPE);
+                let flags = *ptr.add(OFF_FLAGS);
+                let payload_len =
+                    std::ptr::read_unaligned(ptr.add(OFF_PAYLOAD_LEN) as *const u16) as usize;
+                (
+                    u64::from_le(lsn_raw),
+                    u64::from_le(prev_lsn_raw),
+                    u32::from_le(txn_id),
+                    record_type_byte,
+                    flags,
+                    payload_len,
+                )
+            };
+
+            let record_size = HEADER_SIZE + payload_len + CHECKSUM_SIZE;
+            if offset + record_size > data_len {
+                break;
+            }
+
+            let checksum_offset = offset + HEADER_SIZE + payload_len;
+            // SAFETY: bounds check above ensures checksum_offset + 4 <= data_len.
+            let stored_checksum = unsafe {
+                let ptr = base_ptr.add(checksum_offset);
+                u32::from_le(std::ptr::read_unaligned(ptr as *const u32))
+            };
+            // SAFETY: bounds check ensures valid slice.
+            let computed_checksum = unsafe {
+                crc32fast::hash(std::slice::from_raw_parts(
+                    base_ptr.add(offset),
+                    checksum_offset - offset,
+                ))
+            };
+            if stored_checksum != computed_checksum {
+                break;
+            }
+
+            let record_type = match LogRecordType::try_from(record_type_byte) {
+                Ok(rt) => rt,
+                Err(_) => break,
+            };
+
+            let payload_start = offset + HEADER_SIZE;
+            let payload = data.slice(payload_start..payload_start + payload_len);
+
+            f(Self {
+                lsn: Lsn(lsn_raw),
+                prev_lsn: Lsn(prev_lsn_raw),
+                txn_id,
+                record_type,
+                flags,
+                payload,
+            });
+
+            offset += record_size;
+        }
     }
 }
 

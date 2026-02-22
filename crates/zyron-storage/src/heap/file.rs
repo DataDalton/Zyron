@@ -4,7 +4,9 @@
 //! from the pool, modified in memory, marked dirty, and written back lazily.
 
 use crate::disk::DiskManager;
-use crate::freespace::{ENTRIES_PER_FSM_PAGE, FreeSpaceMap, FsmPage, space_to_category};
+use crate::freespace::{
+    ENTRIES_PER_FSM_PAGE, FreeSpaceMap, FsmPage, category_to_min_space, space_to_category,
+};
 use crate::heap::constants::{DATA_START, HEAP_HEADER_OFFSET, TUPLE_HEADER_SIZE, TUPLE_SLOT_SIZE};
 use crate::heap::page::{HeapPage, SlotId};
 use crate::tuple::{Tuple, TupleHeader, TupleId, TupleView};
@@ -533,7 +535,9 @@ impl HeapFile {
 
     /// Batch insert multiple tuples.
     ///
-    /// Uses batch page allocation to minimize async overhead.
+    /// Checks the hint cache for existing pages with free space before allocating
+    /// new pages. Allocates one page at a time as needed, so cached_heap_pages
+    /// stays in sync with the number of pages actually allocated on disk.
     pub async fn insert_batch(&self, tuples: &[Tuple]) -> Result<Vec<TupleId>> {
         use crate::heap::page::TupleSlot;
 
@@ -541,60 +545,72 @@ impl HeapFile {
             return Ok(Vec::new());
         }
 
-        // Estimate pages needed (overestimate by 10% to handle fragmentation)
-        let total_bytes: usize = tuples
-            .iter()
-            .map(|t| t.size_on_disk() + TupleSlot::SIZE)
-            .sum();
-        let usable_per_page = PAGE_SIZE - HeapPage::DATA_START;
-        let base_estimate = (total_bytes / usable_per_page) + 1;
-        let pages_estimate = base_estimate + base_estimate / 10 + 5;
-
-        // Pre-allocate pages in batch (single async call)
-        let allocated_pages = self
-            .disk
-            .allocate_pages_batch(self.config.heap_file_id, pages_estimate as u32)
-            .await?;
-
-        // Track which pages have been used and flushed
-        let mut current_page_idx = 0;
-        let mut current_page = HeapPage::new(allocated_pages[0]);
         let mut results = Vec::with_capacity(tuples.len());
-        let mut pages_used = 0;
+        let mut current_page_id: Option<PageId> = None;
+        let mut current_page: Option<HeapPage> = None;
 
         for tuple in tuples {
             let space_needed = tuple.size_on_disk() + TupleSlot::SIZE;
 
-            // Move to next page if current doesn't have space
-            if current_page.free_space() < space_needed {
-                // Flush current page
-                let page_id = allocated_pages[current_page_idx];
-                self.write_page(page_id, current_page.as_bytes()).await?;
-                self.defer_fsm_update(page_id.page_num, current_page.free_space());
-                pages_used += 1;
+            // Current page has no deleted tuples, so free_space equals total usable.
+            let needs_new_page = match &current_page {
+                Some(p) => p.free_space() < space_needed,
+                None => true,
+            };
 
-                // Move to next page
-                current_page_idx += 1;
-                current_page = HeapPage::new(allocated_pages[current_page_idx]);
+            if needs_new_page {
+                // Flush current page to buffer pool before moving on.
+                if let (Some(pid), Some(p)) = (current_page_id, &current_page) {
+                    self.write_page(pid, p.as_bytes()).await?;
+                    self.defer_fsm_update(pid.page_num, p.total_usable_space());
+                }
+
+                // Check hint cache for an existing page with sufficient free space.
+                let hint_page_num = {
+                    let state = self.fsm_state.lock();
+                    state.hint_cache.hints[..state.hint_cache.count]
+                        .iter()
+                        .find(|(_, cat)| category_to_min_space(*cat) >= space_needed)
+                        .map(|(pn, _)| *pn)
+                };
+
+                if let Some(page_num) = hint_page_num {
+                    let pid = PageId::new(self.config.heap_file_id, page_num);
+                    let page_data = self.fetch_page(pid).await?;
+                    let page = HeapPage::from_bytes(page_data);
+                    // Use total_usable_space to account for reclaimable deleted space.
+                    if page.total_usable_space() >= space_needed {
+                        current_page_id = Some(pid);
+                        current_page = Some(page);
+                        // No increment: reusing an already-counted page.
+                    } else {
+                        // Hint was stale, allocate a new page.
+                        let pid = self.disk.allocate_page(self.config.heap_file_id).await?;
+                        self.increment_heap_pages();
+                        current_page_id = Some(pid);
+                        current_page = Some(HeapPage::new(pid));
+                    }
+                } else {
+                    let pid = self.disk.allocate_page(self.config.heap_file_id).await?;
+                    self.increment_heap_pages();
+                    current_page_id = Some(pid);
+                    current_page = Some(HeapPage::new(pid));
+                }
             }
 
-            // Insert tuple
-            let slot_id = current_page.insert_tuple(tuple)?;
-            results.push(TupleId::new(allocated_pages[current_page_idx], slot_id.0));
+            let pid = current_page_id.unwrap();
+            let page = current_page.as_mut().unwrap();
+            let slot_id = page.insert_tuple(tuple)?;
+            results.push(TupleId::new(pid, slot_id.0));
         }
 
-        // Flush final page
-        let page_id = allocated_pages[current_page_idx];
-        self.write_page(page_id, current_page.as_bytes()).await?;
-        self.defer_fsm_update(page_id.page_num, current_page.free_space());
-        pages_used += 1;
-
-        // Update heap page count
-        for _ in 0..pages_used {
-            self.increment_heap_pages();
+        // Flush the final page.
+        if let (Some(pid), Some(p)) = (current_page_id, &current_page) {
+            self.write_page(pid, p.as_bytes()).await?;
+            self.defer_fsm_update(pid.page_num, p.total_usable_space());
         }
 
-        // Batch flush all FSM updates
+        // Batch flush all FSM updates.
         self.flush_fsm_updates().await?;
 
         Ok(results)
