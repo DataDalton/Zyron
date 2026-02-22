@@ -316,6 +316,11 @@ impl WalWriter {
             }
             Err(e) => {
                 eprintln!("WAL segment rotation error: {:?}", e);
+                // Clear pending state and wake all waiters to prevent deadlock.
+                // Callers will retry rotation on the next append.
+                let mut state = lock.lock();
+                state.pending = false;
+                condvar.notify_all();
             }
         }
     }

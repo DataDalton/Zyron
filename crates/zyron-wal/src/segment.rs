@@ -372,17 +372,12 @@ impl LogSegment {
 }
 
 /// Synchronous segment reader for WAL replay without async overhead.
-pub struct SyncLogSegment {
-    header: SegmentHeader,
-    write_offset: u32,
-    file: std::fs::File,
-}
+pub struct SyncLogSegment;
 
 impl SyncLogSegment {
     /// Opens and reads an entire segment file in 3 syscalls: open, fstat, read.
     ///
     /// Returns only the data bytes after the header via zero-copy Bytes::slice.
-    /// Use this instead of open_sync + read_all_data_sync for replay and recovery.
     pub fn read_all(path: &Path) -> Result<Bytes> {
         use std::io::Read;
 
@@ -395,7 +390,9 @@ impl SyncLogSegment {
 
         let mut buf = Vec::with_capacity(file_size);
         // SAFETY: read_exact fills the entire buffer. Skipping zeroing saves ~6µs per 100KB.
-        unsafe { buf.set_len(file_size); }
+        unsafe {
+            buf.set_len(file_size);
+        }
         file.read_exact(&mut buf)?;
 
         let header = SegmentHeader::from_bytes(buf[..SegmentHeader::SIZE].try_into().unwrap());
@@ -403,56 +400,6 @@ impl SyncLogSegment {
 
         // Zero-copy: Bytes::slice increments the Arc refcount, no data copy.
         Ok(Bytes::from(buf).slice(SegmentHeader::SIZE..))
-    }
-
-    /// Opens an existing segment file synchronously.
-    pub fn open_sync(path: &Path) -> Result<Self> {
-        use std::io::Read;
-
-        let mut file = std::fs::OpenOptions::new().read(true).open(path)?;
-
-        let mut header_bytes = [0u8; SegmentHeader::SIZE];
-        file.read_exact(&mut header_bytes)?;
-        let header = SegmentHeader::from_bytes(&header_bytes);
-        header.validate()?;
-
-        // fstat on the already-open fd: no seek, cursor stays at SegmentHeader::SIZE.
-        let file_size = file.metadata()?.len();
-        let write_offset = file_size as u32;
-
-        Ok(Self { header, write_offset, file })
-    }
-
-    /// Returns the segment ID.
-    pub fn segment_id(&self) -> SegmentId {
-        self.header.segment_id
-    }
-
-    /// Returns the data size in bytes (write_offset - header size).
-    #[inline]
-    pub fn data_size(&self) -> u32 {
-        self.write_offset.saturating_sub(SegmentHeader::SIZE as u32)
-    }
-
-    /// Reads all data from header offset to current write position synchronously.
-    ///
-    /// Requires the file cursor to be at SegmentHeader::SIZE (i.e., immediately
-    /// after open_sync, which leaves the cursor there after reading the header).
-    #[inline]
-    pub fn read_all_data_sync(&mut self) -> Result<Bytes> {
-        use std::io::Read;
-
-        let data_len = (self.write_offset as u64).saturating_sub(SegmentHeader::SIZE as u64);
-
-        if data_len == 0 {
-            return Ok(Bytes::new());
-        }
-
-        // Cursor is already at SegmentHeader::SIZE from open_sync. No seek needed.
-        let mut buf = vec![0u8; data_len as usize];
-        self.file.read_exact(&mut buf)?;
-
-        Ok(Bytes::from(buf))
     }
 }
 

@@ -1,0 +1,111 @@
+{
+  "id": "2026-02-22_202526_7175ef9-local",
+  "date": "2026-02-22 20:26:19Z",
+  "ts": 1771791979,
+  "commit": "7175ef9-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "B+ Tree": {
+      "util_before": { "cpu_pct": 10.0, "ram_used_gb": 19.88 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 25.93 },
+      "Delete throughput (ops/sec)": {
+        "average": 38019922.439358,
+        "runs": [38019922.44],
+        "target": 8000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "Insert throughput (ops/sec)": {
+        "average": 8445407.726085,
+        "runs": [10013949.43, 10430606.74, 10250407.20, 5987418.04, 5544657.22],
+        "target": 8000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "Lookup latency (ns/op)": {
+        "average": 23.296000,
+        "runs": [23.28, 20.45, 25.40, 23.91, 23.44],
+        "target": 40.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Range throughput (ops/sec)": {
+        "average": 1030944444.444444,
+        "runs": [1251250000.00, 1251250000.00, 1112222222.22, 770000000.00, 770000000.00],
+        "target": 40000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Buffer Pool": {
+      "util_before": { "cpu_pct": 11.0, "ram_used_gb": 19.92 },
+      "util_after": { "cpu_pct": 19.0, "ram_used_gb": 28.81 },
+      "Avg fetch latency (ns)": {
+        "average": 7.528000,
+        "runs": [7.50, 7.60, 7.33, 7.41, 7.80],
+        "target": 15.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Cache hit rate": {
+        "average": 1.000000,
+        "runs": [1.00, 1.00, 1.00, 1.00, 1.00],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "WAL Write/Replay": {
+      "util_before": { "cpu_pct": 11.0, "ram_used_gb": 19.93 },
+      "util_after": { "cpu_pct": 16.0, "ram_used_gb": 28.86 },
+      "Write throughput (ops/sec)": {
+        "average": 3426342.223137,
+        "runs": [3521374.74, 4201504.14, 3426769.93, 2399117.12, 3582945.18],
+        "target": 3000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "Replay throughput (ops/sec)": {
+        "average": 8278111.770761,
+        "runs": [7870297.50, 8786574.11, 9090909.09, 6842285.32, 8800492.83],
+        "target": 6000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Recovery": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 14.68 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 14.02 },
+      "Recovery time (us/KB)": {
+        "average": 7.324588,
+        "runs": [7.32],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Heap File": {
+      "util_before": { "cpu_pct": 11.0, "ram_used_gb": 19.92 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 11.31 },
+      "Insert throughput (ops/sec)": {
+        "average": 3088037.877217,
+        "runs": [1170824.46, 2172203.61, 3830522.37, 4194894.81, 4071744.13],
+        "target": 2000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "Scan throughput (ops/sec)": {
+        "average": 41436522.205854,
+        "runs": [10950983.40, 44792833.15, 52438384.90, 48395683.11, 50604726.48],
+        "target": 20000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}

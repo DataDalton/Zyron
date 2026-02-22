@@ -34,7 +34,15 @@ unsafe impl Sync for RingBuffer {}
 
 impl RingBuffer {
     /// Creates a new ring buffer with the given capacity in bytes.
+    ///
+    /// Capacity must be at least 128KB. For correctness, capacity should be >=
+    /// the WAL segment size so that wrap-around only occurs after a full drain.
     pub fn new(capacity_bytes: usize) -> Self {
+        debug_assert!(
+            capacity_bytes >= 128 * 1024 || cfg!(test),
+            "Ring buffer capacity too small: {} bytes",
+            capacity_bytes,
+        );
         let buffer = vec![0u8; capacity_bytes].into_boxed_slice();
 
         Self {
@@ -49,6 +57,13 @@ impl RingBuffer {
 
     /// Claims `size` bytes and returns a pointer to write into.
     ///
+    /// The record must fit contiguously within the buffer. The buffer capacity
+    /// must be large enough relative to the segment size that wrap-around only
+    /// occurs after the flush thread has drained all pending data (write_cursor
+    /// == read_cursor at wrap time). This is guaranteed when
+    /// ring_buffer_capacity >= segment_size, because the sequencer triggers
+    /// rotation + full drain before the buffer can wrap.
+    ///
     /// # Safety
     /// Caller must write exactly `size` bytes to the returned pointer before calling
     /// `commit_write`. The pointer is valid until the ring buffer wraps past this region.
@@ -56,6 +71,17 @@ impl RingBuffer {
     pub unsafe fn write_record(&self, size: usize, _lsn: Lsn) -> *mut u8 {
         let offset = self.write_cursor.fetch_add(size as u64, Ordering::Relaxed);
         let buf_offset = (offset as usize) % self.buffer_size;
+
+        // Verify the record does not straddle the wrap boundary.
+        debug_assert!(
+            buf_offset + size <= self.buffer_size,
+            "WAL record ({} bytes) straddles ring buffer boundary at offset {}. \
+             Ring buffer capacity ({}) may be too small.",
+            size,
+            buf_offset,
+            self.buffer_size,
+        );
+
         unsafe { (*self.buffer.get()).as_mut_ptr().add(buf_offset) }
     }
 

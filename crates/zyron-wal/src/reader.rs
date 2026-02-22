@@ -261,10 +261,6 @@ impl RecoveryManager {
         let mut committed_txns = std::collections::HashSet::with_capacity(1024);
         let mut aborted_txns = std::collections::HashSet::with_capacity(64);
 
-        // Track the last checkpoint encountered. When a CheckpointEnd is found,
-        // clear accumulated state so only post-checkpoint work remains.
-        let mut last_checkpoint_lsn: Option<Lsn> = None;
-
         // for_each_record_from avoids the intermediate Vec<LogRecord> that scan_from
         // would build, eliminating the struct copies from extend() and the intermediate
         // allocation for records that are not committed data records.
@@ -275,7 +271,6 @@ impl RecoveryManager {
                 LogRecordType::CheckpointEnd => {
                     // State before this checkpoint is already durable. Reset accumulators
                     // so only post-checkpoint work drives redo/undo.
-                    last_checkpoint_lsn = Some(record.lsn);
                     redo_records.clear();
                     active_txns.clear();
                     committed_txns.clear();
@@ -307,7 +302,6 @@ impl RecoveryManager {
         redo_records.retain(|r| committed_txns.contains(&r.txn_id));
 
         let undo_txns: Vec<_> = active_txns.keys().copied().collect();
-        let _ = last_checkpoint_lsn;
 
         Ok(RecoveryResult {
             redo_records,

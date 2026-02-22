@@ -1,15 +1,15 @@
 //! Arena-based B+Tree index with bulk insert optimization.
 
-use parking_lot::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
-use crate::tuple::TupleId;
 use super::arena::{ArenaInternalNodeHeader, ArenaLeafNodeHeader, BTreeArena};
 use super::constants::{
     ARENA_CHILD_SIZE, ARENA_INTERNAL_HEADER_SIZE, ARENA_KEY_SIZE, ARENA_LEAF_ENTRY_SIZE,
     ARENA_LEAF_HEADER_SIZE, ARENA_MAX_INTERNAL_KEYS, ARENA_MAX_LEAF_ENTRIES, ARENA_NULL_OFFSET,
 };
-use zyron_common::page::PageId;
+use crate::tuple::TupleId;
+use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use zyron_common::Result;
+use zyron_common::page::PageId;
 
 pub struct BTreeArenaIndex {
     /// Memory arena for all nodes.
@@ -739,7 +739,8 @@ impl BTreeArenaIndex {
         let end = end_key.map(|k| self.key_to_u64(k)).unwrap_or(u64::MAX);
 
         // Pre-allocate to avoid repeated reallocation under concurrent allocator contention.
-        let capacity = ((end.saturating_sub(start) + 1) as usize).min(8192);
+        // saturating_add prevents wrap to 0 when end = u64::MAX.
+        let capacity = (end.saturating_sub(start).saturating_add(1) as usize).min(8192);
         let mut results = Vec::with_capacity(capacity);
 
         // Find starting leaf
@@ -1048,8 +1049,9 @@ impl BTreeArenaIndex {
                 batch_active = false; // Don't start batch after split (version already finalized)
 
                 // Find where key ended up
-                last_insert_pos =
-                    self.find_key_position(new_leaf, key, new_header.num_entries).unwrap_or(0);
+                last_insert_pos = self
+                    .find_key_position(new_leaf, key, new_header.num_entries)
+                    .unwrap_or(0);
             }
         }
 

@@ -28,11 +28,6 @@ impl LsnSequencer {
         }
     }
 
-    /// Creates a sequencer starting at the first segment with header offset.
-    pub fn first_segment(segment_size: u32) -> Self {
-        Self::new(0, SegmentHeader::SIZE as u32, segment_size)
-    }
-
     /// Reserves space for a record atomically.
     ///
     /// Returns `(assigned_lsn, needs_rotation)`:
@@ -95,13 +90,6 @@ impl LsnSequencer {
     pub fn current_segment_id(&self) -> u32 {
         let packed = self.next_lsn.load(Ordering::Acquire);
         (packed >> 32) as u32
-    }
-
-    /// Returns the current offset within the segment.
-    #[inline]
-    pub fn current_offset(&self) -> u32 {
-        let packed = self.next_lsn.load(Ordering::Acquire);
-        packed as u32
     }
 }
 
