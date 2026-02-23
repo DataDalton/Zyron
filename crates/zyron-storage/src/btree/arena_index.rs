@@ -957,14 +957,13 @@ impl BTreeArenaIndex {
                 }
             }
 
-            // End current batch and start new tree traversal
+            // End current batch and start new tree traversal.
+            // No volatile/fence needed: &mut self guarantees exclusive access.
             if batch_active {
                 unsafe {
                     let header_ptr = batch_leaf_ptr as *mut ArenaLeafNodeHeader;
-                    std::sync::atomic::fence(Ordering::Release);
-                    std::ptr::write_volatile(&mut (*header_ptr).version, batch_version + 2);
+                    (*header_ptr).version = batch_version + 2;
                 }
-                // batch_active will be set by the branch below (true or false)
             }
 
             // Tree traversal to find correct leaf, tracking separator key for batch bound
@@ -1003,11 +1002,11 @@ impl BTreeArenaIndex {
                 batch_active = true;
                 batch_leaf_ptr = self.arena.node_ptr_mut(leaf_offset);
 
-                // Bump version (odd = write in progress)
+                // Bump version (odd = write in progress).
+                // No volatile/fence needed: &mut self guarantees exclusive access.
                 unsafe {
                     let header_ptr = batch_leaf_ptr as *mut ArenaLeafNodeHeader;
-                    std::ptr::write_volatile(&mut (*header_ptr).version, batch_version + 1);
-                    std::sync::atomic::fence(Ordering::Release);
+                    (*header_ptr).version = batch_version + 1;
                 }
 
                 // Find insertion position
@@ -1055,12 +1054,11 @@ impl BTreeArenaIndex {
             }
         }
 
-        // Finalize last batch
+        // Finalize last batch. No volatile/fence: &mut self guarantees exclusive access.
         if batch_active {
             unsafe {
                 let header_ptr = batch_leaf_ptr as *mut ArenaLeafNodeHeader;
-                std::sync::atomic::fence(Ordering::Release);
-                std::ptr::write_volatile(&mut (*header_ptr).version, batch_version + 2);
+                (*header_ptr).version = batch_version + 2;
             }
         }
 

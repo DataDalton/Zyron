@@ -1,0 +1,185 @@
+
+=== B+ Tree Arena Performance Test ===
+Keys per run: 1000000
+Lookup sample: 10000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Delete [PASS]: 35,911,801 ops/sec (2.7846ms, 100000 keys, target: 8,000,000)
+  All 100000 deleted keys verified not found
+  Delete throughput (ops/sec) [PASS]: 35,911,801 >= 8,000,000 (target)
+  Insert: 12,577,240 ops/sec (79.5087ms), height=2
+    Breakdown: hash_table=0.0ms, flush=81.9ms, flushes=8
+  Lookup: 24.07 ns/op (240.7µs)
+  Range: 1,251,250,000 ops/sec (800ns)
+
+--- Run 2/5 ---
+  Insert: 13,185,080 ops/sec (75.8433ms), height=2
+    Breakdown: hash_table=0.0ms, flush=80.7ms, flushes=8
+  Lookup: 16.17 ns/op (161.7µs)
+  Range: 1,251,250,000 ops/sec (800ns)
+
+--- Run 3/5 ---
+  Insert: 13,202,383 ops/sec (75.7439ms), height=2
+    Breakdown: hash_table=0.0ms, flush=79.9ms, flushes=8
+  Lookup: 17.33 ns/op (173.3µs)
+  Range: 1,430,000,000 ops/sec (700ns)
+
+--- Run 4/5 ---
+  Insert: 13,296,811 ops/sec (75.206ms), height=2
+    Breakdown: hash_table=0.0ms, flush=80.0ms, flushes=8
+  Lookup: 24.98 ns/op (249.8µs)
+  Range: 1,251,250,000 ops/sec (800ns)
+
+--- Run 5/5 ---
+  Insert: 13,326,031 ops/sec (75.0411ms), height=2
+    Breakdown: hash_table=0.0ms, flush=80.1ms, flushes=8
+  Lookup: 18.52 ns/op (185.2µs)
+  Range: 1,251,250,000 ops/sec (800ns)
+
+=== B+ Tree Validation Results ===
+  Insert throughput (ops/sec) [PASS/OK]:
+    Runs: [12,577,240, 13,185,080, 13,202,383, 13,296,811, 13,326,031]
+    Average: 13,117,509 >= 10,000,000 (target)
+    Min/Max: 12,577,240 / 13,326,031, StdDev: 275,424
+  Lookup latency (ns/op) [PASS/OK]:
+    Runs: [24, 16, 17, 25, 19]
+    Average: 20 <= 40 (target)
+    Min/Max: 16 / 25, StdDev: 4
+  Range throughput (ops/sec) [PASS/OK]:
+    Runs: [1,251,250,000, 1,251,250,000, 1,430,000,000, 1,251,250,000, 1,251,250,000]
+    Average: 1,287,000,000 >= 40,000,000 (target)
+    Min/Max: 1,251,250,000 / 1,430,000,000, StdDev: 71,500,000
+Buffer Pool Pin Test: PASSED - pin prevents eviction
+Buffer Pool Eviction: PASSED - 400 dirty evictions with 500/100 pages
+
+=== Buffer Pool Performance Test ===
+Frames: 50, Pages: 30, Rounds: 1000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Fetch latency: 7.29 ns
+  Hit rate: 1.0000
+
+--- Run 2/5 ---
+  Fetch latency: 7.80 ns
+  Hit rate: 1.0000
+
+--- Run 3/5 ---
+  Fetch latency: 7.31 ns
+  Hit rate: 1.0000
+
+--- Run 4/5 ---
+  Fetch latency: 7.33 ns
+  Hit rate: 1.0000
+
+--- Run 5/5 ---
+  Fetch latency: 8.42 ns
+  Hit rate: 1.0000
+
+=== Buffer Pool Validation Results ===
+  Avg fetch latency (ns) [PASS/OK]:
+    Runs: [7, 8, 7, 7, 8]
+    Average: 8 <= 15 (target)
+    Min/Max: 7 / 8, StdDev: 0
+  Cache hit rate [PASS/OK]:
+    Runs: [1, 1, 1, 1, 1]
+    Average: 1 >= 1 (target)
+    Min/Max: 1 / 1, StdDev: 0
+
+=== Heap File Performance Test ===
+Tuples per run: 100000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Insert: 6,585,880 ops/sec (15.184ms)
+  Scan: 59,333,096 ops/sec (1.6854ms)
+
+--- Run 2/5 ---
+  Insert: 10,134,279 ops/sec (9.8675ms)
+  Scan: 62,421,973 ops/sec (1.602ms)
+
+--- Run 3/5 ---
+  Insert: 10,499,900 ops/sec (9.5239ms)
+  Scan: 61,240,737 ops/sec (1.6329ms)
+
+--- Run 4/5 ---
+  Insert: 10,309,278 ops/sec (9.7ms)
+  Scan: 60,404,712 ops/sec (1.6555ms)
+
+--- Run 5/5 ---
+  Insert: 9,906,385 ops/sec (10.0945ms)
+  Scan: 63,963,157 ops/sec (1.5634ms)
+
+=== Heap File Validation Results ===
+  Insert throughput (ops/sec) [PASS/OK]:
+    Runs: [6,585,880, 10,134,279, 10,499,900, 10,309,278, 9,906,385]
+    Average: 9,487,144 >= 8,000,000 (target)
+    Min/Max: 6,585,880 / 10,499,900, StdDev: 1,463,794
+  Scan throughput (ops/sec) [PASS/OK]:
+    Runs: [59,333,096, 62,421,973, 61,240,737, 60,404,712, 63,963,157]
+    Average: 61,472,735 >= 20,000,000 (target)
+    Min/Max: 59,333,096 / 63,963,157, StdDev: 1,604,731
+WAL Segment Rotation: PASSED - rotated from segment 00000001 to 00000004
+Initial insert: 8,333,333 ops/sec (10,000 tuples)
+Pages after insert: 72
+Delete: 18,539,118 ops/sec (target: 500,000)
+Reinsert (with compaction): 18,950,161 ops/sec (target: 1,000,000)
+Space reuse: 143 pages (was 72)
+Heap File Space Reuse: PASSED
+
+============================================================
+ZyronDB Phase 1: Storage Foundation Validation Complete
+============================================================
+
+Run: cargo test -p zyron-storage --test phase1_test --release -- --nocapture
+
+=== WAL Write/Replay Performance Test ===
+Records per run: 10000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Write: 11,947,431 ops/sec (837µs)
+  Replay: 19,368,584 ops/sec (516.3µs)
+
+--- Run 2/5 ---
+  Write: 14,507,471 ops/sec (689.3µs)
+  Replay: 33,079,722 ops/sec (302.3µs)
+
+--- Run 3/5 ---
+  Write: 12,755,102 ops/sec (784µs)
+  Replay: 20,703,934 ops/sec (483µs)
+
+--- Run 4/5 ---
+  Write: 13,326,226 ops/sec (750.4µs)
+  Replay: 30,330,604 ops/sec (329.7µs)
+
+--- Run 5/5 ---
+  Write: 14,306,152 ops/sec (699µs)
+  Replay: 32,435,939 ops/sec (308.3µs)
+
+=== WAL Validation Results ===
+  Write throughput (ops/sec) [PASS/OK]:
+    Runs: [11,947,431, 14,507,471, 12,755,102, 13,326,226, 14,306,152]
+    Average: 13,368,476 >= 8,000,000 (target)
+    Min/Max: 11,947,431 / 14,507,471, StdDev: 956,444
+  Replay throughput (ops/sec) [PASS/OK]:
+    Runs: [19,368,584, 33,079,722, 20,703,934, 30,330,604, 32,435,939]
+    Average: 27,183,757 >= 12,000,000 (target)
+    Min/Max: 19,368,584 / 33,079,722, StdDev: 5,921,410
+Heap File Delete/Scan: PASSED - deleted 1000/10000 tuples
+WAL Recovery with Uncommitted: PASSED - 10 redo, 5 undo
+
+=== Recovery Performance ===
+  WAL size: 107.1 KB
+  Recovery time: 294µs
+  Recovery time (us/KB) [PASS]: 3 <= 10 (target)
+WAL+Heap Recovery: PASSED - 1000 committed transactions recovered (107.1 KB WAL, 294µs)
+
+=== WAL Checksum Integrity Test ===
+  Clean read: PASSED (100 records)
+  Bit flip detection: PASSED (read 49 of 100 before corruption)
+  Zeroed region detection: PASSED (read 33 of 100 before corruption)
+  Truncation detection: PASSED (recovered 49 of 100 records from half-sized file)
+  Full corruption detection: PASSED (0 records from random data)
+WAL Checksum Integrity: PASSED

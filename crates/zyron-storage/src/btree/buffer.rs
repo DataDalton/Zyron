@@ -479,14 +479,11 @@ impl BufferedBTreeIndex {
 
         // Drain and radix-sort entries for sequential B+Tree insertion.
         // drain_buf and drain_scratch are reused (no heap allocation after first flush).
-        let drain_start = std::time::Instant::now();
         self.buffer
             .drain_sorted_into(&mut self.drain_buf, &mut self.drain_scratch);
-        let drain_elapsed = drain_start.elapsed();
 
         // Bulk insert into arena. When no deletes are pending, pass sorted entries
         // directly from drain_buf. Only allocate a filtered copy when needed.
-        let btree_start = std::time::Instant::now();
         if self.deleted.is_empty() {
             let entries = &self.drain_buf;
             self.btree.insert_bulk_sorted(entries)?;
@@ -499,13 +496,10 @@ impl BufferedBTreeIndex {
                 .collect();
             self.btree.insert_bulk_sorted(&filtered)?;
         }
-        let btree_elapsed = btree_start.elapsed();
 
         // Update stats
         self.stats.flush_count += 1;
         self.stats.flush_time_ns += flush_start.elapsed().as_nanos() as u64;
-        self.stats.drain_time_ns += drain_elapsed.as_nanos() as u64;
-        self.stats.btree_insert_time_ns += btree_elapsed.as_nanos() as u64;
 
         // Mark buffer as empty
         self.buffer_has_data = false;

@@ -7,7 +7,7 @@
 //! The hot path (append) is lock-free, making this writer scale well under
 //! concurrent load from multiple transactions.
 
-use crate::record::{record_size_for_payload, serialize_raw, LogRecordType, Lsn};
+use crate::record::{LogRecordType, Lsn, record_size_for_payload, serialize_raw};
 use crate::ring_buffer::RingBuffer;
 use crate::segment::{LogSegment, SegmentHeader, SegmentId};
 use crate::sequencer::LsnSequencer;
@@ -400,6 +400,13 @@ impl WalWriter {
         flags: u8,
         payload: &[u8],
     ) -> Result<Lsn> {
+        if payload.len() > crate::constants::MAX_PAYLOAD_SIZE {
+            return Err(ZyronError::Internal(format!(
+                "payload {} bytes exceeds MAX_PAYLOAD_SIZE {}",
+                payload.len(),
+                crate::constants::MAX_PAYLOAD_SIZE,
+            )));
+        }
         let record_size = record_size_for_payload(payload.len()) as u32;
 
         loop {
@@ -481,20 +488,6 @@ impl WalWriter {
         if record_size >= 4096 {
             self.wake_flush_thread();
         }
-    }
-
-    /// Appends a log record and waits for it to be flushed to disk.
-    pub fn append_durable(
-        &self,
-        txn_id: u32,
-        prev_lsn: Lsn,
-        record_type: LogRecordType,
-        flags: u8,
-        payload: &[u8],
-    ) -> Result<Lsn> {
-        let lsn = self.append(txn_id, prev_lsn, record_type, flags, payload)?;
-        self.wait_for_flush(lsn)?;
-        Ok(lsn)
     }
 
     /// Waits until the given LSN has been flushed to disk.
@@ -637,16 +630,12 @@ impl WalWriter {
                 continue;
             }
 
-            let buf_start = unsafe {
-                self.ring_buffer
-                    .write_record(batch_size as usize, base_lsn)
-            };
+            let buf_start = unsafe { self.ring_buffer.write_record(batch_size as usize, base_lsn) };
 
             let mut buf_offset: u32 = 0;
             for &(txn_id, payload) in &inserts[batch_start..batch_end] {
                 let rsize = record_size_for_payload(payload.len()) as u32;
-                let record_lsn =
-                    Lsn::new(base_lsn.segment_id(), base_lsn.offset() + buf_offset);
+                let record_lsn = Lsn::new(base_lsn.segment_id(), base_lsn.offset() + buf_offset);
 
                 unsafe {
                     let buf_ptr = buf_start.add(buf_offset as usize);
@@ -844,9 +833,7 @@ mod tests {
         for i in 1..=10 {
             let begin_lsn = writer.log_begin(i).unwrap();
             let data = format!("data{}", i);
-            let insert_lsn = writer
-                .log_insert(i, begin_lsn, data.as_bytes())
-                .unwrap();
+            let insert_lsn = writer.log_insert(i, begin_lsn, data.as_bytes()).unwrap();
             writer.log_commit(i, insert_lsn).unwrap();
         }
 

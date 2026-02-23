@@ -4,9 +4,9 @@ use crate::constants::{
     CHECKSUM_SIZE, HEADER_SIZE, MAX_PAYLOAD_SIZE, OFF_FLAGS, OFF_LSN, OFF_PAYLOAD_LEN,
     OFF_PREV_LSN, OFF_RECORD_TYPE, OFF_TXN_ID,
 };
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use zyron_common::{PageId, Result, ZyronError};
+use zyron_common::{Result, ZyronError};
 
 /// Log Sequence Number - unique identifier for each log record.
 ///
@@ -367,9 +367,14 @@ impl LogRecord {
                 Err(_) => break,
             };
 
-            // Zero-copy slice for payload (shares underlying buffer via Arc)
-            let payload_start = offset + HEADER_SIZE;
-            let payload = data.slice(payload_start..payload_start + payload_len);
+            // For non-empty payloads, zero-copy slice shares underlying buffer via Arc.
+            // Empty payloads use Bytes::new() to skip the Arc refcount increment.
+            let payload = if payload_len > 0 {
+                let payload_start = offset + HEADER_SIZE;
+                data.slice(payload_start..payload_start + payload_len)
+            } else {
+                Bytes::new()
+            };
 
             records.push(Self {
                 lsn: Lsn(lsn_raw),
@@ -445,8 +450,12 @@ impl LogRecord {
                 Err(_) => break,
             };
 
-            let payload_start = offset + HEADER_SIZE;
-            let payload = data.slice(payload_start..payload_start + payload_len);
+            let payload = if payload_len > 0 {
+                let payload_start = offset + HEADER_SIZE;
+                data.slice(payload_start..payload_start + payload_len)
+            } else {
+                Bytes::new()
+            };
 
             f(Self {
                 lsn: Lsn(lsn_raw),
@@ -491,6 +500,13 @@ pub unsafe fn serialize_raw(
     payload: &[u8],
 ) -> usize {
     use crate::checksum::WalHasher;
+
+    debug_assert!(
+        payload.len() <= MAX_PAYLOAD_SIZE,
+        "payload {} bytes exceeds MAX_PAYLOAD_SIZE {}",
+        payload.len(),
+        MAX_PAYLOAD_SIZE,
+    );
 
     let payload_len = payload.len() as u16;
     let data_len = HEADER_SIZE + payload.len();
@@ -542,101 +558,6 @@ pub unsafe fn serialize_raw(
         std::ptr::copy_nonoverlapping(checksum.to_le_bytes().as_ptr(), buf.add(offset), 4);
     }
     offset + CHECKSUM_SIZE
-}
-
-/// Payload for insert/update/delete operations.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DataPayload {
-    /// Page being modified.
-    pub page_id: PageId,
-    /// Slot number within the page.
-    pub slot: u16,
-    /// Old data (for update/delete, used in undo).
-    pub old_data: Option<Bytes>,
-    /// New data (for insert/update, used in redo).
-    pub new_data: Option<Bytes>,
-}
-
-impl DataPayload {
-    /// Serializes the payload to bytes.
-    pub fn serialize(&self) -> Bytes {
-        let mut buf = BytesMut::new();
-
-        buf.put_u32_le(self.page_id.file_id);
-        buf.put_u32_le(self.page_id.page_num);
-        buf.put_u16_le(self.slot);
-
-        // Old data
-        if let Some(ref old) = self.old_data {
-            buf.put_u32_le(old.len() as u32);
-            buf.put_slice(old);
-        } else {
-            buf.put_u32_le(0);
-        }
-
-        // New data
-        if let Some(ref new) = self.new_data {
-            buf.put_u32_le(new.len() as u32);
-            buf.put_slice(new);
-        } else {
-            buf.put_u32_le(0);
-        }
-
-        buf.freeze()
-    }
-
-    /// Deserializes the payload from bytes.
-    pub fn deserialize(mut data: &[u8]) -> Result<Self> {
-        if data.len() < 14 {
-            return Err(ZyronError::WalCorrupted {
-                lsn: 0,
-                reason: "data payload too short".to_string(),
-            });
-        }
-
-        let file_id = data.get_u32_le();
-        let page_num = data.get_u32_le();
-        let page_id = PageId::new(file_id, page_num);
-        let slot = data.get_u16_le();
-
-        // Old data
-        let old_len = data.get_u32_le() as usize;
-        let old_data = if old_len > 0 {
-            if data.len() < old_len {
-                return Err(ZyronError::WalCorrupted {
-                    lsn: 0,
-                    reason: "truncated old data".to_string(),
-                });
-            }
-            let old = Bytes::copy_from_slice(&data[..old_len]);
-            data.advance(old_len);
-            Some(old)
-        } else {
-            None
-        };
-
-        // New data
-        let new_len = data.get_u32_le() as usize;
-        let new_data = if new_len > 0 {
-            if data.len() < new_len {
-                return Err(ZyronError::WalCorrupted {
-                    lsn: 0,
-                    reason: "truncated new data".to_string(),
-                });
-            }
-            let new = Bytes::copy_from_slice(&data[..new_len]);
-            Some(new)
-        } else {
-            None
-        };
-
-        Ok(Self {
-            page_id,
-            slot,
-            old_data,
-            new_data,
-        })
-    }
 }
 
 #[cfg(test)]
@@ -745,40 +666,6 @@ mod tests {
 
         let abort = LogRecord::abort(Lsn::new(1, 200), Lsn::new(1, 100), 100);
         assert_eq!(abort.record_type, LogRecordType::Abort);
-    }
-
-    #[test]
-    fn test_data_payload_serialization() {
-        let payload = DataPayload {
-            page_id: PageId::new(1, 42),
-            slot: 5,
-            old_data: Some(Bytes::from_static(b"old")),
-            new_data: Some(Bytes::from_static(b"new value")),
-        };
-
-        let serialized = payload.serialize();
-        let deserialized = DataPayload::deserialize(&serialized).unwrap();
-
-        assert_eq!(deserialized.page_id, payload.page_id);
-        assert_eq!(deserialized.slot, payload.slot);
-        assert_eq!(deserialized.old_data, payload.old_data);
-        assert_eq!(deserialized.new_data, payload.new_data);
-    }
-
-    #[test]
-    fn test_data_payload_no_old_data() {
-        let payload = DataPayload {
-            page_id: PageId::new(0, 0),
-            slot: 0,
-            old_data: None,
-            new_data: Some(Bytes::from_static(b"inserted")),
-        };
-
-        let serialized = payload.serialize();
-        let deserialized = DataPayload::deserialize(&serialized).unwrap();
-
-        assert!(deserialized.old_data.is_none());
-        assert!(deserialized.new_data.is_some());
     }
 
     #[test]

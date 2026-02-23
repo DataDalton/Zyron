@@ -8,8 +8,9 @@ pub const HEADER_SIZE: usize = 24;
 /// Size of the checksum in bytes.
 pub const CHECKSUM_SIZE: usize = 4;
 
-/// Maximum payload size (64 KB).
-pub const MAX_PAYLOAD_SIZE: usize = 64 * 1024;
+/// Maximum payload size. Capped at u16::MAX (65535) because the on-disk
+/// record header stores payload length as a 2-byte field.
+pub const MAX_PAYLOAD_SIZE: usize = u16::MAX as usize;
 
 // Header field offsets for pointer-based parsing
 

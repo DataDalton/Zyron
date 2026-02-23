@@ -60,6 +60,13 @@ const RECOVERY_TARGET_US_PER_KB: f64 = 10.0;
 const VALIDATION_RUNS: usize = 5;
 const REGRESSION_THRESHOLD: f64 = 2.0; // Fail if any run >2x worse than target
 
+// Serializes performance benchmark tests so they run one at a time.
+// Correctness tests (pin, eviction, etc.) can still run in parallel.
+// Performance benchmarks measure throughput, which requires consistent
+// CPU availability. Running CPU-intensive benchmarks concurrently makes
+// results dependent on OS thread scheduling, not code quality.
+static BENCHMARK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // =============================================================================
 // Validation Infrastructure
 // =============================================================================
@@ -139,7 +146,10 @@ fn validate_metric(
     tprintln!("  {} [{}/{}]:", name, status, regr_status);
     tprintln!(
         "    Runs: [{}]",
-        runs.iter().map(|x| format_with_commas(*x)).collect::<Vec<_>>().join(", ")
+        runs.iter()
+            .map(|x| format_with_commas(*x))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     tprintln!(
         "    Average: {} {} {} (target)",
@@ -163,7 +173,13 @@ fn validate_metric(
     }
 }
 
-fn check_performance(test: &str, name: &str, actual: f64, target: f64, higher_is_better: bool) -> bool {
+fn check_performance(
+    test: &str,
+    name: &str,
+    actual: f64,
+    target: f64,
+    higher_is_better: bool,
+) -> bool {
     let passed = if higher_is_better {
         actual >= target
     } else {
@@ -179,7 +195,15 @@ fn check_performance(test: &str, name: &str, actual: f64, target: f64, higher_is
         comparison,
         format_with_commas(target)
     );
-    write_benchmark_record(test, name, actual, vec![actual], target, passed, higher_is_better);
+    write_benchmark_record(
+        test,
+        name,
+        actual,
+        vec![actual],
+        target,
+        passed,
+        higher_is_better,
+    );
     passed
 }
 
@@ -266,13 +290,21 @@ fn unix_to_datetime(ts: u64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}Z", y, m, d, hours, mins, secs)
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}Z",
+        y, m, d, hours, mins, secs
+    )
 }
 
 fn benchmark_dir() -> std::path::PathBuf {
     // CARGO_MANIFEST_DIR = crates/zyron-storage, so go up 2 levels to workspace root.
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest.parent().unwrap().parent().unwrap().join("benchmarks")
+    manifest
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("benchmarks")
 }
 
 // Formats a slice of strings as a JSON array of quoted strings.
@@ -300,12 +332,24 @@ fn platform_hw_impl() -> PlatformHardware {
         .unwrap_or_default();
     let parts: Vec<&str> = out.trim().splitn(3, "||").collect();
     let cpu = parts.first().copied().unwrap_or("unknown").to_string();
-    let ram_bytes: u64 = parts.get(1).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    let ram_bytes: u64 = parts
+        .get(1)
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
     let gpus = parts
         .get(2)
-        .map(|s| s.split(";;").map(|g| g.trim().to_string()).filter(|g| !g.is_empty()).collect())
+        .map(|s| {
+            s.split(";;")
+                .map(|g| g.trim().to_string())
+                .filter(|g| !g.is_empty())
+                .collect()
+        })
         .unwrap_or_default();
-    PlatformHardware { cpu, ram_gb: ram_bytes as f64 / (1024.0_f64.powi(3)), gpus }
+    PlatformHardware {
+        cpu,
+        ram_gb: ram_bytes as f64 / (1024.0_f64.powi(3)),
+        gpus,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -340,7 +384,11 @@ fn platform_hw_impl() -> PlatformHardware {
                 .collect()
         })
         .unwrap_or_default();
-    PlatformHardware { cpu, ram_gb: ram_kb as f64 / (1024.0 * 1024.0), gpus }
+    PlatformHardware {
+        cpu,
+        ram_gb: ram_kb as f64 / (1024.0 * 1024.0),
+        gpus,
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -372,12 +420,20 @@ fn platform_hw_impl() -> PlatformHardware {
                 .collect()
         })
         .unwrap_or_default();
-    PlatformHardware { cpu, ram_gb: ram_bytes as f64 / (1024.0_f64.powi(3)), gpus }
+    PlatformHardware {
+        cpu,
+        ram_gb: ram_bytes as f64 / (1024.0_f64.powi(3)),
+        gpus,
+    }
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 fn platform_hw_impl() -> PlatformHardware {
-    PlatformHardware { cpu: "unknown".to_string(), ram_gb: 0.0, gpus: vec![] }
+    PlatformHardware {
+        cpu: "unknown".to_string(),
+        ram_gb: 0.0,
+        gpus: vec![],
+    }
 }
 
 // Samples current CPU load percentage and RAM used. One PowerShell call on Windows.
@@ -395,9 +451,18 @@ fn take_util_snapshot() -> UtilSnapshot {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .unwrap_or_default();
     let parts: Vec<&str> = out.trim().splitn(2, "||").collect();
-    let cpu_pct: f64 = parts.first().and_then(|s| s.trim().parse().ok()).unwrap_or(0.0);
-    let used_kb: f64 = parts.get(1).and_then(|s| s.trim().parse().ok()).unwrap_or(0.0);
-    UtilSnapshot { cpu_pct, ram_used_gb: used_kb / (1024.0 * 1024.0) }
+    let cpu_pct: f64 = parts
+        .first()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0.0);
+    let used_kb: f64 = parts
+        .get(1)
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0.0);
+    UtilSnapshot {
+        cpu_pct,
+        ram_used_gb: used_kb / (1024.0 * 1024.0),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -405,7 +470,11 @@ fn take_util_snapshot() -> UtilSnapshot {
     // 1-min load average as a proxy for CPU utilization.
     let cpu_pct = std::fs::read_to_string("/proc/loadavg")
         .ok()
-        .and_then(|s| s.split_whitespace().next().and_then(|v| v.parse::<f64>().ok()))
+        .and_then(|s| {
+            s.split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<f64>().ok())
+        })
         .unwrap_or(0.0);
     let mem_info = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let total_kb: u64 = mem_info
@@ -420,7 +489,10 @@ fn take_util_snapshot() -> UtilSnapshot {
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    UtilSnapshot { cpu_pct, ram_used_gb: (total_kb - avail_kb) as f64 / (1024.0 * 1024.0) }
+    UtilSnapshot {
+        cpu_pct,
+        ram_used_gb: (total_kb - avail_kb) as f64 / (1024.0 * 1024.0),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -466,12 +538,18 @@ fn take_util_snapshot() -> UtilSnapshot {
         .unwrap_or(0);
     let ram_used_gb =
         (ram_bytes.saturating_sub(pages_free * page_size)) as f64 / (1024.0_f64.powi(3));
-    UtilSnapshot { cpu_pct, ram_used_gb }
+    UtilSnapshot {
+        cpu_pct,
+        ram_used_gb,
+    }
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 fn take_util_snapshot() -> UtilSnapshot {
-    UtilSnapshot { cpu_pct: 0.0, ram_used_gb: 0.0 }
+    UtilSnapshot {
+        cpu_pct: 0.0,
+        ram_used_gb: 0.0,
+    }
 }
 
 fn platform_hw() -> &'static PlatformHardware {
@@ -479,7 +557,9 @@ fn platform_hw() -> &'static PlatformHardware {
 }
 
 fn logical_cores() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0)
 }
 
 // Stable identifier for this test binary invocation: "YYYYMMDD_HHMMSS_<commit>".
@@ -507,7 +587,11 @@ fn collected_utils() -> &'static Mutex<Vec<UtilRecord>> {
 
 // Records system utilization for a test group and rewrites the JSON file.
 fn record_test_util(test: &str, before: UtilSnapshot, after: UtilSnapshot) {
-    let record = UtilRecord { test: test.to_string(), before, after };
+    let record = UtilRecord {
+        test: test.to_string(),
+        before,
+        after,
+    };
     let utils_snap = if let Ok(mut g) = collected_utils().lock() {
         if let Some(existing) = g.iter_mut().find(|u| u.test == test) {
             *existing = record;
@@ -518,7 +602,11 @@ fn record_test_util(test: &str, before: UtilSnapshot, after: UtilSnapshot) {
     } else {
         return;
     };
-    let metrics_snap = collected_metrics().lock().ok().map(|g| g.clone()).unwrap_or_default();
+    let metrics_snap = collected_metrics()
+        .lock()
+        .ok()
+        .map(|g| g.clone())
+        .unwrap_or_default();
     write_run_json(&metrics_snap, &utils_snap);
 }
 
@@ -576,18 +664,28 @@ fn build_run_json(metrics: &[MetricRecord], utils: &[UtilRecord]) -> String {
             ));
         }
 
-        let test_metrics: Vec<&MetricRecord> =
-            metrics.iter().filter(|m| m.test.as_str() == *test_name).collect();
+        let test_metrics: Vec<&MetricRecord> = metrics
+            .iter()
+            .filter(|m| m.test.as_str() == *test_name)
+            .collect();
         for (mi, m) in test_metrics.iter().enumerate() {
             let escaped_metric = m.metric.replace('"', "\\\"");
             let comma = if mi + 1 < test_metrics.len() { "," } else { "" };
-            let runs_json = m.runs.iter().map(|v| format!("{:.2}", v)).collect::<Vec<_>>().join(", ");
+            let runs_json = m
+                .runs
+                .iter()
+                .map(|v| format!("{:.2}", v))
+                .collect::<Vec<_>>()
+                .join(", ");
             out.push_str(&format!("      \"{escaped_metric}\": {{\n"));
             out.push_str(&format!("        \"average\": {:.6},\n", m.average));
             out.push_str(&format!("        \"runs\": [{runs_json}],\n"));
             out.push_str(&format!("        \"target\": {:.6},\n", m.target));
             out.push_str(&format!("        \"passed\": {},\n", m.passed));
-            out.push_str(&format!("        \"higher_is_better\": {}\n", m.higher_is_better));
+            out.push_str(&format!(
+                "        \"higher_is_better\": {}\n",
+                m.higher_is_better
+            ));
             out.push_str(&format!("      }}{comma}\n"));
         }
 
@@ -663,7 +761,11 @@ fn write_benchmark_record(
     } else {
         return;
     };
-    let utils_snap = collected_utils().lock().ok().map(|g| g.clone()).unwrap_or_default();
+    let utils_snap = collected_utils()
+        .lock()
+        .ok()
+        .map(|g| g.clone())
+        .unwrap_or_default();
     write_run_json(&metrics_snap, &utils_snap);
 }
 
@@ -676,6 +778,7 @@ fn write_benchmark_record(
 /// Target: 3M writes/sec, 6M replay/sec
 #[tokio::test]
 async fn test_wal_write_replay_10k_records() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     const RECORD_COUNT: usize = 10_000;
 
     tprintln!("\n=== WAL Write/Replay Performance Test ===");
@@ -737,7 +840,10 @@ async fn test_wal_write_replay_10k_records() {
             assert!(
                 written_lsns[i] > written_lsns[i - 1],
                 "Run {}: LSN ordering violated at index {}: {:?} <= {:?}",
-                run + 1, i, written_lsns[i], written_lsns[i - 1]
+                run + 1,
+                i,
+                written_lsns[i],
+                written_lsns[i - 1]
             );
         }
 
@@ -834,6 +940,7 @@ async fn test_wal_write_replay_10k_records() {
 /// Tests WAL segment rotation with many records.
 #[tokio::test]
 async fn test_wal_segment_rotation() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
     let config = WalWriterConfig {
         wal_dir: dir.path().to_path_buf(),
@@ -865,7 +972,8 @@ async fn test_wal_segment_rotation() {
 
     tprintln!(
         "WAL Segment Rotation: PASSED - rotated from segment {} to {}",
-        initial_segment, final_segment
+        initial_segment,
+        final_segment
     );
 }
 
@@ -876,6 +984,7 @@ async fn test_wal_segment_rotation() {
 /// Tests buffer pool with 100 frames accessing 500 different pages.
 #[tokio::test]
 async fn test_buffer_pool_eviction() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     const NUM_FRAMES: usize = 100;
     const NUM_PAGES: usize = 500;
 
@@ -913,13 +1022,16 @@ async fn test_buffer_pool_eviction() {
 
     tprintln!(
         "Buffer Pool Eviction: PASSED - {} dirty evictions with {}/{} pages",
-        dirty_evictions, NUM_PAGES, NUM_FRAMES
+        dirty_evictions,
+        NUM_PAGES,
+        NUM_FRAMES
     );
 }
 
 /// Tests that pinned pages cannot be evicted.
 #[tokio::test]
 async fn test_buffer_pool_pin_prevents_eviction() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     const NUM_FRAMES: usize = 10;
 
     let pool = BufferPool::new(BufferPoolConfig {
@@ -948,6 +1060,7 @@ async fn test_buffer_pool_pin_prevents_eviction() {
 /// Target: 100% hit rate, 15ns average fetch
 #[tokio::test]
 async fn test_buffer_pool_cache_hit_rate() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     const NUM_FRAMES: usize = 50;
     const NUM_PAGES: usize = 30;
     const ACCESS_ROUNDS: usize = 1000;
@@ -955,7 +1068,9 @@ async fn test_buffer_pool_cache_hit_rate() {
     tprintln!("\n=== Buffer Pool Performance Test ===");
     tprintln!(
         "Frames: {}, Pages: {}, Rounds: {}",
-        NUM_FRAMES, NUM_PAGES, ACCESS_ROUNDS
+        NUM_FRAMES,
+        NUM_PAGES,
+        ACCESS_ROUNDS
     );
     tprintln!("Validation runs: {}", VALIDATION_RUNS);
 
@@ -1046,6 +1161,7 @@ async fn test_buffer_pool_cache_hit_rate() {
 /// Target: 10M inserts/sec, 100M scan/sec
 #[tokio::test]
 async fn test_heap_file_100k_tuples() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     const TUPLE_COUNT: usize = 100_000;
 
     tprintln!("\n=== Heap File Performance Test ===");
@@ -1181,6 +1297,7 @@ async fn test_heap_file_100k_tuples() {
 /// Tests delete and scan exclusion.
 #[tokio::test]
 async fn test_heap_file_delete_and_scan() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     const TUPLE_COUNT: usize = 10_000;
     const DELETE_COUNT: usize = 1_000;
 
@@ -1235,7 +1352,8 @@ async fn test_heap_file_delete_and_scan() {
 
     tprintln!(
         "Heap File Delete/Scan: PASSED - deleted {}/{} tuples",
-        DELETE_COUNT, TUPLE_COUNT
+        DELETE_COUNT,
+        TUPLE_COUNT
     );
 }
 
@@ -1243,6 +1361,7 @@ async fn test_heap_file_delete_and_scan() {
 /// Target: Delete throughput >= 500k ops/sec, Reinsert throughput >= 1M ops/sec
 #[tokio::test]
 async fn test_heap_file_space_reuse() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     const TUPLE_COUNT: usize = 10_000;
     const TUPLE_DATA_SIZE: usize = 100;
     const DELETE_TARGET_OPS_SEC: f64 = 500_000.0;
@@ -1319,7 +1438,8 @@ async fn test_heap_file_space_reuse() {
     );
     tprintln!(
         "Space reuse: {} pages (was {})",
-        pages_after_reinsert, pages_after_insert
+        pages_after_reinsert,
+        pages_after_insert
     );
 
     // Performance assertions
@@ -1347,6 +1467,7 @@ async fn test_heap_file_space_reuse() {
 /// Target: 8M inserts/sec, 40ns/lookup, 40M range/sec
 #[test]
 fn test_btree_1m_keys() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     const KEY_COUNT: usize = 1_000_000;
     const LOOKUP_SAMPLE: usize = 10_000;
     const RANGE_SIZE: usize = 1_000;
@@ -1498,7 +1619,11 @@ fn test_btree_1m_keys() {
                 );
             }
 
-            let delete_status = if delete_ops_sec >= BTREE_DELETE_TARGET_OPS_SEC { "PASS" } else { "FAIL" };
+            let delete_status = if delete_ops_sec >= BTREE_DELETE_TARGET_OPS_SEC {
+                "PASS"
+            } else {
+                "FAIL"
+            };
             tprintln!(
                 "  Delete [{}]: {} ops/sec ({:?}, {} keys, target: {})",
                 delete_status,
@@ -1507,7 +1632,10 @@ fn test_btree_1m_keys() {
                 deleted_keys.len(),
                 format_with_commas(BTREE_DELETE_TARGET_OPS_SEC)
             );
-            tprintln!("  All {} deleted keys verified not found", deleted_keys.len());
+            tprintln!(
+                "  All {} deleted keys verified not found",
+                deleted_keys.len()
+            );
 
             check_performance(
                 "B+ Tree",
@@ -1524,7 +1652,8 @@ fn test_btree_1m_keys() {
 
         // Get flush stats for profiling
         let stats = btree.stats();
-        let hash_table_time_ns = insert_duration.as_nanos() as u64 - stats.flush_time_ns;
+        let hash_table_time_ns =
+            (insert_duration.as_nanos() as u64).saturating_sub(stats.flush_time_ns);
 
         tprintln!(
             "  Insert: {} ops/sec ({:?}), height={}",
@@ -1533,11 +1662,9 @@ fn test_btree_1m_keys() {
             final_height
         );
         tprintln!(
-            "    Breakdown: hash_table={:.1}ms, flush={:.1}ms (drain={:.1}ms, btree={:.1}ms), flushes={}",
+            "    Breakdown: hash_table={:.1}ms, flush={:.1}ms, flushes={}",
             hash_table_time_ns as f64 / 1_000_000.0,
             stats.flush_time_ns as f64 / 1_000_000.0,
-            stats.drain_time_ns as f64 / 1_000_000.0,
-            stats.btree_insert_time_ns as f64 / 1_000_000.0,
             stats.flush_count
         );
         tprintln!("  Lookup: {:.2} ns/op ({:?})", lookup_ns, lookup_duration);
@@ -1613,6 +1740,7 @@ fn test_btree_1m_keys() {
 /// Target: 2ms/MB recovery time
 #[tokio::test]
 async fn test_wal_heap_recovery() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
     let heap_dir = dir.path().join("heap");
     let wal_dir = dir.path().join("wal");
@@ -1710,7 +1838,11 @@ async fn test_wal_heap_recovery() {
     // Calculate recovery performance using actual WAL bytes on disk.
     let wal_size_kb = wal_size_bytes as f64 / 1024.0;
     let recovery_us = recovery_duration.as_micros() as f64;
-    let us_per_kb = if wal_size_kb > 0.0 { recovery_us / wal_size_kb } else { 0.0 };
+    let us_per_kb = if wal_size_kb > 0.0 {
+        recovery_us / wal_size_kb
+    } else {
+        0.0
+    };
 
     record_test_util("Recovery", recovery_util_before, take_util_snapshot());
 
@@ -1737,6 +1869,7 @@ async fn test_wal_heap_recovery() {
 /// Tests recovery with uncommitted transactions.
 #[tokio::test]
 async fn test_wal_recovery_with_uncommitted() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
 
     let config = WalWriterConfig {
@@ -1752,9 +1885,7 @@ async fn test_wal_recovery_with_uncommitted() {
         for i in 1..=10 {
             let begin = writer.log_begin(i).unwrap();
             let data = format!("data_{}", i);
-            let insert = writer
-                .log_insert(i, begin, data.as_bytes())
-                .unwrap();
+            let insert = writer.log_insert(i, begin, data.as_bytes()).unwrap();
             writer.log_commit(i, insert).unwrap();
         }
 
@@ -1808,12 +1939,177 @@ async fn test_wal_recovery_with_uncommitted() {
 }
 
 // =============================================================================
+// Test 6: WAL Checksum Integrity
+// =============================================================================
+
+/// Verifies that the WAL checksum catches corruption, truncation, and bit flips.
+/// Writes records through the full WAL pipeline, then tampers with the on-disk
+/// bytes to confirm the reader rejects corrupted data.
+#[tokio::test]
+async fn test_wal_checksum_integrity() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== WAL Checksum Integrity Test ===");
+
+    let dir = tempdir().unwrap();
+    let config = WalWriterConfig {
+        wal_dir: dir.path().to_path_buf(),
+        segment_size: 1024 * 1024,
+        fsync_enabled: false,
+        ring_buffer_capacity: 1024 * 1024,
+    };
+
+    // Write a set of records through the full pipeline
+    let record_count = 100;
+    let writer = WalWriter::new(config.clone()).unwrap();
+    for i in 0..record_count {
+        let payload = format!("checksum_test_record_{}", i);
+        writer
+            .log_insert(1, Lsn::INVALID, payload.as_bytes())
+            .unwrap();
+    }
+    writer.flush().unwrap();
+    writer.close().unwrap();
+
+    // 1. Verify clean read succeeds and all records round-trip
+    {
+        let reader = WalReader::new(dir.path()).unwrap();
+        let records = reader.scan_all().unwrap();
+        assert_eq!(
+            records.len(),
+            record_count,
+            "Clean read should return all {} records",
+            record_count
+        );
+        for (i, r) in records.iter().enumerate() {
+            let expected = format!("checksum_test_record_{}", i);
+            assert_eq!(
+                r.payload.as_ref(),
+                expected.as_bytes(),
+                "Payload mismatch at record {}",
+                i
+            );
+        }
+        tprintln!("  Clean read: PASSED ({} records)", record_count);
+    }
+
+    // Find the segment file for corruption tests
+    let mut seg_path = None;
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        let entry = entry.unwrap();
+        if entry
+            .path()
+            .extension()
+            .map(|e| e == "wal")
+            .unwrap_or(false)
+        {
+            seg_path = Some(entry.path());
+        }
+    }
+    let seg_path = seg_path.expect("Should have at least one segment file");
+    let original_bytes = std::fs::read(&seg_path).unwrap();
+
+    // 2. Single bit flip in a payload byte: reader should stop at the corrupted record
+    {
+        let mut corrupted = original_bytes.clone();
+        // Flip a bit in the middle of the file (past the segment header)
+        let flip_pos = corrupted.len() / 2;
+        corrupted[flip_pos] ^= 0x01;
+        std::fs::write(&seg_path, &corrupted).unwrap();
+
+        let reader = WalReader::new(dir.path()).unwrap();
+        let records = reader.scan_all().unwrap();
+        assert!(
+            records.len() < record_count,
+            "Bit flip should cause reader to stop early. Got {} records, expected fewer than {}",
+            records.len(),
+            record_count
+        );
+        tprintln!(
+            "  Bit flip detection: PASSED (read {} of {} before corruption)",
+            records.len(),
+            record_count
+        );
+    }
+
+    // 3. Zeroed region: wipe 8 bytes in the payload area
+    {
+        let mut corrupted = original_bytes.clone();
+        let zero_start = corrupted.len() / 3;
+        for b in &mut corrupted[zero_start..zero_start + 8] {
+            *b = 0;
+        }
+        std::fs::write(&seg_path, &corrupted).unwrap();
+
+        let reader = WalReader::new(dir.path()).unwrap();
+        let records = reader.scan_all().unwrap();
+        assert!(
+            records.len() < record_count,
+            "Zeroed region should cause reader to stop early. Got {} records",
+            records.len()
+        );
+        tprintln!(
+            "  Zeroed region detection: PASSED (read {} of {} before corruption)",
+            records.len(),
+            record_count
+        );
+    }
+
+    // 4. Truncation: chop the file in half
+    {
+        let truncated = &original_bytes[..original_bytes.len() / 2];
+        std::fs::write(&seg_path, truncated).unwrap();
+
+        let reader = WalReader::new(dir.path()).unwrap();
+        let records = reader.scan_all().unwrap();
+        assert!(
+            records.len() < record_count,
+            "Truncation should return fewer records. Got {} records",
+            records.len()
+        );
+        assert!(
+            !records.is_empty(),
+            "Truncation at midpoint should still recover some records"
+        );
+        tprintln!(
+            "  Truncation detection: PASSED (recovered {} of {} records from half-sized file)",
+            records.len(),
+            record_count
+        );
+    }
+
+    // 5. Full corruption: randomize all data after segment header (32 bytes)
+    {
+        let mut corrupted = original_bytes.clone();
+        let mut rng = rand::rng();
+        for b in &mut corrupted[32..] {
+            *b = rng.random::<u8>();
+        }
+        std::fs::write(&seg_path, &corrupted).unwrap();
+
+        let reader = WalReader::new(dir.path()).unwrap();
+        let records = reader.scan_all().unwrap();
+        assert_eq!(
+            records.len(),
+            0,
+            "Fully corrupted data should yield 0 valid records, got {}",
+            records.len()
+        );
+        tprintln!("  Full corruption detection: PASSED (0 records from random data)");
+    }
+
+    // Restore original file
+    std::fs::write(&seg_path, &original_bytes).unwrap();
+    tprintln!("WAL Checksum Integrity: PASSED");
+}
+
+// =============================================================================
 // Summary Test
 // =============================================================================
 
 /// Summary test - runs after all validation tests complete.
 #[tokio::test]
 async fn test_phase1_summary() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n============================================================");
     tprintln!("ZyronDB Phase 1: Storage Foundation Validation Complete");
     tprintln!("============================================================");

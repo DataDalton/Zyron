@@ -417,6 +417,47 @@ impl BufferPool {
         Ok((frames, evicted))
     }
 
+    /// Pre-allocates frame IDs from the free list in bulk.
+    ///
+    /// Single mutex acquisition drains up to `count` frames. Returns the
+    /// reserved frame IDs. Caller uses `load_reserved_frame` to set up
+    /// each frame individually, and `release_reserved_frames` to return
+    /// any unused frames.
+    pub fn reserve_frames(&self, count: usize) -> Vec<FrameId> {
+        if count == 0 {
+            return Vec::new();
+        }
+        let mut free_list = self.free_list.lock();
+        let available = free_list.len().min(count);
+        let start = free_list.len() - available;
+        free_list.drain(start..).collect()
+    }
+
+    /// Loads a page into a pre-reserved frame.
+    ///
+    /// Skips the free-list lock since the frame was already reserved.
+    /// The frame is pinned, marked dirty, and data is copied in.
+    /// Caller must call unpin_page when done.
+    pub fn load_reserved_frame(&self, frame_id: FrameId, page_id: PageId, data: &[u8; PAGE_SIZE]) {
+        let frame = &self.frames[frame_id.0 as usize];
+        frame.reset();
+        frame.set_page_id(Some(page_id));
+        frame.pin();
+        frame.copy_from(data);
+        frame.set_dirty(true);
+        self.page_table.insert(page_id, frame_id);
+        self.replacer.record_access(frame_id);
+    }
+
+    /// Returns unused reserved frames back to the free list.
+    pub fn release_reserved_frames(&self, frame_ids: &[FrameId]) {
+        if frame_ids.is_empty() {
+            return;
+        }
+        let mut free_list = self.free_list.lock();
+        free_list.extend_from_slice(frame_ids);
+    }
+
     /// Returns a write guard for page data.
     pub fn write_page(&self, page_id: PageId) -> Option<PageWriteGuard<'_>> {
         let frame = self.fetch_page(page_id)?;

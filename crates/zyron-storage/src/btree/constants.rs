@@ -17,8 +17,9 @@ pub const MIN_FILL_FACTOR: f64 = 0.5;
 pub(crate) const ARENA_NODE_SIZE: usize = 32768;
 
 /// Write buffer capacity (number of entries before flush to B+Tree).
-/// 64K entries x 16 bytes = 1MB buffer size.
-pub(crate) const WRITE_BUFFER_CAPACITY: usize = 65536;
+/// 128K entries x 16 bytes = 2MB buffer size. Larger buffer reduces flush
+/// frequency, halving radix sort + tree insert overhead for large key sets.
+pub(crate) const WRITE_BUFFER_CAPACITY: usize = 131072;
 
 /// Header size for internal nodes (16 bytes).
 pub(crate) const ARENA_INTERNAL_HEADER_SIZE: usize = 16;
@@ -49,9 +50,9 @@ pub(crate) const ARENA_NULL_OFFSET: u64 = u64::MAX;
 
 // Write buffer (Swiss Table) constants
 
-/// Hash table size: 131072 slots (power of 2) for 50% load factor with 65536 entries.
+/// Hash table size: 262144 slots (power of 2) for 50% load factor with 131072 entries.
 /// Must be a multiple of GROUP_SIZE (32) for SIMD alignment.
-pub(crate) const HASH_TABLE_SIZE: usize = 131072;
+pub(crate) const HASH_TABLE_SIZE: usize = 262144;
 
 /// Group size for SIMD probing. AVX2 = 32 bytes = 32 control bytes at once.
 pub(crate) const GROUP_SIZE: usize = 32;

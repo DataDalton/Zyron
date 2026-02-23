@@ -8,10 +8,10 @@ use crate::freespace::{
     ENTRIES_PER_FSM_PAGE, FreeSpaceMap, FsmPage, category_to_min_space, space_to_category,
 };
 use crate::heap::constants::{DATA_START, HEAP_HEADER_OFFSET, TUPLE_HEADER_SIZE, TUPLE_SLOT_SIZE};
-use crate::heap::page::{HeapPage, SlotId};
+use crate::heap::page::{HeapPage, HeapPageHeader, SlotId};
 use crate::tuple::{Tuple, TupleHeader, TupleId, TupleView};
 use std::sync::Arc;
-use zyron_buffer::BufferPool;
+use zyron_buffer::{BufferPool, FrameId};
 use zyron_common::page::{PAGE_SIZE, PageId};
 use zyron_common::{Result, ZyronError};
 
@@ -270,6 +270,22 @@ impl HeapFile {
         }
 
         self.pool.unpin_page(page_id, true); // Mark dirty
+        Ok(())
+    }
+
+    /// Writes a newly allocated page to the buffer pool.
+    /// Skips the fetch_page check since the page is known to not exist in the pool yet.
+    #[inline]
+    async fn write_new_page(&self, page_id: PageId, data: &[u8; PAGE_SIZE]) -> Result<()> {
+        let (_, evicted) = self.pool.load_page(page_id, data)?;
+
+        if let Some(evicted_page) = evicted {
+            self.disk
+                .write_page(evicted_page.page_id, &*evicted_page.data)
+                .await?;
+        }
+
+        self.pool.unpin_page(page_id, true);
         Ok(())
     }
 
@@ -540,8 +556,6 @@ impl HeapFile {
     /// allocation when the pre-allocated pool runs out (rare, only when
     /// tuple sizes vary significantly from the estimate).
     pub async fn insert_batch(&self, tuples: &[Tuple]) -> Result<Vec<TupleId>> {
-        use crate::heap::page::TupleSlot;
-
         if tuples.is_empty() {
             return Ok(Vec::new());
         }
@@ -552,7 +566,7 @@ impl HeapFile {
         let usable_per_page = PAGE_SIZE - DATA_START;
         let total_bytes: usize = tuples
             .iter()
-            .map(|t| t.size_on_disk() + TupleSlot::SIZE)
+            .map(|t| t.size_on_disk() + TUPLE_SLOT_SIZE)
             .sum();
         let estimated_pages = (total_bytes / usable_per_page + 1) as u32;
 
@@ -565,24 +579,85 @@ impl HeapFile {
             .fetch_add(estimated_pages, std::sync::atomic::Ordering::Relaxed);
         let mut pre_alloc_idx: usize = 0;
 
+        // Pre-reserve buffer pool frames in a single free-list lock acquisition.
+        // Eliminates per-page mutex lock during the insert loop.
+        let reserved_frames = self.pool.reserve_frames(estimated_pages as usize);
+        let mut reserved_idx: usize = 0;
+
+        let result = self
+            .insert_batch_inner(
+                tuples,
+                &pre_alloc,
+                &mut pre_alloc_idx,
+                &reserved_frames,
+                &mut reserved_idx,
+                estimated_pages,
+            )
+            .await;
+
+        // Release unused reserved frames on both success and error paths.
+        if reserved_idx < reserved_frames.len() {
+            self.pool
+                .release_reserved_frames(&reserved_frames[reserved_idx..]);
+        }
+
+        result
+    }
+
+    /// Core insert loop, separated so the caller can release reserved frames
+    /// on both success and error paths.
+    async fn insert_batch_inner(
+        &self,
+        tuples: &[Tuple],
+        pre_alloc: &[PageId],
+        pre_alloc_idx: &mut usize,
+        reserved_frames: &[FrameId],
+        reserved_idx: &mut usize,
+        estimated_pages: u32,
+    ) -> Result<Vec<TupleId>> {
         let mut results = Vec::with_capacity(tuples.len());
         let mut current_page_id: Option<PageId> = None;
-        let mut current_page: Option<HeapPage> = None;
+        // Stack-allocated page buffer, reused across pages to avoid Box allocation per page.
+        let mut buf = [0u8; PAGE_SIZE];
+        let mut buf_active = false;
+        // Track whether current page is freshly allocated (no deleted slots).
+        // Fresh pages use the O(1) append path instead of scanning for deleted slots.
+        let mut is_fresh_page = false;
+        // Caller-managed heap page header for fresh pages. Read once at page init,
+        // written once at page flush. Eliminates per-tuple header read/write from slice.
+        let mut page_header = HeapPageHeader::new();
+        // Accumulate FSM updates locally to apply in a single lock acquisition at the end.
+        let mut local_fsm_updates: Vec<(u32, usize)> =
+            Vec::with_capacity(estimated_pages as usize + 1);
 
         for tuple in tuples {
-            let space_needed = tuple.size_on_disk() + TupleSlot::SIZE;
+            let space_needed = tuple.size_on_disk() + TUPLE_SLOT_SIZE;
 
-            // Current page has no deleted tuples, so free_space equals total usable.
-            let needs_new_page = match &current_page {
-                Some(p) => p.free_space() < space_needed,
-                None => true,
+            let needs_new_page = if buf_active {
+                if is_fresh_page {
+                    page_header.free_space() < space_needed
+                } else {
+                    HeapPage::free_space_in_slice(&buf) < space_needed
+                }
+            } else {
+                true
             };
 
             if needs_new_page {
                 // Flush current page to buffer pool before moving on.
-                if let (Some(pid), Some(p)) = (current_page_id, &current_page) {
-                    self.write_page(pid, p.as_bytes()).await?;
-                    self.defer_fsm_update(pid.page_num, p.total_usable_space());
+                if let Some(pid) = current_page_id {
+                    if buf_active {
+                        self.flush_page_buf(
+                            pid,
+                            &mut buf,
+                            is_fresh_page,
+                            &page_header,
+                            reserved_frames,
+                            reserved_idx,
+                            &mut local_fsm_updates,
+                        )
+                        .await?;
+                    }
                 }
 
                 // Check hint cache for an existing page with sufficient free space.
@@ -597,57 +672,125 @@ impl HeapFile {
                 if let Some(page_num) = hint_page_num {
                     let pid = PageId::new(self.config.heap_file_id, page_num);
                     let page_data = self.fetch_page(pid).await?;
-                    let page = HeapPage::from_bytes(page_data);
-                    // Use total_usable_space to account for reclaimable deleted space.
-                    if page.total_usable_space() >= space_needed {
+                    buf = page_data;
+                    let usable = HeapPage::total_usable_space_in_slice(&buf);
+                    if usable >= space_needed {
                         current_page_id = Some(pid);
-                        current_page = Some(page);
+                        buf_active = true;
+                        is_fresh_page = false;
                     } else {
-                        // Hint was stale, use pre-allocated page or allocate single.
-                        let pid = if pre_alloc_idx < pre_alloc.len() {
-                            let p = pre_alloc[pre_alloc_idx];
-                            pre_alloc_idx += 1;
+                        let pid = if *pre_alloc_idx < pre_alloc.len() {
+                            let p = pre_alloc[*pre_alloc_idx];
+                            *pre_alloc_idx += 1;
                             p
                         } else {
                             let p = self.disk.allocate_page(self.config.heap_file_id).await?;
                             self.increment_heap_pages();
                             p
                         };
+                        HeapPage::init_fresh_slice_reuse(&mut buf, pid);
                         current_page_id = Some(pid);
-                        current_page = Some(HeapPage::new(pid));
+                        buf_active = true;
+                        is_fresh_page = true;
+                        page_header = HeapPageHeader::new();
                     }
                 } else {
-                    // Use next pre-allocated page or fall back to single allocation.
-                    let pid = if pre_alloc_idx < pre_alloc.len() {
-                        let p = pre_alloc[pre_alloc_idx];
-                        pre_alloc_idx += 1;
+                    let pid = if *pre_alloc_idx < pre_alloc.len() {
+                        let p = pre_alloc[*pre_alloc_idx];
+                        *pre_alloc_idx += 1;
                         p
                     } else {
                         let p = self.disk.allocate_page(self.config.heap_file_id).await?;
                         self.increment_heap_pages();
                         p
                     };
+                    HeapPage::init_fresh_slice_reuse(&mut buf, pid);
                     current_page_id = Some(pid);
-                    current_page = Some(HeapPage::new(pid));
+                    buf_active = true;
+                    is_fresh_page = true;
+                    page_header = HeapPageHeader::new();
                 }
             }
 
             let pid = current_page_id.unwrap();
-            let page = current_page.as_mut().unwrap();
-            let slot_id = page.insert_tuple(tuple)?;
+            let slot_id = if is_fresh_page {
+                HeapPage::insert_tuple_append_with_header(&mut buf, tuple, &mut page_header)?
+            } else {
+                let (sid, _) = HeapPage::insert_tuple_in_slice(&mut buf, tuple)?;
+                sid
+            };
             results.push(TupleId::new(pid, slot_id.0));
         }
 
         // Flush the final page.
-        if let (Some(pid), Some(p)) = (current_page_id, &current_page) {
-            self.write_page(pid, p.as_bytes()).await?;
-            self.defer_fsm_update(pid.page_num, p.total_usable_space());
+        if let Some(pid) = current_page_id {
+            if buf_active {
+                self.flush_page_buf(
+                    pid,
+                    &mut buf,
+                    is_fresh_page,
+                    &page_header,
+                    reserved_frames,
+                    reserved_idx,
+                    &mut local_fsm_updates,
+                )
+                .await?;
+            }
+        }
+
+        // Apply all FSM updates in a single lock acquisition.
+        {
+            let mut state = self.fsm_state.lock();
+            for (page_num, free_space) in &local_fsm_updates {
+                let category = space_to_category(*free_space);
+                if category > 0 {
+                    state.hint_cache.update(*page_num, category);
+                } else {
+                    state.hint_cache.remove(*page_num);
+                }
+                state.pending_updates.push(PendingFsmUpdate {
+                    heap_page_num: *page_num,
+                    free_space: *free_space,
+                });
+            }
         }
 
         // Batch flush all FSM updates.
         self.flush_fsm_updates().await?;
 
         Ok(results)
+    }
+
+    /// Flushes a page buffer to the buffer pool or disk.
+    /// For fresh pages, writes the heap header and uses reserved frames when available.
+    /// For existing pages, writes through the standard write_page path.
+    #[inline]
+    async fn flush_page_buf(
+        &self,
+        pid: PageId,
+        buf: &mut [u8; PAGE_SIZE],
+        is_fresh_page: bool,
+        page_header: &HeapPageHeader,
+        reserved_frames: &[FrameId],
+        reserved_idx: &mut usize,
+        local_fsm_updates: &mut Vec<(u32, usize)>,
+    ) -> Result<()> {
+        if is_fresh_page {
+            HeapPage::set_heap_header_in_slice(buf, *page_header);
+            if *reserved_idx < reserved_frames.len() {
+                let fid = reserved_frames[*reserved_idx];
+                *reserved_idx += 1;
+                self.pool.load_reserved_frame(fid, pid, buf);
+                self.pool.unpin_page(pid, false);
+            } else {
+                self.write_new_page(pid, buf).await?;
+            }
+            local_fsm_updates.push((pid.page_num, page_header.free_space()));
+        } else {
+            self.write_page(pid, buf).await?;
+            local_fsm_updates.push((pid.page_num, HeapPage::total_usable_space_in_slice(buf)));
+        }
+        Ok(())
     }
 }
 

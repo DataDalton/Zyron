@@ -306,8 +306,4 @@ pub struct InsertStats {
     pub flush_count: u64,
     /// Total time spent in flush operations (nanoseconds).
     pub flush_time_ns: u64,
-    /// Total time spent in drain_sorted (nanoseconds).
-    pub drain_time_ns: u64,
-    /// Total time spent inserting to B+Tree during flush (nanoseconds).
-    pub btree_insert_time_ns: u64,
 }

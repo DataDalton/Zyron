@@ -5,6 +5,7 @@
 
 use crate::record::{LogRecord, LogRecordType, Lsn};
 use crate::segment::{SegmentHeader, SegmentId, SyncLogSegment};
+use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use zyron_common::Result;
@@ -12,13 +13,17 @@ use zyron_common::Result;
 /// WAL reader for scanning and replaying log records.
 pub struct WalReader {
     wal_dir: PathBuf,
-    segments: BTreeMap<SegmentId, PathBuf>,
+    /// Eagerly loaded segment data. Populated during new() to avoid re-opening
+    /// files during recovery, reducing Windows filesystem syscall overhead.
+    segment_data: BTreeMap<SegmentId, Bytes>,
 }
 
 impl WalReader {
     /// Creates a new WAL reader by scanning the WAL directory.
+    /// Eagerly reads all segment files into memory so that subsequent
+    /// scan/recovery operations do not require additional file I/O.
     pub fn new(wal_dir: &Path) -> Result<Self> {
-        let mut segments = BTreeMap::new();
+        let mut segment_data = BTreeMap::new();
 
         if wal_dir.exists() {
             for entry in std::fs::read_dir(wal_dir)? {
@@ -28,7 +33,9 @@ impl WalReader {
                 if path.extension().map(|e| e == "wal").unwrap_or(false) {
                     if let Some(stem) = path.file_stem() {
                         if let Ok(id) = stem.to_string_lossy().parse::<u32>() {
-                            segments.insert(SegmentId(id), path);
+                            let sid = SegmentId(id);
+                            let data = SyncLogSegment::read_all(&path)?;
+                            segment_data.insert(sid, data);
                         }
                     }
                 }
@@ -37,23 +44,28 @@ impl WalReader {
 
         Ok(Self {
             wal_dir: wal_dir.to_path_buf(),
-            segments,
+            segment_data,
         })
     }
 
     /// Returns the number of segment files.
     pub fn segment_count(&self) -> usize {
-        self.segments.len()
+        self.segment_data.len()
     }
 
     /// Returns the first segment ID, if any.
     pub fn first_segment_id(&self) -> Option<SegmentId> {
-        self.segments.keys().next().copied()
+        self.segment_data.keys().next().copied()
     }
 
     /// Returns the last segment ID, if any.
     pub fn last_segment_id(&self) -> Option<SegmentId> {
-        self.segments.keys().last().copied()
+        self.segment_data.keys().last().copied()
+    }
+
+    /// Returns total cached data bytes across all segments.
+    fn total_data_bytes(&self) -> usize {
+        self.segment_data.values().map(|d| d.len()).sum()
     }
 
     /// Scans all records in the WAL.
@@ -68,24 +80,16 @@ impl WalReader {
             None => return Ok(Vec::new()),
         };
 
-        // Estimate total data bytes across all segments for pre-allocation.
-        let total_bytes: u64 = self
-            .segments
-            .values()
-            .filter_map(|p| p.metadata().ok())
-            .map(|m| m.len())
-            .sum();
-        let estimated_records = (total_bytes as usize / 48).max(64);
+        // Estimate total records from cached segment data for pre-allocation.
+        let estimated_records = (self.total_data_bytes() / 48).max(64);
         let mut results = Vec::with_capacity(estimated_records);
 
         let mut current_segment_id = Some(first_id);
 
         while let Some(seg_id) = current_segment_id {
-            if let Some(path) = self.segments.get(&seg_id) {
-                let data = SyncLogSegment::read_all(path)?;
-
+            if let Some(data) = self.segment_data.get(&seg_id) {
                 if !data.is_empty() {
-                    let segment_records = LogRecord::parse_all(data)?;
+                    let segment_records = LogRecord::parse_all(data.clone())?;
                     results.extend(segment_records);
                 }
 
@@ -110,11 +114,9 @@ impl WalReader {
         let mut is_first_segment = true;
 
         while let Some(seg_id) = current_segment_id {
-            if let Some(path) = self.segments.get(&seg_id) {
-                let data = SyncLogSegment::read_all(path)?;
-
+            if let Some(data) = self.segment_data.get(&seg_id) {
                 if !data.is_empty() {
-                    let segment_records = LogRecord::parse_all(data)?;
+                    let segment_records = LogRecord::parse_all(data.clone())?;
 
                     if is_first_segment && start_offset > SegmentHeader::SIZE as u32 {
                         let skip_bytes = (start_offset - SegmentHeader::SIZE as u32) as usize;
@@ -158,14 +160,12 @@ impl WalReader {
         let mut is_first_segment = true;
 
         while let Some(seg_id) = current_segment_id {
-            if let Some(path) = self.segments.get(&seg_id) {
-                let data = SyncLogSegment::read_all(path)?;
-
+            if let Some(data) = self.segment_data.get(&seg_id) {
                 if !data.is_empty() {
                     if is_first_segment && start_offset > SegmentHeader::SIZE as u32 {
                         let skip_bytes = (start_offset - SegmentHeader::SIZE as u32) as usize;
                         let mut byte_offset = 0;
-                        LogRecord::for_each(data, |record| {
+                        LogRecord::for_each(data.clone(), |record| {
                             if byte_offset >= skip_bytes {
                                 f(record);
                             } else {
@@ -173,7 +173,7 @@ impl WalReader {
                             }
                         });
                     } else {
-                        LogRecord::for_each(data, &mut f);
+                        LogRecord::for_each(data.clone(), &mut f);
                     }
                 }
 
@@ -223,9 +223,9 @@ impl WalReader {
         Ok(active.into_iter().collect())
     }
 
-    /// Refreshes the list of segment files.
+    /// Refreshes the list of segment files and reloads data.
     pub fn refresh(&mut self) -> Result<()> {
-        self.segments.clear();
+        self.segment_data.clear();
 
         for entry in std::fs::read_dir(&self.wal_dir)? {
             let entry = entry?;
@@ -234,7 +234,9 @@ impl WalReader {
             if path.extension().map(|e| e == "wal").unwrap_or(false) {
                 if let Some(stem) = path.file_stem() {
                     if let Ok(id) = stem.to_string_lossy().parse::<u32>() {
-                        self.segments.insert(SegmentId(id), path);
+                        let sid = SegmentId(id);
+                        let data = SyncLogSegment::read_all(&path)?;
+                        self.segment_data.insert(sid, data);
                     }
                 }
             }
@@ -268,7 +270,9 @@ impl RecoveryManager {
         };
         let start_lsn = Lsn::new(start_id.0, SegmentHeader::SIZE as u32);
 
-        let mut redo_records = Vec::with_capacity(1024);
+        // Pre-size from cached segment data: ~48 bytes per record average.
+        let estimated = (self.reader.total_data_bytes() / 48).max(64);
+        let mut redo_records = Vec::with_capacity(estimated);
         let mut active_txns = std::collections::HashMap::with_capacity(256);
         let mut committed_txns = std::collections::HashSet::with_capacity(1024);
         let mut aborted_txns = std::collections::HashSet::with_capacity(64);
