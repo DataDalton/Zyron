@@ -2,9 +2,12 @@
 
 use bytes::Bytes;
 use parking_lot::RwLock;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::disk::DiskManager;
 use crate::tuple::TupleId;
+use super::checkpoint::{self, CheckpointConfig, CheckpointTrigger};
 use super::constants::MAX_KEY_SIZE;
 use super::page::{BTreeInternalPage, BTreeLeafPage};
 use super::store::InMemoryPageStore;
@@ -17,9 +20,9 @@ pub struct BTreeIndex {
     /// In-memory page storage (all nodes stored here).
     pages: RwLock<InMemoryPageStore>,
     /// Root page number (index into pages).
-    root_page_num: std::sync::atomic::AtomicU32,
+    root_page_num: AtomicU32,
     /// Tree height (1 = just root as leaf).
-    height: std::sync::atomic::AtomicU32,
+    height: AtomicU32,
     /// File ID for this index (used for PageId construction).
     file_id: u32,
     /// Disk manager for checkpoint I/O (not used in hot path).
@@ -28,6 +31,19 @@ pub struct BTreeIndex {
     /// Buffer pool reference (kept for compatibility, not used in hot path).
     #[allow(dead_code)]
     pool: Arc<BufferPool>,
+    /// LSN of the most recent checkpoint. 0 means no checkpoint exists.
+    checkpoint_lsn: AtomicU64,
+    /// Directory for checkpoint files.
+    checkpoint_dir: PathBuf,
+    /// WAL bytes accumulated since last checkpoint. Lock-free counter
+    /// so record_wal_bytes() on every WAL append has zero contention.
+    wal_bytes_since_checkpoint: AtomicU64,
+    /// WAL bytes threshold cached from CheckpointConfig. Allows
+    /// maybe_checkpoint() to skip the Mutex when below threshold.
+    wal_bytes_threshold: u64,
+    /// Checkpoint config + last checkpoint time. Only locked when
+    /// wal_bytes exceeds threshold (rare) and for reset after checkpoint.
+    checkpoint_trigger: parking_lot::Mutex<CheckpointTrigger>,
 }
 
 impl BTreeIndex {
@@ -42,9 +58,19 @@ impl BTreeIndex {
         disk: Arc<DiskManager>,
         pool: Arc<BufferPool>,
         file_id: u32,
+        checkpoint_dir: PathBuf,
     ) -> Result<Self> {
-        use std::sync::atomic::AtomicU32;
+        Self::create_with_config(disk, pool, file_id, checkpoint_dir, CheckpointConfig::default()).await
+    }
 
+    /// Creates a new B+ tree index with a custom checkpoint configuration.
+    pub async fn create_with_config(
+        disk: Arc<DiskManager>,
+        pool: Arc<BufferPool>,
+        file_id: u32,
+        checkpoint_dir: PathBuf,
+        checkpoint_config: CheckpointConfig,
+    ) -> Result<Self> {
         // Create in-memory page store
         let mut store = InMemoryPageStore::new();
 
@@ -63,20 +89,67 @@ impl BTreeIndex {
             file_id,
             disk,
             pool,
+            checkpoint_lsn: AtomicU64::new(0),
+            checkpoint_dir,
+            wal_bytes_since_checkpoint: AtomicU64::new(0),
+            wal_bytes_threshold: checkpoint_config.wal_bytes_threshold,
+            checkpoint_trigger: parking_lot::Mutex::new(CheckpointTrigger::new(checkpoint_config)),
         })
     }
 
-    /// Opens an existing B+ tree index (placeholder - would load from checkpoint).
+    /// Opens an existing B+ tree index, loading from checkpoint if available.
+    ///
+    /// If a .zyridx checkpoint file exists in checkpoint_dir, loads pages from it.
+    /// On checkpoint load failure (corrupt file, bad CRC), falls back to creating
+    /// an empty store. The caller is responsible for replaying WAL records after
+    /// checkpoint_lsn to bring the index up to date.
     pub async fn open(
         disk: Arc<DiskManager>,
         pool: Arc<BufferPool>,
         file_id: u32,
-        _root_page_id: PageId,
-        height: u32,
+        checkpoint_dir: &Path,
     ) -> Result<Self> {
-        use std::sync::atomic::AtomicU32;
+        Self::open_with_config(disk, pool, file_id, checkpoint_dir, CheckpointConfig::default()).await
+    }
 
-        // Create empty in-memory store (in production, would load from checkpoint)
+    /// Opens an existing B+ tree index with a custom checkpoint configuration.
+    pub async fn open_with_config(
+        disk: Arc<DiskManager>,
+        pool: Arc<BufferPool>,
+        file_id: u32,
+        checkpoint_dir: &Path,
+        checkpoint_config: CheckpointConfig,
+    ) -> Result<Self> {
+        let checkpoint_path = checkpoint_dir.join(format!("index_{}.zyridx", file_id));
+
+        // Try loading from checkpoint file directly into the page store.
+        // V2 format: decompresses + bulk-builds the B+Tree. Returns height directly.
+        if checkpoint_path.exists() {
+            let mut store = InMemoryPageStore::new();
+            match checkpoint::load_checkpoint_into_store(&checkpoint_path, &mut store, file_id) {
+                Ok((lsn, root_page_num, _entry_count, height)) => {
+                    return Ok(Self {
+                        pages: RwLock::new(store),
+                        root_page_num: AtomicU32::new(root_page_num),
+                        height: AtomicU32::new(height),
+                        file_id,
+                        disk,
+                        pool,
+                        checkpoint_lsn: AtomicU64::new(lsn),
+                        checkpoint_dir: checkpoint_dir.to_path_buf(),
+                        wal_bytes_since_checkpoint: AtomicU64::new(0),
+                        wal_bytes_threshold: checkpoint_config.wal_bytes_threshold,
+                        checkpoint_trigger: parking_lot::Mutex::new(CheckpointTrigger::new(checkpoint_config)),
+                    });
+                }
+                Err(_) => {
+                    // Corrupt checkpoint. Fall through to create empty store.
+                    // Caller will do full WAL replay.
+                }
+            }
+        }
+
+        // No checkpoint or corrupt checkpoint. Create empty store.
         let mut store = InMemoryPageStore::new();
         let root_page_num = store.allocate();
         let root_page_id = PageId::new(file_id, root_page_num);
@@ -86,10 +159,15 @@ impl BTreeIndex {
         Ok(Self {
             pages: RwLock::new(store),
             root_page_num: AtomicU32::new(root_page_num),
-            height: AtomicU32::new(height),
+            height: AtomicU32::new(1),
             file_id,
             disk,
             pool,
+            checkpoint_lsn: AtomicU64::new(0),
+            checkpoint_dir: checkpoint_dir.to_path_buf(),
+            wal_bytes_since_checkpoint: AtomicU64::new(0),
+            wal_bytes_threshold: checkpoint_config.wal_bytes_threshold,
+            checkpoint_trigger: parking_lot::Mutex::new(CheckpointTrigger::new(checkpoint_config)),
         })
     }
 
@@ -99,7 +177,7 @@ impl BTreeIndex {
         PageId::new(
             self.file_id,
             self.root_page_num
-                .load(std::sync::atomic::Ordering::Acquire),
+                .load(Ordering::Acquire),
         )
     }
 
@@ -112,7 +190,7 @@ impl BTreeIndex {
     /// Returns the tree height.
     #[inline]
     pub fn height(&self) -> u32 {
-        self.height.load(std::sync::atomic::Ordering::Acquire)
+        self.height.load(Ordering::Acquire)
     }
 
     // =========================================================================
@@ -122,10 +200,10 @@ impl BTreeIndex {
     /// Finds the leaf page number for a given key using existing pages reference.
     #[inline]
     fn find_leaf_in_pages(&self, pages: &InMemoryPageStore, key: &[u8]) -> u32 {
-        let height = self.height.load(std::sync::atomic::Ordering::Relaxed);
+        let height = self.height.load(Ordering::Relaxed);
         let mut current = self
             .root_page_num
-            .load(std::sync::atomic::Ordering::Relaxed);
+            .load(Ordering::Relaxed);
 
         // Height 1 means root is the leaf
         if height == 1 {
@@ -153,21 +231,62 @@ impl BTreeIndex {
     }
 
     /// Searches for a key synchronously. All data is in RAM.
-    /// Single lock acquisition for entire operation.
+    ///
+    /// Uses optimistic lock-free reads via version stamps. Retries if a concurrent
+    /// write is detected. Falls back to RwLock read on repeated contention.
     #[inline]
     pub fn search_sync(&self, key: &[u8]) -> Option<TupleId> {
         let pages = self.pages.read();
-        let leaf_page_num = self.find_leaf_in_pages(&pages, key);
 
-        if let Some(data) = pages.get(leaf_page_num) {
-            BTreeLeafPage::get_in_slice(data, key)
-        } else {
-            None
+        // Optimistic path: traverse using try_read with version stamp validation.
+        for _ in 0..4 {
+            match self.search_optimistic(&pages, key) {
+                Ok(result) => return result,
+                Err(()) => {
+                    // Version conflict, retry.
+                    std::hint::spin_loop();
+                }
+            }
+        }
+
+        // Fallback: version-validated read after repeated contention (very rare).
+        let leaf_page_num = self.find_leaf_in_pages(&pages, key);
+        match pages.try_read(leaf_page_num) {
+            Some(Ok(data)) => BTreeLeafPage::get_in_slice(&data, key),
+            _ => None,
         }
     }
 
+    /// Optimistic search using version stamps. Returns Err(()) if a version
+    /// conflict is detected at any point during traversal.
+    #[inline]
+    fn search_optimistic(
+        &self,
+        pages: &InMemoryPageStore,
+        key: &[u8],
+    ) -> std::result::Result<Option<TupleId>, ()> {
+        let height = self.height.load(Ordering::Acquire);
+        let mut current = self.root_page_num.load(Ordering::Acquire);
+
+        // Traverse internal nodes
+        if height > 1 {
+            for _ in 0..(height - 1) {
+                let data = pages.try_read(current).ok_or(())??;
+                let child_page_id = BTreeInternalPage::find_child_in_slice(&data, key);
+                current = child_page_id.page_num;
+            }
+        }
+
+        // Read leaf page
+        let leaf_data = pages.try_read(current).ok_or(())??;
+        Ok(BTreeLeafPage::get_in_slice(&leaf_data, key))
+    }
+
     /// Inserts a key-value pair synchronously. All data is in RAM.
-    /// Single lock acquisition for entire operation (no split case).
+    ///
+    /// Uses optimistic lock-free path for non-split inserts: reads the leaf via
+    /// version stamp, inserts into a local copy, CAS-writes back. Falls back to
+    /// RwLock write on version conflict or when a split is needed.
     #[inline]
     pub fn insert_sync(&self, key: &[u8], tuple_id: TupleId) -> Result<()> {
         if key.len() > MAX_KEY_SIZE {
@@ -177,7 +296,22 @@ impl BTreeIndex {
             });
         }
 
-        // Fast path: single write lock for find + insert
+        // Optimistic fast path: try lock-free insert (no split case).
+        let pages = self.pages.read();
+        for _ in 0..4 {
+            match self.insert_optimistic(&pages, key, tuple_id) {
+                Ok(()) => return Ok(()),
+                Err(ZyronError::NodeFull) => break, // Need split, fall through
+                Err(ZyronError::VersionConflict) => {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        drop(pages);
+
+        // Locked path: handles version conflicts after retries and split case.
         {
             let mut pages = self.pages.write();
             let leaf_page_num = self.find_leaf_in_pages(&pages, key);
@@ -186,7 +320,7 @@ impl BTreeIndex {
                 match BTreeLeafPage::insert_in_slice(data, key, tuple_id) {
                     Ok(()) => return Ok(()),
                     Err(ZyronError::NodeFull) => {
-                        // Need split - fall through
+                        // Need split, fall through
                     }
                     Err(e) => return Err(e),
                 }
@@ -195,6 +329,49 @@ impl BTreeIndex {
 
         // Slow path: need to split
         self.insert_with_split_sync(Bytes::copy_from_slice(key), tuple_id)
+    }
+
+    /// Optimistic lock-free insert. Reads the leaf page via version stamp,
+    /// inserts into a local copy, CAS-writes the result back.
+    /// Returns VersionConflict if a concurrent writer intervened.
+    /// Returns NodeFull if the leaf needs a split.
+    #[inline]
+    fn insert_optimistic(
+        &self,
+        pages: &InMemoryPageStore,
+        key: &[u8],
+        tuple_id: TupleId,
+    ) -> Result<()> {
+        let height = self.height.load(Ordering::Acquire);
+        let mut current = self.root_page_num.load(Ordering::Acquire);
+
+        // Traverse internal nodes to find the leaf.
+        if height > 1 {
+            for _ in 0..(height - 1) {
+                let data = match pages.try_read(current) {
+                    Some(Ok(d)) => d,
+                    _ => return Err(ZyronError::VersionConflict),
+                };
+                let child = BTreeInternalPage::find_child_in_slice(&data, key);
+                current = child.page_num;
+            }
+        }
+
+        // Read the leaf page with its validated version in a single operation.
+        let (mut leaf_data, version) = match pages.try_read_versioned(current) {
+            Some(Ok(dv)) => dv,
+            _ => return Err(ZyronError::VersionConflict),
+        };
+
+        // Insert into the local copy.
+        BTreeLeafPage::insert_in_slice(&mut leaf_data, key, tuple_id)?;
+
+        // CAS-write back. Fails if the version changed since our read.
+        if pages.try_versioned_write(current, &leaf_data, version) {
+            Ok(())
+        } else {
+            Err(ZyronError::VersionConflict)
+        }
     }
 
     /// Inserts a key-value pair with exclusive access (no locking).
@@ -414,10 +591,10 @@ impl BTreeIndex {
     /// Finds the path from root to leaf (returns page numbers).
     fn find_path_sync(&self, key: &[u8]) -> ([u32; Self::MAX_HEIGHT], usize) {
         let pages = self.pages.read();
-        let height = self.height.load(std::sync::atomic::Ordering::Acquire);
+        let height = self.height.load(Ordering::Acquire);
         let root = self
             .root_page_num
-            .load(std::sync::atomic::Ordering::Acquire);
+            .load(Ordering::Acquire);
 
         let mut path = [0u32; Self::MAX_HEIGHT];
         let mut path_len = 0;
@@ -548,8 +725,8 @@ impl BTreeIndex {
         let mut pages = self.pages.write();
         let old_root = self
             .root_page_num
-            .load(std::sync::atomic::Ordering::Acquire);
-        let height = self.height.load(std::sync::atomic::Ordering::Acquire);
+            .load(Ordering::Acquire);
+        let height = self.height.load(Ordering::Acquire);
 
         let new_root_num = pages.allocate();
         let new_root_id = PageId::new(self.file_id, new_root_num);
@@ -563,9 +740,9 @@ impl BTreeIndex {
         pages.write(new_root_num, new_root.as_bytes());
 
         self.root_page_num
-            .store(new_root_num, std::sync::atomic::Ordering::Release);
+            .store(new_root_num, Ordering::Release);
         self.height
-            .store(height + 1, std::sync::atomic::Ordering::Release);
+            .store(height + 1, Ordering::Release);
 
         Ok(())
     }
@@ -637,10 +814,10 @@ impl BTreeIndex {
 
     /// Find leftmost leaf page number.
     fn find_leftmost_leaf_num(&self, pages: &InMemoryPageStore) -> u32 {
-        let height = self.height.load(std::sync::atomic::Ordering::Acquire);
+        let height = self.height.load(Ordering::Acquire);
         let mut current = self
             .root_page_num
-            .load(std::sync::atomic::Ordering::Acquire);
+            .load(Ordering::Acquire);
 
         if height == 1 {
             return current;
@@ -691,7 +868,81 @@ impl BTreeIndex {
         Ok(self.range_scan_sync(None, None))
     }
 
-    /// Flush is a no-op for in-memory B+Tree (persistence handled by checkpoint).
+    /// Writes a compact V2 checkpoint of the current B+Tree to disk.
+    ///
+    /// Extracts all leaf entries, LZ4-compresses them, writes to a single file.
+    /// Uses atomic rename (write to .tmp, rename to final) for crash safety.
+    pub fn force_checkpoint(&self, current_lsn: u64) -> Result<()> {
+        let pages = self.pages.read();
+        let root = self.root_page_num.load(Ordering::Acquire);
+        let height = self.height.load(Ordering::Acquire);
+        let fsync = self.checkpoint_trigger.lock().config().fsync;
+
+        let path = self
+            .checkpoint_dir
+            .join(format!("index_{}.zyridx", self.file_id));
+        let tmp_path = self
+            .checkpoint_dir
+            .join(format!("index_{}.zyridx.tmp", self.file_id));
+
+        std::fs::create_dir_all(&self.checkpoint_dir)?;
+        checkpoint::write_checkpoint_from_store(&tmp_path, &pages, current_lsn, root, height, fsync)?;
+        std::fs::rename(&tmp_path, &path)?;
+
+        self.checkpoint_lsn.store(current_lsn, Ordering::Release);
+        Ok(())
+    }
+
+    /// Performs a graceful shutdown by writing a final checkpoint.
+    ///
+    /// Call this before dropping the BTreeIndex to persist all in-memory state.
+    /// The caller provides the current WAL LSN so the next startup can skip
+    /// replaying WAL records up to this point.
+    pub fn shutdown(&self, current_lsn: u64) -> Result<()> {
+        self.force_checkpoint(current_lsn)
+    }
+
+    /// Returns the LSN of the last completed checkpoint.
+    #[inline]
+    pub fn checkpoint_lsn(&self) -> u64 {
+        self.checkpoint_lsn.load(Ordering::Acquire)
+    }
+
+    /// Flushes the index by writing a checkpoint at the given LSN.
+    pub fn flush_with_lsn(&self, current_lsn: u64) -> Result<()> {
+        self.force_checkpoint(current_lsn)
+    }
+
+    /// Records WAL bytes written since the last checkpoint.
+    /// Lock-free: single fetch_add with Relaxed ordering.
+    #[inline]
+    pub fn record_wal_bytes(&self, bytes: u64) {
+        self.wal_bytes_since_checkpoint.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Checks if a checkpoint should be triggered based on accumulated WAL
+    /// bytes and elapsed time. If so, writes the checkpoint and resets the trigger.
+    ///
+    /// Fast path: single Relaxed atomic load. If below the WAL bytes threshold,
+    /// returns immediately without acquiring the Mutex.
+    pub fn maybe_checkpoint(&self, current_lsn: u64) -> Result<bool> {
+        let wal_bytes = self.wal_bytes_since_checkpoint.load(Ordering::Relaxed);
+        if wal_bytes < self.wal_bytes_threshold {
+            return Ok(false);
+        }
+        let mut trigger = self.checkpoint_trigger.lock();
+        if trigger.should_checkpoint(wal_bytes) {
+            self.force_checkpoint(current_lsn)?;
+            self.wal_bytes_since_checkpoint.store(0, Ordering::Relaxed);
+            trigger.reset();
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Flush is a no-op without a WAL LSN. Use flush_with_lsn() or
+    /// force_checkpoint() for persistence.
     pub async fn flush(&self) -> Result<()> {
         Ok(())
     }
@@ -711,5 +962,32 @@ impl BTreeIndex {
     /// Warm cache is a no-op for in-memory B+Tree (all data already in RAM).
     pub async fn warm_cache(&self) -> Result<usize> {
         Ok(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn test_insert_exclusive_10k() {
+        let dir = tempdir().unwrap();
+        let ckpt_dir = dir.path().join("ckpt");
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let disk = Arc::new(
+            crate::DiskManager::new(crate::DiskManagerConfig {
+                data_dir: dir.path().to_path_buf(),
+                fsync_enabled: false,
+            }).await.unwrap()
+        );
+        let pool = Arc::new(BufferPool::auto_sized());
+        let mut btree = BTreeIndex::create(disk, pool, 0, ckpt_dir).await.unwrap();
+        for i in 0..10_000u64 {
+            let key = i.to_be_bytes();
+            let tid = TupleId::new(PageId::new(0, 0), 0);
+            btree.insert_exclusive(&key, tid).unwrap();
+        }
+        assert!(btree.search_exclusive(&500u64.to_be_bytes()).is_some());
     }
 }

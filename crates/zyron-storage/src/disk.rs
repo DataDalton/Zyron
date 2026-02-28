@@ -1,6 +1,5 @@
 //! Disk manager for async page-level file I/O.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -34,7 +33,9 @@ pub struct DiskManager {
     /// Configuration.
     config: DiskManagerConfig,
     /// Open file handles keyed by file_id.
-    files: Mutex<HashMap<u32, FileHandle>>,
+    /// scc::HashMap allows concurrent access to different file_ids.
+    /// Per-file Mutex serializes operations on the same file.
+    files: scc::HashMap<u32, Mutex<FileHandle>>,
 }
 
 /// Handle for an open data file.
@@ -52,7 +53,7 @@ impl DiskManager {
 
         Ok(Self {
             config,
-            files: Mutex::new(HashMap::new()),
+            files: scc::HashMap::new(),
         })
     }
 
@@ -68,9 +69,7 @@ impl DiskManager {
 
     /// Opens or creates a data file.
     async fn open_file(&self, file_id: u32) -> Result<()> {
-        let mut files = self.files.lock().await;
-
-        if files.contains_key(&file_id) {
+        if self.files.contains_async(&file_id).await {
             return Ok(());
         }
 
@@ -85,7 +84,12 @@ impl DiskManager {
         let file_size = file.metadata().await?.len();
         let num_pages = (file_size / PAGE_SIZE as u64) as u32;
 
-        files.insert(file_id, FileHandle { file, num_pages });
+        // insert_async returns Err if key already exists (concurrent open_file race).
+        // That is fine, the first writer wins and subsequent callers use the existing entry.
+        let _ = self
+            .files
+            .insert_async(file_id, Mutex::new(FileHandle { file, num_pages }))
+            .await;
 
         Ok(())
     }
@@ -94,10 +98,13 @@ impl DiskManager {
     pub async fn read_page(&self, page_id: PageId) -> Result<[u8; PAGE_SIZE]> {
         self.open_file(page_id.file_id).await?;
 
-        let mut files = self.files.lock().await;
-        let handle = files
-            .get_mut(&page_id.file_id)
+        let entry = self
+            .files
+            .get_async(&page_id.file_id)
+            .await
             .ok_or_else(|| ZyronError::IoError(format!("file {} not open", page_id.file_id)))?;
+
+        let mut handle = entry.get().lock().await;
 
         if page_id.page_num >= handle.num_pages {
             return Err(ZyronError::IoError(format!(
@@ -119,10 +126,13 @@ impl DiskManager {
     pub async fn write_page(&self, page_id: PageId, data: &[u8; PAGE_SIZE]) -> Result<()> {
         self.open_file(page_id.file_id).await?;
 
-        let mut files = self.files.lock().await;
-        let handle = files
-            .get_mut(&page_id.file_id)
+        let entry = self
+            .files
+            .get_async(&page_id.file_id)
+            .await
             .ok_or_else(|| ZyronError::IoError(format!("file {} not open", page_id.file_id)))?;
+
+        let mut handle = entry.get().lock().await;
 
         let offset = (page_id.page_num as u64) * (PAGE_SIZE as u64);
         handle.file.seek(std::io::SeekFrom::Start(offset)).await?;
@@ -148,10 +158,13 @@ impl DiskManager {
     pub async fn allocate_page(&self, file_id: u32) -> Result<PageId> {
         self.open_file(file_id).await?;
 
-        let mut files = self.files.lock().await;
-        let handle = files
-            .get_mut(&file_id)
+        let entry = self
+            .files
+            .get_async(&file_id)
+            .await
             .ok_or_else(|| ZyronError::IoError(format!("file {} not open", file_id)))?;
+
+        let mut handle = entry.get().lock().await;
 
         let page_num = handle.num_pages;
         let page_id = PageId::new(file_id, page_num);
@@ -174,10 +187,13 @@ impl DiskManager {
 
         self.open_file(file_id).await?;
 
-        let mut files = self.files.lock().await;
-        let handle = files
-            .get_mut(&file_id)
+        let entry = self
+            .files
+            .get_async(&file_id)
+            .await
             .ok_or_else(|| ZyronError::IoError(format!("file {} not open", file_id)))?;
+
+        let mut handle = entry.get().lock().await;
 
         let mut pages = Vec::with_capacity(count as usize);
         let start_page = handle.num_pages;
@@ -193,28 +209,43 @@ impl DiskManager {
     pub async fn num_pages(&self, file_id: u32) -> Result<u32> {
         self.open_file(file_id).await?;
 
-        let files = self.files.lock().await;
-        let handle = files
-            .get(&file_id)
+        let entry = self
+            .files
+            .get_async(&file_id)
+            .await
             .ok_or_else(|| ZyronError::IoError(format!("file {} not open", file_id)))?;
+
+        let handle = entry.get().lock().await;
 
         Ok(handle.num_pages)
     }
 
     /// Flushes all pending writes to disk.
     pub async fn flush(&self) -> Result<()> {
-        let files = self.files.lock().await;
-        for handle in files.values() {
-            handle.file.sync_all().await?;
+        // Collect file_ids, then flush each individually.
+        let mut file_ids = Vec::new();
+        self.files
+            .iter_async(|&file_id, _| {
+                file_ids.push(file_id);
+                true
+            })
+            .await;
+
+        for file_id in file_ids {
+            if let Some(entry) = self.files.get_async(&file_id).await {
+                let handle = entry.get().lock().await;
+                handle.file.sync_all().await?;
+            }
         }
+
         Ok(())
     }
 
     /// Closes a specific file.
     /// Extends file to match num_pages to persist lazy-allocated pages.
     pub async fn close_file(&self, file_id: u32) -> Result<()> {
-        let mut files = self.files.lock().await;
-        if let Some(handle) = files.remove(&file_id) {
+        if let Some((_, file_mutex)) = self.files.remove_async(&file_id).await {
+            let handle = file_mutex.into_inner();
             // Extend file to match lazy-allocated page count
             let expected_size = (handle.num_pages as u64) * (PAGE_SIZE as u64);
             handle.file.set_len(expected_size).await?;
@@ -226,11 +257,22 @@ impl DiskManager {
     /// Closes all open files.
     /// Extends files to match num_pages to persist lazy-allocated pages.
     pub async fn close_all(&self) -> Result<()> {
-        let mut files = self.files.lock().await;
-        for (_, handle) in files.drain() {
-            let expected_size = (handle.num_pages as u64) * (PAGE_SIZE as u64);
-            handle.file.set_len(expected_size).await?;
-            handle.file.sync_all().await?;
+        // Collect file_ids, then remove and close each.
+        let mut file_ids = Vec::new();
+        self.files
+            .iter_async(|&file_id, _| {
+                file_ids.push(file_id);
+                true
+            })
+            .await;
+
+        for file_id in file_ids {
+            if let Some((_, file_mutex)) = self.files.remove_async(&file_id).await {
+                let handle = file_mutex.into_inner();
+                let expected_size = (handle.num_pages as u64) * (PAGE_SIZE as u64);
+                handle.file.set_len(expected_size).await?;
+                handle.file.sync_all().await?;
+            }
         }
         Ok(())
     }

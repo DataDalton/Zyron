@@ -20,6 +20,7 @@ pub use btree::{
     BTreeArenaIndex, BTreeIndex, BTreeInternalPage, BTreeLeafPage, BufferedBTreeIndex,
     DeleteResult, InternalEntry, InternalPageHeader, LeafEntry, LeafPageHeader, MAX_KEY_SIZE,
     MIN_FILL_FACTOR,
+    checkpoint::{CheckpointConfig, CheckpointTrigger},
 };
 pub use disk::{DiskManager, DiskManagerConfig};
 pub use freespace::{

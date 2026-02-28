@@ -56,6 +56,9 @@ pub enum ZyronError {
     #[error("B+ tree corrupted: {0}")]
     BTreeCorrupted(String),
 
+    #[error("Optimistic version conflict during page access")]
+    VersionConflict,
+
     #[error("Page not in buffer pool cache")]
     CacheMiss,
 

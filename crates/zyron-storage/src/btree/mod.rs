@@ -70,6 +70,7 @@
 pub mod arena;
 pub mod arena_index;
 pub mod buffer;
+pub mod checkpoint;
 pub mod constants;
 pub mod index;
 pub mod page;

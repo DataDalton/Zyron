@@ -3,10 +3,167 @@
 use crate::frame::{BufferFrame, FrameId};
 use crate::page_table::PageTable;
 use crate::replacer::{ClockReplacer, Replacer};
-use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use sysinfo::System;
 use zyron_common::page::{PAGE_SIZE, PageId};
 use zyron_common::{Result, ZyronError};
+
+// ---------------------------------------------------------------------------
+// Lock-free Treiber stack for buffer pool frame allocation
+// ---------------------------------------------------------------------------
+
+/// Sentinel value indicating end of stack (no next frame).
+const TREIBER_NULL: u32 = u32::MAX;
+
+/// Lock-free Treiber stack for buffer pool frame allocation.
+///
+/// Uses an array-based approach where each slot corresponds to a FrameId.
+/// The value at each slot is the next FrameId in the stack chain.
+/// ABA prevention uses a generation counter packed into the head pointer.
+struct TreiberFreeList {
+    /// Per-frame next pointers. next[frame_id] = next frame in stack.
+    next: Box<[AtomicU32]>,
+    /// Stack head: upper 32 bits = generation, lower 32 bits = frame_id.
+    /// TREIBER_NULL in lower bits means empty stack.
+    head: AtomicU64,
+}
+
+impl TreiberFreeList {
+    /// Creates a new Treiber stack with all frames pushed (frame 0 at bottom).
+    fn new(num_frames: usize) -> Self {
+        let next: Box<[AtomicU32]> = (0..num_frames)
+            .map(|i| {
+                if i == 0 {
+                    AtomicU32::new(TREIBER_NULL) // Bottom of stack
+                } else {
+                    AtomicU32::new((i - 1) as u32) // Points to previous frame
+                }
+            })
+            .collect();
+
+        // Top of stack is the last frame
+        let top = if num_frames > 0 {
+            (num_frames - 1) as u32
+        } else {
+            TREIBER_NULL
+        };
+        let head = AtomicU64::new(Self::pack(0, top));
+
+        Self { next, head }
+    }
+
+    #[inline(always)]
+    fn pack(generation: u32, frame_id: u32) -> u64 {
+        ((generation as u64) << 32) | (frame_id as u64)
+    }
+
+    #[inline(always)]
+    fn unpack(packed: u64) -> (u32, u32) {
+        ((packed >> 32) as u32, packed as u32)
+    }
+
+    /// Pops a frame from the stack. Returns None if empty.
+    #[inline]
+    fn pop(&self) -> Option<FrameId> {
+        loop {
+            let current = self.head.load(Ordering::Acquire);
+            let (generation, top) = Self::unpack(current);
+
+            if top == TREIBER_NULL {
+                return None;
+            }
+
+            let next_top = self.next[top as usize].load(Ordering::Acquire);
+            let new_head = Self::pack(generation.wrapping_add(1), next_top);
+
+            match self.head.compare_exchange_weak(
+                current,
+                new_head,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(FrameId(top)),
+                Err(_) => std::hint::spin_loop(),
+            }
+        }
+    }
+
+    /// Pushes a frame onto the stack.
+    #[inline]
+    fn push(&self, frame_id: FrameId) {
+        loop {
+            let current = self.head.load(Ordering::Acquire);
+            let (generation, top) = Self::unpack(current);
+
+            self.next[frame_id.0 as usize].store(top, Ordering::Release);
+            let new_head = Self::pack(generation.wrapping_add(1), frame_id.0);
+
+            match self.head.compare_exchange_weak(
+                current,
+                new_head,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(_) => std::hint::spin_loop(),
+            }
+        }
+    }
+
+    /// Pops up to `count` frames in a single CAS operation.
+    /// Walks the chain to find the Nth node, then atomically swings the head
+    /// past all N nodes. Falls back to per-element pop on CAS failure.
+    #[inline]
+    fn pop_many(&self, count: usize) -> Vec<FrameId> {
+        if count == 0 { return Vec::new(); }
+        loop {
+            let current = self.head.load(Ordering::Acquire);
+            let (generation, top) = Self::unpack(current);
+            if top == TREIBER_NULL { return Vec::new(); }
+
+            // Walk the chain to collect up to `count` frame IDs.
+            let mut collected = Vec::with_capacity(count);
+            let mut cursor = top;
+            for _ in 0..count {
+                if cursor == TREIBER_NULL { break; }
+                collected.push(FrameId(cursor));
+                cursor = self.next[cursor as usize].load(Ordering::Acquire);
+            }
+
+            // CAS head from current top to the node after the last collected.
+            let new_head = Self::pack(generation.wrapping_add(1), cursor);
+            match self.head.compare_exchange_weak(
+                current,
+                new_head,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return collected,
+                Err(_) => std::hint::spin_loop(),
+            }
+        }
+    }
+
+    /// Pushes multiple frames onto the stack.
+    #[inline]
+    fn push_many(&self, frame_ids: &[FrameId]) {
+        for &fid in frame_ids {
+            self.push(fid);
+        }
+    }
+
+    /// Returns approximate count by traversing the stack.
+    /// Not linearizable but sufficient for stats reporting.
+    fn approximate_count(&self) -> usize {
+        let mut count = 0;
+        let (_, mut current) = Self::unpack(self.head.load(Ordering::Relaxed));
+        while current != TREIBER_NULL && count < self.next.len() {
+            count += 1;
+            current = self.next[current as usize].load(Ordering::Relaxed);
+        }
+        count
+    }
+}
 
 /// Information about a dirty page that was evicted from the buffer pool.
 /// Caller must write this to disk to prevent data loss.
@@ -43,8 +200,8 @@ pub struct BufferPool {
     frames: Vec<BufferFrame>,
     /// Page ID to frame ID mapping (lock-free reads).
     page_table: PageTable,
-    /// List of free frame IDs.
-    free_list: Mutex<Vec<FrameId>>,
+    /// Lock-free stack of free frame IDs.
+    free_list: TreiberFreeList,
     /// Page replacement policy.
     replacer: ClockReplacer,
 }
@@ -59,14 +216,11 @@ impl BufferPool {
             .map(|i| BufferFrame::new(FrameId(i as u32)))
             .collect();
 
-        // All frames start in free list
-        let free_list: Vec<_> = (0..num_frames).map(|i| FrameId(i as u32)).collect();
-
         Self {
             config,
             frames,
             page_table: PageTable::new(num_frames),
-            free_list: Mutex::new(free_list),
+            free_list: TreiberFreeList::new(num_frames),
             replacer: ClockReplacer::new(num_frames),
         }
     }
@@ -95,9 +249,9 @@ impl BufferPool {
         self.config.num_frames
     }
 
-    /// Returns the number of free frames.
+    /// Returns the approximate number of free frames.
     pub fn free_count(&self) -> usize {
-        self.free_list.lock().len()
+        self.free_list.approximate_count()
     }
 
     /// Returns the number of pages currently in the pool.
@@ -129,12 +283,9 @@ impl BufferPool {
     /// Tries to get a free frame first, then evicts if necessary.
     /// Returns the frame ID and any evicted dirty page that must be flushed.
     fn allocate_frame(&self) -> Result<(FrameId, Option<EvictedPage>)> {
-        // Try free list first
-        {
-            let mut free_list = self.free_list.lock();
-            if let Some(frame_id) = free_list.pop() {
-                return Ok((frame_id, None));
-            }
+        // Try free list first (lock-free pop)
+        if let Some(frame_id) = self.free_list.pop() {
+            return Ok((frame_id, None));
         }
 
         // Try to evict - check pin_count directly for each candidate frame
@@ -316,7 +467,7 @@ impl BufferPool {
             // Remove from replacer and add to free list
             self.replacer.remove(frame_id);
             frame.reset();
-            self.free_list.lock().push(frame_id);
+            self.free_list.push(frame_id);
 
             return true;
         }
@@ -427,10 +578,7 @@ impl BufferPool {
         if count == 0 {
             return Vec::new();
         }
-        let mut free_list = self.free_list.lock();
-        let available = free_list.len().min(count);
-        let start = free_list.len() - available;
-        free_list.drain(start..).collect()
+        self.free_list.pop_many(count)
     }
 
     /// Loads a page into a pre-reserved frame.
@@ -454,8 +602,7 @@ impl BufferPool {
         if frame_ids.is_empty() {
             return;
         }
-        let mut free_list = self.free_list.lock();
-        free_list.extend_from_slice(frame_ids);
+        self.free_list.push_many(frame_ids);
     }
 
     /// Returns a write guard for page data.

@@ -191,7 +191,7 @@ impl PageTable {
     }
 
     /// Returns true if the table is empty.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

@@ -39,86 +39,105 @@ struct PendingFsmUpdate {
     free_space: usize,
 }
 
-/// LRU cache of page hints for fast insert page lookup.
-/// Stores up to 8 recently used pages with their free space category.
-const PAGE_HINT_CACHE_SIZE: usize = 8;
+// ---------------------------------------------------------------------------
+// Lock-free atomic hint slots for FSM page lookup
+// ---------------------------------------------------------------------------
 
-struct PageHintCache {
-    /// Array of (page_num, free_space_category) pairs. u32::MAX = empty slot.
-    hints: [(u32, u8); PAGE_HINT_CACHE_SIZE],
-    /// Number of valid entries.
-    count: usize,
+/// Number of hint slots for fast insert page lookup.
+const HINT_SLOT_COUNT: usize = 8;
+
+/// Sentinel value for empty hint slot.
+const HINT_EMPTY: u64 = u64::MAX;
+
+/// Lock-free atomic hint slots for FSM page lookup.
+///
+/// Each slot packs (page_num: u32, free_space_category: u32) into a u64.
+/// Reads and writes use Relaxed ordering. Stale reads are acceptable because
+/// the FSM on disk is the source of truth. This is a best-effort cache.
+struct AtomicHintSlots {
+    slots: [std::sync::atomic::AtomicU64; HINT_SLOT_COUNT],
 }
 
-impl PageHintCache {
+impl AtomicHintSlots {
     fn new() -> Self {
         Self {
-            hints: [(u32::MAX, 0); PAGE_HINT_CACHE_SIZE],
-            count: 0,
+            slots: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(HINT_EMPTY)),
         }
     }
 
-    /// Adds or updates a page hint. Moves to front (MRU position).
+    #[inline(always)]
+    fn pack(page_num: u32, category: u32) -> u64 {
+        ((page_num as u64) << 32) | (category as u64)
+    }
+
+    #[inline(always)]
+    fn unpack(packed: u64) -> (u32, u32) {
+        ((packed >> 32) as u32, packed as u32)
+    }
+
+    /// Updates or inserts a hint. Scans for existing entry first.
+    /// If not found, overwrites the last slot (LRU approximation).
     #[inline]
-    fn update(&mut self, page_num: u32, category: u8) {
-        // Check if already present
-        for i in 0..self.count {
-            if self.hints[i].0 == page_num {
-                // Move to front (update category in case it changed)
-                for j in (1..=i).rev() {
-                    self.hints[j] = self.hints[j - 1];
+    fn update(&self, page_num: u32, category: u8) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let new_val = Self::pack(page_num, category as u32);
+
+        // Check if already present in any slot
+        for slot in &self.slots {
+            let current = slot.load(Relaxed);
+            if current != HINT_EMPTY {
+                let (pn, _) = Self::unpack(current);
+                if pn == page_num {
+                    slot.store(new_val, Relaxed);
+                    return;
                 }
-                self.hints[0] = (page_num, category);
+            }
+        }
+
+        // Not found. Find first empty slot.
+        for slot in &self.slots {
+            let current = slot.load(Relaxed);
+            if current == HINT_EMPTY {
+                slot.store(new_val, Relaxed);
                 return;
             }
         }
 
-        // Not present, add to front
-        if self.count < PAGE_HINT_CACHE_SIZE {
-            // Shift existing entries
-            for i in (1..=self.count).rev() {
-                self.hints[i] = self.hints[i - 1];
-            }
-            self.hints[0] = (page_num, category);
-            self.count += 1;
-        } else {
-            // Cache full, evict LRU (last entry)
-            for i in (1..PAGE_HINT_CACHE_SIZE).rev() {
-                self.hints[i] = self.hints[i - 1];
-            }
-            self.hints[0] = (page_num, category);
-        }
+        // All slots full. Overwrite last slot (LRU approximation).
+        self.slots[HINT_SLOT_COUNT - 1].store(new_val, Relaxed);
     }
 
-    /// Removes a page from the cache (when full).
+    /// Removes a page from the hints.
     #[inline]
-    fn remove(&mut self, page_num: u32) {
-        for i in 0..self.count {
-            if self.hints[i].0 == page_num {
-                // Shift remaining entries
-                for j in i..self.count - 1 {
-                    self.hints[j] = self.hints[j + 1];
+    fn remove(&self, page_num: u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        for slot in &self.slots {
+            let current = slot.load(Relaxed);
+            if current != HINT_EMPTY {
+                let (pn, _) = Self::unpack(current);
+                if pn == page_num {
+                    slot.store(HINT_EMPTY, Relaxed);
+                    return;
                 }
-                self.hints[self.count - 1] = (u32::MAX, 0);
-                self.count -= 1;
-                return;
             }
         }
     }
-}
 
-/// Combined state for FSM operations (single lock for hint cache + pending updates).
-struct FsmState {
-    hint_cache: PageHintCache,
-    pending_updates: Vec<PendingFsmUpdate>,
-}
-
-impl FsmState {
-    fn new() -> Self {
-        Self {
-            hint_cache: PageHintCache::new(),
-            pending_updates: Vec::with_capacity(64),
+    /// Finds a page with at least `min_space` free.
+    /// Returns Some(page_num) on first match.
+    #[inline]
+    fn find_page_with_space(&self, min_space: usize) -> Option<u32> {
+        use std::sync::atomic::Ordering::Relaxed;
+        for slot in &self.slots {
+            let current = slot.load(Relaxed);
+            if current != HINT_EMPTY {
+                let (pn, cat) = Self::unpack(current);
+                if category_to_min_space(cat as u8) >= min_space {
+                    return Some(pn);
+                }
+            }
         }
+        None
     }
 }
 
@@ -139,8 +158,11 @@ pub struct HeapFile {
     cached_heap_pages: std::sync::atomic::AtomicU32,
     /// Cached FSM page count.
     cached_fsm_pages: std::sync::atomic::AtomicU32,
-    /// Combined FSM state (hint cache + pending updates) under single lock.
-    fsm_state: parking_lot::Mutex<FsmState>,
+    /// Lock-free hint slots for fast page lookup during inserts.
+    hint_slots: AtomicHintSlots,
+    /// Pending FSM updates. Uses Mutex because Vec append is not lock-free.
+    /// Only contended during FSM flush and page boundary transitions.
+    pending_fsm: parking_lot::Mutex<Vec<PendingFsmUpdate>>,
 }
 
 impl HeapFile {
@@ -160,7 +182,8 @@ impl HeapFile {
             config,
             cached_heap_pages: AtomicU32::new(0),
             cached_fsm_pages: AtomicU32::new(0),
-            fsm_state: parking_lot::Mutex::new(FsmState::new()),
+            hint_slots: AtomicHintSlots::new(),
+            pending_fsm: parking_lot::Mutex::new(Vec::with_capacity(64)),
         })
     }
 
@@ -420,21 +443,29 @@ impl HeapFile {
     }
 
     /// Flushes all dirty heap pages to disk.
+    /// Uses synchronous I/O because flush_all's closure cannot await.
     pub async fn flush(&self) -> Result<()> {
+        let data_dir = self.disk.data_dir().to_path_buf();
+        let heap_file_id = self.config.heap_file_id;
+        let fsm_file_id = self.config.fsm_file_id;
+
         self.pool.flush_all(|page_id, data| {
-            // Only flush pages belonging to this heap file
-            if page_id.file_id == self.config.heap_file_id
-                || page_id.file_id == self.config.fsm_file_id
-            {
-                // Note: This is synchronous, which is a limitation.
-                // For full async, we'd need a different approach.
-                let data_copy: [u8; PAGE_SIZE] = data
-                    .try_into()
-                    .map_err(|_| ZyronError::Internal("Invalid page size".to_string()))?;
-                // We can't await here, so we'll use blocking for now
-                // A proper solution would queue these writes
-                let _ = &data_copy; // Suppress unused warning
+            if page_id.file_id != heap_file_id && page_id.file_id != fsm_file_id {
+                return Ok(());
             }
+
+            let path = data_dir.join(format!("{:08}.dat", page_id.file_id));
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .map_err(|e| ZyronError::IoError(format!("flush open {}: {}", path.display(), e)))?;
+
+            let offset = (page_id.page_num as u64) * (PAGE_SIZE as u64);
+            std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset))
+                .map_err(|e| ZyronError::IoError(format!("flush seek: {}", e)))?;
+            std::io::Write::write_all(&mut file, data)
+                .map_err(|e| ZyronError::IoError(format!("flush write: {}", e)))?;
+
             Ok(())
         })?;
         Ok(())
@@ -472,24 +503,37 @@ impl HeapFile {
     // =========================================================================
     // For high-throughput inserts, FSM updates can be deferred and batched.
 
-    /// Queues an FSM update for later batch processing.
+    /// Updates hint slots atomically (lock-free) and queues FSM update.
+    /// For batch callers that accumulate updates locally, use
+    /// `update_hints()` during the loop and `push_fsm_updates()` once at the end.
     #[inline]
     pub(crate) fn defer_fsm_update(&self, heap_page_num: u32, free_space: usize) {
-        let category = space_to_category(free_space);
-        let mut state = self.fsm_state.lock();
-
-        // Update page hint cache with the current free space category
-        if category > 0 {
-            state.hint_cache.update(heap_page_num, category);
-        } else {
-            // Page is full, remove from cache
-            state.hint_cache.remove(heap_page_num);
-        }
-
-        state.pending_updates.push(PendingFsmUpdate {
+        self.update_hints(heap_page_num, free_space);
+        self.pending_fsm.lock().push(PendingFsmUpdate {
             heap_page_num,
             free_space,
         });
+    }
+
+    /// Lock-free hint slot update only. No Mutex touched.
+    #[inline]
+    pub(crate) fn update_hints(&self, heap_page_num: u32, free_space: usize) {
+        let category = space_to_category(free_space);
+        if category > 0 {
+            self.hint_slots.update(heap_page_num, category);
+        } else {
+            self.hint_slots.remove(heap_page_num);
+        }
+    }
+
+    /// Pushes a batch of FSM updates under a single lock acquisition.
+    #[inline]
+    pub(crate) fn push_fsm_updates(&self, updates: &[(u32, usize)]) {
+        let mut pending = self.pending_fsm.lock();
+        pending.reserve(updates.len());
+        for &(heap_page_num, free_space) in updates {
+            pending.push(PendingFsmUpdate { heap_page_num, free_space });
+        }
     }
 
     /// Flushes all pending FSM updates in a single batch.
@@ -499,8 +543,8 @@ impl HeapFile {
     pub async fn flush_fsm_updates(&self) -> Result<usize> {
         // Take all pending updates
         let updates: Vec<PendingFsmUpdate> = {
-            let mut state = self.fsm_state.lock();
-            std::mem::take(&mut state.pending_updates)
+            let mut pending = self.pending_fsm.lock();
+            std::mem::take(&mut *pending)
         };
 
         if updates.is_empty() {
@@ -660,14 +704,8 @@ impl HeapFile {
                     }
                 }
 
-                // Check hint cache for an existing page with sufficient free space.
-                let hint_page_num = {
-                    let state = self.fsm_state.lock();
-                    state.hint_cache.hints[..state.hint_cache.count]
-                        .iter()
-                        .find(|(_, cat)| category_to_min_space(*cat) >= space_needed)
-                        .map(|(pn, _)| *pn)
-                };
+                // Check hint cache for an existing page with sufficient free space (lock-free).
+                let hint_page_num = self.hint_slots.find_page_with_space(space_needed);
 
                 if let Some(page_num) = hint_page_num {
                     let pid = PageId::new(self.config.heap_file_id, page_num);
@@ -738,22 +776,11 @@ impl HeapFile {
             }
         }
 
-        // Apply all FSM updates in a single lock acquisition.
-        {
-            let mut state = self.fsm_state.lock();
-            for (page_num, free_space) in &local_fsm_updates {
-                let category = space_to_category(*free_space);
-                if category > 0 {
-                    state.hint_cache.update(*page_num, category);
-                } else {
-                    state.hint_cache.remove(*page_num);
-                }
-                state.pending_updates.push(PendingFsmUpdate {
-                    heap_page_num: *page_num,
-                    free_space: *free_space,
-                });
-            }
+        // Apply all FSM updates: hint slots atomically (lock-free), pending Vec in single lock.
+        for &(page_num, free_space) in &local_fsm_updates {
+            self.update_hints(page_num, free_space);
         }
+        self.push_fsm_updates(&local_fsm_updates);
 
         // Batch flush all FSM updates.
         self.flush_fsm_updates().await?;

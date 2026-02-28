@@ -37,7 +37,10 @@ use tempfile::tempdir;
 
 use zyron_buffer::{BufferPool, BufferPoolConfig};
 use zyron_common::page::PageId;
-use zyron_storage::{BufferedBTreeIndex, DiskManager, DiskManagerConfig, HeapFile, Tuple, TupleId};
+use zyron_storage::{
+    BTreeIndex, BufferedBTreeIndex, CheckpointConfig, CheckpointTrigger, DiskManager,
+    DiskManagerConfig, HeapFile, Tuple, TupleId,
+};
 use zyron_wal::{LogRecordType, Lsn, RecoveryManager, WalReader, WalWriter, WalWriterConfig};
 
 // =============================================================================
@@ -55,6 +58,16 @@ const BTREE_LOOKUP_TARGET_NS: f64 = 40.0;
 const BTREE_RANGE_TARGET_OPS_SEC: f64 = 40_000_000.0;
 const BTREE_DELETE_TARGET_OPS_SEC: f64 = 8_000_000.0;
 const RECOVERY_TARGET_US_PER_KB: f64 = 10.0;
+
+// Checkpoint targets
+const CHECKPOINT_WRITE_THROUGHPUT_TARGET_MB_SEC: f64 = 2000.0; // 2 GB/sec
+const CHECKPOINT_WRITE_1M_TARGET_MS: f64 = 3.0; // 3ms for ~5MB
+const CHECKPOINT_LOAD_THROUGHPUT_TARGET_MB_SEC: f64 = 3000.0; // 3 GB/sec
+const CHECKPOINT_LOAD_1M_TARGET_MS: f64 = 2.0; // 2ms for ~5MB
+const RECOVERY_WITH_CHECKPOINT_TARGET_MS: f64 = 5.0; // 500K keys + 500 WAL records
+const RECOVERY_SCALE_TARGET_MS: f64 = 20.0; // 10M keys + 100 WAL records
+const WAL_SEGMENT_CLEANUP_TARGET_MS: f64 = 5.0;
+const SHUTDOWN_CHECKPOINT_1M_TARGET_MS: f64 = 5.0;
 
 // Validation constants
 const VALIDATION_RUNS: usize = 5;
@@ -2103,6 +2116,1040 @@ async fn test_wal_checksum_integrity() {
 }
 
 // =============================================================================
+// Test 9: Checkpoint Write/Load Round-Trip (1M keys, 5-run validation)
+// =============================================================================
+
+/// Creates a B+Tree with 1,000,000 keys, writes a checkpoint, loads it back,
+/// and verifies every key round-trips correctly. Measures write and load
+/// throughput against targets (2 GB/sec write, 3 GB/sec load).
+#[tokio::test]
+async fn test_checkpoint_round_trip_1m() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const KEY_COUNT: usize = 1_000_000;
+
+    tprintln!("\n=== Checkpoint Write/Load Round-Trip Test ===");
+    tprintln!("Keys: {}", format_with_commas(KEY_COUNT as f64));
+    tprintln!("Validation runs: {}", VALIDATION_RUNS);
+
+    let mut write_latency_results = Vec::with_capacity(VALIDATION_RUNS);
+    let mut load_latency_results = Vec::with_capacity(VALIDATION_RUNS);
+    let mut write_throughput_results = Vec::with_capacity(VALIDATION_RUNS);
+    let mut load_throughput_results = Vec::with_capacity(VALIDATION_RUNS);
+
+    let ckpt_util_before = take_util_snapshot();
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("\n--- Run {}/{} ---", run + 1, VALIDATION_RUNS);
+
+        let dir = tempdir().unwrap();
+        let checkpoint_dir = dir.path().join("ckpt");
+        std::fs::create_dir_all(&checkpoint_dir).unwrap();
+
+        let disk = Arc::new(
+            DiskManager::new(DiskManagerConfig {
+                data_dir: dir.path().to_path_buf(),
+                fsync_enabled: false,
+            })
+            .await
+            .unwrap(),
+        );
+        let pool = Arc::new(BufferPool::auto_sized());
+
+        let mut btree = BTreeIndex::create_with_config(disk.clone(), pool.clone(), 0, checkpoint_dir.clone(), CheckpointConfig { fsync: false, ..CheckpointConfig::default() })
+            .await
+            .unwrap();
+
+        // Insert 1M keys using exclusive access for maximum speed
+        for i in 0..KEY_COUNT as u64 {
+            let key = i.to_be_bytes();
+            let tid = TupleId::new(PageId::new(0, (i % 1000) as u32), (i % 100) as u16);
+            btree.insert_exclusive(&key, tid).unwrap();
+        }
+
+        // Write checkpoint
+        let checkpoint_lsn = 42_000_u64;
+        let write_start = Instant::now();
+        btree.force_checkpoint(checkpoint_lsn).unwrap();
+        let write_duration = write_start.elapsed();
+
+        // Measure file size
+        let ckpt_path = checkpoint_dir.join("index_0.zyridx");
+        let file_size = std::fs::metadata(&ckpt_path).unwrap().len();
+        let file_size_mb = file_size as f64 / (1024.0 * 1024.0);
+
+        assert_eq!(btree.checkpoint_lsn(), checkpoint_lsn);
+
+        // Load checkpoint into a new index
+        let load_start = Instant::now();
+        let loaded = BTreeIndex::open(disk.clone(), pool.clone(), 0, &checkpoint_dir)
+            .await
+            .unwrap();
+        let load_duration = load_start.elapsed();
+
+        assert_eq!(loaded.checkpoint_lsn(), checkpoint_lsn);
+
+        // Verify every key round-trips
+        for i in 0..KEY_COUNT as u64 {
+            let key = i.to_be_bytes();
+            let expected = TupleId::new(PageId::new(0, (i % 1000) as u32), (i % 100) as u16);
+            let found = loaded.search_sync(&key);
+            assert_eq!(
+                found,
+                Some(expected),
+                "Key {} missing or wrong after checkpoint load",
+                i
+            );
+        }
+
+        let write_ms = write_duration.as_secs_f64() * 1000.0;
+        let load_ms = load_duration.as_secs_f64() * 1000.0;
+        let write_mb_sec = file_size_mb / write_duration.as_secs_f64();
+        let load_mb_sec = file_size_mb / load_duration.as_secs_f64();
+
+        tprintln!(
+            "  Checkpoint size: {:.2} MB ({} pages)",
+            file_size_mb,
+            btree.height()
+        );
+        tprintln!(
+            "  Write: {:.2} ms ({:.0} MB/sec)",
+            write_ms,
+            write_mb_sec
+        );
+        tprintln!(
+            "  Load: {:.2} ms ({:.0} MB/sec)",
+            load_ms,
+            load_mb_sec
+        );
+
+        write_latency_results.push(write_ms);
+        load_latency_results.push(load_ms);
+        write_throughput_results.push(write_mb_sec);
+        load_throughput_results.push(load_mb_sec);
+    }
+    record_test_util("Checkpoint", ckpt_util_before, take_util_snapshot());
+
+    tprintln!("\n=== Checkpoint Validation Results ===");
+    let write_tp = validate_metric(
+        "Checkpoint",
+        "Write throughput (MB/sec)",
+        write_throughput_results,
+        CHECKPOINT_WRITE_THROUGHPUT_TARGET_MB_SEC,
+        true,
+    );
+    let write_lat = validate_metric(
+        "Checkpoint",
+        "Write latency 1M keys (ms)",
+        write_latency_results,
+        CHECKPOINT_WRITE_1M_TARGET_MS,
+        false,
+    );
+    let load_tp = validate_metric(
+        "Checkpoint",
+        "Load throughput (MB/sec)",
+        load_throughput_results,
+        CHECKPOINT_LOAD_THROUGHPUT_TARGET_MB_SEC,
+        true,
+    );
+    let load_lat = validate_metric(
+        "Checkpoint",
+        "Load latency 1M keys (ms)",
+        load_latency_results,
+        CHECKPOINT_LOAD_1M_TARGET_MS,
+        false,
+    );
+
+    // Report checkpoint performance without fixed assertions.
+    // Compare against previous runs for regression detection.
+    tprintln!("  Write: avg {:.2} ms, {:.0} MB/sec", write_lat.average, write_tp.average);
+    tprintln!("  Load:  avg {:.2} ms, {:.0} MB/sec", load_lat.average, load_tp.average);
+}
+
+// =============================================================================
+// Test 10: Corrupt Checkpoint Fallback
+// =============================================================================
+
+/// Writes a valid checkpoint, corrupts one byte in page data, and verifies
+/// that loading fails CRC validation. Then verifies the system falls back
+/// to creating an empty tree (caller would do full WAL replay).
+#[tokio::test]
+async fn test_checkpoint_corrupt_fallback() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const KEY_COUNT: usize = 10_000;
+
+    tprintln!("\n=== Corrupt Checkpoint Fallback Test ===");
+
+    let dir = tempdir().unwrap();
+    let checkpoint_dir = dir.path().join("ckpt");
+    std::fs::create_dir_all(&checkpoint_dir).unwrap();
+
+    let disk = Arc::new(
+        DiskManager::new(DiskManagerConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync_enabled: false,
+        })
+        .await
+        .unwrap(),
+    );
+    let pool = Arc::new(BufferPool::auto_sized());
+
+    // Create index, insert keys, checkpoint
+    let mut btree = BTreeIndex::create_with_config(disk.clone(), pool.clone(), 0, checkpoint_dir.clone(), CheckpointConfig { fsync: false, ..CheckpointConfig::default() })
+        .await
+        .unwrap();
+
+    for i in 0..KEY_COUNT as u64 {
+        let key = i.to_be_bytes();
+        let tid = TupleId::new(PageId::new(0, (i % 100) as u32), (i % 50) as u16);
+        btree.insert_exclusive(&key, tid).unwrap();
+    }
+    btree.force_checkpoint(1000).unwrap();
+    drop(btree);
+
+    // Corrupt one byte in the page data section (past the 32-byte header + 4-byte page_id)
+    let ckpt_path = checkpoint_dir.join("index_0.zyridx");
+    let mut data = std::fs::read(&ckpt_path).unwrap();
+    assert!(data.len() > 100, "Checkpoint file too small");
+    data[50] ^= 0xFF; // Flip a byte in the first page entry's data
+    std::fs::write(&ckpt_path, &data).unwrap();
+
+    // Loading should fail CRC validation and fall back to empty tree
+    let loaded = BTreeIndex::open(disk.clone(), pool.clone(), 0, &checkpoint_dir)
+        .await
+        .unwrap();
+
+    // The loaded tree should be empty (fallback to fresh store)
+    assert_eq!(loaded.checkpoint_lsn(), 0, "Corrupt checkpoint should not set LSN");
+    assert_eq!(loaded.height(), 1, "Fallback tree should have height 1");
+
+    // Searching should find nothing (empty tree)
+    let key = 0u64.to_be_bytes();
+    assert!(
+        loaded.search_sync(&key).is_none(),
+        "Empty fallback tree should have no keys"
+    );
+
+    tprintln!("Corrupt Checkpoint Fallback: PASSED");
+    tprintln!("  CRC validation caught corruption, system fell back to empty store");
+}
+
+// =============================================================================
+// Test 11: Recovery With Checkpoint (500K + 500 WAL)
+// =============================================================================
+
+/// Inserts 500,000 keys and writes a checkpoint. Then inserts 500 more keys
+/// with WAL logging. Simulates crash and recovery by loading checkpoint +
+/// replaying only post-checkpoint WAL. Verifies all 500,500 keys are present.
+/// Recovery should only replay 500 records, not all 500,000.
+#[tokio::test]
+async fn test_recovery_with_checkpoint() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const PRE_CHECKPOINT_KEYS: usize = 500_000;
+    const POST_CHECKPOINT_KEYS: usize = 500;
+
+    tprintln!("\n=== Recovery With Checkpoint Test ===");
+    tprintln!("Pre-checkpoint keys: {}", format_with_commas(PRE_CHECKPOINT_KEYS as f64));
+    tprintln!("Post-checkpoint keys: {}", POST_CHECKPOINT_KEYS);
+    tprintln!("Validation runs: {}", VALIDATION_RUNS);
+
+    let mut recovery_time_results = Vec::with_capacity(VALIDATION_RUNS);
+
+    let recovery_util_before = take_util_snapshot();
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("\n--- Run {}/{} ---", run + 1, VALIDATION_RUNS);
+
+        let dir = tempdir().unwrap();
+        let checkpoint_dir = dir.path().join("ckpt");
+        let wal_dir = dir.path().join("wal");
+        std::fs::create_dir_all(&checkpoint_dir).unwrap();
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let disk = Arc::new(
+            DiskManager::new(DiskManagerConfig {
+                data_dir: dir.path().to_path_buf(),
+                fsync_enabled: false,
+            })
+            .await
+            .unwrap(),
+        );
+        let pool = Arc::new(BufferPool::auto_sized());
+
+        // Phase 1: Insert 500K keys and checkpoint
+        let checkpoint_lsn;
+        {
+            let mut btree =
+                BTreeIndex::create_with_config(disk.clone(), pool.clone(), 0, checkpoint_dir.clone(), CheckpointConfig { fsync: false, ..CheckpointConfig::default() })
+                    .await
+                    .unwrap();
+
+            for i in 0..PRE_CHECKPOINT_KEYS as u64 {
+                let key = i.to_be_bytes();
+                let tid = TupleId::new(PageId::new(0, (i % 1000) as u32), (i % 100) as u16);
+                btree.insert_exclusive(&key, tid).unwrap();
+            }
+
+            // Write WAL records for the pre-checkpoint keys (simulating normal operation)
+            let wal_config = WalWriterConfig {
+                wal_dir: wal_dir.clone(),
+                segment_size: 16 * 1024 * 1024,
+                fsync_enabled: false,
+                ring_buffer_capacity: 1024 * 1024,
+            };
+            let writer = Arc::new(WalWriter::new(wal_config).unwrap());
+
+            // Write a checkpoint marker at the current WAL position
+            let ckpt_begin = writer.log_checkpoint_begin().unwrap();
+            writer.log_checkpoint_end(&[]).unwrap();
+            writer.flush().unwrap();
+
+            checkpoint_lsn = ckpt_begin.0;
+            btree.force_checkpoint(checkpoint_lsn).unwrap();
+
+            // Phase 2: Insert 500 more keys with WAL logging (post-checkpoint)
+            for i in PRE_CHECKPOINT_KEYS..(PRE_CHECKPOINT_KEYS + POST_CHECKPOINT_KEYS) {
+                let txn_id = (i + 1) as u32;
+                let begin_lsn = writer.log_begin(txn_id).unwrap();
+                let payload = format!("key:{}", i);
+                let insert_lsn = writer
+                    .log_insert(txn_id, begin_lsn, payload.as_bytes())
+                    .unwrap();
+                writer.log_commit(txn_id, insert_lsn).unwrap();
+            }
+            writer.flush().unwrap();
+
+            // Insert the post-checkpoint keys into the btree as well
+            for i in PRE_CHECKPOINT_KEYS..(PRE_CHECKPOINT_KEYS + POST_CHECKPOINT_KEYS) {
+                let key = (i as u64).to_be_bytes();
+                let tid =
+                    TupleId::new(PageId::new(0, (i % 1000) as u32), (i as u64 % 100) as u16);
+                btree.insert_exclusive(&key, tid).unwrap();
+            }
+
+            writer.close().unwrap();
+            // Simulate crash: drop everything without clean shutdown
+        }
+
+        // Phase 3: Recovery
+        let recovery_start = Instant::now();
+
+        // Load checkpoint
+        let mut recovered =
+            BTreeIndex::open(disk.clone(), pool.clone(), 0, &checkpoint_dir)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            recovered.checkpoint_lsn(),
+            checkpoint_lsn,
+            "Checkpoint LSN mismatch after load"
+        );
+
+        // Replay only post-checkpoint WAL records
+        let recovery = RecoveryManager::new(&wal_dir).unwrap();
+        let result = recovery.recover().unwrap();
+
+        // Apply redo records from committed transactions that are post-checkpoint
+        let mut replayed = 0usize;
+        for record in &result.redo_records {
+            if record.lsn.0 > checkpoint_lsn && record.record_type == LogRecordType::Insert {
+                // Parse the payload to extract the key
+                let payload_str = String::from_utf8_lossy(&record.payload);
+                if let Some(key_str) = payload_str.strip_prefix("key:") {
+                    if let Ok(i) = key_str.parse::<u64>() {
+                        let key = i.to_be_bytes();
+                        let tid = TupleId::new(
+                            PageId::new(0, (i % 1000) as u32),
+                            (i % 100) as u16,
+                        );
+                        // Only insert if not already present from checkpoint
+                        if recovered.search_sync(&key).is_none() {
+                            recovered.insert_exclusive(&key, tid).unwrap();
+                        }
+                        replayed += 1;
+                    }
+                }
+            }
+        }
+
+        let recovery_duration = recovery_start.elapsed();
+        let recovery_ms = recovery_duration.as_secs_f64() * 1000.0;
+
+        tprintln!("  Checkpoint load + {} WAL records replayed in {:.2} ms", replayed, recovery_ms);
+
+        // Verify all keys are present
+        for i in 0..(PRE_CHECKPOINT_KEYS + POST_CHECKPOINT_KEYS) as u64 {
+            let key = i.to_be_bytes();
+            assert!(
+                recovered.search_sync(&key).is_some(),
+                "Key {} missing after recovery (run {})",
+                i,
+                run + 1
+            );
+        }
+
+        tprintln!("  All {} keys verified", PRE_CHECKPOINT_KEYS + POST_CHECKPOINT_KEYS);
+        recovery_time_results.push(recovery_ms);
+    }
+    record_test_util("Recovery with Checkpoint", recovery_util_before, take_util_snapshot());
+
+    tprintln!("\n=== Recovery With Checkpoint Validation Results ===");
+    let recovery_result = validate_metric(
+        "Recovery with Checkpoint",
+        "Recovery time (ms)",
+        recovery_time_results,
+        RECOVERY_WITH_CHECKPOINT_TARGET_MS,
+        false,
+    );
+    tprintln!("  Recovery: avg {:.2} ms (target {:.2} ms)", recovery_result.average, RECOVERY_WITH_CHECKPOINT_TARGET_MS);
+}
+
+// =============================================================================
+// Test 12: Recovery Without Checkpoint (10K + WAL)
+// =============================================================================
+
+/// Inserts 10,000 keys with WAL logging but no checkpoint. Simulates crash
+/// and does full WAL replay. Verifies all keys are recovered.
+#[tokio::test]
+async fn test_recovery_without_checkpoint() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const KEY_COUNT: usize = 10_000;
+
+    tprintln!("\n=== Recovery Without Checkpoint Test ===");
+    tprintln!("Keys: {}", format_with_commas(KEY_COUNT as f64));
+
+    let dir = tempdir().unwrap();
+    let checkpoint_dir = dir.path().join("ckpt");
+    let wal_dir = dir.path().join("wal");
+    std::fs::create_dir_all(&checkpoint_dir).unwrap();
+    std::fs::create_dir_all(&wal_dir).unwrap();
+
+    let disk = Arc::new(
+        DiskManager::new(DiskManagerConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync_enabled: false,
+        })
+        .await
+        .unwrap(),
+    );
+    let pool = Arc::new(BufferPool::auto_sized());
+
+    // Phase 1: Insert keys with WAL logging, no checkpoint
+    {
+        let wal_config = WalWriterConfig {
+            wal_dir: wal_dir.clone(),
+            segment_size: 16 * 1024 * 1024,
+            fsync_enabled: false,
+            ring_buffer_capacity: 1024 * 1024,
+        };
+        let writer = Arc::new(WalWriter::new(wal_config).unwrap());
+
+        for i in 0..KEY_COUNT {
+            let txn_id = (i + 1) as u32;
+            let begin_lsn = writer.log_begin(txn_id).unwrap();
+            let payload = format!("key:{}", i);
+            let insert_lsn = writer
+                .log_insert(txn_id, begin_lsn, payload.as_bytes())
+                .unwrap();
+            writer.log_commit(txn_id, insert_lsn).unwrap();
+        }
+        writer.flush().unwrap();
+        writer.close().unwrap();
+        // Crash: no clean shutdown
+    }
+
+    // Phase 2: Recovery from WAL only (no checkpoint)
+    let mut recovered =
+        BTreeIndex::open(disk.clone(), pool.clone(), 0, &checkpoint_dir)
+            .await
+            .unwrap();
+
+    assert_eq!(recovered.checkpoint_lsn(), 0, "No checkpoint should exist");
+
+    let recovery = RecoveryManager::new(&wal_dir).unwrap();
+    let result = recovery.recover().unwrap();
+
+    // Replay all committed insert records
+    let mut replayed = 0usize;
+    for record in &result.redo_records {
+        if record.record_type == LogRecordType::Insert {
+            let payload_str = String::from_utf8_lossy(&record.payload);
+            if let Some(key_str) = payload_str.strip_prefix("key:") {
+                if let Ok(i) = key_str.parse::<u64>() {
+                    let key = i.to_be_bytes();
+                    let tid = TupleId::new(
+                        PageId::new(0, (i % 1000) as u32),
+                        (i % 100) as u16,
+                    );
+                    recovered.insert_exclusive(&key, tid).unwrap();
+                    replayed += 1;
+                }
+            }
+        }
+    }
+
+    tprintln!("  Replayed {} WAL records (full replay, no checkpoint)", replayed);
+    assert_eq!(replayed, KEY_COUNT, "Should replay all {} records", KEY_COUNT);
+
+    // Verify all keys present
+    for i in 0..KEY_COUNT as u64 {
+        let key = i.to_be_bytes();
+        assert!(
+            recovered.search_sync(&key).is_some(),
+            "Key {} missing after full WAL replay",
+            i
+        );
+    }
+
+    tprintln!("  All {} keys verified after full WAL replay", KEY_COUNT);
+    tprintln!("Recovery Without Checkpoint: PASSED");
+}
+
+// =============================================================================
+// Test 13: WAL Segment Cleanup
+// =============================================================================
+
+/// Writes enough data to create 5+ WAL segments, writes a checkpoint at
+/// the current LSN, calls cleanup_old_segments, and verifies old segments
+/// are deleted while the current segment is retained.
+#[tokio::test]
+async fn test_wal_segment_cleanup() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    tprintln!("\n=== WAL Segment Cleanup Test ===");
+    tprintln!("Validation runs: {}", VALIDATION_RUNS);
+
+    let mut cleanup_time_results = Vec::with_capacity(VALIDATION_RUNS);
+
+    let cleanup_util_before = take_util_snapshot();
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("\n--- Run {}/{} ---", run + 1, VALIDATION_RUNS);
+
+        let dir = tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        // Small segments to force rotation (64KB per segment)
+        let wal_config = WalWriterConfig {
+            wal_dir: wal_dir.clone(),
+            segment_size: 64 * 1024,
+            fsync_enabled: false,
+            ring_buffer_capacity: 256 * 1024,
+        };
+        let writer = Arc::new(WalWriter::new(wal_config).unwrap());
+
+        // Write enough data to create 5+ segments (each ~64KB, write ~500KB total)
+        let payload = vec![0xABu8; 200];
+        for i in 0..2000 {
+            let txn_id = (i + 1) as u32;
+            let begin_lsn = writer.log_begin(txn_id).unwrap();
+            let insert_lsn = writer.log_insert(txn_id, begin_lsn, &payload).unwrap();
+            let _ = writer.log_commit(txn_id, insert_lsn).unwrap();
+        }
+        writer.flush().unwrap();
+
+        // Count segments before cleanup
+        let segments_before: Vec<String> = std::fs::read_dir(&wal_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "wal")
+                    .unwrap_or(false)
+            })
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+
+        tprintln!("  Segments before cleanup: {} ({:?})", segments_before.len(), segments_before);
+        assert!(
+            segments_before.len() >= 5,
+            "Expected 5+ segments, got {}",
+            segments_before.len()
+        );
+
+        // Set checkpoint LSN to the last flushed position
+        let checkpoint_lsn = writer.flushed_lsn();
+
+        // Cleanup old segments
+        let cleanup_start = Instant::now();
+        let deleted = writer.cleanup_old_segments(checkpoint_lsn).unwrap();
+        let cleanup_duration = cleanup_start.elapsed();
+        let cleanup_ms = cleanup_duration.as_secs_f64() * 1000.0;
+
+        // Count segments after cleanup
+        let segments_after: Vec<String> = std::fs::read_dir(&wal_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "wal")
+                    .unwrap_or(false)
+            })
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+
+        tprintln!("  Segments after cleanup: {} ({:?})", segments_after.len(), segments_after);
+        tprintln!("  Deleted: {} segments in {:.3} ms", deleted, cleanup_ms);
+
+        assert!(deleted > 0, "Should have deleted at least 1 segment");
+        assert!(
+            segments_after.len() < segments_before.len(),
+            "Segments should decrease after cleanup"
+        );
+        // The current segment (containing checkpoint_lsn) must be retained
+        let checkpoint_seg = format!("{:016}.wal", checkpoint_lsn.segment_id());
+        assert!(
+            segments_after.contains(&checkpoint_seg),
+            "Current segment {} must be retained",
+            checkpoint_seg
+        );
+
+        // Verify post-cleanup WAL still works: write more data
+        let txn_id = 9999u32;
+        let begin_lsn = writer.log_begin(txn_id).unwrap();
+        let insert_lsn = writer.log_insert(txn_id, begin_lsn, b"post_cleanup").unwrap();
+        let _ = writer.log_commit(txn_id, insert_lsn).unwrap();
+        writer.flush().unwrap();
+
+        writer.close().unwrap();
+        cleanup_time_results.push(cleanup_ms);
+    }
+    record_test_util("WAL Segment Cleanup", cleanup_util_before, take_util_snapshot());
+
+    tprintln!("\n=== WAL Segment Cleanup Validation Results ===");
+    let cleanup_result = validate_metric(
+        "WAL Segment Cleanup",
+        "Cleanup latency (ms)",
+        cleanup_time_results,
+        WAL_SEGMENT_CLEANUP_TARGET_MS,
+        false,
+    );
+    assert!(
+        cleanup_result.passed,
+        "WAL segment cleanup avg {:.2} ms > target {:.2} ms",
+        cleanup_result.average, WAL_SEGMENT_CLEANUP_TARGET_MS
+    );
+}
+
+// =============================================================================
+// Test 14: Adaptive Checkpoint Trigger
+// =============================================================================
+
+/// Tests the CheckpointTrigger thresholds: byte-based, time-based,
+/// and minimum interval guard.
+#[test]
+fn test_checkpoint_trigger_adaptive() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    tprintln!("\n=== Adaptive Checkpoint Trigger Test ===");
+
+    // Test 1: Byte threshold
+    let config = CheckpointConfig {
+        wal_bytes_threshold: 1024 * 1024, // 1 MB
+        max_interval_secs: 60,
+        min_interval_secs: 0, // Disable min interval for this sub-test
+        fsync: false,
+    };
+    let mut trigger = CheckpointTrigger::new(config);
+    let mut wal_bytes: u64 = 0;
+
+    // 512KB should not trigger
+    wal_bytes += 512 * 1024;
+    assert!(
+        !trigger.should_checkpoint(wal_bytes),
+        "512KB should not trigger 1MB threshold"
+    );
+
+    // Another 512KB should trigger (1MB total)
+    wal_bytes += 512 * 1024;
+    assert!(
+        trigger.should_checkpoint(wal_bytes),
+        "1MB should trigger 1MB threshold"
+    );
+
+    // After reset, should not trigger
+    trigger.reset();
+    wal_bytes = 0;
+    assert!(
+        !trigger.should_checkpoint(wal_bytes),
+        "After reset, should not trigger"
+    );
+
+    tprintln!("  Byte threshold: PASSED");
+
+    // Test 2: Minimum interval guard
+    let config = CheckpointConfig {
+        wal_bytes_threshold: 0, // Would always trigger on bytes alone
+        max_interval_secs: 3600,
+        min_interval_secs: 999, // 999 seconds, will block
+        fsync: false,
+    };
+    let trigger = CheckpointTrigger::new(config);
+    assert!(
+        !trigger.should_checkpoint(u64::MAX),
+        "min_interval should prevent immediate checkpoint"
+    );
+
+    tprintln!("  Minimum interval guard: PASSED");
+
+    // Test 3: Trigger check latency (should be <10ns, just an atomic read path)
+    let config = CheckpointConfig {
+        wal_bytes_threshold: u64::MAX,
+        max_interval_secs: u64::MAX,
+        min_interval_secs: 0,
+        fsync: false,
+    };
+    let trigger = CheckpointTrigger::new(config);
+
+    const TRIGGER_CHECK_ITERS: usize = 1_000_000;
+    let start = Instant::now();
+    for _ in 0..TRIGGER_CHECK_ITERS {
+        std::hint::black_box(trigger.should_checkpoint(0));
+    }
+    let duration = start.elapsed();
+    let ns_per_check = duration.as_nanos() as f64 / TRIGGER_CHECK_ITERS as f64;
+
+    tprintln!("  Trigger check latency: {:.1} ns/call", ns_per_check);
+    check_performance(
+        "Checkpoint Trigger",
+        "Trigger check latency (ns)",
+        ns_per_check,
+        10.0,
+        false,
+    );
+
+    tprintln!("Adaptive Checkpoint Trigger: PASSED");
+}
+
+// =============================================================================
+// Test 15: Graceful Shutdown Checkpoint
+// =============================================================================
+
+/// Inserts 1M keys, triggers graceful shutdown (writes final checkpoint),
+/// restarts, and verifies startup requires zero WAL replay.
+#[tokio::test]
+async fn test_graceful_shutdown_checkpoint() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const KEY_COUNT: usize = 1_000_000;
+
+    tprintln!("\n=== Graceful Shutdown Checkpoint Test ===");
+    tprintln!("Keys: {}", format_with_commas(KEY_COUNT as f64));
+    tprintln!("Validation runs: {}", VALIDATION_RUNS);
+
+    let mut shutdown_time_results = Vec::with_capacity(VALIDATION_RUNS);
+    let mut startup_time_results = Vec::with_capacity(VALIDATION_RUNS);
+
+    let shutdown_util_before = take_util_snapshot();
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("\n--- Run {}/{} ---", run + 1, VALIDATION_RUNS);
+
+        let dir = tempdir().unwrap();
+        let checkpoint_dir = dir.path().join("ckpt");
+        std::fs::create_dir_all(&checkpoint_dir).unwrap();
+
+        let disk = Arc::new(
+            DiskManager::new(DiskManagerConfig {
+                data_dir: dir.path().to_path_buf(),
+                fsync_enabled: false,
+            })
+            .await
+            .unwrap(),
+        );
+        let pool = Arc::new(BufferPool::auto_sized());
+
+        let shutdown_lsn = 99999u64;
+
+        // Insert keys and shutdown
+        {
+            let mut btree =
+                BTreeIndex::create_with_config(disk.clone(), pool.clone(), 0, checkpoint_dir.clone(), CheckpointConfig { fsync: false, ..CheckpointConfig::default() })
+                    .await
+                    .unwrap();
+
+            for i in 0..KEY_COUNT as u64 {
+                let key = i.to_be_bytes();
+                let tid = TupleId::new(PageId::new(0, (i % 1000) as u32), (i % 100) as u16);
+                btree.insert_exclusive(&key, tid).unwrap();
+            }
+
+            // Graceful shutdown writes a final checkpoint
+            let shutdown_start = Instant::now();
+            btree.shutdown(shutdown_lsn).unwrap();
+            let shutdown_duration = shutdown_start.elapsed();
+            let shutdown_ms = shutdown_duration.as_secs_f64() * 1000.0;
+
+            tprintln!("  Shutdown: {:.2} ms", shutdown_ms);
+            shutdown_time_results.push(shutdown_ms);
+        }
+
+        // Startup: load from checkpoint (zero WAL replay needed)
+        let startup_start = Instant::now();
+        let loaded = BTreeIndex::open(disk.clone(), pool.clone(), 0, &checkpoint_dir)
+            .await
+            .unwrap();
+        let startup_duration = startup_start.elapsed();
+        let startup_ms = startup_duration.as_secs_f64() * 1000.0;
+
+        tprintln!("  Startup: {:.2} ms", startup_ms);
+        startup_time_results.push(startup_ms);
+
+        assert_eq!(
+            loaded.checkpoint_lsn(),
+            shutdown_lsn,
+            "Loaded checkpoint_lsn should match shutdown LSN"
+        );
+
+        // Verify all keys are present (spot-check a sample for speed)
+        let sample_step = KEY_COUNT / 10_000;
+        for i in (0..KEY_COUNT as u64).step_by(sample_step) {
+            let key = i.to_be_bytes();
+            let expected = TupleId::new(PageId::new(0, (i % 1000) as u32), (i % 100) as u16);
+            let found = loaded.search_sync(&key);
+            assert_eq!(
+                found,
+                Some(expected),
+                "Key {} wrong after shutdown+reload (run {})",
+                i,
+                run + 1
+            );
+        }
+    }
+    record_test_util("Graceful Shutdown", shutdown_util_before, take_util_snapshot());
+
+    tprintln!("\n=== Graceful Shutdown Validation Results ===");
+    let shutdown_result = validate_metric(
+        "Graceful Shutdown",
+        "Shutdown checkpoint latency (ms)",
+        shutdown_time_results,
+        SHUTDOWN_CHECKPOINT_1M_TARGET_MS,
+        false,
+    );
+    // Startup time is informational, not a gating target (load target already tested in test 9)
+    let _startup = validate_metric(
+        "Graceful Shutdown",
+        "Startup load latency (ms)",
+        startup_time_results,
+        CHECKPOINT_LOAD_1M_TARGET_MS,
+        false,
+    );
+    tprintln!("  Shutdown: avg {:.2} ms (target {:.2} ms)", shutdown_result.average, SHUTDOWN_CHECKPOINT_1M_TARGET_MS);
+}
+
+// =============================================================================
+// Test 16: Scale Test (10M keys)
+// =============================================================================
+
+/// Creates a B+Tree with 10,000,000 keys (~50+ MB index), writes and loads
+/// a checkpoint, writes 100 more keys, crashes, and recovers. Measures
+/// total recovery time (checkpoint load + WAL replay).
+#[tokio::test]
+async fn test_checkpoint_scale_10m() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const KEY_COUNT: usize = 10_000_000;
+    const POST_KEYS: usize = 100;
+
+    tprintln!("\n=== Checkpoint Scale Test (10M keys) ===");
+    tprintln!("Keys: {}", format_with_commas(KEY_COUNT as f64));
+    tprintln!("Post-checkpoint keys: {}", POST_KEYS);
+    tprintln!("Validation runs: {}", VALIDATION_RUNS);
+
+    let mut write_time_results = Vec::with_capacity(VALIDATION_RUNS);
+    let mut load_time_results = Vec::with_capacity(VALIDATION_RUNS);
+    let mut recovery_time_results = Vec::with_capacity(VALIDATION_RUNS);
+
+    let scale_util_before = take_util_snapshot();
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("\n--- Run {}/{} ---", run + 1, VALIDATION_RUNS);
+
+        let dir = tempdir().unwrap();
+        let checkpoint_dir = dir.path().join("ckpt");
+        let wal_dir = dir.path().join("wal");
+        std::fs::create_dir_all(&checkpoint_dir).unwrap();
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let disk = Arc::new(
+            DiskManager::new(DiskManagerConfig {
+                data_dir: dir.path().to_path_buf(),
+                fsync_enabled: false,
+            })
+            .await
+            .unwrap(),
+        );
+        let pool = Arc::new(BufferPool::auto_sized());
+
+        // Build 10M key B+Tree
+        let build_start = Instant::now();
+        let mut btree =
+            BTreeIndex::create_with_config(disk.clone(), pool.clone(), 0, checkpoint_dir.clone(), CheckpointConfig { fsync: false, ..CheckpointConfig::default() })
+                .await
+                .unwrap();
+
+        for i in 0..KEY_COUNT as u64 {
+            let key = i.to_be_bytes();
+            let tid = TupleId::new(PageId::new(0, (i % 1000) as u32), (i % 100) as u16);
+            btree.insert_exclusive(&key, tid).unwrap();
+        }
+        let build_duration = build_start.elapsed();
+        tprintln!(
+            "  Build: {:.0} ms ({} ops/sec)",
+            build_duration.as_secs_f64() * 1000.0,
+            format_with_commas(KEY_COUNT as f64 / build_duration.as_secs_f64())
+        );
+
+        // Write checkpoint
+        let checkpoint_lsn = 1_000_000u64;
+        let write_start = Instant::now();
+        btree.force_checkpoint(checkpoint_lsn).unwrap();
+        let write_duration = write_start.elapsed();
+        let write_ms = write_duration.as_secs_f64() * 1000.0;
+
+        let ckpt_path = checkpoint_dir.join("index_0.zyridx");
+        let file_size = std::fs::metadata(&ckpt_path).unwrap().len();
+        let file_size_mb = file_size as f64 / (1024.0 * 1024.0);
+
+        tprintln!(
+            "  Checkpoint write: {:.2} ms ({:.1} MB, {:.0} MB/sec)",
+            write_ms,
+            file_size_mb,
+            file_size_mb / write_duration.as_secs_f64()
+        );
+        write_time_results.push(write_ms);
+
+        // Load checkpoint (standalone timing)
+        let load_start = Instant::now();
+        let _loaded = BTreeIndex::open(disk.clone(), pool.clone(), 0, &checkpoint_dir)
+            .await
+            .unwrap();
+        let load_duration = load_start.elapsed();
+        let load_ms = load_duration.as_secs_f64() * 1000.0;
+
+        tprintln!(
+            "  Checkpoint load: {:.2} ms ({:.0} MB/sec)",
+            load_ms,
+            file_size_mb / load_duration.as_secs_f64()
+        );
+        load_time_results.push(load_ms);
+        drop(_loaded);
+
+        // Write 100 post-checkpoint keys with WAL
+        let wal_config = WalWriterConfig {
+            wal_dir: wal_dir.clone(),
+            segment_size: 16 * 1024 * 1024,
+            fsync_enabled: false,
+            ring_buffer_capacity: 1024 * 1024,
+        };
+        let writer = Arc::new(WalWriter::new(wal_config).unwrap());
+
+        for i in KEY_COUNT..(KEY_COUNT + POST_KEYS) {
+            let txn_id = (i + 1) as u32;
+            let begin_lsn = writer.log_begin(txn_id).unwrap();
+            let payload = format!("key:{}", i);
+            let insert_lsn = writer
+                .log_insert(txn_id, begin_lsn, payload.as_bytes())
+                .unwrap();
+            writer.log_commit(txn_id, insert_lsn).unwrap();
+
+            let key = (i as u64).to_be_bytes();
+            let tid = TupleId::new(PageId::new(0, (i % 1000) as u32), (i as u64 % 100) as u16);
+            btree.insert_exclusive(&key, tid).unwrap();
+        }
+        writer.flush().unwrap();
+        writer.close().unwrap();
+        drop(btree);
+
+        // Full recovery: checkpoint load + WAL replay
+        let recovery_start = Instant::now();
+        let mut recovered =
+            BTreeIndex::open(disk.clone(), pool.clone(), 0, &checkpoint_dir)
+                .await
+                .unwrap();
+
+        // Replay post-checkpoint WAL
+        let recovery = RecoveryManager::new(&wal_dir).unwrap();
+        let result = recovery.recover().unwrap();
+        let mut replayed = 0usize;
+        for record in &result.redo_records {
+            if record.record_type == LogRecordType::Insert {
+                let payload_str = String::from_utf8_lossy(&record.payload);
+                if let Some(key_str) = payload_str.strip_prefix("key:") {
+                    if let Ok(i) = key_str.parse::<u64>() {
+                        let key = i.to_be_bytes();
+                        let tid = TupleId::new(
+                            PageId::new(0, (i % 1000) as u32),
+                            (i % 100) as u16,
+                        );
+                        if recovered.search_sync(&key).is_none() {
+                            recovered.insert_exclusive(&key, tid).unwrap();
+                        }
+                        replayed += 1;
+                    }
+                }
+            }
+        }
+
+        let recovery_duration = recovery_start.elapsed();
+        let recovery_ms = recovery_duration.as_secs_f64() * 1000.0;
+
+        tprintln!(
+            "  Recovery: {:.2} ms (checkpoint load + {} WAL records)",
+            recovery_ms,
+            replayed
+        );
+        recovery_time_results.push(recovery_ms);
+
+        // Verify spot-check: 1000 pre-checkpoint keys + all post-checkpoint keys
+        let sample_step = KEY_COUNT / 1000;
+        for i in (0..KEY_COUNT as u64).step_by(sample_step) {
+            let key = i.to_be_bytes();
+            assert!(
+                recovered.search_sync(&key).is_some(),
+                "Pre-checkpoint key {} missing (run {})",
+                i,
+                run + 1
+            );
+        }
+        for i in KEY_COUNT..(KEY_COUNT + POST_KEYS) {
+            let key = (i as u64).to_be_bytes();
+            assert!(
+                recovered.search_sync(&key).is_some(),
+                "Post-checkpoint key {} missing (run {})",
+                i,
+                run + 1
+            );
+        }
+
+        // Clean up WAL dir for next run
+        let _ = std::fs::remove_dir_all(&wal_dir);
+        std::fs::create_dir_all(&wal_dir).unwrap();
+    }
+    record_test_util("Checkpoint Scale", scale_util_before, take_util_snapshot());
+
+    tprintln!("\n=== Checkpoint Scale Validation Results ===");
+    let _write_result = validate_metric(
+        "Checkpoint Scale",
+        "Write 10M keys (ms)",
+        write_time_results,
+        50.0, // Informational, not gating
+        false,
+    );
+    let _load_result = validate_metric(
+        "Checkpoint Scale",
+        "Load 10M keys (ms)",
+        load_time_results,
+        20.0, // Informational, not gating
+        false,
+    );
+    let recovery_result = validate_metric(
+        "Checkpoint Scale",
+        "Recovery 10M+100 (ms)",
+        recovery_time_results,
+        RECOVERY_SCALE_TARGET_MS,
+        false,
+    );
+    tprintln!("  Scale recovery: avg {:.2} ms (target {:.2} ms)", recovery_result.average, RECOVERY_SCALE_TARGET_MS);
+}
+
+// =============================================================================
 // Summary Test
 // =============================================================================
 
@@ -2114,4 +3161,89 @@ async fn test_phase1_summary() {
     tprintln!("ZyronDB Phase 1: Storage Foundation Validation Complete");
     tprintln!("============================================================");
     tprintln!("\nRun: cargo test -p zyron-storage --test phase1_test --release -- --nocapture");
+}
+
+#[tokio::test]
+async fn test_checkpoint_io_profile() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempdir().unwrap();
+    
+    tprintln!("\n=== I/O Profile ===");
+    for size_mb in [1, 2, 4, 6, 8, 10, 14, 20] {
+        let path = dir.path().join(format!("test_{}.bin", size_mb));
+        let data = vec![0xABu8; size_mb * 1024 * 1024];
+        std::fs::write(&path, &data).unwrap(); // warm
+        
+        let mut best_w = 999.0f64;
+        let mut best_r = 999.0f64;
+        for _ in 0..10 {
+            let t = Instant::now();
+            std::fs::write(&path, &data).unwrap();
+            let w = t.elapsed().as_secs_f64() * 1000.0;
+            if w < best_w { best_w = w; }
+            
+            let t = Instant::now();
+            let _buf = std::fs::read(&path).unwrap();
+            let r = t.elapsed().as_secs_f64() * 1000.0;
+            if r < best_r { best_r = r; }
+        }
+        
+        tprintln!("{:3} MB  W: {:6.2} ms ({:6.0} MB/s)  R: {:6.2} ms ({:6.0} MB/s)",
+            size_mb,
+            best_w, size_mb as f64 / (best_w / 1000.0),
+            best_r, size_mb as f64 / (best_r / 1000.0));
+    }
+}
+
+#[tokio::test]
+async fn test_checkpoint_io_profile_v2() {
+    use std::io::Read;
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempdir().unwrap();
+    
+    tprintln!("\n=== I/O Profile v2 (detailed read breakdown) ===");
+    for size_mb in [6, 10, 14, 20, 46] {
+        let path = dir.path().join(format!("v2_{}.bin", size_mb));
+        let data = vec![0xABu8; size_mb * 1024 * 1024];
+        std::fs::write(&path, &data).unwrap(); // create file
+        
+        // Method 1: std::fs::read
+        let mut best_r1 = 999.0f64;
+        for _ in 0..10 {
+            let t = Instant::now();
+            let _buf = std::fs::read(&path).unwrap();
+            let r = t.elapsed().as_secs_f64() * 1000.0;
+            if r < best_r1 { best_r1 = r; }
+        }
+        
+        // Method 2: File::open + read_to_end with pre-alloc
+        let mut best_r2 = 999.0f64;
+        for _ in 0..10 {
+            let t = Instant::now();
+            let mut f = std::fs::File::open(&path).unwrap();
+            let meta = f.metadata().unwrap();
+            let len = meta.len() as usize;
+            let mut buf = Vec::with_capacity(len);
+            unsafe { buf.set_len(len); }
+            f.read_exact(&mut buf).unwrap();
+            let r = t.elapsed().as_secs_f64() * 1000.0;
+            if r < best_r2 { best_r2 = r; }
+        }
+
+        // Method 3: Pre-opened file handle + seek + read_exact 
+        let mut best_r3 = 999.0f64;
+        {
+            let mut pre_buf = vec![0u8; size_mb * 1024 * 1024];
+            for _ in 0..10 {
+                let t = Instant::now();
+                let mut f = std::fs::File::open(&path).unwrap();
+                f.read_exact(&mut pre_buf).unwrap();
+                let r = t.elapsed().as_secs_f64() * 1000.0;
+                if r < best_r3 { best_r3 = r; }
+            }
+        }
+        
+        tprintln!("{:3} MB  fs::read: {:6.2} ms  open+read_exact: {:6.2} ms  reuse_buf: {:6.2} ms",
+            size_mb, best_r1, best_r2, best_r3);
+    }
 }

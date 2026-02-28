@@ -55,14 +55,11 @@ impl RingBuffer {
         }
     }
 
-    /// Claims `size` bytes and returns a pointer to write into.
+    /// Claims `size` bytes contiguously within the buffer.
     ///
-    /// The record must fit contiguously within the buffer. The buffer capacity
-    /// must be large enough relative to the segment size that wrap-around only
-    /// occurs after the flush thread has drained all pending data (write_cursor
-    /// == read_cursor at wrap time). This is guaranteed when
-    /// ring_buffer_capacity >= segment_size, because the sequencer triggers
-    /// rotation + full drain before the buffer can wrap.
+    /// Hot path is a single fetch_add + branch (straight-line, no loop).
+    /// If the claimed region straddles the wrap boundary, the cold path
+    /// commits those bytes as padding and retries.
     ///
     /// # Safety
     /// Caller must write exactly `size` bytes to the returned pointer before calling
@@ -72,17 +69,39 @@ impl RingBuffer {
         let offset = self.write_cursor.fetch_add(size as u64, Ordering::Relaxed);
         let buf_offset = (offset as usize) % self.buffer_size;
 
-        // Verify the record does not straddle the wrap boundary.
+        if buf_offset + size <= self.buffer_size {
+            return unsafe { (*self.buffer.get()).as_mut_ptr().add(buf_offset) };
+        }
+
+        unsafe { self.write_record_straddle(size) }
+    }
+
+    /// Cold path for records that straddle the wrap boundary.
+    /// Commits the straddling bytes as padding and retries until
+    /// the record fits contiguously.
+    #[cold]
+    #[inline(never)]
+    unsafe fn write_record_straddle(&self, size: usize) -> *mut u8 {
         debug_assert!(
-            buf_offset + size <= self.buffer_size,
-            "WAL record ({} bytes) straddles ring buffer boundary at offset {}. \
-             Ring buffer capacity ({}) may be too small.",
+            size <= self.buffer_size,
+            "Record size ({} bytes) exceeds ring buffer capacity ({} bytes)",
             size,
-            buf_offset,
             self.buffer_size,
         );
 
-        unsafe { (*self.buffer.get()).as_mut_ptr().add(buf_offset) }
+        // Commit the initial straddling claim as padding.
+        self.committed_cursor.fetch_add(size as u64, Ordering::Release);
+
+        loop {
+            let offset = self.write_cursor.fetch_add(size as u64, Ordering::Relaxed);
+            let buf_offset = (offset as usize) % self.buffer_size;
+
+            if buf_offset + size <= self.buffer_size {
+                return unsafe { (*self.buffer.get()).as_mut_ptr().add(buf_offset) };
+            }
+
+            self.committed_cursor.fetch_add(size as u64, Ordering::Release);
+        }
     }
 
     /// Marks `size` bytes as committed and records `lsn` as the latest written LSN.

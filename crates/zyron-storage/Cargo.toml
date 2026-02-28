@@ -10,8 +10,9 @@ zyron-buffer = { path = "../zyron-buffer" }
 tokio.workspace = true
 parking_lot.workspace = true
 bytes.workspace = true
-crc32fast.workspace = true
 hashbrown.workspace = true
+lz4_flex.workspace = true
+scc.workspace = true
 
 [dev-dependencies]
 tempfile = "3.24.0"

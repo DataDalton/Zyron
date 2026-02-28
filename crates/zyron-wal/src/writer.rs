@@ -18,12 +18,133 @@ use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use zyron_common::{Result, ZyronError};
 
-/// Shared state for coordinating segment rotation between `append()` and the flush thread.
-struct RotationState {
-    /// Rotation has been requested.
-    pending: bool,
-    /// The segment ID that is full and needs to rotate away.
-    old_segment_id: u32,
+/// Atomic state machine for coordinating segment rotation between append() and the flush thread.
+///
+/// Packs state into a single AtomicU64:
+/// - Bits 0..1: rotation phase (0=Idle, 1=Requested, 2=InProgress, 3=Done)
+/// - Bits 2..31: old_segment_id (30 bits, max ~1 billion segments)
+/// - Bits 32..63: generation counter (32 bits) for ABA prevention
+struct AtomicRotationState {
+    packed: AtomicU64,
+}
+
+const ROTATION_IDLE: u64 = 0;
+const ROTATION_REQUESTED: u64 = 1;
+const ROTATION_IN_PROGRESS: u64 = 2;
+const ROTATION_DONE: u64 = 3;
+const STATE_MASK: u64 = 0b11;
+const SEGMENT_SHIFT: u32 = 2;
+const SEGMENT_MASK: u64 = 0x3FFF_FFFC; // bits 2..31
+const GENERATION_SHIFT: u32 = 32;
+
+impl AtomicRotationState {
+    fn new() -> Self {
+        Self {
+            packed: AtomicU64::new(0),
+        }
+    }
+
+    /// Packs state, segment_id, and generation into a u64.
+    #[inline]
+    fn pack(state: u64, segment_id: u32, generation: u32) -> u64 {
+        (state & STATE_MASK)
+            | (((segment_id as u64) << SEGMENT_SHIFT) & SEGMENT_MASK)
+            | ((generation as u64) << GENERATION_SHIFT)
+    }
+
+    /// Extracts the rotation phase from a packed value.
+    #[inline]
+    fn phase(val: u64) -> u64 {
+        val & STATE_MASK
+    }
+
+    /// Extracts the segment_id from a packed value.
+    #[inline]
+    fn segment_id(val: u64) -> u32 {
+        ((val & SEGMENT_MASK) >> SEGMENT_SHIFT) as u32
+    }
+
+    /// Extracts the generation counter from a packed value.
+    #[inline]
+    fn generation(val: u64) -> u32 {
+        (val >> GENERATION_SHIFT) as u32
+    }
+
+    /// Attempts to transition Idle -> Requested with the given segment_id.
+    /// Returns true if this thread won the CAS race.
+    fn request_rotation(&self, old_segment_id: u32) -> bool {
+        let current = self.packed.load(Ordering::Acquire);
+        if Self::phase(current) != ROTATION_IDLE {
+            return false;
+        }
+        let generation = Self::generation(current);
+        let new_val = Self::pack(ROTATION_REQUESTED, old_segment_id, generation);
+        self.packed
+            .compare_exchange(current, new_val, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// Transitions Requested -> InProgress. Called by the flush thread.
+    /// Returns the old_segment_id on success.
+    fn start_rotation(&self) -> Option<u32> {
+        let current = self.packed.load(Ordering::Acquire);
+        if Self::phase(current) != ROTATION_REQUESTED {
+            return None;
+        }
+        let segment_id = Self::segment_id(current);
+        let generation = Self::generation(current);
+        let new_val = Self::pack(ROTATION_IN_PROGRESS, segment_id, generation);
+        if self
+            .packed
+            .compare_exchange(current, new_val, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            Some(segment_id)
+        } else {
+            None
+        }
+    }
+
+    /// Transitions InProgress -> Done. Called by the flush thread after rotation completes.
+    fn complete_rotation(&self) {
+        let current = self.packed.load(Ordering::Acquire);
+        let generation = Self::generation(current).wrapping_add(1);
+        let new_val = Self::pack(ROTATION_DONE, 0, generation);
+        self.packed.store(new_val, Ordering::Release);
+    }
+
+    /// Transitions Done -> Idle. Called by waiting append() threads after observing Done.
+    fn acknowledge_done(&self) {
+        let current = self.packed.load(Ordering::Acquire);
+        if Self::phase(current) != ROTATION_DONE {
+            return;
+        }
+        let generation = Self::generation(current);
+        let new_val = Self::pack(ROTATION_IDLE, 0, generation);
+        // Best-effort CAS. Multiple threads may race, only one wins. That is fine
+        // because all threads observe Done and proceed to retry their append.
+        let _ = self.packed.compare_exchange(
+            current,
+            new_val,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Returns true if a rotation is pending (Requested or InProgress).
+    /// Relaxed ordering is sufficient: this is a hint check, the actual
+    /// state transition uses CAS with Acquire/Release.
+    #[inline]
+    fn is_rotating(&self) -> bool {
+        let phase = Self::phase(self.packed.load(Ordering::Relaxed));
+        phase == ROTATION_REQUESTED || phase == ROTATION_IN_PROGRESS
+    }
+
+    /// Returns true if the rotation is done and awaiting acknowledgment.
+    #[inline]
+    fn is_done(&self) -> bool {
+        Self::phase(self.packed.load(Ordering::Relaxed)) == ROTATION_DONE
+    }
 }
 
 /// Configuration for the WAL writer.
@@ -84,7 +205,7 @@ pub struct WalWriter {
     /// Configuration.
     config: WalWriterConfig,
     /// Segment rotation coordination between append() and the flush thread.
-    rotation: Arc<(Mutex<RotationState>, Condvar)>,
+    rotation: Arc<AtomicRotationState>,
 }
 
 impl WalWriter {
@@ -107,13 +228,7 @@ impl WalWriter {
         let shutdown = Arc::new(AtomicBool::new(false));
         let segment = Arc::new(Mutex::new(Some(segment)));
         let flushed_lsn = Arc::new(AtomicU64::new(initial_lsn.0.saturating_sub(1)));
-        let rotation = Arc::new((
-            Mutex::new(RotationState {
-                pending: false,
-                old_segment_id: 0,
-            }),
-            Condvar::new(),
-        ));
+        let rotation = Arc::new(AtomicRotationState::new());
         let flush_thread = Self::spawn_flush_thread(
             ring_buffer.clone(),
             segment.clone(),
@@ -187,7 +302,7 @@ impl WalWriter {
         flushed_lsn: Arc<AtomicU64>,
         fsync_enabled: bool,
         sequencer: Arc<LsnSequencer>,
-        rotation: Arc<(Mutex<RotationState>, Condvar)>,
+        rotation: Arc<AtomicRotationState>,
         wal_dir: PathBuf,
         segment_size: u32,
     ) -> JoinHandle<()> {
@@ -204,10 +319,7 @@ impl WalWriter {
                 // if unpark() fires between our last drain_into() and park(),
                 // the token is consumed and park() returns immediately.
                 let has_data = !ring_buffer.is_empty();
-                let has_rotation = {
-                    let state = rotation.0.lock();
-                    state.pending
-                };
+                let has_rotation = rotation.is_rotating();
 
                 if !has_data && !has_rotation && !shutdown.load(Ordering::Acquire) {
                     // Short park with timeout so records below the 4KB wakeup threshold
@@ -238,16 +350,20 @@ impl WalWriter {
                     fsync_enabled,
                 );
 
-                // Handle segment rotation if requested by append()
-                Self::handle_rotation_sync(
-                    &rotation,
-                    &ring_buffer,
-                    &segment,
-                    &sequencer,
-                    &wal_dir,
-                    segment_size,
-                    fsync_enabled,
-                );
+                // Handle segment rotation only when requested by append().
+                // Skipping the call when no rotation is pending avoids an
+                // Acquire load + phase check on every flush iteration.
+                if has_rotation {
+                    Self::handle_rotation_sync(
+                        &rotation,
+                        &ring_buffer,
+                        &segment,
+                        &sequencer,
+                        &wal_dir,
+                        segment_size,
+                        fsync_enabled,
+                    );
+                }
             }
         })
     }
@@ -259,7 +375,7 @@ impl WalWriter {
     /// then does a final drain to capture any bytes committed after the main flush.
     /// This prevents cross-segment contamination caused by delayed commit_write calls.
     fn handle_rotation_sync(
-        rotation: &Arc<(Mutex<RotationState>, Condvar)>,
+        rotation: &Arc<AtomicRotationState>,
         ring_buffer: &RingBuffer,
         segment: &Mutex<Option<LogSegment>>,
         sequencer: &Arc<LsnSequencer>,
@@ -267,13 +383,10 @@ impl WalWriter {
         segment_size: u32,
         fsync_enabled: bool,
     ) {
-        let (lock, condvar) = rotation.as_ref();
-        let old_segment_id = {
-            let state = lock.lock();
-            if !state.pending {
-                return;
-            }
-            state.old_segment_id
+        // Transition Requested -> InProgress. If no rotation was requested, return.
+        let old_segment_id = match rotation.start_rotation() {
+            Some(id) => id,
+            None => return,
         };
 
         // Wait for all in-flight writes to the old segment to commit their bytes.
@@ -314,20 +427,15 @@ impl WalWriter {
                 }
                 // Advance sequencer so append() callers can reserve space
                 sequencer.advance_segment(new_segment_id);
-                // Signal all threads waiting on rotation
-                let mut state = lock.lock();
-                state.pending = false;
-                condvar.notify_all();
             }
             Err(e) => {
                 eprintln!("WAL segment rotation error: {:?}", e);
-                // Clear pending state and wake all waiters to prevent deadlock.
-                // Callers will retry rotation on the next append.
-                let mut state = lock.lock();
-                state.pending = false;
-                condvar.notify_all();
             }
         }
+
+        // Signal InProgress -> Done. Waiting append() threads will observe this
+        // and transition Done -> Idle before retrying.
+        rotation.complete_rotation();
     }
 
     /// Flushes records from ring buffer to disk. Fully synchronous.
@@ -414,14 +522,15 @@ impl WalWriter {
             let (lsn, needs_rotation) = self.sequencer.reserve(record_size);
 
             if needs_rotation {
-                // Request rotation and block until the flush thread completes it
-                let (lock, condvar) = self.rotation.as_ref();
-                let mut state = lock.lock();
+                // If rotation is already done by a previous cycle, acknowledge and retry.
+                if self.rotation.is_done() {
+                    self.rotation.acknowledge_done();
+                    continue;
+                }
 
-                // Check again under the lock: another thread may have already rotated
+                // Try to reserve again, another thread may have completed rotation.
                 let (current_lsn, still_full) = self.sequencer.reserve(record_size);
                 if !still_full {
-                    drop(state);
                     let lsn = current_lsn;
                     unsafe {
                         let buf = self.ring_buffer.write_record(record_size as usize, lsn);
@@ -440,14 +549,17 @@ impl WalWriter {
                     return Ok(lsn);
                 }
 
-                if !state.pending {
-                    state.old_segment_id = lsn.segment_id();
-                    state.pending = true;
-                    self.wake_flush_thread();
+                // Request rotation (CAS Idle -> Requested). Only one thread wins.
+                self.rotation.request_rotation(lsn.segment_id());
+                self.wake_flush_thread();
+
+                // Spin-wait until the flush thread completes rotation (Done state).
+                while !self.rotation.is_done() {
+                    std::thread::park_timeout(std::time::Duration::from_micros(10));
                 }
 
-                condvar.wait(&mut state);
-                drop(state);
+                // Acknowledge Done -> Idle so the next rotation cycle can proceed.
+                self.rotation.acknowledge_done();
                 continue;
             }
 
@@ -531,6 +643,36 @@ impl WalWriter {
     #[inline]
     pub fn wal_dir(&self) -> &Path {
         &self.config.wal_dir
+    }
+
+    /// Deletes WAL segment files whose records are fully covered by a checkpoint.
+    ///
+    /// Segments with segment_id strictly less than the checkpoint LSN's segment are
+    /// fully below the checkpoint and safe to delete. The segment containing the
+    /// checkpoint LSN is kept because recovery replays from that offset.
+    ///
+    /// Returns the number of segments deleted.
+    pub fn cleanup_old_segments(&self, checkpoint_lsn: Lsn) -> Result<usize> {
+        let checkpoint_segment_id = checkpoint_lsn.segment_id();
+        let mut deleted = 0;
+
+        for entry in std::fs::read_dir(&self.config.wal_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            if path.extension().map(|ext| ext == "wal").unwrap_or(false) {
+                if let Some(stem) = path.file_stem() {
+                    if let Ok(id) = stem.to_string_lossy().parse::<u32>() {
+                        if id < checkpoint_segment_id {
+                            std::fs::remove_file(&path)?;
+                            deleted += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(deleted)
     }
 
     /// Forces a flush and waits for completion.

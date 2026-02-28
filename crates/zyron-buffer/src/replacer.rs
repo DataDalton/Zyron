@@ -1,8 +1,7 @@
 //! Page replacement policies for the buffer pool.
 
 use crate::frame::FrameId;
-use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Trait for page replacement algorithms.
 pub trait Replacer: Send + Sync {
@@ -20,18 +19,19 @@ pub trait Replacer: Send + Sync {
     fn remove(&self, frame_id: FrameId);
 }
 
-/// Clock replacement algorithm implementation.
+/// Lock-free clock replacement algorithm implementation.
 ///
-/// Uses atomic reference bits for the clock algorithm.
-/// Evictability is determined by checking pin_count directly during eviction,
-/// eliminating redundant state tracking.
+/// Uses atomic reference bits and an atomic clock hand. The hand advances
+/// via fetch_add, allowing concurrent eviction sweeps without a mutex.
+/// Concurrent evictions may identify the same victim, but the caller's
+/// page_table CAS handles deduplication.
 pub struct ClockReplacer {
     /// Number of frames.
     num_frames: usize,
     /// Reference bits for each frame (atomic for lock-free access).
     reference_bits: Vec<AtomicBool>,
-    /// Clock hand position (protected by mutex during eviction).
-    clock_hand: Mutex<usize>,
+    /// Clock hand position (lock-free advancement via fetch_add).
+    clock_hand: AtomicUsize,
 }
 
 impl ClockReplacer {
@@ -44,7 +44,7 @@ impl ClockReplacer {
         Self {
             num_frames,
             reference_bits,
-            clock_hand: Mutex::new(0),
+            clock_hand: AtomicUsize::new(0),
         }
     }
 
@@ -68,13 +68,11 @@ impl Replacer for ClockReplacer {
     where
         F: Fn(FrameId) -> bool,
     {
-        let mut hand = self.clock_hand.lock();
         let num_frames = self.num_frames;
 
         // Clock sweep: 2 full rotations to find a victim
         for _ in 0..(2 * num_frames) {
-            let idx = *hand;
-            *hand = (idx + 1) % num_frames;
+            let idx = self.clock_hand.fetch_add(1, Ordering::Relaxed) % num_frames;
             let frame_id = FrameId(idx as u32);
 
             // Check if frame is evictable (pin_count == 0)

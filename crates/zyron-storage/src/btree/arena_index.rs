@@ -6,7 +6,6 @@ use super::constants::{
     ARENA_LEAF_HEADER_SIZE, ARENA_MAX_INTERNAL_KEYS, ARENA_MAX_LEAF_ENTRIES, ARENA_NULL_OFFSET,
 };
 use crate::tuple::TupleId;
-use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use zyron_common::Result;
 use zyron_common::page::PageId;
@@ -18,9 +17,6 @@ pub struct BTreeArenaIndex {
     root_offset: AtomicU64,
     /// Tree height (1 = just root as leaf).
     height: AtomicU64,
-    /// Write lock for concurrent insert operations (reserved for future use).
-    #[allow(dead_code)]
-    write_lock: Mutex<()>,
 }
 
 impl BTreeArenaIndex {
@@ -50,7 +46,6 @@ impl BTreeArenaIndex {
             arena,
             root_offset: AtomicU64::new(root_offset),
             height: AtomicU64::new(1),
-            write_lock: Mutex::new(()),
         }
     }
 
@@ -853,7 +848,6 @@ impl BTreeArenaIndex {
 
         // Find leftmost leaf
         for _ in 0..(height - 1) {
-            let _header = self.arena.read_internal_header(current);
             current = self.read_child_ptr(current, 0);
         }
 
