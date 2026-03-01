@@ -7,14 +7,15 @@ rust-version.workspace = true
 [dependencies]
 zyron-common = { path = "../zyron-common" }
 zyron-buffer = { path = "../zyron-buffer" }
+zyron-wal = { path = "../zyron-wal" }
 tokio.workspace = true
 parking_lot.workspace = true
 bytes.workspace = true
 hashbrown.workspace = true
 lz4_flex.workspace = true
 scc.workspace = true
+xxhash-rust.workspace = true
 
 [dev-dependencies]
 tempfile = "3.24.0"
-zyron-wal = { path = "../zyron-wal" }
 rand = "0.9.1"

@@ -45,17 +45,17 @@ pub enum DeleteResult {
 /// Page layout:
 /// ```text
 /// +------------------------+ 0
-/// | Page Header (32 bytes) |
-/// +------------------------+ 32
+/// | Page Header (40 bytes) |
+/// +------------------------+ 40
 /// | Leaf Header (16 bytes) |
-/// +------------------------+ 48 (SLOT_ARRAY_START)
+/// +------------------------+ 56 (SLOT_ARRAY_START)
 /// | Slot Array             |
 /// | [offset:2, len:2] * n  |  <- grows forward
 /// +------------------------+ 48 + 4*n
 /// |      Free Space        |
 /// +------------------------+ data_end
 /// | Entry Data             |
-/// | (key_len:2 + key + tid)|  <- grows backward from PAGE_SIZE
+/// | (key_len:2+key+pn4+s2) |  <- grows backward from PAGE_SIZE
 /// +------------------------+ PAGE_SIZE
 /// ```
 #[derive(Debug, Clone, Copy)]
@@ -183,10 +183,11 @@ impl Default for InternalPageHeader {
 
 /// A key-value entry in a leaf page.
 ///
-/// Layout:
+/// Layout (on-disk):
 /// - key_len: 2 bytes
 /// - key: variable
-/// - tuple_id: 8 bytes (page_id as u64 + slot_id as u16 packed)
+/// - page_num: 4 bytes (u32, file_id is implicit from the B+tree index)
+/// - slot_id: 2 bytes
 #[derive(Debug, Clone)]
 pub struct LeafEntry {
     /// The key bytes.
@@ -198,57 +199,55 @@ pub struct LeafEntry {
 impl LeafEntry {
     /// Size of this entry on disk.
     pub fn size_on_disk(&self) -> usize {
-        2 + self.key.len() + 10 // key_len + key + tuple_id (file_id:4 + page_num:4 + slot_id:2)
+        2 + self.key.len() + 6 // key_len + key + page_num(4) + slot_id(2)
     }
 
     /// Serializes the entry to bytes.
+    /// Stores only page_num (u32) + slot_id (u16). file_id is reconstructed
+    /// from the B+tree index context on read.
     pub fn to_bytes(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(self.size_on_disk());
         buf.extend_from_slice(&(self.key.len() as u16).to_le_bytes());
         buf.extend_from_slice(&self.key);
-        buf.extend_from_slice(&self.tuple_id.page_id.file_id.to_le_bytes());
-        buf.extend_from_slice(&self.tuple_id.page_id.page_num.to_le_bytes());
+        buf.extend_from_slice(&(self.tuple_id.page_id.page_num as u32).to_le_bytes());
         buf.extend_from_slice(&self.tuple_id.slot_id.to_le_bytes());
         buf.freeze()
     }
 
     /// Deserializes an entry from bytes. Returns (entry, bytes_consumed).
+    /// Reconstructs PageId with file_id=0. Callers that need the correct
+    /// file_id must set it from context after deserialization.
     pub fn from_bytes(buf: &[u8]) -> Option<(Self, usize)> {
-        if buf.len() < 12 {
+        if buf.len() < 8 {
             return None;
         }
 
         let key_len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
-        if buf.len() < 2 + key_len + 10 {
+        if buf.len() < 2 + key_len + 6 {
             return None;
         }
 
         let key = Bytes::copy_from_slice(&buf[2..2 + key_len]);
-        let file_id = u32::from_le_bytes([
+        let page_num = u32::from_le_bytes([
             buf[2 + key_len],
             buf[3 + key_len],
             buf[4 + key_len],
             buf[5 + key_len],
         ]);
-        let page_num = u32::from_le_bytes([
-            buf[6 + key_len],
-            buf[7 + key_len],
-            buf[8 + key_len],
-            buf[9 + key_len],
-        ]);
-        let slot_id = u16::from_le_bytes([buf[10 + key_len], buf[11 + key_len]]);
+        let slot_id = u16::from_le_bytes([buf[6 + key_len], buf[7 + key_len]]);
 
-        let tuple_id = TupleId::new(PageId::new(file_id, page_num), slot_id);
-        Some((Self { key, tuple_id }, 2 + key_len + 10))
+        let page_id = PageId::new(0, page_num as u64);
+        let tuple_id = TupleId::new(page_id, slot_id);
+        Some((Self { key, tuple_id }, 2 + key_len + 6))
     }
 }
 
 /// A key-pointer entry in an internal page.
 ///
-/// Layout:
+/// Layout (on-disk):
 /// - key_len: 2 bytes
 /// - key: variable
-/// - child_page_id: 8 bytes
+/// - child_page_num: 4 bytes (u32, file_id is implicit from the B+tree index)
 #[derive(Debug, Clone)]
 pub struct InternalEntry {
     /// The key bytes.
@@ -260,42 +259,43 @@ pub struct InternalEntry {
 impl InternalEntry {
     /// Size of this entry on disk.
     pub fn size_on_disk(&self) -> usize {
-        2 + self.key.len() + 8 // key_len + key + page_id
+        2 + self.key.len() + 4 // key_len + key + page_num(4)
     }
 
     /// Serializes the entry to bytes.
+    /// Stores only page_num (u32). file_id is reconstructed from the
+    /// B+tree index context on read.
     pub fn to_bytes(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(self.size_on_disk());
         buf.extend_from_slice(&(self.key.len() as u16).to_le_bytes());
         buf.extend_from_slice(&self.key);
-        buf.extend_from_slice(&self.child_page_id.as_u64().to_le_bytes());
+        buf.extend_from_slice(&(self.child_page_id.page_num as u32).to_le_bytes());
         buf.freeze()
     }
 
     /// Deserializes an entry from bytes. Returns (entry, bytes_consumed).
+    /// Reconstructs PageId with file_id=0. Callers that need the correct
+    /// file_id must set it from context after deserialization.
     pub fn from_bytes(buf: &[u8]) -> Option<(Self, usize)> {
-        if buf.len() < 10 {
+        if buf.len() < 6 {
             return None;
         }
 
         let key_len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
-        if buf.len() < 2 + key_len + 8 {
+        if buf.len() < 2 + key_len + 4 {
             return None;
         }
 
         let key = Bytes::copy_from_slice(&buf[2..2 + key_len]);
-        let child_page_id = PageId::from_u64(u64::from_le_bytes([
+        let page_num = u32::from_le_bytes([
             buf[2 + key_len],
             buf[3 + key_len],
             buf[4 + key_len],
             buf[5 + key_len],
-            buf[6 + key_len],
-            buf[7 + key_len],
-            buf[8 + key_len],
-            buf[9 + key_len],
-        ]));
+        ]);
+        let child_page_id = PageId::new(0, page_num as u64);
 
-        Some((Self { key, child_page_id }, 2 + key_len + 8))
+        Some((Self { key, child_page_id }, 2 + key_len + 4))
     }
 }
 

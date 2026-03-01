@@ -1008,7 +1008,7 @@ async fn test_buffer_pool_eviction() {
     let mut dirty_evictions = 0;
 
     for i in 0..NUM_PAGES {
-        let page_id = PageId::new(0, i as u32);
+        let page_id = PageId::new(0, i as u64);
 
         let (frame, evicted) = pool.new_page(page_id).unwrap();
 
@@ -1053,7 +1053,7 @@ async fn test_buffer_pool_pin_prevents_eviction() {
 
     let mut pinned_pages = Vec::new();
     for i in 0..NUM_FRAMES {
-        let page_id = PageId::new(0, i as u32);
+        let page_id = PageId::new(0, i as u64);
         pool.new_page(page_id).unwrap();
         pinned_pages.push(page_id);
     }
@@ -1100,7 +1100,7 @@ async fn test_buffer_pool_cache_hit_rate() {
 
         // Initial load
         for i in 0..NUM_PAGES {
-            let page_id = PageId::new(0, i as u32);
+            let page_id = PageId::new(0, i as u64);
             pool.new_page(page_id).unwrap();
             pool.unpin_page(page_id, false);
         }
@@ -1111,7 +1111,7 @@ async fn test_buffer_pool_cache_hit_rate() {
         let start = Instant::now();
         for _ in 0..ACCESS_ROUNDS {
             for i in 0..NUM_PAGES {
-                let page_id = PageId::new(0, i as u32);
+                let page_id = PageId::new(0, i as u64);
                 if pool.fetch_page(page_id).is_some() {
                     hits += 1;
                     pool.unpin_page(page_id, false);
@@ -1515,7 +1515,7 @@ fn test_btree_1m_keys() {
         let insert_start = Instant::now();
         for &key in &keys {
             let key_bytes = key.to_be_bytes();
-            let tuple_id = TupleId::new(PageId::new(0, (key % 1000) as u32), (key % 100) as u16);
+            let tuple_id = TupleId::new(PageId::new(0, (key % 1000) as u64), (key % 100) as u16);
             btree.insert(&key_bytes, tuple_id).unwrap();
         }
         let insert_duration = insert_start.elapsed();
@@ -2154,14 +2154,23 @@ async fn test_checkpoint_round_trip_1m() {
         );
         let pool = Arc::new(BufferPool::auto_sized());
 
-        let mut btree = BTreeIndex::create_with_config(disk.clone(), pool.clone(), 0, checkpoint_dir.clone(), CheckpointConfig { fsync: false, ..CheckpointConfig::default() })
-            .await
-            .unwrap();
+        let mut btree = BTreeIndex::create_with_config(
+            disk.clone(),
+            pool.clone(),
+            0,
+            checkpoint_dir.clone(),
+            CheckpointConfig {
+                fsync: false,
+                ..CheckpointConfig::default()
+            },
+        )
+        .await
+        .unwrap();
 
         // Insert 1M keys using exclusive access for maximum speed
         for i in 0..KEY_COUNT as u64 {
             let key = i.to_be_bytes();
-            let tid = TupleId::new(PageId::new(0, (i % 1000) as u32), (i % 100) as u16);
+            let tid = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
             btree.insert_exclusive(&key, tid).unwrap();
         }
 
@@ -2190,7 +2199,7 @@ async fn test_checkpoint_round_trip_1m() {
         // Verify every key round-trips
         for i in 0..KEY_COUNT as u64 {
             let key = i.to_be_bytes();
-            let expected = TupleId::new(PageId::new(0, (i % 1000) as u32), (i % 100) as u16);
+            let expected = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
             let found = loaded.search_sync(&key);
             assert_eq!(
                 found,
@@ -2210,16 +2219,8 @@ async fn test_checkpoint_round_trip_1m() {
             file_size_mb,
             btree.height()
         );
-        tprintln!(
-            "  Write: {:.2} ms ({:.0} MB/sec)",
-            write_ms,
-            write_mb_sec
-        );
-        tprintln!(
-            "  Load: {:.2} ms ({:.0} MB/sec)",
-            load_ms,
-            load_mb_sec
-        );
+        tprintln!("  Write: {:.2} ms ({:.0} MB/sec)", write_ms, write_mb_sec);
+        tprintln!("  Load: {:.2} ms ({:.0} MB/sec)", load_ms, load_mb_sec);
 
         write_latency_results.push(write_ms);
         load_latency_results.push(load_ms);
@@ -2260,8 +2261,16 @@ async fn test_checkpoint_round_trip_1m() {
 
     // Report checkpoint performance without fixed assertions.
     // Compare against previous runs for regression detection.
-    tprintln!("  Write: avg {:.2} ms, {:.0} MB/sec", write_lat.average, write_tp.average);
-    tprintln!("  Load:  avg {:.2} ms, {:.0} MB/sec", load_lat.average, load_tp.average);
+    tprintln!(
+        "  Write: avg {:.2} ms, {:.0} MB/sec",
+        write_lat.average,
+        write_tp.average
+    );
+    tprintln!(
+        "  Load:  avg {:.2} ms, {:.0} MB/sec",
+        load_lat.average,
+        load_tp.average
+    );
 }
 
 // =============================================================================
@@ -2293,13 +2302,22 @@ async fn test_checkpoint_corrupt_fallback() {
     let pool = Arc::new(BufferPool::auto_sized());
 
     // Create index, insert keys, checkpoint
-    let mut btree = BTreeIndex::create_with_config(disk.clone(), pool.clone(), 0, checkpoint_dir.clone(), CheckpointConfig { fsync: false, ..CheckpointConfig::default() })
-        .await
-        .unwrap();
+    let mut btree = BTreeIndex::create_with_config(
+        disk.clone(),
+        pool.clone(),
+        0,
+        checkpoint_dir.clone(),
+        CheckpointConfig {
+            fsync: false,
+            ..CheckpointConfig::default()
+        },
+    )
+    .await
+    .unwrap();
 
     for i in 0..KEY_COUNT as u64 {
         let key = i.to_be_bytes();
-        let tid = TupleId::new(PageId::new(0, (i % 100) as u32), (i % 50) as u16);
+        let tid = TupleId::new(PageId::new(0, i % 100), (i % 50) as u16);
         btree.insert_exclusive(&key, tid).unwrap();
     }
     btree.force_checkpoint(1000).unwrap();
@@ -2318,7 +2336,11 @@ async fn test_checkpoint_corrupt_fallback() {
         .unwrap();
 
     // The loaded tree should be empty (fallback to fresh store)
-    assert_eq!(loaded.checkpoint_lsn(), 0, "Corrupt checkpoint should not set LSN");
+    assert_eq!(
+        loaded.checkpoint_lsn(),
+        0,
+        "Corrupt checkpoint should not set LSN"
+    );
     assert_eq!(loaded.height(), 1, "Fallback tree should have height 1");
 
     // Searching should find nothing (empty tree)
@@ -2347,7 +2369,10 @@ async fn test_recovery_with_checkpoint() {
     const POST_CHECKPOINT_KEYS: usize = 500;
 
     tprintln!("\n=== Recovery With Checkpoint Test ===");
-    tprintln!("Pre-checkpoint keys: {}", format_with_commas(PRE_CHECKPOINT_KEYS as f64));
+    tprintln!(
+        "Pre-checkpoint keys: {}",
+        format_with_commas(PRE_CHECKPOINT_KEYS as f64)
+    );
     tprintln!("Post-checkpoint keys: {}", POST_CHECKPOINT_KEYS);
     tprintln!("Validation runs: {}", VALIDATION_RUNS);
 
@@ -2376,14 +2401,22 @@ async fn test_recovery_with_checkpoint() {
         // Phase 1: Insert 500K keys and checkpoint
         let checkpoint_lsn;
         {
-            let mut btree =
-                BTreeIndex::create_with_config(disk.clone(), pool.clone(), 0, checkpoint_dir.clone(), CheckpointConfig { fsync: false, ..CheckpointConfig::default() })
-                    .await
-                    .unwrap();
+            let mut btree = BTreeIndex::create_with_config(
+                disk.clone(),
+                pool.clone(),
+                0,
+                checkpoint_dir.clone(),
+                CheckpointConfig {
+                    fsync: false,
+                    ..CheckpointConfig::default()
+                },
+            )
+            .await
+            .unwrap();
 
             for i in 0..PRE_CHECKPOINT_KEYS as u64 {
                 let key = i.to_be_bytes();
-                let tid = TupleId::new(PageId::new(0, (i % 1000) as u32), (i % 100) as u16);
+                let tid = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
                 btree.insert_exclusive(&key, tid).unwrap();
             }
 
@@ -2419,8 +2452,7 @@ async fn test_recovery_with_checkpoint() {
             // Insert the post-checkpoint keys into the btree as well
             for i in PRE_CHECKPOINT_KEYS..(PRE_CHECKPOINT_KEYS + POST_CHECKPOINT_KEYS) {
                 let key = (i as u64).to_be_bytes();
-                let tid =
-                    TupleId::new(PageId::new(0, (i % 1000) as u32), (i as u64 % 100) as u16);
+                let tid = TupleId::new(PageId::new(0, (i % 1000) as u64), (i as u64 % 100) as u16);
                 btree.insert_exclusive(&key, tid).unwrap();
             }
 
@@ -2432,10 +2464,9 @@ async fn test_recovery_with_checkpoint() {
         let recovery_start = Instant::now();
 
         // Load checkpoint
-        let mut recovered =
-            BTreeIndex::open(disk.clone(), pool.clone(), 0, &checkpoint_dir)
-                .await
-                .unwrap();
+        let mut recovered = BTreeIndex::open(disk.clone(), pool.clone(), 0, &checkpoint_dir)
+            .await
+            .unwrap();
 
         assert_eq!(
             recovered.checkpoint_lsn(),
@@ -2456,10 +2487,7 @@ async fn test_recovery_with_checkpoint() {
                 if let Some(key_str) = payload_str.strip_prefix("key:") {
                     if let Ok(i) = key_str.parse::<u64>() {
                         let key = i.to_be_bytes();
-                        let tid = TupleId::new(
-                            PageId::new(0, (i % 1000) as u32),
-                            (i % 100) as u16,
-                        );
+                        let tid = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
                         // Only insert if not already present from checkpoint
                         if recovered.search_sync(&key).is_none() {
                             recovered.insert_exclusive(&key, tid).unwrap();
@@ -2473,7 +2501,11 @@ async fn test_recovery_with_checkpoint() {
         let recovery_duration = recovery_start.elapsed();
         let recovery_ms = recovery_duration.as_secs_f64() * 1000.0;
 
-        tprintln!("  Checkpoint load + {} WAL records replayed in {:.2} ms", replayed, recovery_ms);
+        tprintln!(
+            "  Checkpoint load + {} WAL records replayed in {:.2} ms",
+            replayed,
+            recovery_ms
+        );
 
         // Verify all keys are present
         for i in 0..(PRE_CHECKPOINT_KEYS + POST_CHECKPOINT_KEYS) as u64 {
@@ -2486,10 +2518,17 @@ async fn test_recovery_with_checkpoint() {
             );
         }
 
-        tprintln!("  All {} keys verified", PRE_CHECKPOINT_KEYS + POST_CHECKPOINT_KEYS);
+        tprintln!(
+            "  All {} keys verified",
+            PRE_CHECKPOINT_KEYS + POST_CHECKPOINT_KEYS
+        );
         recovery_time_results.push(recovery_ms);
     }
-    record_test_util("Recovery with Checkpoint", recovery_util_before, take_util_snapshot());
+    record_test_util(
+        "Recovery with Checkpoint",
+        recovery_util_before,
+        take_util_snapshot(),
+    );
 
     tprintln!("\n=== Recovery With Checkpoint Validation Results ===");
     let recovery_result = validate_metric(
@@ -2499,7 +2538,11 @@ async fn test_recovery_with_checkpoint() {
         RECOVERY_WITH_CHECKPOINT_TARGET_MS,
         false,
     );
-    tprintln!("  Recovery: avg {:.2} ms (target {:.2} ms)", recovery_result.average, RECOVERY_WITH_CHECKPOINT_TARGET_MS);
+    tprintln!(
+        "  Recovery: avg {:.2} ms (target {:.2} ms)",
+        recovery_result.average,
+        RECOVERY_WITH_CHECKPOINT_TARGET_MS
+    );
 }
 
 // =============================================================================
@@ -2557,10 +2600,9 @@ async fn test_recovery_without_checkpoint() {
     }
 
     // Phase 2: Recovery from WAL only (no checkpoint)
-    let mut recovered =
-        BTreeIndex::open(disk.clone(), pool.clone(), 0, &checkpoint_dir)
-            .await
-            .unwrap();
+    let mut recovered = BTreeIndex::open(disk.clone(), pool.clone(), 0, &checkpoint_dir)
+        .await
+        .unwrap();
 
     assert_eq!(recovered.checkpoint_lsn(), 0, "No checkpoint should exist");
 
@@ -2575,10 +2617,7 @@ async fn test_recovery_without_checkpoint() {
             if let Some(key_str) = payload_str.strip_prefix("key:") {
                 if let Ok(i) = key_str.parse::<u64>() {
                     let key = i.to_be_bytes();
-                    let tid = TupleId::new(
-                        PageId::new(0, (i % 1000) as u32),
-                        (i % 100) as u16,
-                    );
+                    let tid = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
                     recovered.insert_exclusive(&key, tid).unwrap();
                     replayed += 1;
                 }
@@ -2586,8 +2625,15 @@ async fn test_recovery_without_checkpoint() {
         }
     }
 
-    tprintln!("  Replayed {} WAL records (full replay, no checkpoint)", replayed);
-    assert_eq!(replayed, KEY_COUNT, "Should replay all {} records", KEY_COUNT);
+    tprintln!(
+        "  Replayed {} WAL records (full replay, no checkpoint)",
+        replayed
+    );
+    assert_eq!(
+        replayed, KEY_COUNT,
+        "Should replay all {} records",
+        KEY_COUNT
+    );
 
     // Verify all keys present
     for i in 0..KEY_COUNT as u64 {
@@ -2659,7 +2705,11 @@ async fn test_wal_segment_cleanup() {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
 
-        tprintln!("  Segments before cleanup: {} ({:?})", segments_before.len(), segments_before);
+        tprintln!(
+            "  Segments before cleanup: {} ({:?})",
+            segments_before.len(),
+            segments_before
+        );
         assert!(
             segments_before.len() >= 5,
             "Expected 5+ segments, got {}",
@@ -2688,7 +2738,11 @@ async fn test_wal_segment_cleanup() {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
 
-        tprintln!("  Segments after cleanup: {} ({:?})", segments_after.len(), segments_after);
+        tprintln!(
+            "  Segments after cleanup: {} ({:?})",
+            segments_after.len(),
+            segments_after
+        );
         tprintln!("  Deleted: {} segments in {:.3} ms", deleted, cleanup_ms);
 
         assert!(deleted > 0, "Should have deleted at least 1 segment");
@@ -2707,14 +2761,20 @@ async fn test_wal_segment_cleanup() {
         // Verify post-cleanup WAL still works: write more data
         let txn_id = 9999u32;
         let begin_lsn = writer.log_begin(txn_id).unwrap();
-        let insert_lsn = writer.log_insert(txn_id, begin_lsn, b"post_cleanup").unwrap();
+        let insert_lsn = writer
+            .log_insert(txn_id, begin_lsn, b"post_cleanup")
+            .unwrap();
         let _ = writer.log_commit(txn_id, insert_lsn).unwrap();
         writer.flush().unwrap();
 
         writer.close().unwrap();
         cleanup_time_results.push(cleanup_ms);
     }
-    record_test_util("WAL Segment Cleanup", cleanup_util_before, take_util_snapshot());
+    record_test_util(
+        "WAL Segment Cleanup",
+        cleanup_util_before,
+        take_util_snapshot(),
+    );
 
     tprintln!("\n=== WAL Segment Cleanup Validation Results ===");
     let cleanup_result = validate_metric(
@@ -2861,14 +2921,22 @@ async fn test_graceful_shutdown_checkpoint() {
 
         // Insert keys and shutdown
         {
-            let mut btree =
-                BTreeIndex::create_with_config(disk.clone(), pool.clone(), 0, checkpoint_dir.clone(), CheckpointConfig { fsync: false, ..CheckpointConfig::default() })
-                    .await
-                    .unwrap();
+            let mut btree = BTreeIndex::create_with_config(
+                disk.clone(),
+                pool.clone(),
+                0,
+                checkpoint_dir.clone(),
+                CheckpointConfig {
+                    fsync: false,
+                    ..CheckpointConfig::default()
+                },
+            )
+            .await
+            .unwrap();
 
             for i in 0..KEY_COUNT as u64 {
                 let key = i.to_be_bytes();
-                let tid = TupleId::new(PageId::new(0, (i % 1000) as u32), (i % 100) as u16);
+                let tid = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
                 btree.insert_exclusive(&key, tid).unwrap();
             }
 
@@ -2903,7 +2971,7 @@ async fn test_graceful_shutdown_checkpoint() {
         let sample_step = KEY_COUNT / 10_000;
         for i in (0..KEY_COUNT as u64).step_by(sample_step) {
             let key = i.to_be_bytes();
-            let expected = TupleId::new(PageId::new(0, (i % 1000) as u32), (i % 100) as u16);
+            let expected = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
             let found = loaded.search_sync(&key);
             assert_eq!(
                 found,
@@ -2914,7 +2982,11 @@ async fn test_graceful_shutdown_checkpoint() {
             );
         }
     }
-    record_test_util("Graceful Shutdown", shutdown_util_before, take_util_snapshot());
+    record_test_util(
+        "Graceful Shutdown",
+        shutdown_util_before,
+        take_util_snapshot(),
+    );
 
     tprintln!("\n=== Graceful Shutdown Validation Results ===");
     let shutdown_result = validate_metric(
@@ -2932,7 +3004,11 @@ async fn test_graceful_shutdown_checkpoint() {
         CHECKPOINT_LOAD_1M_TARGET_MS,
         false,
     );
-    tprintln!("  Shutdown: avg {:.2} ms (target {:.2} ms)", shutdown_result.average, SHUTDOWN_CHECKPOINT_1M_TARGET_MS);
+    tprintln!(
+        "  Shutdown: avg {:.2} ms (target {:.2} ms)",
+        shutdown_result.average,
+        SHUTDOWN_CHECKPOINT_1M_TARGET_MS
+    );
 }
 
 // =============================================================================
@@ -2979,14 +3055,22 @@ async fn test_checkpoint_scale_10m() {
 
         // Build 10M key B+Tree
         let build_start = Instant::now();
-        let mut btree =
-            BTreeIndex::create_with_config(disk.clone(), pool.clone(), 0, checkpoint_dir.clone(), CheckpointConfig { fsync: false, ..CheckpointConfig::default() })
-                .await
-                .unwrap();
+        let mut btree = BTreeIndex::create_with_config(
+            disk.clone(),
+            pool.clone(),
+            0,
+            checkpoint_dir.clone(),
+            CheckpointConfig {
+                fsync: false,
+                ..CheckpointConfig::default()
+            },
+        )
+        .await
+        .unwrap();
 
         for i in 0..KEY_COUNT as u64 {
             let key = i.to_be_bytes();
-            let tid = TupleId::new(PageId::new(0, (i % 1000) as u32), (i % 100) as u16);
+            let tid = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
             btree.insert_exclusive(&key, tid).unwrap();
         }
         let build_duration = build_start.elapsed();
@@ -3050,7 +3134,7 @@ async fn test_checkpoint_scale_10m() {
             writer.log_commit(txn_id, insert_lsn).unwrap();
 
             let key = (i as u64).to_be_bytes();
-            let tid = TupleId::new(PageId::new(0, (i % 1000) as u32), (i as u64 % 100) as u16);
+            let tid = TupleId::new(PageId::new(0, (i % 1000) as u64), (i as u64 % 100) as u16);
             btree.insert_exclusive(&key, tid).unwrap();
         }
         writer.flush().unwrap();
@@ -3059,10 +3143,9 @@ async fn test_checkpoint_scale_10m() {
 
         // Full recovery: checkpoint load + WAL replay
         let recovery_start = Instant::now();
-        let mut recovered =
-            BTreeIndex::open(disk.clone(), pool.clone(), 0, &checkpoint_dir)
-                .await
-                .unwrap();
+        let mut recovered = BTreeIndex::open(disk.clone(), pool.clone(), 0, &checkpoint_dir)
+            .await
+            .unwrap();
 
         // Replay post-checkpoint WAL
         let recovery = RecoveryManager::new(&wal_dir).unwrap();
@@ -3074,10 +3157,7 @@ async fn test_checkpoint_scale_10m() {
                 if let Some(key_str) = payload_str.strip_prefix("key:") {
                     if let Ok(i) = key_str.parse::<u64>() {
                         let key = i.to_be_bytes();
-                        let tid = TupleId::new(
-                            PageId::new(0, (i % 1000) as u32),
-                            (i % 100) as u16,
-                        );
+                        let tid = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
                         if recovered.search_sync(&key).is_none() {
                             recovered.insert_exclusive(&key, tid).unwrap();
                         }
@@ -3146,7 +3226,11 @@ async fn test_checkpoint_scale_10m() {
         RECOVERY_SCALE_TARGET_MS,
         false,
     );
-    tprintln!("  Scale recovery: avg {:.2} ms (target {:.2} ms)", recovery_result.average, RECOVERY_SCALE_TARGET_MS);
+    tprintln!(
+        "  Scale recovery: avg {:.2} ms (target {:.2} ms)",
+        recovery_result.average,
+        RECOVERY_SCALE_TARGET_MS
+    );
 }
 
 // =============================================================================
@@ -3167,31 +3251,39 @@ async fn test_phase1_summary() {
 async fn test_checkpoint_io_profile() {
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
-    
+
     tprintln!("\n=== I/O Profile ===");
     for size_mb in [1, 2, 4, 6, 8, 10, 14, 20] {
         let path = dir.path().join(format!("test_{}.bin", size_mb));
         let data = vec![0xABu8; size_mb * 1024 * 1024];
         std::fs::write(&path, &data).unwrap(); // warm
-        
+
         let mut best_w = 999.0f64;
         let mut best_r = 999.0f64;
         for _ in 0..10 {
             let t = Instant::now();
             std::fs::write(&path, &data).unwrap();
             let w = t.elapsed().as_secs_f64() * 1000.0;
-            if w < best_w { best_w = w; }
-            
+            if w < best_w {
+                best_w = w;
+            }
+
             let t = Instant::now();
             let _buf = std::fs::read(&path).unwrap();
             let r = t.elapsed().as_secs_f64() * 1000.0;
-            if r < best_r { best_r = r; }
+            if r < best_r {
+                best_r = r;
+            }
         }
-        
-        tprintln!("{:3} MB  W: {:6.2} ms ({:6.0} MB/s)  R: {:6.2} ms ({:6.0} MB/s)",
+
+        tprintln!(
+            "{:3} MB  W: {:6.2} ms ({:6.0} MB/s)  R: {:6.2} ms ({:6.0} MB/s)",
             size_mb,
-            best_w, size_mb as f64 / (best_w / 1000.0),
-            best_r, size_mb as f64 / (best_r / 1000.0));
+            best_w,
+            size_mb as f64 / (best_w / 1000.0),
+            best_r,
+            size_mb as f64 / (best_r / 1000.0)
+        );
     }
 }
 
@@ -3200,22 +3292,24 @@ async fn test_checkpoint_io_profile_v2() {
     use std::io::Read;
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
-    
+
     tprintln!("\n=== I/O Profile v2 (detailed read breakdown) ===");
     for size_mb in [6, 10, 14, 20, 46] {
         let path = dir.path().join(format!("v2_{}.bin", size_mb));
         let data = vec![0xABu8; size_mb * 1024 * 1024];
         std::fs::write(&path, &data).unwrap(); // create file
-        
+
         // Method 1: std::fs::read
         let mut best_r1 = 999.0f64;
         for _ in 0..10 {
             let t = Instant::now();
             let _buf = std::fs::read(&path).unwrap();
             let r = t.elapsed().as_secs_f64() * 1000.0;
-            if r < best_r1 { best_r1 = r; }
+            if r < best_r1 {
+                best_r1 = r;
+            }
         }
-        
+
         // Method 2: File::open + read_to_end with pre-alloc
         let mut best_r2 = 999.0f64;
         for _ in 0..10 {
@@ -3224,13 +3318,17 @@ async fn test_checkpoint_io_profile_v2() {
             let meta = f.metadata().unwrap();
             let len = meta.len() as usize;
             let mut buf = Vec::with_capacity(len);
-            unsafe { buf.set_len(len); }
+            unsafe {
+                buf.set_len(len);
+            }
             f.read_exact(&mut buf).unwrap();
             let r = t.elapsed().as_secs_f64() * 1000.0;
-            if r < best_r2 { best_r2 = r; }
+            if r < best_r2 {
+                best_r2 = r;
+            }
         }
 
-        // Method 3: Pre-opened file handle + seek + read_exact 
+        // Method 3: Pre-opened file handle + seek + read_exact
         let mut best_r3 = 999.0f64;
         {
             let mut pre_buf = vec![0u8; size_mb * 1024 * 1024];
@@ -3239,11 +3337,18 @@ async fn test_checkpoint_io_profile_v2() {
                 let mut f = std::fs::File::open(&path).unwrap();
                 f.read_exact(&mut pre_buf).unwrap();
                 let r = t.elapsed().as_secs_f64() * 1000.0;
-                if r < best_r3 { best_r3 = r; }
+                if r < best_r3 {
+                    best_r3 = r;
+                }
             }
         }
-        
-        tprintln!("{:3} MB  fs::read: {:6.2} ms  open+read_exact: {:6.2} ms  reuse_buf: {:6.2} ms",
-            size_mb, best_r1, best_r2, best_r3);
+
+        tprintln!(
+            "{:3} MB  fs::read: {:6.2} ms  open+read_exact: {:6.2} ms  reuse_buf: {:6.2} ms",
+            size_mb,
+            best_r1,
+            best_r2,
+            best_r3
+        );
     }
 }

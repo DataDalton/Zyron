@@ -512,13 +512,11 @@ impl BufferedBTreeIndex {
     }
 
     /// Range scan from start_key to end_key (inclusive).
+    /// Returns packed (key, packed_tuple_id) pairs. Use `BTreeArenaIndex::unpack_tuple_id()`
+    /// to decode packed_tuple_id into TupleId when needed.
     /// Merges results from write buffer and B+Tree, filtering tombstoned keys.
     #[inline]
-    pub fn range_scan(
-        &self,
-        start_key: Option<&[u8]>,
-        end_key: Option<&[u8]>,
-    ) -> Vec<(u64, TupleId)> {
+    pub fn range_scan(&self, start_key: Option<&[u8]>, end_key: Option<&[u8]>) -> Vec<(u64, u64)> {
         // Fast path: skip merge when buffer is empty (common after flush)
         if !self.buffer_has_data {
             let mut results = self.btree.range_scan(start_key, end_key);
@@ -531,18 +529,16 @@ impl BufferedBTreeIndex {
         let start = start_key.map(|k| self.key_to_u64(k)).unwrap_or(0);
         let end = end_key.map(|k| self.key_to_u64(k)).unwrap_or(u64::MAX);
 
-        // Get results from B+Tree (already sorted)
+        // Get results from B+Tree (already sorted, packed)
         let btree_results = self.btree.range_scan(start_key, end_key);
 
         // Get results from buffer that fall in range (exclude tombstoned), then sort.
         // Skip the full table scan if the buffer's key range does not overlap [start, end].
-        // buffer.min_key and buffer.max_key are maintained on every insert and reset on drain.
-        let mut buffer_results: Vec<_> =
+        let mut buffer_results: Vec<(u64, u64)> =
             if self.buffer.min_key <= end && self.buffer.max_key >= start {
                 self.buffer
                     .iter()
                     .filter(|(k, _)| *k >= start && *k <= end && !self.deleted.contains(k))
-                    .map(|(k, v)| (k, BTreeArenaIndex::unpack_tuple_id(v)))
                     .collect()
             } else {
                 Vec::new()
@@ -562,7 +558,7 @@ impl BufferedBTreeIndex {
                     } else if bk > bufk {
                         merged.push(buffer_iter.next().unwrap());
                     } else {
-                        // Same key - buffer wins (more recent)
+                        // Same key: buffer wins (more recent)
                         btree_iter.next();
                         merged.push(buffer_iter.next().unwrap());
                     }
@@ -661,7 +657,8 @@ mod tests {
         let (recovered, consumed) = LeafEntry::from_bytes(&bytes).unwrap();
 
         assert_eq!(recovered.key, entry.key);
-        assert_eq!(recovered.tuple_id.page_id.file_id, 1);
+        // file_id is not stored on disk, reconstructed as 0
+        assert_eq!(recovered.tuple_id.page_id.file_id, 0);
         assert_eq!(recovered.tuple_id.page_id.page_num, 42);
         assert_eq!(recovered.tuple_id.slot_id, 5);
         assert_eq!(consumed, bytes.len());
@@ -678,7 +675,8 @@ mod tests {
         let (recovered, consumed) = InternalEntry::from_bytes(&bytes).unwrap();
 
         assert_eq!(recovered.key, entry.key);
-        assert_eq!(recovered.child_page_id.file_id, 2);
+        // file_id is not stored on disk, reconstructed as 0
+        assert_eq!(recovered.child_page_id.file_id, 0);
         assert_eq!(recovered.child_page_id.page_num, 100);
         assert_eq!(consumed, bytes.len());
     }
@@ -702,7 +700,9 @@ mod tests {
         page.insert(key.clone(), tuple_id).unwrap();
 
         assert_eq!(page.num_entries(), 1);
-        assert_eq!(page.get(&key), Some(tuple_id));
+        // file_id is not stored per entry, reads back as 0
+        let expected = TupleId::new(PageId::new(0, 10), 5);
+        assert_eq!(page.get(&key), Some(expected));
     }
 
     #[test]
@@ -925,9 +925,10 @@ mod tests {
         let recovered = BTreeLeafPage::from_bytes(bytes);
 
         assert_eq!(recovered.num_entries(), 1);
+        // file_id is not stored per entry, reads back as 0
         assert_eq!(
             recovered.get(b"test"),
-            Some(TupleId::new(PageId::new(1, 2), 3))
+            Some(TupleId::new(PageId::new(0, 2), 3))
         );
     }
 
@@ -960,12 +961,12 @@ mod tests {
 
         assert_eq!(page.num_keys(), 2);
 
-        // Keys less than "key1" go to leftmost child
+        // Keys less than "key1" go to leftmost child (stored as u64, preserves file_id)
         assert_eq!(page.find_child(b"aaa"), PageId::new(1, 0));
 
-        // Keys >= "key2" go to the right child
-        assert_eq!(page.find_child(b"key2"), PageId::new(1, 2));
-        assert_eq!(page.find_child(b"zzz"), PageId::new(1, 2));
+        // Keys >= "key2" go to the right child (entry pointers store page_num only, file_id=0)
+        assert_eq!(page.find_child(b"key2"), PageId::new(0, 2));
+        assert_eq!(page.find_child(b"zzz"), PageId::new(0, 2));
     }
 
     #[test]
@@ -1012,8 +1013,8 @@ mod tests {
             tuple_id: TupleId::new(PageId::new(0, 0), 0),
         };
 
-        // 2 (key_len) + 5 (key) + 10 (tuple_id) = 17
-        assert_eq!(entry.size_on_disk(), 17);
+        // 2 (key_len) + 5 (key) + 4 (page_num) + 2 (slot_id) = 13
+        assert_eq!(entry.size_on_disk(), 13);
     }
 
     #[test]
@@ -1023,8 +1024,8 @@ mod tests {
             child_page_id: PageId::new(0, 0),
         };
 
-        // 2 (key_len) + 5 (key) + 8 (page_id) = 15
-        assert_eq!(entry.size_on_disk(), 15);
+        // 2 (key_len) + 5 (key) + 4 (page_num) = 11
+        assert_eq!(entry.size_on_disk(), 11);
     }
 
     #[test]
@@ -1084,7 +1085,7 @@ mod tests {
 
         // Insert 1000 keys
         for i in 0..1000u64 {
-            let tid = TupleId::new(PageId::new(0, i as u32), i as u16);
+            let tid = TupleId::new(PageId::new(0, i), i as u16);
             tree.insert(&i.to_be_bytes(), tid).unwrap();
         }
 
@@ -1092,7 +1093,7 @@ mod tests {
 
         // Verify all keys can be found
         for i in 0..1000u64 {
-            let tid = TupleId::new(PageId::new(0, i as u32), i as u16);
+            let tid = TupleId::new(PageId::new(0, i), i as u16);
             assert_eq!(tree.search(&i.to_be_bytes()), Some(tid));
         }
     }
@@ -1103,7 +1104,7 @@ mod tests {
 
         // Insert keys 0, 10, 20, ..., 100
         for i in (0..=100u64).step_by(10) {
-            let tid = TupleId::new(PageId::new(0, i as u32), 0);
+            let tid = TupleId::new(PageId::new(0, i), 0);
             tree.insert(&i.to_be_bytes(), tid).unwrap();
         }
 

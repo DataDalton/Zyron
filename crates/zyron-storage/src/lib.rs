@@ -15,6 +15,7 @@ mod disk;
 mod freespace;
 mod heap;
 mod tuple;
+pub mod txn;
 
 pub use btree::{
     BTreeArenaIndex, BTreeIndex, BTreeInternalPage, BTreeLeafPage, BufferedBTreeIndex,
@@ -31,3 +32,7 @@ pub use heap::{
     HeapFile, HeapFileConfig, HeapPage, HeapPageHeader, HeapPageIterator, SlotId, TupleSlot,
 };
 pub use tuple::{Tuple, TupleFlags, TupleHeader, TupleId};
+pub use txn::{
+    GcStats, IntentLockTable, IsolationLevel, LockTable, MvccGc, NodeLatch, Snapshot, Transaction,
+    TransactionManager, TransactionStatus,
+};

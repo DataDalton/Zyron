@@ -48,9 +48,8 @@ impl PageTable {
         };
 
         // Initialize separate key and value arrays for hash table
-        let hash_keys: Box<[AtomicU64]> = (0..hash_size)
-            .map(|_| AtomicU64::new(EMPTY_KEY))
-            .collect();
+        let hash_keys: Box<[AtomicU64]> =
+            (0..hash_size).map(|_| AtomicU64::new(EMPTY_KEY)).collect();
 
         let hash_values: Box<[AtomicU32]> = (0..hash_size)
             .map(|_| AtomicU32::new(EMPTY_FRAME))
@@ -67,7 +66,7 @@ impl PageTable {
     /// Looks up a page ID and returns its frame ID if present.
     #[inline(always)]
     pub fn get(&self, page_id: PageId) -> Option<FrameId> {
-        if page_id.file_id == 0 && page_id.page_num < DIRECT_PATH_SIZE as u32 {
+        if page_id.file_id == 0 && (page_id.page_num as usize) < DIRECT_PATH_SIZE {
             let val = self.direct_path[page_id.page_num as usize].load(Ordering::Acquire);
             if val != EMPTY_FRAME {
                 return Some(FrameId(val));
@@ -99,7 +98,7 @@ impl PageTable {
 
     /// Inserts a page ID to frame ID mapping. Returns true on success.
     pub fn insert(&self, page_id: PageId, frame_id: FrameId) -> bool {
-        if page_id.file_id == 0 && page_id.page_num < DIRECT_PATH_SIZE as u32 {
+        if page_id.file_id == 0 && (page_id.page_num as usize) < DIRECT_PATH_SIZE {
             self.direct_path[page_id.page_num as usize].store(frame_id.0, Ordering::Release);
             return true;
         }
@@ -130,8 +129,9 @@ impl PageTable {
 
     /// Removes a page ID mapping. Returns the frame ID if it was present.
     pub fn remove(&self, page_id: PageId) -> Option<FrameId> {
-        if page_id.file_id == 0 && page_id.page_num < DIRECT_PATH_SIZE as u32 {
-            let old = self.direct_path[page_id.page_num as usize].swap(EMPTY_FRAME, Ordering::AcqRel);
+        if page_id.file_id == 0 && (page_id.page_num as usize) < DIRECT_PATH_SIZE {
+            let old =
+                self.direct_path[page_id.page_num as usize].swap(EMPTY_FRAME, Ordering::AcqRel);
             if old != EMPTY_FRAME {
                 return Some(FrameId(old));
             }
@@ -206,7 +206,7 @@ impl PageTable {
         for (page_num, slot) in self.direct_path.iter().enumerate() {
             let val = slot.load(Ordering::Relaxed);
             if val != EMPTY_FRAME {
-                let page_id = PageId::new(0, page_num as u32);
+                let page_id = PageId::new(0, page_num as u64);
                 if !f(page_id, FrameId(val)) {
                     return;
                 }
@@ -226,7 +226,6 @@ impl PageTable {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -281,7 +280,7 @@ mod tests {
     fn test_high_page_num_uses_hash() {
         let table = PageTable::new(100);
         // page_num >= DIRECT_PATH_SIZE goes through hash
-        let page_id = PageId::new(0, DIRECT_PATH_SIZE as u32 + 100);
+        let page_id = PageId::new(0, DIRECT_PATH_SIZE as u64 + 100);
         let frame_id = FrameId(5);
 
         assert!(table.insert(page_id, frame_id));

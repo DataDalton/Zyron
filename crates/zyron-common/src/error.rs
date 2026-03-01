@@ -92,6 +92,9 @@ pub enum ZyronError {
     #[error("Deadlock detected")]
     DeadlockDetected,
 
+    #[error("Transaction conflict for txn {txn_id}: {reason}")]
+    TransactionConflict { txn_id: u64, reason: String },
+
     // Catalog errors
     #[error("Table not found: {0}")]
     TableNotFound(String),
@@ -161,7 +164,10 @@ mod tests {
     #[test]
     fn test_buffer_pool_full_display() {
         let err = ZyronError::BufferPoolFull;
-        assert_eq!(err.to_string(), "Buffer pool full, unable to allocate frame");
+        assert_eq!(
+            err.to_string(),
+            "Buffer pool full, unable to allocate frame"
+        );
     }
 
     #[test]

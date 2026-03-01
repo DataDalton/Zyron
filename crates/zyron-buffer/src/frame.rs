@@ -61,18 +61,21 @@ impl BufferFrame {
         }
     }
 
-    /// Packs a PageId into a u64.
+    /// Packs a PageId into a u64 for atomic storage.
+    /// Uses file_id in upper 32 bits and lower 32 bits of page_num.
+    /// For segmented storage, page_num within a segment always fits in u32.
     #[inline(always)]
     fn pack_page_id(page_id: PageId) -> u64 {
-        ((page_id.file_id as u64) << 32) | (page_id.page_num as u64)
+        ((page_id.file_id as u64) << 32) | (page_id.page_num & 0xFFFF_FFFF)
     }
 
     /// Unpacks a u64 into a PageId.
+    /// Recovers file_id from upper 32 bits and page_num from lower 32 bits.
     #[inline(always)]
     fn unpack_page_id(packed: u64) -> PageId {
         PageId {
             file_id: (packed >> 32) as u32,
-            page_num: packed as u32,
+            page_num: (packed as u32) as u64,
         }
     }
 

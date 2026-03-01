@@ -3,7 +3,7 @@
 //! Page layout:
 //! ```text
 //! +------------------+
-//! | Page Header (32) |
+//! | Page Header (40) |
 //! +------------------+
 //! | Slot Array       |  <- Grows downward
 //! | (4 bytes/slot)   |

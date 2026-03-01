@@ -1,17 +1,17 @@
 //! Page-based B+Tree index implementation.
 
+use super::checkpoint::{self, CheckpointConfig, CheckpointTrigger};
+use super::constants::MAX_KEY_SIZE;
+use super::page::{BTreeInternalPage, BTreeLeafPage};
+use super::store::InMemoryPageStore;
+use super::types::{DeleteResult, LeafPageHeader, compare_keys};
+use crate::disk::DiskManager;
+use crate::tuple::TupleId;
 use bytes::Bytes;
 use parking_lot::RwLock;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use crate::disk::DiskManager;
-use crate::tuple::TupleId;
-use super::checkpoint::{self, CheckpointConfig, CheckpointTrigger};
-use super::constants::MAX_KEY_SIZE;
-use super::page::{BTreeInternalPage, BTreeLeafPage};
-use super::store::InMemoryPageStore;
-use super::types::{compare_keys, DeleteResult};
 use zyron_buffer::BufferPool;
 use zyron_common::page::PageId;
 use zyron_common::{Result, ZyronError};
@@ -60,7 +60,14 @@ impl BTreeIndex {
         file_id: u32,
         checkpoint_dir: PathBuf,
     ) -> Result<Self> {
-        Self::create_with_config(disk, pool, file_id, checkpoint_dir, CheckpointConfig::default()).await
+        Self::create_with_config(
+            disk,
+            pool,
+            file_id,
+            checkpoint_dir,
+            CheckpointConfig::default(),
+        )
+        .await
     }
 
     /// Creates a new B+ tree index with a custom checkpoint configuration.
@@ -76,7 +83,7 @@ impl BTreeIndex {
 
         // Allocate root leaf page (page 0)
         let root_page_num = store.allocate();
-        let root_page_id = PageId::new(file_id, root_page_num);
+        let root_page_id = PageId::new(file_id, root_page_num as u64);
 
         // Initialize root as empty leaf
         let root_page = BTreeLeafPage::new(root_page_id);
@@ -109,7 +116,14 @@ impl BTreeIndex {
         file_id: u32,
         checkpoint_dir: &Path,
     ) -> Result<Self> {
-        Self::open_with_config(disk, pool, file_id, checkpoint_dir, CheckpointConfig::default()).await
+        Self::open_with_config(
+            disk,
+            pool,
+            file_id,
+            checkpoint_dir,
+            CheckpointConfig::default(),
+        )
+        .await
     }
 
     /// Opens an existing B+ tree index with a custom checkpoint configuration.
@@ -139,7 +153,9 @@ impl BTreeIndex {
                         checkpoint_dir: checkpoint_dir.to_path_buf(),
                         wal_bytes_since_checkpoint: AtomicU64::new(0),
                         wal_bytes_threshold: checkpoint_config.wal_bytes_threshold,
-                        checkpoint_trigger: parking_lot::Mutex::new(CheckpointTrigger::new(checkpoint_config)),
+                        checkpoint_trigger: parking_lot::Mutex::new(CheckpointTrigger::new(
+                            checkpoint_config,
+                        )),
                     });
                 }
                 Err(_) => {
@@ -152,7 +168,7 @@ impl BTreeIndex {
         // No checkpoint or corrupt checkpoint. Create empty store.
         let mut store = InMemoryPageStore::new();
         let root_page_num = store.allocate();
-        let root_page_id = PageId::new(file_id, root_page_num);
+        let root_page_id = PageId::new(file_id, root_page_num as u64);
         let root_page = BTreeLeafPage::new(root_page_id);
         store.write(root_page_num, root_page.as_bytes());
 
@@ -176,8 +192,7 @@ impl BTreeIndex {
     pub fn root_page_id(&self) -> PageId {
         PageId::new(
             self.file_id,
-            self.root_page_num
-                .load(Ordering::Acquire),
+            self.root_page_num.load(Ordering::Acquire) as u64,
         )
     }
 
@@ -185,6 +200,12 @@ impl BTreeIndex {
     #[inline]
     pub fn file_id(&self) -> u32 {
         self.file_id
+    }
+
+    /// Returns a read lock on the page store (for debugging/testing).
+    #[cfg(test)]
+    pub fn pages_ref(&self) -> parking_lot::RwLockReadGuard<'_, InMemoryPageStore> {
+        self.pages.read()
     }
 
     /// Returns the tree height.
@@ -201,9 +222,7 @@ impl BTreeIndex {
     #[inline]
     fn find_leaf_in_pages(&self, pages: &InMemoryPageStore, key: &[u8]) -> u32 {
         let height = self.height.load(Ordering::Relaxed);
-        let mut current = self
-            .root_page_num
-            .load(Ordering::Relaxed);
+        let mut current = self.root_page_num.load(Ordering::Relaxed);
 
         // Height 1 means root is the leaf
         if height == 1 {
@@ -214,7 +233,7 @@ impl BTreeIndex {
         for _ in 0..(height - 1) {
             if let Some(data) = pages.get(current) {
                 let child_page_id = BTreeInternalPage::find_child_in_slice(data, key);
-                current = child_page_id.page_num;
+                current = child_page_id.page_num as u32;
             } else {
                 break;
             }
@@ -273,7 +292,7 @@ impl BTreeIndex {
             for _ in 0..(height - 1) {
                 let data = pages.try_read(current).ok_or(())??;
                 let child_page_id = BTreeInternalPage::find_child_in_slice(&data, key);
-                current = child_page_id.page_num;
+                current = child_page_id.page_num as u32;
             }
         }
 
@@ -353,7 +372,7 @@ impl BTreeIndex {
                     _ => return Err(ZyronError::VersionConflict),
                 };
                 let child = BTreeInternalPage::find_child_in_slice(&data, key);
-                current = child.page_num;
+                current = child.page_num as u32;
             }
         }
 
@@ -402,7 +421,7 @@ impl BTreeIndex {
             for _ in 0..(height - 1) {
                 if let Some(data) = pages.get(current) {
                     let child = BTreeInternalPage::find_child_in_slice(data, key);
-                    current = child.page_num;
+                    current = child.page_num as u32;
                     path[path_len] = current;
                     path_len += 1;
                 } else {
@@ -450,7 +469,7 @@ impl BTreeIndex {
 
         // Allocate new page
         let new_page_num = pages.allocate();
-        let new_page_id = PageId::new(self.file_id, new_page_num);
+        let new_page_id = PageId::new(self.file_id, new_page_num as u64);
         let (split_key, mut right_leaf) = leaf.split(new_page_id);
 
         // Insert into appropriate leaf
@@ -493,7 +512,7 @@ impl BTreeIndex {
                 .ok_or_else(|| ZyronError::BTreeCorrupted("parent not found".to_string()))?;
             let mut parent = BTreeInternalPage::from_bytes(parent_data);
 
-            let new_child_page_id = PageId::new(self.file_id, current_child);
+            let new_child_page_id = PageId::new(self.file_id, current_child as u64);
 
             match parent.insert(current_key.clone(), new_child_page_id) {
                 Ok(()) => {
@@ -503,7 +522,7 @@ impl BTreeIndex {
                 Err(ZyronError::NodeFull) => {
                     // Split the internal node
                     let new_page_num = pages.allocate();
-                    let new_page_id = PageId::new(self.file_id, new_page_num);
+                    let new_page_id = PageId::new(self.file_id, new_page_num as u64);
                     let (promoted_key, mut right_internal) = parent.split(new_page_id);
 
                     if current_key.as_ref() < promoted_key.as_ref() {
@@ -535,9 +554,9 @@ impl BTreeIndex {
         let height = *self.height.get_mut();
 
         let new_root_num = pages.allocate();
-        let new_root_id = PageId::new(self.file_id, new_root_num);
-        let old_root_id = PageId::new(self.file_id, old_root);
-        let right_child_id = PageId::new(self.file_id, right_child);
+        let new_root_id = PageId::new(self.file_id, new_root_num as u64);
+        let old_root_id = PageId::new(self.file_id, old_root as u64);
+        let right_child_id = PageId::new(self.file_id, right_child as u64);
 
         let mut new_root = BTreeInternalPage::new(new_root_id, height as u16);
         new_root.set_leftmost_child(old_root_id);
@@ -579,7 +598,7 @@ impl BTreeIndex {
         for _ in 0..(height - 1) {
             if let Some(data) = pages.get(current) {
                 let child_page_id = BTreeInternalPage::find_child_in_slice(data, key);
-                current = child_page_id.page_num;
+                current = child_page_id.page_num as u32;
             } else {
                 break;
             }
@@ -592,9 +611,7 @@ impl BTreeIndex {
     fn find_path_sync(&self, key: &[u8]) -> ([u32; Self::MAX_HEIGHT], usize) {
         let pages = self.pages.read();
         let height = self.height.load(Ordering::Acquire);
-        let root = self
-            .root_page_num
-            .load(Ordering::Acquire);
+        let root = self.root_page_num.load(Ordering::Acquire);
 
         let mut path = [0u32; Self::MAX_HEIGHT];
         let mut path_len = 0;
@@ -610,7 +627,7 @@ impl BTreeIndex {
         for _ in 0..(height - 1) {
             if let Some(data) = pages.get(current) {
                 let child_page_id = BTreeInternalPage::find_child_in_slice(data, key);
-                current = child_page_id.page_num;
+                current = child_page_id.page_num as u32;
                 path[path_len] = current;
                 path_len += 1;
             } else {
@@ -640,7 +657,7 @@ impl BTreeIndex {
 
         // Allocate new page for right sibling
         let new_page_num = pages.allocate();
-        let new_page_id = PageId::new(self.file_id, new_page_num);
+        let new_page_id = PageId::new(self.file_id, new_page_num as u64);
         let (split_key, mut right_leaf) = leaf.split(new_page_id);
 
         // Insert the new key into appropriate leaf
@@ -680,7 +697,7 @@ impl BTreeIndex {
                 .ok_or_else(|| ZyronError::BTreeCorrupted("parent not found".to_string()))?;
             let mut parent = BTreeInternalPage::from_bytes(*parent_data);
 
-            let new_child_page_id = PageId::new(self.file_id, current_child);
+            let new_child_page_id = PageId::new(self.file_id, current_child as u64);
 
             match parent.insert(current_key.clone(), new_child_page_id) {
                 Ok(()) => {
@@ -690,7 +707,7 @@ impl BTreeIndex {
                 Err(ZyronError::NodeFull) => {
                     // Split the internal node
                     let new_page_num = pages.allocate();
-                    let new_page_id = PageId::new(self.file_id, new_page_num);
+                    let new_page_id = PageId::new(self.file_id, new_page_num as u64);
                     let (promoted_key, mut right_internal) = parent.split(new_page_id);
 
                     // Insert into appropriate side
@@ -723,15 +740,13 @@ impl BTreeIndex {
     /// Creates a new root when the current root splits.
     fn create_new_root_sync(&self, key: Bytes, right_child: u32) -> Result<()> {
         let mut pages = self.pages.write();
-        let old_root = self
-            .root_page_num
-            .load(Ordering::Acquire);
+        let old_root = self.root_page_num.load(Ordering::Acquire);
         let height = self.height.load(Ordering::Acquire);
 
         let new_root_num = pages.allocate();
-        let new_root_id = PageId::new(self.file_id, new_root_num);
-        let old_root_id = PageId::new(self.file_id, old_root);
-        let right_child_id = PageId::new(self.file_id, right_child);
+        let new_root_id = PageId::new(self.file_id, new_root_num as u64);
+        let old_root_id = PageId::new(self.file_id, old_root as u64);
+        let right_child_id = PageId::new(self.file_id, right_child as u64);
 
         let mut new_root = BTreeInternalPage::new(new_root_id, height as u16);
         new_root.set_leftmost_child(old_root_id);
@@ -739,10 +754,8 @@ impl BTreeIndex {
 
         pages.write(new_root_num, new_root.as_bytes());
 
-        self.root_page_num
-            .store(new_root_num, Ordering::Release);
-        self.height
-            .store(height + 1, Ordering::Release);
+        self.root_page_num.store(new_root_num, Ordering::Release);
+        self.height.store(height + 1, Ordering::Release);
 
         Ok(())
     }
@@ -766,47 +779,94 @@ impl BTreeIndex {
         }
     }
 
-    /// Range scan synchronously.
+    /// Range scan synchronously. Works directly on borrowed page data
+    /// without copying 16KB pages. Uses binary search to find the
+    /// start position in the first leaf page.
     pub fn range_scan_sync(
         &self,
         start_key: Option<&[u8]>,
         end_key: Option<&[u8]>,
     ) -> Vec<(Bytes, TupleId)> {
         let pages = self.pages.read();
-        let mut results = Vec::new();
+        let mut results = Vec::with_capacity(1024);
 
-        // Find starting leaf
         let start_leaf_num = match start_key {
             Some(key) => self.find_leaf_page_num(key),
             None => self.find_leftmost_leaf_num(&pages),
         };
 
+        let ho = LeafPageHeader::OFFSET;
+        let sa = BTreeLeafPage::SLOT_ARRAY_START;
+        let ss = BTreeLeafPage::SLOT_SIZE;
         let mut current_page_num = Some(start_leaf_num);
+        let mut first_page = true;
 
-        while let Some(page_num) = current_page_num {
-            if let Some(data) = pages.get(page_num) {
-                let leaf = BTreeLeafPage::from_bytes(*data);
+        while let Some(pn) = current_page_num {
+            let Some(data) = pages.get(pn) else { break };
+            let ns = u16::from_le_bytes([data[ho], data[ho + 1]]) as usize;
 
-                for entry in leaf.entries() {
-                    if let Some(start) = start_key {
-                        if compare_keys(entry.key.as_ref(), start).is_lt() {
-                            continue;
+            // Binary search for start position on first page
+            let start_slot = if first_page {
+                first_page = false;
+                if let Some(sk) = start_key {
+                    let mut lo = 0usize;
+                    let mut hi = ns;
+                    while lo < hi {
+                        let mid = lo + (hi - lo) / 2;
+                        let so = sa + mid * ss;
+                        let eo = u16::from_le_bytes([data[so], data[so + 1]]) as usize;
+                        let kl = u16::from_le_bytes([data[eo], data[eo + 1]]) as usize;
+                        let ek = &data[eo + 2..eo + 2 + kl];
+                        if compare_keys(ek, sk).is_lt() {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
                         }
                     }
+                    lo
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
 
-                    if let Some(end) = end_key {
-                        if compare_keys(entry.key.as_ref(), end).is_gt() {
-                            return results;
-                        }
+            for slot_idx in start_slot..ns {
+                let so = sa + slot_idx * ss;
+                let eo = u16::from_le_bytes([data[so], data[so + 1]]) as usize;
+                let kl = u16::from_le_bytes([data[eo], data[eo + 1]]) as usize;
+                let ek = &data[eo + 2..eo + 2 + kl];
+
+                if let Some(end) = end_key {
+                    if compare_keys(ek, end).is_gt() {
+                        return results;
                     }
-
-                    results.push((entry.key.clone(), entry.tuple_id));
                 }
 
-                current_page_num = leaf.next_leaf().map(|p| p.page_num);
-            } else {
-                break;
+                let to = eo + 2 + kl;
+                let pnv = u32::from_le_bytes([data[to], data[to + 1], data[to + 2], data[to + 3]]);
+                let sid = u16::from_le_bytes([data[to + 4], data[to + 5]]);
+                results.push((
+                    Bytes::copy_from_slice(ek),
+                    TupleId::new(PageId::new(0, pnv as u64), sid),
+                ));
             }
+
+            let next = u64::from_le_bytes([
+                data[ho + 4],
+                data[ho + 5],
+                data[ho + 6],
+                data[ho + 7],
+                data[ho + 8],
+                data[ho + 9],
+                data[ho + 10],
+                data[ho + 11],
+            ]);
+            current_page_num = if next == u64::MAX {
+                None
+            } else {
+                Some(next as u32)
+            };
         }
 
         results
@@ -815,9 +875,7 @@ impl BTreeIndex {
     /// Find leftmost leaf page number.
     fn find_leftmost_leaf_num(&self, pages: &InMemoryPageStore) -> u32 {
         let height = self.height.load(Ordering::Acquire);
-        let mut current = self
-            .root_page_num
-            .load(Ordering::Acquire);
+        let mut current = self.root_page_num.load(Ordering::Acquire);
 
         if height == 1 {
             return current;
@@ -826,7 +884,7 @@ impl BTreeIndex {
         for _ in 0..(height - 1) {
             if let Some(data) = pages.get(current) {
                 let internal = BTreeInternalPage::from_bytes(*data);
-                current = internal.leftmost_child().page_num;
+                current = internal.leftmost_child().page_num as u32;
             } else {
                 break;
             }
@@ -886,7 +944,14 @@ impl BTreeIndex {
             .join(format!("index_{}.zyridx.tmp", self.file_id));
 
         std::fs::create_dir_all(&self.checkpoint_dir)?;
-        checkpoint::write_checkpoint_from_store(&tmp_path, &pages, current_lsn, root, height, fsync)?;
+        checkpoint::write_checkpoint_from_store(
+            &tmp_path,
+            &pages,
+            current_lsn,
+            root,
+            height,
+            fsync,
+        )?;
         std::fs::rename(&tmp_path, &path)?;
 
         self.checkpoint_lsn.store(current_lsn, Ordering::Release);
@@ -917,7 +982,8 @@ impl BTreeIndex {
     /// Lock-free: single fetch_add with Relaxed ordering.
     #[inline]
     pub fn record_wal_bytes(&self, bytes: u64) {
-        self.wal_bytes_since_checkpoint.fetch_add(bytes, Ordering::Relaxed);
+        self.wal_bytes_since_checkpoint
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Checks if a checkpoint should be triggered based on accumulated WAL
@@ -979,7 +1045,9 @@ mod tests {
             crate::DiskManager::new(crate::DiskManagerConfig {
                 data_dir: dir.path().to_path_buf(),
                 fsync_enabled: false,
-            }).await.unwrap()
+            })
+            .await
+            .unwrap(),
         );
         let pool = Arc::new(BufferPool::auto_sized());
         let mut btree = BTreeIndex::create(disk, pool, 0, ckpt_dir).await.unwrap();
@@ -989,5 +1057,48 @@ mod tests {
             btree.insert_exclusive(&key, tid).unwrap();
         }
         assert!(btree.search_exclusive(&500u64.to_be_bytes()).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_insert_exclusive_1m_verify_all() {
+        let dir = tempdir().unwrap();
+        let ckpt_dir = dir.path().join("ckpt");
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let disk = Arc::new(
+            crate::DiskManager::new(crate::DiskManagerConfig {
+                data_dir: dir.path().to_path_buf(),
+                fsync_enabled: false,
+            })
+            .await
+            .unwrap(),
+        );
+        let pool = Arc::new(BufferPool::auto_sized());
+        let mut btree = BTreeIndex::create(disk, pool, 0, ckpt_dir).await.unwrap();
+        let n = 1_000_000u64;
+        for i in 0..n {
+            let key = i.to_be_bytes();
+            let tid = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
+            btree.insert_exclusive(&key, tid).unwrap();
+        }
+        eprintln!("Tree height: {}", btree.height());
+        let mut missing = 0u64;
+        let mut first_missing = None;
+        for i in 0..n {
+            let key = i.to_be_bytes();
+            let expected = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
+            let found = btree.search_exclusive(&key);
+            if found != Some(expected) {
+                missing += 1;
+                if first_missing.is_none() {
+                    first_missing = Some((i, found, expected));
+                }
+            }
+        }
+        if let Some((i, found, expected)) = first_missing {
+            panic!(
+                "First missing: {} (total: {}) found={:?} expected={:?}",
+                i, missing, found, expected
+            );
+        }
     }
 }

@@ -722,21 +722,19 @@ impl BTreeArenaIndex {
     // =========================================================================
 
     /// Range scan from start_key to end_key (inclusive).
-    /// Relaxed ordering is safe since writes are exclusive.
-    /// Pre-allocates results to avoid allocator contention under concurrent load.
-    /// Binary searches the first leaf to skip entries below start_key.
-    pub fn range_scan(
-        &self,
-        start_key: Option<&[u8]>,
-        end_key: Option<&[u8]>,
-    ) -> Vec<(u64, TupleId)> {
+    /// Returns packed (key, packed_tuple_id) pairs to avoid unpacking overhead.
+    /// Callers use `unpack_tuple_id()` to decode when needed.
+    ///
+    /// Arena leaf entries are stored as contiguous [key:u64][packed_tid:u64] pairs,
+    /// matching the (u64, u64) output layout. This enables bulk memcpy of entire
+    /// entry ranges instead of per-entry reads.
+    pub fn range_scan(&self, start_key: Option<&[u8]>, end_key: Option<&[u8]>) -> Vec<(u64, u64)> {
         let start = start_key.map(|k| self.key_to_u64(k)).unwrap_or(0);
         let end = end_key.map(|k| self.key_to_u64(k)).unwrap_or(u64::MAX);
 
         // Pre-allocate to avoid repeated reallocation under concurrent allocator contention.
-        // saturating_add prevents wrap to 0 when end = u64::MAX.
         let capacity = (end.saturating_sub(start).saturating_add(1) as usize).min(8192);
-        let mut results = Vec::with_capacity(capacity);
+        let mut results: Vec<(u64, u64)> = Vec::with_capacity(capacity);
 
         // Find starting leaf
         let height = self.height.load(Ordering::Relaxed);
@@ -748,18 +746,94 @@ impl BTreeArenaIndex {
             current = self.read_child_ptr(current, child_idx);
         }
 
-        // Scan leaves. Binary search the first leaf for start position.
-        let mut first_leaf = true;
+        // First leaf: binary search for scan_start position.
+        unsafe {
+            let header = self.arena.read_leaf_header(current);
+            let num_entries = header.num_entries as usize;
+            let base = self.arena.node_ptr(current).add(ARENA_LEAF_HEADER_SIZE);
+
+            let scan_start = if start > 0 {
+                let mut lo = 0usize;
+                let mut hi = num_entries;
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    let mid_key = std::ptr::read_unaligned(
+                        base.add(mid * ARENA_LEAF_ENTRY_SIZE) as *const u64
+                    );
+                    if mid_key < start {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                lo
+            } else {
+                0
+            };
+
+            // Binary search for scan_end position.
+            let scan_end = {
+                let mut lo = scan_start;
+                let mut hi = num_entries;
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    let mid_key = std::ptr::read_unaligned(
+                        base.add(mid * ARENA_LEAF_ENTRY_SIZE) as *const u64
+                    );
+                    if mid_key <= end {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                lo
+            };
+
+            // Bulk copy: arena entry layout [key:u64][tid:u64] matches (u64, u64) tuple layout.
+            let count = scan_end - scan_start;
+            if count > 0 {
+                let src = base.add(scan_start * ARENA_LEAF_ENTRY_SIZE);
+                let old_len = results.len();
+                let new_len = old_len + count;
+                if new_len > results.capacity() {
+                    results.reserve(count);
+                }
+                std::ptr::copy_nonoverlapping(
+                    src,
+                    (results.as_mut_ptr() as *mut u8).add(old_len * 16),
+                    count * ARENA_LEAF_ENTRY_SIZE,
+                );
+                results.set_len(new_len);
+            }
+
+            // Single-leaf fast path: end key found in this leaf or no next leaf.
+            if scan_end < num_entries || header.next_leaf == ARENA_NULL_OFFSET {
+                return results;
+            }
+            current = header.next_leaf;
+        }
+
+        // Subsequent leaves: scan_start is always 0 (all entries >= start).
         loop {
             unsafe {
                 let header = self.arena.read_leaf_header(current);
                 let num_entries = header.num_entries as usize;
                 let base = self.arena.node_ptr(current).add(ARENA_LEAF_HEADER_SIZE);
 
-                // Binary search for the first entry >= start in the first leaf.
-                // Subsequent leaves are fully in range (all entries >= start).
-                let scan_start = if first_leaf && start > 0 {
-                    first_leaf = false;
+                // Check if end key falls within this leaf by reading the last entry.
+                // If last_key <= end, the entire leaf is in range (skip binary search).
+                let last_key = if num_entries > 0 {
+                    std::ptr::read_unaligned(
+                        base.add((num_entries - 1) * ARENA_LEAF_ENTRY_SIZE) as *const u64
+                    )
+                } else {
+                    0
+                };
+
+                let scan_end = if last_key <= end {
+                    num_entries
+                } else {
+                    // Binary search only on the last leaf that intersects the end boundary.
                     let mut lo = 0usize;
                     let mut hi = num_entries;
                     while lo < hi {
@@ -767,32 +841,31 @@ impl BTreeArenaIndex {
                         let mid_key = std::ptr::read_unaligned(
                             base.add(mid * ARENA_LEAF_ENTRY_SIZE) as *const u64,
                         );
-                        if mid_key < start {
+                        if mid_key <= end {
                             lo = mid + 1;
                         } else {
                             hi = mid;
                         }
                     }
                     lo
-                } else {
-                    first_leaf = false;
-                    0
                 };
 
-                for i in scan_start..num_entries {
-                    let entry_ptr = base.add(i * ARENA_LEAF_ENTRY_SIZE) as *const u64;
-                    let entry_key = std::ptr::read_unaligned(entry_ptr);
-
-                    if entry_key > end {
-                        return results;
+                // Bulk copy entire range from this leaf.
+                if scan_end > 0 {
+                    let old_len = results.len();
+                    let new_len = old_len + scan_end;
+                    if new_len > results.capacity() {
+                        results.reserve(scan_end);
                     }
-
-                    let tuple_ptr = entry_ptr.add(1);
-                    let packed = std::ptr::read_unaligned(tuple_ptr);
-                    results.push((entry_key, Self::unpack_tuple_id(packed)));
+                    std::ptr::copy_nonoverlapping(
+                        base,
+                        (results.as_mut_ptr() as *mut u8).add(old_len * 16),
+                        scan_end * ARENA_LEAF_ENTRY_SIZE,
+                    );
+                    results.set_len(new_len);
                 }
 
-                if header.next_leaf == ARENA_NULL_OFFSET {
+                if scan_end < num_entries || header.next_leaf == ARENA_NULL_OFFSET {
                     break;
                 }
                 current = header.next_leaf;
@@ -834,7 +907,7 @@ impl BTreeArenaIndex {
         TupleId {
             page_id: PageId {
                 file_id: ((packed >> 48) & 0xFFFF) as u32,
-                page_num: ((packed >> 16) & 0xFFFFFFFF) as u32,
+                page_num: ((packed >> 16) & 0xFFFFFFFF) as u64,
             },
             slot_id: (packed & 0xFFFF) as u16,
         }

@@ -7,32 +7,50 @@ pub const PAGE_SIZE: usize = 16 * 1024;
 
 /// Unique identifier for a page within a file.
 ///
-/// PageId consists of a file ID and page number within that file.
+/// PageId consists of a file ID and a logical page number. The page_num is u64
+/// to support segmented storage with unlimited table sizes. For buffer pool
+/// packing into u64, only the lower 32 bits of page_num are used (segment
+/// offsets fit within u32).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PageId {
     /// File identifier (0 = data file, 1+ = index files).
     pub file_id: u32,
-    /// Page number within the file (0-indexed).
-    pub page_num: u32,
+    /// Logical page number within the file (0-indexed).
+    pub page_num: u64,
 }
 
 impl PageId {
     /// Creates a new PageId.
-    pub fn new(file_id: u32, page_num: u32) -> Self {
+    pub fn new(file_id: u32, page_num: u64) -> Self {
         Self { file_id, page_num }
     }
 
-    /// Returns the PageId as a single u64 for compact storage.
+    /// Packs the PageId into a u64 for buffer pool frame lookup.
+    /// Uses file_id in upper 32 bits and lower 32 bits of page_num.
+    /// For segmented storage, page_num within a segment always fits in u32.
     pub fn as_u64(&self) -> u64 {
-        ((self.file_id as u64) << 32) | (self.page_num as u64)
+        ((self.file_id as u64) << 32) | (self.page_num & 0xFFFF_FFFF)
     }
 
     /// Creates a PageId from a u64 representation.
+    /// Recovers file_id from upper 32 bits and page_num from lower 32 bits.
     pub fn from_u64(value: u64) -> Self {
         Self {
             file_id: (value >> 32) as u32,
-            page_num: value as u32,
+            page_num: (value as u32) as u64,
         }
+    }
+
+    /// Returns the segment ID for this page given a segment size in pages.
+    #[inline]
+    pub fn segment_id(&self, segment_size: u64) -> u64 {
+        self.page_num / segment_size
+    }
+
+    /// Returns the offset within the segment for this page.
+    #[inline]
+    pub fn offset_in_segment(&self, segment_size: u64) -> u32 {
+        (self.page_num % segment_size) as u32
     }
 }
 
@@ -64,15 +82,17 @@ pub enum PageType {
 
 /// Header structure at the beginning of every page.
 ///
-/// Layout (32 bytes total):
-/// - page_id: 8 bytes (file_id: 4, page_num: 4)
+/// Layout (40 bytes total, format v2):
+/// - file_id: 4 bytes
+/// - page_num: 8 bytes (u64, was u32 in v1)
 /// - lsn: 8 bytes (log sequence number for recovery)
 /// - page_type: 1 byte
 /// - flags: 1 byte
 /// - free_space_offset: 2 bytes
 /// - tuple_count: 2 bytes
 /// - checksum: 4 bytes
-/// - reserved: 6 bytes
+/// - format_version: 1 byte
+/// - reserved: 9 bytes
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[repr(C)]
 pub struct PageHeader {
@@ -90,11 +110,16 @@ pub struct PageHeader {
     pub tuple_count: u16,
     /// CRC32 checksum of the page contents (excluding this field).
     pub checksum: u32,
+    /// Page header format version (2 = u64 page_num).
+    pub format_version: u8,
 }
+
+/// Current page header format version.
+pub const PAGE_HEADER_FORMAT_VERSION: u8 = 2;
 
 impl PageHeader {
     /// Size of the page header in bytes.
-    pub const SIZE: usize = 32;
+    pub const SIZE: usize = 40;
 
     /// Creates a new page header.
     pub fn new(page_id: PageId, page_type: PageType) -> Self {
@@ -106,6 +131,7 @@ impl PageHeader {
             free_space_offset: Self::SIZE as u16,
             tuple_count: 0,
             checksum: 0,
+            format_version: PAGE_HEADER_FORMAT_VERSION,
         }
     }
 
@@ -115,39 +141,31 @@ impl PageHeader {
     }
 
     /// Serializes the header to bytes.
-    ///
-    /// Layout (32 bytes):
-    /// - file_id: 4 bytes
-    /// - page_num: 4 bytes
-    /// - lsn: 8 bytes
-    /// - page_type: 1 byte
-    /// - flags: 1 byte
-    /// - free_space_offset: 2 bytes
-    /// - tuple_count: 2 bytes
-    /// - checksum: 4 bytes
-    /// - reserved: 6 bytes
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
         let mut buf = [0u8; Self::SIZE];
         buf[0..4].copy_from_slice(&self.page_id.file_id.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.page_id.page_num.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.lsn.to_le_bytes());
-        buf[16] = self.page_type as u8;
-        buf[17] = self.flags.0;
-        buf[18..20].copy_from_slice(&self.free_space_offset.to_le_bytes());
-        buf[20..22].copy_from_slice(&self.tuple_count.to_le_bytes());
-        buf[22..26].copy_from_slice(&self.checksum.to_le_bytes());
-        // bytes 26-31 are reserved (already zeroed)
+        buf[4..12].copy_from_slice(&self.page_id.page_num.to_le_bytes());
+        buf[12..20].copy_from_slice(&self.lsn.to_le_bytes());
+        buf[20] = self.page_type as u8;
+        buf[21] = self.flags.0;
+        buf[22..24].copy_from_slice(&self.free_space_offset.to_le_bytes());
+        buf[24..26].copy_from_slice(&self.tuple_count.to_le_bytes());
+        buf[26..30].copy_from_slice(&self.checksum.to_le_bytes());
+        buf[30] = self.format_version;
+        // bytes 31-39 are reserved (already zeroed)
         buf
     }
 
     /// Deserializes the header from bytes.
     pub fn from_bytes(buf: &[u8]) -> Self {
         let file_id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        let page_num = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
-        let lsn = u64::from_le_bytes([
-            buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+        let page_num = u64::from_le_bytes([
+            buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
         ]);
-        let page_type = match buf[16] {
+        let lsn = u64::from_le_bytes([
+            buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19],
+        ]);
+        let page_type = match buf[20] {
             0 => PageType::Free,
             1 => PageType::Heap,
             2 => PageType::BTreeLeaf,
@@ -157,10 +175,11 @@ impl PageHeader {
             6 => PageType::Overflow,
             _ => PageType::Free,
         };
-        let flags = PageFlags(buf[17]);
-        let free_space_offset = u16::from_le_bytes([buf[18], buf[19]]);
-        let tuple_count = u16::from_le_bytes([buf[20], buf[21]]);
-        let checksum = u32::from_le_bytes([buf[22], buf[23], buf[24], buf[25]]);
+        let flags = PageFlags(buf[21]);
+        let free_space_offset = u16::from_le_bytes([buf[22], buf[23]]);
+        let tuple_count = u16::from_le_bytes([buf[24], buf[25]]);
+        let checksum = u32::from_le_bytes([buf[26], buf[27], buf[28], buf[29]]);
+        let format_version = if buf.len() > 30 { buf[30] } else { 1 };
 
         Self {
             page_id: PageId::new(file_id, page_num),
@@ -170,6 +189,7 @@ impl PageHeader {
             free_space_offset,
             tuple_count,
             checksum,
+            format_version,
         }
     }
 }
@@ -265,12 +285,12 @@ mod tests {
         let page_id = PageId::new(0, 0);
         assert_eq!(page_id, PageId::from_u64(page_id.as_u64()));
 
-        // Max values
-        let page_id = PageId::new(u32::MAX, u32::MAX);
+        // Max u32 range values (fits in lower 32 bits of as_u64)
+        let page_id = PageId::new(u32::MAX, u32::MAX as u64);
         assert_eq!(page_id, PageId::from_u64(page_id.as_u64()));
 
         // Mixed values
-        let page_id = PageId::new(0, u32::MAX);
+        let page_id = PageId::new(0, u32::MAX as u64);
         assert_eq!(page_id, PageId::from_u64(page_id.as_u64()));
 
         let page_id = PageId::new(u32::MAX, 0);
@@ -283,6 +303,25 @@ mod tests {
         let as_u64 = page_id.as_u64();
         // file_id (1) in upper 32 bits, page_num (2) in lower 32 bits
         assert_eq!(as_u64, (1u64 << 32) | 2);
+    }
+
+    #[test]
+    fn test_page_id_segment_helpers() {
+        let segment_size = 65536u64;
+        // Page in first segment
+        let page = PageId::new(0, 100);
+        assert_eq!(page.segment_id(segment_size), 0);
+        assert_eq!(page.offset_in_segment(segment_size), 100);
+
+        // Page in second segment
+        let page = PageId::new(0, 65536);
+        assert_eq!(page.segment_id(segment_size), 1);
+        assert_eq!(page.offset_in_segment(segment_size), 0);
+
+        // Page in third segment with offset
+        let page = PageId::new(0, 131073);
+        assert_eq!(page.segment_id(segment_size), 2);
+        assert_eq!(page.offset_in_segment(segment_size), 1);
     }
 
     #[test]
@@ -330,11 +369,12 @@ mod tests {
         assert_eq!(header.free_space_offset, PageHeader::SIZE as u16);
         assert_eq!(header.tuple_count, 0);
         assert_eq!(header.checksum, 0);
+        assert_eq!(header.format_version, PAGE_HEADER_FORMAT_VERSION);
     }
 
     #[test]
     fn test_page_header_size() {
-        assert_eq!(PageHeader::SIZE, 32);
+        assert_eq!(PageHeader::SIZE, 40);
     }
 
     #[test]
@@ -344,8 +384,8 @@ mod tests {
 
         // Initial free space = PAGE_SIZE - header size
         assert_eq!(header.free_space(), PAGE_SIZE - PageHeader::SIZE);
-        assert_eq!(header.free_space(), 16384 - 32);
-        assert_eq!(header.free_space(), 16352);
+        assert_eq!(header.free_space(), 16384 - 40);
+        assert_eq!(header.free_space(), 16344);
     }
 
     #[test]
@@ -355,8 +395,11 @@ mod tests {
 
         // Simulate allocating 100 bytes
         header.free_space_offset += 100;
-        assert_eq!(header.free_space(), PAGE_SIZE - header.free_space_offset as usize);
-        assert_eq!(header.free_space(), 16352 - 100);
+        assert_eq!(
+            header.free_space(),
+            PAGE_SIZE - header.free_space_offset as usize
+        );
+        assert_eq!(header.free_space(), 16344 - 100);
     }
 
     #[test]

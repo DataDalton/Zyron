@@ -43,7 +43,7 @@ struct FileHandle {
     /// The async file handle.
     file: File,
     /// Number of pages in the file.
-    num_pages: u32,
+    num_pages: u64,
 }
 
 impl DiskManager {
@@ -82,7 +82,7 @@ impl DiskManager {
             .await?;
 
         let file_size = file.metadata().await?.len();
-        let num_pages = (file_size / PAGE_SIZE as u64) as u32;
+        let num_pages = file_size / PAGE_SIZE as u64;
 
         // insert_async returns Err if key already exists (concurrent open_file race).
         // That is fine, the first writer wins and subsequent callers use the existing entry.
@@ -180,7 +180,7 @@ impl DiskManager {
     ///
     /// Single lock acquisition for all pages - eliminates sequential await overhead.
     /// Lazy allocation - only reserves page numbers.
-    pub async fn allocate_pages_batch(&self, file_id: u32, count: u32) -> Result<Vec<PageId>> {
+    pub async fn allocate_pages_batch(&self, file_id: u32, count: u64) -> Result<Vec<PageId>> {
         if count == 0 {
             return Ok(Vec::new());
         }
@@ -206,7 +206,7 @@ impl DiskManager {
     }
 
     /// Returns the number of pages in a file.
-    pub async fn num_pages(&self, file_id: u32) -> Result<u32> {
+    pub async fn num_pages(&self, file_id: u32) -> Result<u64> {
         self.open_file(file_id).await?;
 
         let entry = self
@@ -246,8 +246,7 @@ impl DiskManager {
     pub async fn close_file(&self, file_id: u32) -> Result<()> {
         if let Some((_, file_mutex)) = self.files.remove_async(&file_id).await {
             let handle = file_mutex.into_inner();
-            // Extend file to match lazy-allocated page count
-            let expected_size = (handle.num_pages as u64) * (PAGE_SIZE as u64);
+            let expected_size = handle.num_pages * (PAGE_SIZE as u64);
             handle.file.set_len(expected_size).await?;
             handle.file.sync_all().await?;
         }
@@ -257,7 +256,6 @@ impl DiskManager {
     /// Closes all open files.
     /// Extends files to match num_pages to persist lazy-allocated pages.
     pub async fn close_all(&self) -> Result<()> {
-        // Collect file_ids, then remove and close each.
         let mut file_ids = Vec::new();
         self.files
             .iter_async(|&file_id, _| {
@@ -269,7 +267,7 @@ impl DiskManager {
         for file_id in file_ids {
             if let Some((_, file_mutex)) = self.files.remove_async(&file_id).await {
                 let handle = file_mutex.into_inner();
-                let expected_size = (handle.num_pages as u64) * (PAGE_SIZE as u64);
+                let expected_size = handle.num_pages * (PAGE_SIZE as u64);
                 handle.file.set_len(expected_size).await?;
                 handle.file.sync_all().await?;
             }

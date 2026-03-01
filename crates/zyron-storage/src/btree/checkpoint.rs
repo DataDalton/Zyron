@@ -12,11 +12,11 @@
 //!   Key suffixes: entry_count * suffix_len bytes
 //!   Packed values: entry_count * 4 bytes (page_num << 16 | slot_id)
 
-use std::path::Path;
 use super::page::{BTreeInternalPage, BTreeLeafPage};
 use super::store::InMemoryPageStore;
 use super::types::LeafPageHeader;
-use zyron_common::page::{PageHeader, PageId, PAGE_SIZE};
+use std::path::Path;
+use zyron_common::page::{PAGE_SIZE, PageHeader, PageId};
 use zyron_common::{Result, ZyronError};
 
 const ZYIDX_MAGIC: [u8; 8] = *b"ZYIDX\0\0\0";
@@ -77,7 +77,9 @@ fn checkpoint_checksum(header: &[u8], data: &[u8]) -> u32 {
     // Tail: remaining < 8 bytes.
     if i < len {
         let mut tail: u64 = 0;
-        unsafe { std::ptr::copy_nonoverlapping(ptr.add(i), &mut tail as *mut u64 as *mut u8, len - i); }
+        unsafe {
+            std::ptr::copy_nonoverlapping(ptr.add(i), &mut tail as *mut u64 as *mut u8, len - i);
+        }
         s0 = (s0 ^ tail).wrapping_mul(P0);
     }
 
@@ -103,7 +105,7 @@ pub fn write_checkpoint_from_store(
         for _ in 0..(height - 1) {
             if let Some(data) = store.get(first_leaf) {
                 let internal = BTreeInternalPage::from_bytes(*data);
-                first_leaf = internal.leftmost_child().page_num;
+                first_leaf = internal.leftmost_child().page_num as u32;
             } else {
                 return write_empty_checkpoint(path, checkpoint_lsn, fsync);
             }
@@ -120,21 +122,38 @@ pub fn write_checkpoint_from_store(
     {
         let mut cur = first_leaf;
         loop {
-            let pd = match store.get(cur) { Some(d) => d, None => break };
+            let pd = match store.get(cur) {
+                Some(d) => d,
+                None => break,
+            };
             let ns = u16::from_le_bytes([pd[ho], pd[ho + 1]]);
             if leaf_pages.is_empty() && ns > 0 {
-                let e0_off = u16::from_le_bytes([pd[SLOT_ARRAY_START], pd[SLOT_ARRAY_START + 1]]) as usize;
+                let e0_off =
+                    u16::from_le_bytes([pd[SLOT_ARRAY_START], pd[SLOT_ARRAY_START + 1]]) as usize;
                 key_len = u16::from_le_bytes([pd[e0_off], pd[e0_off + 1]]);
             }
             leaf_pages.push((cur, ns));
             total_entries += ns as u32;
-            let next = u64::from_le_bytes([pd[ho+4], pd[ho+5], pd[ho+6], pd[ho+7], pd[ho+8], pd[ho+9], pd[ho+10], pd[ho+11]]);
-            if next == u64::MAX { break; }
+            let next = u64::from_le_bytes([
+                pd[ho + 4],
+                pd[ho + 5],
+                pd[ho + 6],
+                pd[ho + 7],
+                pd[ho + 8],
+                pd[ho + 9],
+                pd[ho + 10],
+                pd[ho + 11],
+            ]);
+            if next == u64::MAX {
+                break;
+            }
             cur = next as u32;
         }
     }
 
-    if total_entries == 0 { return write_empty_checkpoint(path, checkpoint_lsn, fsync); }
+    if total_entries == 0 {
+        return write_empty_checkpoint(path, checkpoint_lsn, fsync);
+    }
 
     let kl = key_len as usize;
 
@@ -146,7 +165,8 @@ pub fn write_checkpoint_from_store(
         if fns > 0 && lns > 0 {
             let fd = store.get(fp).unwrap();
             let ld = store.get(lp).unwrap();
-            let f_off = u16::from_le_bytes([fd[SLOT_ARRAY_START], fd[SLOT_ARRAY_START + 1]]) as usize;
+            let f_off =
+                u16::from_le_bytes([fd[SLOT_ARRAY_START], fd[SLOT_ARRAY_START + 1]]) as usize;
             let l_slot_off = SLOT_ARRAY_START + (lns as usize - 1) * SLOT_SIZE;
             let l_off = u16::from_le_bytes([ld[l_slot_off], ld[l_slot_off + 1]]) as usize;
             while prefix_len < kl && fd[f_off + 2 + prefix_len] == ld[l_off + 2 + prefix_len] {
@@ -162,7 +182,9 @@ pub fn write_checkpoint_from_store(
 
     // Allocate output buffer without zeroing.
     let mut buf = Vec::with_capacity(total_size);
-    unsafe { buf.set_len(total_size); }
+    unsafe {
+        buf.set_len(total_size);
+    }
     let bp = buf.as_mut_ptr();
 
     // Header
@@ -183,7 +205,11 @@ pub fn write_checkpoint_from_store(
         let fd = store.get(fp).unwrap();
         let f_off = u16::from_le_bytes([fd[SLOT_ARRAY_START], fd[SLOT_ARRAY_START + 1]]) as usize;
         unsafe {
-            std::ptr::copy_nonoverlapping(fd.as_ptr().add(f_off + 2), bp.add(prefix_start), prefix_len);
+            std::ptr::copy_nonoverlapping(
+                fd.as_ptr().add(f_off + 2),
+                bp.add(prefix_start),
+                prefix_len,
+            );
         }
     }
 
@@ -194,8 +220,7 @@ pub fn write_checkpoint_from_store(
     let mut vp = unsafe { bp.add(values_start) };
 
     // Extract suffixes and packed values from leaf pages.
-    // LLVM inlines copy_nonoverlapping for small constant sizes (4, 8 bytes)
-    // into single mov instructions, so no manual specialization needed.
+    // On-disk leaf entry format: key_len(2) + key + page_num(u32) + slot_id(u16).
     for &(pn, ns) in &leaf_pages {
         let pd = store.get(pn).unwrap();
         let pp = pd.as_ptr();
@@ -208,7 +233,7 @@ pub fn write_checkpoint_from_store(
                 sk = sk.add(suffix_len);
                 let pid_offset = entry_off + 2 + kl;
                 let page_num = (pp.add(pid_offset) as *const u32).read_unaligned();
-                let slot_id = (pp.add(pid_offset + 8) as *const u16).read_unaligned();
+                let slot_id = (pp.add(pid_offset + 4) as *const u16).read_unaligned();
                 (vp as *mut u32).write_unaligned((page_num << 16) | slot_id as u32);
                 vp = vp.add(4);
             }
@@ -217,13 +242,17 @@ pub fn write_checkpoint_from_store(
 
     // Checksum
     let checksum = checkpoint_checksum(&buf[..28], &buf[ZYIDX_HEADER_SIZE..]);
-    unsafe { (bp.add(28) as *mut u32).write_unaligned(checksum); }
+    unsafe {
+        (bp.add(28) as *mut u32).write_unaligned(checksum);
+    }
 
     {
         use std::io::Write;
         let mut file = std::fs::File::create(path)?;
         file.write_all(&buf)?;
-        if fsync { file.sync_all()?; }
+        if fsync {
+            file.sync_all()?;
+        }
     }
 
     Ok(total_size as u64)
@@ -237,7 +266,9 @@ fn write_empty_checkpoint(path: &Path, checkpoint_lsn: u64, fsync: bool) -> Resu
     let checksum = checkpoint_checksum(&buf[..28], &[]);
     buf[28..32].copy_from_slice(&checksum.to_le_bytes());
     std::fs::write(path, &buf)?;
-    if fsync { std::fs::File::open(path)?.sync_all()?; }
+    if fsync {
+        std::fs::File::open(path)?.sync_all()?;
+    }
     Ok(ZYIDX_HEADER_SIZE as u64)
 }
 
@@ -251,28 +282,50 @@ pub fn load_checkpoint_into_store(
     let buf = {
         use std::io::Read;
         let mut file = std::fs::File::open(path).map_err(|e| {
-            ZyronError::IoError(format!("failed to open checkpoint file {}: {}", path.display(), e))
+            ZyronError::IoError(format!(
+                "failed to open checkpoint file {}: {}",
+                path.display(),
+                e
+            ))
         })?;
-        let file_len = file.metadata().map_err(|e| {
-            ZyronError::IoError(format!("failed to read checkpoint metadata {}: {}", path.display(), e))
-        })?.len() as usize;
+        let file_len = file
+            .metadata()
+            .map_err(|e| {
+                ZyronError::IoError(format!(
+                    "failed to read checkpoint metadata {}: {}",
+                    path.display(),
+                    e
+                ))
+            })?
+            .len() as usize;
         let mut buf = Vec::with_capacity(file_len);
-        unsafe { buf.set_len(file_len); }
+        unsafe {
+            buf.set_len(file_len);
+        }
         file.read_exact(&mut buf).map_err(|e| {
-            ZyronError::IoError(format!("failed to read checkpoint file {}: {}", path.display(), e))
+            ZyronError::IoError(format!(
+                "failed to read checkpoint file {}: {}",
+                path.display(),
+                e
+            ))
         })?;
         buf
     };
 
     if buf.len() < ZYIDX_HEADER_SIZE {
-        return Err(ZyronError::RecoveryFailed("checkpoint file too small".into()));
+        return Err(ZyronError::RecoveryFailed(
+            "checkpoint file too small".into(),
+        ));
     }
     if buf[0..8] != ZYIDX_MAGIC {
         return Err(ZyronError::RecoveryFailed("invalid magic bytes".into()));
     }
     let ver = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
     if ver != ZYIDX_FORMAT_VERSION {
-        return Err(ZyronError::RecoveryFailed(format!("unsupported version: {} (expected {})", ver, ZYIDX_FORMAT_VERSION)));
+        return Err(ZyronError::RecoveryFailed(format!(
+            "unsupported version: {} (expected {})",
+            ver, ZYIDX_FORMAT_VERSION
+        )));
     }
 
     let checkpoint_lsn = u64::from_le_bytes(buf[12..20].try_into().unwrap());
@@ -287,18 +340,28 @@ pub fn load_checkpoint_into_store(
     let data_size = prefix_len + n * suffix_len + n * 4;
     let expected_size = ZYIDX_HEADER_SIZE + data_size;
     if buf.len() < expected_size {
-        return Err(ZyronError::RecoveryFailed("checkpoint file truncated".into()));
+        return Err(ZyronError::RecoveryFailed(
+            "checkpoint file truncated".into(),
+        ));
     }
 
     // Validate checksum
-    let computed = checkpoint_checksum(&buf[..28], &buf[ZYIDX_HEADER_SIZE..ZYIDX_HEADER_SIZE + data_size]);
+    let computed = checkpoint_checksum(
+        &buf[..28],
+        &buf[ZYIDX_HEADER_SIZE..ZYIDX_HEADER_SIZE + data_size],
+    );
     if stored_checksum != computed {
-        return Err(ZyronError::RecoveryFailed("checkpoint checksum mismatch".into()));
+        return Err(ZyronError::RecoveryFailed(
+            "checkpoint checksum mismatch".into(),
+        ));
     }
 
     if entry_count == 0 {
         let root = store.allocate();
-        store.write(root, BTreeLeafPage::new(PageId::new(file_id, root)).as_bytes());
+        store.write(
+            root,
+            BTreeLeafPage::new(PageId::new(file_id, root as u64)).as_bytes(),
+        );
         return Ok((checkpoint_lsn, root, 0, 1));
     }
 
@@ -307,7 +370,7 @@ pub fn load_checkpoint_into_store(
     let suffixes_start = prefix_start + prefix_len;
     let values_start = suffixes_start + n * suffix_len;
 
-    let eds = 2 + kl + 10; // entry data size per entry
+    let eds = 2 + kl + 6; // entry data size per entry: key_len(2) + key + page_num(4) + slot_id(2)
     let max_entries_per_page = (PAGE_SIZE - SLOT_ARRAY_START) / (eds + SLOT_SIZE);
     let num_leaves = (n + max_entries_per_page - 1) / max_entries_per_page;
     let data_end_full = PAGE_SIZE - max_entries_per_page * eds;
@@ -322,9 +385,7 @@ pub fn load_checkpoint_into_store(
         slot_array_full[so + 2..so + 4].copy_from_slice(&(eds as u16).to_le_bytes());
     }
 
-    let file_id_base = (file_id as u64) << 32;
-
-    // Pre-build 48-byte page header template (PageHeader + LeafPageHeader).
+    // Pre-build 56-byte page header template (PageHeader + LeafPageHeader).
     let mut hdr_tmpl = [0u8; SLOT_ARRAY_START];
     hdr_tmpl[16] = zyron_common::page::PageType::BTreeLeaf as u8;
     hdr_tmpl[ho_off()..ho_off() + 2].copy_from_slice(&(max_entries_per_page as u16).to_le_bytes());
@@ -345,7 +406,8 @@ pub fn load_checkpoint_into_store(
     let mut entry_tmpl = vec![0u8; eds];
     entry_tmpl[0..2].copy_from_slice(&key_len.to_le_bytes());
     if prefix_len > 0 {
-        entry_tmpl[2..2 + prefix_len].copy_from_slice(&buf[prefix_start..prefix_start + prefix_len]);
+        entry_tmpl[2..2 + prefix_len]
+            .copy_from_slice(&buf[prefix_start..prefix_start + prefix_len]);
     }
 
     for leaf_idx in 0..num_leaves {
@@ -354,10 +416,12 @@ pub fn load_checkpoint_into_store(
         let pb = store.get_mut(pn).unwrap();
         let pp = pb.as_mut_ptr();
 
-        // Write 48-byte header + page_id.
+        // Write page header template + page_id fields.
         unsafe {
             std::ptr::copy_nonoverlapping(hdr_tmpl.as_ptr(), pp, SLOT_ARRAY_START);
-            (pp as *mut u64).write_unaligned(file_id_base | pn as u64);
+            // PageHeader: file_id(u32) at offset 0, page_num(u64) at offset 4
+            (pp as *mut u32).write_unaligned(file_id);
+            (pp.add(4) as *mut u64).write_unaligned(pn as u64);
         }
 
         // Fix num_slots and data_end for partial last page.
@@ -371,14 +435,20 @@ pub fn load_checkpoint_into_store(
         // Write slot array (bulk copy for full pages, computed for partial).
         if ns == max_entries_per_page {
             unsafe {
-                std::ptr::copy_nonoverlapping(slot_array_full.as_ptr(), pp.add(SLOT_ARRAY_START), slot_array_bytes_full);
+                std::ptr::copy_nonoverlapping(
+                    slot_array_full.as_ptr(),
+                    pp.add(SLOT_ARRAY_START),
+                    slot_array_bytes_full,
+                );
             }
         } else {
             for slot in 0..ns {
                 let entry_off = (PAGE_SIZE - (slot + 1) * eds) as u16;
                 unsafe {
-                    (pp.add(SLOT_ARRAY_START + slot * SLOT_SIZE) as *mut u16).write_unaligned(entry_off);
-                    (pp.add(SLOT_ARRAY_START + slot * SLOT_SIZE + 2) as *mut u16).write_unaligned(eds as u16);
+                    (pp.add(SLOT_ARRAY_START + slot * SLOT_SIZE) as *mut u16)
+                        .write_unaligned(entry_off);
+                    (pp.add(SLOT_ARRAY_START + slot * SLOT_SIZE + 2) as *mut u16)
+                        .write_unaligned(eds as u16);
                 }
             }
         }
@@ -404,9 +474,12 @@ pub fn load_checkpoint_into_store(
                         let suf = (src.add(s_off) as *const u64).read_unaligned();
                         (pp.add(entry_base + 2) as *mut u64).write_unaligned(suf);
                         // Unpack value: (page_num << 16) | slot_id.
+                        // Write page_num(u32) + slot_id(u16) = 6 bytes.
                         let packed = (src.add(v_off) as *const u32).read_unaligned();
-                        (pp.add(entry_base + pid_in_entry) as *mut u64).write_unaligned(file_id_base | (packed >> 16) as u64);
-                        (pp.add(entry_base + pid_in_entry + 8) as *mut u16).write_unaligned((packed & 0xFFFF) as u16);
+                        (pp.add(entry_base + pid_in_entry) as *mut u32)
+                            .write_unaligned(packed >> 16);
+                        (pp.add(entry_base + pid_in_entry + 4) as *mut u16)
+                            .write_unaligned((packed & 0xFFFF) as u16);
                     }
                     entry_base -= eds;
                     s_off += 8;
@@ -422,8 +495,10 @@ pub fn load_checkpoint_into_store(
                         let suf = (src.add(s_off) as *const u32).read_unaligned();
                         (pp.add(entry_base + 2) as *mut u32).write_unaligned(suf);
                         let packed = (src.add(v_off) as *const u32).read_unaligned();
-                        (pp.add(entry_base + pid_in_entry) as *mut u64).write_unaligned(file_id_base | (packed >> 16) as u64);
-                        (pp.add(entry_base + pid_in_entry + 8) as *mut u16).write_unaligned((packed & 0xFFFF) as u16);
+                        (pp.add(entry_base + pid_in_entry) as *mut u32)
+                            .write_unaligned(packed >> 16);
+                        (pp.add(entry_base + pid_in_entry + 4) as *mut u16)
+                            .write_unaligned((packed & 0xFFFF) as u16);
                     }
                     entry_base -= eds;
                     s_off += 4;
@@ -435,10 +510,16 @@ pub fn load_checkpoint_into_store(
                 for _ in 0..ns {
                     unsafe {
                         std::ptr::copy_nonoverlapping(tmpl_ptr, pp.add(entry_base), tmpl_fixed);
-                        std::ptr::copy_nonoverlapping(src.add(s_off), pp.add(entry_base + suffix_in_entry), suffix_len);
+                        std::ptr::copy_nonoverlapping(
+                            src.add(s_off),
+                            pp.add(entry_base + suffix_in_entry),
+                            suffix_len,
+                        );
                         let packed = (src.add(v_off) as *const u32).read_unaligned();
-                        (pp.add(entry_base + pid_in_entry) as *mut u64).write_unaligned(file_id_base | (packed >> 16) as u64);
-                        (pp.add(entry_base + pid_in_entry + 8) as *mut u16).write_unaligned((packed & 0xFFFF) as u16);
+                        (pp.add(entry_base + pid_in_entry) as *mut u32)
+                            .write_unaligned(packed >> 16);
+                        (pp.add(entry_base + pid_in_entry + 4) as *mut u16)
+                            .write_unaligned((packed & 0xFFFF) as u16);
                     }
                     entry_base -= eds;
                     s_off += suffix_len;
@@ -452,11 +533,12 @@ pub fn load_checkpoint_into_store(
         let feo = PAGE_SIZE - eds;
         first_keys.extend_from_slice(&pb[feo + 2..feo + 2 + kl]);
 
-        // Set next-leaf pointer.
+        // Set next-leaf pointer (stored as PageId.as_u64() = file_id << 32 | page_num).
         if leaf_idx + 1 < num_leaves {
             let next_pn = first_page + leaf_idx as u32 + 1;
             let nlo = ho_off() + 4;
-            pb[nlo..nlo + 8].copy_from_slice(&(file_id_base | next_pn as u64).to_le_bytes());
+            let next_packed = ((file_id as u64) << 32) | next_pn as u64;
+            pb[nlo..nlo + 8].copy_from_slice(&next_packed.to_le_bytes());
         }
     }
 
@@ -471,9 +553,17 @@ pub fn load_checkpoint_into_store(
 }
 
 #[inline(always)]
-fn ho_off() -> usize { LeafPageHeader::OFFSET }
+fn ho_off() -> usize {
+    LeafPageHeader::OFFSET
+}
 
-fn build_internal_pages(store: &mut InMemoryPageStore, leaf_pages: &[u32], keys_flat: &[u8], kl: usize, file_id: u32) -> (u32, u32) {
+fn build_internal_pages(
+    store: &mut InMemoryPageStore,
+    leaf_pages: &[u32],
+    keys_flat: &[u8],
+    kl: usize,
+    file_id: u32,
+) -> (u32, u32) {
     let mut cp: Vec<u32> = leaf_pages.to_vec();
     let mut ck: Vec<u8> = keys_flat.to_vec();
     let mut level = 0u16;
@@ -483,7 +573,7 @@ fn build_internal_pages(store: &mut InMemoryPageStore, leaf_pages: &[u32], keys_
         let ids = PageHeader::SIZE + super::types::InternalPageHeader::SIZE;
         let iu = PAGE_SIZE - ids - 8;
         let it = iu * 3 / 4;
-        let es = 2 + kl + 8;
+        let es = 2 + kl + 4;
         let mut ci: Option<(u32, BTreeInternalPage)> = None;
         let mut cu = 0usize;
         let mut first = true;
@@ -491,30 +581,45 @@ fn build_internal_pages(store: &mut InMemoryPageStore, leaf_pages: &[u32], keys_
             let ks = i * kl;
             if first {
                 let pn = store.allocate();
-                let pid = PageId::new(file_id, pn);
+                let pid = PageId::new(file_id, pn as u64);
                 let mut int = BTreeInternalPage::new(pid, level);
-                int.set_leftmost_child(PageId::new(file_id, cp[i]));
-                pp.push(pn); pk.extend_from_slice(&ck[ks..ks + kl]);
-                ci = Some((pn, int)); cu = 0; first = false; continue;
+                int.set_leftmost_child(PageId::new(file_id, cp[i] as u64));
+                pp.push(pn);
+                pk.extend_from_slice(&ck[ks..ks + kl]);
+                ci = Some((pn, int));
+                cu = 0;
+                first = false;
+                continue;
             }
             if cu + es > it {
-                if let Some((pn, int)) = ci.take() { store.write(pn, int.as_bytes()); }
+                if let Some((pn, int)) = ci.take() {
+                    store.write(pn, int.as_bytes());
+                }
                 let pn = store.allocate();
-                let pid = PageId::new(file_id, pn);
+                let pid = PageId::new(file_id, pn as u64);
                 let mut int = BTreeInternalPage::new(pid, level);
-                int.set_leftmost_child(PageId::new(file_id, cp[i]));
-                pp.push(pn); pk.extend_from_slice(&ck[ks..ks + kl]);
-                ci = Some((pn, int)); cu = 0; continue;
+                int.set_leftmost_child(PageId::new(file_id, cp[i] as u64));
+                pp.push(pn);
+                pk.extend_from_slice(&ck[ks..ks + kl]);
+                ci = Some((pn, int));
+                cu = 0;
+                continue;
             }
             if let Some((_, ref mut int)) = ci {
                 let key = bytes::Bytes::copy_from_slice(&ck[ks..ks + kl]);
-                let _ = int.insert(key, PageId::new(file_id, cp[i]));
+                let _ = int.insert(key, PageId::new(file_id, cp[i] as u64));
                 cu += es;
             }
         }
-        if let Some((pn, int)) = ci.take() { store.write(pn, int.as_bytes()); }
-        if pp.len() == 1 { return (pp[0], level as u32 + 2); }
-        cp = pp; ck = pk; level += 1;
+        if let Some((pn, int)) = ci.take() {
+            store.write(pn, int.as_bytes());
+        }
+        if pp.len() == 1 {
+            return (pp[0], level as u32 + 2);
+        }
+        cp = pp;
+        ck = pk;
+        level += 1;
     }
 }
 
@@ -528,7 +633,12 @@ pub struct CheckpointConfig {
 
 impl Default for CheckpointConfig {
     fn default() -> Self {
-        Self { wal_bytes_threshold: 64 * 1024 * 1024, max_interval_secs: 600, min_interval_secs: 5, fsync: true }
+        Self {
+            wal_bytes_threshold: 64 * 1024 * 1024,
+            max_interval_secs: 600,
+            min_interval_secs: 5,
+            fsync: true,
+        }
     }
 }
 
@@ -539,7 +649,10 @@ pub struct CheckpointTrigger {
 
 impl CheckpointTrigger {
     pub fn new(config: CheckpointConfig) -> Self {
-        Self { config, last_checkpoint_time: std::time::Instant::now() }
+        Self {
+            config,
+            last_checkpoint_time: std::time::Instant::now(),
+        }
     }
     /// Checks if a checkpoint should be triggered. The wal_bytes parameter
     /// comes from the lock-free AtomicU64 counter on BTreeIndex.
@@ -554,8 +667,13 @@ impl CheckpointTrigger {
         // Below byte threshold. Check time-based max_interval (requires elapsed).
         self.last_checkpoint_time.elapsed().as_secs() >= self.config.max_interval_secs
     }
-    pub fn reset(&mut self) { self.last_checkpoint_time = std::time::Instant::now(); }
-    #[inline] pub fn config(&self) -> &CheckpointConfig { &self.config }
+    pub fn reset(&mut self) {
+        self.last_checkpoint_time = std::time::Instant::now();
+    }
+    #[inline]
+    pub fn config(&self) -> &CheckpointConfig {
+        &self.config
+    }
 }
 
 #[cfg(test)]
@@ -564,34 +682,50 @@ mod tests {
     use crate::tuple::TupleId;
     use tempfile::tempdir;
 
-    #[test] fn test_checkpoint_round_trip() {
+    #[test]
+    fn test_checkpoint_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.zyridx");
         let mut store = InMemoryPageStore::new();
         let root = store.allocate();
-        let mut leaf = BTreeLeafPage::new(PageId::new(0, root));
+        let mut leaf = BTreeLeafPage::new(PageId::new(0, root as u64));
         for i in 0..100u64 {
-            leaf.insert(bytes::Bytes::copy_from_slice(&i.to_be_bytes()), TupleId::new(PageId::new(0, (i % 10) as u32), (i % 5) as u16)).unwrap();
+            leaf.insert(
+                bytes::Bytes::copy_from_slice(&i.to_be_bytes()),
+                TupleId::new(PageId::new(0, i % 10), (i % 5) as u16),
+            )
+            .unwrap();
         }
         store.write(root, leaf.as_bytes());
         write_checkpoint_from_store(&path, &store, 42, root, 1, false).unwrap();
         let mut ls = InMemoryPageStore::new();
         let (lsn, lr, c, h) = load_checkpoint_into_store(&path, &mut ls, 0).unwrap();
-        assert_eq!(lsn, 42); assert_eq!(c, 100); assert_eq!(h, 1);
+        assert_eq!(lsn, 42);
+        assert_eq!(c, 100);
+        assert_eq!(h, 1);
         for i in 0..100u64 {
             let f = BTreeLeafPage::get_in_slice(ls.get(lr).unwrap(), &i.to_be_bytes());
             assert!(f.is_some(), "Key {} missing", i);
-            let t = f.unwrap(); assert_eq!(t.page_id.page_num, (i % 10) as u32); assert_eq!(t.slot_id, (i % 5) as u16);
+            let t = f.unwrap();
+            assert_eq!(t.page_id.page_num, i % 10);
+            assert_eq!(t.slot_id, (i % 5) as u16);
         }
     }
 
-    #[test] fn test_checkpoint_detects_corruption() {
+    #[test]
+    fn test_checkpoint_detects_corruption() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.zyridx");
         let mut store = InMemoryPageStore::new();
         let root = store.allocate();
-        let mut leaf = BTreeLeafPage::new(PageId::new(0, root));
-        for i in 0..10u64 { leaf.insert(bytes::Bytes::copy_from_slice(&i.to_be_bytes()), TupleId::new(PageId::new(0, 0), 0)).unwrap(); }
+        let mut leaf = BTreeLeafPage::new(PageId::new(0, root as u64));
+        for i in 0..10u64 {
+            leaf.insert(
+                bytes::Bytes::copy_from_slice(&i.to_be_bytes()),
+                TupleId::new(PageId::new(0, 0), 0),
+            )
+            .unwrap();
+        }
         store.write(root, leaf.as_bytes());
         write_checkpoint_from_store(&path, &store, 1, root, 1, false).unwrap();
         let mut d = std::fs::read(&path).unwrap();
@@ -602,15 +736,99 @@ mod tests {
         assert!(load_checkpoint_into_store(&path, &mut ls, 0).is_err());
     }
 
-    #[test] fn test_checkpoint_trigger_bytes_threshold() {
-        let t = CheckpointTrigger::new(CheckpointConfig { wal_bytes_threshold: 1000, max_interval_secs: 3600, min_interval_secs: 0, fsync: true });
+    #[test]
+    fn test_checkpoint_trigger_bytes_threshold() {
+        let t = CheckpointTrigger::new(CheckpointConfig {
+            wal_bytes_threshold: 1000,
+            max_interval_secs: 3600,
+            min_interval_secs: 0,
+            fsync: true,
+        });
         assert!(!t.should_checkpoint(0));
         assert!(!t.should_checkpoint(500));
         assert!(t.should_checkpoint(1000));
     }
 
-    #[test] fn test_checkpoint_trigger_min_interval() {
-        let t = CheckpointTrigger::new(CheckpointConfig { wal_bytes_threshold: 0, max_interval_secs: 3600, min_interval_secs: 999, fsync: true });
+    #[test]
+    fn test_checkpoint_trigger_min_interval() {
+        let t = CheckpointTrigger::new(CheckpointConfig {
+            wal_bytes_threshold: 0,
+            max_interval_secs: 3600,
+            min_interval_secs: 999,
+            fsync: true,
+        });
         assert!(!t.should_checkpoint(0));
+    }
+
+    #[test]
+    fn test_checkpoint_multi_page_round_trip() {
+        let dir = tempdir().unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let disk = std::sync::Arc::new(
+                crate::DiskManager::new(crate::DiskManagerConfig {
+                    data_dir: dir.path().to_path_buf(),
+                    fsync_enabled: false,
+                })
+                .await
+                .unwrap(),
+            );
+            let pool = std::sync::Arc::new(zyron_buffer::BufferPool::auto_sized());
+            let ckpt_dir = dir.path().join("ckpt");
+            std::fs::create_dir_all(&ckpt_dir).unwrap();
+
+            let mut btree = crate::btree::index::BTreeIndex::create_with_config(
+                disk.clone(),
+                pool.clone(),
+                0,
+                ckpt_dir.clone(),
+                CheckpointConfig {
+                    fsync: false,
+                    ..CheckpointConfig::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            let n = 1_000_000u64;
+            for i in 0..n {
+                let key = i.to_be_bytes();
+                let tid = crate::tuple::TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
+                btree.insert_exclusive(&key, tid).unwrap();
+            }
+
+            btree.force_checkpoint(42).unwrap();
+
+            let loaded =
+                crate::btree::index::BTreeIndex::open(disk.clone(), pool.clone(), 0, &ckpt_dir)
+                    .await
+                    .unwrap();
+
+            // Verify all keys survived checkpoint round-trip
+            let mut first_missing = None;
+            let mut missing_count = 0;
+            for i in 0..n {
+                let key = i.to_be_bytes();
+                let expected =
+                    crate::tuple::TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
+                let found = loaded.search_sync(&key);
+                if found != Some(expected) {
+                    missing_count += 1;
+                    if first_missing.is_none() {
+                        first_missing = Some((i, found, expected));
+                    }
+                }
+            }
+            if let Some((i, found, expected)) = first_missing {
+                panic!(
+                    "First missing key: {} (total missing: {}) found={:?} expected={:?}",
+                    i, missing_count, found, expected
+                );
+            }
+        });
     }
 }

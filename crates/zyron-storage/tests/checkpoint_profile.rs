@@ -33,7 +33,7 @@ async fn profile_checkpoint_stages() {
 
     for i in 0..KEY_COUNT as u64 {
         let key = i.to_be_bytes();
-        let tid = TupleId::new(PageId::new(0, (i % 1000) as u32), (i % 100) as u16);
+        let tid = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
         btree.insert_exclusive(&key, tid).unwrap();
     }
 
@@ -48,7 +48,11 @@ async fn profile_checkpoint_stages() {
     let buf = vec![0u8; total_bytes];
     let alloc_time = t0.elapsed();
     drop(buf);
-    println!("  Alloc (vec![0u8; {}MB]): {:.2} ms", total_bytes / 1024 / 1024, alloc_time.as_secs_f64() * 1000.0);
+    println!(
+        "  Alloc (vec![0u8; {}MB]): {:.2} ms",
+        total_bytes / 1024 / 1024,
+        alloc_time.as_secs_f64() * 1000.0
+    );
 
     // Stage 2: Full checkpoint write (includes alloc + copy + checksum + write + fsync)
     let ckpt_path = checkpoint_dir.join("index_0.zyridx");
@@ -56,18 +60,22 @@ async fn profile_checkpoint_stages() {
     btree.force_checkpoint(42000).unwrap();
     let full_write_time = t1.elapsed();
     let file_size = std::fs::metadata(&ckpt_path).unwrap().len();
-    println!("  Full write: {:.2} ms ({:.1} MB, {:.0} MB/sec)",
+    println!(
+        "  Full write: {:.2} ms ({:.1} MB, {:.0} MB/sec)",
         full_write_time.as_secs_f64() * 1000.0,
         file_size as f64 / 1024.0 / 1024.0,
-        (file_size as f64 / 1024.0 / 1024.0) / full_write_time.as_secs_f64());
+        (file_size as f64 / 1024.0 / 1024.0) / full_write_time.as_secs_f64()
+    );
 
     // Stage 3: Read the file into memory
     let t2 = Instant::now();
     let data = std::fs::read(&ckpt_path).unwrap();
     let read_time = t2.elapsed();
-    println!("  Raw fs::read: {:.2} ms ({:.0} MB/sec)",
+    println!(
+        "  Raw fs::read: {:.2} ms ({:.0} MB/sec)",
         read_time.as_secs_f64() * 1000.0,
-        (data.len() as f64 / 1024.0 / 1024.0) / read_time.as_secs_f64());
+        (data.len() as f64 / 1024.0 / 1024.0) / read_time.as_secs_f64()
+    );
 
     // Stage 4: Just the write (no fsync) for comparison
     let tmp_path = checkpoint_dir.join("test_no_fsync.zyridx");
@@ -75,16 +83,21 @@ async fn profile_checkpoint_stages() {
     let t3 = Instant::now();
     std::fs::write(&tmp_path, &buf2).unwrap();
     let write_no_fsync = t3.elapsed();
-    println!("  Raw fs::write (no fsync): {:.2} ms ({:.0} MB/sec)",
+    println!(
+        "  Raw fs::write (no fsync): {:.2} ms ({:.0} MB/sec)",
         write_no_fsync.as_secs_f64() * 1000.0,
-        (buf2.len() as f64 / 1024.0 / 1024.0) / write_no_fsync.as_secs_f64());
+        (buf2.len() as f64 / 1024.0 / 1024.0) / write_no_fsync.as_secs_f64()
+    );
 
     // Stage 5: Just fsync
     let file = std::fs::File::open(&tmp_path).unwrap();
     let t4 = Instant::now();
     file.sync_all().unwrap();
     let fsync_time = t4.elapsed();
-    println!("  Standalone fsync: {:.2} ms", fsync_time.as_secs_f64() * 1000.0);
+    println!(
+        "  Standalone fsync: {:.2} ms",
+        fsync_time.as_secs_f64() * 1000.0
+    );
 
     // Stage 6: Write + fsync together
     let tmp2 = checkpoint_dir.join("test_with_fsync.zyridx");
@@ -93,9 +106,11 @@ async fn profile_checkpoint_stages() {
     std::io::Write::write_all(&mut &f, &buf2).unwrap();
     f.sync_all().unwrap();
     let write_with_fsync = t5.elapsed();
-    println!("  Write + fsync: {:.2} ms ({:.0} MB/sec)",
+    println!(
+        "  Write + fsync: {:.2} ms ({:.0} MB/sec)",
         write_with_fsync.as_secs_f64() * 1000.0,
-        (buf2.len() as f64 / 1024.0 / 1024.0) / write_with_fsync.as_secs_f64());
+        (buf2.len() as f64 / 1024.0 / 1024.0) / write_with_fsync.as_secs_f64()
+    );
 
     // Stage 7: Full load from checkpoint
     let t6 = Instant::now();
@@ -103,10 +118,16 @@ async fn profile_checkpoint_stages() {
         .await
         .unwrap();
     let full_load_time = t6.elapsed();
-    println!("  Full load: {:.2} ms ({:.0} MB/sec)",
+    println!(
+        "  Full load: {:.2} ms ({:.0} MB/sec)",
         full_load_time.as_secs_f64() * 1000.0,
-        (file_size as f64 / 1024.0 / 1024.0) / full_load_time.as_secs_f64());
+        (file_size as f64 / 1024.0 / 1024.0) / full_load_time.as_secs_f64()
+    );
     drop(loaded);
 
-    println!("\n  File size: {:.2} MB ({} pages)", file_size as f64 / 1024.0 / 1024.0, page_count);
+    println!(
+        "\n  File size: {:.2} MB ({} pages)",
+        file_size as f64 / 1024.0 / 1024.0,
+        page_count
+    );
 }

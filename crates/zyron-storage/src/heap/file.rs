@@ -192,8 +192,10 @@ impl HeapFile {
         use std::sync::atomic::Ordering;
         let heap_pages = self.disk.num_pages(self.config.heap_file_id).await?;
         let fsm_pages = self.disk.num_pages(self.config.fsm_file_id).await?;
-        self.cached_heap_pages.store(heap_pages, Ordering::Relaxed);
-        self.cached_fsm_pages.store(fsm_pages, Ordering::Relaxed);
+        self.cached_heap_pages
+            .store(heap_pages as u32, Ordering::Relaxed);
+        self.cached_fsm_pages
+            .store(fsm_pages as u32, Ordering::Relaxed);
         Ok(())
     }
 
@@ -345,7 +347,7 @@ impl HeapFile {
         if deleted {
             self.write_page(tuple_id.page_id, page.as_bytes()).await?;
             // Defer FSM update for batched processing
-            self.defer_fsm_update(tuple_id.page_id.page_num, page.total_usable_space());
+            self.defer_fsm_update(tuple_id.page_id.page_num as u32, page.total_usable_space());
         }
 
         Ok(deleted)
@@ -392,7 +394,7 @@ impl HeapFile {
 
             if page_modified {
                 self.write_page(page_id, page.as_bytes()).await?;
-                self.defer_fsm_update(page_id.page_num, page.total_usable_space());
+                self.defer_fsm_update(page_id.page_num as u32, page.total_usable_space());
             }
         }
 
@@ -412,7 +414,7 @@ impl HeapFile {
         page.update_tuple(SlotId(tuple_id.slot_id), tuple)?;
 
         self.write_page(tuple_id.page_id, page.as_bytes()).await?;
-        self.update_fsm_for_page(tuple_id.page_id.page_num, page.free_space())
+        self.update_fsm_for_page(tuple_id.page_id.page_num as u32, page.free_space())
             .await?;
 
         Ok(())
@@ -427,7 +429,9 @@ impl HeapFile {
         let num_pages = self.heap_page_count();
         let file_id = self.config.heap_file_id;
 
-        let page_ids: Vec<PageId> = (0..num_pages).map(|n| PageId::new(file_id, n)).collect();
+        let page_ids: Vec<PageId> = (0..num_pages)
+            .map(|n| PageId::new(file_id, n as u64))
+            .collect();
 
         self.pool.batch_pin(&page_ids);
 
@@ -458,7 +462,9 @@ impl HeapFile {
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&path)
-                .map_err(|e| ZyronError::IoError(format!("flush open {}: {}", path.display(), e)))?;
+                .map_err(|e| {
+                    ZyronError::IoError(format!("flush open {}: {}", path.display(), e))
+                })?;
 
             let offset = (page_id.page_num as u64) * (PAGE_SIZE as u64);
             std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset))
@@ -474,7 +480,7 @@ impl HeapFile {
     /// Updates the FSM entry for a page.
     async fn update_fsm_for_page(&self, heap_page_num: u32, free_space: usize) -> Result<()> {
         let fsm_page_num = self.fsm.fsm_page_for(heap_page_num);
-        let fsm_page_id = PageId::new(self.config.fsm_file_id, fsm_page_num);
+        let fsm_page_id = PageId::new(self.config.fsm_file_id, fsm_page_num as u64);
 
         // Use cached FSM page count
         let num_fsm_pages = self.fsm_page_count();
@@ -532,7 +538,10 @@ impl HeapFile {
         let mut pending = self.pending_fsm.lock();
         pending.reserve(updates.len());
         for &(heap_page_num, free_space) in updates {
-            pending.push(PendingFsmUpdate { heap_page_num, free_space });
+            pending.push(PendingFsmUpdate {
+                heap_page_num,
+                free_space,
+            });
         }
     }
 
@@ -567,7 +576,7 @@ impl HeapFile {
 
         // Process each FSM page once with all its updates
         for (fsm_page_num, page_updates) in by_fsm_page {
-            let fsm_page_id = PageId::new(self.config.fsm_file_id, fsm_page_num);
+            let fsm_page_id = PageId::new(self.config.fsm_file_id, fsm_page_num as u64);
 
             let mut fsm_page = if fsm_page_num < num_fsm_pages {
                 let fsm_data = self.fetch_page(fsm_page_id).await?;
@@ -617,7 +626,7 @@ impl HeapFile {
         // Pre-allocate pages in one mutex acquisition.
         let pre_alloc = self
             .disk
-            .allocate_pages_batch(self.config.heap_file_id, estimated_pages)
+            .allocate_pages_batch(self.config.heap_file_id, estimated_pages as u64)
             .await?;
         self.cached_heap_pages
             .fetch_add(estimated_pages, std::sync::atomic::Ordering::Relaxed);
@@ -708,7 +717,7 @@ impl HeapFile {
                 let hint_page_num = self.hint_slots.find_page_with_space(space_needed);
 
                 if let Some(page_num) = hint_page_num {
-                    let pid = PageId::new(self.config.heap_file_id, page_num);
+                    let pid = PageId::new(self.config.heap_file_id, page_num as u64);
                     let page_data = self.fetch_page(pid).await?;
                     buf = page_data;
                     let usable = HeapPage::total_usable_space_in_slice(&buf);
@@ -812,10 +821,13 @@ impl HeapFile {
             } else {
                 self.write_new_page(pid, buf).await?;
             }
-            local_fsm_updates.push((pid.page_num, page_header.free_space()));
+            local_fsm_updates.push((pid.page_num as u32, page_header.free_space()));
         } else {
             self.write_page(pid, buf).await?;
-            local_fsm_updates.push((pid.page_num, HeapPage::total_usable_space_in_slice(buf)));
+            local_fsm_updates.push((
+                pid.page_num as u32,
+                HeapPage::total_usable_space_in_slice(buf),
+            ));
         }
         Ok(())
     }

@@ -1,5 +1,6 @@
 //! Tuple representation and serialization.
 
+use crate::txn::Snapshot;
 use zyron_common::page::PageId;
 
 /// Unique identifier for a tuple within the database.
@@ -24,7 +25,7 @@ impl TupleId {
     pub const INVALID: TupleId = TupleId {
         page_id: PageId {
             file_id: u32::MAX,
-            page_num: u32::MAX,
+            page_num: u64::MAX,
         },
         slot_id: u16::MAX,
     };
@@ -102,6 +103,15 @@ impl TupleHeader {
     /// - xmax is either 0 (not deleted) or greater than the snapshot
     pub fn is_visible(&self, snapshot_xid: u32) -> bool {
         self.xmin <= snapshot_xid && (self.xmax == 0 || self.xmax > snapshot_xid)
+    }
+
+    /// Returns true if this tuple is visible to the given MVCC snapshot.
+    ///
+    /// Uses full MVCC visibility rules with active transaction tracking.
+    /// Widens u32 xmin/xmax to u64 for the Snapshot check.
+    #[inline]
+    pub fn is_visible_to(&self, snapshot: &Snapshot) -> bool {
+        snapshot.is_visible(self.xmin as u64, self.xmax as u64)
     }
 
     /// Serializes the header to bytes.

@@ -1,10 +1,12 @@
 //! B+Tree page implementations (leaf and internal nodes).
 
-use bytes::Bytes;
-use crate::tuple::TupleId;
 use super::constants::MIN_FILL_FACTOR;
-use super::types::{compare_keys, DeleteResult, InternalEntry, InternalPageHeader, LeafEntry, LeafPageHeader};
-use zyron_common::page::{PageHeader, PageId, PageType, PAGE_SIZE};
+use super::types::{
+    DeleteResult, InternalEntry, InternalPageHeader, LeafEntry, LeafPageHeader, compare_keys,
+};
+use crate::tuple::TupleId;
+use bytes::Bytes;
+use zyron_common::page::{PAGE_SIZE, PageHeader, PageId, PageType};
 use zyron_common::{Result, ZyronError};
 
 /// B+ tree leaf page (slotted page format).
@@ -15,10 +17,10 @@ pub struct BTreeLeafPage {
 
 impl BTreeLeafPage {
     /// Slot array start offset after headers.
-    const SLOT_ARRAY_START: usize = PageHeader::SIZE + LeafPageHeader::SIZE;
+    pub(crate) const SLOT_ARRAY_START: usize = PageHeader::SIZE + LeafPageHeader::SIZE;
 
     /// Size of each slot (offset:2 + len:2).
-    const SLOT_SIZE: usize = 4;
+    pub(crate) const SLOT_SIZE: usize = 4;
 
     /// Creates a new empty leaf page.
     pub fn new(page_id: PageId) -> Self {
@@ -166,6 +168,7 @@ impl BTreeLeafPage {
 
     /// Gets the value for a key using slotted page format.
     /// Binary search directly on slot array for O(log n) lookup - no offset building needed.
+    /// Returns TupleId with file_id=0. Caller sets file_id from index context.
     #[inline(always)]
     pub fn get_in_slice(data: &[u8], key: &[u8]) -> Option<TupleId> {
         // Parse header - read num_slots as single u16
@@ -200,19 +203,16 @@ impl BTreeLeafPage {
             match compare_keys(key, entry_key) {
                 std::cmp::Ordering::Equal => {
                     let tuple_offset = entry_off + 2 + key_len;
-                    // Read page_id as u64 directly
-                    let page_id = PageId::from_u64(u64::from_le_bytes([
+                    // Read page_num as u32, slot_id as u16
+                    let page_num = u32::from_le_bytes([
                         data[tuple_offset],
                         data[tuple_offset + 1],
                         data[tuple_offset + 2],
                         data[tuple_offset + 3],
-                        data[tuple_offset + 4],
-                        data[tuple_offset + 5],
-                        data[tuple_offset + 6],
-                        data[tuple_offset + 7],
-                    ]));
+                    ]);
                     let slot_id =
-                        u16::from_le_bytes([data[tuple_offset + 8], data[tuple_offset + 9]]);
+                        u16::from_le_bytes([data[tuple_offset + 4], data[tuple_offset + 5]]);
+                    let page_id = PageId::new(0, page_num as u64);
                     return Some(TupleId::new(page_id, slot_id));
                 }
                 std::cmp::Ordering::Less => high = mid,
@@ -224,6 +224,7 @@ impl BTreeLeafPage {
 
     /// Inserts a key-value pair using slotted page format.
     /// Binary search for O(log n) lookup, only shift 4-byte slots instead of full entries.
+    /// Stores page_num (u32) + slot_id (u16) = 6 bytes per entry (file_id is implicit).
     /// Returns Ok(()) on success, Err(NodeFull) if page is full, Err(DuplicateKey) if key exists.
     #[inline(always)]
     pub fn insert_in_slice(data: &mut [u8], key: &[u8], tuple_id: TupleId) -> Result<()> {
@@ -240,8 +241,8 @@ impl BTreeLeafPage {
             raw_data_end
         };
 
-        // Entry size: key_len(2) + key + page_id(8) + slot_id(2)
-        let entry_size = 2 + key.len() + 10;
+        // Entry size: key_len(2) + key + page_num(4) + slot_id(2)
+        let entry_size = 2 + key.len() + 6;
 
         // Calculate free space: between slot array end and data start
         let slot_array_end = Self::SLOT_ARRAY_START + num_slots * Self::SLOT_SIZE;
@@ -288,9 +289,9 @@ impl BTreeLeafPage {
         write_offset += 2;
         data[write_offset..write_offset + key.len()].copy_from_slice(key);
         write_offset += key.len();
-        data[write_offset..write_offset + 8]
-            .copy_from_slice(&tuple_id.page_id.as_u64().to_le_bytes());
-        write_offset += 8;
+        data[write_offset..write_offset + 4]
+            .copy_from_slice(&(tuple_id.page_id.page_num as u32).to_le_bytes());
+        write_offset += 4;
         data[write_offset..write_offset + 2].copy_from_slice(&tuple_id.slot_id.to_le_bytes());
 
         // Shift slots forward to make room for new slot (only 4 bytes per slot)
@@ -577,13 +578,14 @@ impl BTreeInternalPage {
 
     /// Finds the child page for a given key directly from raw page data.
     /// Uses linear search for small pages (common case), binary search for large ones.
+    /// Child pointers stored as page_num (u32). Returns PageId with file_id=0.
     #[inline(always)]
     pub fn find_child_in_slice(data: &[u8], key: &[u8]) -> PageId {
         // Parse header to get num_keys
         let header_offset = InternalPageHeader::OFFSET;
         let num_keys = u16::from_le_bytes([data[header_offset], data[header_offset + 1]]) as usize;
 
-        // Leftmost child pointer
+        // Leftmost child pointer (stored as u64 for page linking)
         let leftmost_offset = Self::DATA_START;
         let leftmost = PageId::from_u64(u64::from_le_bytes([
             data[leftmost_offset],
@@ -601,7 +603,6 @@ impl BTreeInternalPage {
         }
 
         // For internal nodes with <= 8 entries, linear search is faster
-        // (avoids offset array allocation)
         if num_keys <= 8 {
             let mut offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
             let mut last_child = leftmost;
@@ -614,34 +615,34 @@ impl BTreeInternalPage {
                     return last_child;
                 }
 
-                // Update last_child to this entry's child pointer
+                // Read child page_num as u32
                 let child_offset = offset + 2 + key_len;
-                last_child = PageId::from_u64(u64::from_le_bytes([
+                let page_num = u32::from_le_bytes([
                     data[child_offset],
                     data[child_offset + 1],
                     data[child_offset + 2],
                     data[child_offset + 3],
-                    data[child_offset + 4],
-                    data[child_offset + 5],
-                    data[child_offset + 6],
-                    data[child_offset + 7],
-                ]));
+                ]);
+                last_child = PageId::new(0, page_num as u64);
 
-                offset += 2 + key_len + 8;
+                offset += 2 + key_len + 4;
             }
 
             return last_child;
         }
 
-        // For larger pages, use binary search with offset indexing
-        let mut offsets = [0usize; 1024];
-        let limit = num_keys.min(1024);
+        // For larger pages, use binary search with offset indexing.
+        // Max entries per internal page: PAGE_SIZE / min_entry_size.
+        // min_entry_size = key_len(2) + key(1) + page_num(4) = 7 bytes.
+        // 16384 / 7 = 2340. Use 2048 (power of 2, fits comfortably).
+        let mut offsets = [0usize; 2048];
+        let limit = num_keys.min(2048);
         let mut offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
 
         for i in 0..limit {
             offsets[i] = offset;
             let key_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
-            offset += 2 + key_len + 8;
+            offset += 2 + key_len + 4;
         }
 
         let mut low = 0usize;
@@ -666,16 +667,13 @@ impl BTreeInternalPage {
             let entry_offset = offsets[low - 1];
             let key_len = u16::from_le_bytes([data[entry_offset], data[entry_offset + 1]]) as usize;
             let child_offset = entry_offset + 2 + key_len;
-            PageId::from_u64(u64::from_le_bytes([
+            let page_num = u32::from_le_bytes([
                 data[child_offset],
                 data[child_offset + 1],
                 data[child_offset + 2],
                 data[child_offset + 3],
-                data[child_offset + 4],
-                data[child_offset + 5],
-                data[child_offset + 6],
-                data[child_offset + 7],
-            ]))
+            ]);
+            PageId::new(0, page_num as u64)
         }
     }
 
@@ -687,6 +685,7 @@ impl BTreeInternalPage {
     }
 
     /// Inserts a key and child pointer directly into raw page data.
+    /// Stores child page_num as u32 (4 bytes). file_id is implicit from index context.
     /// Returns Ok(()) on success, Err(NodeFull) if page is full.
     #[inline(always)]
     pub fn insert_in_slice(data: &mut [u8], key: &[u8], right_child: PageId) -> Result<()> {
@@ -703,8 +702,8 @@ impl BTreeInternalPage {
             raw_free_offset
         };
 
-        // Entry size: key_len(2) + key + page_id(8)
-        let entry_size = 2 + key.len() + 8;
+        // Entry size: key_len(2) + key + page_num(4)
+        let entry_size = 2 + key.len() + 4;
         let free_space = PAGE_SIZE - free_space_offset;
 
         if free_space < entry_size {
@@ -718,7 +717,7 @@ impl BTreeInternalPage {
         for _ in 0..num_keys {
             let key_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
             let entry_key = &data[offset + 2..offset + 2 + key_len];
-            let entry_total = 2 + key_len + 8;
+            let entry_total = 2 + key_len + 4;
 
             if compare_keys(key, entry_key).is_lt() {
                 insert_offset = offset;
@@ -740,7 +739,8 @@ impl BTreeInternalPage {
         write_offset += 2;
         data[write_offset..write_offset + key.len()].copy_from_slice(key);
         write_offset += key.len();
-        data[write_offset..write_offset + 8].copy_from_slice(&right_child.as_u64().to_le_bytes());
+        data[write_offset..write_offset + 4]
+            .copy_from_slice(&(right_child.page_num as u32).to_le_bytes());
 
         // Update header
         let new_num_keys = (num_keys + 1) as u16;

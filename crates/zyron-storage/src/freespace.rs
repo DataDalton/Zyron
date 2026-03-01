@@ -9,7 +9,7 @@
 //! Page layout:
 //! ```text
 //! +------------------+
-//! | Page Header (32) |
+//! | Page Header (40) |
 //! +------------------+
 //! | FSM Header (8)   |
 //! +------------------+
@@ -18,7 +18,7 @@
 //! +------------------+
 //! ```
 
-use zyron_common::page::{PageHeader, PageId, PageType, PAGE_SIZE};
+use zyron_common::page::{PAGE_SIZE, PageHeader, PageId, PageType};
 use zyron_common::{Result, ZyronError};
 
 /// Number of pages tracked per FSM page.
@@ -295,7 +295,7 @@ impl FreeSpaceMap {
     pub fn fsm_page_id(&self, fsm_page_num: u32) -> PageId {
         PageId::new(
             self.first_fsm_page.file_id,
-            self.first_fsm_page.page_num + fsm_page_num,
+            self.first_fsm_page.page_num + fsm_page_num as u64,
         )
     }
 }
