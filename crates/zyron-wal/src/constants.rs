@@ -31,17 +31,3 @@ pub const OFF_FLAGS: usize = 21;
 
 /// Offset of payload length field in header.
 pub const OFF_PAYLOAD_LEN: usize = 22;
-
-// Segment constants
-
-/// Default segment size (16 MB).
-pub const DEFAULT_SEGMENT_SIZE: u32 = 16 * 1024 * 1024;
-
-/// Segment header size in bytes.
-pub const SEGMENT_HEADER_SIZE: usize = 32;
-
-/// Magic bytes identifying a WAL segment.
-pub const SEGMENT_MAGIC: [u8; 4] = *b"ZWAL";
-
-/// Current format version.
-pub const SEGMENT_VERSION: u32 = 1;

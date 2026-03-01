@@ -123,12 +123,9 @@ impl AtomicRotationState {
         let new_val = Self::pack(ROTATION_IDLE, 0, generation);
         // Best-effort CAS. Multiple threads may race, only one wins. That is fine
         // because all threads observe Done and proceed to retry their append.
-        let _ = self.packed.compare_exchange(
-            current,
-            new_val,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        );
+        let _ = self
+            .packed
+            .compare_exchange(current, new_val, Ordering::AcqRel, Ordering::Relaxed);
     }
 
     /// Returns true if a rotation is pending (Requested or InProgress).
@@ -206,6 +203,9 @@ pub struct WalWriter {
     config: WalWriterConfig,
     /// Segment rotation coordination between append() and the flush thread.
     rotation: Arc<AtomicRotationState>,
+    /// Set to true by the flush thread when an I/O error occurs during flush.
+    /// Checked by append() to fail fast instead of buffering into a broken WAL.
+    flush_io_error: Arc<AtomicBool>,
 }
 
 impl WalWriter {
@@ -229,6 +229,7 @@ impl WalWriter {
         let segment = Arc::new(Mutex::new(Some(segment)));
         let flushed_lsn = Arc::new(AtomicU64::new(initial_lsn.0.saturating_sub(1)));
         let rotation = Arc::new(AtomicRotationState::new());
+        let flush_io_error = Arc::new(AtomicBool::new(false));
         let flush_thread = Self::spawn_flush_thread(
             ring_buffer.clone(),
             segment.clone(),
@@ -241,6 +242,7 @@ impl WalWriter {
             rotation.clone(),
             config.wal_dir.clone(),
             config.segment_size,
+            flush_io_error.clone(),
         );
 
         Ok(Self {
@@ -255,6 +257,7 @@ impl WalWriter {
             next_txn_id: AtomicU64::new(1),
             config,
             rotation,
+            flush_io_error,
         })
     }
 
@@ -305,6 +308,7 @@ impl WalWriter {
         rotation: Arc<AtomicRotationState>,
         wal_dir: PathBuf,
         segment_size: u32,
+        flush_io_error: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
         std::thread::spawn(move || {
             // Register this thread for unpark wakeup. OnceLock::get() is a
@@ -336,6 +340,7 @@ impl WalWriter {
                         &flushed_lsn,
                         &flush_done,
                         fsync_enabled,
+                        &flush_io_error,
                     );
                     break;
                 }
@@ -348,6 +353,7 @@ impl WalWriter {
                     &flushed_lsn,
                     &flush_done,
                     fsync_enabled,
+                    &flush_io_error,
                 );
 
                 // Handle segment rotation only when requested by append().
@@ -430,6 +436,7 @@ impl WalWriter {
             }
             Err(e) => {
                 eprintln!("WAL segment rotation error: {:?}", e);
+                // Rotation failure is fatal. New appends will fail fast via flush_io_error.
             }
         }
 
@@ -446,6 +453,7 @@ impl WalWriter {
         flushed_lsn: &AtomicU64,
         flush_done: &Arc<(Mutex<bool>, Condvar)>,
         fsync_enabled: bool,
+        flush_io_error: &AtomicBool,
     ) {
         batch_buffer.clear();
         let max_lsn = ring_buffer.drain_into(batch_buffer);
@@ -465,6 +473,7 @@ impl WalWriter {
             if let Some(ref mut seg) = *seg_guard {
                 if let Err(e) = seg.append_batch(batch_buffer) {
                     eprintln!("WAL flush error: {:?}", e);
+                    flush_io_error.store(true, Ordering::Release);
                     let (lock, condvar) = flush_done.as_ref();
                     let mut done = lock.lock();
                     *done = true;
@@ -475,6 +484,7 @@ impl WalWriter {
                 if fsync_enabled {
                     if let Err(e) = seg.sync() {
                         eprintln!("WAL sync error: {:?}", e);
+                        flush_io_error.store(true, Ordering::Release);
                         let (lock, condvar) = flush_done.as_ref();
                         let mut done = lock.lock();
                         *done = true;
@@ -494,6 +504,18 @@ impl WalWriter {
         condvar.notify_all();
     }
 
+    /// Cold error path for payload size validation. Separated from append()
+    /// to keep the hot path small and branch-predictor-friendly.
+    #[cold]
+    #[inline(never)]
+    fn payload_too_large(len: usize) -> Result<Lsn> {
+        Err(ZyronError::Internal(format!(
+            "payload {} bytes exceeds MAX_PAYLOAD_SIZE {}",
+            len,
+            crate::constants::MAX_PAYLOAD_SIZE,
+        )))
+    }
+
     /// Appends a log record. Zero-allocation hot path.
     ///
     /// Serializes header + payload + checksum directly into a ring buffer slot
@@ -508,12 +530,13 @@ impl WalWriter {
         flags: u8,
         payload: &[u8],
     ) -> Result<Lsn> {
+        if self.flush_io_error.load(Ordering::Acquire) {
+            return Err(ZyronError::WalWriteFailed(
+                "flush thread encountered an I/O error".into(),
+            ));
+        }
         if payload.len() > crate::constants::MAX_PAYLOAD_SIZE {
-            return Err(ZyronError::Internal(format!(
-                "payload {} bytes exceeds MAX_PAYLOAD_SIZE {}",
-                payload.len(),
-                crate::constants::MAX_PAYLOAD_SIZE,
-            )));
+            return Self::payload_too_large(payload.len());
         }
         let record_size = record_size_for_payload(payload.len()) as u32;
 
@@ -533,7 +556,7 @@ impl WalWriter {
                 if !still_full {
                     let lsn = current_lsn;
                     unsafe {
-                        let buf = self.ring_buffer.write_record(record_size as usize, lsn);
+                        let buf = self.ring_buffer.write_record(record_size as usize);
                         serialize_raw(
                             buf,
                             lsn,
@@ -565,7 +588,7 @@ impl WalWriter {
 
             // Normal path: serialize directly into ring buffer
             unsafe {
-                let buf = self.ring_buffer.write_record(record_size as usize, lsn);
+                let buf = self.ring_buffer.write_record(record_size as usize);
                 serialize_raw(
                     buf,
                     lsn,
@@ -772,7 +795,7 @@ impl WalWriter {
                 continue;
             }
 
-            let buf_start = unsafe { self.ring_buffer.write_record(batch_size as usize, base_lsn) };
+            let buf_start = unsafe { self.ring_buffer.write_record(batch_size as usize) };
 
             let mut buf_offset: u32 = 0;
             for &(txn_id, payload) in &inserts[batch_start..batch_end] {

@@ -16,6 +16,9 @@ pub struct RingBuffer {
     buffer: UnsafeCell<Box<[u8]>>,
     /// Buffer size in bytes.
     buffer_size: usize,
+    /// Bitmask for power-of-2 modulo (buffer_size - 1). Bitwise AND replaces
+    /// integer division for offset calculation: 1 cycle vs 20-40 cycles on x86.
+    buffer_mask: usize,
     /// Write cursor - next byte offset to claim.
     write_cursor: AtomicU64,
     /// Committed cursor - bytes ready to drain.
@@ -24,6 +27,10 @@ pub struct RingBuffer {
     read_cursor: AtomicU64,
     /// Maximum LSN written.
     max_lsn: AtomicU64,
+    /// Cached write limit: writers can write up to this point without checking
+    /// read_cursor. Updated by the flush thread after each drain. This avoids
+    /// cross-core cache line traffic on the hot path.
+    safe_write_limit: AtomicU64,
 }
 
 // SAFETY: Buffer access is coordinated via atomic cursors.
@@ -38,6 +45,11 @@ impl RingBuffer {
     /// Capacity must be at least 128KB. For correctness, capacity should be >=
     /// the WAL segment size so that wrap-around only occurs after a full drain.
     pub fn new(capacity_bytes: usize) -> Self {
+        assert!(
+            capacity_bytes.is_power_of_two(),
+            "Ring buffer capacity must be a power of 2, got {} bytes",
+            capacity_bytes,
+        );
         debug_assert!(
             capacity_bytes >= 128 * 1024 || cfg!(test),
             "Ring buffer capacity too small: {} bytes",
@@ -48,16 +60,22 @@ impl RingBuffer {
         Self {
             buffer: UnsafeCell::new(buffer),
             buffer_size: capacity_bytes,
+            buffer_mask: capacity_bytes - 1,
             write_cursor: AtomicU64::new(0),
             committed_cursor: AtomicU64::new(0),
             read_cursor: AtomicU64::new(0),
             max_lsn: AtomicU64::new(0),
+            // Initial limit: writers can fill the entire buffer before needing to check.
+            safe_write_limit: AtomicU64::new(capacity_bytes as u64),
         }
     }
 
     /// Claims `size` bytes contiguously within the buffer.
     ///
-    /// Hot path is a single fetch_add + branch (straight-line, no loop).
+    /// Hot path: single Relaxed load of safe_write_limit (non-contended, stays
+    /// in L1) + fetch_add + branch. No cross-core traffic unless the buffer is
+    /// genuinely filling up.
+    ///
     /// If the claimed region straddles the wrap boundary, the cold path
     /// commits those bytes as padding and retries.
     ///
@@ -65,15 +83,40 @@ impl RingBuffer {
     /// Caller must write exactly `size` bytes to the returned pointer before calling
     /// `commit_write`. The pointer is valid until the ring buffer wraps past this region.
     #[inline]
-    pub unsafe fn write_record(&self, size: usize, _lsn: Lsn) -> *mut u8 {
+    pub unsafe fn write_record(&self, size: usize) -> *mut u8 {
         let offset = self.write_cursor.fetch_add(size as u64, Ordering::Relaxed);
-        let buf_offset = (offset as usize) % self.buffer_size;
+
+        // Fast-path backpressure: compare against cached limit (written by flush
+        // thread after each drain). Only falls into slow path when the buffer is
+        // actually filling up.
+        if offset + size as u64 > self.safe_write_limit.load(Ordering::Relaxed) {
+            self.wait_for_space_slow(offset, size);
+        }
+
+        let buf_offset = (offset as usize) & self.buffer_mask;
 
         if buf_offset + size <= self.buffer_size {
             return unsafe { (*self.buffer.get()).as_mut_ptr().add(buf_offset) };
         }
 
         unsafe { self.write_record_straddle(size) }
+    }
+
+    /// Slow path: the writer has claimed space past the cached safe_write_limit.
+    /// Reload read_cursor, update the limit, and spin if the buffer is genuinely full.
+    #[cold]
+    #[inline(never)]
+    fn wait_for_space_slow(&self, offset: u64, size: usize) {
+        loop {
+            let read = self.read_cursor.load(Ordering::Acquire);
+            let limit = read + self.buffer_size as u64;
+            // Update cached limit so other writers benefit from the fresh read.
+            self.safe_write_limit.store(limit, Ordering::Relaxed);
+            if offset + size as u64 <= limit {
+                return;
+            }
+            std::hint::spin_loop();
+        }
     }
 
     /// Cold path for records that straddle the wrap boundary.
@@ -90,27 +133,44 @@ impl RingBuffer {
         );
 
         // Commit the initial straddling claim as padding.
-        self.committed_cursor.fetch_add(size as u64, Ordering::Release);
+        self.committed_cursor
+            .fetch_add(size as u64, Ordering::Release);
 
         loop {
             let offset = self.write_cursor.fetch_add(size as u64, Ordering::Relaxed);
-            let buf_offset = (offset as usize) % self.buffer_size;
+
+            // Backpressure check in straddle loop.
+            if offset + size as u64 > self.safe_write_limit.load(Ordering::Relaxed) {
+                self.wait_for_space_slow(offset, size);
+            }
+
+            let buf_offset = (offset as usize) & self.buffer_mask;
 
             if buf_offset + size <= self.buffer_size {
                 return unsafe { (*self.buffer.get()).as_mut_ptr().add(buf_offset) };
             }
 
-            self.committed_cursor.fetch_add(size as u64, Ordering::Release);
+            self.committed_cursor
+                .fetch_add(size as u64, Ordering::Release);
         }
     }
 
     /// Marks `size` bytes as committed and records `lsn` as the latest written LSN.
     /// Must be called after `write_record` once the data has been written.
+    ///
+    /// Uses store instead of fetch_max for max_lsn. LSNs are assigned
+    /// monotonically by the sequencer, so the latest committed LSN is always
+    /// the highest. For concurrent writers, commit order may differ from assign
+    /// order, but drain_into reads max_lsn after draining all committed bytes,
+    /// so a briefly stale value just means flushed_lsn lags slightly.
+    /// wait_for_flush retries until the target LSN is reached.
     #[inline]
     pub fn commit_write(&self, size: usize, lsn: Lsn) {
-        self.max_lsn.fetch_max(lsn.0, Ordering::Release);
+        // committed_cursor Release pairs with drain_into's Acquire load,
+        // guaranteeing the max_lsn Relaxed store below is visible to the reader.
         self.committed_cursor
             .fetch_add(size as u64, Ordering::Release);
+        self.max_lsn.store(lsn.0, Ordering::Relaxed);
     }
 
     /// Drains all committed bytes into `output`.
@@ -127,7 +187,22 @@ impl RingBuffer {
         }
 
         let bytes_to_read = (committed - read) as usize;
-        let read_offset = (read as usize) % self.buffer_size;
+
+        // Safety cap: never read more than buffer_size bytes in one drain.
+        // With backpressure in write_record, this should not trigger, but
+        // it prevents an out-of-bounds read if invariants are violated.
+        assert!(
+            bytes_to_read <= self.buffer_size,
+            "drain_into: bytes_to_read ({}) exceeds buffer_size ({}), \
+             committed={}, read={}",
+            bytes_to_read,
+            self.buffer_size,
+            committed,
+            read,
+        );
+        let actual_committed = read + bytes_to_read as u64;
+
+        let read_offset = (read as usize) & self.buffer_mask;
 
         unsafe {
             let buf_ptr = (*self.buffer.get()).as_ptr().add(read_offset);
@@ -145,7 +220,15 @@ impl RingBuffer {
             }
         }
 
-        self.read_cursor.store(committed, Ordering::Release);
+        self.read_cursor.store(actual_committed, Ordering::Release);
+
+        // Update cached write limit so writers see the freed space immediately
+        // without loading read_cursor themselves.
+        self.safe_write_limit.store(
+            actual_committed + self.buffer_size as u64,
+            Ordering::Relaxed,
+        );
+
         Lsn(self.max_lsn.load(Ordering::Acquire))
     }
 
@@ -181,7 +264,7 @@ mod tests {
 
     fn write_bytes(buf: &RingBuffer, data: &[u8], lsn: Lsn) {
         unsafe {
-            let ptr = buf.write_record(data.len(), lsn);
+            let ptr = buf.write_record(data.len());
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
         }
         buf.commit_write(data.len(), lsn);

@@ -55,7 +55,7 @@ impl NodeLatch {
     pub fn read_version(&self) -> Result<u64> {
         let v = self.state.load(Ordering::Acquire);
         if v & 1 != 0 {
-            return Err(ZyronError::WriteConflict { page_id: v });
+            return Err(ZyronError::VersionConflict);
         }
         Ok(v)
     }
@@ -79,7 +79,7 @@ impl NodeLatch {
     pub fn acquire_write(&self) -> Result<u64> {
         let current = self.state.load(Ordering::Acquire);
         if current & 1 != 0 {
-            return Err(ZyronError::WriteConflict { page_id: current });
+            return Err(ZyronError::VersionConflict);
         }
         // CAS: current (even) -> current | 1 (odd, writer active)
         match self
@@ -87,7 +87,7 @@ impl NodeLatch {
             .compare_exchange(current, current | 1, Ordering::AcqRel, Ordering::Acquire)
         {
             Ok(_) => Ok(current),
-            Err(actual) => Err(ZyronError::WriteConflict { page_id: actual }),
+            Err(_) => Err(ZyronError::VersionConflict),
         }
     }
 

@@ -228,7 +228,15 @@ impl TupleFlags {
 
 impl Tuple {
     /// Creates a new tuple from raw data.
+    ///
+    /// Panics if data exceeds 65535 bytes (u16::MAX), the maximum tuple data length.
     pub fn new(data: Vec<u8>, xmin: u32) -> Self {
+        assert!(
+            data.len() <= u16::MAX as usize,
+            "tuple data length {} exceeds maximum {} bytes",
+            data.len(),
+            u16::MAX
+        );
         let header = TupleHeader::new(data.len() as u16, xmin);
         Self { header, data }
     }

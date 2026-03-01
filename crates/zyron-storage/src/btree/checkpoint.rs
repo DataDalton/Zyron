@@ -1,16 +1,16 @@
 //! B+Tree checkpoint serialization and deserialization.
 //!
-//! Format v8: Single-pass columnar extraction from leaf chain.
-//! Common prefix compression for keys, packed page_num + slot_id into u32.
+//! Format v9: Single-pass columnar extraction from leaf chain.
+//! Common prefix compression for keys, separate page_num(u32) + slot_id(u16).
 //! O(pages) for metadata, O(entries) for data with raw pointer access.
 //!
-//! File layout (.zyridx v8):
+//! File layout (.zyridx v9):
 //!   Header (32 bytes):
 //!     magic(8), version(4), lsn(8), entry_count(4),
 //!     key_len(2), prefix_len(2), checksum(4)
 //!   Key prefix: prefix_len bytes (common prefix of all keys)
 //!   Key suffixes: entry_count * suffix_len bytes
-//!   Packed values: entry_count * 4 bytes (page_num << 16 | slot_id)
+//!   Values: entry_count * 6 bytes (page_num:u32 + slot_id:u16)
 
 use super::page::{BTreeInternalPage, BTreeLeafPage};
 use super::store::InMemoryPageStore;
@@ -20,7 +20,7 @@ use zyron_common::page::{PAGE_SIZE, PageHeader, PageId};
 use zyron_common::{Result, ZyronError};
 
 const ZYIDX_MAGIC: [u8; 8] = *b"ZYIDX\0\0\0";
-const ZYIDX_FORMAT_VERSION: u32 = 8;
+const ZYIDX_FORMAT_VERSION: u32 = 9;
 const ZYIDX_HEADER_SIZE: usize = 32;
 
 const SLOT_ARRAY_START: usize = PageHeader::SIZE + LeafPageHeader::SIZE;
@@ -177,7 +177,7 @@ pub fn write_checkpoint_from_store(
 
     let suffix_len = kl - prefix_len;
     let n = total_entries as usize;
-    let data_size = prefix_len + n * suffix_len + n * 4;
+    let data_size = prefix_len + n * suffix_len + n * 6;
     let total_size = ZYIDX_HEADER_SIZE + data_size;
 
     // Allocate output buffer without zeroing.
@@ -213,14 +213,15 @@ pub fn write_checkpoint_from_store(
         }
     }
 
-    // Extract key suffixes and packed values using slot array lookups.
+    // Extract key suffixes and values using slot array lookups.
     let suffixes_start = prefix_start + prefix_len;
     let values_start = suffixes_start + n * suffix_len;
     let mut sk = unsafe { bp.add(suffixes_start) };
     let mut vp = unsafe { bp.add(values_start) };
 
-    // Extract suffixes and packed values from leaf pages.
+    // Extract suffixes and values from leaf pages.
     // On-disk leaf entry format: key_len(2) + key + page_num(u32) + slot_id(u16).
+    // Checkpoint value format: page_num(u32) + slot_id(u16) = 6 bytes per entry.
     for &(pn, ns) in &leaf_pages {
         let pd = store.get(pn).unwrap();
         let pp = pd.as_ptr();
@@ -232,10 +233,9 @@ pub fn write_checkpoint_from_store(
                 std::ptr::copy_nonoverlapping(pp.add(entry_off + 2 + prefix_len), sk, suffix_len);
                 sk = sk.add(suffix_len);
                 let pid_offset = entry_off + 2 + kl;
-                let page_num = (pp.add(pid_offset) as *const u32).read_unaligned();
-                let slot_id = (pp.add(pid_offset + 4) as *const u16).read_unaligned();
-                (vp as *mut u32).write_unaligned((page_num << 16) | slot_id as u32);
-                vp = vp.add(4);
+                // Copy page_num(4) + slot_id(2) = 6 bytes directly.
+                std::ptr::copy_nonoverlapping(pp.add(pid_offset), vp, 6);
+                vp = vp.add(6);
             }
         }
     }
@@ -337,7 +337,7 @@ pub fn load_checkpoint_into_store(
     let kl = key_len as usize;
     let suffix_len = kl - prefix_len;
     let n = entry_count as usize;
-    let data_size = prefix_len + n * suffix_len + n * 4;
+    let data_size = prefix_len + n * suffix_len + n * 6;
     let expected_size = ZYIDX_HEADER_SIZE + data_size;
     if buf.len() < expected_size {
         return Err(ZyronError::RecoveryFailed(
@@ -454,13 +454,14 @@ pub fn load_checkpoint_into_store(
         }
 
         // Reconstruct entries from columnar checkpoint data into page layout.
+        // Checkpoint stores values as page_num(u32) + slot_id(u16) = 6 bytes per entry.
         // Specialized for common key sizes to emit direct mov instructions
         // instead of memcpy calls from copy_nonoverlapping with runtime sizes.
         let tmpl_ptr = entry_tmpl.as_ptr();
         let tmpl_fixed = 2 + prefix_len;
         let mut entry_base = PAGE_SIZE - eds;
         let mut s_off = suffixes_start + ei * suffix_len;
-        let mut v_off = values_start + ei * 4;
+        let mut v_off = values_start + ei * 6;
 
         match (tmpl_fixed, suffix_len) {
             // u64 keys with no common prefix: direct u16 + u64 writes.
@@ -468,22 +469,19 @@ pub fn load_checkpoint_into_store(
                 let kl_le = key_len.to_le();
                 for _ in 0..ns {
                     unsafe {
-                        // key_len: single u16 store.
                         (pp.add(entry_base) as *mut u16).write_unaligned(kl_le);
-                        // suffix: 8 bytes (direct u64 read/write).
                         let suf = (src.add(s_off) as *const u64).read_unaligned();
                         (pp.add(entry_base + 2) as *mut u64).write_unaligned(suf);
-                        // Unpack value: (page_num << 16) | slot_id.
-                        // Write page_num(u32) + slot_id(u16) = 6 bytes.
-                        let packed = (src.add(v_off) as *const u32).read_unaligned();
-                        (pp.add(entry_base + pid_in_entry) as *mut u32)
-                            .write_unaligned(packed >> 16);
-                        (pp.add(entry_base + pid_in_entry + 4) as *mut u16)
-                            .write_unaligned((packed & 0xFFFF) as u16);
+                        // Copy page_num(4) + slot_id(2) = 6 bytes directly.
+                        std::ptr::copy_nonoverlapping(
+                            src.add(v_off),
+                            pp.add(entry_base + pid_in_entry),
+                            6,
+                        );
                     }
                     entry_base -= eds;
                     s_off += 8;
-                    v_off += 4;
+                    v_off += 6;
                 }
             }
             // u32 keys with no common prefix: direct u16 + u32 writes.
@@ -494,15 +492,15 @@ pub fn load_checkpoint_into_store(
                         (pp.add(entry_base) as *mut u16).write_unaligned(kl_le);
                         let suf = (src.add(s_off) as *const u32).read_unaligned();
                         (pp.add(entry_base + 2) as *mut u32).write_unaligned(suf);
-                        let packed = (src.add(v_off) as *const u32).read_unaligned();
-                        (pp.add(entry_base + pid_in_entry) as *mut u32)
-                            .write_unaligned(packed >> 16);
-                        (pp.add(entry_base + pid_in_entry + 4) as *mut u16)
-                            .write_unaligned((packed & 0xFFFF) as u16);
+                        std::ptr::copy_nonoverlapping(
+                            src.add(v_off),
+                            pp.add(entry_base + pid_in_entry),
+                            6,
+                        );
                     }
                     entry_base -= eds;
                     s_off += 4;
-                    v_off += 4;
+                    v_off += 6;
                 }
             }
             // Generic fallback for other key sizes.
@@ -515,15 +513,15 @@ pub fn load_checkpoint_into_store(
                             pp.add(entry_base + suffix_in_entry),
                             suffix_len,
                         );
-                        let packed = (src.add(v_off) as *const u32).read_unaligned();
-                        (pp.add(entry_base + pid_in_entry) as *mut u32)
-                            .write_unaligned(packed >> 16);
-                        (pp.add(entry_base + pid_in_entry + 4) as *mut u16)
-                            .write_unaligned((packed & 0xFFFF) as u16);
+                        std::ptr::copy_nonoverlapping(
+                            src.add(v_off),
+                            pp.add(entry_base + pid_in_entry),
+                            6,
+                        );
                     }
                     entry_base -= eds;
                     s_off += suffix_len;
-                    v_off += 4;
+                    v_off += 6;
                 }
             }
         }
@@ -607,7 +605,8 @@ fn build_internal_pages(
             }
             if let Some((_, ref mut int)) = ci {
                 let key = bytes::Bytes::copy_from_slice(&ck[ks..ks + kl]);
-                let _ = int.insert(key, PageId::new(file_id, cp[i] as u64));
+                int.insert(key, PageId::new(file_id, cp[i] as u64))
+                    .expect("internal page overflow during checkpoint rebuild");
                 cu += es;
             }
         }

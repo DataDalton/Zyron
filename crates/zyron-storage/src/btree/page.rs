@@ -324,14 +324,12 @@ impl BTreeLeafPage {
             Ok(idx) => {
                 let mut entries = self.entries();
                 entries.remove(idx);
-                if self.write_entries(&entries).is_ok() {
-                    if self.is_underfull() {
-                        DeleteResult::Underfull
-                    } else {
-                        DeleteResult::Ok
-                    }
+                self.write_entries(&entries)
+                    .expect("write_entries failed after removing an entry, page data corrupted");
+                if self.is_underfull() {
+                    DeleteResult::Underfull
                 } else {
-                    DeleteResult::NotFound
+                    DeleteResult::Ok
                 }
             }
             Err(_) => DeleteResult::NotFound,
@@ -825,14 +823,12 @@ impl BTreeInternalPage {
             Some(idx) => {
                 let mut entries = entries;
                 entries.remove(idx);
-                if self.write_entries(&entries).is_ok() {
-                    if self.is_underfull() {
-                        DeleteResult::Underfull
-                    } else {
-                        DeleteResult::Ok
-                    }
+                self.write_entries(&entries)
+                    .expect("write_entries failed after removing an entry, page data corrupted");
+                if self.is_underfull() {
+                    DeleteResult::Underfull
                 } else {
-                    DeleteResult::NotFound
+                    DeleteResult::Ok
                 }
             }
             None => DeleteResult::NotFound,

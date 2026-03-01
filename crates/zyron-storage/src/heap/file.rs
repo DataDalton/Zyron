@@ -817,7 +817,7 @@ impl HeapFile {
                 let fid = reserved_frames[*reserved_idx];
                 *reserved_idx += 1;
                 self.pool.load_reserved_frame(fid, pid, buf);
-                self.pool.unpin_page(pid, false);
+                self.pool.unpin_page(pid, true);
             } else {
                 self.write_new_page(pid, buf).await?;
             }
@@ -850,13 +850,16 @@ impl<'a> ScanGuard<'a> {
     where
         F: FnMut(TupleId, TupleView<'_>),
     {
+        let max_slots = (PAGE_SIZE - DATA_START) / TUPLE_SLOT_SIZE;
         for &page_id in &self.page_ids {
             if let Some(p) = unsafe { self.pool.frame_data_ptr(page_id) } {
                 // Safety: page is pinned and frame_data_ptr returned valid pointer
                 let data = unsafe { &*p };
-                let slot_count =
+                let raw_slot_count =
                     u16::from_le_bytes([data[HEAP_HEADER_OFFSET], data[HEAP_HEADER_OFFSET + 1]])
                         as usize;
+                // Cap slot_count to prevent out-of-bounds reads from corrupt page headers.
+                let slot_count = raw_slot_count.min(max_slots);
 
                 for i in 0..slot_count {
                     // Safety: slot_base is within page bounds (slot_count from page header)
@@ -900,13 +903,15 @@ impl<'a> ScanGuard<'a> {
     /// Fast tuple count without constructing TupleView for each tuple.
     #[inline]
     pub fn count(&self) -> usize {
+        let max_slots = (PAGE_SIZE - DATA_START) / TUPLE_SLOT_SIZE;
         let mut total = 0;
         for &page_id in &self.page_ids {
             if let Some(p) = unsafe { self.pool.frame_data_ptr(page_id) } {
                 let data = unsafe { &*p };
-                let slot_count =
+                let raw_slot_count =
                     u16::from_le_bytes([data[HEAP_HEADER_OFFSET], data[HEAP_HEADER_OFFSET + 1]])
                         as usize;
+                let slot_count = raw_slot_count.min(max_slots);
 
                 for i in 0..slot_count {
                     let slot_base = DATA_START + i * TUPLE_SLOT_SIZE;

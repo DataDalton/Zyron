@@ -111,6 +111,7 @@ impl BTreeArenaIndex {
 
         // Prefetch child node header and first entries while returning
         if prefetch_child {
+            #[cfg(target_arch = "x86_64")]
             unsafe {
                 let child_ptr = self.arena.node_ptr(child_offset);
                 std::arch::x86_64::_mm_prefetch(

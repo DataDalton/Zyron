@@ -194,6 +194,7 @@ impl SwissTable {
         let empty_vec: Simd<u8, GROUP_SIZE> = Simd::splat(CTRL_EMPTY);
 
         let mut group_idx = h1 & !(GROUP_SIZE - 1);
+        let start_group = group_idx;
 
         loop {
             let ctrl_slice = &self.ctrl[group_idx..group_idx + GROUP_SIZE];
@@ -225,6 +226,10 @@ impl SwissTable {
             }
 
             group_idx = (group_idx + GROUP_SIZE) & (HASH_TABLE_SIZE - 1);
+            assert!(
+                group_idx != start_group,
+                "SwissTable insert: all slots occupied, no empty slot found"
+            );
         }
     }
 

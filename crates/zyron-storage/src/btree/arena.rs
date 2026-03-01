@@ -73,14 +73,24 @@ impl BTreeArena {
     /// Direct pointer access to node data (read).
     #[inline(always)]
     pub fn node_ptr(&self, offset: u64) -> *const u8 {
-        debug_assert!((offset as usize) < self.capacity);
+        assert!(
+            (offset as usize) < self.capacity,
+            "node_ptr offset {} out of bounds (capacity {})",
+            offset,
+            self.capacity
+        );
         unsafe { self.data.as_ptr().add(offset as usize) }
     }
 
     /// Direct pointer access to node data (write).
     #[inline(always)]
     pub fn node_ptr_mut(&mut self, offset: u64) -> *mut u8 {
-        debug_assert!((offset as usize) < self.capacity);
+        assert!(
+            (offset as usize) < self.capacity,
+            "node_ptr_mut offset {} out of bounds (capacity {})",
+            offset,
+            self.capacity
+        );
         unsafe { self.data.as_mut_ptr().add(offset as usize) }
     }
 

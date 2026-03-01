@@ -55,7 +55,7 @@ impl IntentLockTable {
                 // Track in inverse map for O(k) unlock
                 self.txn_locks
                     .entry_sync(txn_id)
-                    .or_insert_with(|| Vec::new())
+                    .or_insert_with(Vec::new)
                     .get_mut()
                     .push(hash);
                 Ok(())

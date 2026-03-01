@@ -37,33 +37,29 @@ impl LsnSequencer {
     /// If `needs_rotation` is true, the caller must coordinate segment rotation
     /// before retrying. The LSN returned in this case is the current position
     /// (not advanced).
+    ///
+    /// Uses fetch_add instead of CAS for the hot path. fetch_add always succeeds
+    /// on the first attempt, eliminating the retry loop and the Acquire load.
+    /// Rotation detection uses the post-add offset: if the new offset exceeds the
+    /// segment boundary, the record_size is subtracted back (another fetch_add)
+    /// and rotation is signaled.
     #[inline]
     pub fn reserve(&self, record_size: u32) -> (Lsn, bool) {
-        loop {
-            let current = self.next_lsn.load(Ordering::Acquire);
-            let segment_id = (current >> 32) as u32;
-            let offset = current as u32;
+        let prev = self
+            .next_lsn
+            .fetch_add(record_size as u64, Ordering::Relaxed);
+        let segment_id = (prev >> 32) as u32;
+        let offset = prev as u32;
 
-            // Check if record fits in current segment
-            if offset + record_size > self.segment_size {
-                // Signal rotation needed, don't advance
-                return (Lsn::new(segment_id, offset), true);
-            }
-
-            let new_offset = offset + record_size;
-            let new_packed = ((segment_id as u64) << 32) | (new_offset as u64);
-
-            // Attempt atomic update
-            match self.next_lsn.compare_exchange_weak(
-                current,
-                new_packed,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return (Lsn::new(segment_id, offset), false),
-                Err(_) => continue, // Contention, retry
-            }
+        if offset + record_size > self.segment_size {
+            // Record does not fit. Undo the advance so the offset stays at the
+            // segment boundary for the rotation path.
+            self.next_lsn
+                .fetch_sub(record_size as u64, Ordering::Relaxed);
+            return (Lsn::new(segment_id, offset), true);
         }
+
+        (Lsn::new(segment_id, offset), false)
     }
 
     /// Advances to the next segment.
