@@ -88,6 +88,10 @@ pub enum LogRecordType {
     CheckpointEnd = 31,
     /// Compensation log record (for undo).
     Clr = 40,
+    /// Compaction begin marker. Payload: table_id(8) + output file path.
+    CompactionBegin = 50,
+    /// Compaction end marker. Payload: table_id(8) + file_size(8) + row_count(8) + output file path.
+    CompactionEnd = 51,
 }
 
 impl TryFrom<u8> for LogRecordType {
@@ -106,6 +110,8 @@ impl TryFrom<u8> for LogRecordType {
             30 => Ok(LogRecordType::CheckpointBegin),
             31 => Ok(LogRecordType::CheckpointEnd),
             40 => Ok(LogRecordType::Clr),
+            50 => Ok(LogRecordType::CompactionBegin),
+            51 => Ok(LogRecordType::CompactionEnd),
             _ => Err(ZyronError::WalCorrupted {
                 lsn: 0,
                 reason: format!("invalid record type: {}", value),

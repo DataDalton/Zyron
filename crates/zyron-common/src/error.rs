@@ -125,6 +125,22 @@ pub enum ZyronError {
     #[error("Invalid parameter: {name} = {value}")]
     InvalidParameter { name: String, value: String },
 
+    // Columnar storage errors
+    #[error("Encoding failed: {0}")]
+    EncodingFailed(String),
+
+    #[error("Decoding failed: {0}")]
+    DecodingFailed(String),
+
+    #[error("Invalid .zyr file: {0}")]
+    InvalidZyrFile(String),
+
+    #[error("Corrupted segment in column {column_id}: {reason}")]
+    CorruptedSegment { column_id: u32, reason: String },
+
+    #[error("Compaction failed: {0}")]
+    CompactionFailed(String),
+
     // Internal errors
     #[error("Internal error: {0}")]
     Internal(String),

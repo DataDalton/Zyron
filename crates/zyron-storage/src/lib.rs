@@ -9,9 +9,13 @@
 //! - Tuple representation and serialization
 //! - B+ tree index implementation
 //! - Free space map for space management
+//! - Column encoding engine for .zyr columnar storage
+//! - Columnar file format with bloom filters and zone maps
 
 mod btree;
+pub mod columnar;
 mod disk;
+pub mod encoding;
 mod freespace;
 mod heap;
 mod tuple;

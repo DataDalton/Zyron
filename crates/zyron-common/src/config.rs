@@ -62,8 +62,6 @@ pub struct StorageConfig {
     pub fsync_enabled: bool,
     /// Enable direct I/O (bypass OS page cache).
     pub direct_io: bool,
-    /// Compression algorithm for pages.
-    pub compression: CompressionType,
 }
 
 impl Default for StorageConfig {
@@ -72,12 +70,11 @@ impl Default for StorageConfig {
             data_dir: PathBuf::from("./data"),
             wal_dir: PathBuf::from("./data/wal"),
             page_size: PAGE_SIZE,
-            buffer_pool_pages: 8192, // 128 MB with 16 KB pages
+            buffer_pool_pages: 8192,            // 128 MB with 16 KB pages
             wal_segment_size: 16 * 1024 * 1024, // 16 MB
-            checkpoint_interval_secs: 300, // 5 minutes
+            checkpoint_interval_secs: 300,      // 5 minutes
             fsync_enabled: true,
             direct_io: false,
-            compression: CompressionType::None,
         }
     }
 }
@@ -87,18 +84,6 @@ impl StorageConfig {
     pub fn buffer_pool_size_bytes(&self) -> usize {
         self.buffer_pool_pages * self.page_size
     }
-}
-
-/// Compression algorithm for page data.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum CompressionType {
-    /// No compression.
-    #[default]
-    None,
-    /// LZ4 compression (fast, moderate ratio).
-    Lz4,
-    /// Zstd compression (slower, better ratio).
-    Zstd,
 }
 
 /// Returns the number of available CPUs.
@@ -179,7 +164,6 @@ mod tests {
         assert_eq!(config.checkpoint_interval_secs, 300);
         assert!(config.fsync_enabled);
         assert!(!config.direct_io);
-        assert_eq!(config.compression, CompressionType::None);
     }
 
     #[test]
@@ -193,12 +177,10 @@ mod tests {
             checkpoint_interval_secs: 600,
             fsync_enabled: true,
             direct_io: true,
-            compression: CompressionType::Lz4,
         };
 
         assert_eq!(config.data_dir, PathBuf::from("/var/lib/zyrondb"));
         assert_eq!(config.page_size, 8192);
-        assert_eq!(config.compression, CompressionType::Lz4);
         assert!(config.direct_io);
     }
 
@@ -240,42 +222,6 @@ mod tests {
         assert_eq!(original.data_dir, deserialized.data_dir);
         assert_eq!(original.page_size, deserialized.page_size);
         assert_eq!(original.buffer_pool_pages, deserialized.buffer_pool_pages);
-        assert_eq!(original.compression, deserialized.compression);
-    }
-
-    #[test]
-    fn test_compression_type_default() {
-        let compression = CompressionType::default();
-        assert_eq!(compression, CompressionType::None);
-    }
-
-    #[test]
-    fn test_compression_type_variants() {
-        assert_ne!(CompressionType::None, CompressionType::Lz4);
-        assert_ne!(CompressionType::Lz4, CompressionType::Zstd);
-        assert_ne!(CompressionType::None, CompressionType::Zstd);
-    }
-
-    #[test]
-    fn test_compression_type_clone_copy() {
-        let c1 = CompressionType::Lz4;
-        let c2 = c1; // Copy
-        let c3 = c1.clone(); // Clone
-        assert_eq!(c1, c2);
-        assert_eq!(c1, c3);
-    }
-
-    #[test]
-    fn test_compression_type_serde_roundtrip() {
-        for compression in [
-            CompressionType::None,
-            CompressionType::Lz4,
-            CompressionType::Zstd,
-        ] {
-            let serialized = serde_json::to_string(&compression).unwrap();
-            let deserialized: CompressionType = serde_json::from_str(&serialized).unwrap();
-            assert_eq!(compression, deserialized);
-        }
     }
 
     #[test]
@@ -298,24 +244,6 @@ mod tests {
             config.tls_cert_path,
             Some(PathBuf::from("/path/to/cert.pem"))
         );
-        assert_eq!(
-            config.tls_key_path,
-            Some(PathBuf::from("/path/to/key.pem"))
-        );
-    }
-
-    #[test]
-    fn test_storage_config_with_compression() {
-        let config_lz4 = StorageConfig {
-            compression: CompressionType::Lz4,
-            ..Default::default()
-        };
-        assert_eq!(config_lz4.compression, CompressionType::Lz4);
-
-        let config_zstd = StorageConfig {
-            compression: CompressionType::Zstd,
-            ..Default::default()
-        };
-        assert_eq!(config_zstd.compression, CompressionType::Zstd);
+        assert_eq!(config.tls_key_path, Some(PathBuf::from("/path/to/key.pem")));
     }
 }
