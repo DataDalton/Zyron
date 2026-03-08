@@ -5,20 +5,15 @@
 /// Determines when snapshots are refreshed:
 /// - ReadCommitted: new snapshot per statement (caller calls refresh_snapshot)
 /// - SnapshotIsolation: single snapshot for entire transaction lifetime
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IsolationLevel {
     /// Each statement sees data committed before the statement began.
     /// New snapshot acquired per statement via TransactionManager::refresh_snapshot().
     ReadCommitted,
     /// All statements see a consistent snapshot taken at BEGIN time.
     /// Prevents dirty reads, non-repeatable reads, and phantom reads.
+    #[default]
     SnapshotIsolation,
-}
-
-impl Default for IsolationLevel {
-    fn default() -> Self {
-        Self::SnapshotIsolation
-    }
 }
 
 impl std::fmt::Display for IsolationLevel {

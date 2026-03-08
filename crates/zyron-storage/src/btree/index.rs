@@ -837,10 +837,10 @@ impl BTreeIndex {
                 let kl = u16::from_le_bytes([data[eo], data[eo + 1]]) as usize;
                 let ek = &data[eo + 2..eo + 2 + kl];
 
-                if let Some(end) = end_key {
-                    if compare_keys(ek, end).is_gt() {
-                        return results;
-                    }
+                if let Some(end) = end_key
+                    && compare_keys(ek, end).is_gt()
+                {
+                    return results;
                 }
 
                 let to = eo + 2 + kl;

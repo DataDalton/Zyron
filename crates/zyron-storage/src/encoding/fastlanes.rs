@@ -81,7 +81,7 @@ impl Encoding for FastLanesEncoding {
 
         // Pack residuals into bit array
         let packed_bits = row_count as u64 * bit_width as u64;
-        let packed_bytes = ((packed_bits + 7) / 8) as usize;
+        let packed_bytes = packed_bits.div_ceil(8) as usize;
         let mut packed = vec![0u8; packed_bytes];
 
         for (i, &val) in residuals.iter().enumerate() {
@@ -549,13 +549,13 @@ impl Encoding for FastLanesEncoding {
 
                     // Segment-level skip: all values outside range
                     if loVal > maxRepresentable || hiVal < base_value {
-                        let bitmaskLen = (row_count + 7) / 8;
+                        let bitmaskLen = row_count.div_ceil(8);
                         return Ok(vec![0u8; bitmaskLen]);
                     }
 
                     // Segment-level accept: entire range within bounds
                     if loVal <= base_value && hiVal >= maxRepresentable {
-                        let bitmaskLen = (row_count + 7) / 8;
+                        let bitmaskLen = row_count.div_ceil(8);
                         let mut bitmask = vec![0xFFu8; bitmaskLen];
                         let trailing = row_count % 8;
                         if trailing != 0 {
@@ -565,18 +565,14 @@ impl Encoding for FastLanesEncoding {
                     }
 
                     // Row-level filtering on residuals
-                    let loResidual = if loVal > base_value {
-                        loVal - base_value
-                    } else {
-                        0
-                    };
+                    let loResidual = loVal.saturating_sub(base_value);
                     let hiResidual = if hiVal >= base_value {
                         (hiVal - base_value).min(maxResidual)
                     } else {
-                        return Ok(vec![0u8; (row_count + 7) / 8]);
+                        return Ok(vec![0u8; row_count.div_ceil(8)]);
                     };
 
-                    let bitmaskLen = (row_count + 7) / 8;
+                    let bitmaskLen = row_count.div_ceil(8);
                     let mut bitmask = vec![0u8; bitmaskLen];
                     for i in 0..row_count {
                         let residual =
@@ -589,7 +585,7 @@ impl Encoding for FastLanesEncoding {
                 }
                 Predicate::Equality(target) => {
                     let targetVal = read_u64_le(target, 0, target.len().min(8));
-                    let bitmaskLen = (row_count + 7) / 8;
+                    let bitmaskLen = row_count.div_ceil(8);
                     if targetVal < base_value || targetVal > maxRepresentable {
                         return Ok(vec![0u8; bitmaskLen]);
                     }
@@ -616,7 +612,7 @@ impl Encoding for FastLanesEncoding {
                             }
                         })
                         .collect();
-                    let bitmaskLen = (row_count + 7) / 8;
+                    let bitmaskLen = row_count.div_ceil(8);
                     if targetResiduals.is_empty() {
                         return Ok(vec![0u8; bitmaskLen]);
                     }
@@ -634,7 +630,7 @@ impl Encoding for FastLanesEncoding {
         }
 
         // For delta-encoded data, evaluate the predicate without full decode.
-        let bitmaskLen = (row_count + 7) / 8;
+        let bitmaskLen = row_count.div_ceil(8);
         let mut bitmask = vec![0u8; bitmaskLen];
 
         // For Range predicates, try the constant-step fast path first.
@@ -642,77 +638,77 @@ impl Encoding for FastLanesEncoding {
         // where r0 is the first FoR-subtracted value and d is the constant step.
         // After prefix sum: value[i] = base + r0 + i*d for i > 0, value[0] = base + r0.
         // This gives O(1) range computation instead of O(N) unpack + prefix sum.
-        if let Predicate::Range { low, high } = predicate {
-            if row_count >= 2 {
-                let r0 = unpack_fast(packed, 0, bit_width, mask);
-                let step = unpack_fast(packed, bit_width as u64, bit_width, mask);
+        if let Predicate::Range { low, high } = predicate
+            && row_count >= 2
+        {
+            let r0 = unpack_fast(packed, 0, bit_width, mask);
+            let step = unpack_fast(packed, bit_width as u64, bit_width, mask);
 
-                // Spot-check that all deltas from index 1 onward are identical
-                let spots = [
-                    row_count / 4,
-                    row_count / 2,
-                    row_count * 3 / 4,
-                    row_count - 1,
-                ];
-                let isConstantStep = spots.iter().all(|&idx| {
-                    if idx < 1 || idx >= row_count {
-                        return true;
-                    }
-                    unpack_fast(packed, idx as u64 * bit_width as u64, bit_width, mask) == step
-                });
+            // Spot-check that all deltas from index 1 onward are identical
+            let spots = [
+                row_count / 4,
+                row_count / 2,
+                row_count * 3 / 4,
+                row_count - 1,
+            ];
+            let isConstantStep = spots.iter().all(|&idx| {
+                if idx < 1 || idx >= row_count {
+                    return true;
+                }
+                unpack_fast(packed, idx as u64 * bit_width as u64, bit_width, mask) == step
+            });
 
-                if isConstantStep && step > 0 {
-                    // After prefix sum: ps[0] = r0, ps[i] = r0 + i*step
-                    // Original value[i] = base_value + r0 + i * step
-                    let loVal = match low {
-                        Some(lo) => read_u64_le(lo, 0, lo.len().min(8)),
-                        None => 0,
-                    };
-                    let hiVal = match high {
-                        Some(hi) => read_u64_le(hi, 0, hi.len().min(8)),
-                        None => u64::MAX,
-                    };
+            if isConstantStep && step > 0 {
+                // After prefix sum: ps[0] = r0, ps[i] = r0 + i*step
+                // Original value[i] = base_value + r0 + i * step
+                let loVal = match low {
+                    Some(lo) => read_u64_le(lo, 0, lo.len().min(8)),
+                    None => 0,
+                };
+                let hiVal = match high {
+                    Some(hi) => read_u64_le(hi, 0, hi.len().min(8)),
+                    None => u64::MAX,
+                };
 
-                    let firstValue = base_value + r0;
-                    let lastValue = firstValue + (row_count as u64 - 1) * step;
+                let firstValue = base_value + r0;
+                let lastValue = firstValue + (row_count as u64 - 1) * step;
 
-                    // Segment-level skip/accept
-                    if firstValue > hiVal || lastValue < loVal {
-                        return Ok(bitmask);
-                    }
-                    if firstValue >= loVal && lastValue <= hiVal {
-                        for byte in &mut bitmask[..bitmaskLen] {
-                            *byte = 0xFF;
-                        }
-                        let trailing = row_count % 8;
-                        if trailing != 0 {
-                            bitmask[bitmaskLen - 1] = (1u8 << trailing) - 1;
-                        }
-                        return Ok(bitmask);
-                    }
-
-                    // Compute matching index range analytically
-                    let loStart = if loVal <= firstValue {
-                        0
-                    } else {
-                        let diff = loVal - firstValue;
-                        ((diff + step - 1) / step) as usize
-                    };
-                    let hiEnd = if hiVal >= lastValue {
-                        row_count
-                    } else {
-                        let diff = hiVal - firstValue;
-                        (diff / step + 1) as usize
-                    };
-                    let hiEnd = hiEnd.min(row_count);
-
-                    // Bulk-fill bitmask for the matching range
-                    if loStart < hiEnd {
-                        fill_bitmask_range(&mut bitmask, loStart, hiEnd);
-                    }
-
+                // Segment-level skip/accept
+                if firstValue > hiVal || lastValue < loVal {
                     return Ok(bitmask);
                 }
+                if firstValue >= loVal && lastValue <= hiVal {
+                    for byte in &mut bitmask[..bitmaskLen] {
+                        *byte = 0xFF;
+                    }
+                    let trailing = row_count % 8;
+                    if trailing != 0 {
+                        bitmask[bitmaskLen - 1] = (1u8 << trailing) - 1;
+                    }
+                    return Ok(bitmask);
+                }
+
+                // Compute matching index range analytically
+                let loStart = if loVal <= firstValue {
+                    0
+                } else {
+                    let diff = loVal - firstValue;
+                    diff.div_ceil(step) as usize
+                };
+                let hiEnd = if hiVal >= lastValue {
+                    row_count
+                } else {
+                    let diff = hiVal - firstValue;
+                    (diff / step + 1) as usize
+                };
+                let hiEnd = hiEnd.min(row_count);
+
+                // Bulk-fill bitmask for the matching range
+                if loStart < hiEnd {
+                    fill_bitmask_range(&mut bitmask, loStart, hiEnd);
+                }
+
+                return Ok(bitmask);
             }
         }
 
@@ -761,11 +757,7 @@ impl Encoding for FastLanesEncoding {
                 };
 
                 // Convert to residual domain
-                let loResidual = if loVal > base_value {
-                    loVal - base_value
-                } else {
-                    0
-                };
+                let loResidual = loVal.saturating_sub(base_value);
                 let hiResidual = if hiVal >= base_value {
                     hiVal - base_value
                 } else {
@@ -851,7 +843,7 @@ fn pack_bits(packed: &mut [u8], bit_offset: u64, value: u64, bit_width: u8) {
     let shifted = val << bit_idx;
     let shifted_bytes = shifted.to_le_bytes();
     let total_bits = bit_idx + bit_width as u32;
-    let bytes_needed = ((total_bits + 7) / 8) as usize;
+    let bytes_needed = (total_bits as usize).div_ceil(8);
 
     for j in 0..bytes_needed.min(8) {
         if byte_idx + j < packed.len() {
@@ -915,8 +907,8 @@ fn unpack_batch(packed: &[u8], bit_width: u8, mask: u64, count: usize, out: &mut
     let packed_ptr = packed.as_ptr();
     let packed_len = packed.len();
 
-    for i in 0..count {
-        out[i] = unpack_inline(packed_ptr, packed_len, i as u64 * bw, bit_width, mask);
+    for (i, val) in out.iter_mut().enumerate().take(count) {
+        *val = unpack_inline(packed_ptr, packed_len, i as u64 * bw, bit_width, mask);
     }
 }
 
@@ -940,8 +932,8 @@ fn fill_bitmask_range(bitmask: &mut [u8], start: usize, end: usize) {
         for b in firstBit..8 {
             bitmask[firstByte] |= 1 << b;
         }
-        for byte in (firstByte + 1)..lastByte {
-            bitmask[byte] = 0xFF;
+        for b in &mut bitmask[(firstByte + 1)..lastByte] {
+            *b = 0xFF;
         }
         for b in 0..=lastBit {
             bitmask[lastByte] |= 1 << b;

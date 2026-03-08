@@ -54,7 +54,7 @@ impl Encoding for BitPackEncoding {
         } as u8;
 
         let packedBits = row_count as u64 * bitWidth as u64;
-        let packedBytes = ((packedBits + 7) / 8) as usize;
+        let packedBytes = packedBits.div_ceil(8) as usize;
 
         let mut out = Vec::with_capacity(13 + packedBytes);
         out.push(bitWidth);
@@ -115,7 +115,10 @@ impl Encoding for BitPackEncoding {
         ]);
 
         let packed = &encoded[13..];
-        let mut out = vec![0u8; row_count * value_size];
+        let mut out = Vec::with_capacity(row_count * value_size);
+        unsafe {
+            out.set_len(row_count * value_size);
+        }
         let mut bitOffset: u64 = 0;
 
         for i in 0..row_count {
@@ -164,36 +167,37 @@ impl Encoding for BitPackEncoding {
         };
 
         // For single-bit booleans with base=0, use direct bitmask operations
-        if bitWidth == 1 && baseValue == 0 {
-            if let Predicate::Equality(target) = predicate {
-                let targetVal = read_value_as_u64(target, 0, target.len().min(value_size));
-                let bitmaskLen = (row_count + 7) / 8;
-                let mut bitmask = vec![0u8; bitmaskLen];
+        if bitWidth == 1
+            && baseValue == 0
+            && let Predicate::Equality(target) = predicate
+        {
+            let targetVal = read_value_as_u64(target, 0, target.len().min(value_size));
+            let bitmaskLen = row_count.div_ceil(8);
+            let mut bitmask = vec![0u8; bitmaskLen];
 
-                if targetVal == 1 {
-                    let copyLen = bitmaskLen.min(packed.len());
-                    bitmask[..copyLen].copy_from_slice(&packed[..copyLen]);
-                    let trailing = row_count % 8;
-                    if trailing != 0 && bitmaskLen > 0 {
-                        bitmask[bitmaskLen - 1] &= (1u8 << trailing) - 1;
-                    }
-                } else if targetVal == 0 {
-                    let copyLen = bitmaskLen.min(packed.len());
-                    for j in 0..copyLen {
-                        bitmask[j] = !packed[j];
-                    }
-                    let trailing = row_count % 8;
-                    if trailing != 0 && bitmaskLen > 0 {
-                        bitmask[bitmaskLen - 1] &= (1u8 << trailing) - 1;
-                    }
+            if targetVal == 1 {
+                let copyLen = bitmaskLen.min(packed.len());
+                bitmask[..copyLen].copy_from_slice(&packed[..copyLen]);
+                let trailing = row_count % 8;
+                if trailing != 0 && bitmaskLen > 0 {
+                    bitmask[bitmaskLen - 1] &= (1u8 << trailing) - 1;
                 }
-                return Ok(bitmask);
+            } else if targetVal == 0 {
+                let copyLen = bitmaskLen.min(packed.len());
+                for j in 0..copyLen {
+                    bitmask[j] = !packed[j];
+                }
+                let trailing = row_count % 8;
+                if trailing != 0 && bitmaskLen > 0 {
+                    bitmask[bitmaskLen - 1] &= (1u8 << trailing) - 1;
+                }
             }
+            return Ok(bitmask);
         }
 
         // Evaluate predicates on packed residuals by transforming bounds
         // into the FoR domain (subtract base_value from search targets).
-        let bitmaskLen = (row_count + 7) / 8;
+        let bitmaskLen = row_count.div_ceil(8);
         let mut bitmask = vec![0u8; bitmaskLen];
         let mut bitOffset: u64 = 0;
 
@@ -239,11 +243,7 @@ impl Encoding for BitPackEncoding {
                     return Ok(bitmask);
                 }
 
-                let loResidual = if loVal > baseValue {
-                    loVal - baseValue
-                } else {
-                    0
-                };
+                let loResidual = loVal.saturating_sub(baseValue);
                 let hiResidual = if hiVal >= baseValue {
                     (hiVal - baseValue).min(maxResidual)
                 } else {
@@ -320,7 +320,7 @@ fn pack_value(packed: &mut [u8], bit_offset: u64, value: u64, bit_width: u8) {
 
     let shifted = val << bitIdx;
     let totalBits = bitIdx + bit_width as u32;
-    let bytesNeeded = ((totalBits + 7) / 8) as usize;
+    let bytesNeeded = totalBits.div_ceil(8) as usize;
 
     let shiftedBytes = shifted.to_le_bytes();
     for j in 0..bytesNeeded.min(8) {

@@ -114,40 +114,40 @@ pub fn eval_predicate_on_raw(
     value_size: usize,
     predicate: &Predicate,
 ) -> Result<Vec<u8>> {
-    let bitmask_len = (row_count + 7) / 8;
+    let bitmask_len = row_count.div_ceil(8);
     let mut bitmask = vec![0u8; bitmask_len];
 
     // For integer-sized values (1-8 bytes), use numeric u64 comparison
     // instead of lexicographic byte comparison. LE-encoded integers are
     // not sorted by their byte representation at byte boundaries
     // (e.g., 256 = [0,1,0,0] is lexicographically less than 255 = [255,0,0,0]).
-    if value_size <= 8 {
-        if let Predicate::Range { low, high } = predicate {
-            let lo_val = match low {
-                Some(lo) => read_as_u64(lo, value_size),
-                None => 0,
-            };
-            let hi_val = match high {
-                Some(hi) => read_as_u64(hi, value_size),
-                None => u64::MAX,
-            };
+    if value_size <= 8
+        && let Predicate::Range { low, high } = predicate
+    {
+        let lo_val = match low {
+            Some(lo) => read_as_u64(lo, value_size),
+            None => 0,
+        };
+        let hi_val = match high {
+            Some(hi) => read_as_u64(hi, value_size),
+            None => u64::MAX,
+        };
 
-            for i in 0..row_count {
-                let start = i * value_size;
-                let end = start + value_size;
-                if end > data.len() {
-                    return Err(ZyronError::DecodingFailed(
-                        "data shorter than expected row count".to_string(),
-                    ));
-                }
-                let v = read_as_u64(&data[start..end], value_size);
-                if v >= lo_val && v <= hi_val {
-                    bitmask[i / 8] |= 1 << (i % 8);
-                }
+        for i in 0..row_count {
+            let start = i * value_size;
+            let end = start + value_size;
+            if end > data.len() {
+                return Err(ZyronError::DecodingFailed(
+                    "data shorter than expected row count".to_string(),
+                ));
             }
-
-            return Ok(bitmask);
+            let v = read_as_u64(&data[start..end], value_size);
+            if v >= lo_val && v <= hi_val {
+                bitmask[i / 8] |= 1 << (i % 8);
+            }
         }
+
+        return Ok(bitmask);
     }
 
     for i in 0..row_count {
@@ -173,7 +173,7 @@ pub fn eval_predicate_on_raw(
                 };
                 above_low && below_high
             }
-            Predicate::In(values) => values.iter().any(|v| value == *v),
+            Predicate::In(values) => values.contains(&value),
         };
 
         if matches {
@@ -327,10 +327,10 @@ pub fn select_encoding(type_id: TypeId, sample: &[Option<&[u8]>]) -> EncodingTyp
     }
 
     let encoder = create_encoding(typeCandidate);
-    if let Ok(encoded) = encoder.encode(&rawData, sampleCount, valueSize) {
-        if encoded.len() < rawData.len() {
-            return typeCandidate;
-        }
+    if let Ok(encoded) = encoder.encode(&rawData, sampleCount, valueSize)
+        && encoded.len() < rawData.len()
+    {
+        return typeCandidate;
     }
 
     EncodingType::Unencoded

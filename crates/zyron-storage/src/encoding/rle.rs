@@ -176,7 +176,7 @@ impl Encoding for RleEncoding {
         let runCount =
             u32::from_le_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]) as usize;
 
-        let bitmaskLen = (row_count + 7) / 8;
+        let bitmaskLen = row_count.div_ceil(8);
         let mut bitmask = vec![0u8; bitmaskLen];
         let mut rowIdx = 0usize;
         let mut pos = 8;
@@ -207,7 +207,7 @@ impl Encoding for RleEncoding {
                     };
                     above && below
                 }
-                Predicate::In(values) => values.iter().any(|v| value == *v),
+                Predicate::In(values) => values.contains(&value),
             };
 
             if matches {
@@ -235,8 +235,8 @@ impl Encoding for RleEncoding {
                         bitmask[firstByte] |= 1 << b;
                     }
                     // Set full middle bytes
-                    for byte in (firstByte + 1)..lastByte {
-                        bitmask[byte] = 0xFF;
+                    for b in &mut bitmask[(firstByte + 1)..lastByte] {
+                        *b = 0xFF;
                     }
                     // Set partial last byte
                     for b in 0..=lastBitInByte {

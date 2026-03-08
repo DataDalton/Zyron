@@ -100,7 +100,7 @@ impl Encoding for ConstantEncoding {
         }
 
         let value = &encoded[4..4 + value_size];
-        let bitmask_len = (row_count + 7) / 8;
+        let bitmask_len = row_count.div_ceil(8);
 
         let matches = match predicate {
             Predicate::Equality(target) => value == *target,
@@ -115,7 +115,7 @@ impl Encoding for ConstantEncoding {
                 };
                 above_low && below_high
             }
-            Predicate::In(values) => values.iter().any(|v| value == *v),
+            Predicate::In(values) => values.contains(&value),
         };
 
         if matches {

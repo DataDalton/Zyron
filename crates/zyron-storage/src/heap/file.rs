@@ -263,7 +263,7 @@ impl HeapFile {
         // Handle evicted dirty page
         if let Some(evicted_page) = evicted {
             self.disk
-                .write_page(evicted_page.page_id, &*evicted_page.data)
+                .write_page(evicted_page.page_id, &evicted_page.data)
                 .await?;
         }
 
@@ -290,7 +290,7 @@ impl HeapFile {
         // Handle evicted dirty page
         if let Some(evicted_page) = evicted {
             self.disk
-                .write_page(evicted_page.page_id, &*evicted_page.data)
+                .write_page(evicted_page.page_id, &evicted_page.data)
                 .await?;
         }
 
@@ -306,7 +306,7 @@ impl HeapFile {
 
         if let Some(evicted_page) = evicted {
             self.disk
-                .write_page(evicted_page.page_id, &*evicted_page.data)
+                .write_page(evicted_page.page_id, &evicted_page.data)
                 .await?;
         }
 
@@ -466,7 +466,7 @@ impl HeapFile {
                     ZyronError::IoError(format!("flush open {}: {}", path.display(), e))
                 })?;
 
-            let offset = (page_id.page_num as u64) * (PAGE_SIZE as u64);
+            let offset = page_id.page_num * (PAGE_SIZE as u64);
             std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset))
                 .map_err(|e| ZyronError::IoError(format!("flush seek: {}", e)))?;
             std::io::Write::write_all(&mut file, data)
@@ -698,19 +698,19 @@ impl HeapFile {
 
             if needs_new_page {
                 // Flush current page to buffer pool before moving on.
-                if let Some(pid) = current_page_id {
-                    if buf_active {
-                        self.flush_page_buf(
-                            pid,
-                            &mut buf,
-                            is_fresh_page,
-                            &page_header,
-                            reserved_frames,
-                            reserved_idx,
-                            &mut local_fsm_updates,
-                        )
-                        .await?;
-                    }
+                if let Some(pid) = current_page_id
+                    && buf_active
+                {
+                    self.flush_page_buf(
+                        pid,
+                        &mut buf,
+                        is_fresh_page,
+                        &page_header,
+                        reserved_frames,
+                        reserved_idx,
+                        &mut local_fsm_updates,
+                    )
+                    .await?;
                 }
 
                 // Check hint cache for an existing page with sufficient free space (lock-free).
@@ -770,19 +770,19 @@ impl HeapFile {
         }
 
         // Flush the final page.
-        if let Some(pid) = current_page_id {
-            if buf_active {
-                self.flush_page_buf(
-                    pid,
-                    &mut buf,
-                    is_fresh_page,
-                    &page_header,
-                    reserved_frames,
-                    reserved_idx,
-                    &mut local_fsm_updates,
-                )
-                .await?;
-            }
+        if let Some(pid) = current_page_id
+            && buf_active
+        {
+            self.flush_page_buf(
+                pid,
+                &mut buf,
+                is_fresh_page,
+                &page_header,
+                reserved_frames,
+                reserved_idx,
+                &mut local_fsm_updates,
+            )
+            .await?;
         }
 
         // Apply all FSM updates: hint slots atomically (lock-free), pending Vec in single lock.
@@ -801,6 +801,7 @@ impl HeapFile {
     /// For fresh pages, writes the heap header and uses reserved frames when available.
     /// For existing pages, writes through the standard write_page path.
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     async fn flush_page_buf(
         &self,
         pid: PageId,

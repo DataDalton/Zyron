@@ -7,7 +7,9 @@
 //! The hot path (append) is lock-free, making this writer scale well under
 //! concurrent load from multiple transactions.
 
-use crate::record::{LogRecordType, Lsn, record_size_for_payload, serialize_raw};
+use crate::record::{
+    LogRecordType, Lsn, backfill_checksums, record_size_for_payload, serialize_raw_deferred,
+};
 use crate::ring_buffer::RingBuffer;
 use crate::segment::{LogSegment, SegmentHeader, SegmentId};
 use crate::sequencer::LsnSequencer;
@@ -296,6 +298,7 @@ impl WalWriter {
     /// Uses std::thread::park/unpark for lightweight sleep/wake with no runtime
     /// overhead. The thread registers its handle via OnceLock so that append()
     /// can call unpark() with a single atomic load.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_flush_thread(
         ring_buffer: Arc<RingBuffer>,
         segment: Arc<Mutex<Option<LogSegment>>>,
@@ -416,10 +419,10 @@ impl WalWriter {
         // Sync old segment before switching
         {
             let mut seg_guard = segment.lock();
-            if let Some(ref mut seg) = *seg_guard {
-                if fsync_enabled {
-                    let _ = seg.sync();
-                }
+            if let Some(ref mut seg) = *seg_guard
+                && fsync_enabled
+            {
+                let _ = seg.sync();
             }
         }
 
@@ -467,6 +470,10 @@ impl WalWriter {
             return;
         }
 
+        // Compute checksums for all records in the batch before writing to disk.
+        // Deferred from append() hot path to amortize checksum cost in the flush thread.
+        backfill_checksums(batch_buffer);
+
         // Write to segment
         {
             let mut seg_guard = segment.lock();
@@ -481,16 +488,14 @@ impl WalWriter {
                     return;
                 }
 
-                if fsync_enabled {
-                    if let Err(e) = seg.sync() {
-                        eprintln!("WAL sync error: {:?}", e);
-                        flush_io_error.store(true, Ordering::Release);
-                        let (lock, condvar) = flush_done.as_ref();
-                        let mut done = lock.lock();
-                        *done = true;
-                        condvar.notify_all();
-                        return;
-                    }
+                if fsync_enabled && let Err(e) = seg.sync() {
+                    eprintln!("WAL sync error: {:?}", e);
+                    flush_io_error.store(true, Ordering::Release);
+                    let (lock, condvar) = flush_done.as_ref();
+                    let mut done = lock.lock();
+                    *done = true;
+                    condvar.notify_all();
+                    return;
                 }
             }
         }
@@ -557,7 +562,7 @@ impl WalWriter {
                     let lsn = current_lsn;
                     unsafe {
                         let buf = self.ring_buffer.write_record(record_size as usize);
-                        serialize_raw(
+                        serialize_raw_deferred(
                             buf,
                             lsn,
                             prev_lsn,
@@ -586,10 +591,10 @@ impl WalWriter {
                 continue;
             }
 
-            // Normal path: serialize directly into ring buffer
+            // Normal path: serialize into ring buffer with deferred checksum
             unsafe {
                 let buf = self.ring_buffer.write_record(record_size as usize);
-                serialize_raw(
+                serialize_raw_deferred(
                     buf,
                     lsn,
                     prev_lsn,
@@ -683,15 +688,13 @@ impl WalWriter {
             let entry = entry?;
             let path = entry.path();
 
-            if path.extension().map(|ext| ext == "wal").unwrap_or(false) {
-                if let Some(stem) = path.file_stem() {
-                    if let Ok(id) = stem.to_string_lossy().parse::<u32>() {
-                        if id < checkpoint_segment_id {
-                            std::fs::remove_file(&path)?;
-                            deleted += 1;
-                        }
-                    }
-                }
+            if path.extension().map(|ext| ext == "wal").unwrap_or(false)
+                && let Some(stem) = path.file_stem()
+                && let Ok(id) = stem.to_string_lossy().parse::<u32>()
+                && id < checkpoint_segment_id
+            {
+                std::fs::remove_file(&path)?;
+                deleted += 1;
             }
         }
 
@@ -804,7 +807,7 @@ impl WalWriter {
 
                 unsafe {
                     let buf_ptr = buf_start.add(buf_offset as usize);
-                    serialize_raw(
+                    serialize_raw_deferred(
                         buf_ptr,
                         record_lsn,
                         Lsn::INVALID,

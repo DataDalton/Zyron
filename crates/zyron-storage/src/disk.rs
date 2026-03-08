@@ -78,6 +78,7 @@ impl DiskManager {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&path)
             .await?;
 
@@ -113,7 +114,7 @@ impl DiskManager {
             )));
         }
 
-        let offset = (page_id.page_num as u64) * (PAGE_SIZE as u64);
+        let offset = page_id.page_num * (PAGE_SIZE as u64);
         handle.file.seek(std::io::SeekFrom::Start(offset)).await?;
 
         let mut buffer = [0u8; PAGE_SIZE];
@@ -134,7 +135,7 @@ impl DiskManager {
 
         let mut handle = entry.get().lock().await;
 
-        let offset = (page_id.page_num as u64) * (PAGE_SIZE as u64);
+        let offset = page_id.page_num * (PAGE_SIZE as u64);
         handle.file.seek(std::io::SeekFrom::Start(offset)).await?;
         handle.file.write_all(data).await?;
 

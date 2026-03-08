@@ -91,7 +91,7 @@ impl Encoding for FsstEncoding {
         };
 
         let totalOffsetBits = row_count as u64 * offsetBitWidth as u64;
-        let packedOffsetBytes = ((totalOffsetBits + 7) / 8) as usize;
+        let packedOffsetBytes = (totalOffsetBits as usize).div_ceil(8);
         let mut packedOffsets = vec![0u8; packedOffsetBytes];
 
         for (i, &len) in rowLengths.iter().enumerate() {
@@ -183,7 +183,7 @@ impl Encoding for FsstEncoding {
 
         // Read bit-packed delta offsets (per-row compressed lengths)
         let totalOffsetBits = row_count as u64 * offsetBitWidth as u64;
-        let packedOffsetBytes = ((totalOffsetBits + 7) / 8) as usize;
+        let packedOffsetBytes = (totalOffsetBits as usize).div_ceil(8);
         let offsetsStart = pos;
         let offsetsEnd = offsetsStart + packedOffsetBytes;
 
@@ -263,7 +263,7 @@ impl Encoding for FsstEncoding {
                     }
                     // Length from separate L1-hot array, data from packed table
                     let symLen = unsafe { *symLenPtr.add(code) } as usize;
-                    let entry = unsafe { &*(symTablePtr.add(code) as *const [u8; 16]) };
+                    let entry = unsafe { &*symTablePtr.add(code) };
                     // u64 write covers all symbols (max 8 bytes).
                     if writePos + 8 <= outSize {
                         unsafe {
@@ -314,70 +314,70 @@ impl Encoding for FsstEncoding {
 
         // For equality predicates, compress the search term with the same
         // symbol table and compare compressed bytes directly.
-        if let Predicate::Equality(target) = predicate {
-            if encoded.len() >= 14 {
-                let symbolCount =
-                    u32::from_le_bytes([encoded[8], encoded[9], encoded[10], encoded[11]]) as usize;
-                let offsetBitWidth = encoded[12];
+        if let Predicate::Equality(target) = predicate
+            && encoded.len() >= 14
+        {
+            let symbolCount =
+                u32::from_le_bytes([encoded[8], encoded[9], encoded[10], encoded[11]]) as usize;
+            let offsetBitWidth = encoded[12];
 
-                // Read symbol table
-                let mut pos = 14;
-                let mut symbolTable: Vec<Vec<u8>> = Vec::with_capacity(symbolCount);
-                let mut tableOk = true;
-                for _ in 0..symbolCount {
-                    if pos >= encoded.len() {
-                        tableOk = false;
-                        break;
-                    }
-                    let len = encoded[pos] as usize;
-                    pos += 1;
-                    if pos + len > encoded.len() {
-                        tableOk = false;
-                        break;
-                    }
-                    symbolTable.push(encoded[pos..pos + len].to_vec());
-                    pos += len;
+            // Read symbol table
+            let mut pos = 14;
+            let mut symbolTable: Vec<Vec<u8>> = Vec::with_capacity(symbolCount);
+            let mut tableOk = true;
+            for _ in 0..symbolCount {
+                if pos >= encoded.len() {
+                    tableOk = false;
+                    break;
                 }
+                let len = encoded[pos] as usize;
+                pos += 1;
+                if pos + len > encoded.len() {
+                    tableOk = false;
+                    break;
+                }
+                symbolTable.push(encoded[pos..pos + len].to_vec());
+                pos += len;
+            }
 
-                if tableOk {
-                    // Compress the search term with the same symbol table
-                    let mut compressedTarget = Vec::new();
-                    compress_string(target, &symbolTable, symbolCount, &mut compressedTarget);
+            if tableOk {
+                // Compress the search term with the same symbol table
+                let mut compressedTarget = Vec::new();
+                compress_string(target, &symbolTable, symbolCount, &mut compressedTarget);
 
-                    // Read bit-packed offsets
-                    let totalOffsetBits = row_count as u64 * offsetBitWidth as u64;
-                    let packedOffsetBytes = ((totalOffsetBits + 7) / 8) as usize;
-                    let offsetsStart = pos;
-                    let offsetsEnd = offsetsStart + packedOffsetBytes;
+                // Read bit-packed offsets
+                let totalOffsetBits = row_count as u64 * offsetBitWidth as u64;
+                let packedOffsetBytes = (totalOffsetBits as usize).div_ceil(8);
+                let offsetsStart = pos;
+                let offsetsEnd = offsetsStart + packedOffsetBytes;
 
-                    if offsetsEnd <= encoded.len() {
-                        let packedOffsets = &encoded[offsetsStart..offsetsEnd];
-                        let compressedStart = offsetsEnd;
-                        let compressed = &encoded[compressedStart..];
+                if offsetsEnd <= encoded.len() {
+                    let packedOffsets = &encoded[offsetsStart..offsetsEnd];
+                    let compressedStart = offsetsEnd;
+                    let compressed = &encoded[compressedStart..];
 
-                        let bitmaskLen = (row_count + 7) / 8;
-                        let mut bitmask = vec![0u8; bitmaskLen];
-                        let mut cursor = 0usize;
+                    let bitmaskLen = row_count.div_ceil(8);
+                    let mut bitmask = vec![0u8; bitmaskLen];
+                    let mut cursor = 0usize;
 
-                        for i in 0..row_count {
-                            let len = unpack_bits(
-                                packedOffsets,
-                                i as u64 * offsetBitWidth as u64,
-                                offsetBitWidth,
-                            ) as usize;
-                            let end = cursor + len;
+                    for i in 0..row_count {
+                        let len = unpack_bits(
+                            packedOffsets,
+                            i as u64 * offsetBitWidth as u64,
+                            offsetBitWidth,
+                        ) as usize;
+                        let end = cursor + len;
 
-                            if end <= compressed.len() {
-                                let rowCompressed = &compressed[cursor..end];
-                                if rowCompressed == compressedTarget.as_slice() {
-                                    bitmask[i / 8] |= 1 << (i % 8);
-                                }
+                        if end <= compressed.len() {
+                            let rowCompressed = &compressed[cursor..end];
+                            if rowCompressed == compressedTarget.as_slice() {
+                                bitmask[i / 8] |= 1 << (i % 8);
                             }
-                            cursor = end;
                         }
-
-                        return Ok(bitmask);
+                        cursor = end;
                     }
+
+                    return Ok(bitmask);
                 }
             }
         }
@@ -666,7 +666,7 @@ fn pack_bits(packed: &mut [u8], bit_offset: u64, value: u64, bit_width: u8) {
     let shifted = val << bitIdx;
     let shiftedBytes = shifted.to_le_bytes();
     let totalBits = bitIdx + bit_width as u32;
-    let bytesNeeded = ((totalBits + 7) / 8) as usize;
+    let bytesNeeded = (totalBits as usize).div_ceil(8);
 
     for j in 0..bytesNeeded.min(8) {
         if byteIdx + j < packed.len() {

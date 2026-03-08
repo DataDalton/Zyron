@@ -1,381 +1,169 @@
-//! Write buffer with Swiss Tables hash table for B+Tree.
+//! Write buffer with partitioned key-space for B+Tree.
 
 use super::arena_index::BTreeArenaIndex;
-use super::constants::{
-    CTRL_DELETED, CTRL_EMPTY, GROUP_SIZE, HASH_TABLE_SIZE, WRITE_BUFFER_CAPACITY,
-};
+use super::constants::WRITE_BUFFER_CAPACITY;
 use super::types::InsertStats;
 use crate::tuple::TupleId;
-use std::simd::prelude::*;
+use std::cell::Cell;
 use zyron_common::Result;
 
-/// LSD radix sort on (key, value) pairs by key, using 8-bit passes.
-/// For N=65536 elements: O(8N) work with 256-entry (1KB) count arrays that stay in L1.
-/// Roughly 10x faster than comparison sort for this workload.
-///
-/// After sorting, pairs are in output. scratch is used as auxiliary storage.
-/// Both buffers must have at least n slots available (len >= n).
-#[inline]
-fn radix_sort_pairs(output: &mut Vec<(u64, u64)>, scratch: &mut Vec<(u64, u64)>) {
-    let n = output.len();
-    if n <= 1 {
-        return;
-    }
+const NUM_PARTITIONS: usize = 256;
 
-    scratch.resize(n, (0, 0));
-
-    // Detect how many 8-bit passes are needed based on the maximum key.
-    // Skips high-byte passes when keys fit in fewer bytes (common case: keys < 16M = 3 bytes).
-    let max_key = output.iter().map(|&(k, _)| k).max().unwrap_or(0);
-    let passes = if max_key == 0 {
-        1
-    } else {
-        let bits = 64 - max_key.leading_zeros() as usize;
-        (bits + 7) / 8
-    };
-
-    let mut counts = [0u32; 256];
-
-    for pass in 0..passes {
-        let shift = pass * 8;
-
-        // Count occurrences of each byte value at this position.
-        counts.fill(0);
-        for &(k, _) in output.iter() {
-            counts[((k >> shift) & 0xFF) as usize] += 1;
-        }
-
-        // Convert counts to start offsets (prefix sum).
-        let mut offset = 0u32;
-        for c in counts.iter_mut() {
-            let tmp = *c;
-            *c = offset;
-            offset += tmp;
-        }
-
-        // Scatter elements into scratch in stable sorted order for this byte.
-        for &entry in output.iter() {
-            let bucket = ((entry.0 >> shift) & 0xFF) as usize;
-            scratch[counts[bucket] as usize] = entry;
-            counts[bucket] += 1;
-        }
-
-        // Swap: scratch becomes the new output for the next pass.
-        // After each swap, output always holds the most recently sorted data.
-        std::mem::swap(output, scratch);
-    }
+/// Partition index from the top 8 bits of a u64 key.
+#[inline(always)]
+fn partition_of(key: u64) -> usize {
+    (key >> 56) as usize
 }
 
-/// Swiss Tables-style hash table with control bytes.
-/// Uses 32-way parallel control byte comparison via portable SIMD.
+/// Partitioned write buffer. Divides the key space into 256 partitions
+/// based on the top 8 bits of each key. Each partition is a Vec that stays
+/// small enough to fit in L1/L2 cache during sort and scan operations.
 ///
-/// Memory layout:
-/// - ctrl: 1 byte per slot (h2 hash or empty/deleted marker)
-/// - entries: (key, value) pair per slot, co-located in memory
-///
-/// AoS layout: key and value share a cache line, so a single cache miss
-/// loads both. Probe control bytes first, compare full key+value on match.
-#[repr(C, align(32))]
-struct SwissTable {
-    /// Control bytes: h2 (7-bit hash) or CTRL_EMPTY/CTRL_DELETED.
-    ctrl: Box<[u8]>,
-    /// (key, packed_tuple_id) pairs. AoS keeps key and value in the same cache line.
-    entries: Box<[(u64, u64)]>,
-    /// Number of entries.
+/// Insert: ~3-5ns (Vec push into a small partition, cache-hot).
+/// Search: linear scan of one partition (~512 entries average).
+/// Flush: sort each partition independently, concatenate in order (globally sorted).
+struct PartitionedBuffer {
+    /// 256 partitions, each a Vec<(key, packed_tuple_id)>.
+    partitions: Vec<Vec<(u64, u64)>>,
+    /// Total entry count across all partitions.
     len: usize,
+    /// Minimum key currently in the buffer. u64::MAX when empty.
+    min_key: u64,
+    /// Maximum key currently in the buffer. 0 when empty.
+    max_key: u64,
+    /// Whether all partitions are sorted (enables binary search).
+    /// Uses Cell for interior mutability so search() can take &self.
+    sorted: Cell<bool>,
 }
 
-impl SwissTable {
-    /// Creates a new empty hash table.
+impl PartitionedBuffer {
     fn new() -> Self {
+        let cap_per_partition = WRITE_BUFFER_CAPACITY / NUM_PARTITIONS + 1;
+        let partitions = (0..NUM_PARTITIONS)
+            .map(|_| Vec::with_capacity(cap_per_partition))
+            .collect();
         Self {
-            ctrl: vec![CTRL_EMPTY; HASH_TABLE_SIZE].into_boxed_slice(),
-            entries: vec![(0u64, 0u64); HASH_TABLE_SIZE].into_boxed_slice(),
+            partitions,
             len: 0,
+            min_key: u64::MAX,
+            max_key: 0,
+            sorted: Cell::new(true),
         }
     }
 
-    /// Primary hash (h1) - determines slot index.
-    #[inline(always)]
-    fn h1(hash: u64) -> usize {
-        hash as usize & (HASH_TABLE_SIZE - 1)
-    }
-
-    /// Secondary hash (h2) - 7-bit control byte value (0-127).
-    #[inline(always)]
-    fn h2(hash: u64) -> u8 {
-        // Use top 7 bits for h2 (different bits than h1)
-        ((hash >> 57) & 0x7F) as u8
-    }
-
-    /// Full hash using FxHash-style multiply-XOR.
-    /// Faster than Fibonacci for random input while maintaining good distribution.
-    #[inline(always)]
-    fn hash(key: u64) -> u64 {
-        // FxHash constant: highly non-linear mixing
-        const K: u64 = 0x517cc1b727220a95;
-        key.wrapping_mul(K)
-    }
-
-    /// Returns the number of entries.
     #[inline(always)]
     fn len(&self) -> usize {
         self.len
     }
 
-    /// Returns true if at capacity.
     #[inline(always)]
     fn is_full(&self) -> bool {
         self.len >= WRITE_BUFFER_CAPACITY
     }
 
-    /// SIMD search using control bytes. Compares 32 control bytes at once.
+    /// Search for a key using linear scan within its partition.
+    /// Takes &self to allow concurrent reads without exclusive access.
     #[inline(always)]
     fn search(&self, key: u64) -> Option<u64> {
-        let hash = Self::hash(key);
-        let h1 = Self::h1(hash);
-        let h2 = Self::h2(hash);
-
-        // Create SIMD vector of h2 for comparison
-        let h2_vec: Simd<u8, GROUP_SIZE> = Simd::splat(h2);
-        let empty_vec: Simd<u8, GROUP_SIZE> = Simd::splat(CTRL_EMPTY);
-
-        let mut group_idx = h1 & !(GROUP_SIZE - 1);
-        let start_group = group_idx;
-
-        loop {
-            // Load 32 control bytes at once
-            let ctrl_slice = &self.ctrl[group_idx..group_idx + GROUP_SIZE];
-            let ctrl_vec = Simd::from_slice(ctrl_slice);
-
-            // Find slots with matching h2 (potential key matches)
-            let match_mask = ctrl_vec.simd_eq(h2_vec);
-
-            // Check each potential match
-            let mut bits = match_mask.to_bitmask();
-            while bits != 0 {
-                let lane = bits.trailing_zeros() as usize;
-                let slot = group_idx + lane;
-
-                // Compare full key only on h2 match. AoS: key and value load together.
-                let (k, v) = self.entries[slot];
-                if k == key {
-                    return Some(v);
-                }
-
-                bits &= bits - 1; // Clear lowest set bit
-            }
-
-            // Check for empty slots (key definitely not present)
-            let empty_mask = ctrl_vec.simd_eq(empty_vec);
-            if empty_mask.any() {
-                return None;
-            }
-
-            // Move to next group
-            group_idx = (group_idx + GROUP_SIZE) & (HASH_TABLE_SIZE - 1);
-
-            // Full table scan completed
-            if group_idx == start_group {
-                return None;
+        let p = partition_of(key);
+        let partition = &self.partitions[p];
+        // Linear scan of the partition. Each partition averages ~512 entries,
+        // so scanning is ~200ns worst case. Avoids requiring &mut self for
+        // sort-based binary search, which would serialize all reads behind a mutex.
+        let mut last_val = None;
+        for &(k, v) in partition.iter() {
+            if k == key {
+                last_val = Some(v);
             }
         }
+        last_val
     }
 
-    /// Insert a key-value pair using SIMD group-based probing.
-    /// Pure SIMD path without branching fast-paths for consistent performance.
+    /// Insert a key-value pair. Duplicates are resolved at flush time
+    /// (last write wins) to keep the insert path O(1).
     #[inline(always)]
     fn insert(&mut self, key: u64, value: u64) {
-        let hash = Self::hash(key);
-        let h1 = Self::h1(hash);
-        let h2 = Self::h2(hash);
-
-        let h2_vec: Simd<u8, GROUP_SIZE> = Simd::splat(h2);
-        let empty_vec: Simd<u8, GROUP_SIZE> = Simd::splat(CTRL_EMPTY);
-
-        let mut group_idx = h1 & !(GROUP_SIZE - 1);
-        let start_group = group_idx;
-
-        loop {
-            let ctrl_slice = &self.ctrl[group_idx..group_idx + GROUP_SIZE];
-            let ctrl_vec = Simd::from_slice(ctrl_slice);
-
-            // Check for existing key (same h2, then compare full key)
-            let match_mask = ctrl_vec.simd_eq(h2_vec);
-            let mut bits = match_mask.to_bitmask();
-            while bits != 0 {
-                let lane = bits.trailing_zeros() as usize;
-                let slot = group_idx + lane;
-                if self.entries[slot].0 == key {
-                    self.entries[slot].1 = value;
-                    return;
-                }
-                bits &= bits - 1;
-            }
-
-            // Find first empty slot in this group
-            let empty_mask = ctrl_vec.simd_eq(empty_vec);
-            if empty_mask.any() {
-                let bits = empty_mask.to_bitmask();
-                let lane = bits.trailing_zeros() as usize;
-                let slot = group_idx + lane;
-                self.ctrl[slot] = h2;
-                self.entries[slot] = (key, value);
-                self.len += 1;
-                return;
-            }
-
-            group_idx = (group_idx + GROUP_SIZE) & (HASH_TABLE_SIZE - 1);
-            assert!(
-                group_idx != start_group,
-                "SwissTable insert: all slots occupied, no empty slot found"
-            );
-        }
-    }
-
-    /// Drains all occupied slots into output, sorted by key using LSD radix sort.
-    /// Resets ctrl bytes to CTRL_EMPTY and len to 0.
-    /// output and scratch are reused across calls to avoid per-flush allocation.
-    ///
-    /// Uses 32-wide SIMD to scan control bytes, checking 32 slots at once.
-    /// For 131K slots this reduces the scan from 131K scalar comparisons to
-    /// ~4K SIMD operations plus a handful of scalar extractions per group.
-    fn drain_sorted_into(&mut self, output: &mut Vec<(u64, u64)>, scratch: &mut Vec<(u64, u64)>) {
-        output.clear();
-
-        let empty_vec: Simd<u8, GROUP_SIZE> = Simd::splat(CTRL_EMPTY);
-        let deleted_vec: Simd<u8, GROUP_SIZE> = Simd::splat(CTRL_DELETED);
-
-        let mut i = 0;
-        while i < HASH_TABLE_SIZE {
-            let ctrl_slice = &self.ctrl[i..i + GROUP_SIZE];
-            let ctrl_vec = Simd::from_slice(ctrl_slice);
-
-            // A slot is occupied when it is neither EMPTY nor DELETED.
-            let empty_mask = ctrl_vec.simd_eq(empty_vec);
-            let deleted_mask = ctrl_vec.simd_eq(deleted_vec);
-            let vacant_mask = empty_mask | deleted_mask;
-            let occupied_bits = (!vacant_mask).to_bitmask();
-
-            if occupied_bits != 0 {
-                let mut bits = occupied_bits;
-                while bits != 0 {
-                    let lane = bits.trailing_zeros() as usize;
-                    let slot = i + lane;
-                    output.push(self.entries[slot]);
-                    bits &= bits - 1;
-                }
-
-                // Bulk-reset this group's ctrl bytes to EMPTY.
-                empty_vec.copy_to_slice(&mut self.ctrl[i..i + GROUP_SIZE]);
-            }
-
-            i += GROUP_SIZE;
-        }
-
-        self.len = 0;
-        radix_sort_pairs(output, scratch);
-    }
-
-    /// Returns an iterator over (key, packed_tuple_id) pairs (unsorted).
-    fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
-        (0..HASH_TABLE_SIZE)
-            .filter(move |&i| self.ctrl[i] != CTRL_EMPTY && self.ctrl[i] != CTRL_DELETED)
-            .map(move |i| self.entries[i])
-    }
-}
-
-/// Write buffer using Swiss Tables-style hash table.
-/// Provides O(1) insert and lookup with 32-way parallel control byte comparison.
-struct WriteBuffer {
-    table: SwissTable,
-    /// Minimum key currently in the buffer. u64::MAX when empty.
-    min_key: u64,
-    /// Maximum key currently in the buffer. 0 when empty.
-    max_key: u64,
-}
-
-impl WriteBuffer {
-    /// Creates a new write buffer.
-    fn new() -> Self {
-        Self {
-            table: SwissTable::new(),
-            min_key: u64::MAX,
-            max_key: 0,
-        }
-    }
-
-    /// Returns true if buffer is at capacity.
-    #[inline(always)]
-    fn is_full(&self) -> bool {
-        self.table.is_full()
-    }
-
-    /// Returns the number of entries.
-    #[inline(always)]
-    fn len(&self) -> usize {
-        self.table.len()
-    }
-
-    /// O(1) lookup with 32-way SIMD control byte comparison.
-    #[inline(always)]
-    fn search(&self, key: u64) -> Option<u64> {
-        self.table.search(key)
-    }
-
-    /// O(1) insert a key-value pair. Updates min/max key bounds.
-    #[inline(always)]
-    fn insert(&mut self, key: u64, packed_tuple_id: u64) {
         if key < self.min_key {
             self.min_key = key;
         }
         if key > self.max_key {
             self.max_key = key;
         }
-        self.table.insert(key, packed_tuple_id);
+        let p = partition_of(key);
+        self.partitions[p].push((key, value));
+        self.len += 1;
+        self.sorted.set(false);
     }
 
-    /// Drains into caller-provided buffers, sorted by key. Resets min/max key bounds.
-    /// output receives sorted entries, scratch is used as auxiliary storage.
-    fn drain_sorted_into(&mut self, output: &mut Vec<(u64, u64)>, scratch: &mut Vec<(u64, u64)>) {
+    /// Drains all partitions into output, globally sorted by key.
+    /// Each partition is sorted independently, then concatenated in partition
+    /// order (since partition i contains keys with top 8 bits = i, the
+    /// concatenation is globally sorted).
+    fn drain_sorted_into(&mut self, output: &mut Vec<(u64, u64)>) {
+        output.clear();
+        output.reserve(self.len);
+
+        for partition in self.partitions.iter_mut() {
+            if partition.is_empty() {
+                continue;
+            }
+            partition.sort_unstable_by_key(|&(k, _)| k);
+            // Dedup: for duplicate keys, keep the last inserted value.
+            // After sort_unstable, duplicates are adjacent. Walk backwards
+            // through each group to find the last-inserted entry (highest
+            // original index, which sort_unstable preserves as rightmost).
+            let start = output.len();
+            output.extend_from_slice(partition);
+            let slice = &mut output[start..];
+            if slice.len() > 1 {
+                let mut write = 0;
+                for read in 1..slice.len() {
+                    if slice[read].0 == slice[write].0 {
+                        // Duplicate key: keep the later one (last write wins)
+                        slice[write] = slice[read];
+                    } else {
+                        write += 1;
+                        slice[write] = slice[read];
+                    }
+                }
+                let new_len = start + write + 1;
+                output.truncate(new_len);
+            }
+            partition.clear();
+        }
+
+        self.len = 0;
         self.min_key = u64::MAX;
         self.max_key = 0;
-        self.table.drain_sorted_into(output, scratch);
+        self.sorted.set(true);
     }
 
-    /// Returns an iterator over (key, packed_tuple_id) pairs (unsorted, for range scans).
+    /// Returns an iterator over all (key, packed_tuple_id) pairs (unsorted).
     fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
-        self.table.iter()
+        self.partitions.iter().flat_map(|p| p.iter().copied())
     }
 }
 
 /// Buffered B+Tree index with write buffer for high insert throughput.
 ///
 /// Architecture:
-/// - Writes go to an in-memory write buffer (~100ns insert)
+/// - Writes go to an in-memory partitioned write buffer (~3-5ns insert)
 /// - When buffer is full, entries are bulk-merged into the B+Tree
 /// - Reads check the write buffer first, then the B+Tree
 /// - B+Tree uses 32KB nodes for shallow height (height=2 for 1M keys)
-///
-/// Performance characteristics:
-/// - Insert: ~100ns (buffer insert with binary search)
-/// - Lookup: ~80ns (buffer check + B+Tree search)
-/// - Range scan: Merges results from buffer and B+Tree
 pub struct BufferedBTreeIndex {
     /// The underlying B+Tree (read-optimized with 32KB nodes).
     btree: BTreeArenaIndex,
     /// Write buffer for absorbing inserts.
-    buffer: WriteBuffer,
-    /// Fast empty-check flag. Avoids HashMap.len() call on every search.
+    buffer: PartitionedBuffer,
+    /// Fast empty-check flag.
     buffer_has_data: bool,
     /// Performance statistics for profiling.
     stats: InsertStats,
-    /// Tombstone set for deleted keys. Keys added here are invisible to search and range_scan.
+    /// Tombstone set for deleted keys.
     deleted: std::collections::HashSet<u64>,
-    /// Reusable drain output buffer. Pre-allocated to WRITE_BUFFER_CAPACITY to eliminate per-flush allocation.
+    /// Reusable drain output buffer.
     drain_buf: Vec<(u64, u64)>,
-    /// Reusable radix sort scratch buffer. Same capacity as drain_buf.
-    drain_scratch: Vec<(u64, u64)>,
 }
 
 impl BufferedBTreeIndex {
@@ -384,12 +172,11 @@ impl BufferedBTreeIndex {
     pub fn new(capacity_nodes: usize) -> Self {
         Self {
             btree: BTreeArenaIndex::new(capacity_nodes),
-            buffer: WriteBuffer::new(),
+            buffer: PartitionedBuffer::new(),
             buffer_has_data: false,
             stats: InsertStats::default(),
             deleted: std::collections::HashSet::new(),
             drain_buf: Vec::with_capacity(WRITE_BUFFER_CAPACITY),
-            drain_scratch: Vec::with_capacity(WRITE_BUFFER_CAPACITY),
         }
     }
 
@@ -420,17 +207,16 @@ impl BufferedBTreeIndex {
     pub fn search(&self, key: &[u8]) -> Option<TupleId> {
         let search_key = self.key_to_u64(key);
 
-        // Tombstone check: deleted keys are invisible regardless of where they are stored.
+        // Tombstone check
         if !self.deleted.is_empty() && self.deleted.contains(&search_key) {
             return None;
         }
 
-        // Fast path: skip buffer check when empty (common after flush)
-        // Uses bool flag instead of HashMap.len() for ~15ns savings
-        if self.buffer_has_data {
-            if let Some(packed) = self.buffer.search(search_key) {
-                return Some(BTreeArenaIndex::unpack_tuple_id(packed));
-            }
+        // Check write buffer first
+        if self.buffer_has_data
+            && let Some(packed) = self.buffer.search(search_key)
+        {
+            return Some(BTreeArenaIndex::unpack_tuple_id(packed));
         }
 
         // Fall through to B+Tree
@@ -439,42 +225,31 @@ impl BufferedBTreeIndex {
 
     /// Insert a key-value pair.
     /// Goes to write buffer first; flushes to B+Tree when buffer is full.
-    /// Clears any tombstone for this key so re-inserted keys become visible.
     #[inline(always)]
     pub fn insert(&mut self, key: &[u8], tuple_id: TupleId) -> Result<()> {
-        // Check if buffer is full and needs flush (rare case)
         if self.buffer.is_full() {
             self.flush_buffer()?;
         }
 
-        // Convert key and pack tuple_id
         let search_key = self.key_to_u64(key);
         let packed = BTreeArenaIndex::pack_tuple_id(tuple_id);
 
-        // Remove tombstone if this key was previously deleted.
         if !self.deleted.is_empty() {
             self.deleted.remove(&search_key);
         }
 
-        // Insert into buffer and mark as non-empty
         self.buffer.insert(search_key, packed);
         self.buffer_has_data = true;
         Ok(())
     }
 
     /// Delete a key by adding it to the tombstone set.
-    ///
-    /// Tombstoned keys are invisible to search and range_scan. The underlying
-    /// arena node is not modified; space is reclaimed when the index is rebuilt.
-    /// Returns true if the key was newly tombstoned (false if already deleted).
     pub fn delete(&mut self, key: &[u8]) -> bool {
         let search_key = self.key_to_u64(key);
         self.deleted.insert(search_key)
     }
 
     /// Flush write buffer to B+Tree.
-    /// Drains and radix-sorts buffer entries, then bulk inserts into the tree.
-    /// drain_buf and drain_scratch are reused across flushes to avoid per-flush allocation.
     fn flush_buffer(&mut self) -> Result<()> {
         if !self.buffer_has_data {
             return Ok(());
@@ -482,16 +257,12 @@ impl BufferedBTreeIndex {
 
         let flush_start = std::time::Instant::now();
 
-        // Drain and radix-sort entries for sequential B+Tree insertion.
-        // drain_buf and drain_scratch are reused (no heap allocation after first flush).
-        self.buffer
-            .drain_sorted_into(&mut self.drain_buf, &mut self.drain_scratch);
+        // Drain and sort entries for sequential B+Tree insertion.
+        self.buffer.drain_sorted_into(&mut self.drain_buf);
 
-        // Bulk insert into arena. When no deletes are pending, pass sorted entries
-        // directly from drain_buf. Only allocate a filtered copy when needed.
+        // Bulk insert into arena.
         if self.deleted.is_empty() {
-            let entries = &self.drain_buf;
-            self.btree.insert_bulk_sorted(entries)?;
+            self.btree.insert_bulk_sorted(&self.drain_buf)?;
         } else {
             let filtered: Vec<(u64, u64)> = self
                 .drain_buf
@@ -502,11 +273,9 @@ impl BufferedBTreeIndex {
             self.btree.insert_bulk_sorted(&filtered)?;
         }
 
-        // Update stats
         self.stats.flush_count += 1;
         self.stats.flush_time_ns += flush_start.elapsed().as_nanos() as u64;
 
-        // Mark buffer as empty
         self.buffer_has_data = false;
         Ok(())
     }
@@ -517,12 +286,8 @@ impl BufferedBTreeIndex {
     }
 
     /// Range scan from start_key to end_key (inclusive).
-    /// Returns packed (key, packed_tuple_id) pairs. Use `BTreeArenaIndex::unpack_tuple_id()`
-    /// to decode packed_tuple_id into TupleId when needed.
-    /// Merges results from write buffer and B+Tree, filtering tombstoned keys.
     #[inline]
     pub fn range_scan(&self, start_key: Option<&[u8]>, end_key: Option<&[u8]>) -> Vec<(u64, u64)> {
-        // Fast path: skip merge when buffer is empty (common after flush)
         if !self.buffer_has_data {
             let mut results = self.btree.range_scan(start_key, end_key);
             if !self.deleted.is_empty() {
@@ -534,11 +299,8 @@ impl BufferedBTreeIndex {
         let start = start_key.map(|k| self.key_to_u64(k)).unwrap_or(0);
         let end = end_key.map(|k| self.key_to_u64(k)).unwrap_or(u64::MAX);
 
-        // Get results from B+Tree (already sorted, packed)
         let btree_results = self.btree.range_scan(start_key, end_key);
 
-        // Get results from buffer that fall in range (exclude tombstoned), then sort.
-        // Skip the full table scan if the buffer's key range does not overlap [start, end].
         let mut buffer_results: Vec<(u64, u64)> =
             if self.buffer.min_key <= end && self.buffer.max_key >= start {
                 self.buffer
@@ -550,7 +312,6 @@ impl BufferedBTreeIndex {
             };
         buffer_results.sort_unstable_by_key(|(k, _)| *k);
 
-        // Merge sorted results (buffer entries override B+Tree for same key)
         let mut merged = Vec::with_capacity(btree_results.len() + buffer_results.len());
         let mut btree_iter = btree_results.into_iter().peekable();
         let mut buffer_iter = buffer_results.into_iter().peekable();
@@ -563,7 +324,6 @@ impl BufferedBTreeIndex {
                     } else if bk > bufk {
                         merged.push(buffer_iter.next().unwrap());
                     } else {
-                        // Same key: buffer wins (more recent)
                         btree_iter.next();
                         merged.push(buffer_iter.next().unwrap());
                     }
@@ -578,7 +338,6 @@ impl BufferedBTreeIndex {
             }
         }
 
-        // Filter tombstoned entries from B+Tree results that made it into the merge.
         if !self.deleted.is_empty() {
             merged.retain(|(k, _)| !self.deleted.contains(k));
         }

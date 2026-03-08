@@ -30,14 +30,13 @@ impl WalReader {
                 let entry = entry?;
                 let path = entry.path();
 
-                if path.extension().map(|e| e == "wal").unwrap_or(false) {
-                    if let Some(stem) = path.file_stem() {
-                        if let Ok(id) = stem.to_string_lossy().parse::<u32>() {
-                            let sid = SegmentId(id);
-                            let data = SyncLogSegment::read_all(&path)?;
-                            segment_data.insert(sid, data);
-                        }
-                    }
+                if path.extension().map(|e| e == "wal").unwrap_or(false)
+                    && let Some(stem) = path.file_stem()
+                    && let Ok(id) = stem.to_string_lossy().parse::<u32>()
+                {
+                    let sid = SegmentId(id);
+                    let data = SyncLogSegment::read_all(&path)?;
+                    segment_data.insert(sid, data);
                 }
             }
         }
@@ -66,6 +65,36 @@ impl WalReader {
     /// Returns total cached data bytes across all segments.
     fn total_data_bytes(&self) -> usize {
         self.segment_data.values().map(|d| d.len()).sum()
+    }
+
+    /// Scans all records without checksum verification. For trusted data
+    /// paths where records were just written (not crash recovery).
+    #[inline]
+    pub fn scan_all_trusted(&self) -> Vec<LogRecord> {
+        let first_id = match self.first_segment_id() {
+            Some(id) => id,
+            None => return Vec::new(),
+        };
+
+        let estimated_records = (self.total_data_bytes() / 48).max(64);
+        let mut results = Vec::with_capacity(estimated_records);
+
+        let mut current_segment_id = Some(first_id);
+
+        while let Some(seg_id) = current_segment_id {
+            if let Some(data) = self.segment_data.get(&seg_id) {
+                if !data.is_empty() {
+                    let segment_records = LogRecord::parse_all_trusted(data.clone());
+                    results.extend(segment_records);
+                }
+
+                current_segment_id = Some(seg_id.next());
+            } else {
+                break;
+            }
+        }
+
+        results
     }
 
     /// Scans all records in the WAL.
@@ -231,14 +260,13 @@ impl WalReader {
             let entry = entry?;
             let path = entry.path();
 
-            if path.extension().map(|e| e == "wal").unwrap_or(false) {
-                if let Some(stem) = path.file_stem() {
-                    if let Ok(id) = stem.to_string_lossy().parse::<u32>() {
-                        let sid = SegmentId(id);
-                        let data = SyncLogSegment::read_all(&path)?;
-                        self.segment_data.insert(sid, data);
-                    }
-                }
+            if path.extension().map(|e| e == "wal").unwrap_or(false)
+                && let Some(stem) = path.file_stem()
+                && let Ok(id) = stem.to_string_lossy().parse::<u32>()
+            {
+                let sid = SegmentId(id);
+                let data = SyncLogSegment::read_all(&path)?;
+                self.segment_data.insert(sid, data);
             }
         }
 

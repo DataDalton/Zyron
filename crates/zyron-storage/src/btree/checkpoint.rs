@@ -121,11 +121,7 @@ pub fn write_checkpoint_from_store(
 
     {
         let mut cur = first_leaf;
-        loop {
-            let pd = match store.get(cur) {
-                Some(d) => d,
-                None => break,
-            };
+        while let Some(pd) = store.get(cur) {
             let ns = u16::from_le_bytes([pd[ho], pd[ho + 1]]);
             if leaf_pages.is_empty() && ns > 0 {
                 let e0_off =
@@ -180,11 +176,7 @@ pub fn write_checkpoint_from_store(
     let data_size = prefix_len + n * suffix_len + n * 6;
     let total_size = ZYIDX_HEADER_SIZE + data_size;
 
-    // Allocate output buffer without zeroing.
-    let mut buf = Vec::with_capacity(total_size);
-    unsafe {
-        buf.set_len(total_size);
-    }
+    let mut buf = vec![0u8; total_size];
     let bp = buf.as_mut_ptr();
 
     // Header
@@ -265,7 +257,7 @@ fn write_empty_checkpoint(path: &Path, checkpoint_lsn: u64, fsync: bool) -> Resu
     buf[12..20].copy_from_slice(&checkpoint_lsn.to_le_bytes());
     let checksum = checkpoint_checksum(&buf[..28], &[]);
     buf[28..32].copy_from_slice(&checksum.to_le_bytes());
-    std::fs::write(path, &buf)?;
+    std::fs::write(path, buf)?;
     if fsync {
         std::fs::File::open(path)?.sync_all()?;
     }
@@ -298,10 +290,7 @@ pub fn load_checkpoint_into_store(
                 ))
             })?
             .len() as usize;
-        let mut buf = Vec::with_capacity(file_len);
-        unsafe {
-            buf.set_len(file_len);
-        }
+        let mut buf = vec![0u8; file_len];
         file.read_exact(&mut buf).map_err(|e| {
             ZyronError::IoError(format!(
                 "failed to read checkpoint file {}: {}",
@@ -372,7 +361,7 @@ pub fn load_checkpoint_into_store(
 
     let eds = 2 + kl + 6; // entry data size per entry: key_len(2) + key + page_num(4) + slot_id(2)
     let max_entries_per_page = (PAGE_SIZE - SLOT_ARRAY_START) / (eds + SLOT_SIZE);
-    let num_leaves = (n + max_entries_per_page - 1) / max_entries_per_page;
+    let num_leaves = n.div_ceil(max_entries_per_page);
     let data_end_full = PAGE_SIZE - max_entries_per_page * eds;
     let slot_array_bytes_full = max_entries_per_page * SLOT_SIZE;
 
@@ -575,13 +564,13 @@ fn build_internal_pages(
         let mut ci: Option<(u32, BTreeInternalPage)> = None;
         let mut cu = 0usize;
         let mut first = true;
-        for i in 0..cp.len() {
+        for (i, &child_pn) in cp.iter().enumerate() {
             let ks = i * kl;
             if first {
                 let pn = store.allocate();
                 let pid = PageId::new(file_id, pn as u64);
                 let mut int = BTreeInternalPage::new(pid, level);
-                int.set_leftmost_child(PageId::new(file_id, cp[i] as u64));
+                int.set_leftmost_child(PageId::new(file_id, child_pn as u64));
                 pp.push(pn);
                 pk.extend_from_slice(&ck[ks..ks + kl]);
                 ci = Some((pn, int));
@@ -596,7 +585,7 @@ fn build_internal_pages(
                 let pn = store.allocate();
                 let pid = PageId::new(file_id, pn as u64);
                 let mut int = BTreeInternalPage::new(pid, level);
-                int.set_leftmost_child(PageId::new(file_id, cp[i] as u64));
+                int.set_leftmost_child(PageId::new(file_id, child_pn as u64));
                 pp.push(pn);
                 pk.extend_from_slice(&ck[ks..ks + kl]);
                 ci = Some((pn, int));
@@ -605,7 +594,7 @@ fn build_internal_pages(
             }
             if let Some((_, ref mut int)) = ci {
                 let key = bytes::Bytes::copy_from_slice(&ck[ks..ks + kl]);
-                int.insert(key, PageId::new(file_id, cp[i] as u64))
+                int.insert(key, PageId::new(file_id, child_pn as u64))
                     .expect("internal page overflow during checkpoint rebuild");
                 cu += es;
             }

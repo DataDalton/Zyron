@@ -324,6 +324,7 @@ impl<'a> TupleView<'a> {
 
     /// Converts this view to an owned Tuple by copying the data.
     #[inline]
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_owned(&self) -> Tuple {
         Tuple::with_header(self.header, self.data.to_vec())
     }

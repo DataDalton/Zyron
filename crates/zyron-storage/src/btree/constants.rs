@@ -47,18 +47,3 @@ pub(crate) const ARENA_MAX_LEAF_ENTRIES: usize =
 
 /// Sentinel offset indicating null/invalid.
 pub(crate) const ARENA_NULL_OFFSET: u64 = u64::MAX;
-
-// Write buffer (Swiss Table) constants
-
-/// Hash table size: 262144 slots (power of 2) for 50% load factor with 131072 entries.
-/// Must be a multiple of GROUP_SIZE (32) for SIMD alignment.
-pub(crate) const HASH_TABLE_SIZE: usize = 262144;
-
-/// Group size for SIMD probing. AVX2 = 32 bytes = 32 control bytes at once.
-pub(crate) const GROUP_SIZE: usize = 32;
-
-/// Control byte: empty slot.
-pub(crate) const CTRL_EMPTY: u8 = 0x80;
-
-/// Control byte: deleted slot (tombstone).
-pub(crate) const CTRL_DELETED: u8 = 0xFE;

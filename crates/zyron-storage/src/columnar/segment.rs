@@ -263,12 +263,11 @@ impl ColumnSegment {
                         _ => slot,
                     });
 
-                    if isSorted {
-                        if let Some(prev) = prevRaw {
-                            if compare_le_bytes(*v, prev) == std::cmp::Ordering::Less {
-                                isSorted = false;
-                            }
-                        }
+                    if isSorted
+                        && let Some(prev) = prevRaw
+                        && compare_le_bytes(v, prev) == std::cmp::Ordering::Less
+                    {
+                        isSorted = false;
                     }
                     prevRaw = Some(*v);
                 }
@@ -301,7 +300,7 @@ impl ColumnSegment {
 
         // Build null bitmap if any nulls exist. Bit i is set when row i is null.
         let nullBitmap = if nullCount > 0 {
-            let bitmapLen = (rowCount + 7) / 8;
+            let bitmapLen = rowCount.div_ceil(8);
             let mut bitmap = vec![0u8; bitmapLen];
             for (i, val) in values.iter().enumerate() {
                 if val.is_none() {
@@ -315,7 +314,7 @@ impl ColumnSegment {
 
         // Build zone maps, one entry per ZONE_MAP_BATCH_SIZE rows.
         let batchSize = ZONE_MAP_BATCH_SIZE as usize;
-        let zoneCount = (rowCount + batchSize - 1) / batchSize;
+        let zoneCount = rowCount.div_ceil(batchSize);
         let mut zoneMaps = Vec::with_capacity(zoneCount);
 
         for z in 0..zoneCount {
@@ -325,26 +324,18 @@ impl ColumnSegment {
             let mut zoneMin: Option<[u8; STAT_VALUE_SIZE]> = None;
             let mut zoneMax: Option<[u8; STAT_VALUE_SIZE]> = None;
 
-            for val in &values[zoneStart..zoneEnd] {
-                if let Some(v) = val {
-                    let slot = value_to_stat_slot(v);
-                    zoneMin = Some(match zoneMin {
-                        Some(cur)
-                            if compare_stat_slots(&cur, &slot) != std::cmp::Ordering::Greater =>
-                        {
-                            cur
-                        }
-                        _ => slot,
-                    });
-                    zoneMax = Some(match zoneMax {
-                        Some(cur)
-                            if compare_stat_slots(&cur, &slot) != std::cmp::Ordering::Less =>
-                        {
-                            cur
-                        }
-                        _ => slot,
-                    });
-                }
+            for v in values[zoneStart..zoneEnd].iter().flatten() {
+                let slot = value_to_stat_slot(v);
+                zoneMin = Some(match zoneMin {
+                    Some(cur) if compare_stat_slots(&cur, &slot) != std::cmp::Ordering::Greater => {
+                        cur
+                    }
+                    _ => slot,
+                });
+                zoneMax = Some(match zoneMax {
+                    Some(cur) if compare_stat_slots(&cur, &slot) != std::cmp::Ordering::Less => cur,
+                    _ => slot,
+                });
             }
 
             // All-null zones use sentinel min=0xFF/max=0x00 (min > max is
@@ -358,19 +349,16 @@ impl ColumnSegment {
         // Build bloom filter when cardinality is high enough to benefit.
         // Dictionary-encoded segments already have an implicit lookup structure,
         // so bloom filters are skipped for those.
-        let bloomFilter = if cardinality >= BLOOM_MIN_CARDINALITY as u64
-            && encodingType != EncodingType::Dictionary
-        {
-            let mut filter = BloomFilter::new(cardinality);
-            for val in values.iter() {
-                if let Some(v) = val {
+        let bloomFilter =
+            if cardinality >= BLOOM_MIN_CARDINALITY && encodingType != EncodingType::Dictionary {
+                let mut filter = BloomFilter::new(cardinality);
+                for v in values.iter().flatten() {
                     filter.insert(v);
                 }
-            }
-            Some(filter)
-        } else {
-            None
-        };
+                Some(filter)
+            } else {
+                None
+            };
 
         let bloomFilterSize = bloomFilter
             .as_ref()

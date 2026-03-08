@@ -42,7 +42,7 @@ impl BloomFilter {
         let bitsPerBlock = BLOCK_BITS as u64;
 
         // Round up to the nearest whole block count, minimum 1 block.
-        let numBlocks = ((totalBits + bitsPerBlock - 1) / bitsPerBlock).max(1) as u32;
+        let numBlocks = totalBits.div_ceil(bitsPerBlock).max(1) as u32;
         let byteCount = numBlocks as usize * BLOOM_BLOCK_SIZE;
 
         Self {

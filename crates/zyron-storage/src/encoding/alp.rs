@@ -141,7 +141,7 @@ impl Encoding for AlpEncoding {
 
         // Bit-pack the integers
         let packedBits = row_count as u64 * intBitWidth as u64;
-        let packedBytes = ((packedBits + 7) / 8) as usize;
+        let packedBytes = (packedBits as usize).div_ceil(8);
         let mut packedMain = vec![0u8; packedBytes];
 
         for (i, &intVal) in workingIntegers.iter().enumerate() {
@@ -234,7 +234,7 @@ impl Encoding for AlpEncoding {
 
         let packedStart = 28;
         let packedBits = row_count as u64 * intBitWidth as u64;
-        let packedBytes = ((packedBits + 7) / 8) as usize;
+        let packedBytes = (packedBits as usize).div_ceil(8);
         let packedEnd = packedStart + packedBytes;
 
         if encoded.len() < packedEnd {
@@ -528,87 +528,87 @@ impl Encoding for AlpEncoding {
         // For range predicates, convert bounds through the same factor
         // and filter on the encoded integer array. Exception rows are
         // handled by decoding only those specific values.
-        if let Predicate::Range { low, high } = predicate {
-            if encoded.len() >= 28 {
-                let factor = f64::from_le_bytes([
-                    encoded[0], encoded[1], encoded[2], encoded[3], encoded[4], encoded[5],
-                    encoded[6], encoded[7],
+        if let Predicate::Range { low, high } = predicate
+            && encoded.len() >= 28
+        {
+            let factor = f64::from_le_bytes([
+                encoded[0], encoded[1], encoded[2], encoded[3], encoded[4], encoded[5], encoded[6],
+                encoded[7],
+            ]);
+
+            // Only apply pushdown when factor > 0 (not raw fallback)
+            // and no exceptions to keep logic simple and correct
+            if factor > 0.0 {
+                let exceptionCount =
+                    u32::from_le_bytes([encoded[12], encoded[13], encoded[14], encoded[15]])
+                        as usize;
+                let intBitWidth = encoded[16];
+
+                let base = i64::from_le_bytes([
+                    encoded[20],
+                    encoded[21],
+                    encoded[22],
+                    encoded[23],
+                    encoded[24],
+                    encoded[25],
+                    encoded[26],
+                    encoded[27],
                 ]);
 
-                // Only apply pushdown when factor > 0 (not raw fallback)
-                // and no exceptions to keep logic simple and correct
-                if factor > 0.0 {
-                    let exceptionCount =
-                        u32::from_le_bytes([encoded[12], encoded[13], encoded[14], encoded[15]])
-                            as usize;
-                    let intBitWidth = encoded[16];
+                let packedStart = 28;
+                let packedBits = row_count as u64 * intBitWidth as u64;
+                let packedBytes = (packedBits as usize).div_ceil(8);
+                let packedEnd = packedStart + packedBytes;
 
-                    let base = i64::from_le_bytes([
-                        encoded[20],
-                        encoded[21],
-                        encoded[22],
-                        encoded[23],
-                        encoded[24],
-                        encoded[25],
-                        encoded[26],
-                        encoded[27],
-                    ]);
+                let useDelta = encoded[18] & 0x01 != 0;
 
-                    let packedStart = 28;
-                    let packedBits = row_count as u64 * intBitWidth as u64;
-                    let packedBytes = ((packedBits + 7) / 8) as usize;
-                    let packedEnd = packedStart + packedBytes;
-
-                    let useDelta = encoded[18] & 0x01 != 0;
-
-                    // Predicate pushdown only works when no delta and no exceptions
-                    if exceptionCount == 0 && !useDelta && packedEnd <= encoded.len() {
-                        // Convert float bounds to integer bounds in the encoded domain
-                        let loInt = match low {
-                            Some(lo_bytes) => {
-                                let fVal = read_float_from_bytes(lo_bytes, value_size);
-                                let scaled = fVal * factor;
-                                // Ceiling for lower bound: we want integers >= ceil(scaled)
-                                Some(scaled.ceil() as i64)
-                            }
-                            None => None,
-                        };
-
-                        let hiInt = match high {
-                            Some(hi_bytes) => {
-                                let fVal = read_float_from_bytes(hi_bytes, value_size);
-                                let scaled = fVal * factor;
-                                // Floor for upper bound: we want integers <= floor(scaled)
-                                Some(scaled.floor() as i64)
-                            }
-                            None => None,
-                        };
-
-                        let packed = &encoded[packedStart..packedEnd];
-                        let bitmaskLen = (row_count + 7) / 8;
-                        let mut bitmask = vec![0u8; bitmaskLen];
-
-                        for i in 0..row_count {
-                            let unsigned =
-                                unpack_bits(packed, i as u64 * intBitWidth as u64, intBitWidth);
-                            let intVal = unsigned as i64 + base;
-
-                            let aboveLow = match loInt {
-                                Some(lo) => intVal >= lo,
-                                None => true,
-                            };
-                            let belowHigh = match hiInt {
-                                Some(hi) => intVal <= hi,
-                                None => true,
-                            };
-
-                            if aboveLow && belowHigh {
-                                bitmask[i / 8] |= 1 << (i % 8);
-                            }
+                // Predicate pushdown only works when no delta and no exceptions
+                if exceptionCount == 0 && !useDelta && packedEnd <= encoded.len() {
+                    // Convert float bounds to integer bounds in the encoded domain
+                    let loInt = match low {
+                        Some(lo_bytes) => {
+                            let fVal = read_float_from_bytes(lo_bytes, value_size);
+                            let scaled = fVal * factor;
+                            // Ceiling for lower bound: we want integers >= ceil(scaled)
+                            Some(scaled.ceil() as i64)
                         }
+                        None => None,
+                    };
 
-                        return Ok(bitmask);
+                    let hiInt = match high {
+                        Some(hi_bytes) => {
+                            let fVal = read_float_from_bytes(hi_bytes, value_size);
+                            let scaled = fVal * factor;
+                            // Floor for upper bound: we want integers <= floor(scaled)
+                            Some(scaled.floor() as i64)
+                        }
+                        None => None,
+                    };
+
+                    let packed = &encoded[packedStart..packedEnd];
+                    let bitmaskLen = row_count.div_ceil(8);
+                    let mut bitmask = vec![0u8; bitmaskLen];
+
+                    for i in 0..row_count {
+                        let unsigned =
+                            unpack_bits(packed, i as u64 * intBitWidth as u64, intBitWidth);
+                        let intVal = unsigned as i64 + base;
+
+                        let aboveLow = match loInt {
+                            Some(lo) => intVal >= lo,
+                            None => true,
+                        };
+                        let belowHigh = match hiInt {
+                            Some(hi) => intVal <= hi,
+                            None => true,
+                        };
+
+                        if aboveLow && belowHigh {
+                            bitmask[i / 8] |= 1 << (i % 8);
+                        }
                     }
+
+                    return Ok(bitmask);
                 }
             }
         }
@@ -776,7 +776,7 @@ fn pack_bits(packed: &mut [u8], bit_offset: u64, value: u64, bit_width: u8) {
     let shifted = val << bit_idx;
     let shifted_bytes = shifted.to_le_bytes();
     let total_bits = bit_idx + bit_width as u32;
-    let bytes_needed = ((total_bits + 7) / 8) as usize;
+    let bytes_needed = (total_bits as usize).div_ceil(8);
 
     for j in 0..bytes_needed.min(8) {
         if byte_idx + j < packed.len() {

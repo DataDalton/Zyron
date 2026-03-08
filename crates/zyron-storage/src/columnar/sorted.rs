@@ -25,16 +25,14 @@ pub struct SortedSegmentEntry {
 
 /// Index over sorted .zyr files for segment-level pruning on primary key.
 /// Entries are kept sorted by min_pk for binary search.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct SortedSegmentIndex {
     entries: Vec<SortedSegmentEntry>,
 }
 
 impl SortedSegmentIndex {
     pub fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
+        Self::default()
     }
 
     /// Adds a .zyr file to the index. Maintains sorted order by min_pk.
@@ -190,6 +188,7 @@ impl MergeScanIterator {
     /// Advances to the next row in merge order.
     /// Returns (file_idx, row_idx) for the row.
     #[inline]
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<(usize, usize)> {
         if self.active_count == 0 {
             return None;

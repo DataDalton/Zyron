@@ -236,10 +236,10 @@ impl HeapPage {
         let free = header.free_space();
         let mut active_tuple_space = 0usize;
         for i in 0..header.slot_count {
-            if let Some(slot) = Self::get_slot_from_slice(data, SlotId(i), header.slot_count) {
-                if !slot.is_empty() {
-                    active_tuple_space += slot.length as usize;
-                }
+            if let Some(slot) = Self::get_slot_from_slice(data, SlotId(i), header.slot_count)
+                && !slot.is_empty()
+            {
+                active_tuple_space += slot.length as usize;
             }
         }
         let tuple_area_size = (PAGE_SIZE as u16 - header.free_space_end) as usize;
@@ -255,10 +255,10 @@ impl HeapPage {
         let mut active: Vec<(SlotId, usize, usize)> = Vec::new();
         for i in 0..header.slot_count {
             let slot_id = SlotId(i);
-            if let Some(slot) = Self::get_slot_from_slice(data, slot_id, header.slot_count) {
-                if !slot.is_empty() {
-                    active.push((slot_id, slot.offset as usize, slot.length as usize));
-                }
+            if let Some(slot) = Self::get_slot_from_slice(data, slot_id, header.slot_count)
+                && !slot.is_empty()
+            {
+                active.push((slot_id, slot.offset as usize, slot.length as usize));
             }
         }
 
@@ -309,10 +309,10 @@ impl HeapPage {
         let header = Self::heap_header_from_slice(data);
         let mut count = 0;
         for i in 0..header.slot_count {
-            if let Some(slot) = Self::get_slot_from_slice(data, SlotId(i), header.slot_count) {
-                if !slot.is_empty() {
-                    count += 1;
-                }
+            if let Some(slot) = Self::get_slot_from_slice(data, SlotId(i), header.slot_count)
+                && !slot.is_empty()
+            {
+                count += 1;
             }
         }
         count
@@ -342,11 +342,11 @@ impl HeapPage {
         // Check for a deleted slot we can reuse
         let mut reuse_slot: Option<SlotId> = None;
         for i in 0..header.slot_count {
-            if let Some(slot) = Self::get_slot_from_slice(data, SlotId(i), header.slot_count) {
-                if slot.is_empty() {
-                    reuse_slot = Some(SlotId(i));
-                    break;
-                }
+            if let Some(slot) = Self::get_slot_from_slice(data, SlotId(i), header.slot_count)
+                && slot.is_empty()
+            {
+                reuse_slot = Some(SlotId(i));
+                break;
             }
         }
 
@@ -457,11 +457,11 @@ impl HeapPage {
         // Check for a deleted slot we can reuse
         let mut reuse_slot: Option<SlotId> = None;
         for i in 0..header.slot_count {
-            if let Some(slot) = Self::get_slot_from_slice(data, SlotId(i), header.slot_count) {
-                if slot.is_empty() {
-                    reuse_slot = Some(SlotId(i));
-                    break;
-                }
+            if let Some(slot) = Self::get_slot_from_slice(data, SlotId(i), header.slot_count)
+                && slot.is_empty()
+            {
+                reuse_slot = Some(SlotId(i));
+                break;
             }
         }
 
@@ -579,11 +579,11 @@ impl HeapPage {
         // Check for a deleted slot we can reuse
         let mut reuse_slot: Option<SlotId> = None;
         for i in 0..header.slot_count {
-            if let Some(slot) = self.get_slot(SlotId(i)) {
-                if slot.is_empty() {
-                    reuse_slot = Some(SlotId(i));
-                    break;
-                }
+            if let Some(slot) = self.get_slot(SlotId(i))
+                && slot.is_empty()
+            {
+                reuse_slot = Some(SlotId(i));
+                break;
             }
         }
 
@@ -654,11 +654,9 @@ impl HeapPage {
     ///
     /// This marks the slot as empty but doesn't reclaim space immediately.
     pub fn delete_tuple(&mut self, slot_id: SlotId) -> bool {
-        if let Some(slot) = self.get_slot(slot_id) {
-            if slot.is_empty() {
-                return false;
-            }
-
+        if let Some(slot) = self.get_slot(slot_id)
+            && !slot.is_empty()
+        {
             // Mark slot as empty
             let empty_slot = TupleSlot::new(slot.offset, 0);
             self.set_slot(slot_id, empty_slot);
@@ -716,11 +714,11 @@ impl HeapPage {
 
         // Check if we can reuse a deleted slot
         for i in 0..header.slot_count {
-            if let Some(slot) = self.get_slot(SlotId(i)) {
-                if slot.is_empty() {
-                    // Just need space for tuple data
-                    return header.free_space() >= tuple_size;
-                }
+            if let Some(slot) = self.get_slot(SlotId(i))
+                && slot.is_empty()
+            {
+                // Just need space for tuple data
+                return header.free_space() >= tuple_size;
             }
         }
 
@@ -735,10 +733,10 @@ impl HeapPage {
         let mut active_tuple_space = 0usize;
 
         for i in 0..header.slot_count {
-            if let Some(slot) = self.get_slot(SlotId(i)) {
-                if !slot.is_empty() {
-                    active_tuple_space += slot.length as usize;
-                }
+            if let Some(slot) = self.get_slot(SlotId(i))
+                && !slot.is_empty()
+            {
+                active_tuple_space += slot.length as usize;
             }
         }
 
@@ -757,13 +755,13 @@ impl HeapPage {
         let mut active_tuples: Vec<(SlotId, Vec<u8>)> = Vec::new();
         for i in 0..header.slot_count {
             let slot_id = SlotId(i);
-            if let Some(slot) = self.get_slot(slot_id) {
-                if !slot.is_empty() {
-                    let start = slot.offset as usize;
-                    let end = start + slot.length as usize;
-                    let data = self.data[start..end].to_vec();
-                    active_tuples.push((slot_id, data));
-                }
+            if let Some(slot) = self.get_slot(slot_id)
+                && !slot.is_empty()
+            {
+                let start = slot.offset as usize;
+                let end = start + slot.length as usize;
+                let data = self.data[start..end].to_vec();
+                active_tuples.push((slot_id, data));
             }
         }
 

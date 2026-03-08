@@ -457,10 +457,10 @@ impl ZyrFileWriter {
 
         if fsync {
             // Fsync the parent directory to persist the rename.
-            if let Some(parentDir) = self.finalPath.parent() {
-                if let Ok(dir) = File::open(parentDir) {
-                    let _ = dir.sync_all();
-                }
+            if let Some(parentDir) = self.finalPath.parent()
+                && let Ok(dir) = File::open(parentDir)
+            {
+                let _ = dir.sync_all();
             }
         }
 
@@ -589,7 +589,7 @@ impl ZyrFileReader {
 
         // Read segment index entries.
         let indexRegionSize = (trailerStart - segmentIndexOffset) as usize;
-        if indexRegionSize % SEGMENT_INDEX_ENTRY_SIZE != 0 {
+        if !indexRegionSize.is_multiple_of(SEGMENT_INDEX_ENTRY_SIZE) {
             return Err(ZyronError::InvalidZyrFile(format!(
                 "segment index region size {} is not a multiple of entry size {}",
                 indexRegionSize, SEGMENT_INDEX_ENTRY_SIZE

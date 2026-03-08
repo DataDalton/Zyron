@@ -397,6 +397,68 @@ impl LogRecord {
         Ok(records)
     }
 
+    /// Parses all records from a contiguous Bytes buffer without checksum verification.
+    /// For trusted data (just written, no crash recovery needed). The existing
+    /// `parse_all` with checksums remains for crash recovery.
+    #[inline]
+    pub fn parse_all_trusted(data: Bytes) -> Vec<Self> {
+        let mut records = Vec::with_capacity(data.len() / 64);
+        let mut offset = 0;
+        let data_len = data.len();
+        let base_ptr = data.as_ptr();
+
+        while offset + HEADER_SIZE + CHECKSUM_SIZE <= data_len {
+            let (lsn_raw, prev_lsn_raw, txn_id, record_type_byte, flags, payload_len) = unsafe {
+                let ptr = base_ptr.add(offset);
+                let lsn_raw = std::ptr::read_unaligned(ptr.add(OFF_LSN) as *const u64);
+                let prev_lsn_raw = std::ptr::read_unaligned(ptr.add(OFF_PREV_LSN) as *const u64);
+                let txn_id = std::ptr::read_unaligned(ptr.add(OFF_TXN_ID) as *const u32);
+                let record_type_byte = *ptr.add(OFF_RECORD_TYPE);
+                let flags = *ptr.add(OFF_FLAGS);
+                let payload_len =
+                    std::ptr::read_unaligned(ptr.add(OFF_PAYLOAD_LEN) as *const u16) as usize;
+                (
+                    u64::from_le(lsn_raw),
+                    u64::from_le(prev_lsn_raw),
+                    u32::from_le(txn_id),
+                    record_type_byte,
+                    flags,
+                    payload_len,
+                )
+            };
+
+            let record_size = HEADER_SIZE + payload_len + CHECKSUM_SIZE;
+            if offset + record_size > data_len {
+                break;
+            }
+
+            let record_type = match LogRecordType::try_from(record_type_byte) {
+                Ok(rt) => rt,
+                Err(_) => break,
+            };
+
+            let payload = if payload_len > 0 {
+                let payload_start = offset + HEADER_SIZE;
+                data.slice(payload_start..payload_start + payload_len)
+            } else {
+                Bytes::new()
+            };
+
+            records.push(Self {
+                lsn: Lsn(lsn_raw),
+                prev_lsn: Lsn(prev_lsn_raw),
+                txn_id,
+                record_type,
+                flags,
+                payload,
+            });
+
+            offset += record_size;
+        }
+
+        records
+    }
+
     /// Parses records from a contiguous Bytes buffer, calling f for each valid record.
     ///
     /// Same parsing and checksum logic as parse_all but with no intermediate Vec.
@@ -475,6 +537,96 @@ impl LogRecord {
             offset += record_size;
         }
     }
+}
+
+/// Lightweight record reference that defers payload slicing until needed.
+/// Avoids Arc refcount increment per record during parsing. Payload is
+/// accessed on demand via `payload()`.
+#[derive(Debug, Clone)]
+pub struct LazyLogRecord {
+    pub lsn: Lsn,
+    pub prev_lsn: Lsn,
+    pub txn_id: u32,
+    pub record_type: LogRecordType,
+    pub flags: u8,
+    /// Offset of the payload within the original Bytes buffer.
+    payload_offset: u32,
+    /// Length of the payload.
+    payload_len: u16,
+}
+
+impl LazyLogRecord {
+    /// Returns the payload by slicing the original buffer on demand.
+    #[inline]
+    pub fn payload(&self, data: &Bytes) -> Bytes {
+        if self.payload_len > 0 {
+            let start = self.payload_offset as usize;
+            data.slice(start..start + self.payload_len as usize)
+        } else {
+            Bytes::new()
+        }
+    }
+
+    /// Returns the payload length without slicing.
+    #[inline]
+    pub fn payload_len(&self) -> usize {
+        self.payload_len as usize
+    }
+}
+
+/// Parses all records from a contiguous Bytes buffer without checksum
+/// verification and without slicing payloads. Returns the buffer alongside
+/// lightweight record references for on-demand payload access.
+pub fn parse_all_lazy(data: Bytes) -> (Bytes, Vec<LazyLogRecord>) {
+    let mut records = Vec::with_capacity(data.len() / 64);
+    let mut offset = 0;
+    let data_len = data.len();
+    let base_ptr = data.as_ptr();
+
+    while offset + HEADER_SIZE + CHECKSUM_SIZE <= data_len {
+        let (lsn_raw, prev_lsn_raw, txn_id, record_type_byte, flags, payload_len) = unsafe {
+            let ptr = base_ptr.add(offset);
+            let lsn_raw = std::ptr::read_unaligned(ptr.add(OFF_LSN) as *const u64);
+            let prev_lsn_raw = std::ptr::read_unaligned(ptr.add(OFF_PREV_LSN) as *const u64);
+            let txn_id = std::ptr::read_unaligned(ptr.add(OFF_TXN_ID) as *const u32);
+            let record_type_byte = *ptr.add(OFF_RECORD_TYPE);
+            let flags = *ptr.add(OFF_FLAGS);
+            let payload_len =
+                std::ptr::read_unaligned(ptr.add(OFF_PAYLOAD_LEN) as *const u16) as usize;
+            (
+                u64::from_le(lsn_raw),
+                u64::from_le(prev_lsn_raw),
+                u32::from_le(txn_id),
+                record_type_byte,
+                flags,
+                payload_len,
+            )
+        };
+
+        let record_size = HEADER_SIZE + payload_len + CHECKSUM_SIZE;
+        if offset + record_size > data_len {
+            break;
+        }
+
+        let record_type = match LogRecordType::try_from(record_type_byte) {
+            Ok(rt) => rt,
+            Err(_) => break,
+        };
+
+        records.push(LazyLogRecord {
+            lsn: Lsn(lsn_raw),
+            prev_lsn: Lsn(prev_lsn_raw),
+            txn_id,
+            record_type,
+            flags,
+            payload_offset: (offset + HEADER_SIZE) as u32,
+            payload_len: payload_len as u16,
+        });
+
+        offset += record_size;
+    }
+
+    (data, records)
 }
 
 /// Returns the on-disk size for a record with the given payload length.
@@ -564,6 +716,115 @@ pub unsafe fn serialize_raw(
         std::ptr::copy_nonoverlapping(checksum.to_le_bytes().as_ptr(), buf.add(offset), 4);
     }
     offset + CHECKSUM_SIZE
+}
+
+/// Serializes a WAL record without computing the checksum.
+///
+/// Writes header + payload + 4 zero bytes (checksum placeholder) into the buffer.
+/// The checksum must be backfilled later by `backfill_checksums` before the data
+/// reaches disk. This defers the checksum cost from the append() hot path to the
+/// flush thread.
+///
+/// Returns the number of bytes written (HEADER_SIZE + payload.len() + CHECKSUM_SIZE).
+///
+/// # Safety
+/// Caller must ensure `buf` has at least `record_size_for_payload(payload.len())`
+/// bytes available.
+#[inline]
+pub unsafe fn serialize_raw_deferred(
+    buf: *mut u8,
+    lsn: Lsn,
+    prev_lsn: Lsn,
+    txn_id: u32,
+    record_type: u8,
+    flags: u8,
+    payload: &[u8],
+) -> usize {
+    debug_assert!(
+        payload.len() <= MAX_PAYLOAD_SIZE,
+        "payload {} bytes exceeds MAX_PAYLOAD_SIZE {}",
+        payload.len(),
+        MAX_PAYLOAD_SIZE,
+    );
+
+    let payload_len = payload.len() as u16;
+
+    #[repr(C, packed)]
+    struct PackedHeader {
+        lsn: u64,
+        prev_lsn: u64,
+        txn_id: u32,
+        record_type: u8,
+        flags: u8,
+        payload_len: u16,
+    }
+
+    let header = PackedHeader {
+        lsn: lsn.0.to_le(),
+        prev_lsn: prev_lsn.0.to_le(),
+        txn_id: txn_id.to_le(),
+        record_type,
+        flags,
+        payload_len: payload_len.to_le(),
+    };
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            &header as *const PackedHeader as *const u8,
+            buf,
+            HEADER_SIZE,
+        );
+    }
+
+    let mut offset = HEADER_SIZE;
+
+    if !payload.is_empty() {
+        unsafe {
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), buf.add(offset), payload.len());
+        }
+        offset += payload.len();
+    }
+
+    // Write zero checksum placeholder
+    unsafe {
+        std::ptr::write_unaligned(buf.add(offset) as *mut u32, 0u32);
+    }
+    offset + CHECKSUM_SIZE
+}
+
+/// Walks a contiguous buffer of serialized WAL records and computes + writes
+/// the checksum for each record. Called by the flush thread after drain_into
+/// and before writing to disk.
+///
+/// Each record's checksum is computed from its header + payload bytes using
+/// `wal_checksum`, then written into the 4-byte placeholder at the end of
+/// each record.
+pub fn backfill_checksums(buf: &mut [u8]) {
+    let len = buf.len();
+    let mut offset = 0;
+
+    while offset + HEADER_SIZE + CHECKSUM_SIZE <= len {
+        // Read payload_len from header
+        let payload_len = u16::from_le_bytes([
+            buf[offset + OFF_PAYLOAD_LEN],
+            buf[offset + OFF_PAYLOAD_LEN + 1],
+        ]) as usize;
+
+        let record_size = HEADER_SIZE + payload_len + CHECKSUM_SIZE;
+        if offset + record_size > len {
+            break;
+        }
+
+        // Compute checksum over header + payload
+        let data_end = offset + HEADER_SIZE + payload_len;
+        let checksum = crate::checksum::wal_checksum(&buf[offset..data_end], HEADER_SIZE);
+
+        // Write checksum into placeholder
+        let checksum_offset = data_end;
+        buf[checksum_offset..checksum_offset + 4].copy_from_slice(&checksum.to_le_bytes());
+
+        offset += record_size;
+    }
 }
 
 #[cfg(test)]

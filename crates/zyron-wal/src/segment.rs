@@ -383,11 +383,7 @@ impl SyncLogSegment {
             return Ok(Bytes::new());
         }
 
-        let mut buf = Vec::with_capacity(file_size);
-        // SAFETY: read_exact fills the entire buffer. Skipping zeroing saves ~6µs per 100KB.
-        unsafe {
-            buf.set_len(file_size);
-        }
+        let mut buf = vec![0u8; file_size];
         file.read_exact(&mut buf)?;
 
         let header = SegmentHeader::from_bytes(buf[..SegmentHeader::SIZE].try_into().unwrap());
@@ -502,8 +498,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let small_size = 1024u32;
 
-        let segment = LogSegment::create(dir.path(), SegmentId::FIRST, Lsn::FIRST, small_size)
-            .unwrap();
+        let segment =
+            LogSegment::create(dir.path(), SegmentId::FIRST, Lsn::FIRST, small_size).unwrap();
 
         let expected_remaining = small_size - SegmentHeader::SIZE as u32;
         assert_eq!(segment.remaining_space(), expected_remaining);
@@ -514,8 +510,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let small_size = 128u32; // Very small segment
 
-        let mut segment = LogSegment::create(dir.path(), SegmentId::FIRST, Lsn::FIRST, small_size)
-            .unwrap();
+        let mut segment =
+            LogSegment::create(dir.path(), SegmentId::FIRST, Lsn::FIRST, small_size).unwrap();
 
         // Try to write a record larger than remaining space
         let large_payload = Bytes::from(vec![0u8; 200]);

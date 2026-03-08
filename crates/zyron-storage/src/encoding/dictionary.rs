@@ -59,7 +59,7 @@ impl Encoding for DictionaryEncoding {
         };
 
         let totalCodeBits = row_count as u64 * codeBitWidth as u64;
-        let packedCodeBytes = ((totalCodeBits + 7) / 8) as usize;
+        let packedCodeBytes = totalCodeBits.div_ceil(8) as usize;
 
         let mut out = Vec::with_capacity(8 + dictSize + packedCodeBytes);
         out.extend_from_slice(&(value_size as u32).to_le_bytes());
@@ -187,7 +187,7 @@ impl Encoding for DictionaryEncoding {
 
         let packedStart = dictEnd;
 
-        let bitmaskLen = (row_count + 7) / 8;
+        let bitmaskLen = row_count.div_ceil(8);
         let mut bitmask = vec![0u8; bitmaskLen];
 
         // Build a set of matching dictionary codes
@@ -287,7 +287,7 @@ fn pack_bits(packed: &mut [u8], bit_offset: u64, value: u64, bit_width: u8) {
     let shifted = val << bitIdx;
     let shiftedBytes = shifted.to_le_bytes();
     let totalBits = bitIdx + bit_width as u32;
-    let bytesNeeded = ((totalBits + 7) / 8) as usize;
+    let bytesNeeded = totalBits.div_ceil(8) as usize;
 
     for j in 0..bytesNeeded.min(8) {
         if byteIdx + j < packed.len() {

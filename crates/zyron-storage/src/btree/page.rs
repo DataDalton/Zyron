@@ -637,8 +637,8 @@ impl BTreeInternalPage {
         let limit = num_keys.min(2048);
         let mut offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
 
-        for i in 0..limit {
-            offsets[i] = offset;
+        for o in offsets.iter_mut().take(limit) {
+            *o = offset;
             let key_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
             offset += 2 + key_len + 4;
         }
