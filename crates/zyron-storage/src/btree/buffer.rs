@@ -4,7 +4,6 @@ use super::arena_index::BTreeArenaIndex;
 use super::constants::WRITE_BUFFER_CAPACITY;
 use super::types::InsertStats;
 use crate::tuple::TupleId;
-use std::cell::Cell;
 use zyron_common::Result;
 
 const NUM_PARTITIONS: usize = 256;
@@ -31,9 +30,6 @@ struct PartitionedBuffer {
     min_key: u64,
     /// Maximum key currently in the buffer. 0 when empty.
     max_key: u64,
-    /// Whether all partitions are sorted (enables binary search).
-    /// Uses Cell for interior mutability so search() can take &self.
-    sorted: Cell<bool>,
 }
 
 impl PartitionedBuffer {
@@ -47,7 +43,6 @@ impl PartitionedBuffer {
             len: 0,
             min_key: u64::MAX,
             max_key: 0,
-            sorted: Cell::new(true),
         }
     }
 
@@ -67,16 +62,14 @@ impl PartitionedBuffer {
     fn search(&self, key: u64) -> Option<u64> {
         let p = partition_of(key);
         let partition = &self.partitions[p];
-        // Linear scan of the partition. Each partition averages ~512 entries,
-        // so scanning is ~200ns worst case. Avoids requiring &mut self for
-        // sort-based binary search, which would serialize all reads behind a mutex.
-        let mut last_val = None;
-        for &(k, v) in partition.iter() {
+        // Reverse scan: last inserted entry is at the end of the vec.
+        // Early-exit on first match gives O(1) best case for no-duplicate keys.
+        for &(k, v) in partition.iter().rev() {
             if k == key {
-                last_val = Some(v);
+                return Some(v);
             }
         }
-        last_val
+        None
     }
 
     /// Insert a key-value pair. Duplicates are resolved at flush time
@@ -92,7 +85,6 @@ impl PartitionedBuffer {
         let p = partition_of(key);
         self.partitions[p].push((key, value));
         self.len += 1;
-        self.sorted.set(false);
     }
 
     /// Drains all partitions into output, globally sorted by key.
@@ -135,7 +127,6 @@ impl PartitionedBuffer {
         self.len = 0;
         self.min_key = u64::MAX;
         self.max_key = 0;
-        self.sorted.set(true);
     }
 
     /// Returns an iterator over all (key, packed_tuple_id) pairs (unsorted).

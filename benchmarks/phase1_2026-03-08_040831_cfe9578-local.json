@@ -1,0 +1,46 @@
+{
+  "id": "2026-03-08_040831_cfe9578-local",
+  "date": "2026-03-08 04:08:35Z",
+  "ts": 1772942915,
+  "commit": "cfe9578-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "B+ Tree": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 12.74 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 12.70 },
+      "Delete throughput (ops/sec)": {
+        "average": 37827205.326071,
+        "runs": [37827205.33],
+        "target": 8000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "Insert throughput (ops/sec)": {
+        "average": 37486986.890103,
+        "runs": [37091162.66, 38491739.67, 37994065.33, 37694740.45, 36163226.34],
+        "target": 10000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "Lookup latency (ns/op)": {
+        "average": 14.270000,
+        "runs": [19.80, 12.35, 13.71, 11.86, 13.63],
+        "target": 40.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Range throughput (ops/sec)": {
+        "average": 5005000000.000000,
+        "runs": [5005000000.00, 5005000000.00, 5005000000.00, 5005000000.00, 5005000000.00],
+        "target": 40000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}

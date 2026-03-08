@@ -196,56 +196,34 @@ fn read_as_u64(bytes: &[u8], value_size: usize) -> u64 {
 /// Statistics computed from a column sample for encoding selection.
 struct ColumnSampleStats {
     cardinality: usize,
-    #[allow(dead_code)]
-    null_count: usize,
     run_count: usize,
     all_identical: bool,
-    #[allow(dead_code)]
-    sorted_ratio: f64,
 }
 
 /// Computes sample statistics from a set of values.
 /// Each value is Option<&[u8]> where None represents null.
 fn compute_sample_stats(sample: &[Option<&[u8]>]) -> ColumnSampleStats {
-    let mut null_count = 0usize;
     let mut distinct = hashbrown::HashSet::new();
     let mut run_count = 1usize;
-    let mut sorted_count = 0usize;
     let mut prev_value: Option<&[u8]> = None;
-    let mut non_null_count = 0usize;
 
     for val in sample {
-        match val {
-            None => null_count += 1,
-            Some(v) => {
-                non_null_count += 1;
-                distinct.insert(*v);
+        if let Some(v) = val {
+            distinct.insert(*v);
 
-                if let Some(prev) = prev_value {
-                    if *v != prev {
-                        run_count += 1;
-                    }
-                    if *v >= prev {
-                        sorted_count += 1;
-                    }
+            if let Some(prev) = prev_value {
+                if *v != prev {
+                    run_count += 1;
                 }
-                prev_value = Some(*v);
             }
+            prev_value = Some(*v);
         }
     }
 
-    let sorted_ratio = if non_null_count > 1 {
-        sorted_count as f64 / (non_null_count - 1) as f64
-    } else {
-        1.0
-    };
-
     ColumnSampleStats {
         cardinality: distinct.len(),
-        null_count,
         run_count,
         all_identical: distinct.len() <= 1,
-        sorted_ratio,
     }
 }
 

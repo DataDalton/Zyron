@@ -1,0 +1,53 @@
+
+=== Phase 1.7: Encoding Round-Trip Correctness ===
+Rows per encoding: 100000
+
+  FastLanes (sequential i32):
+    Compression ratio: 31.97x
+  FastLanes decode (int/sec) [FAIL/REGR!]:
+    Runs: [5,025,125,628, 2,096,436,059, 5,076,142,132, 5,076,142,132, 5,076,142,132]
+    Average: 4,469,997,617 >= 120,000,000,000 (target)
+    Min/Max: 2,096,436,059 / 5,076,142,132, StdDev: 1,186,945,247
+
+  FSST (32-byte strings):
+    Compression ratio: 5.08x
+  FSST decompress (GB/sec) [FAIL/OK]:
+    Runs: [4, 5, 4, 5, 5]
+    Average: 5 >= 6 (target)
+    Min/Max: 4 / 5, StdDev: 0
+
+  ALP (f64 decimals):
+    Compression ratio: 4.57x
+  ALP decode (float/sec) [FAIL/REGR!]:
+    Runs: [485,201,359, 640,204,866, 715,819,613, 627,352,572, 1,086,956,522]
+    Average: 711,106,986 >= 3,000,000,000 (target)
+    Min/Max: 485,201,359 / 1,086,956,522, StdDev: 202,168,419
+
+  Dictionary (10 distinct i32):
+    Compression ratio: 7.99x
+  Dictionary lookup (ns/val) [FAIL/OK]:
+    Runs: [5, 3, 2, 3, 2]
+    Average: 3 <= 3 (target)
+    Min/Max: 2 / 5, StdDev: 1
+
+  RLE (runs of 1000):
+    Compression ratio: 657.89x
+  RLE decode (val/sec) [FAIL/REGR!]:
+    Runs: [6,211,180,124, 2,638,522,427, 1,555,209,953, 14,285,714,286, 14,492,753,623]
+    Average: 7,836,676,083 >= 60,000,000,000 (target)
+    Min/Max: 1,555,209,953 / 14,492,753,623, StdDev: 5,568,003,542
+
+  BitPack (boolean):
+    Compression ratio: 7.99x
+
+  Constant (all 42):
+    Encoded size: 8 bytes (raw: 400000)
+
+  Unencoded (random u32):
+
+  Edge cases:
+    Single row: all encodings pass
+    All zeros: all encodings pass
+    Max u32: FastLanes pass
+
+  Round-trip correctness: ALL PASS

@@ -339,8 +339,7 @@ impl BTreeArenaIndex {
     }
 
     /// Try to insert in leaf without split.
-    /// If the leaf is in Eytzinger order, converts to sorted first.
-    /// Always writes in sorted order and marks layout as SORTED.
+    /// Writes in sorted interleaved order.
     #[inline(always)]
     fn try_insert_in_leaf(&mut self, offset: u64, key: u64, packed_tuple_id: u64) -> Result<bool> {
         unsafe {
@@ -414,8 +413,7 @@ impl BTreeArenaIndex {
     }
 
     /// Split leaf and insert (handles tree growth).
-    /// Handles both Eytzinger and sorted layouts. Writes halves in sorted order
-    /// since try_insert_in_leaf will be called immediately after on one half.
+    /// Writes halves in sorted interleaved order.
     fn split_and_insert(&mut self, key: u64, packed_tuple_id: u64, path: &[u64]) -> Result<()> {
         let leaf_offset = path[path.len() - 1];
 
@@ -719,7 +717,7 @@ impl BTreeArenaIndex {
 
     /// Range scan from start_key to end_key (inclusive).
     /// Returns packed (key, packed_tuple_id) pairs to avoid unpacking overhead.
-    /// Handles both Eytzinger and sorted leaf layouts.
+    /// Sorted interleaved leaf layout with bulk memcpy.
     pub fn range_scan(&self, start_key: Option<&[u8]>, end_key: Option<&[u8]>) -> Vec<(u64, u64)> {
         let start = start_key.map(|k| self.key_to_u64(k)).unwrap_or(0);
         let end = end_key.map(|k| self.key_to_u64(k)).unwrap_or(u64::MAX);

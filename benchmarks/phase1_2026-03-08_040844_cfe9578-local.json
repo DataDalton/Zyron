@@ -1,0 +1,53 @@
+{
+  "id": "2026-03-08_040844_cfe9578-local",
+  "date": "2026-03-08 04:08:48Z",
+  "ts": 1772942928,
+  "commit": "cfe9578-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Encoding Round-Trip": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 12.75 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 12.75 },
+      "FastLanes decode (int/sec)": {
+        "average": 3627359031.529406,
+        "runs": [1300390117.04, 1607717041.80, 5050505050.51, 5076142131.98, 5102040816.33],
+        "target": 120000000000.000000,
+        "passed": false,
+        "higher_is_better": true
+      },
+      "FSST decompress (GB/sec)": {
+        "average": 4.677270,
+        "runs": [4.48, 4.71, 4.66, 4.78, 4.75],
+        "target": 6.000000,
+        "passed": false,
+        "higher_is_better": true
+      },
+      "ALP decode (float/sec)": {
+        "average": 540033136.938853,
+        "runs": [405844155.84, 358937544.87, 707213578.50, 685871056.24, 542299349.24],
+        "target": 3000000000.000000,
+        "passed": false,
+        "higher_is_better": true
+      },
+      "Dictionary lookup (ns/val)": {
+        "average": 2.536000,
+        "runs": [3.07, 2.64, 2.13, 2.42, 2.42],
+        "target": 3.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "RLE decode (val/sec)": {
+        "average": 4725178069.200727,
+        "runs": [905797101.45, 1821493624.77, 16949152542.37, 2369668246.45, 1579778830.96],
+        "target": 60000000000.000000,
+        "passed": false,
+        "higher_is_better": true
+      }
+    }
+  }
+}
