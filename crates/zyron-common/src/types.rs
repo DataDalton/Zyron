@@ -65,6 +65,9 @@ pub enum TypeId {
 
     // Composite/Struct (field types stored in catalog)
     Composite = 110,
+
+    // Vector (fixed-dimension float array for similarity search)
+    Vector = 120,
 }
 
 impl TypeId {
@@ -97,7 +100,8 @@ impl TypeId {
             | TypeId::Json
             | TypeId::Jsonb
             | TypeId::Array
-            | TypeId::Composite => None,
+            | TypeId::Composite
+            | TypeId::Vector => None,
         }
     }
 
@@ -205,6 +209,7 @@ impl std::fmt::Display for TypeId {
             TypeId::Jsonb => "JSONB",
             TypeId::Array => "ARRAY",
             TypeId::Composite => "COMPOSITE",
+            TypeId::Vector => "VECTOR",
         };
         write!(f, "{}", name)
     }
@@ -264,6 +269,7 @@ mod tests {
         assert_eq!(TypeId::Jsonb.fixed_size(), None);
         assert_eq!(TypeId::Array.fixed_size(), None);
         assert_eq!(TypeId::Composite.fixed_size(), None);
+        assert_eq!(TypeId::Vector.fixed_size(), None);
     }
 
     #[test]
@@ -372,6 +378,7 @@ mod tests {
         assert_eq!(TypeId::Jsonb.to_string(), "JSONB");
         assert_eq!(TypeId::Array.to_string(), "ARRAY");
         assert_eq!(TypeId::Composite.to_string(), "COMPOSITE");
+        assert_eq!(TypeId::Vector.to_string(), "VECTOR");
     }
 
     #[test]
@@ -389,6 +396,7 @@ mod tests {
         assert_eq!(TypeId::Json as u8, 90);
         assert_eq!(TypeId::Array as u8, 100);
         assert_eq!(TypeId::Composite as u8, 110);
+        assert_eq!(TypeId::Vector as u8, 120);
     }
 
     #[test]
@@ -458,11 +466,16 @@ mod tests {
             TypeId::Jsonb,
             TypeId::Array,
             TypeId::Composite,
+            TypeId::Vector,
         ];
 
         for type_id in all_types {
             let display = type_id.to_string();
-            assert!(!display.is_empty(), "TypeId {:?} has empty display", type_id);
+            assert!(
+                !display.is_empty(),
+                "TypeId {:?} has empty display",
+                type_id
+            );
         }
     }
 }

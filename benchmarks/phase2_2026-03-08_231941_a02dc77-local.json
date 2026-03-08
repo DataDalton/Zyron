@@ -1,0 +1,78 @@
+{
+  "id": "2026-03-08_231941_a02dc77-local",
+  "date": "2026-03-08 23:19:57Z",
+  "ts": 1773011997,
+  "commit": "a02dc77-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Lexer Throughput": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 15.08 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 15.06 },
+      "Throughput (MB/sec)": {
+        "average": 223.397026,
+        "runs": [226.11, 225.95, 215.82, 221.84, 227.25],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Parser Simple": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 15.05 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 15.07 },
+      "Latency (ns/parse)": {
+        "average": 788.541600,
+        "runs": [781.91, 781.20, 809.04, 786.95, 783.60],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Parser Complex": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 14.93 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 14.92 },
+      "Latency (us/parse)": {
+        "average": 7.882434,
+        "runs": [7.41, 7.81, 8.84, 7.45, 7.90],
+        "target": 20.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Parser Batch": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 14.91 },
+      "util_after": { "cpu_pct": 5.0, "ram_used_gb": 14.90 },
+      "Throughput (stmts/sec)": {
+        "average": 2094574.670992,
+        "runs": [2037076.42, 2037704.88, 2141531.23, 2105422.73, 2151138.10],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Memory": {
+      "Estimated per-parse (bytes)": {
+        "average": 1024.000000,
+        "runs": [1024.00],
+        "target": 1024.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Error Recovery": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 14.90 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 14.90 },
+      "Latency (us/error)": {
+        "average": 0.278921,
+        "runs": [0.27, 0.29, 0.29, 0.28, 0.28],
+        "target": 2.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    }
+  }
+}
