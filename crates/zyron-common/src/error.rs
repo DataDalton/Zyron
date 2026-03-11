@@ -96,6 +96,18 @@ pub enum ZyronError {
     TransactionConflict { txn_id: u64, reason: String },
 
     // Catalog errors
+    #[error("Database not found: {0}")]
+    DatabaseNotFound(String),
+
+    #[error("Database already exists: {0}")]
+    DatabaseAlreadyExists(String),
+
+    #[error("Schema not found: {0}")]
+    SchemaNotFound(String),
+
+    #[error("Schema already exists: {0}")]
+    SchemaAlreadyExists(String),
+
     #[error("Table not found: {0}")]
     TableNotFound(String),
 
@@ -107,6 +119,12 @@ pub enum ZyronError {
 
     #[error("Index not found: {0}")]
     IndexNotFound(String),
+
+    #[error("Index already exists: {0}")]
+    IndexAlreadyExists(String),
+
+    #[error("Catalog corrupted: {0}")]
+    CatalogCorrupted(String),
 
     // Query errors
     #[error("Parse error: {0}")]

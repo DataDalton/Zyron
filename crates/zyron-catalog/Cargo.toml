@@ -1,0 +1,22 @@
+[package]
+name = "zyron-catalog"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+zyron-common = { path = "../zyron-common" }
+zyron-wal = { path = "../zyron-wal" }
+zyron-storage = { path = "../zyron-storage" }
+zyron-buffer = { path = "../zyron-buffer" }
+zyron-parser = { path = "../zyron-parser" }
+parking_lot = { workspace = true }
+scc = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.24.0"
+rand = "0.9.1"
