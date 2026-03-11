@@ -1,0 +1,181 @@
+
+=== Binding ===
+  Binding: SELECT id, name FROM users WHERE age > 21
+    Projections: 2 (expected 2)
+    Table resolved to OID TableId(10000)
+    WHERE type: Boolean (expected Boolean)
+  Binding: SELECT nonexistent FROM users (expect error)
+    Error: Column not found: nonexistent
+  Binding: SELECT id FROM nonexistent (expect error)
+    Error: Table not found: nonexistent
+  Binding test: PASS
+
+=== Logical Plan Structure ===
+  Planning: SELECT * FROM users WHERE age > 21 ORDER BY name LIMIT 10
+  Top-level operator: Limit
+  Child of Limit: Sort
+  Child of Sort: Filter
+    Contains Filter: true
+    Contains Scan: true
+  Planning: SELECT * FROM a JOIN b ON a.id = b.a_id
+  Contains Join: true
+  Logical plan structure test: PASS
+
+============================================
+  Phase 4: Query Planner - All Tests Complete
+============================================
+  Commit: 37ae737
+  CPU: Intel(R) Core(TM) i9-14900KS
+  RAM: 31.8 GB
+  Cores: 32
+  OS: windows/x86_64
+  Run ID: 2026-03-11_223733_37ae737
+  Output:  benchmarks/phase4_2026-03-11_223733_37ae737.json
+  Log:     benchmarks/phase4_2026-03-11_223733_37ae737.txt
+  Binding:     1 correctness test
+  Logical:     1 correctness test
+  Predicate:   1 correctness test
+  Projection:  1 correctness test
+  Join Order:  1 correctness test
+  Index Sel:   1 correctness test
+  Cost Model:  1 correctness test
+  Complex:     1 correctness test (TPC-H Q1, Q3)
+  Benchmarks:  1 performance test (9 metrics)
+============================================
+
+=== Projection Pushdown ===
+  Planning: SELECT col1, col2 FROM wide_table
+  Scan column counts: [2]
+  Narrowest scan reads 2 columns (originally 20)
+  Projection pushed down to scan level
+  Projection pushdown test: PASS
+
+=== Index Selection ===
+  Planning: SELECT * FROM orders WHERE status = 'pending' (low selectivity, expect IndexScan)
+  Physical operator: IndexScan
+  Cost: 401.50
+  Uses IndexScan: true
+  Planning: SELECT * FROM orders WHERE status != 'pending' (high selectivity, expect SeqScan)
+  Physical operator: SeqScan
+  Cost: 10100.00
+  Uses SeqScan: true
+  Index selection test: PASS
+
+=== Cost Estimation ===
+  Full scan cost (1K rows): 10.10
+  Full scan cost (1M rows): 10100.00
+  Cost ratio: 1000.0x
+  SeqScan cost (1K): io=10.00, cpu=10.00, rows=1000
+  SeqScan cost (1M): io=10000.00, cpu=10000.00, rows=1000000
+  IndexScan cost (1M, 1%%): io=400.00, cpu=150.00, rows=10000
+  Cost estimation test: PASS
+
+=== Complex Queries (TPC-H style) ===
+  TPC-H Q1 (aggregation + filter):
+    Top operator: Sort
+    Total cost: 0.37
+    Contains aggregate: true
+  TPC-H Q3 (3-way join):
+    Top operator: Limit
+    Total cost: 0.00
+    Contains join: true
+  Complex query test: PASS
+
+=== Planner Performance Benchmarks ===
+Validation runs: 5
+
+--- Run 1/5 ---
+  Binding: 1.83 us/op
+  Logical plan: 0.25 us/op (pure, excl. binding)
+  Optimization: 1.92 us/op (pure, excl. logical)
+  Physical plan: 0.33 us/op (pure, excl. optimization)
+  Join reorder (5 tables): 21.36 us/op
+  Index selection: 3.25 us/op
+  Full pipeline: 6.48 us/op
+
+--- Run 2/5 ---
+  Binding: 1.54 us/op
+  Logical plan: 0.42 us/op (pure, excl. binding)
+  Optimization: 2.05 us/op (pure, excl. logical)
+  Physical plan: 0.21 us/op (pure, excl. optimization)
+  Join reorder (5 tables): 21.34 us/op
+  Index selection: 3.28 us/op
+  Full pipeline: 6.36 us/op
+
+--- Run 3/5 ---
+  Binding: 1.57 us/op
+  Logical plan: 0.37 us/op (pure, excl. binding)
+  Optimization: 2.03 us/op (pure, excl. logical)
+  Physical plan: 0.27 us/op (pure, excl. optimization)
+  Join reorder (5 tables): 21.75 us/op
+  Index selection: 3.18 us/op
+  Full pipeline: 6.39 us/op
+
+--- Run 4/5 ---
+  Binding: 1.63 us/op
+  Logical plan: 0.36 us/op (pure, excl. binding)
+  Optimization: 1.95 us/op (pure, excl. logical)
+  Physical plan: 0.25 us/op (pure, excl. optimization)
+  Join reorder (5 tables): 21.40 us/op
+  Index selection: 3.18 us/op
+  Full pipeline: 6.32 us/op
+
+--- Run 5/5 ---
+  Binding: 1.57 us/op
+  Logical plan: 0.50 us/op (pure, excl. binding)
+  Optimization: 1.85 us/op (pure, excl. logical)
+  Physical plan: 0.29 us/op (pure, excl. optimization)
+  Join reorder (5 tables): 21.63 us/op
+  Index selection: 3.12 us/op
+  Full pipeline: 6.25 us/op
+
+=== Planner Performance Results ===
+  Binding latency (us) [PASS/OK]:
+    Runs: [1.83, 1.54, 1.57, 1.63, 1.57]
+    Average: 1.63 <= 2.00 (target)
+    Min/Max: 1.54 / 1.83, StdDev: 0.10
+  Logical plan latency (us) [PASS/OK]:
+    Runs: [0.25, 0.42, 0.37, 0.36, 0.50]
+    Average: 0.38 <= 5.00 (target)
+    Min/Max: 0.25 / 0.50, StdDev: 0.08
+  Optimization latency (us) [PASS/OK]:
+    Runs: [1.92, 2.05, 2.03, 1.95, 1.85]
+    Average: 1.96 <= 25.00 (target)
+    Min/Max: 1.85 / 2.05, StdDev: 0.07
+  Physical plan latency (us) [PASS/OK]:
+    Runs: [0.33, 0.21, 0.27, 0.25, 0.29]
+    Average: 0.27 <= 10.00 (target)
+    Min/Max: 0.21 / 0.33, StdDev: 0.04
+  Join reorder latency (us, 5 tables) [PASS/OK]:
+    Runs: [21.36, 21.34, 21.75, 21.40, 21.63]
+    Average: 21.49 <= 100.00 (target)
+    Min/Max: 21.34 / 21.75, StdDev: 0.17
+  Index selection latency (us) [PASS/OK]:
+    Runs: [3.25, 3.28, 3.18, 3.18, 3.12]
+    Average: 3.20 <= 5.00 (target)
+    Min/Max: 3.12 / 3.28, StdDev: 0.06
+  Full pipeline latency (us) [PASS/OK]:
+    Runs: [6.48, 6.36, 6.39, 6.32, 6.25]
+    Average: 6.36 <= 50.00 (target)
+    Min/Max: 6.25 / 6.48, StdDev: 0.08
+
+--- Plan Cache Simulation ---
+  Plan cache hit rate [PASS]: 0.9990 >= 0.9800 (target)
+
+--- Cardinality Estimation Accuracy ---
+  Cardinality estimation error factor [PASS]: 1.0000 <= 2.0000 (target)
+
+=== All Phase 4 Performance Tests: PASS ===
+
+=== Predicate Pushdown ===
+  Planning: SELECT * FROM a JOIN b ON a.id = b.id WHERE a.x > 10 AND b.y < 5
+  Filter nodes in optimized plan: 2
+  Top-level operator: Join
+  Predicate pushdown test: PASS
+
+=== Join Ordering ===
+  Planning: SELECT * FROM large JOIN medium ON large.id = medium.id JOIN small ON medium.id = small.id
+  Top-level operator: Join
+  Physical plan top: HashJoin
+  Physical plan cost: 10227.29
+  Join ordering test: PASS
