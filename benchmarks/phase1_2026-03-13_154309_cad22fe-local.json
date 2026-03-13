@@ -1,0 +1,32 @@
+{
+  "id": "2026-03-13_154309_cad22fe-local",
+  "date": "2026-03-13 15:43:12Z",
+  "ts": 1773416592,
+  "commit": "cad22fe-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "WAL Write/Replay": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 16.12 },
+      "util_after": { "cpu_pct": 10.0, "ram_used_gb": 16.13 },
+      "Write throughput (ops/sec)": {
+        "average": 33799076.734378,
+        "runs": [31046258.93, 36023054.76, 34867503.49, 32905561.04, 34153005.46],
+        "target": 8000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "Replay throughput (ops/sec)": {
+        "average": 31171268.797978,
+        "runs": [30111412.23, 29010733.97, 31565656.57, 30590394.62, 34578146.61],
+        "target": 12000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}

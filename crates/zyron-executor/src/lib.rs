@@ -7,4 +7,5 @@ pub mod expr;
 pub mod operator;
 
 pub use context::ExecutionContext;
-pub use executor::execute;
+pub use executor::{execute, execute_analyze};
+pub use operator::OperatorMetrics;

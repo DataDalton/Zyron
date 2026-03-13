@@ -844,6 +844,79 @@ impl WalWriter {
         self.append(txn_id, prev_lsn, LogRecordType::Delete, 0, payload)
     }
 
+    /// Logs a batch of delete operations with amortized atomic overhead.
+    ///
+    /// Same batching strategy as log_insert_batch: one CAS reserve, one
+    /// commit for the entire batch. Falls back to per-record append at
+    /// segment boundaries.
+    #[inline]
+    pub fn log_delete_batch(&self, deletes: &[(u32, &[u8])]) -> Result<Vec<Lsn>> {
+        if deletes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut lsns = Vec::with_capacity(deletes.len());
+        let mut idx = 0;
+
+        while idx < deletes.len() {
+            let mut batch_size: u32 = 0;
+            let batch_start = idx;
+            let mut batch_end = idx;
+
+            for (_, payload) in &deletes[idx..] {
+                let rsize = record_size_for_payload(payload.len()) as u32;
+                let new_total = batch_size + rsize;
+                if new_total > 256 * 1024 && batch_end > batch_start {
+                    break;
+                }
+                batch_size = new_total;
+                batch_end += 1;
+            }
+
+            let (base_lsn, needs_rotation) = self.sequencer.reserve(batch_size);
+
+            if needs_rotation {
+                let (txn_id, payload) = deletes[idx];
+                let lsn = self.append(txn_id, Lsn::INVALID, LogRecordType::Delete, 0, payload)?;
+                lsns.push(lsn);
+                idx += 1;
+                continue;
+            }
+
+            let buf_start = unsafe { self.ring_buffer.write_record(batch_size as usize) };
+
+            let mut buf_offset: u32 = 0;
+            for &(txn_id, payload) in &deletes[batch_start..batch_end] {
+                let rsize = record_size_for_payload(payload.len()) as u32;
+                let record_lsn = Lsn::new(base_lsn.segment_id(), base_lsn.offset() + buf_offset);
+
+                unsafe {
+                    let buf_ptr = buf_start.add(buf_offset as usize);
+                    serialize_raw_deferred(
+                        buf_ptr,
+                        record_lsn,
+                        Lsn::INVALID,
+                        txn_id,
+                        LogRecordType::Delete as u8,
+                        0,
+                        payload,
+                    );
+                }
+
+                lsns.push(record_lsn);
+                buf_offset += rsize;
+            }
+
+            self.ring_buffer
+                .commit_write(batch_size as usize, *lsns.last().unwrap());
+            self.maybe_wake_flush_thread(batch_size as usize);
+
+            idx = batch_end;
+        }
+
+        Ok(lsns)
+    }
+
     /// Logs a checkpoint begin marker.
     #[inline]
     pub fn log_checkpoint_begin(&self) -> Result<Lsn> {

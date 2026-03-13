@@ -9,8 +9,6 @@ use std::sync::Arc;
 use zyron_common::{TypeId, ZyronError};
 use zyron_planner::binder::{BoundAssignment, BoundExpr};
 use zyron_planner::logical::LogicalColumn;
-use zyron_wal::Lsn;
-
 use zyron_storage::TupleId;
 
 use crate::batch::{DataBatch, batch_to_tuples};
@@ -147,24 +145,21 @@ impl Operator for InsertOperator {
             let table_entry = self.ctx.get_table_entry(self.table_id)?;
             let heap_file = self.ctx.get_heap_file(self.table_id)?;
             let mut total_inserted: i64 = 0;
-            let mut prev_lsn = Lsn(0);
+            let txn_id = self.ctx.txn_id;
 
             loop {
+                self.ctx.check_cancelled()?;
                 let input = self.source.next().await?;
                 let Some(exec_batch) = input else {
                     break;
                 };
 
-                let tuples =
-                    batch_to_tuples(&exec_batch.batch, &table_entry.columns, self.ctx.txn_id);
+                let tuples = batch_to_tuples(&exec_batch.batch, &table_entry.columns, txn_id);
 
-                // WAL log each insert.
-                for tuple in &tuples {
-                    prev_lsn = self
-                        .ctx
-                        .wal
-                        .log_insert(self.ctx.txn_id, prev_lsn, tuple.data())?;
-                }
+                // Batch WAL log: one CAS + commit for all inserts in this batch.
+                let batch_records: Vec<(u32, &[u8])> =
+                    tuples.iter().map(|t| (txn_id, t.data())).collect();
+                self.ctx.wal.log_insert_batch(&batch_records)?;
 
                 heap_file.insert_batch(&tuples).await?;
                 total_inserted += tuples.len() as i64;
@@ -213,9 +208,10 @@ impl Operator for DeleteOperator {
 
             let heap_file = self.ctx.get_heap_file(self.table_id)?;
             let mut total_deleted: i64 = 0;
-            let mut prev_lsn = Lsn(0);
+            let txn_id = self.ctx.txn_id;
 
             loop {
+                self.ctx.check_cancelled()?;
                 let input = self.child.next().await?;
                 let Some(exec_batch) = input else {
                     break;
@@ -225,14 +221,11 @@ impl Operator for DeleteOperator {
                     ZyronError::Internal("DeleteOperator requires tuple IDs from scan".into())
                 })?;
 
-                // WAL log each deletion.
-                for tid in &tuple_ids {
-                    let payload = tuple_id_payload(tid);
-                    prev_lsn = self
-                        .ctx
-                        .wal
-                        .log_delete(self.ctx.txn_id, prev_lsn, &payload)?;
-                }
+                // Batch WAL log: one CAS + commit for all deletes in this batch.
+                let payloads: Vec<Vec<u8>> = tuple_ids.iter().map(tuple_id_payload).collect();
+                let batch_records: Vec<(u32, &[u8])> =
+                    payloads.iter().map(|p| (txn_id, p.as_slice())).collect();
+                self.ctx.wal.log_delete_batch(&batch_records)?;
 
                 let deleted = heap_file.delete_batch(&tuple_ids).await?;
                 total_deleted += deleted as i64;
@@ -289,9 +282,10 @@ impl Operator for UpdateOperator {
             let table_entry = self.ctx.get_table_entry(self.table_id)?;
             let heap_file = self.ctx.get_heap_file(self.table_id)?;
             let mut total_updated: i64 = 0;
-            let mut prev_lsn = Lsn(0);
+            let txn_id = self.ctx.txn_id;
 
             loop {
+                self.ctx.check_cancelled()?;
                 let input = self.child.next().await?;
                 let Some(exec_batch) = input else {
                     break;
@@ -325,26 +319,22 @@ impl Operator for UpdateOperator {
                 }
 
                 let updated_batch = DataBatch::new(updated_columns);
-                let new_tuples =
-                    batch_to_tuples(&updated_batch, &table_entry.columns, self.ctx.txn_id);
+                let new_tuples = batch_to_tuples(&updated_batch, &table_entry.columns, txn_id);
 
-                // Delete old tuples (MVCC: mark with xmax).
-                for tid in &tuple_ids {
-                    let payload = tuple_id_payload(tid);
-                    prev_lsn = self
-                        .ctx
-                        .wal
-                        .log_delete(self.ctx.txn_id, prev_lsn, &payload)?;
-                }
+                // Batch WAL log deletes: one CAS + commit for all.
+                let delete_payloads: Vec<Vec<u8>> =
+                    tuple_ids.iter().map(tuple_id_payload).collect();
+                let delete_records: Vec<(u32, &[u8])> = delete_payloads
+                    .iter()
+                    .map(|p| (txn_id, p.as_slice()))
+                    .collect();
+                self.ctx.wal.log_delete_batch(&delete_records)?;
                 heap_file.delete_batch(&tuple_ids).await?;
 
-                // Insert new tuples.
-                for tuple in &new_tuples {
-                    prev_lsn = self
-                        .ctx
-                        .wal
-                        .log_insert(self.ctx.txn_id, prev_lsn, tuple.data())?;
-                }
+                // Batch WAL log inserts: one CAS + commit for all.
+                let insert_records: Vec<(u32, &[u8])> =
+                    new_tuples.iter().map(|t| (txn_id, t.data())).collect();
+                self.ctx.wal.log_insert_batch(&insert_records)?;
                 heap_file.insert_batch(&new_tuples).await?;
 
                 total_updated += tuple_ids.len() as i64;

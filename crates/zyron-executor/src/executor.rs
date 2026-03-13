@@ -8,7 +8,6 @@ use zyron_planner::physical::PhysicalPlan;
 
 use crate::batch::DataBatch;
 use crate::context::ExecutionContext;
-use crate::operator::Operator;
 use crate::operator::aggregate::{HashAggregateOperator, SortAggregateOperator};
 use crate::operator::distinct::HashDistinctOperator;
 use crate::operator::filter::FilterOperator;
@@ -16,26 +15,78 @@ use crate::operator::join::{HashJoinOperator, MergeJoinOperator, NestedLoopJoinO
 use crate::operator::limit::LimitOperator;
 use crate::operator::modify::{DeleteOperator, InsertOperator, UpdateOperator, ValuesOperator};
 use crate::operator::project::ProjectOperator;
-use crate::operator::scan::{IndexScanOperator, SeqScanOperator};
+use crate::operator::scan::{
+    IndexScanOperator, ParallelSeqScanOperator, SeqScanOperator, should_use_parallel_scan,
+};
 use crate::operator::setop::SetOpOperator;
 use crate::operator::sort::SortOperator;
+use crate::operator::{MetricsOperator, Operator, OperatorMetrics};
+
+/// Result of building an operator tree: the operator plus optional metrics
+/// (populated only when analyze mode is enabled on the ExecutionContext).
+struct BuildResult {
+    op: Box<dyn Operator>,
+    metrics: Option<Arc<OperatorMetrics>>,
+}
+
+impl BuildResult {
+    fn new(op: Box<dyn Operator>) -> Self {
+        Self { op, metrics: None }
+    }
+
+    /// Wraps the operator with a MetricsOperator if analyze is enabled.
+    fn with_metrics(
+        mut self,
+        name: &str,
+        analyze: bool,
+        child_metrics: Vec<Arc<OperatorMetrics>>,
+    ) -> Self {
+        if analyze {
+            let metrics = OperatorMetrics::with_children(name, child_metrics);
+            self.op = Box::new(MetricsOperator::new(self.op, metrics.clone()));
+            self.metrics = Some(metrics);
+        }
+        self
+    }
+}
+
+/// Helper to collect child metrics into a Vec, filtering out None values.
+fn collect_metrics(items: &[&Option<Arc<OperatorMetrics>>]) -> Vec<Arc<OperatorMetrics>> {
+    items.iter().filter_map(|m| m.as_ref().cloned()).collect()
+}
 
 /// Recursively converts a PhysicalPlan into an executable Operator tree.
+/// When analyze mode is enabled on the context, each operator is wrapped
+/// with a MetricsOperator that collects timing and row count stats.
 fn build_operator_tree(
     plan: PhysicalPlan,
     ctx: &Arc<ExecutionContext>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn Operator>>> + Send + '_>> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BuildResult>> + Send + '_>> {
     Box::pin(async move {
-        let result: Result<Box<dyn Operator>> = match plan {
+        let analyze = ctx.analyze;
+        let result: Result<BuildResult> = match plan {
             PhysicalPlan::SeqScan {
                 table_id,
                 columns,
                 predicate,
                 ..
             } => {
-                let op =
-                    SeqScanOperator::new(ctx.clone(), table_id, columns, predicate, false).await?;
-                Ok(Box::new(op))
+                // Use parallel scan for large tables when not tracking tuple IDs.
+                let table_entry = ctx.get_table_entry(table_id)?;
+                let num_pages = ctx.disk_manager.num_pages(table_entry.heap_file_id).await?;
+
+                if should_use_parallel_scan(num_pages, false) {
+                    let op =
+                        ParallelSeqScanOperator::new(ctx.clone(), table_id, columns, predicate)
+                            .await?;
+                    let br = BuildResult::new(Box::new(op));
+                    Ok(br.with_metrics("ParallelSeqScan", analyze, vec![]))
+                } else {
+                    let op = SeqScanOperator::new(ctx.clone(), table_id, columns, predicate, false)
+                        .await?;
+                    let br = BuildResult::new(Box::new(op));
+                    Ok(br.with_metrics("SeqScan", analyze, vec![]))
+                }
             }
 
             PhysicalPlan::IndexScan {
@@ -54,31 +105,36 @@ fn build_operator_tree(
                     false,
                 )
                 .await?;
-                Ok(Box::new(op))
+                let br = BuildResult::new(Box::new(op));
+                Ok(br.with_metrics("IndexScan", analyze, vec![]))
             }
 
             PhysicalPlan::Filter {
                 predicate, child, ..
             } => {
                 let input_schema = child.output_schema();
-                let child_op = build_operator_tree(*child, ctx).await?;
-                Ok(Box::new(FilterOperator::new(
-                    child_op,
+                let child_br = build_operator_tree(*child, ctx).await?;
+                let child_m = collect_metrics(&[&child_br.metrics]);
+                let br = BuildResult::new(Box::new(FilterOperator::new(
+                    child_br.op,
                     predicate,
                     input_schema,
-                )))
+                )));
+                Ok(br.with_metrics("Filter", analyze, child_m))
             }
 
             PhysicalPlan::Project {
                 expressions, child, ..
             } => {
                 let input_schema = child.output_schema();
-                let child_op = build_operator_tree(*child, ctx).await?;
-                Ok(Box::new(ProjectOperator::new(
-                    child_op,
+                let child_br = build_operator_tree(*child, ctx).await?;
+                let child_m = collect_metrics(&[&child_br.metrics]);
+                let br = BuildResult::new(Box::new(ProjectOperator::new(
+                    child_br.op,
                     expressions,
                     input_schema,
-                )))
+                )));
+                Ok(br.with_metrics("Project", analyze, child_m))
             }
 
             PhysicalPlan::NestedLoopJoin {
@@ -90,16 +146,18 @@ fn build_operator_tree(
             } => {
                 let left_schema = left.output_schema();
                 let right_schema = right.output_schema();
-                let left_op = build_operator_tree(*left, ctx).await?;
-                let right_op = build_operator_tree(*right, ctx).await?;
-                Ok(Box::new(NestedLoopJoinOperator::new(
-                    left_op,
-                    right_op,
+                let left_br = build_operator_tree(*left, ctx).await?;
+                let right_br = build_operator_tree(*right, ctx).await?;
+                let child_m = collect_metrics(&[&left_br.metrics, &right_br.metrics]);
+                let br = BuildResult::new(Box::new(NestedLoopJoinOperator::new(
+                    left_br.op,
+                    right_br.op,
                     join_type,
                     condition,
                     left_schema,
                     right_schema,
-                )))
+                )));
+                Ok(br.with_metrics("NestedLoopJoin", analyze, child_m))
             }
 
             PhysicalPlan::HashJoin {
@@ -113,18 +171,20 @@ fn build_operator_tree(
             } => {
                 let left_schema = left.output_schema();
                 let right_schema = right.output_schema();
-                let left_op = build_operator_tree(*left, ctx).await?;
-                let right_op = build_operator_tree(*right, ctx).await?;
-                Ok(Box::new(HashJoinOperator::new(
-                    left_op,
-                    right_op,
+                let left_br = build_operator_tree(*left, ctx).await?;
+                let right_br = build_operator_tree(*right, ctx).await?;
+                let child_m = collect_metrics(&[&left_br.metrics, &right_br.metrics]);
+                let br = BuildResult::new(Box::new(HashJoinOperator::new(
+                    left_br.op,
+                    right_br.op,
                     join_type,
                     left_keys,
                     right_keys,
                     remaining_condition,
                     left_schema,
                     right_schema,
-                )))
+                )));
+                Ok(br.with_metrics("HashJoin", analyze, child_m))
             }
 
             PhysicalPlan::MergeJoin {
@@ -137,17 +197,19 @@ fn build_operator_tree(
             } => {
                 let left_schema = left.output_schema();
                 let right_schema = right.output_schema();
-                let left_op = build_operator_tree(*left, ctx).await?;
-                let right_op = build_operator_tree(*right, ctx).await?;
-                Ok(Box::new(MergeJoinOperator::new(
-                    left_op,
-                    right_op,
+                let left_br = build_operator_tree(*left, ctx).await?;
+                let right_br = build_operator_tree(*right, ctx).await?;
+                let child_m = collect_metrics(&[&left_br.metrics, &right_br.metrics]);
+                let br = BuildResult::new(Box::new(MergeJoinOperator::new(
+                    left_br.op,
+                    right_br.op,
                     join_type,
                     left_keys,
                     right_keys,
                     left_schema,
                     right_schema,
-                )))
+                )));
+                Ok(br.with_metrics("MergeJoin", analyze, child_m))
             }
 
             PhysicalPlan::HashAggregate {
@@ -157,37 +219,17 @@ fn build_operator_tree(
                 ..
             } => {
                 let input_schema = child.output_schema();
-                let output_schema = {
-                    let mut schema = Vec::new();
-                    for (i, expr) in group_by.iter().enumerate() {
-                        schema.push(zyron_planner::logical::LogicalColumn {
-                            table_idx: None,
-                            column_id: zyron_catalog::ColumnId(i as u16),
-                            name: format!("group{}", i),
-                            type_id: expr.type_id(),
-                            nullable: expr.nullable(),
-                        });
-                    }
-                    for (i, agg) in aggregates.iter().enumerate() {
-                        let idx = group_by.len() + i;
-                        schema.push(zyron_planner::logical::LogicalColumn {
-                            table_idx: None,
-                            column_id: zyron_catalog::ColumnId(idx as u16),
-                            name: agg.function_name.clone(),
-                            type_id: agg.return_type,
-                            nullable: true,
-                        });
-                    }
-                    schema
-                };
-                let child_op = build_operator_tree(*child, ctx).await?;
-                Ok(Box::new(HashAggregateOperator::new(
-                    child_op,
+                let output_schema = build_aggregate_schema(&group_by, &aggregates);
+                let child_br = build_operator_tree(*child, ctx).await?;
+                let child_m = collect_metrics(&[&child_br.metrics]);
+                let br = BuildResult::new(Box::new(HashAggregateOperator::new(
+                    child_br.op,
                     group_by,
                     aggregates,
                     input_schema,
                     output_schema,
-                )))
+                )));
+                Ok(br.with_metrics("HashAggregate", analyze, child_m))
             }
 
             PhysicalPlan::SortAggregate {
@@ -197,37 +239,17 @@ fn build_operator_tree(
                 ..
             } => {
                 let input_schema = child.output_schema();
-                let output_schema = {
-                    let mut schema = Vec::new();
-                    for (i, expr) in group_by.iter().enumerate() {
-                        schema.push(zyron_planner::logical::LogicalColumn {
-                            table_idx: None,
-                            column_id: zyron_catalog::ColumnId(i as u16),
-                            name: format!("group{}", i),
-                            type_id: expr.type_id(),
-                            nullable: expr.nullable(),
-                        });
-                    }
-                    for (i, agg) in aggregates.iter().enumerate() {
-                        let idx = group_by.len() + i;
-                        schema.push(zyron_planner::logical::LogicalColumn {
-                            table_idx: None,
-                            column_id: zyron_catalog::ColumnId(idx as u16),
-                            name: agg.function_name.clone(),
-                            type_id: agg.return_type,
-                            nullable: true,
-                        });
-                    }
-                    schema
-                };
-                let child_op = build_operator_tree(*child, ctx).await?;
-                Ok(Box::new(SortAggregateOperator::new(
-                    child_op,
+                let output_schema = build_aggregate_schema(&group_by, &aggregates);
+                let child_br = build_operator_tree(*child, ctx).await?;
+                let child_m = collect_metrics(&[&child_br.metrics]);
+                let br = BuildResult::new(Box::new(SortAggregateOperator::new(
+                    child_br.op,
                     group_by,
                     aggregates,
                     input_schema,
                     output_schema,
-                )))
+                )));
+                Ok(br.with_metrics("SortAggregate", analyze, child_m))
             }
 
             PhysicalPlan::Sort {
@@ -237,13 +259,15 @@ fn build_operator_tree(
                 ..
             } => {
                 let input_schema = child.output_schema();
-                let child_op = build_operator_tree(*child, ctx).await?;
-                Ok(Box::new(SortOperator::new(
-                    child_op,
+                let child_br = build_operator_tree(*child, ctx).await?;
+                let child_m = collect_metrics(&[&child_br.metrics]);
+                let br = BuildResult::new(Box::new(SortOperator::new(
+                    child_br.op,
                     order_by,
                     input_schema,
                     limit,
-                )))
+                )));
+                Ok(br.with_metrics("Sort", analyze, child_m))
             }
 
             PhysicalPlan::Limit {
@@ -252,13 +276,17 @@ fn build_operator_tree(
                 child,
                 ..
             } => {
-                let child_op = build_operator_tree(*child, ctx).await?;
-                Ok(Box::new(LimitOperator::new(child_op, limit, offset)))
+                let child_br = build_operator_tree(*child, ctx).await?;
+                let child_m = collect_metrics(&[&child_br.metrics]);
+                let br = BuildResult::new(Box::new(LimitOperator::new(child_br.op, limit, offset)));
+                Ok(br.with_metrics("Limit", analyze, child_m))
             }
 
             PhysicalPlan::HashDistinct { child, .. } => {
-                let child_op = build_operator_tree(*child, ctx).await?;
-                Ok(Box::new(HashDistinctOperator::new(child_op)))
+                let child_br = build_operator_tree(*child, ctx).await?;
+                let child_m = collect_metrics(&[&child_br.metrics]);
+                let br = BuildResult::new(Box::new(HashDistinctOperator::new(child_br.op)));
+                Ok(br.with_metrics("HashDistinct", analyze, child_m))
             }
 
             PhysicalPlan::SetOp {
@@ -268,36 +296,47 @@ fn build_operator_tree(
                 right,
                 ..
             } => {
-                let left_op = build_operator_tree(*left, ctx).await?;
-                let right_op = build_operator_tree(*right, ctx).await?;
-                Ok(Box::new(SetOpOperator::new(left_op, right_op, op, all)))
+                let left_br = build_operator_tree(*left, ctx).await?;
+                let right_br = build_operator_tree(*right, ctx).await?;
+                let child_m = collect_metrics(&[&left_br.metrics, &right_br.metrics]);
+                let br = BuildResult::new(Box::new(SetOpOperator::new(
+                    left_br.op,
+                    right_br.op,
+                    op,
+                    all,
+                )));
+                Ok(br.with_metrics("SetOp", analyze, child_m))
             }
 
             PhysicalPlan::Values { rows, schema, .. } => {
-                Ok(Box::new(ValuesOperator::new(rows, schema)))
+                let br = BuildResult::new(Box::new(ValuesOperator::new(rows, schema)));
+                Ok(br.with_metrics("Values", analyze, vec![]))
             }
 
             PhysicalPlan::Insert {
                 table_id, source, ..
             } => {
-                let source_op = build_operator_tree(*source, ctx).await?;
-                Ok(Box::new(InsertOperator::new(
-                    source_op,
+                let source_br = build_operator_tree(*source, ctx).await?;
+                let child_m = collect_metrics(&[&source_br.metrics]);
+                let br = BuildResult::new(Box::new(InsertOperator::new(
+                    source_br.op,
                     ctx.clone(),
                     table_id,
-                )))
+                )));
+                Ok(br.with_metrics("Insert", analyze, child_m))
             }
 
             PhysicalPlan::Delete {
                 table_id, child, ..
             } => {
-                // Build a scan that tracks tuple IDs for deletion.
-                let child_op = build_scan_with_tuple_ids(*child, ctx).await?;
-                Ok(Box::new(DeleteOperator::new(
-                    child_op,
+                let child_br = build_scan_with_tuple_ids(*child, ctx).await?;
+                let child_m = collect_metrics(&[&child_br.metrics]);
+                let br = BuildResult::new(Box::new(DeleteOperator::new(
+                    child_br.op,
                     ctx.clone(),
                     table_id,
-                )))
+                )));
+                Ok(br.with_metrics("Delete", analyze, child_m))
             }
 
             PhysicalPlan::Update {
@@ -307,18 +346,48 @@ fn build_operator_tree(
                 ..
             } => {
                 let input_schema = child.output_schema();
-                let child_op = build_scan_with_tuple_ids(*child, ctx).await?;
-                Ok(Box::new(UpdateOperator::new(
-                    child_op,
+                let child_br = build_scan_with_tuple_ids(*child, ctx).await?;
+                let child_m = collect_metrics(&[&child_br.metrics]);
+                let br = BuildResult::new(Box::new(UpdateOperator::new(
+                    child_br.op,
                     ctx.clone(),
                     table_id,
                     assignments,
                     input_schema,
-                )))
+                )));
+                Ok(br.with_metrics("Update", analyze, child_m))
             }
         };
         result
     })
+}
+
+/// Builds the output schema for aggregate operators.
+fn build_aggregate_schema(
+    group_by: &[zyron_planner::binder::BoundExpr],
+    aggregates: &[zyron_planner::logical::AggregateExpr],
+) -> Vec<zyron_planner::logical::LogicalColumn> {
+    let mut schema = Vec::new();
+    for (i, expr) in group_by.iter().enumerate() {
+        schema.push(zyron_planner::logical::LogicalColumn {
+            table_idx: None,
+            column_id: zyron_catalog::ColumnId(i as u16),
+            name: format!("group{}", i),
+            type_id: expr.type_id(),
+            nullable: expr.nullable(),
+        });
+    }
+    for (i, agg) in aggregates.iter().enumerate() {
+        let idx = group_by.len() + i;
+        schema.push(zyron_planner::logical::LogicalColumn {
+            table_idx: None,
+            column_id: zyron_catalog::ColumnId(idx as u16),
+            name: agg.function_name.clone(),
+            type_id: agg.return_type,
+            nullable: true,
+        });
+    }
+    schema
 }
 
 /// Builds an operator tree where the leaf scan tracks tuple IDs.
@@ -326,9 +395,10 @@ fn build_operator_tree(
 fn build_scan_with_tuple_ids(
     plan: PhysicalPlan,
     ctx: &Arc<ExecutionContext>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn Operator>>> + Send + '_>> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BuildResult>> + Send + '_>> {
     Box::pin(async move {
-        let result: Result<Box<dyn Operator>> = match plan {
+        let analyze = ctx.analyze;
+        let result: Result<BuildResult> = match plan {
             PhysicalPlan::SeqScan {
                 table_id,
                 columns,
@@ -337,7 +407,8 @@ fn build_scan_with_tuple_ids(
             } => {
                 let op =
                     SeqScanOperator::new(ctx.clone(), table_id, columns, predicate, true).await?;
-                Ok(Box::new(op) as Box<dyn Operator>)
+                let br = BuildResult::new(Box::new(op) as Box<dyn Operator>);
+                Ok(br.with_metrics("SeqScan", analyze, vec![]))
             }
 
             PhysicalPlan::IndexScan {
@@ -356,19 +427,22 @@ fn build_scan_with_tuple_ids(
                     true,
                 )
                 .await?;
-                Ok(Box::new(op) as Box<dyn Operator>)
+                let br = BuildResult::new(Box::new(op) as Box<dyn Operator>);
+                Ok(br.with_metrics("IndexScan", analyze, vec![]))
             }
 
             PhysicalPlan::Filter {
                 predicate, child, ..
             } => {
                 let input_schema = child.output_schema();
-                let child_op = build_scan_with_tuple_ids(*child, ctx).await?;
-                Ok(Box::new(FilterOperator::new(
-                    child_op,
+                let child_br = build_scan_with_tuple_ids(*child, ctx).await?;
+                let child_m = collect_metrics(&[&child_br.metrics]);
+                let br = BuildResult::new(Box::new(FilterOperator::new(
+                    child_br.op,
                     predicate,
                     input_schema,
-                )))
+                )));
+                Ok(br.with_metrics("Filter", analyze, child_m))
             }
 
             PhysicalPlan::Limit {
@@ -377,25 +451,27 @@ fn build_scan_with_tuple_ids(
                 child,
                 ..
             } => {
-                let child_op = build_scan_with_tuple_ids(*child, ctx).await?;
-                Ok(Box::new(LimitOperator::new(child_op, limit, offset)))
+                let child_br = build_scan_with_tuple_ids(*child, ctx).await?;
+                let child_m = collect_metrics(&[&child_br.metrics]);
+                let br = BuildResult::new(Box::new(LimitOperator::new(child_br.op, limit, offset)));
+                Ok(br.with_metrics("Limit", analyze, child_m))
             }
 
-            other => {
-                // Fall back to normal build for non-scan nodes.
-                build_operator_tree(other, ctx).await
-            }
+            other => build_operator_tree(other, ctx).await,
         };
         result
     })
 }
 
 /// Executes a PhysicalPlan and collects all result batches.
+/// Checks for query cancellation between each batch.
 pub async fn execute(plan: PhysicalPlan, ctx: &Arc<ExecutionContext>) -> Result<Vec<DataBatch>> {
-    let mut root = build_operator_tree(plan, ctx).await?;
+    let br = build_operator_tree(plan, ctx).await?;
+    let mut root = br.op;
     let mut results = Vec::new();
 
     loop {
+        ctx.check_cancelled()?;
         match root.next().await? {
             Some(exec_batch) => results.push(exec_batch.batch),
             None => break,
@@ -403,4 +479,26 @@ pub async fn execute(plan: PhysicalPlan, ctx: &Arc<ExecutionContext>) -> Result<
     }
 
     Ok(results)
+}
+
+/// Executes a PhysicalPlan with EXPLAIN ANALYZE, returning both the result
+/// batches and the per-operator metrics tree.
+pub async fn execute_analyze(
+    plan: PhysicalPlan,
+    ctx: &Arc<ExecutionContext>,
+) -> Result<(Vec<DataBatch>, Option<Arc<OperatorMetrics>>)> {
+    let br = build_operator_tree(plan, ctx).await?;
+    let root_metrics = br.metrics.clone();
+    let mut root = br.op;
+    let mut results = Vec::new();
+
+    loop {
+        ctx.check_cancelled()?;
+        match root.next().await? {
+            Some(exec_batch) => results.push(exec_batch.batch),
+            None => break,
+        }
+    }
+
+    Ok((results, root_metrics))
 }

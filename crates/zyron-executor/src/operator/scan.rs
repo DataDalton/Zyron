@@ -1,7 +1,9 @@
-//! Sequential and index scan operators.
+//! Sequential, parallel, and index scan operators.
 //!
 //! SeqScanOperator reads heap pages one at a time, decodes visible tuples
 //! into columnar batches, and optionally applies a predicate filter.
+//! ParallelSeqScanOperator splits the page range across multiple tokio tasks
+//! for multi-core throughput on large tables.
 //! IndexScanOperator provides the same interface using index-guided access
 //! (currently falls back to sequential scan with predicate filtering).
 
@@ -14,11 +16,17 @@ use zyron_planner::binder::BoundExpr;
 use zyron_planner::logical::LogicalColumn;
 use zyron_storage::{HeapPage, TupleId};
 
-use crate::batch::{create_builders, decode_tuple_into_builders, finalize_builders};
+use crate::batch::{
+    BATCH_SIZE, DataBatch, create_builders, decode_tuple_into_builders, finalize_builders,
+};
 use crate::compute::column_to_mask;
 use crate::context::ExecutionContext;
 use crate::expr::evaluate;
 use crate::operator::{ExecutionBatch, Operator, OperatorResult};
+
+/// Minimum number of pages before parallel scan is used.
+/// Below this threshold, the task spawn overhead outweighs the benefit.
+const PARALLEL_SCAN_MIN_PAGES: u64 = 64;
 
 // ---------------------------------------------------------------------------
 // Sequential scan
@@ -69,6 +77,7 @@ impl Operator for SeqScanOperator {
             if self.finished {
                 return Ok(None);
             }
+            self.ctx.check_cancelled()?;
 
             let batch_size = self.ctx.batch_size;
             let mut builders = create_builders(&self.output_columns, batch_size);
@@ -144,6 +153,187 @@ impl Operator for SeqScanOperator {
             }
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Parallel sequential scan
+// ---------------------------------------------------------------------------
+
+/// Multi-threaded sequential scan that divides the page range across
+/// multiple tokio tasks. Each worker scans its assigned pages, decodes
+/// visible tuples, applies the predicate, and sends result batches
+/// through an MPSC channel. The operator's next() receives from the
+/// channel, providing multi-core throughput for large table scans.
+///
+/// Not used for tuple ID tracking (DML operations need ordered IDs).
+pub struct ParallelSeqScanOperator {
+    receiver: tokio::sync::mpsc::Receiver<Result<DataBatch>>,
+    finished: bool,
+}
+
+impl ParallelSeqScanOperator {
+    /// Creates a parallel scan operator. Spawns worker tasks immediately.
+    /// Each worker scans a contiguous slice of the table's pages.
+    pub async fn new(
+        ctx: Arc<ExecutionContext>,
+        table_id: zyron_catalog::TableId,
+        columns: Vec<LogicalColumn>,
+        predicate: Option<BoundExpr>,
+    ) -> Result<Self> {
+        let table_entry = ctx.get_table_entry(table_id)?;
+        let num_pages = ctx.disk_manager.num_pages(table_entry.heap_file_id).await?;
+
+        let num_workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(num_pages as usize)
+            .max(1);
+
+        let pages_per_worker = (num_pages + num_workers as u64 - 1) / num_workers as u64;
+
+        // Channel capacity: 2 batches per worker to keep workers busy
+        // without unbounded buffering.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<DataBatch>>(num_workers * 2);
+
+        for worker_id in 0..num_workers {
+            let start_page = worker_id as u64 * pages_per_worker;
+            let end_page = ((worker_id as u64 + 1) * pages_per_worker).min(num_pages);
+
+            if start_page >= end_page {
+                continue;
+            }
+
+            let tx = tx.clone();
+            let ctx = ctx.clone();
+            let table_entry = table_entry.clone();
+            let columns = columns.clone();
+            let predicate = predicate.clone();
+
+            tokio::spawn(async move {
+                let result = scan_page_range(
+                    &ctx,
+                    &table_entry,
+                    &columns,
+                    predicate.as_ref(),
+                    start_page,
+                    end_page,
+                    &tx,
+                )
+                .await;
+
+                // If the scan itself errored, send the error through the channel.
+                if let Err(e) = result {
+                    let _ = tx.send(Err(e)).await;
+                }
+            });
+        }
+
+        Ok(Self {
+            receiver: rx,
+            finished: false,
+        })
+    }
+}
+
+/// Scans a contiguous range of pages, decodes visible tuples, applies
+/// the predicate filter, and sends result batches through the channel.
+async fn scan_page_range(
+    ctx: &ExecutionContext,
+    table_entry: &TableEntry,
+    output_columns: &[LogicalColumn],
+    predicate: Option<&BoundExpr>,
+    start_page: u64,
+    end_page: u64,
+    tx: &tokio::sync::mpsc::Sender<Result<DataBatch>>,
+) -> Result<()> {
+    let batch_size = BATCH_SIZE;
+    let mut page_cursor = start_page;
+
+    while page_cursor < end_page {
+        ctx.check_cancelled()?;
+
+        let mut builders = create_builders(output_columns, batch_size);
+        let mut row_count = 0usize;
+
+        while row_count < batch_size && page_cursor < end_page {
+            let page_id = PageId::new(table_entry.heap_file_id, page_cursor);
+            page_cursor += 1;
+
+            let page_data: [u8; PAGE_SIZE] = ctx.disk_manager.read_page(page_id).await?;
+            let page = HeapPage::from_bytes(page_data);
+
+            for (_slot_id, tuple) in page.iter() {
+                if tuple.is_deleted() {
+                    continue;
+                }
+                if !tuple.header().is_visible_to(&ctx.snapshot) {
+                    continue;
+                }
+
+                decode_tuple_into_builders(tuple.data(), &table_entry.columns, &mut builders);
+
+                row_count += 1;
+                if row_count >= batch_size {
+                    break;
+                }
+            }
+        }
+
+        if row_count == 0 {
+            break;
+        }
+
+        let batch = finalize_builders(builders);
+
+        // Apply predicate filter if present.
+        let output = if let Some(pred) = predicate {
+            let mask_col = evaluate(pred, &batch, output_columns)?;
+            let mask = column_to_mask(&mask_col);
+            let filtered = batch.filter(&mask);
+            if filtered.num_rows == 0 {
+                continue;
+            }
+            filtered
+        } else {
+            batch
+        };
+
+        // If the receiver has been dropped (query cancelled), stop scanning.
+        if tx.send(Ok(output)).await.is_err() {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+impl Operator for ParallelSeqScanOperator {
+    fn next(&mut self) -> OperatorResult<'_> {
+        Box::pin(async move {
+            if self.finished {
+                return Ok(None);
+            }
+
+            match self.receiver.recv().await {
+                Some(Ok(batch)) => Ok(Some(ExecutionBatch::new(batch))),
+                Some(Err(e)) => {
+                    self.finished = true;
+                    Err(e)
+                }
+                None => {
+                    self.finished = true;
+                    Ok(None)
+                }
+            }
+        })
+    }
+}
+
+/// Determines whether a parallel scan should be used for the given table.
+/// Returns true when the table has enough pages to benefit from parallelism
+/// and tuple ID tracking is not required.
+pub fn should_use_parallel_scan(num_pages: u64, track_tuple_ids: bool) -> bool {
+    !track_tuple_ids && num_pages >= PARALLEL_SCAN_MIN_PAGES
 }
 
 // ---------------------------------------------------------------------------
