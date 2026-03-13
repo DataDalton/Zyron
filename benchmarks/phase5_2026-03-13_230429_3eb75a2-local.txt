@@ -1,0 +1,25 @@
+
+=== Sort Performance Test ===
+Rows: 500000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Sort: 97,782,297 rows/sec (5.1134ms)
+
+--- Run 2/5 ---
+  Sort: 102,821,420 rows/sec (4.8628ms)
+
+--- Run 3/5 ---
+  Sort: 103,995,507 rows/sec (4.8079ms)
+
+--- Run 4/5 ---
+  Sort: 105,610,003 rows/sec (4.7344ms)
+
+--- Run 5/5 ---
+  Sort: 104,637,536 rows/sec (4.7784ms)
+
+=== Sort Validation Results ===
+  Sort throughput (rows/sec) [PASS/OK]:
+    Runs: [97,782,297, 102,821,420, 103,995,507, 105,610,003, 104,637,536]
+    Average: 102,969,353 >= 100,000,000 (target)
+    Min/Max: 97,782,297 / 105,610,003, StdDev: 2,747,227

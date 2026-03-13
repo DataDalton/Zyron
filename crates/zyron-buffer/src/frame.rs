@@ -44,6 +44,9 @@ pub struct BufferFrame {
     pin_count: AtomicU32,
     /// Whether the page has been modified.
     is_dirty: AtomicBool,
+    /// LSN of the first modification since last flush. 0 = clean.
+    /// Stamped via CAS from 0 on first dirty, so it always reflects the oldest unflushed change.
+    dirty_lsn: AtomicU64,
     /// Reference bit for clock replacement algorithm.
     reference_bit: AtomicBool,
 }
@@ -57,6 +60,7 @@ impl BufferFrame {
             data: RwLock::new(Box::new([0u8; PAGE_SIZE])),
             pin_count: AtomicU32::new(0),
             is_dirty: AtomicBool::new(false),
+            dirty_lsn: AtomicU64::new(0),
             reference_bit: AtomicBool::new(false),
         }
     }
@@ -158,6 +162,30 @@ impl BufferFrame {
         self.is_dirty.store(dirty, Ordering::Release);
     }
 
+    /// Returns the dirty LSN (0 = clean).
+    #[inline]
+    pub fn dirty_lsn(&self) -> u64 {
+        self.dirty_lsn.load(Ordering::Relaxed)
+    }
+
+    /// Stamps the dirty LSN if this is the first modification since last flush.
+    /// Uses CAS from 0 so the value always reflects the oldest unflushed change.
+    #[inline]
+    pub fn set_dirty_lsn(&self, lsn: u64) {
+        let _ = self
+            .dirty_lsn
+            .compare_exchange(0, lsn, Ordering::Release, Ordering::Relaxed);
+    }
+
+    /// Clears the dirty LSN if it still matches the expected value.
+    /// Returns true if cleared, false if the page was re-dirtied during flush.
+    #[inline]
+    pub fn clear_dirty_lsn(&self, expected: u64) -> bool {
+        self.dirty_lsn
+            .compare_exchange(expected, 0, Ordering::Release, Ordering::Relaxed)
+            .is_ok()
+    }
+
     /// Returns the reference bit value.
     #[inline]
     pub fn reference_bit(&self) -> bool {
@@ -238,6 +266,7 @@ impl BufferFrame {
         self.page_id.store(NO_PAGE, Ordering::Release);
         self.pin_count.store(0, Ordering::Release);
         self.is_dirty.store(false, Ordering::Release);
+        self.dirty_lsn.store(0, Ordering::Release);
         self.reference_bit.store(false, Ordering::Relaxed);
         // Zero out data for security
         let mut data = self.data.write();
@@ -421,6 +450,42 @@ mod tests {
 
         frame.set_reference_bit(false);
         assert!(!frame.reference_bit());
+    }
+
+    #[test]
+    fn test_buffer_frame_dirty_lsn() {
+        let frame = BufferFrame::new(FrameId(0));
+        assert_eq!(frame.dirty_lsn(), 0);
+
+        // First set wins (CAS from 0)
+        frame.set_dirty_lsn(100);
+        assert_eq!(frame.dirty_lsn(), 100);
+
+        // Second set is ignored (CAS from 0 fails because current is 100)
+        frame.set_dirty_lsn(200);
+        assert_eq!(frame.dirty_lsn(), 100);
+
+        // Clear with wrong expected fails
+        assert!(!frame.clear_dirty_lsn(200));
+        assert_eq!(frame.dirty_lsn(), 100);
+
+        // Clear with correct expected succeeds
+        assert!(frame.clear_dirty_lsn(100));
+        assert_eq!(frame.dirty_lsn(), 0);
+
+        // Now a new set works again
+        frame.set_dirty_lsn(300);
+        assert_eq!(frame.dirty_lsn(), 300);
+    }
+
+    #[test]
+    fn test_buffer_frame_reset_clears_dirty_lsn() {
+        let frame = BufferFrame::new(FrameId(0));
+        frame.set_dirty_lsn(500);
+        assert_eq!(frame.dirty_lsn(), 500);
+
+        frame.reset();
+        assert_eq!(frame.dirty_lsn(), 0);
     }
 
     #[test]

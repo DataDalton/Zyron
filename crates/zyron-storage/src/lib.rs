@@ -13,6 +13,8 @@
 //! - Columnar file format with bloom filters and zone maps
 
 mod btree;
+pub mod checkpoint;
+pub mod checkpoint_coordinator;
 pub mod columnar;
 mod disk;
 pub mod encoding;
@@ -26,6 +28,11 @@ pub use btree::{
     DeleteResult, InternalEntry, InternalPageHeader, LeafEntry, LeafPageHeader, MAX_KEY_SIZE,
     MIN_FILL_FACTOR,
     checkpoint::{CheckpointConfig, CheckpointTrigger},
+};
+pub use checkpoint::CheckpointTracker;
+pub use checkpoint_coordinator::{
+    CheckpointCoordinator, CheckpointCoordinatorConfig, CheckpointResult, CheckpointScheduler,
+    CheckpointStats,
 };
 pub use disk::{DiskManager, DiskManagerConfig};
 pub use freespace::{

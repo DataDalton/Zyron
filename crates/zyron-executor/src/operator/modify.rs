@@ -159,9 +159,20 @@ impl Operator for InsertOperator {
                 // Batch WAL log: one CAS + commit for all inserts in this batch.
                 let batch_records: Vec<(u32, &[u8])> =
                     tuples.iter().map(|t| (txn_id, t.data())).collect();
-                self.ctx.wal.log_insert_batch(&batch_records)?;
+                let lsns = self.ctx.wal.log_insert_batch(&batch_records)?;
+                let last_lsn = lsns.last().copied().unwrap_or(zyron_wal::Lsn::INVALID);
 
-                heap_file.insert_batch(&tuples).await?;
+                let tuple_ids = heap_file.insert_batch(&tuples).await?;
+
+                // Stamp dirty pages with WAL LSN for checkpoint ordering.
+                // Duplicate page_ids are harmless: set_dirty_lsn uses CAS from 0,
+                // so only the first call per page succeeds.
+                for tid in &tuple_ids {
+                    self.ctx
+                        .buffer_pool
+                        .mark_dirty_with_lsn(tid.page_id, last_lsn.0);
+                }
+
                 total_inserted += tuples.len() as i64;
             }
 
@@ -225,9 +236,19 @@ impl Operator for DeleteOperator {
                 let payloads: Vec<Vec<u8>> = tuple_ids.iter().map(tuple_id_payload).collect();
                 let batch_records: Vec<(u32, &[u8])> =
                     payloads.iter().map(|p| (txn_id, p.as_slice())).collect();
-                self.ctx.wal.log_delete_batch(&batch_records)?;
+                let lsns = self.ctx.wal.log_delete_batch(&batch_records)?;
+                let last_lsn = lsns.last().copied().unwrap_or(zyron_wal::Lsn::INVALID);
 
                 let deleted = heap_file.delete_batch(&tuple_ids).await?;
+
+                // Stamp dirty pages with WAL LSN for checkpoint ordering.
+                // Duplicate page_ids are harmless: set_dirty_lsn uses CAS from 0.
+                for tid in &tuple_ids {
+                    self.ctx
+                        .buffer_pool
+                        .mark_dirty_with_lsn(tid.page_id, last_lsn.0);
+                }
+
                 total_deleted += deleted as i64;
             }
 
@@ -328,14 +349,31 @@ impl Operator for UpdateOperator {
                     .iter()
                     .map(|p| (txn_id, p.as_slice()))
                     .collect();
-                self.ctx.wal.log_delete_batch(&delete_records)?;
+                let del_lsns = self.ctx.wal.log_delete_batch(&delete_records)?;
+                let del_last_lsn = del_lsns.last().copied().unwrap_or(zyron_wal::Lsn::INVALID);
                 heap_file.delete_batch(&tuple_ids).await?;
+
+                // Stamp deleted pages with WAL LSN for checkpoint ordering.
+                // Duplicate page_ids are harmless: set_dirty_lsn uses CAS from 0.
+                for tid in &tuple_ids {
+                    self.ctx
+                        .buffer_pool
+                        .mark_dirty_with_lsn(tid.page_id, del_last_lsn.0);
+                }
 
                 // Batch WAL log inserts: one CAS + commit for all.
                 let insert_records: Vec<(u32, &[u8])> =
                     new_tuples.iter().map(|t| (txn_id, t.data())).collect();
-                self.ctx.wal.log_insert_batch(&insert_records)?;
-                heap_file.insert_batch(&new_tuples).await?;
+                let ins_lsns = self.ctx.wal.log_insert_batch(&insert_records)?;
+                let ins_last_lsn = ins_lsns.last().copied().unwrap_or(zyron_wal::Lsn::INVALID);
+                let new_tuple_ids = heap_file.insert_batch(&new_tuples).await?;
+
+                // Stamp inserted pages with WAL LSN for checkpoint ordering.
+                for tid in &new_tuple_ids {
+                    self.ctx
+                        .buffer_pool
+                        .mark_dirty_with_lsn(tid.page_id, ins_last_lsn.0);
+                }
 
                 total_updated += tuple_ids.len() as i64;
             }

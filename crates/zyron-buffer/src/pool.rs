@@ -115,17 +115,23 @@ impl TreiberFreeList {
     /// past all N nodes. Falls back to per-element pop on CAS failure.
     #[inline]
     fn pop_many(&self, count: usize) -> Vec<FrameId> {
-        if count == 0 { return Vec::new(); }
+        if count == 0 {
+            return Vec::new();
+        }
         loop {
             let current = self.head.load(Ordering::Acquire);
             let (generation, top) = Self::unpack(current);
-            if top == TREIBER_NULL { return Vec::new(); }
+            if top == TREIBER_NULL {
+                return Vec::new();
+            }
 
             // Walk the chain to collect up to `count` frame IDs.
             let mut collected = Vec::with_capacity(count);
             let mut cursor = top;
             for _ in 0..count {
-                if cursor == TREIBER_NULL { break; }
+                if cursor == TREIBER_NULL {
+                    break;
+                }
                 collected.push(FrameId(cursor));
                 cursor = self.next[cursor as usize].load(Ordering::Acquire);
             }
@@ -613,6 +619,94 @@ impl BufferPool {
             page_id,
             frame,
         })
+    }
+
+    /// Marks a page dirty and stamps it with the given LSN for checkpoint ordering.
+    /// The LSN is only written if this is the first dirty since last flush (CAS from 0).
+    #[inline]
+    pub fn mark_dirty_with_lsn(&self, page_id: PageId, lsn: u64) {
+        if let Some(frame_id) = self.page_table.get(page_id) {
+            let frame = &self.frames[frame_id.0 as usize];
+            frame.set_dirty(true);
+            frame.set_dirty_lsn(lsn);
+        }
+    }
+
+    /// Returns true if any unpinned frame has dirty_lsn in (0, below_lsn].
+    /// Early-exit scan, O(1) best case when the first frame matches.
+    pub fn has_dirty_pages_below(&self, below_lsn: u64) -> bool {
+        let mut found = false;
+        self.page_table.for_each(|_page_id, frame_id| {
+            let frame = &self.frames[frame_id.0 as usize];
+            let dlsn = frame.dirty_lsn();
+            if dlsn > 0 && dlsn <= below_lsn {
+                found = true;
+                return false; // stop iteration
+            }
+            true
+        });
+        found
+    }
+
+    /// Collects dirty frames with dirty_lsn <= below_lsn, sorted oldest-first.
+    /// Skips pinned pages to avoid blocking the background writer.
+    /// Returns up to `limit` entries as (page_id, frame_id, dirty_lsn).
+    pub fn collect_dirty_pages(&self, below_lsn: u64, limit: usize) -> Vec<(PageId, FrameId, u64)> {
+        let mut dirty = Vec::new();
+        self.page_table.for_each(|page_id, frame_id| {
+            let frame = &self.frames[frame_id.0 as usize];
+            let dlsn = frame.dirty_lsn();
+            if dlsn > 0 && dlsn <= below_lsn && !frame.is_pinned() {
+                dirty.push((page_id, frame_id, dlsn));
+            }
+            true
+        });
+        dirty.sort_unstable_by_key(|&(_, _, lsn)| lsn);
+        dirty.truncate(limit);
+        dirty
+    }
+
+    /// Flushes a single dirty page by pinning, copying data, unpinning, then writing.
+    /// Clears dirty_lsn only if it still matches expected_lsn (page was not re-dirtied).
+    /// Returns true if the page was flushed, false if evicted or already clean.
+    pub fn flush_dirty_frame<F>(
+        &self,
+        page_id: PageId,
+        frame_id: FrameId,
+        expected_lsn: u64,
+        flush_fn: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce(PageId, &[u8; PAGE_SIZE]) -> Result<()>,
+    {
+        // Verify the frame still holds the expected page
+        let frame = &self.frames[frame_id.0 as usize];
+        if frame.page_id() != Some(page_id) {
+            return Ok(false);
+        }
+
+        // Pin before reading to prevent eviction
+        frame.pin();
+
+        // Copy data out while pinned
+        let mut buf = Box::new([0u8; PAGE_SIZE]);
+        let data = frame.read_data();
+        buf.copy_from_slice(&**data);
+        drop(data);
+
+        // Unpin before I/O (allows eviction of other pages during write)
+        frame.unpin();
+
+        // Write to disk
+        flush_fn(page_id, &buf)?;
+
+        // Clear dirty state only if the page was not re-dirtied during flush.
+        // If dirty_lsn changed, a newer write occurred and the page needs to stay dirty.
+        if frame.clear_dirty_lsn(expected_lsn) {
+            frame.set_dirty(false);
+        }
+
+        Ok(true)
     }
 
     /// Returns statistics about the buffer pool.

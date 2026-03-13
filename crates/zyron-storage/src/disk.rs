@@ -1,5 +1,7 @@
 //! Disk manager for async page-level file I/O.
 
+use std::collections::HashMap;
+use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -36,6 +38,9 @@ pub struct DiskManager {
     /// scc::HashMap allows concurrent access to different file_ids.
     /// Per-file Mutex serializes operations on the same file.
     files: scc::HashMap<u32, Mutex<FileHandle>>,
+    /// Synchronous file handles for the background writer thread.
+    /// Separate from async handles to avoid tokio runtime dependency.
+    sync_files: parking_lot::Mutex<HashMap<u32, std::fs::File>>,
 }
 
 /// Handle for an open data file.
@@ -54,6 +59,7 @@ impl DiskManager {
         Ok(Self {
             config,
             files: scc::HashMap::new(),
+            sync_files: parking_lot::Mutex::new(HashMap::new()),
         })
     }
 
@@ -219,6 +225,33 @@ impl DiskManager {
         let handle = entry.get().lock().await;
 
         Ok(handle.num_pages)
+    }
+
+    /// Synchronous page write for the background writer thread.
+    /// Uses std::fs::File handles separate from the async path.
+    /// The background writer is a dedicated OS thread that can block on I/O.
+    pub fn write_page_sync(&self, page_id: PageId, data: &[u8; PAGE_SIZE]) -> Result<()> {
+        let mut sync_files = self.sync_files.lock();
+        let file = sync_files.entry(page_id.file_id).or_insert_with(|| {
+            let path = self.file_path(page_id.file_id);
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .expect("failed to open sync file handle")
+        });
+
+        let offset = page_id.page_num * (PAGE_SIZE as u64);
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        file.write_all(data)?;
+
+        if self.config.fsync_enabled {
+            file.sync_all()?;
+        }
+
+        Ok(())
     }
 
     /// Flushes all pending writes to disk.

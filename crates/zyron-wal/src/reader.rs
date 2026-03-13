@@ -304,6 +304,7 @@ impl RecoveryManager {
         let mut active_txns = std::collections::HashMap::with_capacity(256);
         let mut committed_txns = std::collections::HashSet::with_capacity(1024);
         let mut aborted_txns = std::collections::HashSet::with_capacity(64);
+        let mut checkpoint_lsn: Option<u64> = None;
 
         // for_each_record_from avoids the intermediate Vec<LogRecord> that scan_from
         // would build, eliminating the struct copies from extend() and the intermediate
@@ -313,6 +314,12 @@ impl RecoveryManager {
 
             match record.record_type {
                 LogRecordType::CheckpointEnd => {
+                    // Extract checkpoint LSN from the payload (first 8 bytes, little-endian u64).
+                    if record.payload.len() >= 8 {
+                        let bytes: [u8; 8] = record.payload[..8].try_into().unwrap_or([0; 8]);
+                        checkpoint_lsn = Some(u64::from_le_bytes(bytes));
+                    }
+
                     // State before this checkpoint is already durable. Reset accumulators
                     // so only post-checkpoint work drives redo/undo.
                     redo_records.clear();
@@ -351,6 +358,7 @@ impl RecoveryManager {
             redo_records,
             undo_txns,
             last_lsn: self.reader.last_segment_id().map(|id| Lsn::new(id.0, 0)),
+            checkpoint_lsn,
         })
     }
 }
@@ -364,6 +372,9 @@ pub struct RecoveryResult {
     pub undo_txns: Vec<u32>,
     /// Last LSN found in the WAL.
     pub last_lsn: Option<Lsn>,
+    /// Checkpoint LSN from the last CheckpointEnd record payload, if present.
+    /// Recovery replays only records after this LSN.
+    pub checkpoint_lsn: Option<u64>,
 }
 
 impl RecoveryResult {
@@ -372,6 +383,7 @@ impl RecoveryResult {
             redo_records: Vec::new(),
             undo_txns: Vec::new(),
             last_lsn: None,
+            checkpoint_lsn: None,
         }
     }
 

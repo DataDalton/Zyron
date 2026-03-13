@@ -6,11 +6,13 @@
 //! - Pin counting for concurrent access
 //! - Dirty page tracking for write-back
 
+pub mod background_writer;
 mod frame;
 mod page_table;
 mod pool;
 mod replacer;
 
+pub use background_writer::{BackgroundWriter, BackgroundWriterConfig, WriteFn};
 pub use frame::{BufferFrame, FrameId};
 pub use pool::{BufferPool, BufferPoolConfig, EvictedPage};
 pub use replacer::{ClockReplacer, Replacer};

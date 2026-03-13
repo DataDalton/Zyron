@@ -667,6 +667,13 @@ impl WalWriter {
         Ok(SegmentId(self.sequencer.current_segment_id()))
     }
 
+    /// Returns the current segment ID as a raw u32 without error wrapping.
+    /// Cheap atomic read, used by the checkpoint scheduler for WAL growth triggers.
+    #[inline]
+    pub fn segment_id(&self) -> u32 {
+        self.sequencer.current_segment_id()
+    }
+
     /// Returns the WAL directory.
     #[inline]
     pub fn wal_dir(&self) -> &Path {

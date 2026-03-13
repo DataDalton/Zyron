@@ -1,0 +1,25 @@
+{
+  "id": "2026-03-13_230429_3eb75a2-local",
+  "date": "2026-03-13 23:04:33Z",
+  "ts": 1773443073,
+  "commit": "3eb75a2-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Sort": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 16.03 },
+      "util_after": { "cpu_pct": 9.0, "ram_used_gb": 16.02 },
+      "Sort throughput (rows/sec)": {
+        "average": 102969352.720278,
+        "runs": [97782297.49, 102821419.76, 103995507.39, 105610003.38, 104637535.58],
+        "target": 100000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}

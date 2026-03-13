@@ -7328,3 +7328,695 @@ fn test_parallel_column_encoding() {
     record_test_util("Parallel Column Encoding", utilBefore, utilAfter);
     tprintln!("\n  Parallel column encoding: ALL PASS");
 }
+
+// =============================================================================
+// Test: Non-Blocking Checkpoint Integration
+// =============================================================================
+
+/// Full integration test for the checkpoint system with throughput measurement.
+///
+/// Phases:
+/// 1. Batch insert 50K rows with WAL logging + dirty page LSN stamping (throughput)
+/// 2. Run checkpoint, measure duration and pages flushed
+/// 3. Insert 5K more rows after checkpoint
+/// 4. Recovery: verify only post-checkpoint records are replayed
+/// 5. Concurrent writes during checkpoint (non-blocking verification)
+#[tokio::test]
+async fn test_checkpoint_integration() {
+    use zyron_buffer::{BackgroundWriter, BackgroundWriterConfig, WriteFn};
+    use zyron_storage::{CheckpointCoordinator, CheckpointCoordinatorConfig, CheckpointTracker};
+
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    tprintln!("\n=== Non-Blocking Checkpoint Integration Test ===");
+
+    let dir = tempdir().unwrap();
+    let wal_dir = dir.path().join("wal");
+    std::fs::create_dir_all(&wal_dir).unwrap();
+
+    let disk = Arc::new(
+        DiskManager::new(DiskManagerConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync_enabled: false,
+        })
+        .await
+        .unwrap(),
+    );
+    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 4096 }));
+    let wal = Arc::new(
+        WalWriter::new(WalWriterConfig {
+            wal_dir: wal_dir.clone(),
+            segment_size: 32 * 1024 * 1024, // 32MB segments
+            fsync_enabled: false,
+            ring_buffer_capacity: 8 * 1024 * 1024, // 8MB ring buffer
+        })
+        .unwrap(),
+    );
+
+    // Set up background writer with real disk writes
+    let disk_for_writer = Arc::clone(&disk);
+    let write_fn: WriteFn =
+        Arc::new(move |page_id, data| disk_for_writer.write_page_sync(page_id, data));
+    let bg_writer = Arc::new(BackgroundWriter::new(
+        Arc::clone(&pool),
+        write_fn,
+        BackgroundWriterConfig::default(),
+    ));
+
+    // Set up checkpoint tracker with one table (file_ids 0 and 1)
+    let tracker = Arc::new(CheckpointTracker::new());
+    tracker.register_table(1, &[0, 1]);
+
+    let coordinator = CheckpointCoordinator::new(
+        Arc::clone(&pool),
+        Arc::clone(&wal),
+        Arc::clone(&bg_writer),
+        Arc::clone(&tracker),
+        CheckpointCoordinatorConfig {
+            checkpoint_timeout_secs: 30,
+            ..Default::default()
+        },
+    );
+
+    let heap = HeapFile::with_defaults(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
+
+    // -------------------------------------------------------------------------
+    // Phase 1: Batch insert 50K rows with WAL + LSN stamping (throughput)
+    // -------------------------------------------------------------------------
+    let pre_checkpoint_count = 100_000usize;
+    let batch_size = 1_000usize;
+    tprintln!(
+        "  Phase 1: Inserting {} rows (batch size {}) with WAL + LSN stamping...",
+        format_with_commas(pre_checkpoint_count as f64),
+        batch_size
+    );
+
+    // Pre-allocate all payloads outside the timed section to measure pipeline throughput,
+    // not string formatting.
+    let payload_template = b"row:00000000____"; // 16 bytes, fixed size
+    let mut all_payloads: Vec<Vec<u8>> = Vec::with_capacity(pre_checkpoint_count);
+    for i in 0..pre_checkpoint_count {
+        let mut p = payload_template.to_vec();
+        // Write the index into the first 8 bytes after "row:"
+        let idx_bytes = (i as u64).to_le_bytes();
+        p[4..12].copy_from_slice(&idx_bytes);
+        all_payloads.push(p);
+    }
+
+    let insert_start = Instant::now();
+    for batch_start in (0..pre_checkpoint_count).step_by(batch_size) {
+        let batch_end = (batch_start + batch_size).min(pre_checkpoint_count);
+        let txn_id = (batch_start / batch_size + 1) as u32;
+        let _begin_lsn = wal.log_begin(txn_id).unwrap();
+
+        let wal_records: Vec<(u32, &[u8])> = all_payloads[batch_start..batch_end]
+            .iter()
+            .map(|p| (txn_id, p.as_slice()))
+            .collect();
+        let lsns = wal.log_insert_batch(&wal_records).unwrap();
+        let last_lsn = lsns.last().copied().unwrap_or(Lsn::INVALID);
+        wal.log_commit(txn_id, last_lsn).unwrap();
+
+        let tuples: Vec<Tuple> = all_payloads[batch_start..batch_end]
+            .iter()
+            .map(|p| Tuple::new(p.clone(), txn_id))
+            .collect();
+        let tids = heap.insert_batch(&tuples).await.unwrap();
+        let mut seen = HashSet::new();
+        for tid in &tids {
+            if seen.insert(tid.page_id) {
+                pool.mark_dirty_with_lsn(tid.page_id, last_lsn.0);
+            }
+        }
+    }
+    wal.flush().unwrap();
+    let insert_duration = insert_start.elapsed();
+    let insert_throughput = pre_checkpoint_count as f64 / insert_duration.as_secs_f64();
+
+    let segments_before = WalReader::new(&wal_dir).unwrap().segment_count();
+    tprintln!(
+        "  Insert throughput: {} rows/sec ({:.2}ms)",
+        format_with_commas(insert_throughput),
+        insert_duration.as_secs_f64() * 1000.0
+    );
+    tprintln!("  WAL segments: {}", segments_before);
+    tprintln!("  Pages flushed (trickle): {}", bg_writer.pages_flushed());
+    // With 256KB segments and ~50K rows, we may or may not get multiple segments
+    // depending on WAL record size and rotation timing. Just verify we got at least 1.
+    assert!(segments_before >= 1, "Should have at least 1 WAL segment");
+
+    // -------------------------------------------------------------------------
+    // Phase 2: Run checkpoint (measure duration, pages flushed, segments cleaned)
+    // -------------------------------------------------------------------------
+    tprintln!("  Phase 2: Running checkpoint...");
+    let pages_before_ckpt = bg_writer.pages_flushed();
+    let ckpt_start = Instant::now();
+    let ckpt_result = coordinator.run_checkpoint().unwrap();
+    let ckpt_duration = ckpt_start.elapsed();
+    let pages_during_ckpt = bg_writer.pages_flushed() - pages_before_ckpt;
+
+    let segments_after = WalReader::new(&wal_dir).unwrap().segment_count();
+    tprintln!(
+        "  Checkpoint duration: {:.2}ms",
+        ckpt_duration.as_secs_f64() * 1000.0
+    );
+    tprintln!("  Checkpoint LSN: {}", ckpt_result.checkpoint_lsn);
+    tprintln!(
+        "  Wait for flush: {:.2}ms",
+        ckpt_result.wait_duration.as_secs_f64() * 1000.0
+    );
+    tprintln!("  Pages flushed during checkpoint: {}", pages_during_ckpt);
+    tprintln!(
+        "  Segments deleted: {} ({} -> {})",
+        ckpt_result.segments_deleted,
+        segments_before,
+        segments_after
+    );
+
+    // WAL cleanup depends on segment boundaries. With large segments and small data,
+    // cleanup may not delete any segments (all data in the active segment).
+    let table_ckpt_lsn = tracker.table_checkpoint_lsn(1);
+    assert!(
+        table_ckpt_lsn > 0,
+        "Table checkpoint LSN should be advanced"
+    );
+
+    tprintln!("  Phase 2: PASS");
+
+    // -------------------------------------------------------------------------
+    // Phase 3: Insert 5K more rows after checkpoint
+    // -------------------------------------------------------------------------
+    let post_checkpoint_count = 10_000usize;
+    tprintln!(
+        "  Phase 3: Inserting {} rows after checkpoint...",
+        format_with_commas(post_checkpoint_count as f64)
+    );
+
+    // Pre-allocate post-checkpoint payloads
+    let mut post_payloads: Vec<Vec<u8>> = Vec::with_capacity(post_checkpoint_count);
+    for i in 0..post_checkpoint_count {
+        let mut p = b"post:00000000____".to_vec();
+        let idx_bytes = (i as u64).to_le_bytes();
+        p[5..13].copy_from_slice(&idx_bytes);
+        post_payloads.push(p);
+    }
+
+    let post_insert_start = Instant::now();
+    let txn_base = (pre_checkpoint_count / batch_size + 2) as u32;
+    for batch_start in (0..post_checkpoint_count).step_by(batch_size) {
+        let batch_end = (batch_start + batch_size).min(post_checkpoint_count);
+        let txn_id = txn_base + (batch_start / batch_size) as u32;
+        let _begin_lsn = wal.log_begin(txn_id).unwrap();
+
+        let wal_records: Vec<(u32, &[u8])> = post_payloads[batch_start..batch_end]
+            .iter()
+            .map(|p| (txn_id, p.as_slice()))
+            .collect();
+        let lsns = wal.log_insert_batch(&wal_records).unwrap();
+        let last_lsn = lsns.last().copied().unwrap_or(Lsn::INVALID);
+        wal.log_commit(txn_id, last_lsn).unwrap();
+
+        let tuples: Vec<Tuple> = post_payloads[batch_start..batch_end]
+            .iter()
+            .map(|p| Tuple::new(p.clone(), txn_id))
+            .collect();
+        let tids = heap.insert_batch(&tuples).await.unwrap();
+        let mut seen = HashSet::new();
+        for tid in &tids {
+            if seen.insert(tid.page_id) {
+                pool.mark_dirty_with_lsn(tid.page_id, last_lsn.0);
+            }
+        }
+    }
+    wal.flush().unwrap();
+    wal.close().unwrap();
+    let post_insert_duration = post_insert_start.elapsed();
+    let post_insert_throughput = post_checkpoint_count as f64 / post_insert_duration.as_secs_f64();
+    tprintln!(
+        "  Post-checkpoint insert throughput: {} rows/sec ({:.2}ms)",
+        format_with_commas(post_insert_throughput),
+        post_insert_duration.as_secs_f64() * 1000.0
+    );
+
+    // -------------------------------------------------------------------------
+    // Phase 4: Recovery - only post-checkpoint records should be replayed
+    // -------------------------------------------------------------------------
+    tprintln!("  Phase 4: Recovery from checkpoint...");
+
+    let recovery_start = Instant::now();
+    let recovery = RecoveryManager::new(&wal_dir).unwrap();
+    let result = recovery.recover().unwrap();
+    let recovery_duration = recovery_start.elapsed();
+
+    assert!(
+        result.checkpoint_lsn.is_some(),
+        "Recovery should find checkpoint LSN"
+    );
+    tprintln!(
+        "  Recovered checkpoint LSN: {}",
+        result.checkpoint_lsn.unwrap()
+    );
+
+    let redo_insert_count = result
+        .redo_records
+        .iter()
+        .filter(|r| r.record_type == LogRecordType::Insert)
+        .count();
+    tprintln!(
+        "  Redo records: {} inserts (expected <= {}, skipped {} pre-checkpoint)",
+        redo_insert_count,
+        post_checkpoint_count,
+        pre_checkpoint_count
+    );
+    tprintln!(
+        "  Recovery time: {:.2}ms",
+        recovery_duration.as_secs_f64() * 1000.0
+    );
+
+    assert!(
+        redo_insert_count <= post_checkpoint_count,
+        "Should only replay post-checkpoint records, got {} (expected <= {})",
+        redo_insert_count,
+        post_checkpoint_count
+    );
+    assert!(
+        redo_insert_count > 0,
+        "Should have post-checkpoint records to replay"
+    );
+
+    tprintln!("  Phase 4: PASS");
+
+    // -------------------------------------------------------------------------
+    // Phase 5: Concurrent writes during checkpoint (non-blocking)
+    // -------------------------------------------------------------------------
+    tprintln!("  Phase 5: Concurrent writes during checkpoint...");
+
+    let wal2 = Arc::new(
+        WalWriter::new(WalWriterConfig {
+            wal_dir: dir.path().join("wal2"),
+            segment_size: 32 * 1024 * 1024,
+            fsync_enabled: false,
+            ring_buffer_capacity: 8 * 1024 * 1024,
+        })
+        .unwrap(),
+    );
+    let pool2 = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 4096 }));
+    let disk2 = Arc::new(
+        DiskManager::new(DiskManagerConfig {
+            data_dir: dir.path().join("data2"),
+            fsync_enabled: false,
+        })
+        .await
+        .unwrap(),
+    );
+    let disk2_for_writer = Arc::clone(&disk2);
+    let write_fn2: WriteFn =
+        Arc::new(move |page_id, data| disk2_for_writer.write_page_sync(page_id, data));
+    let bg_writer2 = Arc::new(BackgroundWriter::new(
+        Arc::clone(&pool2),
+        write_fn2,
+        BackgroundWriterConfig::default(),
+    ));
+    let tracker2 = Arc::new(CheckpointTracker::new());
+    tracker2.register_table(1, &[0, 1]);
+
+    let coordinator2 = CheckpointCoordinator::new(
+        Arc::clone(&pool2),
+        Arc::clone(&wal2),
+        Arc::clone(&bg_writer2),
+        Arc::clone(&tracker2),
+        CheckpointCoordinatorConfig {
+            checkpoint_timeout_secs: 30,
+            ..Default::default()
+        },
+    );
+
+    let heap2 = HeapFile::with_defaults(Arc::clone(&disk2), Arc::clone(&pool2)).unwrap();
+
+    // Pre-allocate setup payloads
+    let setup_count = 50_000usize;
+    let mut setup_payloads: Vec<Vec<u8>> = Vec::with_capacity(setup_count);
+    for i in 0..setup_count {
+        let mut p = b"setup:0000000000_".to_vec();
+        let idx_bytes = (i as u64).to_le_bytes();
+        p[6..14].copy_from_slice(&idx_bytes);
+        setup_payloads.push(p);
+    }
+
+    for batch_start in (0..setup_count).step_by(batch_size) {
+        let batch_end = (batch_start + batch_size).min(setup_count);
+        let txn_id = (batch_start / batch_size + 1) as u32;
+        let _begin_lsn = wal2.log_begin(txn_id).unwrap();
+
+        let wal_records: Vec<(u32, &[u8])> = setup_payloads[batch_start..batch_end]
+            .iter()
+            .map(|p| (txn_id, p.as_slice()))
+            .collect();
+        let lsns = wal2.log_insert_batch(&wal_records).unwrap();
+        let last_lsn = lsns.last().copied().unwrap_or(Lsn::INVALID);
+        wal2.log_commit(txn_id, last_lsn).unwrap();
+
+        let tuples: Vec<Tuple> = setup_payloads[batch_start..batch_end]
+            .iter()
+            .map(|p| Tuple::new(p.clone(), txn_id))
+            .collect();
+        let tids = heap2.insert_batch(&tuples).await.unwrap();
+        let mut seen = HashSet::new();
+        for tid in &tids {
+            if seen.insert(tid.page_id) {
+                pool2.mark_dirty_with_lsn(tid.page_id, last_lsn.0);
+            }
+        }
+    }
+    wal2.flush().unwrap();
+
+    // Pre-allocate concurrent write payloads
+    let concurrent_writes = 50_000usize;
+    let mut concurrent_payloads: Vec<Vec<u8>> = Vec::with_capacity(concurrent_writes);
+    for i in 0..concurrent_writes {
+        let mut p = b"conc:00000000____".to_vec();
+        let idx_bytes = (i as u64).to_le_bytes();
+        p[5..13].copy_from_slice(&idx_bytes);
+        concurrent_payloads.push(p);
+    }
+
+    // Run checkpoint on one thread while writing on another
+    let wal2_clone = Arc::clone(&wal2);
+    let pool2_clone = Arc::clone(&pool2);
+    let disk2_clone = Arc::clone(&disk2);
+    let checkpoint_handle = std::thread::spawn(move || {
+        let start = Instant::now();
+        let result = coordinator2.run_checkpoint().unwrap();
+        (result, start.elapsed())
+    });
+
+    let write_handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let heap_w = HeapFile::with_defaults(disk2_clone.clone(), pool2_clone.clone()).unwrap();
+        let start = Instant::now();
+
+        for batch_start in (0..concurrent_writes).step_by(1000) {
+            let batch_end = (batch_start + 1000).min(concurrent_writes);
+            let txn_id = (100_000 + batch_start / 1000) as u32;
+            let _begin_lsn = wal2_clone.log_begin(txn_id).unwrap();
+
+            let wal_records: Vec<(u32, &[u8])> = concurrent_payloads[batch_start..batch_end]
+                .iter()
+                .map(|p| (txn_id, p.as_slice()))
+                .collect();
+            let lsns = wal2_clone.log_insert_batch(&wal_records).unwrap();
+            let last_lsn = lsns.last().copied().unwrap_or(Lsn::INVALID);
+            wal2_clone.log_commit(txn_id, last_lsn).unwrap();
+
+            let tuples: Vec<Tuple> = concurrent_payloads[batch_start..batch_end]
+                .iter()
+                .map(|p| Tuple::new(p.clone(), txn_id))
+                .collect();
+            let tids = rt.block_on(heap_w.insert_batch(&tuples)).unwrap();
+            let mut seen = HashSet::new();
+            for tid in &tids {
+                if seen.insert(tid.page_id) {
+                    pool2_clone.mark_dirty_with_lsn(tid.page_id, last_lsn.0);
+                }
+            }
+        }
+        (start.elapsed(), concurrent_writes as u32)
+    });
+
+    let (write_duration, writes_done) = write_handle.join().unwrap();
+    let (ckpt2_result, ckpt2_duration) = checkpoint_handle.join().unwrap();
+    let concurrent_throughput = writes_done as f64 / write_duration.as_secs_f64();
+
+    tprintln!(
+        "  Concurrent write throughput: {} rows/sec ({} rows in {:.2}ms)",
+        format_with_commas(concurrent_throughput),
+        format_with_commas(writes_done as f64),
+        write_duration.as_secs_f64() * 1000.0
+    );
+    tprintln!(
+        "  Checkpoint during writes: {:.2}ms, LSN={}, deleted={} segments",
+        ckpt2_duration.as_secs_f64() * 1000.0,
+        ckpt2_result.checkpoint_lsn,
+        ckpt2_result.segments_deleted
+    );
+
+    // Writers should not be blocked by checkpoint
+    assert!(
+        write_duration.as_millis() < 5000,
+        "Writers should not block during checkpoint, took {}ms",
+        write_duration.as_millis()
+    );
+
+    tprintln!("  Phase 5: PASS");
+
+    // -------------------------------------------------------------------------
+    // Summary
+    // -------------------------------------------------------------------------
+    tprintln!();
+    tprintln!("  === Checkpoint Integration Summary ===");
+    tprintln!(
+        "  Insert throughput (with LSN stamping): {} rows/sec",
+        format_with_commas(insert_throughput)
+    );
+    tprintln!(
+        "  Checkpoint duration: {:.2}ms ({} segments deleted, {} pages flushed)",
+        ckpt_duration.as_secs_f64() * 1000.0,
+        ckpt_result.segments_deleted,
+        pages_during_ckpt
+    );
+    tprintln!(
+        "  Post-checkpoint insert throughput: {} rows/sec",
+        format_with_commas(post_insert_throughput)
+    );
+    tprintln!(
+        "  Recovery time (post-checkpoint only): {:.2}ms ({} redo records)",
+        recovery_duration.as_secs_f64() * 1000.0,
+        redo_insert_count
+    );
+    tprintln!(
+        "  Concurrent write throughput (during checkpoint): {} rows/sec",
+        format_with_commas(concurrent_throughput)
+    );
+    tprintln!(
+        "  Total pages flushed by background writer: {}",
+        bg_writer.pages_flushed()
+    );
+    tprintln!();
+    tprintln!("  Non-blocking checkpoint integration: ALL PASS");
+}
+
+/// Automatic checkpoint scheduler integration test.
+///
+/// Writes enough data to trigger both time-based and WAL segment-based checkpoints,
+/// then verifies the scheduler completed checkpoints and reports stats.
+#[tokio::test]
+async fn test_checkpoint_scheduler_integration() {
+    use zyron_buffer::{BackgroundWriter, BackgroundWriterConfig, WriteFn};
+    use zyron_storage::{
+        CheckpointCoordinator, CheckpointCoordinatorConfig, CheckpointScheduler,
+        CheckpointTracker,
+    };
+
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    tprintln!("\n=== Automatic Checkpoint Scheduler Integration Test ===");
+
+    let dir = tempdir().unwrap();
+    let wal_dir = dir.path().join("wal");
+    std::fs::create_dir_all(&wal_dir).unwrap();
+
+    let disk = Arc::new(
+        DiskManager::new(DiskManagerConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync_enabled: false,
+        })
+        .await
+        .unwrap(),
+    );
+
+    // Small segments (256KB) so WAL segment trigger fires quickly
+    let wal = Arc::new(
+        WalWriter::new(WalWriterConfig {
+            wal_dir: wal_dir.clone(),
+            segment_size: 256 * 1024,
+            fsync_enabled: false,
+            ring_buffer_capacity: 4 * 1024 * 1024,
+        })
+        .unwrap(),
+    );
+
+    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 4096 }));
+
+    let disk_for_write = Arc::clone(&disk);
+    let write_fn: WriteFn = Arc::new(move |pid, data| disk_for_write.write_page_sync(pid, data));
+    let bg_writer = Arc::new(BackgroundWriter::new(
+        Arc::clone(&pool),
+        write_fn,
+        BackgroundWriterConfig::default(),
+    ));
+
+    let tracker = Arc::new(CheckpointTracker::new());
+    tracker.register_table(1, &[200, 201]);
+
+    let coordinator = Arc::new(CheckpointCoordinator::new(
+        Arc::clone(&pool),
+        Arc::clone(&wal),
+        Arc::clone(&bg_writer),
+        Arc::clone(&tracker),
+        CheckpointCoordinatorConfig {
+            checkpoint_timeout_secs: 30,
+            ..Default::default()
+        },
+    ));
+
+    // -------------------------------------------------------------------------
+    // Phase 1: Time-trigger test (1s interval, no data needed)
+    // -------------------------------------------------------------------------
+    tprintln!("  Phase 1: Time-based trigger (1s interval)...");
+
+    let mut scheduler = CheckpointScheduler::start(
+        Arc::clone(&coordinator),
+        Arc::clone(&wal),
+        CheckpointCoordinatorConfig {
+            checkpoint_interval_secs: 1,
+            max_wal_segments: 1000, // won't fire
+            ..Default::default()
+        },
+    );
+
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let time_checkpoints = scheduler
+        .stats()
+        .checkpoints_completed
+        .load(std::sync::atomic::Ordering::Relaxed);
+    tprintln!(
+        "  Time-triggered checkpoints in 3s: {} (expected >= 1)",
+        time_checkpoints
+    );
+    assert!(
+        time_checkpoints >= 1,
+        "expected at least 1 time-triggered checkpoint, got {}",
+        time_checkpoints
+    );
+    scheduler.shutdown();
+    tprintln!("  Phase 1: PASS");
+
+    // -------------------------------------------------------------------------
+    // Phase 2: WAL segment trigger (write enough data to rotate segments)
+    // -------------------------------------------------------------------------
+    tprintln!("  Phase 2: WAL segment trigger (max_wal_segments=2, 256KB segments)...");
+
+    let heap = HeapFile::with_defaults(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
+
+    // Pre-allocate payloads (50K rows at ~40 bytes each = ~2MB, rotates multiple 256KB segments)
+    let row_count = 50_000usize;
+    let batch_size = 1000;
+    let payload_template = b"sched_test______"; // 16 bytes fixed
+    let mut all_payloads: Vec<Vec<u8>> = Vec::with_capacity(row_count);
+    for i in 0..row_count {
+        let mut p = payload_template.to_vec();
+        let idx_bytes = (i as u64).to_le_bytes();
+        p[4..12].copy_from_slice(&idx_bytes);
+        all_payloads.push(p);
+    }
+
+    let mut scheduler = CheckpointScheduler::start(
+        Arc::clone(&coordinator),
+        Arc::clone(&wal),
+        CheckpointCoordinatorConfig {
+            checkpoint_interval_secs: 3600, // won't fire from time
+            max_wal_segments: 2,
+            ..Default::default()
+        },
+    );
+
+    let start_segment = wal.segment_id();
+    let insert_start = std::time::Instant::now();
+
+    for batch_start in (0..row_count).step_by(batch_size) {
+        let batch_end = (batch_start + batch_size).min(row_count);
+        let txn_id = (batch_start / batch_size + 1) as u32;
+
+        // WAL log the batch
+        let wal_records: Vec<(u32, &[u8])> = all_payloads[batch_start..batch_end]
+            .iter()
+            .map(|p| (txn_id, p.as_slice()))
+            .collect();
+        let lsns = wal.log_insert_batch(&wal_records).unwrap();
+        let last_lsn = lsns.last().copied().unwrap_or(Lsn::INVALID);
+
+        // Heap insert
+        let tuples: Vec<Tuple> = all_payloads[batch_start..batch_end]
+            .iter()
+            .map(|p| Tuple::new(p.clone(), txn_id))
+            .collect();
+        let tuple_ids = heap.insert_batch(&tuples).await.unwrap();
+
+        // LSN-stamp dirty pages
+        for tid in &tuple_ids {
+            pool.mark_dirty_with_lsn(tid.page_id, last_lsn.0);
+        }
+    }
+
+    let insert_elapsed = insert_start.elapsed();
+    let insert_throughput = row_count as f64 / insert_elapsed.as_secs_f64();
+
+    // Give the scheduler a moment to react to segment growth
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    let end_segment = wal.segment_id();
+    let wal_checkpoints = scheduler
+        .stats()
+        .checkpoints_completed
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let segments_deleted = scheduler
+        .stats()
+        .total_segments_deleted
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let last_lsn = scheduler
+        .stats()
+        .last_checkpoint_lsn
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    tprintln!(
+        "  Insert throughput: {} rows/sec ({:.2}ms)",
+        format_with_commas(insert_throughput),
+        insert_elapsed.as_secs_f64() * 1000.0
+    );
+    tprintln!(
+        "  WAL segments written: {} -> {} ({} rotations)",
+        start_segment,
+        end_segment,
+        end_segment - start_segment
+    );
+    tprintln!("  WAL-triggered checkpoints: {}", wal_checkpoints);
+    tprintln!("  Total segments deleted: {}", segments_deleted);
+    tprintln!(
+        "  Last checkpoint LSN: {}/{}",
+        last_lsn >> 32,
+        last_lsn & 0xFFFF_FFFF
+    );
+    tprintln!(
+        "  Background writer pages flushed: {}",
+        bg_writer.pages_flushed()
+    );
+
+    assert!(
+        wal_checkpoints >= 1,
+        "expected at least 1 WAL-triggered checkpoint, got {} (segments: {} -> {})",
+        wal_checkpoints,
+        start_segment,
+        end_segment
+    );
+
+    scheduler.shutdown();
+    tprintln!("  Phase 2: PASS");
+
+    tprintln!();
+    tprintln!("  === Scheduler Summary ===");
+    tprintln!("  Time-triggered checkpoints: {}", time_checkpoints);
+    tprintln!("  WAL-triggered checkpoints: {}", wal_checkpoints);
+    tprintln!("  Total segments deleted: {}", segments_deleted);
+    tprintln!();
+    tprintln!("  Automatic checkpoint scheduler: ALL PASS");
+}
