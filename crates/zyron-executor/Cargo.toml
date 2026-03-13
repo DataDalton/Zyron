@@ -1,0 +1,19 @@
+[package]
+name = "zyron-executor"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+zyron-common = { path = "../zyron-common" }
+zyron-parser = { path = "../zyron-parser" }
+zyron-catalog = { path = "../zyron-catalog" }
+zyron-planner = { path = "../zyron-planner" }
+zyron-storage = { path = "../zyron-storage" }
+zyron-wal = { path = "../zyron-wal" }
+zyron-buffer = { path = "../zyron-buffer" }
+tokio.workspace = true
+hashbrown.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+rand = "0.9.1"
