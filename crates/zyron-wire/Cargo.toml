@@ -1,0 +1,36 @@
+[package]
+name = "zyron-wire"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+zyron-common = { path = "../zyron-common" }
+zyron-parser = { path = "../zyron-parser" }
+zyron-catalog = { path = "../zyron-catalog" }
+zyron-planner = { path = "../zyron-planner" }
+zyron-executor = { path = "../zyron-executor" }
+zyron-storage = { path = "../zyron-storage" }
+zyron-wal = { path = "../zyron-wal" }
+zyron-buffer = { path = "../zyron-buffer" }
+tokio.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+md-5.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+pbkdf2.workspace = true
+base64.workspace = true
+rand.workspace = true
+itoa.workspace = true
+ryu.workspace = true
+socket2.workspace = true
+crossbeam.workspace = true
+mimalloc.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+md-5 = { workspace = true }
+tokio-util.workspace = true
+futures.workspace = true

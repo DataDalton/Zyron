@@ -1,0 +1,2830 @@
+//! Phase 6: Wire Protocol Validation Suite
+//!
+//! Tests the PostgreSQL wire protocol v3 implementation including message
+//! encoding/decoding, type serialization, authentication, COPY protocol,
+//! TCP connection handshake, and concurrent connection handling.
+//!
+//! Run: cargo test -p zyron-wire --test phase6_test --release -- --nocapture
+
+use std::collections::HashMap;
+use std::io::Write as _;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
+
+use bytes::BytesMut;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_util::codec::{Decoder, Encoder};
+
+use zyron_buffer::{BufferPool, BufferPoolConfig};
+use zyron_catalog::{Catalog, CatalogCache, HeapCatalogStorage};
+use zyron_common::ZyronError;
+use zyron_common::types::TypeId;
+use zyron_executor::batch::DataBatch;
+use zyron_executor::column::{Column, ColumnData, NullBitmap, ScalarValue};
+use zyron_planner::logical::LogicalColumn;
+use zyron_storage::txn::TransactionManager;
+use zyron_storage::{DiskManager, DiskManagerConfig};
+use zyron_wal::{WalWriter, WalWriterConfig};
+
+use zyron_wire::auth::{
+    AuthResult, Authenticator, CleartextAuthenticator, Md5Authenticator, TrustAuthenticator,
+};
+use zyron_wire::codec::PostgresCodec;
+use zyron_wire::connection::ServerState;
+use zyron_wire::copy::{CopyFormat, CopyInHandler, CopyOutHandler};
+use zyron_wire::messages::backend::{
+    AuthenticationMessage, BackendMessage, ErrorFields, FieldDescription, TransactionState,
+};
+use zyron_wire::messages::frontend::{DescribeTarget, FrontendMessage, PasswordMessage};
+use zyron_wire::session::Session;
+use zyron_wire::types;
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const VALIDATION_RUNS: usize = 5;
+const REGRESSION_THRESHOLD: f64 = 2.0;
+
+// Performance targets (minimum thresholds)
+const HANDSHAKE_TARGET_US: f64 = 50.0;
+const SIMPLE_QUERY_TARGET_US: f64 = 20.0;
+const PARSE_MESSAGE_TARGET_US: f64 = 8.0;
+const BIND_MESSAGE_TARGET_US: f64 = 4.0;
+const EXECUTE_MESSAGE_TARGET_US: f64 = 20.0;
+const ROW_SERIALIZATION_TARGET_OPS: f64 = 8_000_000.0;
+const COPY_FROM_TARGET_OPS: f64 = 3_000_000.0;
+const COPY_TO_TARGET_OPS: f64 = 5_000_000.0;
+#[allow(dead_code)]
+const CONCURRENT_CONN_TARGET: f64 = 200_000.0;
+const QUERY_PER_SEC_TARGET: f64 = 2_000_000.0;
+
+// Benchmark infrastructure
+static BENCHMARK_LOCK: Mutex<()> = Mutex::new(());
+
+// =============================================================================
+// Validation Infrastructure
+// =============================================================================
+
+macro_rules! tprintln {
+    () => {{
+        std::println!();
+        write_raw_output("");
+    }};
+    ($($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        std::println!("{}", msg);
+        write_raw_output(&msg);
+    }};
+}
+
+struct ValidationResult {
+    passed: bool,
+    regression_detected: bool,
+}
+
+fn format_with_commas(n: f64) -> String {
+    let s = format!("{:.0}", n);
+    let bytes: Vec<char> = s.chars().collect();
+    let mut result = String::new();
+    let len = bytes.len();
+    for (i, c) in bytes.iter().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            result.push(',');
+        }
+        result.push(*c);
+    }
+    result
+}
+
+fn validate_metric(
+    test: &str,
+    name: &str,
+    runs: Vec<f64>,
+    target: f64,
+    higher_is_better: bool,
+) -> ValidationResult {
+    let average = runs.iter().sum::<f64>() / runs.len() as f64;
+    let min = runs.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = runs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+    let variance = runs.iter().map(|x| (x - average).powi(2)).sum::<f64>() / runs.len() as f64;
+    let std_dev = variance.sqrt();
+
+    let passed = if higher_is_better {
+        average >= target
+    } else {
+        average <= target
+    };
+
+    let regression_threshold = if higher_is_better {
+        target / REGRESSION_THRESHOLD
+    } else {
+        target * REGRESSION_THRESHOLD
+    };
+
+    let regression_detected = runs.iter().any(|&r| {
+        if higher_is_better {
+            r < regression_threshold
+        } else {
+            r > regression_threshold
+        }
+    });
+
+    let status = if passed { "PASS" } else { "FAIL" };
+    let regr_status = if regression_detected { "REGR!" } else { "OK" };
+    let comparison = if higher_is_better { ">=" } else { "<=" };
+
+    tprintln!("  {} [{}/{}]:", name, status, regr_status);
+    tprintln!(
+        "    Runs: [{}]",
+        runs.iter()
+            .map(|x| format_with_commas(*x))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    tprintln!(
+        "    Average: {} {} {} (target)",
+        format_with_commas(average),
+        comparison,
+        format_with_commas(target)
+    );
+    tprintln!(
+        "    Min/Max: {} / {}, StdDev: {}",
+        format_with_commas(min),
+        format_with_commas(max),
+        format_with_commas(std_dev)
+    );
+
+    write_benchmark_record(test, name, average, runs, target, passed, higher_is_better);
+
+    ValidationResult {
+        passed,
+        regression_detected,
+    }
+}
+
+#[allow(dead_code)]
+fn check_performance(
+    test: &str,
+    metric_name: &str,
+    value: f64,
+    target: f64,
+    higher_is_better: bool,
+) -> bool {
+    let passed = if higher_is_better {
+        value >= target
+    } else {
+        value <= target
+    };
+    let status = if passed { "PASS" } else { "FAIL" };
+    let comparison = if higher_is_better { ">=" } else { "<=" };
+    tprintln!(
+        "  {} [{}]: {} {} {} (target)",
+        metric_name,
+        status,
+        format_with_commas(value),
+        comparison,
+        format_with_commas(target),
+    );
+    write_benchmark_record(
+        test,
+        metric_name,
+        value,
+        vec![value],
+        target,
+        passed,
+        higher_is_better,
+    );
+    passed
+}
+
+// =============================================================================
+// Benchmark Output
+// =============================================================================
+
+#[derive(Clone)]
+struct MetricRecord {
+    test: String,
+    metric: String,
+    average: f64,
+    runs: Vec<f64>,
+    target: f64,
+    passed: bool,
+    higher_is_better: bool,
+}
+
+#[derive(Clone)]
+struct UtilSnapshot {
+    cpu_pct: f64,
+    ram_used_gb: f64,
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+struct UtilRecord {
+    test: String,
+    before: UtilSnapshot,
+    after: UtilSnapshot,
+}
+
+static GIT_COMMIT: OnceLock<String> = OnceLock::new();
+static PLATFORM_HW: OnceLock<PlatformHardware> = OnceLock::new();
+static RUN_ID: OnceLock<String> = OnceLock::new();
+static RAW_LOG: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
+static COLLECTED_METRICS: OnceLock<Mutex<Vec<MetricRecord>>> = OnceLock::new();
+static COLLECTED_UTILS: OnceLock<Mutex<Vec<UtilRecord>>> = OnceLock::new();
+
+struct PlatformHardware {
+    cpu: String,
+    ram_gb: f64,
+    gpus: Vec<String>,
+}
+
+fn git_commit() -> &'static str {
+    GIT_COMMIT.get_or_init(|| {
+        std::process::Command::new("git")
+            .args(["describe", "--always", "--dirty=-local", "--abbrev=7"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    })
+}
+
+fn unix_to_datetime(ts: u64) -> String {
+    let secs = ts % 60;
+    let mins = (ts / 60) % 60;
+    let hours = (ts / 3600) % 24;
+    let z = ts / 86400 + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}Z",
+        y, m, d, hours, mins, secs
+    )
+}
+
+fn benchmark_dir() -> std::path::PathBuf {
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("benchmarks")
+}
+
+fn json_str_array(items: &[String]) -> String {
+    let inner = items
+        .iter()
+        .map(|s| format!("\"{}\"", s.replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{}]", inner)
+}
+
+#[cfg(target_os = "windows")]
+fn platform_hw_impl() -> PlatformHardware {
+    let script = "$cpu = (Get-WmiObject Win32_Processor).Name.Trim(); \
+                  $ram = (Get-WmiObject Win32_ComputerSystem).TotalPhysicalMemory; \
+                  $gpus = (Get-WmiObject Win32_VideoController | ForEach-Object { $_.Name.Trim() }) -join ';;'; \
+                  Write-Output \"$cpu||$ram||$gpus\"";
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", script])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+    let parts: Vec<&str> = out.trim().splitn(3, "||").collect();
+    let cpu = parts.first().copied().unwrap_or("unknown").to_string();
+    let ram_bytes: u64 = parts
+        .get(1)
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    let gpus = parts
+        .get(2)
+        .map(|s| {
+            s.split(";;")
+                .map(|g| g.trim().to_string())
+                .filter(|g| !g.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    PlatformHardware {
+        cpu,
+        ram_gb: ram_bytes as f64 / (1024.0_f64.powi(3)),
+        gpus,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn platform_hw_impl() -> PlatformHardware {
+    let cpu = std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("model name"))
+                .and_then(|l| l.split(':').nth(1))
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let ram_kb: u64 = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("MemTotal:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(0);
+    let gpus = std::process::Command::new("lspci")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| {
+            s.lines()
+                .filter(|l| l.contains("VGA") || l.contains("3D controller"))
+                .filter_map(|l| l.split(':').last())
+                .map(|s| s.trim().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    PlatformHardware {
+        cpu,
+        ram_gb: ram_kb as f64 / (1024.0 * 1024.0),
+        gpus,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn platform_hw_impl() -> PlatformHardware {
+    let cpu = std::process::Command::new("sysctl")
+        .args(["-n", "machdep.cpu.brand_string"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let ram_bytes: u64 = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    let gpus = std::process::Command::new("system_profiler")
+        .args(["SPDisplaysDataType"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| {
+            s.lines()
+                .filter(|l| l.contains("Chipset Model:"))
+                .filter_map(|l| l.split(':').nth(1))
+                .map(|s| s.trim().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    PlatformHardware {
+        cpu,
+        ram_gb: ram_bytes as f64 / (1024.0_f64.powi(3)),
+        gpus,
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+fn platform_hw_impl() -> PlatformHardware {
+    PlatformHardware {
+        cpu: "unknown".to_string(),
+        ram_gb: 0.0,
+        gpus: vec![],
+    }
+}
+
+fn platform_hw() -> &'static PlatformHardware {
+    PLATFORM_HW.get_or_init(platform_hw_impl)
+}
+
+fn logical_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0)
+}
+
+fn run_id() -> &'static str {
+    RUN_ID.get_or_init(|| {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let date_tag = unix_to_datetime(ts)
+            .replace(' ', "_")
+            .replace(':', "")
+            .replace('Z', "");
+        format!("{}_{}", date_tag, git_commit())
+    })
+}
+
+fn collected_metrics() -> &'static Mutex<Vec<MetricRecord>> {
+    COLLECTED_METRICS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn collected_utils() -> &'static Mutex<Vec<UtilRecord>> {
+    COLLECTED_UTILS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn build_run_json(metrics: &[MetricRecord], utils: &[UtilRecord]) -> String {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let date = unix_to_datetime(ts);
+    let hw = platform_hw();
+    let cores = logical_cores();
+    let cpu = hw.cpu.replace('"', "\\\"");
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    let id = run_id();
+    let commit = git_commit();
+    let gpus_json = json_str_array(&hw.gpus);
+
+    let mut test_names: Vec<&str> = Vec::new();
+    for m in metrics {
+        if !test_names.contains(&m.test.as_str()) {
+            test_names.push(&m.test);
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str("{\n");
+    out.push_str(&format!("  \"id\": \"{id}\",\n"));
+    out.push_str(&format!("  \"date\": \"{date}\",\n"));
+    out.push_str(&format!("  \"ts\": {ts},\n"));
+    out.push_str(&format!("  \"commit\": \"{commit}\",\n"));
+    out.push_str(&format!("  \"cpu\": \"{cpu}\",\n"));
+    out.push_str(&format!("  \"cores\": {cores},\n"));
+    out.push_str(&format!("  \"ram_gb\": {:.1},\n", hw.ram_gb));
+    out.push_str(&format!("  \"gpus\": {gpus_json},\n"));
+    out.push_str(&format!("  \"os\": \"{os}\",\n"));
+    out.push_str(&format!("  \"arch\": \"{arch}\",\n"));
+    out.push_str("  \"tests\": {\n");
+
+    for (ti, test_name) in test_names.iter().enumerate() {
+        let escaped_test = test_name.replace('"', "\\\"");
+        out.push_str(&format!("    \"{escaped_test}\": {{\n"));
+
+        if let Some(u) = utils.iter().find(|u| u.test.as_str() == *test_name) {
+            out.push_str(&format!(
+                "      \"util_before\": {{ \"cpu_pct\": {:.1}, \"ram_used_gb\": {:.2} }},\n",
+                u.before.cpu_pct, u.before.ram_used_gb
+            ));
+            out.push_str(&format!(
+                "      \"util_after\": {{ \"cpu_pct\": {:.1}, \"ram_used_gb\": {:.2} }},\n",
+                u.after.cpu_pct, u.after.ram_used_gb
+            ));
+        }
+
+        let test_metrics: Vec<&MetricRecord> = metrics
+            .iter()
+            .filter(|m| m.test.as_str() == *test_name)
+            .collect();
+        for (mi, m) in test_metrics.iter().enumerate() {
+            let escaped_metric = m.metric.replace('"', "\\\"");
+            let comma = if mi + 1 < test_metrics.len() { "," } else { "" };
+            let runs_json = m
+                .runs
+                .iter()
+                .map(|v| format!("{:.2}", v))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("      \"{escaped_metric}\": {{\n"));
+            out.push_str(&format!("        \"average\": {:.6},\n", m.average));
+            out.push_str(&format!("        \"runs\": [{runs_json}],\n"));
+            out.push_str(&format!("        \"target\": {:.6},\n", m.target));
+            out.push_str(&format!("        \"passed\": {},\n", m.passed));
+            out.push_str(&format!(
+                "        \"higher_is_better\": {}\n",
+                m.higher_is_better
+            ));
+            out.push_str(&format!("      }}{comma}\n"));
+        }
+
+        let test_comma = if ti + 1 < test_names.len() { "," } else { "" };
+        out.push_str(&format!("    }}{test_comma}\n"));
+    }
+
+    out.push_str("  }\n");
+    out.push_str("}\n");
+    out
+}
+
+fn write_run_json(metrics: &[MetricRecord], utils: &[UtilRecord]) {
+    let dir = benchmark_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let fname = format!("phase6_{}.json", run_id());
+    let json = build_run_json(metrics, utils);
+    let _ = std::fs::write(dir.join(fname), json.as_bytes());
+}
+
+fn raw_log_file() -> &'static Mutex<std::fs::File> {
+    RAW_LOG.get_or_init(|| {
+        let dir = benchmark_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let fname = format!("phase6_{}.txt", run_id());
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(dir.join(&fname))
+            .unwrap_or_else(|_| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(dir.join("phase6_latest.txt"))
+                    .expect("failed to open benchmark log")
+            });
+        Mutex::new(f)
+    })
+}
+
+fn write_raw_output(line: &str) {
+    if let Ok(mut guard) = raw_log_file().lock() {
+        let _ = writeln!(guard, "{}", line);
+    }
+}
+
+fn write_benchmark_record(
+    test: &str,
+    metric: &str,
+    average: f64,
+    runs: Vec<f64>,
+    target: f64,
+    passed: bool,
+    higher_is_better: bool,
+) {
+    let record = MetricRecord {
+        test: test.to_string(),
+        metric: metric.to_string(),
+        average,
+        runs,
+        target,
+        passed,
+        higher_is_better,
+    };
+    let metrics_snap = if let Ok(mut g) = collected_metrics().lock() {
+        g.push(record);
+        g.clone()
+    } else {
+        return;
+    };
+    let utils_snap = collected_utils()
+        .lock()
+        .ok()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    write_run_json(&metrics_snap, &utils_snap);
+}
+
+// ---------------------------------------------------------------------------
+// Test infrastructure helpers
+// ---------------------------------------------------------------------------
+
+/// Creates a full ServerState backed by temp directories for integration tests.
+async fn create_test_server(db_name: &str) -> (Arc<ServerState>, tempfile::TempDir) {
+    let tmp = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let data_dir = tmp.path().join("data");
+    let wal_dir = tmp.path().join("wal");
+
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::create_dir_all(&wal_dir).unwrap();
+
+    let wal = Arc::new(
+        WalWriter::new(WalWriterConfig {
+            wal_dir,
+            segment_size: 16 * 1024 * 1024,
+            fsync_enabled: false,
+            ring_buffer_capacity: 4 * 1024 * 1024,
+        })
+        .expect("WalWriter creation failed"),
+    );
+
+    let disk = Arc::new(
+        DiskManager::new(DiskManagerConfig {
+            data_dir,
+            fsync_enabled: false,
+        })
+        .await
+        .expect("DiskManager creation failed"),
+    );
+
+    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 1024 }));
+
+    let storage = Arc::new(
+        HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool))
+            .expect("HeapCatalogStorage creation failed"),
+    );
+    let cache = Arc::new(CatalogCache::new(256, 64));
+    let catalog = Arc::new(
+        Catalog::new(storage, cache, Arc::clone(&wal))
+            .await
+            .expect("Catalog creation failed"),
+    );
+
+    // Create a test database
+    catalog
+        .create_database(db_name, "test_user")
+        .await
+        .expect("Failed to create test database");
+
+    let txn_manager = Arc::new(TransactionManager::new(Arc::clone(&wal)));
+
+    let state = Arc::new(ServerState {
+        catalog,
+        wal,
+        buffer_pool: pool,
+        disk_manager: disk,
+        txn_manager,
+    });
+
+    (state, tmp)
+}
+
+/// Builds a raw PG startup message for a given user and database.
+fn build_startup_bytes(user: &str, database: &str) -> Vec<u8> {
+    let mut payload = Vec::new();
+    // Protocol version 3.0
+    payload.extend_from_slice(&196608i32.to_be_bytes());
+    // Parameters: key\0value\0 pairs
+    payload.extend_from_slice(b"user\0");
+    payload.extend_from_slice(user.as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(b"database\0");
+    payload.extend_from_slice(database.as_bytes());
+    payload.push(0);
+    // Terminating null
+    payload.push(0);
+
+    // Prepend length (includes itself)
+    let len = (payload.len() + 4) as i32;
+    let mut msg = Vec::new();
+    msg.extend_from_slice(&len.to_be_bytes());
+    msg.extend_from_slice(&payload);
+    msg
+}
+
+/// Builds a raw PG Query message.
+fn build_query_bytes(sql: &str) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(sql.as_bytes());
+    payload.push(0);
+
+    let len = (payload.len() + 4) as i32;
+    let mut msg = Vec::new();
+    msg.push(b'Q');
+    msg.extend_from_slice(&len.to_be_bytes());
+    msg.extend_from_slice(&payload);
+    msg
+}
+
+/// Builds a raw PG Terminate message.
+fn build_terminate_bytes() -> Vec<u8> {
+    let mut msg = Vec::new();
+    msg.push(b'X');
+    msg.extend_from_slice(&4i32.to_be_bytes());
+    msg
+}
+
+/// Builds a raw PG Parse message (extended query protocol).
+fn build_parse_bytes(name: &str, query: &str, param_types: &[i32]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(name.as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(query.as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(&(param_types.len() as i16).to_be_bytes());
+    for &oid in param_types {
+        payload.extend_from_slice(&oid.to_be_bytes());
+    }
+
+    let len = (payload.len() + 4) as i32;
+    let mut msg = Vec::new();
+    msg.push(b'P');
+    msg.extend_from_slice(&len.to_be_bytes());
+    msg.extend_from_slice(&payload);
+    msg
+}
+
+/// Builds a raw PG Bind message.
+fn build_bind_bytes(
+    portal: &str,
+    statement: &str,
+    param_formats: &[i16],
+    params: &[Option<&[u8]>],
+    result_formats: &[i16],
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(portal.as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(statement.as_bytes());
+    payload.push(0);
+
+    // Parameter formats
+    payload.extend_from_slice(&(param_formats.len() as i16).to_be_bytes());
+    for &f in param_formats {
+        payload.extend_from_slice(&f.to_be_bytes());
+    }
+
+    // Parameter values
+    payload.extend_from_slice(&(params.len() as i16).to_be_bytes());
+    for param in params {
+        match param {
+            Some(data) => {
+                payload.extend_from_slice(&(data.len() as i32).to_be_bytes());
+                payload.extend_from_slice(data);
+            }
+            None => {
+                payload.extend_from_slice(&(-1i32).to_be_bytes());
+            }
+        }
+    }
+
+    // Result formats
+    payload.extend_from_slice(&(result_formats.len() as i16).to_be_bytes());
+    for &f in result_formats {
+        payload.extend_from_slice(&f.to_be_bytes());
+    }
+
+    let len = (payload.len() + 4) as i32;
+    let mut msg = Vec::new();
+    msg.push(b'B');
+    msg.extend_from_slice(&len.to_be_bytes());
+    msg.extend_from_slice(&payload);
+    msg
+}
+
+/// Builds a raw PG Execute message.
+fn build_execute_bytes(portal: &str, max_rows: i32) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(portal.as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(&max_rows.to_be_bytes());
+
+    let len = (payload.len() + 4) as i32;
+    let mut msg = Vec::new();
+    msg.push(b'E');
+    msg.extend_from_slice(&len.to_be_bytes());
+    msg.extend_from_slice(&payload);
+    msg
+}
+
+/// Builds a raw PG Describe message.
+fn build_describe_bytes(target: u8, name: &str) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(target); // 'S' for statement, 'P' for portal
+    payload.extend_from_slice(name.as_bytes());
+    payload.push(0);
+
+    let len = (payload.len() + 4) as i32;
+    let mut msg = Vec::new();
+    msg.push(b'D');
+    msg.extend_from_slice(&len.to_be_bytes());
+    msg.extend_from_slice(&payload);
+    msg
+}
+
+/// Builds a raw PG Sync message.
+fn build_sync_bytes() -> Vec<u8> {
+    let mut msg = Vec::new();
+    msg.push(b'S');
+    msg.extend_from_slice(&4i32.to_be_bytes());
+    msg
+}
+
+/// Reads one raw PG backend message from a stream.
+/// Returns (type_byte, payload_bytes).
+async fn read_backend_message(stream: &mut TcpStream) -> Result<(u8, Vec<u8>), String> {
+    let mut type_buf = [0u8; 1];
+    stream
+        .read_exact(&mut type_buf)
+        .await
+        .map_err(|e| format!("read type: {}", e))?;
+
+    let mut len_buf = [0u8; 4];
+    stream
+        .read_exact(&mut len_buf)
+        .await
+        .map_err(|e| format!("read len: {}", e))?;
+    let len = i32::from_be_bytes(len_buf) as usize;
+
+    if len < 4 {
+        return Err("Invalid message length".into());
+    }
+
+    let payload_len = len - 4;
+    let mut payload = vec![0u8; payload_len];
+    if payload_len > 0 {
+        stream
+            .read_exact(&mut payload)
+            .await
+            .map_err(|e| format!("read payload: {}", e))?;
+    }
+
+    Ok((type_buf[0], payload))
+}
+
+/// Reads backend messages until ReadyForQuery ('Z') is received.
+/// Returns all message type bytes collected.
+async fn read_until_ready(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+    let mut types = Vec::new();
+    loop {
+        let (msg_type, _payload) = read_backend_message(stream).await?;
+        types.push(msg_type);
+        if msg_type == b'Z' {
+            break;
+        }
+    }
+    Ok(types)
+}
+
+/// Performs a full PG handshake on a raw TCP stream.
+/// Returns the message types received during startup.
+async fn do_handshake(
+    stream: &mut TcpStream,
+    user: &str,
+    database: &str,
+) -> Result<Vec<u8>, String> {
+    let startup = build_startup_bytes(user, database);
+    stream
+        .write_all(&startup)
+        .await
+        .map_err(|e| format!("write startup: {}", e))?;
+    stream.flush().await.map_err(|e| format!("flush: {}", e))?;
+
+    read_until_ready(stream).await
+}
+
+/// Creates a test column with the given ScalarValues.
+fn make_column(type_id: TypeId, values: Vec<ScalarValue>) -> Column {
+    let len = values.len();
+    let mut nulls = NullBitmap::none(len);
+
+    let data = match type_id {
+        TypeId::Boolean => {
+            let v: Vec<bool> = values
+                .iter()
+                .enumerate()
+                .map(|(i, s)| match s {
+                    ScalarValue::Boolean(b) => *b,
+                    ScalarValue::Null => {
+                        nulls.set_null(i);
+                        false
+                    }
+                    _ => false,
+                })
+                .collect();
+            ColumnData::Boolean(v)
+        }
+        TypeId::Int32 => {
+            let v: Vec<i32> = values
+                .iter()
+                .enumerate()
+                .map(|(i, s)| match s {
+                    ScalarValue::Int32(n) => *n,
+                    ScalarValue::Null => {
+                        nulls.set_null(i);
+                        0
+                    }
+                    _ => 0,
+                })
+                .collect();
+            ColumnData::Int32(v)
+        }
+        TypeId::Int64 => {
+            let v: Vec<i64> = values
+                .iter()
+                .enumerate()
+                .map(|(i, s)| match s {
+                    ScalarValue::Int64(n) => *n,
+                    ScalarValue::Null => {
+                        nulls.set_null(i);
+                        0
+                    }
+                    _ => 0,
+                })
+                .collect();
+            ColumnData::Int64(v)
+        }
+        TypeId::Float64 => {
+            let v: Vec<f64> = values
+                .iter()
+                .enumerate()
+                .map(|(i, s)| match s {
+                    ScalarValue::Float64(f) => *f,
+                    ScalarValue::Null => {
+                        nulls.set_null(i);
+                        0.0
+                    }
+                    _ => 0.0,
+                })
+                .collect();
+            ColumnData::Float64(v)
+        }
+        TypeId::Text | TypeId::Varchar => {
+            let v: Vec<String> = values
+                .iter()
+                .enumerate()
+                .map(|(i, s)| match s {
+                    ScalarValue::Utf8(s) => s.clone(),
+                    ScalarValue::Null => {
+                        nulls.set_null(i);
+                        String::new()
+                    }
+                    _ => String::new(),
+                })
+                .collect();
+            ColumnData::Utf8(v)
+        }
+        TypeId::Uuid => {
+            let v: Vec<[u8; 16]> = values
+                .iter()
+                .enumerate()
+                .map(|(i, s)| match s {
+                    ScalarValue::FixedBinary16(b) => *b,
+                    ScalarValue::Null => {
+                        nulls.set_null(i);
+                        [0u8; 16]
+                    }
+                    _ => [0u8; 16],
+                })
+                .collect();
+            ColumnData::FixedBinary16(v)
+        }
+        TypeId::Bytea => {
+            let v: Vec<Vec<u8>> = values
+                .iter()
+                .enumerate()
+                .map(|(i, s)| match s {
+                    ScalarValue::Binary(b) => b.clone(),
+                    ScalarValue::Null => {
+                        nulls.set_null(i);
+                        Vec::new()
+                    }
+                    _ => Vec::new(),
+                })
+                .collect();
+            ColumnData::Binary(v)
+        }
+        _ => {
+            // Fallback to Int32 for unsupported types in this helper
+            ColumnData::Int32(vec![0; len])
+        }
+    };
+
+    Column {
+        data,
+        nulls,
+        type_id,
+    }
+}
+
+// ===========================================================================
+// Correctness Tests
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Test 1: Message codec roundtrip
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_message_codec_roundtrip() {
+    tprintln!("\n=== Message Codec Roundtrip Test ===");
+
+    let mut codec = PostgresCodec::new();
+    let mut buf = BytesMut::new();
+
+    // Test BackendMessage encoding
+    let messages: Vec<BackendMessage> = vec![
+        BackendMessage::Authentication(AuthenticationMessage::Ok),
+        BackendMessage::Authentication(AuthenticationMessage::CleartextPassword),
+        BackendMessage::Authentication(AuthenticationMessage::Md5Password { salt: [1, 2, 3, 4] }),
+        BackendMessage::ParameterStatus {
+            name: "server_version".into(),
+            value: "16.0".into(),
+        },
+        BackendMessage::BackendKeyData {
+            process_id: 12345,
+            secret_key: 67890,
+        },
+        BackendMessage::ReadyForQuery(TransactionState::Idle),
+        BackendMessage::ReadyForQuery(TransactionState::InTransaction),
+        BackendMessage::ReadyForQuery(TransactionState::Failed),
+        BackendMessage::RowDescription(vec![
+            FieldDescription {
+                name: "id".into(),
+                table_oid: 0,
+                column_attr: 0,
+                type_oid: types::PG_INT4_OID,
+                type_size: 4,
+                type_modifier: -1,
+                format: 0,
+            },
+            FieldDescription {
+                name: "name".into(),
+                table_oid: 0,
+                column_attr: 0,
+                type_oid: types::PG_TEXT_OID,
+                type_size: -1,
+                type_modifier: -1,
+                format: 0,
+            },
+        ]),
+        BackendMessage::DataRow(vec![Some(b"42".to_vec()), Some(b"Alice".to_vec()), None]),
+        BackendMessage::CommandComplete {
+            tag: "SELECT 1".into(),
+        },
+        BackendMessage::ErrorResponse(ErrorFields {
+            severity: "ERROR".into(),
+            code: "42P01".into(),
+            message: "table not found".into(),
+            detail: Some("the table does not exist".into()),
+            hint: None,
+            position: Some(10),
+        }),
+        BackendMessage::ParseComplete,
+        BackendMessage::BindComplete,
+        BackendMessage::CloseComplete,
+        BackendMessage::NoData,
+        BackendMessage::EmptyQueryResponse,
+        BackendMessage::PortalSuspended,
+        BackendMessage::ParameterDescription(vec![types::PG_INT4_OID, types::PG_TEXT_OID]),
+        BackendMessage::CopyInResponse {
+            format: 0,
+            column_formats: vec![0, 0],
+        },
+        BackendMessage::CopyOutResponse {
+            format: 0,
+            column_formats: vec![0, 0],
+        },
+        BackendMessage::CopyData(b"1\tAlice\n".to_vec()),
+        BackendMessage::CopyDone,
+    ];
+
+    let msg_count = messages.len();
+    for msg in &messages {
+        codec.encode(msg.clone(), &mut buf).expect("encode failed");
+    }
+
+    tprintln!(
+        "  Encoded {} backend message types ({} bytes total)\n",
+        msg_count,
+        buf.len()
+    );
+    assert!(buf.len() > 0, "Encoded buffer should not be empty");
+
+    // Test FrontendMessage decoding via codec
+    let mut codec2 = PostgresCodec::new();
+
+    // Startup message decode
+    let startup_bytes = build_startup_bytes("testuser", "testdb");
+    let mut startup_buf = BytesMut::from(&startup_bytes[..]);
+    let decoded = codec2
+        .decode(&mut startup_buf)
+        .expect("startup decode failed");
+    assert!(decoded.is_some(), "Should decode startup message");
+    if let Some(FrontendMessage::Startup(s)) = decoded {
+        assert_eq!(s.params.get("user").map(|s| s.as_str()), Some("testuser"));
+        assert_eq!(s.params.get("database").map(|s| s.as_str()), Some("testdb"));
+        tprintln!("  Startup message decoded: user=testuser, database=testdb\n");
+    } else {
+        panic!("Expected Startup message");
+    }
+
+    // Switch to normal mode for remaining messages
+    codec2.set_normal_mode();
+
+    // Query message
+    let query_bytes = build_query_bytes("SELECT 1");
+    let mut query_buf = BytesMut::from(&query_bytes[..]);
+    let decoded = codec2.decode(&mut query_buf).expect("query decode failed");
+    if let Some(FrontendMessage::Query { sql }) = decoded {
+        assert_eq!(sql, "SELECT 1");
+        tprintln!("  Query message decoded: SELECT 1\n");
+    } else {
+        panic!("Expected Query message");
+    }
+
+    // Parse message
+    let parse_bytes = build_parse_bytes("stmt1", "SELECT $1", &[types::PG_INT4_OID]);
+    let mut parse_buf = BytesMut::from(&parse_bytes[..]);
+    let decoded = codec2.decode(&mut parse_buf).expect("parse decode failed");
+    if let Some(FrontendMessage::Parse {
+        name,
+        query,
+        param_types,
+    }) = decoded
+    {
+        assert_eq!(name, "stmt1");
+        assert_eq!(query, "SELECT $1");
+        assert_eq!(param_types, vec![types::PG_INT4_OID]);
+        tprintln!("  Parse message decoded: stmt1, SELECT $1\n");
+    } else {
+        panic!("Expected Parse message");
+    }
+
+    // Bind message
+    let bind_bytes = build_bind_bytes("", "stmt1", &[0], &[Some(b"42")], &[0]);
+    let mut bind_buf = BytesMut::from(&bind_bytes[..]);
+    let decoded = codec2.decode(&mut bind_buf).expect("bind decode failed");
+    assert!(
+        matches!(decoded, Some(FrontendMessage::Bind { .. })),
+        "Expected Bind message"
+    );
+    tprintln!("  Bind message decoded\n");
+
+    // Execute message
+    let exec_bytes = build_execute_bytes("", 0);
+    let mut exec_buf = BytesMut::from(&exec_bytes[..]);
+    let decoded = codec2.decode(&mut exec_buf).expect("execute decode failed");
+    assert!(
+        matches!(decoded, Some(FrontendMessage::Execute { .. })),
+        "Expected Execute message"
+    );
+    tprintln!("  Execute message decoded\n");
+
+    // Describe message
+    let desc_bytes = build_describe_bytes(b'S', "stmt1");
+    let mut desc_buf = BytesMut::from(&desc_bytes[..]);
+    let decoded = codec2
+        .decode(&mut desc_buf)
+        .expect("describe decode failed");
+    assert!(
+        matches!(decoded, Some(FrontendMessage::Describe { .. })),
+        "Expected Describe message"
+    );
+    tprintln!("  Describe message decoded\n");
+
+    // Sync message
+    let sync_bytes = build_sync_bytes();
+    let mut sync_buf = BytesMut::from(&sync_bytes[..]);
+    let decoded = codec2.decode(&mut sync_buf).expect("sync decode failed");
+    assert!(
+        matches!(decoded, Some(FrontendMessage::Sync)),
+        "Expected Sync message"
+    );
+    tprintln!("  Sync message decoded\n");
+
+    // Terminate message
+    let term_bytes = build_terminate_bytes();
+    let mut term_buf = BytesMut::from(&term_bytes[..]);
+    let decoded = codec2
+        .decode(&mut term_buf)
+        .expect("terminate decode failed");
+    assert!(
+        matches!(decoded, Some(FrontendMessage::Terminate)),
+        "Expected Terminate message"
+    );
+    tprintln!("  Terminate message decoded\n");
+
+    tprintln!(
+        "  All {} backend + 8 frontend message types verified\n",
+        msg_count
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 2: Type serialization for all supported types
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_type_serialization_all_types() {
+    tprintln!("\n=== Type Serialization (All Types) Test ===");
+
+    // Test type_id_to_pg_oid mapping
+    let type_mappings = vec![
+        (TypeId::Boolean, types::PG_BOOL_OID),
+        (TypeId::Int16, types::PG_INT2_OID),
+        (TypeId::Int32, types::PG_INT4_OID),
+        (TypeId::Int64, types::PG_INT8_OID),
+        (TypeId::Float32, types::PG_FLOAT4_OID),
+        (TypeId::Float64, types::PG_FLOAT8_OID),
+        (TypeId::Text, types::PG_TEXT_OID),
+        (TypeId::Varchar, types::PG_VARCHAR_OID),
+        (TypeId::Char, types::PG_CHAR_OID),
+        (TypeId::Bytea, types::PG_BYTEA_OID),
+        (TypeId::Uuid, types::PG_UUID_OID),
+        (TypeId::Date, types::PG_DATE_OID),
+        (TypeId::Time, types::PG_TIME_OID),
+        (TypeId::Timestamp, types::PG_TIMESTAMP_OID),
+        (TypeId::TimestampTz, types::PG_TIMESTAMPTZ_OID),
+        (TypeId::Interval, types::PG_INTERVAL_OID),
+        (TypeId::Json, types::PG_JSON_OID),
+        (TypeId::Jsonb, types::PG_JSONB_OID),
+        (TypeId::Decimal, types::PG_NUMERIC_OID),
+    ];
+
+    for (type_id, expected_oid) in &type_mappings {
+        let oid = types::type_id_to_pg_oid(*type_id);
+        assert_eq!(
+            oid, *expected_oid,
+            "TypeId {:?} should map to OID {}",
+            type_id, expected_oid
+        );
+    }
+    tprintln!(
+        "  {} TypeId -> PG OID mappings verified\n",
+        type_mappings.len()
+    );
+
+    // Test scalar_to_text roundtrip for common types
+    let text_cases: Vec<(ScalarValue, &str)> = vec![
+        (ScalarValue::Boolean(true), "t"),
+        (ScalarValue::Boolean(false), "f"),
+        (ScalarValue::Int32(42), "42"),
+        (ScalarValue::Int32(-1), "-1"),
+        (ScalarValue::Int32(0), "0"),
+        (ScalarValue::Int64(9999999999i64), "9999999999"),
+        (ScalarValue::Float64(3.14), "3.14"),
+        (ScalarValue::Utf8("hello world".into()), "hello world"),
+        (ScalarValue::Utf8("".into()), ""),
+    ];
+
+    for (scalar, expected) in &text_cases {
+        let encoded = types::scalar_to_text(scalar);
+        assert!(
+            encoded.is_some(),
+            "scalar_to_text should produce value for {:?}",
+            scalar
+        );
+        let bytes = encoded.unwrap();
+        let text = String::from_utf8(bytes).expect("Should be valid UTF-8");
+        assert_eq!(text, *expected, "Text encoding mismatch for {:?}", scalar);
+    }
+    tprintln!(
+        "  {} scalar_to_text conversions verified\n",
+        text_cases.len()
+    );
+
+    // Test scalar_to_text returns None for Null
+    assert!(
+        types::scalar_to_text(&ScalarValue::Null).is_none(),
+        "Null should produce None"
+    );
+    tprintln!("  Null -> None verified\n");
+
+    // Test scalar_to_binary for integer types
+    let binary_cases: Vec<(ScalarValue, Vec<u8>)> = vec![
+        (ScalarValue::Boolean(true), vec![1]),
+        (ScalarValue::Boolean(false), vec![0]),
+        (ScalarValue::Int32(42), 42i32.to_be_bytes().to_vec()),
+        (ScalarValue::Int64(12345), 12345i64.to_be_bytes().to_vec()),
+        (ScalarValue::Float64(2.718), 2.718f64.to_be_bytes().to_vec()),
+    ];
+
+    for (scalar, expected) in &binary_cases {
+        let encoded = types::scalar_to_binary(scalar);
+        assert!(
+            encoded.is_some(),
+            "scalar_to_binary should produce value for {:?}",
+            scalar
+        );
+        assert_eq!(
+            encoded.unwrap(),
+            *expected,
+            "Binary encoding mismatch for {:?}",
+            scalar
+        );
+    }
+    tprintln!(
+        "  {} scalar_to_binary conversions verified\n",
+        binary_cases.len()
+    );
+
+    // Test text_to_scalar roundtrip
+    let text_roundtrip: Vec<(i32, &[u8], ScalarValue)> = vec![
+        (types::PG_BOOL_OID, b"t", ScalarValue::Boolean(true)),
+        (types::PG_BOOL_OID, b"f", ScalarValue::Boolean(false)),
+        (types::PG_INT4_OID, b"42", ScalarValue::Int32(42)),
+        (types::PG_INT8_OID, b"99", ScalarValue::Int64(99)),
+        (
+            types::PG_TEXT_OID,
+            b"hello",
+            ScalarValue::Utf8("hello".into()),
+        ),
+    ];
+
+    for (oid, text, expected) in &text_roundtrip {
+        let result = types::text_to_scalar(text, *oid)
+            .expect(&format!("text_to_scalar failed for OID {}", oid));
+        assert_eq!(
+            result,
+            *expected,
+            "text_to_scalar mismatch for OID {} input {:?}",
+            oid,
+            String::from_utf8_lossy(text)
+        );
+    }
+    tprintln!(
+        "  {} text_to_scalar conversions verified\n",
+        text_roundtrip.len()
+    );
+
+    // Test binary_to_scalar roundtrip
+    let binary_roundtrip: Vec<(i32, Vec<u8>, ScalarValue)> = vec![
+        (
+            types::PG_INT4_OID,
+            42i32.to_be_bytes().to_vec(),
+            ScalarValue::Int32(42),
+        ),
+        (
+            types::PG_INT8_OID,
+            99i64.to_be_bytes().to_vec(),
+            ScalarValue::Int64(99),
+        ),
+        (types::PG_BOOL_OID, vec![1], ScalarValue::Boolean(true)),
+    ];
+
+    for (oid, bytes, expected) in &binary_roundtrip {
+        let result = types::binary_to_scalar(bytes, *oid)
+            .expect(&format!("binary_to_scalar failed for OID {}", oid));
+        assert_eq!(
+            result, *expected,
+            "binary_to_scalar mismatch for OID {}",
+            oid
+        );
+    }
+    tprintln!(
+        "  {} binary_to_scalar conversions verified\n",
+        binary_roundtrip.len()
+    );
+
+    // Test pg_type_size
+    assert_eq!(types::pg_type_size(TypeId::Boolean), 1);
+    assert_eq!(types::pg_type_size(TypeId::Int16), 2);
+    assert_eq!(types::pg_type_size(TypeId::Int32), 4);
+    assert_eq!(types::pg_type_size(TypeId::Int64), 8);
+    assert_eq!(types::pg_type_size(TypeId::Float32), 4);
+    assert_eq!(types::pg_type_size(TypeId::Float64), 8);
+    assert_eq!(types::pg_type_size(TypeId::Uuid), 16);
+    assert_eq!(types::pg_type_size(TypeId::Text), -1);
+    assert_eq!(types::pg_type_size(TypeId::Varchar), -1);
+    assert_eq!(types::pg_type_size(TypeId::Bytea), -1);
+    tprintln!("  pg_type_size verified for 10 types\n");
+}
+
+// ---------------------------------------------------------------------------
+// Test 3: Authentication protocols
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_auth_protocols() {
+    tprintln!("\n=== Authentication Protocols Test ===");
+
+    // Trust authenticator
+    {
+        let auth = TrustAuthenticator;
+        let result = auth.initial_message("anyone");
+        assert!(
+            matches!(result, AuthResult::Authenticated),
+            "TrustAuth should authenticate immediately"
+        );
+        tprintln!("  TrustAuthenticator: immediate authentication verified\n");
+    }
+
+    // Cleartext authenticator - correct password
+    {
+        let mut passwords = HashMap::new();
+        passwords.insert("alice".to_string(), "secret".to_string());
+        let mut auth = CleartextAuthenticator::new(passwords);
+
+        let result = auth.initial_message("alice");
+        assert!(
+            matches!(result, AuthResult::Challenge(_)),
+            "CleartextAuth should send challenge"
+        );
+
+        let response = PasswordMessage::Cleartext("secret".to_string());
+        let progress = auth.process_response("alice", &response);
+        assert!(progress.is_ok(), "Correct password should succeed");
+        tprintln!("  CleartextAuthenticator: correct password accepted\n");
+    }
+
+    // Cleartext authenticator - wrong password
+    {
+        let mut passwords = HashMap::new();
+        passwords.insert("alice".to_string(), "secret".to_string());
+        let mut auth = CleartextAuthenticator::new(passwords);
+        let _ = auth.initial_message("alice");
+
+        let response = PasswordMessage::Cleartext("wrong".to_string());
+        let progress = auth.process_response("alice", &response);
+        assert!(progress.is_err(), "Wrong password should fail");
+        tprintln!("  CleartextAuthenticator: wrong password rejected\n");
+    }
+
+    // MD5 authenticator - correct password
+    {
+        let mut passwords = HashMap::new();
+        passwords.insert("bob".to_string(), "pass123".to_string());
+        let mut auth = Md5Authenticator::new(passwords);
+
+        let result = auth.initial_message("bob");
+        // Extract salt from the challenge message
+        let salt = match &result {
+            AuthResult::Challenge(BackendMessage::Authentication(
+                AuthenticationMessage::Md5Password { salt },
+            )) => *salt,
+            _ => panic!("Md5Auth should send Md5Password challenge"),
+        };
+
+        // Compute expected MD5: md5(md5(password + user) + salt)
+        use md5::{Digest, Md5};
+        let mut hasher = Md5::new();
+        hasher.update(b"pass123bob");
+        let inner = format!("{:x}", hasher.finalize());
+
+        let mut hasher2 = Md5::new();
+        hasher2.update(inner.as_bytes());
+        hasher2.update(&salt);
+        let expected = format!("md5{:x}", hasher2.finalize());
+
+        let response = PasswordMessage::Cleartext(expected);
+        let progress = auth.process_response("bob", &response);
+        assert!(progress.is_ok(), "Correct MD5 password should succeed");
+        tprintln!("  Md5Authenticator: correct MD5 hash accepted\n");
+    }
+
+    tprintln!("  All 4 authentication protocol tests passed\n");
+}
+
+// ---------------------------------------------------------------------------
+// Test 4: COPY protocol
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_copy_protocol() {
+    tprintln!("\n=== COPY Protocol Test ===");
+
+    let columns = vec![
+        LogicalColumn {
+            table_idx: None,
+            column_id: zyron_catalog::ColumnId(0),
+            name: "id".into(),
+            type_id: TypeId::Int32,
+            nullable: false,
+        },
+        LogicalColumn {
+            table_idx: None,
+            column_id: zyron_catalog::ColumnId(1),
+            name: "name".into(),
+            type_id: TypeId::Text,
+            nullable: false,
+        },
+    ];
+
+    // COPY IN (text format)
+    {
+        let mut handler = CopyInHandler::new(columns.clone(), CopyFormat::Text);
+
+        let header = handler.header_message();
+        assert!(
+            matches!(header, BackendMessage::CopyInResponse { .. }),
+            "Should produce CopyInResponse"
+        );
+
+        handler.feed(b"1\tAlice\n2\tBob\n").expect("feed failed");
+        let rows = handler.finish().expect("finish failed");
+        assert_eq!(rows.len(), 2, "Should have 2 rows");
+        assert_eq!(rows[0].len(), 2, "Each row should have 2 columns");
+        assert_eq!(rows[0][0].as_deref(), Some(b"1".as_slice()));
+        assert_eq!(rows[0][1].as_deref(), Some(b"Alice".as_slice()));
+        assert_eq!(rows[1][0].as_deref(), Some(b"2".as_slice()));
+        assert_eq!(rows[1][1].as_deref(), Some(b"Bob".as_slice()));
+        tprintln!("  COPY IN (text): 2 rows parsed correctly\n");
+    }
+
+    // COPY IN (CSV format)
+    {
+        let mut handler = CopyInHandler::new(columns.clone(), CopyFormat::Csv);
+
+        handler.feed(b"1,Alice\n2,Bob\n").expect("feed CSV failed");
+        let rows = handler.finish().expect("finish CSV failed");
+        assert_eq!(rows.len(), 2, "CSV should have 2 rows");
+        assert_eq!(rows[0][0].as_deref(), Some(b"1".as_slice()));
+        assert_eq!(rows[0][1].as_deref(), Some(b"Alice".as_slice()));
+        tprintln!("  COPY IN (CSV): 2 rows parsed correctly\n");
+    }
+
+    // COPY IN (CSV with quoted fields)
+    {
+        let mut handler = CopyInHandler::new(columns.clone(), CopyFormat::Csv);
+
+        handler
+            .feed(b"3,\"O'Brien, Jr.\"\n")
+            .expect("feed quoted CSV failed");
+        let rows = handler.finish().expect("finish quoted CSV failed");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][1].as_deref(), Some(b"O'Brien, Jr.".as_slice()));
+        tprintln!("  COPY IN (CSV quoted): quoted field with comma parsed correctly\n");
+    }
+
+    // COPY OUT (text format)
+    {
+        let batch = DataBatch::new(vec![
+            make_column(
+                TypeId::Int32,
+                vec![ScalarValue::Int32(1), ScalarValue::Int32(2)],
+            ),
+            make_column(
+                TypeId::Text,
+                vec![
+                    ScalarValue::Utf8("Alice".into()),
+                    ScalarValue::Utf8("Bob".into()),
+                ],
+            ),
+        ]);
+
+        let handler = CopyOutHandler::new(columns.clone(), CopyFormat::Text);
+        let header = handler.header_message();
+        assert!(matches!(header, BackendMessage::CopyOutResponse { .. }));
+
+        let data_msgs = handler.format_batch(&batch);
+        assert_eq!(data_msgs.len(), 2, "Should produce 2 CopyData messages");
+
+        let done = handler.done_message();
+        assert!(matches!(done, BackendMessage::CopyDone));
+        tprintln!("  COPY OUT (text): 2 rows formatted correctly\n");
+    }
+
+    // COPY OUT (CSV format)
+    {
+        let batch = DataBatch::new(vec![
+            make_column(TypeId::Int32, vec![ScalarValue::Int32(10)]),
+            make_column(TypeId::Text, vec![ScalarValue::Utf8("hello,world".into())]),
+        ]);
+
+        let handler = CopyOutHandler::new(columns.clone(), CopyFormat::Csv);
+        let data_msgs = handler.format_batch(&batch);
+        assert_eq!(data_msgs.len(), 1);
+
+        // Verify the CSV output has proper quoting
+        if let BackendMessage::CopyData(data) = &data_msgs[0] {
+            let line = String::from_utf8_lossy(data);
+            assert!(
+                line.contains("\"hello,world\""),
+                "CSV should quote fields containing commas: {}",
+                line
+            );
+        }
+        tprintln!("  COPY OUT (CSV): field with comma properly quoted\n");
+    }
+
+    tprintln!("  All COPY protocol tests passed\n");
+}
+
+// ---------------------------------------------------------------------------
+// Test 5: Error SQLSTATE mapping
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_error_sqlstate_mapping() {
+    tprintln!("\n=== Error SQLSTATE Mapping Test ===");
+
+    // Build BackendMessage::ErrorResponse from ZyronErrors and verify SQLSTATE codes.
+    // We test this via the protocol error encoding, which produces ErrorFields.
+    let test_cases: Vec<(ZyronError, &str)> = vec![
+        (ZyronError::ParseError("bad syntax".into()), "42601"),
+        (ZyronError::TableNotFound("users".into()), "42P01"),
+        (ZyronError::ColumnNotFound("foo".into()), "42703"),
+        (ZyronError::DuplicateKey, "23505"),
+        (ZyronError::TransactionAborted("aborted".into()), "25P02"),
+        (ZyronError::DeadlockDetected, "40P01"),
+        (ZyronError::WriteConflict { page_id: 1 }, "40001"),
+        (ZyronError::NullNotAllowed, "23502"),
+        (ZyronError::DatabaseNotFound("nope".into()), "3D000"),
+        (ZyronError::SchemaNotFound("nope".into()), "3F000"),
+        (ZyronError::TableAlreadyExists("users".into()), "42P07"),
+        (ZyronError::DatabaseAlreadyExists("db".into()), "42P04"),
+        (ZyronError::PlanError("bad plan".into()), "42000"),
+        (ZyronError::ExecutionError("exec fail".into()), "XX000"),
+    ];
+
+    // Encode each error into a BackendMessage::ErrorResponse and parse the SQLSTATE
+    for (error, expected_code) in &test_cases {
+        let fields = zyron_wire::connection::zyron_error_to_fields(error);
+        assert_eq!(
+            fields.code,
+            *expected_code,
+            "ZyronError::{:?} should map to SQLSTATE {}",
+            std::mem::discriminant(error),
+            expected_code,
+        );
+
+        // Verify it encodes to valid bytes
+        let msg = BackendMessage::ErrorResponse(fields);
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf);
+        assert!(
+            buf.len() > 5,
+            "Error message should encode to non-trivial bytes"
+        );
+    }
+
+    tprintln!("  {} SQLSTATE mappings verified\n", test_cases.len());
+}
+
+// ---------------------------------------------------------------------------
+// Test 6: Session management
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_session_management() {
+    tprintln!("\n=== Session Management Test ===");
+
+    let session = Session::new(
+        "testuser".into(),
+        "testdb".into(),
+        zyron_catalog::DatabaseId(1),
+    );
+
+    // Default variables
+    assert_eq!(session.get_variable("server_version"), Some("16.0"));
+    assert_eq!(session.get_variable("server_encoding"), Some("UTF8"));
+    assert_eq!(session.get_variable("client_encoding"), Some("UTF8"));
+    tprintln!("  Default variables verified (server_version, encoding)\n");
+
+    // Startup parameters
+    let params = session.startup_parameters();
+    assert!(!params.is_empty(), "Startup parameters should not be empty");
+    let param_names: Vec<&str> = params.iter().map(|(k, _)| *k).collect();
+    assert!(
+        param_names.contains(&"server_version"),
+        "Should include server_version"
+    );
+    assert!(
+        param_names.contains(&"server_encoding"),
+        "Should include server_encoding"
+    );
+    tprintln!("  Startup parameters: {} entries\n", params.len());
+
+    // Transaction state transitions
+    let mut session = Session::new(
+        "testuser".into(),
+        "testdb".into(),
+        zyron_catalog::DatabaseId(1),
+    );
+    assert_eq!(session.transaction_state(), TransactionState::Idle);
+
+    session.set_transaction_state(TransactionState::InTransaction);
+    assert_eq!(session.transaction_state(), TransactionState::InTransaction);
+
+    session.set_transaction_state(TransactionState::Failed);
+    assert_eq!(session.transaction_state(), TransactionState::Failed);
+
+    session.set_transaction_state(TransactionState::Idle);
+    assert_eq!(session.transaction_state(), TransactionState::Idle);
+    tprintln!("  Transaction state transitions: Idle -> InTransaction -> Failed -> Idle\n");
+
+    // Set/get variable
+    let mut session = Session::new(
+        "testuser".into(),
+        "testdb".into(),
+        zyron_catalog::DatabaseId(1),
+    );
+    session.set_variable("timezone".into(), "US/Eastern".into());
+    assert_eq!(session.get_variable("timezone"), Some("US/Eastern"));
+    tprintln!("  Custom variable set/get verified\n");
+
+    // Search path update
+    session.set_variable("search_path".into(), "public, myschema".into());
+    assert!(
+        session.search_path.contains(&"public".to_string()),
+        "Search path should contain public"
+    );
+    assert!(
+        session.search_path.contains(&"myschema".to_string()),
+        "Search path should contain myschema"
+    );
+    tprintln!(
+        "  Search path parsing verified: {:?}\n",
+        session.search_path
+    );
+}
+
+// ===========================================================================
+// Performance Benchmarks (5 runs each)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Test 7: Message encode throughput (BackendMessage -> bytes)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_message_encode_throughput() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Message Encode Throughput Test ===");
+
+    let iterations = 1_000_000;
+    let mut results = Vec::with_capacity(VALIDATION_RUNS);
+
+    // Pre-build a DataRow message to encode repeatedly
+    let data_row = BackendMessage::DataRow(vec![
+        Some(b"42".to_vec()),
+        Some(b"Alice Johnson".to_vec()),
+        Some(b"2024-01-15".to_vec()),
+        None,
+    ]);
+
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("--- Run {}/{} ---\n", run + 1, VALIDATION_RUNS);
+
+        let mut codec = PostgresCodec::new();
+        codec.set_normal_mode();
+        let mut buf = BytesMut::with_capacity(128 * iterations);
+
+        let start = Instant::now();
+        for _ in 0..iterations {
+            codec
+                .encode(data_row.clone(), &mut buf)
+                .expect("encode failed");
+            buf.clear();
+        }
+        let elapsed = start.elapsed();
+
+        let ops_sec = iterations as f64 / elapsed.as_secs_f64();
+        results.push(ops_sec);
+        tprintln!(
+            "  {} encodes in {:.2?}, {} ops/sec\n",
+            format_with_commas(iterations as f64),
+            elapsed,
+            format_with_commas(ops_sec),
+        );
+    }
+
+    // Use query_per_sec target as a proxy for message encode throughput
+    let result = validate_metric(
+        "Message Encode",
+        "BackendMessage encode throughput (ops/sec)",
+        results,
+        QUERY_PER_SEC_TARGET,
+        true,
+    );
+
+    assert!(
+        result.passed,
+        "Message encode throughput below minimum threshold"
+    );
+    assert!(
+        !result.regression_detected,
+        "Regression detected in message encode"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: Message decode throughput (bytes -> FrontendMessage)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_message_decode_throughput() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Message Decode Throughput Test ===");
+
+    let iterations = 1_000_000;
+    let mut results = Vec::with_capacity(VALIDATION_RUNS);
+
+    // Pre-build Query message bytes
+    let query_bytes = build_query_bytes("SELECT id, name FROM users WHERE id = 42");
+
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("--- Run {}/{} ---\n", run + 1, VALIDATION_RUNS);
+
+        let mut codec = PostgresCodec::new();
+        codec.set_normal_mode();
+
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let mut buf = BytesMut::from(&query_bytes[..]);
+            let _ = codec.decode(&mut buf).expect("decode failed");
+        }
+        let elapsed = start.elapsed();
+
+        let ops_sec = iterations as f64 / elapsed.as_secs_f64();
+        results.push(ops_sec);
+        tprintln!(
+            "  {} decodes in {:.2?}, {} ops/sec\n",
+            format_with_commas(iterations as f64),
+            elapsed,
+            format_with_commas(ops_sec),
+        );
+    }
+
+    let result = validate_metric(
+        "Message Decode",
+        "FrontendMessage decode throughput (ops/sec)",
+        results,
+        QUERY_PER_SEC_TARGET,
+        true,
+    );
+
+    assert!(
+        result.passed,
+        "Message decode throughput below minimum threshold"
+    );
+    assert!(
+        !result.regression_detected,
+        "Regression detected in message decode"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: Row serialization throughput (ScalarValue -> wire format)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_row_serialization_throughput() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Row Serialization Throughput Test ===");
+
+    let num_rows: usize = 1_000_000;
+    let mut results = Vec::with_capacity(VALIDATION_RUNS);
+
+    // Pre-build scalars (4 columns per row)
+    let scalars: Vec<Vec<ScalarValue>> = (0..num_rows)
+        .map(|i| {
+            vec![
+                ScalarValue::Int32(i as i32),
+                ScalarValue::Utf8(format!("user_{}", i)),
+                ScalarValue::Float64(i as f64 * 1.5),
+                ScalarValue::Boolean(i % 2 == 0),
+            ]
+        })
+        .collect();
+
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("--- Run {}/{} ---\n", run + 1, VALIDATION_RUNS);
+
+        let start = Instant::now();
+        let mut total_bytes: usize = 0;
+
+        for row in &scalars {
+            let values: Vec<Option<Vec<u8>>> =
+                row.iter().map(|s| types::scalar_to_text(s)).collect();
+            for v in &values {
+                if let Some(b) = v {
+                    total_bytes += b.len();
+                }
+            }
+        }
+        let elapsed = start.elapsed();
+
+        let rows_sec = num_rows as f64 / elapsed.as_secs_f64();
+        results.push(rows_sec);
+        tprintln!(
+            "  {} rows ({} bytes) in {:.2?}, {} rows/sec\n",
+            format_with_commas(num_rows as f64),
+            format_with_commas(total_bytes as f64),
+            elapsed,
+            format_with_commas(rows_sec),
+        );
+    }
+
+    let result = validate_metric(
+        "Row Serialization",
+        "Row serialization throughput (rows/sec)",
+        results,
+        ROW_SERIALIZATION_TARGET_OPS,
+        true,
+    );
+
+    assert!(
+        result.passed,
+        "Row serialization throughput below minimum threshold"
+    );
+    assert!(
+        !result.regression_detected,
+        "Regression detected in row serialization"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: Type serialization throughput (individual scalar conversions)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_type_serialization_throughput() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Type Serialization Throughput Test ===");
+
+    let iterations = 5_000_000;
+    let mut text_results = Vec::with_capacity(VALIDATION_RUNS);
+    let mut binary_results = Vec::with_capacity(VALIDATION_RUNS);
+
+    let test_scalar = ScalarValue::Int64(1234567890);
+
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("--- Run {}/{} ---\n", run + 1, VALIDATION_RUNS);
+
+        // Text format
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let _ = types::scalar_to_text(&test_scalar);
+        }
+        let text_elapsed = start.elapsed();
+        let text_ops = iterations as f64 / text_elapsed.as_secs_f64();
+        text_results.push(text_ops);
+
+        // Binary format
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let _ = types::scalar_to_binary(&test_scalar);
+        }
+        let binary_elapsed = start.elapsed();
+        let binary_ops = iterations as f64 / binary_elapsed.as_secs_f64();
+        binary_results.push(binary_ops);
+
+        tprintln!(
+            "  Text: {} ops/sec, Binary: {} ops/sec\n",
+            format_with_commas(text_ops),
+            format_with_commas(binary_ops),
+        );
+    }
+
+    let text_result = validate_metric(
+        "Type Serialization",
+        "scalar_to_text throughput (ops/sec)",
+        text_results,
+        ROW_SERIALIZATION_TARGET_OPS,
+        true,
+    );
+
+    let binary_result = validate_metric(
+        "Type Serialization",
+        "scalar_to_binary throughput (ops/sec)",
+        binary_results,
+        ROW_SERIALIZATION_TARGET_OPS,
+        true,
+    );
+
+    assert!(
+        text_result.passed,
+        "Text serialization throughput below minimum threshold"
+    );
+    assert!(
+        binary_result.passed,
+        "Binary serialization throughput below minimum threshold"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 11: COPY FROM throughput (CSV parsing)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_copy_from_throughput() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== COPY FROM Throughput Test ===");
+
+    let num_rows = 500_000;
+    let mut results = Vec::with_capacity(VALIDATION_RUNS);
+
+    let columns = vec![
+        LogicalColumn {
+            table_idx: None,
+            column_id: zyron_catalog::ColumnId(0),
+            name: "id".into(),
+            type_id: TypeId::Int32,
+            nullable: false,
+        },
+        LogicalColumn {
+            table_idx: None,
+            column_id: zyron_catalog::ColumnId(1),
+            name: "name".into(),
+            type_id: TypeId::Text,
+            nullable: false,
+        },
+        LogicalColumn {
+            table_idx: None,
+            column_id: zyron_catalog::ColumnId(2),
+            name: "value".into(),
+            type_id: TypeId::Float64,
+            nullable: true,
+        },
+    ];
+
+    // Pre-build CSV data
+    let mut csv_data = Vec::with_capacity(num_rows * 30);
+    for i in 0..num_rows {
+        csv_data.extend_from_slice(format!("{},user_{},{:.2}\n", i, i, i as f64 * 0.5).as_bytes());
+    }
+
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("--- Run {}/{} ---\n", run + 1, VALIDATION_RUNS);
+
+        let start = Instant::now();
+        let mut handler = CopyInHandler::new(columns.clone(), CopyFormat::Csv);
+
+        // Feed in chunks (simulating network packets)
+        let chunk_size = 65536;
+        for chunk in csv_data.chunks(chunk_size) {
+            handler.feed(chunk).expect("feed failed");
+        }
+        let rows = handler.finish().expect("finish failed");
+        let elapsed = start.elapsed();
+
+        assert_eq!(rows.len(), num_rows, "Should parse all rows");
+
+        let rows_sec = num_rows as f64 / elapsed.as_secs_f64();
+        results.push(rows_sec);
+        tprintln!(
+            "  {} rows ({} bytes) in {:.2?}, {} rows/sec\n",
+            format_with_commas(num_rows as f64),
+            format_with_commas(csv_data.len() as f64),
+            elapsed,
+            format_with_commas(rows_sec),
+        );
+    }
+
+    let result = validate_metric(
+        "COPY FROM",
+        "COPY FROM (CSV) throughput (rows/sec)",
+        results,
+        COPY_FROM_TARGET_OPS,
+        true,
+    );
+
+    assert!(
+        result.passed,
+        "COPY FROM throughput below minimum threshold"
+    );
+    assert!(
+        !result.regression_detected,
+        "Regression detected in COPY FROM"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: COPY TO throughput (row formatting)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_copy_to_throughput() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== COPY TO Throughput Test ===");
+
+    let batch_rows = 1024;
+    let num_batches = 500;
+    let total_rows = batch_rows * num_batches;
+    let mut results = Vec::with_capacity(VALIDATION_RUNS);
+
+    let columns = vec![
+        LogicalColumn {
+            table_idx: None,
+            column_id: zyron_catalog::ColumnId(0),
+            name: "id".into(),
+            type_id: TypeId::Int32,
+            nullable: false,
+        },
+        LogicalColumn {
+            table_idx: None,
+            column_id: zyron_catalog::ColumnId(1),
+            name: "name".into(),
+            type_id: TypeId::Text,
+            nullable: false,
+        },
+    ];
+
+    // Pre-build batches
+    let batches: Vec<DataBatch> = (0..num_batches)
+        .map(|b| {
+            DataBatch::new(vec![
+                make_column(
+                    TypeId::Int32,
+                    (0..batch_rows)
+                        .map(|r| ScalarValue::Int32((b * batch_rows + r) as i32))
+                        .collect(),
+                ),
+                make_column(
+                    TypeId::Text,
+                    (0..batch_rows)
+                        .map(|r| ScalarValue::Utf8(format!("row_{}", b * batch_rows + r)))
+                        .collect(),
+                ),
+            ])
+        })
+        .collect();
+
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("--- Run {}/{} ---\n", run + 1, VALIDATION_RUNS);
+
+        let handler = CopyOutHandler::new(columns.clone(), CopyFormat::Text);
+
+        let start = Instant::now();
+        let mut total_msgs = 0;
+        for batch in &batches {
+            let msgs = handler.format_batch(batch);
+            total_msgs += msgs.len();
+        }
+        let elapsed = start.elapsed();
+
+        assert_eq!(total_msgs, total_rows, "Should format all rows");
+
+        let rows_sec = total_rows as f64 / elapsed.as_secs_f64();
+        results.push(rows_sec);
+        tprintln!(
+            "  {} rows in {:.2?}, {} rows/sec\n",
+            format_with_commas(total_rows as f64),
+            elapsed,
+            format_with_commas(rows_sec),
+        );
+    }
+
+    let result = validate_metric(
+        "COPY TO",
+        "COPY TO (text) throughput (rows/sec)",
+        results,
+        COPY_TO_TARGET_OPS,
+        true,
+    );
+
+    assert!(result.passed, "COPY TO throughput below minimum threshold");
+    assert!(
+        !result.regression_detected,
+        "Regression detected in COPY TO"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 13: Parse message latency
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_parse_message_latency() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Parse Message Latency Test ===");
+
+    let iterations = 500_000;
+    let mut results = Vec::with_capacity(VALIDATION_RUNS);
+
+    let parse_bytes = build_parse_bytes(
+        "stmt1",
+        "SELECT id, name, email FROM users WHERE id = $1 AND active = $2",
+        &[types::PG_INT4_OID, types::PG_BOOL_OID],
+    );
+
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("--- Run {}/{} ---\n", run + 1, VALIDATION_RUNS);
+
+        let mut codec = PostgresCodec::new();
+        codec.set_normal_mode();
+
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let mut buf = BytesMut::from(&parse_bytes[..]);
+            let _ = codec.decode(&mut buf).expect("decode failed");
+        }
+        let elapsed = start.elapsed();
+
+        let avg_us = elapsed.as_secs_f64() * 1_000_000.0 / iterations as f64;
+        results.push(avg_us);
+        tprintln!(
+            "  {} parse decodes in {:.2?}, avg {:.3} us/op\n",
+            format_with_commas(iterations as f64),
+            elapsed,
+            avg_us,
+        );
+    }
+
+    let result = validate_metric(
+        "Parse Message",
+        "Parse message decode latency (us)",
+        results,
+        PARSE_MESSAGE_TARGET_US,
+        false,
+    );
+
+    assert!(
+        result.passed,
+        "Parse message latency above minimum threshold"
+    );
+    assert!(
+        !result.regression_detected,
+        "Regression detected in parse message latency"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 14: Bind message latency
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_bind_message_latency() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Bind Message Latency Test ===");
+
+    let iterations = 500_000;
+    let mut results = Vec::with_capacity(VALIDATION_RUNS);
+
+    let bind_bytes = build_bind_bytes("", "stmt1", &[0, 0], &[Some(b"42"), Some(b"true")], &[0]);
+
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("--- Run {}/{} ---\n", run + 1, VALIDATION_RUNS);
+
+        let mut codec = PostgresCodec::new();
+        codec.set_normal_mode();
+
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let mut buf = BytesMut::from(&bind_bytes[..]);
+            let _ = codec.decode(&mut buf).expect("decode failed");
+        }
+        let elapsed = start.elapsed();
+
+        let avg_us = elapsed.as_secs_f64() * 1_000_000.0 / iterations as f64;
+        results.push(avg_us);
+        tprintln!(
+            "  {} bind decodes in {:.2?}, avg {:.3} us/op\n",
+            format_with_commas(iterations as f64),
+            elapsed,
+            avg_us,
+        );
+    }
+
+    let result = validate_metric(
+        "Bind Message",
+        "Bind message decode latency (us)",
+        results,
+        BIND_MESSAGE_TARGET_US,
+        false,
+    );
+
+    assert!(
+        result.passed,
+        "Bind message latency above minimum threshold"
+    );
+    assert!(
+        !result.regression_detected,
+        "Regression detected in bind message latency"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 15: Connection handshake latency (TCP + PG startup)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_connection_handshake_latency() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Connection Handshake Latency Test ===");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let (server_state, _tmp) = create_test_server("testdb").await;
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.expect("bind failed"));
+        let addr = listener.local_addr().unwrap();
+        tprintln!("  Server listening on {}\n", addr);
+
+        let iterations = 500;
+        let mut results = Vec::with_capacity(VALIDATION_RUNS);
+
+        for run in 0..VALIDATION_RUNS {
+            tprintln!("--- Run {}/{} ---\n", run + 1, VALIDATION_RUNS);
+
+            let start = Instant::now();
+            let mut success_count = 0;
+
+            for _ in 0..iterations {
+                let state = Arc::clone(&server_state);
+                let lis = Arc::clone(&listener);
+
+                // Spawn server accept as a local task so it doesn't block the client
+                let server_handle = tokio::task::spawn_local(async move {
+                    let (stream, _) = lis.accept().await.expect("accept failed");
+                    let mut conn = zyron_wire::connection::Connection::new(stream, state);
+                    let _ = conn.run().await;
+                });
+
+                // Client side - runs concurrently with server accept
+                let mut client = TcpStream::connect(addr).await.expect("connect failed");
+                match do_handshake(&mut client, "test_user", "testdb").await {
+                    Ok(msg_types) => {
+                        assert!(msg_types.contains(&b'R'), "Should receive AuthenticationOk");
+                        assert!(msg_types.contains(&b'Z'), "Should receive ReadyForQuery");
+                        success_count += 1;
+                    }
+                    Err(e) => {
+                        tprintln!("  Handshake error: {}\n", e);
+                    }
+                }
+
+                // Clean disconnect
+                let _ = client.write_all(&build_terminate_bytes()).await;
+                let _ = client.shutdown().await;
+                let _ = server_handle.await;
+            }
+            let elapsed = start.elapsed();
+
+            let avg_us = elapsed.as_secs_f64() * 1_000_000.0 / iterations as f64;
+            results.push(avg_us);
+            tprintln!(
+                "  {} handshakes ({} success) in {:.2?}, avg {:.1} us/handshake\n",
+                iterations,
+                success_count,
+                elapsed,
+                avg_us,
+            );
+            assert_eq!(success_count, iterations, "All handshakes should succeed");
+        }
+
+        let result = validate_metric(
+            "Connection Handshake",
+            "Handshake latency (us)",
+            results,
+            HANDSHAKE_TARGET_US,
+            false,
+        );
+
+        assert!(result.passed, "Handshake latency above minimum threshold");
+        assert!(
+            !result.regression_detected,
+            "Regression detected in handshake latency"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Test 16: Concurrent connections
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_concurrent_connections() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Concurrent Connections Test ===");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let (server_state, _tmp) = create_test_server("testdb").await;
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.expect("bind failed"));
+        let addr = listener.local_addr().unwrap();
+        tprintln!("  Server listening on {}\n", addr);
+
+        let concurrent = 200;
+        let mut results = Vec::with_capacity(VALIDATION_RUNS);
+
+        for run in 0..VALIDATION_RUNS {
+            tprintln!("--- Run {}/{} ---\n", run + 1, VALIDATION_RUNS);
+
+            let start = Instant::now();
+
+            // Spawn server accept loop as a local task
+            let server_listener = Arc::clone(&listener);
+            let server_ss = Arc::clone(&server_state);
+            let server_handle = tokio::task::spawn_local(async move {
+                let mut handles = Vec::new();
+                for _ in 0..concurrent {
+                    let (stream, _) = server_listener.accept().await.expect("accept failed");
+                    let state = Arc::clone(&server_ss);
+                    handles.push(tokio::task::spawn_local(async move {
+                        let mut conn = zyron_wire::connection::Connection::new(stream, state);
+                        let _ = conn.run().await;
+                    }));
+                }
+                handles
+            });
+
+            // Spawn clients concurrently
+            let mut client_handles = Vec::new();
+            for _ in 0..concurrent {
+                let client_handle = tokio::task::spawn_local(async move {
+                    let mut stream = TcpStream::connect(addr).await.expect("connect failed");
+                    let result = do_handshake(&mut stream, "test_user", "testdb").await;
+                    let _ = stream.write_all(&build_terminate_bytes()).await;
+                    let _ = stream.shutdown().await;
+                    result.is_ok()
+                });
+                client_handles.push(client_handle);
+            }
+
+            let mut success = 0;
+            for handle in client_handles {
+                if handle.await.unwrap_or(false) {
+                    success += 1;
+                }
+            }
+
+            // Wait for server handlers to finish
+            if let Ok(server_handles) = server_handle.await {
+                for h in server_handles {
+                    let _ = h.await;
+                }
+            }
+
+            let elapsed = start.elapsed();
+            let conns_per_sec = concurrent as f64 / elapsed.as_secs_f64();
+            results.push(conns_per_sec);
+
+            tprintln!(
+                "  {} concurrent connections ({} success) in {:.2?}, {} conns/sec\n",
+                concurrent,
+                success,
+                elapsed,
+                format_with_commas(conns_per_sec),
+            );
+            assert!(
+                success >= concurrent * 9 / 10,
+                "At least 90% of connections should succeed"
+            );
+        }
+
+        let result = validate_metric(
+            "Concurrent Connections",
+            "Connection establishment rate (conns/sec)",
+            results,
+            1000.0,
+            true,
+        );
+
+        assert!(
+            result.passed,
+            "Concurrent connection rate below minimum threshold"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Test 17: Extended query protocol message roundtrip
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_extended_query_protocol_messages() {
+    tprintln!("\n=== Extended Query Protocol Messages Test ===");
+
+    let mut codec = PostgresCodec::new();
+    codec.set_normal_mode();
+
+    // Full extended query cycle: Parse -> Describe -> Bind -> Execute -> Sync
+
+    // 1. Parse
+    let parse = build_parse_bytes(
+        "stmt1",
+        "SELECT * FROM t WHERE id = $1",
+        &[types::PG_INT4_OID],
+    );
+    let mut buf = BytesMut::from(&parse[..]);
+    let msg = codec.decode(&mut buf).unwrap().unwrap();
+    if let FrontendMessage::Parse {
+        name,
+        query,
+        param_types,
+    } = msg
+    {
+        assert_eq!(name, "stmt1");
+        assert_eq!(query, "SELECT * FROM t WHERE id = $1");
+        assert_eq!(param_types, vec![types::PG_INT4_OID]);
+    } else {
+        panic!("Expected Parse");
+    }
+    tprintln!("  Parse: stmt1 with 1 param\n");
+
+    // 2. Describe statement
+    let desc = build_describe_bytes(b'S', "stmt1");
+    let mut buf = BytesMut::from(&desc[..]);
+    let msg = codec.decode(&mut buf).unwrap().unwrap();
+    if let FrontendMessage::Describe { target, name } = msg {
+        assert_eq!(target, DescribeTarget::Statement);
+        assert_eq!(name, "stmt1");
+    } else {
+        panic!("Expected Describe");
+    }
+    tprintln!("  Describe: statement stmt1\n");
+
+    // 3. Bind with parameter
+    let bind = build_bind_bytes("portal1", "stmt1", &[0], &[Some(b"42")], &[0]);
+    let mut buf = BytesMut::from(&bind[..]);
+    let msg = codec.decode(&mut buf).unwrap().unwrap();
+    if let FrontendMessage::Bind {
+        portal,
+        statement,
+        param_formats,
+        param_values,
+        result_formats,
+    } = msg
+    {
+        assert_eq!(portal, "portal1");
+        assert_eq!(statement, "stmt1");
+        assert_eq!(param_formats, vec![0i16]);
+        assert_eq!(param_values.len(), 1);
+        assert_eq!(param_values[0].as_deref(), Some(b"42".as_slice()));
+        assert_eq!(result_formats, vec![0i16]);
+    } else {
+        panic!("Expected Bind");
+    }
+    tprintln!("  Bind: portal1 <- stmt1 with param=42\n");
+
+    // 4. Describe portal
+    let desc = build_describe_bytes(b'P', "portal1");
+    let mut buf = BytesMut::from(&desc[..]);
+    let msg = codec.decode(&mut buf).unwrap().unwrap();
+    if let FrontendMessage::Describe { target, name } = msg {
+        assert_eq!(target, DescribeTarget::Portal);
+        assert_eq!(name, "portal1");
+    } else {
+        panic!("Expected Describe Portal");
+    }
+    tprintln!("  Describe: portal portal1\n");
+
+    // 5. Execute
+    let exec = build_execute_bytes("portal1", 0);
+    let mut buf = BytesMut::from(&exec[..]);
+    let msg = codec.decode(&mut buf).unwrap().unwrap();
+    if let FrontendMessage::Execute { portal, max_rows } = msg {
+        assert_eq!(portal, "portal1");
+        assert_eq!(max_rows, 0);
+    } else {
+        panic!("Expected Execute");
+    }
+    tprintln!("  Execute: portal1 (unlimited rows)\n");
+
+    // 6. Sync
+    let sync = build_sync_bytes();
+    let mut buf = BytesMut::from(&sync[..]);
+    let msg = codec.decode(&mut buf).unwrap().unwrap();
+    assert!(matches!(msg, FrontendMessage::Sync));
+    tprintln!("  Sync\n");
+
+    // Verify the backend can produce the corresponding responses
+    let mut enc_buf = BytesMut::new();
+    let mut enc_codec = PostgresCodec::new();
+    enc_codec.set_normal_mode();
+
+    let responses = vec![
+        BackendMessage::ParseComplete,
+        BackendMessage::ParameterDescription(vec![types::PG_INT4_OID]),
+        BackendMessage::RowDescription(vec![FieldDescription {
+            name: "id".into(),
+            table_oid: 0,
+            column_attr: 0,
+            type_oid: types::PG_INT4_OID,
+            type_size: 4,
+            type_modifier: -1,
+            format: 0,
+        }]),
+        BackendMessage::BindComplete,
+        BackendMessage::DataRow(vec![Some(b"42".to_vec())]),
+        BackendMessage::CommandComplete {
+            tag: "SELECT 1".into(),
+        },
+        BackendMessage::ReadyForQuery(TransactionState::Idle),
+    ];
+
+    for msg in &responses {
+        enc_codec
+            .encode(msg.clone(), &mut enc_buf)
+            .expect("response encode failed");
+    }
+    tprintln!(
+        "  {} response messages encoded ({} bytes)\n",
+        responses.len(),
+        enc_buf.len()
+    );
+    tprintln!("  Full extended query protocol cycle verified\n");
+}
+
+// ---------------------------------------------------------------------------
+// Test 18: Execute message latency
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_execute_message_latency() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Execute Message Latency Test ===");
+
+    let iterations = 500_000;
+    let mut results = Vec::with_capacity(VALIDATION_RUNS);
+
+    let exec_bytes = build_execute_bytes("", 0);
+
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("--- Run {}/{} ---\n", run + 1, VALIDATION_RUNS);
+
+        let mut codec = PostgresCodec::new();
+        codec.set_normal_mode();
+
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let mut buf = BytesMut::from(&exec_bytes[..]);
+            let _ = codec.decode(&mut buf).expect("decode failed");
+        }
+        let elapsed = start.elapsed();
+
+        let avg_us = elapsed.as_secs_f64() * 1_000_000.0 / iterations as f64;
+        results.push(avg_us);
+        tprintln!(
+            "  {} execute decodes in {:.2?}, avg {:.3} us/op\n",
+            format_with_commas(iterations as f64),
+            elapsed,
+            avg_us,
+        );
+    }
+
+    let result = validate_metric(
+        "Execute Message",
+        "Execute message decode latency (us)",
+        results,
+        EXECUTE_MESSAGE_TARGET_US,
+        false,
+    );
+
+    assert!(
+        result.passed,
+        "Execute message latency above minimum threshold"
+    );
+    assert!(
+        !result.regression_detected,
+        "Regression detected in execute message latency"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 19: Simple query message throughput
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_simple_query_message_throughput() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Simple Query Message Throughput Test ===");
+
+    let iterations = 1_000_000;
+    let mut results = Vec::with_capacity(VALIDATION_RUNS);
+
+    // Test full encode+decode cycle for a simple query
+    let query_bytes = build_query_bytes("SELECT 1");
+    let response_msg = BackendMessage::DataRow(vec![Some(b"1".to_vec())]);
+
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("--- Run {}/{} ---\n", run + 1, VALIDATION_RUNS);
+
+        let mut decode_codec = PostgresCodec::new();
+        decode_codec.set_normal_mode();
+        let mut encode_codec = PostgresCodec::new();
+        encode_codec.set_normal_mode();
+        let mut enc_buf = BytesMut::with_capacity(64);
+
+        let start = Instant::now();
+        for _ in 0..iterations {
+            // Decode client query
+            let mut buf = BytesMut::from(&query_bytes[..]);
+            let _ = decode_codec.decode(&mut buf).unwrap();
+
+            // Encode server response
+            encode_codec
+                .encode(response_msg.clone(), &mut enc_buf)
+                .unwrap();
+            enc_buf.clear();
+        }
+        let elapsed = start.elapsed();
+
+        let avg_us = elapsed.as_secs_f64() * 1_000_000.0 / iterations as f64;
+        let qps = iterations as f64 / elapsed.as_secs_f64();
+        results.push(avg_us);
+        tprintln!(
+            "  {} query roundtrips in {:.2?}, avg {:.3} us/op ({} qps)\n",
+            format_with_commas(iterations as f64),
+            elapsed,
+            avg_us,
+            format_with_commas(qps),
+        );
+    }
+
+    let result = validate_metric(
+        "Simple Query",
+        "Simple query message latency (us)",
+        results,
+        SIMPLE_QUERY_TARGET_US,
+        false,
+    );
+
+    assert!(
+        result.passed,
+        "Simple query latency above minimum threshold"
+    );
+    assert!(
+        !result.regression_detected,
+        "Regression detected in simple query latency"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 20: DataRow encode throughput (full row encoding pipeline)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_datarow_encode_throughput() {
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== DataRow Encode Throughput Test ===");
+
+    let num_rows = 2_000_000;
+    let mut results = Vec::with_capacity(VALIDATION_RUNS);
+
+    // Pre-build DataBatch with 4 columns, 1024 rows per batch
+    let batch_size = 1024;
+    let num_batches = num_rows / batch_size;
+
+    let batch = DataBatch::new(vec![
+        make_column(
+            TypeId::Int32,
+            (0..batch_size)
+                .map(|i| ScalarValue::Int32(i as i32))
+                .collect(),
+        ),
+        make_column(
+            TypeId::Text,
+            (0..batch_size)
+                .map(|i| ScalarValue::Utf8(format!("name_{}", i)))
+                .collect(),
+        ),
+        make_column(
+            TypeId::Float64,
+            (0..batch_size)
+                .map(|i| ScalarValue::Float64(i as f64 * 1.1))
+                .collect(),
+        ),
+        make_column(
+            TypeId::Boolean,
+            (0..batch_size)
+                .map(|i| ScalarValue::Boolean(i % 2 == 0))
+                .collect(),
+        ),
+    ]);
+
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("--- Run {}/{} ---\n", run + 1, VALIDATION_RUNS);
+
+        let mut codec = PostgresCodec::new();
+        codec.set_normal_mode();
+        let mut buf = BytesMut::with_capacity(256 * 1024);
+        let mut total_bytes: usize = 0;
+
+        let start = Instant::now();
+        for _ in 0..num_batches {
+            for row in 0..batch.num_rows {
+                let values: Vec<Option<Vec<u8>>> = batch
+                    .columns
+                    .iter()
+                    .map(|col| types::scalar_to_text(&col.get_scalar(row)))
+                    .collect();
+                let msg = BackendMessage::DataRow(values);
+                codec.encode(msg, &mut buf).unwrap();
+                total_bytes += buf.len();
+                buf.clear();
+            }
+        }
+        let elapsed = start.elapsed();
+
+        let rows_sec = num_rows as f64 / elapsed.as_secs_f64();
+        results.push(rows_sec);
+        tprintln!(
+            "  {} rows ({} bytes) in {:.2?}, {} rows/sec\n",
+            format_with_commas(num_rows as f64),
+            format_with_commas(total_bytes as f64),
+            elapsed,
+            format_with_commas(rows_sec),
+        );
+    }
+
+    let result = validate_metric(
+        "DataRow Encode",
+        "DataRow encode throughput (rows/sec)",
+        results,
+        ROW_SERIALIZATION_TARGET_OPS,
+        true,
+    );
+
+    assert!(
+        result.passed,
+        "DataRow encode throughput below minimum threshold"
+    );
+    assert!(
+        !result.regression_detected,
+        "Regression detected in DataRow encode"
+    );
+}
