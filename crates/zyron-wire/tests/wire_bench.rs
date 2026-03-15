@@ -1,15 +1,13 @@
-//! Phase 6: Wire Protocol Validation Suite
+//! Wire Protocol Benchmark Suite
 //!
 //! Tests the PostgreSQL wire protocol v3 implementation including message
 //! encoding/decoding, type serialization, authentication, COPY protocol,
 //! TCP connection handshake, and concurrent connection handling.
 //!
-//! Run: cargo test -p zyron-wire --test phase6_test --release -- --nocapture
+//! Run: cargo test -p zyron-wire --test wire_bench --release -- --nocapture
 
 use std::collections::HashMap;
-use std::io::Write as _;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
 
 use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -40,12 +38,11 @@ use zyron_wire::messages::frontend::{DescribeTarget, FrontendMessage, PasswordMe
 use zyron_wire::session::Session;
 use zyron_wire::types;
 
+use zyron_bench_harness::*;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-const VALIDATION_RUNS: usize = 5;
-const REGRESSION_THRESHOLD: f64 = 2.0;
 
 // Performance targets (minimum thresholds)
 const HANDSHAKE_TARGET_US: f64 = 50.0;
@@ -62,539 +59,6 @@ const QUERY_PER_SEC_TARGET: f64 = 2_000_000.0;
 
 // Benchmark infrastructure
 static BENCHMARK_LOCK: Mutex<()> = Mutex::new(());
-
-// =============================================================================
-// Validation Infrastructure
-// =============================================================================
-
-macro_rules! tprintln {
-    () => {{
-        std::println!();
-        write_raw_output("");
-    }};
-    ($($arg:tt)*) => {{
-        let msg = format!($($arg)*);
-        std::println!("{}", msg);
-        write_raw_output(&msg);
-    }};
-}
-
-struct ValidationResult {
-    passed: bool,
-    regression_detected: bool,
-}
-
-fn format_with_commas(n: f64) -> String {
-    let s = format!("{:.0}", n);
-    let bytes: Vec<char> = s.chars().collect();
-    let mut result = String::new();
-    let len = bytes.len();
-    for (i, c) in bytes.iter().enumerate() {
-        if i > 0 && (len - i) % 3 == 0 {
-            result.push(',');
-        }
-        result.push(*c);
-    }
-    result
-}
-
-fn validate_metric(
-    test: &str,
-    name: &str,
-    runs: Vec<f64>,
-    target: f64,
-    higher_is_better: bool,
-) -> ValidationResult {
-    let average = runs.iter().sum::<f64>() / runs.len() as f64;
-    let min = runs.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max = runs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-
-    let variance = runs.iter().map(|x| (x - average).powi(2)).sum::<f64>() / runs.len() as f64;
-    let std_dev = variance.sqrt();
-
-    let passed = if higher_is_better {
-        average >= target
-    } else {
-        average <= target
-    };
-
-    let regression_threshold = if higher_is_better {
-        target / REGRESSION_THRESHOLD
-    } else {
-        target * REGRESSION_THRESHOLD
-    };
-
-    let regression_detected = runs.iter().any(|&r| {
-        if higher_is_better {
-            r < regression_threshold
-        } else {
-            r > regression_threshold
-        }
-    });
-
-    let status = if passed { "PASS" } else { "FAIL" };
-    let regr_status = if regression_detected { "REGR!" } else { "OK" };
-    let comparison = if higher_is_better { ">=" } else { "<=" };
-
-    tprintln!("  {} [{}/{}]:", name, status, regr_status);
-    tprintln!(
-        "    Runs: [{}]",
-        runs.iter()
-            .map(|x| format_with_commas(*x))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    tprintln!(
-        "    Average: {} {} {} (target)",
-        format_with_commas(average),
-        comparison,
-        format_with_commas(target)
-    );
-    tprintln!(
-        "    Min/Max: {} / {}, StdDev: {}",
-        format_with_commas(min),
-        format_with_commas(max),
-        format_with_commas(std_dev)
-    );
-
-    write_benchmark_record(test, name, average, runs, target, passed, higher_is_better);
-
-    ValidationResult {
-        passed,
-        regression_detected,
-    }
-}
-
-#[allow(dead_code)]
-fn check_performance(
-    test: &str,
-    metric_name: &str,
-    value: f64,
-    target: f64,
-    higher_is_better: bool,
-) -> bool {
-    let passed = if higher_is_better {
-        value >= target
-    } else {
-        value <= target
-    };
-    let status = if passed { "PASS" } else { "FAIL" };
-    let comparison = if higher_is_better { ">=" } else { "<=" };
-    tprintln!(
-        "  {} [{}]: {} {} {} (target)",
-        metric_name,
-        status,
-        format_with_commas(value),
-        comparison,
-        format_with_commas(target),
-    );
-    write_benchmark_record(
-        test,
-        metric_name,
-        value,
-        vec![value],
-        target,
-        passed,
-        higher_is_better,
-    );
-    passed
-}
-
-// =============================================================================
-// Benchmark Output
-// =============================================================================
-
-#[derive(Clone)]
-struct MetricRecord {
-    test: String,
-    metric: String,
-    average: f64,
-    runs: Vec<f64>,
-    target: f64,
-    passed: bool,
-    higher_is_better: bool,
-}
-
-#[derive(Clone)]
-struct UtilSnapshot {
-    cpu_pct: f64,
-    ram_used_gb: f64,
-}
-
-#[derive(Clone)]
-#[allow(dead_code)]
-struct UtilRecord {
-    test: String,
-    before: UtilSnapshot,
-    after: UtilSnapshot,
-}
-
-static GIT_COMMIT: OnceLock<String> = OnceLock::new();
-static PLATFORM_HW: OnceLock<PlatformHardware> = OnceLock::new();
-static RUN_ID: OnceLock<String> = OnceLock::new();
-static RAW_LOG: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
-static COLLECTED_METRICS: OnceLock<Mutex<Vec<MetricRecord>>> = OnceLock::new();
-static COLLECTED_UTILS: OnceLock<Mutex<Vec<UtilRecord>>> = OnceLock::new();
-
-struct PlatformHardware {
-    cpu: String,
-    ram_gb: f64,
-    gpus: Vec<String>,
-}
-
-fn git_commit() -> &'static str {
-    GIT_COMMIT.get_or_init(|| {
-        std::process::Command::new("git")
-            .args(["describe", "--always", "--dirty=-local", "--abbrev=7"])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| "unknown".to_string())
-    })
-}
-
-fn unix_to_datetime(ts: u64) -> String {
-    let secs = ts % 60;
-    let mins = (ts / 60) % 60;
-    let hours = (ts / 3600) % 24;
-    let z = ts / 86400 + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}Z",
-        y, m, d, hours, mins, secs
-    )
-}
-
-fn benchmark_dir() -> std::path::PathBuf {
-    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("benchmarks")
-}
-
-fn json_str_array(items: &[String]) -> String {
-    let inner = items
-        .iter()
-        .map(|s| format!("\"{}\"", s.replace('"', "\\\"")))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{}]", inner)
-}
-
-#[cfg(target_os = "windows")]
-fn platform_hw_impl() -> PlatformHardware {
-    let script = "$cpu = (Get-WmiObject Win32_Processor).Name.Trim(); \
-                  $ram = (Get-WmiObject Win32_ComputerSystem).TotalPhysicalMemory; \
-                  $gpus = (Get-WmiObject Win32_VideoController | ForEach-Object { $_.Name.Trim() }) -join ';;'; \
-                  Write-Output \"$cpu||$ram||$gpus\"";
-    let out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", script])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default();
-    let parts: Vec<&str> = out.trim().splitn(3, "||").collect();
-    let cpu = parts.first().copied().unwrap_or("unknown").to_string();
-    let ram_bytes: u64 = parts
-        .get(1)
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
-    let gpus = parts
-        .get(2)
-        .map(|s| {
-            s.split(";;")
-                .map(|g| g.trim().to_string())
-                .filter(|g| !g.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    PlatformHardware {
-        cpu,
-        ram_gb: ram_bytes as f64 / (1024.0_f64.powi(3)),
-        gpus,
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn platform_hw_impl() -> PlatformHardware {
-    let cpu = std::fs::read_to_string("/proc/cpuinfo")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("model name"))
-                .and_then(|l| l.split(':').nth(1))
-                .map(|s| s.trim().to_string())
-        })
-        .unwrap_or_else(|| "unknown".to_string());
-    let ram_kb: u64 = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("MemTotal:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|s| s.parse().ok())
-        })
-        .unwrap_or(0);
-    let gpus = std::process::Command::new("lspci")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| {
-            s.lines()
-                .filter(|l| l.contains("VGA") || l.contains("3D controller"))
-                .filter_map(|l| l.split(':').last())
-                .map(|s| s.trim().to_string())
-                .collect()
-        })
-        .unwrap_or_default();
-    PlatformHardware {
-        cpu,
-        ram_gb: ram_kb as f64 / (1024.0 * 1024.0),
-        gpus,
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn platform_hw_impl() -> PlatformHardware {
-    let cpu = std::process::Command::new("sysctl")
-        .args(["-n", "machdep.cpu.brand_string"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let ram_bytes: u64 = std::process::Command::new("sysctl")
-        .args(["-n", "hw.memsize"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
-    let gpus = std::process::Command::new("system_profiler")
-        .args(["SPDisplaysDataType"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| {
-            s.lines()
-                .filter(|l| l.contains("Chipset Model:"))
-                .filter_map(|l| l.split(':').nth(1))
-                .map(|s| s.trim().to_string())
-                .collect()
-        })
-        .unwrap_or_default();
-    PlatformHardware {
-        cpu,
-        ram_gb: ram_bytes as f64 / (1024.0_f64.powi(3)),
-        gpus,
-    }
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-fn platform_hw_impl() -> PlatformHardware {
-    PlatformHardware {
-        cpu: "unknown".to_string(),
-        ram_gb: 0.0,
-        gpus: vec![],
-    }
-}
-
-fn platform_hw() -> &'static PlatformHardware {
-    PLATFORM_HW.get_or_init(platform_hw_impl)
-}
-
-fn logical_cores() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(0)
-}
-
-fn run_id() -> &'static str {
-    RUN_ID.get_or_init(|| {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let date_tag = unix_to_datetime(ts)
-            .replace(' ', "_")
-            .replace(':', "")
-            .replace('Z', "");
-        format!("{}_{}", date_tag, git_commit())
-    })
-}
-
-fn collected_metrics() -> &'static Mutex<Vec<MetricRecord>> {
-    COLLECTED_METRICS.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-fn collected_utils() -> &'static Mutex<Vec<UtilRecord>> {
-    COLLECTED_UTILS.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-fn build_run_json(metrics: &[MetricRecord], utils: &[UtilRecord]) -> String {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let date = unix_to_datetime(ts);
-    let hw = platform_hw();
-    let cores = logical_cores();
-    let cpu = hw.cpu.replace('"', "\\\"");
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
-    let id = run_id();
-    let commit = git_commit();
-    let gpus_json = json_str_array(&hw.gpus);
-
-    let mut test_names: Vec<&str> = Vec::new();
-    for m in metrics {
-        if !test_names.contains(&m.test.as_str()) {
-            test_names.push(&m.test);
-        }
-    }
-
-    let mut out = String::new();
-    out.push_str("{\n");
-    out.push_str(&format!("  \"id\": \"{id}\",\n"));
-    out.push_str(&format!("  \"date\": \"{date}\",\n"));
-    out.push_str(&format!("  \"ts\": {ts},\n"));
-    out.push_str(&format!("  \"commit\": \"{commit}\",\n"));
-    out.push_str(&format!("  \"cpu\": \"{cpu}\",\n"));
-    out.push_str(&format!("  \"cores\": {cores},\n"));
-    out.push_str(&format!("  \"ram_gb\": {:.1},\n", hw.ram_gb));
-    out.push_str(&format!("  \"gpus\": {gpus_json},\n"));
-    out.push_str(&format!("  \"os\": \"{os}\",\n"));
-    out.push_str(&format!("  \"arch\": \"{arch}\",\n"));
-    out.push_str("  \"tests\": {\n");
-
-    for (ti, test_name) in test_names.iter().enumerate() {
-        let escaped_test = test_name.replace('"', "\\\"");
-        out.push_str(&format!("    \"{escaped_test}\": {{\n"));
-
-        if let Some(u) = utils.iter().find(|u| u.test.as_str() == *test_name) {
-            out.push_str(&format!(
-                "      \"util_before\": {{ \"cpu_pct\": {:.1}, \"ram_used_gb\": {:.2} }},\n",
-                u.before.cpu_pct, u.before.ram_used_gb
-            ));
-            out.push_str(&format!(
-                "      \"util_after\": {{ \"cpu_pct\": {:.1}, \"ram_used_gb\": {:.2} }},\n",
-                u.after.cpu_pct, u.after.ram_used_gb
-            ));
-        }
-
-        let test_metrics: Vec<&MetricRecord> = metrics
-            .iter()
-            .filter(|m| m.test.as_str() == *test_name)
-            .collect();
-        for (mi, m) in test_metrics.iter().enumerate() {
-            let escaped_metric = m.metric.replace('"', "\\\"");
-            let comma = if mi + 1 < test_metrics.len() { "," } else { "" };
-            let runs_json = m
-                .runs
-                .iter()
-                .map(|v| format!("{:.2}", v))
-                .collect::<Vec<_>>()
-                .join(", ");
-            out.push_str(&format!("      \"{escaped_metric}\": {{\n"));
-            out.push_str(&format!("        \"average\": {:.6},\n", m.average));
-            out.push_str(&format!("        \"runs\": [{runs_json}],\n"));
-            out.push_str(&format!("        \"target\": {:.6},\n", m.target));
-            out.push_str(&format!("        \"passed\": {},\n", m.passed));
-            out.push_str(&format!(
-                "        \"higher_is_better\": {}\n",
-                m.higher_is_better
-            ));
-            out.push_str(&format!("      }}{comma}\n"));
-        }
-
-        let test_comma = if ti + 1 < test_names.len() { "," } else { "" };
-        out.push_str(&format!("    }}{test_comma}\n"));
-    }
-
-    out.push_str("  }\n");
-    out.push_str("}\n");
-    out
-}
-
-fn write_run_json(metrics: &[MetricRecord], utils: &[UtilRecord]) {
-    let dir = benchmark_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    let fname = format!("phase6_{}.json", run_id());
-    let json = build_run_json(metrics, utils);
-    let _ = std::fs::write(dir.join(fname), json.as_bytes());
-}
-
-fn raw_log_file() -> &'static Mutex<std::fs::File> {
-    RAW_LOG.get_or_init(|| {
-        let dir = benchmark_dir();
-        let _ = std::fs::create_dir_all(&dir);
-        let fname = format!("phase6_{}.txt", run_id());
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(dir.join(&fname))
-            .unwrap_or_else(|_| {
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(dir.join("phase6_latest.txt"))
-                    .expect("failed to open benchmark log")
-            });
-        Mutex::new(f)
-    })
-}
-
-fn write_raw_output(line: &str) {
-    if let Ok(mut guard) = raw_log_file().lock() {
-        let _ = writeln!(guard, "{}", line);
-    }
-}
-
-fn write_benchmark_record(
-    test: &str,
-    metric: &str,
-    average: f64,
-    runs: Vec<f64>,
-    target: f64,
-    passed: bool,
-    higher_is_better: bool,
-) {
-    let record = MetricRecord {
-        test: test.to_string(),
-        metric: metric.to_string(),
-        average,
-        runs,
-        target,
-        passed,
-        higher_is_better,
-    };
-    let metrics_snap = if let Ok(mut g) = collected_metrics().lock() {
-        g.push(record);
-        g.clone()
-    } else {
-        return;
-    };
-    let utils_snap = collected_utils()
-        .lock()
-        .ok()
-        .map(|g| g.clone())
-        .unwrap_or_default();
-    write_run_json(&metrics_snap, &utils_snap);
-}
 
 // ---------------------------------------------------------------------------
 // Test infrastructure helpers
@@ -1008,6 +472,7 @@ fn make_column(type_id: TypeId, values: Vec<ScalarValue>) -> Column {
 
 #[test]
 fn test_wire_message_codec_roundtrip() {
+    zyron_bench_harness::init("wire");
     tprintln!("\n=== Message Codec Roundtrip Test ===");
 
     let mut codec = PostgresCodec::new();
@@ -1208,6 +673,7 @@ fn test_wire_message_codec_roundtrip() {
 
 #[test]
 fn test_wire_type_serialization_all_types() {
+    zyron_bench_harness::init("wire");
     tprintln!("\n=== Type Serialization (All Types) Test ===");
 
     // Test type_id_to_pg_oid mapping
@@ -1388,6 +854,7 @@ fn test_wire_type_serialization_all_types() {
 
 #[test]
 fn test_wire_auth_protocols() {
+    zyron_bench_harness::init("wire");
     tprintln!("\n=== Authentication Protocols Test ===");
 
     // Trust authenticator
@@ -1473,6 +940,7 @@ fn test_wire_auth_protocols() {
 
 #[test]
 fn test_wire_copy_protocol() {
+    zyron_bench_harness::init("wire");
     tprintln!("\n=== COPY Protocol Test ===");
 
     let columns = vec![
@@ -1598,6 +1066,7 @@ fn test_wire_copy_protocol() {
 
 #[test]
 fn test_wire_error_sqlstate_mapping() {
+    zyron_bench_harness::init("wire");
     tprintln!("\n=== Error SQLSTATE Mapping Test ===");
 
     // Build BackendMessage::ErrorResponse from ZyronErrors and verify SQLSTATE codes.
@@ -1649,6 +1118,7 @@ fn test_wire_error_sqlstate_mapping() {
 
 #[test]
 fn test_wire_session_management() {
+    zyron_bench_harness::init("wire");
     tprintln!("\n=== Session Management Test ===");
 
     let session = Session::new(
@@ -1731,6 +1201,7 @@ fn test_wire_session_management() {
 
 #[test]
 fn test_wire_message_encode_throughput() {
+    zyron_bench_harness::init("wire");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Message Encode Throughput Test ===");
 
@@ -1796,6 +1267,7 @@ fn test_wire_message_encode_throughput() {
 
 #[test]
 fn test_wire_message_decode_throughput() {
+    zyron_bench_harness::init("wire");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Message Decode Throughput Test ===");
 
@@ -1852,6 +1324,7 @@ fn test_wire_message_decode_throughput() {
 
 #[test]
 fn test_wire_row_serialization_throughput() {
+    zyron_bench_harness::init("wire");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Row Serialization Throughput Test ===");
 
@@ -1922,6 +1395,7 @@ fn test_wire_row_serialization_throughput() {
 
 #[test]
 fn test_wire_type_serialization_throughput() {
+    zyron_bench_harness::init("wire");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Type Serialization Throughput Test ===");
 
@@ -1991,6 +1465,7 @@ fn test_wire_type_serialization_throughput() {
 
 #[test]
 fn test_wire_copy_from_throughput() {
+    zyron_bench_harness::init("wire");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== COPY FROM Throughput Test ===");
 
@@ -2078,6 +1553,7 @@ fn test_wire_copy_from_throughput() {
 
 #[test]
 fn test_wire_copy_to_throughput() {
+    zyron_bench_harness::init("wire");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== COPY TO Throughput Test ===");
 
@@ -2169,6 +1645,7 @@ fn test_wire_copy_to_throughput() {
 
 #[test]
 fn test_wire_parse_message_latency() {
+    zyron_bench_harness::init("wire");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Parse Message Latency Test ===");
 
@@ -2228,6 +1705,7 @@ fn test_wire_parse_message_latency() {
 
 #[test]
 fn test_wire_bind_message_latency() {
+    zyron_bench_harness::init("wire");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Bind Message Latency Test ===");
 
@@ -2283,6 +1761,7 @@ fn test_wire_bind_message_latency() {
 
 #[test]
 fn test_wire_connection_handshake_latency() {
+    zyron_bench_harness::init("wire");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Connection Handshake Latency Test ===");
 
@@ -2372,6 +1851,7 @@ fn test_wire_connection_handshake_latency() {
 
 #[test]
 fn test_wire_concurrent_connections() {
+    zyron_bench_harness::init("wire");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Concurrent Connections Test ===");
 
@@ -2476,6 +1956,7 @@ fn test_wire_concurrent_connections() {
 
 #[test]
 fn test_wire_extended_query_protocol_messages() {
+    zyron_bench_harness::init("wire");
     tprintln!("\n=== Extended Query Protocol Messages Test ===");
 
     let mut codec = PostgresCodec::new();
@@ -2615,6 +2096,7 @@ fn test_wire_extended_query_protocol_messages() {
 
 #[test]
 fn test_wire_execute_message_latency() {
+    zyron_bench_harness::init("wire");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Execute Message Latency Test ===");
 
@@ -2670,6 +2152,7 @@ fn test_wire_execute_message_latency() {
 
 #[test]
 fn test_wire_simple_query_message_throughput() {
+    zyron_bench_harness::init("wire");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Simple Query Message Throughput Test ===");
 
@@ -2739,6 +2222,7 @@ fn test_wire_simple_query_message_throughput() {
 
 #[test]
 fn test_wire_datarow_encode_throughput() {
+    zyron_bench_harness::init("wire");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== DataRow Encode Throughput Test ===");
 

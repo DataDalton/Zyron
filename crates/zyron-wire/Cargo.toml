@@ -34,3 +34,4 @@ tempfile = "3"
 md-5 = { workspace = true }
 tokio-util.workspace = true
 futures.workspace = true
+zyron-bench-harness = { path = "../zyron-bench-harness" }

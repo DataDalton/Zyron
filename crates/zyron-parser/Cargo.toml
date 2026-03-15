@@ -6,3 +6,6 @@ rust-version.workspace = true
 
 [dependencies]
 zyron-common = { path = "../zyron-common" }
+
+[dev-dependencies]
+zyron-bench-harness = { path = "../zyron-bench-harness" }

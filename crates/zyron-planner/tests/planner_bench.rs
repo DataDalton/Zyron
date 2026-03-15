@@ -1,8 +1,8 @@
 #![allow(non_snake_case, unused_assignments, dead_code)]
 
-//! Phase 4: Query Planner Validation Tests
+//! Query Planner Benchmark Suite
 //!
-//! Comprehensive integration tests for ZyronDB Phase 4 components:
+//! Comprehensive integration tests for ZyronDB query planner components:
 //! - Binding (AST to bound plan with name resolution, type checking)
 //! - Logical plan construction (relational algebra tree)
 //! - Optimizer rules (predicate pushdown, projection pushdown, constant folding, join reorder)
@@ -30,10 +30,10 @@
 //! - Test FAILS if any single run is >2x worse than target
 
 use std::collections::HashMap;
-use std::io::Write as _;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
+
+use zyron_bench_harness::*;
 
 use zyron_buffer::{BufferPool, BufferPoolConfig};
 use zyron_catalog::stats::{ColumnStats, TableStats};
@@ -41,14 +41,14 @@ use zyron_catalog::storage::{CatalogStorage, HeapCatalogStorage};
 use zyron_catalog::*;
 use zyron_common::TypeId;
 use zyron_parser::ast::{ColumnConstraint, ColumnDef, DataType};
+use zyron_planner::Binder;
 use zyron_planner::binder::{BoundFromItem, BoundStatement};
 use zyron_planner::cost::CostModel;
-use zyron_planner::logical::builder::build_logical_plan;
 use zyron_planner::logical::LogicalPlan;
+use zyron_planner::logical::builder::build_logical_plan;
 use zyron_planner::optimizer::Optimizer;
-use zyron_planner::physical::builder::build_physical_plan;
 use zyron_planner::physical::PhysicalPlan;
-use zyron_planner::Binder;
+use zyron_planner::physical::builder::build_physical_plan;
 use zyron_storage::{DiskManager, DiskManagerConfig};
 use zyron_wal::{WalWriter, WalWriterConfig};
 
@@ -66,680 +66,8 @@ const CARDINALITY_ERROR_TARGET: f64 = 2.0; // max 2x error factor
 const PLAN_CACHE_HIT_RATE_TARGET: f64 = 0.98;
 const FULL_PIPELINE_TARGET_US: f64 = 50.0;
 
-// Validation constants
-const VALIDATION_RUNS: usize = 5;
-const REGRESSION_THRESHOLD: f64 = 2.0;
-
 // Serialize benchmarks to avoid CPU contention between tests.
 static BENCHMARK_LOCK: Mutex<()> = Mutex::new(());
-
-// =============================================================================
-// Validation Infrastructure
-// =============================================================================
-
-macro_rules! tprintln {
-    () => {{
-        std::println!();
-        write_raw_output("");
-    }};
-    ($($arg:tt)*) => {{
-        let msg = format!($($arg)*);
-        std::println!("{}", msg);
-        write_raw_output(&msg);
-    }};
-}
-
-struct ValidationResult {
-    passed: bool,
-    regression_detected: bool,
-    average: f64,
-}
-
-fn format_with_commas(n: f64) -> String {
-    let s = format!("{:.0}", n);
-    let bytes: Vec<char> = s.chars().collect();
-    let mut result = String::new();
-    let len = bytes.len();
-    for (i, c) in bytes.iter().enumerate() {
-        if i > 0 && (len - i) % 3 == 0 {
-            result.push(',');
-        }
-        result.push(*c);
-    }
-    result
-}
-
-fn validate_metric(
-    test: &str,
-    name: &str,
-    runs: Vec<f64>,
-    target: f64,
-    higher_is_better: bool,
-) -> ValidationResult {
-    let average = runs.iter().sum::<f64>() / runs.len() as f64;
-    let min = runs.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max = runs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-
-    let variance = runs.iter().map(|x| (x - average).powi(2)).sum::<f64>() / runs.len() as f64;
-    let std_dev = variance.sqrt();
-
-    let passed = if higher_is_better {
-        average >= target
-    } else {
-        average <= target
-    };
-
-    let regression_threshold = if higher_is_better {
-        target / REGRESSION_THRESHOLD
-    } else {
-        target * REGRESSION_THRESHOLD
-    };
-
-    let regression_detected = runs.iter().any(|&r| {
-        if higher_is_better {
-            r < regression_threshold
-        } else {
-            r > regression_threshold
-        }
-    });
-
-    let status = if passed { "PASS" } else { "FAIL" };
-    let regr_status = if regression_detected { "REGR!" } else { "OK" };
-    let comparison = if higher_is_better { ">=" } else { "<=" };
-
-    tprintln!("  {} [{}/{}]:", name, status, regr_status);
-    tprintln!(
-        "    Runs: [{}]",
-        runs.iter()
-            .map(|x| format!("{:.2}", x))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    tprintln!(
-        "    Average: {:.2} {} {:.2} (target)",
-        average, comparison, target
-    );
-    tprintln!(
-        "    Min/Max: {:.2} / {:.2}, StdDev: {:.2}",
-        min, max, std_dev
-    );
-
-    write_benchmark_record(test, name, average, runs, target, passed, higher_is_better);
-
-    ValidationResult {
-        passed,
-        regression_detected,
-        average,
-    }
-}
-
-fn check_performance(
-    test: &str,
-    name: &str,
-    actual: f64,
-    target: f64,
-    higher_is_better: bool,
-) -> bool {
-    let passed = if higher_is_better {
-        actual >= target
-    } else {
-        actual <= target
-    };
-    let status = if passed { "PASS" } else { "FAIL" };
-    let comparison = if higher_is_better { ">=" } else { "<=" };
-    tprintln!(
-        "  {} [{}]: {:.4} {} {:.4} (target)",
-        name, status, actual, comparison, target
-    );
-    write_benchmark_record(
-        test,
-        name,
-        actual,
-        vec![actual],
-        target,
-        passed,
-        higher_is_better,
-    );
-    passed
-}
-
-// =============================================================================
-// Benchmark Output
-// =============================================================================
-
-#[derive(Clone)]
-struct MetricRecord {
-    test: String,
-    metric: String,
-    average: f64,
-    runs: Vec<f64>,
-    target: f64,
-    passed: bool,
-    higher_is_better: bool,
-}
-
-#[derive(Clone)]
-struct UtilSnapshot {
-    cpu_pct: f64,
-    ram_used_gb: f64,
-}
-
-#[derive(Clone)]
-struct UtilRecord {
-    test: String,
-    before: UtilSnapshot,
-    after: UtilSnapshot,
-}
-
-static GIT_COMMIT: OnceLock<String> = OnceLock::new();
-static PLATFORM_HW: OnceLock<PlatformHardware> = OnceLock::new();
-static RUN_ID: OnceLock<String> = OnceLock::new();
-static RAW_LOG: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
-static COLLECTED_METRICS: OnceLock<Mutex<Vec<MetricRecord>>> = OnceLock::new();
-static COLLECTED_UTILS: OnceLock<Mutex<Vec<UtilRecord>>> = OnceLock::new();
-
-struct PlatformHardware {
-    cpu: String,
-    ram_gb: f64,
-    gpus: Vec<String>,
-}
-
-fn git_commit() -> &'static str {
-    GIT_COMMIT.get_or_init(|| {
-        std::process::Command::new("git")
-            .args(["describe", "--always", "--dirty=-local", "--abbrev=7"])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| "unknown".to_string())
-    })
-}
-
-fn unix_to_datetime(ts: u64) -> String {
-    let secs = ts % 60;
-    let mins = (ts / 60) % 60;
-    let hours = (ts / 3600) % 24;
-    let z = ts / 86400 + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}Z",
-        y, m, d, hours, mins, secs
-    )
-}
-
-fn benchmark_dir() -> std::path::PathBuf {
-    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("benchmarks")
-}
-
-fn json_str_array(items: &[String]) -> String {
-    let inner = items
-        .iter()
-        .map(|s| format!("\"{}\"", s.replace('"', "\\\"")))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{}]", inner)
-}
-
-#[cfg(target_os = "windows")]
-fn platform_hw_impl() -> PlatformHardware {
-    let script = "$cpu = (Get-WmiObject Win32_Processor).Name.Trim(); \
-                  $ram = (Get-WmiObject Win32_ComputerSystem).TotalPhysicalMemory; \
-                  $gpus = (Get-WmiObject Win32_VideoController | ForEach-Object { $_.Name.Trim() }) -join ';;'; \
-                  Write-Output \"$cpu||$ram||$gpus\"";
-    let out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", script])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default();
-    let parts: Vec<&str> = out.trim().splitn(3, "||").collect();
-    let cpu = parts.first().copied().unwrap_or("unknown").to_string();
-    let ram_bytes: u64 = parts
-        .get(1)
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
-    let gpus = parts
-        .get(2)
-        .map(|s| {
-            s.split(";;")
-                .map(|g| g.trim().to_string())
-                .filter(|g| !g.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    PlatformHardware {
-        cpu,
-        ram_gb: ram_bytes as f64 / (1024.0_f64.powi(3)),
-        gpus,
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn platform_hw_impl() -> PlatformHardware {
-    let cpu = std::fs::read_to_string("/proc/cpuinfo")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("model name"))
-                .and_then(|l| l.split(':').nth(1))
-                .map(|s| s.trim().to_string())
-        })
-        .unwrap_or_else(|| "unknown".to_string());
-    let ram_kb: u64 = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("MemTotal:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|s| s.parse().ok())
-        })
-        .unwrap_or(0);
-    let gpus = std::process::Command::new("lspci")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| {
-            s.lines()
-                .filter(|l| l.contains("VGA") || l.contains("3D controller"))
-                .filter_map(|l| l.split(':').last())
-                .map(|s| s.trim().to_string())
-                .collect()
-        })
-        .unwrap_or_default();
-    PlatformHardware {
-        cpu,
-        ram_gb: ram_kb as f64 / (1024.0 * 1024.0),
-        gpus,
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn platform_hw_impl() -> PlatformHardware {
-    let cpu = std::process::Command::new("sysctl")
-        .args(["-n", "machdep.cpu.brand_string"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let ram_bytes: u64 = std::process::Command::new("sysctl")
-        .args(["-n", "hw.memsize"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
-    let gpus = std::process::Command::new("system_profiler")
-        .args(["SPDisplaysDataType"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| {
-            s.lines()
-                .filter(|l| l.contains("Chipset Model:"))
-                .filter_map(|l| l.split(':').nth(1))
-                .map(|s| s.trim().to_string())
-                .collect()
-        })
-        .unwrap_or_default();
-    PlatformHardware {
-        cpu,
-        ram_gb: ram_bytes as f64 / (1024.0_f64.powi(3)),
-        gpus,
-    }
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-fn platform_hw_impl() -> PlatformHardware {
-    PlatformHardware {
-        cpu: "unknown".to_string(),
-        ram_gb: 0.0,
-        gpus: vec![],
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn take_util_snapshot() -> UtilSnapshot {
-    let script = "$cpu = (Get-WmiObject Win32_Processor).LoadPercentage; \
-                  $os = Get-WmiObject Win32_OperatingSystem; \
-                  $usedKb = $os.TotalVisibleMemorySize - $os.FreePhysicalMemory; \
-                  Write-Output \"$cpu||$usedKb\"";
-    let out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", script])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default();
-    let parts: Vec<&str> = out.trim().splitn(2, "||").collect();
-    let cpu_pct: f64 = parts
-        .first()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0.0);
-    let used_kb: f64 = parts
-        .get(1)
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0.0);
-    UtilSnapshot {
-        cpu_pct,
-        ram_used_gb: used_kb / (1024.0 * 1024.0),
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn take_util_snapshot() -> UtilSnapshot {
-    let cpu_pct = std::fs::read_to_string("/proc/loadavg")
-        .ok()
-        .and_then(|s| {
-            s.split_whitespace()
-                .next()
-                .and_then(|v| v.parse::<f64>().ok())
-        })
-        .unwrap_or(0.0);
-    let mem_info = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
-    let total_kb: u64 = mem_info
-        .lines()
-        .find(|l| l.starts_with("MemTotal:"))
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let avail_kb: u64 = mem_info
-        .lines()
-        .find(|l| l.starts_with("MemAvailable:"))
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    UtilSnapshot {
-        cpu_pct,
-        ram_used_gb: (total_kb - avail_kb) as f64 / (1024.0 * 1024.0),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn take_util_snapshot() -> UtilSnapshot {
-    let cpu_pct = std::process::Command::new("sysctl")
-        .args(["-n", "vm.loadavg"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| {
-            s.trim()
-                .trim_matches(|c| c == '{' || c == '}')
-                .split_whitespace()
-                .next()
-                .and_then(|v| v.parse::<f64>().ok())
-        })
-        .unwrap_or(0.0);
-    let ram_bytes: u64 = std::process::Command::new("sysctl")
-        .args(["-n", "hw.memsize"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
-    let page_size: u64 = std::process::Command::new("pagesize")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(4096);
-    let pages_free: u64 = std::process::Command::new("vm_stat")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("Pages free:"))
-                .and_then(|l| l.split(':').nth(1))
-                .and_then(|v| v.trim().trim_end_matches('.').parse().ok())
-        })
-        .unwrap_or(0);
-    let ram_used_gb =
-        (ram_bytes.saturating_sub(pages_free * page_size)) as f64 / (1024.0_f64.powi(3));
-    UtilSnapshot {
-        cpu_pct,
-        ram_used_gb,
-    }
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-fn take_util_snapshot() -> UtilSnapshot {
-    UtilSnapshot {
-        cpu_pct: 0.0,
-        ram_used_gb: 0.0,
-    }
-}
-
-fn platform_hw() -> &'static PlatformHardware {
-    PLATFORM_HW.get_or_init(platform_hw_impl)
-}
-
-fn logical_cores() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(0)
-}
-
-fn run_id() -> &'static str {
-    RUN_ID.get_or_init(|| {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let date_tag = unix_to_datetime(ts)
-            .replace(' ', "_")
-            .replace(':', "")
-            .replace('Z', "");
-        format!("{}_{}", date_tag, git_commit())
-    })
-}
-
-fn collected_metrics() -> &'static Mutex<Vec<MetricRecord>> {
-    COLLECTED_METRICS.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-fn collected_utils() -> &'static Mutex<Vec<UtilRecord>> {
-    COLLECTED_UTILS.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-fn record_test_util(test: &str, before: UtilSnapshot, after: UtilSnapshot) {
-    let record = UtilRecord {
-        test: test.to_string(),
-        before,
-        after,
-    };
-    let utils_snap = if let Ok(mut g) = collected_utils().lock() {
-        if let Some(existing) = g.iter_mut().find(|u| u.test == test) {
-            *existing = record;
-        } else {
-            g.push(record);
-        }
-        g.clone()
-    } else {
-        return;
-    };
-    let metrics_snap = collected_metrics()
-        .lock()
-        .ok()
-        .map(|g| g.clone())
-        .unwrap_or_default();
-    write_run_json(&metrics_snap, &utils_snap);
-}
-
-fn build_run_json(metrics: &[MetricRecord], utils: &[UtilRecord]) -> String {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let date = unix_to_datetime(ts);
-    let hw = platform_hw();
-    let cores = logical_cores();
-    let cpu = hw.cpu.replace('"', "\\\"");
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
-    let id = run_id();
-    let commit = git_commit();
-    let gpus_json = json_str_array(&hw.gpus);
-
-    let mut test_names: Vec<&str> = Vec::new();
-    for m in metrics {
-        if !test_names.contains(&m.test.as_str()) {
-            test_names.push(&m.test);
-        }
-    }
-
-    let mut out = String::new();
-    out.push_str("{\n");
-    out.push_str(&format!("  \"id\": \"{id}\",\n"));
-    out.push_str(&format!("  \"date\": \"{date}\",\n"));
-    out.push_str(&format!("  \"ts\": {ts},\n"));
-    out.push_str(&format!("  \"commit\": \"{commit}\",\n"));
-    out.push_str(&format!("  \"cpu\": \"{cpu}\",\n"));
-    out.push_str(&format!("  \"cores\": {cores},\n"));
-    out.push_str(&format!("  \"ram_gb\": {:.1},\n", hw.ram_gb));
-    out.push_str(&format!("  \"gpus\": {gpus_json},\n"));
-    out.push_str(&format!("  \"os\": \"{os}\",\n"));
-    out.push_str(&format!("  \"arch\": \"{arch}\",\n"));
-    out.push_str("  \"tests\": {\n");
-
-    for (ti, test_name) in test_names.iter().enumerate() {
-        let escaped_test = test_name.replace('"', "\\\"");
-        out.push_str(&format!("    \"{escaped_test}\": {{\n"));
-
-        if let Some(u) = utils.iter().find(|u| u.test.as_str() == *test_name) {
-            out.push_str(&format!(
-                "      \"util_before\": {{ \"cpu_pct\": {:.1}, \"ram_used_gb\": {:.2} }},\n",
-                u.before.cpu_pct, u.before.ram_used_gb
-            ));
-            out.push_str(&format!(
-                "      \"util_after\": {{ \"cpu_pct\": {:.1}, \"ram_used_gb\": {:.2} }},\n",
-                u.after.cpu_pct, u.after.ram_used_gb
-            ));
-        }
-
-        let test_metrics: Vec<&MetricRecord> = metrics
-            .iter()
-            .filter(|m| m.test.as_str() == *test_name)
-            .collect();
-        for (mi, m) in test_metrics.iter().enumerate() {
-            let escaped_metric = m.metric.replace('"', "\\\"");
-            let comma = if mi + 1 < test_metrics.len() {
-                ","
-            } else {
-                ""
-            };
-            let runs_json = m
-                .runs
-                .iter()
-                .map(|v| format!("{:.2}", v))
-                .collect::<Vec<_>>()
-                .join(", ");
-            out.push_str(&format!("      \"{escaped_metric}\": {{\n"));
-            out.push_str(&format!("        \"average\": {:.6},\n", m.average));
-            out.push_str(&format!("        \"runs\": [{runs_json}],\n"));
-            out.push_str(&format!("        \"target\": {:.6},\n", m.target));
-            out.push_str(&format!("        \"passed\": {},\n", m.passed));
-            out.push_str(&format!(
-                "        \"higher_is_better\": {}\n",
-                m.higher_is_better
-            ));
-            out.push_str(&format!("      }}{comma}\n"));
-        }
-
-        let test_comma = if ti + 1 < test_names.len() {
-            ","
-        } else {
-            ""
-        };
-        out.push_str(&format!("    }}{test_comma}\n"));
-    }
-
-    out.push_str("  }\n");
-    out.push_str("}\n");
-    out
-}
-
-fn write_run_json(metrics: &[MetricRecord], utils: &[UtilRecord]) {
-    let dir = benchmark_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    let fname = format!("phase4_{}.json", run_id());
-    let json = build_run_json(metrics, utils);
-    let _ = std::fs::write(dir.join(fname), json.as_bytes());
-}
-
-fn raw_log_file() -> &'static Mutex<std::fs::File> {
-    RAW_LOG.get_or_init(|| {
-        let dir = benchmark_dir();
-        let _ = std::fs::create_dir_all(&dir);
-        let fname = format!("phase4_{}.txt", run_id());
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(dir.join(&fname))
-            .unwrap_or_else(|_| {
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(dir.join("phase4_latest.txt"))
-                    .expect("failed to open benchmark log")
-            });
-        Mutex::new(f)
-    })
-}
-
-fn write_raw_output(line: &str) {
-    if let Ok(mut guard) = raw_log_file().lock() {
-        let _ = writeln!(guard, "{}", line);
-    }
-}
-
-fn write_benchmark_record(
-    test: &str,
-    metric: &str,
-    average: f64,
-    runs: Vec<f64>,
-    target: f64,
-    passed: bool,
-    higher_is_better: bool,
-) {
-    let record = MetricRecord {
-        test: test.to_string(),
-        metric: metric.to_string(),
-        average,
-        runs,
-        target,
-        passed,
-        higher_is_better,
-    };
-    let metrics_snap = if let Ok(mut g) = collected_metrics().lock() {
-        g.push(record);
-        g.clone()
-    } else {
-        return;
-    };
-    let utils_snap = collected_utils()
-        .lock()
-        .ok()
-        .map(|g| g.clone())
-        .unwrap_or_default();
-    write_run_json(&metrics_snap, &utils_snap);
-}
 
 // =============================================================================
 // Catalog Setup Helpers
@@ -775,7 +103,9 @@ async fn setup_catalog(
     storage.init_cache().await.unwrap();
     let storage: Arc<dyn CatalogStorage> = Arc::new(storage);
     let cache = Arc::new(CatalogCache::new(1024, 256));
-    let catalog = Catalog::new(storage, cache, Arc::clone(&wal)).await.unwrap();
+    let catalog = Catalog::new(storage, cache, Arc::clone(&wal))
+        .await
+        .unwrap();
 
     (disk, pool, wal, catalog)
 }
@@ -835,7 +165,11 @@ async fn create_index(
 
 /// Parses SQL and returns the Statement.
 fn parse_sql(sql: &str) -> zyron_parser::Statement {
-    zyron_parser::parse(sql).unwrap().into_iter().next().unwrap()
+    zyron_parser::parse(sql)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
 }
 
 /// Runs the full planner pipeline: parse -> bind -> logical -> optimize -> physical.
@@ -1071,7 +405,8 @@ fn join_table_columns(name_prefix: &str) -> Vec<ColumnDef> {
 // =============================================================================
 
 #[tokio::test]
-async fn phase4_01_binding() {
+async fn test_binding() {
+    zyron_bench_harness::init("planner");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
     let (_disk, _pool, _wal, catalog) = setup_catalog(dir.path()).await;
@@ -1135,7 +470,8 @@ async fn phase4_01_binding() {
 // =============================================================================
 
 #[tokio::test]
-async fn phase4_02_logical_plan() {
+async fn test_logical_plan() {
+    zyron_bench_harness::init("planner");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
     let (_disk, _pool, _wal, catalog) = setup_catalog(dir.path()).await;
@@ -1178,12 +514,36 @@ async fn phase4_02_logical_plan() {
     // Plan: SELECT * FROM users AS a JOIN users AS b ON a.id = b.id
     // Create a second table for the join test
     let cols_a = vec![
-        ColumnDef { name: "id".to_string(), data_type: DataType::Int, nullable: Some(false), default: None, constraints: vec![] },
-        ColumnDef { name: "val".to_string(), data_type: DataType::Int, nullable: Some(true), default: None, constraints: vec![] },
+        ColumnDef {
+            name: "id".to_string(),
+            data_type: DataType::Int,
+            nullable: Some(false),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "val".to_string(),
+            data_type: DataType::Int,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
     ];
     let cols_b = vec![
-        ColumnDef { name: "id".to_string(), data_type: DataType::Int, nullable: Some(false), default: None, constraints: vec![] },
-        ColumnDef { name: "a_id".to_string(), data_type: DataType::Int, nullable: Some(true), default: None, constraints: vec![] },
+        ColumnDef {
+            name: "id".to_string(),
+            data_type: DataType::Int,
+            nullable: Some(false),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "a_id".to_string(),
+            data_type: DataType::Int,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
     ];
     let _a_id = create_table(&catalog, schema_id, "a", cols_a).await;
     let _b_id = create_table(&catalog, schema_id, "b", cols_b).await;
@@ -1205,7 +565,8 @@ async fn phase4_02_logical_plan() {
 // =============================================================================
 
 #[tokio::test]
-async fn phase4_03_predicate_pushdown() {
+async fn test_predicate_pushdown() {
+    zyron_bench_harness::init("planner");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
     let (_disk, _pool, _wal, catalog) = setup_catalog(dir.path()).await;
@@ -1214,12 +575,36 @@ async fn phase4_03_predicate_pushdown() {
 
     let schema_id = DEFAULT_SCHEMA_ID;
     let cols_a = vec![
-        ColumnDef { name: "id".to_string(), data_type: DataType::Int, nullable: Some(false), default: None, constraints: vec![] },
-        ColumnDef { name: "x".to_string(), data_type: DataType::Int, nullable: Some(true), default: None, constraints: vec![] },
+        ColumnDef {
+            name: "id".to_string(),
+            data_type: DataType::Int,
+            nullable: Some(false),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "x".to_string(),
+            data_type: DataType::Int,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
     ];
     let cols_b = vec![
-        ColumnDef { name: "id".to_string(), data_type: DataType::Int, nullable: Some(false), default: None, constraints: vec![] },
-        ColumnDef { name: "y".to_string(), data_type: DataType::Int, nullable: Some(true), default: None, constraints: vec![] },
+        ColumnDef {
+            name: "id".to_string(),
+            data_type: DataType::Int,
+            nullable: Some(false),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "y".to_string(),
+            data_type: DataType::Int,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
     ];
     let a_id = create_table(&catalog, schema_id, "a", cols_a).await;
     let b_id = create_table(&catalog, schema_id, "b", cols_b).await;
@@ -1238,7 +623,11 @@ async fn phase4_03_predicate_pushdown() {
 
     // Count filter nodes in the plan
     fn count_filters(plan: &LogicalPlan) -> usize {
-        let mut count = if matches!(plan, LogicalPlan::Filter { .. }) { 1 } else { 0 };
+        let mut count = if matches!(plan, LogicalPlan::Filter { .. }) {
+            1
+        } else {
+            0
+        };
         for child in plan.children() {
             count += count_filters(child);
         }
@@ -1260,7 +649,8 @@ async fn phase4_03_predicate_pushdown() {
 // =============================================================================
 
 #[tokio::test]
-async fn phase4_04_projection_pushdown() {
+async fn test_projection_pushdown() {
+    zyron_bench_harness::init("planner");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
     let (_disk, _pool, _wal, catalog) = setup_catalog(dir.path()).await;
@@ -1282,7 +672,10 @@ async fn phase4_04_projection_pushdown() {
 
     if !scan_col_counts.is_empty() {
         let narrowest = *scan_col_counts.iter().min().unwrap();
-        tprintln!("  Narrowest scan reads {} columns (originally 20)", narrowest);
+        tprintln!(
+            "  Narrowest scan reads {} columns (originally 20)",
+            narrowest
+        );
         // The projection pushdown should narrow the scan to 2 columns
         assert!(
             narrowest <= 20,
@@ -1292,7 +685,10 @@ async fn phase4_04_projection_pushdown() {
         if narrowest <= 2 {
             tprintln!("  Projection pushed down to scan level");
         } else {
-            tprintln!("  Scan reads {} columns (projection pushdown partially applied)", narrowest);
+            tprintln!(
+                "  Scan reads {} columns (projection pushdown partially applied)",
+                narrowest
+            );
         }
     }
 
@@ -1304,7 +700,8 @@ async fn phase4_04_projection_pushdown() {
 // =============================================================================
 
 #[tokio::test]
-async fn phase4_05_join_ordering() {
+async fn test_join_ordering() {
+    zyron_bench_harness::init("planner");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
     let (_disk, _pool, _wal, catalog) = setup_catalog(dir.path()).await;
@@ -1357,7 +754,8 @@ async fn phase4_05_join_ordering() {
 // =============================================================================
 
 #[tokio::test]
-async fn phase4_06_index_selection() {
+async fn test_index_selection() {
+    zyron_bench_harness::init("planner");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
     let (_disk, _pool, _wal, catalog) = setup_catalog(dir.path()).await;
@@ -1443,7 +841,10 @@ async fn phase4_06_index_selection() {
 
     // Low selectivity query: should prefer IndexScan
     let sql_low = "SELECT * FROM orders WHERE status = 'pending'";
-    tprintln!("  Planning: {} (low selectivity, expect IndexScan)", sql_low);
+    tprintln!(
+        "  Planning: {} (low selectivity, expect IndexScan)",
+        sql_low
+    );
     let physical_low = plan_sql(&catalog, sql_low).await;
     let top_op = physical_op_name(&physical_low);
     tprintln!("  Physical operator: {}", top_op);
@@ -1458,7 +859,10 @@ async fn phase4_06_index_selection() {
     // High selectivity query: should prefer SeqScan
     // status != 'pending' has ~99% selectivity, well above the 10% threshold
     let sql_high = "SELECT * FROM orders WHERE status != 'pending'";
-    tprintln!("  Planning: {} (high selectivity, expect SeqScan)", sql_high);
+    tprintln!(
+        "  Planning: {} (high selectivity, expect SeqScan)",
+        sql_high
+    );
     let physical_high = plan_sql(&catalog, sql_high).await;
     let top_op_high = physical_op_name(&physical_high);
     tprintln!("  Physical operator: {}", top_op_high);
@@ -1478,7 +882,8 @@ async fn phase4_06_index_selection() {
 // =============================================================================
 
 #[tokio::test]
-async fn phase4_07_cost_estimation() {
+async fn test_cost_estimation() {
+    zyron_bench_harness::init("planner");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
     let (_disk, _pool, _wal, catalog) = setup_catalog(dir.path()).await;
@@ -1535,9 +940,24 @@ async fn phase4_07_cost_estimation() {
     let seq_large = cost_model.cost_seq_scan(&large_stats);
     let idx_large = cost_model.cost_index_scan(&large_stats, 0.01); // 1% selectivity
 
-    tprintln!("  SeqScan cost (1K): io={:.2}, cpu={:.2}, rows={:.0}", seq_small.io_cost, seq_small.cpu_cost, seq_small.row_count);
-    tprintln!("  SeqScan cost (1M): io={:.2}, cpu={:.2}, rows={:.0}", seq_large.io_cost, seq_large.cpu_cost, seq_large.row_count);
-    tprintln!("  IndexScan cost (1M, 1%%): io={:.2}, cpu={:.2}, rows={:.0}", idx_large.io_cost, idx_large.cpu_cost, idx_large.row_count);
+    tprintln!(
+        "  SeqScan cost (1K): io={:.2}, cpu={:.2}, rows={:.0}",
+        seq_small.io_cost,
+        seq_small.cpu_cost,
+        seq_small.row_count
+    );
+    tprintln!(
+        "  SeqScan cost (1M): io={:.2}, cpu={:.2}, rows={:.0}",
+        seq_large.io_cost,
+        seq_large.cpu_cost,
+        seq_large.row_count
+    );
+    tprintln!(
+        "  IndexScan cost (1M, 1%%): io={:.2}, cpu={:.2}, rows={:.0}",
+        idx_large.io_cost,
+        idx_large.cpu_cost,
+        idx_large.row_count
+    );
 
     assert!(
         idx_large.total() < seq_large.total(),
@@ -1552,7 +972,8 @@ async fn phase4_07_cost_estimation() {
 // =============================================================================
 
 #[tokio::test]
-async fn phase4_08_complex_queries() {
+async fn test_complex_queries() {
+    zyron_bench_harness::init("planner");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
     let (_disk, _pool, _wal, catalog) = setup_catalog(dir.path()).await;
@@ -1563,30 +984,114 @@ async fn phase4_08_complex_queries() {
 
     // Create TPC-H-like tables
     let lineitem_cols = vec![
-        ColumnDef { name: "l_orderkey".to_string(), data_type: DataType::Int, nullable: Some(false), default: None, constraints: vec![] },
-        ColumnDef { name: "l_quantity".to_string(), data_type: DataType::Decimal(Some(10), Some(2)), nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "l_extendedprice".to_string(), data_type: DataType::Decimal(Some(10), Some(2)), nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "l_discount".to_string(), data_type: DataType::Decimal(Some(10), Some(2)), nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "l_tax".to_string(), data_type: DataType::Decimal(Some(10), Some(2)), nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "l_returnflag".to_string(), data_type: DataType::Char(Some(1)), nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "l_linestatus".to_string(), data_type: DataType::Char(Some(1)), nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "l_shipdate".to_string(), data_type: DataType::Date, nullable: Some(true), default: None, constraints: vec![] },
+        ColumnDef {
+            name: "l_orderkey".to_string(),
+            data_type: DataType::Int,
+            nullable: Some(false),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "l_quantity".to_string(),
+            data_type: DataType::Decimal(Some(10), Some(2)),
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "l_extendedprice".to_string(),
+            data_type: DataType::Decimal(Some(10), Some(2)),
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "l_discount".to_string(),
+            data_type: DataType::Decimal(Some(10), Some(2)),
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "l_tax".to_string(),
+            data_type: DataType::Decimal(Some(10), Some(2)),
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "l_returnflag".to_string(),
+            data_type: DataType::Char(Some(1)),
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "l_linestatus".to_string(),
+            data_type: DataType::Char(Some(1)),
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "l_shipdate".to_string(),
+            data_type: DataType::Date,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
     ];
     let lineitem_id = create_table(&catalog, schema_id, "lineitem", lineitem_cols).await;
     put_table_stats(&catalog, lineitem_id, 6_000_000, 8);
 
     let orders_cols = vec![
-        ColumnDef { name: "o_orderkey".to_string(), data_type: DataType::Int, nullable: Some(false), default: None, constraints: vec![] },
-        ColumnDef { name: "o_custkey".to_string(), data_type: DataType::Int, nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "o_orderdate".to_string(), data_type: DataType::Date, nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "o_shippriority".to_string(), data_type: DataType::Int, nullable: Some(true), default: None, constraints: vec![] },
+        ColumnDef {
+            name: "o_orderkey".to_string(),
+            data_type: DataType::Int,
+            nullable: Some(false),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "o_custkey".to_string(),
+            data_type: DataType::Int,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "o_orderdate".to_string(),
+            data_type: DataType::Date,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "o_shippriority".to_string(),
+            data_type: DataType::Int,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
     ];
     let orders_id = create_table(&catalog, schema_id, "orders2", orders_cols).await;
     put_table_stats(&catalog, orders_id, 1_500_000, 4);
 
     let customer_cols = vec![
-        ColumnDef { name: "c_custkey".to_string(), data_type: DataType::Int, nullable: Some(false), default: None, constraints: vec![] },
-        ColumnDef { name: "c_mktsegment".to_string(), data_type: DataType::Varchar(Some(25)), nullable: Some(true), default: None, constraints: vec![] },
+        ColumnDef {
+            name: "c_custkey".to_string(),
+            data_type: DataType::Int,
+            nullable: Some(false),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_mktsegment".to_string(),
+            data_type: DataType::Varchar(Some(25)),
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
     ];
     let customer_id = create_table(&catalog, schema_id, "customer", customer_cols).await;
     put_table_stats(&catalog, customer_id, 150_000, 2);
@@ -1606,7 +1111,10 @@ async fn phase4_08_complex_queries() {
     tprintln!("    Total cost: {:.2}", physical_q1.total_cost().total());
 
     let has_agg = physical_contains(&physical_q1, &|p| {
-        matches!(p, PhysicalPlan::HashAggregate { .. } | PhysicalPlan::SortAggregate { .. })
+        matches!(
+            p,
+            PhysicalPlan::HashAggregate { .. } | PhysicalPlan::SortAggregate { .. }
+        )
     });
     assert!(has_agg, "Q1 should contain an aggregate operator");
     tprintln!("    Contains aggregate: {}", has_agg);
@@ -1644,7 +1152,8 @@ async fn phase4_08_complex_queries() {
 // =============================================================================
 
 #[tokio::test]
-async fn phase4_30_bench_planner_performance() {
+async fn test_bench_planner_performance() {
+    zyron_bench_harness::init("planner");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
     let (_disk, _pool, _wal, catalog) = setup_catalog(dir.path()).await;
@@ -1751,7 +1260,10 @@ async fn phase4_30_bench_planner_performance() {
         // Subtract binding time to get pure logical plan time
         let pure_logical_us = (logical_us - binding_us).max(0.01);
         logical_runs.push(pure_logical_us);
-        tprintln!("  Logical plan: {:.2} us/op (pure, excl. binding)", pure_logical_us);
+        tprintln!(
+            "  Logical plan: {:.2} us/op (pure, excl. binding)",
+            pure_logical_us
+        );
 
         // Optimization latency
         let start = Instant::now();
@@ -1762,7 +1274,10 @@ async fn phase4_30_bench_planner_performance() {
         let opt_total_us = start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64;
         let pure_opt_us = (opt_total_us - logical_us).max(0.01);
         optimization_runs.push(pure_opt_us);
-        tprintln!("  Optimization: {:.2} us/op (pure, excl. logical)", pure_opt_us);
+        tprintln!(
+            "  Optimization: {:.2} us/op (pure, excl. logical)",
+            pure_opt_us
+        );
 
         // Physical plan latency
         let start = Instant::now();
@@ -1773,7 +1288,10 @@ async fn phase4_30_bench_planner_performance() {
         let phys_total_us = start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64;
         let pure_phys_us = (phys_total_us - opt_total_us).max(0.01);
         physical_runs.push(pure_phys_us);
-        tprintln!("  Physical plan: {:.2} us/op (pure, excl. optimization)", pure_phys_us);
+        tprintln!(
+            "  Physical plan: {:.2} us/op (pure, excl. optimization)",
+            pure_phys_us
+        );
 
         // Join reorder latency (5 tables)
         let join_iterations = 100;
@@ -1958,10 +1476,18 @@ async fn phase4_30_bench_planner_performance() {
         full_result.average, FULL_PIPELINE_TARGET_US
     );
 
-    assert!(cache_passed, "Plan cache hit rate {:.2} < target {:.2}", hit_rate, PLAN_CACHE_HIT_RATE_TARGET);
-    assert!(cardinality_passed, "Cardinality error {:.2}x > target {:.2}x", row_error, CARDINALITY_ERROR_TARGET);
+    assert!(
+        cache_passed,
+        "Plan cache hit rate {:.2} < target {:.2}",
+        hit_rate, PLAN_CACHE_HIT_RATE_TARGET
+    );
+    assert!(
+        cardinality_passed,
+        "Cardinality error {:.2}x > target {:.2}x",
+        row_error, CARDINALITY_ERROR_TARGET
+    );
 
-    tprintln!("\n=== All Phase 4 Performance Tests: PASS ===");
+    tprintln!("\n=== All Planner Performance Tests: PASS ===");
 }
 
 // =============================================================================
@@ -1969,20 +1495,18 @@ async fn phase4_30_bench_planner_performance() {
 // =============================================================================
 
 #[tokio::test]
-async fn phase4_99_summary() {
+async fn test_planner_summary() {
+    zyron_bench_harness::init("planner");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     tprintln!("\n============================================");
-    tprintln!("  Phase 4: Query Planner - All Tests Complete");
+    tprintln!("  Planner Benchmark Suite - All Tests Complete");
     tprintln!("============================================");
-    tprintln!("  Commit: {}", git_commit());
-    tprintln!("  CPU: {}", platform_hw().cpu);
-    tprintln!("  RAM: {:.1} GB", platform_hw().ram_gb);
     tprintln!("  Cores: {}", logical_cores());
     tprintln!("  OS: {}/{}", std::env::consts::OS, std::env::consts::ARCH);
     tprintln!("  Run ID: {}", run_id());
-    tprintln!("  Output:  benchmarks/phase4_{}.json", run_id());
-    tprintln!("  Log:     benchmarks/phase4_{}.txt", run_id());
+    tprintln!("  Output:  benchmarks/planner/planner_{}.json", run_id());
+    tprintln!("  Log:     benchmarks/planner/planner_{}.txt", run_id());
     tprintln!("  Binding:     1 correctness test");
     tprintln!("  Logical:     1 correctness test");
     tprintln!("  Predicate:   1 correctness test");

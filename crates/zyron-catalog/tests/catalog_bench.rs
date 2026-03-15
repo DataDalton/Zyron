@@ -1,8 +1,8 @@
 #![allow(non_snake_case, unused_assignments, dead_code)]
 
-//! Phase 3: Catalog Validation Tests
+//! Catalog Benchmark Suite
 //!
-//! Comprehensive integration tests for ZyronDB Phase 3 components:
+//! Comprehensive integration tests for ZyronDB catalog components:
 //! - DDL persistence (create/drop database, schema, table, index)
 //! - Name resolution (search path, qualified/unqualified)
 //! - Column type roundtrip (all supported data types)
@@ -29,17 +29,19 @@
 //! - Individual runs logged for variance analysis
 //! - Test FAILS if any single run is >2x worse than target
 
-use std::io::Write as _;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
 
+use zyron_bench_harness::*;
+
 use zyron_buffer::{BufferPool, BufferPoolConfig};
-use zyron_catalog::*;
 use zyron_catalog::stats::analyze_table;
 use zyron_catalog::storage::{CatalogStorage, HeapCatalogStorage};
+use zyron_catalog::*;
 use zyron_common::TypeId;
-use zyron_parser::ast::{ColumnConstraint, ColumnDef, DataType, Expr, LiteralValue, TableConstraint};
+use zyron_parser::ast::{
+    ColumnConstraint, ColumnDef, DataType, Expr, LiteralValue, TableConstraint,
+};
 use zyron_storage::{DiskManager, DiskManagerConfig, HeapFile, HeapFileConfig, Tuple};
 use zyron_wal::{WalWriter, WalWriterConfig};
 
@@ -56,709 +58,8 @@ const HISTOGRAM_TARGET_MS_PER_COL: f64 = 10.0;
 const CACHE_HIT_RATE_TARGET: f64 = 1.0; // 100%
 const RECOVERY_TARGET_MS: f64 = 1.0;
 
-// Validation constants
-const VALIDATION_RUNS: usize = 5;
-const REGRESSION_THRESHOLD: f64 = 2.0; // Fail if any run >2x worse than target
-
 // Serialize benchmarks to avoid CPU contention between tests.
 static BENCHMARK_LOCK: Mutex<()> = Mutex::new(());
-
-// =============================================================================
-// Validation Infrastructure
-// =============================================================================
-
-/// Writes to both stdout and the run's dated text log file.
-macro_rules! tprintln {
-    () => {{
-        std::println!();
-        write_raw_output("");
-    }};
-    ($($arg:tt)*) => {{
-        let msg = format!($($arg)*);
-        std::println!("{}", msg);
-        write_raw_output(&msg);
-    }};
-}
-
-struct ValidationResult {
-    passed: bool,
-    regression_detected: bool,
-    average: f64,
-}
-
-/// Formats a number with comma separators for readability.
-fn format_with_commas(n: f64) -> String {
-    let s = format!("{:.0}", n);
-    let bytes: Vec<char> = s.chars().collect();
-    let mut result = String::new();
-    let len = bytes.len();
-    for (i, c) in bytes.iter().enumerate() {
-        if i > 0 && (len - i) % 3 == 0 {
-            result.push(',');
-        }
-        result.push(*c);
-    }
-    result
-}
-
-fn validate_metric(
-    test: &str,
-    name: &str,
-    runs: Vec<f64>,
-    target: f64,
-    higher_is_better: bool,
-) -> ValidationResult {
-    let average = runs.iter().sum::<f64>() / runs.len() as f64;
-    let min = runs.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max = runs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-
-    let variance = runs.iter().map(|x| (x - average).powi(2)).sum::<f64>() / runs.len() as f64;
-    let std_dev = variance.sqrt();
-
-    let passed = if higher_is_better {
-        average >= target
-    } else {
-        average <= target
-    };
-
-    let regression_threshold = if higher_is_better {
-        target / REGRESSION_THRESHOLD
-    } else {
-        target * REGRESSION_THRESHOLD
-    };
-
-    let regression_detected = runs.iter().any(|&r| {
-        if higher_is_better {
-            r < regression_threshold
-        } else {
-            r > regression_threshold
-        }
-    });
-
-    let status = if passed { "PASS" } else { "FAIL" };
-    let regr_status = if regression_detected { "REGR!" } else { "OK" };
-    let comparison = if higher_is_better { ">=" } else { "<=" };
-
-    tprintln!("  {} [{}/{}]:", name, status, regr_status);
-    tprintln!(
-        "    Runs: [{}]",
-        runs.iter()
-            .map(|x| format_with_commas(*x))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    tprintln!(
-        "    Average: {} {} {} (target)",
-        format_with_commas(average),
-        comparison,
-        format_with_commas(target)
-    );
-    tprintln!(
-        "    Min/Max: {} / {}, StdDev: {}",
-        format_with_commas(min),
-        format_with_commas(max),
-        format_with_commas(std_dev)
-    );
-
-    write_benchmark_record(test, name, average, runs, target, passed, higher_is_better);
-
-    ValidationResult {
-        passed,
-        regression_detected,
-        average,
-    }
-}
-
-fn check_performance(
-    test: &str,
-    name: &str,
-    actual: f64,
-    target: f64,
-    higher_is_better: bool,
-) -> bool {
-    let passed = if higher_is_better {
-        actual >= target
-    } else {
-        actual <= target
-    };
-    let status = if passed { "PASS" } else { "FAIL" };
-    let comparison = if higher_is_better { ">=" } else { "<=" };
-    tprintln!(
-        "  {} [{}]: {} {} {} (target)",
-        name,
-        status,
-        format_with_commas(actual),
-        comparison,
-        format_with_commas(target)
-    );
-    write_benchmark_record(
-        test,
-        name,
-        actual,
-        vec![actual],
-        target,
-        passed,
-        higher_is_better,
-    );
-    passed
-}
-
-// =============================================================================
-// Benchmark Output
-// =============================================================================
-//
-// One .json file per run with a fully nested structure:
-//   {
-//     hardware/commit context,
-//     "tests": {
-//       "DDL Persistence": {
-//         "util_before": { cpu_pct, ram_used_gb },
-//         "util_after":  { cpu_pct, ram_used_gb },
-//         "Create table latency (us)": { average, runs: [...], target, passed, higher_is_better },
-//         ...
-//       },
-//       ...
-//     }
-//   }
-
-#[derive(Clone)]
-struct MetricRecord {
-    test: String,
-    metric: String,
-    average: f64,
-    runs: Vec<f64>,
-    target: f64,
-    passed: bool,
-    higher_is_better: bool,
-}
-
-#[derive(Clone)]
-struct UtilSnapshot {
-    cpu_pct: f64,
-    ram_used_gb: f64,
-}
-
-#[derive(Clone)]
-struct UtilRecord {
-    test: String,
-    before: UtilSnapshot,
-    after: UtilSnapshot,
-}
-
-static GIT_COMMIT: OnceLock<String> = OnceLock::new();
-static PLATFORM_HW: OnceLock<PlatformHardware> = OnceLock::new();
-static RUN_ID: OnceLock<String> = OnceLock::new();
-static RAW_LOG: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
-static COLLECTED_METRICS: OnceLock<Mutex<Vec<MetricRecord>>> = OnceLock::new();
-static COLLECTED_UTILS: OnceLock<Mutex<Vec<UtilRecord>>> = OnceLock::new();
-
-struct PlatformHardware {
-    cpu: String,
-    ram_gb: f64,
-    gpus: Vec<String>,
-}
-
-// Appends "-local" to the short hash when the working tree has uncommitted changes.
-fn git_commit() -> &'static str {
-    GIT_COMMIT.get_or_init(|| {
-        std::process::Command::new("git")
-            .args(["describe", "--always", "--dirty=-local", "--abbrev=7"])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| "unknown".to_string())
-    })
-}
-
-// Howard Hinnant's algorithm: converts Unix seconds to "YYYY-MM-DD HH:MM:SSZ".
-fn unix_to_datetime(ts: u64) -> String {
-    let secs = ts % 60;
-    let mins = (ts / 60) % 60;
-    let hours = (ts / 3600) % 24;
-    let z = ts / 86400 + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}Z",
-        y, m, d, hours, mins, secs
-    )
-}
-
-// CARGO_MANIFEST_DIR = crates/zyron-catalog, so go up 2 levels to workspace root.
-fn benchmark_dir() -> std::path::PathBuf {
-    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("benchmarks")
-}
-
-// Formats a slice of strings as a JSON array of quoted strings.
-fn json_str_array(items: &[String]) -> String {
-    let inner = items
-        .iter()
-        .map(|s| format!("\"{}\"", s.replace('"', "\\\"")))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{}]", inner)
-}
-
-// Single PowerShell invocation fetches CPU, RAM, and all GPUs on Windows.
-#[cfg(target_os = "windows")]
-fn platform_hw_impl() -> PlatformHardware {
-    let script = "$cpu = (Get-WmiObject Win32_Processor).Name.Trim(); \
-                  $ram = (Get-WmiObject Win32_ComputerSystem).TotalPhysicalMemory; \
-                  $gpus = (Get-WmiObject Win32_VideoController | ForEach-Object { $_.Name.Trim() }) -join ';;'; \
-                  Write-Output \"$cpu||$ram||$gpus\"";
-    let out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", script])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default();
-    let parts: Vec<&str> = out.trim().splitn(3, "||").collect();
-    let cpu = parts.first().copied().unwrap_or("unknown").to_string();
-    let ram_bytes: u64 = parts
-        .get(1)
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
-    let gpus = parts
-        .get(2)
-        .map(|s| {
-            s.split(";;")
-                .map(|g| g.trim().to_string())
-                .filter(|g| !g.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    PlatformHardware {
-        cpu,
-        ram_gb: ram_bytes as f64 / (1024.0_f64.powi(3)),
-        gpus,
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn platform_hw_impl() -> PlatformHardware {
-    let cpu = std::fs::read_to_string("/proc/cpuinfo")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("model name"))
-                .and_then(|l| l.split(':').nth(1))
-                .map(|s| s.trim().to_string())
-        })
-        .unwrap_or_else(|| "unknown".to_string());
-    let ram_kb: u64 = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("MemTotal:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|s| s.parse().ok())
-        })
-        .unwrap_or(0);
-    let gpus = std::process::Command::new("lspci")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| {
-            s.lines()
-                .filter(|l| l.contains("VGA") || l.contains("3D controller"))
-                .filter_map(|l| l.split(':').last())
-                .map(|s| s.trim().to_string())
-                .collect()
-        })
-        .unwrap_or_default();
-    PlatformHardware {
-        cpu,
-        ram_gb: ram_kb as f64 / (1024.0 * 1024.0),
-        gpus,
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn platform_hw_impl() -> PlatformHardware {
-    let cpu = std::process::Command::new("sysctl")
-        .args(["-n", "machdep.cpu.brand_string"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let ram_bytes: u64 = std::process::Command::new("sysctl")
-        .args(["-n", "hw.memsize"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
-    let gpus = std::process::Command::new("system_profiler")
-        .args(["SPDisplaysDataType"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| {
-            s.lines()
-                .filter(|l| l.contains("Chipset Model:"))
-                .filter_map(|l| l.split(':').nth(1))
-                .map(|s| s.trim().to_string())
-                .collect()
-        })
-        .unwrap_or_default();
-    PlatformHardware {
-        cpu,
-        ram_gb: ram_bytes as f64 / (1024.0_f64.powi(3)),
-        gpus,
-    }
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-fn platform_hw_impl() -> PlatformHardware {
-    PlatformHardware {
-        cpu: "unknown".to_string(),
-        ram_gb: 0.0,
-        gpus: vec![],
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn take_util_snapshot() -> UtilSnapshot {
-    let script = "$cpu = (Get-WmiObject Win32_Processor).LoadPercentage; \
-                  $os = Get-WmiObject Win32_OperatingSystem; \
-                  $usedKb = $os.TotalVisibleMemorySize - $os.FreePhysicalMemory; \
-                  Write-Output \"$cpu||$usedKb\"";
-    let out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", script])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default();
-    let parts: Vec<&str> = out.trim().splitn(2, "||").collect();
-    let cpu_pct: f64 = parts
-        .first()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0.0);
-    let used_kb: f64 = parts
-        .get(1)
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0.0);
-    UtilSnapshot {
-        cpu_pct,
-        ram_used_gb: used_kb / (1024.0 * 1024.0),
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn take_util_snapshot() -> UtilSnapshot {
-    let cpu_pct = std::fs::read_to_string("/proc/loadavg")
-        .ok()
-        .and_then(|s| {
-            s.split_whitespace()
-                .next()
-                .and_then(|v| v.parse::<f64>().ok())
-        })
-        .unwrap_or(0.0);
-    let mem_info = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
-    let total_kb: u64 = mem_info
-        .lines()
-        .find(|l| l.starts_with("MemTotal:"))
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let avail_kb: u64 = mem_info
-        .lines()
-        .find(|l| l.starts_with("MemAvailable:"))
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    UtilSnapshot {
-        cpu_pct,
-        ram_used_gb: (total_kb - avail_kb) as f64 / (1024.0 * 1024.0),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn take_util_snapshot() -> UtilSnapshot {
-    let cpu_pct = std::process::Command::new("sysctl")
-        .args(["-n", "vm.loadavg"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| {
-            s.trim()
-                .trim_matches(|c| c == '{' || c == '}')
-                .split_whitespace()
-                .next()
-                .and_then(|v| v.parse::<f64>().ok())
-        })
-        .unwrap_or(0.0);
-    let ram_bytes: u64 = std::process::Command::new("sysctl")
-        .args(["-n", "hw.memsize"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
-    let page_size: u64 = std::process::Command::new("pagesize")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(4096);
-    let pages_free: u64 = std::process::Command::new("vm_stat")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("Pages free:"))
-                .and_then(|l| l.split(':').nth(1))
-                .and_then(|v| v.trim().trim_end_matches('.').parse().ok())
-        })
-        .unwrap_or(0);
-    let ram_used_gb =
-        (ram_bytes.saturating_sub(pages_free * page_size)) as f64 / (1024.0_f64.powi(3));
-    UtilSnapshot {
-        cpu_pct,
-        ram_used_gb,
-    }
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-fn take_util_snapshot() -> UtilSnapshot {
-    UtilSnapshot {
-        cpu_pct: 0.0,
-        ram_used_gb: 0.0,
-    }
-}
-
-fn platform_hw() -> &'static PlatformHardware {
-    PLATFORM_HW.get_or_init(platform_hw_impl)
-}
-
-fn logical_cores() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(0)
-}
-
-fn run_id() -> &'static str {
-    RUN_ID.get_or_init(|| {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let date_tag = unix_to_datetime(ts)
-            .replace(' ', "_")
-            .replace(':', "")
-            .replace('Z', "");
-        format!("{}_{}", date_tag, git_commit())
-    })
-}
-
-fn collected_metrics() -> &'static Mutex<Vec<MetricRecord>> {
-    COLLECTED_METRICS.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-fn collected_utils() -> &'static Mutex<Vec<UtilRecord>> {
-    COLLECTED_UTILS.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-fn record_test_util(test: &str, before: UtilSnapshot, after: UtilSnapshot) {
-    let record = UtilRecord {
-        test: test.to_string(),
-        before,
-        after,
-    };
-    let utils_snap = if let Ok(mut g) = collected_utils().lock() {
-        if let Some(existing) = g.iter_mut().find(|u| u.test == test) {
-            *existing = record;
-        } else {
-            g.push(record);
-        }
-        g.clone()
-    } else {
-        return;
-    };
-    let metrics_snap = collected_metrics()
-        .lock()
-        .ok()
-        .map(|g| g.clone())
-        .unwrap_or_default();
-    write_run_json(&metrics_snap, &utils_snap);
-}
-
-fn build_run_json(metrics: &[MetricRecord], utils: &[UtilRecord]) -> String {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let date = unix_to_datetime(ts);
-    let hw = platform_hw();
-    let cores = logical_cores();
-    let cpu = hw.cpu.replace('"', "\\\"");
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
-    let id = run_id();
-    let commit = git_commit();
-    let gpus_json = json_str_array(&hw.gpus);
-
-    let mut test_names: Vec<&str> = Vec::new();
-    for m in metrics {
-        if !test_names.contains(&m.test.as_str()) {
-            test_names.push(&m.test);
-        }
-    }
-
-    let mut out = String::new();
-    out.push_str("{\n");
-    out.push_str(&format!("  \"id\": \"{id}\",\n"));
-    out.push_str(&format!("  \"date\": \"{date}\",\n"));
-    out.push_str(&format!("  \"ts\": {ts},\n"));
-    out.push_str(&format!("  \"commit\": \"{commit}\",\n"));
-    out.push_str(&format!("  \"cpu\": \"{cpu}\",\n"));
-    out.push_str(&format!("  \"cores\": {cores},\n"));
-    out.push_str(&format!("  \"ram_gb\": {:.1},\n", hw.ram_gb));
-    out.push_str(&format!("  \"gpus\": {gpus_json},\n"));
-    out.push_str(&format!("  \"os\": \"{os}\",\n"));
-    out.push_str(&format!("  \"arch\": \"{arch}\",\n"));
-    out.push_str("  \"tests\": {\n");
-
-    for (ti, test_name) in test_names.iter().enumerate() {
-        let escaped_test = test_name.replace('"', "\\\"");
-        out.push_str(&format!("    \"{escaped_test}\": {{\n"));
-
-        if let Some(u) = utils.iter().find(|u| u.test.as_str() == *test_name) {
-            out.push_str(&format!(
-                "      \"util_before\": {{ \"cpu_pct\": {:.1}, \"ram_used_gb\": {:.2} }},\n",
-                u.before.cpu_pct, u.before.ram_used_gb
-            ));
-            out.push_str(&format!(
-                "      \"util_after\": {{ \"cpu_pct\": {:.1}, \"ram_used_gb\": {:.2} }},\n",
-                u.after.cpu_pct, u.after.ram_used_gb
-            ));
-        }
-
-        let test_metrics: Vec<&MetricRecord> = metrics
-            .iter()
-            .filter(|m| m.test.as_str() == *test_name)
-            .collect();
-        for (mi, m) in test_metrics.iter().enumerate() {
-            let escaped_metric = m.metric.replace('"', "\\\"");
-            let comma = if mi + 1 < test_metrics.len() {
-                ","
-            } else {
-                ""
-            };
-            let runs_json = m
-                .runs
-                .iter()
-                .map(|v| format!("{:.2}", v))
-                .collect::<Vec<_>>()
-                .join(", ");
-            out.push_str(&format!("      \"{escaped_metric}\": {{\n"));
-            out.push_str(&format!("        \"average\": {:.6},\n", m.average));
-            out.push_str(&format!("        \"runs\": [{runs_json}],\n"));
-            out.push_str(&format!("        \"target\": {:.6},\n", m.target));
-            out.push_str(&format!("        \"passed\": {},\n", m.passed));
-            out.push_str(&format!(
-                "        \"higher_is_better\": {}\n",
-                m.higher_is_better
-            ));
-            out.push_str(&format!("      }}{comma}\n"));
-        }
-
-        let test_comma = if ti + 1 < test_names.len() {
-            ","
-        } else {
-            ""
-        };
-        out.push_str(&format!("    }}{test_comma}\n"));
-    }
-
-    out.push_str("  }\n");
-    out.push_str("}\n");
-    out
-}
-
-fn write_run_json(metrics: &[MetricRecord], utils: &[UtilRecord]) {
-    let dir = benchmark_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    let fname = format!("phase3_{}.json", run_id());
-    let json = build_run_json(metrics, utils);
-    let _ = std::fs::write(dir.join(fname), json.as_bytes());
-}
-
-fn raw_log_file() -> &'static Mutex<std::fs::File> {
-    RAW_LOG.get_or_init(|| {
-        let dir = benchmark_dir();
-        let _ = std::fs::create_dir_all(&dir);
-        let fname = format!("phase3_{}.txt", run_id());
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(dir.join(&fname))
-            .unwrap_or_else(|_| {
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(dir.join("phase3_latest.txt"))
-                    .expect("failed to open benchmark log")
-            });
-        Mutex::new(f)
-    })
-}
-
-fn write_raw_output(line: &str) {
-    if let Ok(mut guard) = raw_log_file().lock() {
-        let _ = writeln!(guard, "{}", line);
-    }
-}
-
-fn write_benchmark_record(
-    test: &str,
-    metric: &str,
-    average: f64,
-    runs: Vec<f64>,
-    target: f64,
-    passed: bool,
-    higher_is_better: bool,
-) {
-    let record = MetricRecord {
-        test: test.to_string(),
-        metric: metric.to_string(),
-        average,
-        runs,
-        target,
-        passed,
-        higher_is_better,
-    };
-    let metrics_snap = if let Ok(mut g) = collected_metrics().lock() {
-        g.push(record);
-        g.clone()
-    } else {
-        return;
-    };
-    let utils_snap = collected_utils()
-        .lock()
-        .ok()
-        .map(|g| g.clone())
-        .unwrap_or_default();
-    write_run_json(&metrics_snap, &utils_snap);
-}
 
 // =============================================================================
 // Helper functions
@@ -795,7 +96,9 @@ async fn setup_catalog(
     storage.init_cache().await.unwrap();
     let storage: Arc<dyn CatalogStorage> = Arc::new(storage);
     let cache = Arc::new(CatalogCache::new(1024, 256));
-    let catalog = Catalog::new(storage, cache, Arc::clone(&wal)).await.unwrap();
+    let catalog = Catalog::new(storage, cache, Arc::clone(&wal))
+        .await
+        .unwrap();
 
     (disk, pool, wal, catalog)
 }
@@ -879,35 +182,209 @@ fn make_10_column_defs() -> Vec<ColumnDef> {
 /// Column definitions covering every supported data type.
 fn make_all_types_column_defs() -> Vec<ColumnDef> {
     vec![
-        ColumnDef { name: "c_bool".into(), data_type: DataType::Boolean, nullable: Some(false), default: None, constraints: vec![] },
-        ColumnDef { name: "c_tinyint".into(), data_type: DataType::TinyInt, nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "c_smallint".into(), data_type: DataType::SmallInt, nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "c_int".into(), data_type: DataType::Int, nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "c_bigint".into(), data_type: DataType::BigInt, nullable: Some(false), default: None, constraints: vec![] },
-        ColumnDef { name: "c_int128".into(), data_type: DataType::Int128, nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "c_uint8".into(), data_type: DataType::UInt8, nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "c_uint16".into(), data_type: DataType::UInt16, nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "c_uint32".into(), data_type: DataType::UInt32, nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "c_uint64".into(), data_type: DataType::UInt64, nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "c_uint128".into(), data_type: DataType::UInt128, nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "c_real".into(), data_type: DataType::Real, nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "c_double".into(), data_type: DataType::DoublePrecision, nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "c_decimal".into(), data_type: DataType::Decimal(Some(18), Some(4)), nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "c_char".into(), data_type: DataType::Char(Some(10)), nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "c_varchar".into(), data_type: DataType::Varchar(Some(255)), nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "c_text".into(), data_type: DataType::Text, nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "c_binary".into(), data_type: DataType::Binary(Some(64)), nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "c_varbinary".into(), data_type: DataType::Varbinary(Some(128)), nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "c_bytea".into(), data_type: DataType::Bytea, nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "c_date".into(), data_type: DataType::Date, nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "c_time".into(), data_type: DataType::Time, nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "c_timestamp".into(), data_type: DataType::Timestamp, nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "c_timestamptz".into(), data_type: DataType::TimestampTz, nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "c_interval".into(), data_type: DataType::Interval, nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "c_uuid".into(), data_type: DataType::Uuid, nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "c_json".into(), data_type: DataType::Json, nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "c_jsonb".into(), data_type: DataType::Jsonb, nullable: Some(true), default: None, constraints: vec![] },
-        ColumnDef { name: "c_vector".into(), data_type: DataType::Vector(Some(128)), nullable: Some(true), default: None, constraints: vec![] },
+        ColumnDef {
+            name: "c_bool".into(),
+            data_type: DataType::Boolean,
+            nullable: Some(false),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_tinyint".into(),
+            data_type: DataType::TinyInt,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_smallint".into(),
+            data_type: DataType::SmallInt,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_int".into(),
+            data_type: DataType::Int,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_bigint".into(),
+            data_type: DataType::BigInt,
+            nullable: Some(false),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_int128".into(),
+            data_type: DataType::Int128,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_uint8".into(),
+            data_type: DataType::UInt8,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_uint16".into(),
+            data_type: DataType::UInt16,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_uint32".into(),
+            data_type: DataType::UInt32,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_uint64".into(),
+            data_type: DataType::UInt64,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_uint128".into(),
+            data_type: DataType::UInt128,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_real".into(),
+            data_type: DataType::Real,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_double".into(),
+            data_type: DataType::DoublePrecision,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_decimal".into(),
+            data_type: DataType::Decimal(Some(18), Some(4)),
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_char".into(),
+            data_type: DataType::Char(Some(10)),
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_varchar".into(),
+            data_type: DataType::Varchar(Some(255)),
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_text".into(),
+            data_type: DataType::Text,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_binary".into(),
+            data_type: DataType::Binary(Some(64)),
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_varbinary".into(),
+            data_type: DataType::Varbinary(Some(128)),
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_bytea".into(),
+            data_type: DataType::Bytea,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_date".into(),
+            data_type: DataType::Date,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_time".into(),
+            data_type: DataType::Time,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_timestamp".into(),
+            data_type: DataType::Timestamp,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_timestamptz".into(),
+            data_type: DataType::TimestampTz,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_interval".into(),
+            data_type: DataType::Interval,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_uuid".into(),
+            data_type: DataType::Uuid,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_json".into(),
+            data_type: DataType::Json,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_jsonb".into(),
+            data_type: DataType::Jsonb,
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
+        ColumnDef {
+            name: "c_vector".into(),
+            data_type: DataType::Vector(Some(128)),
+            nullable: Some(true),
+            default: None,
+            constraints: vec![],
+        },
     ]
 }
 
@@ -916,7 +393,8 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
 // =============================================================================
 
 #[tokio::test]
-async fn phase3_01_ddl_persistence() {
+async fn test_ddl_persistence() {
+    zyron_bench_harness::init("catalog");
     let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== DDL Persistence ===");
     let before = take_util_snapshot();
@@ -952,8 +430,7 @@ async fn phase3_01_ddl_persistence() {
     let idx1_id;
     let idx2_id;
     {
-        let storage =
-            HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
+        let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
         storage.init_cache().await.unwrap();
         let storage: Arc<dyn CatalogStorage> = Arc::new(storage);
         let cache = Arc::new(CatalogCache::new(1024, 256));
@@ -994,14 +471,19 @@ async fn phase3_01_ddl_persistence() {
             .await
             .unwrap();
 
-        tprintln!("  Created: database={}, schema={}, table={}, idx1={}, idx2={}",
-            db_id, schema_id, table_id, idx1_id, idx2_id);
+        tprintln!(
+            "  Created: database={}, schema={}, table={}, idx1={}, idx2={}",
+            db_id,
+            schema_id,
+            table_id,
+            idx1_id,
+            idx2_id
+        );
     }
 
     // Phase 2: Reload catalog from storage and verify
     {
-        let storage =
-            HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
+        let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
         storage.init_cache().await.unwrap();
         let storage: Arc<dyn CatalogStorage> = Arc::new(storage);
         let cache = Arc::new(CatalogCache::new(1024, 256));
@@ -1044,7 +526,10 @@ async fn phase3_01_ddl_persistence() {
         let indexes = catalog.get_indexes_for_table(table_id);
         assert_eq!(indexes.len(), 2);
 
-        let email_idx = indexes.iter().find(|i| i.name == "idx_users_email").unwrap();
+        let email_idx = indexes
+            .iter()
+            .find(|i| i.name == "idx_users_email")
+            .unwrap();
         assert_eq!(email_idx.id, idx1_id);
         assert!(email_idx.unique);
         assert_eq!(email_idx.columns.len(), 1);
@@ -1069,7 +554,8 @@ async fn phase3_01_ddl_persistence() {
 // =============================================================================
 
 #[tokio::test]
-async fn phase3_02_name_resolution() {
+async fn test_name_resolution() {
+    zyron_bench_harness::init("catalog");
     let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Name Resolution ===");
     let before = take_util_snapshot();
@@ -1081,10 +567,7 @@ async fn phase3_02_name_resolution() {
     let db_id = SYSTEM_DATABASE_ID;
 
     // "public" schema is bootstrapped as DEFAULT_SCHEMA_ID
-    let app_schema_id = catalog
-        .create_schema(db_id, "app", "system")
-        .await
-        .unwrap();
+    let app_schema_id = catalog.create_schema(db_id, "app", "system").await.unwrap();
 
     // Create public.users
     let public_users_cols = vec![ColumnDef {
@@ -1126,10 +609,7 @@ async fn phase3_02_name_resolution() {
         .unwrap();
 
     // Set search path to ['app', 'public']
-    let resolver = catalog.resolver(
-        db_id,
-        vec!["app".to_string(), "public".to_string()],
-    );
+    let resolver = catalog.resolver(db_id, vec!["app".to_string(), "public".to_string()]);
 
     // Resolve unqualified 'users' -> should find app.users (app is first in search path)
     let resolved = resolver.resolve_table(None, "users").await.unwrap();
@@ -1177,7 +657,8 @@ async fn phase3_02_name_resolution() {
 // =============================================================================
 
 #[tokio::test]
-async fn phase3_03_column_types() {
+async fn test_column_types() {
+    zyron_bench_harness::init("catalog");
     let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Column Type Roundtrip ===");
     let before = take_util_snapshot();
@@ -1229,8 +710,16 @@ async fn phase3_03_column_types() {
     for (i, (name, type_id, nullable, max_len)) in expected_types.iter().enumerate() {
         let col = &table.columns[i];
         assert_eq!(col.name, *name, "column {} name mismatch", i);
-        assert_eq!(col.type_id, *type_id, "column {} ({}) type mismatch", i, name);
-        assert_eq!(col.nullable, *nullable, "column {} ({}) nullable mismatch", i, name);
+        assert_eq!(
+            col.type_id, *type_id,
+            "column {} ({}) type mismatch",
+            i, name
+        );
+        assert_eq!(
+            col.nullable, *nullable,
+            "column {} ({}) nullable mismatch",
+            i, name
+        );
         assert_eq!(
             col.max_length, *max_len,
             "column {} ({}) max_length mismatch",
@@ -1238,20 +727,26 @@ async fn phase3_03_column_types() {
         );
     }
 
-    tprintln!("  All {} column types roundtripped: PASS", expected_types.len());
+    tprintln!(
+        "  All {} column types roundtripped: PASS",
+        expected_types.len()
+    );
 
     // Verify default expression is preserved
-    let col_defs_with_default = vec![
-        ColumnDef {
-            name: "amount".to_string(),
-            data_type: DataType::Decimal(Some(10), Some(2)),
-            nullable: Some(true),
-            default: Some(Expr::Literal(LiteralValue::Float(42.0))),
-            constraints: vec![],
-        },
-    ];
+    let col_defs_with_default = vec![ColumnDef {
+        name: "amount".to_string(),
+        data_type: DataType::Decimal(Some(10), Some(2)),
+        nullable: Some(true),
+        default: Some(Expr::Literal(LiteralValue::Float(42.0))),
+        constraints: vec![],
+    }];
     let tid = catalog
-        .create_table(DEFAULT_SCHEMA_ID, "defaults_test", &col_defs_with_default, &[])
+        .create_table(
+            DEFAULT_SCHEMA_ID,
+            "defaults_test",
+            &col_defs_with_default,
+            &[],
+        )
         .await
         .unwrap();
     let t = catalog.get_table_by_id(tid).unwrap();
@@ -1268,7 +763,8 @@ async fn phase3_03_column_types() {
 // =============================================================================
 
 #[tokio::test]
-async fn phase3_04_constraints() {
+async fn test_constraints() {
+    zyron_bench_harness::init("catalog");
     let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Constraint Storage ===");
     let before = take_util_snapshot();
@@ -1404,8 +900,15 @@ async fn phase3_04_constraints() {
 
     // Verify constraints survive reload
     let tables = catalog.list_tables(DEFAULT_SCHEMA_ID);
-    assert!(tables.len() >= 5, "expected at least 5 tables, got {}", tables.len());
-    tprintln!("  All constraint tables listed: PASS ({} tables)", tables.len());
+    assert!(
+        tables.len() >= 5,
+        "expected at least 5 tables, got {}",
+        tables.len()
+    );
+    tprintln!(
+        "  All constraint tables listed: PASS ({} tables)",
+        tables.len()
+    );
 
     wal.close().unwrap();
     let after = take_util_snapshot();
@@ -1417,7 +920,8 @@ async fn phase3_04_constraints() {
 // =============================================================================
 
 #[tokio::test]
-async fn phase3_05_ddl_create_drop() {
+async fn test_ddl_create_drop() {
+    zyron_bench_harness::init("catalog");
     let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== DDL Create/Drop Cycle ===");
     let before = take_util_snapshot();
@@ -1461,13 +965,19 @@ async fn phase3_05_ddl_create_drop() {
     tprintln!("  Drop index: PASS");
 
     // Drop table
-    catalog.drop_table(DEFAULT_SCHEMA_ID, "temp_table").await.unwrap();
+    catalog
+        .drop_table(DEFAULT_SCHEMA_ID, "temp_table")
+        .await
+        .unwrap();
     assert!(catalog.get_table(DEFAULT_SCHEMA_ID, "temp_table").is_err());
     tprintln!("  Drop table: PASS");
 
     // Create and drop schema
     let db_id = SYSTEM_DATABASE_ID;
-    catalog.create_schema(db_id, "temp_schema", "admin").await.unwrap();
+    catalog
+        .create_schema(db_id, "temp_schema", "admin")
+        .await
+        .unwrap();
     assert!(catalog.get_schema(db_id, "temp_schema").is_ok());
     catalog.drop_schema(db_id, "temp_schema").await.unwrap();
     assert!(catalog.get_schema(db_id, "temp_schema").is_err());
@@ -1496,7 +1006,8 @@ async fn phase3_05_ddl_create_drop() {
 // =============================================================================
 
 #[tokio::test]
-async fn phase3_06_statistics() {
+async fn test_statistics() {
+    zyron_bench_harness::init("catalog");
     let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Statistics Collection ===");
     let before = take_util_snapshot();
@@ -1585,7 +1096,11 @@ async fn phase3_06_statistics() {
         "row count mismatch: expected {}, got {}",
         row_count, table_stats.row_count
     );
-    tprintln!("  Row count: {} (expected {}): PASS", table_stats.row_count, row_count);
+    tprintln!(
+        "  Row count: {} (expected {}): PASS",
+        table_stats.row_count,
+        row_count
+    );
 
     // Verify page count > 0
     assert!(table_stats.page_count > 0);
@@ -1609,7 +1124,8 @@ async fn phase3_06_statistics() {
     assert_eq!(total_in_buckets, row_count);
     tprintln!(
         "  Histogram: {} buckets, total={}: PASS",
-        hist.num_buckets, total_in_buckets
+        hist.num_buckets,
+        total_in_buckets
     );
 
     // Verify MCV
@@ -1627,8 +1143,12 @@ async fn phase3_06_statistics() {
     // Benchmark analyze throughput
     let analyze_us = analyze_elapsed.as_micros() as f64;
     let rows_per_sec = row_count as f64 / (analyze_us / 1_000_000.0);
-    tprintln!("  ANALYZE: {:.0} us for {} rows ({:.0} rows/sec)",
-        analyze_us, row_count, rows_per_sec);
+    tprintln!(
+        "  ANALYZE: {:.0} us for {} rows ({:.0} rows/sec)",
+        analyze_us,
+        row_count,
+        rows_per_sec
+    );
 
     wal.close().unwrap();
     let after = take_util_snapshot();
@@ -1640,7 +1160,8 @@ async fn phase3_06_statistics() {
 // =============================================================================
 
 #[tokio::test]
-async fn phase3_07_recovery() {
+async fn test_recovery() {
+    zyron_bench_harness::init("catalog");
     let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Crash Recovery ===");
     let before = take_util_snapshot();
@@ -1673,8 +1194,7 @@ async fn phase3_07_recovery() {
             .unwrap(),
         );
 
-        let storage =
-            HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
+        let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
         storage.init_cache().await.unwrap();
         let storage: Arc<dyn CatalogStorage> = Arc::new(storage);
         let cache = Arc::new(CatalogCache::new(1024, 256));
@@ -1683,7 +1203,10 @@ async fn phase3_07_recovery() {
             .unwrap();
 
         // Create several objects (all WAL-logged)
-        let db_id = catalog.create_database("recovery_db", "admin").await.unwrap();
+        let db_id = catalog
+            .create_database("recovery_db", "admin")
+            .await
+            .unwrap();
         let schema_id = catalog
             .create_schema(db_id, "recovery_schema", "admin")
             .await
@@ -1727,8 +1250,7 @@ async fn phase3_07_recovery() {
             .unwrap(),
         );
 
-        let storage =
-            HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
+        let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
         storage.init_cache().await.unwrap();
         let storage: Arc<dyn CatalogStorage> = Arc::new(storage);
         let cache = Arc::new(CatalogCache::new(1024, 256));
@@ -1764,7 +1286,8 @@ async fn phase3_07_recovery() {
 // =============================================================================
 
 #[tokio::test]
-async fn phase3_08_bench_table_lookup() {
+async fn test_bench_table_lookup() {
+    zyron_bench_harness::init("catalog");
     let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Benchmark: Table Lookup Latency ===");
     let before = take_util_snapshot();
@@ -1796,9 +1319,7 @@ async fn phase3_08_bench_table_lookup() {
     for _ in 0..VALIDATION_RUNS {
         let start = Instant::now();
         for _ in 0..iterations {
-            let _ = std::hint::black_box(
-                catalog.get_table(DEFAULT_SCHEMA_ID, "bench_table"),
-            );
+            let _ = std::hint::black_box(catalog.get_table(DEFAULT_SCHEMA_ID, "bench_table"));
         }
         let elapsed_ns = start.elapsed().as_nanos() as f64;
         let ns_per_op = elapsed_ns / iterations as f64;
@@ -1821,7 +1342,8 @@ async fn phase3_08_bench_table_lookup() {
 }
 
 #[tokio::test]
-async fn phase3_09_bench_schema_resolve() {
+async fn test_bench_schema_resolve() {
+    zyron_bench_harness::init("catalog");
     let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Benchmark: Schema Resolve Latency ===");
     let before = take_util_snapshot();
@@ -1856,9 +1378,7 @@ async fn phase3_09_bench_schema_resolve() {
     for _ in 0..VALIDATION_RUNS {
         let start = Instant::now();
         for _ in 0..iterations {
-            let _ = std::hint::black_box(
-                resolver.resolve_table(None, "target").await,
-            );
+            let _ = std::hint::black_box(resolver.resolve_table(None, "target").await);
         }
         let elapsed_ns = start.elapsed().as_nanos() as f64;
         let ns_per_op = elapsed_ns / iterations as f64;
@@ -1881,7 +1401,8 @@ async fn phase3_09_bench_schema_resolve() {
 }
 
 #[tokio::test]
-async fn phase3_10_bench_ddl_create() {
+async fn test_bench_ddl_create() {
+    zyron_bench_harness::init("catalog");
     let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Benchmark: DDL Create Latency ===");
     let before = take_util_snapshot();
@@ -1930,7 +1451,8 @@ async fn phase3_10_bench_ddl_create() {
 }
 
 #[tokio::test]
-async fn phase3_11_bench_ddl_drop() {
+async fn test_bench_ddl_drop() {
+    zyron_bench_harness::init("catalog");
     let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Benchmark: DDL Drop Latency ===");
     let before = take_util_snapshot();
@@ -1988,7 +1510,8 @@ async fn phase3_11_bench_ddl_drop() {
 }
 
 #[tokio::test]
-async fn phase3_12_bench_analyze() {
+async fn test_bench_analyze() {
+    zyron_bench_harness::init("catalog");
     let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Benchmark: ANALYZE Throughput ===");
     let before = take_util_snapshot();
@@ -2085,7 +1608,8 @@ async fn phase3_12_bench_analyze() {
 }
 
 #[tokio::test]
-async fn phase3_13_bench_histogram() {
+async fn test_bench_histogram() {
+    zyron_bench_harness::init("catalog");
     let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Benchmark: Histogram Build Latency ===");
     let before = take_util_snapshot();
@@ -2122,7 +1646,8 @@ async fn phase3_13_bench_histogram() {
 }
 
 #[tokio::test]
-async fn phase3_14_bench_cache_hit_rate() {
+async fn test_bench_cache_hit_rate() {
+    zyron_bench_harness::init("catalog");
     let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Benchmark: Cache Hit Rate ===");
     let before = take_util_snapshot();
@@ -2184,7 +1709,8 @@ async fn phase3_14_bench_cache_hit_rate() {
 }
 
 #[tokio::test]
-async fn phase3_15_bench_recovery() {
+async fn test_bench_recovery() {
+    zyron_bench_harness::init("catalog");
     let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Benchmark: Recovery Time ===");
     let before = take_util_snapshot();
@@ -2216,8 +1742,7 @@ async fn phase3_15_bench_recovery() {
             .unwrap(),
         );
 
-        let storage =
-            HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
+        let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
         storage.init_cache().await.unwrap();
         let storage: Arc<dyn CatalogStorage> = Arc::new(storage);
         let cache = Arc::new(CatalogCache::new(1024, 256));
@@ -2226,7 +1751,10 @@ async fn phase3_15_bench_recovery() {
             .unwrap();
 
         let db_id = catalog.create_database("bench_db", "admin").await.unwrap();
-        let sid = catalog.create_schema(db_id, "bench_schema", "admin").await.unwrap();
+        let sid = catalog
+            .create_schema(db_id, "bench_schema", "admin")
+            .await
+            .unwrap();
         let col_defs = vec![ColumnDef {
             name: "id".to_string(),
             data_type: DataType::BigInt,
@@ -2260,8 +1788,7 @@ async fn phase3_15_bench_recovery() {
             .unwrap(),
         );
 
-        let storage =
-            HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
+        let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
         storage.init_cache().await.unwrap();
         let storage: Arc<dyn CatalogStorage> = Arc::new(storage);
         let cache = Arc::new(CatalogCache::new(1024, 256));
@@ -2296,10 +1823,11 @@ async fn phase3_15_bench_recovery() {
 // =============================================================================
 
 #[tokio::test]
-async fn phase3_99_summary() {
+async fn test_catalog_summary() {
+    zyron_bench_harness::init("catalog");
     let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n============================================");
-    tprintln!("  Phase 3: Catalog - All Tests Complete");
+    tprintln!("  Catalog - All Tests Complete");
     tprintln!("============================================");
     tprintln!("  DDL Persistence:    1 test (create + reload)");
     tprintln!("  Name Resolution:    1 test (6 cases)");
