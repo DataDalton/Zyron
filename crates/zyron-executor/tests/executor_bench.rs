@@ -33,7 +33,7 @@
 
 use std::sync::Mutex;
 
-use rand::Rng;
+use rand::RngExt;
 use zyron_bench_harness::*;
 
 use zyron_common::TypeId;

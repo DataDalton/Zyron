@@ -37,9 +37,8 @@ pub struct ClockReplacer {
 impl ClockReplacer {
     /// Creates a new clock replacer with the given number of frames.
     pub fn new(num_frames: usize) -> Self {
-        let reference_bits: Vec<AtomicBool> = (0..num_frames)
-            .map(|_| AtomicBool::new(false))
-            .collect();
+        let reference_bits: Vec<AtomicBool> =
+            (0..num_frames).map(|_| AtomicBool::new(false)).collect();
 
         Self {
             num_frames,

@@ -62,7 +62,8 @@ impl NameResolver {
         }
 
         for path_schema in &self.search_path {
-            if let Some(schema_entry) = self.cache.get_schema_by_name(self.database_id, path_schema) {
+            if let Some(schema_entry) = self.cache.get_schema_by_name(self.database_id, path_schema)
+            {
                 if let Some(table) = self.cache.get_table_by_name(schema_entry.id, table_name) {
                     return Ok(table);
                 }

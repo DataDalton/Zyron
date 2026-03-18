@@ -1,0 +1,125 @@
+
+=== Phase 1.7: Bloom Filter ===
+  Zero false negatives (10K probes): PASS
+  False positive rate: 0.0651 (6508/100000)
+  FP rate < 8%: PASS
+  Serialization round-trip: PASS
+  Bloom skip rate: 100.0% (99/99 files skipped)
+  Low-cardinality segment: no bloom filter (cardinality=10): PASS
+  High-cardinality segment: bloom filter present (cardinality=200): PASS
+  Bloom probe latency (ns) [PASS/OK]:
+    Runs: [9, 9, 8, 8, 9]
+    Average: 9 <= 30 (target)
+    Min/Max: 8 / 9, StdDev: 0
+  Bloom skip rate (%) [PASS]: 100 >= 99 (target)
+
+  Bloom filter: ALL PASS
+
+=== Phase 1.7: Column Segment Format ===
+Rows: 10000, Columns: 5
+  Compaction result: 10000 rows, 5 cols, 114808 bytes
+  File header: PASS
+  Column 0 (Int32): encoding=FastLanes, compressed=1262, sorted=true
+  Column 1 (Float64): encoding=Alp, compressed=17528, sorted=true
+  Column 2 (Int32): encoding=Dictionary, compressed=6338, sorted=false
+  Column 3 (Boolean): encoding=BitPack, compressed=1263, sorted=false
+  Column 4 (Int32): encoding=Constant, compressed=8, sorted=true
+  .zyr scan throughput (GB/sec) [PASS/OK]:
+    Runs: [2, 2, 2, 3, 2]
+    Average: 2 >= 1 (target)
+    Min/Max: 2 / 3, StdDev: 0
+
+  Column segment format: ALL PASS
+
+=== Phase 1.7: Compaction Pipeline ===
+Rows: 100000
+  First compaction: 100000 rows, 507984 bytes
+  Compaction throughput (rows/sec) [PASS/OK]:
+    Runs: [2,482,757, 2,639,017, 2,466,700, 2,432,705, 2,392,156]
+    Average: 2,482,667 >= 1,000,000 (target)
+    Min/Max: 2,392,156 / 2,639,017, StdDev: 84,129
+  Incremental compaction: 50000 rows, 278608 bytes
+
+  Compaction pipeline: ALL PASS
+
+=== Phase 1.7: HTAP Hybrid Scan ===
+Columnar: 50000 rows, Heap: 10000 rows, Total: 60000
+  Hybrid scan correctness (60000 rows, sorted, no duplicates): PASS
+  Value correctness: PASS
+  Hybrid scan overhead (%) [PASS/OK]:
+    Runs: [3, -3, -0, 3, 4]
+    Average: 2 <= 5 (target)
+    Min/Max: -3 / 4, StdDev: 3
+
+  HTAP hybrid scan: ALL PASS
+
+=== Phase 1.7: Micro-Batch Zone Map ===
+  Zone map count: 100 (expected 100): PASS
+  Narrow range [5000,5999]: 1 matching zones, skip rate 99.0%
+  Wide range [5000,15999]: 11 matching zones, skip rate 89.0%
+  Out-of-range [200K,300K]: 0 matching zones, skip rate 100%: PASS
+  Zone map serialization round-trip: PASS
+  Narrow range batch skip rate (%) [PASS]: 99 >= 95 (target)
+  Zone map overhead: 49.95% of encoded data (6400 / 12812 bytes)
+
+  Micro-batch zone map: ALL PASS
+
+=== Phase 1.7: Parallel Column Encoding ===
+Rows: 100000, Columns: 8
+  Sequential: 100000 rows, 8 cols, 1720500 bytes
+  Parallel: 100000 rows, 8 cols, 1720500 bytes
+  Parallel correctness (all columns decodable): PASS
+  Avg sequential: 0.088s, avg parallel: 0.030s
+  Parallel speedup (x) [FAIL/OK]:
+    Runs: [3, 3, 3, 2, 3]
+    Average: 3 >= 3 (target)
+    Min/Max: 2 / 3, StdDev: 0
+  Sequential compaction (rows/sec) [PASS/OK]:
+    Runs: [1,102,769, 1,120,264, 1,144,708, 1,139,061, 1,144,849]
+    Average: 1,130,330 >= 1,000,000 (target)
+    Min/Max: 1,102,769 / 1,144,849, StdDev: 16,460
+
+  Parallel column encoding: ALL PASS
+
+=== Phase 1.7: Segment Cache ===
+  Cache insert + get (5 keys): PASS
+  Stats (hit_count=5, used=51200): PASS
+  Eviction on overflow: PASS
+  Eviction count: 1 (expected >= 1): PASS
+  Invalidate: PASS
+  Clear (used_bytes=0): PASS
+  Cache get (ns/lookup) [PASS]: 25 <= 100 (target)
+
+  Segment cache: ALL PASS
+
+=== Phase 1.7: Sorted Segment ===
+Files: 3, Rows per file: 10000
+  SortedSegmentIndex: 3 files, 30000 total rows: PASS
+  find_point(5000): 1 file: PASS
+  find_point(15000): 1 file: PASS
+  find_point(99999): 0 files: PASS
+  binary_search(5000): found at index 5000: PASS
+  binary_search(99999): None: PASS
+  find_range(5000,15000): 2 files: PASS
+  Merge scan: 30000 rows in sorted order: PASS
+  Sorted PK lookup (ns) [PASS/OK]:
+    Runs: [30, 30, 30, 30, 30]
+    Average: 30 <= 500 (target)
+    Min/Max: 30 / 30, StdDev: 0
+  Sorted PK range (keys/sec) [PASS/OK]:
+    Runs: [217,076,700, 213,068,182, 233,644,860, 387,096,774, 230,061,350]
+    Average: 256,189,573 >= 80,000,000 (target)
+    Min/Max: 213,068,182 / 387,096,774, StdDev: 65,904,347
+
+  Sorted segment: ALL PASS
+
+=== Phase 1.7: Transaction-Aware Pruning ===
+  Snapshot txn_id=350
+  Fully visible files: [0, 1] (expected [0, 1])
+  Partially visible: [2] (expected [2])
+  Pruned: [3, 4] (expected [3, 4])
+  Pruning correctness: PASS
+  xmin range round-trip: PASS
+  Pruning decision (ns/file) [PASS]: 0 <= 10 (target)
+
+  Transaction-aware pruning: ALL PASS

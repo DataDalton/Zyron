@@ -1,0 +1,28 @@
+
+=== Connection Handshake Latency Test ===
+  Server listening on 127.0.0.1:56870
+
+--- Run 1/5 ---
+
+  500 handshakes (500 success) in 226.99ms, avg 454.0 us/handshake
+
+--- Run 2/5 ---
+
+  500 handshakes (500 success) in 268.73ms, avg 537.5 us/handshake
+
+--- Run 3/5 ---
+
+  500 handshakes (500 success) in 116.48ms, avg 233.0 us/handshake
+
+--- Run 4/5 ---
+
+  500 handshakes (500 success) in 140.68ms, avg 281.4 us/handshake
+
+--- Run 5/5 ---
+
+  500 handshakes (500 success) in 248.20ms, avg 496.4 us/handshake
+
+  Handshake latency (us) [FAIL/REGR!]:
+    Runs: [454, 537, 233, 281, 496]
+    Average: 400 <= 50 (target)
+    Min/Max: 233 / 537, StdDev: 121

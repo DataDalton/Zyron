@@ -14,5 +14,5 @@ tokio.workspace = true
 zyron-buffer = { path = "../zyron-buffer" }
 zyron-storage = { path = "../zyron-storage" }
 zyron-wal = { path = "../zyron-wal" }
-tempfile = "3.24.0"
+tempfile = "3.27.0"
 zyron-bench-harness = { path = "../zyron-bench-harness" }

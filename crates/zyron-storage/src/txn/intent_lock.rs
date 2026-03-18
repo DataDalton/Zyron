@@ -77,7 +77,7 @@ impl IntentLockTable {
     /// Returns the txn_id holding the intent lock on a key, if any.
     pub fn is_locked_by(&self, table_id: u32, key: &[u8]) -> Option<u64> {
         let hash = Self::hash_key(table_id, key);
-        self.locks.get_sync(&hash).map(|entry| *entry.get())
+        self.locks.read_sync(&hash, |_, v| *v)
     }
 
     /// Returns the number of active intent locks.

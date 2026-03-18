@@ -2,6 +2,26 @@
 
 use crate::txn::Snapshot;
 use zyron_common::page::PageId;
+use zyron_common::zerocopy::{AsBytes, FromBytes};
+
+/// Packed 12-byte tuple header for single-memcpy serialization.
+/// All fields stored in little-endian format.
+#[repr(C, packed)]
+struct PackedTupleHeader {
+    flags: u16,
+    data_len: u16,
+    xmin: u32,
+    xmax: u32,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<PackedTupleHeader>() == 2 + 2 + 4 + 4);
+    assert!(std::mem::align_of::<PackedTupleHeader>() == 1);
+};
+
+// Safety: PackedTupleHeader is repr(C, packed) with no padding (verified above).
+unsafe impl AsBytes for PackedTupleHeader {}
+unsafe impl FromBytes for PackedTupleHeader {}
 
 /// Unique identifier for a tuple within the database.
 ///
@@ -114,23 +134,27 @@ impl TupleHeader {
         snapshot.is_visible(self.xmin as u64, self.xmax as u64)
     }
 
-    /// Serializes the header to bytes.
+    /// Serializes the header to bytes via single memcpy.
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let packed = PackedTupleHeader {
+            flags: self.flags.0.to_le(),
+            data_len: self.data_len.to_le(),
+            xmin: self.xmin.to_le(),
+            xmax: self.xmax.to_le(),
+        };
         let mut buf = [0u8; Self::SIZE];
-        buf[0..2].copy_from_slice(&self.flags.0.to_le_bytes());
-        buf[2..4].copy_from_slice(&self.data_len.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.xmin.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.xmax.to_le_bytes());
+        packed.write_to(&mut buf, 0);
         buf
     }
 
-    /// Deserializes the header from bytes.
+    /// Deserializes the header from bytes via single unaligned read.
     pub fn from_bytes(buf: &[u8]) -> Self {
+        let packed = PackedTupleHeader::read_from(buf, 0);
         Self {
-            flags: TupleFlags(u16::from_le_bytes([buf[0], buf[1]])),
-            data_len: u16::from_le_bytes([buf[2], buf[3]]),
-            xmin: u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
-            xmax: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+            flags: TupleFlags(u16::from_le(packed.flags)),
+            data_len: u16::from_le(packed.data_len),
+            xmin: u32::from_le(packed.xmin),
+            xmax: u32::from_le(packed.xmax),
         }
     }
 
@@ -140,26 +164,12 @@ impl TupleHeader {
     /// Caller must ensure buf has at least SIZE (12) bytes.
     #[inline(always)]
     pub unsafe fn from_bytes_unchecked(buf: &[u8]) -> Self {
-        unsafe {
-            Self {
-                flags: TupleFlags(u16::from_le_bytes([
-                    *buf.get_unchecked(0),
-                    *buf.get_unchecked(1),
-                ])),
-                data_len: u16::from_le_bytes([*buf.get_unchecked(2), *buf.get_unchecked(3)]),
-                xmin: u32::from_le_bytes([
-                    *buf.get_unchecked(4),
-                    *buf.get_unchecked(5),
-                    *buf.get_unchecked(6),
-                    *buf.get_unchecked(7),
-                ]),
-                xmax: u32::from_le_bytes([
-                    *buf.get_unchecked(8),
-                    *buf.get_unchecked(9),
-                    *buf.get_unchecked(10),
-                    *buf.get_unchecked(11),
-                ]),
-            }
+        let packed = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const PackedTupleHeader) };
+        Self {
+            flags: TupleFlags(u16::from_le(packed.flags)),
+            data_len: u16::from_le(packed.data_len),
+            xmin: u32::from_le(packed.xmin),
+            xmax: u32::from_le(packed.xmax),
         }
     }
 }

@@ -100,7 +100,7 @@ impl LockTable {
     /// Returns the txn_id holding the lock on a row, if any.
     pub fn is_locked_by(&self, table_id: u32, rid: TupleId) -> Option<u64> {
         let key = RowLockKey::new(table_id, rid);
-        self.locks.get_sync(&key).map(|entry| *entry.get())
+        self.locks.read_sync(&key, |_, v| *v)
     }
 
     /// Returns the number of active locks.

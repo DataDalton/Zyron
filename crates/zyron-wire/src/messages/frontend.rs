@@ -313,8 +313,9 @@ fn read_cstring(buf: &mut BytesMut) -> Result<String, ProtocolError> {
         .iter()
         .position(|&b| b == 0)
         .ok_or_else(|| ProtocolError::Malformed("Missing null terminator".into()))?;
-    let s = String::from_utf8(bytes[..null_pos].to_vec())
-        .map_err(|e| ProtocolError::Malformed(format!("Invalid UTF-8: {}", e)))?;
+    let s = std::str::from_utf8(&bytes[..null_pos])
+        .map_err(|e| ProtocolError::Malformed(format!("Invalid UTF-8: {}", e)))?
+        .to_string();
     buf.advance(null_pos + 1);
     Ok(s)
 }

@@ -225,18 +225,21 @@ impl Catalog {
         }
 
         if column_defs.len() > u16::MAX as usize {
-            return Err(ZyronError::Internal(
-                format!("table has {} columns, max is {}", column_defs.len(), u16::MAX),
-            ));
+            return Err(ZyronError::Internal(format!(
+                "table has {} columns, max is {}",
+                column_defs.len(),
+                u16::MAX
+            )));
         }
 
         // Validate no duplicate column names
         let mut seen_names = HashSet::with_capacity(column_defs.len());
         for def in column_defs {
             if !seen_names.insert(&def.name) {
-                return Err(ZyronError::Internal(
-                    format!("duplicate column name: {}", def.name),
-                ));
+                return Err(ZyronError::Internal(format!(
+                    "duplicate column name: {}",
+                    def.name
+                )));
             }
         }
 

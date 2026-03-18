@@ -1,0 +1,86 @@
+
+=== Phase 1.7: Encoding Round-Trip Correctness ===
+Rows per encoding: 100000
+
+  FastLanes (sequential i32):
+    Compression ratio: 31.97x
+  FastLanes decode (int/sec) [FAIL/REGR!]:
+    Runs: [5,025,125,628, 5,102,040,816, 5,102,040,816, 4,385,964,912, 5,025,125,628]
+    Average: 4,928,059,560 >= 120,000,000,000 (target)
+    Min/Max: 4,385,964,912 / 5,102,040,816, StdDev: 273,221,231
+
+  FSST (32-byte strings):
+    Compression ratio: 5.08x
+  FSST decompress (GB/sec) [FAIL/OK]:
+    Runs: [4, 4, 4, 5, 4]
+    Average: 4 >= 6 (target)
+    Min/Max: 4 / 5, StdDev: 0
+
+  ALP (f64 decimals):
+    Compression ratio: 4.57x
+  ALP decode (float/sec) [FAIL/REGR!]:
+    Runs: [490,677,134, 646,830,530, 1,152,073,733, 842,459,983, 678,886,626]
+    Average: 762,185,601 >= 3,000,000,000 (target)
+    Min/Max: 490,677,134 / 1,152,073,733, StdDev: 224,686,043
+
+  Dictionary (10 distinct i32):
+    Compression ratio: 7.99x
+  Dictionary lookup (ns/val) [PASS/OK]:
+    Runs: [3, 3, 2, 2, 2]
+    Average: 2 <= 3 (target)
+    Min/Max: 2 / 3, StdDev: 0
+
+  RLE (runs of 1000):
+    Compression ratio: 657.89x
+  RLE decode (val/sec) [FAIL/REGR!]:
+    Runs: [5,681,818,182, 2,141,327,623, 1,522,070,015, 16,949,152,542, 16,949,152,542]
+    Average: 8,648,704,181 >= 60,000,000,000 (target)
+    Min/Max: 1,522,070,015 / 16,949,152,542, StdDev: 6,924,336,253
+
+  BitPack (boolean):
+    Compression ratio: 7.99x
+
+  Constant (all 42):
+    Encoded size: 8 bytes (raw: 400000)
+
+  Unencoded (random u32):
+
+  Edge cases:
+    Single row: all encodings pass
+    All zeros: all encodings pass
+    Max u32: FastLanes pass
+
+  Round-trip correctness: ALL PASS
+
+=== Phase 1.7: Encoding Selection ===
+  All-identical -> Constant: PASS
+  Boolean -> BitPack: PASS
+  Low-cardinality (10 distinct, 100K rows) -> Dictionary: PASS
+  Sequential integers -> FastLanes: PASS
+  Decimal floats -> ALP: PASS
+  Boolean column -> BitPack: PASS
+  Single-value column -> Constant: PASS
+  High-entropy random -> Unencoded: PASS
+  Empty sample -> Unencoded: PASS
+  Encoding select (us/col) [PASS/OK]:
+    Runs: [24, 23, 20, 20, 21]
+    Average: 22 <= 500 (target)
+    Min/Max: 20 / 24, StdDev: 2
+
+  Encoding selection: ALL PASS
+
+=== Phase 1.7: Query-on-Compressed ===
+Rows: 100000
+  Dictionary equality: PASS
+  RLE range: PASS
+  BitPack equality: PASS
+  Constant equality: PASS
+  FastLanes range: PASS
+  Compressed eval speedup (x) [PASS/OK]:
+    Runs: [2,554, 2,531, 2,508, 2,407, 2,494]
+    Average: 2,499 >= 3 (target)
+    Min/Max: 2,407 / 2,554, StdDev: 50
+  ALP range: PASS
+  FSST equality: PASS
+
+  Query-on-compressed: ALL PASS

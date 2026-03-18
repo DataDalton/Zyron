@@ -6,8 +6,9 @@ pub mod config;
 pub mod error;
 pub mod page;
 pub mod types;
+pub mod zerocopy;
 
 pub use config::{ServerConfig, StorageConfig};
 pub use error::{Result, ZyronError};
-pub use page::{PageHeader, PageId, PAGE_SIZE};
+pub use page::{PAGE_SIZE, PageHeader, PageId};
 pub use types::TypeId;

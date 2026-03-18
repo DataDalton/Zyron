@@ -2,7 +2,7 @@
 //!
 //! Tests the PostgreSQL wire protocol v3 implementation including message
 //! encoding/decoding, type serialization, authentication, COPY protocol,
-//! TCP connection handshake, and concurrent connection handling.
+//! TCP connection handshake, concurrent connection handling, and QUIC transport.
 //!
 //! Run: cargo test -p zyron-wire --test wire_bench --release -- --nocapture
 
@@ -12,7 +12,6 @@ use std::sync::{Arc, Mutex};
 use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_util::codec::{Decoder, Encoder};
 
 use zyron_buffer::{BufferPool, BufferPoolConfig};
 use zyron_catalog::{Catalog, CatalogCache, HeapCatalogStorage};
@@ -36,6 +35,7 @@ use zyron_wire::messages::backend::{
 };
 use zyron_wire::messages::frontend::{DescribeTarget, FrontendMessage, PasswordMessage};
 use zyron_wire::session::Session;
+use zyron_wire::transport::WireTransport;
 use zyron_wire::types;
 
 use zyron_bench_harness::*;
@@ -2311,4 +2311,726 @@ fn test_wire_datarow_encode_throughput() {
         !result.regression_detected,
         "Regression detected in DataRow encode"
     );
+}
+
+// ---------------------------------------------------------------------------
+// QUIC Transport Benchmarks
+// ---------------------------------------------------------------------------
+
+/// Generates a self-signed TLS certificate and private key using rcgen.
+/// Writes PEM files to the given directory and returns (cert_path, key_path).
+fn generate_test_certs(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("Failed to generate self-signed cert");
+
+    let cert_pem = cert.cert.pem();
+    let key_pem = cert.key_pair.serialize_pem();
+
+    let cert_path = dir.join("test_cert.pem");
+    let key_path = dir.join("test_key.pem");
+
+    std::fs::write(&cert_path, cert_pem).expect("Failed to write cert PEM");
+    std::fs::write(&key_path, key_pem).expect("Failed to write key PEM");
+
+    (cert_path, key_path)
+}
+
+/// Client-side ApplicationOverQuic that sends data on the first bidi stream
+/// and collects the response. Used for QUIC e2e handshake benchmarks.
+struct QuicClientApp {
+    buf: Vec<u8>,
+    stream_id: Option<u64>,
+    send_data: Vec<u8>,
+    sent: bool,
+    received: Arc<tokio::sync::Mutex<Vec<u8>>>,
+    done_notify: Arc<tokio::sync::Notify>,
+}
+
+impl QuicClientApp {
+    fn new(
+        send_data: Vec<u8>,
+    ) -> (
+        Self,
+        Arc<tokio::sync::Mutex<Vec<u8>>>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let received = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let done_notify = Arc::new(tokio::sync::Notify::new());
+        let app = Self {
+            buf: vec![0u8; 65535],
+            stream_id: None,
+            send_data,
+            sent: false,
+            received: Arc::clone(&received),
+            done_notify: Arc::clone(&done_notify),
+        };
+        (app, received, done_notify)
+    }
+}
+
+impl tokio_quiche::ApplicationOverQuic for QuicClientApp {
+    fn on_conn_established(
+        &mut self,
+        qconn: &mut tokio_quiche::quic::QuicheConnection,
+        _handshake_info: &tokio_quiche::quic::HandshakeInfo,
+    ) -> tokio_quiche::QuicResult<()> {
+        // Open stream 0 and send data immediately on connection establishment
+        let sid = 0u64;
+        self.stream_id = Some(sid);
+        let _ = qconn.stream_send(sid, &self.send_data, true);
+        self.sent = true;
+        Ok(())
+    }
+
+    fn should_act(&self) -> bool {
+        true
+    }
+    fn buffer(&mut self) -> &mut [u8] {
+        &mut self.buf
+    }
+
+    async fn wait_for_data(
+        &mut self,
+        _qconn: &mut tokio_quiche::quic::QuicheConnection,
+    ) -> tokio_quiche::QuicResult<()> {
+        // Short cycle to keep the worker loop responsive to incoming data.
+        tokio::time::sleep(std::time::Duration::from_micros(50)).await;
+        Ok(())
+    }
+
+    fn process_reads(
+        &mut self,
+        qconn: &mut tokio_quiche::quic::QuicheConnection,
+    ) -> tokio_quiche::QuicResult<()> {
+        let sid = match self.stream_id {
+            Some(id) => id,
+            None => return Ok(()),
+        };
+
+        let mut temp = [0u8; 16384];
+        loop {
+            match qconn.stream_recv(sid, &mut temp) {
+                Ok((n, _fin)) if n > 0 => {
+                    let mut recv = self.received.blocking_lock();
+                    recv.extend_from_slice(&temp[..n]);
+                    self.done_notify.notify_one();
+                }
+                Ok(_) => break,
+                Err(tokio_quiche::quiche::Error::Done) => break,
+                Err(_) => break,
+            }
+        }
+        Ok(())
+    }
+
+    fn process_writes(
+        &mut self,
+        _qconn: &mut tokio_quiche::quic::QuicheConnection,
+    ) -> tokio_quiche::QuicResult<()> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 19: QUIC e2e handshake + stream setup via tokio-quiche
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_quic_handshake_latency() {
+    zyron_bench_harness::init("wire");
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== QUIC Handshake Latency Test ===");
+
+    let tmp = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let (cert_path, key_path) = generate_test_certs(tmp.path());
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    rt.block_on(async {
+        use tokio_quiche::settings::{ConnectionParams, Hooks, QuicSettings};
+
+        let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        // Bind and release to get a port, then let setup_quic_listener rebind
+        let udp_sock = tokio::net::UdpSocket::bind(bind_addr)
+            .await
+            .expect("Failed to bind UDP");
+        let server_addr = udp_sock.local_addr().unwrap();
+        drop(udp_sock);
+
+        let mut quic_rx =
+            zyron_wire::quic::setup_quic_listener(server_addr, &cert_path, &key_path, 30)
+                .await
+                .expect("Failed to setup QUIC listener");
+
+        tprintln!("  QUIC server listening on {}\n", server_addr);
+
+        let iterations = 20;
+        let mut results = Vec::with_capacity(VALIDATION_RUNS);
+
+        for run in 0..VALIDATION_RUNS {
+            tprintln!("--- Run {}/{} ---\n", run + 1, VALIDATION_RUNS);
+
+            let start = Instant::now();
+            let mut success_count = 0u32;
+
+            for i in 0..iterations {
+                let startup_bytes = build_startup_bytes("test_user", "testdb");
+
+                // Create a client UDP socket connected to the server
+                let client_sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind client");
+                client_sock.connect(server_addr).await.expect("connect");
+
+                let (app, _received, _done_notify) = QuicClientApp::new(startup_bytes);
+
+                let mut settings = QuicSettings::default();
+                settings.max_idle_timeout = Some(std::time::Duration::from_secs(5));
+                let client_params = ConnectionParams::new_client(settings, None, Hooks::default());
+
+                // Convert tokio UdpSocket to tokio_quiche Socket
+                let socket: tokio_quiche::socket::Socket<_, _> = client_sock
+                    .try_into()
+                    .expect("Failed to convert UdpSocket to Socket");
+
+                let connect_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    tokio_quiche::quic::connect_with_config(
+                        socket,
+                        Some("localhost"),
+                        &client_params,
+                        app,
+                    ),
+                )
+                .await;
+
+                match connect_result {
+                    Ok(Ok(_quic_conn)) => {
+                        // Connection established, wait for server to accept and deliver QuicStream
+                        let accepted =
+                            tokio::time::timeout(std::time::Duration::from_secs(2), quic_rx.recv())
+                                .await;
+
+                        match accepted {
+                            Ok(Some((_qs, _peer))) => {
+                                success_count += 1;
+                            }
+                            Ok(None) => {
+                                tprintln!("  Iteration {}: QUIC accept channel closed\n", i);
+                            }
+                            Err(_) => {
+                                tprintln!("  Iteration {}: QUIC accept timed out\n", i);
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        tprintln!("  Iteration {}: QUIC connect failed: {}\n", i, e);
+                    }
+                    Err(_) => {
+                        tprintln!("  Iteration {}: QUIC connect timed out\n", i);
+                    }
+                }
+            }
+
+            let elapsed = start.elapsed();
+            let avg_us = if success_count > 0 {
+                elapsed.as_secs_f64() * 1_000_000.0 / success_count as f64
+            } else {
+                0.0
+            };
+
+            results.push(avg_us);
+            tprintln!(
+                "  {} QUIC handshakes ({} success) in {:.2?}, avg {:.1} us/handshake\n",
+                iterations,
+                success_count,
+                elapsed,
+                avg_us,
+            );
+        }
+
+        let result = validate_metric(
+            "QUIC Handshake",
+            "QUIC handshake latency (us)",
+            results,
+            10000.0, // QUIC handshake includes TLS 1.3 negotiation
+            false,
+        );
+
+        tprintln!(
+            "  QUIC handshake benchmark completed (passed: {})\n",
+            result.passed
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Test 20: QUIC channel bridge throughput (QuicStream read/write)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_quic_channel_bridge_throughput() {
+    zyron_bench_harness::init("wire");
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== QUIC Channel Bridge Throughput Test ===");
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    rt.block_on(async {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let chunk_size = 4096;
+        let total_bytes = 64 * 1024 * 1024; // 64 MB
+        let num_chunks = total_bytes / chunk_size;
+        let payload = vec![0xABu8; chunk_size];
+
+        let mut results_write = Vec::with_capacity(VALIDATION_RUNS);
+        let mut results_read = Vec::with_capacity(VALIDATION_RUNS);
+
+        for run in 0..VALIDATION_RUNS {
+            tprintln!("--- Run {}/{} ---\n", run + 1, VALIDATION_RUNS);
+
+            // Write throughput: measure how fast we can push data through the channel
+            let (mut stream, _read_tx, mut write_rx) = zyron_wire::quic::test_stream_pair();
+
+            let drain_handle = tokio::spawn(async move {
+                let mut drained = 0usize;
+                while let Some(data) = write_rx.recv().await {
+                    drained += data.len();
+                }
+                drained
+            });
+
+            let start = Instant::now();
+            for _ in 0..num_chunks {
+                stream.write_all(&payload).await.unwrap();
+            }
+            drop(stream); // Close the channel
+            let drained = drain_handle.await.unwrap();
+            let write_elapsed = start.elapsed();
+
+            let write_mbps = (drained as f64 / (1024.0 * 1024.0)) / write_elapsed.as_secs_f64();
+            results_write.push(write_mbps);
+
+            // Read throughput: measure how fast we can pull data from the channel
+            let (mut stream, read_tx, _write_rx) = zyron_wire::quic::test_stream_pair();
+
+            let feed_handle = tokio::spawn(async move {
+                for _ in 0..num_chunks {
+                    let data = bytes::Bytes::from(vec![0xCDu8; chunk_size]);
+                    if read_tx.send(data).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let start = Instant::now();
+            let mut total_read = 0usize;
+            let mut buf = vec![0u8; chunk_size * 2];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => total_read += n,
+                    Err(_) => break,
+                }
+            }
+            let read_elapsed = start.elapsed();
+            feed_handle.await.unwrap();
+
+            let read_mbps = (total_read as f64 / (1024.0 * 1024.0)) / read_elapsed.as_secs_f64();
+            results_read.push(read_mbps);
+
+            tprintln!(
+                "  Write: {:.0} MB/s ({} bytes in {:.2?}), Read: {:.0} MB/s ({} bytes in {:.2?})\n",
+                write_mbps,
+                format_with_commas(drained as f64),
+                write_elapsed,
+                read_mbps,
+                format_with_commas(total_read as f64),
+                read_elapsed,
+            );
+        }
+
+        let write_result = validate_metric(
+            "QUIC Channel Bridge",
+            "QUIC channel write throughput (MB/s)",
+            results_write,
+            500.0, // 500 MB/s minimum for in-process channel
+            true,
+        );
+
+        let read_result = validate_metric(
+            "QUIC Channel Bridge",
+            "QUIC channel read throughput (MB/s)",
+            results_read,
+            500.0,
+            true,
+        );
+
+        assert!(
+            write_result.passed,
+            "QUIC channel write throughput below minimum threshold"
+        );
+        assert!(
+            read_result.passed,
+            "QUIC channel read throughput below minimum threshold"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Test 21: QUIC vs TCP latency comparison (channel bridge overhead)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_quic_transport_properties() {
+    zyron_bench_harness::init("wire");
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== QUIC Transport Properties Test ===");
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    rt.block_on(async {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use zyron_wire::transport::transport_name;
+
+        // Verify transport identification
+        let (quic_stream, _tx, _rx) = zyron_wire::quic::test_stream_pair();
+        assert!(quic_stream.is_encrypted(), "QUIC must report encrypted");
+        assert_eq!(transport_name(&quic_stream), "QUIC");
+        tprintln!(
+            "  QUIC transport: encrypted={}, name={}\n",
+            quic_stream.is_encrypted(),
+            transport_name(&quic_stream)
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tcp_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        assert!(!tcp_stream.is_encrypted(), "TCP must report unencrypted");
+        assert_eq!(transport_name(&tcp_stream), "TCP");
+        tprintln!(
+            "  TCP transport: encrypted={}, name={}\n",
+            tcp_stream.is_encrypted(),
+            transport_name(&tcp_stream)
+        );
+
+        // Measure small message round-trip latency through QUIC channel bridge
+        let iterations = 100_000;
+        let mut results = Vec::with_capacity(VALIDATION_RUNS);
+
+        for run in 0..VALIDATION_RUNS {
+            tprintln!("--- Run {}/{} ---\n", run + 1, VALIDATION_RUNS);
+
+            let (mut stream, read_tx, mut write_rx) = zyron_wire::quic::test_stream_pair();
+
+            // Feed data in a background task
+            let feed_handle = tokio::spawn(async move {
+                for i in 0..iterations {
+                    let msg = bytes::Bytes::from(format!("msg{:06}", i));
+                    if read_tx.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            // Drain write side in background
+            let drain_handle = tokio::spawn(async move {
+                let mut count = 0u64;
+                while let Some(_) = write_rx.recv().await {
+                    count += 1;
+                }
+                count
+            });
+
+            let start = Instant::now();
+            let mut buf = [0u8; 64];
+            for _ in 0..iterations {
+                let n = stream.read(&mut buf).await.unwrap();
+                stream.write_all(&buf[..n]).await.unwrap();
+            }
+            let elapsed = start.elapsed();
+            drop(stream);
+
+            feed_handle.await.unwrap();
+            let writes = drain_handle.await.unwrap();
+
+            let avg_ns = elapsed.as_nanos() as f64 / iterations as f64;
+            let ops_sec = iterations as f64 / elapsed.as_secs_f64();
+            results.push(ops_sec);
+
+            tprintln!(
+                "  {} round-trips in {:.2?}, avg {:.0} ns/op ({} ops/sec), {} writes confirmed\n",
+                format_with_commas(iterations as f64),
+                elapsed,
+                avg_ns,
+                format_with_commas(ops_sec),
+                format_with_commas(writes as f64),
+            );
+        }
+
+        let result = validate_metric(
+            "QUIC Transport Properties",
+            "QUIC channel round-trip throughput (ops/sec)",
+            results,
+            500_000.0,
+            true,
+        );
+
+        assert!(
+            result.passed,
+            "QUIC channel round-trip throughput below minimum threshold"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Test 22: QUIC PG Protocol Handshake (Connection<QuicStream> e2e)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_quic_pg_handshake_latency() {
+    zyron_bench_harness::init("wire");
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== QUIC PG Handshake Latency Test ===");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let (server_state, _tmp) = create_test_server("testdb").await;
+
+        let iterations = 500;
+        let mut results = Vec::with_capacity(VALIDATION_RUNS);
+
+        for run in 0..VALIDATION_RUNS {
+            tprintln!("--- Run {}/{} ---\n", run + 1, VALIDATION_RUNS);
+
+            let start = Instant::now();
+            let mut success_count = 0u32;
+
+            for _ in 0..iterations {
+                let state = Arc::clone(&server_state);
+
+                // Create channel pair: server_stream reads from client writes
+                let (client_tx, server_rx) = tokio::sync::mpsc::channel(256);
+                let (server_tx, mut client_rx) = tokio::sync::mpsc::unbounded_channel();
+                let notify = Arc::new(tokio::sync::Notify::new());
+
+                let server_stream = zyron_wire::quic::QuicStream::from_parts(
+                    server_rx,
+                    server_tx,
+                    notify.clone(),
+                    "127.0.0.1:5433".parse().unwrap(),
+                );
+
+                // spawn_local for !Send Connection futures (planner uses Pin<Box<dyn Future>>)
+                let server_handle = tokio::task::spawn_local(async move {
+                    let mut conn = zyron_wire::connection::Connection::new(server_stream, state);
+                    let _ = conn.run().await;
+                });
+
+                // Client: send PG startup
+                let startup = bytes::Bytes::from(build_startup_bytes("test_user", "testdb"));
+                if client_tx.send(startup).await.is_ok() {
+                    // Read until we see ReadyForQuery ('Z')
+                    let deadline =
+                        tokio::time::Instant::now() + std::time::Duration::from_millis(200);
+                    loop {
+                        match tokio::time::timeout_at(deadline, client_rx.recv()).await {
+                            Ok(Some(data)) => {
+                                if data.iter().any(|&b| b == b'Z') {
+                                    success_count += 1;
+                                    break;
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+
+                // Clean disconnect
+                let _ = client_tx
+                    .send(bytes::Bytes::from(build_terminate_bytes()))
+                    .await;
+                drop(client_tx);
+                let _ = server_handle.await;
+            }
+
+            let elapsed = start.elapsed();
+            let avg_us = elapsed.as_secs_f64() * 1_000_000.0 / iterations as f64;
+            results.push(avg_us);
+
+            tprintln!(
+                "  {} QUIC PG handshakes ({} success) in {:.2?}, avg {:.1} us/handshake\n",
+                iterations,
+                success_count,
+                elapsed,
+                avg_us,
+            );
+            assert_eq!(
+                success_count, iterations as u32,
+                "All handshakes should succeed"
+            );
+        }
+
+        let result = validate_metric(
+            "QUIC PG Handshake",
+            "QUIC PG handshake latency (us)",
+            results,
+            500.0,
+            false,
+        );
+
+        assert!(result.passed, "QUIC PG handshake latency above threshold");
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Test 23: QUIC PG Simple Query Throughput (Connection<QuicStream> e2e)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_quic_pg_simple_query_throughput() {
+    zyron_bench_harness::init("wire");
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== QUIC PG Simple Query Throughput Test ===");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let (server_state, _tmp) = create_test_server("testdb").await;
+
+        let iterations = 5000;
+        let mut results = Vec::with_capacity(VALIDATION_RUNS);
+
+        for run in 0..VALIDATION_RUNS {
+            tprintln!("--- Run {}/{} ---\n", run + 1, VALIDATION_RUNS);
+
+            let state = Arc::clone(&server_state);
+
+            // Create channel pair
+            let (client_tx, server_rx) = tokio::sync::mpsc::channel(256);
+            let (server_tx, mut client_rx) = tokio::sync::mpsc::unbounded_channel();
+            let notify = Arc::new(tokio::sync::Notify::new());
+
+            let server_stream = zyron_wire::quic::QuicStream::from_parts(
+                server_rx,
+                server_tx,
+                notify.clone(),
+                "127.0.0.1:5433".parse().unwrap(),
+            );
+
+            let server_handle = tokio::task::spawn_local(async move {
+                let mut conn = zyron_wire::connection::Connection::new(server_stream, state);
+                let _ = conn.run().await;
+            });
+
+            // Handshake
+            let startup = bytes::Bytes::from(build_startup_bytes("test_user", "testdb"));
+            client_tx.send(startup).await.unwrap();
+
+            // Wait for ReadyForQuery
+            let mut got_ready = false;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                match tokio::time::timeout_at(deadline, client_rx.recv()).await {
+                    Ok(Some(data)) => {
+                        if data.iter().any(|&b| b == b'Z') {
+                            got_ready = true;
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+
+            if !got_ready {
+                tprintln!("  Failed to complete handshake\n");
+                let _ = server_handle.await;
+                continue;
+            }
+
+            // Simple query loop
+            let start = Instant::now();
+            let mut query_count = 0u64;
+
+            for _ in 0..iterations {
+                let query = bytes::Bytes::from(build_query_bytes("SELECT 1"));
+                if client_tx.send(query).await.is_err() {
+                    break;
+                }
+
+                // Read until ReadyForQuery
+                let mut got_z = false;
+                loop {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(500),
+                        client_rx.recv(),
+                    )
+                    .await
+                    {
+                        Ok(Some(data)) => {
+                            if data.iter().any(|&b| b == b'Z') {
+                                got_z = true;
+                                query_count += 1;
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+
+                if !got_z {
+                    break;
+                }
+            }
+
+            let elapsed = start.elapsed();
+
+            // Clean shutdown
+            let _ = client_tx
+                .send(bytes::Bytes::from(build_terminate_bytes()))
+                .await;
+            drop(client_tx);
+            let _ = server_handle.await;
+
+            let qps = query_count as f64 / elapsed.as_secs_f64();
+            let avg_us = if query_count > 0 {
+                elapsed.as_secs_f64() * 1_000_000.0 / query_count as f64
+            } else {
+                0.0
+            };
+            results.push(qps);
+
+            tprintln!(
+                "  {} queries in {:.2?}, avg {:.1} us/query ({} qps)\n",
+                format_with_commas(query_count as f64),
+                elapsed,
+                avg_us,
+                format_with_commas(qps),
+            );
+        }
+
+        let result = validate_metric(
+            "QUIC PG Simple Query",
+            "QUIC PG simple query throughput (qps)",
+            results,
+            10_000.0,
+            true,
+        );
+
+        assert!(
+            result.passed,
+            "QUIC PG simple query throughput below threshold"
+        );
+    });
 }

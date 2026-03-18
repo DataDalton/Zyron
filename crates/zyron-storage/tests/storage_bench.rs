@@ -14,9 +14,9 @@
 
 use zyron_bench_harness::*;
 
-use rand::Rng;
+use rand::RngExt;
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 use tempfile::tempdir;
 
@@ -24,8 +24,7 @@ use zyron_buffer::{BufferPool, BufferPoolConfig};
 use zyron_common::page::PageId;
 use zyron_storage::{
     BTreeIndex, BufferedBTreeIndex, CheckpointConfig, CheckpointTrigger, DiskManager,
-    DiskManagerConfig, HeapFile, Snapshot, Transaction, TransactionManager, TransactionStatus,
-    Tuple, TupleHeader, TupleId,
+    DiskManagerConfig, HeapFile, Tuple, TupleId,
 };
 use zyron_wal::{LogRecordType, Lsn, RecoveryManager, WalReader, WalWriter, WalWriterConfig};
 

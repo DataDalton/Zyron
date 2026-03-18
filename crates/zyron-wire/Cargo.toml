@@ -28,10 +28,13 @@ ryu.workspace = true
 socket2.workspace = true
 crossbeam.workspace = true
 mimalloc.workspace = true
+tokio-quiche.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
 md-5 = { workspace = true }
 tokio-util.workspace = true
 futures.workspace = true
+rcgen.workspace = true
 zyron-bench-harness = { path = "../zyron-bench-harness" }

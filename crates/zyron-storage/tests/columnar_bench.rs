@@ -16,7 +16,7 @@
 
 use zyron_bench_harness::*;
 
-use rand::Rng;
+use rand::RngExt;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;

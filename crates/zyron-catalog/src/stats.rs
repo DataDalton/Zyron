@@ -199,7 +199,11 @@ fn count_distinct_sorted(sorted: &[Vec<u8>]) -> u64 {
 
 /// Computes the top-N most common values from a pre-sorted slice.
 /// Walks sorted runs to count frequencies without a HashMap.
-fn compute_most_common_sorted(sorted: &[Vec<u8>], total: u64, top_n: usize) -> (Vec<Vec<u8>>, Vec<f64>) {
+fn compute_most_common_sorted(
+    sorted: &[Vec<u8>],
+    total: u64,
+    top_n: usize,
+) -> (Vec<Vec<u8>>, Vec<f64>) {
     if sorted.is_empty() || total == 0 {
         return (Vec::new(), Vec::new());
     }

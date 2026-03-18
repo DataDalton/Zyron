@@ -10,8 +10,9 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tracing::{debug, warn};
+
+use crate::transport::WireTransport;
 
 use zyron_buffer::BufferPool;
 use zyron_catalog::Catalog;
@@ -71,8 +72,9 @@ const MAX_PREPARED_STATEMENTS: usize = 1000;
 const MAX_PORTALS: usize = 10000;
 
 /// Per-connection handler for the PostgreSQL wire protocol.
-pub struct Connection {
-    stream: TcpStream,
+/// Generic over the transport layer (TCP or QUIC).
+pub struct Connection<T: WireTransport> {
+    stream: T,
     codec: PostgresCodec,
     read_buf: BytesMut,
     write_buf: BytesMut,
@@ -91,19 +93,17 @@ pub struct Connection {
     secret_key: i32,
 }
 
-impl Connection {
-    /// Creates a new connection handler for the given TCP stream.
-    pub fn new(stream: TcpStream, server: Arc<ServerState>) -> Self {
-        // Disable Nagle's algorithm for low-latency message exchange.
-        let _ = stream.set_nodelay(true);
-
+impl<T: WireTransport> Connection<T> {
+    /// Creates a new connection handler for the given transport stream.
+    pub fn new(stream: T, server: Arc<ServerState>) -> Self {
+        stream.configure_immediate();
         let pid = NEXT_PROCESS_ID.fetch_add(1, Ordering::Relaxed);
 
         Self {
             stream,
             codec: PostgresCodec::new(),
-            read_buf: BytesMut::with_capacity(4096),
-            write_buf: BytesMut::with_capacity(4096),
+            read_buf: BytesMut::with_capacity(32768),
+            write_buf: BytesMut::with_capacity(65536),
             session: None,
             server,
             authenticator: Box::new(TrustAuthenticator),
@@ -117,7 +117,7 @@ impl Connection {
 
     /// Creates a connection with a custom authenticator.
     pub fn with_authenticator(
-        stream: TcpStream,
+        stream: T,
         server: Arc<ServerState>,
         authenticator: Box<dyn Authenticator>,
     ) -> Self {
@@ -133,7 +133,7 @@ impl Connection {
             Err(e) => {
                 // Send error to client before closing
                 let _ = self
-                    .send(BackendMessage::ErrorResponse(ErrorFields {
+                    .feed(BackendMessage::ErrorResponse(ErrorFields {
                         severity: "FATAL".into(),
                         code: "08000".into(),
                         message: format!("Startup failed: {}", e),
@@ -147,14 +147,10 @@ impl Connection {
             }
         }
 
-        // Enable TCP keepalive after handshake to detect dead connections
-        // (60s idle, 10s probe interval). Deferred from Connection::new()
-        // to keep the handshake latency path fast.
-        let keepalive = socket2::TcpKeepalive::new()
-            .with_time(std::time::Duration::from_secs(60))
-            .with_interval(std::time::Duration::from_secs(10));
-        let sock_ref = socket2::SockRef::from(&self.stream);
-        let _ = sock_ref.set_tcp_keepalive(&keepalive);
+        // Configure transport-specific options after handshake.
+        // TCP: keepalive, TCP_NODELAY, OS-specific socket tuning.
+        // QUIC: no-op (handled by QUIC connection layer).
+        self.stream.configure_post_handshake();
 
         self.message_loop().await
     }
@@ -388,7 +384,7 @@ impl Connection {
         debug!("Simple query: {}", sql);
 
         if sql.trim().is_empty() {
-            self.send(BackendMessage::EmptyQueryResponse).await?;
+            self.feed(BackendMessage::EmptyQueryResponse).await?;
             self.send_ready_for_query().await?;
             return Ok(());
         }
@@ -404,7 +400,7 @@ impl Connection {
         };
 
         if stmts.is_empty() {
-            self.send(BackendMessage::EmptyQueryResponse).await?;
+            self.feed(BackendMessage::EmptyQueryResponse).await?;
             self.send_ready_for_query().await?;
             return Ok(());
         }
@@ -424,7 +420,7 @@ impl Connection {
             if let Some(result) = self.try_handle_transaction_control(&stmt).await {
                 match result {
                     Ok(tag) => {
-                        self.send(BackendMessage::CommandComplete { tag }).await?;
+                        self.feed(BackendMessage::CommandComplete { tag }).await?;
                     }
                     Err(e) => {
                         self.send_error(&e).await?;
@@ -596,7 +592,7 @@ impl Connection {
             },
         );
 
-        self.send(BackendMessage::ParseComplete).await?;
+        self.feed(BackendMessage::ParseComplete).await?;
         Ok(())
     }
 
@@ -697,7 +693,7 @@ impl Connection {
             },
         );
 
-        self.send(BackendMessage::BindComplete).await?;
+        self.feed(BackendMessage::BindComplete).await?;
         Ok(())
     }
 
@@ -786,15 +782,15 @@ impl Connection {
                 let output_schema = stmt.output_schema.clone();
 
                 // Send ParameterDescription
-                self.send(BackendMessage::ParameterDescription(param_types))
+                self.feed(BackendMessage::ParameterDescription(param_types))
                     .await?;
 
                 // Send RowDescription or NoData
                 if output_schema.is_empty() {
-                    self.send(BackendMessage::NoData).await?;
+                    self.feed(BackendMessage::NoData).await?;
                 } else {
                     let row_desc = self.build_row_description(&output_schema, &[]);
-                    self.send(row_desc).await?;
+                    self.feed(row_desc).await?;
                 }
             }
             DescribeTarget::Portal => {
@@ -803,11 +799,11 @@ impl Connection {
                 })?;
 
                 if portal.output_schema.is_empty() {
-                    self.send(BackendMessage::NoData).await?;
+                    self.feed(BackendMessage::NoData).await?;
                 } else {
                     let row_desc =
                         self.build_row_description(&portal.output_schema, &portal.result_formats);
-                    self.send(row_desc).await?;
+                    self.feed(row_desc).await?;
                 }
             }
         }
@@ -828,7 +824,7 @@ impl Connection {
                 self.portals.remove(&name);
             }
         }
-        self.send(BackendMessage::CloseComplete).await?;
+        self.feed(BackendMessage::CloseComplete).await?;
         Ok(())
     }
 
@@ -869,7 +865,7 @@ impl Connection {
                 if self.transaction.is_some() {
                     // Already in a transaction, warn but allow
                     let _ = self
-                        .send(BackendMessage::NoticeResponse(ErrorFields {
+                        .feed(BackendMessage::NoticeResponse(ErrorFields {
                             severity: "WARNING".into(),
                             code: "25001".into(),
                             message: "there is already a transaction in progress".into(),
@@ -908,7 +904,7 @@ impl Connection {
                     }
                 } else {
                     let _ = self
-                        .send(BackendMessage::NoticeResponse(ErrorFields {
+                        .feed(BackendMessage::NoticeResponse(ErrorFields {
                             severity: "WARNING".into(),
                             code: "25P01".into(),
                             message: "there is no transaction in progress".into(),
@@ -945,7 +941,7 @@ impl Connection {
                     session.set_variable(s.name.clone(), val_str);
                 }
                 let result = self
-                    .send(BackendMessage::CommandComplete { tag: "SET".into() })
+                    .feed(BackendMessage::CommandComplete { tag: "SET".into() })
                     .await;
                 Some(result)
             }
@@ -969,16 +965,16 @@ impl Connection {
 
                 let data_row = BackendMessage::DataRow(vec![Some(value.into_bytes())]);
 
-                let r1 = self.send(row_desc).await;
+                let r1 = self.feed(row_desc).await;
                 if r1.is_err() {
                     return Some(r1);
                 }
-                let r2 = self.send(data_row).await;
+                let r2 = self.feed(data_row).await;
                 if r2.is_err() {
                     return Some(r2);
                 }
                 Some(
-                    self.send(BackendMessage::CommandComplete { tag: "SHOW".into() })
+                    self.feed(BackendMessage::CommandComplete { tag: "SHOW".into() })
                         .await,
                 )
             }
@@ -1070,19 +1066,42 @@ impl Connection {
         let num_cols = batches[0].columns.len();
 
         // Precompute per-column format (text=0 or binary=1) once.
-        let col_formats: Vec<i16> = (0..num_cols)
-            .map(|i| {
-                if i < formats.len() {
+        // Stack buffer for up to 32 columns (covers the vast majority of queries).
+        // Heap fallback for wide tables.
+        let mut col_fmt_stack = [0i16; 32];
+        let col_fmt_heap: Vec<i16>;
+        let col_formats: &[i16] = if num_cols <= 32 {
+            for i in 0..num_cols {
+                col_fmt_stack[i] = if i < formats.len() {
                     formats[i]
                 } else if formats.len() == 1 {
                     formats[0]
                 } else {
                     0
-                }
-            })
-            .collect();
+                };
+            }
+            &col_fmt_stack[..num_cols]
+        } else {
+            col_fmt_heap = (0..num_cols)
+                .map(|i| {
+                    if i < formats.len() {
+                        formats[i]
+                    } else if formats.len() == 1 {
+                        formats[0]
+                    } else {
+                        0
+                    }
+                })
+                .collect();
+            &col_fmt_heap
+        };
 
         // Shared buffer for encoding DataRow messages directly.
+        // 64KB flush threshold matches the Windows TCP send buffer default
+        // and sits within the Linux default range (16-128KB). Benchmarking
+        // confirmed this is the optimal size: larger values (128KB, 256KB)
+        // cause BytesMut reallocation overhead that outweighs the syscall
+        // savings.
         const FLUSH_THRESHOLD: usize = 65536;
         let mut buf = BytesMut::with_capacity(FLUSH_THRESHOLD + 4096);
 
@@ -1153,7 +1172,7 @@ impl Connection {
     /// Converts a ZyronError to an ErrorResponse and sends it.
     async fn send_error(&mut self, err: &ZyronError) -> Result<(), ProtocolError> {
         let fields = zyron_error_to_fields(err);
-        self.send(BackendMessage::ErrorResponse(fields)).await
+        self.feed(BackendMessage::ErrorResponse(fields)).await
     }
 
     /// Sends a ProtocolError as an ErrorResponse. Extracts the inner ZyronError
@@ -1170,12 +1189,12 @@ impl Connection {
                 position: None,
             },
         };
-        self.send(BackendMessage::ErrorResponse(fields)).await
+        self.feed(BackendMessage::ErrorResponse(fields)).await
     }
 
     async fn send_ready_for_query(&mut self) -> Result<(), ProtocolError> {
         let state = self.session_ref().transaction_state();
-        self.send(BackendMessage::ReadyForQuery(state)).await?;
+        self.feed(BackendMessage::ReadyForQuery(state)).await?;
         self.flush().await
     }
 
@@ -1188,16 +1207,6 @@ impl Connection {
     }
 
     /// Encodes a message and writes it to the TCP stream immediately.
-    async fn send(&mut self, msg: BackendMessage) -> Result<(), ProtocolError> {
-        msg.encode(&mut self.write_buf);
-        self.stream
-            .write_all(&self.write_buf)
-            .await
-            .map_err(ProtocolError::Io)?;
-        self.write_buf.clear();
-        Ok(())
-    }
-
     /// Buffers a message into the write buffer without flushing.
     /// Call flush() after feeding all messages to send them in one syscall.
     async fn feed(&mut self, msg: BackendMessage) -> Result<(), ProtocolError> {
@@ -1232,6 +1241,24 @@ impl Connection {
                     size: self.read_buf.len(),
                     max: 16 * 1024 * 1024,
                 });
+            }
+
+            // If we have the message header, reserve the full message size
+            // to avoid incremental BytesMut reallocation on large messages.
+            if !self.codec.is_startup_phase() && self.read_buf.len() >= 5 {
+                let len = i32::from_be_bytes([
+                    self.read_buf[1],
+                    self.read_buf[2],
+                    self.read_buf[3],
+                    self.read_buf[4],
+                ]) as usize;
+                if len >= 4 && len <= 16 * 1024 * 1024 {
+                    let total = 1 + len;
+                    let needed = total.saturating_sub(self.read_buf.len());
+                    if needed > 0 {
+                        self.read_buf.reserve(needed);
+                    }
+                }
             }
 
             // Not enough data. Read more from the stream.

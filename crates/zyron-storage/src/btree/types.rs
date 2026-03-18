@@ -3,6 +3,41 @@
 use crate::tuple::TupleId;
 use bytes::{Bytes, BytesMut};
 use zyron_common::page::{PAGE_SIZE, PageHeader, PageId};
+use zyron_common::zerocopy::{AsBytes, FromBytes};
+
+/// Packed 16-byte leaf page header for single-memcpy serialization.
+#[repr(C, packed)]
+struct PackedLeafHeader {
+    num_slots: u16,
+    data_end: u16,
+    next_leaf: u64,
+    reserved: u32,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<PackedLeafHeader>() == 2 + 2 + 8 + 4);
+    assert!(std::mem::align_of::<PackedLeafHeader>() == 1);
+};
+
+unsafe impl AsBytes for PackedLeafHeader {}
+unsafe impl FromBytes for PackedLeafHeader {}
+
+/// Packed 16-byte internal page header for single-memcpy serialization.
+#[repr(C, packed)]
+struct PackedInternalHeader {
+    num_keys: u16,
+    free_space_offset: u16,
+    level: u16,
+    reserved: [u8; 10],
+}
+
+const _INTERNAL: () = {
+    assert!(std::mem::size_of::<PackedInternalHeader>() == 2 + 2 + 2 + 10);
+    assert!(std::mem::align_of::<PackedInternalHeader>() == 1);
+};
+
+unsafe impl AsBytes for PackedInternalHeader {}
+unsafe impl FromBytes for PackedInternalHeader {}
 
 /// Key comparison using u64 prefix for 8+ byte keys.
 /// Falls back to slice comparison for shorter keys or when prefix matches.
@@ -87,25 +122,27 @@ impl LeafPageHeader {
         }
     }
 
-    /// Serializes to bytes.
+    /// Serializes to bytes via single memcpy.
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let packed = PackedLeafHeader {
+            num_slots: self.num_slots.to_le(),
+            data_end: self.data_end.to_le(),
+            next_leaf: self.next_leaf.to_le(),
+            reserved: self.reserved.to_le(),
+        };
         let mut buf = [0u8; Self::SIZE];
-        buf[0..2].copy_from_slice(&self.num_slots.to_le_bytes());
-        buf[2..4].copy_from_slice(&self.data_end.to_le_bytes());
-        buf[4..12].copy_from_slice(&self.next_leaf.to_le_bytes());
-        buf[12..16].copy_from_slice(&self.reserved.to_le_bytes());
+        packed.write_to(&mut buf, 0);
         buf
     }
 
-    /// Deserializes from bytes.
+    /// Deserializes from bytes via single unaligned read.
     pub fn from_bytes(buf: &[u8]) -> Self {
+        let packed = PackedLeafHeader::read_from(buf, 0);
         Self {
-            num_slots: u16::from_le_bytes([buf[0], buf[1]]),
-            data_end: u16::from_le_bytes([buf[2], buf[3]]),
-            next_leaf: u64::from_le_bytes([
-                buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
-            ]),
-            reserved: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
+            num_slots: u16::from_le(packed.num_slots),
+            data_end: u16::from_le(packed.data_end),
+            next_leaf: u64::from_le(packed.next_leaf),
+            reserved: u32::from_le(packed.reserved),
         }
     }
 }
@@ -152,25 +189,27 @@ impl InternalPageHeader {
         }
     }
 
-    /// Serializes to bytes.
+    /// Serializes to bytes via single memcpy.
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let packed = PackedInternalHeader {
+            num_keys: self.num_keys.to_le(),
+            free_space_offset: self.free_space_offset.to_le(),
+            level: self.level.to_le(),
+            reserved: self.reserved,
+        };
         let mut buf = [0u8; Self::SIZE];
-        buf[0..2].copy_from_slice(&self.num_keys.to_le_bytes());
-        buf[2..4].copy_from_slice(&self.free_space_offset.to_le_bytes());
-        buf[4..6].copy_from_slice(&self.level.to_le_bytes());
-        buf[6..16].copy_from_slice(&self.reserved);
+        packed.write_to(&mut buf, 0);
         buf
     }
 
-    /// Deserializes from bytes.
+    /// Deserializes from bytes via single unaligned read.
     pub fn from_bytes(buf: &[u8]) -> Self {
-        let mut reserved = [0u8; 10];
-        reserved.copy_from_slice(&buf[6..16]);
+        let packed = PackedInternalHeader::read_from(buf, 0);
         Self {
-            num_keys: u16::from_le_bytes([buf[0], buf[1]]),
-            free_space_offset: u16::from_le_bytes([buf[2], buf[3]]),
-            level: u16::from_le_bytes([buf[4], buf[5]]),
-            reserved,
+            num_keys: u16::from_le(packed.num_keys),
+            free_space_offset: u16::from_le(packed.free_space_offset),
+            level: u16::from_le(packed.level),
+            reserved: packed.reserved,
         }
     }
 }
@@ -306,4 +345,170 @@ pub struct InsertStats {
     pub flush_count: u64,
     /// Total time spent in flush operations (nanoseconds).
     pub flush_time_ns: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Packed struct fields can't be referenced in assert_eq! due to alignment.
+    // Copy fields to locals before comparing.
+
+    #[test]
+    fn test_packed_leaf_header_roundtrip() {
+        let header = PackedLeafHeader {
+            num_slots: 42,
+            data_end: 8192,
+            next_leaf: 0x0102030405060708,
+            reserved: 0,
+        };
+
+        let bytes = header.as_bytes();
+        assert_eq!(bytes.len(), 16);
+
+        let r = PackedLeafHeader::read_from(bytes, 0);
+        let (ns, de, nl, rv) = (r.num_slots, r.data_end, r.next_leaf, r.reserved);
+        assert_eq!(ns, 42);
+        assert_eq!(de, 8192);
+        assert_eq!(nl, 0x0102030405060708);
+        assert_eq!(rv, 0);
+    }
+
+    #[test]
+    fn test_packed_leaf_header_write_to() {
+        let header = PackedLeafHeader {
+            num_slots: 10,
+            data_end: 4096,
+            next_leaf: 999,
+            reserved: 0,
+        };
+
+        let mut buf = [0u8; 32];
+        let written = header.write_to(&mut buf, 8);
+        assert_eq!(written, 16);
+
+        let r = PackedLeafHeader::read_from(&buf, 8);
+        let (ns, de, nl) = (r.num_slots, r.data_end, r.next_leaf);
+        assert_eq!(ns, 10);
+        assert_eq!(de, 4096);
+        assert_eq!(nl, 999);
+    }
+
+    #[test]
+    fn test_packed_internal_header_roundtrip() {
+        let header = PackedInternalHeader {
+            num_keys: 100,
+            free_space_offset: 2048,
+            level: 3,
+            reserved: [0; 10],
+        };
+
+        let bytes = header.as_bytes();
+        assert_eq!(bytes.len(), 16);
+
+        let r = PackedInternalHeader::read_from(bytes, 0);
+        let (nk, fso, lv) = (r.num_keys, r.free_space_offset, r.level);
+        assert_eq!(nk, 100);
+        assert_eq!(fso, 2048);
+        assert_eq!(lv, 3);
+    }
+
+    #[test]
+    fn test_packed_internal_header_all_bits() {
+        let header = PackedInternalHeader {
+            num_keys: u16::MAX,
+            free_space_offset: u16::MAX,
+            level: u16::MAX,
+            reserved: [0xFF; 10],
+        };
+
+        let r = PackedInternalHeader::read_from(header.as_bytes(), 0);
+        let (nk, fso, lv) = (r.num_keys, r.free_space_offset, r.level);
+        assert_eq!(nk, u16::MAX);
+        assert_eq!(fso, u16::MAX);
+        assert_eq!(lv, u16::MAX);
+    }
+
+    #[test]
+    fn test_leaf_page_header_roundtrip() {
+        let header = LeafPageHeader {
+            num_slots: 5,
+            data_end: 1024,
+            next_leaf: 42,
+            reserved: 0,
+        };
+
+        let bytes = header.to_bytes();
+        let restored = LeafPageHeader::from_bytes(&bytes);
+        assert_eq!(restored.num_slots, 5);
+        assert_eq!(restored.data_end, 1024);
+        assert_eq!(restored.next_leaf, 42);
+    }
+
+    #[test]
+    fn test_internal_page_header_roundtrip() {
+        let header = InternalPageHeader {
+            num_keys: 20,
+            free_space_offset: 512,
+            level: 2,
+            reserved: [0; 10],
+        };
+
+        let bytes = header.to_bytes();
+        let restored = InternalPageHeader::from_bytes(&bytes);
+        assert_eq!(restored.num_keys, 20);
+        assert_eq!(restored.free_space_offset, 512);
+        assert_eq!(restored.level, 2);
+    }
+
+    #[test]
+    fn test_leaf_entry_roundtrip() {
+        let entry = LeafEntry {
+            key: Bytes::from(vec![1, 2, 3, 4]),
+            tuple_id: TupleId::new(PageId::new(0, 10), 5),
+        };
+
+        let bytes = entry.to_bytes();
+        let (restored, _size) = LeafEntry::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.key, entry.key);
+        assert_eq!(restored.tuple_id.page_id.page_num, 10);
+        assert_eq!(restored.tuple_id.slot_id, 5);
+    }
+
+    #[test]
+    fn test_internal_entry_roundtrip() {
+        let entry = InternalEntry {
+            key: Bytes::from(vec![10, 20, 30]),
+            child_page_id: PageId::new(0, 77),
+        };
+
+        let bytes = entry.to_bytes();
+        let (restored, size) = InternalEntry::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.key, entry.key);
+        assert_eq!(restored.child_page_id.page_num, 77);
+        assert_eq!(size, 2 + 3 + 4); // key_len(2) + key(3) + page_num(4)
+    }
+
+    #[test]
+    fn test_compare_keys_short() {
+        assert_eq!(compare_keys(b"abc", b"abc"), std::cmp::Ordering::Equal);
+        assert_eq!(compare_keys(b"abc", b"abd"), std::cmp::Ordering::Less);
+        assert_eq!(compare_keys(b"abd", b"abc"), std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_keys_long_prefix_optimization() {
+        let a = b"12345678_suffix_a";
+        let b = b"12345678_suffix_b";
+        // Same 8-byte prefix, falls back to slice comparison
+        assert_eq!(compare_keys(a, b), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn test_compare_keys_long_different_prefix() {
+        let a = b"00000000rest";
+        let b = b"11111111rest";
+        // Different prefix, u64 comparison catches it
+        assert_eq!(compare_keys(a, b), std::cmp::Ordering::Less);
+    }
 }

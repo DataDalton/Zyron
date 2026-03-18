@@ -34,6 +34,11 @@ impl PostgresCodec {
         self.startup_phase = false;
     }
 
+    /// Returns true if the codec is still in the startup phase.
+    pub fn is_startup_phase(&self) -> bool {
+        self.startup_phase
+    }
+
     /// Encodes a backend message into the destination buffer.
     pub fn encode(
         &mut self,

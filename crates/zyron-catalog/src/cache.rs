@@ -176,14 +176,15 @@ impl CatalogCache {
 
     pub fn get_database_by_name(&self, name: &str) -> Option<Arc<DatabaseEntry>> {
         let key = name_key(0, name);
-        self.database_names.get_sync(&key).and_then(|guard| {
-            let entry = guard.get();
-            if entry.name == name {
-                Some(Arc::clone(entry))
-            } else {
-                None
-            }
-        })
+        self.database_names
+            .read_sync(&key, |_, entry| {
+                if entry.name == name {
+                    Some(Arc::clone(entry))
+                } else {
+                    None
+                }
+            })
+            .flatten()
     }
 
     pub fn put_database(&self, entry: DatabaseEntry) {
@@ -197,7 +198,8 @@ impl CatalogCache {
     pub fn invalidate_database(&self, id: DatabaseId) {
         if let Some(entry) = self.databases.write().remove(&id) {
             let key = name_key(0, &entry.name);
-            self.database_names.remove_if_sync(&key, |v| v.name == entry.name);
+            self.database_names
+                .remove_if_sync(&key, |v| v.name == entry.name);
         }
     }
 
@@ -210,14 +212,15 @@ impl CatalogCache {
     /// Lock-free name lookup with verify-on-read for collision safety.
     pub fn get_schema_by_name(&self, db_id: DatabaseId, name: &str) -> Option<Arc<SchemaEntry>> {
         let key = name_key(db_id.0, name);
-        self.schema_by_name.get_sync(&key).and_then(|guard| {
-            let entry = guard.get();
-            if entry.database_id == db_id && entry.name == name {
-                Some(Arc::clone(entry))
-            } else {
-                None
-            }
-        })
+        self.schema_by_name
+            .read_sync(&key, |_, entry| {
+                if entry.database_id == db_id && entry.name == name {
+                    Some(Arc::clone(entry))
+                } else {
+                    None
+                }
+            })
+            .flatten()
     }
 
     pub fn put_schema(&self, entry: SchemaEntry) {
@@ -249,14 +252,15 @@ impl CatalogCache {
     /// Lock-free name lookup with verify-on-read for collision safety.
     pub fn get_table_by_name(&self, schema_id: SchemaId, name: &str) -> Option<Arc<TableEntry>> {
         let key = name_key(schema_id.0, name);
-        self.table_by_name.get_sync(&key).and_then(|guard| {
-            let entry = guard.get();
-            if entry.schema_id == schema_id && entry.name == name {
-                Some(Arc::clone(entry))
-            } else {
-                None
-            }
-        })
+        self.table_by_name
+            .read_sync(&key, |_, entry| {
+                if entry.schema_id == schema_id && entry.name == name {
+                    Some(Arc::clone(entry))
+                } else {
+                    None
+                }
+            })
+            .flatten()
     }
 
     pub fn put_table(&self, entry: TableEntry) {

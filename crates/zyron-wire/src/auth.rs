@@ -125,7 +125,7 @@ pub struct Md5Authenticator {
 impl Md5Authenticator {
     pub fn new(passwords: HashMap<String, String>) -> Self {
         let mut salt = [0u8; 4];
-        use rand::RngCore;
+        use rand::Rng;
         rand::rng().fill_bytes(&mut salt);
         Self { passwords, salt }
     }
@@ -246,8 +246,9 @@ impl Authenticator for ScramAuthenticator {
                     _ => return Err(AuthError::UnexpectedMessage),
                 };
 
-                let client_first = String::from_utf8(data.clone())
-                    .map_err(|_| AuthError::SaslError("Invalid UTF-8 in SASL initial".into()))?;
+                let client_first = std::str::from_utf8(&data)
+                    .map_err(|_| AuthError::SaslError("Invalid UTF-8 in SASL initial".into()))?
+                    .to_string();
 
                 // Parse client-first-message: "n,,n=user,r=client-nonce"
                 let client_first_bare = client_first
@@ -306,8 +307,9 @@ impl Authenticator for ScramAuthenticator {
                     _ => return Err(AuthError::UnexpectedMessage),
                 };
 
-                let client_final = String::from_utf8(data.clone())
-                    .map_err(|_| AuthError::SaslError("Invalid UTF-8 in SASL response".into()))?;
+                let client_final = std::str::from_utf8(&data)
+                    .map_err(|_| AuthError::SaslError("Invalid UTF-8 in SASL response".into()))?
+                    .to_string();
 
                 // Parse client-final-message: "c=biws,r=nonce,p=proof"
                 let proof_b64 = extract_field(&client_final, "p=")
@@ -438,7 +440,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Generates a random 18-byte nonce encoded as base64.
 fn generate_nonce() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 18];
     rand::rng().fill_bytes(&mut bytes);
     base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes)
@@ -446,7 +448,7 @@ fn generate_nonce() -> String {
 
 /// Generates a random 16-byte salt.
 fn generate_salt() -> Vec<u8> {
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 16];
     rand::rng().fill_bytes(&mut bytes);
     bytes.to_vec()

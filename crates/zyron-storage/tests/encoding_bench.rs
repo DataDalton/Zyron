@@ -11,7 +11,7 @@
 
 use zyron_bench_harness::*;
 
-use rand::Rng;
+use rand::RngExt;
 use std::time::Instant;
 
 use zyron_common::types::TypeId;

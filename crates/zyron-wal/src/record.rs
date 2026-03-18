@@ -6,7 +6,29 @@ use crate::constants::{
 };
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
+use zyron_common::zerocopy::{AsBytes, FromBytes};
 use zyron_common::{Result, ZyronError};
+
+/// Packed 24-byte WAL record header for single-memcpy serialization.
+/// All integer fields stored in little-endian format.
+#[repr(C, packed)]
+struct PackedHeader {
+    lsn: u64,
+    prev_lsn: u64,
+    txn_id: u32,
+    record_type: u8,
+    flags: u8,
+    payload_len: u16,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<PackedHeader>() == 8 + 8 + 4 + 1 + 1 + 2);
+    assert!(std::mem::align_of::<PackedHeader>() == 1);
+};
+
+// Safety: PackedHeader is repr(C, packed) with no padding (verified above).
+unsafe impl AsBytes for PackedHeader {}
+unsafe impl FromBytes for PackedHeader {}
 
 /// Log Sequence Number - unique identifier for each log record.
 ///
@@ -675,17 +697,6 @@ pub unsafe fn serialize_raw(
     hasher.write_payload(payload);
     let checksum = hasher.finish();
 
-    // Pack the 24-byte header for a single memcpy
-    #[repr(C, packed)]
-    struct PackedHeader {
-        lsn: u64,
-        prev_lsn: u64,
-        txn_id: u32,
-        record_type: u8,
-        flags: u8,
-        payload_len: u16,
-    }
-
     let header = PackedHeader {
         lsn: lsn.0.to_le(),
         prev_lsn: prev_lsn.0.to_le(),
@@ -695,26 +706,16 @@ pub unsafe fn serialize_raw(
         payload_len: payload_len.to_le(),
     };
 
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            &header as *const PackedHeader as *const u8,
-            buf,
-            HEADER_SIZE,
-        );
-    }
-
-    let mut offset = HEADER_SIZE;
+    let buf_slice =
+        unsafe { std::slice::from_raw_parts_mut(buf, record_size_for_payload(payload.len())) };
+    let mut offset = header.write_to(buf_slice, 0);
 
     if !payload.is_empty() {
-        unsafe {
-            std::ptr::copy_nonoverlapping(payload.as_ptr(), buf.add(offset), payload.len());
-        }
+        buf_slice[offset..offset + payload.len()].copy_from_slice(payload);
         offset += payload.len();
     }
 
-    unsafe {
-        std::ptr::copy_nonoverlapping(checksum.to_le_bytes().as_ptr(), buf.add(offset), 4);
-    }
+    buf_slice[offset..offset + CHECKSUM_SIZE].copy_from_slice(&checksum.to_le_bytes());
     offset + CHECKSUM_SIZE
 }
 
@@ -749,16 +750,6 @@ pub unsafe fn serialize_raw_deferred(
 
     let payload_len = payload.len() as u16;
 
-    #[repr(C, packed)]
-    struct PackedHeader {
-        lsn: u64,
-        prev_lsn: u64,
-        txn_id: u32,
-        record_type: u8,
-        flags: u8,
-        payload_len: u16,
-    }
-
     let header = PackedHeader {
         lsn: lsn.0.to_le(),
         prev_lsn: prev_lsn.0.to_le(),
@@ -768,27 +759,17 @@ pub unsafe fn serialize_raw_deferred(
         payload_len: payload_len.to_le(),
     };
 
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            &header as *const PackedHeader as *const u8,
-            buf,
-            HEADER_SIZE,
-        );
-    }
-
-    let mut offset = HEADER_SIZE;
+    let buf_slice =
+        unsafe { std::slice::from_raw_parts_mut(buf, record_size_for_payload(payload.len())) };
+    let mut offset = header.write_to(buf_slice, 0);
 
     if !payload.is_empty() {
-        unsafe {
-            std::ptr::copy_nonoverlapping(payload.as_ptr(), buf.add(offset), payload.len());
-        }
+        buf_slice[offset..offset + payload.len()].copy_from_slice(payload);
         offset += payload.len();
     }
 
     // Write zero checksum placeholder
-    unsafe {
-        std::ptr::write_unaligned(buf.add(offset) as *mut u32, 0u32);
-    }
+    buf_slice[offset..offset + CHECKSUM_SIZE].copy_from_slice(&0u32.to_le_bytes());
     offset + CHECKSUM_SIZE
 }
 

@@ -77,10 +77,12 @@ impl SegmentCache {
     /// Looks up a cached segment. Sets reference bit on hit.
     pub fn get(&self, key: &SegmentCacheKey) -> Option<Arc<CachedSegment>> {
         let packedKey = pack_key(key);
-        if let Some(entry) = self.entries.get_sync(&packedKey) {
-            entry.get().reference_bit.store(true, Ordering::Relaxed);
+        if let Some(segment) = self.entries.read_sync(&packedKey, |_, v| {
+            v.reference_bit.store(true, Ordering::Relaxed);
+            Arc::clone(v)
+        }) {
             self.hit_count.fetch_add(1, Ordering::Relaxed);
-            Some(Arc::clone(entry.get()))
+            Some(segment)
         } else {
             self.miss_count.fetch_add(1, Ordering::Relaxed);
             None

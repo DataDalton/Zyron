@@ -372,13 +372,18 @@ fn write_uuid(bytes: &[u8; 16], buf: &mut BytesMut) {
 }
 
 /// Writes bytea value as hex format (\\x followed by hex pairs) directly into buf.
-/// Zero heap allocations.
+/// Processes 8 bytes at a time to reduce extend_from_slice call count.
 fn write_bytea_hex(bytes: &[u8], buf: &mut BytesMut) {
     buf.reserve(2 + bytes.len() * 2);
     buf.extend_from_slice(b"\\x");
-    for &b in bytes {
-        buf.put_u8(HEX_CHARS[(b >> 4) as usize]);
-        buf.put_u8(HEX_CHARS[(b & 0x0f) as usize]);
+
+    let mut hex = [0u8; 16];
+    for chunk in bytes.chunks(8) {
+        for (i, &b) in chunk.iter().enumerate() {
+            hex[i * 2] = HEX_CHARS[(b >> 4) as usize];
+            hex[i * 2 + 1] = HEX_CHARS[(b & 0x0f) as usize];
+        }
+        buf.extend_from_slice(&hex[..chunk.len() * 2]);
     }
 }
 
@@ -564,17 +569,6 @@ fn hex_nibble(c: u8) -> Option<u8> {
     }
 }
 
-/// Converts bytea value to hex format: "\\x" followed by hex pairs.
-fn bytea_to_hex(bytes: &[u8]) -> Vec<u8> {
-    let mut result = Vec::with_capacity(2 + bytes.len() * 2);
-    result.extend_from_slice(b"\\x");
-    for b in bytes {
-        result.push(HEX_CHARS[(b >> 4) as usize]);
-        result.push(HEX_CHARS[(b & 0x0f) as usize]);
-    }
-    result
-}
-
 const HEX_CHARS: [u8; 16] = *b"0123456789abcdef";
 
 /// Parses hex-encoded bytea (\\xABCD or \xABCD) back to bytes.
@@ -602,6 +596,17 @@ fn hex_to_bytea(text: &str) -> Result<Vec<u8>, ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test helper: converts bytea to hex format for roundtrip testing.
+    fn bytea_to_hex(bytes: &[u8]) -> Vec<u8> {
+        let mut result = Vec::with_capacity(2 + bytes.len() * 2);
+        result.extend_from_slice(b"\\x");
+        for b in bytes {
+            result.push(HEX_CHARS[(b >> 4) as usize]);
+            result.push(HEX_CHARS[(b & 0x0f) as usize]);
+        }
+        result
+    }
 
     /// Test helper: formats UUID from 16 bytes to string.
     fn format_uuid(bytes: &[u8; 16]) -> String {

@@ -90,7 +90,8 @@ impl CopyOutHandler {
                 }
             }
             line.extend_from_slice(b"\n");
-            messages.push(BackendMessage::CopyData(line.to_vec()));
+            let owned = std::mem::replace(&mut line, BytesMut::with_capacity(256));
+            messages.push(BackendMessage::CopyData(owned.to_vec()));
         }
 
         messages
