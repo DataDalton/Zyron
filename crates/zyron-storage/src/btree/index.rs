@@ -872,6 +872,92 @@ impl BTreeIndex {
         results
     }
 
+    /// Zero-copy range scan that calls a callback for each matching entry.
+    /// The key is borrowed from the page buffer. Returns false from f to stop early.
+    pub fn range_scan_for_each<F>(&self, start_key: Option<&[u8]>, end_key: Option<&[u8]>, mut f: F)
+    where
+        F: FnMut(&[u8], TupleId) -> bool,
+    {
+        let pages = self.pages.read();
+
+        let start_leaf_num = match start_key {
+            Some(key) => self.find_leaf_page_num(key),
+            None => self.find_leftmost_leaf_num(&pages),
+        };
+
+        let ho = LeafPageHeader::OFFSET;
+        let sa = BTreeLeafPage::SLOT_ARRAY_START;
+        let ss = BTreeLeafPage::SLOT_SIZE;
+        let mut current_page_num = Some(start_leaf_num);
+        let mut first_page = true;
+
+        while let Some(pn) = current_page_num {
+            let Some(data) = pages.get(pn) else { break };
+            let ns = u16::from_le_bytes([data[ho], data[ho + 1]]) as usize;
+
+            let start_slot = if first_page {
+                first_page = false;
+                if let Some(sk) = start_key {
+                    let mut lo = 0usize;
+                    let mut hi = ns;
+                    while lo < hi {
+                        let mid = lo + (hi - lo) / 2;
+                        let so = sa + mid * ss;
+                        let eo = u16::from_le_bytes([data[so], data[so + 1]]) as usize;
+                        let kl = u16::from_le_bytes([data[eo], data[eo + 1]]) as usize;
+                        let ek = &data[eo + 2..eo + 2 + kl];
+                        if compare_keys(ek, sk).is_lt() {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    lo
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+
+            for slot_idx in start_slot..ns {
+                let so = sa + slot_idx * ss;
+                let eo = u16::from_le_bytes([data[so], data[so + 1]]) as usize;
+                let kl = u16::from_le_bytes([data[eo], data[eo + 1]]) as usize;
+                let ek = &data[eo + 2..eo + 2 + kl];
+
+                if let Some(end) = end_key
+                    && compare_keys(ek, end).is_gt()
+                {
+                    return;
+                }
+
+                let to = eo + 2 + kl;
+                let pnv = u32::from_le_bytes([data[to], data[to + 1], data[to + 2], data[to + 3]]);
+                let sid = u16::from_le_bytes([data[to + 4], data[to + 5]]);
+                if !f(ek, TupleId::new(PageId::new(0, pnv as u64), sid)) {
+                    return;
+                }
+            }
+
+            let next = u64::from_le_bytes([
+                data[ho + 4],
+                data[ho + 5],
+                data[ho + 6],
+                data[ho + 7],
+                data[ho + 8],
+                data[ho + 9],
+                data[ho + 10],
+                data[ho + 11],
+            ]);
+            current_page_num = if next == u64::MAX {
+                None
+            } else {
+                Some(next as u32)
+            };
+        }
+    }
+
     /// Find leftmost leaf page number.
     fn find_leftmost_leaf_num(&self, pages: &InMemoryPageStore) -> u32 {
         let height = self.height.load(Ordering::Acquire);

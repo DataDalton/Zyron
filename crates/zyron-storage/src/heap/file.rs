@@ -318,7 +318,7 @@ impl HeapFile {
     // Tuple Operations
     // =========================================================================
 
-    /// Retrieves a tuple by its TupleId.
+    /// Retrieves a tuple by its TupleId (allocates a Vec for tuple data).
     pub async fn get(&self, tuple_id: TupleId) -> Result<Option<Tuple>> {
         let page_data = match self.fetch_page(tuple_id.page_id).await {
             Ok(data) => data,
@@ -328,6 +328,23 @@ impl HeapFile {
 
         let page = HeapPage::from_bytes(page_data);
         Ok(page.get_tuple(SlotId(tuple_id.slot_id)))
+    }
+
+    /// Zero-copy tuple access. The closure receives a TupleView that borrows
+    /// directly from the page buffer. No Vec allocation for tuple data.
+    /// The page frame is held for the duration of the closure.
+    pub async fn with_tuple<F, R>(&self, tuple_id: TupleId, f: F) -> Result<Option<R>>
+    where
+        F: FnOnce(TupleView<'_>) -> R,
+    {
+        let page_data = match self.fetch_page(tuple_id.page_id).await {
+            Ok(data) => data,
+            Err(ZyronError::IoError(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+
+        let view = HeapPage::get_tuple_view_from_slice(&page_data, SlotId(tuple_id.slot_id));
+        Ok(view.map(f))
     }
 
     /// Deletes a tuple by its TupleId.

@@ -338,6 +338,148 @@ impl InternalEntry {
     }
 }
 
+/// Zero-copy view of a leaf entry. Borrows key from page buffer.
+#[derive(Debug, Clone, Copy)]
+pub struct LeafEntryView<'a> {
+    pub key: &'a [u8],
+    pub tuple_id: TupleId,
+}
+
+impl<'a> LeafEntryView<'a> {
+    /// Parses a leaf entry view from a byte slice without copying the key.
+    pub fn from_bytes(buf: &'a [u8]) -> Option<(Self, usize)> {
+        if buf.len() < 8 {
+            return None;
+        }
+        let key_len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+        let total = 2 + key_len + 6;
+        if buf.len() < total {
+            return None;
+        }
+        let key = &buf[2..2 + key_len];
+        let page_num = u32::from_le_bytes([
+            buf[2 + key_len],
+            buf[3 + key_len],
+            buf[4 + key_len],
+            buf[5 + key_len],
+        ]);
+        let slot_id = u16::from_le_bytes([buf[6 + key_len], buf[7 + key_len]]);
+        let page_id = PageId::new(0, page_num as u64);
+        let tuple_id = TupleId::new(page_id, slot_id);
+        Some((Self { key, tuple_id }, total))
+    }
+
+    /// Size of this entry on disk.
+    pub fn size_on_disk(&self) -> usize {
+        2 + self.key.len() + 6
+    }
+
+    /// Converts to an owned LeafEntry by copying the key.
+    pub fn to_owned(&self) -> LeafEntry {
+        LeafEntry {
+            key: Bytes::copy_from_slice(self.key),
+            tuple_id: self.tuple_id,
+        }
+    }
+
+    /// Writes this entry directly to a byte slice at the given offset.
+    /// Returns the number of bytes written.
+    #[inline]
+    pub fn write_to_slice(&self, buf: &mut [u8], offset: usize) -> usize {
+        let kl = self.key.len();
+        buf[offset..offset + 2].copy_from_slice(&(kl as u16).to_le_bytes());
+        buf[offset + 2..offset + 2 + kl].copy_from_slice(self.key);
+        let vo = offset + 2 + kl;
+        buf[vo..vo + 4].copy_from_slice(&(self.tuple_id.page_id.page_num as u32).to_le_bytes());
+        buf[vo + 4..vo + 6].copy_from_slice(&self.tuple_id.slot_id.to_le_bytes());
+        2 + kl + 6
+    }
+}
+
+impl LeafEntry {
+    /// Writes this entry directly to a byte slice at the given offset.
+    /// Returns the number of bytes written. Avoids BytesMut allocation.
+    #[inline]
+    pub fn write_to_slice(&self, buf: &mut [u8], offset: usize) -> usize {
+        let kl = self.key.len();
+        buf[offset..offset + 2].copy_from_slice(&(kl as u16).to_le_bytes());
+        buf[offset + 2..offset + 2 + kl].copy_from_slice(&self.key);
+        let vo = offset + 2 + kl;
+        buf[vo..vo + 4].copy_from_slice(&(self.tuple_id.page_id.page_num as u32).to_le_bytes());
+        buf[vo + 4..vo + 6].copy_from_slice(&self.tuple_id.slot_id.to_le_bytes());
+        2 + kl + 6
+    }
+}
+
+/// Zero-copy view of an internal entry. Borrows key from page buffer.
+#[derive(Debug, Clone, Copy)]
+pub struct InternalEntryView<'a> {
+    pub key: &'a [u8],
+    pub child_page_id: PageId,
+}
+
+impl<'a> InternalEntryView<'a> {
+    /// Parses an internal entry view from a byte slice without copying the key.
+    pub fn from_bytes(buf: &'a [u8]) -> Option<(Self, usize)> {
+        if buf.len() < 6 {
+            return None;
+        }
+        let key_len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+        let total = 2 + key_len + 4;
+        if buf.len() < total {
+            return None;
+        }
+        let key = &buf[2..2 + key_len];
+        let page_num = u32::from_le_bytes([
+            buf[2 + key_len],
+            buf[3 + key_len],
+            buf[4 + key_len],
+            buf[5 + key_len],
+        ]);
+        let child_page_id = PageId::new(0, page_num as u64);
+        Some((Self { key, child_page_id }, total))
+    }
+
+    /// Size of this entry on disk.
+    pub fn size_on_disk(&self) -> usize {
+        2 + self.key.len() + 4
+    }
+
+    /// Converts to an owned InternalEntry by copying the key.
+    pub fn to_owned(&self) -> InternalEntry {
+        InternalEntry {
+            key: Bytes::copy_from_slice(self.key),
+            child_page_id: self.child_page_id,
+        }
+    }
+
+    /// Writes this entry directly to a byte slice at the given offset.
+    /// Returns the number of bytes written.
+    #[inline]
+    pub fn write_to_slice(&self, buf: &mut [u8], offset: usize) -> usize {
+        let kl = self.key.len();
+        buf[offset..offset + 2].copy_from_slice(&(kl as u16).to_le_bytes());
+        buf[offset + 2..offset + 2 + kl].copy_from_slice(self.key);
+        let vo = offset + 2 + kl;
+        buf[vo..vo + 4].copy_from_slice(&(self.child_page_id.page_num as u32).to_le_bytes());
+        2 + kl + 4
+    }
+}
+
+impl InternalEntry {
+    /// Writes this entry directly to a byte slice at the given offset.
+    /// Returns the number of bytes written. Avoids BytesMut allocation.
+    #[inline]
+    pub fn write_to_slice(&self, buf: &mut [u8], offset: usize) -> usize {
+        let kl = self.key.len();
+        buf[offset..offset + 2].copy_from_slice(&(kl as u16).to_le_bytes());
+        buf[offset + 2..offset + 2 + kl].copy_from_slice(&self.key);
+        let vo = offset + 2 + kl;
+        buf[vo..vo + 4].copy_from_slice(&(self.child_page_id.page_num as u32).to_le_bytes());
+        2 + kl + 4
+    }
+}
+
 /// Performance statistics for profiling insert operations.
 #[derive(Default, Clone)]
 pub struct InsertStats {

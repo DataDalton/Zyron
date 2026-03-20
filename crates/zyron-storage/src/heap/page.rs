@@ -17,7 +17,7 @@
 //! ```
 
 use super::constants::{DATA_START, HEAP_HEADER_OFFSET, HEAP_HEADER_SIZE, TUPLE_SLOT_SIZE};
-use crate::tuple::{Tuple, TupleHeader};
+use crate::tuple::{Tuple, TupleHeader, TupleView};
 use zyron_common::page::{PAGE_SIZE, PageHeader, PageId, PageType};
 use zyron_common::{Result, ZyronError};
 
@@ -318,7 +318,7 @@ impl HeapPage {
         count
     }
 
-    /// Reads a tuple from a slice at the given slot.
+    /// Reads a tuple from a slice at the given slot (allocates).
     #[inline]
     pub fn get_tuple_from_slice(data: &[u8], slot_id: SlotId) -> Option<Tuple> {
         let header = Self::heap_header_from_slice(data);
@@ -329,6 +329,23 @@ impl HeapPage {
         let start = slot.offset as usize;
         let end = start + slot.length as usize;
         Tuple::deserialize(&data[start..end])
+    }
+
+    /// Zero-copy tuple read from a slice. Borrows data from the page buffer.
+    #[inline]
+    pub fn get_tuple_view_from_slice<'a>(data: &'a [u8], slot_id: SlotId) -> Option<TupleView<'a>> {
+        let header = Self::heap_header_from_slice(data);
+        let slot = Self::get_slot_from_slice(data, slot_id, header.slot_count)?;
+        if slot.is_empty() {
+            return None;
+        }
+        let start = slot.offset as usize;
+        let hdr = TupleHeader::from_bytes(&data[start..start + TupleHeader::SIZE]);
+        let data_end = start + TupleHeader::SIZE + hdr.data_len as usize;
+        Some(TupleView::new(
+            hdr,
+            &data[start + TupleHeader::SIZE..data_end],
+        ))
     }
 
     /// Inserts a tuple into a page slice.
@@ -636,7 +653,7 @@ impl HeapPage {
         Ok(slot_id)
     }
 
-    /// Reads a tuple from the page.
+    /// Reads a tuple from the page (allocates).
     pub fn get_tuple(&self, slot_id: SlotId) -> Option<Tuple> {
         let slot = self.get_slot(slot_id)?;
 
@@ -648,6 +665,22 @@ impl HeapPage {
         let end = start + slot.length as usize;
 
         Tuple::deserialize(&self.data[start..end])
+    }
+
+    /// Zero-copy tuple read. Borrows data from this page's buffer.
+    #[inline]
+    pub fn get_tuple_view(&self, slot_id: SlotId) -> Option<TupleView<'_>> {
+        Self::get_tuple_view_from_slice(&*self.data, slot_id)
+    }
+
+    /// Returns an iterator that yields zero-copy tuple views.
+    pub fn iter_views(&self) -> HeapPageViewIterator<'_> {
+        let header = self.heap_header();
+        HeapPageViewIterator {
+            page: self,
+            current_slot: 0,
+            slot_count: header.slot_count,
+        }
     }
 
     /// Deletes a tuple from the page.
@@ -793,7 +826,7 @@ impl HeapPage {
     }
 }
 
-/// Iterator over tuples in a heap page.
+/// Iterator over tuples in a heap page (allocates per tuple).
 pub struct HeapPageIterator<'a> {
     page: &'a HeapPage,
     current_slot: u16,
@@ -810,6 +843,30 @@ impl<'a> Iterator for HeapPageIterator<'a> {
 
             if let Some(tuple) = self.page.get_tuple(slot_id) {
                 return Some((slot_id, tuple));
+            }
+        }
+        None
+    }
+}
+
+/// Zero-copy iterator over tuples in a heap page.
+/// Yields borrowed TupleView references instead of owned Tuples.
+pub struct HeapPageViewIterator<'a> {
+    page: &'a HeapPage,
+    current_slot: u16,
+    slot_count: u16,
+}
+
+impl<'a> Iterator for HeapPageViewIterator<'a> {
+    type Item = (SlotId, TupleView<'a>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.current_slot < self.slot_count {
+            let slot_id = SlotId(self.current_slot);
+            self.current_slot += 1;
+
+            if let Some(view) = self.page.get_tuple_view(slot_id) {
+                return Some((slot_id, view));
             }
         }
         None

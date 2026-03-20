@@ -2,7 +2,8 @@
 
 use super::constants::MIN_FILL_FACTOR;
 use super::types::{
-    DeleteResult, InternalEntry, InternalPageHeader, LeafEntry, LeafPageHeader, compare_keys,
+    DeleteResult, InternalEntry, InternalEntryView, InternalPageHeader, LeafEntry, LeafEntryView,
+    LeafPageHeader, compare_keys,
 };
 use crate::tuple::TupleId;
 use bytes::Bytes;
@@ -111,10 +112,29 @@ impl BTreeLeafPage {
         entries
     }
 
+    /// Zero-copy read of all entries. Borrows keys from page buffer.
+    pub fn entry_views(&self) -> Vec<LeafEntryView<'_>> {
+        let header = self.leaf_header();
+        let num_slots = header.num_slots as usize;
+        let mut views = Vec::with_capacity(num_slots);
+
+        for slot_idx in 0..num_slots {
+            let slot_offset = Self::SLOT_ARRAY_START + slot_idx * Self::SLOT_SIZE;
+            let entry_offset =
+                u16::from_le_bytes([self.data[slot_offset], self.data[slot_offset + 1]]) as usize;
+
+            if let Some((view, _)) = LeafEntryView::from_bytes(&self.data[entry_offset..]) {
+                views.push(view);
+            }
+        }
+
+        views
+    }
+
     /// Binary search for a key. Returns Ok(index) if found, Err(index) for insertion point.
     pub fn search(&self, key: &[u8]) -> std::result::Result<usize, usize> {
-        let entries = self.entries();
-        entries.binary_search_by(|e| compare_keys(e.key.as_ref(), key))
+        let views = self.entry_views();
+        views.binary_search_by(|e| compare_keys(e.key, key))
     }
 
     /// Inserts a key-value pair into the leaf. Returns error if page is full.
@@ -125,10 +145,10 @@ impl BTreeLeafPage {
     }
 
     /// Writes entries to the page using slotted format.
+    /// Uses write_to_slice to avoid BytesMut allocation per entry.
     fn write_entries(&mut self, entries: &[LeafEntry]) -> Result<()> {
         let num_entries = entries.len();
 
-        // Calculate total space needed
         let slot_space = num_entries * Self::SLOT_SIZE;
         let entry_space: usize = entries.iter().map(|e| e.size_on_disk()).sum();
         let slot_array_end = Self::SLOT_ARRAY_START + slot_space;
@@ -137,23 +157,20 @@ impl BTreeLeafPage {
             return Err(ZyronError::NodeFull);
         }
 
-        // Write entries backward from end and slots forward from start
         let mut data_end = PAGE_SIZE;
 
         for (slot_idx, entry) in entries.iter().enumerate() {
-            let bytes = entry.to_bytes();
-            data_end -= bytes.len();
-            self.data[data_end..data_end + bytes.len()].copy_from_slice(&bytes);
+            let entry_size = entry.size_on_disk();
+            data_end -= entry_size;
+            entry.write_to_slice(&mut *self.data, data_end);
 
-            // Write slot
             let slot_offset = Self::SLOT_ARRAY_START + slot_idx * Self::SLOT_SIZE;
             self.data[slot_offset..slot_offset + 2]
                 .copy_from_slice(&(data_end as u16).to_le_bytes());
             self.data[slot_offset + 2..slot_offset + 4]
-                .copy_from_slice(&(bytes.len() as u16).to_le_bytes());
+                .copy_from_slice(&(entry_size as u16).to_le_bytes());
         }
 
-        // Update header
         let mut header = self.leaf_header();
         header.num_slots = num_entries as u16;
         header.data_end = data_end as u16;
@@ -319,13 +336,21 @@ impl BTreeLeafPage {
     }
 
     /// Deletes a key from the leaf. Returns DeleteResult indicating outcome.
+    /// Uses entry_views to avoid Bytes allocation during search, then
+    /// materializes remaining entries for the rewrite.
     pub fn delete(&mut self, key: &[u8]) -> DeleteResult {
         match self.search(key) {
             Ok(idx) => {
-                let mut entries = self.entries();
-                entries.remove(idx);
-                self.write_entries(&entries)
-                    .expect("write_entries failed after removing an entry, page data corrupted");
+                let views = self.entry_views();
+                let owned: Vec<LeafEntry> = views
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != idx)
+                    .map(|(_, v)| v.to_owned())
+                    .collect();
+                drop(views);
+                self.write_entries(&owned)
+                    .expect("write_entries failed after delete, page data corrupted");
                 if self.is_underfull() {
                     DeleteResult::Underfull
                 } else {
@@ -357,71 +382,60 @@ impl BTreeLeafPage {
     }
 
     /// Borrows entries from a right sibling to fix underflow.
-    ///
-    /// Returns the new separator key that should replace the old separator
-    /// in the parent node, or None if borrowing is not possible.
+    /// Uses entry views for reads, write_to_slice for writes.
     pub fn borrow_from_right(&mut self, right_sibling: &mut BTreeLeafPage) -> Option<Bytes> {
         if right_sibling.num_entries() <= 1 {
-            return None; // Can't borrow if sibling would become empty
+            return None;
         }
 
-        let mut right_entries = right_sibling.entries();
-        let borrowed = right_entries.remove(0);
+        let right_views = right_sibling.entry_views();
+        let borrowed = right_views[0].to_owned();
+        let new_sep = Bytes::copy_from_slice(right_views[1].key);
+        let new_right: Vec<LeafEntry> = right_views[1..].iter().map(|v| v.to_owned()).collect();
+        drop(right_views);
+
+        right_sibling.write_entries(&new_right).ok()?;
 
         let mut my_entries = self.entries();
         my_entries.push(borrowed);
+        self.write_entries(&my_entries).ok()?;
 
-        // Write updated entries
-        if self.write_entries(&my_entries).is_err() {
-            return None;
-        }
-        if right_sibling.write_entries(&right_entries).is_err() {
-            return None;
-        }
-
-        // New separator is the first key of the right sibling after borrowing
-        right_entries.first().map(|e| e.key.clone())
+        Some(new_sep)
     }
 
     /// Borrows entries from a left sibling to fix underflow.
-    ///
-    /// Returns the new separator key that should replace the old separator
-    /// in the parent node, or None if borrowing is not possible.
+    /// Uses entry views for reads, write_to_slice for writes.
     pub fn borrow_from_left(&mut self, left_sibling: &mut BTreeLeafPage) -> Option<Bytes> {
         if left_sibling.num_entries() <= 1 {
-            return None; // Can't borrow if sibling would become empty
+            return None;
         }
 
-        let mut left_entries = left_sibling.entries();
-        let borrowed = left_entries.pop()?;
+        let left_views = left_sibling.entry_views();
+        let last_idx = left_views.len() - 1;
+        let borrowed = left_views[last_idx].to_owned();
+        let new_sep = Bytes::copy_from_slice(left_views[last_idx].key);
+        let new_left: Vec<LeafEntry> = left_views[..last_idx]
+            .iter()
+            .map(|v| v.to_owned())
+            .collect();
+        drop(left_views);
+
+        left_sibling.write_entries(&new_left).ok()?;
 
         let mut my_entries = self.entries();
         my_entries.insert(0, borrowed);
+        self.write_entries(&my_entries).ok()?;
 
-        // Write updated entries
-        if self.write_entries(&my_entries).is_err() {
-            return None;
-        }
-        if left_sibling.write_entries(&left_entries).is_err() {
-            return None;
-        }
-
-        // New separator is the first key of this node after borrowing
-        my_entries.first().map(|e| e.key.clone())
+        Some(new_sep)
     }
 
     /// Merges this leaf with its right sibling.
-    ///
-    /// All entries from right_sibling are moved into this leaf.
-    /// The right sibling becomes empty and should be deallocated.
-    /// Returns true if merge succeeded.
+    /// Right sibling is read via views, self uses owned entries since it grows.
     pub fn merge_with_right(&mut self, right_sibling: &mut BTreeLeafPage) -> bool {
         let mut my_entries = self.entries();
-        let right_entries = right_sibling.entries();
+        let right_views = right_sibling.entry_views();
+        my_entries.extend(right_views.iter().map(|v| v.to_owned()));
 
-        my_entries.extend(right_entries);
-
-        // Update next_leaf pointer to skip the merged sibling
         let new_next = right_sibling.next_leaf();
         self.set_next_leaf(new_next);
 
@@ -434,24 +448,22 @@ impl BTreeLeafPage {
     }
 
     /// Splits this leaf into two. Returns (split_key, new_right_page).
+    /// Uses entry_views to avoid Bytes allocation during read, materializes
+    /// both halves for the rewrite (required since write regions overlap reads).
     pub fn split(&mut self, new_page_id: PageId) -> (Bytes, BTreeLeafPage) {
-        let entries = self.entries();
-        let mid = entries.len() / 2;
+        let views = self.entry_views();
+        let mid = views.len() / 2;
+        let split_key = Bytes::copy_from_slice(views[mid].key);
 
-        let left_entries: Vec<_> = entries[..mid].to_vec();
-        let right_entries: Vec<_> = entries[mid..].to_vec();
+        let left_owned: Vec<LeafEntry> = views[..mid].iter().map(|v| v.to_owned()).collect();
+        let right_owned: Vec<LeafEntry> = views[mid..].iter().map(|v| v.to_owned()).collect();
+        drop(views);
 
-        // The split key is the first key of the right page
-        let split_key = right_entries[0].key.clone();
+        let _ = self.write_entries(&left_owned);
 
-        // Rewrite left page
-        let _ = self.write_entries(&left_entries);
-
-        // Create right page
         let mut right_page = BTreeLeafPage::new(new_page_id);
-        let _ = right_page.write_entries(&right_entries);
+        let _ = right_page.write_entries(&right_owned);
 
-        // Link pages
         let old_next = self.next_leaf();
         self.set_next_leaf(Some(new_page_id));
         right_page.set_next_leaf(old_next);
@@ -551,7 +563,7 @@ impl BTreeInternalPage {
         }
     }
 
-    /// Reads all entries from the internal node.
+    /// Reads all entries from the internal node (allocates per key).
     pub fn entries(&self) -> Vec<InternalEntry> {
         let header = self.internal_header();
         let mut entries = Vec::with_capacity(header.num_keys as usize);
@@ -567,6 +579,51 @@ impl BTreeInternalPage {
         }
 
         entries
+    }
+
+    /// Zero-copy read of all entries. Borrows keys from page buffer.
+    pub fn entry_views(&self) -> Vec<InternalEntryView<'_>> {
+        let header = self.internal_header();
+        let mut views = Vec::with_capacity(header.num_keys as usize);
+        let mut offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
+
+        for _ in 0..header.num_keys {
+            if let Some((view, consumed)) = InternalEntryView::from_bytes(&self.data[offset..]) {
+                views.push(view);
+                offset += consumed;
+            } else {
+                break;
+            }
+        }
+
+        views
+    }
+
+    /// Reads entry views via raw pointer, bypassing borrow checker.
+    /// Internal page entries are sequential, so writes to self.data at the same
+    /// offsets would overlap with reads. Callers must write to a DIFFERENT buffer
+    /// (right_page, sibling) or ensure the write region is beyond the read region.
+    ///
+    /// SAFETY: Returned views reference self.data via raw pointer with 'static lifetime.
+    /// The caller must ensure self.data is not deallocated while views are in use.
+    unsafe fn entry_views_raw(&self) -> Vec<InternalEntryView<'static>> {
+        let header = self.internal_header();
+        let mut views = Vec::with_capacity(header.num_keys as usize);
+        let ptr = self.data.as_ptr();
+        let mut offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
+
+        for _ in 0..header.num_keys {
+            let remaining = PAGE_SIZE - offset;
+            let buf = unsafe { std::slice::from_raw_parts(ptr.add(offset), remaining) };
+            if let Some((view, consumed)) = InternalEntryView::from_bytes(buf) {
+                views.push(view);
+                offset += consumed;
+            } else {
+                break;
+            }
+        }
+
+        views
     }
 
     /// Finds the child page for a given key.
@@ -749,18 +806,18 @@ impl BTreeInternalPage {
         Ok(())
     }
 
-    /// Writes entries to the page.
+    /// Writes entries to the page using write_to_slice (no BytesMut alloc).
     fn write_entries(&mut self, entries: &[InternalEntry]) -> Result<()> {
         let mut header = self.internal_header();
         let mut offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
 
         for entry in entries {
-            let bytes = entry.to_bytes();
-            if offset + bytes.len() > PAGE_SIZE {
+            let entry_size = entry.size_on_disk();
+            if offset + entry_size > PAGE_SIZE {
                 return Err(ZyronError::NodeFull);
             }
-            self.data[offset..offset + bytes.len()].copy_from_slice(&bytes);
-            offset += bytes.len();
+            entry.write_to_slice(&mut *self.data, offset);
+            offset += entry_size;
         }
 
         header.num_keys = entries.len() as u16;
@@ -770,22 +827,42 @@ impl BTreeInternalPage {
     }
 
     /// Splits this internal node. Returns (promoted_key, new_right_page).
+    /// Uses raw pointer reads to avoid per-entry Bytes allocation.
     pub fn split(&mut self, new_page_id: PageId) -> (Bytes, BTreeInternalPage) {
-        let entries = self.entries();
-        let mid = entries.len() / 2;
+        // SAFETY: Views read via raw pointer. Left half is written to self (sequential
+        // entries start at same offset, but left half is always <= original size so
+        // the write is bounded within the original data). Right half writes to a
+        // different buffer (right_page).
+        let views = unsafe { self.entry_views_raw() };
+        let mid = views.len() / 2;
 
-        let left_entries: Vec<_> = entries[..mid].to_vec();
-        let promoted_key = entries[mid].key.clone();
-        let right_first_child = entries[mid].child_page_id;
-        let right_entries: Vec<_> = entries[mid + 1..].to_vec();
+        let promoted_key = Bytes::copy_from_slice(views[mid].key);
+        let right_first_child = views[mid].child_page_id;
+        let level = self.level();
 
-        // Rewrite left page
-        let _ = self.write_entries(&left_entries);
+        // Left half: entries are already in place at their current offsets
+        // (they're the first `mid` entries in sequential order). Just update the header.
+        let mut left_end = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
+        for view in &views[..mid] {
+            left_end += view.size_on_disk();
+        }
+        let mut header = self.internal_header();
+        header.num_keys = mid as u16;
+        header.free_space_offset = left_end as u16;
+        self.set_internal_header(header);
 
-        // Create right page
-        let mut right_page = BTreeInternalPage::new(new_page_id, self.level());
+        // Write right half to new page (different buffer, no overlap)
+        let mut right_page = BTreeInternalPage::new(new_page_id, level);
         right_page.set_leftmost_child(right_first_child);
-        let _ = right_page.write_entries(&right_entries);
+        let mut offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
+        for view in &views[mid + 1..] {
+            view.write_to_slice(&mut *right_page.data, offset);
+            offset += view.size_on_disk();
+        }
+        let mut rh = right_page.internal_header();
+        rh.num_keys = (views.len() - mid - 1) as u16;
+        rh.free_space_offset = offset as u16;
+        right_page.set_internal_header(rh);
 
         (promoted_key, right_page)
     }
@@ -816,15 +893,29 @@ impl BTreeInternalPage {
 
     /// Deletes a key from the internal node. Returns DeleteResult indicating outcome.
     pub fn delete(&mut self, key: &[u8]) -> DeleteResult {
-        let entries = self.entries();
-        let pos = entries.iter().position(|e| e.key.as_ref() == key);
+        // SAFETY: Views read via raw pointer. Deleting one entry and rewriting
+        // the rest sequentially is safe because the written data is always
+        // <= the original data size (one entry removed).
+        let views = unsafe { self.entry_views_raw() };
+        let pos = views.iter().position(|v| v.key == key);
 
         match pos {
             Some(idx) => {
-                let mut entries = entries;
-                entries.remove(idx);
-                self.write_entries(&entries)
-                    .expect("write_entries failed after removing an entry, page data corrupted");
+                // Entries before idx are already in place. Compute offset of entry[idx].
+                let mut offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
+                for view in &views[..idx] {
+                    offset += view.size_on_disk();
+                }
+                // Skip entry[idx], write entries after it starting at offset
+                for view in &views[idx + 1..] {
+                    view.write_to_slice(&mut *self.data, offset);
+                    offset += view.size_on_disk();
+                }
+                let mut header = self.internal_header();
+                header.num_keys = (views.len() - 1) as u16;
+                header.free_space_offset = offset as u16;
+                self.set_internal_header(header);
+
                 if self.is_underfull() {
                     DeleteResult::Underfull
                 } else {
@@ -836,109 +927,158 @@ impl BTreeInternalPage {
     }
 
     /// Borrows an entry from a right sibling to fix underflow.
-    ///
-    /// The separator_key is the key in the parent that separates this node from the sibling.
-    /// Returns the new separator key that should replace the old one in the parent,
-    /// or None if borrowing is not possible.
     pub fn borrow_from_right(
         &mut self,
         right_sibling: &mut BTreeInternalPage,
         separator_key: Bytes,
     ) -> Option<Bytes> {
         if right_sibling.num_keys() <= 1 {
-            return None; // Can't borrow if sibling would become too empty
+            return None;
         }
 
-        let mut right_entries = right_sibling.entries();
-        let borrowed = right_entries.remove(0);
+        // SAFETY: Raw reads from both pages. Self grows by one entry (appended past
+        // existing data). Right sibling shrinks (fewer entries, no overlap issue).
+        let right_views = unsafe { right_sibling.entry_views_raw() };
+        let my_views = unsafe { self.entry_views_raw() };
 
-        // The separator comes down to become a key in this node
-        let new_entry = InternalEntry {
-            key: separator_key,
-            child_page_id: right_sibling.leftmost_child(),
+        let new_sep = Bytes::copy_from_slice(right_views[0].key);
+        let borrowed_child = right_views[0].child_page_id;
+        let right_leftmost = right_sibling.leftmost_child();
+
+        // Self: existing entries are already in place. Append separator past them.
+        let sep_view = InternalEntryView {
+            key: &separator_key,
+            child_page_id: right_leftmost,
         };
-
-        let mut my_entries = self.entries();
-        my_entries.push(new_entry);
-
-        // Update right sibling's leftmost child to the borrowed entry's child
-        right_sibling.set_leftmost_child(borrowed.child_page_id);
-
-        // Write updated entries
-        if self.write_entries(&my_entries).is_err() {
-            return None;
+        let my_count = my_views.len() + 1;
+        let mut append_offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
+        for view in my_views.iter() {
+            append_offset += view.size_on_disk();
         }
-        if right_sibling.write_entries(&right_entries).is_err() {
-            return None;
-        }
+        sep_view.write_to_slice(&mut *self.data, append_offset);
+        append_offset += sep_view.size_on_disk();
+        let mut header = self.internal_header();
+        header.num_keys = my_count as u16;
+        header.free_space_offset = append_offset as u16;
+        self.set_internal_header(header);
 
-        // The borrowed key becomes the new separator in the parent
-        Some(borrowed.key)
+        // Right sibling: remove first entry by shifting remaining entries left.
+        // Uses copy_within to handle overlapping regions safely.
+        right_sibling.set_leftmost_child(borrowed_child);
+        let first_entry_size = right_views[0].size_on_disk();
+        let entries_start = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
+        let old_free = right_sibling.internal_header().free_space_offset as usize;
+        let src_start = entries_start + first_entry_size;
+        let shift_len = old_free - src_start;
+        if shift_len > 0 {
+            right_sibling
+                .data
+                .copy_within(src_start..old_free, entries_start);
+        }
+        let mut rh = right_sibling.internal_header();
+        rh.num_keys = (right_views.len() - 1) as u16;
+        rh.free_space_offset = (old_free - first_entry_size) as u16;
+        right_sibling.set_internal_header(rh);
+
+        Some(new_sep)
     }
 
     /// Borrows an entry from a left sibling to fix underflow.
-    ///
-    /// The separator_key is the key in the parent that separates this node from the sibling.
-    /// Returns the new separator key that should replace the old one in the parent,
-    /// or None if borrowing is not possible.
     pub fn borrow_from_left(
         &mut self,
         left_sibling: &mut BTreeInternalPage,
         separator_key: Bytes,
     ) -> Option<Bytes> {
         if left_sibling.num_keys() <= 1 {
-            return None; // Can't borrow if sibling would become too empty
+            return None;
         }
 
-        let mut left_entries = left_sibling.entries();
-        let borrowed = left_entries.pop()?;
+        // SAFETY: Raw reads. Self grows by one entry (prepended). Left shrinks.
+        // For self: prepending shifts all data, but raw views point to old locations
+        // which are read before being overwritten. Since we write sequentially from
+        // the start, entry[0] is written first (from sep_view, not from self),
+        // then entry[1] is written from my_views[0] which was read before any overlap.
+        let left_views = unsafe { left_sibling.entry_views_raw() };
+        let my_views = unsafe { self.entry_views_raw() };
 
-        // The separator comes down to become a key in this node
-        let new_entry = InternalEntry {
-            key: separator_key,
-            child_page_id: self.leftmost_child(),
+        let last_idx = left_views.len() - 1;
+        let new_sep = Bytes::copy_from_slice(left_views[last_idx].key);
+        let borrowed_child = left_views[last_idx].child_page_id;
+        let my_leftmost = self.leftmost_child();
+
+        // Write self: separator + existing entries
+        self.set_leftmost_child(borrowed_child);
+        let sep_view = InternalEntryView {
+            key: &separator_key,
+            child_page_id: my_leftmost,
         };
-
-        let mut my_entries = self.entries();
-        my_entries.insert(0, new_entry);
-
-        // Update this node's leftmost child to the borrowed entry's child
-        self.set_leftmost_child(borrowed.child_page_id);
-
-        // Write updated entries
-        if self.write_entries(&my_entries).is_err() {
-            return None;
+        let my_count = 1 + my_views.len();
+        // For prepend on sequential layout, we need owned entries to avoid overlap
+        let owned_my: Vec<InternalEntry> = my_views.iter().map(|v| v.to_owned()).collect();
+        let mut offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
+        sep_view.write_to_slice(&mut *self.data, offset);
+        offset += sep_view.size_on_disk();
+        for entry in &owned_my {
+            entry.write_to_slice(&mut *self.data, offset);
+            offset += entry.size_on_disk();
         }
-        if left_sibling.write_entries(&left_entries).is_err() {
-            return None;
-        }
+        let mut header = self.internal_header();
+        header.num_keys = my_count as u16;
+        header.free_space_offset = offset as u16;
+        self.set_internal_header(header);
 
-        // The borrowed key becomes the new separator in the parent
-        Some(borrowed.key)
+        // Left sibling: removing last entry is just a header update (truncation).
+        // Entries before last_idx are already in place.
+        let mut left_end = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
+        for view in &left_views[..last_idx] {
+            left_end += view.size_on_disk();
+        }
+        let mut lh = left_sibling.internal_header();
+        lh.num_keys = last_idx as u16;
+        lh.free_space_offset = left_end as u16;
+        left_sibling.set_internal_header(lh);
+
+        Some(new_sep)
     }
 
     /// Merges this internal node with its right sibling.
-    ///
-    /// The separator_key is the key from the parent that separates the two nodes.
-    /// All entries from right_sibling are moved into this node.
-    /// Returns true if merge succeeded.
     pub fn merge_with_right(
         &mut self,
         right_sibling: &BTreeInternalPage,
         separator_key: Bytes,
     ) -> bool {
-        let mut my_entries = self.entries();
+        // SAFETY: Raw reads from both pages. Self grows (existing entries + sep + right),
+        // but existing entries are written first at the same offsets (identity copy),
+        // then separator and right entries are appended past the original data.
+        let my_views = unsafe { self.entry_views_raw() };
+        let right_views = unsafe { right_sibling.entry_views_raw() };
 
-        // The separator key comes down with the right sibling's leftmost child
-        let separator_entry = InternalEntry {
-            key: separator_key,
-            child_page_id: right_sibling.leftmost_child(),
+        let right_leftmost = right_sibling.leftmost_child();
+        let sep_view = InternalEntryView {
+            key: &separator_key,
+            child_page_id: right_leftmost,
         };
-        my_entries.push(separator_entry);
 
-        // Add all entries from the right sibling
-        my_entries.extend(right_sibling.entries());
+        let total = my_views.len() + 1 + right_views.len();
+        // Skip identity copy of my_views (already in place), start appending at their end
+        let mut offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
+        for view in my_views.iter() {
+            offset += view.size_on_disk();
+        }
+        // Append separator + right entries past existing data
+        for view in std::iter::once(&sep_view).chain(right_views.iter()) {
+            let sz = view.size_on_disk();
+            if offset + sz > PAGE_SIZE {
+                return false;
+            }
+            view.write_to_slice(&mut *self.data, offset);
+            offset += sz;
+        }
+        let mut header = self.internal_header();
+        header.num_keys = total as u16;
+        header.free_space_offset = offset as u16;
+        self.set_internal_header(header);
 
-        self.write_entries(&my_entries).is_ok()
+        true
     }
 }
