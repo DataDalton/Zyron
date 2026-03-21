@@ -44,6 +44,6 @@ pub use heap::{
 };
 pub use tuple::{Tuple, TupleFlags, TupleHeader, TupleId};
 pub use txn::{
-    GcStats, IntentLockTable, IsolationLevel, LockTable, MvccGc, NodeLatch, Snapshot, Transaction,
-    TransactionManager, TransactionStatus,
+    GcStats, IntentLockTable, IsolationLevel, LockTable, MvccGc, NodeLatch, Savepoint, Snapshot,
+    Transaction, TransactionManager, TransactionStatus, WaitForGraph,
 };

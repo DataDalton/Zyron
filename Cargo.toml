@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+members = ["crates/*", "binaries/*"]
 
 [workspace.package]
 edition = "2024"
@@ -58,6 +58,9 @@ ryu = "1"
 # Arrow ecosystem
 arrow = "58.0.0"
 parquet = "58.0.0"
+
+# Config
+toml = "0.8"
 
 # Testing
 rcgen = "0.13"

@@ -369,6 +369,11 @@ impl Catalog {
         self.cache.list_tables(schema_id)
     }
 
+    /// Returns all cached tables across all schemas.
+    pub fn list_all_tables(&self) -> Vec<Arc<TableEntry>> {
+        self.cache.list_all_tables()
+    }
+
     // --- Index operations ---
 
     pub async fn create_index(

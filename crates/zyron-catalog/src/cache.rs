@@ -289,6 +289,11 @@ impl CatalogCache {
             .collect()
     }
 
+    /// Returns all cached tables across all schemas.
+    pub fn list_all_tables(&self) -> Vec<Arc<TableEntry>> {
+        self.tables.read().values().cloned().collect()
+    }
+
     // --- Index operations ---
 
     pub fn get_index(&self, id: IndexId) -> Option<Arc<IndexEntry>> {

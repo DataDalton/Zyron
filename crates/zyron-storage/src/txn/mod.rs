@@ -6,6 +6,7 @@
 //! and buffer pool pin/unpin.
 
 mod btree_latch;
+mod deadlock;
 mod gc;
 mod intent_lock;
 mod isolation;
@@ -13,6 +14,7 @@ mod lock_table;
 mod snapshot;
 
 pub use btree_latch::NodeLatch;
+pub use deadlock::WaitForGraph;
 pub use gc::{GcStats, MvccGc};
 pub use intent_lock::IntentLockTable;
 pub use isolation::IsolationLevel;
@@ -36,6 +38,17 @@ pub enum TransactionStatus {
     Aborted,
 }
 
+/// A saved transaction state for partial rollback.
+pub struct Savepoint {
+    /// User-specified savepoint name.
+    pub name: String,
+    /// Snapshot at the time the savepoint was created.
+    pub snapshot: Snapshot,
+    /// Number of row locks held when the savepoint was created.
+    /// Used to determine which locks were acquired after the savepoint.
+    pub lock_count: usize,
+}
+
 /// A database transaction with MVCC snapshot isolation.
 pub struct Transaction {
     /// Monotonically increasing transaction ID.
@@ -48,6 +61,8 @@ pub struct Transaction {
     pub status: TransactionStatus,
     /// Last LSN written by this transaction (for WAL chaining).
     last_lsn: Lsn,
+    /// Stack of savepoints for partial rollback.
+    savepoints: Vec<Savepoint>,
 }
 
 impl Transaction {
@@ -86,6 +101,48 @@ impl Transaction {
             ))
         })
     }
+
+    /// Creates a savepoint with the given name.
+    /// Captures the current snapshot and lock count for later rollback.
+    pub fn savepoint(&mut self, name: String, current_lock_count: usize) {
+        self.savepoints.push(Savepoint {
+            name,
+            snapshot: self.snapshot.clone(),
+            lock_count: current_lock_count,
+        });
+    }
+
+    /// Rolls back to the named savepoint.
+    /// Restores the snapshot to the savepoint's state and returns the
+    /// lock count at the savepoint (caller is responsible for releasing
+    /// locks acquired after this count).
+    /// Returns None if no savepoint with that name exists.
+    pub fn rollback_to_savepoint(&mut self, name: &str) -> Option<usize> {
+        // Find the savepoint, keeping all savepoints at or before it
+        let idx = self.savepoints.iter().rposition(|sp| sp.name == name)?;
+        let sp = &self.savepoints[idx];
+        let lock_count = sp.lock_count;
+        self.snapshot = sp.snapshot.clone();
+        // Remove savepoints created after this one (but keep the named one)
+        self.savepoints.truncate(idx + 1);
+        Some(lock_count)
+    }
+
+    /// Releases a savepoint by name. Locks acquired after the savepoint persist.
+    /// Returns false if the savepoint was not found.
+    pub fn release_savepoint(&mut self, name: &str) -> bool {
+        if let Some(idx) = self.savepoints.iter().rposition(|sp| sp.name == name) {
+            self.savepoints.remove(idx);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns the number of active savepoints.
+    pub fn savepoint_count(&self) -> usize {
+        self.savepoints.len()
+    }
 }
 
 /// Manages transaction lifecycle: begin, commit, abort.
@@ -103,6 +160,8 @@ pub struct TransactionManager {
     lock_table: LockTable,
     /// Intent lock table for B+Tree key-level conflict detection.
     intent_locks: IntentLockTable,
+    /// Wait-for graph for deadlock detection.
+    wait_for_graph: WaitForGraph,
 }
 
 impl TransactionManager {
@@ -114,6 +173,7 @@ impl TransactionManager {
             wal,
             lock_table: LockTable::new(),
             intent_locks: IntentLockTable::new(),
+            wait_for_graph: WaitForGraph::new(),
         }
     }
 
@@ -126,6 +186,7 @@ impl TransactionManager {
             wal,
             lock_table: LockTable::new(),
             intent_locks: IntentLockTable::new(),
+            wait_for_graph: WaitForGraph::new(),
         }
     }
 
@@ -156,6 +217,7 @@ impl TransactionManager {
             snapshot,
             status: TransactionStatus::Active,
             last_lsn: lsn,
+            savepoints: Vec::new(),
         })
     }
 
@@ -179,6 +241,9 @@ impl TransactionManager {
         // Release all locks held by this transaction
         self.lock_table.unlock_all(txn.txn_id);
         self.intent_locks.unlock_all(txn.txn_id);
+
+        // Clean up wait-for graph edges
+        self.wait_for_graph.remove_transaction(txn.txn_id);
 
         // Remove from active set
         let _ = self.active_txns.remove_sync(&txn.txn_id);
@@ -206,6 +271,9 @@ impl TransactionManager {
         // Release all locks held by this transaction
         self.lock_table.unlock_all(txn.txn_id);
         self.intent_locks.unlock_all(txn.txn_id);
+
+        // Clean up wait-for graph edges
+        self.wait_for_graph.remove_transaction(txn.txn_id);
 
         // Remove from active set
         let _ = self.active_txns.remove_sync(&txn.txn_id);
@@ -242,6 +310,11 @@ impl TransactionManager {
     /// Returns a reference to the intent lock table.
     pub fn intent_locks(&self) -> &IntentLockTable {
         &self.intent_locks
+    }
+
+    /// Returns a reference to the wait-for graph for deadlock detection.
+    pub fn wait_for_graph(&self) -> &WaitForGraph {
+        &self.wait_for_graph
     }
 
     /// Returns the number of currently active transactions.
@@ -385,5 +458,74 @@ mod tests {
         let (mgr, _dir) = create_test_manager();
         let txn = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
         assert_eq!(txn.txn_id_u32().unwrap(), 1u32);
+    }
+
+    #[test]
+    fn test_savepoint_basic() {
+        let (mgr, _dir) = create_test_manager();
+        let mut txn = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
+
+        assert_eq!(txn.savepoint_count(), 0);
+
+        txn.savepoint("sp1".into(), 0);
+        assert_eq!(txn.savepoint_count(), 1);
+
+        txn.savepoint("sp2".into(), 5);
+        assert_eq!(txn.savepoint_count(), 2);
+    }
+
+    #[test]
+    fn test_savepoint_rollback() {
+        let (mgr, _dir) = create_test_manager();
+        let mut txn = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
+
+        txn.savepoint("sp1".into(), 3);
+        txn.savepoint("sp2".into(), 7);
+
+        // Rollback to sp1 should remove sp2 and return lock count 3
+        let lock_count = txn.rollback_to_savepoint("sp1");
+        assert_eq!(lock_count, Some(3));
+        assert_eq!(txn.savepoint_count(), 1); // sp1 retained
+
+        // Rollback to non-existent savepoint
+        assert!(txn.rollback_to_savepoint("sp3").is_none());
+    }
+
+    #[test]
+    fn test_savepoint_release() {
+        let (mgr, _dir) = create_test_manager();
+        let mut txn = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
+
+        txn.savepoint("sp1".into(), 0);
+        txn.savepoint("sp2".into(), 5);
+
+        // Release sp1
+        assert!(txn.release_savepoint("sp1"));
+        assert_eq!(txn.savepoint_count(), 1);
+
+        // Release non-existent
+        assert!(!txn.release_savepoint("sp3"));
+    }
+
+    #[test]
+    fn test_wait_for_graph_accessor() {
+        let (mgr, _dir) = create_test_manager();
+        assert_eq!(mgr.wait_for_graph().edge_count(), 0);
+    }
+
+    #[test]
+    fn test_commit_cleans_wait_for_graph() {
+        let (mgr, _dir) = create_test_manager();
+
+        let txn1 = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
+        let mut txn2 = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
+
+        // Simulate: txn2 is waiting for txn1
+        mgr.wait_for_graph().add_edge(txn2.txn_id, txn1.txn_id);
+        assert_eq!(mgr.wait_for_graph().edge_count(), 1);
+
+        // Committing txn2 should clean up its edges
+        mgr.commit(&mut txn2).unwrap();
+        assert_eq!(mgr.wait_for_graph().edge_count(), 0);
     }
 }

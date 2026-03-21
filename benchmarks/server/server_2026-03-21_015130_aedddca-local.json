@@ -1,0 +1,130 @@
+{
+  "id": "2026-03-21_015130_aedddca-local",
+  "date": "2026-03-21 01:51:54Z",
+  "ts": 1774057914,
+  "commit": "aedddca-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Checkpoint": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 15.09 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 15.19 },
+      "Checkpoint latency (ms)": {
+        "average": 0.060360,
+        "runs": [0.06, 0.06, 0.05, 0.05, 0.08],
+        "target": 3.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Metrics": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 15.09 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 15.06 },
+      "Metrics scrape latency (us)": {
+        "average": 3.420000,
+        "runs": [7.20, 2.80, 2.40, 2.40, 2.30],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Graceful Shutdown": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 15.05 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 15.12 },
+      "Shutdown latency (ms)": {
+        "average": 0.055560,
+        "runs": [0.05, 0.05, 0.07, 0.06, 0.05],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Crash Recovery": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 15.08 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 15.03 },
+      "1MB WAL recovery latency (ms)": {
+        "average": 3.642480,
+        "runs": [4.57, 3.44, 3.33, 3.41, 3.47],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Clean recovery latency (ms)": {
+        "average": 0.400600,
+        "runs": [0.43, 0.40, 0.42, 0.37, 0.39],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Health Checks": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 15.03 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 15.14 },
+      "Health check latency (us)": {
+        "average": 161.600000,
+        "runs": [448.80, 96.00, 93.10, 84.50, 85.60],
+        "target": 100.000000,
+        "passed": false,
+        "higher_is_better": false
+      },
+      "Health endpoint round-trip (us)": {
+        "average": 161.600000,
+        "runs": [161.60],
+        "target": 10000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Server Startup": {
+      "util_before": { "cpu_pct": 9.0, "ram_used_gb": 15.24 },
+      "util_after": { "cpu_pct": 7.0, "ram_used_gb": 15.28 },
+      "Cold start latency (ms)": {
+        "average": 6.192040,
+        "runs": [11.38, 4.93, 4.88, 4.89, 4.89],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Warm start latency (ms)": {
+        "average": 5.350360,
+        "runs": [10.04, 4.31, 4.18, 4.12, 4.09],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Memory Baseline": {
+      "Core struct overhead (bytes)": {
+        "average": 568.000000,
+        "runs": [568.00],
+        "target": 10000000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "End-to-End Wire": {
+      "util_before": { "cpu_pct": 6.0, "ram_used_gb": 15.22 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 15.25 },
+      "Handshake latency (us)": {
+        "average": 215.242200,
+        "runs": [120.34, 227.79, 113.98, 493.04, 121.06],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Concurrent Connections": {
+      "Max connections capacity": {
+        "average": 100000.000000,
+        "runs": [100000.00],
+        "target": 100000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}
