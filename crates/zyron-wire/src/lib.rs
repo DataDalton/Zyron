@@ -111,7 +111,11 @@ pub async fn start_server(
                         } => {
                             local.block_on(&rt, async {
                                 debug!("TCP connection from {} on worker {}", peer_addr, worker_id);
-                                let mut conn = Connection::new(stream, state);
+                                let mut conn = Connection::new(
+                                    stream,
+                                    state,
+                                    Some(peer_addr.ip().to_string()),
+                                );
                                 if let Err(e) = conn.run().await {
                                     error!("Connection error from {}: {}", peer_addr, e);
                                 }
@@ -130,7 +134,11 @@ pub async fn start_server(
                                     "QUIC connection from {} on worker {}",
                                     peer_addr, worker_id
                                 );
-                                let mut conn = Connection::new(stream, state);
+                                let mut conn = Connection::new(
+                                    stream,
+                                    state,
+                                    Some(peer_addr.ip().to_string()),
+                                );
                                 if let Err(e) = conn.run().await {
                                     error!("Connection error from {}: {}", peer_addr, e);
                                 }
@@ -224,7 +232,7 @@ pub async fn start_server(
 
 /// Handles a single TCP connection. Useful for testing and embedding.
 pub async fn handle_connection(stream: tokio::net::TcpStream, server_state: Arc<ServerState>) {
-    let mut conn = Connection::new(stream, server_state);
+    let mut conn = Connection::new(stream, server_state, None);
     if let Err(e) = conn.run().await {
         error!("Connection error: {}", e);
     }

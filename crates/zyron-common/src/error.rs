@@ -126,6 +126,28 @@ pub enum ZyronError {
     #[error("Catalog corrupted: {0}")]
     CatalogCorrupted(String),
 
+    // Authentication and authorization errors
+    #[error("Authentication failed for user \"{0}\"")]
+    AuthenticationFailed(String),
+
+    #[error("Permission denied: {0}")]
+    PermissionDenied(String),
+
+    #[error("Insufficient clearance for column \"{0}\"")]
+    InsufficientClearance(String),
+
+    #[error("Role not found: {0}")]
+    RoleNotFound(String),
+
+    #[error("Role already exists: {0}")]
+    RoleAlreadyExists(String),
+
+    #[error("Circular role dependency detected")]
+    CircularRoleDependency,
+
+    #[error("Invalid credential: {0}")]
+    InvalidCredential(String),
+
     // Query errors
     #[error("Parse error: {0}")]
     ParseError(String),
@@ -158,6 +180,16 @@ pub enum ZyronError {
 
     #[error("Compaction failed: {0}")]
     CompactionFailed(String),
+
+    // Brute force and rate limiting errors
+    #[error("Account locked: {0}")]
+    AccountLocked(String),
+
+    #[error("IP blocked: {0}")]
+    IpBlocked(String),
+
+    #[error("Rate limited, retry after {0}ms")]
+    RateLimited(u64),
 
     // Internal errors
     #[error("Internal error: {0}")]

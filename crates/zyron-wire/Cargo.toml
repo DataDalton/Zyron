@@ -13,6 +13,7 @@ zyron-executor = { path = "../zyron-executor" }
 zyron-storage = { path = "../zyron-storage" }
 zyron-wal = { path = "../zyron-wal" }
 zyron-buffer = { path = "../zyron-buffer" }
+zyron-auth = { path = "../zyron-auth" }
 tokio.workspace = true
 bytes.workspace = true
 tracing.workspace = true

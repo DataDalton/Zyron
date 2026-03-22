@@ -47,7 +47,8 @@ socket2 = "0.6"
 tokio-util = { version = "0.7", features = ["codec"] }
 futures = "0.3"
 md-5 = "0.10"
-sha2 = "0.10"
+sha1 = "0.10"
+sha2 = { version = "0.10", features = ["compress"] }
 hmac = "0.12"
 pbkdf2 = "0.12"
 base64 = "0.22"

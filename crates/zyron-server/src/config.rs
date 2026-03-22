@@ -309,6 +309,19 @@ impl Default for CheckpointSection {
 pub struct AuthSection {
     pub method: String,
     pub password_file: Option<PathBuf>,
+    pub password_encryption: String,
+    pub balloon_space_cost: Option<usize>,
+    pub balloon_time_cost: Option<usize>,
+    pub jwt_secret: Option<String>,
+    pub jwt_algorithm: Option<String>,
+    pub jwt_issuer: Option<String>,
+    pub brute_force_enabled: Option<bool>,
+    pub lockout_threshold: Option<u32>,
+    pub lockout_duration_secs: Option<u64>,
+    pub ip_block_threshold: Option<u32>,
+    pub failure_window_secs: Option<u64>,
+    pub ip_block_duration_secs: Option<u64>,
+    pub min_attempt_interval_ms: Option<u64>,
 }
 
 impl Default for AuthSection {
@@ -316,6 +329,19 @@ impl Default for AuthSection {
         Self {
             method: "trust".into(),
             password_file: None,
+            password_encryption: "balloon-sha-256".into(),
+            balloon_space_cost: None,
+            balloon_time_cost: None,
+            jwt_secret: None,
+            jwt_algorithm: None,
+            jwt_issuer: None,
+            brute_force_enabled: None,
+            lockout_threshold: None,
+            lockout_duration_secs: None,
+            ip_block_threshold: None,
+            failure_window_secs: None,
+            ip_block_duration_secs: None,
+            min_attempt_interval_ms: None,
         }
     }
 }

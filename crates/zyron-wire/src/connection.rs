@@ -44,6 +44,7 @@ pub struct ServerState {
     pub buffer_pool: Arc<BufferPool>,
     pub disk_manager: Arc<DiskManager>,
     pub txn_manager: Arc<TransactionManager>,
+    pub security_manager: Option<Arc<zyron_auth::SecurityManager>>,
 }
 
 /// Cached prepared statement.
@@ -91,11 +92,13 @@ pub struct Connection<T: WireTransport> {
     process_id: i32,
     /// Secret key for cancel request verification.
     secret_key: i32,
+    /// Remote peer IP address (if available).
+    pub peer_addr: Option<String>,
 }
 
 impl<T: WireTransport> Connection<T> {
     /// Creates a new connection handler for the given transport stream.
-    pub fn new(stream: T, server: Arc<ServerState>) -> Self {
+    pub fn new(stream: T, server: Arc<ServerState>, peer_addr: Option<String>) -> Self {
         stream.configure_immediate();
         let pid = NEXT_PROCESS_ID.fetch_add(1, Ordering::Relaxed);
 
@@ -112,6 +115,7 @@ impl<T: WireTransport> Connection<T> {
             portals: HashMap::new(),
             process_id: pid,
             secret_key: pid.wrapping_mul(2654435761_u32 as i32),
+            peer_addr,
         }
     }
 
@@ -120,8 +124,9 @@ impl<T: WireTransport> Connection<T> {
         stream: T,
         server: Arc<ServerState>,
         authenticator: Box<dyn Authenticator>,
+        peer_addr: Option<String>,
     ) -> Self {
-        let mut conn = Self::new(stream, server);
+        let mut conn = Self::new(stream, server, peer_addr);
         conn.authenticator = authenticator;
         conn
     }
@@ -221,6 +226,44 @@ impl<T: WireTransport> Connection<T> {
             ));
         }
 
+        // Pre-authentication brute force gate
+        let peer_ip = self
+            .peer_addr
+            .clone()
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        if let Some(ref sm) = self.server.security_manager {
+            let gate = sm.brute_force.check_allowed(
+                &peer_ip,
+                &user,
+                &database,
+                0,
+                &sm.ip_manager,
+                false,
+                None,
+            );
+            match gate {
+                zyron_auth::AuthGate::Blocked(reason) => {
+                    self.feed(BackendMessage::ErrorResponse(ErrorFields {
+                        severity: "FATAL".into(),
+                        code: "28000".into(),
+                        message: reason,
+                        detail: None,
+                        hint: None,
+                        position: None,
+                    }))
+                    .await?;
+                    self.flush().await?;
+                    return Err(ProtocolError::AuthFailed(
+                        "blocked by brute force policy".into(),
+                    ));
+                }
+                zyron_auth::AuthGate::Delayed(dur) => {
+                    tokio::time::sleep(dur).await;
+                }
+                zyron_auth::AuthGate::Proceed => {}
+            }
+        }
+
         // Authenticate
         match self.authenticator.initial_message(&user) {
             AuthResult::Authenticated => {}
@@ -249,11 +292,30 @@ impl<T: WireTransport> Connection<T> {
                             self.flush().await?;
                         }
                         Err(e) => {
+                            if let Some(ref sm) = self.server.security_manager {
+                                let action = sm.brute_force.record_failure(
+                                    &peer_ip,
+                                    &user,
+                                    &database,
+                                    0,
+                                    "authentication failed",
+                                    &sm.ip_manager,
+                                );
+                                if action.is_some() {
+                                    sm.brute_force
+                                        .report_lockout(&peer_ip, &user, &sm.ip_manager);
+                                }
+                            }
                             return Err(ProtocolError::AuthFailed(e.to_string()));
                         }
                     }
                 }
             }
+        }
+
+        // Record successful authentication
+        if let Some(ref sm) = self.server.security_manager {
+            sm.brute_force.record_success(&peer_ip, &user, &database);
         }
 
         // Resolve database ID from catalog
@@ -1296,6 +1358,16 @@ pub fn zyron_error_to_fields(err: &ZyronError) -> ErrorFields {
         ZyronError::DatabaseAlreadyExists(_) => ("42P04", "ERROR"),
         ZyronError::PlanError(_) => ("42000", "ERROR"),
         ZyronError::ExecutionError(_) => ("XX000", "ERROR"),
+        ZyronError::AuthenticationFailed(_) => ("28000", "FATAL"),
+        ZyronError::PermissionDenied(_) => ("42501", "ERROR"),
+        ZyronError::InsufficientClearance(_) => ("42501", "ERROR"),
+        ZyronError::AccountLocked(_) => ("28000", "FATAL"),
+        ZyronError::IpBlocked(_) => ("28000", "FATAL"),
+        ZyronError::RateLimited(_) => ("28000", "FATAL"),
+        ZyronError::RoleNotFound(_) => ("42704", "ERROR"),
+        ZyronError::RoleAlreadyExists(_) => ("42710", "ERROR"),
+        ZyronError::InvalidCredential(_) => ("28P01", "FATAL"),
+        ZyronError::CircularRoleDependency => ("42P27", "ERROR"),
         _ => ("XX000", "ERROR"),
     };
 

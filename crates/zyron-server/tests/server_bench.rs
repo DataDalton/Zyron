@@ -1386,7 +1386,7 @@ fn test_13_end_to_end_wire() {
 
                 let server_handle = tokio::task::spawn_local(async move {
                     let (stream, _) = lis.accept().await.expect("accept failed");
-                    let mut conn = zyron_wire::connection::Connection::new(stream, state);
+                    let mut conn = zyron_wire::connection::Connection::new(stream, state, None);
                     let _ = conn.run().await;
                 });
 

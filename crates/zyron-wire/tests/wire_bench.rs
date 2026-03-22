@@ -1793,7 +1793,7 @@ fn test_wire_connection_handshake_latency() {
                 // Spawn server accept as a local task so it doesn't block the client
                 let server_handle = tokio::task::spawn_local(async move {
                     let (stream, _) = lis.accept().await.expect("accept failed");
-                    let mut conn = zyron_wire::connection::Connection::new(stream, state);
+                    let mut conn = zyron_wire::connection::Connection::new(stream, state, None);
                     let _ = conn.run().await;
                 });
 
@@ -1884,7 +1884,7 @@ fn test_wire_concurrent_connections() {
                     let (stream, _) = server_listener.accept().await.expect("accept failed");
                     let state = Arc::clone(&server_ss);
                     handles.push(tokio::task::spawn_local(async move {
-                        let mut conn = zyron_wire::connection::Connection::new(stream, state);
+                        let mut conn = zyron_wire::connection::Connection::new(stream, state, None);
                         let _ = conn.run().await;
                     }));
                 }
@@ -2830,7 +2830,8 @@ fn test_quic_pg_handshake_latency() {
 
                 // spawn_local for !Send Connection futures (planner uses Pin<Box<dyn Future>>)
                 let server_handle = tokio::task::spawn_local(async move {
-                    let mut conn = zyron_wire::connection::Connection::new(server_stream, state);
+                    let mut conn =
+                        zyron_wire::connection::Connection::new(server_stream, state, None);
                     let _ = conn.run().await;
                 });
 
@@ -2930,7 +2931,7 @@ fn test_quic_pg_simple_query_throughput() {
             );
 
             let server_handle = tokio::task::spawn_local(async move {
-                let mut conn = zyron_wire::connection::Connection::new(server_stream, state);
+                let mut conn = zyron_wire::connection::Connection::new(server_stream, state, None);
                 let _ = conn.run().await;
             });
 

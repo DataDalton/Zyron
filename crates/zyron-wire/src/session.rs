@@ -23,11 +23,28 @@ pub struct Session {
     pub database_id: DatabaseId,
     /// Parsed search path for the planner.
     pub search_path: Vec<String>,
+    /// Security context for privilege checks. None if auth system is not initialized.
+    pub security_context: Option<zyron_auth::SecurityContext>,
 }
 
 impl Session {
     /// Creates a new session with default PostgreSQL-compatible parameters.
     pub fn new(user: String, database: String, database_id: DatabaseId) -> Self {
+        Self::with_security_context(user, database, database_id, None)
+    }
+
+    /// Creates a new session with an optional security context for privilege checks.
+    pub fn with_security_context(
+        user: String,
+        database: String,
+        database_id: DatabaseId,
+        security_context: Option<zyron_auth::SecurityContext>,
+    ) -> Self {
+        // PG wire protocol requires is_superuser parameter for client compatibility.
+        // In ZyronDB, all access control flows through the RBAC/ABAC privilege system.
+        // This value is for client display only and does not bypass any checks.
+        let superuser_str = "on";
+
         let variables = HashMap::from([
             ("server_version".into(), String::from("16.0")),
             ("server_encoding".into(), String::from("UTF8")),
@@ -37,7 +54,7 @@ impl Session {
             ("integer_datetimes".into(), String::from("on")),
             ("standard_conforming_strings".into(), String::from("on")),
             ("search_path".into(), String::from("\"$user\", public")),
-            ("is_superuser".into(), String::from("on")),
+            ("is_superuser".into(), String::from(superuser_str)),
             ("session_authorization".into(), user.clone()),
         ]);
 
@@ -48,6 +65,7 @@ impl Session {
             user,
             database_id,
             search_path: vec!["public".into()],
+            security_context,
         }
     }
 

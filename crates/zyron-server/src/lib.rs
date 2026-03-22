@@ -4,6 +4,7 @@
 //! session management, background workers, metrics, health endpoints, and
 //! graceful shutdown.
 
+pub mod auth_storage;
 pub mod background;
 pub mod config;
 pub mod health;
@@ -310,13 +311,35 @@ impl Server {
             start_txn_id,
         ));
 
-        // 8. Build ServerState for zyron-wire
+        // 8. Create SecurityManager with heap-backed auth storage
+        let auth_storage: Arc<dyn zyron_auth::storage::AuthStorage> = Arc::new(
+            zyron_auth::HeapAuthStorage::new(Arc::clone(&disk_manager), Arc::clone(&buffer_pool))?,
+        );
+        let security_manager = zyron_auth::SecurityManager::new(auth_storage).await?;
+
+        // Apply brute force config from the config file
+        {
+            let auth_cfg = &self.config.auth;
+            let policy = zyron_auth::BruteForcePolicy {
+                lockout_threshold: auth_cfg.lockout_threshold.unwrap_or(5),
+                lockout_duration_secs: auth_cfg.lockout_duration_secs.unwrap_or(900),
+                ip_block_threshold: auth_cfg.ip_block_threshold.unwrap_or(50),
+                failure_window_secs: auth_cfg.failure_window_secs.unwrap_or(600),
+                ip_block_duration_secs: auth_cfg.ip_block_duration_secs.unwrap_or(3600),
+                min_attempt_interval_ms: auth_cfg.min_attempt_interval_ms.unwrap_or(100),
+                lockout_enabled: auth_cfg.brute_force_enabled.unwrap_or(true),
+            };
+            security_manager.brute_force.set_global_policy(policy);
+        }
+
+        // Build ServerState for zyron-wire
         let server_state = Arc::new(ServerState {
             catalog: Arc::clone(&catalog),
             wal: Arc::clone(&wal),
             buffer_pool: Arc::clone(&buffer_pool),
             disk_manager: Arc::clone(&disk_manager),
             txn_manager: Arc::clone(&txn_manager),
+            security_manager: Some(Arc::new(security_manager)),
         });
 
         // 9. Create CheckpointTracker
