@@ -3,6 +3,7 @@
 //! Provides shared IP blocking and trusted IP lists used by brute force defense,
 //! compliance, and other subsystems. Controlled by ManageAuthRules privilege.
 
+use crate::rcu::Rcu;
 use crate::role::UserId;
 use zyron_catalog::encoding::{
     read_string, read_u8, read_u32, read_u64, write_string, write_u8, write_u32, write_u64,
@@ -178,7 +179,7 @@ fn matches_cidr(cidr: &str, ip: &str) -> bool {
 /// Thread-safe IP blocking and trust management.
 pub struct IpManager {
     blocks: scc::HashMap<String, IpBlockEntry>,
-    trusted: parking_lot::RwLock<Vec<TrustedIpEntry>>,
+    trusted: Rcu<Vec<TrustedIpEntry>>,
 }
 
 impl IpManager {
@@ -186,7 +187,7 @@ impl IpManager {
     pub fn new() -> Self {
         Self {
             blocks: scc::HashMap::new(),
-            trusted: parking_lot::RwLock::new(Vec::new()),
+            trusted: Rcu::new(Vec::new()),
         }
     }
 
@@ -199,8 +200,7 @@ impl IpManager {
 
     /// Bulk loads trusted IP entries from storage.
     pub fn load_trusted(&self, entries: Vec<TrustedIpEntry>) {
-        let mut trusted = self.trusted.write();
-        *trusted = entries;
+        self.trusted.store(entries);
     }
 
     /// Checks if an IP is blocked. Returns the block entry if found.
@@ -230,7 +230,7 @@ impl IpManager {
 
     /// Checks if an IP matches any trusted CIDR range.
     pub fn is_trusted(&self, ip: &str) -> bool {
-        let trusted = self.trusted.read();
+        let trusted = self.trusted.load();
         for entry in trusted.iter() {
             if matches_cidr(&entry.ip_or_cidr, ip) {
                 return true;
@@ -279,16 +279,20 @@ impl IpManager {
 
     /// Adds a trusted IP entry.
     pub fn add_trusted(&self, entry: TrustedIpEntry) {
-        let mut trusted = self.trusted.write();
-        trusted.push(entry);
+        self.trusted.update(|v| v.push(entry));
     }
 
     /// Removes a trusted IP entry by its IP or CIDR string. Returns true if found.
     pub fn remove_trusted(&self, ip_or_cidr: &str) -> bool {
-        let mut trusted = self.trusted.write();
-        let len_before = trusted.len();
-        trusted.retain(|e| e.ip_or_cidr != ip_or_cidr);
-        trusted.len() < len_before
+        let snap = self.trusted.load();
+        if !snap.iter().any(|e| e.ip_or_cidr == ip_or_cidr) {
+            return false;
+        }
+        let target = ip_or_cidr.to_string();
+        self.trusted.update(|v| {
+            v.retain(|e| e.ip_or_cidr != target);
+        });
+        true
     }
 
     /// Returns a snapshot of all active (non-expired) blocks.
@@ -306,7 +310,7 @@ impl IpManager {
 
     /// Returns a snapshot of all trusted IP entries.
     pub fn trusted_list(&self) -> Vec<TrustedIpEntry> {
-        self.trusted.read().clone()
+        (*self.trusted.load()).clone()
     }
 
     /// Removes all expired blocks.
@@ -336,7 +340,7 @@ impl IpManager {
 
     /// Returns all trusted entries for persistence.
     pub fn export_trusted(&self) -> Vec<TrustedIpEntry> {
-        self.trusted.read().clone()
+        (*self.trusted.load()).clone()
     }
 }
 

@@ -22,7 +22,10 @@ async-trait.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+p256.workspace = true
+ed25519-dalek.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+mimalloc.workspace = true
 zyron-bench-harness = { path = "../zyron-bench-harness" }

@@ -23,6 +23,8 @@ pub enum AuthMethod {
     Jwt = 7,
     ApiKey = 8,
     PasswordAndTotp = 9,
+    Fido2 = 10,
+    PasswordAndFido2 = 11,
 }
 
 impl AuthMethod {
@@ -39,6 +41,8 @@ impl AuthMethod {
             7 => Ok(AuthMethod::Jwt),
             8 => Ok(AuthMethod::ApiKey),
             9 => Ok(AuthMethod::PasswordAndTotp),
+            10 => Ok(AuthMethod::Fido2),
+            11 => Ok(AuthMethod::PasswordAndFido2),
             _ => Err(ZyronError::Internal(format!(
                 "Invalid AuthMethod value: {}",
                 v
@@ -628,10 +632,10 @@ mod tests {
 
     #[test]
     fn test_auth_method_from_u8_all_variants() {
-        for i in 0..=9u8 {
+        for i in 0..=11u8 {
             assert!(AuthMethod::from_u8(i).is_ok());
         }
-        assert!(AuthMethod::from_u8(10).is_err());
+        assert!(AuthMethod::from_u8(12).is_err());
     }
 
     #[test]

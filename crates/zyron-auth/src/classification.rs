@@ -4,6 +4,7 @@
 //! Confidential, Restricted). Roles have a clearance level, and access
 //! is granted only when the clearance meets or exceeds the column label.
 
+use crate::rcu::RcuMap;
 use serde::{Deserialize, Serialize};
 use zyron_common::{Result, ZyronError};
 
@@ -79,16 +80,16 @@ impl ColumnClassification {
 }
 
 /// In-memory store mapping (table_id, column_id) to classification levels.
-/// Thread-safe via scc::HashMap for concurrent read/write access.
+/// Thread-safe via RcuMap for lock-free reads.
 pub struct ClassificationStore {
-    labels: scc::HashMap<(u32, u16), ClassificationLevel>,
+    labels: RcuMap<(u32, u16), ClassificationLevel>,
 }
 
 impl ClassificationStore {
     /// Creates an empty classification store.
     pub fn new() -> Self {
         Self {
-            labels: scc::HashMap::new(),
+            labels: RcuMap::empty_map(),
         }
     }
 
@@ -102,7 +103,7 @@ impl ClassificationStore {
         column_id: u16,
     ) -> bool {
         let key = (table_id, column_id);
-        match self.labels.read_sync(&key, |_, level| *level) {
+        match self.labels.get(&key) {
             Some(level) => role_clearance >= level,
             None => true,
         }
@@ -111,27 +112,21 @@ impl ClassificationStore {
     /// Sets or updates the classification level for a column.
     pub fn set_classification(&self, table_id: u32, column_id: u16, level: ClassificationLevel) {
         let key = (table_id, column_id);
-        match self.labels.entry_sync(key) {
-            scc::hash_map::Entry::Occupied(mut occ) => {
-                *occ.get_mut() = level;
-            }
-            scc::hash_map::Entry::Vacant(vac) => {
-                let _ = vac.insert_entry(level);
-            }
-        }
+        self.labels.insert(key, level);
     }
 
     /// Removes the classification label from a column.
     pub fn drop_classification(&self, table_id: u32, column_id: u16) {
         let key = (table_id, column_id);
-        let _ = self.labels.remove_sync(&key);
+        self.labels.remove(&key);
     }
 
     /// Returns all classifications for the given table.
     /// Scans every entry and filters by table_id.
     pub fn classifications_for_table(&self, table_id: u32) -> Vec<ColumnClassification> {
+        let snap = self.labels.load();
         let mut result = Vec::new();
-        self.labels.iter_sync(|key, level| {
+        for (key, level) in snap.iter() {
             if key.0 == table_id {
                 result.push(ColumnClassification {
                     table_id: key.0,
@@ -139,8 +134,7 @@ impl ClassificationStore {
                     level: *level,
                 });
             }
-            true
-        });
+        }
         result
     }
 

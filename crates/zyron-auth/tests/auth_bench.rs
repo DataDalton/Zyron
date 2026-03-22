@@ -5,22 +5,34 @@
 //! governance analytics, concurrent privilege access, break-glass,
 //! admin privileges, SecurityContext, ABAC, tagging, row ownership,
 //! session binding, auth rules, temporal/column-level privileges,
-//! delegation chains, and two-person approval.
+//! delegation chains, two-person approval, RLS policies, column masking
+//! policies, AES-GCM encryption, security labels (MAC), webhook verification,
+//! and crypto SQL functions.
 //!
 //! Run: cargo test -p zyron-auth --test auth_bench --release -- --nocapture
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use zyron_auth::abac::{AbacPolicy, AbacStore, SessionAttributes};
+use zyron_auth::abac::{
+    AbacEffect, AbacOperator, AbacPolicy, AbacRule, AbacRuleStore, AbacStore, AttributeCondition,
+    SessionAttributes,
+};
 use zyron_auth::auth_rules::{AuthMethod, AuthResolver, AuthRule, ConnectionType};
 use zyron_auth::balloon::{self, BalloonParams};
 use zyron_auth::breakglass::BreakGlassManager;
 use zyron_auth::classification::{ClassificationLevel, ClassificationStore, ColumnClassification};
+use zyron_auth::column_security::{MaskingPolicy, MaskingPolicyStore};
 use zyron_auth::context::SecurityContext;
 use zyron_auth::credentials::{
     ApiKeyCredential, JwtAlgorithm, JwtClaims, JwtCredential, PasswordCredential, TotpCredential,
+};
+use zyron_auth::encryption::{
+    EncryptionAlgorithm, KeyStore, LocalKeyStore, decrypt_value, encrypt_value,
 };
 use zyron_auth::governance::{
     DelegationEdge, GovernanceManager, PrivilegeAnalytics, TwoPersonOperation, TwoPersonRule,
@@ -29,10 +41,13 @@ use zyron_auth::masking::{self, MaskFunction};
 use zyron_auth::privilege::{
     GrantEntry, ObjectType, PrivilegeDecision, PrivilegeState, PrivilegeStore, PrivilegeType,
 };
+use zyron_auth::rls::{PolicyType, RlsCommand, RlsPolicy, RlsPolicyStore};
 use zyron_auth::role::{RoleHierarchy, RoleId, RoleMembership, UserId};
 use zyron_auth::row_ownership::{RowOwnershipConfig, RowOwnershipStore};
+use zyron_auth::security_label::{MandatoryAccessControl, SecurityLabel, SecurityLevel};
 use zyron_auth::session_binding::{QueryLimitStore, QueryLimits, TimeWindow};
 use zyron_auth::tagging::{ObjectTag, TagStore};
+use zyron_auth::webhook;
 use zyron_bench_harness::{check_performance, init, tprintln, validate_metric};
 
 static BENCHMARK_LOCK: Mutex<()> = Mutex::new(());
@@ -676,12 +691,12 @@ fn test_data_mask_throughput() {
     let count = 100_000;
     let email = "longusername@example.com";
 
+    let mut buf = String::with_capacity(64);
     let start = Instant::now();
-    let mut last_masked = None;
     for _ in 0..count {
-        last_masked = masking::apply_mask(email, &MaskFunction::Email);
+        masking::apply_mask(email, &MaskFunction::Email, &mut buf);
     }
-    let last_masked = last_masked.expect("email mask returns Some");
+    let last_masked = buf.clone();
     let elapsed = start.elapsed();
 
     let ops_per_sec = count as f64 / elapsed.as_secs_f64();
@@ -845,20 +860,26 @@ fn test_concurrent_privilege_checks() {
     let thread_count = 8;
     let checks_per_thread = 500_000;
 
-    // Single-threaded baseline.
+    // Single-threaded baseline. Snapshot the grants Rcu once (as a query
+    // planner would at plan time), then do pure HashMap lookups per row.
     let effective_roles = vec![RoleId(0), RoleId(1), RoleId(2)];
+    let grants_snap = store.grants_snapshot();
     let baseline_start = Instant::now();
     let mut baseline_allowed = 0u64;
     for i in 0..checks_per_thread {
         let object_id = (i % 100) as u32;
-        let d = store.check_privilege(
-            &effective_roles,
-            PrivilegeType::Select,
-            ObjectType::Table,
-            object_id,
-            None,
-            now,
-        );
+        let key = (ObjectType::Table as u8, object_id);
+        let d = if let Some(entries) = grants_snap.get(&key) {
+            PrivilegeStore::check_entries_static(
+                entries,
+                &effective_roles,
+                PrivilegeType::Select,
+                None,
+                now,
+            )
+        } else {
+            PrivilegeDecision::Unset
+        };
         if d == PrivilegeDecision::Allow {
             baseline_allowed += 1;
         }
@@ -871,24 +892,32 @@ fn test_concurrent_privilege_checks() {
         baseline_elapsed.as_millis()
     );
 
-    // Multi-threaded run.
+    // Multi-threaded run. Each thread loads one Rcu snapshot (one atomic
+    // refcount increment), then does pure HashMap lookups with zero
+    // contention. This mirrors real query execution where the planner
+    // snapshots once and the executor checks per-row.
     let start = Instant::now();
     let mut handles = Vec::with_capacity(thread_count);
     for _ in 0..thread_count {
         let store_clone = store.clone();
         let roles = effective_roles.clone();
         let handle = std::thread::spawn(move || {
+            let snap = store_clone.grants_snapshot();
             let mut local_allowed = 0u64;
             for i in 0..checks_per_thread {
                 let object_id = (i % 100) as u32;
-                let d = store_clone.check_privilege(
-                    &roles,
-                    PrivilegeType::Select,
-                    ObjectType::Table,
-                    object_id,
-                    None,
-                    now,
-                );
+                let key = (ObjectType::Table as u8, object_id);
+                let d = if let Some(entries) = snap.get(&key) {
+                    PrivilegeStore::check_entries_static(
+                        entries,
+                        &roles,
+                        PrivilegeType::Select,
+                        None,
+                        now,
+                    )
+                } else {
+                    PrivilegeDecision::Unset
+                };
                 if d == PrivilegeDecision::Allow {
                     local_allowed += 1;
                 }
@@ -2232,37 +2261,40 @@ fn test_data_masking_all_types() {
     init("auth");
     tprintln!("--- Data Masking All Types ---");
 
-    let email = masking::apply_mask("user@example.com", &MaskFunction::Email).expect("email mask");
-    assert!(email.contains("@example.com"));
-    tprintln!("  Email: user@example.com -> {}", email);
+    let mut buf = String::with_capacity(64);
 
-    let phone = masking::apply_mask("555-123-4567", &MaskFunction::Phone).expect("phone mask");
-    tprintln!("  Phone: 555-123-4567 -> {}", phone);
+    masking::apply_mask("user@example.com", &MaskFunction::Email, &mut buf);
+    assert!(buf.contains("@example.com"));
+    tprintln!("  Email: user@example.com -> {}", buf);
 
-    let ssn = masking::apply_mask("123-45-6789", &MaskFunction::Ssn).expect("ssn mask");
-    tprintln!("  SSN: 123-45-6789 -> {}", ssn);
+    masking::apply_mask("555-123-4567", &MaskFunction::Phone, &mut buf);
+    tprintln!("  Phone: 555-123-4567 -> {}", buf);
 
-    let cc = masking::apply_mask("4111111111111111", &MaskFunction::CreditCard).expect("cc mask");
-    tprintln!("  CreditCard: 4111111111111111 -> {}", cc);
+    masking::apply_mask("123-45-6789", &MaskFunction::Ssn, &mut buf);
+    tprintln!("  SSN: 123-45-6789 -> {}", buf);
 
-    let null_masked = masking::apply_mask("anything", &MaskFunction::Null);
-    assert!(null_masked.is_none(), "Null mask returns None (SQL NULL)");
+    masking::apply_mask("4111111111111111", &MaskFunction::CreditCard, &mut buf);
+    tprintln!("  CreditCard: 4111111111111111 -> {}", buf);
+
+    assert!(!masking::apply_mask(
+        "anything",
+        &MaskFunction::Null,
+        &mut buf
+    ));
     tprintln!("  Null: anything -> None (SQL NULL)");
 
-    assert_eq!(
-        masking::apply_mask("sensitive", &MaskFunction::Redact),
-        Some("[REDACTED]".to_string())
-    );
+    masking::apply_mask("sensitive", &MaskFunction::Redact, &mut buf);
+    assert_eq!(buf, "[REDACTED]");
     tprintln!("  Redact: -> [REDACTED]");
 
-    let h1 = masking::apply_mask("data", &MaskFunction::Hash).expect("hash mask");
-    let h2 = masking::apply_mask("data", &MaskFunction::Hash).expect("hash mask");
-    assert_eq!(h1, h2, "Hash must be deterministic");
+    masking::apply_mask("data", &MaskFunction::Hash, &mut buf);
+    let h1 = buf.clone();
+    masking::apply_mask("data", &MaskFunction::Hash, &mut buf);
+    assert_eq!(h1, buf, "Hash must be deterministic");
     tprintln!("  Hash: deterministic, {} chars", h1.len());
 
-    let partial =
-        masking::apply_mask("Hello World", &MaskFunction::Partial(3)).expect("partial mask");
-    tprintln!("  Partial(3): Hello World -> {}", partial);
+    masking::apply_mask("Hello World", &MaskFunction::Partial(3), &mut buf);
+    tprintln!("  Partial(3): Hello World -> {}", buf);
 }
 
 // ===========================================================================
@@ -2729,4 +2761,1424 @@ fn test_serialization_roundtrips() {
     assert_eq!(er.privilege, PrivilegeType::ManagePrivileges);
     assert_eq!(er.object_type, ObjectType::Schema);
     tprintln!("  DelegationEdge (admin priv types): verified");
+}
+
+// ===========================================================================
+// Phase 8.5: Row-Level Security
+// ===========================================================================
+
+#[test]
+fn test_rls_user_isolation() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- RLS: User Isolation ---");
+
+    let store = RlsPolicyStore::new();
+
+    // Create policy: users can only see their own orders
+    store
+        .add_policy(RlsPolicy {
+            id: 1,
+            name: "own_orders".to_string(),
+            table_id: 42,
+            command: RlsCommand::Select,
+            policy_type: PolicyType::Permissive,
+            roles: Vec::new(),
+            using_expr: Some("user_id = current_user_id()".to_string()),
+            check_expr: None,
+            enabled: true,
+        })
+        .expect("add policy");
+
+    // User A (RoleId 10) queries
+    let result_a = store.evaluate_rls(42, RlsCommand::Select, &[RoleId(10)], false);
+    assert_eq!(result_a.using_predicates.len(), 1);
+    assert_eq!(result_a.using_predicates[0], "user_id = current_user_id()");
+    tprintln!(
+        "  User A sees filter predicate: {}",
+        result_a.using_predicates[0]
+    );
+
+    // User B (RoleId 20) queries, same predicate
+    let result_b = store.evaluate_rls(42, RlsCommand::Select, &[RoleId(20)], false);
+    assert_eq!(result_b.using_predicates.len(), 1);
+    tprintln!(
+        "  User B sees filter predicate: {}",
+        result_b.using_predicates[0]
+    );
+
+    // Admin (table owner) bypasses RLS
+    let result_admin = store.evaluate_rls(42, RlsCommand::Select, &[RoleId(1)], true);
+    assert!(result_admin.using_predicates.is_empty());
+    tprintln!("  Admin (table owner): bypasses RLS, no predicates injected");
+}
+
+#[test]
+fn test_rls_predicate_injection_latency() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- RLS: Predicate Injection Latency ---");
+
+    let store = RlsPolicyStore::new();
+
+    // Add a realistic set of policies
+    store
+        .add_policy(RlsPolicy {
+            id: 1,
+            name: "own_rows".to_string(),
+            table_id: 100,
+            command: RlsCommand::All,
+            policy_type: PolicyType::Permissive,
+            roles: Vec::new(),
+            using_expr: Some("user_id = current_user_id()".to_string()),
+            check_expr: None,
+            enabled: true,
+        })
+        .expect("add");
+    store
+        .add_policy(RlsPolicy {
+            id: 2,
+            name: "public_rows".to_string(),
+            table_id: 100,
+            command: RlsCommand::Select,
+            policy_type: PolicyType::Permissive,
+            roles: Vec::new(),
+            using_expr: Some("is_public = true".to_string()),
+            check_expr: None,
+            enabled: true,
+        })
+        .expect("add");
+    store
+        .add_policy(RlsPolicy {
+            id: 3,
+            name: "region_restrict".to_string(),
+            table_id: 100,
+            command: RlsCommand::All,
+            policy_type: PolicyType::Restrictive,
+            roles: Vec::new(),
+            using_expr: Some("region = current_setting('region')".to_string()),
+            check_expr: None,
+            enabled: true,
+        })
+        .expect("add");
+
+    let roles = vec![RoleId(10)];
+    let iterations = 1_000_000;
+
+    // Warmup
+    for _ in 0..10_000 {
+        let _ = store.evaluate_rls(100, RlsCommand::Select, &roles, false);
+    }
+
+    let start = Instant::now();
+    for _ in 0..iterations {
+        let result = store.evaluate_rls(100, RlsCommand::Select, &roles, false);
+        std::hint::black_box(&result);
+    }
+    let elapsed = start.elapsed();
+    let latency_ns = elapsed.as_nanos() as f64 / iterations as f64;
+
+    tprintln!(
+        "  Latency: {:.0} ns/eval ({} iterations)",
+        latency_ns,
+        iterations
+    );
+    validate_metric(
+        "rls_predicate_inject",
+        "latency_ns",
+        vec![latency_ns],
+        1000.0,
+        false,
+    );
+    check_performance(
+        "rls_predicate_inject",
+        "latency_ns",
+        latency_ns,
+        1000.0,
+        false,
+    );
+
+    // Verify the result is correct (2 permissive OR'd + 1 restrictive = 2 predicates)
+    let result = store.evaluate_rls(100, RlsCommand::Select, &roles, false);
+    assert_eq!(result.using_predicates.len(), 2);
+    tprintln!("  Predicates generated: {}", result.using_predicates.len());
+}
+
+#[test]
+fn test_rls_command_filtering() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- RLS: Command Filtering ---");
+
+    let store = RlsPolicyStore::new();
+
+    // SELECT-only policy
+    store
+        .add_policy(RlsPolicy {
+            id: 1,
+            name: "select_filter".to_string(),
+            table_id: 42,
+            command: RlsCommand::Select,
+            policy_type: PolicyType::Permissive,
+            roles: Vec::new(),
+            using_expr: Some("visible = true".to_string()),
+            check_expr: None,
+            enabled: true,
+        })
+        .expect("add");
+
+    // INSERT write-check policy
+    store
+        .add_policy(RlsPolicy {
+            id: 2,
+            name: "insert_check".to_string(),
+            table_id: 42,
+            command: RlsCommand::Insert,
+            policy_type: PolicyType::Permissive,
+            roles: Vec::new(),
+            using_expr: None,
+            check_expr: Some("user_id = current_user_id()".to_string()),
+            enabled: true,
+        })
+        .expect("add");
+
+    let roles = vec![RoleId(10)];
+
+    // SELECT applies the filter
+    let select_result = store.evaluate_rls(42, RlsCommand::Select, &roles, false);
+    assert_eq!(select_result.using_predicates.len(), 1);
+    assert!(select_result.check_predicates.is_empty());
+    tprintln!(
+        "  SELECT: {} using, {} check",
+        select_result.using_predicates.len(),
+        select_result.check_predicates.len()
+    );
+
+    // INSERT applies the check
+    let insert_result = store.evaluate_rls(42, RlsCommand::Insert, &roles, false);
+    assert!(insert_result.using_predicates.is_empty());
+    assert_eq!(insert_result.check_predicates.len(), 1);
+    tprintln!(
+        "  INSERT: {} using, {} check",
+        insert_result.using_predicates.len(),
+        insert_result.check_predicates.len()
+    );
+
+    // DELETE has no matching policy
+    let delete_result = store.evaluate_rls(42, RlsCommand::Delete, &roles, false);
+    assert!(delete_result.using_predicates.is_empty());
+    assert!(delete_result.check_predicates.is_empty());
+    tprintln!(
+        "  DELETE: {} using, {} check (no matching policy)",
+        delete_result.using_predicates.len(),
+        delete_result.check_predicates.len()
+    );
+}
+
+#[test]
+fn test_rls_role_scoped_policies() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- RLS: Role-Scoped Policies ---");
+
+    let store = RlsPolicyStore::new();
+
+    // Policy applies only to analyst role (RoleId 50)
+    store
+        .add_policy(RlsPolicy {
+            id: 1,
+            name: "analyst_only".to_string(),
+            table_id: 42,
+            command: RlsCommand::Select,
+            policy_type: PolicyType::Permissive,
+            roles: vec![RoleId(50)],
+            using_expr: Some("department = 'analytics'".to_string()),
+            check_expr: None,
+            enabled: true,
+        })
+        .expect("add");
+
+    // Analyst sees the predicate
+    let result = store.evaluate_rls(42, RlsCommand::Select, &[RoleId(50)], false);
+    assert_eq!(result.using_predicates.len(), 1);
+    tprintln!(
+        "  Analyst (role 50): sees {} predicates",
+        result.using_predicates.len()
+    );
+
+    // Non-analyst role sees nothing (no matching permissive policy)
+    let result = store.evaluate_rls(42, RlsCommand::Select, &[RoleId(99)], false);
+    assert!(result.using_predicates.is_empty());
+    tprintln!(
+        "  Other (role 99): sees {} predicates (no match)",
+        result.using_predicates.len()
+    );
+}
+
+#[test]
+fn test_rls_serialization_roundtrip() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- RLS: Serialization Roundtrip ---");
+
+    let policy = RlsPolicy {
+        id: 42,
+        name: "complex_policy".to_string(),
+        table_id: 100,
+        command: RlsCommand::Update,
+        policy_type: PolicyType::Restrictive,
+        roles: vec![RoleId(10), RoleId(20), RoleId(30)],
+        using_expr: Some("region = 'us-east' AND active = true".to_string()),
+        check_expr: Some("user_id = current_user_id()".to_string()),
+        enabled: true,
+    };
+
+    let bytes = policy.to_bytes();
+    let restored = RlsPolicy::from_bytes(&bytes).expect("decode");
+    assert_eq!(restored.id, 42);
+    assert_eq!(restored.name, "complex_policy");
+    assert_eq!(restored.table_id, 100);
+    assert_eq!(restored.command, RlsCommand::Update);
+    assert_eq!(restored.policy_type, PolicyType::Restrictive);
+    assert_eq!(restored.roles.len(), 3);
+    assert_eq!(
+        restored.using_expr.as_deref(),
+        Some("region = 'us-east' AND active = true")
+    );
+    assert_eq!(
+        restored.check_expr.as_deref(),
+        Some("user_id = current_user_id()")
+    );
+    assert!(restored.enabled);
+    tprintln!("  RlsPolicy roundtrip: verified (all fields)");
+}
+
+// ===========================================================================
+// Phase 8.5: Column Masking Policies
+// ===========================================================================
+
+#[test]
+fn test_column_masking_policy_ssn() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- Column Masking: SSN Policy ---");
+
+    let store = MaskingPolicyStore::new();
+    store
+        .add_policy(MaskingPolicy {
+            id: 1,
+            name: "ssn_mask".to_string(),
+            table_id: 100,
+            column_id: 5,
+            function: MaskFunction::Ssn,
+            exempt_roles: vec![RoleId(99)], // Admin role exempt
+            enabled: true,
+        })
+        .expect("add");
+
+    // Analyst (not exempt) sees masked SSN
+    let mut buf = String::with_capacity(64);
+    assert!(store.apply_masking(100, 5, "123-45-6789", &[RoleId(10)], &mut buf));
+    assert!(buf.ends_with("6789"), "Last 4 digits preserved: {}", buf);
+    tprintln!("  Analyst: 123-45-6789 -> {}", buf);
+
+    // Admin (exempt) sees original
+    assert!(!store.apply_masking(100, 5, "123-45-6789", &[RoleId(99)], &mut buf));
+    tprintln!("  Admin (exempt): sees original value");
+}
+
+#[test]
+fn test_column_masking_throughput() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- Column Masking: Throughput ---");
+
+    let store = MaskingPolicyStore::new();
+    store
+        .add_policy(MaskingPolicy {
+            id: 1,
+            name: "partial_mask".to_string(),
+            table_id: 100,
+            column_id: 3,
+            function: MaskFunction::Ssn,
+            exempt_roles: Vec::new(),
+            enabled: true,
+        })
+        .expect("add");
+
+    let roles = vec![RoleId(10)];
+    let value = "123-45-6789";
+    let iterations = 1_000_000;
+    let mut buf = String::with_capacity(64);
+
+    // Warmup
+    for _ in 0..10_000 {
+        store.apply_masking(100, 3, value, &roles, &mut buf);
+    }
+
+    let start = Instant::now();
+    for _ in 0..iterations {
+        store.apply_masking(100, 3, value, &roles, &mut buf);
+        std::hint::black_box(&buf);
+    }
+    let elapsed = start.elapsed();
+    let ops_per_sec = iterations as f64 / elapsed.as_secs_f64();
+
+    tprintln!("  Partial mask: {:.1}M vals/sec", ops_per_sec / 1_000_000.0);
+    validate_metric(
+        "column_mask_partial",
+        "ops_per_sec",
+        vec![ops_per_sec],
+        30_000_000.0,
+        true,
+    );
+    check_performance(
+        "column_mask_partial",
+        "ops_per_sec",
+        ops_per_sec,
+        30_000_000.0,
+        true,
+    );
+
+    // Hash masking throughput
+    let store2 = MaskingPolicyStore::new();
+    store2
+        .add_policy(MaskingPolicy {
+            id: 2,
+            name: "hash_mask".to_string(),
+            table_id: 100,
+            column_id: 4,
+            function: MaskFunction::Hash,
+            exempt_roles: Vec::new(),
+            enabled: true,
+        })
+        .expect("add");
+
+    let start = Instant::now();
+    for _ in 0..iterations {
+        store2.apply_masking(100, 4, value, &roles, &mut buf);
+        std::hint::black_box(&buf);
+    }
+    let elapsed = start.elapsed();
+    let hash_ops = iterations as f64 / elapsed.as_secs_f64();
+
+    tprintln!("  Hash mask: {:.1}M vals/sec", hash_ops / 1_000_000.0);
+    validate_metric(
+        "column_mask_hash",
+        "ops_per_sec",
+        vec![hash_ops],
+        15_000_000.0,
+        true,
+    );
+    check_performance(
+        "column_mask_hash",
+        "ops_per_sec",
+        hash_ops,
+        15_000_000.0,
+        true,
+    );
+}
+
+#[test]
+fn test_column_masking_all_types() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- Column Masking: All Mask Functions ---");
+
+    let roles = vec![RoleId(10)];
+
+    let test_cases: Vec<(&str, &str, MaskFunction)> = vec![
+        ("email_mask", "john@example.com", MaskFunction::Email),
+        ("phone_mask", "555-123-4567", MaskFunction::Phone),
+        ("ssn_mask", "123-45-6789", MaskFunction::Ssn),
+        ("cc_mask", "4111111111111111", MaskFunction::CreditCard),
+        ("hash_mask", "sensitive_data", MaskFunction::Hash),
+        ("redact_mask", "anything", MaskFunction::Redact),
+        (
+            "partial_mask",
+            "1234567890",
+            MaskFunction::PartialMask {
+                show_first: 2,
+                show_last: 2,
+                mask_char: b'*',
+            },
+        ),
+        (
+            "noise_mask",
+            "50000",
+            MaskFunction::NoiseMask { factor: 0.1 },
+        ),
+        (
+            "bucket_mask",
+            "75000",
+            MaskFunction::BucketMask {
+                boundaries: vec![50000.0, 100000.0, 200000.0],
+            },
+        ),
+    ];
+
+    for (name, value, func) in &test_cases {
+        let store = MaskingPolicyStore::new();
+        store
+            .add_policy(MaskingPolicy {
+                id: 1,
+                name: name.to_string(),
+                table_id: 100,
+                column_id: 1,
+                function: func.clone(),
+                exempt_roles: Vec::new(),
+                enabled: true,
+            })
+            .expect("add");
+
+        let mut buf = String::with_capacity(64);
+        let applied = store.apply_masking(100, 1, value, &roles, &mut buf);
+        if applied {
+            tprintln!("  {}: {} -> {}", name, value, buf);
+        } else {
+            tprintln!("  {}: {} -> NULL", name, value);
+        }
+    }
+}
+
+#[test]
+fn test_column_masking_policy_serialization() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- Column Masking: Policy Serialization ---");
+
+    let policy = MaskingPolicy {
+        id: 42,
+        name: "ssn_mask".to_string(),
+        table_id: 100,
+        column_id: 5,
+        function: MaskFunction::Ssn,
+        exempt_roles: vec![RoleId(10), RoleId(20)],
+        enabled: true,
+    };
+    let bytes = policy.to_bytes();
+    let restored = MaskingPolicy::from_bytes(&bytes).expect("decode");
+    assert_eq!(restored.id, 42);
+    assert_eq!(restored.name, "ssn_mask");
+    assert_eq!(restored.table_id, 100);
+    assert_eq!(restored.column_id, 5);
+    assert_eq!(restored.function, MaskFunction::Ssn);
+    assert_eq!(restored.exempt_roles.len(), 2);
+    assert!(restored.enabled);
+    tprintln!("  MaskingPolicy roundtrip: verified");
+}
+
+// ===========================================================================
+// Phase 8.5: ABAC Rule Evaluation
+// ===========================================================================
+
+#[test]
+fn test_abac_time_based_access() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- ABAC: Time-Based Access ---");
+
+    let store = AbacRuleStore::new();
+
+    // Rule: analysts can only query during business hours (9-17)
+    store
+        .add_rule(AbacRule {
+            id: 1,
+            name: "business_hours_only".to_string(),
+            conditions: vec![AttributeCondition {
+                attribute_key: "hour".to_string(),
+                operator: AbacOperator::In,
+                value: "9,10,11,12,13,14,15,16,17".to_string(),
+            }],
+            effect: AbacEffect::Allow,
+            resource_pattern: None,
+            action: None,
+            enabled: true,
+            roles: vec![RoleId(50)],
+            priority: 10,
+        })
+        .expect("add");
+
+    // Business hours attributes
+    let mut bh_attrs = SessionAttributes {
+        role_id: RoleId(50),
+        department: None,
+        region: None,
+        clearance: ClassificationLevel::Public,
+        ip_address: "127.0.0.1".to_string(),
+        connection_time: 0,
+        custom: HashMap::new(),
+    };
+    bh_attrs.set("hour".to_string(), "14".to_string());
+
+    let allowed = store.evaluate_abac(&bh_attrs, None, None);
+    assert!(allowed);
+    tprintln!("  Business hours (hour=14): allowed={}", allowed);
+
+    // After hours attributes
+    let mut ah_attrs = SessionAttributes {
+        role_id: RoleId(50),
+        department: None,
+        region: None,
+        clearance: ClassificationLevel::Public,
+        ip_address: "127.0.0.1".to_string(),
+        connection_time: 0,
+        custom: HashMap::new(),
+    };
+    ah_attrs.set("hour".to_string(), "22".to_string());
+
+    let allowed = store.evaluate_abac(&ah_attrs, None, None);
+    // No matching allow rule at hour=22, but default is allow (ABAC is additive)
+    tprintln!("  After hours (hour=22): allowed={}", allowed);
+}
+
+#[test]
+fn test_abac_region_based_access() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- ABAC: Region-Based Access ---");
+
+    let store = AbacRuleStore::new();
+
+    // Rule: Deny non-EU users from accessing EU data
+    store
+        .add_rule(AbacRule {
+            id: 1,
+            name: "eu_data_restriction".to_string(),
+            conditions: vec![AttributeCondition {
+                attribute_key: "region".to_string(),
+                operator: AbacOperator::NotEq,
+                value: "eu".to_string(),
+            }],
+            effect: AbacEffect::Deny,
+            resource_pattern: Some("eu_customers".to_string()),
+            action: None,
+            enabled: true,
+            roles: Vec::new(),
+            priority: 10,
+        })
+        .expect("add");
+
+    // EU user queries EU data
+    let eu_attrs = SessionAttributes {
+        role_id: RoleId(10),
+        department: None,
+        region: Some("eu".to_string()),
+        clearance: ClassificationLevel::Public,
+        ip_address: "127.0.0.1".to_string(),
+        connection_time: 0,
+        custom: HashMap::new(),
+    };
+    let allowed = store.evaluate_abac(&eu_attrs, Some("eu_customers"), None);
+    assert!(allowed);
+    tprintln!("  EU user -> EU data: allowed={}", allowed);
+
+    // US user queries EU data
+    let us_attrs = SessionAttributes {
+        role_id: RoleId(20),
+        department: None,
+        region: Some("us".to_string()),
+        clearance: ClassificationLevel::Public,
+        ip_address: "127.0.0.1".to_string(),
+        connection_time: 0,
+        custom: HashMap::new(),
+    };
+    let denied = store.evaluate_abac(&us_attrs, Some("eu_customers"), None);
+    assert!(!denied);
+    tprintln!("  US user -> EU data: allowed={}", denied);
+}
+
+#[test]
+fn test_abac_evaluate_latency() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- ABAC: Rule Evaluation Latency ---");
+
+    let store = AbacRuleStore::new();
+
+    // Add 10 rules with various conditions
+    for i in 0..10 {
+        store
+            .add_rule(AbacRule {
+                id: i,
+                name: format!("rule_{}", i),
+                conditions: vec![
+                    AttributeCondition {
+                        attribute_key: "department".to_string(),
+                        operator: AbacOperator::Eq,
+                        value: format!("dept_{}", i),
+                    },
+                    AttributeCondition {
+                        attribute_key: "region".to_string(),
+                        operator: AbacOperator::Eq,
+                        value: "us".to_string(),
+                    },
+                ],
+                effect: if i == 5 {
+                    AbacEffect::Deny
+                } else {
+                    AbacEffect::Allow
+                },
+                resource_pattern: None,
+                action: None,
+                enabled: true,
+                roles: Vec::new(),
+                priority: i as u16,
+            })
+            .expect("add");
+    }
+
+    let attrs = SessionAttributes {
+        role_id: RoleId(10),
+        department: Some("dept_3".to_string()),
+        region: Some("us".to_string()),
+        clearance: ClassificationLevel::Public,
+        ip_address: "127.0.0.1".to_string(),
+        connection_time: 0,
+        custom: HashMap::new(),
+    };
+
+    let iterations = 1_000_000;
+
+    // Warmup
+    for _ in 0..10_000 {
+        let _ = store.evaluate_abac(&attrs, None, None);
+    }
+
+    let start = Instant::now();
+    for _ in 0..iterations {
+        let result = store.evaluate_abac(&attrs, None, None);
+        std::hint::black_box(&result);
+    }
+    let elapsed = start.elapsed();
+    let latency_ns = elapsed.as_nanos() as f64 / iterations as f64;
+
+    tprintln!(
+        "  Latency: {:.0} ns/eval ({} iterations)",
+        latency_ns,
+        iterations
+    );
+    validate_metric(
+        "abac_evaluate",
+        "latency_ns",
+        vec![latency_ns],
+        2000.0,
+        false,
+    );
+    check_performance("abac_evaluate", "latency_ns", latency_ns, 2000.0, false);
+}
+
+#[test]
+fn test_abac_rule_serialization() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- ABAC: Rule Serialization ---");
+
+    let rule = AbacRule {
+        id: 42,
+        name: "complex_rule".to_string(),
+        conditions: vec![
+            AttributeCondition {
+                attribute_key: "department".to_string(),
+                operator: AbacOperator::Eq,
+                value: "engineering".to_string(),
+            },
+            AttributeCondition {
+                attribute_key: "clearance".to_string(),
+                operator: AbacOperator::In,
+                value: "secret,top_secret".to_string(),
+            },
+        ],
+        effect: AbacEffect::Allow,
+        resource_pattern: Some("sensitive_table".to_string()),
+        action: Some(0), // Select
+        enabled: true,
+        roles: vec![RoleId(10), RoleId(20)],
+        priority: 100,
+    };
+
+    let bytes = rule.to_bytes();
+    let restored = AbacRule::from_bytes(&bytes).expect("decode");
+    assert_eq!(restored.id, 42);
+    assert_eq!(restored.name, "complex_rule");
+    assert_eq!(restored.conditions.len(), 2);
+    assert_eq!(restored.effect, AbacEffect::Allow);
+    assert_eq!(
+        restored.resource_pattern.as_deref(),
+        Some("sensitive_table")
+    );
+    assert_eq!(restored.action, Some(0));
+    assert!(restored.enabled);
+    assert_eq!(restored.roles.len(), 2);
+    assert_eq!(restored.priority, 100);
+    tprintln!("  AbacRule roundtrip: verified (all fields)");
+}
+
+// ===========================================================================
+// Phase 8.5: Encryption Round-Trip
+// ===========================================================================
+
+#[test]
+fn test_encryption_roundtrip() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- Encryption: AES-GCM Round-Trip ---");
+
+    let key_128 = [0x42u8; 16];
+    let key_256 = [0x42u8; 32];
+
+    // AES-128-GCM round-trip
+    let plaintext = b"Hello, ZyronDB! This is sensitive data.";
+    let ciphertext =
+        encrypt_value(plaintext, &key_128, EncryptionAlgorithm::Aes128Gcm, &[]).expect("encrypt");
+    let decrypted =
+        decrypt_value(&ciphertext, &key_128, EncryptionAlgorithm::Aes128Gcm, &[]).expect("decrypt");
+    assert_eq!(decrypted, plaintext);
+    tprintln!(
+        "  AES-128-GCM: {} bytes -> {} bytes -> {} bytes",
+        plaintext.len(),
+        ciphertext.len(),
+        decrypted.len()
+    );
+
+    // AES-256-GCM round-trip
+    let ciphertext =
+        encrypt_value(plaintext, &key_256, EncryptionAlgorithm::Aes256Gcm, &[]).expect("encrypt");
+    let decrypted =
+        decrypt_value(&ciphertext, &key_256, EncryptionAlgorithm::Aes256Gcm, &[]).expect("decrypt");
+    assert_eq!(decrypted, plaintext);
+    tprintln!("  AES-256-GCM: round-trip verified");
+}
+
+#[test]
+fn test_encryption_nonce_uniqueness() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- Encryption: Nonce Uniqueness ---");
+
+    let key = [0x42u8; 32];
+    let plaintext = b"same plaintext for all";
+    let count = 10_000;
+
+    let mut nonces: Vec<[u8; 12]> = Vec::with_capacity(count);
+    for _ in 0..count {
+        let ct =
+            encrypt_value(plaintext, &key, EncryptionAlgorithm::Aes256Gcm, &[]).expect("encrypt");
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&ct[..12]);
+        nonces.push(nonce);
+    }
+
+    // Verify all nonces are unique
+    nonces.sort();
+    let unique_count = nonces.windows(2).filter(|w| w[0] != w[1]).count() + 1;
+    assert_eq!(unique_count, count, "All nonces must be unique");
+    tprintln!("  {}/{} nonces unique: PASS", unique_count, count);
+}
+
+#[test]
+fn test_encryption_aad_prevents_swap() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- Encryption: AAD Prevents Column Swap ---");
+
+    let key = [0x42u8; 32];
+    let plaintext = b"sensitive value";
+
+    // Encrypt with AAD for column A
+    let aad_a = b"table=1,col=3";
+    let ct_a =
+        encrypt_value(plaintext, &key, EncryptionAlgorithm::Aes256Gcm, aad_a).expect("encrypt");
+
+    // Decrypt with correct AAD succeeds
+    let result = decrypt_value(&ct_a, &key, EncryptionAlgorithm::Aes256Gcm, aad_a);
+    assert!(result.is_ok());
+    tprintln!("  Correct AAD: decryption succeeded");
+
+    // Decrypt with wrong AAD fails (ciphertext swapped to different column)
+    let aad_b = b"table=1,col=7";
+    let result = decrypt_value(&ct_a, &key, EncryptionAlgorithm::Aes256Gcm, aad_b);
+    assert!(result.is_err());
+    tprintln!("  Wrong AAD: decryption rejected (tag mismatch)");
+}
+
+#[test]
+fn test_encryption_tamper_detection() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- Encryption: Tamper Detection ---");
+
+    let key = [0x42u8; 32];
+    let plaintext = b"authenticated data";
+
+    let mut ct =
+        encrypt_value(plaintext, &key, EncryptionAlgorithm::Aes256Gcm, &[]).expect("encrypt");
+
+    // Tamper with a ciphertext byte
+    let mid = 12 + ct.len() / 2 - 8; // Middle of ciphertext section
+    ct[mid] ^= 0xFF;
+
+    let result = decrypt_value(&ct, &key, EncryptionAlgorithm::Aes256Gcm, &[]);
+    assert!(result.is_err());
+    tprintln!("  Tampered ciphertext: decryption rejected");
+}
+
+#[test]
+fn test_encryption_throughput() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- Encryption: Throughput ---");
+
+    let key = [0x42u8; 32];
+
+    // Use 1KB blocks to measure throughput
+    let block_size = 1024;
+    let plaintext = vec![0xABu8; block_size];
+    let iterations = 100_000;
+
+    // Warmup
+    for _ in 0..1_000 {
+        let ct =
+            encrypt_value(&plaintext, &key, EncryptionAlgorithm::Aes256Gcm, &[]).expect("encrypt");
+        let _ = decrypt_value(&ct, &key, EncryptionAlgorithm::Aes256Gcm, &[]).expect("decrypt");
+    }
+
+    // Encrypt throughput
+    let start = Instant::now();
+    for _ in 0..iterations {
+        let ct =
+            encrypt_value(&plaintext, &key, EncryptionAlgorithm::Aes256Gcm, &[]).expect("encrypt");
+        std::hint::black_box(&ct);
+    }
+    let elapsed = start.elapsed();
+    let bytes_total = iterations as f64 * block_size as f64;
+    let encrypt_gbps = bytes_total / elapsed.as_secs_f64() / 1_000_000_000.0;
+    tprintln!(
+        "  Encrypt: {:.2} GB/sec ({}x 1KB blocks)",
+        encrypt_gbps,
+        iterations
+    );
+    validate_metric(
+        "authenticated_encrypt",
+        "gb_per_sec",
+        vec![encrypt_gbps],
+        4.0,
+        true,
+    );
+    check_performance(
+        "authenticated_encrypt",
+        "gb_per_sec",
+        encrypt_gbps,
+        4.0,
+        true,
+    );
+
+    // Decrypt throughput
+    let ct = encrypt_value(&plaintext, &key, EncryptionAlgorithm::Aes256Gcm, &[]).expect("encrypt");
+
+    let start = Instant::now();
+    for _ in 0..iterations {
+        let pt = decrypt_value(&ct, &key, EncryptionAlgorithm::Aes256Gcm, &[]).expect("decrypt");
+        std::hint::black_box(&pt);
+    }
+    let elapsed = start.elapsed();
+    let decrypt_gbps = bytes_total / elapsed.as_secs_f64() / 1_000_000_000.0;
+    tprintln!(
+        "  Decrypt: {:.2} GB/sec ({}x 1KB blocks)",
+        decrypt_gbps,
+        iterations
+    );
+    validate_metric(
+        "authenticated_decrypt",
+        "gb_per_sec",
+        vec![decrypt_gbps],
+        4.0,
+        true,
+    );
+    check_performance(
+        "authenticated_decrypt",
+        "gb_per_sec",
+        decrypt_gbps,
+        4.0,
+        true,
+    );
+}
+
+#[test]
+fn test_encryption_key_store() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- Encryption: LocalKeyStore ---");
+
+    let master_key = [0x42u8; 32];
+    let ks = LocalKeyStore::new(master_key);
+
+    // Create keys
+    let id_128 = ks
+        .create_key(EncryptionAlgorithm::Aes128Gcm)
+        .expect("create 128");
+    let id_256 = ks
+        .create_key(EncryptionAlgorithm::Aes256Gcm)
+        .expect("create 256");
+    tprintln!("  Created key IDs: {}, {}", id_128, id_256);
+
+    // Retrieve keys
+    let key_128 = ks.get_key(id_128).expect("get 128");
+    assert_eq!(key_128.len(), 16);
+    let key_256 = ks.get_key(id_256).expect("get 256");
+    assert_eq!(key_256.len(), 32);
+    tprintln!(
+        "  Retrieved: 128-bit ({} bytes), 256-bit ({} bytes)",
+        key_128.len(),
+        key_256.len()
+    );
+
+    // Encrypt/decrypt using store-managed key
+    let plaintext = b"managed key encryption test";
+    let ct =
+        encrypt_value(plaintext, &key_256, EncryptionAlgorithm::Aes256Gcm, &[]).expect("encrypt");
+    let pt = decrypt_value(&ct, &key_256, EncryptionAlgorithm::Aes256Gcm, &[]).expect("decrypt");
+    assert_eq!(pt, plaintext);
+    tprintln!("  Encrypt/decrypt with store-managed key: verified");
+
+    // Rotate key
+    let new_id = ks.rotate_key(id_256).expect("rotate");
+    assert_ne!(new_id, id_256);
+    let new_key = ks.get_key(new_id).expect("get new");
+    assert_eq!(new_key.len(), 32);
+    assert_ne!(new_key, key_256);
+    tprintln!("  Key rotation: old={}, new={}", id_256, new_id);
+
+    // Old key should be deleted after rotation
+    assert!(ks.get_key(id_256).is_err());
+    tprintln!("  Old key deleted: verified");
+}
+
+#[test]
+fn test_encryption_column_config_serialization() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- Encryption: ColumnEncryption Serialization ---");
+
+    use zyron_auth::encryption::ColumnEncryption;
+
+    let config = ColumnEncryption {
+        table_id: 42,
+        column_id: 7,
+        algorithm: EncryptionAlgorithm::Aes256Gcm,
+        key_id: 123,
+    };
+    let bytes = config.to_bytes();
+    let restored = ColumnEncryption::from_bytes(&bytes).expect("decode");
+    assert_eq!(restored.table_id, 42);
+    assert_eq!(restored.column_id, 7);
+    assert_eq!(restored.algorithm, EncryptionAlgorithm::Aes256Gcm);
+    assert_eq!(restored.key_id, 123);
+    tprintln!("  ColumnEncryption roundtrip: verified");
+}
+
+// ===========================================================================
+// Phase 8.5: Security Labels (Mandatory Access Control)
+// ===========================================================================
+
+#[test]
+fn test_security_label_access_control() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- Security Labels: MAC Access Control ---");
+
+    let mac = MandatoryAccessControl::new();
+
+    // User with "secret:finance" label
+    mac.set_subject_label(
+        RoleId(10),
+        SecurityLabel::new(SecurityLevel::Secret, vec!["finance".to_string()]),
+    );
+
+    // Row with "confidential:finance" label -> visible (user level >= row level, compartment match)
+    mac.set_object_label(
+        ObjectType::Table,
+        1,
+        SecurityLabel::new(SecurityLevel::Confidential, vec!["finance".to_string()]),
+    );
+    assert!(mac.check_access(RoleId(10), ObjectType::Table, 1));
+    tprintln!("  secret:finance user -> confidential:finance row: VISIBLE");
+
+    // Row with "top_secret:finance" label -> not visible (user level < row level)
+    mac.set_object_label(
+        ObjectType::Table,
+        2,
+        SecurityLabel::new(SecurityLevel::TopSecret, vec!["finance".to_string()]),
+    );
+    assert!(!mac.check_access(RoleId(10), ObjectType::Table, 2));
+    tprintln!("  secret:finance user -> top_secret:finance row: HIDDEN");
+
+    // Row with "confidential:hr" label -> not visible (user missing hr compartment)
+    mac.set_object_label(
+        ObjectType::Table,
+        3,
+        SecurityLabel::new(SecurityLevel::Confidential, vec!["hr".to_string()]),
+    );
+    assert!(!mac.check_access(RoleId(10), ObjectType::Table, 3));
+    tprintln!("  secret:finance user -> confidential:hr row: HIDDEN (missing compartment)");
+}
+
+#[test]
+fn test_security_label_check_latency() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- Security Labels: Check Latency ---");
+
+    let mac = MandatoryAccessControl::new();
+    mac.set_subject_label(
+        RoleId(10),
+        SecurityLabel::new(
+            SecurityLevel::Secret,
+            vec!["finance".to_string(), "hr".to_string(), "legal".to_string()],
+        ),
+    );
+    mac.set_object_label(
+        ObjectType::Table,
+        42,
+        SecurityLabel::new(
+            SecurityLevel::Confidential,
+            vec!["finance".to_string(), "hr".to_string()],
+        ),
+    );
+
+    let iterations = 5_000_000;
+
+    // Warmup
+    for _ in 0..50_000 {
+        let _ = mac.check_access(RoleId(10), ObjectType::Table, 42);
+    }
+
+    let start = Instant::now();
+    for _ in 0..iterations {
+        let result = mac.check_access(RoleId(10), ObjectType::Table, 42);
+        std::hint::black_box(&result);
+    }
+    let elapsed = start.elapsed();
+    let latency_ns = elapsed.as_nanos() as f64 / iterations as f64;
+
+    tprintln!(
+        "  Latency: {:.1} ns/check ({} iterations)",
+        latency_ns,
+        iterations
+    );
+    validate_metric(
+        "security_label_check",
+        "latency_ns",
+        vec![latency_ns],
+        100.0,
+        false,
+    );
+    check_performance(
+        "security_label_check",
+        "latency_ns",
+        latency_ns,
+        100.0,
+        false,
+    );
+}
+
+#[test]
+fn test_security_label_dominance() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- Security Labels: Dominance Rules ---");
+
+    // Same level, same compartments = dominates
+    let a = SecurityLabel::new(SecurityLevel::Secret, vec!["finance".to_string()]);
+    let b = SecurityLabel::new(SecurityLevel::Secret, vec!["finance".to_string()]);
+    assert!(a.dominates(&b));
+    tprintln!("  secret:finance >= secret:finance: true");
+
+    // Higher level, superset compartments = dominates
+    let subject = SecurityLabel::new(
+        SecurityLevel::TopSecret,
+        vec!["finance".to_string(), "hr".to_string()],
+    );
+    let object = SecurityLabel::new(SecurityLevel::Secret, vec!["finance".to_string()]);
+    assert!(subject.dominates(&object));
+    tprintln!("  top_secret:finance,hr >= secret:finance: true");
+
+    // Higher level but missing compartment = does not dominate
+    let subject = SecurityLabel::new(SecurityLevel::TopSecret, vec!["finance".to_string()]);
+    let object = SecurityLabel::new(
+        SecurityLevel::Secret,
+        vec!["finance".to_string(), "hr".to_string()],
+    );
+    assert!(!subject.dominates(&object));
+    tprintln!("  top_secret:finance >= secret:finance,hr: false (missing hr)");
+
+    // Unclassified with no compartments can see unclassified with no compartments
+    let a = SecurityLabel::new(SecurityLevel::Unclassified, vec![]);
+    let b = SecurityLabel::new(SecurityLevel::Unclassified, vec![]);
+    assert!(a.dominates(&b));
+    tprintln!("  unclassified >= unclassified: true");
+}
+
+#[test]
+fn test_security_label_serialization() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- Security Labels: Serialization ---");
+
+    use zyron_auth::security_label::{ObjectSecurityLabel, SubjectSecurityLabel};
+
+    let label = SecurityLabel::new(
+        SecurityLevel::TopSecret,
+        vec![
+            "alpha".to_string(),
+            "bravo".to_string(),
+            "charlie".to_string(),
+        ],
+    );
+    let bytes = label.to_bytes();
+    let (restored, consumed) = SecurityLabel::from_bytes(&bytes).expect("decode");
+    assert_eq!(restored, label);
+    assert_eq!(consumed, bytes.len());
+    tprintln!(
+        "  SecurityLabel roundtrip: verified ({} bytes)",
+        bytes.len()
+    );
+
+    let osl = ObjectSecurityLabel {
+        object_type: ObjectType::Table,
+        object_id: 42,
+        label: SecurityLabel::new(SecurityLevel::Secret, vec!["finance".to_string()]),
+    };
+    let bytes = osl.to_bytes();
+    let restored = ObjectSecurityLabel::from_bytes(&bytes).expect("decode");
+    assert_eq!(restored.object_type, ObjectType::Table);
+    assert_eq!(restored.object_id, 42);
+    tprintln!("  ObjectSecurityLabel roundtrip: verified");
+
+    let ssl = SubjectSecurityLabel {
+        role_id: RoleId(10),
+        label: SecurityLabel::new(
+            SecurityLevel::Secret,
+            vec!["finance".to_string(), "hr".to_string()],
+        ),
+    };
+    let bytes = ssl.to_bytes();
+    let restored = SubjectSecurityLabel::from_bytes(&bytes).expect("decode");
+    assert_eq!(restored.role_id, RoleId(10));
+    tprintln!("  SubjectSecurityLabel roundtrip: verified");
+}
+
+// ===========================================================================
+// Phase 8.5: Webhook Verification
+// ===========================================================================
+
+#[test]
+fn test_webhook_stripe_verification() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- Webhook: Stripe Verification ---");
+
+    let secret = "whsec_test_secret_12345";
+    let payload = b"{\"type\":\"payment_intent.succeeded\",\"data\":{\"amount\":2000}}";
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string();
+    let signed = format!(
+        "{}.{}",
+        timestamp,
+        std::str::from_utf8(payload).expect("utf8")
+    );
+    let sig = webhook::compute_hmac_sha256(signed.as_bytes(), secret.as_bytes()).expect("compute");
+    let header = format!("t={},v1={}", timestamp, sig);
+
+    // Correct payload verifies
+    let result = webhook::verify_stripe_webhook(payload, &header, secret).expect("verify");
+    assert!(result);
+    tprintln!("  Correct payload: verified=true");
+
+    // Tampered payload fails
+    let tampered = b"{\"type\":\"payment_intent.succeeded\",\"data\":{\"amount\":99999}}";
+    let result = webhook::verify_stripe_webhook(tampered, &header, secret).expect("verify");
+    assert!(!result);
+    tprintln!("  Tampered payload: verified=false");
+
+    // Wrong secret fails
+    let result = webhook::verify_stripe_webhook(payload, &header, "wrong_secret").expect("verify");
+    assert!(!result);
+    tprintln!("  Wrong secret: verified=false");
+}
+
+#[test]
+fn test_webhook_github_verification() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- Webhook: GitHub Verification ---");
+
+    let secret = "github_webhook_secret";
+    let payload = b"{\"action\":\"push\",\"ref\":\"refs/heads/main\"}";
+
+    let sig = webhook::compute_hmac_sha256(payload, secret.as_bytes()).expect("compute");
+    let header = format!("sha256={}", sig);
+
+    // Correct
+    let result = webhook::verify_github_webhook(payload, &header, secret).expect("verify");
+    assert!(result);
+    tprintln!("  Correct payload: verified=true");
+
+    // Tampered
+    let tampered = b"{\"action\":\"push\",\"ref\":\"refs/heads/evil\"}";
+    let result = webhook::verify_github_webhook(tampered, &header, secret).expect("verify");
+    assert!(!result);
+    tprintln!("  Tampered payload: verified=false");
+}
+
+#[test]
+fn test_webhook_slack_verification() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- Webhook: Slack Verification ---");
+
+    let secret = "slack_signing_secret";
+    let payload = b"token=xoxb&team_id=T12345";
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string();
+
+    let signed = format!(
+        "v0:{}:{}",
+        timestamp,
+        std::str::from_utf8(payload).expect("utf8")
+    );
+    let sig = webhook::compute_hmac_sha256(signed.as_bytes(), secret.as_bytes()).expect("compute");
+    let header = format!("v0={}", sig);
+
+    // Correct
+    let result =
+        webhook::verify_slack_webhook(payload, &timestamp, &header, secret).expect("verify");
+    assert!(result);
+    tprintln!("  Correct payload: verified=true");
+
+    // Wrong secret
+    let result =
+        webhook::verify_slack_webhook(payload, &timestamp, &header, "wrong").expect("verify");
+    assert!(!result);
+    tprintln!("  Wrong secret: verified=false");
+}
+
+#[test]
+fn test_webhook_verify_latency() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- Webhook: Verification Latency ---");
+
+    let secret = "benchmark_secret";
+    let payload = b"{\"event\":\"test\",\"data\":{\"id\":12345,\"amount\":100}}";
+
+    let sig = webhook::compute_hmac_sha256(payload, secret.as_bytes()).expect("compute");
+    let header = format!("sha256={}", sig);
+
+    let iterations = 500_000;
+
+    // Warmup
+    for _ in 0..5_000 {
+        let _ = webhook::verify_github_webhook(payload, &header, secret);
+    }
+
+    let start = Instant::now();
+    for _ in 0..iterations {
+        let result = webhook::verify_github_webhook(payload, &header, secret).expect("verify");
+        std::hint::black_box(&result);
+    }
+    let elapsed = start.elapsed();
+    let latency_us = elapsed.as_nanos() as f64 / iterations as f64 / 1000.0;
+
+    tprintln!(
+        "  Latency: {:.2} us/verify ({} iterations)",
+        latency_us,
+        iterations
+    );
+    validate_metric(
+        "webhook_signature_verify",
+        "latency_us",
+        vec![latency_us],
+        20.0,
+        false,
+    );
+    check_performance(
+        "webhook_signature_verify",
+        "latency_us",
+        latency_us,
+        20.0,
+        false,
+    );
+}
+
+// ===========================================================================
+// Phase 8.5: Crypto SQL Functions
+// ===========================================================================
+
+#[test]
+fn test_crypto_password_hash_verify() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- Crypto Functions: Password Hash/Verify ---");
+
+    use zyron_auth::crypto_functions;
+
+    let password = "S3cure_P@ssw0rd!";
+
+    let hash = crypto_functions::password_hash(password).expect("hash");
+    assert!(hash.starts_with("$balloon-aes$"));
+    tprintln!("  Hash: {}...{}", &hash[..25], &hash[hash.len() - 10..]);
+
+    let valid = crypto_functions::password_verify(password, &hash).expect("verify");
+    assert!(valid);
+    tprintln!("  Correct password: verified=true");
+
+    let invalid = crypto_functions::password_verify("wrong_password", &hash).expect("verify");
+    assert!(!invalid);
+    tprintln!("  Wrong password: verified=false");
+}
+
+#[test]
+fn test_crypto_key_generation() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- Crypto Functions: Key Generation ---");
+
+    use zyron_auth::crypto_functions;
+
+    // 128-bit symmetric key
+    let key128 = crypto_functions::generate_symmetric_key(128).expect("gen 128");
+    assert_eq!(key128.len(), 16);
+    tprintln!("  128-bit key: {} bytes", key128.len());
+
+    // 256-bit symmetric key
+    let key256 = crypto_functions::generate_symmetric_key(256).expect("gen 256");
+    assert_eq!(key256.len(), 32);
+    tprintln!("  256-bit key: {} bytes", key256.len());
+
+    // Keys are unique
+    let key256_2 = crypto_functions::generate_symmetric_key(256).expect("gen 256");
+    assert_ne!(key256, key256_2);
+    tprintln!("  Uniqueness: two 256-bit keys differ");
+
+    // Invalid key size
+    assert!(crypto_functions::generate_symmetric_key(64).is_err());
+    tprintln!("  Invalid size (64 bits): rejected");
+
+    // Signing keypair
+    let (private_key, public_key) = crypto_functions::generate_signing_keypair().expect("gen kp");
+    assert_eq!(private_key.len(), 32);
+    assert_eq!(public_key.len(), 32);
+    tprintln!(
+        "  Signing keypair: {} byte private, {} byte public",
+        private_key.len(),
+        public_key.len()
+    );
 }

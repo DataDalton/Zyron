@@ -105,7 +105,9 @@ impl Authenticator for CleartextAuthenticator {
         };
 
         match self.passwords.get(user) {
-            Some(expected) if expected == password => Ok(AuthProgress::Authenticated),
+            Some(expected) if constant_time_eq(expected.as_bytes(), password.as_bytes()) => {
+                Ok(AuthProgress::Authenticated)
+            }
             _ => Err(AuthError::Failed(user.to_string())),
         }
     }
@@ -462,6 +464,336 @@ fn extract_field<'a>(message: &'a str, prefix: &str) -> Option<String> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// WebAuthn (FIDO2) authenticator
+// ---------------------------------------------------------------------------
+
+/// WebAuthn authentication state machine.
+/// Uses the existing SASL message flow (SaslMechanisms, SaslInitial, SaslContinue,
+/// SaslResponse, SaslFinal) with mechanism name "WEBAUTHN".
+///
+/// Flow:
+/// 1. Server sends SaslMechanisms(["WEBAUTHN"])
+/// 2. Client sends SaslInitial { mechanism: "WEBAUTHN", data: empty }
+/// 3. Server generates challenge, sends SaslContinue with JSON options
+/// 4. Client interacts with hardware key, sends SaslResponse with JSON assertion
+/// 5. Server verifies signature, sends SaslFinal
+pub struct WebAuthnAuthenticator {
+    state: WebAuthnState,
+    security_manager: std::sync::Arc<zyron_auth::SecurityManager>,
+    rp_config: std::sync::Arc<zyron_auth::RelyingPartyConfig>,
+    /// Resolves username to UserId for credential lookup.
+    user_lookup: std::sync::Arc<dyn Fn(&str) -> Option<zyron_auth::role::UserId> + Send + Sync>,
+}
+
+enum WebAuthnState {
+    WaitingForInitial,
+    WaitingForAssertion {
+        challenge: [u8; 32],
+        issued_at: u64,
+        allowed_credential_ids: Vec<Vec<u8>>,
+        user_id: zyron_auth::role::UserId,
+    },
+}
+
+impl WebAuthnAuthenticator {
+    pub fn new(
+        security_manager: std::sync::Arc<zyron_auth::SecurityManager>,
+        rp_config: std::sync::Arc<zyron_auth::RelyingPartyConfig>,
+        user_lookup: std::sync::Arc<dyn Fn(&str) -> Option<zyron_auth::role::UserId> + Send + Sync>,
+    ) -> Self {
+        Self {
+            state: WebAuthnState::WaitingForInitial,
+            security_manager,
+            rp_config,
+            user_lookup,
+        }
+    }
+}
+
+impl Authenticator for WebAuthnAuthenticator {
+    fn initial_message(&self, _user: &str) -> AuthResult {
+        AuthResult::Challenge(BackendMessage::Authentication(
+            AuthenticationMessage::SaslMechanisms(vec!["WEBAUTHN".into()]),
+        ))
+    }
+
+    fn process_response(
+        &mut self,
+        user: &str,
+        response: &PasswordMessage,
+    ) -> Result<AuthProgress, AuthError> {
+        match &self.state {
+            WebAuthnState::WaitingForInitial => {
+                let _data = match response {
+                    PasswordMessage::SaslInitial { mechanism, data } => {
+                        if mechanism != "WEBAUTHN" {
+                            return Err(AuthError::SaslError(format!(
+                                "Expected mechanism WEBAUTHN, got {}",
+                                mechanism
+                            )));
+                        }
+                        data
+                    }
+                    _ => return Err(AuthError::UnexpectedMessage),
+                };
+
+                // Look up user and their credentials
+                let user_id =
+                    (self.user_lookup)(user).ok_or_else(|| AuthError::Failed(user.to_string()))?;
+
+                let credentials = self
+                    .security_manager
+                    .webauthn_store
+                    .credentials_for_user(user_id);
+                if credentials.is_empty() {
+                    return Err(AuthError::Failed(format!(
+                        "No WebAuthn credentials registered for user \"{}\"",
+                        user
+                    )));
+                }
+
+                // Generate challenge
+                let challenge = zyron_auth::webauthn::generate_challenge();
+                let challenge_b64 = zyron_auth::webauthn::base64url_encode(&challenge);
+
+                let issued_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                // Build allowCredentials list
+                let allowed_credential_ids: Vec<Vec<u8>> = credentials
+                    .iter()
+                    .map(|c| c.credential_id.clone())
+                    .collect();
+
+                let allow_creds_json: Vec<String> = credentials
+                    .iter()
+                    .map(|c| {
+                        let id_b64 = zyron_auth::webauthn::base64url_encode(&c.credential_id);
+                        format!("{{\"type\":\"public-key\",\"id\":\"{}\"}}", id_b64)
+                    })
+                    .collect();
+
+                let options_json = format!(
+                    "{{\"challenge\":\"{}\",\"rpId\":\"{}\",\"allowCredentials\":[{}],\"timeout\":{}}}",
+                    challenge_b64,
+                    self.rp_config.rp_id,
+                    allow_creds_json.join(","),
+                    self.rp_config.challenge_timeout_secs * 1000,
+                );
+
+                self.state = WebAuthnState::WaitingForAssertion {
+                    challenge,
+                    issued_at,
+                    allowed_credential_ids,
+                    user_id,
+                };
+
+                Ok(AuthProgress::Continue(BackendMessage::Authentication(
+                    AuthenticationMessage::SaslContinue(options_json.into_bytes()),
+                )))
+            }
+
+            WebAuthnState::WaitingForAssertion {
+                challenge,
+                issued_at,
+                allowed_credential_ids,
+                user_id,
+            } => {
+                let data = match response {
+                    PasswordMessage::SaslResponse(data) => data,
+                    _ => return Err(AuthError::UnexpectedMessage),
+                };
+
+                // Check challenge timeout
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if now - issued_at > self.rp_config.challenge_timeout_secs {
+                    return Err(AuthError::SaslError("WebAuthn challenge expired".into()));
+                }
+
+                // Parse the assertion JSON from client
+                let json_str = std::str::from_utf8(data)
+                    .map_err(|_| AuthError::SaslError("Invalid UTF-8 in assertion".into()))?;
+
+                let authenticator_data_b64 = extract_json_field(json_str, "authenticatorData")
+                    .ok_or_else(|| AuthError::SaslError("Missing authenticatorData".into()))?;
+                let client_data_json_b64 = extract_json_field(json_str, "clientDataJSON")
+                    .ok_or_else(|| AuthError::SaslError("Missing clientDataJSON".into()))?;
+                let signature_b64 = extract_json_field(json_str, "signature")
+                    .ok_or_else(|| AuthError::SaslError("Missing signature".into()))?;
+                let credential_id_b64 = extract_json_field(json_str, "credentialId")
+                    .ok_or_else(|| AuthError::SaslError("Missing credentialId".into()))?;
+
+                // Decode base64url fields
+                let authenticator_data = zyron_auth::webauthn::base64url_decode(
+                    &authenticator_data_b64,
+                )
+                .map_err(|e| AuthError::SaslError(format!("Invalid authenticatorData: {}", e)))?;
+                let client_data_json =
+                    zyron_auth::webauthn::base64url_decode(&client_data_json_b64).map_err(|e| {
+                        AuthError::SaslError(format!("Invalid clientDataJSON: {}", e))
+                    })?;
+                let signature = zyron_auth::webauthn::base64url_decode(&signature_b64)
+                    .map_err(|e| AuthError::SaslError(format!("Invalid signature: {}", e)))?;
+                let credential_id = zyron_auth::webauthn::base64url_decode(&credential_id_b64)
+                    .map_err(|e| AuthError::SaslError(format!("Invalid credentialId: {}", e)))?;
+
+                // Verify credential ID is in the allowed list
+                if !allowed_credential_ids.iter().any(|id| id == &credential_id) {
+                    return Err(AuthError::SaslError(
+                        "Credential ID not in allowed list".into(),
+                    ));
+                }
+
+                // Find the stored credential
+                let credential = self
+                    .security_manager
+                    .webauthn_store
+                    .find_credential(&credential_id)
+                    .ok_or_else(|| AuthError::SaslError("Credential not found in store".into()))?;
+
+                // Verify credential belongs to this user
+                if credential.user_id != *user_id {
+                    return Err(AuthError::Failed(user.to_string()));
+                }
+
+                // Verify the assertion using the webauthn module
+                let new_sign_count = zyron_auth::webauthn::verify_assertion(
+                    &credential,
+                    &authenticator_data,
+                    &client_data_json,
+                    &signature,
+                    &self.rp_config,
+                    challenge,
+                )
+                .map_err(|e| {
+                    AuthError::SaslError(format!("WebAuthn verification failed: {}", e))
+                })?;
+
+                // Update sign count in store
+                self.security_manager
+                    .webauthn_store
+                    .update_sign_count(&credential_id, new_sign_count);
+
+                // Send SaslFinal (empty success payload) then return Authenticated
+                // The connection loop expects Continue with SaslFinal, then Authenticated
+                // on the next iteration. Since SaslFinal is the terminal SASL message,
+                // we return Authenticated directly here. The caller sends AuthenticationOk.
+                Ok(AuthProgress::Authenticated)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Composed authenticator for MFA (password + WebAuthn)
+// ---------------------------------------------------------------------------
+
+/// Chains two authentication methods: password first, then WebAuthn.
+/// Used for PasswordAndFido2 auth method.
+pub struct ComposedAuthenticator {
+    password_auth: Box<dyn Authenticator>,
+    webauthn_auth: WebAuthnAuthenticator,
+    phase: ComposedPhase,
+}
+
+enum ComposedPhase {
+    Password,
+    WebAuthn,
+}
+
+impl ComposedAuthenticator {
+    pub fn new(
+        password_auth: Box<dyn Authenticator>,
+        webauthn_auth: WebAuthnAuthenticator,
+    ) -> Self {
+        Self {
+            password_auth,
+            webauthn_auth,
+            phase: ComposedPhase::Password,
+        }
+    }
+}
+
+impl Authenticator for ComposedAuthenticator {
+    fn initial_message(&self, user: &str) -> AuthResult {
+        // Start with password authentication
+        self.password_auth.initial_message(user)
+    }
+
+    fn process_response(
+        &mut self,
+        user: &str,
+        response: &PasswordMessage,
+    ) -> Result<AuthProgress, AuthError> {
+        match self.phase {
+            ComposedPhase::Password => {
+                match self.password_auth.process_response(user, response)? {
+                    AuthProgress::Authenticated => {
+                        // Password phase complete, transition to WebAuthn
+                        self.phase = ComposedPhase::WebAuthn;
+                        // Send WebAuthn SASL mechanisms as the next challenge
+                        match self.webauthn_auth.initial_message(user) {
+                            AuthResult::Challenge(msg) => Ok(AuthProgress::Continue(msg)),
+                            AuthResult::Authenticated => Ok(AuthProgress::Authenticated),
+                        }
+                    }
+                    AuthProgress::Continue(msg) => Ok(AuthProgress::Continue(msg)),
+                }
+            }
+            ComposedPhase::WebAuthn => self.webauthn_auth.process_response(user, response),
+        }
+    }
+}
+
+/// Extracts a string value from a JSON object for WebAuthn assertion parsing.
+fn extract_json_field(json: &str, key: &str) -> Option<String> {
+    let search = format!("\"{}\"", key);
+    // Find the key as a top-level JSON key (preceded by '{' or ',')
+    // to avoid matching key names inside string values.
+    let mut search_from = 0;
+    let key_pos = loop {
+        let pos = json[search_from..].find(&search)?;
+        let abs_pos = search_from + pos;
+        let before = json[..abs_pos].trim_end();
+        if before.ends_with('{') || before.ends_with(',') {
+            break abs_pos;
+        }
+        search_from = abs_pos + 1;
+        if search_from >= json.len() {
+            return None;
+        }
+    };
+    let after_key = &json[key_pos + search.len()..];
+    let after_colon = after_key
+        .trim_start()
+        .strip_prefix(':')?
+        .trim_start()
+        .strip_prefix('"')?;
+    let mut end = 0;
+    let bytes = after_colon.as_bytes();
+    while end < bytes.len() {
+        if bytes[end] == b'"' {
+            let mut backslash_count = 0;
+            let mut pos = end;
+            while pos > 0 && bytes[pos - 1] == b'\\' {
+                backslash_count += 1;
+                pos -= 1;
+            }
+            if backslash_count % 2 == 0 {
+                break;
+            }
+        }
+        end += 1;
+    }
+    Some(after_colon[..end].to_string())
 }
 
 #[cfg(test)]

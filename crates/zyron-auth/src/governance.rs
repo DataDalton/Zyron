@@ -5,6 +5,7 @@
 //! TwoPersonManager requires a second approver for destructive operations.
 
 use crate::privilege::{ObjectType, PrivilegeType};
+use crate::rcu::{Rcu, RcuMap};
 use crate::role::RoleId;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -165,15 +166,15 @@ impl DelegationEdge {
 
 /// Tracks delegation chains for cascade revocation and lineage queries.
 pub struct DelegationTracker {
-    incoming: scc::HashMap<RoleId, Vec<DelegationEdge>>,
-    outgoing: scc::HashMap<RoleId, Vec<DelegationEdge>>,
+    incoming: RcuMap<RoleId, Vec<DelegationEdge>>,
+    outgoing: RcuMap<RoleId, Vec<DelegationEdge>>,
 }
 
 impl DelegationTracker {
     pub fn new() -> Self {
         Self {
-            incoming: scc::HashMap::new(),
-            outgoing: scc::HashMap::new(),
+            incoming: RcuMap::empty_map(),
+            outgoing: RcuMap::empty_map(),
         }
     }
 
@@ -184,24 +185,14 @@ impl DelegationTracker {
         let edge_clone = edge.clone();
 
         // Add to incoming[grantee]
-        match self.incoming.entry_sync(grantee) {
-            scc::hash_map::Entry::Occupied(mut occ) => {
-                occ.get_mut().push(edge);
-            }
-            scc::hash_map::Entry::Vacant(vac) => {
-                vac.insert_entry(vec![edge]);
-            }
-        }
+        self.incoming.update(|m| {
+            m.entry(grantee).or_insert_with(Vec::new).push(edge);
+        });
 
         // Add to outgoing[grantor]
-        match self.outgoing.entry_sync(grantor) {
-            scc::hash_map::Entry::Occupied(mut occ) => {
-                occ.get_mut().push(edge_clone);
-            }
-            scc::hash_map::Entry::Vacant(vac) => {
-                vac.insert_entry(vec![edge_clone]);
-            }
-        }
+        self.outgoing.update(|m| {
+            m.entry(grantor).or_insert_with(Vec::new).push(edge_clone);
+        });
     }
 
     /// BFS from grantor through outgoing edges matching the given privilege and object.
@@ -220,8 +211,9 @@ impl DelegationTracker {
         let mut visited = std::collections::HashSet::new();
         visited.insert(grantor);
 
+        let snap = self.outgoing.load();
         while let Some(current) = queue.pop_front() {
-            self.outgoing.read_sync(&current, |_k, edges| {
+            if let Some(edges) = snap.get(&current) {
                 for e in edges {
                     if e.privilege == privilege
                         && e.object_type == object_type
@@ -233,7 +225,7 @@ impl DelegationTracker {
                         queue.push_back(e.grantee);
                     }
                 }
-            });
+            }
         }
         result
     }
@@ -251,9 +243,10 @@ impl DelegationTracker {
         let mut visited = std::collections::HashSet::new();
         visited.insert(current);
 
+        let snap = self.incoming.load();
         loop {
             let mut found_edge = None;
-            self.incoming.read_sync(&current, |_k, edges| {
+            if let Some(edges) = snap.get(&current) {
                 for e in edges {
                     if e.privilege == privilege
                         && e.object_type == object_type
@@ -263,7 +256,7 @@ impl DelegationTracker {
                         found_edge = Some(e.clone());
                     }
                 }
-            });
+            }
             match found_edge {
                 Some(edge) => {
                     let next = edge.grantor;
@@ -312,6 +305,7 @@ pub struct PendingApproval {
 }
 
 /// Defines which operations require approval, by whom, and the timeout.
+#[derive(Clone)]
 pub struct TwoPersonRule {
     pub operation: TwoPersonOperation,
     pub required_role: Option<RoleId>,
@@ -320,7 +314,7 @@ pub struct TwoPersonRule {
 
 /// Manages two-person approval workflows.
 pub struct TwoPersonManager {
-    rules: parking_lot::RwLock<Vec<TwoPersonRule>>,
+    rules: Rcu<Vec<TwoPersonRule>>,
     pending: scc::HashMap<u64, PendingApproval>,
     next_id: AtomicU64,
 }
@@ -328,7 +322,7 @@ pub struct TwoPersonManager {
 impl TwoPersonManager {
     pub fn new() -> Self {
         Self {
-            rules: parking_lot::RwLock::new(Vec::new()),
+            rules: Rcu::new(Vec::new()),
             pending: scc::HashMap::new(),
             next_id: AtomicU64::new(1),
         }
@@ -336,12 +330,12 @@ impl TwoPersonManager {
 
     /// Adds a rule defining which operations need approval.
     pub fn add_rule(&self, rule: TwoPersonRule) {
-        self.rules.write().push(rule);
+        self.rules.update(|v| v.push(rule));
     }
 
     /// Returns true if any rule matches the given operation.
     pub fn requires_approval(&self, operation: TwoPersonOperation) -> bool {
-        let rules = self.rules.read();
+        let rules = self.rules.load();
         rules.iter().any(|r| r.operation == operation)
     }
 
@@ -412,7 +406,7 @@ impl TwoPersonManager {
     /// Removes timed-out approval requests based on rule timeouts.
     pub fn cleanup_expired(&self) {
         let now = now_secs();
-        let rules = self.rules.read();
+        let rules = self.rules.load();
         let mut to_remove = Vec::new();
         self.pending.iter_sync(|_k, v| {
             for rule in rules.iter() {
@@ -423,7 +417,6 @@ impl TwoPersonManager {
             }
             true
         });
-        drop(rules);
         for id in to_remove {
             let _ = self.pending.remove_sync(&id);
         }

@@ -6,13 +6,12 @@
 //! and can be scoped to a specific role or applied globally.
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use zyron_common::{Result, ZyronError};
 
 use crate::role::RoleId;
 
 /// Identifies the masking transformation to apply to column values.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MaskFunction {
     /// Masks the local part of an email address, preserving first char and domain.
     Email,
@@ -32,7 +31,62 @@ pub enum MaskFunction {
     Redact,
     /// A named custom masking function (resolved at runtime).
     Custom(String),
+    /// Adds random noise to numeric values within the given factor (0.0 to 1.0).
+    /// For example, factor 0.1 adds up to 10% noise.
+    NoiseMask { factor: f64 },
+    /// Replaces numeric values with a range bucket based on boundaries.
+    /// For example, boundaries [50000.0, 100000.0, 200000.0] maps 75000 to "50000-100000".
+    BucketMask { boundaries: Vec<f64> },
+    /// Shows the first N and last M characters, masking the middle with mask_char.
+    PartialMask {
+        show_first: u8,
+        show_last: u8,
+        mask_char: u8,
+    },
 }
+
+impl PartialEq for MaskFunction {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (MaskFunction::Email, MaskFunction::Email)
+            | (MaskFunction::Phone, MaskFunction::Phone)
+            | (MaskFunction::Ssn, MaskFunction::Ssn)
+            | (MaskFunction::CreditCard, MaskFunction::CreditCard)
+            | (MaskFunction::Hash, MaskFunction::Hash)
+            | (MaskFunction::Null, MaskFunction::Null)
+            | (MaskFunction::Redact, MaskFunction::Redact) => true,
+            (MaskFunction::Partial(a), MaskFunction::Partial(b)) => a == b,
+            (MaskFunction::Custom(a), MaskFunction::Custom(b)) => a == b,
+            (MaskFunction::NoiseMask { factor: a }, MaskFunction::NoiseMask { factor: b }) => {
+                a.to_bits() == b.to_bits()
+            }
+            (
+                MaskFunction::BucketMask { boundaries: a },
+                MaskFunction::BucketMask { boundaries: b },
+            ) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b.iter())
+                        .all(|(x, y)| x.to_bits() == y.to_bits())
+            }
+            (
+                MaskFunction::PartialMask {
+                    show_first: sf1,
+                    show_last: sl1,
+                    mask_char: mc1,
+                },
+                MaskFunction::PartialMask {
+                    show_first: sf2,
+                    show_last: sl2,
+                    mask_char: mc2,
+                },
+            ) => sf1 == sf2 && sl1 == sl2 && mc1 == mc2,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for MaskFunction {}
 
 impl MaskFunction {
     // Tag bytes for binary serialization of each variant.
@@ -45,10 +99,13 @@ impl MaskFunction {
     const TAG_NULL: u8 = 6;
     const TAG_REDACT: u8 = 7;
     const TAG_CUSTOM: u8 = 8;
+    const TAG_NOISE_MASK: u8 = 9;
+    const TAG_BUCKET_MASK: u8 = 10;
+    const TAG_PARTIAL_MASK: u8 = 11;
 
     /// Serializes the mask function to bytes.
     /// Format: 1-byte tag, followed by variant-specific data.
-    fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> Vec<u8> {
         match self {
             MaskFunction::Email => vec![Self::TAG_EMAIL],
             MaskFunction::Phone => vec![Self::TAG_PHONE],
@@ -66,12 +123,34 @@ impl MaskFunction {
                 buf.extend_from_slice(name_bytes);
                 buf
             }
+            MaskFunction::NoiseMask { factor } => {
+                let mut buf = Vec::with_capacity(9);
+                buf.push(Self::TAG_NOISE_MASK);
+                buf.extend_from_slice(&factor.to_le_bytes());
+                buf
+            }
+            MaskFunction::BucketMask { boundaries } => {
+                let mut buf = Vec::with_capacity(1 + 4 + boundaries.len() * 8);
+                buf.push(Self::TAG_BUCKET_MASK);
+                buf.extend_from_slice(&(boundaries.len() as u32).to_le_bytes());
+                for b in boundaries {
+                    buf.extend_from_slice(&b.to_le_bytes());
+                }
+                buf
+            }
+            MaskFunction::PartialMask {
+                show_first,
+                show_last,
+                mask_char,
+            } => {
+                vec![Self::TAG_PARTIAL_MASK, *show_first, *show_last, *mask_char]
+            }
         }
     }
 
     /// Deserializes a mask function from a byte slice. Returns the parsed
     /// function and the number of bytes consumed.
-    fn from_bytes(data: &[u8]) -> Result<(Self, usize)> {
+    pub fn from_bytes(data: &[u8]) -> Result<(Self, usize)> {
         if data.is_empty() {
             return Err(ZyronError::DecodingFailed(
                 "MaskFunction requires at least 1 byte".to_string(),
@@ -115,6 +194,65 @@ impl MaskFunction {
                     })?
                     .to_string();
                 Ok((MaskFunction::Custom(name), 3 + name_len))
+            }
+            Self::TAG_NOISE_MASK => {
+                if data.len() < 9 {
+                    return Err(ZyronError::DecodingFailed(
+                        "MaskFunction::NoiseMask requires 9 bytes".to_string(),
+                    ));
+                }
+                let factor = f64::from_le_bytes([
+                    data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
+                ]);
+                Ok((MaskFunction::NoiseMask { factor }, 9))
+            }
+            Self::TAG_BUCKET_MASK => {
+                if data.len() < 5 {
+                    return Err(ZyronError::DecodingFailed(
+                        "MaskFunction::BucketMask requires at least 5 bytes".to_string(),
+                    ));
+                }
+                let count = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
+                let needed = 5 + count * 8;
+                if data.len() < needed {
+                    return Err(ZyronError::DecodingFailed(format!(
+                        "MaskFunction::BucketMask requires {} bytes, got {}",
+                        needed,
+                        data.len()
+                    )));
+                }
+                let mut boundaries = Vec::with_capacity(count);
+                let mut pos = 5;
+                for _ in 0..count {
+                    let val = f64::from_le_bytes([
+                        data[pos],
+                        data[pos + 1],
+                        data[pos + 2],
+                        data[pos + 3],
+                        data[pos + 4],
+                        data[pos + 5],
+                        data[pos + 6],
+                        data[pos + 7],
+                    ]);
+                    boundaries.push(val);
+                    pos += 8;
+                }
+                Ok((MaskFunction::BucketMask { boundaries }, needed))
+            }
+            Self::TAG_PARTIAL_MASK => {
+                if data.len() < 4 {
+                    return Err(ZyronError::DecodingFailed(
+                        "MaskFunction::PartialMask requires 4 bytes".to_string(),
+                    ));
+                }
+                Ok((
+                    MaskFunction::PartialMask {
+                        show_first: data[1],
+                        show_last: data[2],
+                        mask_char: data[3],
+                    },
+                    4,
+                ))
             }
             tag => Err(ZyronError::DecodingFailed(format!(
                 "Unknown MaskFunction tag: {}",
@@ -194,12 +332,13 @@ impl MaskingRule {
 pub fn apply_email_mask(value: &str) -> String {
     match value.find('@') {
         Some(at_pos) if at_pos > 0 => {
-            let first_char = &value[..1];
+            let mut chars = value[..at_pos].chars();
+            let first_char = chars.next().unwrap_or('*');
+            let local_rest_count = chars.count();
             let domain = &value[at_pos..];
-            let mask_len = at_pos - 1;
             let mut result = String::with_capacity(value.len());
-            result.push_str(first_char);
-            for _ in 0..mask_len {
+            result.push(first_char);
+            for _ in 0..local_rest_count {
                 result.push('*');
             }
             result.push_str(domain);
@@ -207,114 +346,253 @@ pub fn apply_email_mask(value: &str) -> String {
         }
         _ => {
             // No @ or empty local part, mask entire value.
-            "*".repeat(value.len())
+            "*".repeat(value.chars().count())
         }
     }
 }
 
 /// Masks a phone number by showing the first 6 characters and replacing
-/// the rest with asterisks.
+/// the rest with asterisks. Non-ASCII input is returned unchanged.
 pub fn apply_phone_mask(value: &str) -> String {
-    if value.len() <= 6 {
+    if !value.is_ascii() {
         return value.to_string();
     }
-    let visible = &value[..6];
-    let mask_len = value.len() - 6;
-    let mut result = String::with_capacity(value.len());
-    result.push_str(visible);
-    for _ in 0..mask_len {
-        result.push('*');
+    let bytes = value.as_bytes();
+    let len = bytes.len();
+    if len <= 6 {
+        return value.to_string();
+    }
+    let mut result = String::with_capacity(len);
+    unsafe {
+        let out = result.as_mut_vec();
+        out.set_len(len);
+        let ptr = out.as_mut_ptr();
+        for i in 0..len {
+            *ptr.add(i) = if i < 6 { bytes[i] } else { b'*' };
+        }
     }
     result
 }
 
 /// Masks a Social Security Number by hiding everything except the last 4 characters.
-/// Example: "123-45-6789" -> "***-**-6789"
+/// Example: "123-45-6789" -> "***-**-6789". Non-ASCII input is returned unchanged.
 pub fn apply_ssn_mask(value: &str) -> String {
-    if value.len() <= 4 {
+    if !value.is_ascii() {
         return value.to_string();
     }
-    let mask_len = value.len() - 4;
-    let last_four = &value[mask_len..];
-    let mut result = String::with_capacity(value.len());
-    for ch in value[..mask_len].chars() {
-        if ch == '-' {
-            result.push('-');
-        } else {
-            result.push('*');
+    let bytes = value.as_bytes();
+    let len = bytes.len();
+    if len <= 4 {
+        return value.to_string();
+    }
+    let mask_count = len - 4;
+    let mut result = String::with_capacity(len);
+    unsafe {
+        let out = result.as_mut_vec();
+        out.set_len(len);
+        let ptr = out.as_mut_ptr();
+        for i in 0..len {
+            *ptr.add(i) = if i < mask_count {
+                if bytes[i] == b'-' { b'-' } else { b'*' }
+            } else {
+                bytes[i]
+            };
         }
     }
-    result.push_str(last_four);
     result
 }
 
 /// Masks a credit card number by hiding all but the last 4 digits.
-/// Non-digit characters (spaces, dashes) are preserved.
+/// Non-digit characters (spaces, dashes) are preserved. Non-ASCII input
+/// is returned unchanged.
 pub fn apply_credit_card_mask(value: &str) -> String {
-    let digit_count = value.chars().filter(|c| c.is_ascii_digit()).count();
+    if !value.is_ascii() {
+        return value.to_string();
+    }
+    let bytes = value.as_bytes();
+    let len = bytes.len();
+    let digit_count = bytes.iter().filter(|&&b| b.is_ascii_digit()).count();
     if digit_count <= 4 {
         return value.to_string();
     }
     let digits_to_mask = digit_count - 4;
     let mut masked_count = 0;
-    let mut result = String::with_capacity(value.len());
-    for ch in value.chars() {
-        if ch.is_ascii_digit() {
-            if masked_count < digits_to_mask {
-                result.push('*');
-                masked_count += 1;
+    let mut result = String::with_capacity(len);
+    unsafe {
+        let out = result.as_mut_vec();
+        out.set_len(len);
+        let ptr = out.as_mut_ptr();
+        for i in 0..len {
+            *ptr.add(i) = if bytes[i].is_ascii_digit() {
+                if masked_count < digits_to_mask {
+                    masked_count += 1;
+                    b'*'
+                } else {
+                    bytes[i]
+                }
             } else {
-                result.push(ch);
-            }
-        } else {
-            result.push(ch);
+                bytes[i]
+            };
         }
     }
     result
 }
 
-/// Shows the first N characters and masks the rest with asterisks.
+/// Shows the first N characters and masks the rest with asterisks. Non-ASCII
+/// input is returned unchanged.
 pub fn apply_partial_mask(value: &str, show_chars: u8) -> String {
-    let show = show_chars as usize;
-    if value.len() <= show {
+    if !value.is_ascii() {
         return value.to_string();
     }
-    let visible = &value[..show];
-    let mask_len = value.len() - show;
-    let mut result = String::with_capacity(value.len());
-    result.push_str(visible);
-    for _ in 0..mask_len {
-        result.push('*');
+    let bytes = value.as_bytes();
+    let len = bytes.len();
+    let show = show_chars as usize;
+    if len <= show {
+        return value.to_string();
+    }
+    let mut result = String::with_capacity(len);
+    unsafe {
+        let out = result.as_mut_vec();
+        out.set_len(len);
+        let ptr = out.as_mut_ptr();
+        for i in 0..len {
+            *ptr.add(i) = if i < show { bytes[i] } else { b'*' };
+        }
     }
     result
 }
 
-/// Replaces the value with its SHA-256 hex digest.
+/// Hex encoding lookup table. Avoids per-byte format! allocations.
+const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+
+/// Replaces the value with its AES-based 256-bit hash hex digest.
+/// Uses VAES (x86_64) or AESE (aarch64) for hardware-accelerated hashing.
 /// Deterministic output allows masked columns to be used in JOINs.
-pub fn apply_hash_mask(value: &str) -> String {
+/// Writes into a caller-provided buffer. Zero allocation when buffer
+/// capacity >= 64 bytes.
+pub fn apply_hash_mask(value: &str, buf: &mut String) {
+    let hash = crate::encryption::aes_hash_256(value.as_bytes());
+    buf.clear();
+    buf.reserve(64);
+    unsafe {
+        let out = buf.as_mut_vec();
+        out.set_len(64);
+        let ptr = out.as_mut_ptr();
+        for (i, &b) in hash.iter().enumerate() {
+            *ptr.add(i * 2) = HEX_CHARS[(b >> 4) as usize];
+            *ptr.add(i * 2 + 1) = HEX_CHARS[(b & 0x0f) as usize];
+        }
+    }
+}
+
+/// Adds deterministic noise to a numeric value within the given factor.
+/// The noise is derived from a SHA-256 hash of the input value, producing
+/// consistent output for the same input (prevents statistical recovery
+/// through repeated queries). Non-numeric values return "0".
+pub fn apply_noise_mask(value: &str, factor: f64) -> String {
+    use sha2::{Digest, Sha256};
+
+    let num: f64 = value.parse().unwrap_or(0.0);
+    // Derive a deterministic noise value from the input using SHA-256.
+    // The hash output is mapped to [-1.0, 1.0) range.
     let mut hasher = Sha256::new();
     hasher.update(value.as_bytes());
+    hasher.update(b"noise_mask_seed");
     let hash = hasher.finalize();
-    let mut hex = String::with_capacity(64);
-    for byte in hash.iter() {
-        hex.push_str(&format!("{:02x}", byte));
+    let hash_u64 = u64::from_le_bytes([
+        hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
+    ]);
+    let normalized = (hash_u64 as f64 / u64::MAX as f64) * 2.0 - 1.0;
+    let noise = normalized * factor * num;
+    format!("{}", num + noise)
+}
+
+/// Replaces a numeric value with its corresponding range bucket.
+/// Boundaries must be sorted. Values below the first boundary return
+/// "< first". Values above the last return ">= last".
+pub fn apply_bucket_mask(value: &str, boundaries: &[f64]) -> String {
+    let num: f64 = value.parse().unwrap_or(0.0);
+    if boundaries.is_empty() {
+        return value.to_string();
     }
-    hex
+    if num < boundaries[0] {
+        return format!("<{}", boundaries[0]);
+    }
+    for i in 0..boundaries.len() - 1 {
+        if num >= boundaries[i] && num < boundaries[i + 1] {
+            return format!("{}-{}", boundaries[i], boundaries[i + 1]);
+        }
+    }
+    format!(">={}", boundaries[boundaries.len() - 1])
+}
+
+/// Shows the first N and last M characters, masking the middle with mask_char.
+/// If the value is shorter than show_first + show_last, returns it unchanged.
+/// Non-ASCII input is returned unchanged.
+pub fn apply_partial_mask_extended(
+    value: &str,
+    show_first: u8,
+    show_last: u8,
+    mask_char: u8,
+) -> String {
+    if !value.is_ascii() {
+        return value.to_string();
+    }
+    let bytes = value.as_bytes();
+    let len = bytes.len();
+    let first = show_first as usize;
+    let last = show_last as usize;
+    if len <= first + last {
+        return value.to_string();
+    }
+    let mut result = String::with_capacity(len);
+    unsafe {
+        let out = result.as_mut_vec();
+        out.set_len(len);
+        let ptr = out.as_mut_ptr();
+        for i in 0..len {
+            *ptr.add(i) = if i < first || i >= len - last {
+                bytes[i]
+            } else {
+                mask_char
+            };
+        }
+    }
+    result
 }
 
 /// Dispatches to the appropriate masking function based on the rule.
-/// Returns None for Null mask (represents SQL NULL in the result row).
-pub fn apply_mask(value: &str, function: &MaskFunction) -> Option<String> {
+/// Writes the masked value into buf. Returns false for Null mask
+/// (represents SQL NULL in the result row).
+pub fn apply_mask(value: &str, function: &MaskFunction, buf: &mut String) -> bool {
     match function {
-        MaskFunction::Email => Some(apply_email_mask(value)),
-        MaskFunction::Phone => Some(apply_phone_mask(value)),
-        MaskFunction::Ssn => Some(apply_ssn_mask(value)),
-        MaskFunction::CreditCard => Some(apply_credit_card_mask(value)),
-        MaskFunction::Partial(n) => Some(apply_partial_mask(value, *n)),
-        MaskFunction::Hash => Some(apply_hash_mask(value)),
-        MaskFunction::Null => None,
-        MaskFunction::Redact => Some("[REDACTED]".to_string()),
-        MaskFunction::Custom(_) => Some(value.to_string()),
+        MaskFunction::Hash => {
+            apply_hash_mask(value, buf);
+            true
+        }
+        MaskFunction::Null => false,
+        other => {
+            buf.clear();
+            let masked = match other {
+                MaskFunction::Email => apply_email_mask(value),
+                MaskFunction::Phone => apply_phone_mask(value),
+                MaskFunction::Ssn => apply_ssn_mask(value),
+                MaskFunction::CreditCard => apply_credit_card_mask(value),
+                MaskFunction::Partial(n) => apply_partial_mask(value, *n),
+                MaskFunction::Redact => "[REDACTED]".to_string(),
+                MaskFunction::Custom(_) => value.to_string(),
+                MaskFunction::NoiseMask { factor } => apply_noise_mask(value, *factor),
+                MaskFunction::BucketMask { boundaries } => apply_bucket_mask(value, boundaries),
+                MaskFunction::PartialMask {
+                    show_first,
+                    show_last,
+                    mask_char,
+                } => apply_partial_mask_extended(value, *show_first, *show_last, *mask_char),
+                MaskFunction::Hash | MaskFunction::Null => unreachable!(),
+            };
+            buf.push_str(&masked);
+            true
+        }
     }
 }
 
@@ -508,16 +786,20 @@ mod tests {
 
     #[test]
     fn test_hash_mask_deterministic() {
-        let h1 = apply_hash_mask("test_value");
-        let h2 = apply_hash_mask("test_value");
+        let mut h1 = String::new();
+        let mut h2 = String::new();
+        apply_hash_mask("test_value", &mut h1);
+        apply_hash_mask("test_value", &mut h2);
         assert_eq!(h1, h2);
         assert_eq!(h1.len(), 64);
     }
 
     #[test]
     fn test_hash_mask_different_inputs() {
-        let h1 = apply_hash_mask("value_a");
-        let h2 = apply_hash_mask("value_b");
+        let mut h1 = String::new();
+        let mut h2 = String::new();
+        apply_hash_mask("value_a", &mut h1);
+        apply_hash_mask("value_b", &mut h2);
         assert_ne!(h1, h2);
     }
 
@@ -525,37 +807,44 @@ mod tests {
 
     #[test]
     fn test_apply_mask_null() {
-        assert_eq!(apply_mask("anything", &MaskFunction::Null), None);
+        let mut buf = String::new();
+        assert!(!apply_mask("anything", &MaskFunction::Null, &mut buf));
     }
 
     #[test]
     fn test_apply_mask_redact() {
-        assert_eq!(
-            apply_mask("anything", &MaskFunction::Redact),
-            Some("[REDACTED]".to_string())
-        );
+        let mut buf = String::new();
+        assert!(apply_mask("anything", &MaskFunction::Redact, &mut buf));
+        assert_eq!(buf, "[REDACTED]");
     }
 
     #[test]
     fn test_apply_mask_custom_passthrough() {
-        assert_eq!(
-            apply_mask("data", &MaskFunction::Custom("my_fn".to_string())),
-            Some("data".to_string())
-        );
+        let mut buf = String::new();
+        assert!(apply_mask(
+            "data",
+            &MaskFunction::Custom("my_fn".to_string()),
+            &mut buf
+        ));
+        assert_eq!(buf, "data");
     }
 
     #[test]
     fn test_apply_mask_dispatches_email() {
-        assert_eq!(
-            apply_mask("john@example.com", &MaskFunction::Email),
-            Some("j***@example.com".to_string())
-        );
+        let mut buf = String::new();
+        assert!(apply_mask(
+            "john@example.com",
+            &MaskFunction::Email,
+            &mut buf
+        ));
+        assert_eq!(buf, "j***@example.com");
     }
 
     #[test]
     fn test_apply_mask_dispatches_hash() {
-        let result = apply_mask("test", &MaskFunction::Hash).expect("hash mask returns Some");
-        assert_eq!(result.len(), 64);
+        let mut buf = String::new();
+        assert!(apply_mask("test", &MaskFunction::Hash, &mut buf));
+        assert_eq!(buf.len(), 64);
     }
 
     // -- MaskingRule with all function variants --
@@ -572,6 +861,15 @@ mod tests {
             MaskFunction::Null,
             MaskFunction::Redact,
             MaskFunction::Custom("test_fn".to_string()),
+            MaskFunction::NoiseMask { factor: 0.15 },
+            MaskFunction::BucketMask {
+                boundaries: vec![50000.0, 100000.0, 200000.0],
+            },
+            MaskFunction::PartialMask {
+                show_first: 3,
+                show_last: 4,
+                mask_char: b'X',
+            },
         ];
         for (i, func) in variants.into_iter().enumerate() {
             let rule = MaskingRule {
@@ -584,5 +882,145 @@ mod tests {
             let decoded = MaskingRule::from_bytes(&bytes).expect("decode");
             assert_eq!(decoded.function, func);
         }
+    }
+
+    // -- NoiseMask tests --
+
+    #[test]
+    fn test_noise_mask_roundtrip() {
+        let func = MaskFunction::NoiseMask { factor: 0.25 };
+        let bytes = func.to_bytes();
+        let (decoded, consumed) = MaskFunction::from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded, func);
+        assert_eq!(consumed, 9);
+    }
+
+    #[test]
+    fn test_noise_mask_apply() {
+        let result = apply_noise_mask("100.0", 0.1);
+        let val: f64 = result.parse().expect("should be numeric");
+        assert!(val >= 90.0 && val <= 110.0, "noise out of range: {}", val);
+    }
+
+    #[test]
+    fn test_noise_mask_non_numeric() {
+        let result = apply_noise_mask("not_a_number", 0.1);
+        let val: f64 = result.parse().expect("should be numeric");
+        assert!(val.abs() < 0.001);
+    }
+
+    // -- BucketMask tests --
+
+    #[test]
+    fn test_bucket_mask_roundtrip() {
+        let func = MaskFunction::BucketMask {
+            boundaries: vec![100.0, 200.0, 300.0],
+        };
+        let bytes = func.to_bytes();
+        let (decoded, consumed) = MaskFunction::from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded, func);
+        assert_eq!(consumed, 5 + 3 * 8);
+    }
+
+    #[test]
+    fn test_bucket_mask_below_first() {
+        assert_eq!(apply_bucket_mask("25000", &[50000.0, 100000.0]), "<50000");
+    }
+
+    #[test]
+    fn test_bucket_mask_in_range() {
+        assert_eq!(
+            apply_bucket_mask("75000", &[50000.0, 100000.0, 200000.0]),
+            "50000-100000"
+        );
+    }
+
+    #[test]
+    fn test_bucket_mask_above_last() {
+        assert_eq!(
+            apply_bucket_mask("300000", &[50000.0, 100000.0, 200000.0]),
+            ">=200000"
+        );
+    }
+
+    #[test]
+    fn test_bucket_mask_empty_boundaries() {
+        assert_eq!(apply_bucket_mask("100", &[]), "100");
+    }
+
+    // -- PartialMask tests --
+
+    #[test]
+    fn test_partial_mask_extended_roundtrip() {
+        let func = MaskFunction::PartialMask {
+            show_first: 3,
+            show_last: 4,
+            mask_char: b'X',
+        };
+        let bytes = func.to_bytes();
+        let (decoded, consumed) = MaskFunction::from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded, func);
+        assert_eq!(consumed, 4);
+    }
+
+    #[test]
+    fn test_partial_mask_extended_apply() {
+        assert_eq!(
+            apply_partial_mask_extended("123-45-6789", 0, 4, b'*'),
+            "*******6789"
+        );
+    }
+
+    #[test]
+    fn test_partial_mask_extended_both_ends() {
+        assert_eq!(
+            apply_partial_mask_extended("1234567890", 3, 2, b'X'),
+            "123XXXXX90"
+        );
+    }
+
+    #[test]
+    fn test_partial_mask_extended_short_value() {
+        assert_eq!(apply_partial_mask_extended("hi", 3, 4, b'*'), "hi");
+    }
+
+    #[test]
+    fn test_apply_mask_dispatches_noise() {
+        let mut buf = String::new();
+        assert!(apply_mask(
+            "100.0",
+            &MaskFunction::NoiseMask { factor: 0.1 },
+            &mut buf
+        ));
+        let val: f64 = buf.parse().expect("numeric");
+        assert!(val >= 90.0 && val <= 110.0);
+    }
+
+    #[test]
+    fn test_apply_mask_dispatches_bucket() {
+        let mut buf = String::new();
+        assert!(apply_mask(
+            "75000",
+            &MaskFunction::BucketMask {
+                boundaries: vec![50000.0, 100000.0],
+            },
+            &mut buf,
+        ));
+        assert_eq!(buf, "50000-100000");
+    }
+
+    #[test]
+    fn test_apply_mask_dispatches_partial_mask() {
+        let mut buf = String::new();
+        assert!(apply_mask(
+            "1234567890",
+            &MaskFunction::PartialMask {
+                show_first: 2,
+                show_last: 3,
+                mask_char: b'#',
+            },
+            &mut buf,
+        ));
+        assert_eq!(buf, "12#####890");
     }
 }

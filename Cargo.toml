@@ -63,6 +63,10 @@ parquet = "58.0.0"
 # Config
 toml = "0.8"
 
+# Asymmetric crypto (WebAuthn/FIDO2 signature verification)
+p256 = { version = "0.13", features = ["ecdsa"] }
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+
 # Testing
 rcgen = "0.13"
 

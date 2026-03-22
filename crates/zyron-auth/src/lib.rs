@@ -10,22 +10,35 @@ pub mod auth_rules;
 pub mod balloon;
 pub mod breakglass;
 pub mod brute_force;
+pub mod cbor;
 pub mod classification;
+pub mod column_security;
 pub mod context;
 pub mod credentials;
+pub mod crypto_functions;
+pub mod encryption;
 pub mod governance;
 pub mod heap_storage;
 pub mod ip_management;
 pub mod masking;
 pub mod privilege;
+pub mod rcu;
+pub mod rls;
 pub mod role;
 pub mod row_ownership;
+pub mod security_label;
 pub mod session_binding;
 pub mod storage;
 pub mod tagging;
 pub mod user;
+pub mod webauthn;
+pub mod webauthn_store;
+pub mod webhook;
 
-pub use abac::{AbacPolicy, AbacStore, SessionAttributes};
+pub use abac::{
+    AbacEffect, AbacOperator, AbacPolicy, AbacRule, AbacRuleStore, AbacStore, AttributeCondition,
+    SessionAttributes,
+};
 pub use auth_rules::{AuthMethod, AuthResolver, AuthRule, ConnectionType};
 pub use balloon::BalloonParams;
 pub use breakglass::{BreakGlassManager, BreakGlassSession};
@@ -34,9 +47,13 @@ pub use brute_force::{
     LockAction,
 };
 pub use classification::{ClassificationLevel, ClassificationStore, ColumnClassification};
+pub use column_security::{MaskingPolicy, MaskingPolicyStore};
 pub use context::SecurityContext;
 pub use credentials::{
     ApiKeyCredential, JwtAlgorithm, JwtClaims, JwtCredential, PasswordCredential, TotpCredential,
+};
+pub use encryption::{
+    ColumnEncryption, EncryptionAlgorithm, EncryptionStore, KeyStore, LocalKeyStore,
 };
 pub use governance::{
     DelegationEdge, DelegationTracker, GovernanceManager, PendingApproval, PrivilegeAnalytics,
@@ -48,14 +65,24 @@ pub use masking::{MaskFunction, MaskingRule};
 pub use privilege::{
     GrantEntry, ObjectType, PrivilegeDecision, PrivilegeState, PrivilegeStore, PrivilegeType,
 };
+pub use rls::{PolicyType, RlsCommand, RlsPolicy, RlsPolicyStore, RlsResult};
 pub use role::{Role, RoleHierarchy, RoleId, RoleMembership, UserId};
 pub use row_ownership::{RowOwnershipConfig, RowOwnershipStore};
+pub use security_label::{
+    MandatoryAccessControl, ObjectSecurityLabel, SecurityLabel, SecurityLevel, SubjectSecurityLabel,
+};
 pub use session_binding::{QueryLimitStore, QueryLimits, SessionBinding, TimeWindow};
 pub use tagging::{ObjectTag, TagStore};
 pub use user::{User, UserRoleMembership};
+pub use webauthn::{
+    CoseAlgorithm, CosePublicKey, CredentialTransport, RelyingPartyConfig, WebAuthnCredential,
+};
+pub use webauthn_store::WebAuthnCredentialStore;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::rcu::RcuMap;
 use zyron_common::Result;
 
 /// Top-level coordinator that owns all auth subsystems.
@@ -72,6 +99,21 @@ pub struct SecurityManager {
     pub auth_resolver: AuthResolver,
     pub ip_manager: IpManager,
     pub brute_force: BruteForceManager,
+    pub rls_store: RlsPolicyStore,
+    pub masking_policy_store: MaskingPolicyStore,
+    pub abac_rule_store: AbacRuleStore,
+    pub encryption_store: EncryptionStore,
+    pub mac: MandatoryAccessControl,
+    pub webauthn_store: WebAuthnCredentialStore,
+    /// Cached password hashes keyed by username. Loaded at startup and updated
+    /// on user create/alter. Avoids heap scans per connection.
+    pub password_cache: RcuMap<String, String>,
+    /// Cached user ID lookup by name.
+    pub user_id_cache: RcuMap<String, UserId>,
+    /// Cached role lookup by name. Populated at startup, updated on create/drop.
+    pub role_cache: RcuMap<String, Role>,
+    /// WebAuthn relying party configuration for FIDO2 authentication.
+    pub webauthn_rp_config: RelyingPartyConfig,
     pub auth_storage: Arc<dyn storage::AuthStorage>,
 }
 
@@ -90,6 +132,16 @@ impl SecurityManager {
         let auth_resolver = AuthResolver::new(Vec::new());
         let ip_manager = IpManager::new();
         let brute_force = BruteForceManager::new();
+        let rls_store = RlsPolicyStore::new();
+        let masking_policy_store = MaskingPolicyStore::new();
+        let abac_rule_store = AbacRuleStore::new();
+        let encryption_store = EncryptionStore::new();
+        let mac = MandatoryAccessControl::new();
+        let webauthn_store = WebAuthnCredentialStore::new();
+        let password_cache: RcuMap<String, String> = RcuMap::empty_map();
+        let user_id_cache: RcuMap<String, UserId> = RcuMap::empty_map();
+        let role_cache: RcuMap<String, Role> = RcuMap::empty_map();
+        let webauthn_rp_config = RelyingPartyConfig::default();
 
         let mut manager = Self {
             role_hierarchy,
@@ -104,6 +156,16 @@ impl SecurityManager {
             auth_resolver,
             ip_manager,
             brute_force,
+            rls_store,
+            masking_policy_store,
+            abac_rule_store,
+            encryption_store,
+            mac,
+            webauthn_store,
+            password_cache,
+            user_id_cache,
+            role_cache,
+            webauthn_rp_config,
             auth_storage,
         };
 
@@ -143,6 +205,48 @@ impl SecurityManager {
         self.ip_manager.load_trusted(trusted_ips);
         let bf_policies = self.auth_storage.load_brute_force_policies().await?;
         self.brute_force.load_policy_bindings(bf_policies);
+
+        let rls_policies = self.auth_storage.load_rls_policies().await?;
+        self.rls_store.load(rls_policies);
+
+        let masking_policies = self.auth_storage.load_masking_policies().await?;
+        self.masking_policy_store.load(masking_policies);
+
+        let abac_rules = self.auth_storage.load_abac_rules().await?;
+        self.abac_rule_store.load(abac_rules);
+
+        let col_encryptions = self.auth_storage.load_column_encryptions().await?;
+        self.encryption_store.load(col_encryptions);
+
+        let object_labels = self.auth_storage.load_object_security_labels().await?;
+        self.mac.load_object_labels(object_labels);
+
+        let subject_labels = self.auth_storage.load_subject_security_labels().await?;
+        self.mac.load_subject_labels(subject_labels);
+
+        let webauthn_creds = self.auth_storage.load_webauthn_credentials().await?;
+        self.webauthn_store.load(webauthn_creds);
+
+        // Cache user passwords and IDs for fast auth lookups
+        let users = self.auth_storage.load_users().await?;
+        let mut id_map = HashMap::with_capacity(users.len());
+        let mut pw_map = HashMap::with_capacity(users.len());
+        for user in &users {
+            id_map.insert(user.name.clone(), user.id);
+            if let Some(ref hash) = user.password_hash {
+                pw_map.insert(user.name.clone(), hash.clone());
+            }
+        }
+        self.user_id_cache.store(id_map);
+        self.password_cache.store(pw_map);
+
+        // Cache roles by name for O(1) lookup
+        let roles = self.auth_storage.load_roles().await?;
+        let mut role_map = HashMap::with_capacity(roles.len());
+        for role in roles {
+            role_map.insert(role.name.clone(), role);
+        }
+        self.role_cache.store(role_map);
 
         Ok(())
     }
@@ -184,9 +288,8 @@ impl SecurityManager {
     }
 
     /// Looks up a role by name from storage.
-    pub async fn lookup_role(&self, name: &str) -> Result<Option<Role>> {
-        let roles = self.auth_storage.load_roles().await?;
-        Ok(roles.into_iter().find(|r| r.name == name))
+    pub fn lookup_role(&self, name: &str) -> Option<Role> {
+        self.role_cache.get(&name.to_string())
     }
 
     /// Creates a new role and persists it.
@@ -326,6 +429,17 @@ impl SecurityManager {
     /// Sets a masking rule on a column.
     pub async fn set_masking_rule(&self, rule: MaskingRule) -> Result<()> {
         self.auth_storage.store_masking_rule(&rule).await?;
+        // Update in-memory masking policy store so the rule takes effect immediately
+        let policy = column_security::MaskingPolicy {
+            id: 0,
+            name: format!("rule_{}_{}", rule.table_id, rule.column_id),
+            table_id: rule.table_id,
+            column_id: rule.column_id,
+            function: rule.function.clone(),
+            exempt_roles: rule.role_id.map_or_else(Vec::new, |r| vec![r]),
+            enabled: true,
+        };
+        let _ = self.masking_policy_store.add_policy(policy);
         Ok(())
     }
 

@@ -4,6 +4,7 @@
 //! SessionBinding ties a role to a specific IP address.
 //! QueryLimits constrains resource usage per role.
 
+use crate::rcu::RcuMap;
 use crate::role::RoleId;
 use serde::{Deserialize, Serialize};
 use zyron_common::{Result, ZyronError};
@@ -107,22 +108,23 @@ impl Default for QueryLimits {
 
 /// Stores and merges query limits for multiple roles.
 pub struct QueryLimitStore {
-    limits: scc::HashMap<RoleId, QueryLimits>,
+    limits: RcuMap<RoleId, QueryLimits>,
 }
 
 impl QueryLimitStore {
     pub fn new() -> Self {
         Self {
-            limits: scc::HashMap::new(),
+            limits: RcuMap::empty_map(),
         }
     }
 
     /// Merges limits from all effective roles. The most restrictive value wins:
     /// smallest Some value for numeric limits, false if any role disallows full scans.
     pub fn get_limits(&self, effective_roles: &[RoleId]) -> QueryLimits {
+        let snap = self.limits.load();
         let mut merged = QueryLimits::default();
         for role_id in effective_roles {
-            self.limits.read_sync(role_id, |_k, v| {
+            if let Some(v) = snap.get(role_id) {
                 merged.max_scan_rows = merge_min_option(merged.max_scan_rows, v.max_scan_rows);
                 merged.max_result_rows =
                     merge_min_option(merged.max_result_rows, v.max_result_rows);
@@ -134,20 +136,20 @@ impl QueryLimitStore {
                 if !v.allow_full_scan {
                     merged.allow_full_scan = false;
                 }
-            });
+            }
         }
         merged
     }
 
     /// Sets (or replaces) limits for a role.
     pub fn set_limits(&self, limits: QueryLimits) {
-        let _ = self.limits.insert_sync(limits.role_id, limits);
+        self.limits.insert(limits.role_id, limits);
     }
 
     /// Bulk-loads limits, replacing any existing entries.
     pub fn load(&self, all_limits: Vec<QueryLimits>) {
         for limits in all_limits {
-            let _ = self.limits.insert_sync(limits.role_id, limits);
+            self.limits.insert(limits.role_id, limits);
         }
     }
 }

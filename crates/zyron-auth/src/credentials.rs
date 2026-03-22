@@ -245,12 +245,19 @@ impl JwtCredential {
         })?;
         let claims = json_to_claims(payload_str)?;
 
-        // Validate expiration using max_age_secs as current time reference.
-        // The caller should set exp = iat + max_age. We check that iat + max_age >= exp context.
         if claims.exp == 0 {
             return Err(ZyronError::InvalidCredential(
                 "JWT missing exp claim".to_string(),
             ));
+        }
+
+        // Check expiration against current system time.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if now > claims.exp {
+            return Err(ZyronError::InvalidCredential("JWT has expired".to_string()));
         }
 
         // Check issuer if configured.
@@ -321,10 +328,15 @@ impl JwtCredential {
 
 /// Time-based One-Time Password credential using HMAC-SHA1.
 /// Implements RFC 6238 with configurable digits and period.
+/// Pre-computes the HMAC key schedule so repeated generate/verify
+/// calls skip the key pad derivation (XOR of key with ipad/opad).
 pub struct TotpCredential {
     secret: Vec<u8>,
     digits: u32,
     period: u64,
+    /// Pre-computed HMAC-SHA1 instance cloned per operation. Avoids
+    /// re-deriving the inner/outer key pads on every generate_code call.
+    hmac_template: Hmac<sha1::Sha1>,
 }
 
 impl TotpCredential {
@@ -333,30 +345,35 @@ impl TotpCredential {
         use rand::Rng;
         let mut secret = vec![0u8; 20];
         rand::rng().fill_bytes(&mut secret);
+        let hmac_template =
+            Hmac::<sha1::Sha1>::new_from_slice(&secret).expect("HMAC-SHA1 accepts any key length");
         Self {
             secret,
             digits: 6,
             period: 30,
+            hmac_template,
         }
     }
 
     /// Creates a TOTP credential from an existing secret.
     pub fn from_secret(secret: Vec<u8>) -> Self {
+        let hmac_template =
+            Hmac::<sha1::Sha1>::new_from_slice(&secret).expect("HMAC-SHA1 accepts any key length");
         Self {
             secret,
             digits: 6,
             period: 30,
+            hmac_template,
         }
     }
 
-    /// Generates the TOTP code for the given unix timestamp.
-    /// counter = timestamp / period, then HMAC-SHA1 with dynamic truncation.
-    pub fn generate_code(&self, timestamp: u64) -> String {
+    /// Returns the raw TOTP integer for the given timestamp, avoiding String allocation.
+    /// Clones the pre-computed HMAC template instead of re-deriving key pads.
+    fn generate_code_raw(&self, timestamp: u64) -> u32 {
         let counter = timestamp / self.period;
         let counter_bytes = counter.to_be_bytes();
 
-        let mut mac = Hmac::<sha1::Sha1>::new_from_slice(&self.secret)
-            .expect("HMAC-SHA1 accepts any key length");
+        let mut mac = self.hmac_template.clone();
         mac.update(&counter_bytes);
         let result = mac.finalize().into_bytes();
 
@@ -368,25 +385,37 @@ impl TotpCredential {
             | (result[offset + 3] as u32);
 
         let modulus = 10u32.pow(self.digits);
-        let code = binary % modulus;
+        binary % modulus
+    }
+
+    /// Generates the TOTP code for the given unix timestamp.
+    /// counter = timestamp / period, then HMAC-SHA1 with dynamic truncation.
+    pub fn generate_code(&self, timestamp: u64) -> String {
+        let code = self.generate_code_raw(timestamp);
         format!("{:0>width$}", code, width = self.digits as usize)
     }
 
     /// Verifies a TOTP code, checking the current period and one period before and after
-    /// to account for clock drift.
+    /// to account for clock drift. Uses integer comparison to avoid String allocation.
     pub fn verify(&self, code: &str, timestamp: u64) -> bool {
-        // Check current window and +/- 1 period for clock skew tolerance.
-        for offset in [0i64, -1, 1] {
-            let adjusted = if offset < 0 {
-                timestamp.saturating_sub(self.period)
-            } else if offset > 0 {
-                timestamp.saturating_add(self.period)
-            } else {
-                timestamp
-            };
-            if self.generate_code(adjusted) == code {
-                return true;
-            }
+        let parsed = match code.parse::<u32>() {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let modulus = 10u32.pow(self.digits);
+        if parsed >= modulus {
+            return false;
+        }
+
+        // Check current window first (most likely match), then +/- 1 period.
+        if self.generate_code_raw(timestamp) == parsed {
+            return true;
+        }
+        if self.generate_code_raw(timestamp.saturating_sub(self.period)) == parsed {
+            return true;
+        }
+        if self.generate_code_raw(timestamp.saturating_add(self.period)) == parsed {
+            return true;
         }
         false
     }
@@ -549,9 +578,24 @@ fn json_to_claims(json: &str) -> Result<JwtClaims> {
 /// Extracts a string value for a given key from a JSON object.
 fn extract_json_string(json: &str, key: &str) -> Result<Option<String>> {
     let search = format!("\"{}\":\"", key);
-    let start = match json.find(&search) {
-        Some(pos) => pos + search.len(),
-        None => return Ok(None),
+    // Find the key as a top-level JSON key (preceded by '{' or ',')
+    // to avoid matching key names inside string values.
+    let start = {
+        let mut search_from = 0;
+        loop {
+            let pos = match json[search_from..].find(&search) {
+                Some(p) => search_from + p,
+                None => return Ok(None),
+            };
+            let before = json[..pos].trim_end();
+            if before.ends_with('{') || before.ends_with(',') {
+                break pos + search.len();
+            }
+            search_from = pos + 1;
+            if search_from >= json.len() {
+                return Ok(None);
+            }
+        }
     };
 
     let mut result = String::new();
@@ -643,9 +687,22 @@ fn extract_json_number(json: &str, key: &str) -> Result<Option<u64>> {
 /// Extracts a string array value for a given key from a JSON object.
 fn extract_json_string_array(json: &str, key: &str) -> Result<Vec<String>> {
     let search = format!("\"{}\":[", key);
-    let start = match json.find(&search) {
-        Some(pos) => pos + search.len(),
-        None => return Ok(Vec::new()),
+    let start = {
+        let mut search_from = 0;
+        loop {
+            let pos = match json[search_from..].find(&search) {
+                Some(p) => search_from + p,
+                None => return Ok(Vec::new()),
+            };
+            let before = json[..pos].trim_end();
+            if before.ends_with('{') || before.ends_with(',') {
+                break pos + search.len();
+            }
+            search_from = pos + 1;
+            if search_from >= json.len() {
+                return Ok(Vec::new());
+            }
+        }
     };
 
     let remaining = &json[start..];

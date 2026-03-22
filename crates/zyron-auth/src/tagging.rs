@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use zyron_common::{Result, ZyronError};
 
 use crate::privilege::ObjectType;
+use crate::rcu::RcuMap;
 
 /// A tag attached to a specific database object, optionally at the column level.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,16 +96,16 @@ impl ObjectTag {
 /// - by_tag: tag name -> list of (ObjectType, object_id, column_id)
 /// - by_object: (object_type as u8, object_id) -> list of tag names
 pub struct TagStore {
-    by_tag: scc::HashMap<String, Vec<(ObjectType, u32, Option<u16>)>>,
-    by_object: scc::HashMap<(u8, u32), Vec<String>>,
+    by_tag: RcuMap<String, Vec<(ObjectType, u32, Option<u16>)>>,
+    by_object: RcuMap<(u8, u32), Vec<String>>,
 }
 
 impl TagStore {
     /// Creates an empty tag store.
     pub fn new() -> Self {
         Self {
-            by_tag: scc::HashMap::new(),
-            by_object: scc::HashMap::new(),
+            by_tag: RcuMap::empty_map(),
+            by_object: RcuMap::empty_map(),
         }
     }
 
@@ -115,30 +116,20 @@ impl TagStore {
         let tag_name = tag.tag;
 
         // Update by_tag index.
-        match self.by_tag.entry_sync(tag_name.clone()) {
-            scc::hash_map::Entry::Occupied(mut occ) => {
-                let list = occ.get_mut();
-                if !list.contains(&entry) {
-                    list.push(entry);
-                }
+        self.by_tag.update(|m| {
+            let list = m.entry(tag_name.clone()).or_insert_with(Vec::new);
+            if !list.contains(&entry) {
+                list.push(entry);
             }
-            scc::hash_map::Entry::Vacant(vac) => {
-                let _ = vac.insert_entry(vec![entry]);
-            }
-        }
+        });
 
         // Update by_object index.
-        match self.by_object.entry_sync(obj_key) {
-            scc::hash_map::Entry::Occupied(mut occ) => {
-                let list = occ.get_mut();
-                if !list.contains(&tag_name) {
-                    list.push(tag_name);
-                }
+        self.by_object.update(|m| {
+            let list = m.entry(obj_key).or_insert_with(Vec::new);
+            if !list.contains(&tag_name) {
+                list.push(tag_name.clone());
             }
-            scc::hash_map::Entry::Vacant(vac) => {
-                let _ = vac.insert_entry(vec![tag_name]);
-            }
-        }
+        });
 
         Ok(())
     }
@@ -148,58 +139,51 @@ impl TagStore {
         let mut removed = false;
 
         // Remove from by_tag index.
-        let _ = self.by_tag.read_sync(tag, |_, list| {
-            // We need mutable access, so just check existence here.
-            list.iter().any(|e| e.0 == object_type && e.1 == object_id)
+        self.by_tag.update(|m| {
+            if let Some(list) = m.get_mut(tag) {
+                let before = list.len();
+                list.retain(|e| !(e.0 == object_type && e.1 == object_id));
+                if list.len() < before {
+                    removed = true;
+                }
+                if list.is_empty() {
+                    m.remove(tag);
+                }
+            }
         });
-
-        // Use entry to modify by_tag.
-        if let scc::hash_map::Entry::Occupied(mut occ) = self.by_tag.entry_sync(tag.to_string()) {
-            let list = occ.get_mut();
-            let before = list.len();
-            list.retain(|e| !(e.0 == object_type && e.1 == object_id));
-            if list.len() < before {
-                removed = true;
-            }
-            if list.is_empty() {
-                let _ = occ.remove();
-            }
-        }
 
         // Remove from by_object index.
         let obj_key = (object_type as u8, object_id);
-        if let scc::hash_map::Entry::Occupied(mut occ) = self.by_object.entry_sync(obj_key) {
-            let list = occ.get_mut();
-            list.retain(|t| t != tag);
-            if list.is_empty() {
-                let _ = occ.remove();
+        self.by_object.update(|m| {
+            if let Some(list) = m.get_mut(&obj_key) {
+                list.retain(|t| t != tag);
+                if list.is_empty() {
+                    m.remove(&obj_key);
+                }
             }
-        }
+        });
 
         removed
     }
 
     /// Returns all objects that have the given tag.
     pub fn objects_with_tag(&self, tag: &str) -> Vec<(ObjectType, u32, Option<u16>)> {
-        self.by_tag
-            .read_sync(tag, |_, list| list.clone())
-            .unwrap_or_default()
+        let snap = self.by_tag.load();
+        snap.get(tag).cloned().unwrap_or_default()
     }
 
     /// Returns all tags for the given object.
     pub fn tags_for_object(&self, object_type: ObjectType, object_id: u32) -> Vec<String> {
         let key = (object_type as u8, object_id);
-        self.by_object
-            .read_sync(&key, |_, list| list.clone())
-            .unwrap_or_default()
+        let snap = self.by_object.load();
+        snap.get(&key).cloned().unwrap_or_default()
     }
 
     /// Checks whether the given object has a specific tag.
     pub fn has_tag(&self, object_type: ObjectType, object_id: u32, tag: &str) -> bool {
-        self.by_tag
-            .read_sync(tag, |_, list| {
-                list.iter().any(|e| e.0 == object_type && e.1 == object_id)
-            })
+        let snap = self.by_tag.load();
+        snap.get(tag)
+            .map(|list| list.iter().any(|e| e.0 == object_type && e.1 == object_id))
             .unwrap_or(false)
     }
 

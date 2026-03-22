@@ -14,6 +14,7 @@ use zyron_catalog::encoding::{
 use zyron_common::{Result, ZyronError};
 
 use crate::ip_management::{IpBlockSource, IpManager};
+use crate::rcu::Rcu;
 use crate::role::RoleId;
 
 /// Returns the current time in seconds since the Unix epoch.
@@ -343,14 +344,15 @@ impl AuditRing {
 
 /// Brute force defense manager with per-user and per-IP tracking.
 pub struct BruteForceManager {
-    global_policy: parking_lot::RwLock<BruteForcePolicy>,
-    policy_bindings: parking_lot::RwLock<Vec<BruteForcePolicyBinding>>,
+    global_policy: Rcu<BruteForcePolicy>,
+    policy_bindings: Rcu<Vec<BruteForcePolicyBinding>>,
     user_attempts: scc::HashMap<String, AttemptTracker>,
     ip_attempts: scc::HashMap<String, AttemptTracker>,
-    /// Tracks how many distinct accounts have been locked from each IP.
-    /// When an IP causes 2+ account lockouts, it gets auto-blocked.
-    /// One lockout could be a user mistake. Two is a pattern.
-    locked_accounts_per_ip: scc::HashMap<String, AtomicU32>,
+    /// Tracks distinct usernames that have been locked out from each IP.
+    /// When an IP causes 2+ distinct account lockouts, it gets auto-blocked.
+    /// One lockout could be a user mistake. Two distinct users is a pattern.
+    locked_accounts_per_ip:
+        scc::HashMap<String, parking_lot::Mutex<std::collections::HashSet<String>>>,
     audit_ring: parking_lot::Mutex<AuditRing>,
 }
 
@@ -358,8 +360,8 @@ impl BruteForceManager {
     /// Creates a new BruteForceManager with default policy and 1024-entry audit ring.
     pub fn new() -> Self {
         Self {
-            global_policy: parking_lot::RwLock::new(BruteForcePolicy::default()),
-            policy_bindings: parking_lot::RwLock::new(Vec::new()),
+            global_policy: Rcu::new(BruteForcePolicy::default()),
+            policy_bindings: Rcu::new(Vec::new()),
             user_attempts: scc::HashMap::new(),
             ip_attempts: scc::HashMap::new(),
             locked_accounts_per_ip: scc::HashMap::new(),
@@ -402,7 +404,7 @@ impl BruteForceManager {
 
         // Rate limit check on IP
         if !ip_trusted {
-            let policy = self.global_policy.read();
+            let policy = self.global_policy.load();
             let min_interval = policy.min_attempt_interval_ms;
             if min_interval > 0 {
                 let current_ms = now_ms();
@@ -432,7 +434,7 @@ impl BruteForceManager {
     ) -> Option<LockAction> {
         let ts = now_secs();
         let ms = now_ms();
-        let policy = self.global_policy.read().clone();
+        let policy = (*self.global_policy.load()).clone();
 
         let user_capacity = (policy.lockout_threshold as usize).max(8);
         let ip_capacity = (policy.ip_block_threshold as usize).max(8);
@@ -543,15 +545,21 @@ impl BruteForceManager {
     /// One account lockout could be a user mistake. Two is an attack pattern.
     pub fn report_lockout(&self, ip: &str, user_name: &str, ip_manager: &IpManager) {
         let count = match self.locked_accounts_per_ip.entry_sync(ip.to_string()) {
-            scc::hash_map::Entry::Occupied(occ) => occ.get().fetch_add(1, Ordering::Relaxed) + 1,
+            scc::hash_map::Entry::Occupied(occ) => {
+                let mut set = occ.get().lock();
+                set.insert(user_name.to_string());
+                set.len()
+            }
             scc::hash_map::Entry::Vacant(vac) => {
-                vac.insert_entry(AtomicU32::new(1));
+                let mut set = std::collections::HashSet::new();
+                set.insert(user_name.to_string());
+                vac.insert_entry(parking_lot::Mutex::new(set));
                 1
             }
         };
 
         if count >= 2 {
-            let policy = self.global_policy.read();
+            let policy = self.global_policy.load();
             let expires = now_secs() + policy.ip_block_duration_secs;
             ip_manager.block_ip(
                 ip.to_string(),
@@ -567,22 +575,27 @@ impl BruteForceManager {
 
     /// Sets the global brute force policy.
     pub fn set_global_policy(&self, policy: BruteForcePolicy) {
-        *self.global_policy.write() = policy;
+        self.global_policy.store(policy);
     }
 
     /// Adds a policy binding. Bindings are kept sorted by priority (ascending).
     pub fn add_policy_binding(&self, binding: BruteForcePolicyBinding) {
-        let mut bindings = self.policy_bindings.write();
-        bindings.push(binding);
-        bindings.sort_by_key(|b| b.priority);
+        self.policy_bindings.update(|v| {
+            v.push(binding);
+            v.sort_by_key(|b| b.priority);
+        });
     }
 
     /// Removes a policy binding by priority. Returns true if found.
     pub fn remove_policy_binding(&self, priority: u16) -> bool {
-        let mut bindings = self.policy_bindings.write();
-        let len_before = bindings.len();
-        bindings.retain(|b| b.priority != priority);
-        bindings.len() < len_before
+        let snap = self.policy_bindings.load();
+        if !snap.iter().any(|b| b.priority == priority) {
+            return false;
+        }
+        self.policy_bindings.update(|v| {
+            v.retain(|b| b.priority != priority);
+        });
+        true
     }
 
     /// Resets the consecutive failure counter for a user.
@@ -609,7 +622,7 @@ impl BruteForceManager {
 
     /// Returns the failure count for an IP within the current policy window.
     pub fn ip_failure_count(&self, ip: &str) -> u32 {
-        let policy = self.global_policy.read();
+        let policy = self.global_policy.load();
         let window = policy.failure_window_secs;
         let ts = now_secs();
         let mut count = 0u32;
@@ -626,25 +639,19 @@ impl BruteForceManager {
 
     /// Returns a clone of all policy bindings.
     pub fn policy_bindings(&self) -> Vec<BruteForcePolicyBinding> {
-        self.policy_bindings.read().clone()
+        (*self.policy_bindings.load()).clone()
     }
 
     /// Loads policy bindings from storage (replaces existing).
-    pub fn load_policy_bindings(&self, bindings: Vec<BruteForcePolicyBinding>) {
-        let mut store = self.policy_bindings.write();
-        *store = bindings;
-        store.sort_by_key(|b| b.priority);
-    }
-
-    /// Exports policy bindings for persistence.
-    pub fn export_policy_bindings(&self) -> Vec<BruteForcePolicyBinding> {
-        self.policy_bindings.read().clone()
+    pub fn load_policy_bindings(&self, mut bindings: Vec<BruteForcePolicyBinding>) {
+        bindings.sort_by_key(|b| b.priority);
+        self.policy_bindings.store(bindings);
     }
 
     /// Resolves the effective policy by checking bindings in priority order.
     /// Returns the first matching binding's policy, or the global policy as fallback.
     fn resolve_policy(&self, effective_roles: &[RoleId], database: &str) -> BruteForcePolicy {
-        let bindings = self.policy_bindings.read();
+        let bindings = self.policy_bindings.load();
         for binding in bindings.iter() {
             // Check role match
             let role_matches = match binding.role_id {
@@ -669,7 +676,7 @@ impl BruteForceManager {
                 return binding.policy.clone();
             }
         }
-        self.global_policy.read().clone()
+        (*self.global_policy.load()).clone()
     }
 }
 

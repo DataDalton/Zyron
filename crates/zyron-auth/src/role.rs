@@ -9,7 +9,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use zyron_catalog::encoding::{
     read_bool, read_string, read_u8, read_u32, read_u64, write_bool, write_string, write_u8,
@@ -18,6 +17,7 @@ use zyron_catalog::encoding::{
 use zyron_common::{Result, ZyronError};
 
 use crate::classification::ClassificationLevel;
+use crate::rcu::RcuMap;
 
 /// Unique identifier for a role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -40,6 +40,7 @@ impl fmt::Display for UserId {
 }
 
 /// A database role with a clearance level for privilege grouping.
+#[derive(Clone)]
 pub struct Role {
     pub id: RoleId,
     pub name: String,
@@ -122,14 +123,14 @@ const MAX_ROLE_DEPTH: usize = 64;
 /// Thread-safe role hierarchy stored as an adjacency list.
 /// Key = member role, Value = list of (parent role, inherit flag).
 pub struct RoleHierarchy {
-    adjacency: RwLock<HashMap<RoleId, Vec<(RoleId, bool)>>>,
+    adjacency: RcuMap<RoleId, Vec<(RoleId, bool)>>,
 }
 
 impl RoleHierarchy {
     /// Creates an empty role hierarchy.
     pub fn new() -> Self {
         Self {
-            adjacency: RwLock::new(HashMap::new()),
+            adjacency: RcuMap::empty_map(),
         }
     }
 
@@ -142,7 +143,7 @@ impl RoleHierarchy {
                 .or_insert_with(Vec::new)
                 .push((m.parent_id, m.inherit));
         }
-        *self.adjacency.write() = adj;
+        self.adjacency.store(adj);
     }
 
     /// Adds a membership edge after checking for cycles.
@@ -152,35 +153,35 @@ impl RoleHierarchy {
             return Err(ZyronError::CircularRoleDependency);
         }
 
-        let adj = self.adjacency.read();
-        if would_create_cycle(&adj, member, parent) {
+        let snap = self.adjacency.load();
+        if would_create_cycle(&snap, member, parent) {
             return Err(ZyronError::CircularRoleDependency);
         }
-        drop(adj);
 
-        self.adjacency
-            .write()
-            .entry(member)
-            .or_insert_with(Vec::new)
-            .push((parent, inherit));
+        self.adjacency.update(|m| {
+            m.entry(member)
+                .or_insert_with(Vec::new)
+                .push((parent, inherit));
+        });
         Ok(())
     }
 
     /// Removes a membership edge between member and parent.
     pub fn remove_membership(&self, member: RoleId, parent: RoleId) {
-        let mut adj = self.adjacency.write();
-        if let Some(parents) = adj.get_mut(&member) {
-            parents.retain(|(p, _)| *p != parent);
-            if parents.is_empty() {
-                adj.remove(&member);
+        self.adjacency.update(|m| {
+            if let Some(parents) = m.get_mut(&member) {
+                parents.retain(|(p, _)| *p != parent);
+                if parents.is_empty() {
+                    m.remove(&member);
+                }
             }
-        }
+        });
     }
 
     /// Returns all roles that the given role inherits from, including itself.
     /// Only follows edges where inherit=true. BFS with depth limit.
     pub fn effective_roles(&self, role_id: RoleId) -> Vec<RoleId> {
-        let adj = self.adjacency.read();
+        let adj = self.adjacency.load();
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
         let mut result = Vec::new();
@@ -208,7 +209,7 @@ impl RoleHierarchy {
     /// Returns all roles reachable from the given role, including non-inherited ones.
     /// Includes the role itself. BFS with depth limit.
     pub fn all_roles(&self, role_id: RoleId) -> Vec<RoleId> {
-        let adj = self.adjacency.read();
+        let adj = self.adjacency.load();
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
         let mut result = Vec::new();
@@ -239,7 +240,7 @@ impl RoleHierarchy {
         if role_id == group_id {
             return true;
         }
-        let adj = self.adjacency.read();
+        let adj = self.adjacency.load();
         let mut visited = HashSet::new();
         let mut stack = Vec::new();
         stack.push((role_id, 0usize));

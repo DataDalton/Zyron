@@ -191,6 +191,26 @@ pub enum ZyronError {
     #[error("Rate limited, retry after {0}ms")]
     RateLimited(u64),
 
+    // Encryption errors
+    #[error("Encryption failed: {0}")]
+    EncryptionFailed(String),
+
+    #[error("Decryption failed: {0}")]
+    DecryptionFailed(String),
+
+    #[error("Encryption key not found: {0}")]
+    EncryptionKeyNotFound(String),
+
+    // Policy errors
+    #[error("Policy not found: {0}")]
+    PolicyNotFound(String),
+
+    #[error("Policy already exists: {0}")]
+    PolicyAlreadyExists(String),
+
+    #[error("Webhook verification failed: {0}")]
+    WebhookVerificationFailed(String),
+
     // Internal errors
     #[error("Internal error: {0}")]
     Internal(String),

@@ -7,15 +7,20 @@
 use async_trait::async_trait;
 use zyron_common::Result;
 
-use crate::abac::AbacPolicy;
+use crate::abac::{AbacPolicy, AbacRule};
 use crate::auth_rules::AuthRule;
 use crate::classification::ColumnClassification;
+use crate::column_security::MaskingPolicy;
+use crate::encryption::ColumnEncryption;
 use crate::governance::DelegationEdge;
 use crate::masking::MaskingRule;
 use crate::privilege::{GrantEntry, ObjectType, PrivilegeType};
+use crate::rls::RlsPolicy;
 use crate::role::{Role, RoleId, RoleMembership};
 use crate::row_ownership::RowOwnershipConfig;
+use crate::security_label::{ObjectSecurityLabel, SubjectSecurityLabel};
 use crate::tagging::ObjectTag;
+use crate::webauthn::WebAuthnCredential;
 
 /// Async persistence interface for all auth subsystem data.
 #[async_trait]
@@ -96,4 +101,36 @@ pub trait AuthStorage: Send + Sync {
         role_id: Option<crate::role::RoleId>,
         database: Option<&str>,
     ) -> Result<()>;
+
+    // RLS policies
+    async fn load_rls_policies(&self) -> Result<Vec<RlsPolicy>>;
+    async fn store_rls_policy(&self, policy: &RlsPolicy) -> Result<()>;
+    async fn delete_rls_policy(&self, table_id: u32, name: &str) -> Result<()>;
+
+    // Masking policies (column_security)
+    async fn load_masking_policies(&self) -> Result<Vec<MaskingPolicy>>;
+    async fn store_masking_policy(&self, policy: &MaskingPolicy) -> Result<()>;
+    async fn delete_masking_policy(&self, table_id: u32, column_id: u16, name: &str) -> Result<()>;
+
+    // ABAC rules
+    async fn load_abac_rules(&self) -> Result<Vec<AbacRule>>;
+    async fn store_abac_rule(&self, rule: &AbacRule) -> Result<()>;
+    async fn delete_abac_rule(&self, id: u32) -> Result<()>;
+
+    // Column encryption
+    async fn load_column_encryptions(&self) -> Result<Vec<ColumnEncryption>>;
+    async fn store_column_encryption(&self, config: &ColumnEncryption) -> Result<()>;
+    async fn delete_column_encryption(&self, table_id: u32, column_id: u16) -> Result<()>;
+
+    // Security labels
+    async fn load_object_security_labels(&self) -> Result<Vec<ObjectSecurityLabel>>;
+    async fn store_object_security_label(&self, label: &ObjectSecurityLabel) -> Result<()>;
+    async fn load_subject_security_labels(&self) -> Result<Vec<SubjectSecurityLabel>>;
+    async fn store_subject_security_label(&self, label: &SubjectSecurityLabel) -> Result<()>;
+
+    // WebAuthn credentials
+    async fn load_webauthn_credentials(&self) -> Result<Vec<WebAuthnCredential>>;
+    async fn store_webauthn_credential(&self, cred: &WebAuthnCredential) -> Result<()>;
+    async fn delete_webauthn_credential(&self, credential_id: &[u8]) -> Result<()>;
+    async fn update_webauthn_sign_count(&self, credential_id: &[u8], new_count: u32) -> Result<()>;
 }

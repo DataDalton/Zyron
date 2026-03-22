@@ -12,19 +12,24 @@ use zyron_buffer::BufferPool;
 use zyron_common::Result;
 use zyron_storage::{DiskManager, HeapFile, HeapFileConfig, Tuple};
 
-use crate::abac::AbacPolicy;
+use crate::abac::{AbacPolicy, AbacRule};
 use crate::auth_rules::AuthRule;
 use crate::brute_force::{AttemptEntry, BruteForcePolicyBinding};
 use crate::classification::ColumnClassification;
+use crate::column_security::MaskingPolicy;
+use crate::encryption::ColumnEncryption;
 use crate::governance::DelegationEdge;
 use crate::ip_management::{IpBlockEntry, TrustedIpEntry};
 use crate::masking::MaskingRule;
 use crate::privilege::{GrantEntry, ObjectType, PrivilegeType};
+use crate::rls::RlsPolicy;
 use crate::role::{Role, RoleId, RoleMembership, UserId};
 use crate::row_ownership::RowOwnershipConfig;
+use crate::security_label::{ObjectSecurityLabel, SubjectSecurityLabel};
 use crate::storage::AuthStorage;
 use crate::tagging::ObjectTag;
 use crate::user::{User, UserRoleMembership};
+use crate::webauthn::WebAuthnCredential;
 
 // System table file ID assignments (reserved range 110-159 for auth).
 const ROLES_HEAP_FILE_ID: u32 = 110;
@@ -59,6 +64,20 @@ const USERS_HEAP_FILE_ID: u32 = 142;
 const USERS_FSM_FILE_ID: u32 = 143;
 const USER_MEMBERSHIPS_HEAP_FILE_ID: u32 = 144;
 const USER_MEMBERSHIPS_FSM_FILE_ID: u32 = 145;
+const RLS_POLICIES_HEAP_FILE_ID: u32 = 146;
+const RLS_POLICIES_FSM_FILE_ID: u32 = 147;
+const MASKING_POLICIES_HEAP_FILE_ID: u32 = 148;
+const MASKING_POLICIES_FSM_FILE_ID: u32 = 149;
+const ABAC_RULES_HEAP_FILE_ID: u32 = 150;
+const ABAC_RULES_FSM_FILE_ID: u32 = 151;
+const COLUMN_ENCRYPTION_HEAP_FILE_ID: u32 = 152;
+const COLUMN_ENCRYPTION_FSM_FILE_ID: u32 = 153;
+const SECURITY_LABELS_HEAP_FILE_ID: u32 = 154;
+const SECURITY_LABELS_FSM_FILE_ID: u32 = 155;
+const SUBJECT_LABELS_HEAP_FILE_ID: u32 = 156;
+const SUBJECT_LABELS_FSM_FILE_ID: u32 = 157;
+const WEBAUTHN_CREDENTIALS_HEAP_FILE_ID: u32 = 158;
+const WEBAUTHN_CREDENTIALS_FSM_FILE_ID: u32 = 159;
 
 /// Auth storage backed by heap files (self-hosting).
 /// Each auth entity type has its own heap file (system table).
@@ -79,6 +98,13 @@ pub struct HeapAuthStorage {
     trusted_ips_heap: HeapFile,
     auth_attempts_heap: HeapFile,
     brute_force_policies_heap: HeapFile,
+    rls_policies_heap: HeapFile,
+    masking_policies_heap: HeapFile,
+    abac_rules_heap: HeapFile,
+    column_encryption_heap: HeapFile,
+    security_labels_heap: HeapFile,
+    subject_labels_heap: HeapFile,
+    webauthn_credentials_heap: HeapFile,
 }
 
 impl HeapAuthStorage {
@@ -213,6 +239,55 @@ impl HeapAuthStorage {
             },
         )?;
 
+        let rls_policies_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: RLS_POLICIES_HEAP_FILE_ID,
+                fsm_file_id: RLS_POLICIES_FSM_FILE_ID,
+            },
+        )?;
+        let masking_policies_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: MASKING_POLICIES_HEAP_FILE_ID,
+                fsm_file_id: MASKING_POLICIES_FSM_FILE_ID,
+            },
+        )?;
+        let abac_rules_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: ABAC_RULES_HEAP_FILE_ID,
+                fsm_file_id: ABAC_RULES_FSM_FILE_ID,
+            },
+        )?;
+        let column_encryption_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: COLUMN_ENCRYPTION_HEAP_FILE_ID,
+                fsm_file_id: COLUMN_ENCRYPTION_FSM_FILE_ID,
+            },
+        )?;
+        let security_labels_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: SECURITY_LABELS_HEAP_FILE_ID,
+                fsm_file_id: SECURITY_LABELS_FSM_FILE_ID,
+            },
+        )?;
+        let subject_labels_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: SUBJECT_LABELS_HEAP_FILE_ID,
+                fsm_file_id: SUBJECT_LABELS_FSM_FILE_ID,
+            },
+        )?;
+
         Ok(Self {
             roles_heap,
             memberships_heap,
@@ -230,6 +305,20 @@ impl HeapAuthStorage {
             trusted_ips_heap,
             auth_attempts_heap,
             brute_force_policies_heap,
+            rls_policies_heap,
+            masking_policies_heap,
+            abac_rules_heap,
+            column_encryption_heap,
+            security_labels_heap,
+            subject_labels_heap,
+            webauthn_credentials_heap: HeapFile::new(
+                Arc::clone(&disk),
+                Arc::clone(&pool),
+                HeapFileConfig {
+                    heap_file_id: WEBAUTHN_CREDENTIALS_HEAP_FILE_ID,
+                    fsm_file_id: WEBAUTHN_CREDENTIALS_FSM_FILE_ID,
+                },
+            )?,
         })
     }
 
@@ -253,6 +342,15 @@ impl HeapAuthStorage {
             self.auth_attempts_heap.init_cache(),
             self.brute_force_policies_heap.init_cache(),
         )?;
+        tokio::try_join!(
+            self.rls_policies_heap.init_cache(),
+            self.masking_policies_heap.init_cache(),
+            self.abac_rules_heap.init_cache(),
+            self.column_encryption_heap.init_cache(),
+            self.security_labels_heap.init_cache(),
+            self.subject_labels_heap.init_cache(),
+        )?;
+        self.webauthn_credentials_heap.init_cache().await?;
         Ok(())
     }
 }
@@ -730,6 +828,271 @@ impl AuthStorage for HeapAuthStorage {
         });
         if let Some(tid) = target {
             self.brute_force_policies_heap.delete(tid).await?;
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // RLS Policies
+    // -----------------------------------------------------------------------
+
+    async fn load_rls_policies(&self) -> Result<Vec<RlsPolicy>> {
+        let mut entries = Vec::new();
+        let guard = self.rls_policies_heap.scan()?;
+        guard.for_each(|_tid, view| {
+            if let Ok(entry) = RlsPolicy::from_bytes(view.data) {
+                entries.push(entry);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_rls_policy(&self, policy: &RlsPolicy) -> Result<()> {
+        let bytes = policy.to_bytes();
+        let tuple = Tuple::new(bytes, 0);
+        let _ = self.rls_policies_heap.insert_batch(&[tuple]).await?;
+        Ok(())
+    }
+
+    async fn delete_rls_policy(&self, table_id: u32, name: &str) -> Result<()> {
+        let mut target = None;
+        let guard = self.rls_policies_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(entry) = RlsPolicy::from_bytes(view.data) {
+                if entry.table_id == table_id && entry.name == name {
+                    target = Some(tid);
+                }
+            }
+        });
+        if let Some(tid) = target {
+            self.rls_policies_heap.delete(tid).await?;
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Masking Policies
+    // -----------------------------------------------------------------------
+
+    async fn load_masking_policies(&self) -> Result<Vec<MaskingPolicy>> {
+        let mut entries = Vec::new();
+        let guard = self.masking_policies_heap.scan()?;
+        guard.for_each(|_tid, view| {
+            if let Ok(entry) = MaskingPolicy::from_bytes(view.data) {
+                entries.push(entry);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_masking_policy(&self, policy: &MaskingPolicy) -> Result<()> {
+        let bytes = policy.to_bytes();
+        let tuple = Tuple::new(bytes, 0);
+        let _ = self.masking_policies_heap.insert_batch(&[tuple]).await?;
+        Ok(())
+    }
+
+    async fn delete_masking_policy(&self, table_id: u32, column_id: u16, name: &str) -> Result<()> {
+        let mut target = None;
+        let guard = self.masking_policies_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(entry) = MaskingPolicy::from_bytes(view.data) {
+                if entry.table_id == table_id && entry.column_id == column_id && entry.name == name
+                {
+                    target = Some(tid);
+                }
+            }
+        });
+        if let Some(tid) = target {
+            self.masking_policies_heap.delete(tid).await?;
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // ABAC Rules
+    // -----------------------------------------------------------------------
+
+    async fn load_abac_rules(&self) -> Result<Vec<AbacRule>> {
+        let mut entries = Vec::new();
+        let guard = self.abac_rules_heap.scan()?;
+        guard.for_each(|_tid, view| {
+            if let Ok(entry) = AbacRule::from_bytes(view.data) {
+                entries.push(entry);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_abac_rule(&self, rule: &AbacRule) -> Result<()> {
+        let bytes = rule.to_bytes();
+        let tuple = Tuple::new(bytes, 0);
+        let _ = self.abac_rules_heap.insert_batch(&[tuple]).await?;
+        Ok(())
+    }
+
+    async fn delete_abac_rule(&self, id: u32) -> Result<()> {
+        let mut target = None;
+        let guard = self.abac_rules_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(entry) = AbacRule::from_bytes(view.data) {
+                if entry.id == id {
+                    target = Some(tid);
+                }
+            }
+        });
+        if let Some(tid) = target {
+            self.abac_rules_heap.delete(tid).await?;
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Column Encryption
+    // -----------------------------------------------------------------------
+
+    async fn load_column_encryptions(&self) -> Result<Vec<ColumnEncryption>> {
+        let mut entries = Vec::new();
+        let guard = self.column_encryption_heap.scan()?;
+        guard.for_each(|_tid, view| {
+            if let Ok(entry) = ColumnEncryption::from_bytes(view.data) {
+                entries.push(entry);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_column_encryption(&self, config: &ColumnEncryption) -> Result<()> {
+        let bytes = config.to_bytes();
+        let tuple = Tuple::new(bytes, 0);
+        let _ = self.column_encryption_heap.insert_batch(&[tuple]).await?;
+        Ok(())
+    }
+
+    async fn delete_column_encryption(&self, table_id: u32, column_id: u16) -> Result<()> {
+        let mut target = None;
+        let guard = self.column_encryption_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(entry) = ColumnEncryption::from_bytes(view.data) {
+                if entry.table_id == table_id && entry.column_id == column_id {
+                    target = Some(tid);
+                }
+            }
+        });
+        if let Some(tid) = target {
+            self.column_encryption_heap.delete(tid).await?;
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Security Labels
+    // -----------------------------------------------------------------------
+
+    async fn load_object_security_labels(&self) -> Result<Vec<ObjectSecurityLabel>> {
+        let mut entries = Vec::new();
+        let guard = self.security_labels_heap.scan()?;
+        guard.for_each(|_tid, view| {
+            if let Ok(entry) = ObjectSecurityLabel::from_bytes(view.data) {
+                entries.push(entry);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_object_security_label(&self, label: &ObjectSecurityLabel) -> Result<()> {
+        let bytes = label.to_bytes();
+        let tuple = Tuple::new(bytes, 0);
+        let _ = self.security_labels_heap.insert_batch(&[tuple]).await?;
+        Ok(())
+    }
+
+    async fn load_subject_security_labels(&self) -> Result<Vec<SubjectSecurityLabel>> {
+        let mut entries = Vec::new();
+        let guard = self.subject_labels_heap.scan()?;
+        guard.for_each(|_tid, view| {
+            if let Ok(entry) = SubjectSecurityLabel::from_bytes(view.data) {
+                entries.push(entry);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_subject_security_label(&self, label: &SubjectSecurityLabel) -> Result<()> {
+        let bytes = label.to_bytes();
+        let tuple = Tuple::new(bytes, 0);
+        let _ = self.subject_labels_heap.insert_batch(&[tuple]).await?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // WebAuthn Credentials
+    // -----------------------------------------------------------------------
+
+    async fn load_webauthn_credentials(&self) -> Result<Vec<WebAuthnCredential>> {
+        let mut entries = Vec::new();
+        let guard = self.webauthn_credentials_heap.scan()?;
+        guard.for_each(|_tid, view| {
+            if let Ok(entry) = WebAuthnCredential::from_bytes(view.data) {
+                entries.push(entry);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_webauthn_credential(&self, cred: &WebAuthnCredential) -> Result<()> {
+        let bytes = cred.to_bytes();
+        let tuple = Tuple::new(bytes, 0);
+        let _ = self
+            .webauthn_credentials_heap
+            .insert_batch(&[tuple])
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_webauthn_credential(&self, credential_id: &[u8]) -> Result<()> {
+        let mut target = None;
+        let guard = self.webauthn_credentials_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(entry) = WebAuthnCredential::from_bytes(view.data) {
+                if entry.credential_id == credential_id {
+                    target = Some(tid);
+                }
+            }
+        });
+        if let Some(tid) = target {
+            self.webauthn_credentials_heap.delete(tid).await?;
+        }
+        Ok(())
+    }
+
+    async fn update_webauthn_sign_count(&self, credential_id: &[u8], new_count: u32) -> Result<()> {
+        // Delete the old entry and re-insert with updated sign count.
+        // This is the simplest approach with heap storage (no in-place update).
+        let mut found = None;
+        let guard = self.webauthn_credentials_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(entry) = WebAuthnCredential::from_bytes(view.data) {
+                if entry.credential_id == credential_id {
+                    found = Some((tid, entry));
+                }
+            }
+        });
+        drop(guard);
+
+        if let Some((tid, mut cred)) = found {
+            self.webauthn_credentials_heap.delete(tid).await?;
+            cred.sign_count = new_count;
+            cred.last_used_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let bytes = cred.to_bytes();
+            let tuple = Tuple::new(bytes, 0);
+            let _ = self
+                .webauthn_credentials_heap
+                .insert_batch(&[tuple])
+                .await?;
         }
         Ok(())
     }

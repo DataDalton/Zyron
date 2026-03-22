@@ -4,7 +4,6 @@
 //! session management, background workers, metrics, health endpoints, and
 //! graceful shutdown.
 
-pub mod auth_storage;
 pub mod background;
 pub mod config;
 pub mod health;
@@ -315,11 +314,25 @@ impl Server {
         let auth_storage: Arc<dyn zyron_auth::storage::AuthStorage> = Arc::new(
             zyron_auth::HeapAuthStorage::new(Arc::clone(&disk_manager), Arc::clone(&buffer_pool))?,
         );
-        let security_manager = zyron_auth::SecurityManager::new(auth_storage).await?;
+        let mut security_manager = zyron_auth::SecurityManager::new(auth_storage).await?;
 
-        // Apply brute force config from the config file
+        // Apply auth config from the config file
         {
             let auth_cfg = &self.config.auth;
+
+            // WebAuthn relying party config
+            if let Some(ref rp_id) = auth_cfg.webauthn_rp_id {
+                security_manager.webauthn_rp_config.rp_id = rp_id.clone();
+            }
+            if let Some(ref rp_name) = auth_cfg.webauthn_rp_name {
+                security_manager.webauthn_rp_config.rp_name = rp_name.clone();
+            }
+            if let Some(ref origin) = auth_cfg.webauthn_origin {
+                security_manager.webauthn_rp_config.origin = origin.clone();
+            }
+            if let Some(timeout) = auth_cfg.webauthn_challenge_timeout {
+                security_manager.webauthn_rp_config.challenge_timeout_secs = timeout;
+            }
             let policy = zyron_auth::BruteForcePolicy {
                 lockout_threshold: auth_cfg.lockout_threshold.unwrap_or(5),
                 lockout_duration_secs: auth_cfg.lockout_duration_secs.unwrap_or(900),

@@ -4,10 +4,10 @@
 //! the role that inserted it. Only the owning role (or designated admin
 //! roles) can read, update, or delete the row.
 
+use crate::rcu::RcuMap;
+use crate::role::RoleId;
 use serde::{Deserialize, Serialize};
 use zyron_common::{Result, ZyronError};
-
-use crate::role::RoleId;
 
 /// Configuration for row-level ownership on a single table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,52 +88,44 @@ impl RowOwnershipConfig {
 
 /// In-memory store for row ownership configurations, keyed by table_id.
 pub struct RowOwnershipStore {
-    configs: scc::HashMap<u32, RowOwnershipConfig>,
+    configs: RcuMap<u32, RowOwnershipConfig>,
 }
 
 impl RowOwnershipStore {
     /// Creates an empty row ownership store.
     pub fn new() -> Self {
         Self {
-            configs: scc::HashMap::new(),
+            configs: RcuMap::empty_map(),
         }
     }
 
     /// Returns true if row ownership is enabled for the given table.
     pub fn is_enabled(&self, table_id: u32) -> bool {
-        self.configs
-            .read_sync(&table_id, |_, config| config.enabled)
-            .unwrap_or(false)
+        let snap = self.configs.load();
+        snap.get(&table_id).map(|c| c.enabled).unwrap_or(false)
     }
 
     /// Returns a clone of the config for the given table, if one exists.
     pub fn get_config(&self, table_id: u32) -> Option<RowOwnershipConfig> {
-        self.configs
-            .read_sync(&table_id, |_, config| config.clone())
+        self.configs.get(&table_id)
     }
 
     /// Enables row ownership for a table by storing or replacing the config.
     pub fn enable(&self, table_id: u32, config: RowOwnershipConfig) {
-        match self.configs.entry_sync(table_id) {
-            scc::hash_map::Entry::Occupied(mut occ) => {
-                *occ.get_mut() = config;
-            }
-            scc::hash_map::Entry::Vacant(vac) => {
-                let _ = vac.insert_entry(config);
-            }
-        }
+        self.configs.insert(table_id, config);
     }
 
     /// Disables row ownership for a table by removing its config.
     pub fn disable(&self, table_id: u32) {
-        let _ = self.configs.remove_sync(&table_id);
+        self.configs.remove(&table_id);
     }
 
     /// Checks whether the given role is an admin for the specified table.
     /// Returns false if no config exists or if the role is not in admin_roles.
     pub fn is_admin(&self, table_id: u32, role_id: RoleId) -> bool {
-        self.configs
-            .read_sync(&table_id, |_, config| config.admin_roles.contains(&role_id))
+        let snap = self.configs.load();
+        snap.get(&table_id)
+            .map(|config| config.admin_roles.contains(&role_id))
             .unwrap_or(false)
     }
 

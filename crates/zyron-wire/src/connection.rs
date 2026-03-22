@@ -27,7 +27,10 @@ use zyron_storage::DiskManager;
 use zyron_storage::txn::{IsolationLevel, Snapshot, Transaction, TransactionManager};
 use zyron_wal::WalWriter;
 
-use crate::auth::{AuthProgress, AuthResult, Authenticator, TrustAuthenticator};
+use crate::auth::{
+    AuthProgress, AuthResult, Authenticator, ComposedAuthenticator, ScramAuthenticator,
+    TrustAuthenticator, WebAuthnAuthenticator,
+};
 use crate::codec::PostgresCodec;
 use crate::messages::ProtocolError;
 use crate::messages::backend::{
@@ -114,7 +117,7 @@ impl<T: WireTransport> Connection<T> {
             statements: HashMap::new(),
             portals: HashMap::new(),
             process_id: pid,
-            secret_key: pid.wrapping_mul(2654435761_u32 as i32),
+            secret_key: rand::random::<u32>() as i32,
             peer_addr,
         }
     }
@@ -226,17 +229,50 @@ impl<T: WireTransport> Connection<T> {
             ));
         }
 
-        // Pre-authentication brute force gate
+        // Resolve auth method first, then apply brute force gate with real method
         let peer_ip = self
             .peer_addr
             .clone()
             .unwrap_or_else(|| "127.0.0.1".to_string());
         if let Some(ref sm) = self.server.security_manager {
+            let conn_type = if self.peer_addr.as_deref() == Some("127.0.0.1") {
+                zyron_auth::auth_rules::ConnectionType::Local
+            } else {
+                zyron_auth::auth_rules::ConnectionType::Host
+            };
+            let method =
+                sm.auth_resolver
+                    .resolve(conn_type, &database, &user, self.peer_addr.as_deref());
+
+            // Reject immediately without prompting for credentials
+            if matches!(method, zyron_auth::auth_rules::AuthMethod::Reject) {
+                self.feed(BackendMessage::ErrorResponse(ErrorFields {
+                    severity: "FATAL".into(),
+                    code: "28000".into(),
+                    message: "Connection rejected by authentication rule".to_string(),
+                    detail: None,
+                    hint: None,
+                    position: None,
+                }))
+                .await?;
+                self.flush().await?;
+                return Err(ProtocolError::AuthFailed("rejected by auth rule".into()));
+            }
+
+            // Map auth method to brute force gate code.
+            // 0=Trust and 6=Certificate skip all brute force checks.
+            let auth_code = match &method {
+                zyron_auth::auth_rules::AuthMethod::Trust => 0u8,
+                zyron_auth::auth_rules::AuthMethod::Certificate => 6,
+                _ => 1, // All password-based methods get rate-limited
+            };
+
+            // Pre-authentication brute force gate with resolved method
             let gate = sm.brute_force.check_allowed(
                 &peer_ip,
                 &user,
                 &database,
-                0,
+                auth_code,
                 &sm.ip_manager,
                 false,
                 None,
@@ -262,6 +298,8 @@ impl<T: WireTransport> Connection<T> {
                 }
                 zyron_auth::AuthGate::Proceed => {}
             }
+
+            self.authenticator = build_authenticator(method, sm);
         }
 
         // Authenticate
@@ -1425,4 +1463,70 @@ fn make_dml_tag(schema: &[LogicalColumn], affected: usize) -> String {
     } else {
         format!("SELECT {}", affected)
     }
+}
+
+/// Builds the appropriate authenticator for the resolved auth method.
+fn build_authenticator(
+    method: zyron_auth::auth_rules::AuthMethod,
+    sm: &Arc<zyron_auth::SecurityManager>,
+) -> Box<dyn Authenticator> {
+    use zyron_auth::auth_rules::AuthMethod;
+
+    // Build password map from SecurityManager's cached user passwords.
+    // No heap scan needed, passwords were loaded at startup.
+    let load_passwords =
+        || -> std::collections::HashMap<String, String> { (*sm.password_cache.load()).clone() };
+
+    match method {
+        AuthMethod::Trust => Box::new(TrustAuthenticator),
+        // Reject is handled before this function is called (immediate error in process_startup).
+        // If reached despite the guard, return an authenticator with no valid passwords
+        // so all attempts fail.
+        AuthMethod::Reject => Box::new(crate::auth::CleartextAuthenticator::new(
+            std::collections::HashMap::new(),
+        )),
+        AuthMethod::Password | AuthMethod::BalloonSha256 => {
+            Box::new(crate::auth::CleartextAuthenticator::new(load_passwords()))
+        }
+        AuthMethod::Md5 => Box::new(crate::auth::Md5Authenticator::new(load_passwords())),
+        AuthMethod::ScramSha256 => Box::new(ScramAuthenticator::new(load_passwords())),
+        AuthMethod::Fido2 => Box::new(build_webauthn_authenticator(sm)),
+        AuthMethod::PasswordAndFido2 => {
+            let password_auth: Box<dyn Authenticator> =
+                Box::new(ScramAuthenticator::new(load_passwords()));
+            let webauthn_auth = build_webauthn_authenticator(sm);
+            Box::new(ComposedAuthenticator::new(password_auth, webauthn_auth))
+        }
+        AuthMethod::PasswordAndTotp => {
+            // TOTP composed auth not yet wired, use SCRAM only for now
+            Box::new(ScramAuthenticator::new(load_passwords()))
+        }
+        // Jwt, ApiKey, Certificate need dedicated authenticator implementations
+        AuthMethod::Jwt | AuthMethod::ApiKey | AuthMethod::Certificate => {
+            warn!(
+                "Auth method {:?} not yet implemented, rejecting connection",
+                method
+            );
+            Box::new(crate::auth::CleartextAuthenticator::new(
+                std::collections::HashMap::new(),
+            ))
+        }
+    }
+}
+
+/// Builds a WebAuthnAuthenticator from the SecurityManager.
+fn build_webauthn_authenticator(sm: &Arc<zyron_auth::SecurityManager>) -> WebAuthnAuthenticator {
+    let sm_for_auth = Arc::clone(sm);
+    let sm_for_lookup = Arc::clone(sm);
+
+    let rp_config = std::sync::Arc::new(sm_for_auth.webauthn_rp_config.clone());
+
+    let user_lookup: std::sync::Arc<
+        dyn Fn(&str) -> Option<zyron_auth::role::UserId> + Send + Sync,
+    > = std::sync::Arc::new(move |name: &str| {
+        // Look up user ID from the cached user_id_cache (no heap scan).
+        sm_for_lookup.user_id_cache.get(&name.to_string())
+    });
+
+    WebAuthnAuthenticator::new(sm_for_auth, rp_config, user_lookup)
 }

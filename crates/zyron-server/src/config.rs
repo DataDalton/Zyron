@@ -322,6 +322,14 @@ pub struct AuthSection {
     pub failure_window_secs: Option<u64>,
     pub ip_block_duration_secs: Option<u64>,
     pub min_attempt_interval_ms: Option<u64>,
+    /// WebAuthn relying party ID (domain name, e.g. "db.example.com").
+    pub webauthn_rp_id: Option<String>,
+    /// WebAuthn relying party display name.
+    pub webauthn_rp_name: Option<String>,
+    /// WebAuthn expected origin (e.g. "https://db.example.com").
+    pub webauthn_origin: Option<String>,
+    /// WebAuthn challenge timeout in seconds (default 60).
+    pub webauthn_challenge_timeout: Option<u64>,
 }
 
 impl Default for AuthSection {
@@ -342,6 +350,10 @@ impl Default for AuthSection {
             failure_window_secs: None,
             ip_block_duration_secs: None,
             min_attempt_interval_ms: None,
+            webauthn_rp_id: None,
+            webauthn_rp_name: None,
+            webauthn_origin: None,
+            webauthn_challenge_timeout: None,
         }
     }
 }

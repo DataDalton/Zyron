@@ -5,6 +5,8 @@
 //! column-level granularity. Pattern-based grants match object names using SQL LIKE
 //! syntax (% for any sequence, _ for single character).
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -14,6 +16,7 @@ use zyron_catalog::encoding::{
 };
 use zyron_common::{Result, ZyronError};
 
+use crate::rcu::{Rcu, RcuMap};
 use crate::role::RoleId;
 use crate::session_binding::TimeWindow;
 
@@ -378,76 +381,57 @@ fn is_temporally_active(entry: &GrantEntry, now: u64) -> bool {
 }
 
 /// SQL LIKE pattern matcher where % matches any sequence and _ matches one character.
+/// Uses an iterative algorithm with O(n*m) worst case (no exponential backtracking).
 fn matches_pattern(pattern: &str, name: &str) -> bool {
     let pat: Vec<char> = pattern.chars().collect();
-    let name: Vec<char> = name.chars().collect();
-    matches_pattern_recursive(&pat, 0, &name, 0)
-}
+    let text: Vec<char> = name.chars().collect();
+    let (plen, tlen) = (pat.len(), text.len());
+    let mut pi = 0;
+    let mut ti = 0;
+    // Track the last '%' position for backtracking
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti = 0;
 
-/// Recursive helper for pattern matching with backtracking.
-fn matches_pattern_recursive(pat: &[char], pi: usize, name: &[char], ni: usize) -> bool {
-    if pi == pat.len() && ni == name.len() {
-        return true;
-    }
-    if pi == pat.len() {
-        return false;
-    }
-
-    match pat[pi] {
-        '%' => {
-            // % can match zero or more characters. Try matching zero, then one, two, etc.
-            for skip in 0..=(name.len() - ni) {
-                if matches_pattern_recursive(pat, pi + 1, name, ni + skip) {
-                    return true;
-                }
-            }
-            false
-        }
-        '_' => {
-            // _ matches exactly one character.
-            if ni < name.len() {
-                matches_pattern_recursive(pat, pi + 1, name, ni + 1)
-            } else {
-                false
-            }
-        }
-        c => {
-            if ni < name.len() && name[ni] == c {
-                matches_pattern_recursive(pat, pi + 1, name, ni + 1)
-            } else {
-                false
-            }
+    while ti < tlen {
+        if pi < plen && pat[pi] == '_' {
+            pi += 1;
+            ti += 1;
+        } else if pi < plen && pat[pi] != '%' && pat[pi] == text[ti] {
+            pi += 1;
+            ti += 1;
+        } else if pi < plen && pat[pi] == '%' {
+            star_pi = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            star_ti += 1;
+            ti = star_ti;
+            pi = sp + 1;
+        } else {
+            return false;
         }
     }
+    // Consume trailing % in pattern
+    while pi < plen && pat[pi] == '%' {
+        pi += 1;
+    }
+    pi == plen
 }
 
 /// Thread-safe privilege store holding all grant and deny entries.
 /// Pattern-based grants are stored separately for name-based lookups.
 pub struct PrivilegeStore {
-    grants: scc::HashMap<(u8, u32), Vec<GrantEntry>>,
-    pattern_grants: parking_lot::RwLock<Vec<GrantEntry>>,
+    grants: RcuMap<(u8, u32), Vec<GrantEntry>>,
+    pattern_grants: Rcu<Vec<GrantEntry>>,
     generation: AtomicU64,
-}
-
-/// Inserts a grant entry into the scc::HashMap, appending to an existing vec or creating a new one.
-/// Inserts a grant entry into the scc::HashMap, appending to an existing vec or creating a new one.
-fn upsert_grant(map: &scc::HashMap<(u8, u32), Vec<GrantEntry>>, key: (u8, u32), entry: GrantEntry) {
-    let found = map.read_sync(&key, |_, _| {}).is_some();
-    if found {
-        map.update_sync(&key, |_, v| {
-            v.push(entry.clone());
-        });
-    } else {
-        let _ = map.insert_sync(key, vec![entry]);
-    }
 }
 
 impl PrivilegeStore {
     /// Creates an empty privilege store.
     pub fn new() -> Self {
         Self {
-            grants: scc::HashMap::new(),
-            pattern_grants: parking_lot::RwLock::new(Vec::new()),
+            grants: RcuMap::empty_map(),
+            pattern_grants: Rcu::new(Vec::new()),
             generation: AtomicU64::new(0),
         }
     }
@@ -455,16 +439,47 @@ impl PrivilegeStore {
     /// Bulk loads grant entries, separating pattern-based grants from object-based grants.
     pub fn load(&self, entries: Vec<GrantEntry>) {
         let mut patterns = Vec::new();
+        let mut map: HashMap<(u8, u32), Vec<GrantEntry>> = HashMap::new();
         for entry in entries {
             if entry.object_pattern.is_some() {
                 patterns.push(entry);
             } else {
                 let key = (entry.object_type as u8, entry.object_id);
-                upsert_grant(&self.grants, key, entry);
+                map.entry(key).or_insert_with(Vec::new).push(entry);
             }
         }
-        *self.pattern_grants.write() = patterns;
+        self.grants.store(map);
+        self.pattern_grants.store(patterns);
         self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// Returns an Arc snapshot of the grants map. One atomic refcount
+    /// increment, then all subsequent lookups are pure HashMap reads with
+    /// zero synchronization. Use this at query plan time, then check
+    /// per-row with check_entries_static.
+    pub fn grants_snapshot(&self) -> Arc<HashMap<(u8, u32), Vec<GrantEntry>>> {
+        self.grants.load()
+    }
+
+    /// Checks a privilege against a pre-snapshotted entry list.
+    /// Pure function, no synchronization, fully thread-safe for parallel
+    /// row-level checks across any number of threads.
+    pub fn check_entries_static(
+        entries: &[GrantEntry],
+        effective_roles: &[RoleId],
+        privilege: PrivilegeType,
+        columns: Option<&[u16]>,
+        now: u64,
+    ) -> PrivilegeDecision {
+        let (has_deny, has_grant) =
+            check_entries(entries, effective_roles, privilege, columns, now);
+        if has_deny {
+            PrivilegeDecision::Denied
+        } else if has_grant {
+            PrivilegeDecision::Allow
+        } else {
+            PrivilegeDecision::Unset
+        }
     }
 
     /// Checks whether the given effective roles have the requested privilege on an object.
@@ -479,29 +494,20 @@ impl PrivilegeStore {
         now: u64,
     ) -> PrivilegeDecision {
         let key = (object_type as u8, object_id);
-        let mut found_grant = false;
+        let snap = self.grants.load();
 
-        let check_result = self.grants.read_sync(&key, |_, entries| {
-            check_entries(entries, effective_roles, privilege, columns, now)
-        });
-
-        match check_result {
-            Some((has_deny, has_grant)) => {
-                if has_deny {
-                    return PrivilegeDecision::Denied;
-                }
-                if has_grant {
-                    found_grant = true;
-                }
+        if let Some(entries) = snap.get(&key) {
+            let (has_deny, has_grant) =
+                check_entries(entries, effective_roles, privilege, columns, now);
+            if has_deny {
+                return PrivilegeDecision::Denied;
             }
-            None => {}
+            if has_grant {
+                return PrivilegeDecision::Allow;
+            }
         }
 
-        if found_grant {
-            PrivilegeDecision::Allow
-        } else {
-            PrivilegeDecision::Unset
-        }
+        PrivilegeDecision::Unset
     }
 
     /// Checks pattern-based grants against an object name.
@@ -513,7 +519,7 @@ impl PrivilegeStore {
         object_name: &str,
         now: u64,
     ) -> PrivilegeDecision {
-        let patterns = self.pattern_grants.read();
+        let patterns = self.pattern_grants.load();
         let mut found_grant = false;
         let mut found_deny = false;
 
@@ -553,10 +559,12 @@ impl PrivilegeStore {
     /// Adds a GRANT entry to the store.
     pub fn grant(&self, entry: GrantEntry) -> Result<()> {
         if entry.object_pattern.is_some() {
-            self.pattern_grants.write().push(entry);
+            self.pattern_grants.update(|v| v.push(entry));
         } else {
             let key = (entry.object_type as u8, entry.object_id);
-            upsert_grant(&self.grants, key, entry);
+            self.grants.update(|m| {
+                m.entry(key).or_insert_with(Vec::new).push(entry);
+            });
         }
         self.generation.fetch_add(1, Ordering::Release);
         Ok(())
@@ -566,10 +574,12 @@ impl PrivilegeStore {
     pub fn deny(&self, mut entry: GrantEntry) -> Result<()> {
         entry.state = PrivilegeState::Deny;
         if entry.object_pattern.is_some() {
-            self.pattern_grants.write().push(entry);
+            self.pattern_grants.update(|v| v.push(entry));
         } else {
             let key = (entry.object_type as u8, entry.object_id);
-            upsert_grant(&self.grants, key, entry);
+            self.grants.update(|m| {
+                m.entry(key).or_insert_with(Vec::new).push(entry);
+            });
         }
         self.generation.fetch_add(1, Ordering::Release);
         Ok(())
@@ -586,11 +596,13 @@ impl PrivilegeStore {
     ) -> bool {
         let key = (object_type as u8, object_id);
         let mut removed = false;
-        self.grants.update_sync(&key, |_, entries| {
-            let before = entries.len();
-            entries.retain(|e| !(e.grantee == grantee && e.privilege == privilege));
-            if entries.len() < before {
-                removed = true;
+        self.grants.update(|m| {
+            if let Some(entries) = m.get_mut(&key) {
+                let before = entries.len();
+                entries.retain(|e| !(e.grantee == grantee && e.privilege == privilege));
+                if entries.len() < before {
+                    removed = true;
+                }
             }
         });
         if removed {
@@ -602,35 +614,34 @@ impl PrivilegeStore {
     /// Revokes all grants on a specific object.
     pub fn revoke_all_on_object(&self, object_type: ObjectType, object_id: u32) {
         let key = (object_type as u8, object_id);
-        let _ = self.grants.remove_sync(&key);
-        self.pattern_grants
-            .write()
-            .retain(|e| !(e.object_type == object_type && e.object_id == object_id));
+        self.grants.update(|m| {
+            m.remove(&key);
+        });
+        self.pattern_grants.update(|v| {
+            v.retain(|e| !(e.object_type == object_type && e.object_id == object_id));
+        });
         self.generation.fetch_add(1, Ordering::Release);
     }
 
     /// Returns all grant entries for a specific object.
     pub fn grants_for_object(&self, object_type: ObjectType, object_id: u32) -> Vec<GrantEntry> {
         let key = (object_type as u8, object_id);
-        let mut result = Vec::new();
-        self.grants.read_sync(&key, |_, entries| {
-            result = entries.clone();
-        });
-        result
+        let snap = self.grants.load();
+        snap.get(&key).cloned().unwrap_or_default()
     }
 
     /// Returns all grant entries where the grantee matches the given role.
     pub fn grants_for_role(&self, role_id: RoleId) -> Vec<GrantEntry> {
         let mut result = Vec::new();
-        self.grants.iter_sync(|_, entries| {
+        let snap = self.grants.load();
+        for entries in snap.values() {
             for entry in entries {
                 if entry.grantee == role_id {
                     result.push(entry.clone());
                 }
             }
-            true
-        });
-        let patterns = self.pattern_grants.read();
+        }
+        let patterns = self.pattern_grants.load();
         for entry in patterns.iter() {
             if entry.grantee == role_id {
                 result.push(entry.clone());
