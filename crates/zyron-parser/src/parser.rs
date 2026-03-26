@@ -1341,12 +1341,100 @@ impl<'a> Parser<'a> {
 
     fn parse_explain(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Explain)?;
-        let analyze = self.consume_keyword(Keyword::Analyze)?;
+
+        let mut analyze = false;
+        let mut costs = true;
+        let mut buffers = false;
+        let mut timing = true;
+        let mut format = None;
+
+        // Check for parenthesized options: EXPLAIN (ANALYZE, COSTS, BUFFERS, TIMING, FORMAT TEXT)
+        if self.at_token(&Token::LParen) {
+            self.advance()?;
+            loop {
+                let option_name = self.parse_explain_option_name()?;
+                match option_name.to_uppercase().as_str() {
+                    "ANALYZE" => analyze = self.parse_explain_bool_value(true)?,
+                    "COSTS" => costs = self.parse_explain_bool_value(true)?,
+                    "BUFFERS" => buffers = self.parse_explain_bool_value(true)?,
+                    "TIMING" => timing = self.parse_explain_bool_value(true)?,
+                    "FORMAT" => {
+                        let fmt_name = self.parse_explain_option_name()?;
+                        format = Some(fmt_name);
+                    }
+                    _ => {
+                        return Err(self.error(&format!("Unknown EXPLAIN option: {}", option_name)));
+                    }
+                }
+
+                if !self.at_token(&Token::Comma) {
+                    break;
+                }
+                self.advance()?;
+            }
+            self.expect_token(&Token::RParen)?;
+        } else {
+            // Legacy syntax: EXPLAIN [ANALYZE] <statement>
+            analyze = self.consume_keyword(Keyword::Analyze)?;
+        }
+
         let statement = self.parse_statement()?;
         Ok(Statement::Explain(Box::new(ExplainStatement {
             analyze,
+            costs,
+            buffers,
+            timing,
+            format,
             statement: Box::new(statement),
         })))
+    }
+
+    /// Parses an optional ON/OFF value for an EXPLAIN boolean option.
+    /// If the next token is ON or OFF (as keyword or identifier), consumes it.
+    /// Otherwise returns the default value.
+    fn parse_explain_bool_value(&mut self, default: bool) -> Result<bool> {
+        // Check for ON keyword
+        if self.at_keyword(Keyword::On) {
+            self.advance()?;
+            return Ok(true);
+        }
+        // Check for OFF or TRUE/FALSE as identifiers
+        match &self.current.token {
+            Token::Ident(s) => {
+                let upper = s.to_uppercase();
+                if upper == "OFF" || upper == "FALSE" {
+                    self.advance()?;
+                    return Ok(false);
+                }
+                if upper == "TRUE" {
+                    self.advance()?;
+                    return Ok(true);
+                }
+            }
+            _ => {}
+        }
+        Ok(default)
+    }
+
+    /// Parses an EXPLAIN option name. Handles both identifiers and keywords
+    /// that can appear as option names (ANALYZE is a keyword).
+    fn parse_explain_option_name(&mut self) -> Result<String> {
+        match &self.current.token {
+            Token::Ident(_) => {
+                let tok = self.advance()?;
+                if let Token::Ident(name) = tok.token {
+                    Ok(name)
+                } else {
+                    Err(self.error("Expected option name"))
+                }
+            }
+            Token::Keyword(kw) => {
+                let name = format!("{}", kw);
+                self.advance()?;
+                Ok(name)
+            }
+            _ => Err(self.error("Expected EXPLAIN option name")),
+        }
     }
 
     // -----------------------------------------------------------------------

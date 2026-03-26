@@ -140,7 +140,11 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
 
 fn build_from_item(item: &BoundFromItem) -> Result<LogicalPlan> {
     match item {
-        BoundFromItem::BaseTable { table_idx, table_id, entry } => {
+        BoundFromItem::BaseTable {
+            table_idx,
+            table_id,
+            entry,
+        } => {
             let columns: Vec<LogicalColumn> = entry
                 .columns
                 .iter()
@@ -157,9 +161,15 @@ fn build_from_item(item: &BoundFromItem) -> Result<LogicalPlan> {
                 table_idx: *table_idx,
                 columns,
                 alias: entry.name.clone(),
+                encoding_hints: None,
             })
         }
-        BoundFromItem::Join { left, join_type, right, condition } => {
+        BoundFromItem::Join {
+            left,
+            join_type,
+            right,
+            condition,
+        } => {
             let left_plan = build_from_item(left)?;
             let right_plan = build_from_item(right)?;
             let join_condition = match condition {
@@ -204,7 +214,12 @@ fn collect_aggregates_from_expr(
     has_agg: &mut bool,
 ) {
     match expr {
-        BoundExpr::AggregateFunction { name, args, distinct, return_type } => {
+        BoundExpr::AggregateFunction {
+            name,
+            args,
+            distinct,
+            return_type,
+        } => {
             *has_agg = true;
             out.push(AggregateExpr {
                 function_name: name.clone(),
@@ -228,7 +243,12 @@ fn collect_aggregates_from_expr(
         BoundExpr::Nested(inner) => {
             collect_aggregates_from_expr(inner, out, has_agg);
         }
-        BoundExpr::Case { operand, conditions, else_result, .. } => {
+        BoundExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
             if let Some(op) = operand {
                 collect_aggregates_from_expr(op, out, has_agg);
             }
@@ -251,9 +271,7 @@ fn collect_aggregates_from_expr(
 // Projection list construction
 // ---------------------------------------------------------------------------
 
-fn build_projection_list(
-    projections: &[BoundSelectItem],
-) -> (Vec<BoundExpr>, Vec<Option<String>>) {
+fn build_projection_list(projections: &[BoundSelectItem]) -> (Vec<BoundExpr>, Vec<Option<String>>) {
     let mut expressions = Vec::new();
     let mut aliases = Vec::new();
 
@@ -285,9 +303,7 @@ fn build_insert_plan(insert: &BoundInsert) -> Result<LogicalPlan> {
                 .columns
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| {
-                    insert.target_columns.contains(&ColumnId(*i as u16))
-                })
+                .filter(|(i, _)| insert.target_columns.contains(&ColumnId(*i as u16)))
                 .map(|(_i, c)| LogicalColumn {
                     table_idx: None,
                     column_id: c.id,
@@ -331,6 +347,7 @@ fn build_update_plan(update: &BoundUpdate) -> Result<LogicalPlan> {
         table_idx: 0,
         columns,
         alias: update.table_entry.name.clone(),
+        encoding_hints: None,
     };
 
     // Apply WHERE filter
@@ -367,6 +384,7 @@ fn build_delete_plan(delete: &BoundDelete) -> Result<LogicalPlan> {
         table_idx: 0,
         columns,
         alias: delete.table_entry.name.clone(),
+        encoding_hints: None,
     };
 
     if let Some(predicate) = &delete.where_clause {
@@ -389,7 +407,10 @@ fn build_delete_plan(delete: &BoundDelete) -> Result<LogicalPlan> {
 /// Extracts a u64 from a bound literal expression (for LIMIT/OFFSET).
 fn extract_u64_literal(expr: &Option<BoundExpr>) -> Option<u64> {
     match expr {
-        Some(BoundExpr::Literal { value: LiteralValue::Integer(n), .. }) => Some(*n as u64),
+        Some(BoundExpr::Literal {
+            value: LiteralValue::Integer(n),
+            ..
+        }) => Some(*n as u64),
         _ => None,
     }
 }

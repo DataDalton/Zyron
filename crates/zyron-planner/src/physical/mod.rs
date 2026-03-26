@@ -9,9 +9,9 @@ pub mod builder;
 use crate::binder::{BoundAssignment, BoundExpr, BoundOrderBy};
 use crate::cost::PlanCost;
 use crate::logical::{AggregateExpr, LogicalColumn};
+use std::sync::Arc;
 use zyron_catalog::{ColumnId, IndexEntry, IndexId, TableId};
 use zyron_parser::ast::{JoinType, SetOpType};
-use std::sync::Arc;
 
 /// Physical execution plan. Each variant maps to a concrete operator
 /// and carries cost estimates.
@@ -158,6 +158,49 @@ pub enum PhysicalPlan {
         child: Box<PhysicalPlan>,
         cost: PlanCost,
     },
+
+    /// Parallel sequential scan distributing page ranges across workers.
+    ParallelSeqScan {
+        table_id: TableId,
+        columns: Vec<LogicalColumn>,
+        predicate: Option<BoundExpr>,
+        num_workers: usize,
+        cost: PlanCost,
+    },
+
+    /// Parallel hash join with partitioned build and probe phases.
+    ParallelHashJoin {
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+        join_type: JoinType,
+        left_keys: Vec<BoundExpr>,
+        right_keys: Vec<BoundExpr>,
+        remaining_condition: Option<BoundExpr>,
+        num_workers: usize,
+        cost: PlanCost,
+    },
+
+    /// Exchange operator: gathers partitioned streams into one.
+    Gather {
+        child: Box<PhysicalPlan>,
+        num_workers: usize,
+        cost: PlanCost,
+    },
+
+    /// Exchange operator: repartitions data by hash for parallel joins.
+    Repartition {
+        child: Box<PhysicalPlan>,
+        partition_keys: Vec<BoundExpr>,
+        num_partitions: usize,
+        cost: PlanCost,
+    },
+
+    /// Exchange operator: broadcasts small table to all workers.
+    Broadcast {
+        child: Box<PhysicalPlan>,
+        num_workers: usize,
+        cost: PlanCost,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,7 +229,12 @@ impl PhysicalPlan {
             | PhysicalPlan::Insert { cost, .. }
             | PhysicalPlan::Values { cost, .. }
             | PhysicalPlan::Update { cost, .. }
-            | PhysicalPlan::Delete { cost, .. } => cost,
+            | PhysicalPlan::Delete { cost, .. }
+            | PhysicalPlan::ParallelSeqScan { cost, .. }
+            | PhysicalPlan::ParallelHashJoin { cost, .. }
+            | PhysicalPlan::Gather { cost, .. }
+            | PhysicalPlan::Repartition { cost, .. }
+            | PhysicalPlan::Broadcast { cost, .. } => cost,
         }
     }
 
@@ -194,36 +242,48 @@ impl PhysicalPlan {
     pub fn output_schema(&self) -> Vec<LogicalColumn> {
         match self {
             PhysicalPlan::SeqScan { columns, .. }
-            | PhysicalPlan::IndexScan { columns, .. } => columns.clone(),
+            | PhysicalPlan::IndexScan { columns, .. }
+            | PhysicalPlan::ParallelSeqScan { columns, .. } => columns.clone(),
             PhysicalPlan::Filter { child, .. } => child.output_schema(),
-            PhysicalPlan::Project { expressions, aliases, .. } => {
-                expressions
-                    .iter()
-                    .enumerate()
-                    .map(|(i, expr)| {
-                        let name = aliases
-                            .get(i)
-                            .and_then(|a| a.clone())
-                            .unwrap_or_else(|| format!("col{}", i));
-                        LogicalColumn {
-                            table_idx: None,
-                            column_id: ColumnId(i as u16),
-                            name,
-                            type_id: expr.type_id(),
-                            nullable: expr.nullable(),
-                        }
-                    })
-                    .collect()
-            }
+            PhysicalPlan::Project {
+                expressions,
+                aliases,
+                ..
+            } => expressions
+                .iter()
+                .enumerate()
+                .map(|(i, expr)| {
+                    let name = aliases
+                        .get(i)
+                        .and_then(|a| a.clone())
+                        .unwrap_or_else(|| format!("col{}", i));
+                    LogicalColumn {
+                        table_idx: None,
+                        column_id: ColumnId(i as u16),
+                        name,
+                        type_id: expr.type_id(),
+                        nullable: expr.nullable(),
+                    }
+                })
+                .collect(),
             PhysicalPlan::NestedLoopJoin { left, right, .. }
             | PhysicalPlan::HashJoin { left, right, .. }
-            | PhysicalPlan::MergeJoin { left, right, .. } => {
+            | PhysicalPlan::MergeJoin { left, right, .. }
+            | PhysicalPlan::ParallelHashJoin { left, right, .. } => {
                 let mut schema = left.output_schema();
                 schema.extend(right.output_schema());
                 schema
             }
-            PhysicalPlan::HashAggregate { group_by, aggregates, .. }
-            | PhysicalPlan::SortAggregate { group_by, aggregates, .. } => {
+            PhysicalPlan::HashAggregate {
+                group_by,
+                aggregates,
+                ..
+            }
+            | PhysicalPlan::SortAggregate {
+                group_by,
+                aggregates,
+                ..
+            } => {
                 let mut schema = Vec::new();
                 for (i, expr) in group_by.iter().enumerate() {
                     schema.push(LogicalColumn {
@@ -248,7 +308,10 @@ impl PhysicalPlan {
             }
             PhysicalPlan::Sort { child, .. }
             | PhysicalPlan::Limit { child, .. }
-            | PhysicalPlan::HashDistinct { child, .. } => child.output_schema(),
+            | PhysicalPlan::HashDistinct { child, .. }
+            | PhysicalPlan::Gather { child, .. }
+            | PhysicalPlan::Repartition { child, .. }
+            | PhysicalPlan::Broadcast { child, .. } => child.output_schema(),
             PhysicalPlan::SetOp { left, .. } => left.output_schema(),
             PhysicalPlan::Insert { .. }
             | PhysicalPlan::Update { .. }
@@ -257,13 +320,14 @@ impl PhysicalPlan {
         }
     }
 
-    /// Returns the total cost including all children.
+    /// Returns the total cost of this node plus all children.
     pub fn total_cost(&self) -> PlanCost {
         let own = *self.cost();
-        let _children_cost: f64 = match self {
+        let children_cost = match self {
             PhysicalPlan::SeqScan { .. }
             | PhysicalPlan::IndexScan { .. }
-            | PhysicalPlan::Values { .. } => 0.0,
+            | PhysicalPlan::Values { .. }
+            | PhysicalPlan::ParallelSeqScan { .. } => PlanCost::zero(),
             PhysicalPlan::Filter { child, .. }
             | PhysicalPlan::Project { child, .. }
             | PhysicalPlan::HashAggregate { child, .. }
@@ -273,17 +337,21 @@ impl PhysicalPlan {
             | PhysicalPlan::HashDistinct { child, .. }
             | PhysicalPlan::Insert { source: child, .. }
             | PhysicalPlan::Update { child, .. }
-            | PhysicalPlan::Delete { child, .. } => child.total_cost().total(),
+            | PhysicalPlan::Delete { child, .. }
+            | PhysicalPlan::Gather { child, .. }
+            | PhysicalPlan::Repartition { child, .. }
+            | PhysicalPlan::Broadcast { child, .. } => child.total_cost(),
             PhysicalPlan::NestedLoopJoin { left, right, .. }
             | PhysicalPlan::HashJoin { left, right, .. }
             | PhysicalPlan::MergeJoin { left, right, .. }
-            | PhysicalPlan::SetOp { left, right, .. } => {
-                left.total_cost().total() + right.total_cost().total()
+            | PhysicalPlan::SetOp { left, right, .. }
+            | PhysicalPlan::ParallelHashJoin { left, right, .. } => {
+                left.total_cost().add(&right.total_cost())
             }
         };
         PlanCost {
-            io_cost: own.io_cost,
-            cpu_cost: own.cpu_cost,
+            io_cost: own.io_cost + children_cost.io_cost,
+            cpu_cost: own.cpu_cost + children_cost.cpu_cost,
             row_count: own.row_count,
         }
     }

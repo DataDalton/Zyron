@@ -6,8 +6,8 @@
 
 use crate::binder::BoundExpr;
 use crate::logical::{JoinCondition, LogicalPlan};
-use zyron_catalog::{Catalog, ColumnId, ColumnStats, TableStats};
-use zyron_parser::ast::{BinaryOperator, JoinType, LiteralValue};
+use zyron_catalog::{Catalog, ColumnStats, TableStats};
+use zyron_parser::ast::JoinType;
 
 // ---------------------------------------------------------------------------
 // Plan cost
@@ -45,6 +45,103 @@ impl PlanCost {
 }
 
 // ---------------------------------------------------------------------------
+// Cost component breakdown
+// ---------------------------------------------------------------------------
+
+/// Detailed cost breakdown by resource type for hardware-aware plan comparison.
+#[derive(Debug, Clone, Copy)]
+pub struct CostComponent {
+    /// Sequential page reads (base weight: 1.0).
+    pub seq_io: f64,
+    /// Random page reads (base weight: 4.0).
+    pub random_io: f64,
+    /// Per-tuple processing cost (base weight: 0.01).
+    pub cpu_tuple: f64,
+    /// Per-operator evaluation cost (base weight: 0.0025).
+    pub cpu_operator: f64,
+    /// Per-byte network transfer cost (base weight: 0.0001).
+    pub network: f64,
+    /// Per-byte working memory pressure (base weight: 0.00001).
+    pub memory: f64,
+}
+
+impl CostComponent {
+    pub fn zero() -> Self {
+        Self {
+            seq_io: 0.0,
+            random_io: 0.0,
+            cpu_tuple: 0.0,
+            cpu_operator: 0.0,
+            network: 0.0,
+            memory: 0.0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Encoding cost parameters
+// ---------------------------------------------------------------------------
+
+/// Cost parameters for columnar-encoded scans. Controls how zone maps,
+/// bloom filters, and encoding-specific evaluation affect scan cost.
+#[derive(Debug, Clone, Copy)]
+pub struct EncodingCostParameters {
+    /// Fraction of segments skipped via zone maps or bloom filters (0.0 to 1.0).
+    pub skip_rate: f64,
+    /// CPU cost to decode one value from the encoded format.
+    pub decode_cost_per_value: f64,
+    /// Speedup ratio of encoded scan vs unencoded scan (< 1.0 means faster).
+    pub encoded_scan_speedup: f64,
+}
+
+impl Default for EncodingCostParameters {
+    fn default() -> Self {
+        Self {
+            skip_rate: 0.0,
+            decode_cost_per_value: 0.0001,
+            encoded_scan_speedup: 0.3,
+        }
+    }
+}
+
+/// Pre-defined encoding decode costs (relative to unencoded = 1.0).
+pub mod encoding_costs {
+    use super::EncodingCostParameters;
+
+    pub fn fastlanes() -> EncodingCostParameters {
+        EncodingCostParameters {
+            skip_rate: 0.0,
+            decode_cost_per_value: 0.00015,
+            encoded_scan_speedup: 0.15,
+        }
+    }
+
+    pub fn dictionary() -> EncodingCostParameters {
+        EncodingCostParameters {
+            skip_rate: 0.0,
+            decode_cost_per_value: 0.0001,
+            encoded_scan_speedup: 0.10,
+        }
+    }
+
+    pub fn rle() -> EncodingCostParameters {
+        EncodingCostParameters {
+            skip_rate: 0.0,
+            decode_cost_per_value: 0.00005,
+            encoded_scan_speedup: 0.05,
+        }
+    }
+
+    pub fn bitpack() -> EncodingCostParameters {
+        EncodingCostParameters {
+            skip_rate: 0.0,
+            decode_cost_per_value: 0.00008,
+            encoded_scan_speedup: 0.08,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Default selectivity constants
 // ---------------------------------------------------------------------------
 
@@ -69,6 +166,14 @@ pub struct CostModel {
     pub cpu_tuple_cost: f64,
     pub cpu_index_tuple_cost: f64,
     pub cpu_operator_cost: f64,
+    /// Per-byte cost for network transfer (local queries use 0.0001).
+    pub network_cost_per_byte: f64,
+    /// Per-byte cost for working memory pressure (hash tables, sort buffers).
+    pub memory_cost_per_byte: f64,
+    /// Per-tuple cost for transferring tuples between parallel workers.
+    pub parallel_tuple_cost: f64,
+    /// Fixed startup cost for launching parallel workers.
+    pub parallel_setup_cost: f64,
 }
 
 impl Default for CostModel {
@@ -79,177 +184,149 @@ impl Default for CostModel {
             cpu_tuple_cost: 0.01,
             cpu_index_tuple_cost: 0.005,
             cpu_operator_cost: 0.0025,
+            network_cost_per_byte: 0.0001,
+            memory_cost_per_byte: 0.00001,
+            parallel_tuple_cost: 0.1,
+            parallel_setup_cost: 1000.0,
         }
     }
 }
 
 impl CostModel {
     // -----------------------------------------------------------------------
+    // Cost component decomposition
+    // -----------------------------------------------------------------------
+
+    /// Breaks a PlanCost into a detailed CostComponent for hardware-aware comparison.
+    pub fn decompose(&self, plan_cost: &PlanCost) -> CostComponent {
+        CostComponent {
+            seq_io: plan_cost.io_cost,
+            random_io: 0.0,
+            cpu_tuple: plan_cost.row_count * self.cpu_tuple_cost,
+            cpu_operator: plan_cost.cpu_cost - plan_cost.row_count * self.cpu_tuple_cost,
+            network: 0.0,
+            memory: 0.0,
+        }
+    }
+
+    /// Computes a total cost from components weighted by hardware-specific parameters.
+    pub fn weighted_total(&self, components: &CostComponent) -> f64 {
+        components.seq_io * self.seq_page_cost
+            + components.random_io * self.random_page_cost
+            + components.cpu_tuple * self.cpu_tuple_cost
+            + components.cpu_operator * self.cpu_operator_cost
+            + components.network * self.network_cost_per_byte
+            + components.memory * self.memory_cost_per_byte
+    }
+
+    // -----------------------------------------------------------------------
+    // Encoding-aware scan cost
+    // -----------------------------------------------------------------------
+
+    /// Estimates the cost of a columnar-encoded scan using encoding parameters.
+    /// Accounts for segment skipping (zone maps, bloom filters) and decode overhead.
+    pub fn cost_encoded_scan(
+        &self,
+        stats: &TableStats,
+        params: &EncodingCostParameters,
+    ) -> PlanCost {
+        let rows = stats.row_count as f64;
+        let pages = stats.page_count as f64;
+
+        // IO: sequential scan with skip_rate reducing pages read
+        let pages_read = pages * (1.0 - params.skip_rate);
+        let io_cost = pages_read * self.seq_page_cost * params.encoded_scan_speedup;
+
+        // CPU: decode cost for non-skipped rows
+        let rows_read = rows * (1.0 - params.skip_rate);
+        let cpu_cost = rows_read * params.decode_cost_per_value + rows_read * self.cpu_tuple_cost;
+
+        PlanCost {
+            io_cost,
+            cpu_cost,
+            row_count: rows_read,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Parallel cost estimation
+    // -----------------------------------------------------------------------
+
+    /// Estimates the cost of a parallel sequential scan split across workers.
+    pub fn cost_parallel_scan(&self, stats: &TableStats, num_workers: usize) -> PlanCost {
+        let workers = (num_workers as f64).max(1.0);
+        let rows = stats.row_count as f64;
+        let pages = stats.page_count as f64;
+
+        // IO is divided among workers (each reads a partition of pages)
+        let io_cost = (pages / workers) * self.seq_page_cost;
+
+        // CPU divided among workers plus per-tuple coordination overhead
+        let cpu_cost = (rows / workers) * self.cpu_tuple_cost
+            + rows * self.parallel_tuple_cost
+            + self.parallel_setup_cost;
+
+        PlanCost {
+            io_cost,
+            cpu_cost,
+            row_count: rows,
+        }
+    }
+
+    /// Estimates the cost of a parallel hash join with partitioned build and probe.
+    pub fn cost_parallel_hash_join(
+        &self,
+        left: &PlanCost,
+        right: &PlanCost,
+        num_workers: usize,
+    ) -> PlanCost {
+        let workers = (num_workers as f64).max(1.0);
+
+        // Build hash table in parallel (smaller side)
+        let (build, probe) = if left.row_count <= right.row_count {
+            (left, right)
+        } else {
+            (right, left)
+        };
+
+        // IO from both sides
+        let io_cost = left.io_cost + right.io_cost;
+
+        // CPU: build and probe divided by workers, plus coordination overhead
+        let build_cpu = (build.row_count / workers) * self.cpu_operator_cost;
+        let probe_cpu = (probe.row_count / workers) * self.cpu_operator_cost;
+        let coordination = (left.row_count + right.row_count) * self.parallel_tuple_cost;
+        let cpu_cost = build_cpu
+            + probe_cpu
+            + coordination
+            + left.cpu_cost
+            + right.cpu_cost
+            + self.parallel_setup_cost;
+
+        PlanCost {
+            io_cost,
+            cpu_cost,
+            row_count: estimate_join_rows(left.row_count, right.row_count),
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Selectivity estimation
     // -----------------------------------------------------------------------
 
     /// Estimates selectivity of a predicate on a table.
+    /// Delegates to CardinalityEstimator for MCV + histogram + NDV based estimation.
     pub fn estimate_selectivity(
         &self,
         predicate: &BoundExpr,
         table_stats: Option<&TableStats>,
         column_stats: Option<&[ColumnStats]>,
     ) -> f64 {
-        match predicate {
-            // AND: independence assumption
-            BoundExpr::BinaryOp { left, op: BinaryOperator::And, right, .. } => {
-                let left_sel = self.estimate_selectivity(left, table_stats, column_stats);
-                let right_sel = self.estimate_selectivity(right, table_stats, column_stats);
-                left_sel * right_sel
-            }
-            // OR: inclusion-exclusion
-            BoundExpr::BinaryOp { left, op: BinaryOperator::Or, right, .. } => {
-                let left_sel = self.estimate_selectivity(left, table_stats, column_stats);
-                let right_sel = self.estimate_selectivity(right, table_stats, column_stats);
-                left_sel + right_sel - left_sel * right_sel
-            }
-            // NOT
-            BoundExpr::UnaryOp { op: zyron_parser::ast::UnaryOperator::Not, expr, .. } => {
-                1.0 - self.estimate_selectivity(expr, table_stats, column_stats)
-            }
-            // Equality: col = literal
-            BoundExpr::BinaryOp { left, op: BinaryOperator::Eq, right, .. } => {
-                if let Some(col_id) = extract_column_id(left) {
-                    if is_literal(right) {
-                        return self.estimate_equality_selectivity(col_id, column_stats);
-                    }
-                }
-                if let Some(col_id) = extract_column_id(right) {
-                    if is_literal(left) {
-                        return self.estimate_equality_selectivity(col_id, column_stats);
-                    }
-                }
-                DEFAULT_EQUALITY_SELECTIVITY
-            }
-            // Inequality: col != literal
-            BoundExpr::BinaryOp { left, op: BinaryOperator::Neq, right, .. } => {
-                if let Some(col_id) = extract_column_id(left) {
-                    if is_literal(right) {
-                        return 1.0 - self.estimate_equality_selectivity(col_id, column_stats);
-                    }
-                }
-                1.0 - DEFAULT_EQUALITY_SELECTIVITY
-            }
-            // Range: col < literal, col > literal, col <= literal, col >= literal
-            BoundExpr::BinaryOp {
-                left,
-                op: BinaryOperator::Lt | BinaryOperator::Gt | BinaryOperator::LtEq | BinaryOperator::GtEq,
-                right,
-                ..
-            } => {
-                if let Some(col_id) = extract_column_id(left) {
-                    if is_literal(right) {
-                        return self.estimate_range_selectivity(col_id, column_stats);
-                    }
-                }
-                DEFAULT_RANGE_SELECTIVITY
-            }
-            // IS NULL / IS NOT NULL
-            BoundExpr::IsNull { expr, negated } => {
-                if let Some(col_id) = extract_column_id(expr) {
-                    if let Some(stats) = column_stats {
-                        if let Some(cs) = stats.iter().find(|s| s.column_id == col_id) {
-                            return if *negated {
-                                1.0 - cs.null_fraction
-                            } else {
-                                cs.null_fraction
-                            };
-                        }
-                    }
-                }
-                if *negated {
-                    1.0 - DEFAULT_NULL_SELECTIVITY
-                } else {
-                    DEFAULT_NULL_SELECTIVITY
-                }
-            }
-            // IN list
-            BoundExpr::InList { expr, list, negated } => {
-                let base = if let Some(col_id) = extract_column_id(expr) {
-                    let eq_sel = self.estimate_equality_selectivity(col_id, column_stats);
-                    (list.len() as f64 * eq_sel).min(1.0)
-                } else {
-                    DEFAULT_IN_LIST_SELECTIVITY
-                };
-                if *negated { 1.0 - base } else { base }
-            }
-            // BETWEEN
-            BoundExpr::Between { expr, negated, .. } => {
-                let base = if let Some(col_id) = extract_column_id(expr) {
-                    self.estimate_range_selectivity(col_id, column_stats)
-                } else {
-                    DEFAULT_RANGE_SELECTIVITY
-                };
-                if *negated { 1.0 - base } else { base }
-            }
-            // LIKE / ILIKE
-            BoundExpr::Like { negated, .. } | BoundExpr::ILike { negated, .. } => {
-                if *negated {
-                    1.0 - DEFAULT_LIKE_SELECTIVITY
-                } else {
-                    DEFAULT_LIKE_SELECTIVITY
-                }
-            }
-            // Boolean literal
-            BoundExpr::Literal { value: LiteralValue::Boolean(true), .. } => 1.0,
-            BoundExpr::Literal { value: LiteralValue::Boolean(false), .. } => 0.0,
-            // Default
-            _ => 0.5,
-        }
-    }
-
-    /// Estimates selectivity of an equality predicate (col = value).
-    /// Uses MCV list, then 1/NDV fallback.
-    fn estimate_equality_selectivity(
-        &self,
-        column_id: ColumnId,
-        column_stats: Option<&[ColumnStats]>,
-    ) -> f64 {
-        if let Some(stats) = column_stats {
-            if let Some(cs) = stats.iter().find(|s| s.column_id == column_id) {
-                // If we have MCV frequencies, use average MCV frequency
-                if !cs.most_common_freqs.is_empty() {
-                    let avg_freq: f64 =
-                        cs.most_common_freqs.iter().sum::<f64>() / cs.most_common_freqs.len() as f64;
-                    return avg_freq;
-                }
-                // Use 1/NDV
-                if cs.distinct_count > 0 {
-                    return 1.0 / cs.distinct_count as f64;
-                }
-            }
-        }
-        DEFAULT_EQUALITY_SELECTIVITY
-    }
-
-    /// Estimates selectivity of a range predicate.
-    /// Uses histogram bucket interpolation, or DEFAULT_RANGE_SELECTIVITY as fallback.
-    fn estimate_range_selectivity(
-        &self,
-        column_id: ColumnId,
-        column_stats: Option<&[ColumnStats]>,
-    ) -> f64 {
-        if let Some(stats) = column_stats {
-            if let Some(cs) = stats.iter().find(|s| s.column_id == column_id) {
-                if let Some(hist) = &cs.histogram {
-                    if hist.num_buckets > 0 {
-                        // Approximate: assume uniform distribution across buckets.
-                        // A range predicate touches roughly 1/3 of the data.
-                        return DEFAULT_RANGE_SELECTIVITY;
-                    }
-                }
-                // Without histogram, use NDV-based estimate
-                if cs.distinct_count > 0 {
-                    return DEFAULT_RANGE_SELECTIVITY;
-                }
-            }
-        }
-        DEFAULT_RANGE_SELECTIVITY
+        crate::optimizer::cardinality::CardinalityEstimator::estimate_selectivity(
+            predicate,
+            table_stats,
+            column_stats,
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -303,7 +380,8 @@ impl CostModel {
         PlanCost {
             io_cost: left.io_cost + left.row_count * right.io_cost,
             cpu_cost: left.row_count * right.row_count * self.cpu_operator_cost
-                + left.cpu_cost + right.cpu_cost,
+                + left.cpu_cost
+                + right.cpu_cost,
             row_count: estimate_join_rows(left.row_count, right.row_count),
         }
     }
@@ -313,7 +391,8 @@ impl CostModel {
         PlanCost {
             io_cost: left.io_cost + right.io_cost,
             cpu_cost: (left.row_count + right.row_count) * self.cpu_operator_cost
-                + left.cpu_cost + right.cpu_cost,
+                + left.cpu_cost
+                + right.cpu_cost,
             row_count: estimate_join_rows(left.row_count, right.row_count),
         }
     }
@@ -391,8 +470,7 @@ impl CostModel {
                 let selectivity = self.estimate_selectivity(predicate, None, None);
                 PlanCost {
                     io_cost: child_cost.io_cost,
-                    cpu_cost: child_cost.cpu_cost
-                        + child_cost.row_count * self.cpu_operator_cost,
+                    cpu_cost: child_cost.cpu_cost + child_cost.row_count * self.cpu_operator_cost,
                     row_count: (child_cost.row_count * selectivity).max(1.0),
                 }
             }
@@ -400,12 +478,16 @@ impl CostModel {
                 let child_cost = self.estimate_plan_cost(child, catalog);
                 PlanCost {
                     io_cost: child_cost.io_cost,
-                    cpu_cost: child_cost.cpu_cost
-                        + child_cost.row_count * self.cpu_operator_cost,
+                    cpu_cost: child_cost.cpu_cost + child_cost.row_count * self.cpu_operator_cost,
                     row_count: child_cost.row_count,
                 }
             }
-            LogicalPlan::Join { left, right, join_type, condition } => {
+            LogicalPlan::Join {
+                left,
+                right,
+                join_type,
+                condition,
+            } => {
                 let left_cost = self.estimate_plan_cost(left, catalog);
                 let right_cost = self.estimate_plan_cost(right, catalog);
                 let rows = self.estimate_join_cardinality(
@@ -417,12 +499,15 @@ impl CostModel {
                 );
                 PlanCost {
                     io_cost: left_cost.io_cost + right_cost.io_cost,
-                    cpu_cost: left_cost.cpu_cost + right_cost.cpu_cost
+                    cpu_cost: left_cost.cpu_cost
+                        + right_cost.cpu_cost
                         + rows * self.cpu_operator_cost,
                     row_count: rows,
                 }
             }
-            LogicalPlan::Aggregate { group_by, child, .. } => {
+            LogicalPlan::Aggregate {
+                group_by, child, ..
+            } => {
                 let child_cost = self.estimate_plan_cost(child, catalog);
                 let group_count = if group_by.is_empty() {
                     1.0
@@ -436,7 +521,11 @@ impl CostModel {
                 let child_cost = self.estimate_plan_cost(child, catalog);
                 self.cost_sort(&child_cost)
             }
-            LogicalPlan::Limit { limit, offset: _, child } => {
+            LogicalPlan::Limit {
+                limit,
+                offset: _,
+                child,
+            } => {
                 let child_cost = self.estimate_plan_cost(child, catalog);
                 let rows = if let Some(l) = limit {
                     (*l as f64).min(child_cost.row_count)
@@ -453,8 +542,7 @@ impl CostModel {
                 let child_cost = self.estimate_plan_cost(child, catalog);
                 PlanCost {
                     io_cost: child_cost.io_cost,
-                    cpu_cost: child_cost.cpu_cost
-                        + child_cost.row_count * self.cpu_operator_cost,
+                    cpu_cost: child_cost.cpu_cost + child_cost.row_count * self.cpu_operator_cost,
                     row_count: child_cost.row_count * 0.8, // Assume 20% duplicates
                 }
             }
@@ -485,20 +573,6 @@ fn estimate_join_rows(left: f64, right: f64) -> f64 {
     (left * right).sqrt().max(1.0)
 }
 
-/// Extracts a ColumnId from a BoundExpr if it's a column reference.
-fn extract_column_id(expr: &BoundExpr) -> Option<ColumnId> {
-    match expr {
-        BoundExpr::ColumnRef(cr) => Some(cr.column_id),
-        BoundExpr::Nested(inner) => extract_column_id(inner),
-        _ => None,
-    }
-}
-
-/// Returns true if the expression is a literal value.
-fn is_literal(expr: &BoundExpr) -> bool {
-    matches!(expr, BoundExpr::Literal { .. })
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -506,8 +580,10 @@ fn is_literal(expr: &BoundExpr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zyron_catalog::TableId;
+    use crate::binder::BoundExpr;
+    use zyron_catalog::{ColumnId, TableId};
     use zyron_common::TypeId;
+    use zyron_parser::ast::{BinaryOperator, LiteralValue};
 
     fn make_cost_model() -> CostModel {
         CostModel::default()
@@ -604,15 +680,38 @@ mod tests {
             most_common_values: vec![],
             most_common_freqs: vec![],
         }];
-        let sel = model.estimate_equality_selectivity(ColumnId(0), Some(&stats));
+        // col0 = 42
+        let pred = BoundExpr::BinaryOp {
+            left: Box::new(BoundExpr::ColumnRef(crate::binder::ColumnRef {
+                table_idx: 0,
+                column_id: ColumnId(0),
+                type_id: TypeId::Int64,
+                nullable: false,
+            })),
+            op: BinaryOperator::Eq,
+            right: Box::new(BoundExpr::Literal {
+                value: LiteralValue::Integer(42),
+                type_id: TypeId::Int64,
+            }),
+            type_id: TypeId::Boolean,
+        };
+        let sel = model.estimate_selectivity(&pred, None, Some(&stats));
         assert!((sel - 0.01).abs() < 0.001); // 1/100
     }
 
     #[test]
     fn test_hash_join_cheaper_than_nested_loop() {
         let model = make_cost_model();
-        let left = PlanCost { io_cost: 100.0, cpu_cost: 10000.0, row_count: 10000.0 };
-        let right = PlanCost { io_cost: 50.0, cpu_cost: 5000.0, row_count: 5000.0 };
+        let left = PlanCost {
+            io_cost: 100.0,
+            cpu_cost: 10000.0,
+            row_count: 10000.0,
+        };
+        let right = PlanCost {
+            io_cost: 50.0,
+            cpu_cost: 5000.0,
+            row_count: 5000.0,
+        };
         let hash = model.cost_hash_join(&left, &right);
         let nl = model.cost_nested_loop_join(&left, &right);
         assert!(hash.total() < nl.total());
@@ -628,10 +727,105 @@ mod tests {
     #[test]
     fn test_sort_cost_increases_with_rows() {
         let model = make_cost_model();
-        let small = PlanCost { io_cost: 10.0, cpu_cost: 100.0, row_count: 100.0 };
-        let large = PlanCost { io_cost: 100.0, cpu_cost: 10000.0, row_count: 10000.0 };
+        let small = PlanCost {
+            io_cost: 10.0,
+            cpu_cost: 100.0,
+            row_count: 100.0,
+        };
+        let large = PlanCost {
+            io_cost: 100.0,
+            cpu_cost: 10000.0,
+            row_count: 10000.0,
+        };
         let small_sort = model.cost_sort(&small);
         let large_sort = model.cost_sort(&large);
         assert!(large_sort.cpu_cost > small_sort.cpu_cost);
+    }
+
+    #[test]
+    fn test_cost_component_decompose() {
+        let model = make_cost_model();
+        let cost = PlanCost {
+            io_cost: 100.0,
+            cpu_cost: 50.0,
+            row_count: 1000.0,
+        };
+        let components = model.decompose(&cost);
+        assert_eq!(components.seq_io, 100.0);
+        assert!((components.cpu_tuple - 1000.0 * 0.01).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_weighted_total() {
+        let model = make_cost_model();
+        let components = CostComponent {
+            seq_io: 10.0,
+            random_io: 5.0,
+            cpu_tuple: 100.0,
+            cpu_operator: 50.0,
+            network: 0.0,
+            memory: 0.0,
+        };
+        let total = model.weighted_total(&components);
+        let expected = 10.0 * 1.0 + 5.0 * 4.0 + 100.0 * 0.01 + 50.0 * 0.0025;
+        assert!((total - expected).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_encoded_scan_cheaper_with_high_skip_rate() {
+        let model = make_cost_model();
+        let stats = make_table_stats(100_000, 1000);
+        let no_skip = model.cost_encoded_scan(
+            &stats,
+            &EncodingCostParameters {
+                skip_rate: 0.0,
+                decode_cost_per_value: 0.0001,
+                encoded_scan_speedup: 0.3,
+            },
+        );
+        let high_skip = model.cost_encoded_scan(
+            &stats,
+            &EncodingCostParameters {
+                skip_rate: 0.9,
+                decode_cost_per_value: 0.0001,
+                encoded_scan_speedup: 0.3,
+            },
+        );
+        assert!(high_skip.total() < no_skip.total());
+        assert!(high_skip.row_count < no_skip.row_count);
+    }
+
+    #[test]
+    fn test_parallel_scan_cheaper_for_large_tables() {
+        let model = make_cost_model();
+        let stats = make_table_stats(1_000_000, 10_000);
+        let serial = model.cost_seq_scan(&stats);
+        let parallel = model.cost_parallel_scan(&stats, 4);
+        // Parallel IO should be roughly 1/4 of serial
+        assert!(parallel.io_cost < serial.io_cost);
+    }
+
+    #[test]
+    fn test_parallel_hash_join_cost() {
+        let model = make_cost_model();
+        let left = PlanCost {
+            io_cost: 100.0,
+            cpu_cost: 10000.0,
+            row_count: 10000.0,
+        };
+        let right = PlanCost {
+            io_cost: 50.0,
+            cpu_cost: 5000.0,
+            row_count: 5000.0,
+        };
+        let serial = model.cost_hash_join(&left, &right);
+        let parallel = model.cost_parallel_hash_join(&left, &right, 4);
+        // Parallel build+probe CPU per-worker should be lower than serial
+        // (total may be higher due to coordination overhead, but wall-clock is less)
+        let serial_build_probe = 10000.0 * 0.0025 + 10000.0 * 0.0025;
+        let parallel_build_probe = (5000.0 / 4.0) * 0.0025 + (10000.0 / 4.0) * 0.0025;
+        assert!(parallel_build_probe < serial_build_probe);
+        // IO cost is the same
+        assert_eq!(parallel.io_cost, serial.io_cost);
     }
 }

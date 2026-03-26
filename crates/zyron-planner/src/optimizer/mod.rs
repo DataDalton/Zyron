@@ -3,6 +3,7 @@
 //! Applies transformation rules in a fixed-point loop until no rule
 //! produces a change, or the maximum iteration count is reached.
 
+pub mod cardinality;
 pub mod rules;
 
 use crate::logical::LogicalPlan;
@@ -34,6 +35,8 @@ impl<'a> Optimizer<'a> {
             Box::new(rules::ProjectionPushdown),
             Box::new(rules::SubqueryDecorrelate),
             Box::new(rules::JoinReorder::new()),
+            Box::new(rules::EncodingPushdown),
+            Box::new(rules::IndexAdvisor::new()),
         ];
         Self {
             catalog,

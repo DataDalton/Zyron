@@ -357,6 +357,69 @@ fn build_operator_tree(
                 )));
                 Ok(br.with_metrics("Update", analyze, child_m))
             }
+
+            // Parallel scan: reuse the existing ParallelSeqScanOperator
+            PhysicalPlan::ParallelSeqScan {
+                table_id,
+                columns,
+                predicate,
+                ..
+            } => {
+                let op =
+                    ParallelSeqScanOperator::new(ctx.clone(), table_id, columns, predicate).await?;
+                let br = BuildResult::new(Box::new(op));
+                Ok(br.with_metrics("ParallelSeqScan", analyze, Vec::new()))
+            }
+
+            // Parallel hash join: fall back to serial hash join for now.
+            // The planner marks it parallel for cost estimation purposes.
+            PhysicalPlan::ParallelHashJoin {
+                left,
+                right,
+                join_type,
+                left_keys,
+                right_keys,
+                remaining_condition,
+                ..
+            } => {
+                let left_schema = left.output_schema();
+                let right_schema = right.output_schema();
+                let left_br = build_operator_tree(*left, ctx).await?;
+                let right_br = build_operator_tree(*right, ctx).await?;
+                let child_m = collect_metrics(&[&left_br.metrics, &right_br.metrics]);
+                let br = BuildResult::new(Box::new(HashJoinOperator::new(
+                    left_br.op,
+                    right_br.op,
+                    join_type,
+                    left_keys,
+                    right_keys,
+                    remaining_condition,
+                    left_schema,
+                    right_schema,
+                )));
+                Ok(br.with_metrics("ParallelHashJoin", analyze, child_m))
+            }
+
+            // Gather: passes through to child, wraps with metrics for EXPLAIN ANALYZE alignment
+            PhysicalPlan::Gather { child, .. } => {
+                let child_br = build_operator_tree(*child, ctx).await?;
+                let child_m = collect_metrics(&[&child_br.metrics]);
+                Ok(BuildResult::new(child_br.op).with_metrics("Gather", analyze, child_m))
+            }
+
+            // Repartition: passes through to child (partitioning is a future extension)
+            PhysicalPlan::Repartition { child, .. } => {
+                let child_br = build_operator_tree(*child, ctx).await?;
+                let child_m = collect_metrics(&[&child_br.metrics]);
+                Ok(BuildResult::new(child_br.op).with_metrics("Repartition", analyze, child_m))
+            }
+
+            // Broadcast: passes through to child
+            PhysicalPlan::Broadcast { child, .. } => {
+                let child_br = build_operator_tree(*child, ctx).await?;
+                let child_m = collect_metrics(&[&child_br.metrics]);
+                Ok(BuildResult::new(child_br.op).with_metrics("Broadcast", analyze, child_m))
+            }
         };
         result
     })

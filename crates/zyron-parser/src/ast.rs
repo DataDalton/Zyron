@@ -298,10 +298,15 @@ pub struct ReleaseSavepointStatement {
 // Query analysis
 // ---------------------------------------------------------------------------
 
-/// EXPLAIN [ANALYZE] <statement>
+/// EXPLAIN [(option_list)] <statement>
+/// Supports: EXPLAIN ANALYZE stmt, EXPLAIN (ANALYZE, COSTS, BUFFERS, TIMING, FORMAT TEXT|JSON|YAML) stmt
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExplainStatement {
     pub analyze: bool,
+    pub costs: bool,
+    pub buffers: bool,
+    pub timing: bool,
+    pub format: Option<String>,
     pub statement: Box<Statement>,
 }
 
@@ -1622,6 +1627,10 @@ mod tests {
 
         let explain = Statement::Explain(Box::new(ExplainStatement {
             analyze: true,
+            costs: true,
+            buffers: false,
+            timing: true,
+            format: None,
             statement: Box::new(select.clone()),
         }));
         assert!(matches!(explain, Statement::Explain(_)));

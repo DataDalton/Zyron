@@ -6,13 +6,14 @@
 //! - HashAggregate vs SortAggregate
 
 use crate::binder::BoundExpr;
-use crate::cost::{CostModel, PlanCost, INDEX_SCAN_SELECTIVITY_THRESHOLD};
+use crate::cost::{CostModel, EncodingCostParameters, INDEX_SCAN_SELECTIVITY_THRESHOLD, PlanCost};
 use crate::logical::{JoinCondition, LogicalPlan};
+use crate::optimizer::rules::{encoding_pushdown, parallel_plan};
 use crate::physical::*;
+use std::sync::Arc;
 use zyron_catalog::{Catalog, IndexEntry};
 use zyron_common::{Result, TypeId};
 use zyron_parser::ast::{BinaryOperator, JoinType};
-use std::sync::Arc;
 
 /// Converts an optimized logical plan into a physical plan using cost-based decisions.
 pub fn build_physical_plan(logical: LogicalPlan, catalog: &Catalog) -> Result<PhysicalPlan> {
@@ -27,18 +28,30 @@ struct PhysicalPlanner<'a> {
 
 impl<'a> PhysicalPlanner<'a> {
     fn new(catalog: &'a Catalog, cost_model: CostModel) -> Self {
-        Self { catalog, cost_model }
+        Self {
+            catalog,
+            cost_model,
+        }
     }
 
     fn plan(&self, logical: LogicalPlan) -> Result<PhysicalPlan> {
         match logical {
-            LogicalPlan::Scan { table_id, table_idx: _, columns, alias: _ } => {
-                self.plan_scan(table_id, columns, None)
-            }
+            LogicalPlan::Scan {
+                table_id,
+                columns,
+                encoding_hints,
+                ..
+            } => self.plan_scan(table_id, columns, None, encoding_hints),
             LogicalPlan::Filter { predicate, child } => {
                 // Try to push the filter into a scan (index scan opportunity)
-                if let LogicalPlan::Scan { table_id, columns, .. } = *child {
-                    return self.plan_scan(table_id, columns, Some(predicate));
+                if let LogicalPlan::Scan {
+                    table_id,
+                    columns,
+                    encoding_hints,
+                    ..
+                } = *child
+                {
+                    return self.plan_scan(table_id, columns, Some(predicate), encoding_hints);
                 }
 
                 let child_plan = self.plan(*child)?;
@@ -55,7 +68,11 @@ impl<'a> PhysicalPlanner<'a> {
                     cost,
                 })
             }
-            LogicalPlan::Project { expressions, aliases, child } => {
+            LogicalPlan::Project {
+                expressions,
+                aliases,
+                child,
+            } => {
                 let child_plan = self.plan(*child)?;
                 let child_cost = *child_plan.cost();
                 let cost = PlanCost {
@@ -70,12 +87,17 @@ impl<'a> PhysicalPlanner<'a> {
                     cost,
                 })
             }
-            LogicalPlan::Join { left, right, join_type, condition } => {
-                self.plan_join(*left, *right, join_type, condition)
-            }
-            LogicalPlan::Aggregate { group_by, aggregates, child } => {
-                self.plan_aggregate(group_by, aggregates, *child)
-            }
+            LogicalPlan::Join {
+                left,
+                right,
+                join_type,
+                condition,
+            } => self.plan_join(*left, *right, join_type, condition),
+            LogicalPlan::Aggregate {
+                group_by,
+                aggregates,
+                child,
+            } => self.plan_aggregate(group_by, aggregates, *child),
             LogicalPlan::Sort { order_by, child } => {
                 let child_plan = self.plan(*child)?;
                 let child_cost = *child_plan.cost();
@@ -91,7 +113,11 @@ impl<'a> PhysicalPlanner<'a> {
                     },
                 })
             }
-            LogicalPlan::Limit { limit, offset, child } => {
+            LogicalPlan::Limit {
+                limit,
+                offset,
+                child,
+            } => {
                 // Check if there's a Sort below for top-N optimization
                 let child_plan = self.plan(*child)?;
                 let rows = limit
@@ -122,7 +148,12 @@ impl<'a> PhysicalPlanner<'a> {
                     cost,
                 })
             }
-            LogicalPlan::SetOp { op, all, left, right } => {
+            LogicalPlan::SetOp {
+                op,
+                all,
+                left,
+                right,
+            } => {
                 let left_plan = self.plan(*left)?;
                 let right_plan = self.plan(*right)?;
                 let cost = PlanCost {
@@ -139,7 +170,11 @@ impl<'a> PhysicalPlanner<'a> {
                     cost,
                 })
             }
-            LogicalPlan::Insert { table_id, target_columns, source } => {
+            LogicalPlan::Insert {
+                table_id,
+                target_columns,
+                source,
+            } => {
                 let source_plan = self.plan(*source)?;
                 let cost = *source_plan.cost();
                 Ok(PhysicalPlan::Insert {
@@ -157,7 +192,11 @@ impl<'a> PhysicalPlanner<'a> {
                 };
                 Ok(PhysicalPlan::Values { rows, schema, cost })
             }
-            LogicalPlan::Update { table_id, assignments, child } => {
+            LogicalPlan::Update {
+                table_id,
+                assignments,
+                child,
+            } => {
                 let child_plan = self.plan(*child)?;
                 let cost = *child_plan.cost();
                 Ok(PhysicalPlan::Update {
@@ -188,6 +227,7 @@ impl<'a> PhysicalPlanner<'a> {
         table_id: zyron_catalog::TableId,
         columns: Vec<crate::logical::LogicalColumn>,
         predicate: Option<BoundExpr>,
+        encoding_hints: Option<encoding_pushdown::EncodingHint>,
     ) -> Result<PhysicalPlan> {
         // Get table stats
         let table_stats = self.catalog.get_stats(table_id);
@@ -200,11 +240,9 @@ impl<'a> PhysicalPlanner<'a> {
             if let Some((ts, cs)) = &table_stats {
                 for index in &indexes {
                     if let Some((index_pred, remaining)) = match_index(pred, index) {
-                        let selectivity = self.cost_model.estimate_selectivity(
-                            &index_pred,
-                            Some(ts),
-                            Some(cs),
-                        );
+                        let selectivity =
+                            self.cost_model
+                                .estimate_selectivity(&index_pred, Some(ts), Some(cs));
 
                         if selectivity < INDEX_SCAN_SELECTIVITY_THRESHOLD {
                             let cost = self.cost_model.cost_index_scan(ts, selectivity);
@@ -224,11 +262,15 @@ impl<'a> PhysicalPlanner<'a> {
             }
         }
 
-        // Default to sequential scan
-        let cost = if let Some((ts, _)) = &table_stats {
+        // Compute sequential scan cost
+        let seq_cost = if let Some((ts, _)) = &table_stats {
             let mut scan_cost = self.cost_model.cost_seq_scan(ts);
             if let Some(pred) = &predicate {
-                let selectivity = self.cost_model.estimate_selectivity(pred, table_stats.as_ref().map(|(ts, _)| ts), table_stats.as_ref().map(|(_, cs)| cs.as_slice()));
+                let selectivity = self.cost_model.estimate_selectivity(
+                    pred,
+                    table_stats.as_ref().map(|(ts, _)| ts),
+                    table_stats.as_ref().map(|(_, cs)| cs.as_slice()),
+                );
                 scan_cost.row_count = (scan_cost.row_count * selectivity).max(1.0);
             }
             scan_cost
@@ -240,11 +282,72 @@ impl<'a> PhysicalPlanner<'a> {
             }
         };
 
+        // Consider parallel scan for large tables.
+        // Use the predicate-adjusted row count from seq_cost to decide threshold,
+        // since filtering reduces the effective work.
+        if let Some((ts, _)) = &table_stats {
+            if parallel_plan::should_parallelize(ts.row_count as f64) {
+                let num_workers = parallel_plan::compute_worker_count(ts.page_count);
+                if num_workers > 1 {
+                    let mut parallel_cost = self.cost_model.cost_parallel_scan(ts, num_workers);
+                    // Apply predicate selectivity to parallel scan row count
+                    if predicate.is_some() {
+                        parallel_cost.row_count = seq_cost.row_count;
+                    }
+                    // Gather node adds minimal coordination cost (parallel_tuple_cost
+                    // is already included in cost_parallel_scan)
+                    let gather_cost = PlanCost {
+                        io_cost: 0.0,
+                        cpu_cost: 0.0,
+                        row_count: parallel_cost.row_count,
+                    };
+                    let total_parallel = parallel_cost.total() + gather_cost.total();
+                    if total_parallel < seq_cost.total() {
+                        let parallel_scan = PhysicalPlan::ParallelSeqScan {
+                            table_id,
+                            columns: columns.clone(),
+                            predicate: predicate.clone(),
+                            num_workers,
+                            cost: parallel_cost,
+                        };
+                        return Ok(PhysicalPlan::Gather {
+                            child: Box::new(parallel_scan),
+                            num_workers,
+                            cost: gather_cost,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Consider encoding-aware scan cost if hints are present
+        if let Some(hints) = &encoding_hints {
+            if hints.any_applicable() {
+                if let Some((ts, _)) = &table_stats {
+                    let skip_rate = hints.estimated_skip_rate();
+                    let params = EncodingCostParameters {
+                        skip_rate,
+                        ..EncodingCostParameters::default()
+                    };
+                    let encoded_cost = self.cost_model.cost_encoded_scan(ts, &params);
+                    // If encoded scan is cheaper, adjust the sequential scan cost
+                    if encoded_cost.total() < seq_cost.total() {
+                        return Ok(PhysicalPlan::SeqScan {
+                            table_id,
+                            columns,
+                            predicate,
+                            cost: encoded_cost,
+                        });
+                    }
+                }
+            }
+        }
+
         Ok(PhysicalPlan::SeqScan {
             table_id,
             columns,
             predicate,
-            cost,
+            cost: seq_cost,
         })
     }
 
@@ -271,17 +374,19 @@ impl<'a> PhysicalPlanner<'a> {
                     // Cost all three strategies
                     let hash_cost = self.cost_model.cost_hash_join(&left_cost, &right_cost);
                     let merge_cost_base = self.cost_model.cost_merge_join(&left_cost, &right_cost);
-                    let nl_cost = self.cost_model.cost_nested_loop_join(&left_cost, &right_cost);
+                    let nl_cost = self
+                        .cost_model
+                        .cost_nested_loop_join(&left_cost, &right_cost);
 
                     // Add sort cost to merge join if needed
                     let left_sort_cost = self.cost_model.cost_sort(&left_cost);
                     let right_sort_cost = self.cost_model.cost_sort(&right_cost);
-                    let merge_total = merge_cost_base.total()
-                        + left_sort_cost.total()
-                        + right_sort_cost.total();
+                    let merge_total =
+                        merge_cost_base.total() + left_sort_cost.total() + right_sort_cost.total();
 
                     // Pick cheapest
-                    if nl_cost.total() < hash_cost.total() && nl_cost.total() < merge_total
+                    if nl_cost.total() < hash_cost.total()
+                        && nl_cost.total() < merge_total
                         && right_cost.row_count < 100.0
                     {
                         // Nested loop for small right side
@@ -303,6 +408,46 @@ impl<'a> PhysicalPlanner<'a> {
                             cost: merge_cost_base,
                         })
                     } else {
+                        // Consider parallel hash join for large inputs
+                        if parallel_plan::should_parallelize(left_cost.row_count)
+                            || parallel_plan::should_parallelize(right_cost.row_count)
+                        {
+                            // Approximate page count from row counts, clamped to u32 range
+                            let approx_pages =
+                                ((left_cost.row_count + right_cost.row_count) / 100.0)
+                                    .min(u32::MAX as f64) as u32;
+                            let num_workers = parallel_plan::compute_worker_count(approx_pages);
+                            if num_workers > 1 {
+                                let parallel_cost = self.cost_model.cost_parallel_hash_join(
+                                    &left_cost,
+                                    &right_cost,
+                                    num_workers,
+                                );
+                                if parallel_cost.total() < hash_cost.total() {
+                                    let gather_cost = PlanCost {
+                                        io_cost: 0.0,
+                                        cpu_cost: 0.0,
+                                        row_count: parallel_cost.row_count,
+                                    };
+                                    let par_join = PhysicalPlan::ParallelHashJoin {
+                                        left: Box::new(left_plan),
+                                        right: Box::new(right_plan),
+                                        join_type,
+                                        left_keys,
+                                        right_keys,
+                                        remaining_condition: remaining,
+                                        num_workers,
+                                        cost: parallel_cost,
+                                    };
+                                    return Ok(PhysicalPlan::Gather {
+                                        child: Box::new(par_join),
+                                        num_workers,
+                                        cost: gather_cost,
+                                    });
+                                }
+                            }
+                        }
+
                         // Hash join (default for equi-joins)
                         Ok(PhysicalPlan::HashJoin {
                             left: Box::new(left_plan),
@@ -316,7 +461,9 @@ impl<'a> PhysicalPlanner<'a> {
                     }
                 } else {
                     // Non-equi join: must use nested loop
-                    let cost = self.cost_model.cost_nested_loop_join(&left_cost, &right_cost);
+                    let cost = self
+                        .cost_model
+                        .cost_nested_loop_join(&left_cost, &right_cost);
                     Ok(PhysicalPlan::NestedLoopJoin {
                         left: Box::new(left_plan),
                         right: Box::new(right_plan),
@@ -340,7 +487,9 @@ impl<'a> PhysicalPlanner<'a> {
                 })
             }
             JoinCondition::Cross => {
-                let cost = self.cost_model.cost_nested_loop_join(&left_cost, &right_cost);
+                let cost = self
+                    .cost_model
+                    .cost_nested_loop_join(&left_cost, &right_cost);
                 Ok(PhysicalPlan::NestedLoopJoin {
                     left: Box::new(left_plan),
                     right: Box::new(right_plan),
@@ -371,7 +520,9 @@ impl<'a> PhysicalPlanner<'a> {
             child_cost.row_count.sqrt().max(1.0)
         };
 
-        let cost = self.cost_model.cost_hash_aggregate(&child_cost, group_count);
+        let cost = self
+            .cost_model
+            .cost_hash_aggregate(&child_cost, group_count);
 
         // Use HashAggregate by default (better for random group distributions)
         Ok(PhysicalPlan::HashAggregate {
@@ -407,8 +558,12 @@ fn match_index(
     match predicate {
         BoundExpr::BinaryOp {
             left,
-            op: BinaryOperator::Eq | BinaryOperator::Lt | BinaryOperator::Gt
-                | BinaryOperator::LtEq | BinaryOperator::GtEq,
+            op:
+                BinaryOperator::Eq
+                | BinaryOperator::Lt
+                | BinaryOperator::Gt
+                | BinaryOperator::LtEq
+                | BinaryOperator::GtEq,
             right,
             ..
         } => {
@@ -421,7 +576,12 @@ fn match_index(
             None
         }
         // AND: check if any conjunct matches the index
-        BoundExpr::BinaryOp { left, op: BinaryOperator::And, right, .. } => {
+        BoundExpr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+            ..
+        } => {
             let left_match = match_index(left, index);
             let right_match = match_index(right, index);
 
@@ -438,23 +598,27 @@ fn match_index(
                         None,
                     ))
                 }
-                (Some((idx_pred, _)), None) => {
-                    Some((idx_pred, Some(right.as_ref().clone())))
-                }
-                (None, Some((idx_pred, _))) => {
-                    Some((idx_pred, Some(left.as_ref().clone())))
-                }
+                (Some((idx_pred, _)), None) => Some((idx_pred, Some(right.as_ref().clone()))),
+                (None, Some((idx_pred, _))) => Some((idx_pred, Some(left.as_ref().clone()))),
                 (None, None) => None,
             }
         }
-        BoundExpr::Between { expr, negated: false, .. } => {
+        BoundExpr::Between {
+            expr,
+            negated: false,
+            ..
+        } => {
             if extract_column_id_from_expr(expr) == Some(leading_col) {
                 Some((predicate.clone(), None))
             } else {
                 None
             }
         }
-        BoundExpr::InList { expr, negated: false, .. } => {
+        BoundExpr::InList {
+            expr,
+            negated: false,
+            ..
+        } => {
             if extract_column_id_from_expr(expr) == Some(leading_col) {
                 Some((predicate.clone(), None))
             } else {
@@ -489,7 +653,13 @@ fn extract_equi_keys(
     let mut remaining = Vec::new();
 
     for conj in conjuncts {
-        if let BoundExpr::BinaryOp { left, op: BinaryOperator::Eq, right, .. } = &conj {
+        if let BoundExpr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+            ..
+        } = &conj
+        {
             if is_column_ref(left) && is_column_ref(right) {
                 left_keys.push(left.as_ref().clone());
                 right_keys.push(right.as_ref().clone());
@@ -514,7 +684,12 @@ fn extract_equi_keys(
 
 fn split_conjuncts(expr: &BoundExpr) -> Vec<BoundExpr> {
     match expr {
-        BoundExpr::BinaryOp { left, op: BinaryOperator::And, right, .. } => {
+        BoundExpr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+            ..
+        } => {
             let mut result = split_conjuncts(left);
             result.extend(split_conjuncts(right));
             result

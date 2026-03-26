@@ -20,7 +20,8 @@ use zyron_common::{Result as ZyronResult, ZyronError};
 use zyron_executor::batch::DataBatch;
 use zyron_executor::column::ScalarValue;
 use zyron_executor::context::ExecutionContext;
-use zyron_executor::executor::execute;
+use zyron_executor::executor::{execute, execute_analyze};
+use zyron_executor::operator::OperatorMetrics;
 use zyron_planner::logical::LogicalColumn;
 use zyron_planner::physical::PhysicalPlan;
 use zyron_storage::DiskManager;
@@ -542,6 +543,18 @@ impl<T: WireTransport> Connection<T> {
                 continue;
             }
 
+            // Handle EXPLAIN statements (pass owned value to avoid cloning the AST)
+            if let zyron_parser::Statement::Explain(explain_stmt) = stmt {
+                match self.handle_explain_statement(*explain_stmt).await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        self.send_protocol_error(&e).await?;
+                        self.mark_failed_if_in_transaction();
+                    }
+                }
+                continue;
+            }
+
             // Plan and execute the statement
             match self.plan_and_execute_statement(stmt).await {
                 Ok(()) => {}
@@ -618,6 +631,107 @@ impl<T: WireTransport> Connection<T> {
             let tag = make_dml_tag(&output_schema, affected);
             self.feed(BackendMessage::CommandComplete { tag }).await?;
         }
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // EXPLAIN handling
+    // -----------------------------------------------------------------------
+
+    async fn handle_explain_statement(
+        &mut self,
+        explain_stmt: zyron_parser::ast::ExplainStatement,
+    ) -> Result<(), ProtocolError> {
+        let (db_id, search_path) = {
+            let session = self
+                .session
+                .as_ref()
+                .ok_or(ProtocolError::Malformed("No session established".into()))?;
+            (session.database_id, session.search_path.clone())
+        };
+
+        let options = zyron_planner::ExplainOptions {
+            analyze: explain_stmt.analyze,
+            costs: explain_stmt.costs,
+            buffers: explain_stmt.buffers,
+            timing: explain_stmt.timing,
+            format: explain_stmt
+                .format
+                .as_deref()
+                .map(zyron_planner::ExplainFormat::from_str)
+                .unwrap_or(zyron_planner::ExplainFormat::Text),
+        };
+
+        let inner_stmt = *explain_stmt.statement;
+        let (plan, options) = zyron_planner::plan_for_explain(
+            &self.server.catalog,
+            db_id,
+            search_path,
+            inner_stmt,
+            options,
+        )
+        .await
+        .map_err(ProtocolError::Database)?;
+
+        let explain_tree = zyron_planner::ExplainNode::from_physical_plan(&plan);
+
+        if options.analyze {
+            let (txn_id, snapshot) = self.ensure_transaction()?;
+            let ctx = Arc::new(ExecutionContext::new(
+                self.server.catalog.clone(),
+                self.server.wal.clone(),
+                self.server.buffer_pool.clone(),
+                self.server.disk_manager.clone(),
+                txn_id as u32,
+                snapshot,
+            ));
+
+            let (_batches, metrics) = execute_analyze(plan, &ctx)
+                .await
+                .map_err(ProtocolError::Database)?;
+
+            let mut tree = explain_tree;
+            if let Some(m) = metrics {
+                // Collect metrics into flat list for merge
+                let flat = collect_metrics_flat(&m);
+                tree.merge_metrics_flat(&flat);
+            }
+            let output = tree.render(&options);
+            self.send_explain_output(&output).await?;
+        } else {
+            let output = explain_tree.render(&options);
+            self.send_explain_output(&output).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn send_explain_output(&mut self, output: &str) -> Result<(), ProtocolError> {
+        // Send as single-column text result: column name "QUERY PLAN"
+        let row_desc = BackendMessage::RowDescription(vec![FieldDescription {
+            name: "QUERY PLAN".to_string(),
+            table_oid: 0,
+            column_attr: 0,
+            type_oid: types::PG_TEXT_OID,
+            type_size: -1,
+            type_modifier: -1,
+            format: 0,
+        }]);
+        self.feed(row_desc).await?;
+
+        // Send each line as a separate DataRow
+        let mut line_count = 0usize;
+        for line in output.lines() {
+            let row = BackendMessage::DataRow(vec![Some(line.as_bytes().to_vec())]);
+            self.feed(row).await?;
+            line_count += 1;
+        }
+        self.feed(BackendMessage::CommandComplete {
+            tag: format!("EXPLAIN {}", line_count),
+        })
+        .await?;
+        self.flush().await?;
 
         Ok(())
     }
@@ -1422,6 +1536,27 @@ pub fn zyron_error_to_fields(err: &ZyronError) -> ErrorFields {
 /// Checks if a statement is a ROLLBACK.
 fn is_rollback(stmt: &zyron_parser::Statement) -> bool {
     matches!(stmt, zyron_parser::Statement::Rollback(_))
+}
+
+/// Collects OperatorMetrics tree into a flat pre-order list of (rows, elapsed_ms, batches).
+fn collect_metrics_flat(metrics: &Arc<OperatorMetrics>) -> Vec<(u64, f64, u64)> {
+    let mut result = Vec::new();
+    collect_metrics_recursive(metrics, &mut result);
+    result
+}
+
+fn collect_metrics_recursive(metrics: &OperatorMetrics, result: &mut Vec<(u64, f64, u64)>) {
+    let rows = metrics
+        .rows_produced
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let ns = metrics
+        .elapsed_ns
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let batches = metrics.batches.load(std::sync::atomic::Ordering::Relaxed);
+    result.push((rows, ns as f64 / 1_000_000.0, batches));
+    for child in &metrics.children {
+        collect_metrics_recursive(child, result);
+    }
 }
 
 /// Checks if a physical plan produces query results (SELECT-like).

@@ -8,6 +8,7 @@
 pub mod builder;
 
 use crate::binder::{BoundAssignment, BoundExpr, BoundOrderBy};
+use crate::optimizer::rules::encoding_pushdown::EncodingHint;
 use zyron_catalog::{ColumnId, TableId};
 use zyron_common::TypeId;
 use zyron_parser::ast::{JoinType, SetOpType};
@@ -39,6 +40,8 @@ pub enum LogicalPlan {
         table_idx: usize,
         columns: Vec<LogicalColumn>,
         alias: String,
+        /// Encoding optimization hints set by the encoding pushdown rule.
+        encoding_hints: Option<EncodingHint>,
     },
 
     /// Predicate filter.
@@ -83,9 +86,7 @@ pub enum LogicalPlan {
     },
 
     /// Distinct elimination.
-    Distinct {
-        child: Box<LogicalPlan>,
-    },
+    Distinct { child: Box<LogicalPlan> },
 
     /// Set operations (UNION, INTERSECT, EXCEPT).
     SetOp {
@@ -158,31 +159,37 @@ impl LogicalPlan {
         match self {
             LogicalPlan::Scan { columns, .. } => columns.clone(),
             LogicalPlan::Filter { child, .. } => child.output_schema(),
-            LogicalPlan::Project { expressions, aliases, .. } => {
-                expressions
-                    .iter()
-                    .enumerate()
-                    .map(|(i, expr)| {
-                        let name = aliases
-                            .get(i)
-                            .and_then(|a| a.clone())
-                            .unwrap_or_else(|| format!("col{}", i));
-                        LogicalColumn {
-                            table_idx: None,
-                            column_id: ColumnId(i as u16),
-                            name,
-                            type_id: expr.type_id(),
-                            nullable: expr.nullable(),
-                        }
-                    })
-                    .collect()
-            }
+            LogicalPlan::Project {
+                expressions,
+                aliases,
+                ..
+            } => expressions
+                .iter()
+                .enumerate()
+                .map(|(i, expr)| {
+                    let name = aliases
+                        .get(i)
+                        .and_then(|a| a.clone())
+                        .unwrap_or_else(|| format!("col{}", i));
+                    LogicalColumn {
+                        table_idx: None,
+                        column_id: ColumnId(i as u16),
+                        name,
+                        type_id: expr.type_id(),
+                        nullable: expr.nullable(),
+                    }
+                })
+                .collect(),
             LogicalPlan::Join { left, right, .. } => {
                 let mut schema = left.output_schema();
                 schema.extend(right.output_schema());
                 schema
             }
-            LogicalPlan::Aggregate { group_by, aggregates, .. } => {
+            LogicalPlan::Aggregate {
+                group_by,
+                aggregates,
+                ..
+            } => {
                 let mut schema = Vec::with_capacity(group_by.len() + aggregates.len());
                 for (i, expr) in group_by.iter().enumerate() {
                     schema.push(LogicalColumn {
@@ -229,8 +236,9 @@ impl LogicalPlan {
             | LogicalPlan::Insert { source: child, .. }
             | LogicalPlan::Update { child, .. }
             | LogicalPlan::Delete { child, .. } => vec![child],
-            LogicalPlan::Join { left, right, .. }
-            | LogicalPlan::SetOp { left, right, .. } => vec![left, right],
+            LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
+                vec![left, right]
+            }
         }
     }
 
@@ -247,8 +255,9 @@ impl LogicalPlan {
             | LogicalPlan::Insert { source: child, .. }
             | LogicalPlan::Update { child, .. }
             | LogicalPlan::Delete { child, .. } => vec![child],
-            LogicalPlan::Join { left, right, .. }
-            | LogicalPlan::SetOp { left, right, .. } => vec![left, right],
+            LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
+                vec![left, right]
+            }
         }
     }
 }
@@ -280,6 +289,7 @@ mod tests {
                 },
             ],
             alias: "users".to_string(),
+            encoding_hints: None,
         };
         let schema = plan.output_schema();
         assert_eq!(schema.len(), 2);
@@ -300,6 +310,7 @@ mod tests {
                 nullable: false,
             }],
             alias: "t".to_string(),
+            encoding_hints: None,
         };
         let filter = LogicalPlan::Filter {
             predicate: BoundExpr::Literal {
@@ -326,6 +337,7 @@ mod tests {
                 nullable: false,
             }],
             alias: "l".to_string(),
+            encoding_hints: None,
         };
         let right = LogicalPlan::Scan {
             table_id: TableId(2),
@@ -338,6 +350,7 @@ mod tests {
                 nullable: false,
             }],
             alias: "r".to_string(),
+            encoding_hints: None,
         };
         let join = LogicalPlan::Join {
             left: Box::new(left),
@@ -358,6 +371,7 @@ mod tests {
             table_idx: 0,
             columns: vec![],
             alias: "t".to_string(),
+            encoding_hints: None,
         };
         assert_eq!(scan.children().len(), 0);
 

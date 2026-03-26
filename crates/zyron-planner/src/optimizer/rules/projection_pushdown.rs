@@ -6,8 +6,8 @@
 use crate::binder::BoundExpr;
 use crate::logical::{LogicalColumn, LogicalPlan};
 use crate::optimizer::OptimizationRule;
-use zyron_catalog::{Catalog, ColumnId};
 use std::collections::HashSet;
+use zyron_catalog::{Catalog, ColumnId};
 
 pub struct ProjectionPushdown;
 
@@ -22,11 +22,7 @@ impl OptimizationRule for ProjectionPushdown {
             return None;
         }
         let pushed = push_projections(plan, None);
-        if pushed != *plan {
-            Some(pushed)
-        } else {
-            None
-        }
+        if pushed != *plan { Some(pushed) } else { None }
     }
 }
 
@@ -39,9 +35,18 @@ fn has_project(plan: &LogicalPlan) -> bool {
 }
 
 /// Pushes projections down into scans by tracking which columns are needed.
-fn push_projections(plan: &LogicalPlan, needed: Option<&HashSet<(usize, ColumnId)>>) -> LogicalPlan {
+fn push_projections(
+    plan: &LogicalPlan,
+    needed: Option<&HashSet<(usize, ColumnId)>>,
+) -> LogicalPlan {
     match plan {
-        LogicalPlan::Scan { table_id, table_idx, columns, alias } => {
+        LogicalPlan::Scan {
+            table_id,
+            table_idx,
+            columns,
+            alias,
+            ..
+        } => {
             if let Some(needed_cols) = needed {
                 let pruned: Vec<LogicalColumn> = columns
                     .iter()
@@ -59,12 +64,17 @@ fn push_projections(plan: &LogicalPlan, needed: Option<&HashSet<(usize, ColumnId
                         table_idx: *table_idx,
                         columns: pruned,
                         alias: alias.clone(),
+                        encoding_hints: None,
                     };
                 }
             }
             plan.clone()
         }
-        LogicalPlan::Project { expressions, aliases, child } => {
+        LogicalPlan::Project {
+            expressions,
+            aliases,
+            child,
+        } => {
             // Collect columns needed by the projection expressions
             let mut child_needed = HashSet::new();
             for expr in expressions {
@@ -84,7 +94,12 @@ fn push_projections(plan: &LogicalPlan, needed: Option<&HashSet<(usize, ColumnId
                 child: Box::new(push_projections(child, Some(&child_needed))),
             }
         }
-        LogicalPlan::Join { left, right, join_type, condition } => {
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            condition,
+        } => {
             let mut left_needed = HashSet::new();
             let mut right_needed = HashSet::new();
 
@@ -108,13 +123,31 @@ fn push_projections(plan: &LogicalPlan, needed: Option<&HashSet<(usize, ColumnId
             }
 
             LogicalPlan::Join {
-                left: Box::new(push_projections(left, if left_needed.is_empty() { None } else { Some(&left_needed) })),
-                right: Box::new(push_projections(right, if right_needed.is_empty() { None } else { Some(&right_needed) })),
+                left: Box::new(push_projections(
+                    left,
+                    if left_needed.is_empty() {
+                        None
+                    } else {
+                        Some(&left_needed)
+                    },
+                )),
+                right: Box::new(push_projections(
+                    right,
+                    if right_needed.is_empty() {
+                        None
+                    } else {
+                        Some(&right_needed)
+                    },
+                )),
                 join_type: *join_type,
                 condition: condition.clone(),
             }
         }
-        LogicalPlan::Aggregate { group_by, aggregates, child } => {
+        LogicalPlan::Aggregate {
+            group_by,
+            aggregates,
+            child,
+        } => {
             let mut child_needed = HashSet::new();
             for expr in group_by {
                 collect_needed_columns(expr, &mut child_needed);
@@ -141,7 +174,11 @@ fn push_projections(plan: &LogicalPlan, needed: Option<&HashSet<(usize, ColumnId
             }
         }
         // Pass through for other node types
-        LogicalPlan::Limit { limit, offset, child } => LogicalPlan::Limit {
+        LogicalPlan::Limit {
+            limit,
+            offset,
+            child,
+        } => LogicalPlan::Limit {
             limit: *limit,
             offset: *offset,
             child: Box::new(push_projections(child, needed)),
@@ -149,7 +186,12 @@ fn push_projections(plan: &LogicalPlan, needed: Option<&HashSet<(usize, ColumnId
         LogicalPlan::Distinct { child } => LogicalPlan::Distinct {
             child: Box::new(push_projections(child, needed)),
         },
-        LogicalPlan::SetOp { op, all, left, right } => LogicalPlan::SetOp {
+        LogicalPlan::SetOp {
+            op,
+            all,
+            left,
+            right,
+        } => LogicalPlan::SetOp {
             op: *op,
             all: *all,
             left: Box::new(push_projections(left, needed)),
@@ -177,7 +219,9 @@ fn collect_needed_columns(expr: &BoundExpr, out: &mut HashSet<(usize, ColumnId)>
                 collect_needed_columns(item, out);
             }
         }
-        BoundExpr::Between { expr, low, high, .. } => {
+        BoundExpr::Between {
+            expr, low, high, ..
+        } => {
             collect_needed_columns(expr, out);
             collect_needed_columns(low, out);
             collect_needed_columns(high, out);
@@ -193,7 +237,12 @@ fn collect_needed_columns(expr: &BoundExpr, out: &mut HashSet<(usize, ColumnId)>
         }
         BoundExpr::Cast { expr, .. } => collect_needed_columns(expr, out),
         BoundExpr::Nested(inner) => collect_needed_columns(inner, out),
-        BoundExpr::Case { operand, conditions, else_result, .. } => {
+        BoundExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
             if let Some(op) = operand {
                 collect_needed_columns(op, out);
             }
@@ -205,7 +254,12 @@ fn collect_needed_columns(expr: &BoundExpr, out: &mut HashSet<(usize, ColumnId)>
                 collect_needed_columns(e, out);
             }
         }
-        BoundExpr::WindowFunction { function, partition_by, order_by, .. } => {
+        BoundExpr::WindowFunction {
+            function,
+            partition_by,
+            order_by,
+            ..
+        } => {
             collect_needed_columns(function, out);
             for pb in partition_by {
                 collect_needed_columns(pb, out);
