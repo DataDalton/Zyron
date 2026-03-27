@@ -49,6 +49,24 @@ pub struct ServerState {
     pub disk_manager: Arc<DiskManager>,
     pub txn_manager: Arc<TransactionManager>,
     pub security_manager: Option<Arc<zyron_auth::SecurityManager>>,
+    /// Config value lookup: returns (key, value) for a dotted key.
+    pub config_lookup: Option<Arc<dyn Fn(&str) -> Option<String> + Send + Sync>>,
+    /// Config entries for SHOW ALL: returns vec of (key, value, description).
+    pub config_all: Option<Arc<dyn Fn() -> Vec<(String, String, String)> + Send + Sync>>,
+    /// Data directory path (for ALTER SYSTEM auto.conf writes).
+    pub data_dir: std::path::PathBuf,
+    /// Session manager for stat view queries.
+    pub session_info_collector:
+        Option<Arc<dyn Fn() -> Vec<crate::stat_views::SessionRow> + Send + Sync>>,
+    /// Checkpoint worker stats: (checkpoints_completed, segments_deleted, last_checkpoint_lsn).
+    pub checkpoint_stats: Option<Arc<dyn Fn() -> (u64, u64, u64) + Send + Sync>>,
+    /// Vacuum worker stats: (cycles_completed, tuples_reclaimed, pages_scanned).
+    pub vacuum_stats: Option<Arc<dyn Fn() -> (u64, u64, u64) + Send + Sync>>,
+    /// Checkpoint wake trigger.
+    pub checkpoint_wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// ALTER SYSTEM SET callback: writes key=value to auto.conf. Returns Ok or error message.
+    pub alter_system_set:
+        Option<Arc<dyn Fn(&str, &str) -> std::result::Result<(), String> + Send + Sync>>,
 }
 
 /// Cached prepared statement.
@@ -541,6 +559,22 @@ impl<T: WireTransport> Connection<T> {
                     }
                 }
                 continue;
+            }
+
+            // Intercept SELECT from virtual stat views
+            if let zyron_parser::Statement::Select(ref sel) = stmt {
+                if let Some(view_name) = extract_single_from_table(sel) {
+                    if crate::stat_views::is_stat_view(&view_name) {
+                        match self.handle_stat_view_query(&view_name).await {
+                            Ok(()) => {}
+                            Err(e) => {
+                                self.send_protocol_error(&e).await?;
+                                self.mark_failed_if_in_transaction();
+                            }
+                        }
+                        continue;
+                    }
+                }
             }
 
             // Handle EXPLAIN statements (pass owned value to avoid cloning the AST)
@@ -1160,12 +1194,66 @@ impl<T: WireTransport> Connection<T> {
                 Some(result)
             }
             zyron_parser::Statement::Show(s) => {
+                if s.name.eq_ignore_ascii_case("all") {
+                    // SHOW ALL: return all config entries
+                    if let Some(ref config_all) = self.server.config_all {
+                        let entries = config_all();
+                        let row_desc = BackendMessage::RowDescription(vec![
+                            FieldDescription {
+                                name: "name".into(),
+                                table_oid: 0,
+                                column_attr: 0,
+                                type_oid: types::PG_TEXT_OID,
+                                type_size: -1,
+                                type_modifier: -1,
+                                format: 0,
+                            },
+                            FieldDescription {
+                                name: "setting".into(),
+                                table_oid: 0,
+                                column_attr: 0,
+                                type_oid: types::PG_TEXT_OID,
+                                type_size: -1,
+                                type_modifier: -1,
+                                format: 0,
+                            },
+                            FieldDescription {
+                                name: "description".into(),
+                                table_oid: 0,
+                                column_attr: 0,
+                                type_oid: types::PG_TEXT_OID,
+                                type_size: -1,
+                                type_modifier: -1,
+                                format: 0,
+                            },
+                        ]);
+                        if let Err(e) = self.feed(row_desc).await {
+                            return Some(Err(e));
+                        }
+                        for (key, val, desc) in entries {
+                            let row = BackendMessage::DataRow(vec![
+                                Some(key.into_bytes()),
+                                Some(val.into_bytes()),
+                                Some(desc.into_bytes()),
+                            ]);
+                            if let Err(e) = self.feed(row).await {
+                                return Some(Err(e));
+                            }
+                        }
+                        return Some(
+                            self.feed(BackendMessage::CommandComplete { tag: "SHOW".into() })
+                                .await,
+                        );
+                    }
+                }
+
+                // Check session variables first, then config
                 let value = self
                     .session
                     .as_ref()
-                    .and_then(|sess| sess.get_variable(&s.name))
-                    .unwrap_or("unset")
-                    .to_string();
+                    .and_then(|sess| sess.get_variable(&s.name).map(|v| v.to_string()))
+                    .or_else(|| self.server.config_lookup.as_ref().and_then(|f| f(&s.name)))
+                    .unwrap_or_else(|| "unset".to_string());
 
                 let row_desc = BackendMessage::RowDescription(vec![FieldDescription {
                     name: s.name.clone(),
@@ -1192,8 +1280,87 @@ impl<T: WireTransport> Connection<T> {
                         .await,
                 )
             }
+            zyron_parser::Statement::AlterSystemSet(s) => {
+                let val_str = expr_to_string(&s.value);
+                if let Some(ref writer) = self.server.alter_system_set {
+                    match writer(&s.name, &val_str) {
+                        Ok(()) => Some(
+                            self.feed(BackendMessage::CommandComplete {
+                                tag: "ALTER SYSTEM".into(),
+                            })
+                            .await,
+                        ),
+                        Err(msg) => {
+                            let fields = ErrorFields {
+                                severity: "ERROR".into(),
+                                code: "XX000".into(),
+                                message: msg,
+                                detail: None,
+                                hint: None,
+                                position: None,
+                            };
+                            let _ = self.feed(BackendMessage::ErrorResponse(fields)).await;
+                            Some(Ok(()))
+                        }
+                    }
+                } else {
+                    let fields = ErrorFields {
+                        severity: "ERROR".into(),
+                        code: "XX000".into(),
+                        message: "ALTER SYSTEM not available".into(),
+                        detail: None,
+                        hint: None,
+                        position: None,
+                    };
+                    let _ = self.feed(BackendMessage::ErrorResponse(fields)).await;
+                    Some(Ok(()))
+                }
+            }
+            zyron_parser::Statement::Checkpoint(_) => {
+                if let Some(ref wake) = self.server.checkpoint_wake {
+                    wake();
+                }
+                Some(
+                    self.feed(BackendMessage::CommandComplete {
+                        tag: "CHECKPOINT".into(),
+                    })
+                    .await,
+                )
+            }
+            zyron_parser::Statement::Vacuum(_) => Some(
+                self.feed(BackendMessage::CommandComplete {
+                    tag: "VACUUM".into(),
+                })
+                .await,
+            ),
+            zyron_parser::Statement::Analyze(_) => Some(
+                self.feed(BackendMessage::CommandComplete {
+                    tag: "ANALYZE".into(),
+                })
+                .await,
+            ),
             _ => None,
         }
+    }
+
+    /// Handles a SELECT query against a virtual stat view, sending the result
+    /// directly without going through the planner/executor.
+    async fn handle_stat_view_query(&mut self, view_name: &str) -> Result<(), ProtocolError> {
+        let (fields, rows) = match crate::stat_views::query_stat_view(view_name, &self.server) {
+            Some(result) => result,
+            None => return Ok(()),
+        };
+
+        self.feed(BackendMessage::RowDescription(fields)).await?;
+        let row_count = rows.len();
+        for row in rows {
+            self.feed(BackendMessage::DataRow(row)).await?;
+        }
+        self.feed(BackendMessage::CommandComplete {
+            tag: format!("SELECT {}", row_count),
+        })
+        .await?;
+        Ok(())
     }
 
     /// Auto-commits implicit transactions (when not inside an explicit BEGIN block).
@@ -1573,6 +1740,23 @@ fn count_affected_rows(batches: &[DataBatch]) -> usize {
 }
 
 /// Converts an AST expression to its string representation for SET commands.
+/// Extracts the table name from a simple SELECT ... FROM table_name query.
+/// Returns None for complex queries (joins, subqueries, multiple tables).
+fn extract_single_from_table(sel: &zyron_parser::SelectStatement) -> Option<String> {
+    // Only match simple FROM with a single table reference
+    if sel.from.len() != 1 {
+        return None;
+    }
+    match &sel.from[0] {
+        zyron_parser::TableRef::Table {
+            name,
+            alias: _,
+            as_of: _,
+        } => Some(name.clone()),
+        _ => None,
+    }
+}
+
 fn expr_to_string(expr: &zyron_parser::Expr) -> String {
     match expr {
         zyron_parser::Expr::Literal(lit) => match lit {

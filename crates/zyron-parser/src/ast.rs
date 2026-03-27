@@ -108,6 +108,10 @@ pub enum Statement {
     CreateFulltextIndex(Box<CreateFulltextIndexStatement>),
     /// CREATE VECTOR INDEX name ON table(column) [WITH (options)]
     CreateVectorIndex(Box<CreateVectorIndexStatement>),
+    /// ALTER SYSTEM SET name = value
+    AlterSystemSet(Box<AlterSystemSetStatement>),
+    /// ANALYZE [table_name]
+    Analyze(Box<AnalyzeStatement>),
 }
 
 // ---------------------------------------------------------------------------
@@ -760,6 +764,17 @@ pub struct TableSample {
 /// CHECKPOINT
 #[derive(Debug, Clone, PartialEq)]
 pub struct CheckpointStatement {}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterSystemSetStatement {
+    pub name: String,
+    pub value: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnalyzeStatement {
+    pub table: Option<String>,
+}
 
 // ---------------------------------------------------------------------------
 // TTL / data retention

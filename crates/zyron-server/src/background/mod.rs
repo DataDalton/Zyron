@@ -106,6 +106,16 @@ impl BackgroundWorkers {
         &self.checkpoint
     }
 
+    /// Returns the checkpoint worker stats Arc.
+    pub fn checkpoint_stats(&self) -> Arc<checkpoint::CheckpointWorkerStats> {
+        Arc::clone(self.checkpoint.stats())
+    }
+
+    /// Returns the vacuum worker stats Arc.
+    pub fn vacuum_stats(&self) -> Arc<vacuum::VacuumStats> {
+        Arc::clone(self.vacuum.stats())
+    }
+
     /// Gracefully shuts down all workers.
     /// Runs a final checkpoint before stopping the checkpoint worker.
     pub fn shutdown(&mut self) {

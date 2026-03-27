@@ -24,3 +24,6 @@ parking_lot.workspace = true
 [dev-dependencies]
 tempfile = "3"
 zyron-bench-harness = { path = "../zyron-bench-harness" }
+zyron-parser = { path = "../zyron-parser" }
+zyron-wire = { path = "../zyron-wire" }
+zyron-wal = { path = "../zyron-wal" }

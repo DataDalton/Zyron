@@ -15,6 +15,7 @@ pub mod copy;
 pub mod messages;
 pub mod quic;
 pub mod session;
+pub mod stat_views;
 pub mod transport;
 pub mod types;
 

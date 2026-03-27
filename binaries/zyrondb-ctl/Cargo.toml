@@ -1,0 +1,13 @@
+[package]
+name = "zyrondb-ctl"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "zyrondb-ctl"
+path = "src/main.rs"
+
+[dependencies]
+zyron-server = { path = "../../crates/zyron-server" }
+zyron-common = { path = "../../crates/zyron-common" }

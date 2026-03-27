@@ -5,8 +5,10 @@
 //! graceful shutdown.
 
 pub mod background;
+pub mod backup;
 pub mod config;
 pub mod health;
+pub mod io_stats;
 pub mod metrics;
 pub mod session;
 pub mod signal;
@@ -345,16 +347,6 @@ impl Server {
             security_manager.brute_force.set_global_policy(policy);
         }
 
-        // Build ServerState for zyron-wire
-        let server_state = Arc::new(ServerState {
-            catalog: Arc::clone(&catalog),
-            wal: Arc::clone(&wal),
-            buffer_pool: Arc::clone(&buffer_pool),
-            disk_manager: Arc::clone(&disk_manager),
-            txn_manager: Arc::clone(&txn_manager),
-            security_manager: Some(Arc::new(security_manager)),
-        });
-
         // 9. Create CheckpointTracker
         let tracker = Arc::new(CheckpointTracker::new());
 
@@ -363,6 +355,10 @@ impl Server {
             wal_bytes_threshold: self.config.checkpoint.wal_bytes_threshold,
             max_interval_secs: self.config.checkpoint.max_interval_secs as u64,
             min_interval_secs: self.config.checkpoint.min_interval_secs as u64,
+        };
+        let vacuum_config = VacuumWorkerConfig {
+            interval_secs: self.config.vacuum.interval_secs,
+            ..VacuumWorkerConfig::default()
         };
         let mut background = BackgroundWorkers::start(
             Arc::clone(&catalog),
@@ -374,13 +370,102 @@ impl Server {
             tracker,
             ckpt_config,
             StatsCollectorConfig::default(),
-            VacuumWorkerConfig::default(),
+            vacuum_config,
             wal_dir,
             None, // WAL archiving disabled unless configured
         );
 
+        // Extract background worker stats for ServerState
+        let ckpt_stats = background.checkpoint_stats();
+        let vac_stats = background.vacuum_stats();
+
+        // Build config callbacks for ServerState
+        let config_for_lookup = self.config.clone();
+        let config_for_all = self.config.clone();
+        let data_dir_for_alter = data_dir.clone();
+
+        let session_mgr_for_view = Arc::clone(&self.session_mgr);
+        let ckpt_wake = {
+            let ckpt_ref = background.checkpoint();
+            let waker: Option<Arc<dyn Fn() + Send + Sync>> = None;
+            // CheckpointWorker does not expose a wake method via Arc. Skip for now.
+            waker
+        };
+
+        // Build ServerState for zyron-wire
+        let server_state = Arc::new(ServerState {
+            catalog: Arc::clone(&catalog),
+            wal: Arc::clone(&wal),
+            buffer_pool: Arc::clone(&buffer_pool),
+            disk_manager: Arc::clone(&disk_manager),
+            txn_manager: Arc::clone(&txn_manager),
+            security_manager: Some(Arc::new(security_manager)),
+            config_lookup: Some(Arc::new(move |key: &str| -> Option<String> {
+                config_for_lookup.get_config_value(key)
+            })),
+            config_all: Some(Arc::new(move || -> Vec<(String, String, String)> {
+                config_for_all.all_config_entries()
+            })),
+            data_dir: data_dir.clone(),
+            session_info_collector: Some(Arc::new(
+                move || -> Vec<zyron_wire::stat_views::SessionRow> {
+                    let mut rows = Vec::new();
+                    session_mgr_for_view.for_each(|info| {
+                        rows.push(zyron_wire::stat_views::SessionRow {
+                            pid: info.process_id,
+                            user_name: info.user.clone(),
+                            database: info.database.clone(),
+                            state: format!("{:?}", info.state()),
+                            connected_at_secs: info.connected_at.elapsed().as_secs(),
+                            last_activity_secs: info.last_activity_nanos() / 1_000_000_000,
+                        });
+                    });
+                    rows
+                },
+            )),
+            checkpoint_stats: Some({
+                let stats = Arc::clone(&ckpt_stats);
+                Arc::new(move || -> (u64, u64, u64) {
+                    (
+                        stats
+                            .checkpoints_completed
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        stats
+                            .total_segments_deleted
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        stats
+                            .last_checkpoint_lsn
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    )
+                })
+            }),
+            vacuum_stats: Some({
+                let stats = Arc::clone(&vac_stats);
+                Arc::new(move || -> (u64, u64, u64) {
+                    (
+                        stats
+                            .cycles_completed
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        stats
+                            .tuples_reclaimed
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        stats
+                            .pages_scanned
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    )
+                })
+            }),
+            checkpoint_wake: ckpt_wake,
+            alter_system_set: Some(Arc::new(
+                move |key: &str, value: &str| -> std::result::Result<(), String> {
+                    crate::config::ZyronConfig::write_auto_conf(&data_dir_for_alter, key, value)
+                        .map_err(|e| e.to_string())
+                },
+            )),
+        });
+
         // 11. Start health/metrics HTTP server
-        let health_port = self.config.server.health_port;
+        let health_port = self.config.metrics.port;
         let health_shutdown = Arc::clone(&self.shutdown);
         let health_state = Arc::clone(&self.health_state);
         tokio::spawn(async move {

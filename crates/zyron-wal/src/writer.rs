@@ -193,8 +193,8 @@ pub struct WalWriter {
     flush_done: Arc<(Mutex<bool>, Condvar)>,
     /// Shutdown flag.
     shutdown: Arc<AtomicBool>,
-    /// Flush thread join handle.
-    flush_thread: Option<JoinHandle<()>>,
+    /// Flush thread join handle. Wrapped in Mutex so close() can join via &self.
+    flush_thread: Mutex<Option<JoinHandle<()>>>,
     /// Current segment (only accessed by flush thread).
     segment: Arc<Mutex<Option<LogSegment>>>,
     /// Last flushed LSN.
@@ -208,6 +208,12 @@ pub struct WalWriter {
     /// Set to true by the flush thread when an I/O error occurs during flush.
     /// Checked by append() to fail fast instead of buffering into a broken WAL.
     flush_io_error: Arc<AtomicBool>,
+    /// Total records written (for zyron_stat_wal).
+    pub wal_records_written: AtomicU64,
+    /// Total bytes written (for zyron_stat_wal).
+    pub wal_bytes_written: AtomicU64,
+    /// Total fsync calls (for zyron_stat_wal). Arc-shared with the flush thread.
+    pub wal_syncs: Arc<AtomicU64>,
 }
 
 impl WalWriter {
@@ -232,6 +238,7 @@ impl WalWriter {
         let flushed_lsn = Arc::new(AtomicU64::new(initial_lsn.0.saturating_sub(1)));
         let rotation = Arc::new(AtomicRotationState::new());
         let flush_io_error = Arc::new(AtomicBool::new(false));
+        let wal_syncs = Arc::new(AtomicU64::new(0));
         let flush_thread = Self::spawn_flush_thread(
             ring_buffer.clone(),
             segment.clone(),
@@ -245,6 +252,7 @@ impl WalWriter {
             config.wal_dir.clone(),
             config.segment_size,
             flush_io_error.clone(),
+            wal_syncs.clone(),
         );
 
         Ok(Self {
@@ -253,13 +261,16 @@ impl WalWriter {
             flush_thread_waker,
             flush_done,
             shutdown,
-            flush_thread: Some(flush_thread),
+            flush_thread: Mutex::new(Some(flush_thread)),
             segment,
             flushed_lsn,
             next_txn_id: AtomicU64::new(1),
             config,
             rotation,
             flush_io_error,
+            wal_records_written: AtomicU64::new(0),
+            wal_bytes_written: AtomicU64::new(0),
+            wal_syncs,
         })
     }
 
@@ -312,6 +323,7 @@ impl WalWriter {
         wal_dir: PathBuf,
         segment_size: u32,
         flush_io_error: Arc<AtomicBool>,
+        wal_syncs_counter: Arc<AtomicU64>,
     ) -> JoinHandle<()> {
         std::thread::spawn(move || {
             // Register this thread for unpark wakeup. OnceLock::get() is a
@@ -335,7 +347,23 @@ impl WalWriter {
                 }
 
                 if shutdown.load(Ordering::Acquire) {
-                    // Final drain before exit
+                    // Complete any in-flight rotation before final drain.
+                    // Without this, records committed to the ring buffer between
+                    // the last flush and the rotation request are lost because
+                    // handle_rotation_sync drains residual bytes into the old
+                    // segment and installs the new one.
+                    if rotation.is_rotating() {
+                        Self::handle_rotation_sync(
+                            &rotation,
+                            &ring_buffer,
+                            &segment,
+                            &sequencer,
+                            &wal_dir,
+                            segment_size,
+                            fsync_enabled,
+                        );
+                    }
+                    // Final drain of any remaining records
                     Self::flush_records_sync(
                         &ring_buffer,
                         &segment,
@@ -344,6 +372,7 @@ impl WalWriter {
                         &flush_done,
                         fsync_enabled,
                         &flush_io_error,
+                        &wal_syncs_counter,
                     );
                     break;
                 }
@@ -357,6 +386,7 @@ impl WalWriter {
                     &flush_done,
                     fsync_enabled,
                     &flush_io_error,
+                    &wal_syncs_counter,
                 );
 
                 // Handle segment rotation only when requested by append().
@@ -457,6 +487,7 @@ impl WalWriter {
         flush_done: &Arc<(Mutex<bool>, Condvar)>,
         fsync_enabled: bool,
         flush_io_error: &AtomicBool,
+        wal_syncs_counter: &AtomicU64,
     ) {
         batch_buffer.clear();
         let max_lsn = ring_buffer.drain_into(batch_buffer);
@@ -488,14 +519,17 @@ impl WalWriter {
                     return;
                 }
 
-                if fsync_enabled && let Err(e) = seg.sync() {
-                    eprintln!("WAL sync error: {:?}", e);
-                    flush_io_error.store(true, Ordering::Release);
-                    let (lock, condvar) = flush_done.as_ref();
-                    let mut done = lock.lock();
-                    *done = true;
-                    condvar.notify_all();
-                    return;
+                if fsync_enabled {
+                    if let Err(e) = seg.sync() {
+                        eprintln!("WAL sync error: {:?}", e);
+                        flush_io_error.store(true, Ordering::Release);
+                        let (lock, condvar) = flush_done.as_ref();
+                        let mut done = lock.lock();
+                        *done = true;
+                        condvar.notify_all();
+                        return;
+                    }
+                    wal_syncs_counter.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -574,6 +608,9 @@ impl WalWriter {
                     }
                     self.ring_buffer.commit_write(record_size as usize, lsn);
                     self.wake_flush_thread();
+                    self.wal_records_written.fetch_add(1, Ordering::Relaxed);
+                    self.wal_bytes_written
+                        .fetch_add(record_size as u64, Ordering::Relaxed);
                     return Ok(lsn);
                 }
 
@@ -607,6 +644,9 @@ impl WalWriter {
 
             self.ring_buffer.commit_write(record_size as usize, lsn);
             self.maybe_wake_flush_thread(record_size as usize);
+            self.wal_records_written.fetch_add(1, Ordering::Relaxed);
+            self.wal_bytes_written
+                .fetch_add(record_size as u64, Ordering::Relaxed);
             return Ok(lsn);
         }
     }
@@ -709,9 +749,12 @@ impl WalWriter {
     }
 
     /// Forces a flush and waits for completion.
+    /// Waits until the ring buffer is empty and no segment rotation is in progress.
     pub fn flush(&self) -> Result<Lsn> {
         loop {
-            if self.ring_buffer.is_empty() {
+            let buffer_empty = self.ring_buffer.is_empty();
+            let rotation_idle = !self.rotation.is_rotating() && !self.rotation.is_done();
+            if buffer_empty && rotation_idle {
                 return Ok(self.flushed_lsn());
             }
             self.wake_flush_thread();
@@ -722,15 +765,27 @@ impl WalWriter {
     }
 
     /// Closes the WAL writer.
+    ///
+    /// Flushes pending records, signals the flush thread to exit, joins it
+    /// to guarantee all in-flight writes and rotations complete, then closes
+    /// the final segment file.
     pub fn close(&self) -> Result<()> {
-        // First flush any pending records
+        // Flush pending records and wait for rotation to settle
         self.flush()?;
 
-        // Signal shutdown
+        // Signal shutdown and wake the flush thread
         self.shutdown.store(true, Ordering::Release);
         self.wake_flush_thread();
 
-        // Close segment
+        // Join the flush thread to guarantee it has finished all writes.
+        // Without this, close() can take the segment out of the Option while
+        // the flush thread is between drain_into() and seg.append_batch(),
+        // causing the flush thread to see None and silently drop the batch.
+        if let Some(handle) = self.flush_thread.lock().take() {
+            let _ = handle.join();
+        }
+
+        // Close segment (flush thread has exited, safe to take ownership)
         let mut seg_guard = self.segment.lock();
         if let Some(ref mut seg) = seg_guard.take() {
             seg.sync()?;
@@ -943,8 +998,8 @@ impl Drop for WalWriter {
         self.shutdown.store(true, Ordering::Release);
         self.wake_flush_thread();
 
-        // Wait for flush thread
-        if let Some(handle) = self.flush_thread.take() {
+        // Wait for flush thread (get_mut is safe in Drop since we have &mut self)
+        if let Some(handle) = self.flush_thread.get_mut().take() {
             let _ = handle.join();
         }
     }

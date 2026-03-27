@@ -1,0 +1,87 @@
+{
+  "id": "2026-03-27_023919_cc52293-local",
+  "date": "2026-03-27 02:39:35Z",
+  "ts": 1774579175,
+  "commit": "cc52293-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Backup": {
+      "Backup throughput (MB/sec)": {
+        "average": 2456.215199,
+        "runs": [2258.37, 2468.20, 2532.51, 2481.46, 2540.53],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Restore": {
+      "Restore throughput (MB/sec)": {
+        "average": 2617.860976,
+        "runs": [1746.83, 2851.82, 2809.48, 2854.40, 2826.77],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "SHOW Command": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 14.05 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 14.02 },
+      "Lookup latency (us/op)": {
+        "average": 0.014691,
+        "runs": [0.01, 0.02, 0.01, 0.01, 0.01],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "SET Command": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 14.02 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 14.02 },
+      "Set+Get latency (us/op)": {
+        "average": 0.047324,
+        "runs": [0.05, 0.05, 0.05, 0.05, 0.05],
+        "target": 20.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Stat View Query": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 14.02 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 14.02 },
+      "View build latency (us/op)": {
+        "average": 0.084900,
+        "runs": [0.08, 0.08, 0.08, 0.09, 0.08],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Tab Completion": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 14.01 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 14.02 },
+      "Completion latency (ms/op)": {
+        "average": 0.000115,
+        "runs": [0.00, 0.00, 0.00, 0.00, 0.00],
+        "target": 20.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Config Load": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 14.02 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 14.02 },
+      "Load latency (ms)": {
+        "average": 1.017000,
+        "runs": [4.93, 0.06, 0.04, 0.04, 0.03],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    }
+  }
+}

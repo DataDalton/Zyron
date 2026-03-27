@@ -71,6 +71,7 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Run) => self.parse_run_pipeline(),
             Token::Keyword(Keyword::Archive) => self.parse_archive_table(),
             Token::Keyword(Keyword::Restore) => self.parse_restore_table(),
+            Token::Keyword(Keyword::Analyze) => self.parse_analyze(),
             _ => Err(self.error(&format!(
                 "Expected a statement, found {}",
                 self.current.token
@@ -250,7 +251,8 @@ impl<'a> Parser<'a> {
                     | Keyword::Resume
                     | Keyword::Run
                     | Keyword::Archive
-                    | Keyword::Restore,
+                    | Keyword::Restore
+                    | Keyword::Analyze,
                 ) => return true,
                 _ => {
                     if self.advance().is_err() {
@@ -1091,11 +1093,23 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::View) => self.parse_alter_view(),
             Token::Keyword(Keyword::User) => self.parse_alter_user(),
             Token::Keyword(Keyword::Role) => self.parse_alter_role(),
+            Token::Keyword(Keyword::System) => self.parse_alter_system(),
             _ => Err(self.error(&format!(
-                "Expected TABLE, INDEX, SEQUENCE, VIEW, USER, or ROLE after ALTER, found {}",
+                "Expected TABLE, INDEX, SEQUENCE, VIEW, USER, ROLE, or SYSTEM after ALTER, found {}",
                 self.current.token
             ))),
         }
+    }
+
+    fn parse_alter_system(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::System)?;
+        self.expect_keyword(Keyword::Set)?;
+        let name = self.parse_ident()?;
+        self.expect_token(&Token::Eq)?;
+        let value = self.parse_expr()?;
+        Ok(Statement::AlterSystemSet(Box::new(
+            AlterSystemSetStatement { name, value },
+        )))
     }
 
     fn parse_alter_table(&mut self) -> Result<Statement> {
@@ -2732,6 +2746,16 @@ impl<'a> Parser<'a> {
         Ok(Statement::Vacuum(Box::new(VacuumStatement { table })))
     }
 
+    fn parse_analyze(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Analyze)?;
+        let table = if self.current.token != Token::Eof && self.current.token != Token::Semicolon {
+            Some(self.parse_ident()?)
+        } else {
+            None
+        };
+        Ok(Statement::Analyze(Box::new(AnalyzeStatement { table })))
+    }
+
     fn parse_reindex(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Reindex)?;
         let target = if self.consume_keyword(Keyword::Index)? {
@@ -2765,7 +2789,11 @@ impl<'a> Parser<'a> {
 
     fn parse_show(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Show)?;
-        let name = self.parse_ident()?;
+        let name = if self.consume_keyword(Keyword::All)? {
+            "all".to_string()
+        } else {
+            self.parse_ident()?
+        };
         Ok(Statement::Show(Box::new(ShowStatement { name })))
     }
 
