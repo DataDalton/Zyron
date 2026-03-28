@@ -392,6 +392,8 @@ mod tests {
             scd_type: None,
             system_versioned: false,
             history_table_id: None,
+            cdf_enabled: false,
+            cdf_retention_days: 0,
         }
     }
 

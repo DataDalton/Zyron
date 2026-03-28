@@ -233,6 +233,31 @@ pub enum ZyronError {
     #[error("SCD configuration error: {0}")]
     ScdConfigError(String),
 
+    // CDC errors
+    #[error("Slot not found: {0}")]
+    SlotNotFound(String),
+
+    #[error("Slot already exists: {0}")]
+    SlotAlreadyExists(String),
+
+    #[error("CDC stream error: {0}")]
+    CdcStreamError(String),
+
+    #[error("CDC feed not enabled for table {table_id}")]
+    CdcFeedNotEnabled { table_id: u32 },
+
+    #[error("CDC ingest error: {0}")]
+    CdcIngestError(String),
+
+    #[error("CDC decoder error: {0}")]
+    CdcDecoderError(String),
+
+    #[error("Replication slot lag exceeded limit for slot \"{0}\"")]
+    SlotLagExceeded(String),
+
+    #[error("CDC snapshot failed: {0}")]
+    CdcSnapshotFailed(String),
+
     // Internal errors
     #[error("Internal error: {0}")]
     Internal(String),
@@ -423,6 +448,36 @@ mod tests {
             err.to_string(),
             "SCD configuration error: unknown scd_type 5"
         );
+    }
+
+    #[test]
+    fn test_cdc_errors_display() {
+        let err = ZyronError::SlotNotFound("my_slot".to_string());
+        assert_eq!(err.to_string(), "Slot not found: my_slot");
+
+        let err = ZyronError::SlotAlreadyExists("my_slot".to_string());
+        assert_eq!(err.to_string(), "Slot already exists: my_slot");
+
+        let err = ZyronError::CdcStreamError("sink unreachable".to_string());
+        assert_eq!(err.to_string(), "CDC stream error: sink unreachable");
+
+        let err = ZyronError::CdcFeedNotEnabled { table_id: 42 };
+        assert_eq!(err.to_string(), "CDC feed not enabled for table 42");
+
+        let err = ZyronError::CdcIngestError("parse failed".to_string());
+        assert_eq!(err.to_string(), "CDC ingest error: parse failed");
+
+        let err = ZyronError::CdcDecoderError("unknown record type".to_string());
+        assert_eq!(err.to_string(), "CDC decoder error: unknown record type");
+
+        let err = ZyronError::SlotLagExceeded("my_slot".to_string());
+        assert_eq!(
+            err.to_string(),
+            "Replication slot lag exceeded limit for slot \"my_slot\""
+        );
+
+        let err = ZyronError::CdcSnapshotFailed("table not found".to_string());
+        assert_eq!(err.to_string(), "CDC snapshot failed: table not found");
     }
 
     #[test]

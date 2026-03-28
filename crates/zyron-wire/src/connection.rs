@@ -67,6 +67,15 @@ pub struct ServerState {
     /// ALTER SYSTEM SET callback: writes key=value to auto.conf. Returns Ok or error message.
     pub alter_system_set:
         Option<Arc<dyn Fn(&str, &str) -> std::result::Result<(), String> + Send + Sync>>,
+    /// CDC feed stats: Vec<(table_id, record_count, file_size, retention_days)>
+    pub cdc_feed_stats: Option<Arc<dyn Fn() -> Vec<(u32, u64, u64, u32)> + Send + Sync>>,
+    /// Replication slot stats: Vec<(name, plugin, confirmed_lsn, restart_lsn, active, lag_bytes)>
+    pub cdc_slot_stats:
+        Option<Arc<dyn Fn() -> Vec<(String, String, u64, u64, bool, u64)> + Send + Sync>>,
+    /// CDC stream stats: Vec<(name, table_id, active, slot_name)>
+    pub cdc_stream_stats: Option<Arc<dyn Fn() -> Vec<(String, u32, bool, String)> + Send + Sync>>,
+    /// CDC ingest stats: Vec<(name, table_id, active, records_applied, records_failed)>
+    pub cdc_ingest_stats: Option<Arc<dyn Fn() -> Vec<(String, u32, bool, u64, u64)> + Send + Sync>>,
 }
 
 /// Cached prepared statement.

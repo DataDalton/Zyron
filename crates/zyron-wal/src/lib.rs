@@ -16,6 +16,7 @@ pub mod segment;
 pub mod sequencer;
 pub mod writer;
 
+pub use checksum::data_checksum;
 pub use reader::{RecoveryManager, RecoveryResult, WalReader};
 pub use record::{LogRecord, LogRecordType, Lsn};
 pub use segment::{LogSegment, SegmentId};

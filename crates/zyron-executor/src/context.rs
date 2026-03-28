@@ -16,6 +16,43 @@ use zyron_wal::WalWriter;
 
 use crate::batch::BATCH_SIZE;
 
+/// Hook for Change Data Capture. Implemented by zyron-cdc, called by DML operators.
+pub trait CdcHook: Send + Sync {
+    /// Called after rows are inserted.
+    fn on_insert(
+        &self,
+        table_id: u32,
+        tuples: &[&[u8]],
+        version: u64,
+        timestamp: i64,
+        txn_id: u32,
+        is_last_in_txn: bool,
+    ) -> zyron_common::Result<()>;
+
+    /// Called after rows are deleted. old_data contains pre-delete tuple bytes.
+    fn on_delete(
+        &self,
+        table_id: u32,
+        old_data: &[&[u8]],
+        version: u64,
+        timestamp: i64,
+        txn_id: u32,
+        is_last_in_txn: bool,
+    ) -> zyron_common::Result<()>;
+
+    /// Called after rows are updated. old_data/new_data contain pre/post tuple bytes.
+    fn on_update(
+        &self,
+        table_id: u32,
+        old_data: &[&[u8]],
+        new_data: &[&[u8]],
+        version: u64,
+        timestamp: i64,
+        txn_id: u32,
+        is_last_in_txn: bool,
+    ) -> zyron_common::Result<()>;
+}
+
 /// Per-query execution context with access to storage and transaction state.
 pub struct ExecutionContext {
     pub catalog: Arc<Catalog>,
@@ -29,6 +66,8 @@ pub struct ExecutionContext {
     cancelled: AtomicBool,
     /// When true, operators collect per-operator metrics (rows, timing).
     pub analyze: bool,
+    /// Optional CDC hook invoked by DML operators after mutations.
+    pub cdc_hook: Option<Arc<dyn CdcHook>>,
 }
 
 impl ExecutionContext {
@@ -51,6 +90,7 @@ impl ExecutionContext {
             snapshot,
             cancelled: AtomicBool::new(false),
             analyze: false,
+            cdc_hook: None,
         }
     }
 

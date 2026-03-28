@@ -462,6 +462,10 @@ impl Server {
                         .map_err(|e| e.to_string())
                 },
             )),
+            cdc_feed_stats: None,
+            cdc_slot_stats: None,
+            cdc_stream_stats: None,
+            cdc_ingest_stats: None,
         });
 
         // 11. Start health/metrics HTTP server

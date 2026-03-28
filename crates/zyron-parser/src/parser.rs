@@ -984,8 +984,11 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Vector) => self.parse_create_vector_index(),
             Token::Keyword(Keyword::Branch) => self.parse_create_branch(),
             Token::Keyword(Keyword::Version) => self.parse_create_version(),
+            Token::Keyword(Keyword::Replication) => self.parse_create_replication_slot(),
+            Token::Keyword(Keyword::Cdc) => self.parse_create_cdc(),
+            Token::Keyword(Keyword::Publication) => self.parse_create_publication(),
             _ => Err(self.error(&format!(
-                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, PIPELINE, FULLTEXT, VECTOR, BRANCH, or VERSION after CREATE, found {}",
+                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, PIPELINE, FULLTEXT, VECTOR, BRANCH, VERSION, REPLICATION, CDC, or PUBLICATION after CREATE, found {}",
                 self.current.token
             ))),
         }
@@ -1083,8 +1086,11 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Role) => self.parse_drop_role(),
             Token::Keyword(Keyword::Pipeline) => self.parse_drop_pipeline(),
             Token::Keyword(Keyword::Branch) => self.parse_drop_branch(),
+            Token::Keyword(Keyword::Replication) => self.parse_drop_replication_slot(),
+            Token::Keyword(Keyword::Cdc) => self.parse_drop_cdc(),
+            Token::Keyword(Keyword::Publication) => self.parse_drop_publication(),
             _ => Err(self.error(&format!(
-                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, PIPELINE, or BRANCH after DROP, found {}",
+                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, PIPELINE, BRANCH, REPLICATION, CDC, or PUBLICATION after DROP, found {}",
                 self.current.token
             ))),
         }
@@ -1140,8 +1146,9 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::User) => self.parse_alter_user(),
             Token::Keyword(Keyword::Role) => self.parse_alter_role(),
             Token::Keyword(Keyword::System) => self.parse_alter_system(),
+            Token::Keyword(Keyword::Publication) => self.parse_alter_publication(),
             _ => Err(self.error(&format!(
-                "Expected TABLE, INDEX, SEQUENCE, VIEW, USER, ROLE, or SYSTEM after ALTER, found {}",
+                "Expected TABLE, INDEX, SEQUENCE, VIEW, USER, ROLE, SYSTEM, or PUBLICATION after ALTER, found {}",
                 self.current.token
             ))),
         }
@@ -4089,6 +4096,179 @@ impl<'a> Parser<'a> {
     }
 
     // -----------------------------------------------------------------------
+    // CDC: Replication Slots, CDC Streams, CDC Ingest, Publications
+    // -----------------------------------------------------------------------
+
+    fn parse_create_replication_slot(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Replication)?;
+        self.expect_keyword(Keyword::Slot)?;
+        let name = self.parse_ident()?;
+        self.expect_keyword(Keyword::Plugin)?;
+        let plugin = match &self.current.token {
+            Token::String(s) => {
+                let v = s.clone();
+                self.advance()?;
+                v
+            }
+            _ => return Err(self.error("Expected plugin name string after PLUGIN")),
+        };
+        let mut table_filter = vec![];
+        if self.consume_keyword(Keyword::For)? {
+            self.expect_keyword(Keyword::Table)?;
+            table_filter = self.parse_comma_separated(|p| p.parse_ident())?;
+        }
+        Ok(Statement::CreateReplicationSlot(Box::new(
+            CreateReplicationSlotStatement {
+                name,
+                plugin,
+                table_filter,
+            },
+        )))
+    }
+
+    fn parse_drop_replication_slot(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Replication)?;
+        self.expect_keyword(Keyword::Slot)?;
+        let name = self.parse_ident()?;
+        Ok(Statement::DropReplicationSlot(Box::new(
+            DropReplicationSlotStatement { name },
+        )))
+    }
+
+    fn parse_create_cdc(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Cdc)?;
+        match &self.current.token {
+            Token::Keyword(Keyword::Stream) => self.parse_create_cdc_stream(),
+            Token::Keyword(Keyword::Ingest) => self.parse_create_cdc_ingest(),
+            _ => Err(self.error("Expected STREAM or INGEST after CREATE CDC")),
+        }
+    }
+
+    fn parse_create_cdc_stream(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Stream)?;
+        let name = self.parse_ident()?;
+        self.expect_keyword(Keyword::On)?;
+        let table_name = self.parse_ident()?;
+        self.expect_keyword(Keyword::To)?;
+        let sink_type = self.parse_ident()?;
+        let mut options = vec![];
+        if self.consume_keyword(Keyword::With)? {
+            self.expect_token(&Token::LParen)?;
+            options = self.parse_comma_separated(|p| p.parse_table_option())?;
+            self.expect_token(&Token::RParen)?;
+        }
+        Ok(Statement::CreateCdcStream(Box::new(
+            CreateCdcStreamStatement {
+                name,
+                table_name,
+                sink_type,
+                options,
+            },
+        )))
+    }
+
+    fn parse_create_cdc_ingest(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Ingest)?;
+        let name = self.parse_ident()?;
+        self.expect_keyword(Keyword::From)?;
+        let source_type = self.parse_ident()?;
+        self.expect_keyword(Keyword::Into)?;
+        let target_table = self.parse_ident()?;
+        let mut options = vec![];
+        if self.consume_keyword(Keyword::With)? {
+            self.expect_token(&Token::LParen)?;
+            options = self.parse_comma_separated(|p| p.parse_table_option())?;
+            self.expect_token(&Token::RParen)?;
+        }
+        Ok(Statement::CreateCdcIngest(Box::new(
+            CreateCdcIngestStatement {
+                name,
+                source_type,
+                target_table,
+                options,
+            },
+        )))
+    }
+
+    fn parse_drop_cdc(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Cdc)?;
+        match &self.current.token {
+            Token::Keyword(Keyword::Stream) => {
+                self.advance()?;
+                let name = self.parse_ident()?;
+                Ok(Statement::DropCdcStream(Box::new(DropCdcStreamStatement {
+                    name,
+                })))
+            }
+            Token::Keyword(Keyword::Ingest) => {
+                self.advance()?;
+                let name = self.parse_ident()?;
+                Ok(Statement::DropCdcIngest(Box::new(DropCdcIngestStatement {
+                    name,
+                })))
+            }
+            _ => Err(self.error("Expected STREAM or INGEST after DROP CDC")),
+        }
+    }
+
+    fn parse_create_publication(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Publication)?;
+        let name = self.parse_ident()?;
+        self.expect_keyword(Keyword::For)?;
+        let mut tables = vec![];
+        let mut all_tables = false;
+        if self.consume_keyword(Keyword::All)? {
+            self.expect_keyword(Keyword::Table)?;
+            all_tables = true;
+        } else {
+            self.expect_keyword(Keyword::Table)?;
+            tables = self.parse_comma_separated(|p| p.parse_ident())?;
+        }
+        let include_ddl = if self.consume_keyword(Keyword::Include)? {
+            self.expect_keyword(Keyword::Ddl)?;
+            true
+        } else {
+            false
+        };
+        Ok(Statement::CreatePublication(Box::new(
+            CreatePublicationStatement {
+                name,
+                tables,
+                all_tables,
+                include_ddl,
+            },
+        )))
+    }
+
+    fn parse_alter_publication(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Publication)?;
+        let name = self.parse_ident()?;
+        let action = if self.consume_keyword(Keyword::Add)? {
+            self.expect_keyword(Keyword::Table)?;
+            let table = self.parse_ident()?;
+            AlterPublicationAction::AddTable(table)
+        } else if self.at_keyword(Keyword::Drop) {
+            self.advance()?;
+            self.expect_keyword(Keyword::Table)?;
+            let table = self.parse_ident()?;
+            AlterPublicationAction::DropTable(table)
+        } else {
+            return Err(self.error("Expected ADD or DROP after ALTER PUBLICATION name"));
+        };
+        Ok(Statement::AlterPublication(Box::new(
+            AlterPublicationStatement { name, action },
+        )))
+    }
+
+    fn parse_drop_publication(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Publication)?;
+        let name = self.parse_ident()?;
+        Ok(Statement::DropPublication(Box::new(
+            DropPublicationStatement { name },
+        )))
+    }
+
+    // -----------------------------------------------------------------------
     // ALTER TABLE extensions
     // -----------------------------------------------------------------------
 
@@ -4430,6 +4610,16 @@ fn keyword_to_ident_str(kw: Keyword) -> Option<&'static str> {
         Keyword::Disable => Some("disable"),
         Keyword::Feed => Some("feed"),
         Keyword::Change => Some("change"),
+        // CDC
+        Keyword::Replication => Some("replication"),
+        Keyword::Slot => Some("slot"),
+        Keyword::Plugin => Some("plugin"),
+        Keyword::Cdc => Some("cdc"),
+        Keyword::Stream => Some("stream"),
+        Keyword::Ingest => Some("ingest"),
+        Keyword::Publication => Some("publication"),
+        Keyword::Include => Some("include"),
+        Keyword::Ddl => Some("ddl"),
         // New data types
         Keyword::Tinyint => Some("tinyint"),
         Keyword::Int128 => Some("int128"),
@@ -8553,6 +8743,216 @@ mod tests {
                 assert!(r.at_timestamp.is_none());
             }
             _ => panic!("Expected RestoreTable"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // CDC statement tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_replication_slot() {
+        let stmt = parse_one("CREATE REPLICATION SLOT my_slot PLUGIN 'wal2json'");
+        match stmt {
+            Statement::CreateReplicationSlot(s) => {
+                assert_eq!(s.name, "my_slot");
+                assert_eq!(s.plugin, "wal2json");
+                assert!(s.table_filter.is_empty());
+            }
+            _ => panic!("Expected CreateReplicationSlot"),
+        }
+    }
+
+    #[test]
+    fn test_create_replication_slot_with_filter() {
+        let stmt =
+            parse_one("CREATE REPLICATION SLOT my_slot PLUGIN 'wal2json' FOR TABLE orders, users");
+        match stmt {
+            Statement::CreateReplicationSlot(s) => {
+                assert_eq!(s.name, "my_slot");
+                assert_eq!(s.plugin, "wal2json");
+                assert_eq!(s.table_filter, vec!["orders", "users"]);
+            }
+            _ => panic!("Expected CreateReplicationSlot"),
+        }
+    }
+
+    #[test]
+    fn test_drop_replication_slot() {
+        let stmt = parse_one("DROP REPLICATION SLOT my_slot");
+        match stmt {
+            Statement::DropReplicationSlot(s) => {
+                assert_eq!(s.name, "my_slot");
+            }
+            _ => panic!("Expected DropReplicationSlot"),
+        }
+    }
+
+    #[test]
+    fn test_create_cdc_stream() {
+        let stmt = parse_one(
+            "CREATE CDC STREAM order_stream ON orders TO kafka WITH (topic = 'order_events', format = 'avro')",
+        );
+        match stmt {
+            Statement::CreateCdcStream(s) => {
+                assert_eq!(s.name, "order_stream");
+                assert_eq!(s.table_name, "orders");
+                assert_eq!(s.sink_type, "kafka");
+                assert_eq!(s.options.len(), 2);
+                assert_eq!(s.options[0].key, "topic");
+                assert_eq!(s.options[1].key, "format");
+            }
+            _ => panic!("Expected CreateCdcStream"),
+        }
+    }
+
+    #[test]
+    fn test_create_cdc_stream_no_options() {
+        let stmt = parse_one("CREATE CDC STREAM order_stream ON orders TO kafka");
+        match stmt {
+            Statement::CreateCdcStream(s) => {
+                assert_eq!(s.name, "order_stream");
+                assert_eq!(s.table_name, "orders");
+                assert_eq!(s.sink_type, "kafka");
+                assert!(s.options.is_empty());
+            }
+            _ => panic!("Expected CreateCdcStream"),
+        }
+    }
+
+    #[test]
+    fn test_drop_cdc_stream() {
+        let stmt = parse_one("DROP CDC STREAM order_stream");
+        match stmt {
+            Statement::DropCdcStream(s) => {
+                assert_eq!(s.name, "order_stream");
+            }
+            _ => panic!("Expected DropCdcStream"),
+        }
+    }
+
+    #[test]
+    fn test_create_cdc_ingest() {
+        let stmt = parse_one(
+            "CREATE CDC INGEST kafka_ingest FROM kafka INTO raw_events WITH (topic = 'events', group_id = 'cdc_group')",
+        );
+        match stmt {
+            Statement::CreateCdcIngest(s) => {
+                assert_eq!(s.name, "kafka_ingest");
+                assert_eq!(s.source_type, "kafka");
+                assert_eq!(s.target_table, "raw_events");
+                assert_eq!(s.options.len(), 2);
+                assert_eq!(s.options[0].key, "topic");
+                assert_eq!(s.options[1].key, "group_id");
+            }
+            _ => panic!("Expected CreateCdcIngest"),
+        }
+    }
+
+    #[test]
+    fn test_create_cdc_ingest_no_options() {
+        let stmt = parse_one("CREATE CDC INGEST kafka_ingest FROM kafka INTO raw_events");
+        match stmt {
+            Statement::CreateCdcIngest(s) => {
+                assert_eq!(s.name, "kafka_ingest");
+                assert_eq!(s.source_type, "kafka");
+                assert_eq!(s.target_table, "raw_events");
+                assert!(s.options.is_empty());
+            }
+            _ => panic!("Expected CreateCdcIngest"),
+        }
+    }
+
+    #[test]
+    fn test_drop_cdc_ingest() {
+        let stmt = parse_one("DROP CDC INGEST kafka_ingest");
+        match stmt {
+            Statement::DropCdcIngest(s) => {
+                assert_eq!(s.name, "kafka_ingest");
+            }
+            _ => panic!("Expected DropCdcIngest"),
+        }
+    }
+
+    #[test]
+    fn test_create_publication_for_tables() {
+        let stmt = parse_one("CREATE PUBLICATION my_pub FOR TABLE orders, users");
+        match stmt {
+            Statement::CreatePublication(p) => {
+                assert_eq!(p.name, "my_pub");
+                assert_eq!(p.tables, vec!["orders", "users"]);
+                assert!(!p.all_tables);
+                assert!(!p.include_ddl);
+            }
+            _ => panic!("Expected CreatePublication"),
+        }
+    }
+
+    #[test]
+    fn test_create_publication_all_tables() {
+        let stmt = parse_one("CREATE PUBLICATION my_pub FOR ALL TABLE");
+        match stmt {
+            Statement::CreatePublication(p) => {
+                assert_eq!(p.name, "my_pub");
+                assert!(p.all_tables);
+                assert!(p.tables.is_empty());
+                assert!(!p.include_ddl);
+            }
+            _ => panic!("Expected CreatePublication"),
+        }
+    }
+
+    #[test]
+    fn test_create_publication_include_ddl() {
+        let stmt = parse_one("CREATE PUBLICATION my_pub FOR TABLE orders INCLUDE DDL");
+        match stmt {
+            Statement::CreatePublication(p) => {
+                assert_eq!(p.name, "my_pub");
+                assert_eq!(p.tables, vec!["orders"]);
+                assert!(p.include_ddl);
+            }
+            _ => panic!("Expected CreatePublication"),
+        }
+    }
+
+    #[test]
+    fn test_alter_publication_add_table() {
+        let stmt = parse_one("ALTER PUBLICATION my_pub ADD TABLE users");
+        match stmt {
+            Statement::AlterPublication(a) => {
+                assert_eq!(a.name, "my_pub");
+                assert_eq!(
+                    a.action,
+                    AlterPublicationAction::AddTable("users".to_string())
+                );
+            }
+            _ => panic!("Expected AlterPublication"),
+        }
+    }
+
+    #[test]
+    fn test_alter_publication_drop_table() {
+        let stmt = parse_one("ALTER PUBLICATION my_pub DROP TABLE users");
+        match stmt {
+            Statement::AlterPublication(a) => {
+                assert_eq!(a.name, "my_pub");
+                assert_eq!(
+                    a.action,
+                    AlterPublicationAction::DropTable("users".to_string())
+                );
+            }
+            _ => panic!("Expected AlterPublication"),
+        }
+    }
+
+    #[test]
+    fn test_drop_publication() {
+        let stmt = parse_one("DROP PUBLICATION my_pub");
+        match stmt {
+            Statement::DropPublication(p) => {
+                assert_eq!(p.name, "my_pub");
+            }
+            _ => panic!("Expected DropPublication"),
         }
     }
 }

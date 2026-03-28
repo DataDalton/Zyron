@@ -122,6 +122,24 @@ pub enum Statement {
     UseBranch(Box<UseBranchStatement>),
     /// CREATE VERSION name ON table [AS OF VERSION expr]
     CreateVersion(Box<CreateVersionStatement>),
+    /// CREATE REPLICATION SLOT name PLUGIN 'plugin_name'
+    CreateReplicationSlot(Box<CreateReplicationSlotStatement>),
+    /// DROP REPLICATION SLOT name
+    DropReplicationSlot(Box<DropReplicationSlotStatement>),
+    /// CREATE CDC STREAM name ON table TO sink WITH (...)
+    CreateCdcStream(Box<CreateCdcStreamStatement>),
+    /// DROP CDC STREAM name
+    DropCdcStream(Box<DropCdcStreamStatement>),
+    /// CREATE CDC INGEST name FROM source INTO table WITH (...)
+    CreateCdcIngest(Box<CreateCdcIngestStatement>),
+    /// DROP CDC INGEST name
+    DropCdcIngest(Box<DropCdcIngestStatement>),
+    /// CREATE PUBLICATION name FOR TABLE t1, t2, ...
+    CreatePublication(Box<CreatePublicationStatement>),
+    /// ALTER PUBLICATION name ADD/DROP TABLE t
+    AlterPublication(Box<AlterPublicationStatement>),
+    /// DROP PUBLICATION name
+    DropPublication(Box<DropPublicationStatement>),
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,6 +1040,73 @@ pub struct CreateVersionStatement {
     pub name: String,
     pub table: String,
     pub at_version: Option<Expr>,
+}
+
+// ---------------------------------------------------------------------------
+// CDC Statement Structs
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateReplicationSlotStatement {
+    pub name: String,
+    pub plugin: String,
+    pub table_filter: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropReplicationSlotStatement {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateCdcStreamStatement {
+    pub name: String,
+    pub table_name: String,
+    pub sink_type: String,
+    pub options: Vec<TableOption>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropCdcStreamStatement {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateCdcIngestStatement {
+    pub name: String,
+    pub source_type: String,
+    pub target_table: String,
+    pub options: Vec<TableOption>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropCdcIngestStatement {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreatePublicationStatement {
+    pub name: String,
+    pub tables: Vec<String>,
+    pub all_tables: bool,
+    pub include_ddl: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterPublicationAction {
+    AddTable(String),
+    DropTable(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterPublicationStatement {
+    pub name: String,
+    pub action: AlterPublicationAction,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropPublicationStatement {
+    pub name: String,
 }
 
 // ---------------------------------------------------------------------------

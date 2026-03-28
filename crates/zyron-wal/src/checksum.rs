@@ -266,6 +266,22 @@ pub fn wal_checksum(data: &[u8], header_size: usize) -> u32 {
     finalize(mix(lane_a, lane_b))
 }
 
+// ---------------------------------------------------------------------------
+// General-purpose data checksum
+// ---------------------------------------------------------------------------
+
+/// Computes a 32-bit checksum over an arbitrary byte slice.
+///
+/// Uses the same multiply-xor mixing primitives as the WAL checksum but
+/// without the header/payload phase separator. Suitable for any data
+/// integrity check (CDF records, slot state files, etc.).
+#[inline]
+pub fn data_checksum(data: &[u8]) -> u32 {
+    let seed: u64 = (data.len() as u64) ^ MIX_A;
+    let (la, lb) = mix_bytes(seed, seed, data);
+    finalize(mix(la, lb))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,6 +501,54 @@ mod tests {
                 "Incremental mismatch at payload size {}",
                 size
             );
+        }
+    }
+
+    #[test]
+    fn test_data_checksum_deterministic() {
+        let data = b"test data for CDF integrity checking";
+        let c1 = data_checksum(data);
+        let c2 = data_checksum(data);
+        assert_eq!(c1, c2);
+    }
+
+    #[test]
+    fn test_data_checksum_empty() {
+        // Empty input is deterministic. The actual value is not important
+        // since CDF records are never empty.
+        let c1 = data_checksum(b"");
+        let c2 = data_checksum(b"");
+        assert_eq!(c1, c2);
+    }
+
+    #[test]
+    fn test_data_checksum_bit_flip_detected() {
+        let mut data = vec![0u8; 64];
+        for i in 0..64 {
+            data[i] = (i * 17 + 3) as u8;
+        }
+        let original = data_checksum(&data);
+
+        for byte_pos in 0..64 {
+            for bit in 0..8 {
+                data[byte_pos] ^= 1 << bit;
+                let flipped = data_checksum(&data);
+                assert_ne!(
+                    original, flipped,
+                    "Bit flip at byte {byte_pos} bit {bit} not detected"
+                );
+                data[byte_pos] ^= 1 << bit;
+            }
+        }
+    }
+
+    #[test]
+    fn test_data_checksum_different_lengths() {
+        let data: Vec<u8> = (0..100).map(|i| (i * 7) as u8).collect();
+        let full = data_checksum(&data);
+        for len in 1..100 {
+            let truncated = data_checksum(&data[..len]);
+            assert_ne!(full, truncated, "Truncation to {len} bytes not detected");
         }
     }
 }

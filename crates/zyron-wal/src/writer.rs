@@ -214,6 +214,9 @@ pub struct WalWriter {
     pub wal_bytes_written: AtomicU64,
     /// Total fsync calls (for zyron_stat_wal). Arc-shared with the flush thread.
     pub wal_syncs: Arc<AtomicU64>,
+    /// Retention hook that returns the minimum LSN that must be retained.
+    /// Used by replication slots to prevent WAL segment deletion.
+    retention_hook: parking_lot::RwLock<Option<Arc<dyn Fn() -> Option<Lsn> + Send + Sync>>>,
 }
 
 impl WalWriter {
@@ -271,6 +274,7 @@ impl WalWriter {
             wal_records_written: AtomicU64::new(0),
             wal_bytes_written: AtomicU64::new(0),
             wal_syncs,
+            retention_hook: parking_lot::RwLock::new(None),
         })
     }
 
@@ -720,6 +724,12 @@ impl WalWriter {
         &self.config.wal_dir
     }
 
+    /// Sets a retention hook that returns the minimum LSN that must be retained.
+    /// Used by replication slots to prevent WAL segment deletion.
+    pub fn set_retention_hook(&self, hook: Arc<dyn Fn() -> Option<Lsn> + Send + Sync>) {
+        *self.retention_hook.write() = Some(hook);
+    }
+
     /// Deletes WAL segment files whose records are fully covered by a checkpoint.
     ///
     /// Segments with segment_id strictly less than the checkpoint LSN's segment are
@@ -729,6 +739,21 @@ impl WalWriter {
     /// Returns the number of segments deleted.
     pub fn cleanup_old_segments(&self, checkpoint_lsn: Lsn) -> Result<usize> {
         let checkpoint_segment_id = checkpoint_lsn.segment_id();
+
+        // Respect replication slot retention: do not delete segments
+        // that any active slot still needs.
+        // Clone the Arc out of the Mutex so the lock is not held during the hook call.
+        let hook_fn = self.retention_hook.read().clone();
+        let effective_segment_id = if let Some(ref hook_fn) = hook_fn {
+            if let Some(min_lsn) = hook_fn() {
+                checkpoint_segment_id.min(min_lsn.segment_id())
+            } else {
+                checkpoint_segment_id
+            }
+        } else {
+            checkpoint_segment_id
+        };
+
         let mut deleted = 0;
 
         for entry in std::fs::read_dir(&self.config.wal_dir)? {
@@ -738,7 +763,7 @@ impl WalWriter {
             if path.extension().map(|ext| ext == "wal").unwrap_or(false)
                 && let Some(stem) = path.file_stem()
                 && let Ok(id) = stem.to_string_lossy().parse::<u32>()
-                && id < checkpoint_segment_id
+                && id < effective_segment_id
             {
                 std::fs::remove_file(&path)?;
                 deleted += 1;

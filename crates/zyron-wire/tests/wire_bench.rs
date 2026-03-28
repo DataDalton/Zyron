@@ -119,6 +119,19 @@ async fn create_test_server(db_name: &str) -> (Arc<ServerState>, tempfile::TempD
         buffer_pool: pool,
         disk_manager: disk,
         txn_manager,
+        security_manager: None,
+        config_lookup: None,
+        config_all: None,
+        data_dir: std::path::PathBuf::from(tmp.path()),
+        session_info_collector: None,
+        checkpoint_stats: None,
+        vacuum_stats: None,
+        checkpoint_wake: None,
+        alter_system_set: None,
+        cdc_feed_stats: None,
+        cdc_slot_stats: None,
+        cdc_stream_stats: None,
+        cdc_ingest_stats: None,
     });
 
     (state, tmp)

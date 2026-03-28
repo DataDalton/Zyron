@@ -243,6 +243,10 @@ pub struct TableEntry {
     pub system_versioned: bool,
     /// For SCD Type 4: the companion history table's table_id.
     pub history_table_id: Option<u32>,
+    /// Whether change data feed (CDC) is enabled for this table.
+    pub cdf_enabled: bool,
+    /// CDF retention in days (0 = unlimited).
+    pub cdf_retention_days: u32,
 }
 
 impl TableEntry {
@@ -276,6 +280,8 @@ impl TableEntry {
         buf.push(self.scd_type.unwrap_or(0));
         buf.push(if self.system_versioned { 1 } else { 0 });
         write_u32(&mut buf, self.history_table_id.unwrap_or(0));
+        buf.push(if self.cdf_enabled { 1 } else { 0 });
+        write_u32(&mut buf, self.cdf_retention_days);
 
         buf
     }
@@ -338,6 +344,18 @@ impl TableEntry {
         } else {
             None
         };
+        let cdf_enabled = if off < data.len() {
+            let v = data[off];
+            off += 1;
+            v != 0
+        } else {
+            false
+        };
+        let cdf_retention_days = if off + 4 <= data.len() {
+            read_u32(data, &mut off)?
+        } else {
+            0
+        };
 
         Ok(Self {
             id,
@@ -352,6 +370,8 @@ impl TableEntry {
             scd_type,
             system_versioned,
             history_table_id,
+            cdf_enabled,
+            cdf_retention_days,
         })
     }
 }
@@ -631,6 +651,8 @@ mod tests {
             scd_type: None,
             system_versioned: false,
             history_table_id: None,
+            cdf_enabled: false,
+            cdf_retention_days: 0,
         };
         let bytes = entry.to_bytes();
         let decoded = TableEntry::from_bytes(&bytes).unwrap();
@@ -773,6 +795,8 @@ mod tests {
             scd_type: None,
             system_versioned: false,
             history_table_id: None,
+            cdf_enabled: false,
+            cdf_retention_days: 0,
         };
         let bytes = entry.to_bytes();
         let decoded = TableEntry::from_bytes(&bytes).unwrap();

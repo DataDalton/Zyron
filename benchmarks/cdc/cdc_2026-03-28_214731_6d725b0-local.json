@@ -1,0 +1,223 @@
+{
+  "id": "2026-03-28_214731_6d725b0-local",
+  "date": "2026-03-28 21:48:39Z",
+  "ts": 1774734519,
+  "commit": "6d725b0-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Decoder Formats": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 15.90 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 15.84 },
+      "Formats validated": {
+        "average": 4.000000,
+        "runs": [4.00],
+        "target": 4.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "CDF Insert Overhead": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 15.79 },
+      "util_after": { "cpu_pct": 12.0, "ram_used_gb": 15.80 },
+      "Insert overhead (ns/row)": {
+        "average": 55.512800,
+        "runs": [59.95, 55.46, 54.62, 54.00, 53.53],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "CDF Query 100K": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 15.79 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 15.78 },
+      "Query latency (ms)": {
+        "average": 7.800000,
+        "runs": [11.00, 7.00, 7.00, 7.00, 7.00],
+        "target": 25.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Debezium Encoding": {
+      "util_before": { "cpu_pct": 29.0, "ram_used_gb": 15.76 },
+      "util_after": { "cpu_pct": 20.0, "ram_used_gb": 15.87 },
+      "Encoding throughput (rec/sec)": {
+        "average": 800018.338653,
+        "runs": [780714.84, 786532.55, 816276.55, 799278.35, 817289.40],
+        "target": 200000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Metrics": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 15.73 },
+      "util_after": { "cpu_pct": 8.0, "ram_used_gb": 15.71 },
+      "Metric types rendered": {
+        "average": 14.000000,
+        "runs": [14.00],
+        "target": 14.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Stream/Ingest": {
+      "util_before": { "cpu_pct": 5.0, "ram_used_gb": 15.71 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 15.70 },
+      "Components validated": {
+        "average": 4.000000,
+        "runs": [4.00],
+        "target": 4.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "RETURNING Overhead": {
+      "util_before": { "cpu_pct": 4.0, "ram_used_gb": 15.74 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 15.77 },
+      "RETURNING clause overhead (ns/row)": {
+        "average": 21.004660,
+        "runs": [20.85, 21.23, 20.87, 21.52, 20.56],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Slot Advance": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 15.74 },
+      "util_after": { "cpu_pct": 10.0, "ram_used_gb": 15.68 },
+      "Slot advance latency (us/op)": {
+        "average": 0.044100,
+        "runs": [0.05, 0.04, 0.04, 0.05, 0.04],
+        "target": 50.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "CDC Retention": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 15.67 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 15.66 },
+      "Records purged": {
+        "average": 50.000000,
+        "runs": [50.00],
+        "target": 50.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "CDF Basic": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 15.65 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 15.64 },
+      "Records stored": {
+        "average": 150.000000,
+        "runs": [150.00],
+        "target": 150.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "CDF Time Range": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 15.61 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 15.59 },
+      "Queries correct": {
+        "average": 3.000000,
+        "runs": [3.00],
+        "target": 3.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Debezium Format": {
+      "util_before": { "cpu_pct": 11.0, "ram_used_gb": 15.58 },
+      "util_after": { "cpu_pct": 7.0, "ram_used_gb": 15.60 },
+      "Formats validated": {
+        "average": 3.000000,
+        "runs": [3.00],
+        "target": 3.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Publication": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 15.60 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 15.60 },
+      "Operations validated": {
+        "average": 5.000000,
+        "runs": [5.00],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Replication Slot": {
+      "util_before": { "cpu_pct": 7.0, "ram_used_gb": 15.66 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 15.68 },
+      "Checks passed": {
+        "average": 4.000000,
+        "runs": [4.00],
+        "target": 4.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "RETURNING Clause": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 15.67 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 15.67 },
+      "Tests passed": {
+        "average": 3.000000,
+        "runs": [3.00],
+        "target": 3.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "RETURNING CTE": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 15.68 },
+      "util_after": { "cpu_pct": 18.0, "ram_used_gb": 15.73 },
+      "Audit rows": {
+        "average": 50.000000,
+        "runs": [50.00],
+        "target": 50.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Snapshot": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 15.70 },
+      "util_after": { "cpu_pct": 29.0, "ram_used_gb": 15.66 },
+      "Rows exported": {
+        "average": 1000.000000,
+        "runs": [1000.00],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Logical Decoding": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 15.62 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 15.90 },
+      "Decoding throughput (rec/sec)": {
+        "average": 15957861.093803,
+        "runs": [16011220.66, 15852332.35, 15809026.95, 16056415.82, 16060309.67],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Retention Purge 1M": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 15.63 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 15.61 },
+      "Purge latency (s)": {
+        "average": 0.099265,
+        "runs": [0.10, 0.10, 0.10, 0.10, 0.10],
+        "target": 2.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    }
+  }
+}

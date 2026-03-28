@@ -334,6 +334,8 @@ impl Catalog {
             scd_type: None,
             system_versioned: false,
             history_table_id: None,
+            cdf_enabled: false,
+            cdf_retention_days: 0,
         };
 
         self.log_ddl(DDL_CREATE_TABLE, &entry.to_bytes())?;

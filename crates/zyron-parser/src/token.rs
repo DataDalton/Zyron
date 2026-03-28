@@ -366,6 +366,15 @@ pub enum Keyword {
     Disable,
     Feed,
     Change,
+    Replication,
+    Slot,
+    Plugin,
+    Cdc,
+    Stream,
+    Ingest,
+    Publication,
+    Include,
+    Ddl,
 
     // Data type keywords
     Type,
@@ -868,6 +877,15 @@ pub fn lookup_keyword(word: &str) -> Option<Keyword> {
         "DISABLE" => Some(Keyword::Disable),
         "FEED" => Some(Keyword::Feed),
         "CHANGE" => Some(Keyword::Change),
+        "REPLICATION" => Some(Keyword::Replication),
+        "SLOT" => Some(Keyword::Slot),
+        "PLUGIN" => Some(Keyword::Plugin),
+        "CDC" => Some(Keyword::Cdc),
+        "STREAM" => Some(Keyword::Stream),
+        "INGEST" => Some(Keyword::Ingest),
+        "PUBLICATION" => Some(Keyword::Publication),
+        "INCLUDE" => Some(Keyword::Include),
+        "DDL" => Some(Keyword::Ddl),
 
         // Data type keywords
         "TYPE" => Some(Keyword::Type),

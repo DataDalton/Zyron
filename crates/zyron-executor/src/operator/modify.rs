@@ -174,6 +174,20 @@ impl Operator for InsertOperator {
                 }
 
                 total_inserted += tuples.len() as i64;
+
+                // Notify CDC hook if present.
+                if let Some(ref hook) = self.ctx.cdc_hook {
+                    let tuple_refs: Vec<&[u8]> = tuples.iter().map(|t| t.data()).collect();
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_micros() as i64;
+                    if let Err(e) =
+                        hook.on_insert(self.table_id.0, &tuple_refs, last_lsn.0, now, txn_id, true)
+                    {
+                        eprintln!("CDC insert hook failed: {e}");
+                    }
+                }
             }
 
             Ok(Some(ExecutionBatch::new(count_batch(total_inserted))))
@@ -232,6 +246,18 @@ impl Operator for DeleteOperator {
                     ZyronError::Internal("DeleteOperator requires tuple IDs from scan".into())
                 })?;
 
+                // Capture old tuples for CDC hook (batch data is from the scan).
+                let old_tuples_for_cdc = if self.ctx.cdc_hook.is_some() {
+                    let table_entry = self.ctx.get_table_entry(self.table_id)?;
+                    Some(batch_to_tuples(
+                        &exec_batch.batch,
+                        &table_entry.columns,
+                        txn_id,
+                    ))
+                } else {
+                    None
+                };
+
                 // Batch WAL log: one CAS + commit for all deletes in this batch.
                 let payloads: Vec<Vec<u8>> = tuple_ids.iter().map(tuple_id_payload).collect();
                 let batch_records: Vec<(u32, &[u8])> =
@@ -250,6 +276,22 @@ impl Operator for DeleteOperator {
                 }
 
                 total_deleted += deleted as i64;
+
+                // Notify CDC hook if present.
+                if let Some(ref hook) = self.ctx.cdc_hook {
+                    if let Some(ref old_tuples) = old_tuples_for_cdc {
+                        let refs: Vec<&[u8]> = old_tuples.iter().map(|t| t.data()).collect();
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_micros() as i64;
+                        if let Err(e) =
+                            hook.on_delete(self.table_id.0, &refs, last_lsn.0, now, txn_id, true)
+                        {
+                            eprintln!("CDC delete hook failed: {e}");
+                        }
+                    }
+                }
             }
 
             Ok(Some(ExecutionBatch::new(count_batch(total_deleted))))
@@ -376,6 +418,29 @@ impl Operator for UpdateOperator {
                 }
 
                 total_updated += tuple_ids.len() as i64;
+
+                // Notify CDC hook if present.
+                if let Some(ref hook) = self.ctx.cdc_hook {
+                    let old_tuples =
+                        batch_to_tuples(&exec_batch.batch, &table_entry.columns, txn_id);
+                    let old_slices: Vec<&[u8]> = old_tuples.iter().map(|t| t.data()).collect();
+                    let new_refs_data: Vec<&[u8]> = new_tuples.iter().map(|t| t.data()).collect();
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_micros() as i64;
+                    if let Err(e) = hook.on_update(
+                        self.table_id.0,
+                        &old_slices,
+                        &new_refs_data,
+                        ins_last_lsn.0,
+                        now,
+                        txn_id,
+                        true,
+                    ) {
+                        eprintln!("CDC update hook failed: {e}");
+                    }
+                }
             }
 
             Ok(Some(ExecutionBatch::new(count_batch(total_updated))))

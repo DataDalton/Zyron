@@ -27,6 +27,10 @@ const STAT_VIEW_NAMES: &[&str] = &[
     "zyron_stat_indexes",
     "zyron_stat_wal",
     "zyron_stat_bgwriter",
+    "zyron_stat_cdc_feeds",
+    "zyron_stat_replication_slots",
+    "zyron_stat_cdc_streams",
+    "zyron_stat_cdc_ingests",
 ];
 
 /// Returns true if the given name matches a virtual statistics view.
@@ -46,6 +50,10 @@ pub fn query_stat_view(
         "zyron_stat_indexes" => Some(build_stat_indexes(server)),
         "zyron_stat_wal" => Some(build_stat_wal(server)),
         "zyron_stat_bgwriter" => Some(build_stat_bgwriter(server)),
+        "zyron_stat_cdc_feeds" => Some(build_stat_cdc_feeds(server)),
+        "zyron_stat_replication_slots" => Some(build_stat_replication_slots(server)),
+        "zyron_stat_cdc_streams" => Some(build_stat_cdc_streams(server)),
+        "zyron_stat_cdc_ingests" => Some(build_stat_cdc_ingests(server)),
         _ => None,
     }
 }
@@ -216,6 +224,136 @@ fn build_stat_bgwriter(server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<
     ];
 
     (fields, vec![row])
+}
+
+/// Builds the zyron_stat_cdc_feeds view.
+/// Columns: table_id, record_count, file_size_bytes, retention_days.
+/// Data source: server.cdc_feed_stats callback.
+fn build_stat_cdc_feeds(
+    server: &ServerState,
+) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+    let fields = vec![
+        make_field("table_id", PG_INT4_OID, 4),
+        make_field("record_count", PG_INT8_OID, 8),
+        make_field("file_size_bytes", PG_INT8_OID, 8),
+        make_field("retention_days", PG_INT4_OID, 4),
+    ];
+
+    let rows = if let Some(ref stats_fn) = server.cdc_feed_stats {
+        stats_fn()
+            .into_iter()
+            .map(|(tid, count, size, ret)| {
+                vec![
+                    Some(tid.to_string().into_bytes()),
+                    Some(count.to_string().into_bytes()),
+                    Some(size.to_string().into_bytes()),
+                    Some(ret.to_string().into_bytes()),
+                ]
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    (fields, rows)
+}
+
+/// Builds the zyron_stat_replication_slots view.
+/// Columns: name, plugin, confirmed_lsn, restart_lsn, active, lag_bytes.
+/// Data source: server.cdc_slot_stats callback.
+fn build_stat_replication_slots(
+    server: &ServerState,
+) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+    let fields = vec![
+        make_field("name", PG_TEXT_OID, -1),
+        make_field("plugin", PG_TEXT_OID, -1),
+        make_field("confirmed_lsn", PG_INT8_OID, 8),
+        make_field("restart_lsn", PG_INT8_OID, 8),
+        make_field("active", PG_TEXT_OID, -1),
+        make_field("lag_bytes", PG_INT8_OID, 8),
+    ];
+
+    let rows = if let Some(ref stats_fn) = server.cdc_slot_stats {
+        stats_fn()
+            .into_iter()
+            .map(|(name, plugin, confirmed, restart, active, lag)| {
+                vec![
+                    Some(name.into_bytes()),
+                    Some(plugin.into_bytes()),
+                    Some(confirmed.to_string().into_bytes()),
+                    Some(restart.to_string().into_bytes()),
+                    Some(active.to_string().into_bytes()),
+                    Some(lag.to_string().into_bytes()),
+                ]
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    (fields, rows)
+}
+
+/// Builds the zyron_stat_cdc_streams view.
+/// Columns: name, table_id, active, slot_name.
+/// Data source: server.cdc_stream_stats callback.
+fn build_stat_cdc_streams(
+    server: &ServerState,
+) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+    let fields = vec![
+        make_field("name", PG_TEXT_OID, -1),
+        make_field("table_id", PG_INT4_OID, 4),
+        make_field("active", PG_TEXT_OID, -1),
+        make_field("slot_name", PG_TEXT_OID, -1),
+    ];
+
+    let rows = if let Some(ref stats_fn) = server.cdc_stream_stats {
+        stats_fn()
+            .into_iter()
+            .map(|(name, tid, active, slot)| {
+                vec![
+                    Some(name.into_bytes()),
+                    Some(tid.to_string().into_bytes()),
+                    Some(active.to_string().into_bytes()),
+                    Some(slot.into_bytes()),
+                ]
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    (fields, rows)
+}
+
+/// Builds the zyron_stat_cdc_ingests view.
+/// Columns: name, table_id, active, records_applied, records_failed.
+/// Data source: server.cdc_ingest_stats callback.
+fn build_stat_cdc_ingests(
+    server: &ServerState,
+) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+    let fields = vec![
+        make_field("name", PG_TEXT_OID, -1),
+        make_field("table_id", PG_INT4_OID, 4),
+        make_field("active", PG_TEXT_OID, -1),
+        make_field("records_applied", PG_INT8_OID, 8),
+        make_field("records_failed", PG_INT8_OID, 8),
+    ];
+
+    let rows = if let Some(ref stats_fn) = server.cdc_ingest_stats {
+        stats_fn()
+            .into_iter()
+            .map(|(name, tid, active, applied, failed)| {
+                vec![
+                    Some(name.into_bytes()),
+                    Some(tid.to_string().into_bytes()),
+                    Some(active.to_string().into_bytes()),
+                    Some(applied.to_string().into_bytes()),
+                    Some(failed.to_string().into_bytes()),
+                ]
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    (fields, rows)
 }
 
 #[cfg(test)]

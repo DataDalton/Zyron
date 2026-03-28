@@ -1,0 +1,107 @@
+
+=== Decoder Formats: All 4 Plugins ===
+  zyron_cdc: 62 bytes, roundtrip OK
+  debezium: 248 bytes, roundtrip OK
+  wal2json: 201 bytes, roundtrip OK
+  avro: 212 bytes, roundtrip OK
+  Formats validated [PASS]: 4 >= 4 (target)
+
+=== Benchmark: CDF Insert Overhead ===
+  Insert overhead (ns/row) [PASS/OK]:
+    Runs: [60, 55, 55, 54, 54]
+    Average: 56 <= 100 (target)
+    Min/Max: 54 / 60, StdDev: 2
+
+=== Benchmark: CDF Query 100K ===
+  Query latency (ms) [PASS/OK]:
+    Runs: [11, 7, 7, 7, 7]
+    Average: 8 <= 25 (target)
+    Min/Max: 7 / 11, StdDev: 2
+
+=== Benchmark: Debezium Encoding ===
+  Encoding throughput (rec/sec) [PASS/OK]:
+    Runs: [780,715, 786,533, 816,277, 799,278, 817,289]
+    Average: 800,018 >= 200,000 (target)
+    Min/Max: 780,715 / 817,289, StdDev: 14,951
+
+=== Metrics: CDC Observability ===
+  Prometheus output: 2316 bytes, all counters present
+  Metric types rendered [PASS]: 14 >= 14 (target)
+
+=== Streams and Ingests: Management ===
+  CDC Stream created: Kafka sink, Debezium format
+  CDC Ingest created: Kafka source, OnConflict::Update
+  State persisted and recovered
+  Components validated [PASS]: 4 >= 4 (target)
+
+=== Benchmark: RETURNING Clause Overhead ===
+  RETURNING clause overhead (ns/row) [PASS/OK]:
+    Runs: [21, 21, 21, 22, 21]
+    Average: 21 <= 200 (target)
+    Min/Max: 21 / 22, StdDev: 0
+
+=== Benchmark: Replication Slot Advance ===
+  Slot advance latency (us/op) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 50 (target)
+    Min/Max: 0 / 0, StdDev: 0
+
+=== CDC Retention: Purge Enforcement ===
+  100 records: 50 old, 50 recent
+  Enforced: 1 tables, 50 purged, 2350 bytes reclaimed
+  50 old purged, 50 recent retained
+  Records purged [PASS]: 50 >= 50 (target)
+
+=== Change Data Feed: Basic Operations ===
+  150 records: 100 insert, 20 preimage, 20 postimage, 10 delete
+  Records stored [PASS]: 150 >= 150 (target)
+
+=== Change Data Feed: Time Range Queries ===
+  T1-T2: 140 records (inserts + updates)
+  T2-T3: 50 records (updates + deletes)
+  Version 101-120: 40 records
+  Queries correct [PASS]: 3 >= 3 (target)
+
+=== Debezium Format: JSON Envelope ===
+  INSERT: op='c', before=null, after=present
+  UPDATE: op='u', before=present, after=present
+  DELETE: op='d', before=present, after=null, ts_ms=3
+  Formats validated [PASS]: 3 >= 3 (target)
+
+=== Publication: Multi-table Subscriptions ===
+  create, alter add/drop, all_tables verified
+  Operations validated [PASS]: 5 >= 5 (target)
+
+=== Replication Slot: Lifecycle ===
+  Created slot 'test_slot' with zyron_cdc plugin
+  Advanced 1000 times, confirmed_lsn = 100000
+  WAL min_restart_lsn = Some(Lsn(100000))
+  Slot state persisted and recovered
+  Slot lag: 100000 bytes
+  Checks passed [PASS]: 4 >= 4 (target)
+
+=== RETURNING Clause: OLD/NEW Resolution ===
+  UPDATE: old.price=100, new.price=110
+  INSERT: old.price=NULL, new.price=110
+  DELETE: old.price=100, new.price=NULL
+  Tests passed [PASS]: 3 >= 3 (target)
+
+=== RETURNING with CTE: Audit Log Population ===
+  CTE audit_log populated with 50 change records
+  Audit rows [PASS]: 50 >= 50 (target)
+
+=== Snapshot: Export and Import ===
+  1000 rows exported and imported at LSN 5000
+  Rows exported [PASS]: 1,000 >= 1,000 (target)
+
+=== Benchmark: Logical Decoding 1M ===
+  Decoding throughput (rec/sec) [PASS/OK]:
+    Runs: [16,011,221, 15,852,332, 15,809,027, 16,056,416, 16,060,310]
+    Average: 15,957,861 >= 500,000 (target)
+    Min/Max: 15,809,027 / 16,060,310, StdDev: 106,155
+
+=== Benchmark: Retention Purge 1M ===
+  Purge latency (s) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 2 (target)
+    Min/Max: 0 / 0, StdDev: 0
