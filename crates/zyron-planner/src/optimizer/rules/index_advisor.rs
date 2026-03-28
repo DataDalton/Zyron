@@ -238,6 +238,7 @@ mod tests {
             columns: vec![],
             alias: "t".to_string(),
             encoding_hints: None,
+            as_of: None,
         };
         let filter = LogicalPlan::Filter {
             predicate: BoundExpr::ColumnRef(crate::binder::ColumnRef {

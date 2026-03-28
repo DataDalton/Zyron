@@ -112,6 +112,16 @@ pub enum Statement {
     AlterSystemSet(Box<AlterSystemSetStatement>),
     /// ANALYZE [table_name]
     Analyze(Box<AnalyzeStatement>),
+    /// CREATE BRANCH name [FROM name] [AT VERSION expr]
+    CreateBranch(Box<CreateBranchStatement>),
+    /// MERGE BRANCH name INTO name
+    MergeBranch(Box<MergeBranchStatement>),
+    /// DROP BRANCH [IF EXISTS] name
+    DropBranch(Box<DropBranchStatement>),
+    /// USE BRANCH name
+    UseBranch(Box<UseBranchStatement>),
+    /// CREATE VERSION name ON table [AS OF VERSION expr]
+    CreateVersion(Box<CreateVersionStatement>),
 }
 
 // ---------------------------------------------------------------------------
@@ -975,6 +985,43 @@ pub struct RestoreTableStatement {
     pub table: String,
     pub source: String,
     pub into_table: Option<String>,
+    pub at_version: Option<Expr>,
+    pub at_timestamp: Option<Expr>,
+}
+
+// ---------------------------------------------------------------------------
+// Branching
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateBranchStatement {
+    pub name: String,
+    pub from_branch: Option<String>,
+    pub at_version: Option<Expr>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergeBranchStatement {
+    pub source: String,
+    pub into_target: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropBranchStatement {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UseBranchStatement {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateVersionStatement {
+    pub name: String,
+    pub table: String,
+    pub at_version: Option<Expr>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1082,7 +1129,20 @@ pub enum GroupBySets {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AsOf {
     Timestamp(Expr),
-    SystemTime { start: Expr, end: Expr },
+    SystemTime {
+        start: Expr,
+        end: Expr,
+    },
+    Version(Expr),
+    ApplicationTime {
+        start: Expr,
+        end: Expr,
+    },
+    ForPortionOf {
+        period: String,
+        start: Expr,
+        end: Expr,
+    },
 }
 
 // ---------------------------------------------------------------------------

@@ -114,6 +114,12 @@ pub enum LogRecordType {
     CompactionBegin = 50,
     /// Compaction end marker. Payload: table_id(8) + file_size(8) + row_count(8) + output file path.
     CompactionEnd = 51,
+    /// Version log append. Payload: table_id(4) + version_id(8) + commit_timestamp(8) + operation_type(1) + row_count_delta(4) = 25 bytes.
+    VersionAppend = 60,
+    /// Branch creation. Payload: branch_id(8) + parent_branch_id(8) + base_version_id(8) + name_len(2) + name bytes.
+    BranchCreate = 61,
+    /// Branch merge. Payload: source_branch_id(8) + target_branch_id(8) + result_version_id(8).
+    BranchMerge = 62,
 }
 
 impl TryFrom<u8> for LogRecordType {
@@ -134,6 +140,9 @@ impl TryFrom<u8> for LogRecordType {
             40 => Ok(LogRecordType::Clr),
             50 => Ok(LogRecordType::CompactionBegin),
             51 => Ok(LogRecordType::CompactionEnd),
+            60 => Ok(LogRecordType::VersionAppend),
+            61 => Ok(LogRecordType::BranchCreate),
+            62 => Ok(LogRecordType::BranchMerge),
             _ => Err(ZyronError::WalCorrupted {
                 lsn: 0,
                 reason: format!("invalid record type: {}", value),

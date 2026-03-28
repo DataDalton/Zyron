@@ -98,6 +98,7 @@ impl ExplainNode {
                 columns,
                 predicate,
                 cost,
+                ..
             } => {
                 let mut details = vec![
                     ("table_id".to_string(), format!("{}", table_id.0)),

@@ -45,6 +45,7 @@ fn push_projections(
             table_idx,
             columns,
             alias,
+            as_of,
             ..
         } => {
             if let Some(needed_cols) = needed {
@@ -65,6 +66,7 @@ fn push_projections(
                         columns: pruned,
                         alias: alias.clone(),
                         encoding_hints: None,
+                        as_of: as_of.clone(),
                     };
                 }
             }

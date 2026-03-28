@@ -276,6 +276,10 @@ mod tests {
                     ],
                     constraints: vec![],
                     created_at: 0,
+                    versioning_enabled: false,
+                    scd_type: None,
+                    system_versioned: false,
+                    history_table_id: None,
                 },
                 TableEntry {
                     id: TableId(20),
@@ -286,6 +290,10 @@ mod tests {
                     columns: vec![],
                     constraints: vec![],
                     created_at: 0,
+                    versioning_enabled: false,
+                    scd_type: None,
+                    system_versioned: false,
+                    history_table_id: None,
                 },
             ],
         });

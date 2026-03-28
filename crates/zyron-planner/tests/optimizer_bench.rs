@@ -1313,6 +1313,7 @@ fn test_v7_index_advisor() {
             columns: vec![],
             alias: "t".to_string(),
             encoding_hints: None,
+            as_of: None,
         };
         let filter = LogicalPlan::Filter {
             predicate: binop(col_ref(7), BinaryOperator::Eq, lit_int(42)),

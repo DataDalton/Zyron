@@ -192,6 +192,22 @@ impl TupleFlags {
     pub const HAS_NULLS: u16 = 0x0004;
     /// Tuple has variable-length fields.
     pub const HAS_VARLEN: u16 = 0x0008;
+    /// Tuple carries version metadata (version_id + deleted_at_version).
+    pub const HAS_VERSION: u16 = 0x0010;
+
+    /// Returns true if this tuple has version metadata.
+    pub fn has_version(&self) -> bool {
+        self.0 & Self::HAS_VERSION != 0
+    }
+
+    /// Sets the has_version flag.
+    pub fn set_has_version(&mut self, val: bool) {
+        if val {
+            self.0 |= Self::HAS_VERSION;
+        } else {
+            self.0 &= !Self::HAS_VERSION;
+        }
+    }
 
     /// Returns true if the deleted flag is set.
     pub fn is_deleted(&self) -> bool {
@@ -355,6 +371,186 @@ impl<'a> TupleView<'a> {
     #[inline]
     pub fn is_deleted(&self) -> bool {
         self.header.flags.is_deleted()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Versioned tuple header (28 bytes): base header + version tracking
+// ---------------------------------------------------------------------------
+
+/// Packed 28-byte versioned tuple header for single-memcpy serialization.
+#[repr(C, packed)]
+struct PackedVersionedTupleHeader {
+    flags: u16,
+    data_len: u16,
+    xmin: u32,
+    xmax: u32,
+    version_id: u64,
+    deleted_at_version: u64,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<PackedVersionedTupleHeader>() == 28);
+    assert!(std::mem::align_of::<PackedVersionedTupleHeader>() == 1);
+};
+
+unsafe impl AsBytes for PackedVersionedTupleHeader {}
+unsafe impl FromBytes for PackedVersionedTupleHeader {}
+
+/// Size of the versioned tuple header in bytes.
+pub const VERSIONED_TUPLE_HEADER_SIZE: usize = 28;
+
+/// Extended tuple header with version tracking.
+///
+/// Layout (28 bytes):
+/// - base: 12 bytes (flags, data_len, xmin, xmax)
+/// - version_id: 8 bytes (version that created this tuple)
+/// - deleted_at_version: 8 bytes (version that deleted this tuple, 0 if live)
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VersionedTupleHeader {
+    /// Base tuple header containing flags, data_len, xmin, xmax.
+    pub base: TupleHeader,
+    /// Version that created this tuple.
+    pub version_id: u64,
+    /// Version that deleted this tuple (0 if still live).
+    pub deleted_at_version: u64,
+}
+
+impl VersionedTupleHeader {
+    /// Size of the versioned tuple header in bytes.
+    pub const SIZE: usize = VERSIONED_TUPLE_HEADER_SIZE;
+
+    /// Creates a new versioned tuple header.
+    pub fn new(data_len: u16, xmin: u32, version_id: u64) -> Self {
+        let mut base = TupleHeader::new(data_len, xmin);
+        base.flags.set_has_version(true);
+        Self {
+            base,
+            version_id,
+            deleted_at_version: 0,
+        }
+    }
+
+    /// Creates a versioned tuple header with all fields.
+    pub fn with_deletion(
+        data_len: u16,
+        xmin: u32,
+        xmax: u32,
+        version_id: u64,
+        deleted_at_version: u64,
+    ) -> Self {
+        let mut base = TupleHeader::with_xmax(data_len, xmin, xmax);
+        base.flags.set_has_version(true);
+        Self {
+            base,
+            version_id,
+            deleted_at_version,
+        }
+    }
+
+    /// Returns true if this tuple is visible at the given version.
+    #[inline]
+    pub fn is_visible_at_version(&self, target_version: u64) -> bool {
+        self.version_id <= target_version
+            && (self.deleted_at_version == 0 || self.deleted_at_version > target_version)
+    }
+
+    /// Serializes the header to bytes via single memcpy.
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let packed = PackedVersionedTupleHeader {
+            flags: self.base.flags.0.to_le(),
+            data_len: self.base.data_len.to_le(),
+            xmin: self.base.xmin.to_le(),
+            xmax: self.base.xmax.to_le(),
+            version_id: self.version_id.to_le(),
+            deleted_at_version: self.deleted_at_version.to_le(),
+        };
+        let mut buf = [0u8; Self::SIZE];
+        packed.write_to(&mut buf, 0);
+        buf
+    }
+
+    /// Deserializes the header from bytes via single unaligned read.
+    pub fn from_bytes(buf: &[u8]) -> Self {
+        let packed = PackedVersionedTupleHeader::read_from(buf, 0);
+        Self {
+            base: TupleHeader {
+                flags: TupleFlags(u16::from_le(packed.flags)),
+                data_len: u16::from_le(packed.data_len),
+                xmin: u32::from_le(packed.xmin),
+                xmax: u32::from_le(packed.xmax),
+            },
+            version_id: u64::from_le(packed.version_id),
+            deleted_at_version: u64::from_le(packed.deleted_at_version),
+        }
+    }
+
+    /// Deserializes the header from bytes without bounds checks.
+    ///
+    /// # Safety
+    /// Caller must ensure buf has at least SIZE (28) bytes.
+    #[inline(always)]
+    pub unsafe fn from_bytes_unchecked(buf: &[u8]) -> Self {
+        let packed =
+            unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const PackedVersionedTupleHeader) };
+        Self {
+            base: TupleHeader {
+                flags: TupleFlags(u16::from_le(packed.flags)),
+                data_len: u16::from_le(packed.data_len),
+                xmin: u32::from_le(packed.xmin),
+                xmax: u32::from_le(packed.xmax),
+            },
+            version_id: u64::from_le(packed.version_id),
+            deleted_at_version: u64::from_le(packed.deleted_at_version),
+        }
+    }
+}
+
+/// Zero-copy view into versioned tuple data stored in a page buffer.
+#[derive(Debug, Clone, Copy)]
+pub struct VersionedTupleView<'a> {
+    /// Versioned tuple header (copied, 28 bytes).
+    pub header: VersionedTupleHeader,
+    /// Reference to tuple data in the page buffer.
+    pub data: &'a [u8],
+}
+
+impl<'a> VersionedTupleView<'a> {
+    /// Creates a new versioned tuple view.
+    #[inline]
+    pub fn new(header: VersionedTupleHeader, data: &'a [u8]) -> Self {
+        Self { header, data }
+    }
+
+    /// Converts this view to an owned Tuple by copying the data.
+    #[inline]
+    #[allow(clippy::wrong_self_convention)]
+    pub fn to_owned(&self) -> Tuple {
+        Tuple::with_header(self.header.base, self.data.to_vec())
+    }
+
+    /// Returns the tuple data length.
+    #[inline]
+    pub fn data_len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Returns total size on disk (versioned header + data).
+    #[inline]
+    pub fn size_on_disk(&self) -> usize {
+        VersionedTupleHeader::SIZE + self.data.len()
+    }
+
+    /// Returns true if this tuple is marked as deleted.
+    #[inline]
+    pub fn is_deleted(&self) -> bool {
+        self.header.base.flags.is_deleted()
+    }
+
+    /// Returns true if this tuple is visible at the given version.
+    #[inline]
+    pub fn is_visible_at_version(&self, target_version: u64) -> bool {
+        self.header.is_visible_at_version(target_version)
     }
 }
 
@@ -532,5 +728,105 @@ mod tests {
 
         tuple.header_mut().flags.set_locked(true);
         assert!(tuple.header().flags.is_locked());
+    }
+
+    #[test]
+    fn test_has_version_flag() {
+        let mut flags = TupleFlags::empty();
+        assert!(!flags.has_version());
+
+        flags.set_has_version(true);
+        assert!(flags.has_version());
+        assert!(!flags.is_deleted()); // other flags unaffected
+
+        flags.set_has_version(false);
+        assert!(!flags.has_version());
+    }
+
+    #[test]
+    fn test_versioned_tuple_header_new() {
+        let header = VersionedTupleHeader::new(100, 42, 7);
+
+        assert_eq!(header.base.data_len, 100);
+        assert_eq!(header.base.xmin, 42);
+        assert_eq!(header.base.xmax, 0);
+        assert!(header.base.flags.has_version());
+        assert_eq!(header.version_id, 7);
+        assert_eq!(header.deleted_at_version, 0);
+    }
+
+    #[test]
+    fn test_versioned_tuple_header_roundtrip() {
+        let header = VersionedTupleHeader::with_deletion(256, 12345, 67890, 999, 1050);
+
+        let bytes = header.to_bytes();
+        assert_eq!(bytes.len(), VersionedTupleHeader::SIZE);
+
+        let recovered = VersionedTupleHeader::from_bytes(&bytes);
+
+        assert_eq!(recovered.base.flags.0, header.base.flags.0);
+        assert_eq!(recovered.base.data_len, 256);
+        assert_eq!(recovered.base.xmin, 12345);
+        assert_eq!(recovered.base.xmax, 67890);
+        assert_eq!(recovered.version_id, 999);
+        assert_eq!(recovered.deleted_at_version, 1050);
+    }
+
+    #[test]
+    fn test_versioned_tuple_header_unchecked() {
+        let header = VersionedTupleHeader::new(50, 100, 42);
+        let bytes = header.to_bytes();
+
+        let recovered = unsafe { VersionedTupleHeader::from_bytes_unchecked(&bytes) };
+
+        assert_eq!(recovered.base.data_len, 50);
+        assert_eq!(recovered.base.xmin, 100);
+        assert_eq!(recovered.version_id, 42);
+        assert_eq!(recovered.deleted_at_version, 0);
+    }
+
+    #[test]
+    fn test_versioned_visibility_at_version() {
+        // Live tuple created at version 10
+        let header = VersionedTupleHeader::new(5, 1, 10);
+        assert!(header.is_visible_at_version(10)); // visible at creation version
+        assert!(header.is_visible_at_version(100)); // visible at later versions
+        assert!(!header.is_visible_at_version(5)); // not visible before creation
+
+        // Tuple created at version 10, deleted at version 20
+        let header = VersionedTupleHeader::with_deletion(5, 1, 2, 10, 20);
+        assert!(header.is_visible_at_version(10)); // visible at creation
+        assert!(header.is_visible_at_version(15)); // visible between create and delete
+        assert!(header.is_visible_at_version(19)); // visible just before deletion
+        assert!(!header.is_visible_at_version(20)); // not visible at deletion version
+        assert!(!header.is_visible_at_version(25)); // not visible after deletion
+        assert!(!header.is_visible_at_version(5)); // not visible before creation
+    }
+
+    #[test]
+    fn test_versioned_tuple_view() {
+        let header = VersionedTupleHeader::new(5, 1, 42);
+        let data = b"hello";
+        let view = VersionedTupleView::new(header, data);
+
+        assert_eq!(view.data_len(), 5);
+        assert_eq!(view.size_on_disk(), VersionedTupleHeader::SIZE + 5);
+        assert!(!view.is_deleted());
+        assert!(view.is_visible_at_version(42));
+        assert!(!view.is_visible_at_version(41));
+
+        let owned = view.to_owned();
+        assert_eq!(owned.data(), data);
+        assert_eq!(owned.header().xmin, 1);
+    }
+
+    #[test]
+    fn test_versioned_header_size_constant() {
+        assert_eq!(VERSIONED_TUPLE_HEADER_SIZE, 28);
+        assert_eq!(VersionedTupleHeader::SIZE, 28);
+        assert_eq!(
+            VersionedTupleHeader::SIZE,
+            TupleHeader::SIZE + std::mem::size_of::<u64>() * 2
+        );
     }
 }

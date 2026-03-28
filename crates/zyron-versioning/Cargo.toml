@@ -1,0 +1,19 @@
+[package]
+name = "zyron-versioning"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+zyron-common = { path = "../zyron-common" }
+zyron-storage = { path = "../zyron-storage" }
+zyron-catalog = { path = "../zyron-catalog" }
+zyron-wal = { path = "../zyron-wal" }
+zyron-buffer = { path = "../zyron-buffer" }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+scc = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+zyron-bench-harness = { path = "../zyron-bench-harness" }

@@ -330,6 +330,10 @@ impl Catalog {
             columns,
             constraints,
             created_at: now,
+            versioning_enabled: false,
+            scd_type: None,
+            system_versioned: false,
+            history_table_id: None,
         };
 
         self.log_ddl(DDL_CREATE_TABLE, &entry.to_bytes())?;

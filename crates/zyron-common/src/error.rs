@@ -211,6 +211,28 @@ pub enum ZyronError {
     #[error("Webhook verification failed: {0}")]
     WebhookVerificationFailed(String),
 
+    // Versioning errors
+    #[error("Version not found: {0}")]
+    VersionNotFound(u64),
+
+    #[error("Branch conflict: {0}")]
+    BranchConflict(String),
+
+    #[error("Branch not found: {0}")]
+    BranchNotFound(String),
+
+    #[error("Branch already exists: {0}")]
+    BranchAlreadyExists(String),
+
+    #[error("Version log corrupted for table {table_id}: {reason}")]
+    VersionLogCorrupted { table_id: u32, reason: String },
+
+    #[error("Temporal constraint violated: {0}")]
+    TemporalViolation(String),
+
+    #[error("SCD configuration error: {0}")]
+    ScdConfigError(String),
+
     // Internal errors
     #[error("Internal error: {0}")]
     Internal(String),
@@ -362,6 +384,45 @@ mod tests {
     fn test_internal_error_display() {
         let err = ZyronError::Internal("assertion failed".to_string());
         assert_eq!(err.to_string(), "Internal error: assertion failed");
+    }
+
+    #[test]
+    fn test_versioning_errors_display() {
+        let err = ZyronError::VersionNotFound(42);
+        assert_eq!(err.to_string(), "Version not found: 42");
+
+        let err = ZyronError::BranchConflict("page 100 modified in both branches".to_string());
+        assert_eq!(
+            err.to_string(),
+            "Branch conflict: page 100 modified in both branches"
+        );
+
+        let err = ZyronError::BranchNotFound("dev".to_string());
+        assert_eq!(err.to_string(), "Branch not found: dev");
+
+        let err = ZyronError::BranchAlreadyExists("dev".to_string());
+        assert_eq!(err.to_string(), "Branch already exists: dev");
+
+        let err = ZyronError::VersionLogCorrupted {
+            table_id: 5,
+            reason: "truncated entry".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "Version log corrupted for table 5: truncated entry"
+        );
+
+        let err = ZyronError::TemporalViolation("period start must precede end".to_string());
+        assert_eq!(
+            err.to_string(),
+            "Temporal constraint violated: period start must precede end"
+        );
+
+        let err = ZyronError::ScdConfigError("unknown scd_type 5".to_string());
+        assert_eq!(
+            err.to_string(),
+            "SCD configuration error: unknown scd_type 5"
+        );
     }
 
     #[test]

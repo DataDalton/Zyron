@@ -235,6 +235,14 @@ pub struct TableEntry {
     pub columns: Vec<ColumnEntry>,
     pub constraints: Vec<ConstraintEntry>,
     pub created_at: u64,
+    /// Whether table-level versioning is enabled for time travel queries.
+    pub versioning_enabled: bool,
+    /// SCD type configured on this table (None, 1-4, or 6).
+    pub scd_type: Option<u8>,
+    /// Whether this table is system-versioned (automatic sys_start/sys_end).
+    pub system_versioned: bool,
+    /// For SCD Type 4: the companion history table's table_id.
+    pub history_table_id: Option<u32>,
 }
 
 impl TableEntry {
@@ -262,6 +270,12 @@ impl TableEntry {
             write_u32(&mut buf, con_bytes.len() as u32);
             buf.extend_from_slice(&con_bytes);
         }
+
+        // Versioning fields (appended for backward compatibility)
+        buf.push(if self.versioning_enabled { 1 } else { 0 });
+        buf.push(self.scd_type.unwrap_or(0));
+        buf.push(if self.system_versioned { 1 } else { 0 });
+        write_u32(&mut buf, self.history_table_id.unwrap_or(0));
 
         buf
     }
@@ -296,6 +310,35 @@ impl TableEntry {
             off += con_len;
         }
 
+        // Versioning fields (backward compatible: default to false/None if missing)
+        let versioning_enabled = if off < data.len() {
+            let v = data[off];
+            off += 1;
+            v != 0
+        } else {
+            false
+        };
+        let scd_type = if off < data.len() {
+            let v = data[off];
+            off += 1;
+            if v == 0 { None } else { Some(v) }
+        } else {
+            None
+        };
+        let system_versioned = if off < data.len() {
+            let v = data[off];
+            off += 1;
+            v != 0
+        } else {
+            false
+        };
+        let history_table_id = if off + 4 <= data.len() {
+            let v = read_u32(data, &mut off)?;
+            if v == 0 { None } else { Some(v) }
+        } else {
+            None
+        };
+
         Ok(Self {
             id,
             schema_id,
@@ -305,6 +348,10 @@ impl TableEntry {
             columns,
             constraints,
             created_at,
+            versioning_enabled,
+            scd_type,
+            system_versioned,
+            history_table_id,
         })
     }
 }
@@ -580,6 +627,10 @@ mod tests {
                 check_expr: None,
             }],
             created_at: 1700000000,
+            versioning_enabled: false,
+            scd_type: None,
+            system_versioned: false,
+            history_table_id: None,
         };
         let bytes = entry.to_bytes();
         let decoded = TableEntry::from_bytes(&bytes).unwrap();
@@ -718,6 +769,10 @@ mod tests {
             columns: vec![],
             constraints: vec![],
             created_at: 0,
+            versioning_enabled: false,
+            scd_type: None,
+            system_versioned: false,
+            history_table_id: None,
         };
         let bytes = entry.to_bytes();
         let decoded = TableEntry::from_bytes(&bytes).unwrap();

@@ -190,6 +190,7 @@ impl EncodingPushdown {
                     columns,
                     alias,
                     encoding_hints: _,
+                    as_of,
                 } = child.as_ref()
                 {
                     let hint = analyze_predicate(predicate);
@@ -200,6 +201,7 @@ impl EncodingPushdown {
                             columns: columns.clone(),
                             alias: alias.clone(),
                             encoding_hints: Some(hint),
+                            as_of: as_of.clone(),
                         };
                         return Some(LogicalPlan::Filter {
                             predicate: predicate.clone(),

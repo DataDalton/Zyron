@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use zyron_common::Result;
+use zyron_planner::logical::AsOfTarget;
 use zyron_planner::physical::PhysicalPlan;
 
 use crate::batch::DataBatch;
@@ -69,21 +70,35 @@ fn build_operator_tree(
                 table_id,
                 columns,
                 predicate,
+                as_of,
                 ..
             } => {
+                let as_of_version = match &as_of {
+                    Some(AsOfTarget::Version(v)) => Some(*v),
+                    _ => None,
+                };
+
                 // Use parallel scan for large tables when not tracking tuple IDs.
+                // Parallel scan does not support as_of yet, fall back to serial.
                 let table_entry = ctx.get_table_entry(table_id)?;
                 let num_pages = ctx.disk_manager.num_pages(table_entry.heap_file_id).await?;
 
-                if should_use_parallel_scan(num_pages, false) {
+                if as_of_version.is_none() && should_use_parallel_scan(num_pages, false) {
                     let op =
                         ParallelSeqScanOperator::new(ctx.clone(), table_id, columns, predicate)
                             .await?;
                     let br = BuildResult::new(Box::new(op));
                     Ok(br.with_metrics("ParallelSeqScan", analyze, vec![]))
                 } else {
-                    let op = SeqScanOperator::new(ctx.clone(), table_id, columns, predicate, false)
-                        .await?;
+                    let op = SeqScanOperator::new(
+                        ctx.clone(),
+                        table_id,
+                        columns,
+                        predicate,
+                        false,
+                        as_of_version,
+                    )
+                    .await?;
                     let br = BuildResult::new(Box::new(op));
                     Ok(br.with_metrics("SeqScan", analyze, vec![]))
                 }
@@ -466,10 +481,22 @@ fn build_scan_with_tuple_ids(
                 table_id,
                 columns,
                 predicate,
+                as_of,
                 ..
             } => {
-                let op =
-                    SeqScanOperator::new(ctx.clone(), table_id, columns, predicate, true).await?;
+                let as_of_version = match &as_of {
+                    Some(AsOfTarget::Version(v)) => Some(*v),
+                    _ => None,
+                };
+                let op = SeqScanOperator::new(
+                    ctx.clone(),
+                    table_id,
+                    columns,
+                    predicate,
+                    true,
+                    as_of_version,
+                )
+                .await?;
                 let br = BuildResult::new(Box::new(op) as Box<dyn Operator>);
                 Ok(br.with_metrics("SeqScan", analyze, vec![]))
             }

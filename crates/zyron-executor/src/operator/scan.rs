@@ -44,6 +44,8 @@ pub struct SeqScanOperator {
     num_pages: u64,
     finished: bool,
     track_tuple_ids: bool,
+    /// When set, use version-based visibility instead of MVCC snapshot.
+    as_of_version: Option<u64>,
 }
 
 impl SeqScanOperator {
@@ -54,6 +56,7 @@ impl SeqScanOperator {
         columns: Vec<LogicalColumn>,
         predicate: Option<BoundExpr>,
         track_tuple_ids: bool,
+        as_of_version: Option<u64>,
     ) -> Result<Self> {
         let table_entry = ctx.get_table_entry(table_id)?;
         let num_pages = ctx.disk_manager.num_pages(table_entry.heap_file_id).await?;
@@ -67,6 +70,7 @@ impl SeqScanOperator {
             num_pages,
             finished: false,
             track_tuple_ids,
+            as_of_version,
         })
     }
 }
@@ -99,7 +103,27 @@ impl Operator for SeqScanOperator {
                     if tuple.is_deleted() {
                         continue;
                     }
-                    if !tuple.header().is_visible_to(&self.ctx.snapshot) {
+                    // Version-based visibility for time travel queries,
+                    // MVCC snapshot visibility for normal queries.
+                    //
+                    // When as_of_version is set, the tuple's base header
+                    // xmin/xmax are reinterpreted as version bounds via
+                    // is_visible (version_id <= target, deleted_at > target).
+                    // This works because versioned tables store version_id
+                    // in xmin and deleted_at_version in xmax on the base
+                    // TupleHeader, keeping the same visibility predicate shape.
+                    //
+                    // Non-versioned tuples in a time travel query fall back
+                    // to MVCC snapshot visibility as a safety measure.
+                    if let Some(target_version) = self.as_of_version {
+                        if tuple.header().flags.has_version() {
+                            if !tuple.header().is_visible(target_version as u32) {
+                                continue;
+                            }
+                        } else if !tuple.header().is_visible_to(&self.ctx.snapshot) {
+                            continue;
+                        }
+                    } else if !tuple.header().is_visible_to(&self.ctx.snapshot) {
                         continue;
                     }
 
@@ -372,8 +396,15 @@ impl IndexScanOperator {
             None => predicate,
         };
 
-        let inner =
-            SeqScanOperator::new(ctx, table_id, columns, Some(combined), track_tuple_ids).await?;
+        let inner = SeqScanOperator::new(
+            ctx,
+            table_id,
+            columns,
+            Some(combined),
+            track_tuple_ids,
+            None,
+        )
+        .await?;
 
         Ok(Self { inner })
     }

@@ -339,6 +339,13 @@ pub enum Keyword {
     // Archive / Restore
     Restore,
 
+    // Branching / Versioning
+    Branch,
+    Version,
+    Portion,
+    Use,
+    At,
+
     // Security
     User,
     Role,
@@ -833,6 +840,13 @@ pub fn lookup_keyword(word: &str) -> Option<Keyword> {
 
         // Archive / Restore
         "RESTORE" => Some(Keyword::Restore),
+
+        // Branching / Versioning
+        "BRANCH" => Some(Keyword::Branch),
+        "VERSION" => Some(Keyword::Version),
+        "PORTION" => Some(Keyword::Portion),
+        "USE" => Some(Keyword::Use),
+        "AT" => Some(Keyword::At),
 
         // Security
         "USER" => Some(Keyword::User),

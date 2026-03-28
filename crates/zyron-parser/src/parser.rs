@@ -72,6 +72,7 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Archive) => self.parse_archive_table(),
             Token::Keyword(Keyword::Restore) => self.parse_restore_table(),
             Token::Keyword(Keyword::Analyze) => self.parse_analyze(),
+            Token::Keyword(Keyword::Use) => self.parse_use_branch(),
             _ => Err(self.error(&format!(
                 "Expected a statement, found {}",
                 self.current.token
@@ -700,31 +701,72 @@ impl<'a> Parser<'a> {
 
         let name = self.parse_ident()?;
 
-        // Check for time travel: AS OF TIMESTAMP expr or FOR SYSTEM_TIME BETWEEN
-        let as_of =
-            if self.at_keyword(Keyword::As) && self.peek.token == Token::Keyword(Keyword::Of) {
-                self.advance()?; // AS
-                self.advance()?; // OF
-                // Optionally consume TIMESTAMP or TIMESTAMPTZ keyword
-                let _ = self.consume_keyword(Keyword::Timestamp)?;
-                let _ = self.consume_keyword(Keyword::Timestamptz)?;
-                let expr = self.parse_expr()?;
-                Some(Box::new(AsOf::Timestamp(expr)))
-            } else if self.at_keyword(Keyword::For)
-                && (self.peek.token == Token::Keyword(Keyword::System)
-                    || self.peek.token == Token::Keyword(Keyword::Versioning))
-            {
-                self.advance()?; // FOR
-                self.advance()?; // SYSTEM or VERSIONING
-                // Expect BETWEEN or AS OF
-                self.expect_keyword(Keyword::Between)?;
+        // Check for time travel: AS OF TIMESTAMP expr, VERSION AS OF expr,
+        // FOR SYSTEM_TIME BETWEEN, FOR APPLICATION_TIME, FOR PORTION OF
+        let as_of = if self.at_keyword(Keyword::Version)
+            && self.peek.token == Token::Keyword(Keyword::As)
+        {
+            self.advance()?; // VERSION
+            self.advance()?; // AS
+            self.expect_keyword(Keyword::Of)?;
+            let expr = self.parse_expr()?;
+            Some(Box::new(AsOf::Version(expr)))
+        } else if self.at_keyword(Keyword::As) && self.peek.token == Token::Keyword(Keyword::Of) {
+            self.advance()?; // AS
+            self.advance()?; // OF
+            // Optionally consume TIMESTAMP or TIMESTAMPTZ keyword
+            let _ = self.consume_keyword(Keyword::Timestamp)?;
+            let _ = self.consume_keyword(Keyword::Timestamptz)?;
+            let expr = self.parse_expr()?;
+            Some(Box::new(AsOf::Timestamp(expr)))
+        } else if self.at_keyword(Keyword::For)
+            && (self.peek.token == Token::Keyword(Keyword::System)
+                || self.peek.token == Token::Keyword(Keyword::Versioning))
+        {
+            self.advance()?; // FOR
+            self.advance()?; // SYSTEM or VERSIONING
+            self.expect_keyword(Keyword::Between)?;
+            let start = self.parse_expr()?;
+            self.expect_keyword(Keyword::And)?;
+            let end = self.parse_expr()?;
+            Some(Box::new(AsOf::SystemTime { start, end }))
+        } else if self.at_keyword(Keyword::For)
+            && self.peek.token == Token::Keyword(Keyword::Portion)
+        {
+            // FOR PORTION OF period FROM start TO end
+            self.advance()?; // FOR
+            self.advance()?; // PORTION
+            self.expect_keyword(Keyword::Of)?;
+            let period = self.parse_ident()?;
+            self.expect_keyword(Keyword::From)?;
+            let start = self.parse_expr()?;
+            self.expect_keyword(Keyword::To)?;
+            let end = self.parse_expr()?;
+            Some(Box::new(AsOf::ForPortionOf { period, start, end }))
+        } else if self.at_keyword(Keyword::For)
+            && matches!(&self.peek.token, Token::Ident(s) if s.eq_ignore_ascii_case("application_time"))
+        {
+            self.advance()?; // FOR
+            self.advance()?; // APPLICATION_TIME (ident)
+            if self.consume_keyword(Keyword::Between)? {
                 let start = self.parse_expr()?;
                 self.expect_keyword(Keyword::And)?;
                 let end = self.parse_expr()?;
-                Some(Box::new(AsOf::SystemTime { start, end }))
+                Some(Box::new(AsOf::ApplicationTime { start, end }))
             } else {
-                None
-            };
+                // AS OF expr
+                self.expect_keyword(Keyword::As)?;
+                self.expect_keyword(Keyword::Of)?;
+                let expr = self.parse_expr()?;
+                let cloned = expr.clone();
+                Some(Box::new(AsOf::ApplicationTime {
+                    start: expr,
+                    end: cloned,
+                }))
+            }
+        } else {
+            None
+        };
 
         let alias = if self.consume_keyword(Keyword::As)? {
             Some(self.parse_ident()?)
@@ -767,6 +809,7 @@ impl<'a> Parser<'a> {
                     | Keyword::Returning
                     | Keyword::For
                     | Keyword::Qualify
+                    | Keyword::Version
             )
         )
     }
@@ -939,8 +982,10 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Pipeline) => self.parse_create_pipeline(),
             Token::Keyword(Keyword::Fulltext) => self.parse_create_fulltext_index(),
             Token::Keyword(Keyword::Vector) => self.parse_create_vector_index(),
+            Token::Keyword(Keyword::Branch) => self.parse_create_branch(),
+            Token::Keyword(Keyword::Version) => self.parse_create_version(),
             _ => Err(self.error(&format!(
-                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, PIPELINE, FULLTEXT, or VECTOR after CREATE, found {}",
+                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, PIPELINE, FULLTEXT, VECTOR, BRANCH, or VERSION after CREATE, found {}",
                 self.current.token
             ))),
         }
@@ -1037,8 +1082,9 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::User) => self.parse_drop_user(),
             Token::Keyword(Keyword::Role) => self.parse_drop_role(),
             Token::Keyword(Keyword::Pipeline) => self.parse_drop_pipeline(),
+            Token::Keyword(Keyword::Branch) => self.parse_drop_branch(),
             _ => Err(self.error(&format!(
-                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, or PIPELINE after DROP, found {}",
+                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, PIPELINE, or BRANCH after DROP, found {}",
                 self.current.token
             ))),
         }
@@ -2951,6 +2997,12 @@ impl<'a> Parser<'a> {
 
     fn parse_merge(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Merge)?;
+
+        // MERGE BRANCH source INTO target
+        if self.consume_keyword(Keyword::Branch)? {
+            return self.parse_merge_branch();
+        }
+
         self.expect_keyword(Keyword::Into)?;
         let target = self.parse_ident()?;
         self.expect_keyword(Keyword::Using)?;
@@ -3931,10 +3983,108 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+
+        // Optional: TO VERSION AS OF expr or TO TIMESTAMP AS OF expr
+        let mut at_version = None;
+        let mut at_timestamp = None;
+        if self.consume_keyword(Keyword::To)? {
+            if self.consume_keyword(Keyword::Version)? {
+                self.expect_keyword(Keyword::As)?;
+                self.expect_keyword(Keyword::Of)?;
+                at_version = Some(self.parse_expr()?);
+            } else if self.consume_keyword(Keyword::Timestamp)? {
+                self.expect_keyword(Keyword::As)?;
+                self.expect_keyword(Keyword::Of)?;
+                at_timestamp = Some(self.parse_expr()?);
+            } else {
+                return Err(self.error("Expected VERSION or TIMESTAMP after TO in RESTORE TABLE"));
+            }
+        }
+
         Ok(Statement::RestoreTable(Box::new(RestoreTableStatement {
             table,
             source,
             into_table,
+            at_version,
+            at_timestamp,
+        })))
+    }
+
+    // -----------------------------------------------------------------------
+    // Branching / Versioning
+    // -----------------------------------------------------------------------
+
+    fn parse_create_branch(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Branch)?;
+        let name = self.parse_ident()?;
+        let from_branch = if self.consume_keyword(Keyword::From)? {
+            Some(self.parse_ident()?)
+        } else {
+            None
+        };
+        let at_version = if self.at_keyword(Keyword::At) {
+            self.advance()?; // AT
+            self.expect_keyword(Keyword::Version)?;
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(Statement::CreateBranch(Box::new(CreateBranchStatement {
+            name,
+            from_branch,
+            at_version,
+        })))
+    }
+
+    fn parse_merge_branch(&mut self) -> Result<Statement> {
+        let source = self.parse_ident()?;
+        self.expect_keyword(Keyword::Into)?;
+        let into_target = self.parse_ident()?;
+        Ok(Statement::MergeBranch(Box::new(MergeBranchStatement {
+            source,
+            into_target,
+        })))
+    }
+
+    fn parse_drop_branch(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Branch)?;
+        let if_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_ident()?;
+        Ok(Statement::DropBranch(Box::new(DropBranchStatement {
+            name,
+            if_exists,
+        })))
+    }
+
+    fn parse_use_branch(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Use)?;
+        self.expect_keyword(Keyword::Branch)?;
+        let name = self.parse_ident()?;
+        Ok(Statement::UseBranch(Box::new(UseBranchStatement { name })))
+    }
+
+    fn parse_create_version(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Version)?;
+        let name = self.parse_ident()?;
+        self.expect_keyword(Keyword::On)?;
+        let table = self.parse_ident()?;
+        let at_version = if self.at_keyword(Keyword::As) {
+            self.advance()?; // AS
+            self.expect_keyword(Keyword::Of)?;
+            self.expect_keyword(Keyword::Version)?;
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(Statement::CreateVersion(Box::new(CreateVersionStatement {
+            name,
+            table,
+            at_version,
         })))
     }
 
@@ -4289,6 +4439,12 @@ fn keyword_to_ident_str(kw: Keyword) -> Option<&'static str> {
         Keyword::Uint64 => Some("uint64"),
         Keyword::Uint128 => Some("uint128"),
         Keyword::Vector => Some("vector"),
+        // Branching / Versioning
+        Keyword::Branch => Some("branch"),
+        Keyword::Version => Some("version"),
+        Keyword::Portion => Some("portion"),
+        Keyword::Use => Some("use"),
+        Keyword::At => Some("at"),
         _ => None,
     }
 }
@@ -8259,6 +8415,144 @@ mod tests {
                 _ => panic!("Expected MatchAgainst"),
             },
             _ => panic!("Expected SELECT"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Branching / Versioning
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_version_as_of() {
+        let stmt = parse_one("SELECT * FROM orders VERSION AS OF 42");
+        match stmt {
+            Statement::Select(s) => match &s.from[0] {
+                TableRef::Table { name, as_of, .. } => {
+                    assert_eq!(name, "orders");
+                    assert!(matches!(as_of.as_deref(), Some(AsOf::Version(_))));
+                }
+                _ => panic!("Expected Table"),
+            },
+            _ => panic!("Expected SELECT"),
+        }
+    }
+
+    #[test]
+    fn test_create_branch_from_at_version() {
+        let stmt = parse_one("CREATE BRANCH dev FROM main AT VERSION 10");
+        match stmt {
+            Statement::CreateBranch(b) => {
+                assert_eq!(b.name, "dev");
+                assert_eq!(b.from_branch.as_deref(), Some("main"));
+                assert!(b.at_version.is_some());
+            }
+            _ => panic!("Expected CreateBranch"),
+        }
+    }
+
+    #[test]
+    fn test_merge_branch_into() {
+        let stmt = parse_one("MERGE BRANCH dev INTO main");
+        match stmt {
+            Statement::MergeBranch(m) => {
+                assert_eq!(m.source, "dev");
+                assert_eq!(m.into_target, "main");
+            }
+            _ => panic!("Expected MergeBranch"),
+        }
+    }
+
+    #[test]
+    fn test_drop_branch_if_exists() {
+        let stmt = parse_one("DROP BRANCH IF EXISTS dev");
+        match stmt {
+            Statement::DropBranch(d) => {
+                assert_eq!(d.name, "dev");
+                assert!(d.if_exists);
+            }
+            _ => panic!("Expected DropBranch"),
+        }
+    }
+
+    #[test]
+    fn test_use_branch() {
+        let stmt = parse_one("USE BRANCH dev");
+        match stmt {
+            Statement::UseBranch(u) => {
+                assert_eq!(u.name, "dev");
+            }
+            _ => panic!("Expected UseBranch"),
+        }
+    }
+
+    #[test]
+    fn test_create_version() {
+        let stmt = parse_one("CREATE VERSION v1 ON orders AS OF VERSION 5");
+        match stmt {
+            Statement::CreateVersion(v) => {
+                assert_eq!(v.name, "v1");
+                assert_eq!(v.table, "orders");
+                assert!(v.at_version.is_some());
+            }
+            _ => panic!("Expected CreateVersion"),
+        }
+    }
+
+    #[test]
+    fn test_create_branch_simple() {
+        let stmt = parse_one("CREATE BRANCH feature_x");
+        match stmt {
+            Statement::CreateBranch(b) => {
+                assert_eq!(b.name, "feature_x");
+                assert!(b.from_branch.is_none());
+                assert!(b.at_version.is_none());
+            }
+            _ => panic!("Expected CreateBranch"),
+        }
+    }
+
+    #[test]
+    fn test_drop_branch_no_if_exists() {
+        let stmt = parse_one("DROP BRANCH dev");
+        match stmt {
+            Statement::DropBranch(d) => {
+                assert_eq!(d.name, "dev");
+                assert!(!d.if_exists);
+            }
+            _ => panic!("Expected DropBranch"),
+        }
+    }
+
+    #[test]
+    fn test_for_portion_of() {
+        let stmt = parse_one(
+            "SELECT * FROM emp FOR PORTION OF employment_period FROM '2024-01-01' TO '2024-06-01'",
+        );
+        match stmt {
+            Statement::Select(s) => match &s.from[0] {
+                TableRef::Table { as_of, .. } => match as_of.as_deref() {
+                    Some(AsOf::ForPortionOf { period, .. }) => {
+                        assert_eq!(period, "employment_period");
+                    }
+                    _ => panic!("Expected ForPortionOf"),
+                },
+                _ => panic!("Expected Table"),
+            },
+            _ => panic!("Expected SELECT"),
+        }
+    }
+
+    #[test]
+    fn test_restore_table_with_version() {
+        let stmt = parse_one("RESTORE TABLE orders FROM '/backup/orders' TO VERSION AS OF 7");
+        match stmt {
+            Statement::RestoreTable(r) => {
+                assert_eq!(r.table, "orders");
+                assert_eq!(r.source, "/backup/orders");
+                assert!(r.at_version.is_some());
+                assert!(r.at_timestamp.is_none());
+            }
+            _ => panic!("Expected RestoreTable"),
         }
     }
 }

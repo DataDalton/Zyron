@@ -40,18 +40,26 @@ impl<'a> PhysicalPlanner<'a> {
                 table_id,
                 columns,
                 encoding_hints,
+                as_of,
                 ..
-            } => self.plan_scan(table_id, columns, None, encoding_hints),
+            } => self.plan_scan(table_id, columns, None, encoding_hints, as_of),
             LogicalPlan::Filter { predicate, child } => {
                 // Try to push the filter into a scan (index scan opportunity)
                 if let LogicalPlan::Scan {
                     table_id,
                     columns,
                     encoding_hints,
+                    as_of,
                     ..
                 } = *child
                 {
-                    return self.plan_scan(table_id, columns, Some(predicate), encoding_hints);
+                    return self.plan_scan(
+                        table_id,
+                        columns,
+                        Some(predicate),
+                        encoding_hints,
+                        as_of,
+                    );
                 }
 
                 let child_plan = self.plan(*child)?;
@@ -228,6 +236,7 @@ impl<'a> PhysicalPlanner<'a> {
         columns: Vec<crate::logical::LogicalColumn>,
         predicate: Option<BoundExpr>,
         encoding_hints: Option<encoding_pushdown::EncodingHint>,
+        as_of: Option<crate::logical::AsOfTarget>,
     ) -> Result<PhysicalPlan> {
         // Get table stats
         let table_stats = self.catalog.get_stats(table_id);
@@ -255,6 +264,7 @@ impl<'a> PhysicalPlanner<'a> {
                                 remaining_predicate: remaining,
                                 scan_direction: ScanDirection::Forward,
                                 cost,
+                                as_of: as_of.clone(),
                             });
                         }
                     }
@@ -337,6 +347,7 @@ impl<'a> PhysicalPlanner<'a> {
                             columns,
                             predicate,
                             cost: encoded_cost,
+                            as_of: as_of.clone(),
                         });
                     }
                 }
@@ -348,6 +359,7 @@ impl<'a> PhysicalPlanner<'a> {
             columns,
             predicate,
             cost: seq_cost,
+            as_of,
         })
     }
 

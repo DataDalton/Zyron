@@ -23,6 +23,8 @@ pub enum PhysicalPlan {
         columns: Vec<LogicalColumn>,
         predicate: Option<BoundExpr>,
         cost: PlanCost,
+        /// Time travel target for versioned table scans.
+        as_of: Option<super::logical::AsOfTarget>,
     },
 
     /// Index-based scan for selective predicates.
@@ -35,6 +37,8 @@ pub enum PhysicalPlan {
         remaining_predicate: Option<BoundExpr>,
         scan_direction: ScanDirection,
         cost: PlanCost,
+        /// Time travel target for versioned table scans.
+        as_of: Option<super::logical::AsOfTarget>,
     },
 
     /// Filter rows by predicate.

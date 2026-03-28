@@ -42,7 +42,10 @@ pub use freespace::{
 pub use heap::{
     HeapFile, HeapFileConfig, HeapPage, HeapPageHeader, HeapPageIterator, SlotId, TupleSlot,
 };
-pub use tuple::{Tuple, TupleFlags, TupleHeader, TupleId};
+pub use tuple::{
+    Tuple, TupleFlags, TupleHeader, TupleId, TupleView, VERSIONED_TUPLE_HEADER_SIZE,
+    VersionedTupleHeader, VersionedTupleView,
+};
 pub use txn::{
     GcStats, IntentLockTable, IsolationLevel, LockTable, MvccGc, NodeLatch, Savepoint, Snapshot,
     Transaction, TransactionManager, TransactionStatus, WaitForGraph,

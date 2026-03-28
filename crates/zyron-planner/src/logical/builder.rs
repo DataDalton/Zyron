@@ -162,6 +162,7 @@ fn build_from_item(item: &BoundFromItem) -> Result<LogicalPlan> {
                 columns,
                 alias: entry.name.clone(),
                 encoding_hints: None,
+                as_of: None,
             })
         }
         BoundFromItem::Join {
@@ -348,6 +349,7 @@ fn build_update_plan(update: &BoundUpdate) -> Result<LogicalPlan> {
         columns,
         alias: update.table_entry.name.clone(),
         encoding_hints: None,
+        as_of: None,
     };
 
     // Apply WHERE filter
@@ -385,6 +387,7 @@ fn build_delete_plan(delete: &BoundDelete) -> Result<LogicalPlan> {
         columns,
         alias: delete.table_entry.name.clone(),
         encoding_hints: None,
+        as_of: None,
     };
 
     if let Some(predicate) = &delete.where_clause {

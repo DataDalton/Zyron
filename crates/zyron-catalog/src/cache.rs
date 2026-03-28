@@ -388,6 +388,10 @@ mod tests {
             }],
             constraints: vec![],
             created_at: 0,
+            versioning_enabled: false,
+            scd_type: None,
+            system_versioned: false,
+            history_table_id: None,
         }
     }
 

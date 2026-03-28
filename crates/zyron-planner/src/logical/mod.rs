@@ -28,6 +28,19 @@ pub struct LogicalColumn {
 }
 
 // ---------------------------------------------------------------------------
+// Time travel target
+// ---------------------------------------------------------------------------
+
+/// Target for time travel queries on scan nodes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AsOfTarget {
+    /// Query table at a specific version number.
+    Version(u64),
+    /// Query table at a specific timestamp (microseconds since epoch).
+    Timestamp(i64),
+}
+
+// ---------------------------------------------------------------------------
 // Logical plan
 // ---------------------------------------------------------------------------
 
@@ -42,6 +55,8 @@ pub enum LogicalPlan {
         alias: String,
         /// Encoding optimization hints set by the encoding pushdown rule.
         encoding_hints: Option<EncodingHint>,
+        /// Time travel target for versioned table scans.
+        as_of: Option<AsOfTarget>,
     },
 
     /// Predicate filter.
@@ -290,6 +305,7 @@ mod tests {
             ],
             alias: "users".to_string(),
             encoding_hints: None,
+            as_of: None,
         };
         let schema = plan.output_schema();
         assert_eq!(schema.len(), 2);
@@ -311,6 +327,7 @@ mod tests {
             }],
             alias: "t".to_string(),
             encoding_hints: None,
+            as_of: None,
         };
         let filter = LogicalPlan::Filter {
             predicate: BoundExpr::Literal {
@@ -338,6 +355,7 @@ mod tests {
             }],
             alias: "l".to_string(),
             encoding_hints: None,
+            as_of: None,
         };
         let right = LogicalPlan::Scan {
             table_id: TableId(2),
@@ -351,6 +369,7 @@ mod tests {
             }],
             alias: "r".to_string(),
             encoding_hints: None,
+            as_of: None,
         };
         let join = LogicalPlan::Join {
             left: Box::new(left),
@@ -372,6 +391,7 @@ mod tests {
             columns: vec![],
             alias: "t".to_string(),
             encoding_hints: None,
+            as_of: None,
         };
         assert_eq!(scan.children().len(), 0);
 
