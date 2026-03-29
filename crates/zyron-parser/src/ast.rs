@@ -140,6 +140,28 @@ pub enum Statement {
     AlterPublication(Box<AlterPublicationStatement>),
     /// DROP PUBLICATION name
     DropPublication(Box<DropPublicationStatement>),
+    /// CREATE TRIGGER name BEFORE/AFTER/INSTEAD OF event ON table ...
+    CreateTrigger(Box<CreateTriggerStatement>),
+    /// DROP TRIGGER [IF EXISTS] name ON table [CASCADE|RESTRICT]
+    DropTrigger(Box<DropTriggerStatement>),
+    /// CREATE [OR REPLACE] FUNCTION name(...) RETURNS type ...
+    CreateFunction(Box<CreateFunctionStatement>),
+    /// DROP FUNCTION [IF EXISTS] name [CASCADE|RESTRICT]
+    DropFunction(Box<DropFunctionStatement>),
+    /// CREATE AGGREGATE name(...) (SFUNC = ..., STYPE = ..., ...)
+    CreateAggregate(Box<CreateAggregateStatement>),
+    /// DROP AGGREGATE [IF EXISTS] name [CASCADE|RESTRICT]
+    DropAggregate(Box<DropAggregateStatement>),
+    /// CREATE [OR REPLACE] PROCEDURE name(...) AS $$ ... $$
+    CreateProcedure(Box<CreateProcedureStatement>),
+    /// DROP PROCEDURE [IF EXISTS] name [CASCADE|RESTRICT]
+    DropProcedure(Box<DropProcedureStatement>),
+    /// CALL procedure_name(args...)
+    Call(Box<CallStatement>),
+    /// CREATE EVENT HANDLER name WHEN event EXECUTE FUNCTION func
+    CreateEventHandler(Box<CreateEventHandlerStatement>),
+    /// DROP EVENT HANDLER [IF EXISTS] name
+    DropEventHandler(Box<DropEventHandlerStatement>),
 }
 
 // ---------------------------------------------------------------------------
@@ -979,6 +1001,7 @@ pub struct PipelineExpectation {
 pub struct RunPipelineStatement {
     pub name: String,
     pub stage: Option<String>,
+    pub preview_limit: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1709,6 +1732,201 @@ pub enum TableConstraint {
         ref_table: String,
         ref_columns: Vec<String>,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Triggers
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerTiming {
+    Before,
+    After,
+    InsteadOf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerEvent {
+    Insert,
+    Update,
+    Delete,
+    Truncate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerGranularity {
+    Row,
+    Statement,
+}
+
+/// REFERENCING OLD TABLE AS name NEW TABLE AS name (for statement-level triggers)
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransitionTables {
+    pub old_table: Option<String>,
+    pub new_table: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateTriggerStatement {
+    pub name: String,
+    pub timing: TriggerTiming,
+    pub events: Vec<TriggerEvent>,
+    pub table: String,
+    pub for_each: TriggerGranularity,
+    pub when_condition: Option<Box<Expr>>,
+    pub referencing: Option<TransitionTables>,
+    pub execute_function: String,
+    pub args: Vec<Expr>,
+    pub priority: Option<u32>,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropTriggerStatement {
+    pub name: String,
+    pub table: String,
+    pub if_exists: bool,
+    pub drop_behavior: Option<DropBehavior>,
+}
+
+/// CASCADE or RESTRICT behavior for DROP statements
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropBehavior {
+    Cascade,
+    Restrict,
+}
+
+// ---------------------------------------------------------------------------
+// User-defined functions
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Volatility {
+    Immutable,
+    Stable,
+    Volatile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionLanguage {
+    Sql,
+    Rust,
+    RustVectorized,
+}
+
+/// Return type for a function: scalar, table, or set of scalars
+#[derive(Debug, Clone, PartialEq)]
+pub enum FunctionReturnType {
+    Scalar(DataType),
+    Table(Vec<FunctionParam>),
+    SetOf(DataType),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionParam {
+    pub name: String,
+    pub data_type: DataType,
+    pub default_value: Option<Box<Expr>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateFunctionStatement {
+    pub name: String,
+    pub or_replace: bool,
+    pub params: Vec<FunctionParam>,
+    pub return_type: FunctionReturnType,
+    pub language: FunctionLanguage,
+    pub body: String,
+    pub volatility: Volatility,
+    pub rust_library: Option<String>,
+    pub rust_symbol: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropFunctionStatement {
+    pub name: String,
+    pub if_exists: bool,
+    pub drop_behavior: Option<DropBehavior>,
+}
+
+// ---------------------------------------------------------------------------
+// User-defined aggregates
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateAggregateStatement {
+    pub name: String,
+    pub params: Vec<FunctionParam>,
+    pub sfunc: String,
+    pub stype: DataType,
+    pub finalfunc: Option<String>,
+    pub combinefunc: Option<String>,
+    pub initcond: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropAggregateStatement {
+    pub name: String,
+    pub if_exists: bool,
+    pub drop_behavior: Option<DropBehavior>,
+}
+
+// ---------------------------------------------------------------------------
+// Stored procedures
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecurityMode {
+    Definer,
+    Invoker,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcedureLanguage {
+    Sql,
+    PlSql,
+    Rust,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateProcedureStatement {
+    pub name: String,
+    pub or_replace: bool,
+    pub params: Vec<FunctionParam>,
+    pub language: ProcedureLanguage,
+    pub body: String,
+    pub security: SecurityMode,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropProcedureStatement {
+    pub name: String,
+    pub if_exists: bool,
+    pub drop_behavior: Option<DropBehavior>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallStatement {
+    pub name: String,
+    pub args: Vec<Expr>,
+}
+
+// ---------------------------------------------------------------------------
+// Event handlers
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateEventHandlerStatement {
+    pub name: String,
+    pub event_type: String,
+    pub condition: Option<Box<Expr>>,
+    pub execute_function: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropEventHandlerStatement {
+    pub name: String,
+    pub if_exists: bool,
 }
 
 #[cfg(test)]

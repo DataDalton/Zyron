@@ -1,0 +1,23 @@
+[package]
+name = "zyron-pipeline"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+zyron-common = { path = "../zyron-common" }
+zyron-catalog = { path = "../zyron-catalog" }
+zyron-parser = { path = "../zyron-parser" }
+zyron-storage = { path = "../zyron-storage" }
+zyron-buffer = { path = "../zyron-buffer" }
+zyron-wal = { path = "../zyron-wal" }
+
+parking_lot.workspace = true
+scc.workspace = true
+hashbrown.workspace = true
+crossbeam.workspace = true
+serde.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+zyron-bench-harness = { path = "../zyron-bench-harness" }

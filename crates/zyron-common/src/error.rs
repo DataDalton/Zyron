@@ -258,6 +258,90 @@ pub enum ZyronError {
     #[error("CDC snapshot failed: {0}")]
     CdcSnapshotFailed(String),
 
+    // Pipeline errors
+    #[error("Pipeline not found: {0}")]
+    PipelineNotFound(String),
+
+    #[error("Pipeline already exists: {0}")]
+    PipelineAlreadyExists(String),
+
+    #[error("Pipeline execution failed: {0}")]
+    PipelineExecutionFailed(String),
+
+    #[error("Circular pipeline dependency: {0}")]
+    CircularPipelineDependency(String),
+
+    #[error("Pipeline SLA breach for \"{pipeline}\": {reason}")]
+    PipelineSlaBreach { pipeline: String, reason: String },
+
+    // Quality check errors
+    #[error("Quality check failed on table \"{table}\": {reason}")]
+    QualityCheckFailed { table: String, reason: String },
+
+    #[error("Quality drift detected on column \"{column}\": {reason}")]
+    QualityDriftDetected { column: String, reason: String },
+
+    // Trigger errors
+    #[error("Trigger not found: {0}")]
+    TriggerNotFound(String),
+
+    #[error("Trigger already exists: {0}")]
+    TriggerAlreadyExists(String),
+
+    #[error("Trigger execution failed: {0}")]
+    TriggerExecutionFailed(String),
+
+    #[error("Trigger cancelled operation: {0}")]
+    TriggerCancelled(String),
+
+    #[error("Trigger recursion limit reached for \"{trigger}\" at depth {depth}")]
+    TriggerRecursionLimit { trigger: String, depth: u32 },
+
+    // UDF errors
+    #[error("Function not found: {0}")]
+    FunctionNotFound(String),
+
+    #[error("Function already exists: {0}")]
+    FunctionAlreadyExists(String),
+
+    #[error("UDF execution error: {0}")]
+    UdfExecutionError(String),
+
+    #[error("Failed to load UDF library \"{library}\": {reason}")]
+    UdfLibraryLoadFailed { library: String, reason: String },
+
+    // Materialized view errors
+    #[error("Materialized view not found: {0}")]
+    MaterializedViewNotFound(String),
+
+    #[error("Materialized view already exists: {0}")]
+    MaterializedViewAlreadyExists(String),
+
+    #[error("Materialized view refresh failed: {0}")]
+    MaterializedViewRefreshFailed(String),
+
+    // Schedule errors
+    #[error("Schedule not found: {0}")]
+    ScheduleNotFound(String),
+
+    #[error("Schedule already exists: {0}")]
+    ScheduleAlreadyExists(String),
+
+    // Stored procedure errors
+    #[error("Procedure not found: {0}")]
+    ProcedureNotFound(String),
+
+    #[error("Procedure execution error: {0}")]
+    ProcedureExecutionError(String),
+
+    // Event handler errors
+    #[error("Event handler not found: {0}")]
+    EventHandlerNotFound(String),
+
+    // Dependency errors
+    #[error("Cannot drop {object}, depended on by: {dependents}")]
+    DependencyViolation { object: String, dependents: String },
+
     // Internal errors
     #[error("Internal error: {0}")]
     Internal(String),

@@ -73,6 +73,7 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Restore) => self.parse_restore_table(),
             Token::Keyword(Keyword::Analyze) => self.parse_analyze(),
             Token::Keyword(Keyword::Use) => self.parse_use_branch(),
+            Token::Keyword(Keyword::Call) => self.parse_call(),
             _ => Err(self.error(&format!(
                 "Expected a statement, found {}",
                 self.current.token
@@ -962,11 +963,19 @@ impl<'a> Parser<'a> {
             return self.parse_create_index(true);
         }
 
-        // CREATE OR REPLACE VIEW
+        // CREATE OR REPLACE VIEW/FUNCTION/PROCEDURE
         if self.at_keyword(Keyword::Or) {
             self.advance()?;
             self.expect_keyword(Keyword::Replace)?;
-            return self.parse_create_view(true);
+            return match &self.current.token {
+                Token::Keyword(Keyword::View) => self.parse_create_view(true),
+                Token::Keyword(Keyword::Function) => self.parse_create_function(true),
+                Token::Keyword(Keyword::Procedure) => self.parse_create_procedure(true),
+                _ => Err(self.error(&format!(
+                    "Expected VIEW, FUNCTION, or PROCEDURE after CREATE OR REPLACE, found {}",
+                    self.current.token
+                ))),
+            };
         }
 
         match &self.current.token {
@@ -987,8 +996,13 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Replication) => self.parse_create_replication_slot(),
             Token::Keyword(Keyword::Cdc) => self.parse_create_cdc(),
             Token::Keyword(Keyword::Publication) => self.parse_create_publication(),
+            Token::Keyword(Keyword::Trigger) => self.parse_create_trigger(),
+            Token::Keyword(Keyword::Function) => self.parse_create_function(false),
+            Token::Keyword(Keyword::Aggregate) => self.parse_create_aggregate(),
+            Token::Keyword(Keyword::Procedure) => self.parse_create_procedure(false),
+            Token::Keyword(Keyword::Event) => self.parse_create_event_handler(),
             _ => Err(self.error(&format!(
-                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, PIPELINE, FULLTEXT, VECTOR, BRANCH, VERSION, REPLICATION, CDC, or PUBLICATION after CREATE, found {}",
+                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, PIPELINE, FULLTEXT, VECTOR, BRANCH, VERSION, REPLICATION, CDC, PUBLICATION, TRIGGER, FUNCTION, AGGREGATE, PROCEDURE, or EVENT after CREATE, found {}",
                 self.current.token
             ))),
         }
@@ -1089,8 +1103,13 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Replication) => self.parse_drop_replication_slot(),
             Token::Keyword(Keyword::Cdc) => self.parse_drop_cdc(),
             Token::Keyword(Keyword::Publication) => self.parse_drop_publication(),
+            Token::Keyword(Keyword::Trigger) => self.parse_drop_trigger(),
+            Token::Keyword(Keyword::Function) => self.parse_drop_function(),
+            Token::Keyword(Keyword::Aggregate) => self.parse_drop_aggregate(),
+            Token::Keyword(Keyword::Procedure) => self.parse_drop_procedure(),
+            Token::Keyword(Keyword::Event) => self.parse_drop_event_handler(),
             _ => Err(self.error(&format!(
-                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, PIPELINE, BRANCH, REPLICATION, CDC, or PUBLICATION after DROP, found {}",
+                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, PIPELINE, BRANCH, REPLICATION, CDC, PUBLICATION, TRIGGER, FUNCTION, AGGREGATE, PROCEDURE, or EVENT after DROP, found {}",
                 self.current.token
             ))),
         }
@@ -1826,6 +1845,20 @@ impl<'a> Parser<'a> {
                 Ok(val)
             }
             _ => Err(self.error(&format!("Expected integer, found {}", self.current.token))),
+        }
+    }
+
+    fn parse_string_literal(&mut self) -> Result<String> {
+        match &self.current.token {
+            Token::String(s) => {
+                let val = s.clone();
+                self.advance()?;
+                Ok(val)
+            }
+            _ => Err(self.error(&format!(
+                "Expected string literal, found {}",
+                self.current.token
+            ))),
         }
     }
 
@@ -3924,9 +3957,16 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        let preview_limit = if self.consume_keyword(Keyword::Preview)? {
+            self.expect_keyword(Keyword::Limit)?;
+            Some(self.parse_integer_value()? as u64)
+        } else {
+            None
+        };
         Ok(Statement::RunPipeline(Box::new(RunPipelineStatement {
             name,
             stage,
+            preview_limit,
         })))
     }
 
@@ -4265,6 +4305,553 @@ impl<'a> Parser<'a> {
         let name = self.parse_ident()?;
         Ok(Statement::DropPublication(Box::new(
             DropPublicationStatement { name },
+        )))
+    }
+
+    // -----------------------------------------------------------------------
+    // Triggers
+    // -----------------------------------------------------------------------
+
+    /// CREATE TRIGGER name {BEFORE|AFTER|INSTEAD OF} {INSERT|UPDATE|DELETE|TRUNCATE} [OR ...]
+    /// ON table [REFERENCING OLD TABLE AS name NEW TABLE AS name]
+    /// FOR EACH {ROW|STATEMENT} [WHEN (condition)]
+    /// [PRIORITY n] EXECUTE FUNCTION func_name(args...)
+    fn parse_create_trigger(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Trigger)?;
+        let name = self.parse_ident()?;
+
+        // Parse timing: BEFORE | AFTER | INSTEAD OF
+        let timing = if self.consume_keyword(Keyword::Before)? {
+            TriggerTiming::Before
+        } else if self.consume_keyword(Keyword::After)? {
+            TriggerTiming::After
+        } else if self.consume_keyword(Keyword::Instead)? {
+            self.expect_keyword(Keyword::Of)?;
+            TriggerTiming::InsteadOf
+        } else {
+            return Err(self.error("Expected BEFORE, AFTER, or INSTEAD OF"));
+        };
+
+        // Parse events: INSERT [OR UPDATE [OR DELETE [OR TRUNCATE]]]
+        let mut events = vec![self.parse_trigger_event()?];
+        while self.consume_keyword(Keyword::Or)? {
+            events.push(self.parse_trigger_event()?);
+        }
+
+        self.expect_keyword(Keyword::On)?;
+        let table = self.parse_ident()?;
+
+        // Optional REFERENCING clause
+        let referencing = if self.consume_keyword(Keyword::Referencing)? {
+            let mut old_table = None;
+            let mut new_table = None;
+            // Can have OLD TABLE AS name and/or NEW TABLE AS name in any order
+            for _ in 0..2 {
+                if self.consume_keyword(Keyword::Old)? {
+                    self.expect_keyword(Keyword::Table)?;
+                    self.expect_keyword(Keyword::As)?;
+                    old_table = Some(self.parse_ident()?);
+                } else if self.consume_keyword(Keyword::New)? {
+                    self.expect_keyword(Keyword::Table)?;
+                    self.expect_keyword(Keyword::As)?;
+                    new_table = Some(self.parse_ident()?);
+                } else {
+                    break;
+                }
+            }
+            Some(TransitionTables {
+                old_table,
+                new_table,
+            })
+        } else {
+            None
+        };
+
+        // FOR EACH ROW | FOR EACH STATEMENT
+        self.expect_keyword(Keyword::For)?;
+        self.expect_keyword(Keyword::Each)?;
+        let for_each = if self.consume_keyword(Keyword::Row)? {
+            TriggerGranularity::Row
+        } else {
+            // "STATEMENT" is not a keyword, parse as ident
+            let ident = self.parse_ident()?;
+            if ident.eq_ignore_ascii_case("statement") {
+                TriggerGranularity::Statement
+            } else {
+                return Err(self.error("Expected ROW or STATEMENT after FOR EACH"));
+            }
+        };
+
+        // Optional WHEN (condition)
+        let when_condition = if self.consume_keyword(Keyword::When)? {
+            self.expect_token(&Token::LParen)?;
+            let expr = self.parse_expr()?;
+            self.expect_token(&Token::RParen)?;
+            Some(Box::new(expr))
+        } else {
+            None
+        };
+
+        // Optional PRIORITY n
+        let priority = if self.consume_keyword(Keyword::Priority)? {
+            Some(self.parse_integer_value()? as u32)
+        } else {
+            None
+        };
+
+        // EXECUTE FUNCTION func_name(args...)
+        self.expect_keyword(Keyword::Execute)?;
+        self.expect_keyword(Keyword::Function)?;
+        let execute_function = self.parse_ident()?;
+
+        let mut args = Vec::new();
+        if self.current.token == Token::LParen {
+            self.advance()?;
+            if self.current.token != Token::RParen {
+                args = self.parse_comma_separated(|p| p.parse_expr())?;
+            }
+            self.expect_token(&Token::RParen)?;
+        }
+
+        Ok(Statement::CreateTrigger(Box::new(CreateTriggerStatement {
+            name,
+            timing,
+            events,
+            table,
+            for_each,
+            when_condition,
+            referencing,
+            execute_function,
+            args,
+            priority,
+            enabled: true,
+        })))
+    }
+
+    fn parse_trigger_event(&mut self) -> Result<TriggerEvent> {
+        if self.consume_keyword(Keyword::Insert)? {
+            Ok(TriggerEvent::Insert)
+        } else if self.consume_keyword(Keyword::Update)? {
+            Ok(TriggerEvent::Update)
+        } else if self.consume_keyword(Keyword::Delete)? {
+            Ok(TriggerEvent::Delete)
+        } else if self.consume_keyword(Keyword::Truncate)? {
+            Ok(TriggerEvent::Truncate)
+        } else {
+            Err(self.error("Expected INSERT, UPDATE, DELETE, or TRUNCATE"))
+        }
+    }
+
+    /// DROP TRIGGER [IF EXISTS] name ON table [CASCADE|RESTRICT]
+    fn parse_drop_trigger(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Trigger)?;
+        let if_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_ident()?;
+        self.expect_keyword(Keyword::On)?;
+        let table = self.parse_ident()?;
+        let drop_behavior = self.parse_optional_drop_behavior()?;
+        Ok(Statement::DropTrigger(Box::new(DropTriggerStatement {
+            name,
+            table,
+            if_exists,
+            drop_behavior,
+        })))
+    }
+
+    fn parse_optional_drop_behavior(&mut self) -> Result<Option<DropBehavior>> {
+        if self.consume_keyword(Keyword::Cascade)? {
+            Ok(Some(DropBehavior::Cascade))
+        } else if self.consume_keyword(Keyword::Restrict)? {
+            Ok(Some(DropBehavior::Restrict))
+        } else {
+            Ok(None)
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // User-defined functions
+    // -----------------------------------------------------------------------
+
+    /// CREATE [OR REPLACE] FUNCTION name(params) RETURNS type
+    /// AS $$ body $$ LANGUAGE {SQL|RUST|RUST_VECTORIZED} [IMMUTABLE|STABLE|VOLATILE]
+    /// [LIBRARY 'path' SYMBOL 'name']
+    fn parse_create_function(&mut self, or_replace: bool) -> Result<Statement> {
+        self.expect_keyword(Keyword::Function)?;
+        let name = self.parse_ident()?;
+
+        // Parse parameters
+        self.expect_token(&Token::LParen)?;
+        let params = if self.current.token == Token::RParen {
+            Vec::new()
+        } else {
+            self.parse_comma_separated(|p| p.parse_function_param())?
+        };
+        self.expect_token(&Token::RParen)?;
+
+        // RETURNS type | RETURNS TABLE(col type, ...) | RETURNS SETOF type
+        self.expect_keyword(Keyword::Returns)?;
+        let return_type = if self.consume_keyword(Keyword::Table)? {
+            self.expect_token(&Token::LParen)?;
+            let cols = self.parse_comma_separated(|p| p.parse_function_param())?;
+            self.expect_token(&Token::RParen)?;
+            FunctionReturnType::Table(cols)
+        } else if self.consume_keyword(Keyword::Setof)? {
+            FunctionReturnType::SetOf(self.parse_data_type()?)
+        } else {
+            FunctionReturnType::Scalar(self.parse_data_type()?)
+        };
+
+        // AS $$ body $$
+        self.expect_keyword(Keyword::As)?;
+        let body = self.parse_dollar_quoted_string()?;
+
+        // LANGUAGE {SQL|RUST|RUST_VECTORIZED}
+        self.expect_keyword(Keyword::Language)?;
+        let language = if self.consume_keyword(Keyword::Sql)? {
+            FunctionLanguage::Sql
+        } else if self.consume_keyword(Keyword::RustVectorized)? {
+            FunctionLanguage::RustVectorized
+        } else if self.consume_keyword(Keyword::Rust)? {
+            FunctionLanguage::Rust
+        } else {
+            return Err(self.error("Expected SQL, RUST, or RUST_VECTORIZED"));
+        };
+
+        // Optional volatility: IMMUTABLE | STABLE | VOLATILE
+        let volatility = if self.consume_keyword(Keyword::Immutable)? {
+            Volatility::Immutable
+        } else if self.consume_keyword(Keyword::Stable)? {
+            Volatility::Stable
+        } else if self.consume_keyword(Keyword::Volatile)? {
+            Volatility::Volatile
+        } else {
+            Volatility::Volatile // default
+        };
+
+        // Optional LIBRARY 'path' SYMBOL 'symbol'
+        let mut rust_library = None;
+        let mut rust_symbol = None;
+        if self.at_ident_eq("library") {
+            self.advance()?;
+            rust_library = Some(self.parse_string_literal()?);
+            self.expect_keyword(Keyword::Symbol)?;
+            rust_symbol = Some(self.parse_string_literal()?);
+        }
+
+        Ok(Statement::CreateFunction(Box::new(
+            CreateFunctionStatement {
+                name,
+                or_replace,
+                params,
+                return_type,
+                language,
+                body,
+                volatility,
+                rust_library,
+                rust_symbol,
+            },
+        )))
+    }
+
+    fn parse_function_param(&mut self) -> Result<FunctionParam> {
+        let name = self.parse_ident()?;
+        let data_type = self.parse_data_type()?;
+        let default_value = if self.consume_keyword(Keyword::Default)? {
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        Ok(FunctionParam {
+            name,
+            data_type,
+            default_value,
+        })
+    }
+
+    /// Parse a dollar-quoted string: $$ ... $$ or $tag$ ... $tag$
+    fn parse_dollar_quoted_string(&mut self) -> Result<String> {
+        // Expect current token to be a dollar-quoted string or a string literal
+        match &self.current.token {
+            Token::String(s) => {
+                let body = s.clone();
+                self.advance()?;
+                Ok(body)
+            }
+            _ => {
+                // Try to consume $$ delimited content from raw token stream
+                // For simplicity, also accept a regular string literal
+                Err(self.error(
+                    "Expected a dollar-quoted string ($$...$$) or string literal for function body",
+                ))
+            }
+        }
+    }
+
+    fn at_ident_eq(&self, expected: &str) -> bool {
+        match &self.current.token {
+            Token::Ident(s) => s.eq_ignore_ascii_case(expected),
+            Token::Keyword(kw) => {
+                keyword_to_ident_str(*kw).map_or(false, |s| s.eq_ignore_ascii_case(expected))
+            }
+            _ => false,
+        }
+    }
+
+    /// DROP FUNCTION [IF EXISTS] name [CASCADE|RESTRICT]
+    fn parse_drop_function(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Function)?;
+        let if_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_ident()?;
+        let drop_behavior = self.parse_optional_drop_behavior()?;
+        Ok(Statement::DropFunction(Box::new(DropFunctionStatement {
+            name,
+            if_exists,
+            drop_behavior,
+        })))
+    }
+
+    // -----------------------------------------------------------------------
+    // User-defined aggregates
+    // -----------------------------------------------------------------------
+
+    /// CREATE AGGREGATE name(params) (
+    ///   SFUNC = sfunc_name,
+    ///   STYPE = state_type
+    ///   [, FINALFUNC = finalfunc_name]
+    ///   [, COMBINEFUNC = combinefunc_name]
+    ///   [, INITCOND = 'initial_value']
+    /// )
+    fn parse_create_aggregate(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Aggregate)?;
+        let name = self.parse_ident()?;
+
+        // Parse input parameters
+        self.expect_token(&Token::LParen)?;
+        let params = if self.current.token == Token::RParen {
+            Vec::new()
+        } else {
+            self.parse_comma_separated(|p| p.parse_function_param())?
+        };
+        self.expect_token(&Token::RParen)?;
+
+        // Parse aggregate options in parentheses
+        self.expect_token(&Token::LParen)?;
+
+        let mut sfunc = None;
+        let mut stype = None;
+        let mut finalfunc = None;
+        let mut combinefunc = None;
+        let mut initcond = None;
+
+        loop {
+            if self.consume_keyword(Keyword::Sfunc)? {
+                self.expect_token(&Token::Eq)?;
+                sfunc = Some(self.parse_ident()?);
+            } else if self.consume_keyword(Keyword::Stype)? {
+                self.expect_token(&Token::Eq)?;
+                stype = Some(self.parse_data_type()?);
+            } else if self.consume_keyword(Keyword::Finalfunc)? {
+                self.expect_token(&Token::Eq)?;
+                finalfunc = Some(self.parse_ident()?);
+            } else if self.consume_keyword(Keyword::Combinefunc)? {
+                self.expect_token(&Token::Eq)?;
+                combinefunc = Some(self.parse_ident()?);
+            } else if self.consume_keyword(Keyword::Initcond)? {
+                self.expect_token(&Token::Eq)?;
+                initcond = Some(self.parse_string_literal()?);
+            } else {
+                break;
+            }
+            // Consume optional comma between options
+            if self.current.token == Token::Comma {
+                self.advance()?;
+            }
+        }
+        self.expect_token(&Token::RParen)?;
+
+        let sfunc = sfunc.ok_or_else(|| self.error("SFUNC is required in CREATE AGGREGATE"))?;
+        let stype = stype.ok_or_else(|| self.error("STYPE is required in CREATE AGGREGATE"))?;
+
+        Ok(Statement::CreateAggregate(Box::new(
+            CreateAggregateStatement {
+                name,
+                params,
+                sfunc,
+                stype,
+                finalfunc,
+                combinefunc,
+                initcond,
+            },
+        )))
+    }
+
+    /// DROP AGGREGATE [IF EXISTS] name [CASCADE|RESTRICT]
+    fn parse_drop_aggregate(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Aggregate)?;
+        let if_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_ident()?;
+        let drop_behavior = self.parse_optional_drop_behavior()?;
+        Ok(Statement::DropAggregate(Box::new(DropAggregateStatement {
+            name,
+            if_exists,
+            drop_behavior,
+        })))
+    }
+
+    // -----------------------------------------------------------------------
+    // Stored procedures
+    // -----------------------------------------------------------------------
+
+    /// CREATE [OR REPLACE] PROCEDURE name(params)
+    /// AS $$ body $$ LANGUAGE {SQL|PLSQL|RUST}
+    /// [SECURITY {DEFINER|INVOKER}]
+    fn parse_create_procedure(&mut self, or_replace: bool) -> Result<Statement> {
+        self.expect_keyword(Keyword::Procedure)?;
+        let name = self.parse_ident()?;
+
+        // Parse parameters
+        self.expect_token(&Token::LParen)?;
+        let params = if self.current.token == Token::RParen {
+            Vec::new()
+        } else {
+            self.parse_comma_separated(|p| p.parse_function_param())?
+        };
+        self.expect_token(&Token::RParen)?;
+
+        // AS $$ body $$
+        self.expect_keyword(Keyword::As)?;
+        let body = self.parse_dollar_quoted_string()?;
+
+        // LANGUAGE {SQL|PLSQL|RUST}
+        self.expect_keyword(Keyword::Language)?;
+        let language = if self.consume_keyword(Keyword::Sql)? {
+            ProcedureLanguage::Sql
+        } else if self.consume_keyword(Keyword::Plsql)? {
+            ProcedureLanguage::PlSql
+        } else if self.consume_keyword(Keyword::Rust)? {
+            ProcedureLanguage::Rust
+        } else {
+            return Err(self.error("Expected SQL, PLSQL, or RUST"));
+        };
+
+        // Optional SECURITY {DEFINER|INVOKER}
+        let security = if self.consume_keyword(Keyword::Security)? {
+            if self.consume_keyword(Keyword::Definer)? {
+                SecurityMode::Definer
+            } else if self.consume_keyword(Keyword::Invoker)? {
+                SecurityMode::Invoker
+            } else {
+                return Err(self.error("Expected DEFINER or INVOKER after SECURITY"));
+            }
+        } else {
+            SecurityMode::Invoker // default
+        };
+
+        Ok(Statement::CreateProcedure(Box::new(
+            CreateProcedureStatement {
+                name,
+                or_replace,
+                params,
+                language,
+                body,
+                security,
+            },
+        )))
+    }
+
+    /// DROP PROCEDURE [IF EXISTS] name [CASCADE|RESTRICT]
+    fn parse_drop_procedure(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Procedure)?;
+        let if_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_ident()?;
+        let drop_behavior = self.parse_optional_drop_behavior()?;
+        Ok(Statement::DropProcedure(Box::new(DropProcedureStatement {
+            name,
+            if_exists,
+            drop_behavior,
+        })))
+    }
+
+    /// CALL procedure_name(args...)
+    fn parse_call(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Call)?;
+        let name = self.parse_ident()?;
+        self.expect_token(&Token::LParen)?;
+        let args = if self.current.token == Token::RParen {
+            Vec::new()
+        } else {
+            self.parse_comma_separated(|p| p.parse_expr())?
+        };
+        self.expect_token(&Token::RParen)?;
+        Ok(Statement::Call(Box::new(CallStatement { name, args })))
+    }
+
+    // -----------------------------------------------------------------------
+    // Event handlers
+    // -----------------------------------------------------------------------
+
+    /// CREATE EVENT HANDLER name WHEN event_type EXECUTE FUNCTION func_name
+    fn parse_create_event_handler(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Event)?;
+        self.expect_keyword(Keyword::Handler)?;
+        let name = self.parse_ident()?;
+
+        self.expect_keyword(Keyword::When)?;
+        let event_type = self.parse_ident()?;
+
+        let condition = if self.consume_keyword(Keyword::And)? {
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+
+        self.expect_keyword(Keyword::Execute)?;
+        self.expect_keyword(Keyword::Function)?;
+        let execute_function = self.parse_ident()?;
+
+        Ok(Statement::CreateEventHandler(Box::new(
+            CreateEventHandlerStatement {
+                name,
+                event_type,
+                condition,
+                execute_function,
+            },
+        )))
+    }
+
+    /// DROP EVENT HANDLER [IF EXISTS] name
+    fn parse_drop_event_handler(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Event)?;
+        self.expect_keyword(Keyword::Handler)?;
+        let if_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_ident()?;
+        Ok(Statement::DropEventHandler(Box::new(
+            DropEventHandlerStatement { name, if_exists },
         )))
     }
 
@@ -4635,6 +5222,41 @@ fn keyword_to_ident_str(kw: Keyword) -> Option<&'static str> {
         Keyword::Portion => Some("portion"),
         Keyword::Use => Some("use"),
         Keyword::At => Some("at"),
+        // Triggers, UDFs, procedures, aggregates
+        Keyword::Trigger => Some("trigger"),
+        Keyword::Before => Some("before"),
+        Keyword::After => Some("after"),
+        Keyword::Instead => Some("instead"),
+        Keyword::Each => Some("each"),
+        Keyword::Referencing => Some("referencing"),
+        Keyword::Old => Some("old"),
+        Keyword::New => Some("new"),
+        Keyword::Priority => Some("priority"),
+        Keyword::Function => Some("function"),
+        Keyword::Returns => Some("returns"),
+        Keyword::Immutable => Some("immutable"),
+        Keyword::Volatile => Some("volatile"),
+        Keyword::Stable => Some("stable"),
+        Keyword::Setof => Some("setof"),
+        Keyword::Procedure => Some("procedure"),
+        Keyword::Call => Some("call"),
+        Keyword::Aggregate => Some("aggregate"),
+        Keyword::Sfunc => Some("sfunc"),
+        Keyword::Stype => Some("stype"),
+        Keyword::Finalfunc => Some("finalfunc"),
+        Keyword::Combinefunc => Some("combinefunc"),
+        Keyword::Initcond => Some("initcond"),
+        Keyword::Definer => Some("definer"),
+        Keyword::Security => Some("security"),
+        Keyword::Invoker => Some("invoker"),
+        Keyword::Handler => Some("handler"),
+        Keyword::Event => Some("event"),
+        Keyword::Preview => Some("preview"),
+        Keyword::Plsql => Some("plsql"),
+        Keyword::Sql => Some("sql"),
+        Keyword::Symbol => Some("symbol"),
+        Keyword::Rust => Some("rust"),
+        Keyword::RustVectorized => Some("rust_vectorized"),
         _ => None,
     }
 }

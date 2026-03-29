@@ -1,0 +1,288 @@
+
+=== AFTER Trigger ===
+  AFTER INSERT|UPDATE|DELETE on orders
+  INSERT context: new row only
+  UPDATE context: old + new rows
+  PASS
+
+=== BEFORE Trigger ===
+  BEFORE INSERT: set_updated(1000), reject_neg(500, WHEN new.total<0)
+  Priority order: reject_neg fires first
+  PASS
+
+=== Stored Procedure ===
+  batch_process(batch_size INT) SECURITY INVOKER
+  admin_cleanup() SECURITY DEFINER
+  PASS
+
+=== Benchmark: BEFORE Trigger Per Row ===
+  Run 1: 49.1 ns/row
+  Run 2: 48.5 ns/row
+  Run 3: 49.5 ns/row
+  Run 4: 48.7 ns/row
+  Run 5: 49.2 ns/row
+  Latency (ns/row) [PASS/OK]:
+    Runs: [49, 49, 49, 49, 49]
+    Average: 49 <= 300 (target)
+    Min/Max: 49 / 49, StdDev: 0
+
+=== Benchmark: Cron Parse + Match ===
+  Run 1: 0.0002 ms/parse+match
+  Run 2: 0.0002 ms/parse+match
+  Run 3: 0.0002 ms/parse+match
+  Run 4: 0.0002 ms/parse+match
+  Run 5: 0.0002 ms/parse+match
+  Jitter (ms/parse+match) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 20 (target)
+    Min/Max: 0 / 0, StdDev: 0
+
+=== Benchmark: Event Dispatch Latency ===
+  Run 1: 0.028 us/dispatch
+  Run 2: 0.028 us/dispatch
+  Run 3: 0.028 us/dispatch
+  Run 4: 0.028 us/dispatch
+  Run 5: 0.091 us/dispatch
+  Latency (us/dispatch) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 3 (target)
+    Min/Max: 0 / 0, StdDev: 0
+
+=== Materialized View Lifecycle ===
+  MV CRUD, staleness detection, auto-refresh trigger
+  Incremental agg: COUNT, SUM, AVG, MIN/MAX delta maintenance
+  Min boundary delete flags recompute
+  PASS
+
+=== MV Auto-Advisor ===
+  20 executions at 5ms: advisor recommends MV
+  GROUP BY detected -> incremental refresh
+  Estimated savings: 100 ms/hour
+  PASS
+
+=== Pipeline Full Refresh ===
+  Pipeline with FULL mode created
+  Full executor returns no watermark (complete rebuild)
+  PASS
+
+=== Quality Quarantine Mode ===
+  10/1000 rows quarantined (1.0% failure rate)
+  Quarantine mode does not abort pipeline
+  PASS
+
+=== Trigger Recursion Depth Limit ===
+  MAX_TRIGGER_DEPTH = 16
+  PASS
+
+=== Benchmark: Quality Check Overhead (1M rows) ===
+  Run 1: 0.00% overhead (base=0.2ms, checked=0.2ms)
+  Run 2: 0.00% overhead (base=0.2ms, checked=0.2ms)
+  Run 3: 0.06% overhead (base=0.2ms, checked=0.2ms)
+  Run 4: 0.00% overhead (base=0.2ms, checked=0.2ms)
+  Run 5: 2.48% overhead (base=0.2ms, checked=0.2ms)
+  Overhead (%) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 2]
+    Average: 1 <= 5 (target)
+    Min/Max: 0 / 2, StdDev: 1
+
+=== Benchmark: SQL UDF Inlined Call ===
+  Measures inlined expression evaluation cost (no registry lookup).
+  Inlining substitutes the function body into the expression tree at plan time.
+  Run 1: 0.69 ns/call
+  Run 2: 0.69 ns/call
+  Run 3: 0.68 ns/call
+  Run 4: 0.67 ns/call
+  Run 5: 0.68 ns/call
+  Latency (ns/call) [PASS/OK]:
+    Runs: [1, 1, 1, 1, 1]
+    Average: 1 <= 8 (target)
+    Min/Max: 1 / 1, StdDev: 0
+
+=== Benchmark: Stored Procedure Call ===
+  Run 1: 0.044 us/call
+  Run 2: 0.042 us/call
+  Run 3: 0.043 us/call
+  Run 4: 0.042 us/call
+  Run 5: 0.043 us/call
+  Latency (us/call) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 200 (target)
+    Min/Max: 0 / 0, StdDev: 0
+
+=== Benchmark: Trigger Dispatch (No Triggers) ===
+  Run 1: 7.33 ns/check
+  Run 2: 7.35 ns/check
+  Run 3: 7.35 ns/check
+  Run 4: 7.40 ns/check
+  Run 5: 7.36 ns/check
+  Latency (ns/check) [PASS/OK]:
+    Runs: [7, 7, 7, 7, 7]
+    Average: 7 <= 15 (target)
+    Min/Max: 7 / 7, StdDev: 0
+
+=== Benchmark: Watermark Resolution ===
+  Run 1: 0.079 us/lookup
+  Run 2: 0.079 us/lookup
+  Run 3: 0.076 us/lookup
+  Run 4: 0.076 us/lookup
+  Run 5: 0.080 us/lookup
+  Latency (us/lookup) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 500 (target)
+    Min/Max: 0 / 0, StdDev: 0
+
+=== Data Lineage ===
+  orders.total -[Aggregated]-> order_stats.sum_total -[Direct]-> gold_metrics.revenue
+  Forward/backward trace works
+  Impact analysis: changing orders.total affects 2 downstream nodes
+  PASS
+
+=== Event Handler ===
+  Handler registered for TableCreated
+  Dispatch non-blocking (async channel)
+  No handlers for unregistered event types
+  PASS
+
+=== Hot-Swap Rust UDF ===
+  Rust UDF hot-swapped v1 -> v2 atomically
+  SQL UDF hot-swap correctly rejected
+  PASS
+
+=== Benchmark: Full Refresh Throughput (1M rows) ===
+  Run 1: 5714285714 rows/sec
+  Run 2: 5899705015 rows/sec
+  Run 3: 5636978579 rows/sec
+  Run 4: 5437737901 rows/sec
+  Run 5: 5899705015 rows/sec
+  Throughput (rows/sec) [PASS/OK]:
+    Runs: [5,714,285,714, 5,899,705,015, 5,636,978,579, 5,437,737,901, 5,899,705,015]
+    Average: 5,717,682,445 >= 1,500,000 (target)
+    Min/Max: 5,437,737,901 / 5,899,705,015, StdDev: 173,872,385
+
+=== Benchmark: Incremental Refresh (10K rows) ===
+  Run 1: 0.002 ms
+  Run 2: 0.002 ms
+  Run 3: 0.002 ms
+  Run 4: 0.002 ms
+  Run 5: 0.002 ms
+  Latency (ms/10K rows) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 150 (target)
+    Min/Max: 0 / 0, StdDev: 0
+
+=== Benchmark: Merge Refresh (10K changes) ===
+  Run 1: 0.002 ms
+  Run 2: 0.002 ms
+  Run 3: 0.002 ms
+  Run 4: 0.002 ms
+  Run 5: 0.002 ms
+  Latency (ms/10K changes) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 300 (target)
+    Min/Max: 0 / 0, StdDev: 0
+
+=== Pipeline Incremental Refresh ===
+  First run without watermark: full scan fallback
+  Watermark advanced after first run
+  Second run with watermark: delta only
+  PASS
+
+=== Pipeline Merge Refresh ===
+  Merge executor: key-match insert/update/delete
+  Watermark preserved through merge
+  PASS
+
+=== Pipeline DAG and Dependencies ===
+  Circular dependency rejected: a, b, c
+  Linear chain: pa -> mid -> pb verified
+  Circular dependency correctly rejected
+  Diamond DAG accepted, topological order correct
+  RESTRICT prevents drop with dependents
+  CASCADE returns dependent objects to drop
+  PASS
+
+=== Pipeline Scheduling ===
+  Schedule: 0 * * * * (every hour at :00)
+  Cron: */5 9-17 * * 1-5 (every 5min, business hours, weekdays)
+  Pause/resume toggles active state
+  Scheduler thread starts and stops cleanly
+  PASS
+
+=== Pipeline SLA Monitoring ===
+  Within SLA (3s/30s): no breach
+  Exceeded duration (8s > 5s): breach with reason
+  PASS
+
+=== Quality Drift Detection ===
+  PSI = 0.8789, severity = Critical
+  Shifted distribution detected (PSI > 0.10)
+  Stable distribution: no false positive
+  PASS
+
+=== Quality Checks and Abort Logic ===
+  NOT_NULL, RANGE(0-150), UNIQUE checks
+  All pass -> pipeline proceeds
+  Fatal+Abort -> pipeline rolls back
+  Warn+Continue -> pipeline completes with warnings
+  PASS
+
+=== Benchmark: AFTER Trigger Per Row ===
+  Run 1: 51.2 ns/row
+  Run 2: 52.2 ns/row
+  Run 3: 50.7 ns/row
+  Run 4: 50.7 ns/row
+  Run 5: 51.1 ns/row
+  Latency (ns/row) [PASS/OK]:
+    Runs: [51, 52, 51, 51, 51]
+    Average: 51 <= 800 (target)
+    Min/Max: 51 / 52, StdDev: 1
+
+=== User-Defined Aggregate ===
+  geometric_mean: sfunc + finalfunc + combinefunc
+  combinefunc enables parallel aggregation
+  PASS
+
+=== UDF Overloading and Inlining ===
+  calc(FLOAT64, FLOAT64) IMMUTABLE -> inlinable
+  calc(INT32) VOLATILE -> not inlinable
+  Overload resolution by param types
+  PASS
+
+=== Trigger Trace ===
+  SET trigger_trace = on
+  Trace captures name, table, timing, event, duration, result
+  PASS
+
+=== Trigger Priority Order ===
+  Priorities: high(100), med(1000), low(3000)
+  Fire order verified: high, med, low
+  PASS
+
+=== Benchmark: Pipeline Create + Trigger ===
+  Run 1: 0.001 ms/pipeline
+  Run 2: 0.001 ms/pipeline
+  Run 3: 0.001 ms/pipeline
+  Run 4: 0.001 ms/pipeline
+  Run 5: 0.001 ms/pipeline
+  Latency (ms/pipeline) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 100 (target)
+    Min/Max: 0 / 0, StdDev: 0
+
+=== SQL UDF Lifecycle ===
+  discount_price(DECIMAL, DECIMAL) -> DECIMAL IMMUTABLE
+  Resolved by name + param types
+  isImmutableSql = true (inlinable at plan time)
+  DROP removes from registry
+  PASS
+
+=== Benchmark: MV Aggregate Maintenance (10K deltas) ===
+  Run 1: 0.000 ms for 10000 deltas
+  Run 2: 0.000 ms for 10000 deltas
+  Run 3: 0.000 ms for 10000 deltas
+  Run 4: 0.000 ms for 10000 deltas
+  Run 5: 0.000 ms for 10000 deltas
+  Latency (ms/10K deltas) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 5 (target)
+    Min/Max: 0 / 0, StdDev: 0
