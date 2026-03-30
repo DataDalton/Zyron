@@ -342,6 +342,22 @@ pub enum ZyronError {
     #[error("Cannot drop {object}, depended on by: {dependents}")]
     DependencyViolation { object: String, dependents: String },
 
+    // Streaming errors
+    #[error("Streaming error: {0}")]
+    StreamingError(String),
+
+    #[error("Streaming checkpoint error: {0}")]
+    CheckpointError(String),
+
+    #[error("Backpressure error: {0}")]
+    BackpressureError(String),
+
+    #[error("Streaming job not found: {0}")]
+    StreamingJobNotFound(String),
+
+    #[error("Streaming job already exists: {0}")]
+    StreamingJobAlreadyExists(String),
+
     // Internal errors
     #[error("Internal error: {0}")]
     Internal(String),
@@ -562,6 +578,30 @@ mod tests {
 
         let err = ZyronError::CdcSnapshotFailed("table not found".to_string());
         assert_eq!(err.to_string(), "CDC snapshot failed: table not found");
+    }
+
+    #[test]
+    fn test_streaming_errors_display() {
+        let err = ZyronError::StreamingError("window assignment failed".to_string());
+        assert_eq!(err.to_string(), "Streaming error: window assignment failed");
+
+        let err = ZyronError::CheckpointError("barrier timeout".to_string());
+        assert_eq!(
+            err.to_string(),
+            "Streaming checkpoint error: barrier timeout"
+        );
+
+        let err = ZyronError::BackpressureError("queue overflow".to_string());
+        assert_eq!(err.to_string(), "Backpressure error: queue overflow");
+
+        let err = ZyronError::StreamingJobNotFound("click_analytics".to_string());
+        assert_eq!(err.to_string(), "Streaming job not found: click_analytics");
+
+        let err = ZyronError::StreamingJobAlreadyExists("click_analytics".to_string());
+        assert_eq!(
+            err.to_string(),
+            "Streaming job already exists: click_analytics"
+        );
     }
 
     #[test]

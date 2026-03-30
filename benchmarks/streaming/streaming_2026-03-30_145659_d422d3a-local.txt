@@ -1,0 +1,118 @@
+
+=== Benchmark: Backpressure Monitor ===
+  Backpressure: ratio checks correct, load shedding operational
+  Total time (ms) [PASS/OK]:
+    Runs: [1, 1, 1, 1, 1]
+    Average: 1 <= 500 (target)
+    Min/Max: 1 / 1, StdDev: 0
+
+=== Benchmark: Checkpoint and Recovery ===
+  Populated state backend with 100000 entries (100 bytes each)
+  Snapshot time (s) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 5 (target)
+    Min/Max: 0 / 0, StdDev: 0
+  Restore time (s) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 10 (target)
+    Min/Max: 0 / 0, StdDev: 0
+
+=== E2E: Exactly Once Processing ===
+  Produced 3 output rows from 3 windows
+  Checkpoint: 0 state entries
+  Recovery replay: 3 rows (matches original)
+  Windows processed [PASS]: 3 >= 3 (target)
+
+=== Correctness: Lookup Join ===
+  Lookup join: enrichment, caching, and TTL expiry verified
+
+=== Late Data: SideOutput Policy ===
+  SideOutput policy: 2 on-time passed, 2 late routed to side output
+  Side output records [PASS]: 2 >= 2 (target)
+
+=== Benchmark: Session Window Throughput ===
+  Events/sec [PASS/OK]:
+    Runs: [187,888,695, 190,501,591, 191,990,170, 188,914,497, 191,314,329]
+    Average: 190,121,856 >= 2,000,000 (target)
+    Min/Max: 187,888,695 / 191,990,170, StdDev: 1,516,675
+
+=== Benchmark: Lookup Join (Cached) ===
+  Events/sec [PASS/OK]:
+    Runs: [100,472,219, 105,909,765, 105,425,180, 106,906,136, 106,705,365]
+    Average: 105,083,733 >= 5,000,000 (target)
+    Min/Max: 100,472,219 / 106,906,136, StdDev: 2,367,100
+
+=== State Backend: HeapStateBackend + DiskStateBackend ===
+  HeapState: inserted 1000 entries
+  HeapState: verified 1000 reads
+  HeapState: 100 updates, 50 deletes, count = 950
+  HeapState: snapshot/clear/restore verified
+  DiskState: inserted and verified 500 entries
+  DiskState: snapshot/clear/restore verified
+  DiskState: delete and prefix scan verified
+  Total entries verified [PASS]: 1,950 >= 1,950 (target)
+
+=== Operator Chain: Filter -> Project -> KeyBy ===
+  Operator 1: 0 state entries
+  Operator 2: 0 state entries
+  Operator 3: 0 state entries
+  Chain: 200 in, 150 after filter, 1 column after project, keys set
+  Output rows [PASS]: 150 >= 150 (target)
+
+=== Correctness: Operator Checkpoint and Recovery ===
+  Checkpoint/recovery: 5 windows, identical SUM values after restore
+
+=== Correctness: Session Window ===
+  Session merger: 2 sessions, ranges [0, 2.4M) and [3.6M, 5.7M) verified
+
+=== Late Data: Update Policy ===
+  Update policy: all records returned, late count tracked
+  Records returned [PASS]: 5 >= 5 (target)
+
+=== Correctness: Sliding Window ===
+  Sliding window: 10 output rows, overlapping sums verified
+
+=== Benchmark: Sliding Window Throughput ===
+  Events/sec [PASS/OK]:
+    Runs: [42,404,145, 43,784,371, 43,938,276, 43,937,310, 43,293,604]
+    Average: 43,471,541 >= 3,000,000 (target)
+    Min/Max: 42,404,145 / 43,938,276, StdDev: 583,719
+
+=== Late Data: Drop Policy ===
+  Drop policy: 3 dropped, 2 passed, counter incremented
+  On-time records [PASS]: 2 >= 2 (target)
+
+=== Stream Join Latency Breakdown ===
+  Left insert (no probe):  16.8M/sec (3.0ms for 50000)
+  Right probe+insert:      13.3M/sec (3.8ms for 50000)
+  Hash only:               1506.0M/sec (0.0ms for 50000)
+  Map lookup only:         395.9M/sec (0.1ms for 50000, found=50000)
+  Record clone only:       560.5M/sec (0.1ms for 50000)
+  Combined rate:           14.9M/sec
+
+=== Benchmark: Stream-Stream Join ===
+  Events/sec [PASS/OK]:
+    Runs: [14,806,699, 15,916,217, 15,566,867, 15,322,853, 15,270,206]
+    Average: 15,376,568 >= 1,000,000 (target)
+    Min/Max: 14,806,699 / 15,916,217, StdDev: 365,071
+
+=== Correctness: Stream-Stream Join ===
+  Stream-stream join: match, no-match, eviction, and re-match verified
+
+=== Correctness: Tumbling Window ===
+  10 tumbling windows verified with correct SUM values
+
+=== Benchmark: Tumbling Window Throughput ===
+  Events/sec [PASS/OK]:
+    Runs: [51,963,979, 52,530,527, 52,201,875, 52,642,384, 52,165,793]
+    Average: 52,300,912 >= 8,000,000 (target)
+    Min/Max: 51,963,979 / 52,642,384, StdDev: 249,366
+
+=== Correctness: Watermark ===
+  BoundedOutOfOrder watermark: 5 events, monotonic advance verified
+
+=== Benchmark: Watermark Propagation ===
+  Total time (ms) [PASS/OK]:
+    Runs: [1, 1, 1, 1, 1]
+    Average: 1 <= 20 (target)
+    Min/Max: 1 / 1, StdDev: 0

@@ -1,0 +1,18 @@
+[package]
+name = "zyron-streaming"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+zyron-common = { path = "../zyron-common" }
+parking_lot = { workspace = true }
+scc = { workspace = true }
+crossbeam = { workspace = true }
+hashbrown = { workspace = true }
+xxhash-rust = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+zyron-bench-harness = { path = "../zyron-bench-harness" }
