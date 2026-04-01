@@ -1,7 +1,7 @@
 //! COPY protocol handler for bulk data transfer.
 //!
 //! Implements COPY TO (server to client) and COPY FROM (client to server)
-//! with text and CSV formats. Binary format support is deferred.
+//! with text, CSV, and PostgreSQL binary formats.
 
 use bytes::BytesMut;
 
@@ -36,7 +36,7 @@ impl CopyOutHandler {
         let (delimiter, null_string) = match format {
             CopyFormat::Text => (b'\t', b"\\N".to_vec()),
             CopyFormat::Csv => (b',', b"".to_vec()),
-            CopyFormat::Binary => (b'\t', b"\\N".to_vec()), // placeholder
+            CopyFormat::Binary => (b'\0', b"".to_vec()),
         };
         Self {
             columns,
@@ -60,13 +60,15 @@ impl CopyOutHandler {
     }
 
     /// Converts a DataBatch to CopyData messages.
-    /// Reuses a single BytesMut buffer across rows and writes scalars directly
-    /// to avoid per-cell and per-row heap allocations.
+    /// For text/CSV: reuses a single BytesMut buffer, writes scalars with escaping.
+    /// For binary: PostgreSQL binary COPY format (header + rows + trailer).
     pub fn format_batch(&self, batch: &DataBatch) -> Vec<BackendMessage> {
+        if self.format == CopyFormat::Binary {
+            return self.format_batch_binary(batch);
+        }
+
         let mut messages = Vec::with_capacity(batch.num_rows);
-        // Reuse a single line buffer across rows.
         let mut line = BytesMut::with_capacity(256);
-        // Scratch buffer for scalar text output (used for escaping).
         let mut scalar_buf = BytesMut::with_capacity(64);
 
         for row in 0..batch.num_rows {
@@ -79,7 +81,6 @@ impl CopyOutHandler {
 
                 let scalar = column.get_scalar(row);
 
-                // Write scalar into scratch buffer, then escape into line.
                 scalar_buf.clear();
                 if !types::scalar_write_text(&scalar, &mut scalar_buf) {
                     line.extend_from_slice(&self.null_string);
@@ -95,6 +96,44 @@ impl CopyOutHandler {
         }
 
         messages
+    }
+
+    /// Formats a batch in PostgreSQL binary COPY format.
+    /// Format: header (19 bytes), then per row: i16 field count + per field (i32 length + data).
+    /// Trailer: i16 -1 as field count sentinel.
+    fn format_batch_binary(&self, batch: &DataBatch) -> Vec<BackendMessage> {
+        let mut buf = Vec::with_capacity(batch.num_rows * self.columns.len() * 16 + 32);
+
+        // Binary COPY header: signature + flags + header extension length
+        buf.extend_from_slice(b"PGCOPY\n\xff\r\n\x00"); // 11-byte signature
+        buf.extend_from_slice(&0u32.to_be_bytes()); // flags (no OIDs)
+        buf.extend_from_slice(&0u32.to_be_bytes()); // header extension area length
+
+        let num_fields = self.columns.len() as i16;
+        let mut scalar_buf = BytesMut::with_capacity(64);
+
+        for row in 0..batch.num_rows {
+            buf.extend_from_slice(&num_fields.to_be_bytes());
+
+            for column in &batch.columns {
+                let scalar = column.get_scalar(row);
+                scalar_buf.clear();
+
+                if !types::scalar_write_text(&scalar, &mut scalar_buf) {
+                    // NULL: length = -1
+                    buf.extend_from_slice(&(-1i32).to_be_bytes());
+                } else {
+                    let len = scalar_buf.len() as i32;
+                    buf.extend_from_slice(&len.to_be_bytes());
+                    buf.extend_from_slice(&scalar_buf);
+                }
+            }
+        }
+
+        // Trailer: field count = -1
+        buf.extend_from_slice(&(-1i16).to_be_bytes());
+
+        vec![BackendMessage::CopyData(buf)]
     }
 
     /// Returns the CopyDone message.

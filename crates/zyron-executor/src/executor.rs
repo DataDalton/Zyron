@@ -106,14 +106,19 @@ fn build_operator_tree(
 
             PhysicalPlan::IndexScan {
                 table_id,
+                index_id,
+                index,
                 columns,
                 predicate,
                 remaining_predicate,
                 ..
             } => {
+                let btree = ctx.get_index(index_id);
                 let op = IndexScanOperator::new(
                     ctx.clone(),
                     table_id,
+                    Some(index),
+                    btree,
                     columns,
                     predicate,
                     remaining_predicate,
@@ -503,14 +508,19 @@ fn build_scan_with_tuple_ids(
 
             PhysicalPlan::IndexScan {
                 table_id,
+                index_id,
+                index,
                 columns,
                 predicate,
                 remaining_predicate,
                 ..
             } => {
+                let btree = ctx.get_index(index_id);
                 let op = IndexScanOperator::new(
                     ctx.clone(),
                     table_id,
+                    Some(index),
+                    btree,
                     columns,
                     predicate,
                     remaining_predicate,

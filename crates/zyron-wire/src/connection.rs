@@ -19,7 +19,7 @@ use zyron_catalog::Catalog;
 use zyron_common::{Result as ZyronResult, ZyronError};
 use zyron_executor::batch::DataBatch;
 use zyron_executor::column::ScalarValue;
-use zyron_executor::context::ExecutionContext;
+use zyron_executor::context::{CdcHook, ExecutionContext};
 use zyron_executor::executor::{execute, execute_analyze};
 use zyron_executor::operator::OperatorMetrics;
 use zyron_planner::logical::LogicalColumn;
@@ -76,6 +76,54 @@ pub struct ServerState {
     pub cdc_stream_stats: Option<Arc<dyn Fn() -> Vec<(String, u32, bool, String)> + Send + Sync>>,
     /// CDC ingest stats: Vec<(name, table_id, active, records_applied, records_failed)>
     pub cdc_ingest_stats: Option<Arc<dyn Fn() -> Vec<(String, u32, bool, u64, u64)> + Send + Sync>>,
+
+    // -- CDC managers --
+    /// Change Data Feed registry for tracking table change feeds.
+    pub cdc_registry: Option<Arc<zyron_cdc::CdfRegistry>>,
+    /// Replication slot manager.
+    pub slot_manager: Option<Arc<zyron_cdc::SlotManager>>,
+    /// Multi-table publication manager.
+    pub publication_manager: Option<Arc<zyron_cdc::PublicationManager>>,
+    /// Outbound CDC stream manager.
+    pub cdc_stream_manager: Option<Arc<zyron_cdc::CdcStreamManager>>,
+    /// Inbound CDC ingestion manager.
+    pub cdc_ingest_manager: Option<Arc<zyron_cdc::CdcIngestManager>>,
+
+    // -- Pipeline managers --
+    /// Trigger registry indexed by table and event type.
+    pub trigger_manager: Option<Arc<zyron_pipeline::trigger::TriggerManager>>,
+    /// User-defined function registry.
+    pub udf_registry: Option<Arc<zyron_pipeline::udf::UdfRegistry>>,
+    /// User-defined aggregate registry.
+    pub uda_registry: Option<Arc<zyron_pipeline::aggregate::UdaRegistry>>,
+    /// Stored procedure registry.
+    pub procedure_registry: Option<Arc<zyron_pipeline::stored_procedure::ProcedureRegistry>>,
+    /// Pipeline execution engine.
+    pub pipeline_manager: Option<Arc<zyron_pipeline::pipeline::PipelineManager>>,
+    /// Scheduled execution manager.
+    pub schedule_manager: Option<Arc<zyron_pipeline::schedule::ScheduleManager>>,
+    /// Event handler dispatcher.
+    pub event_dispatcher: Option<Arc<zyron_pipeline::event_handler::EventDispatcher>>,
+    /// Materialized view refresh manager.
+    pub mv_manager: Option<Arc<zyron_pipeline::materialized_view::MaterializedViewManager>>,
+
+    // -- Streaming --
+    /// Streaming job lifecycle manager. Wrapped in Mutex because StreamOperator
+    /// trait objects are Send but not Sync.
+    pub stream_job_manager: Option<Arc<parking_lot::Mutex<zyron_streaming::job::StreamJobManager>>>,
+
+    // -- Versioning --
+    /// Data branch manager for version branching.
+    pub branch_manager: Option<Arc<zyron_versioning::BranchManager>>,
+
+    // -- DML hooks --
+    /// CDC hook invoked by DML operators after mutations.
+    pub cdc_hook: Option<Arc<dyn CdcHook>>,
+    /// DML hook invoked by DML operators before mutations (BEFORE triggers).
+    pub dml_hook: Option<Arc<dyn zyron_executor::context::DmlHook>>,
+
+    // -- Notification channels for LISTEN/NOTIFY --
+    pub notification_channels: Option<Arc<crate::notifications::NotificationChannels>>,
 }
 
 /// Cached prepared statement.
@@ -125,6 +173,27 @@ pub struct Connection<T: WireTransport> {
     secret_key: i32,
     /// Remote peer IP address (if available).
     pub peer_addr: Option<String>,
+    /// Active branch for versioning (set by USE BRANCH).
+    active_branch: Option<String>,
+    /// Cursor state for DECLARE/FETCH/CLOSE cursor support.
+    cursors: HashMap<String, CursorState>,
+    /// Notification channel receivers for LISTEN/NOTIFY.
+    notification_receivers:
+        HashMap<String, tokio::sync::broadcast::Receiver<crate::notifications::Notification>>,
+}
+
+/// Per-connection cursor state for DECLARE/FETCH/CLOSE support.
+pub struct CursorState {
+    /// The query plan backing this cursor.
+    pub plan: Arc<PhysicalPlan>,
+    /// Output column schema.
+    pub output_schema: Vec<LogicalColumn>,
+    /// Buffered result rows from execution.
+    pub rows: Vec<DataBatch>,
+    /// Current position within the buffered rows.
+    pub position: usize,
+    /// Whether the cursor holds across transactions.
+    pub with_hold: bool,
 }
 
 impl<T: WireTransport> Connection<T> {
@@ -147,6 +216,9 @@ impl<T: WireTransport> Connection<T> {
             process_id: pid,
             secret_key: rand::random::<u32>() as i32,
             peer_addr,
+            active_branch: None,
+            cursors: HashMap::new(),
+            notification_receivers: HashMap::new(),
         }
     }
 
@@ -394,8 +466,26 @@ impl<T: WireTransport> Connection<T> {
             })?
             .id;
 
+        // Create security context if the auth system is configured.
+        // Looks up the user's role and builds a SecurityContext with effective
+        // roles, clearance, session attributes, and query limits.
+        let security_context = if let Some(ref sm) = self.server.security_manager {
+            let peer_ip = self
+                .peer_addr
+                .clone()
+                .unwrap_or_else(|| "127.0.0.1".to_string());
+            if let Some(role) = sm.lookup_role(&user) {
+                let user_id = sm.user_id_cache.get(&user).unwrap_or(zyron_auth::UserId(0));
+                Some(sm.create_security_context(user_id, &role, &peer_ip))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Create session
-        let session = Session::new(user, database, database_id);
+        let session = Session::with_security_context(user, database, database_id, security_context);
 
         // Encode all startup responses into self.write_buf (reuses existing allocation
         // instead of creating a new BytesMut per handshake), then write once.
@@ -598,6 +688,687 @@ impl<T: WireTransport> Connection<T> {
                 continue;
             }
 
+            // Handle DDL, DCL, and utility statements directly
+            if let Some(result) = crate::ddl_dispatch::try_handle_ddl_utility(
+                &stmt,
+                &self.server,
+                &mut self.session,
+                &mut self.transaction,
+                &mut self.active_branch,
+            )
+            .await
+            {
+                match result {
+                    Ok(crate::ddl_dispatch::DdlResult::Tag(tag)) => {
+                        self.feed(BackendMessage::CommandComplete { tag }).await?;
+                    }
+                    Ok(crate::ddl_dispatch::DdlResult::Rows { tag, columns, rows }) => {
+                        // Build row description from column definitions
+                        let fields: Vec<FieldDescription> = columns
+                            .iter()
+                            .map(|(name, oid)| FieldDescription {
+                                name: name.clone(),
+                                table_oid: 0,
+                                column_attr: 0,
+                                type_oid: *oid,
+                                type_size: -1,
+                                type_modifier: -1,
+                                format: 0,
+                            })
+                            .collect();
+                        self.feed(BackendMessage::RowDescription(fields)).await?;
+                        for row in &rows {
+                            let values: Vec<Option<Vec<u8>>> =
+                                row.iter().map(|v| Some(v.as_bytes().to_vec())).collect();
+                            self.feed(BackendMessage::DataRow(values)).await?;
+                        }
+                        self.feed(BackendMessage::CommandComplete { tag }).await?;
+                    }
+                    Err(e) => {
+                        self.send_protocol_error(&e).await?;
+                        self.mark_failed_if_in_transaction();
+                    }
+                }
+                continue;
+            }
+
+            // ---------------------------------------------------------------
+            // LISTEN / NOTIFY
+            // ---------------------------------------------------------------
+            if let zyron_parser::Statement::Listen(ref listen_stmt) = stmt {
+                if let Some(ref nc) = self.server.notification_channels {
+                    let rx = nc.listen(&listen_stmt.channel);
+                    self.notification_receivers
+                        .insert(listen_stmt.channel.clone(), rx);
+                    self.feed(BackendMessage::CommandComplete {
+                        tag: "LISTEN".to_string(),
+                    })
+                    .await?;
+                } else {
+                    self.send_error(&ZyronError::Internal(
+                        "notification channels not enabled".into(),
+                    ))
+                    .await?;
+                    self.mark_failed_if_in_transaction();
+                }
+                continue;
+            }
+
+            if let zyron_parser::Statement::Notify(ref notify_stmt) = stmt {
+                if let Some(ref nc) = self.server.notification_channels {
+                    let payload = notify_stmt.payload.as_deref().unwrap_or("");
+                    nc.notify(&notify_stmt.channel, payload, self.process_id);
+                    self.feed(BackendMessage::CommandComplete {
+                        tag: "NOTIFY".to_string(),
+                    })
+                    .await?;
+                } else {
+                    self.send_error(&ZyronError::Internal(
+                        "notification channels not enabled".into(),
+                    ))
+                    .await?;
+                    self.mark_failed_if_in_transaction();
+                }
+                continue;
+            }
+
+            // ---------------------------------------------------------------
+            // PREPARE / EXECUTE / DEALLOCATE
+            // ---------------------------------------------------------------
+            if let zyron_parser::Statement::Prepare(prepare_stmt) = stmt {
+                let name = prepare_stmt.name.clone();
+                let inner_query = format!("{:?}", prepare_stmt.statement);
+                let param_types: Vec<i32> =
+                    prepare_stmt.param_types.iter().map(|_dt| 0i32).collect();
+
+                // Plan the inner statement
+                let (plan, schema) = {
+                    let session = match self.session.as_ref() {
+                        Some(s) => s,
+                        None => {
+                            self.send_error(&ZyronError::Internal("no session established".into()))
+                                .await?;
+                            self.mark_failed_if_in_transaction();
+                            continue;
+                        }
+                    };
+                    match zyron_planner::plan(
+                        &self.server.catalog,
+                        session.database_id,
+                        session.search_path.clone(),
+                        *prepare_stmt.statement,
+                    )
+                    .await
+                    {
+                        Ok(p) => {
+                            let s = p.output_schema();
+                            (Some(Arc::new(p)), s)
+                        }
+                        Err(e) => {
+                            self.send_error(&e).await?;
+                            self.mark_failed_if_in_transaction();
+                            continue;
+                        }
+                    }
+                };
+
+                self.statements.insert(
+                    name,
+                    PreparedStatement {
+                        query: inner_query,
+                        param_types,
+                        plan,
+                        output_schema: schema,
+                    },
+                );
+
+                self.feed(BackendMessage::CommandComplete {
+                    tag: "PREPARE".to_string(),
+                })
+                .await?;
+                continue;
+            }
+
+            if let zyron_parser::Statement::Execute(execute_stmt) = stmt {
+                let ps = match self.statements.get(&execute_stmt.name) {
+                    Some(ps) => ps,
+                    None => {
+                        self.send_error(&ZyronError::Internal(format!(
+                            "prepared statement \"{}\" does not exist",
+                            execute_stmt.name
+                        )))
+                        .await?;
+                        self.mark_failed_if_in_transaction();
+                        continue;
+                    }
+                };
+
+                if let Some(ref plan) = ps.plan {
+                    let plan_clone = (**plan).clone();
+                    let output_schema = ps.output_schema.clone();
+                    let is_select = !output_schema.is_empty() && is_query_plan(&plan_clone);
+
+                    let (txn_id, snapshot) = self.ensure_transaction()?;
+                    let mut ctx = ExecutionContext::new(
+                        self.server.catalog.clone(),
+                        self.server.wal.clone(),
+                        self.server.buffer_pool.clone(),
+                        self.server.disk_manager.clone(),
+                        txn_id as u32,
+                        snapshot,
+                    );
+                    if let Some(ref hook) = self.server.cdc_hook {
+                        ctx.cdc_hook = Some(Arc::clone(hook));
+                    }
+                    if let Some(ref hook) = self.server.dml_hook {
+                        ctx.dml_hook = Some(Arc::clone(hook));
+                    }
+                    let ctx = Arc::new(ctx);
+
+                    match execute(plan_clone, &ctx).await {
+                        Ok(batches) => {
+                            if is_select {
+                                let row_desc = self.build_row_description(&output_schema, &[]);
+                                self.feed(row_desc).await?;
+                                let row_count =
+                                    self.send_data_rows(&batches, &output_schema, &[]).await?;
+                                self.feed(BackendMessage::CommandComplete {
+                                    tag: format!("SELECT {}", row_count),
+                                })
+                                .await?;
+                            } else {
+                                let affected = count_affected_rows(&batches);
+                                let tag = make_dml_tag(&output_schema, affected);
+                                self.feed(BackendMessage::CommandComplete { tag }).await?;
+                            }
+                        }
+                        Err(e) => {
+                            self.send_protocol_error(&ProtocolError::Database(e))
+                                .await?;
+                            self.mark_failed_if_in_transaction();
+                        }
+                    }
+                } else {
+                    // Re-parse and execute the stored query
+                    let query = ps.query.clone();
+                    match zyron_parser::parse(&query) {
+                        Ok(stmts) if !stmts.is_empty() => {
+                            let inner = stmts.into_iter().next().unwrap();
+                            match self.plan_and_execute_statement(inner).await {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    self.send_protocol_error(&e).await?;
+                                    self.mark_failed_if_in_transaction();
+                                }
+                            }
+                        }
+                        Ok(_) => {
+                            self.feed(BackendMessage::EmptyQueryResponse).await?;
+                        }
+                        Err(e) => {
+                            self.send_error(&e).await?;
+                            self.mark_failed_if_in_transaction();
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if let zyron_parser::Statement::Deallocate(dealloc_stmt) = stmt {
+                if dealloc_stmt.all {
+                    self.statements.clear();
+                } else if let Some(ref name) = dealloc_stmt.name {
+                    self.statements.remove(name);
+                }
+                self.feed(BackendMessage::CommandComplete {
+                    tag: "DEALLOCATE".to_string(),
+                })
+                .await?;
+                continue;
+            }
+
+            // ---------------------------------------------------------------
+            // DECLARE / FETCH / CLOSE CURSOR
+            // ---------------------------------------------------------------
+            if let zyron_parser::Statement::DeclareCursor(decl_stmt) = stmt {
+                let session = match self.session.as_ref() {
+                    Some(s) => s,
+                    None => {
+                        self.send_error(&ZyronError::Internal("no session established".into()))
+                            .await?;
+                        self.mark_failed_if_in_transaction();
+                        continue;
+                    }
+                };
+                let db_id = session.database_id;
+                let search_path = session.search_path.clone();
+
+                let select_stmt = zyron_parser::Statement::Select(decl_stmt.query);
+                match zyron_planner::plan(&self.server.catalog, db_id, search_path, select_stmt)
+                    .await
+                {
+                    Ok(plan) => {
+                        let output_schema = plan.output_schema();
+                        let with_hold = decl_stmt.hold.unwrap_or(false);
+                        self.cursors.insert(
+                            decl_stmt.name.clone(),
+                            CursorState {
+                                plan: Arc::new(plan),
+                                output_schema,
+                                rows: Vec::new(),
+                                position: 0,
+                                with_hold,
+                            },
+                        );
+                        self.feed(BackendMessage::CommandComplete {
+                            tag: "DECLARE CURSOR".to_string(),
+                        })
+                        .await?;
+                    }
+                    Err(e) => {
+                        self.send_error(&e).await?;
+                        self.mark_failed_if_in_transaction();
+                    }
+                }
+                continue;
+            }
+
+            if let zyron_parser::Statement::FetchCursor(fetch_stmt) = stmt {
+                let cursor_name = fetch_stmt.cursor.clone();
+                let fetch_count = match fetch_stmt.direction {
+                    zyron_parser::ast::FetchDirection::Next => 1i64,
+                    zyron_parser::ast::FetchDirection::Prior => -1,
+                    zyron_parser::ast::FetchDirection::First => 1,
+                    zyron_parser::ast::FetchDirection::Last => -1,
+                    zyron_parser::ast::FetchDirection::Absolute(n) => n,
+                    zyron_parser::ast::FetchDirection::Relative(n) => n,
+                    zyron_parser::ast::FetchDirection::Forward(n) => n.unwrap_or(1),
+                    zyron_parser::ast::FetchDirection::Backward(n) => -(n.unwrap_or(1)),
+                    zyron_parser::ast::FetchDirection::All => i64::MAX,
+                };
+
+                let cursor = match self.cursors.get_mut(&cursor_name) {
+                    Some(c) => c,
+                    None => {
+                        self.send_error(&ZyronError::Internal(format!(
+                            "cursor \"{}\" does not exist",
+                            cursor_name
+                        )))
+                        .await?;
+                        self.mark_failed_if_in_transaction();
+                        continue;
+                    }
+                };
+
+                // Execute the plan on first fetch if rows are empty
+                if cursor.rows.is_empty() {
+                    let plan_clone = (*cursor.plan).clone();
+                    let (txn_id, snapshot) = self.ensure_transaction()?;
+                    let ctx = Arc::new(ExecutionContext::new(
+                        self.server.catalog.clone(),
+                        self.server.wal.clone(),
+                        self.server.buffer_pool.clone(),
+                        self.server.disk_manager.clone(),
+                        txn_id as u32,
+                        snapshot,
+                    ));
+                    match execute(plan_clone, &ctx).await {
+                        Ok(batches) => {
+                            let cursor = self.cursors.get_mut(&cursor_name).unwrap();
+                            cursor.rows = batches;
+                        }
+                        Err(e) => {
+                            self.send_protocol_error(&ProtocolError::Database(e))
+                                .await?;
+                            self.mark_failed_if_in_transaction();
+                            continue;
+                        }
+                    }
+                }
+
+                // Collect row data from cursor into owned values to avoid
+                // holding a borrow on self.cursors while calling self.feed.
+                let (output_schema, data_rows) = {
+                    let cursor = self.cursors.get(&cursor_name).unwrap();
+                    let output_schema = cursor.output_schema.clone();
+                    let total_rows: usize = cursor.rows.iter().map(|b| b.num_rows).sum();
+                    let start = cursor.position;
+                    let count = if fetch_count < 0 {
+                        0usize // Backward fetch returns empty for simplicity
+                    } else if fetch_count == i64::MAX {
+                        total_rows.saturating_sub(start)
+                    } else {
+                        (fetch_count as usize).min(total_rows.saturating_sub(start))
+                    };
+
+                    let mut data_rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
+                    let mut sent = 0usize;
+                    let mut global_pos = 0usize;
+                    for batch in &cursor.rows {
+                        if sent >= count {
+                            break;
+                        }
+                        let batch_end = global_pos + batch.num_rows;
+                        if batch_end <= start {
+                            global_pos = batch_end;
+                            continue;
+                        }
+                        let batch_start = if start > global_pos {
+                            start - global_pos
+                        } else {
+                            0
+                        };
+                        let remaining = count - sent;
+                        let slice_end = (batch_start + remaining).min(batch.num_rows);
+
+                        for row_idx in batch_start..slice_end {
+                            let mut values: Vec<Option<Vec<u8>>> =
+                                Vec::with_capacity(output_schema.len());
+                            for col in &batch.columns {
+                                let scalar = col.get_scalar(row_idx);
+                                let mut buf = bytes::BytesMut::with_capacity(32);
+                                if types::scalar_write_text(&scalar, &mut buf) {
+                                    values.push(Some(buf.to_vec()));
+                                } else {
+                                    values.push(None);
+                                }
+                            }
+                            data_rows.push(values);
+                            sent += 1;
+                        }
+                        global_pos = batch_end;
+                    }
+                    (output_schema, data_rows)
+                };
+
+                let sent = data_rows.len();
+
+                // Send row description and data rows
+                let row_desc = self.build_row_description(&output_schema, &[]);
+                self.feed(row_desc).await?;
+                for values in data_rows {
+                    self.feed(BackendMessage::DataRow(values)).await?;
+                }
+
+                // Advance cursor position
+                if let Some(cursor) = self.cursors.get_mut(&cursor_name) {
+                    cursor.position += sent;
+                }
+
+                self.feed(BackendMessage::CommandComplete {
+                    tag: format!("FETCH {}", sent),
+                })
+                .await?;
+                continue;
+            }
+
+            if let zyron_parser::Statement::CloseCursor(close_stmt) = stmt {
+                if close_stmt.all {
+                    self.cursors.clear();
+                } else if let Some(ref name) = close_stmt.name {
+                    self.cursors.remove(name);
+                }
+                self.feed(BackendMessage::CommandComplete {
+                    tag: "CLOSE CURSOR".to_string(),
+                })
+                .await?;
+                continue;
+            }
+
+            // ---------------------------------------------------------------
+            // COPY
+            // ---------------------------------------------------------------
+            if let zyron_parser::Statement::Copy(copy_stmt) = stmt {
+                match copy_stmt.direction {
+                    zyron_parser::ast::CopyDirection::To(_target) => {
+                        // Build a SELECT * FROM table query, plan and execute,
+                        // then stream results through CopyOutHandler.
+                        let select_sql = if copy_stmt.columns.is_empty() {
+                            format!("SELECT * FROM {}", copy_stmt.table)
+                        } else {
+                            format!(
+                                "SELECT {} FROM {}",
+                                copy_stmt.columns.join(", "),
+                                copy_stmt.table
+                            )
+                        };
+                        let stmts = match zyron_parser::parse(&select_sql) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                self.send_error(&e).await?;
+                                self.mark_failed_if_in_transaction();
+                                continue;
+                            }
+                        };
+                        let select_stmt = stmts.into_iter().next().unwrap();
+
+                        let session = match self.session.as_ref() {
+                            Some(s) => s,
+                            None => {
+                                self.send_error(&ZyronError::Internal(
+                                    "no session established".into(),
+                                ))
+                                .await?;
+                                self.mark_failed_if_in_transaction();
+                                continue;
+                            }
+                        };
+                        let db_id = session.database_id;
+                        let search_path = session.search_path.clone();
+
+                        match zyron_planner::plan(
+                            &self.server.catalog,
+                            db_id,
+                            search_path,
+                            select_stmt,
+                        )
+                        .await
+                        {
+                            Ok(plan) => {
+                                let output_schema = plan.output_schema();
+                                let (txn_id, snapshot) = self.ensure_transaction()?;
+                                let ctx = Arc::new(ExecutionContext::new(
+                                    self.server.catalog.clone(),
+                                    self.server.wal.clone(),
+                                    self.server.buffer_pool.clone(),
+                                    self.server.disk_manager.clone(),
+                                    txn_id as u32,
+                                    snapshot,
+                                ));
+
+                                match execute(plan, &ctx).await {
+                                    Ok(batches) => {
+                                        let handler = crate::copy::CopyOutHandler::new(
+                                            output_schema,
+                                            crate::copy::CopyFormat::Text,
+                                        );
+                                        self.feed(handler.header_message()).await?;
+                                        for batch in &batches {
+                                            let msgs = handler.format_batch(batch);
+                                            for msg in msgs {
+                                                self.feed(msg).await?;
+                                            }
+                                        }
+                                        self.feed(handler.done_message()).await?;
+                                        let total: usize = batches.iter().map(|b| b.num_rows).sum();
+                                        self.feed(BackendMessage::CommandComplete {
+                                            tag: format!("COPY {}", total),
+                                        })
+                                        .await?;
+                                    }
+                                    Err(e) => {
+                                        self.send_protocol_error(&ProtocolError::Database(e))
+                                            .await?;
+                                        self.mark_failed_if_in_transaction();
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                self.send_error(&e).await?;
+                                self.mark_failed_if_in_transaction();
+                            }
+                        }
+                        continue;
+                    }
+                    zyron_parser::ast::CopyDirection::From(ref target) => {
+                        // COPY FROM STDIN: read CopyData messages from client
+                        if !matches!(target, zyron_parser::ast::CopyTarget::Stdin) {
+                            self.send_error(&ZyronError::Internal(
+                                "COPY FROM only supports STDIN in wire protocol".into(),
+                            ))
+                            .await?;
+                            self.mark_failed_if_in_transaction();
+                            continue;
+                        }
+
+                        // Resolve table columns from catalog
+                        let session = match self.session.as_ref() {
+                            Some(s) => s,
+                            None => {
+                                self.send_error(&ZyronError::Internal(
+                                    "no session established".into(),
+                                ))
+                                .await?;
+                                self.mark_failed_if_in_transaction();
+                                continue;
+                            }
+                        };
+                        let db_id = session.database_id;
+                        let search_path = session.search_path.clone();
+
+                        // Build column schema by planning a SELECT query
+                        let probe_sql = format!("SELECT * FROM {} LIMIT 0", copy_stmt.table);
+                        let probe_stmts = match zyron_parser::parse(&probe_sql) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                self.send_error(&e).await?;
+                                self.mark_failed_if_in_transaction();
+                                continue;
+                            }
+                        };
+                        let probe_stmt = probe_stmts.into_iter().next().unwrap();
+                        let columns = match zyron_planner::plan(
+                            &self.server.catalog,
+                            db_id,
+                            search_path,
+                            probe_stmt,
+                        )
+                        .await
+                        {
+                            Ok(plan) => plan.output_schema(),
+                            Err(e) => {
+                                self.send_error(&e).await?;
+                                self.mark_failed_if_in_transaction();
+                                continue;
+                            }
+                        };
+
+                        let mut handler = crate::copy::CopyInHandler::new(
+                            columns.clone(),
+                            crate::copy::CopyFormat::Text,
+                        );
+
+                        // Send CopyInResponse to tell client to start sending data
+                        self.feed(handler.header_message()).await?;
+                        self.flush().await?;
+
+                        // Read CopyData messages until CopyDone or CopyFail
+                        loop {
+                            let msg = self.read_message().await?;
+                            match msg {
+                                FrontendMessage::CopyData(data) => {
+                                    if let Err(e) = handler.feed(&data) {
+                                        self.send_protocol_error(&e).await?;
+                                        self.mark_failed_if_in_transaction();
+                                        break;
+                                    }
+                                }
+                                FrontendMessage::CopyDone => {
+                                    break;
+                                }
+                                _ => {
+                                    // CopyFail or unexpected message
+                                    self.send_error(&ZyronError::Internal(
+                                        "COPY FROM aborted".into(),
+                                    ))
+                                    .await?;
+                                    self.mark_failed_if_in_transaction();
+                                    break;
+                                }
+                            }
+                        }
+
+                        let _row_count = handler.row_count();
+                        match handler.finish() {
+                            Ok(rows) => {
+                                if !rows.is_empty() {
+                                    // Build INSERT for the rows via plan_and_execute
+                                    let col_names = if copy_stmt.columns.is_empty() {
+                                        columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+                                    } else {
+                                        copy_stmt.columns.clone()
+                                    };
+                                    let col_list = col_names.join(", ");
+
+                                    let mut values_parts = Vec::with_capacity(rows.len());
+                                    for row in &rows {
+                                        let vals: Vec<String> = row
+                                            .iter()
+                                            .map(|v| match v {
+                                                Some(bytes) => {
+                                                    let s = String::from_utf8_lossy(bytes);
+                                                    format!("'{}'", s.replace('\'', "''"))
+                                                }
+                                                None => "NULL".to_string(),
+                                            })
+                                            .collect();
+                                        values_parts.push(format!("({})", vals.join(", ")));
+                                    }
+                                    let insert_sql = format!(
+                                        "INSERT INTO {} ({}) VALUES {}",
+                                        copy_stmt.table,
+                                        col_list,
+                                        values_parts.join(", ")
+                                    );
+                                    match zyron_parser::parse(&insert_sql) {
+                                        Ok(stmts) if !stmts.is_empty() => {
+                                            let insert_stmt = stmts.into_iter().next().unwrap();
+                                            match self.plan_and_execute_statement(insert_stmt).await
+                                            {
+                                                Ok(()) => {
+                                                    // Override the INSERT tag with COPY tag
+                                                }
+                                                Err(e) => {
+                                                    self.send_protocol_error(&e).await?;
+                                                    self.mark_failed_if_in_transaction();
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        Ok(_) => {}
+                                        Err(e) => {
+                                            self.send_error(&e).await?;
+                                            self.mark_failed_if_in_transaction();
+                                            continue;
+                                        }
+                                    }
+                                }
+                                // The plan_and_execute_statement already sent CommandComplete
+                                // with INSERT tag. For COPY, we want COPY tag instead.
+                                // Since we cannot unsend the INSERT tag, we accept the INSERT
+                                // tag from plan_and_execute. A more refined implementation
+                                // would bypass plan_and_execute for direct tuple insertion.
+                            }
+                            Err(e) => {
+                                self.send_protocol_error(&e).await?;
+                                self.mark_failed_if_in_transaction();
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+
             // Plan and execute the statement
             match self.plan_and_execute_statement(stmt).await {
                 Ok(()) => {}
@@ -624,13 +1395,16 @@ impl<T: WireTransport> Connection<T> {
         &mut self,
         stmt: zyron_parser::Statement,
     ) -> Result<(), ProtocolError> {
-        // Copy session values before mutable borrow
-        let (db_id, search_path) = {
+        // Copy session values before mutable borrow. Take the security context
+        // temporarily so it can be moved into the ExecutionContext. It is returned
+        // to the session after execution completes.
+        let (db_id, search_path, sec_ctx) = {
             let session = self
                 .session
-                .as_ref()
+                .as_mut()
                 .ok_or(ProtocolError::Malformed("No session established".into()))?;
-            (session.database_id, session.search_path.clone())
+            let sc = session.security_context.take();
+            (session.database_id, session.search_path.clone(), sc)
         };
 
         // Start implicit transaction if needed
@@ -644,18 +1418,34 @@ impl<T: WireTransport> Connection<T> {
         let output_schema = plan.output_schema();
         let is_select = !output_schema.is_empty() && is_query_plan(&plan);
 
-        // Build execution context
-        let ctx = Arc::new(ExecutionContext::new(
+        // Build execution context with security context for privilege enforcement
+        let mut ctx = ExecutionContext::new(
             self.server.catalog.clone(),
             self.server.wal.clone(),
             self.server.buffer_pool.clone(),
             self.server.disk_manager.clone(),
             txn_id as u32,
             snapshot,
-        ));
+        );
+        ctx.security_context = sec_ctx;
+        if let Some(ref hook) = self.server.cdc_hook {
+            ctx.cdc_hook = Some(Arc::clone(hook));
+        }
+        if let Some(ref hook) = self.server.dml_hook {
+            ctx.dml_hook = Some(Arc::clone(hook));
+        }
+        let ctx = Arc::new(ctx);
 
         // Execute
         let batches = execute(plan, &ctx).await.map_err(ProtocolError::Database)?;
+
+        // Return the security context to the session so subsequent queries
+        // can reuse the cached privilege decisions.
+        if let Ok(mut unwrapped) = Arc::try_unwrap(ctx) {
+            if let Some(session) = self.session.as_mut() {
+                session.security_context = unwrapped.security_context.take();
+            }
+        }
 
         if is_select {
             // Send RowDescription + DataRows + CommandComplete batched
@@ -800,27 +1590,34 @@ impl<T: WireTransport> Connection<T> {
         };
 
         let (plan, schema) = if stmts.len() == 1 && param_types.is_empty() {
-            // No parameters, plan immediately
-            let session = self
-                .session
-                .as_ref()
-                .ok_or(ProtocolError::Malformed("No session established".into()))?;
+            let stmt = stmts.into_iter().next().unwrap();
 
-            match zyron_planner::plan(
-                &self.server.catalog,
-                session.database_id,
-                session.search_path.clone(),
-                stmts.into_iter().next().unwrap(),
-            )
-            .await
-            {
-                Ok(p) => {
-                    let schema = p.output_schema();
-                    (Some(Arc::new(p)), schema)
-                }
-                Err(e) => {
-                    self.send_error(&e).await?;
-                    return Ok(());
+            // DDL/utility statements bypass the planner. They get None plan
+            // and are dispatched through ddl_dispatch at Execute time.
+            if is_ddl_statement(&stmt) {
+                (None, Vec::new())
+            } else {
+                let session = self
+                    .session
+                    .as_ref()
+                    .ok_or(ProtocolError::Malformed("No session established".into()))?;
+
+                match zyron_planner::plan(
+                    &self.server.catalog,
+                    session.database_id,
+                    session.search_path.clone(),
+                    stmt,
+                )
+                .await
+                {
+                    Ok(p) => {
+                        let schema = p.output_schema();
+                        (Some(Arc::new(p)), schema)
+                    }
+                    Err(e) => {
+                        self.send_error(&e).await?;
+                        return Ok(());
+                    }
                 }
             }
         } else {
@@ -1336,20 +2133,199 @@ impl<T: WireTransport> Connection<T> {
                     .await,
                 )
             }
-            zyron_parser::Statement::Vacuum(_) => Some(
-                self.feed(BackendMessage::CommandComplete {
-                    tag: "VACUUM".into(),
-                })
-                .await,
-            ),
-            zyron_parser::Statement::Analyze(_) => Some(
-                self.feed(BackendMessage::CommandComplete {
-                    tag: "ANALYZE".into(),
-                })
-                .await,
-            ),
+            zyron_parser::Statement::Vacuum(v) => {
+                let result = self.handle_vacuum(v.table.as_deref()).await;
+                Some(result)
+            }
+            zyron_parser::Statement::Analyze(a) => {
+                let result = self.handle_analyze(a.table.as_deref()).await;
+                Some(result)
+            }
             _ => None,
         }
+    }
+
+    /// Handles the VACUUM SQL command. Scans heap pages for dead tuples and
+    /// reclaims space by zeroing slots for tuples no longer visible to any
+    /// active transaction.
+    async fn handle_vacuum(&mut self, table_name: Option<&str>) -> Result<(), ProtocolError> {
+        use zyron_common::page::PAGE_SIZE;
+        use zyron_storage::{HeapFile, HeapFileConfig, HeapPage, MvccGc, TupleHeader};
+
+        let active_txns = self.server.txn_manager.active_txn_ids();
+        let oldest_active = if active_txns.is_empty() {
+            self.server.txn_manager.next_txn_id()
+        } else {
+            active_txns[0]
+        };
+
+        let tables = self.server.catalog.list_all_tables();
+        let target_tables: Vec<_> = if let Some(name) = table_name {
+            tables.into_iter().filter(|t| t.name == name).collect()
+        } else {
+            tables
+        };
+
+        if target_tables.is_empty() {
+            if let Some(name) = table_name {
+                let fields = crate::messages::backend::ErrorFields {
+                    severity: "ERROR".into(),
+                    code: "42P01".into(),
+                    message: format!("relation \"{}\" does not exist", name),
+                    detail: None,
+                    hint: None,
+                    position: None,
+                };
+                let _ = self.feed(BackendMessage::ErrorResponse(fields)).await;
+                return Ok(());
+            }
+        }
+
+        let mut _total_reclaimed = 0u64;
+        let mut _total_pages = 0u64;
+
+        for table in &target_tables {
+            let heap_file = match HeapFile::new(
+                Arc::clone(&self.server.disk_manager),
+                Arc::clone(&self.server.buffer_pool),
+                HeapFileConfig {
+                    heap_file_id: table.heap_file_id,
+                    fsm_file_id: table.fsm_file_id,
+                },
+            ) {
+                Ok(hf) => hf,
+                Err(_) => continue,
+            };
+
+            let scan_guard = match heap_file.scan() {
+                Ok(sg) => sg,
+                Err(_) => continue,
+            };
+
+            let page_ids = scan_guard.page_ids().to_vec();
+            drop(scan_guard);
+
+            for page_id in &page_ids {
+                _total_pages += 1;
+
+                let page_data = match self.server.buffer_pool.fetch_page(*page_id) {
+                    Some(frame) => {
+                        let guard = frame.read_data();
+                        let data: [u8; PAGE_SIZE] = **guard;
+                        drop(guard);
+                        self.server.buffer_pool.unpin_page(*page_id, false);
+                        data
+                    }
+                    None => continue,
+                };
+
+                let header = HeapPage::heap_header_from_slice(&page_data);
+                if header.slot_count == 0 {
+                    continue;
+                }
+
+                let mut modified_page = page_data;
+                let mut reclaimed_on_page = 0u64;
+
+                for i in 0..header.slot_count {
+                    let slot_offset = HeapPage::DATA_START + (i as usize) * 4;
+                    let slot_len = u16::from_le_bytes([
+                        modified_page[slot_offset + 2],
+                        modified_page[slot_offset + 3],
+                    ]);
+                    if slot_len == 0 {
+                        continue;
+                    }
+
+                    let tuple_offset = u16::from_le_bytes([
+                        modified_page[slot_offset],
+                        modified_page[slot_offset + 1],
+                    ]) as usize;
+
+                    if tuple_offset + TupleHeader::SIZE <= PAGE_SIZE {
+                        let xmax = u32::from_le_bytes([
+                            modified_page[tuple_offset + 8],
+                            modified_page[tuple_offset + 9],
+                            modified_page[tuple_offset + 10],
+                            modified_page[tuple_offset + 11],
+                        ]);
+
+                        if MvccGc::is_reclaimable(xmax, oldest_active) {
+                            modified_page[slot_offset + 2] = 0;
+                            modified_page[slot_offset + 3] = 0;
+                            reclaimed_on_page += 1;
+                        }
+                    }
+                }
+
+                if reclaimed_on_page > 0 {
+                    if let Some(frame) = self.server.buffer_pool.fetch_page(*page_id) {
+                        frame.copy_from(&modified_page);
+                        self.server.buffer_pool.unpin_page(*page_id, true);
+                    }
+                    _total_reclaimed += reclaimed_on_page;
+                }
+            }
+        }
+
+        self.feed(BackendMessage::CommandComplete {
+            tag: "VACUUM".into(),
+        })
+        .await
+    }
+
+    /// Handles the ANALYZE SQL command. Scans heap pages and computes table
+    /// and column statistics for query planner cost estimation.
+    async fn handle_analyze(&mut self, table_name: Option<&str>) -> Result<(), ProtocolError> {
+        use zyron_catalog::analyze_table;
+        use zyron_storage::{HeapFile, HeapFileConfig};
+
+        let tables = self.server.catalog.list_all_tables();
+        let target_tables: Vec<_> = if let Some(name) = table_name {
+            tables.into_iter().filter(|t| t.name == name).collect()
+        } else {
+            tables
+        };
+
+        if target_tables.is_empty() {
+            if let Some(name) = table_name {
+                let fields = crate::messages::backend::ErrorFields {
+                    severity: "ERROR".into(),
+                    code: "42P01".into(),
+                    message: format!("relation \"{}\" does not exist", name),
+                    detail: None,
+                    hint: None,
+                    position: None,
+                };
+                let _ = self.feed(BackendMessage::ErrorResponse(fields)).await;
+                return Ok(());
+            }
+        }
+
+        for table in &target_tables {
+            let heap_file = match HeapFile::new(
+                Arc::clone(&self.server.disk_manager),
+                Arc::clone(&self.server.buffer_pool),
+                HeapFileConfig {
+                    heap_file_id: table.heap_file_id,
+                    fsm_file_id: table.fsm_file_id,
+                },
+            ) {
+                Ok(hf) => hf,
+                Err(_) => continue,
+            };
+
+            if let Ok((table_stats, column_stats)) = analyze_table(&table, &heap_file).await {
+                self.server
+                    .catalog
+                    .put_stats(table.id, table_stats, column_stats);
+            }
+        }
+
+        self.feed(BackendMessage::CommandComplete {
+            tag: "ANALYZE".into(),
+        })
+        .await
     }
 
     /// Handles a SELECT query against a virtual stat view, sending the result
@@ -1735,6 +2711,20 @@ fn collect_metrics_recursive(metrics: &OperatorMetrics, result: &mut Vec<(u64, f
     }
 }
 
+/// Returns true if the statement is a DDL/utility type that should bypass
+/// the planner and be dispatched through ddl_dispatch instead.
+fn is_ddl_statement(stmt: &zyron_parser::Statement) -> bool {
+    use zyron_parser::Statement;
+    !matches!(
+        stmt,
+        Statement::Select(_)
+            | Statement::Insert(_)
+            | Statement::Update(_)
+            | Statement::Delete(_)
+            | Statement::Merge(_)
+    )
+}
+
 /// Checks if a physical plan produces query results (SELECT-like).
 fn is_query_plan(plan: &PhysicalPlan) -> bool {
     !matches!(
@@ -1826,11 +2816,17 @@ fn build_authenticator(
             Box::new(ComposedAuthenticator::new(password_auth, webauthn_auth))
         }
         AuthMethod::PasswordAndTotp => {
-            // TOTP composed auth not yet wired, use SCRAM only for now
-            Box::new(ScramAuthenticator::new(load_passwords()))
+            let password_auth: Box<dyn Authenticator> =
+                Box::new(ScramAuthenticator::new(load_passwords()));
+            let totp_auth = crate::auth::TotpAuthenticator::new(Arc::clone(sm));
+            Box::new(crate::auth::PasswordTotpAuthenticator::new(
+                password_auth,
+                totp_auth,
+            ))
         }
-        // Jwt, ApiKey, Certificate need dedicated authenticator implementations
-        AuthMethod::Jwt | AuthMethod::ApiKey | AuthMethod::Certificate => {
+        AuthMethod::ApiKey => Box::new(crate::auth::ApiKeyAuthenticator::new(Arc::clone(sm))),
+        AuthMethod::Jwt => Box::new(crate::auth::JwtAuthenticator::new(Arc::clone(sm))),
+        AuthMethod::Certificate => {
             warn!(
                 "Auth method {:?} not yet implemented, rejecting connection",
                 method

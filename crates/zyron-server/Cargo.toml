@@ -12,6 +12,11 @@ zyron-storage = { path = "../zyron-storage" }
 zyron-catalog = { path = "../zyron-catalog" }
 zyron-wire = { path = "../zyron-wire" }
 zyron-auth = { path = "../zyron-auth" }
+zyron-cdc = { path = "../zyron-cdc" }
+zyron-pipeline = { path = "../zyron-pipeline" }
+zyron-streaming = { path = "../zyron-streaming" }
+zyron-versioning = { path = "../zyron-versioning" }
+zyron-executor = { path = "../zyron-executor" }
 tokio.workspace = true
 async-trait.workspace = true
 tracing.workspace = true

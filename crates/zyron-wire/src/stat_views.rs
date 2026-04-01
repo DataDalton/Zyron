@@ -31,6 +31,9 @@ const STAT_VIEW_NAMES: &[&str] = &[
     "zyron_stat_replication_slots",
     "zyron_stat_cdc_streams",
     "zyron_stat_cdc_ingests",
+    "zyron_stat_streaming_jobs",
+    "zyron_stat_triggers",
+    "zyron_stat_branches",
 ];
 
 /// Returns true if the given name matches a virtual statistics view.
@@ -54,6 +57,9 @@ pub fn query_stat_view(
         "zyron_stat_replication_slots" => Some(build_stat_replication_slots(server)),
         "zyron_stat_cdc_streams" => Some(build_stat_cdc_streams(server)),
         "zyron_stat_cdc_ingests" => Some(build_stat_cdc_ingests(server)),
+        "zyron_stat_streaming_jobs" => Some(build_stat_streaming_jobs(server)),
+        "zyron_stat_triggers" => Some(build_stat_triggers(server)),
+        "zyron_stat_branches" => Some(build_stat_branches(server)),
         _ => None,
     }
 }
@@ -75,7 +81,7 @@ fn make_field(name: &str, typeOid: i32, typeSize: i16) -> FieldDescription {
 
 /// Builds the zyron_stat_activity view.
 /// Columns: pid, user_name, database, state, connected_at_secs, last_activity_secs.
-/// Data source: server.session_mgr (not yet available on ServerState).
+/// Data source: server.session_info_collector callback.
 fn build_stat_activity(server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
     let fields = vec![
         make_field("pid", PG_INT4_OID, 4),
@@ -111,8 +117,9 @@ fn build_stat_activity(server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<
 /// Columns: table_name, seq_scan, seq_tup_read, idx_scan, idx_tup_fetch,
 ///          n_tup_ins, n_tup_upd, n_tup_del, n_dead_tup,
 ///          last_vacuum, last_analyze, row_count.
-/// Data source: server.table_io_stats + server.catalog (not yet available).
-fn build_stat_tables(_server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+/// Data source: catalog for table names, IO counters default to zero
+/// until per-table IO tracking is added.
+fn build_stat_tables(server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
     let fields = vec![
         make_field("table_name", PG_TEXT_OID, -1),
         make_field("seq_scan", PG_INT8_OID, 8),
@@ -128,15 +135,35 @@ fn build_stat_tables(_server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<O
         make_field("row_count", PG_INT8_OID, 8),
     ];
 
-    // table_io_stats is not yet on ServerState, return empty rows for now.
-    let rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
+    let zero = "0";
+    let tables = server.catalog.list_all_tables();
+    let rows: Vec<Vec<Option<Vec<u8>>>> = tables
+        .iter()
+        .map(|t| {
+            vec![
+                Some(t.name.as_bytes().to_vec()),
+                Some(zero.as_bytes().to_vec()),
+                Some(zero.as_bytes().to_vec()),
+                Some(zero.as_bytes().to_vec()),
+                Some(zero.as_bytes().to_vec()),
+                Some(zero.as_bytes().to_vec()),
+                Some(zero.as_bytes().to_vec()),
+                Some(zero.as_bytes().to_vec()),
+                Some(zero.as_bytes().to_vec()),
+                Some(zero.as_bytes().to_vec()),
+                Some(zero.as_bytes().to_vec()),
+                Some(zero.as_bytes().to_vec()),
+            ]
+        })
+        .collect();
     (fields, rows)
 }
 
 /// Builds the zyron_stat_indexes view.
 /// Columns: index_name, table_name, index_type, idx_scan, idx_tup_read, idx_tup_fetch.
-/// Data source: server.index_io_stats + server.catalog (not yet available).
-fn build_stat_indexes(_server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+/// Data source: catalog for index and table names. IO stats counters are not
+/// yet tracked, so they return zeros.
+fn build_stat_indexes(server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
     let fields = vec![
         make_field("index_name", PG_TEXT_OID, -1),
         make_field("table_name", PG_TEXT_OID, -1),
@@ -146,8 +173,27 @@ fn build_stat_indexes(_server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<
         make_field("idx_tup_fetch", PG_INT8_OID, 8),
     ];
 
-    // index_io_stats is not yet on ServerState, return empty rows for now.
-    let rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
+    let zero = "0";
+    let tables = server.catalog.list_all_tables();
+    let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
+    for table in &tables {
+        let indexes = server.catalog.get_indexes_for_table(table.id);
+        for idx in &indexes {
+            let type_name = match idx.index_type {
+                zyron_catalog::IndexType::BTree => "btree",
+                zyron_catalog::IndexType::Fulltext => "fulltext",
+                zyron_catalog::IndexType::Vector => "vector",
+            };
+            rows.push(vec![
+                Some(idx.name.as_bytes().to_vec()),
+                Some(table.name.as_bytes().to_vec()),
+                Some(type_name.as_bytes().to_vec()),
+                Some(zero.as_bytes().to_vec()),
+                Some(zero.as_bytes().to_vec()),
+                Some(zero.as_bytes().to_vec()),
+            ]);
+        }
+    }
     (fields, rows)
 }
 
@@ -155,7 +201,7 @@ fn build_stat_indexes(_server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<
 /// Columns: wal_records, wal_bytes, wal_syncs, wal_flushed_lsn,
 ///          wal_current_segment, last_checkpoint_lsn.
 /// Reads flushed_lsn and current_segment_id from the WAL writer.
-/// checkpoint_stats is not yet on ServerState.
+/// Last checkpoint LSN from server.checkpoint_stats callback.
 fn build_stat_wal(server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
     let fields = vec![
         make_field("wal_records", PG_INT8_OID, 8),
@@ -192,7 +238,7 @@ fn build_stat_wal(server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<Optio
 /// Builds the zyron_stat_bgwriter view.
 /// Columns: checkpoints_completed, checkpoint_segments_deleted,
 ///          last_checkpoint_lsn, vacuum_cycles, tuples_reclaimed, pages_scanned.
-/// Data source: server.checkpoint_stats and server.vacuum_stats (not yet available).
+/// Data source: server.checkpoint_stats and server.vacuum_stats callbacks.
 fn build_stat_bgwriter(server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
     let fields = vec![
         make_field("checkpoints_completed", PG_INT8_OID, 8),
@@ -356,6 +402,105 @@ fn build_stat_cdc_ingests(
     (fields, rows)
 }
 
+/// Builds the zyron_stat_streaming_jobs view.
+/// Columns: job_id, name, status, parallelism.
+/// Data source: server.stream_job_manager.
+fn build_stat_streaming_jobs(
+    server: &ServerState,
+) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+    let fields = vec![
+        make_field("job_id", PG_INT4_OID, 4),
+        make_field("name", PG_TEXT_OID, -1),
+        make_field("status", PG_TEXT_OID, -1),
+        make_field("parallelism", PG_INT4_OID, 4),
+    ];
+
+    let rows = if let Some(ref mgr) = server.stream_job_manager {
+        let guard = mgr.lock();
+        let jobs = guard.list();
+        jobs.into_iter()
+            .map(|(id, name, status)| {
+                vec![
+                    Some(id.as_u32().to_string().into_bytes()),
+                    Some(name.into_bytes()),
+                    Some(format!("{:?}", status).into_bytes()),
+                    Some("1".as_bytes().to_vec()),
+                ]
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    (fields, rows)
+}
+
+/// Builds the zyron_stat_triggers view.
+/// Columns: trigger_name, table_id, timing, events, enabled.
+/// Data source: server.trigger_manager.
+fn build_stat_triggers(server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+    let fields = vec![
+        make_field("trigger_name", PG_TEXT_OID, -1),
+        make_field("table_id", PG_INT4_OID, 4),
+        make_field("timing", PG_TEXT_OID, -1),
+        make_field("events", PG_TEXT_OID, -1),
+        make_field("enabled", PG_TEXT_OID, -1),
+    ];
+
+    let rows = if let Some(ref mgr) = server.trigger_manager {
+        mgr.listAll()
+            .into_iter()
+            .map(|t| {
+                let events: String = t
+                    .events
+                    .iter()
+                    .map(|e| format!("{:?}", e))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                vec![
+                    Some(t.name.as_bytes().to_vec()),
+                    Some(t.tableId.to_string().into_bytes()),
+                    Some(format!("{:?}", t.timing).into_bytes()),
+                    Some(events.into_bytes()),
+                    Some(t.enabled.to_string().into_bytes()),
+                ]
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    (fields, rows)
+}
+
+/// Builds the zyron_stat_branches view.
+/// Columns: branch_name, parent_branch, created_at, is_active.
+/// Data source: server.branch_manager.
+fn build_stat_branches(server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+    let fields = vec![
+        make_field("branch_name", PG_TEXT_OID, -1),
+        make_field("parent_branch", PG_TEXT_OID, -1),
+        make_field("created_at", PG_INT8_OID, 8),
+        make_field("is_active", PG_TEXT_OID, -1),
+    ];
+
+    let rows = if let Some(ref mgr) = server.branch_manager {
+        let branches = mgr.list_branches();
+        branches
+            .into_iter()
+            .map(|b| {
+                vec![
+                    Some(b.name.clone().into_bytes()),
+                    b.parent_branch_id.map(|p| p.0.to_string().into_bytes()),
+                    Some(b.created_at.to_string().into_bytes()),
+                    Some("true".as_bytes().to_vec()),
+                ]
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    (fields, rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,6 +512,9 @@ mod tests {
         assert!(is_stat_view("zyron_stat_indexes"));
         assert!(is_stat_view("zyron_stat_wal"));
         assert!(is_stat_view("zyron_stat_bgwriter"));
+        assert!(is_stat_view("zyron_stat_streaming_jobs"));
+        assert!(is_stat_view("zyron_stat_triggers"));
+        assert!(is_stat_view("zyron_stat_branches"));
     }
 
     #[test]

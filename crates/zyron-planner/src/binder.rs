@@ -194,61 +194,179 @@ impl PartialEq for BoundExpr {
         match (self, other) {
             (BoundExpr::ColumnRef(a), BoundExpr::ColumnRef(b)) => a == b,
             (
-                BoundExpr::Literal { value: v1, type_id: t1 },
-                BoundExpr::Literal { value: v2, type_id: t2 },
+                BoundExpr::Literal {
+                    value: v1,
+                    type_id: t1,
+                },
+                BoundExpr::Literal {
+                    value: v2,
+                    type_id: t2,
+                },
             ) => v1 == v2 && t1 == t2,
             (
-                BoundExpr::BinaryOp { left: l1, op: o1, right: r1, type_id: t1 },
-                BoundExpr::BinaryOp { left: l2, op: o2, right: r2, type_id: t2 },
+                BoundExpr::BinaryOp {
+                    left: l1,
+                    op: o1,
+                    right: r1,
+                    type_id: t1,
+                },
+                BoundExpr::BinaryOp {
+                    left: l2,
+                    op: o2,
+                    right: r2,
+                    type_id: t2,
+                },
             ) => o1 == o2 && t1 == t2 && l1 == l2 && r1 == r2,
             (
-                BoundExpr::UnaryOp { op: o1, expr: e1, type_id: t1 },
-                BoundExpr::UnaryOp { op: o2, expr: e2, type_id: t2 },
+                BoundExpr::UnaryOp {
+                    op: o1,
+                    expr: e1,
+                    type_id: t1,
+                },
+                BoundExpr::UnaryOp {
+                    op: o2,
+                    expr: e2,
+                    type_id: t2,
+                },
             ) => o1 == o2 && t1 == t2 && e1 == e2,
             (
-                BoundExpr::IsNull { expr: e1, negated: n1 },
-                BoundExpr::IsNull { expr: e2, negated: n2 },
+                BoundExpr::IsNull {
+                    expr: e1,
+                    negated: n1,
+                },
+                BoundExpr::IsNull {
+                    expr: e2,
+                    negated: n2,
+                },
             ) => n1 == n2 && e1 == e2,
             (
-                BoundExpr::InList { expr: e1, list: l1, negated: n1 },
-                BoundExpr::InList { expr: e2, list: l2, negated: n2 },
+                BoundExpr::InList {
+                    expr: e1,
+                    list: l1,
+                    negated: n1,
+                },
+                BoundExpr::InList {
+                    expr: e2,
+                    list: l2,
+                    negated: n2,
+                },
             ) => n1 == n2 && e1 == e2 && l1 == l2,
             (
-                BoundExpr::Between { expr: e1, low: lo1, high: hi1, negated: n1 },
-                BoundExpr::Between { expr: e2, low: lo2, high: hi2, negated: n2 },
+                BoundExpr::Between {
+                    expr: e1,
+                    low: lo1,
+                    high: hi1,
+                    negated: n1,
+                },
+                BoundExpr::Between {
+                    expr: e2,
+                    low: lo2,
+                    high: hi2,
+                    negated: n2,
+                },
             ) => n1 == n2 && e1 == e2 && lo1 == lo2 && hi1 == hi2,
             (
-                BoundExpr::Like { expr: e1, pattern: p1, negated: n1 },
-                BoundExpr::Like { expr: e2, pattern: p2, negated: n2 },
+                BoundExpr::Like {
+                    expr: e1,
+                    pattern: p1,
+                    negated: n1,
+                },
+                BoundExpr::Like {
+                    expr: e2,
+                    pattern: p2,
+                    negated: n2,
+                },
             ) => n1 == n2 && e1 == e2 && p1 == p2,
             (
-                BoundExpr::ILike { expr: e1, pattern: p1, negated: n1 },
-                BoundExpr::ILike { expr: e2, pattern: p2, negated: n2 },
+                BoundExpr::ILike {
+                    expr: e1,
+                    pattern: p1,
+                    negated: n1,
+                },
+                BoundExpr::ILike {
+                    expr: e2,
+                    pattern: p2,
+                    negated: n2,
+                },
             ) => n1 == n2 && e1 == e2 && p1 == p2,
             (
-                BoundExpr::Function { name: n1, args: a1, return_type: r1, distinct: d1 },
-                BoundExpr::Function { name: n2, args: a2, return_type: r2, distinct: d2 },
+                BoundExpr::Function {
+                    name: n1,
+                    args: a1,
+                    return_type: r1,
+                    distinct: d1,
+                },
+                BoundExpr::Function {
+                    name: n2,
+                    args: a2,
+                    return_type: r2,
+                    distinct: d2,
+                },
             ) => n1 == n2 && d1 == d2 && r1 == r2 && a1 == a2,
             (
-                BoundExpr::AggregateFunction { name: n1, args: a1, distinct: d1, return_type: r1 },
-                BoundExpr::AggregateFunction { name: n2, args: a2, distinct: d2, return_type: r2 },
+                BoundExpr::AggregateFunction {
+                    name: n1,
+                    args: a1,
+                    distinct: d1,
+                    return_type: r1,
+                },
+                BoundExpr::AggregateFunction {
+                    name: n2,
+                    args: a2,
+                    distinct: d2,
+                    return_type: r2,
+                },
             ) => n1 == n2 && d1 == d2 && r1 == r2 && a1 == a2,
             (
-                BoundExpr::Cast { expr: e1, target_type: t1 },
-                BoundExpr::Cast { expr: e2, target_type: t2 },
+                BoundExpr::Cast {
+                    expr: e1,
+                    target_type: t1,
+                },
+                BoundExpr::Cast {
+                    expr: e2,
+                    target_type: t2,
+                },
             ) => t1 == t2 && e1 == e2,
             (
-                BoundExpr::Case { operand: o1, conditions: c1, else_result: e1, type_id: t1 },
-                BoundExpr::Case { operand: o2, conditions: c2, else_result: e2, type_id: t2 },
+                BoundExpr::Case {
+                    operand: o1,
+                    conditions: c1,
+                    else_result: e1,
+                    type_id: t1,
+                },
+                BoundExpr::Case {
+                    operand: o2,
+                    conditions: c2,
+                    else_result: e2,
+                    type_id: t2,
+                },
             ) => t1 == t2 && o1 == o2 && c1 == c2 && e1 == e2,
             (BoundExpr::Nested(a), BoundExpr::Nested(b)) => a == b,
             (
-                BoundExpr::Parameter { index: i1, type_id: t1 },
-                BoundExpr::Parameter { index: i2, type_id: t2 },
+                BoundExpr::Parameter {
+                    index: i1,
+                    type_id: t1,
+                },
+                BoundExpr::Parameter {
+                    index: i2,
+                    type_id: t2,
+                },
             ) => i1 == i2 && t1 == t2,
             (
-                BoundExpr::WindowFunction { function: f1, partition_by: p1, order_by: o1, frame: fr1, type_id: t1 },
-                BoundExpr::WindowFunction { function: f2, partition_by: p2, order_by: o2, frame: fr2, type_id: t2 },
+                BoundExpr::WindowFunction {
+                    function: f1,
+                    partition_by: p1,
+                    order_by: o1,
+                    frame: fr1,
+                    type_id: t1,
+                },
+                BoundExpr::WindowFunction {
+                    function: f2,
+                    partition_by: p2,
+                    order_by: o2,
+                    frame: fr2,
+                    type_id: t2,
+                },
             ) => t1 == t2 && f1 == f2 && p1 == p2 && o1 == o2 && fr1 == fr2,
             // Subquery variants: conservatively unequal (contain Arc<TableEntry>).
             (BoundExpr::Subquery { .. }, BoundExpr::Subquery { .. }) => false,
@@ -426,7 +544,9 @@ pub struct BoundDelete {
 const AGGREGATE_FUNCTIONS: &[&str] = &["count", "sum", "avg", "min", "max"];
 
 fn is_aggregate_function(name: &str) -> bool {
-    AGGREGATE_FUNCTIONS.iter().any(|&f| f.eq_ignore_ascii_case(name))
+    AGGREGATE_FUNCTIONS
+        .iter()
+        .any(|&f| f.eq_ignore_ascii_case(name))
 }
 
 // ---------------------------------------------------------------------------
@@ -493,96 +613,96 @@ impl<'a> Binder<'a> {
         stmt: &'b SelectStatement,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BoundSelect>> + 'b>> {
         Box::pin(async move {
-        // Bind CTEs first
-        let mut bound_ctes = Vec::new();
-        if let Some(with) = &stmt.with {
-            for cte in &with.ctes {
-                let mut cte_ctx = BindContext::new();
-                let cte_query = self.bind_select(&mut cte_ctx, &cte.query).await?;
-                let cte_columns = cte_query.output_schema.clone();
-                let bound_cte = BoundCte {
-                    name: cte.name.clone(),
-                    columns: cte_columns,
-                    query: Box::new(cte_query),
-                };
-                ctx.ctes.insert(cte.name.clone(), bound_cte.clone());
-                bound_ctes.push(bound_cte);
+            // Bind CTEs first
+            let mut bound_ctes = Vec::new();
+            if let Some(with) = &stmt.with {
+                for cte in &with.ctes {
+                    let mut cte_ctx = BindContext::new();
+                    let cte_query = self.bind_select(&mut cte_ctx, &cte.query).await?;
+                    let cte_columns = cte_query.output_schema.clone();
+                    let bound_cte = BoundCte {
+                        name: cte.name.clone(),
+                        columns: cte_columns,
+                        query: Box::new(cte_query),
+                    };
+                    ctx.ctes.insert(cte.name.clone(), bound_cte.clone());
+                    bound_ctes.push(bound_cte);
+                }
             }
-        }
 
-        // Bind FROM clause
-        let from = self.bind_from(ctx, &stmt.from).await?;
+            // Bind FROM clause
+            let from = self.bind_from(ctx, &stmt.from).await?;
 
-        // Bind WHERE
-        let where_clause = if let Some(expr) = &stmt.where_clause {
-            Some(self.bind_expr(ctx, expr).await?)
-        } else {
-            None
-        };
+            // Bind WHERE
+            let where_clause = if let Some(expr) = &stmt.where_clause {
+                Some(self.bind_expr(ctx, expr).await?)
+            } else {
+                None
+            };
 
-        // Bind GROUP BY
-        let mut group_by = Vec::with_capacity(stmt.group_by.len());
-        for e in &stmt.group_by {
-            group_by.push(self.bind_expr(ctx, e).await?);
-        }
+            // Bind GROUP BY
+            let mut group_by = Vec::with_capacity(stmt.group_by.len());
+            for e in &stmt.group_by {
+                group_by.push(self.bind_expr(ctx, e).await?);
+            }
 
-        // Bind HAVING
-        let having = if let Some(expr) = &stmt.having {
-            Some(self.bind_expr(ctx, expr).await?)
-        } else {
-            None
-        };
+            // Bind HAVING
+            let having = if let Some(expr) = &stmt.having {
+                Some(self.bind_expr(ctx, expr).await?)
+            } else {
+                None
+            };
 
-        // Bind projections
-        let projections = self.bind_select_items(ctx, &stmt.projections).await?;
+            // Bind projections
+            let projections = self.bind_select_items(ctx, &stmt.projections).await?;
 
-        // Build output schema from projections
-        let output_schema = self.build_output_schema(ctx, &projections);
+            // Build output schema from projections
+            let output_schema = self.build_output_schema(ctx, &projections);
 
-        // Bind ORDER BY
-        let mut order_by = Vec::with_capacity(stmt.order_by.len());
-        for o in &stmt.order_by {
-            order_by.push(self.bind_order_by(ctx, o).await?);
-        }
+            // Bind ORDER BY
+            let mut order_by = Vec::with_capacity(stmt.order_by.len());
+            for o in &stmt.order_by {
+                order_by.push(self.bind_order_by(ctx, o).await?);
+            }
 
-        // Bind LIMIT / OFFSET
-        let limit = if let Some(expr) = &stmt.limit {
-            Some(self.bind_expr(ctx, expr).await?)
-        } else {
-            None
-        };
-        let offset = if let Some(expr) = &stmt.offset {
-            Some(self.bind_expr(ctx, expr).await?)
-        } else {
-            None
-        };
+            // Bind LIMIT / OFFSET
+            let limit = if let Some(expr) = &stmt.limit {
+                Some(self.bind_expr(ctx, expr).await?)
+            } else {
+                None
+            };
+            let offset = if let Some(expr) = &stmt.offset {
+                Some(self.bind_expr(ctx, expr).await?)
+            } else {
+                None
+            };
 
-        // Bind set operations
-        let mut set_ops = Vec::new();
-        for set_op in &stmt.set_ops {
-            let mut right_ctx = BindContext::new();
-            let right = self.bind_select(&mut right_ctx, &set_op.right).await?;
-            set_ops.push(BoundSetOp {
-                op: set_op.op,
-                all: set_op.all,
-                right: Box::new(right),
-            });
-        }
+            // Bind set operations
+            let mut set_ops = Vec::new();
+            for set_op in &stmt.set_ops {
+                let mut right_ctx = BindContext::new();
+                let right = self.bind_select(&mut right_ctx, &set_op.right).await?;
+                set_ops.push(BoundSetOp {
+                    op: set_op.op,
+                    all: set_op.all,
+                    right: Box::new(right),
+                });
+            }
 
-        Ok(BoundSelect {
-            projections,
-            from,
-            where_clause,
-            group_by,
-            having,
-            order_by,
-            limit,
-            offset,
-            distinct: stmt.distinct,
-            set_ops,
-            ctes: bound_ctes,
-            output_schema,
-        })
+            Ok(BoundSelect {
+                projections,
+                from,
+                where_clause,
+                group_by,
+                having,
+                order_by,
+                limit,
+                offset,
+                distinct: stmt.distinct,
+                set_ops,
+                ctes: bound_ctes,
+                output_schema,
+            })
         }) // end Box::pin
     }
 
@@ -609,97 +729,97 @@ impl<'a> Binder<'a> {
         table_ref: &'b TableRef,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BoundFromItem>> + 'b>> {
         Box::pin(async move {
-        match table_ref {
-            TableRef::Table { name, alias, .. } => {
-                // Check if this is a CTE reference
-                let display_name = alias.as_deref().unwrap_or(name);
-                if let Some(cte) = ctx.ctes.get(name).cloned() {
+            match table_ref {
+                TableRef::Table { name, alias, .. } => {
+                    // Check if this is a CTE reference
+                    let display_name = alias.as_deref().unwrap_or(name);
+                    if let Some(cte) = ctx.ctes.get(name).cloned() {
+                        let idx = self.alloc_table_idx();
+                        let bound_table = BoundTableRef {
+                            table_idx: idx,
+                            table_id: None,
+                            alias: display_name.to_string(),
+                            columns: cte.columns.clone(),
+                            entry: None,
+                        };
+                        ctx.tables.push(bound_table);
+                        return Ok(BoundFromItem::Subquery {
+                            table_idx: idx,
+                            query: cte.query.clone(),
+                        });
+                    }
+
+                    // Parse optional schema qualifier (schema.table)
+                    let (schema_name, table_name) = if let Some(dot_pos) = name.find('.') {
+                        (Some(&name[..dot_pos]), &name[dot_pos + 1..])
+                    } else {
+                        (None, name.as_str())
+                    };
+
+                    let entry = self.resolver.resolve_table(schema_name, table_name).await?;
                     let idx = self.alloc_table_idx();
+
+                    let columns: Vec<BoundColumnDef> = entry
+                        .columns
+                        .iter()
+                        .map(|c| BoundColumnDef {
+                            column_id: c.id,
+                            name: c.name.clone(),
+                            type_id: c.type_id,
+                            nullable: c.nullable,
+                            ordinal: c.ordinal,
+                        })
+                        .collect();
+
+                    let bound_table = BoundTableRef {
+                        table_idx: idx,
+                        table_id: Some(entry.id),
+                        alias: display_name.to_string(),
+                        columns,
+                        entry: Some(Arc::clone(&entry)),
+                    };
+                    ctx.tables.push(bound_table);
+
+                    Ok(BoundFromItem::BaseTable {
+                        table_idx: idx,
+                        table_id: entry.id,
+                        entry,
+                    })
+                }
+                TableRef::Join(join_ref) => {
+                    let left = self.bind_table_ref(ctx, &join_ref.left).await?;
+                    let right = self.bind_table_ref(ctx, &join_ref.right).await?;
+                    let condition = self.bind_join_condition(ctx, &join_ref.condition).await?;
+                    Ok(BoundFromItem::Join {
+                        left: Box::new(left),
+                        join_type: join_ref.join_type,
+                        right: Box::new(right),
+                        condition,
+                    })
+                }
+                TableRef::Subquery { query, alias } => {
+                    let mut sub_ctx = BindContext::new();
+                    let bound_query = self.bind_select(&mut sub_ctx, query).await?;
+                    let idx = self.alloc_table_idx();
+                    let columns = bound_query.output_schema.clone();
                     let bound_table = BoundTableRef {
                         table_idx: idx,
                         table_id: None,
-                        alias: display_name.to_string(),
-                        columns: cte.columns.clone(),
+                        alias: alias.clone(),
+                        columns,
                         entry: None,
                     };
                     ctx.tables.push(bound_table);
-                    return Ok(BoundFromItem::Subquery {
+                    Ok(BoundFromItem::Subquery {
                         table_idx: idx,
-                        query: cte.query.clone(),
-                    });
-                }
-
-                // Parse optional schema qualifier (schema.table)
-                let (schema_name, table_name) = if let Some(dot_pos) = name.find('.') {
-                    (Some(&name[..dot_pos]), &name[dot_pos + 1..])
-                } else {
-                    (None, name.as_str())
-                };
-
-                let entry = self.resolver.resolve_table(schema_name, table_name).await?;
-                let idx = self.alloc_table_idx();
-
-                let columns: Vec<BoundColumnDef> = entry
-                    .columns
-                    .iter()
-                    .map(|c| BoundColumnDef {
-                        column_id: c.id,
-                        name: c.name.clone(),
-                        type_id: c.type_id,
-                        nullable: c.nullable,
-                        ordinal: c.ordinal,
+                        query: Box::new(bound_query),
                     })
-                    .collect();
-
-                let bound_table = BoundTableRef {
-                    table_idx: idx,
-                    table_id: Some(entry.id),
-                    alias: display_name.to_string(),
-                    columns,
-                    entry: Some(Arc::clone(&entry)),
-                };
-                ctx.tables.push(bound_table);
-
-                Ok(BoundFromItem::BaseTable {
-                    table_idx: idx,
-                    table_id: entry.id,
-                    entry,
-                })
+                }
+                TableRef::Lateral { subquery } => {
+                    // Treat LATERAL as a regular subquery for now
+                    self.bind_table_ref(ctx, subquery).await
+                }
             }
-            TableRef::Join(join_ref) => {
-                let left = self.bind_table_ref(ctx, &join_ref.left).await?;
-                let right = self.bind_table_ref(ctx, &join_ref.right).await?;
-                let condition = self.bind_join_condition(ctx, &join_ref.condition).await?;
-                Ok(BoundFromItem::Join {
-                    left: Box::new(left),
-                    join_type: join_ref.join_type,
-                    right: Box::new(right),
-                    condition,
-                })
-            }
-            TableRef::Subquery { query, alias } => {
-                let mut sub_ctx = BindContext::new();
-                let bound_query = self.bind_select(&mut sub_ctx, query).await?;
-                let idx = self.alloc_table_idx();
-                let columns = bound_query.output_schema.clone();
-                let bound_table = BoundTableRef {
-                    table_idx: idx,
-                    table_id: None,
-                    alias: alias.clone(),
-                    columns,
-                    entry: None,
-                };
-                ctx.tables.push(bound_table);
-                Ok(BoundFromItem::Subquery {
-                    table_idx: idx,
-                    query: Box::new(bound_query),
-                })
-            }
-            TableRef::Lateral { subquery } => {
-                // Treat LATERAL as a regular subquery for now
-                self.bind_table_ref(ctx, subquery).await
-            }
-        }
         }) // end Box::pin
     }
 
@@ -747,297 +867,338 @@ impl<'a> Binder<'a> {
         expr: &'b Expr,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BoundExpr>> + 'b>> {
         Box::pin(async move {
-        match expr {
-            Expr::Identifier(name) => {
-                let cr = self.resolve_column(ctx, name)?;
-                Ok(BoundExpr::ColumnRef(cr))
-            }
-            Expr::QualifiedIdentifier { table, column } => {
-                let cr = self.resolve_qualified_column(ctx, table, column)?;
-                Ok(BoundExpr::ColumnRef(cr))
-            }
-            Expr::Literal(lit) => {
-                let type_id = literal_type(lit);
-                Ok(BoundExpr::Literal {
-                    value: lit.clone(),
-                    type_id,
-                })
-            }
-            Expr::BinaryOp { left, op, right } => {
-                let left_bound = self.bind_expr(ctx, left).await?;
-                let right_bound = self.bind_expr(ctx, right).await?;
-                let type_id = infer_binary_type(op, left_bound.type_id(), right_bound.type_id())?;
-                Ok(BoundExpr::BinaryOp {
-                    left: Box::new(left_bound),
-                    op: *op,
-                    right: Box::new(right_bound),
-                    type_id,
-                })
-            }
-            Expr::UnaryOp { op, expr: inner } => {
-                let bound = self.bind_expr(ctx, inner).await?;
-                let type_id = match op {
-                    UnaryOperator::Not => TypeId::Boolean,
-                    UnaryOperator::Minus => bound.type_id(),
-                };
-                Ok(BoundExpr::UnaryOp {
-                    op: *op,
-                    expr: Box::new(bound),
-                    type_id,
-                })
-            }
-            Expr::IsNull { expr: inner, negated } => {
-                let bound = self.bind_expr(ctx, inner).await?;
-                Ok(BoundExpr::IsNull {
-                    expr: Box::new(bound),
-                    negated: *negated,
-                })
-            }
-            Expr::InList { expr: inner, list, negated } => {
-                let bound_expr = self.bind_expr(ctx, inner).await?;
-                let mut bound_list = Vec::with_capacity(list.len());
-                for e in list {
-                    bound_list.push(self.bind_expr(ctx, e).await?);
+            match expr {
+                Expr::Identifier(name) => {
+                    let cr = self.resolve_column(ctx, name)?;
+                    Ok(BoundExpr::ColumnRef(cr))
                 }
-                Ok(BoundExpr::InList {
-                    expr: Box::new(bound_expr),
-                    list: bound_list,
-                    negated: *negated,
-                })
-            }
-            Expr::Between { expr: inner, low, high, negated } => {
-                let bound_expr = self.bind_expr(ctx, inner).await?;
-                let bound_low = self.bind_expr(ctx, low).await?;
-                let bound_high = self.bind_expr(ctx, high).await?;
-                Ok(BoundExpr::Between {
-                    expr: Box::new(bound_expr),
-                    low: Box::new(bound_low),
-                    high: Box::new(bound_high),
-                    negated: *negated,
-                })
-            }
-            Expr::Like { expr: inner, pattern, negated } => {
-                let bound_expr = self.bind_expr(ctx, inner).await?;
-                let bound_pattern = self.bind_expr(ctx, pattern).await?;
-                Ok(BoundExpr::Like {
-                    expr: Box::new(bound_expr),
-                    pattern: Box::new(bound_pattern),
-                    negated: *negated,
-                })
-            }
-            Expr::ILike { expr: inner, pattern, negated } => {
-                let bound_expr = self.bind_expr(ctx, inner).await?;
-                let bound_pattern = self.bind_expr(ctx, pattern).await?;
-                Ok(BoundExpr::ILike {
-                    expr: Box::new(bound_expr),
-                    pattern: Box::new(bound_pattern),
-                    negated: *negated,
-                })
-            }
-            Expr::Function { name, args, distinct } => {
-                let mut bound_args = Vec::with_capacity(args.len());
-                for a in args {
-                    let e = match a {
-                        FunctionArg::Unnamed(e) => e,
-                        FunctionArg::Named { value, .. } => value,
+                Expr::QualifiedIdentifier { table, column } => {
+                    let cr = self.resolve_qualified_column(ctx, table, column)?;
+                    Ok(BoundExpr::ColumnRef(cr))
+                }
+                Expr::Literal(lit) => {
+                    let type_id = literal_type(lit);
+                    Ok(BoundExpr::Literal {
+                        value: lit.clone(),
+                        type_id,
+                    })
+                }
+                Expr::BinaryOp { left, op, right } => {
+                    let left_bound = self.bind_expr(ctx, left).await?;
+                    let right_bound = self.bind_expr(ctx, right).await?;
+                    let type_id =
+                        infer_binary_type(op, left_bound.type_id(), right_bound.type_id())?;
+                    Ok(BoundExpr::BinaryOp {
+                        left: Box::new(left_bound),
+                        op: *op,
+                        right: Box::new(right_bound),
+                        type_id,
+                    })
+                }
+                Expr::UnaryOp { op, expr: inner } => {
+                    let bound = self.bind_expr(ctx, inner).await?;
+                    let type_id = match op {
+                        UnaryOperator::Not => TypeId::Boolean,
+                        UnaryOperator::Minus => bound.type_id(),
                     };
-                    bound_args.push(self.bind_expr(ctx, e).await?);
-                }
-
-                let arg_types: Vec<TypeId> = bound_args.iter().map(|a| a.type_id()).collect();
-
-                if is_aggregate_function(name) {
-                    let return_type = infer_aggregate_type(name, &arg_types)?;
-                    Ok(BoundExpr::AggregateFunction {
-                        name: name.to_lowercase(),
-                        args: bound_args,
-                        distinct: *distinct,
-                        return_type,
-                    })
-                } else {
-                    let return_type = infer_function_type(name, &arg_types);
-                    Ok(BoundExpr::Function {
-                        name: name.clone(),
-                        args: bound_args,
-                        return_type,
-                        distinct: *distinct,
+                    Ok(BoundExpr::UnaryOp {
+                        op: *op,
+                        expr: Box::new(bound),
+                        type_id,
                     })
                 }
-            }
-            Expr::Cast { expr: inner, data_type } => {
-                let bound = self.bind_expr(ctx, inner).await?;
-                let target_type = data_type.to_type_id();
-                Ok(BoundExpr::Cast {
-                    expr: Box::new(bound),
-                    target_type,
-                })
-            }
-            Expr::Case { operand, conditions, else_result } => {
-                let bound_operand = if let Some(e) = operand.as_ref() {
-                    Some(self.bind_expr(ctx, e).await?)
-                } else {
-                    None
-                };
-                let mut bound_conditions = Vec::with_capacity(conditions.len());
-                for wc in conditions {
-                    bound_conditions.push(BoundWhen {
-                        condition: self.bind_expr(ctx, &wc.condition).await?,
-                        result: self.bind_expr(ctx, &wc.result).await?,
-                    });
+                Expr::IsNull {
+                    expr: inner,
+                    negated,
+                } => {
+                    let bound = self.bind_expr(ctx, inner).await?;
+                    Ok(BoundExpr::IsNull {
+                        expr: Box::new(bound),
+                        negated: *negated,
+                    })
                 }
-                let bound_else = if let Some(e) = else_result.as_ref() {
-                    Some(self.bind_expr(ctx, e).await?)
-                } else {
-                    None
-                };
-
-                // Result type is the type of the first THEN clause
-                let type_id = bound_conditions
-                    .first()
-                    .map(|w| w.result.type_id())
-                    .unwrap_or(TypeId::Null);
-
-                Ok(BoundExpr::Case {
-                    operand: bound_operand.map(Box::new),
-                    conditions: bound_conditions,
-                    else_result: bound_else.map(Box::new),
-                    type_id,
-                })
-            }
-            Expr::Nested(inner) => {
-                let bound = self.bind_expr(ctx, inner).await?;
-                Ok(BoundExpr::Nested(Box::new(bound)))
-            }
-            Expr::Subquery(query) => {
-                let mut sub_ctx = BindContext::new();
-                // Copy outer scope for correlated subquery support
-                for table in &ctx.tables {
-                    sub_ctx.tables.push(table.clone());
+                Expr::InList {
+                    expr: inner,
+                    list,
+                    negated,
+                } => {
+                    let bound_expr = self.bind_expr(ctx, inner).await?;
+                    let mut bound_list = Vec::with_capacity(list.len());
+                    for e in list {
+                        bound_list.push(self.bind_expr(ctx, e).await?);
+                    }
+                    Ok(BoundExpr::InList {
+                        expr: Box::new(bound_expr),
+                        list: bound_list,
+                        negated: *negated,
+                    })
                 }
-                let bound = Box::pin(self.bind_select(&mut sub_ctx, query)).await?;
-                let type_id = bound
-                    .output_schema
-                    .first()
-                    .map(|c| c.type_id)
-                    .unwrap_or(TypeId::Null);
-                Ok(BoundExpr::Subquery {
-                    plan: Box::new(bound),
-                    type_id,
-                })
-            }
-            Expr::Exists { query, negated } => {
-                let mut sub_ctx = BindContext::new();
-                for table in &ctx.tables {
-                    sub_ctx.tables.push(table.clone());
+                Expr::Between {
+                    expr: inner,
+                    low,
+                    high,
+                    negated,
+                } => {
+                    let bound_expr = self.bind_expr(ctx, inner).await?;
+                    let bound_low = self.bind_expr(ctx, low).await?;
+                    let bound_high = self.bind_expr(ctx, high).await?;
+                    Ok(BoundExpr::Between {
+                        expr: Box::new(bound_expr),
+                        low: Box::new(bound_low),
+                        high: Box::new(bound_high),
+                        negated: *negated,
+                    })
                 }
-                let bound = Box::pin(self.bind_select(&mut sub_ctx, query)).await?;
-                Ok(BoundExpr::Exists {
-                    plan: Box::new(bound),
-                    negated: *negated,
-                })
-            }
-            Expr::InSubquery { expr: inner, query, negated } => {
-                let bound_expr = self.bind_expr(ctx, inner).await?;
-                let mut sub_ctx = BindContext::new();
-                for table in &ctx.tables {
-                    sub_ctx.tables.push(table.clone());
+                Expr::Like {
+                    expr: inner,
+                    pattern,
+                    negated,
+                } => {
+                    let bound_expr = self.bind_expr(ctx, inner).await?;
+                    let bound_pattern = self.bind_expr(ctx, pattern).await?;
+                    Ok(BoundExpr::Like {
+                        expr: Box::new(bound_expr),
+                        pattern: Box::new(bound_pattern),
+                        negated: *negated,
+                    })
                 }
-                let bound_query = Box::pin(self.bind_select(&mut sub_ctx, query)).await?;
-                Ok(BoundExpr::InSubquery {
-                    expr: Box::new(bound_expr),
-                    plan: Box::new(bound_query),
-                    negated: *negated,
-                })
-            }
-            Expr::WindowFunction { function, partition_by, order_by, frame } => {
-                let bound_func = self.bind_expr(ctx, function).await?;
-                let mut bound_partition = Vec::with_capacity(partition_by.len());
-                for e in partition_by {
-                    bound_partition.push(self.bind_expr(ctx, e).await?);
+                Expr::ILike {
+                    expr: inner,
+                    pattern,
+                    negated,
+                } => {
+                    let bound_expr = self.bind_expr(ctx, inner).await?;
+                    let bound_pattern = self.bind_expr(ctx, pattern).await?;
+                    Ok(BoundExpr::ILike {
+                        expr: Box::new(bound_expr),
+                        pattern: Box::new(bound_pattern),
+                        negated: *negated,
+                    })
                 }
-                let mut bound_order = Vec::with_capacity(order_by.len());
-                for o in order_by {
-                    bound_order.push(self.bind_order_by(ctx, o).await?);
-                }
-                let type_id = bound_func.type_id();
-                Ok(BoundExpr::WindowFunction {
-                    function: Box::new(bound_func),
-                    partition_by: bound_partition,
-                    order_by: bound_order,
-                    frame: frame.clone(),
-                    type_id,
-                })
-            }
-            Expr::Parameter(idx) => Ok(BoundExpr::Parameter {
-                index: *idx,
-                type_id: TypeId::Null, // Resolved at execution time
-            }),
-            // JSON, array, vector operators: bind as generic binary ops for now
-            Expr::JsonAccess { left, right, .. }
-            | Expr::JsonContains { left, right, .. }
-            | Expr::JsonExists { left, right, .. }
-            | Expr::VectorDistance { left, right, .. } => {
-                let bound_left = self.bind_expr(ctx, left).await?;
-                let _bound_right = self.bind_expr(ctx, right).await?;
-                Ok(BoundExpr::Function {
-                    name: "json_op".to_string(),
-                    args: vec![bound_left, _bound_right],
-                    return_type: TypeId::Jsonb,
-                    distinct: false,
-                })
-            }
-            Expr::ArrayConstructor(elements) => {
-                let mut bound_elements = Vec::with_capacity(elements.len());
-                for e in elements {
-                    bound_elements.push(self.bind_expr(ctx, e).await?);
-                }
-                Ok(BoundExpr::Function {
-                    name: "array".to_string(),
-                    args: bound_elements,
-                    return_type: TypeId::Array,
-                    distinct: false,
-                })
-            }
-            Expr::ArraySubscript { array, index } => {
-                let bound_array = self.bind_expr(ctx, array).await?;
-                let bound_index = self.bind_expr(ctx, index).await?;
-                Ok(BoundExpr::Function {
-                    name: "array_subscript".to_string(),
-                    args: vec![bound_array, bound_index],
-                    return_type: TypeId::Null, // Element type unknown without full type system
-                    distinct: false,
-                })
-            }
-            Expr::AnySubquery { query } | Expr::AllSubquery { query } => {
-                let mut sub_ctx = BindContext::new();
-                let bound_query = Box::pin(self.bind_select(&mut sub_ctx, query)).await?;
-                let type_id = bound_query
-                    .output_schema
-                    .first()
-                    .map(|c| c.type_id)
-                    .unwrap_or(TypeId::Null);
-                Ok(BoundExpr::Subquery {
-                    plan: Box::new(bound_query),
-                    type_id,
-                })
-            }
-            Expr::MatchAgainst { columns, query, .. } => {
-                // Bind as a function call with the match columns and query
-                let bound_query = self.bind_expr(ctx, query).await?;
-                let mut args = Vec::with_capacity(columns.len() + 1);
-                for col_name in columns {
-                    let cr = self.resolve_column(ctx, col_name)?;
-                    args.push(BoundExpr::ColumnRef(cr));
-                }
-                args.push(bound_query);
-                Ok(BoundExpr::Function {
-                    name: "match_against".to_string(),
+                Expr::Function {
+                    name,
                     args,
-                    return_type: TypeId::Float64,
-                    distinct: false,
-                })
+                    distinct,
+                } => {
+                    let mut bound_args = Vec::with_capacity(args.len());
+                    for a in args {
+                        let e = match a {
+                            FunctionArg::Unnamed(e) => e,
+                            FunctionArg::Named { value, .. } => value,
+                        };
+                        bound_args.push(self.bind_expr(ctx, e).await?);
+                    }
+
+                    let arg_types: Vec<TypeId> = bound_args.iter().map(|a| a.type_id()).collect();
+
+                    if is_aggregate_function(name) {
+                        let return_type = infer_aggregate_type(name, &arg_types)?;
+                        Ok(BoundExpr::AggregateFunction {
+                            name: name.to_lowercase(),
+                            args: bound_args,
+                            distinct: *distinct,
+                            return_type,
+                        })
+                    } else {
+                        let return_type = infer_function_type(name, &arg_types);
+                        Ok(BoundExpr::Function {
+                            name: name.clone(),
+                            args: bound_args,
+                            return_type,
+                            distinct: *distinct,
+                        })
+                    }
+                }
+                Expr::Cast {
+                    expr: inner,
+                    data_type,
+                } => {
+                    let bound = self.bind_expr(ctx, inner).await?;
+                    let target_type = data_type.to_type_id();
+                    Ok(BoundExpr::Cast {
+                        expr: Box::new(bound),
+                        target_type,
+                    })
+                }
+                Expr::Case {
+                    operand,
+                    conditions,
+                    else_result,
+                } => {
+                    let bound_operand = if let Some(e) = operand.as_ref() {
+                        Some(self.bind_expr(ctx, e).await?)
+                    } else {
+                        None
+                    };
+                    let mut bound_conditions = Vec::with_capacity(conditions.len());
+                    for wc in conditions {
+                        bound_conditions.push(BoundWhen {
+                            condition: self.bind_expr(ctx, &wc.condition).await?,
+                            result: self.bind_expr(ctx, &wc.result).await?,
+                        });
+                    }
+                    let bound_else = if let Some(e) = else_result.as_ref() {
+                        Some(self.bind_expr(ctx, e).await?)
+                    } else {
+                        None
+                    };
+
+                    // Result type is the type of the first THEN clause
+                    let type_id = bound_conditions
+                        .first()
+                        .map(|w| w.result.type_id())
+                        .unwrap_or(TypeId::Null);
+
+                    Ok(BoundExpr::Case {
+                        operand: bound_operand.map(Box::new),
+                        conditions: bound_conditions,
+                        else_result: bound_else.map(Box::new),
+                        type_id,
+                    })
+                }
+                Expr::Nested(inner) => {
+                    let bound = self.bind_expr(ctx, inner).await?;
+                    Ok(BoundExpr::Nested(Box::new(bound)))
+                }
+                Expr::Subquery(query) => {
+                    let mut sub_ctx = BindContext::new();
+                    // Copy outer scope for correlated subquery support
+                    for table in &ctx.tables {
+                        sub_ctx.tables.push(table.clone());
+                    }
+                    let bound = Box::pin(self.bind_select(&mut sub_ctx, query)).await?;
+                    let type_id = bound
+                        .output_schema
+                        .first()
+                        .map(|c| c.type_id)
+                        .unwrap_or(TypeId::Null);
+                    Ok(BoundExpr::Subquery {
+                        plan: Box::new(bound),
+                        type_id,
+                    })
+                }
+                Expr::Exists { query, negated } => {
+                    let mut sub_ctx = BindContext::new();
+                    for table in &ctx.tables {
+                        sub_ctx.tables.push(table.clone());
+                    }
+                    let bound = Box::pin(self.bind_select(&mut sub_ctx, query)).await?;
+                    Ok(BoundExpr::Exists {
+                        plan: Box::new(bound),
+                        negated: *negated,
+                    })
+                }
+                Expr::InSubquery {
+                    expr: inner,
+                    query,
+                    negated,
+                } => {
+                    let bound_expr = self.bind_expr(ctx, inner).await?;
+                    let mut sub_ctx = BindContext::new();
+                    for table in &ctx.tables {
+                        sub_ctx.tables.push(table.clone());
+                    }
+                    let bound_query = Box::pin(self.bind_select(&mut sub_ctx, query)).await?;
+                    Ok(BoundExpr::InSubquery {
+                        expr: Box::new(bound_expr),
+                        plan: Box::new(bound_query),
+                        negated: *negated,
+                    })
+                }
+                Expr::WindowFunction {
+                    function,
+                    partition_by,
+                    order_by,
+                    frame,
+                } => {
+                    let bound_func = self.bind_expr(ctx, function).await?;
+                    let mut bound_partition = Vec::with_capacity(partition_by.len());
+                    for e in partition_by {
+                        bound_partition.push(self.bind_expr(ctx, e).await?);
+                    }
+                    let mut bound_order = Vec::with_capacity(order_by.len());
+                    for o in order_by {
+                        bound_order.push(self.bind_order_by(ctx, o).await?);
+                    }
+                    let type_id = bound_func.type_id();
+                    Ok(BoundExpr::WindowFunction {
+                        function: Box::new(bound_func),
+                        partition_by: bound_partition,
+                        order_by: bound_order,
+                        frame: frame.clone(),
+                        type_id,
+                    })
+                }
+                Expr::Parameter(idx) => Ok(BoundExpr::Parameter {
+                    index: *idx,
+                    type_id: TypeId::Null, // Resolved at execution time
+                }),
+                // JSON, array, vector operators: bind as generic binary ops for now
+                Expr::JsonAccess { left, right, .. }
+                | Expr::JsonContains { left, right, .. }
+                | Expr::JsonExists { left, right, .. }
+                | Expr::VectorDistance { left, right, .. } => {
+                    let bound_left = self.bind_expr(ctx, left).await?;
+                    let _bound_right = self.bind_expr(ctx, right).await?;
+                    Ok(BoundExpr::Function {
+                        name: "json_op".to_string(),
+                        args: vec![bound_left, _bound_right],
+                        return_type: TypeId::Jsonb,
+                        distinct: false,
+                    })
+                }
+                Expr::ArrayConstructor(elements) => {
+                    let mut bound_elements = Vec::with_capacity(elements.len());
+                    for e in elements {
+                        bound_elements.push(self.bind_expr(ctx, e).await?);
+                    }
+                    Ok(BoundExpr::Function {
+                        name: "array".to_string(),
+                        args: bound_elements,
+                        return_type: TypeId::Array,
+                        distinct: false,
+                    })
+                }
+                Expr::ArraySubscript { array, index } => {
+                    let bound_array = self.bind_expr(ctx, array).await?;
+                    let bound_index = self.bind_expr(ctx, index).await?;
+                    Ok(BoundExpr::Function {
+                        name: "array_subscript".to_string(),
+                        args: vec![bound_array, bound_index],
+                        return_type: TypeId::Null, // Element type unknown without full type system
+                        distinct: false,
+                    })
+                }
+                Expr::AnySubquery { query } | Expr::AllSubquery { query } => {
+                    let mut sub_ctx = BindContext::new();
+                    let bound_query = Box::pin(self.bind_select(&mut sub_ctx, query)).await?;
+                    let type_id = bound_query
+                        .output_schema
+                        .first()
+                        .map(|c| c.type_id)
+                        .unwrap_or(TypeId::Null);
+                    Ok(BoundExpr::Subquery {
+                        plan: Box::new(bound_query),
+                        type_id,
+                    })
+                }
+                Expr::MatchAgainst { columns, query, .. } => {
+                    // Bind as a function call with the match columns and query
+                    let bound_query = self.bind_expr(ctx, query).await?;
+                    let mut args = Vec::with_capacity(columns.len() + 1);
+                    for col_name in columns {
+                        let cr = self.resolve_column(ctx, col_name)?;
+                        args.push(BoundExpr::ColumnRef(cr));
+                    }
+                    args.push(bound_query);
+                    Ok(BoundExpr::Function {
+                        name: "match_against".to_string(),
+                        args,
+                        return_type: TypeId::Float64,
+                        distinct: false,
+                    })
+                }
             }
-        }
         }) // end Box::pin for bind_expr
     }
 
@@ -1200,7 +1361,11 @@ impl<'a> Binder<'a> {
     // ORDER BY binding
     // -----------------------------------------------------------------------
 
-    async fn bind_order_by(&mut self, ctx: &BindContext, order: &OrderByExpr) -> Result<BoundOrderBy> {
+    async fn bind_order_by(
+        &mut self,
+        ctx: &BindContext,
+        order: &OrderByExpr,
+    ) -> Result<BoundOrderBy> {
         let bound_expr = self.bind_expr(ctx, &order.expr).await?;
         Ok(BoundOrderBy {
             expr: bound_expr,
@@ -1429,11 +1594,7 @@ fn literal_type(lit: &LiteralValue) -> TypeId {
 }
 
 /// Infers the result type of a binary operation.
-fn infer_binary_type(
-    op: &BinaryOperator,
-    left: TypeId,
-    right: TypeId,
-) -> Result<TypeId> {
+fn infer_binary_type(op: &BinaryOperator, left: TypeId, right: TypeId) -> Result<TypeId> {
     match op {
         // Comparison operators always produce Boolean
         BinaryOperator::Eq
@@ -1486,11 +1647,7 @@ fn promote_numeric(left: TypeId, right: TypeId) -> TypeId {
     // Integer promotion: pick the wider type
     let left_rank = integer_rank(left);
     let right_rank = integer_rank(right);
-    if left_rank >= right_rank {
-        left
-    } else {
-        right
-    }
+    if left_rank >= right_rank { left } else { right }
 }
 
 fn integer_rank(t: TypeId) -> u8 {
@@ -1610,19 +1767,43 @@ mod tests {
 
     #[test]
     fn test_aggregate_type_inference() {
-        assert_eq!(infer_aggregate_type("count", &[TypeId::Int32]).unwrap(), TypeId::Int64);
-        assert_eq!(infer_aggregate_type("sum", &[TypeId::Int32]).unwrap(), TypeId::Int64);
-        assert_eq!(infer_aggregate_type("sum", &[TypeId::Float64]).unwrap(), TypeId::Float64);
-        assert_eq!(infer_aggregate_type("avg", &[TypeId::Int32]).unwrap(), TypeId::Float64);
-        assert_eq!(infer_aggregate_type("min", &[TypeId::Varchar]).unwrap(), TypeId::Varchar);
-        assert_eq!(infer_aggregate_type("max", &[TypeId::Int64]).unwrap(), TypeId::Int64);
+        assert_eq!(
+            infer_aggregate_type("count", &[TypeId::Int32]).unwrap(),
+            TypeId::Int64
+        );
+        assert_eq!(
+            infer_aggregate_type("sum", &[TypeId::Int32]).unwrap(),
+            TypeId::Int64
+        );
+        assert_eq!(
+            infer_aggregate_type("sum", &[TypeId::Float64]).unwrap(),
+            TypeId::Float64
+        );
+        assert_eq!(
+            infer_aggregate_type("avg", &[TypeId::Int32]).unwrap(),
+            TypeId::Float64
+        );
+        assert_eq!(
+            infer_aggregate_type("min", &[TypeId::Varchar]).unwrap(),
+            TypeId::Varchar
+        );
+        assert_eq!(
+            infer_aggregate_type("max", &[TypeId::Int64]).unwrap(),
+            TypeId::Int64
+        );
     }
 
     #[test]
     fn test_numeric_promotion() {
         assert_eq!(promote_numeric(TypeId::Int32, TypeId::Int64), TypeId::Int64);
-        assert_eq!(promote_numeric(TypeId::Int64, TypeId::Float64), TypeId::Float64);
-        assert_eq!(promote_numeric(TypeId::Int32, TypeId::Float32), TypeId::Float64);
+        assert_eq!(
+            promote_numeric(TypeId::Int64, TypeId::Float64),
+            TypeId::Float64
+        );
+        assert_eq!(
+            promote_numeric(TypeId::Int32, TypeId::Float32),
+            TypeId::Float64
+        );
         assert_eq!(promote_numeric(TypeId::Null, TypeId::Int64), TypeId::Int64);
         assert_eq!(promote_numeric(TypeId::Int64, TypeId::Null), TypeId::Int64);
     }

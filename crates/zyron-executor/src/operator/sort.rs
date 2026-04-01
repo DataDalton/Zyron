@@ -162,7 +162,7 @@ impl SortOperator {
                 let idx = resolve_column_index(cr.table_idx, cr.column_id, &self.input_schema)?;
                 key_sources.push(Some(idx));
             } else {
-                let col = evaluate(&ob.expr, &merged, &self.input_schema)?;
+                let col = evaluate(&ob.expr, &merged, &self.input_schema, &[])?;
                 key_sources.push(None);
                 owned_sort_columns.push(col);
             }

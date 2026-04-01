@@ -583,7 +583,7 @@ pub struct LookupJoin {
     ttl_ms: i64,
     max_entries: usize,
     /// Lookup function called on cache misses.
-    lookup_fn: Box<dyn Fn(u64) -> Result<Option<StreamBatch>> + Send>,
+    lookup_fn: Box<dyn Fn(u64) -> Result<Option<StreamBatch>> + Send + Sync>,
     current_time_ms: i64,
     /// Reusable hash buffer.
     hash_buf: Vec<u64>,
@@ -595,7 +595,7 @@ impl LookupJoin {
         probe_key_cols: Vec<usize>,
         ttl_ms: i64,
         max_entries: usize,
-        lookup_fn: Box<dyn Fn(u64) -> Result<Option<StreamBatch>> + Send>,
+        lookup_fn: Box<dyn Fn(u64) -> Result<Option<StreamBatch>> + Send + Sync>,
     ) -> Self {
         Self {
             id,

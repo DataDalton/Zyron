@@ -83,7 +83,7 @@ impl Operator for ValuesOperator {
 
             for row_exprs in &self.rows {
                 for (c, expr) in row_exprs.iter().enumerate() {
-                    let col = evaluate(expr, &dummy, &self.schema)?;
+                    let col = evaluate(expr, &dummy, &self.schema, &[])?;
                     let scalar = if col.len() > 0 {
                         col.get_scalar(0)
                     } else {
@@ -155,6 +155,14 @@ impl Operator for InsertOperator {
                 };
 
                 let tuples = batch_to_tuples(&exec_batch.batch, &table_entry.columns, txn_id);
+
+                // Fire BEFORE INSERT triggers if present.
+                if let Some(ref hook) = self.ctx.dml_hook {
+                    let tuple_refs: Vec<&[u8]> = tuples.iter().map(|t| t.data()).collect();
+                    if !hook.before_insert(self.table_id.0, &tuple_refs, txn_id)? {
+                        continue; // Trigger cancelled the insert
+                    }
+                }
 
                 // Batch WAL log: one CAS + commit for all inserts in this batch.
                 let batch_records: Vec<(u32, &[u8])> =
@@ -245,6 +253,17 @@ impl Operator for DeleteOperator {
                 let tuple_ids = exec_batch.tuple_ids.ok_or_else(|| {
                     ZyronError::Internal("DeleteOperator requires tuple IDs from scan".into())
                 })?;
+
+                // Fire BEFORE DELETE triggers if present.
+                if let Some(ref hook) = self.ctx.dml_hook {
+                    let table_entry = self.ctx.get_table_entry(self.table_id)?;
+                    let old_tuples =
+                        batch_to_tuples(&exec_batch.batch, &table_entry.columns, txn_id);
+                    let refs: Vec<&[u8]> = old_tuples.iter().map(|t| t.data()).collect();
+                    if !hook.before_delete(self.table_id.0, &refs, txn_id)? {
+                        continue; // Trigger cancelled the delete
+                    }
+                }
 
                 // Capture old tuples for CDC hook (batch data is from the scan).
                 let old_tuples_for_cdc = if self.ctx.cdc_hook.is_some() {
@@ -363,8 +382,12 @@ impl Operator for UpdateOperator {
                 let mut updated_columns = exec_batch.batch.columns.clone();
 
                 for assignment in &self.assignments {
-                    let new_col =
-                        evaluate(&assignment.value, &exec_batch.batch, &self.input_schema)?;
+                    let new_col = evaluate(
+                        &assignment.value,
+                        &exec_batch.batch,
+                        &self.input_schema,
+                        &[],
+                    )?;
 
                     // Find the column index matching this assignment's column_id.
                     let col_idx = self
@@ -383,6 +406,17 @@ impl Operator for UpdateOperator {
 
                 let updated_batch = DataBatch::new(updated_columns);
                 let new_tuples = batch_to_tuples(&updated_batch, &table_entry.columns, txn_id);
+
+                // Fire BEFORE UPDATE triggers if present.
+                if let Some(ref hook) = self.ctx.dml_hook {
+                    let old_tuples =
+                        batch_to_tuples(&exec_batch.batch, &table_entry.columns, txn_id);
+                    let old_refs: Vec<&[u8]> = old_tuples.iter().map(|t| t.data()).collect();
+                    let new_refs: Vec<&[u8]> = new_tuples.iter().map(|t| t.data()).collect();
+                    if !hook.before_update(self.table_id.0, &old_refs, &new_refs, txn_id)? {
+                        continue; // Trigger cancelled the update
+                    }
+                }
 
                 // Batch WAL log deletes: one CAS + commit for all.
                 let delete_payloads: Vec<Vec<u8>> =

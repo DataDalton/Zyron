@@ -218,6 +218,16 @@ impl TriggerManager {
             .unwrap_or_default()
     }
 
+    /// Returns all registered triggers across all tables.
+    pub fn listAll(&self) -> Vec<Arc<Trigger>> {
+        let mut result = Vec::new();
+        self.triggers.iter_sync(|_table_id, triggers| {
+            result.extend(triggers.iter().cloned());
+            true
+        });
+        result
+    }
+
     /// Returns the total number of triggers registered across all tables.
     pub fn triggerCount(&self) -> usize {
         let mut count = 0;

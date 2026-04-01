@@ -11,7 +11,9 @@ use std::time::Duration;
 
 use tracing::{debug, info};
 
-use zyron_catalog::Catalog;
+use zyron_buffer::BufferPool;
+use zyron_catalog::{Catalog, analyze_table};
+use zyron_storage::{DiskManager, HeapFile, HeapFileConfig};
 
 /// Configuration for the statistics collector.
 #[derive(Debug, Clone)]
@@ -43,7 +45,12 @@ pub struct StatsCollector {
 
 impl StatsCollector {
     /// Starts the stats collector thread.
-    pub fn start(catalog: Arc<Catalog>, config: StatsCollectorConfig) -> Self {
+    pub fn start(
+        catalog: Arc<Catalog>,
+        disk_manager: Arc<DiskManager>,
+        buffer_pool: Arc<BufferPool>,
+        config: StatsCollectorConfig,
+    ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let waker = Arc::new(OnceLock::new());
 
@@ -54,7 +61,13 @@ impl StatsCollector {
             .name("zyron-stats".into())
             .spawn(move || {
                 let _ = thread_waker.set(thread::current());
-                Self::collector_loop(&catalog, &config, &thread_shutdown);
+                Self::collector_loop(
+                    &catalog,
+                    &disk_manager,
+                    &buffer_pool,
+                    &config,
+                    &thread_shutdown,
+                );
             })
             .expect("failed to spawn stats collector thread");
 
@@ -66,8 +79,18 @@ impl StatsCollector {
     }
 
     /// Main collector loop. Runs analysis on each table at the configured interval.
-    fn collector_loop(catalog: &Catalog, config: &StatsCollectorConfig, shutdown: &AtomicBool) {
+    fn collector_loop(
+        catalog: &Catalog,
+        disk_manager: &Arc<DiskManager>,
+        buffer_pool: &Arc<BufferPool>,
+        config: &StatsCollectorConfig,
+        shutdown: &AtomicBool,
+    ) {
         let interval = Duration::from_secs(config.interval_secs);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build tokio runtime for stats collector");
 
         loop {
             thread::park_timeout(interval);
@@ -78,7 +101,6 @@ impl StatsCollector {
 
             debug!("Stats collection cycle starting");
 
-            // Collect stats for all tables across all schemas.
             let tables = catalog.list_all_tables();
             let mut analyzed = 0u32;
 
@@ -87,13 +109,40 @@ impl StatsCollector {
                     return;
                 }
 
-                let table_id = table_entry.id;
+                let heap_file = match HeapFile::new(
+                    Arc::clone(disk_manager),
+                    Arc::clone(buffer_pool),
+                    HeapFileConfig {
+                        heap_file_id: table_entry.heap_file_id,
+                        fsm_file_id: table_entry.fsm_file_id,
+                    },
+                ) {
+                    Ok(hf) => hf,
+                    Err(e) => {
+                        debug!(
+                            "Failed to open heap file for table {}: {}",
+                            table_entry.name, e
+                        );
+                        continue;
+                    }
+                };
 
-                // For now, log that we would analyze this table.
-                // Full analysis requires heap page sampling through the buffer pool,
-                // which uses zyron_catalog::analyze_table() once wired up.
-                debug!("Would analyze table {:?} ({})", table_id, table_entry.name);
-                analyzed += 1;
+                match rt.block_on(analyze_table(&table_entry, &heap_file)) {
+                    Ok((table_stats, column_stats)) => {
+                        debug!(
+                            "Analyzed table {} ({} rows, {} pages)",
+                            table_entry.name, table_stats.row_count, table_stats.page_count
+                        );
+                        catalog.put_stats(table_entry.id, table_stats, column_stats);
+                        analyzed += 1;
+                    }
+                    Err(e) => {
+                        debug!(
+                            "Stats analysis failed for table {}: {}",
+                            table_entry.name, e
+                        );
+                    }
+                }
             }
 
             if analyzed > 0 {
@@ -120,6 +169,33 @@ impl Drop for StatsCollector {
             self.shutdown();
         }
     }
+}
+
+/// Runs ANALYZE on a single table immediately. Called by the ANALYZE SQL command.
+/// Returns Ok(row_count) on success.
+pub async fn analyze_table_immediate(
+    table: &zyron_catalog::TableEntry,
+    catalog: &Catalog,
+    disk_manager: &Arc<DiskManager>,
+    buffer_pool: &Arc<BufferPool>,
+) -> std::result::Result<u64, String> {
+    let heap_file = HeapFile::new(
+        Arc::clone(disk_manager),
+        Arc::clone(buffer_pool),
+        HeapFileConfig {
+            heap_file_id: table.heap_file_id,
+            fsm_file_id: table.fsm_file_id,
+        },
+    )
+    .map_err(|e| format!("failed to open heap file: {}", e))?;
+
+    let (table_stats, column_stats) = analyze_table(table, &heap_file)
+        .await
+        .map_err(|e| format!("analyze failed: {}", e))?;
+
+    let row_count = table_stats.row_count;
+    catalog.put_stats(table.id, table_stats, column_stats);
+    Ok(row_count)
 }
 
 #[cfg(test)]

@@ -81,7 +81,7 @@ impl Default for OperatorMetrics {
 /// Each operator is single-threaded. All internal state uses thread-local
 /// data structures (hashbrown::HashMap, FlatU64Map). Cross-thread
 /// communication is via SPSC ring buffers only.
-pub trait StreamOperator: Send {
+pub trait StreamOperator: Send + Sync {
     /// Process a micro-batch of records.
     fn process(&mut self, record: StreamRecord) -> Result<Vec<StreamRecord>>;
 
@@ -120,7 +120,7 @@ pub struct WindowAggregateOperator {
     /// Column index to aggregate.
     agg_column: usize,
     /// Factory function to create accumulators.
-    accumulator_factory: Box<dyn Fn() -> Box<dyn StreamAccumulator> + Send>,
+    accumulator_factory: Box<dyn Fn() -> Box<dyn StreamAccumulator> + Send + Sync>,
     /// Per-group-key accumulator state: key_hash -> [(window, accumulator)].
     state: FlatU64Map<Vec<(WindowRange, Box<dyn StreamAccumulator>)>>,
     /// Window assigner (determines which windows an event belongs to).
@@ -138,7 +138,7 @@ impl WindowAggregateOperator {
         id: u32,
         key_columns: Vec<usize>,
         agg_column: usize,
-        accumulator_factory: Box<dyn Fn() -> Box<dyn StreamAccumulator> + Send>,
+        accumulator_factory: Box<dyn Fn() -> Box<dyn StreamAccumulator> + Send + Sync>,
         window_assigner: Box<dyn crate::window::WindowAssigner>,
     ) -> Self {
         Self {
@@ -385,11 +385,11 @@ pub struct StreamFilterOperator {
     id: u32,
     op_metrics: OperatorMetrics,
     /// Predicate applied to each row. Returns true to keep the row.
-    predicate: Box<dyn Fn(&StreamBatch, usize) -> bool + Send>,
+    predicate: Box<dyn Fn(&StreamBatch, usize) -> bool + Send + Sync>,
 }
 
 impl StreamFilterOperator {
-    pub fn new(id: u32, predicate: Box<dyn Fn(&StreamBatch, usize) -> bool + Send>) -> Self {
+    pub fn new(id: u32, predicate: Box<dyn Fn(&StreamBatch, usize) -> bool + Send + Sync>) -> Self {
         Self {
             id,
             op_metrics: OperatorMetrics::new(),

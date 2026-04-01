@@ -21,38 +21,44 @@ use crate::compute::{
 // ---------------------------------------------------------------------------
 
 /// Evaluates a bound expression against a DataBatch, returning the result as a Column.
-pub fn evaluate(expr: &BoundExpr, batch: &DataBatch, schema: &[LogicalColumn]) -> Result<Column> {
+/// The `params` slice provides values for query parameters ($1, $2, ...).
+pub fn evaluate(
+    expr: &BoundExpr,
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
     match expr {
         BoundExpr::ColumnRef(col_ref) => evaluate_column_ref(col_ref, batch, schema),
         BoundExpr::Literal { value, type_id } => evaluate_literal(value, *type_id, batch.num_rows),
         BoundExpr::BinaryOp {
             left, op, right, ..
-        } => evaluate_binary_op(left, *op, right, batch, schema),
+        } => evaluate_binary_op(left, *op, right, batch, schema, params),
         BoundExpr::UnaryOp {
             op, expr: inner, ..
-        } => evaluate_unary_op(*op, inner, batch, schema),
+        } => evaluate_unary_op(*op, inner, batch, schema, params),
         BoundExpr::IsNull {
             expr: inner,
             negated,
-        } => evaluate_is_null(inner, *negated, batch, schema),
+        } => evaluate_is_null(inner, *negated, batch, schema, params),
         BoundExpr::InList {
             expr: inner,
             list,
             negated,
-        } => evaluate_in_list(inner, list, *negated, batch, schema),
+        } => evaluate_in_list(inner, list, *negated, batch, schema, params),
         BoundExpr::Between {
             expr: inner,
             low,
             high,
             negated,
-        } => evaluate_between(inner, low, high, *negated, batch, schema),
+        } => evaluate_between(inner, low, high, *negated, batch, schema, params),
         BoundExpr::Like {
             expr: inner,
             pattern,
             negated,
         } => {
-            let col = evaluate(inner, batch, schema)?;
-            let pat = evaluate(pattern, batch, schema)?;
+            let col = evaluate(inner, batch, schema, params)?;
+            let pat = evaluate(pattern, batch, schema, params)?;
             compute::like(&col, &pat, *negated)
         }
         BoundExpr::ILike {
@@ -60,11 +66,13 @@ pub fn evaluate(expr: &BoundExpr, batch: &DataBatch, schema: &[LogicalColumn]) -
             pattern,
             negated,
         } => {
-            let col = evaluate(inner, batch, schema)?;
-            let pat = evaluate(pattern, batch, schema)?;
+            let col = evaluate(inner, batch, schema, params)?;
+            let pat = evaluate(pattern, batch, schema, params)?;
             compute::ilike(&col, &pat, *negated)
         }
-        BoundExpr::Function { name, args, .. } => evaluate_function(name, args, batch, schema),
+        BoundExpr::Function { name, args, .. } => {
+            evaluate_function(name, args, batch, schema, params)
+        }
         BoundExpr::AggregateFunction { .. } => Err(ZyronError::ExecutionError(
             "aggregate functions must be evaluated by the aggregate operator".to_string(),
         )),
@@ -72,7 +80,7 @@ pub fn evaluate(expr: &BoundExpr, batch: &DataBatch, schema: &[LogicalColumn]) -
             expr: inner,
             target_type,
         } => {
-            let col = evaluate(inner, batch, schema)?;
+            let col = evaluate(inner, batch, schema, params)?;
             cast_column(&col, *target_type)
         }
         BoundExpr::Case {
@@ -86,8 +94,9 @@ pub fn evaluate(expr: &BoundExpr, batch: &DataBatch, schema: &[LogicalColumn]) -
             else_result.as_deref(),
             batch,
             schema,
+            params,
         ),
-        BoundExpr::Nested(inner) => evaluate(inner, batch, schema),
+        BoundExpr::Nested(inner) => evaluate(inner, batch, schema, params),
         BoundExpr::Subquery { .. } | BoundExpr::Exists { .. } | BoundExpr::InSubquery { .. } => {
             Err(ZyronError::ExecutionError(
                 "subqueries not supported in executor".to_string(),
@@ -96,9 +105,7 @@ pub fn evaluate(expr: &BoundExpr, batch: &DataBatch, schema: &[LogicalColumn]) -
         BoundExpr::WindowFunction { .. } => Err(ZyronError::ExecutionError(
             "window functions not supported yet".to_string(),
         )),
-        BoundExpr::Parameter { .. } => Err(ZyronError::ExecutionError(
-            "parameters not supported yet".to_string(),
-        )),
+        BoundExpr::Parameter { index, .. } => evaluate_parameter(*index, params, batch.num_rows),
     }
 }
 
@@ -116,6 +123,32 @@ pub fn resolve_column_index(
     Err(ZyronError::ExecutionError(format!(
         "column not found in schema: table_idx={table_idx}, column_id={column_id}"
     )))
+}
+
+// ---------------------------------------------------------------------------
+// Parameter lookup
+// ---------------------------------------------------------------------------
+
+/// Looks up a query parameter ($1, $2, ...) by index and expands it to a Column.
+/// Parameter indices are 1-based in SQL but stored as 1-based in BoundExpr.
+fn evaluate_parameter(index: usize, params: &[ScalarValue], num_rows: usize) -> Result<Column> {
+    // Parameters use 1-based indexing ($1 = index 1).
+    if index == 0 || index > params.len() {
+        return Err(ZyronError::ExecutionError(format!(
+            "parameter ${index} is out of range, {} parameter(s) provided",
+            params.len()
+        )));
+    }
+    let scalar = &params[index - 1];
+    if matches!(scalar, ScalarValue::Null) {
+        return Ok(Column::null_column(TypeId::Null, num_rows));
+    }
+    let type_id = scalar.type_id();
+    let mut data = ColumnData::with_capacity(type_id, num_rows);
+    for _ in 0..num_rows {
+        data.push_scalar(scalar);
+    }
+    Ok(Column::new(data, type_id))
 }
 
 // ---------------------------------------------------------------------------
@@ -167,9 +200,10 @@ fn evaluate_binary_op(
     right: &BoundExpr,
     batch: &DataBatch,
     schema: &[LogicalColumn],
+    params: &[ScalarValue],
 ) -> Result<Column> {
-    let left_col = evaluate(left, batch, schema)?;
-    let right_col = evaluate(right, batch, schema)?;
+    let left_col = evaluate(left, batch, schema, params)?;
+    let right_col = evaluate(right, batch, schema, params)?;
 
     match op {
         BinaryOperator::Plus => compute::arithmetic(&left_col, &right_col, ArithOp::Add),
@@ -198,8 +232,9 @@ fn evaluate_unary_op(
     expr: &BoundExpr,
     batch: &DataBatch,
     schema: &[LogicalColumn],
+    params: &[ScalarValue],
 ) -> Result<Column> {
-    let col = evaluate(expr, batch, schema)?;
+    let col = evaluate(expr, batch, schema, params)?;
     match op {
         UnaryOperator::Not => bool_not(&col),
         UnaryOperator::Minus => negate(&col),
@@ -215,8 +250,9 @@ fn evaluate_is_null(
     negated: bool,
     batch: &DataBatch,
     schema: &[LogicalColumn],
+    params: &[ScalarValue],
 ) -> Result<Column> {
-    let col = evaluate(expr, batch, schema)?;
+    let col = evaluate(expr, batch, schema, params)?;
     if negated {
         Ok(is_not_null(&col))
     } else {
@@ -234,8 +270,9 @@ fn evaluate_in_list(
     negated: bool,
     batch: &DataBatch,
     schema: &[LogicalColumn],
+    params: &[ScalarValue],
 ) -> Result<Column> {
-    let expr_col = evaluate(expr, batch, schema)?;
+    let expr_col = evaluate(expr, batch, schema, params)?;
     let num_rows = batch.num_rows;
 
     if list.is_empty() {
@@ -246,11 +283,11 @@ fn evaluate_in_list(
         ));
     }
 
-    let first = evaluate(&list[0], batch, schema)?;
+    let first = evaluate(&list[0], batch, schema, params)?;
     let mut combined = compare(&expr_col, &first, CmpOp::Eq)?;
 
     for item in &list[1..] {
-        let item_col = evaluate(item, batch, schema)?;
+        let item_col = evaluate(item, batch, schema, params)?;
         let cmp_result = compare(&expr_col, &item_col, CmpOp::Eq)?;
         combined = bool_or(&combined, &cmp_result)?;
     }
@@ -273,10 +310,11 @@ fn evaluate_between(
     negated: bool,
     batch: &DataBatch,
     schema: &[LogicalColumn],
+    params: &[ScalarValue],
 ) -> Result<Column> {
-    let expr_col = evaluate(expr, batch, schema)?;
-    let low_col = evaluate(low, batch, schema)?;
-    let high_col = evaluate(high, batch, schema)?;
+    let expr_col = evaluate(expr, batch, schema, params)?;
+    let low_col = evaluate(low, batch, schema, params)?;
+    let high_col = evaluate(high, batch, schema, params)?;
 
     let gte_low = compare(&expr_col, &low_col, CmpOp::GtEq)?;
     let lte_high = compare(&expr_col, &high_col, CmpOp::LtEq)?;
@@ -299,31 +337,32 @@ fn evaluate_case(
     else_result: Option<&BoundExpr>,
     batch: &DataBatch,
     schema: &[LogicalColumn],
+    params: &[ScalarValue],
 ) -> Result<Column> {
     let num_rows = batch.num_rows;
 
     // Start with else branch or null.
     let mut result = if let Some(else_expr) = else_result {
-        evaluate(else_expr, batch, schema)?
+        evaluate(else_expr, batch, schema, params)?
     } else {
         Column::null_column(TypeId::Text, num_rows)
     };
 
     let operand_col = match operand {
-        Some(op) => Some(evaluate(op, batch, schema)?),
+        Some(op) => Some(evaluate(op, batch, schema, params)?),
         None => None,
     };
 
     // Process conditions in reverse so first match wins.
     for when in conditions.iter().rev() {
         let condition_bool = if let Some(ref op_col) = operand_col {
-            let cond_col = evaluate(&when.condition, batch, schema)?;
+            let cond_col = evaluate(&when.condition, batch, schema, params)?;
             compare(op_col, &cond_col, CmpOp::Eq)?
         } else {
-            evaluate(&when.condition, batch, schema)?
+            evaluate(&when.condition, batch, schema, params)?
         };
 
-        let then_col = evaluate(&when.result, batch, schema)?;
+        let then_col = evaluate(&when.result, batch, schema, params)?;
         let mask = column_to_mask(&condition_bool);
 
         // Use typed push_from to build result without ScalarValue.
@@ -355,28 +394,29 @@ fn evaluate_function(
     args: &[BoundExpr],
     batch: &DataBatch,
     schema: &[LogicalColumn],
+    params: &[ScalarValue],
 ) -> Result<Column> {
     match name {
         "abs" => {
-            let col = evaluate(&args[0], batch, schema)?;
+            let col = evaluate(&args[0], batch, schema, params)?;
             eval_abs(&col)
         }
         "upper" => {
-            let col = evaluate(&args[0], batch, schema)?;
+            let col = evaluate(&args[0], batch, schema, params)?;
             eval_string_transform(&col, |s| s.to_uppercase())
         }
         "lower" => {
-            let col = evaluate(&args[0], batch, schema)?;
+            let col = evaluate(&args[0], batch, schema, params)?;
             eval_string_transform(&col, |s| s.to_lowercase())
         }
         "length" => {
-            let col = evaluate(&args[0], batch, schema)?;
+            let col = evaluate(&args[0], batch, schema, params)?;
             eval_length(&col)
         }
-        "coalesce" => eval_coalesce(args, batch, schema),
+        "coalesce" => eval_coalesce(args, batch, schema, params),
         "nullif" => {
-            let a = evaluate(&args[0], batch, schema)?;
-            let b = evaluate(&args[1], batch, schema)?;
+            let a = evaluate(&args[0], batch, schema, params)?;
+            let b = evaluate(&args[1], batch, schema, params)?;
             eval_nullif(&a, &b)
         }
         _ => Err(ZyronError::ExecutionError(format!(
@@ -501,13 +541,14 @@ fn eval_coalesce(
     args: &[BoundExpr],
     batch: &DataBatch,
     schema: &[LogicalColumn],
+    params: &[ScalarValue],
 ) -> Result<Column> {
     let num_rows = batch.num_rows;
     let last_idx = args.len() - 1;
-    let mut result = evaluate(&args[last_idx], batch, schema)?;
+    let mut result = evaluate(&args[last_idx], batch, schema, params)?;
 
     for arg in args[..last_idx].iter().rev() {
-        let arg_col = evaluate(arg, batch, schema)?;
+        let arg_col = evaluate(arg, batch, schema, params)?;
         let mut new_data = ColumnData::with_capacity(result.type_id, num_rows);
         let mut new_nulls = NullBitmap::none(num_rows);
 

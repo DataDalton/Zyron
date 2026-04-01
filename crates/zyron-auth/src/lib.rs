@@ -112,9 +112,22 @@ pub struct SecurityManager {
     pub user_id_cache: RcuMap<String, UserId>,
     /// Cached role lookup by name. Populated at startup, updated on create/drop.
     pub role_cache: RcuMap<String, Role>,
+    /// Cached TOTP secrets keyed by username for TOTP authentication.
+    pub totp_secret_cache: RcuMap<String, Vec<u8>>,
+    /// Cached API key credentials keyed by username: (prefix, hash).
+    pub api_key_cache: RcuMap<String, (String, Vec<u8>)>,
+    /// Server-wide JWT signing secret for JWT authentication.
+    pub jwt_secret: Option<Vec<u8>>,
+    /// JWT signing algorithm (default HS256).
+    pub jwt_algorithm: JwtAlgorithm,
+    /// Expected JWT issuer claim. If set, tokens must match.
+    pub jwt_issuer: Option<String>,
     /// WebAuthn relying party configuration for FIDO2 authentication.
     pub webauthn_rp_config: RelyingPartyConfig,
     pub auth_storage: Arc<dyn storage::AuthStorage>,
+    /// Monotonic counter for generating unique role IDs. Initialized from
+    /// the max existing role ID at startup to survive restarts.
+    next_role_id: std::sync::atomic::AtomicU32,
 }
 
 impl SecurityManager {
@@ -141,6 +154,8 @@ impl SecurityManager {
         let password_cache: RcuMap<String, String> = RcuMap::empty_map();
         let user_id_cache: RcuMap<String, UserId> = RcuMap::empty_map();
         let role_cache: RcuMap<String, Role> = RcuMap::empty_map();
+        let totp_secret_cache: RcuMap<String, Vec<u8>> = RcuMap::empty_map();
+        let api_key_cache: RcuMap<String, (String, Vec<u8>)> = RcuMap::empty_map();
         let webauthn_rp_config = RelyingPartyConfig::default();
 
         let mut manager = Self {
@@ -165,11 +180,30 @@ impl SecurityManager {
             password_cache,
             user_id_cache,
             role_cache,
+            totp_secret_cache,
+            api_key_cache,
+            jwt_secret: None,
+            jwt_algorithm: JwtAlgorithm::Hs256,
+            jwt_issuer: None,
             webauthn_rp_config,
             auth_storage,
+            next_role_id: std::sync::atomic::AtomicU32::new(1),
         };
 
         manager.load_from_storage().await?;
+
+        // Initialize the role ID counter from the max existing role ID
+        let max_id = manager
+            .role_cache
+            .load()
+            .values()
+            .map(|r| r.id.0)
+            .max()
+            .unwrap_or(0);
+        manager
+            .next_role_id
+            .store(max_id + 1, std::sync::atomic::Ordering::Relaxed);
+
         Ok(manager)
     }
 
@@ -227,18 +261,28 @@ impl SecurityManager {
         let webauthn_creds = self.auth_storage.load_webauthn_credentials().await?;
         self.webauthn_store.load(webauthn_creds);
 
-        // Cache user passwords and IDs for fast auth lookups
+        // Cache user passwords, IDs, TOTP secrets, and API keys for fast auth lookups
         let users = self.auth_storage.load_users().await?;
         let mut id_map = HashMap::with_capacity(users.len());
         let mut pw_map = HashMap::with_capacity(users.len());
+        let mut totp_map = HashMap::new();
+        let mut api_key_map = HashMap::new();
         for user in &users {
             id_map.insert(user.name.clone(), user.id);
             if let Some(ref hash) = user.password_hash {
                 pw_map.insert(user.name.clone(), hash.clone());
             }
+            if let Some(ref secret) = user.totp_secret {
+                totp_map.insert(user.name.clone(), secret.clone());
+            }
+            if let (Some(prefix), Some(hash)) = (&user.api_key_prefix, &user.api_key_hash) {
+                api_key_map.insert(user.name.clone(), (prefix.clone(), hash.clone()));
+            }
         }
         self.user_id_cache.store(id_map);
         self.password_cache.store(pw_map);
+        self.totp_secret_cache.store(totp_map);
+        self.api_key_cache.store(api_key_map);
 
         // Cache roles by name for O(1) lookup
         let roles = self.auth_storage.load_roles().await?;
@@ -292,15 +336,37 @@ impl SecurityManager {
         self.role_cache.get(&name.to_string())
     }
 
-    /// Creates a new role and persists it.
+    /// Allocates a unique monotonic role ID.
+    pub fn allocate_role_id(&self) -> RoleId {
+        RoleId(
+            self.next_role_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Creates a new role, persists it, and updates the in-memory cache.
+    /// If role.id is RoleId(0), a new unique ID is allocated automatically.
     pub async fn create_role(&self, role: &Role) -> Result<()> {
-        self.auth_storage.store_role(role).await?;
+        let mut role = role.clone();
+        if role.id.0 == 0 {
+            role.id = self.allocate_role_id();
+        }
+        self.auth_storage.store_role(&role).await?;
+        self.role_cache.insert(role.name.clone(), role);
         Ok(())
     }
 
-    /// Drops a role and all associated memberships and grants.
+    /// Drops a role, removes it from storage and the in-memory cache.
     pub async fn drop_role(&self, id: RoleId) -> Result<()> {
+        // Find the role name by scanning the cache snapshot
+        let snap = self.role_cache.load();
+        let name = snap
+            .iter()
+            .find_map(|(k, v)| if v.id == id { Some(k.clone()) } else { None });
         self.auth_storage.delete_role(id).await?;
+        if let Some(name) = name {
+            self.role_cache.remove(&name);
+        }
         Ok(())
     }
 

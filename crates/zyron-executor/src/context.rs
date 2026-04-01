@@ -6,15 +6,17 @@
 //! cancellation via an atomic flag and optional per-operator metrics
 //! collection for EXPLAIN ANALYZE.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use zyron_buffer::BufferPool;
-use zyron_catalog::{Catalog, TableEntry, TableId};
+use zyron_catalog::{Catalog, IndexId, TableEntry, TableId};
 use zyron_common::{Result, ZyronError};
-use zyron_storage::{DiskManager, HeapFile, HeapFileConfig, Snapshot};
+use zyron_storage::{BTreeIndex, DiskManager, HeapFile, HeapFileConfig, Snapshot};
 use zyron_wal::WalWriter;
 
 use crate::batch::BATCH_SIZE;
+use crate::column::ScalarValue;
 
 /// Hook for Change Data Capture. Implemented by zyron-cdc, called by DML operators.
 pub trait CdcHook: Send + Sync {
@@ -53,6 +55,35 @@ pub trait CdcHook: Send + Sync {
     ) -> zyron_common::Result<()>;
 }
 
+/// Hook for BEFORE triggers. Called before DML mutations to allow
+/// trigger logic to inspect, modify, or cancel the operation.
+pub trait DmlHook: Send + Sync {
+    /// Called before rows are inserted. Returns false to cancel the insert.
+    fn before_insert(
+        &self,
+        table_id: u32,
+        tuples: &[&[u8]],
+        txn_id: u32,
+    ) -> zyron_common::Result<bool>;
+
+    /// Called before rows are deleted. Returns false to cancel the delete.
+    fn before_delete(
+        &self,
+        table_id: u32,
+        old_data: &[&[u8]],
+        txn_id: u32,
+    ) -> zyron_common::Result<bool>;
+
+    /// Called before rows are updated. Returns false to cancel the update.
+    fn before_update(
+        &self,
+        table_id: u32,
+        old_data: &[&[u8]],
+        new_data: &[&[u8]],
+        txn_id: u32,
+    ) -> zyron_common::Result<bool>;
+}
+
 /// Per-query execution context with access to storage and transaction state.
 pub struct ExecutionContext {
     pub catalog: Arc<Catalog>,
@@ -68,6 +99,16 @@ pub struct ExecutionContext {
     pub analyze: bool,
     /// Optional CDC hook invoked by DML operators after mutations.
     pub cdc_hook: Option<Arc<dyn CdcHook>>,
+    /// Optional DML hook invoked by DML operators before mutations (BEFORE triggers).
+    pub dml_hook: Option<Arc<dyn DmlHook>>,
+    /// Bound parameter values ($1, $2, ...) for prepared statements.
+    pub params: Vec<ScalarValue>,
+    /// Per-session security context for privilege checks. None when the auth
+    /// system is not configured or for internal queries that bypass auth.
+    pub security_context: Option<zyron_auth::SecurityContext>,
+    /// Live B+ tree index instances keyed by IndexId. Registered by the
+    /// server layer so the index scan operator can perform actual tree lookups.
+    indexes: HashMap<IndexId, Arc<BTreeIndex>>,
 }
 
 impl ExecutionContext {
@@ -91,6 +132,10 @@ impl ExecutionContext {
             cancelled: AtomicBool::new(false),
             analyze: false,
             cdc_hook: None,
+            dml_hook: None,
+            params: Vec::new(),
+            security_context: None,
+            indexes: HashMap::new(),
         }
     }
 
@@ -132,5 +177,16 @@ impl ExecutionContext {
     /// Returns the catalog TableEntry for the given table ID.
     pub fn get_table_entry(&self, table_id: TableId) -> Result<Arc<TableEntry>> {
         self.catalog.get_table_by_id(table_id)
+    }
+
+    /// Registers a live B+ tree index instance for use by index scan operators.
+    /// Called by the server layer after creating or loading an index.
+    pub fn register_index(&mut self, index_id: IndexId, btree: Arc<BTreeIndex>) {
+        self.indexes.insert(index_id, btree);
+    }
+
+    /// Returns the B+ tree index instance for the given IndexId, if registered.
+    pub fn get_index(&self, index_id: IndexId) -> Option<Arc<BTreeIndex>> {
+        self.indexes.get(&index_id).cloned()
     }
 }

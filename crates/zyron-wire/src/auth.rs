@@ -753,6 +753,243 @@ impl Authenticator for ComposedAuthenticator {
     }
 }
 
+// ---------------------------------------------------------------------------
+// TOTP authenticator
+// ---------------------------------------------------------------------------
+
+/// TOTP authentication: requests a 6-digit one-time code from the client
+/// and verifies it against the user's stored TOTP secret via SecurityManager.
+pub struct TotpAuthenticator {
+    security_manager: std::sync::Arc<zyron_auth::SecurityManager>,
+}
+
+impl TotpAuthenticator {
+    pub fn new(security_manager: std::sync::Arc<zyron_auth::SecurityManager>) -> Self {
+        Self { security_manager }
+    }
+}
+
+impl Authenticator for TotpAuthenticator {
+    fn initial_message(&self, _user: &str) -> AuthResult {
+        // Request the TOTP code via cleartext password message.
+        // The client sends the 6-digit code as the "password".
+        AuthResult::Challenge(BackendMessage::Authentication(
+            AuthenticationMessage::CleartextPassword,
+        ))
+    }
+
+    fn process_response(
+        &mut self,
+        user: &str,
+        response: &PasswordMessage,
+    ) -> Result<AuthProgress, AuthError> {
+        let code = match response {
+            PasswordMessage::Cleartext(pw) => pw,
+            _ => return Err(AuthError::UnexpectedMessage),
+        };
+
+        let totp_secret = self
+            .security_manager
+            .totp_secret_cache
+            .get(&user.to_string())
+            .ok_or_else(|| {
+                AuthError::Failed(format!("No TOTP secret configured for user \"{}\"", user))
+            })?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let totp = zyron_auth::TotpCredential::from_secret(totp_secret);
+        if totp.verify(code, now) {
+            Ok(AuthProgress::Authenticated)
+        } else {
+            Err(AuthError::Failed(user.to_string()))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Password + TOTP composed authenticator
+// ---------------------------------------------------------------------------
+
+/// Chains password authentication (SCRAM-SHA-256) followed by TOTP verification.
+/// Password phase completes first, then the server requests the TOTP code.
+pub struct PasswordTotpAuthenticator {
+    password_auth: Box<dyn Authenticator>,
+    totp_auth: TotpAuthenticator,
+    phase: PasswordTotpPhase,
+}
+
+enum PasswordTotpPhase {
+    Password,
+    Totp,
+}
+
+impl PasswordTotpAuthenticator {
+    pub fn new(password_auth: Box<dyn Authenticator>, totp_auth: TotpAuthenticator) -> Self {
+        Self {
+            password_auth,
+            totp_auth,
+            phase: PasswordTotpPhase::Password,
+        }
+    }
+}
+
+impl Authenticator for PasswordTotpAuthenticator {
+    fn initial_message(&self, user: &str) -> AuthResult {
+        self.password_auth.initial_message(user)
+    }
+
+    fn process_response(
+        &mut self,
+        user: &str,
+        response: &PasswordMessage,
+    ) -> Result<AuthProgress, AuthError> {
+        match self.phase {
+            PasswordTotpPhase::Password => {
+                match self.password_auth.process_response(user, response)? {
+                    AuthProgress::Authenticated => {
+                        // Password phase complete, transition to TOTP
+                        self.phase = PasswordTotpPhase::Totp;
+                        match self.totp_auth.initial_message(user) {
+                            AuthResult::Challenge(msg) => Ok(AuthProgress::Continue(msg)),
+                            AuthResult::Authenticated => Ok(AuthProgress::Authenticated),
+                        }
+                    }
+                    AuthProgress::Continue(msg) => Ok(AuthProgress::Continue(msg)),
+                }
+            }
+            PasswordTotpPhase::Totp => self.totp_auth.process_response(user, response),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// API Key authenticator
+// ---------------------------------------------------------------------------
+
+/// API Key authentication: the client sends the full API key as the "password".
+/// The server hashes it and compares against the stored SHA-256 hash.
+pub struct ApiKeyAuthenticator {
+    security_manager: std::sync::Arc<zyron_auth::SecurityManager>,
+}
+
+impl ApiKeyAuthenticator {
+    pub fn new(security_manager: std::sync::Arc<zyron_auth::SecurityManager>) -> Self {
+        Self { security_manager }
+    }
+}
+
+impl Authenticator for ApiKeyAuthenticator {
+    fn initial_message(&self, _user: &str) -> AuthResult {
+        // Request the API key via cleartext password message.
+        AuthResult::Challenge(BackendMessage::Authentication(
+            AuthenticationMessage::CleartextPassword,
+        ))
+    }
+
+    fn process_response(
+        &mut self,
+        user: &str,
+        response: &PasswordMessage,
+    ) -> Result<AuthProgress, AuthError> {
+        let presented_key = match response {
+            PasswordMessage::Cleartext(pw) => pw,
+            _ => return Err(AuthError::UnexpectedMessage),
+        };
+
+        let (prefix, hash) = self
+            .security_manager
+            .api_key_cache
+            .get(&user.to_string())
+            .ok_or_else(|| {
+                AuthError::Failed(format!("No API key configured for user \"{}\"", user))
+            })?;
+
+        // Reconstruct the credential and verify. The hash is stored as Vec<u8>
+        // but ApiKeyCredential::from_stored expects [u8; 32].
+        if hash.len() != 32 {
+            return Err(AuthError::Failed(user.to_string()));
+        }
+        let mut key_hash = [0u8; 32];
+        key_hash.copy_from_slice(&hash);
+
+        let credential = zyron_auth::ApiKeyCredential::from_stored(prefix, key_hash);
+        if credential.verify(presented_key) {
+            Ok(AuthProgress::Authenticated)
+        } else {
+            Err(AuthError::Failed(user.to_string()))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JWT authenticator
+// ---------------------------------------------------------------------------
+
+/// JWT authentication: the client sends a signed JWT token as the "password".
+/// The server verifies the signature, checks expiration, and validates that
+/// the token subject matches the connecting username.
+pub struct JwtAuthenticator {
+    security_manager: std::sync::Arc<zyron_auth::SecurityManager>,
+}
+
+impl JwtAuthenticator {
+    pub fn new(security_manager: std::sync::Arc<zyron_auth::SecurityManager>) -> Self {
+        Self { security_manager }
+    }
+}
+
+impl Authenticator for JwtAuthenticator {
+    fn initial_message(&self, _user: &str) -> AuthResult {
+        // Request the JWT token via cleartext password message.
+        AuthResult::Challenge(BackendMessage::Authentication(
+            AuthenticationMessage::CleartextPassword,
+        ))
+    }
+
+    fn process_response(
+        &mut self,
+        user: &str,
+        response: &PasswordMessage,
+    ) -> Result<AuthProgress, AuthError> {
+        let token = match response {
+            PasswordMessage::Cleartext(pw) => pw,
+            _ => return Err(AuthError::UnexpectedMessage),
+        };
+
+        let secret = self.security_manager.jwt_secret.as_ref().ok_or_else(|| {
+            AuthError::Failed("JWT authentication not configured: no jwt_secret set".to_string())
+        })?;
+
+        let credential =
+            zyron_auth::JwtCredential::new(secret.clone(), self.security_manager.jwt_algorithm)
+                .map_err(|e| AuthError::Failed(format!("JWT configuration error: {}", e)))?;
+
+        // Apply issuer validation if configured.
+        let credential = match &self.security_manager.jwt_issuer {
+            Some(issuer) => credential.with_issuer(issuer.clone()),
+            None => credential,
+        };
+
+        let claims = credential
+            .decode(token)
+            .map_err(|e| AuthError::Failed(format!("JWT verification failed: {}", e)))?;
+
+        // Validate that the token subject matches the connecting username.
+        if claims.sub != user {
+            return Err(AuthError::Failed(format!(
+                "JWT subject \"{}\" does not match connecting user \"{}\"",
+                claims.sub, user
+            )));
+        }
+
+        Ok(AuthProgress::Authenticated)
+    }
+}
+
 /// Extracts a string value from a JSON object for WebAuthn assertion parsing.
 fn extract_json_field(json: &str, key: &str) -> Option<String> {
     let search = format!("\"{}\"", key);

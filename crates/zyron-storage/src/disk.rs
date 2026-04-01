@@ -275,6 +275,27 @@ impl DiskManager {
         Ok(())
     }
 
+    /// Truncates a data file to zero pages, removing all stored data.
+    /// The file remains on disk but is reset to empty.
+    pub async fn truncate_file(&self, file_id: u32) -> Result<()> {
+        self.open_file(file_id).await?;
+
+        let entry = self
+            .files
+            .get_async(&file_id)
+            .await
+            .ok_or_else(|| ZyronError::IoError(format!("file {} not open", file_id)))?;
+
+        let mut handle = entry.get().lock().await;
+        handle.file.set_len(0).await?;
+        if self.config.fsync_enabled {
+            handle.file.sync_all().await?;
+        }
+        handle.num_pages = 0;
+
+        Ok(())
+    }
+
     /// Closes a specific file.
     /// Extends file to match num_pages to persist lazy-allocated pages.
     pub async fn close_file(&self, file_id: u32) -> Result<()> {

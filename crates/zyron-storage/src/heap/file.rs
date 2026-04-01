@@ -861,6 +861,12 @@ pub struct ScanGuard<'a> {
 }
 
 impl<'a> ScanGuard<'a> {
+    /// Returns the list of page IDs held by this scan guard.
+    #[inline]
+    pub fn page_ids(&self) -> &[PageId] {
+        &self.page_ids
+    }
+
     /// Direct callback iteration over all tuples.
     /// Uses raw pointer access and unchecked indexing for maximum throughput.
     #[inline]

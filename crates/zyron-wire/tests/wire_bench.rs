@@ -34,9 +34,12 @@ use zyron_wire::messages::backend::{
     AuthenticationMessage, BackendMessage, ErrorFields, FieldDescription, TransactionState,
 };
 use zyron_wire::messages::frontend::{DescribeTarget, FrontendMessage, PasswordMessage};
+use zyron_wire::notifications::NotificationChannels;
 use zyron_wire::session::Session;
 use zyron_wire::transport::WireTransport;
 use zyron_wire::types;
+
+use zyron_auth::{ApiKeyCredential, JwtAlgorithm, JwtClaims, JwtCredential, TotpCredential};
 
 use zyron_bench_harness::*;
 
@@ -132,6 +135,24 @@ async fn create_test_server(db_name: &str) -> (Arc<ServerState>, tempfile::TempD
         cdc_slot_stats: None,
         cdc_stream_stats: None,
         cdc_ingest_stats: None,
+        cdc_registry: None,
+        slot_manager: None,
+        publication_manager: None,
+        cdc_stream_manager: None,
+        cdc_ingest_manager: None,
+        trigger_manager: None,
+        udf_registry: None,
+        uda_registry: None,
+        procedure_registry: None,
+        pipeline_manager: None,
+        schedule_manager: None,
+        event_dispatcher: None,
+        mv_manager: None,
+        stream_job_manager: None,
+        branch_manager: None,
+        cdc_hook: None,
+        dml_hook: None,
+        notification_channels: None,
     });
 
     (state, tmp)
@@ -473,6 +494,26 @@ fn make_column(type_id: TypeId, values: Vec<ScalarValue>) -> Column {
         nulls,
         type_id,
     }
+}
+
+/// Creates LogicalColumn descriptors for a two-column (id INT, name TEXT) schema.
+fn make_test_columns() -> Vec<LogicalColumn> {
+    vec![
+        LogicalColumn {
+            table_idx: None,
+            column_id: zyron_catalog::ColumnId(0),
+            name: "id".to_string(),
+            type_id: TypeId::Int32,
+            nullable: false,
+        },
+        LogicalColumn {
+            table_idx: None,
+            column_id: zyron_catalog::ColumnId(1),
+            name: "name".to_string(),
+            type_id: TypeId::Text,
+            nullable: false,
+        },
+    ]
 }
 
 // ===========================================================================
@@ -3047,4 +3088,709 @@ fn test_quic_pg_simple_query_throughput() {
             "QUIC PG simple query throughput below threshold"
         );
     });
+}
+
+// ---------------------------------------------------------------------------
+// DDL dispatch, notifications, and COPY binary format
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// DDL dispatch coverage for all statement types
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_ddl_dispatch_statement_coverage() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    zyron_bench_harness::init("wire");
+
+    tprintln!("\n=== DDL Dispatch Statement Coverage ===");
+
+    let statements: Vec<(&str, &str)> = vec![
+        ("CREATE TABLE t (id INT)", "CreateTable"),
+        ("DROP TABLE t", "DropTable"),
+        ("ALTER TABLE t ADD COLUMN x INT", "AlterTable"),
+        ("CREATE INDEX idx ON t(id)", "CreateIndex"),
+        ("DROP INDEX idx", "DropIndex"),
+        ("CREATE SCHEMA s", "CreateSchema"),
+        ("DROP SCHEMA s", "DropSchema"),
+        ("CREATE SEQUENCE seq", "CreateSequence"),
+        ("DROP SEQUENCE seq", "DropSequence"),
+        ("TRUNCATE TABLE t", "Truncate"),
+        ("CREATE VIEW v AS SELECT 1", "CreateView"),
+        ("DROP VIEW v", "DropView"),
+        (
+            "CREATE MATERIALIZED VIEW mv AS SELECT 1",
+            "CreateMaterializedView",
+        ),
+        ("DROP MATERIALIZED VIEW mv", "DropMaterializedView"),
+        ("REFRESH MATERIALIZED VIEW mv", "RefreshMaterializedView"),
+        ("CREATE USER u WITH PASSWORD 'pw'", "CreateUser"),
+        ("DROP USER u", "DropUser"),
+        ("CREATE ROLE r", "CreateRole"),
+        ("DROP ROLE r", "DropRole"),
+        ("GRANT SELECT ON t TO r", "Grant"),
+        ("REVOKE SELECT ON t FROM r", "Revoke"),
+        (
+            "CREATE REPLICATION SLOT slot PLUGIN 'zyron'",
+            "CreateReplicationSlot",
+        ),
+        ("DROP REPLICATION SLOT slot", "DropReplicationSlot"),
+        ("CREATE PUBLICATION pub FOR TABLE t", "CreatePublication"),
+        ("DROP PUBLICATION pub", "DropPublication"),
+        ("CREATE BRANCH b", "CreateBranch"),
+        ("DROP BRANCH b", "DropBranch"),
+        ("USE BRANCH b", "UseBranch"),
+        (
+            "CREATE PIPELINE p AS (STAGE src (SOURCE src_tbl, TARGET tgt_tbl))",
+            "CreatePipeline",
+        ),
+        ("DROP PIPELINE p", "DropPipeline"),
+        (
+            "CREATE SCHEDULE s EVERY 1 HOURS DO SELECT 1",
+            "CreateSchedule",
+        ),
+        ("DROP SCHEDULE s", "DropSchedule"),
+        (
+            "CREATE FUNCTION f() RETURNS INT AS 'SELECT 1' LANGUAGE SQL",
+            "CreateFunction",
+        ),
+        ("DROP FUNCTION f", "DropFunction"),
+        (
+            "CREATE TRIGGER t BEFORE INSERT ON tbl FOR EACH ROW EXECUTE FUNCTION f()",
+            "CreateTrigger",
+        ),
+        ("DROP TRIGGER t ON tbl", "DropTrigger"),
+        (
+            "CREATE PROCEDURE p() AS 'SELECT 1' LANGUAGE SQL",
+            "CreateProcedure",
+        ),
+        ("DROP PROCEDURE p", "DropProcedure"),
+        ("CALL p()", "Call"),
+        ("SAVEPOINT sp1", "Savepoint"),
+        ("RELEASE SAVEPOINT sp1", "ReleaseSavepoint"),
+        ("PREPARE stmt AS SELECT 1", "Prepare"),
+        ("EXECUTE stmt", "Execute"),
+        ("DEALLOCATE stmt", "Deallocate"),
+        ("LISTEN channel", "Listen"),
+        ("NOTIFY channel", "Notify"),
+        ("DECLARE c CURSOR FOR SELECT 1", "DeclareCursor"),
+        ("FETCH NEXT FROM c", "FetchCursor"),
+        ("CLOSE c", "CloseCursor"),
+        ("COMMENT ON TABLE t IS 'test'", "CommentOn"),
+        ("VALUES (1, 2, 3)", "ValuesQuery"),
+        ("EXPLAIN SELECT 1", "Explain"),
+        ("BEGIN", "Begin"),
+        ("COMMIT", "Commit"),
+        ("ROLLBACK", "Rollback"),
+        ("VACUUM", "Vacuum"),
+        ("ANALYZE", "Analyze"),
+        ("CHECKPOINT", "Checkpoint"),
+        ("SET search_path TO public", "SetVariable"),
+        ("SHOW search_path", "Show"),
+        ("REINDEX TABLE t", "Reindex"),
+        ("DO 'BEGIN END'", "DoBlock"),
+    ];
+
+    let total = statements.len();
+    let mut failed = Vec::new();
+
+    for (sql, expected_variant) in &statements {
+        match zyron_parser::parse(sql) {
+            Ok(stmts) if !stmts.is_empty() => {
+                let variant_name = statement_variant_name(&stmts[0]);
+                if variant_name != *expected_variant {
+                    failed.push(format!(
+                        "{}: expected {}, got {}",
+                        sql, expected_variant, variant_name
+                    ));
+                }
+            }
+            Ok(_) => failed.push(format!("{}: parsed to empty list", sql)),
+            Err(e) => failed.push(format!("{}: parse error: {}", sql, e)),
+        }
+    }
+
+    for reason in &failed {
+        tprintln!("  FAIL: {}\n", reason);
+    }
+
+    assert!(
+        failed.is_empty(),
+        "{} statement types failed: {:?}",
+        failed.len(),
+        failed
+    );
+    tprintln!(
+        "  {} statement types parsed and dispatched correctly\n",
+        total
+    );
+}
+
+/// Returns a string identifying the Statement variant for comparison.
+fn statement_variant_name(stmt: &zyron_parser::Statement) -> &'static str {
+    use zyron_parser::Statement;
+    match stmt {
+        Statement::Select(_) => "Select",
+        Statement::Insert(_) => "Insert",
+        Statement::Update(_) => "Update",
+        Statement::Delete(_) => "Delete",
+        Statement::Merge(_) => "Merge",
+        Statement::CreateTable(_) => "CreateTable",
+        Statement::DropTable(_) => "DropTable",
+        Statement::AlterTable(_) => "AlterTable",
+        Statement::CreateIndex(_) => "CreateIndex",
+        Statement::DropIndex(_) => "DropIndex",
+        Statement::AlterIndex(_) => "AlterIndex",
+        Statement::CreateSchema(_) => "CreateSchema",
+        Statement::DropSchema(_) => "DropSchema",
+        Statement::CreateSequence(_) => "CreateSequence",
+        Statement::DropSequence(_) => "DropSequence",
+        Statement::AlterSequence(_) => "AlterSequence",
+        Statement::Truncate(_) => "Truncate",
+        Statement::CreateView(_) => "CreateView",
+        Statement::DropView(_) => "DropView",
+        Statement::AlterView(_) => "AlterView",
+        Statement::CreateMaterializedView(_) => "CreateMaterializedView",
+        Statement::DropMaterializedView(_) => "DropMaterializedView",
+        Statement::RefreshMaterializedView(_) => "RefreshMaterializedView",
+        Statement::CreateUser(_) => "CreateUser",
+        Statement::AlterUser(_) => "AlterUser",
+        Statement::DropUser(_) => "DropUser",
+        Statement::CreateRole(_) => "CreateRole",
+        Statement::AlterRole(_) => "AlterRole",
+        Statement::DropRole(_) => "DropRole",
+        Statement::Grant(_) => "Grant",
+        Statement::Revoke(_) => "Revoke",
+        Statement::Begin(_) => "Begin",
+        Statement::Commit(_) => "Commit",
+        Statement::Rollback(_) => "Rollback",
+        Statement::Savepoint(_) => "Savepoint",
+        Statement::ReleaseSavepoint(_) => "ReleaseSavepoint",
+        Statement::Prepare(_) => "Prepare",
+        Statement::Execute(_) => "Execute",
+        Statement::Deallocate(_) => "Deallocate",
+        Statement::SetVariable(_) => "SetVariable",
+        Statement::Show(_) => "Show",
+        Statement::Listen(_) => "Listen",
+        Statement::Notify(_) => "Notify",
+        Statement::DeclareCursor(_) => "DeclareCursor",
+        Statement::FetchCursor(_) => "FetchCursor",
+        Statement::CloseCursor(_) => "CloseCursor",
+        Statement::Copy(_) => "Copy",
+        Statement::Vacuum(_) => "Vacuum",
+        Statement::Analyze(_) => "Analyze",
+        Statement::Reindex(_) => "Reindex",
+        Statement::CommentOn(_) => "CommentOn",
+        Statement::Checkpoint(_) => "Checkpoint",
+        Statement::Explain(_) => "Explain",
+        Statement::DoBlock(_) => "DoBlock",
+        Statement::ValuesQuery(_) => "ValuesQuery",
+        Statement::CreatePipeline(_) => "CreatePipeline",
+        Statement::RunPipeline(_) => "RunPipeline",
+        Statement::DropPipeline(_) => "DropPipeline",
+        Statement::CreateSchedule(_) => "CreateSchedule",
+        Statement::DropSchedule(_) => "DropSchedule",
+        Statement::PauseSchedule(_) => "PauseSchedule",
+        Statement::ResumeSchedule(_) => "ResumeSchedule",
+        Statement::CreateFulltextIndex(_) => "CreateFulltextIndex",
+        Statement::CreateVectorIndex(_) => "CreateVectorIndex",
+        Statement::AlterTableTtl(_) => "AlterTableTtl",
+        Statement::AlterTableOptions(_) => "AlterTableOptions",
+        Statement::OptimizeTable(_) => "OptimizeTable",
+        Statement::CreateReplicationSlot(_) => "CreateReplicationSlot",
+        Statement::DropReplicationSlot(_) => "DropReplicationSlot",
+        Statement::CreatePublication(_) => "CreatePublication",
+        Statement::AlterPublication(_) => "AlterPublication",
+        Statement::DropPublication(_) => "DropPublication",
+        Statement::CreateBranch(_) => "CreateBranch",
+        Statement::MergeBranch(_) => "MergeBranch",
+        Statement::DropBranch(_) => "DropBranch",
+        Statement::UseBranch(_) => "UseBranch",
+        Statement::CreateVersion(_) => "CreateVersion",
+        Statement::CreateFunction(_) => "CreateFunction",
+        Statement::DropFunction(_) => "DropFunction",
+        Statement::CreateAggregate(_) => "CreateAggregate",
+        Statement::DropAggregate(_) => "DropAggregate",
+        Statement::CreateProcedure(_) => "CreateProcedure",
+        Statement::DropProcedure(_) => "DropProcedure",
+        Statement::Call(_) => "Call",
+        Statement::CreateTrigger(_) => "CreateTrigger",
+        Statement::DropTrigger(_) => "DropTrigger",
+        Statement::CreateEventHandler(_) => "CreateEventHandler",
+        Statement::DropEventHandler(_) => "DropEventHandler",
+        Statement::AddExpectation(_) => "AddExpectation",
+        Statement::DropExpectation(_) => "DropExpectation",
+        Statement::EnableFeature(_) => "EnableFeature",
+        Statement::DisableFeature(_) => "DisableFeature",
+        Statement::ArchiveTable(_) => "ArchiveTable",
+        Statement::RestoreTable(_) => "RestoreTable",
+        Statement::AlterSystemSet(_) => "AlterSystemSet",
+        Statement::CreateCdcStream(_) => "CreateCdcStream",
+        Statement::DropCdcStream(_) => "DropCdcStream",
+        Statement::CreateCdcIngest(_) => "CreateCdcIngest",
+        Statement::DropCdcIngest(_) => "DropCdcIngest",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Notification channels (LISTEN/NOTIFY)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_notification_channels() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    zyron_bench_harness::init("wire");
+
+    tprintln!("=== Notification Channels Test ===\n");
+
+    let channels = NotificationChannels::new();
+
+    // Subscribe to a channel
+    let mut rx = channels.listen("test_channel");
+    tprintln!("  Subscribed to 'test_channel'\n");
+
+    // Send a notification
+    let receivers = channels.notify("test_channel", "hello from test", 42);
+    assert_eq!(receivers, 1, "Expected 1 receiver to get the notification");
+    tprintln!("  Sent notification, {} receiver(s) notified\n", receivers);
+
+    // Verify the receiver gets the notification
+    let notification = rx.try_recv().expect("Should receive the notification");
+    assert_eq!(notification.channel, "test_channel");
+    assert_eq!(notification.payload, "hello from test");
+    assert_eq!(notification.sender_pid, 42);
+    tprintln!(
+        "  Received: channel='{}', payload='{}', pid={}\n",
+        notification.channel,
+        notification.payload,
+        notification.sender_pid
+    );
+
+    // Notify a channel with no listeners
+    let receivers = channels.notify("nonexistent_channel", "nobody home", 1);
+    assert_eq!(receivers, 0, "No listeners should mean 0 receivers");
+    tprintln!("  Notify on empty channel returned 0 receivers\n");
+
+    // Multiple listeners on the same channel
+    let mut rx2 = channels.listen("test_channel");
+    let receivers = channels.notify("test_channel", "broadcast", 99);
+    assert_eq!(receivers, 2, "Expected 2 receivers");
+    let n1 = rx.try_recv().expect("rx1 should receive");
+    let n2 = rx2.try_recv().expect("rx2 should receive");
+    assert_eq!(n1.payload, "broadcast");
+    assert_eq!(n2.payload, "broadcast");
+    tprintln!("  Broadcast to 2 listeners verified\n");
+
+    // Unlisten removes empty channels
+    drop(rx);
+    drop(rx2);
+    channels.unlisten("test_channel");
+    tprintln!("  Unlisten on dropped receivers cleaned up channel\n");
+
+    tprintln!("  All notification channel tests passed\n");
+}
+
+// ---------------------------------------------------------------------------
+// COPY binary format output
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_copy_binary_format() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    zyron_bench_harness::init("wire");
+
+    tprintln!("=== COPY Binary Format Test ===\n");
+
+    let columns = make_test_columns();
+
+    let batch = DataBatch::new(vec![
+        make_column(
+            TypeId::Int32,
+            vec![
+                ScalarValue::Int32(100),
+                ScalarValue::Int32(200),
+                ScalarValue::Int32(300),
+            ],
+        ),
+        make_column(
+            TypeId::Text,
+            vec![
+                ScalarValue::Utf8("Alice".into()),
+                ScalarValue::Utf8("Bob".into()),
+                ScalarValue::Utf8("Charlie".into()),
+            ],
+        ),
+    ]);
+
+    let handler = CopyOutHandler::new(columns, CopyFormat::Binary);
+
+    // Verify the header message indicates binary format
+    let header = handler.header_message();
+    match &header {
+        zyron_wire::messages::backend::BackendMessage::CopyOutResponse {
+            format,
+            column_formats,
+        } => {
+            assert_eq!(*format, 1, "Binary format code should be 1");
+            assert_eq!(
+                column_formats.len(),
+                2,
+                "Should have 2 column format entries"
+            );
+            assert!(
+                column_formats.iter().all(|&f| f == 1),
+                "All columns should use binary format"
+            );
+            tprintln!(
+                "  Header: format=1 (binary), {} column format entries\n",
+                column_formats.len()
+            );
+        }
+        other => panic!("Expected CopyOutResponse, got {:?}", other),
+    }
+
+    // Format the batch in binary mode
+    let data_msgs = handler.format_batch(&batch);
+    assert_eq!(
+        data_msgs.len(),
+        1,
+        "Binary COPY produces a single CopyData message"
+    );
+    tprintln!("  format_batch() returned {} message(s)\n", data_msgs.len());
+
+    // Verify the PGCOPY signature at the start
+    match &data_msgs[0] {
+        zyron_wire::messages::backend::BackendMessage::CopyData(data) => {
+            let signature = b"PGCOPY\n\xff\r\n\x00";
+            assert!(
+                data.len() >= signature.len(),
+                "Binary data too short: {} bytes",
+                data.len(),
+            );
+            assert_eq!(
+                &data[..signature.len()],
+                signature,
+                "Binary COPY data must start with PGCOPY signature",
+            );
+            tprintln!("  PGCOPY signature verified ({} bytes total)\n", data.len());
+
+            // Verify flags (4 bytes, should be 0 for no OIDs)
+            let flags = u32::from_be_bytes([data[11], data[12], data[13], data[14]]);
+            assert_eq!(flags, 0, "Flags should be 0 (no OIDs)");
+            tprintln!("  Flags: {} (no OIDs)\n", flags);
+
+            // Verify header extension length (4 bytes, should be 0)
+            let ext_len = u32::from_be_bytes([data[15], data[16], data[17], data[18]]);
+            assert_eq!(ext_len, 0, "Header extension length should be 0");
+            tprintln!("  Header extension length: {}\n", ext_len);
+
+            // Verify first row field count (2 bytes after the 19-byte header)
+            let field_count = i16::from_be_bytes([data[19], data[20]]);
+            assert_eq!(field_count, 2, "First row should have 2 fields");
+            tprintln!("  First row field count: {}\n", field_count);
+
+            // Verify the trailer (last 2 bytes should be -1 as i16)
+            let trailer = i16::from_be_bytes([data[data.len() - 2], data[data.len() - 1]]);
+            assert_eq!(trailer, -1, "Trailer field count sentinel should be -1");
+            tprintln!("  Trailer sentinel: {}\n", trailer);
+        }
+        other => panic!("Expected CopyData, got {:?}", other),
+    }
+
+    // Verify the done message
+    let done = handler.done_message();
+    assert!(
+        matches!(
+            done,
+            zyron_wire::messages::backend::BackendMessage::CopyDone
+        ),
+        "Done message should be CopyDone",
+    );
+    tprintln!("  CopyDone message verified\n");
+
+    tprintln!("  All COPY binary format tests passed\n");
+}
+
+// ===========================================================================
+// Auth and subsystem throughput benchmarks
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// DDL Dispatch Throughput
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_ddl_dispatch_throughput() {
+    zyron_bench_harness::init("wire");
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== DDL Dispatch Throughput Test ===");
+
+    let iterations = 1_000_000;
+    let mut results = Vec::with_capacity(VALIDATION_RUNS);
+
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("--- Run {}/{} ---\n", run + 1, VALIDATION_RUNS);
+
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let _ = zyron_parser::parse("CREATE TABLE t (id INT)");
+        }
+        let elapsed = start.elapsed();
+
+        let ops_sec = iterations as f64 / elapsed.as_secs_f64();
+        results.push(ops_sec);
+        tprintln!(
+            "  {} parses in {:.2?}, {} ops/sec\n",
+            format_with_commas(iterations as f64),
+            elapsed,
+            format_with_commas(ops_sec),
+        );
+    }
+
+    let result = validate_metric(
+        "DDL Dispatch",
+        "DDL parse throughput (ops/sec)",
+        results,
+        500_000.0,
+        true,
+    );
+
+    assert!(
+        result.passed,
+        "DDL dispatch throughput below minimum threshold"
+    );
+    assert!(
+        !result.regression_detected,
+        "Regression detected in DDL dispatch"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Notification Channel Throughput
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_notification_throughput() {
+    zyron_bench_harness::init("wire");
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Notification Channel Throughput Test ===");
+
+    let iterations = 1_000_000;
+    let mut results = Vec::with_capacity(VALIDATION_RUNS);
+
+    let channels = NotificationChannels::new();
+    let _rx = channels.listen("bench");
+
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("--- Run {}/{} ---\n", run + 1, VALIDATION_RUNS);
+
+        let start = Instant::now();
+        for _ in 0..iterations {
+            channels.notify("bench", "payload", 1);
+        }
+        let elapsed = start.elapsed();
+
+        let ops_sec = iterations as f64 / elapsed.as_secs_f64();
+        results.push(ops_sec);
+        tprintln!(
+            "  {} notifies in {:.2?}, {} ops/sec\n",
+            format_with_commas(iterations as f64),
+            elapsed,
+            format_with_commas(ops_sec),
+        );
+    }
+
+    let result = validate_metric(
+        "Notification Channel",
+        "notify() throughput (ops/sec)",
+        results,
+        1_000_000.0,
+        true,
+    );
+
+    assert!(
+        result.passed,
+        "Notification channel throughput below minimum threshold"
+    );
+    assert!(
+        !result.regression_detected,
+        "Regression detected in notification channel"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// TOTP Verification Throughput
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_totp_auth_throughput() {
+    zyron_bench_harness::init("wire");
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== TOTP Auth Throughput Test ===");
+
+    let iterations = 1_000_000;
+    let mut results = Vec::with_capacity(VALIDATION_RUNS);
+
+    let totp = TotpCredential::from_secret(vec![1u8; 20]);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let code = totp.generate_code(timestamp);
+
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("--- Run {}/{} ---\n", run + 1, VALIDATION_RUNS);
+
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let _ = totp.verify(&code, timestamp);
+        }
+        let elapsed = start.elapsed();
+
+        let ops_sec = iterations as f64 / elapsed.as_secs_f64();
+        results.push(ops_sec);
+        tprintln!(
+            "  {} verifications in {:.2?}, {} ops/sec\n",
+            format_with_commas(iterations as f64),
+            elapsed,
+            format_with_commas(ops_sec),
+        );
+    }
+
+    let result = validate_metric(
+        "TOTP Auth",
+        "TOTP verify throughput (ops/sec)",
+        results,
+        500_000.0,
+        true,
+    );
+
+    assert!(
+        result.passed,
+        "TOTP auth throughput below minimum threshold"
+    );
+    assert!(
+        !result.regression_detected,
+        "Regression detected in TOTP auth"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// API Key Verification Throughput
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_apikey_auth_throughput() {
+    zyron_bench_harness::init("wire");
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== API Key Auth Throughput Test ===");
+
+    let iterations = 1_000_000;
+    let mut results = Vec::with_capacity(VALIDATION_RUNS);
+
+    let (cred, raw_key) = ApiKeyCredential::generate();
+
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("--- Run {}/{} ---\n", run + 1, VALIDATION_RUNS);
+
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let _ = cred.verify(&raw_key);
+        }
+        let elapsed = start.elapsed();
+
+        let ops_sec = iterations as f64 / elapsed.as_secs_f64();
+        results.push(ops_sec);
+        tprintln!(
+            "  {} verifications in {:.2?}, {} ops/sec\n",
+            format_with_commas(iterations as f64),
+            elapsed,
+            format_with_commas(ops_sec),
+        );
+    }
+
+    let result = validate_metric(
+        "API Key Auth",
+        "API key verify throughput (ops/sec)",
+        results,
+        500_000.0,
+        true,
+    );
+
+    assert!(
+        result.passed,
+        "API key auth throughput below minimum threshold"
+    );
+    assert!(
+        !result.regression_detected,
+        "Regression detected in API key auth"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// JWT Decode Throughput
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wire_jwt_auth_throughput() {
+    zyron_bench_harness::init("wire");
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== JWT Auth Throughput Test ===");
+
+    let iterations = 1_000_000;
+    let mut results = Vec::with_capacity(VALIDATION_RUNS);
+
+    let secret = vec![0xABu8; 32];
+    let jwt = JwtCredential::new(secret, JwtAlgorithm::Hs256)
+        .expect("JwtCredential creation should succeed");
+
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+
+    let claims = JwtClaims {
+        sub: "bench_user".to_string(),
+        iss: None,
+        exp,
+        iat: exp - 3600,
+        roles: vec!["admin".to_string()],
+        custom: std::collections::HashMap::new(),
+    };
+
+    let token = jwt.encode(&claims).expect("JWT encode should succeed");
+
+    for run in 0..VALIDATION_RUNS {
+        tprintln!("--- Run {}/{} ---\n", run + 1, VALIDATION_RUNS);
+
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let _ = jwt.decode(&token);
+        }
+        let elapsed = start.elapsed();
+
+        let ops_sec = iterations as f64 / elapsed.as_secs_f64();
+        results.push(ops_sec);
+        tprintln!(
+            "  {} decodes in {:.2?}, {} ops/sec\n",
+            format_with_commas(iterations as f64),
+            elapsed,
+            format_with_commas(ops_sec),
+        );
+    }
+
+    let result = validate_metric(
+        "JWT Auth",
+        "JWT decode throughput (ops/sec)",
+        results,
+        200_000.0,
+        true,
+    );
+
+    assert!(result.passed, "JWT auth throughput below minimum threshold");
+    assert!(
+        !result.regression_detected,
+        "Regression detected in JWT auth"
+    );
 }

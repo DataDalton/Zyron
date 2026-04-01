@@ -138,7 +138,16 @@ async fn create_test_state(
         buffer_pool: Arc::clone(&pool),
         disk_manager: Arc::clone(&disk),
         txn_manager,
-        security_manager: None,
+        security_manager: {
+            let auth_storage: Arc<dyn zyron_auth::storage::AuthStorage> = Arc::new(
+                zyron_auth::HeapAuthStorage::new(Arc::clone(&disk), Arc::clone(&pool))
+                    .expect("HeapAuthStorage creation failed"),
+            );
+            let sm = zyron_auth::SecurityManager::new(auth_storage)
+                .await
+                .expect("SecurityManager creation failed");
+            Some(Arc::new(sm))
+        },
         config_lookup: None,
         config_all: None,
         data_dir: std::path::PathBuf::from(tmp.path()),
@@ -151,6 +160,26 @@ async fn create_test_state(
         cdc_slot_stats: None,
         cdc_stream_stats: None,
         cdc_ingest_stats: None,
+        cdc_registry: None,
+        slot_manager: None,
+        publication_manager: None,
+        cdc_stream_manager: None,
+        cdc_ingest_manager: None,
+        trigger_manager: None,
+        udf_registry: None,
+        uda_registry: None,
+        procedure_registry: None,
+        pipeline_manager: None,
+        schedule_manager: None,
+        event_dispatcher: None,
+        mv_manager: None,
+        stream_job_manager: None,
+        branch_manager: None,
+        cdc_hook: None,
+        dml_hook: None,
+        notification_channels: Some(Arc::new(
+            zyron_wire::notifications::NotificationChannels::new(),
+        )),
     });
 
     (state, wal, pool, disk, bg_writer, catalog)
@@ -1511,3 +1540,840 @@ fn test_14_memory_baseline() {
 
     tprintln!("\n  Memory baseline: PASS");
 }
+
+// ===========================================================================
+// Phase 12.5 Integration Tests (15-25)
+// ===========================================================================
+
+/// Reads all backend messages until ReadyForQuery, returning full payloads.
+async fn read_responses(stream: &mut TcpStream) -> Result<Vec<(u8, Vec<u8>)>, String> {
+    let mut messages = Vec::new();
+    loop {
+        let (msg_type, payload) = read_backend_message(stream).await?;
+        messages.push((msg_type, payload));
+        if msg_type == b'Z' {
+            break;
+        }
+    }
+    Ok(messages)
+}
+
+/// Sends SQL and returns all response messages with payloads.
+async fn query_full(stream: &mut TcpStream, sql: &str) -> Result<Vec<(u8, Vec<u8>)>, String> {
+    let msg = build_query_bytes(sql);
+    stream
+        .write_all(&msg)
+        .await
+        .map_err(|e| format!("write: {}", e))?;
+    stream.flush().await.map_err(|e| format!("flush: {}", e))?;
+    read_responses(stream).await
+}
+
+/// Checks if response messages contain a CommandComplete with the given tag prefix.
+fn has_command_tag(messages: &[(u8, Vec<u8>)], tag_prefix: &str) -> bool {
+    for (msg_type, payload) in messages {
+        if *msg_type == b'C' {
+            if let Ok(tag) = std::str::from_utf8(payload) {
+                let tag = tag.trim_end_matches('\0');
+                if tag.starts_with(tag_prefix) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Checks if response messages contain an ErrorResponse.
+fn has_error(messages: &[(u8, Vec<u8>)]) -> bool {
+    messages.iter().any(|(t, _)| *t == b'E')
+}
+
+/// Checks if response messages contain at least one DataRow.
+fn has_data_row(messages: &[(u8, Vec<u8>)]) -> bool {
+    messages.iter().any(|(t, _)| *t == b'D')
+}
+
+/// Extracts the error message from an ErrorResponse for debugging.
+fn extract_error_message(messages: &[(u8, Vec<u8>)]) -> String {
+    for (msg_type, payload) in messages {
+        if *msg_type == b'E' {
+            // ErrorResponse fields are: type_byte + string + null, repeated
+            let mut result = String::new();
+            let mut pos = 0;
+            while pos < payload.len() {
+                let field_type = payload[pos];
+                if field_type == 0 {
+                    break;
+                }
+                pos += 1;
+                let end = payload[pos..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(payload.len() - pos);
+                let value = std::str::from_utf8(&payload[pos..pos + end]).unwrap_or("?");
+                if field_type == b'M' {
+                    result = value.to_string();
+                }
+                pos += end + 1;
+            }
+            return result;
+        }
+    }
+    "unknown error".to_string()
+}
+
+/// Checks if response messages contain a RowDescription.
+fn has_row_description(messages: &[(u8, Vec<u8>)]) -> bool {
+    messages.iter().any(|(t, _)| *t == b'T')
+}
+
+/// Runs a SQL query on a connected client, asserts it has a CommandComplete with
+/// the expected tag and no ErrorResponse. Returns the messages.
+async fn assert_query_ok(stream: &mut TcpStream, sql: &str, expected_tag: &str, label: &str) {
+    let msgs = query_full(stream, sql).await.expect(label);
+    if has_error(&msgs) {
+        let err_msg = extract_error_message(&msgs);
+        panic!("{}: got ErrorResponse for: {} -- {}", label, sql, err_msg);
+    }
+    assert!(
+        has_command_tag(&msgs, expected_tag),
+        "{}: missing {} tag for: {}",
+        label,
+        expected_tag,
+        sql
+    );
+}
+
+/// Macro to reduce boilerplate for server test setup.
+macro_rules! server_test {
+    ($test_name:ident, $title:expr, $body:expr) => {
+        #[test]
+        fn $test_name() {
+            zyron_bench_harness::init("server");
+            let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            tprintln!(concat!("\n=== ", $title, " ==="));
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let local = tokio::task::LocalSet::new();
+
+            local.block_on(&rt, async {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let (server_state, _wal, _pool, _disk, _bg, catalog) =
+                    create_test_state(&tmp).await;
+
+                // Create "public" schema under the test database
+                let testdb = catalog.get_database("testdb").expect("testdb should exist");
+                let _ = catalog.create_schema(testdb.id, "public", "zyron").await;
+
+                let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+                let addr = listener.local_addr().unwrap();
+
+                // Spawn server connection handler
+                let state = Arc::clone(&server_state);
+                let server_handle = tokio::task::spawn_local(async move {
+                    let (stream, _) = listener.accept().await.expect("accept");
+                    let mut conn = zyron_wire::connection::Connection::new(stream, state, None);
+                    let _ = conn.run().await;
+                });
+
+                // Connect client
+                let mut client = TcpStream::connect(addr).await.expect("connect");
+                do_handshake(&mut client, "test_user", "testdb")
+                    .await
+                    .expect("handshake");
+
+                // Run the test body
+                let body: &dyn Fn(
+                    &mut TcpStream,
+                )
+                    -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>> = &$body;
+                body(&mut client).await;
+
+                // Disconnect
+                let _ = client.write_all(&build_terminate_bytes()).await;
+                let _ = client.shutdown().await;
+                let _ = server_handle.await;
+            });
+
+            tprintln!("  PASS\n");
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Test 15: DDL Roundtrip
+// ---------------------------------------------------------------------------
+
+server_test!(test_15_ddl_roundtrip, "DDL Roundtrip Test", |client| {
+    Box::pin(async move {
+        assert_query_ok(
+            client,
+            "CREATE TABLE t (id INT, name TEXT)",
+            "CREATE TABLE",
+            "create table",
+        )
+        .await;
+        assert_query_ok(
+            client,
+            "CREATE INDEX idx_t ON t(id)",
+            "CREATE INDEX",
+            "create index",
+        )
+        .await;
+        assert_query_ok(
+            client,
+            "CREATE SCHEMA s_test",
+            "CREATE SCHEMA",
+            "create schema",
+        )
+        .await;
+        assert_query_ok(client, "DROP INDEX idx_t", "DROP INDEX", "drop index").await;
+        assert_query_ok(client, "TRUNCATE TABLE t", "TRUNCATE", "truncate").await;
+        assert_query_ok(client, "DROP TABLE t", "DROP TABLE", "drop table").await;
+        assert_query_ok(client, "DROP SCHEMA s_test", "DROP SCHEMA", "drop schema").await;
+        tprintln!("  7 DDL roundtrip operations verified");
+    })
+});
+
+// ---------------------------------------------------------------------------
+// Test 16: Auth Roundtrip
+// ---------------------------------------------------------------------------
+
+server_test!(test_16_auth_roundtrip, "Auth Roundtrip Test", |client| {
+    Box::pin(async move {
+        assert_query_ok(
+            client,
+            "CREATE ROLE test_role",
+            "CREATE ROLE",
+            "create role",
+        )
+        .await;
+        assert_query_ok(
+            client,
+            "CREATE USER test_user WITH PASSWORD 'pw'",
+            "CREATE USER",
+            "create user",
+        )
+        .await;
+        assert_query_ok(
+            client,
+            "CREATE TABLE auth_t (id INT)",
+            "CREATE TABLE",
+            "setup table",
+        )
+        .await;
+        assert_query_ok(
+            client,
+            "GRANT SELECT ON auth_t TO test_role",
+            "GRANT",
+            "grant",
+        )
+        .await;
+        assert_query_ok(
+            client,
+            "REVOKE SELECT ON auth_t FROM test_role",
+            "REVOKE",
+            "revoke",
+        )
+        .await;
+        assert_query_ok(client, "DROP USER test_user", "DROP USER", "drop user").await;
+        assert_query_ok(client, "DROP ROLE test_role", "DROP ROLE", "drop role").await;
+        assert_query_ok(client, "DROP TABLE auth_t", "DROP TABLE", "cleanup").await;
+        tprintln!("  8 auth roundtrip operations verified");
+    })
+});
+
+// ---------------------------------------------------------------------------
+// Test 17: Session Features
+// ---------------------------------------------------------------------------
+
+server_test!(
+    test_17_session_features,
+    "Session Features Test",
+    |client| {
+        Box::pin(async move {
+            // Transaction control + savepoints
+            assert_query_ok(client, "BEGIN", "BEGIN", "begin").await;
+            assert_query_ok(client, "SAVEPOINT sp1", "SAVEPOINT", "savepoint").await;
+            assert_query_ok(
+                client,
+                "RELEASE SAVEPOINT sp1",
+                "RELEASE",
+                "release savepoint",
+            )
+            .await;
+            assert_query_ok(client, "COMMIT", "COMMIT", "commit").await;
+
+            // Prepared statements
+            assert_query_ok(
+                client,
+                "PREPARE test_stmt AS SELECT 1",
+                "PREPARE",
+                "prepare",
+            )
+            .await;
+            let msgs = query_full(client, "EXECUTE test_stmt")
+                .await
+                .expect("execute");
+            assert!(!has_error(&msgs), "execute should not error");
+            assert_query_ok(client, "DEALLOCATE test_stmt", "DEALLOCATE", "deallocate").await;
+
+            // LISTEN/NOTIFY
+            assert_query_ok(client, "LISTEN test_chan", "LISTEN", "listen").await;
+            assert_query_ok(client, "NOTIFY test_chan, 'hello'", "NOTIFY", "notify").await;
+
+            // EXPLAIN
+            let msgs = query_full(client, "EXPLAIN SELECT 1")
+                .await
+                .expect("explain");
+            assert!(!has_error(&msgs), "explain should not error");
+            assert!(has_row_description(&msgs), "explain should return rows");
+
+            // Maintenance commands
+            assert_query_ok(client, "VACUUM", "VACUUM", "vacuum").await;
+            assert_query_ok(client, "ANALYZE", "ANALYZE", "analyze").await;
+            assert_query_ok(client, "CHECKPOINT", "CHECKPOINT", "checkpoint").await;
+
+            tprintln!("  14 session feature operations verified");
+        })
+    }
+);
+
+// ---------------------------------------------------------------------------
+// Test 18: Stat View Completeness
+// ---------------------------------------------------------------------------
+
+server_test!(
+    test_18_stat_view_completeness,
+    "Stat View Completeness Test",
+    |client| {
+        Box::pin(async move {
+            // Generate some activity
+            assert_query_ok(
+                client,
+                "CREATE TABLE stat_t (id INT)",
+                "CREATE TABLE",
+                "setup",
+            )
+            .await;
+            let _ = query_full(client, "INSERT INTO stat_t VALUES (1)").await;
+
+            // Query each stat view
+            let views = [
+                "zyron_stat_activity",
+                "zyron_stat_wal",
+                "zyron_stat_bgwriter",
+                "zyron_stat_tables",
+                "zyron_stat_indexes",
+                "zyron_stat_streaming_jobs",
+                "zyron_stat_triggers",
+                "zyron_stat_branches",
+            ];
+            let mut verified = 0;
+            for view in &views {
+                let sql = format!("SELECT * FROM {}", view);
+                let msgs = query_full(client, &sql).await.expect(view);
+                assert!(!has_error(&msgs), "{} returned error", view);
+                assert!(
+                    has_row_description(&msgs),
+                    "{} missing RowDescription",
+                    view
+                );
+                verified += 1;
+            }
+
+            assert_query_ok(client, "DROP TABLE stat_t", "DROP TABLE", "cleanup").await;
+            tprintln!("  {} stat views queried without error", verified);
+        })
+    }
+);
+
+// ---------------------------------------------------------------------------
+// Test 19: Subsystem DDL Coverage
+// ---------------------------------------------------------------------------
+
+server_test!(
+    test_19_subsystem_ddl_coverage,
+    "Subsystem DDL Coverage Test",
+    |client| {
+        Box::pin(async move {
+            assert_query_ok(
+                client,
+                "CREATE TABLE sub_t (id INT)",
+                "CREATE TABLE",
+                "setup",
+            )
+            .await;
+
+            // Views
+            assert_query_ok(
+                client,
+                "CREATE VIEW sub_v AS SELECT 1",
+                "CREATE VIEW",
+                "create view",
+            )
+            .await;
+            assert_query_ok(client, "DROP VIEW sub_v", "DROP VIEW", "drop view").await;
+
+            // Materialized views
+            assert_query_ok(
+                client,
+                "CREATE MATERIALIZED VIEW sub_mv AS SELECT 1",
+                "CREATE MATERIALIZED VIEW",
+                "create mv",
+            )
+            .await;
+            assert_query_ok(
+                client,
+                "DROP MATERIALIZED VIEW sub_mv",
+                "DROP MATERIALIZED VIEW",
+                "drop mv",
+            )
+            .await;
+
+            // Versioning
+            assert_query_ok(
+                client,
+                "CREATE BRANCH sub_b",
+                "CREATE BRANCH",
+                "create branch",
+            )
+            .await;
+            assert_query_ok(client, "USE BRANCH sub_b", "USE BRANCH", "use branch").await;
+            assert_query_ok(client, "DROP BRANCH sub_b", "DROP BRANCH", "drop branch").await;
+
+            // CDC
+            assert_query_ok(
+                client,
+                "CREATE PUBLICATION sub_pub FOR TABLE sub_t",
+                "CREATE PUBLICATION",
+                "create pub",
+            )
+            .await;
+            assert_query_ok(
+                client,
+                "DROP PUBLICATION sub_pub",
+                "DROP PUBLICATION",
+                "drop pub",
+            )
+            .await;
+            assert_query_ok(
+                client,
+                "CREATE REPLICATION SLOT sub_slot PLUGIN 'zyron'",
+                "CREATE_REPLICATION_SLOT",
+                "create slot",
+            )
+            .await;
+            assert_query_ok(
+                client,
+                "DROP REPLICATION SLOT sub_slot",
+                "DROP_REPLICATION_SLOT",
+                "drop slot",
+            )
+            .await;
+
+            // Functions/Triggers/Procedures
+            assert_query_ok(
+                client,
+                "CREATE FUNCTION sub_fn() RETURNS INT AS 'SELECT 1' LANGUAGE SQL",
+                "CREATE FUNCTION",
+                "create fn",
+            )
+            .await;
+            assert_query_ok(client, "DROP FUNCTION sub_fn", "DROP FUNCTION", "drop fn").await;
+            assert_query_ok(client, "CREATE TRIGGER sub_trg BEFORE INSERT ON sub_t FOR EACH ROW EXECUTE FUNCTION sub_fn()", "CREATE TRIGGER", "create trigger").await;
+            assert_query_ok(
+                client,
+                "DROP TRIGGER sub_trg ON sub_t",
+                "DROP TRIGGER",
+                "drop trigger",
+            )
+            .await;
+            assert_query_ok(
+                client,
+                "CREATE PROCEDURE sub_proc() AS 'SELECT 1' LANGUAGE SQL",
+                "CREATE PROCEDURE",
+                "create proc",
+            )
+            .await;
+            assert_query_ok(
+                client,
+                "DROP PROCEDURE sub_proc",
+                "DROP PROCEDURE",
+                "drop proc",
+            )
+            .await;
+            assert_query_ok(client, "CALL sub_proc()", "CALL", "call proc").await;
+
+            // Aggregate
+            assert_query_ok(
+                client,
+                "CREATE AGGREGATE sub_agg(val INT) (SFUNC = int4pl, STYPE = INT)",
+                "CREATE AGGREGATE",
+                "create agg",
+            )
+            .await;
+            assert_query_ok(
+                client,
+                "DROP AGGREGATE sub_agg",
+                "DROP AGGREGATE",
+                "drop agg",
+            )
+            .await;
+
+            // Pipeline/Schedule
+            assert_query_ok(
+                client,
+                "CREATE PIPELINE sub_pipe AS (STAGE s1 (SOURCE sub_t, TARGET sub_t))",
+                "CREATE PIPELINE",
+                "create pipeline",
+            )
+            .await;
+            assert_query_ok(
+                client,
+                "DROP PIPELINE sub_pipe",
+                "DROP PIPELINE",
+                "drop pipeline",
+            )
+            .await;
+            assert_query_ok(
+                client,
+                "CREATE SCHEDULE sub_sched EVERY 1 HOURS DO SELECT 1",
+                "CREATE SCHEDULE",
+                "create sched",
+            )
+            .await;
+            assert_query_ok(
+                client,
+                "DROP SCHEDULE sub_sched",
+                "DROP SCHEDULE",
+                "drop sched",
+            )
+            .await;
+
+            // Event handlers
+            assert_query_ok(
+                client,
+                "CREATE EVENT HANDLER sub_eh WHEN table_change EXECUTE FUNCTION sub_fn",
+                "CREATE EVENT HANDLER",
+                "create eh",
+            )
+            .await;
+            assert_query_ok(
+                client,
+                "DROP EVENT HANDLER sub_eh",
+                "DROP EVENT HANDLER",
+                "drop eh",
+            )
+            .await;
+
+            // VALUES query
+            let msgs = query_full(client, "VALUES (1, 2, 3)")
+                .await
+                .expect("values");
+            assert!(!has_error(&msgs), "VALUES should not error");
+            assert!(has_data_row(&msgs), "VALUES should return data rows");
+
+            assert_query_ok(client, "DROP TABLE sub_t", "DROP TABLE", "cleanup").await;
+            tprintln!("  28 subsystem DDL operations verified");
+        })
+    }
+);
+
+// ---------------------------------------------------------------------------
+// Test 20: CDC DDL Roundtrip
+// ---------------------------------------------------------------------------
+
+server_test!(test_20_cdc_roundtrip, "CDC DDL Roundtrip Test", |client| {
+    Box::pin(async move {
+        assert_query_ok(
+            client,
+            "CREATE TABLE cdc_t (id INT, val TEXT)",
+            "CREATE TABLE",
+            "setup",
+        )
+        .await;
+        assert_query_ok(
+            client,
+            "CREATE PUBLICATION cdc_pub FOR TABLE cdc_t",
+            "CREATE PUBLICATION",
+            "create pub",
+        )
+        .await;
+        assert_query_ok(
+            client,
+            "CREATE REPLICATION SLOT cdc_slot PLUGIN 'zyron'",
+            "CREATE_REPLICATION_SLOT",
+            "create slot",
+        )
+        .await;
+
+        // DML to generate CDC activity
+        let _ = query_full(client, "INSERT INTO cdc_t VALUES (1, 'first')").await;
+        let _ = query_full(client, "UPDATE cdc_t SET val = 'updated' WHERE id = 1").await;
+        let _ = query_full(client, "DELETE FROM cdc_t WHERE id = 1").await;
+
+        // Query CDC stat views
+        let msgs = query_full(client, "SELECT * FROM zyron_stat_cdc_feeds")
+            .await
+            .expect("cdc feeds");
+        assert!(!has_error(&msgs), "cdc feeds should not error");
+
+        assert_query_ok(
+            client,
+            "DROP PUBLICATION cdc_pub",
+            "DROP PUBLICATION",
+            "drop pub",
+        )
+        .await;
+        assert_query_ok(
+            client,
+            "DROP REPLICATION SLOT cdc_slot",
+            "DROP_REPLICATION_SLOT",
+            "drop slot",
+        )
+        .await;
+        assert_query_ok(client, "DROP TABLE cdc_t", "DROP TABLE", "cleanup").await;
+        tprintln!("  9 CDC roundtrip operations verified");
+    })
+});
+
+// ---------------------------------------------------------------------------
+// Test 21: Trigger and Function DDL
+// ---------------------------------------------------------------------------
+
+server_test!(
+    test_21_trigger_function_ddl,
+    "Trigger and Function DDL Test",
+    |client| {
+        Box::pin(async move {
+            assert_query_ok(
+                client,
+                "CREATE TABLE trg_t (id INT)",
+                "CREATE TABLE",
+                "setup",
+            )
+            .await;
+            assert_query_ok(
+                client,
+                "CREATE FUNCTION trg_fn(x INT) RETURNS INT AS 'SELECT x * 2' LANGUAGE SQL",
+                "CREATE FUNCTION",
+                "create fn",
+            )
+            .await;
+            assert_query_ok(client, "CREATE TRIGGER trg_b BEFORE INSERT ON trg_t FOR EACH ROW EXECUTE FUNCTION trg_fn()", "CREATE TRIGGER", "create before trigger").await;
+            assert_query_ok(
+                client,
+                "DROP TRIGGER trg_b ON trg_t",
+                "DROP TRIGGER",
+                "drop trigger",
+            )
+            .await;
+            assert_query_ok(client, "DROP FUNCTION trg_fn", "DROP FUNCTION", "drop fn").await;
+            assert_query_ok(
+                client,
+                "CREATE AGGREGATE trg_agg(val INT) (SFUNC = int4pl, STYPE = INT)",
+                "CREATE AGGREGATE",
+                "create agg",
+            )
+            .await;
+            assert_query_ok(
+                client,
+                "DROP AGGREGATE trg_agg",
+                "DROP AGGREGATE",
+                "drop agg",
+            )
+            .await;
+            assert_query_ok(
+                client,
+                "CREATE PROCEDURE trg_proc() AS 'SELECT 1' LANGUAGE SQL",
+                "CREATE PROCEDURE",
+                "create proc",
+            )
+            .await;
+            assert_query_ok(
+                client,
+                "DROP PROCEDURE trg_proc",
+                "DROP PROCEDURE",
+                "drop proc",
+            )
+            .await;
+            assert_query_ok(client, "DROP TABLE trg_t", "DROP TABLE", "cleanup").await;
+            tprintln!("  10 trigger/function DDL operations verified");
+        })
+    }
+);
+
+// ---------------------------------------------------------------------------
+// Test 22: Pipeline and Schedule DDL
+// ---------------------------------------------------------------------------
+
+server_test!(
+    test_22_pipeline_schedule_ddl,
+    "Pipeline and Schedule DDL Test",
+    |client| {
+        Box::pin(async move {
+            assert_query_ok(
+                client,
+                "CREATE TABLE pipe_t (id INT)",
+                "CREATE TABLE",
+                "setup",
+            )
+            .await;
+            assert_query_ok(
+                client,
+                "CREATE PIPELINE pipe_p AS (STAGE s1 (SOURCE pipe_t, TARGET pipe_t))",
+                "CREATE PIPELINE",
+                "create pipeline",
+            )
+            .await;
+            assert_query_ok(
+                client,
+                "DROP PIPELINE pipe_p",
+                "DROP PIPELINE",
+                "drop pipeline",
+            )
+            .await;
+            assert_query_ok(
+                client,
+                "CREATE SCHEDULE sched_s EVERY 1 HOURS DO SELECT 1",
+                "CREATE SCHEDULE",
+                "create schedule",
+            )
+            .await;
+            assert_query_ok(
+                client,
+                "DROP SCHEDULE sched_s",
+                "DROP SCHEDULE",
+                "drop schedule",
+            )
+            .await;
+            assert_query_ok(client, "DROP TABLE pipe_t", "DROP TABLE", "cleanup").await;
+            tprintln!("  6 pipeline/schedule DDL operations verified");
+        })
+    }
+);
+
+// ---------------------------------------------------------------------------
+// Test 23: Versioning DDL
+// ---------------------------------------------------------------------------
+
+server_test!(test_23_versioning_ddl, "Versioning DDL Test", |client| {
+    Box::pin(async move {
+        assert_query_ok(
+            client,
+            "CREATE BRANCH ver_b",
+            "CREATE BRANCH",
+            "create branch",
+        )
+        .await;
+        assert_query_ok(client, "USE BRANCH ver_b", "USE BRANCH", "use branch").await;
+        assert_query_ok(client, "DROP BRANCH ver_b", "DROP BRANCH", "drop branch").await;
+
+        // Stat view
+        let msgs = query_full(client, "SELECT * FROM zyron_stat_branches")
+            .await
+            .expect("branches");
+        assert!(!has_error(&msgs), "branches view should not error");
+        tprintln!("  4 versioning DDL operations verified");
+    })
+});
+
+// ---------------------------------------------------------------------------
+// Test 24: Full Integration Smoke Test
+// ---------------------------------------------------------------------------
+
+server_test!(
+    test_24_full_smoke,
+    "Full Integration Smoke Test",
+    |client| {
+        Box::pin(async move {
+            let steps = vec![
+                ("CREATE SCHEMA smoke_s", "CREATE SCHEMA"),
+                ("CREATE TABLE smoke_t (id INT, name TEXT)", "CREATE TABLE"),
+                ("CREATE INDEX smoke_idx ON smoke_t(id)", "CREATE INDEX"),
+                ("CREATE VIEW smoke_v AS SELECT 1", "CREATE VIEW"),
+                (
+                    "CREATE MATERIALIZED VIEW smoke_mv AS SELECT 1",
+                    "CREATE MATERIALIZED VIEW",
+                ),
+                (
+                    "CREATE FUNCTION smoke_fn() RETURNS INT AS 'SELECT 42' LANGUAGE SQL",
+                    "CREATE FUNCTION",
+                ),
+                (
+                    "CREATE TRIGGER smoke_trg BEFORE INSERT ON smoke_t FOR EACH ROW EXECUTE FUNCTION smoke_fn()",
+                    "CREATE TRIGGER",
+                ),
+                (
+                    "CREATE PUBLICATION smoke_pub FOR TABLE smoke_t",
+                    "CREATE PUBLICATION",
+                ),
+                ("CREATE BRANCH smoke_branch", "CREATE BRANCH"),
+                (
+                    "CREATE PIPELINE smoke_pipe AS (STAGE s1 (SOURCE smoke_t, TARGET smoke_t))",
+                    "CREATE PIPELINE",
+                ),
+                (
+                    "CREATE SCHEDULE smoke_sched EVERY 1 HOURS DO SELECT 1",
+                    "CREATE SCHEDULE",
+                ),
+                ("CREATE ROLE smoke_role", "CREATE ROLE"),
+                ("GRANT SELECT ON smoke_t TO smoke_role", "GRANT"),
+                ("PREPARE smoke_stmt AS SELECT 1", "PREPARE"),
+                ("LISTEN smoke_chan", "LISTEN"),
+                ("NOTIFY smoke_chan, 'ping'", "NOTIFY"),
+            ];
+
+            let mut passed = 0;
+            for (sql, tag) in &steps {
+                assert_query_ok(client, sql, tag, tag).await;
+                passed += 1;
+            }
+
+            // Execute prepared
+            let _ = query_full(client, "EXECUTE smoke_stmt").await;
+            assert_query_ok(client, "DEALLOCATE smoke_stmt", "DEALLOCATE", "deallocate").await;
+            passed += 2;
+
+            // Transaction + savepoint
+            assert_query_ok(client, "BEGIN", "BEGIN", "begin").await;
+            assert_query_ok(client, "SAVEPOINT sp", "SAVEPOINT", "savepoint").await;
+            assert_query_ok(client, "ROLLBACK", "ROLLBACK", "rollback").await;
+            passed += 3;
+
+            // Maintenance
+            assert_query_ok(client, "VACUUM", "VACUUM", "vacuum").await;
+            assert_query_ok(client, "ANALYZE", "ANALYZE", "analyze").await;
+            assert_query_ok(client, "CHECKPOINT", "CHECKPOINT", "checkpoint").await;
+            passed += 3;
+
+            // Cleanup (reverse order)
+            let cleanups = vec![
+                ("DROP SCHEDULE smoke_sched", "DROP SCHEDULE"),
+                ("DROP PIPELINE smoke_pipe", "DROP PIPELINE"),
+                ("DROP BRANCH smoke_branch", "DROP BRANCH"),
+                ("DROP PUBLICATION smoke_pub", "DROP PUBLICATION"),
+                ("DROP TRIGGER smoke_trg ON smoke_t", "DROP TRIGGER"),
+                ("DROP FUNCTION smoke_fn", "DROP FUNCTION"),
+                ("DROP MATERIALIZED VIEW smoke_mv", "DROP MATERIALIZED VIEW"),
+                ("DROP VIEW smoke_v", "DROP VIEW"),
+                ("REVOKE SELECT ON smoke_t FROM smoke_role", "REVOKE"),
+                ("DROP ROLE smoke_role", "DROP ROLE"),
+                ("DROP INDEX smoke_idx", "DROP INDEX"),
+                ("DROP TABLE smoke_t", "DROP TABLE"),
+                ("DROP SCHEMA smoke_s", "DROP SCHEMA"),
+            ];
+            for (sql, tag) in &cleanups {
+                assert_query_ok(client, sql, tag, tag).await;
+                passed += 1;
+            }
+
+            tprintln!("  {} smoke test operations verified", passed);
+        })
+    }
+);

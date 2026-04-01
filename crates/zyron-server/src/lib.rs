@@ -8,6 +8,7 @@ pub mod background;
 pub mod backup;
 pub mod config;
 pub mod health;
+pub mod hooks;
 pub mod io_stats;
 pub mod metrics;
 pub mod session;
@@ -335,6 +336,21 @@ impl Server {
             if let Some(timeout) = auth_cfg.webauthn_challenge_timeout {
                 security_manager.webauthn_rp_config.challenge_timeout_secs = timeout;
             }
+            // JWT authentication config
+            if let Some(ref secret) = auth_cfg.jwt_secret {
+                security_manager.jwt_secret = Some(secret.as_bytes().to_vec());
+            }
+            if let Some(ref alg) = auth_cfg.jwt_algorithm {
+                security_manager.jwt_algorithm = match alg.as_str() {
+                    "HS384" => zyron_auth::JwtAlgorithm::Hs384,
+                    "HS512" => zyron_auth::JwtAlgorithm::Hs512,
+                    _ => zyron_auth::JwtAlgorithm::Hs256,
+                };
+            }
+            if let Some(ref issuer) = auth_cfg.jwt_issuer {
+                security_manager.jwt_issuer = Some(issuer.clone());
+            }
+
             let policy = zyron_auth::BruteForcePolicy {
                 lockout_threshold: auth_cfg.lockout_threshold.unwrap_or(5),
                 lockout_duration_secs: auth_cfg.lockout_duration_secs.unwrap_or(900),
@@ -350,7 +366,39 @@ impl Server {
         // 9. Create CheckpointTracker
         let tracker = Arc::new(CheckpointTracker::new());
 
-        // 10. Start background workers
+        // 10. Initialize subsystem managers (before background workers so workers can use them)
+        let cdc_registry_arc = Arc::new(zyron_cdc::CdfRegistry::new(data_dir.clone()));
+        let slot_mgr_arc =
+            zyron_cdc::SlotManager::open(&data_dir, zyron_cdc::SlotLagConfig::default())
+                .ok()
+                .map(Arc::new);
+        let pub_mgr_arc = zyron_cdc::PublicationManager::open(&data_dir)
+            .ok()
+            .map(Arc::new);
+        let cdc_stream_mgr_arc = zyron_cdc::CdcStreamManager::new(&data_dir)
+            .ok()
+            .map(Arc::new);
+        let cdc_ingest_mgr_arc = zyron_cdc::CdcIngestManager::new(&data_dir)
+            .ok()
+            .map(Arc::new);
+
+        let trigger_mgr_arc = Arc::new(zyron_pipeline::trigger::TriggerManager::new());
+        let udf_reg_arc = Arc::new(zyron_pipeline::udf::UdfRegistry::new());
+        let uda_reg_arc = Arc::new(zyron_pipeline::aggregate::UdaRegistry::new());
+        let proc_reg_arc = Arc::new(zyron_pipeline::stored_procedure::ProcedureRegistry::new());
+        let pipeline_mgr_arc = Arc::new(zyron_pipeline::pipeline::PipelineManager::new());
+        let sched_mgr_arc = Arc::new(zyron_pipeline::schedule::ScheduleManager::new());
+        let event_disp_arc = Arc::new(zyron_pipeline::event_handler::EventDispatcher::new());
+        let mv_mgr_arc =
+            Arc::new(zyron_pipeline::materialized_view::MaterializedViewManager::new());
+
+        let stream_mgr_arc = Arc::new(parking_lot::Mutex::new(
+            zyron_streaming::job::StreamJobManager::new(),
+        ));
+        let branch_mgr_arc = Arc::new(zyron_versioning::BranchManager::new(data_dir.clone()));
+        let notif_arc = Arc::new(zyron_wire::notifications::NotificationChannels::new());
+
+        // 11. Start background workers
         let ckpt_config = CheckpointWorkerConfig {
             wal_bytes_threshold: self.config.checkpoint.wal_bytes_threshold,
             max_interval_secs: self.config.checkpoint.max_interval_secs as u64,
@@ -373,6 +421,8 @@ impl Server {
             vacuum_config,
             wal_dir,
             None, // WAL archiving disabled unless configured
+            Some(Arc::clone(&cdc_registry_arc)),
+            Some(Arc::clone(&stream_mgr_arc)),
         );
 
         // Extract background worker stats for ServerState
@@ -462,10 +512,92 @@ impl Server {
                         .map_err(|e| e.to_string())
                 },
             )),
-            cdc_feed_stats: None,
-            cdc_slot_stats: None,
-            cdc_stream_stats: None,
-            cdc_ingest_stats: None,
+            cdc_feed_stats: {
+                let reg = Arc::clone(&cdc_registry_arc);
+                Some(Arc::new(move || -> Vec<(u32, u64, u64, u32)> {
+                    reg.list_feeds()
+                }))
+            },
+            cdc_slot_stats: {
+                let mgr = slot_mgr_arc.clone();
+                Some(Arc::new(
+                    move || -> Vec<(String, String, u64, u64, bool, u64)> {
+                        mgr.as_ref()
+                            .map(|m| {
+                                m.list_slots()
+                                    .into_iter()
+                                    .map(|s| {
+                                        (
+                                            s.name,
+                                            format!("{:?}", s.plugin),
+                                            s.confirmed_lsn,
+                                            s.restart_lsn,
+                                            s.active,
+                                            0u64,
+                                        )
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    },
+                ))
+            },
+            cdc_stream_stats: {
+                let mgr = cdc_stream_mgr_arc.clone();
+                Some(Arc::new(move || -> Vec<(String, u32, bool, String)> {
+                    mgr.as_ref()
+                        .map(|m| {
+                            m.list_streams()
+                                .into_iter()
+                                .map(|s| (s.name, s.table_id, s.active, s.slot_name))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                }))
+            },
+            cdc_ingest_stats: {
+                let mgr = cdc_ingest_mgr_arc.clone();
+                Some(Arc::new(move || -> Vec<(String, u32, bool, u64, u64)> {
+                    mgr.as_ref()
+                        .map(|m| {
+                            m.list_ingests()
+                                .into_iter()
+                                .map(|i| (i.name, i.target_table_id, i.active, 0u64, 0u64))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                }))
+            },
+            // CDC managers
+            cdc_registry: Some(Arc::clone(&cdc_registry_arc)),
+            slot_manager: slot_mgr_arc,
+            publication_manager: pub_mgr_arc,
+            cdc_stream_manager: cdc_stream_mgr_arc,
+            cdc_ingest_manager: cdc_ingest_mgr_arc,
+            // Pipeline managers
+            trigger_manager: Some(Arc::clone(&trigger_mgr_arc)),
+            udf_registry: Some(udf_reg_arc),
+            uda_registry: Some(uda_reg_arc),
+            procedure_registry: Some(proc_reg_arc),
+            pipeline_manager: Some(pipeline_mgr_arc),
+            schedule_manager: Some(sched_mgr_arc),
+            event_dispatcher: Some(event_disp_arc),
+            mv_manager: Some(mv_mgr_arc),
+            // Streaming
+            stream_job_manager: Some(stream_mgr_arc),
+            // Versioning
+            branch_manager: Some(branch_mgr_arc),
+            // DML hooks: CDC capture + trigger dispatch
+            cdc_hook: Some(Arc::new(hooks::CdcHookBridge::new(
+                Arc::clone(&cdc_registry_arc),
+                Arc::clone(&trigger_mgr_arc),
+            )) as Arc<dyn zyron_executor::context::CdcHook>),
+            dml_hook: Some(
+                Arc::new(hooks::DmlHookBridge::new(Arc::clone(&trigger_mgr_arc)))
+                    as Arc<dyn zyron_executor::context::DmlHook>,
+            ),
+            // Notification channels
+            notification_channels: Some(notif_arc),
         });
 
         // 11. Start health/metrics HTTP server

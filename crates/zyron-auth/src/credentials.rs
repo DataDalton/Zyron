@@ -162,11 +162,17 @@ pub struct JwtClaims {
 }
 
 /// JWT credential that can encode and decode tokens using HMAC signing.
+/// Pre-computes the HMAC key schedule on construction to avoid per-call overhead.
 pub struct JwtCredential {
     secret: Vec<u8>,
     algorithm: JwtAlgorithm,
     issuer: Option<String>,
     max_age_secs: u64,
+    /// Pre-computed HMAC-SHA256 instance. Cloned per sign() call to skip key
+    /// derivation (inner/outer pad computation).
+    hmac256: Option<Hmac<sha2::Sha256>>,
+    hmac384: Option<Hmac<sha2::Sha384>>,
+    hmac512: Option<Hmac<sha2::Sha512>>,
 }
 
 impl JwtCredential {
@@ -182,11 +188,38 @@ impl JwtCredential {
                 secret.len()
             )));
         }
+        let hmac256 = if matches!(algorithm, JwtAlgorithm::Hs256) {
+            Some(
+                Hmac::<sha2::Sha256>::new_from_slice(&secret)
+                    .map_err(|e| ZyronError::InvalidCredential(format!("HMAC key error: {}", e)))?,
+            )
+        } else {
+            None
+        };
+        let hmac384 = if matches!(algorithm, JwtAlgorithm::Hs384) {
+            Some(
+                Hmac::<sha2::Sha384>::new_from_slice(&secret)
+                    .map_err(|e| ZyronError::InvalidCredential(format!("HMAC key error: {}", e)))?,
+            )
+        } else {
+            None
+        };
+        let hmac512 = if matches!(algorithm, JwtAlgorithm::Hs512) {
+            Some(
+                Hmac::<sha2::Sha512>::new_from_slice(&secret)
+                    .map_err(|e| ZyronError::InvalidCredential(format!("HMAC key error: {}", e)))?,
+            )
+        } else {
+            None
+        };
         Ok(Self {
             secret,
             algorithm,
             issuer: None,
             max_age_secs: 3600,
+            hmac256,
+            hmac384,
+            hmac512,
         })
     }
 
@@ -222,15 +255,21 @@ impl JwtCredential {
 
     /// Decodes and verifies a JWT token. Checks signature, expiration, and issuer.
     pub fn decode(&self, token: &str) -> Result<JwtClaims> {
-        let parts: Vec<&str> = token.split('.').collect();
-        if parts.len() != 3 {
-            return Err(ZyronError::InvalidCredential(
-                "JWT must have three dot-separated parts".to_string(),
-            ));
-        }
+        // Split into header.payload.signature using byte offsets instead of
+        // collecting into a Vec. The signing input is header.payload (the
+        // original bytes up to the last dot), avoiding a format! allocation.
+        let last_dot = token.rfind('.').ok_or_else(|| {
+            ZyronError::InvalidCredential("JWT must have three dot-separated parts".to_string())
+        })?;
+        let first_dot = token[..last_dot].find('.').ok_or_else(|| {
+            ZyronError::InvalidCredential("JWT must have three dot-separated parts".to_string())
+        })?;
 
-        let signing_input = format!("{}.{}", parts[0], parts[1]);
-        let presented_sig = base64url_decode(parts[2])?;
+        let signing_input = &token[..last_dot]; // header.payload (no allocation)
+        let sig_b64 = &token[last_dot + 1..];
+        let payload_b64 = &token[first_dot + 1..last_dot];
+
+        let presented_sig = base64url_decode(sig_b64)?;
         let expected_sig = self.sign(signing_input.as_bytes())?;
 
         if !balloon::constant_time_eq(&presented_sig, &expected_sig) {
@@ -239,7 +278,7 @@ impl JwtCredential {
             ));
         }
 
-        let payload_bytes = base64url_decode(parts[1])?;
+        let payload_bytes = base64url_decode(payload_b64)?;
         let payload_str = std::str::from_utf8(&payload_bytes).map_err(|_| {
             ZyronError::InvalidCredential("JWT payload is not valid UTF-8".to_string())
         })?;
@@ -299,24 +338,22 @@ impl JwtCredential {
         Ok((header, claims))
     }
 
-    /// Computes HMAC signature over the input bytes using the configured algorithm.
+    /// Computes HMAC signature over the input bytes using the pre-computed key schedule.
+    /// Cloning the pre-computed HMAC avoids re-deriving inner/outer pads per call.
     fn sign(&self, input: &[u8]) -> Result<Vec<u8>> {
         match self.algorithm {
             JwtAlgorithm::Hs256 => {
-                let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&self.secret)
-                    .map_err(|e| ZyronError::InvalidCredential(format!("HMAC key error: {}", e)))?;
+                let mut mac = self.hmac256.as_ref().unwrap().clone();
                 mac.update(input);
                 Ok(mac.finalize().into_bytes().to_vec())
             }
             JwtAlgorithm::Hs384 => {
-                let mut mac = Hmac::<sha2::Sha384>::new_from_slice(&self.secret)
-                    .map_err(|e| ZyronError::InvalidCredential(format!("HMAC key error: {}", e)))?;
+                let mut mac = self.hmac384.as_ref().unwrap().clone();
                 mac.update(input);
                 Ok(mac.finalize().into_bytes().to_vec())
             }
             JwtAlgorithm::Hs512 => {
-                let mut mac = Hmac::<sha2::Sha512>::new_from_slice(&self.secret)
-                    .map_err(|e| ZyronError::InvalidCredential(format!("HMAC key error: {}", e)))?;
+                let mut mac = self.hmac512.as_ref().unwrap().clone();
                 mac.update(input);
                 Ok(mac.finalize().into_bytes().to_vec())
             }
@@ -529,6 +566,32 @@ fn claims_to_json(claims: &JwtClaims) -> String {
     s
 }
 
+/// Unescapes a JSON string value (handles \\, \", \n, \r, \t).
+fn json_unescape(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('"') => result.push('"'),
+                Some('\\') => result.push('\\'),
+                Some('n') => result.push('\n'),
+                Some('r') => result.push('\r'),
+                Some('t') => result.push('\t'),
+                Some('/') => result.push('/'),
+                Some(other) => {
+                    result.push('\\');
+                    result.push(other);
+                }
+                None => result.push('\\'),
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
 /// Escapes a string for JSON output (handles backslash, quote, control chars).
 fn json_escape_into(buf: &mut String, s: &str) {
     for ch in s.chars() {
@@ -554,16 +617,146 @@ fn json_to_header(json: &str) -> Result<JwtHeader> {
     Ok(JwtHeader { alg, typ })
 }
 
-/// Parses a minimal JSON object into JwtClaims.
+/// Parses a minimal JSON object into JwtClaims using a single pass.
+/// Scans the JSON once to extract all key-value pairs instead of running
+/// separate find() calls per field.
 fn json_to_claims(json: &str) -> Result<JwtClaims> {
-    let sub = extract_json_string(json, "sub")?
-        .ok_or_else(|| ZyronError::InvalidCredential("JWT claims missing sub".to_string()))?;
-    let iss = extract_json_string(json, "iss")?;
-    let exp = extract_json_number(json, "exp")?
-        .ok_or_else(|| ZyronError::InvalidCredential("JWT claims missing exp".to_string()))?;
-    let iat = extract_json_number(json, "iat")?.unwrap_or(0);
-    let roles = extract_json_string_array(json, "roles")?;
-    let custom = extract_json_custom_fields(json, &["sub", "iss", "exp", "iat", "roles"])?;
+    // Fast path: single-pass extraction for the common case where claims
+    // contain only standard fields with simple string/number values.
+    let mut sub: Option<String> = None;
+    let mut iss: Option<String> = None;
+    let mut exp: Option<u64> = None;
+    let mut iat: u64 = 0;
+    let mut roles: Vec<String> = Vec::new();
+    let mut custom = std::collections::HashMap::new();
+
+    let trimmed = json.trim();
+    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        return Err(ZyronError::InvalidCredential(
+            "JWT claims must be a JSON object".to_string(),
+        ));
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    let bytes = inner.as_bytes();
+    let len = bytes.len();
+    let mut pos = 0;
+
+    while pos < len {
+        // Skip whitespace and commas
+        while pos < len
+            && (bytes[pos] == b' '
+                || bytes[pos] == b','
+                || bytes[pos] == b'\n'
+                || bytes[pos] == b'\r'
+                || bytes[pos] == b'\t')
+        {
+            pos += 1;
+        }
+        if pos >= len {
+            break;
+        }
+
+        // Parse key
+        if bytes[pos] != b'"' {
+            pos += 1;
+            continue;
+        }
+        pos += 1;
+        let key_start = pos;
+        while pos < len && bytes[pos] != b'"' {
+            pos += 1;
+        }
+        let key = &inner[key_start..pos];
+        pos += 1; // closing quote
+
+        // Skip colon and whitespace
+        while pos < len && (bytes[pos] == b':' || bytes[pos] == b' ') {
+            pos += 1;
+        }
+        if pos >= len {
+            break;
+        }
+
+        // Parse value based on first character
+        if bytes[pos] == b'"' {
+            // String value
+            pos += 1;
+            let val_start = pos;
+            let mut has_escape = false;
+            while pos < len && bytes[pos] != b'"' {
+                if bytes[pos] == b'\\' {
+                    has_escape = true;
+                    pos += 1;
+                }
+                pos += 1;
+            }
+            let raw_val = &inner[val_start..pos];
+            pos += 1; // closing quote
+
+            let val = if has_escape {
+                json_unescape(raw_val)
+            } else {
+                raw_val.to_string()
+            };
+
+            match key {
+                "sub" => sub = Some(val),
+                "iss" => iss = Some(val),
+                _ => {
+                    custom.insert(key.to_string(), val);
+                }
+            }
+        } else if bytes[pos] == b'[' {
+            // Array value (only roles uses this)
+            pos += 1;
+            if key == "roles" {
+                while pos < len && bytes[pos] != b']' {
+                    while pos < len && bytes[pos] != b'"' && bytes[pos] != b']' {
+                        pos += 1;
+                    }
+                    if pos >= len || bytes[pos] == b']' {
+                        break;
+                    }
+                    pos += 1; // opening quote
+                    let val_start = pos;
+                    while pos < len && bytes[pos] != b'"' {
+                        if bytes[pos] == b'\\' {
+                            pos += 1;
+                        }
+                        pos += 1;
+                    }
+                    roles.push(inner[val_start..pos].to_string());
+                    pos += 1; // closing quote
+                }
+            }
+            // Skip to end of array
+            while pos < len && bytes[pos] != b']' {
+                pos += 1;
+            }
+            if pos < len {
+                pos += 1;
+            }
+        } else {
+            // Number or other literal
+            let val_start = pos;
+            while pos < len && bytes[pos] != b',' && bytes[pos] != b'}' && bytes[pos] != b' ' {
+                pos += 1;
+            }
+            let num_str = inner[val_start..pos].trim();
+            if let Ok(n) = num_str.parse::<u64>() {
+                match key {
+                    "exp" => exp = Some(n),
+                    "iat" => iat = n,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let sub =
+        sub.ok_or_else(|| ZyronError::InvalidCredential("JWT claims missing sub".to_string()))?;
+    let exp =
+        exp.ok_or_else(|| ZyronError::InvalidCredential("JWT claims missing exp".to_string()))?;
 
     Ok(JwtClaims {
         sub,

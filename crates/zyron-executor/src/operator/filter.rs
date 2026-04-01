@@ -42,7 +42,8 @@ impl Operator for FilterOperator {
                     return Ok(None);
                 };
 
-                let mask_col = evaluate(&self.predicate, &exec_batch.batch, &self.input_schema)?;
+                let mask_col =
+                    evaluate(&self.predicate, &exec_batch.batch, &self.input_schema, &[])?;
                 let mask = column_to_mask(&mask_col);
 
                 let filtered = exec_batch.batch.filter(&mask);

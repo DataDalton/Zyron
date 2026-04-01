@@ -42,7 +42,7 @@ impl Operator for ProjectOperator {
 
             let mut columns = Vec::with_capacity(self.expressions.len());
             for expr in &self.expressions {
-                let col = evaluate(expr, &exec_batch.batch, &self.input_schema)?;
+                let col = evaluate(expr, &exec_batch.batch, &self.input_schema, &[])?;
                 columns.push(col);
             }
 

@@ -314,7 +314,7 @@ impl Operator for NestedLoopJoinOperator {
                         // For condition evaluation, build a single-row combined batch.
                         let matches_cond = if let Some(ref cond) = self.condition {
                             let combined = combine_rows_single(left_batch, self.left_row, rb, rr);
-                            let mask = evaluate(cond, &combined, &self.input_schema)?;
+                            let mask = evaluate(cond, &combined, &self.input_schema, &[])?;
                             !mask.is_null(0) && mask.get_bool(0)
                         } else {
                             true
@@ -590,7 +590,7 @@ impl HashJoinOperator {
             let mut owned_key_cols: Vec<Column> = Vec::new();
             for (ki, src) in key_col_indices.iter().enumerate() {
                 if src.is_none() {
-                    let col = evaluate(&self.left_keys[ki], &merged, &self.left_schema)?;
+                    let col = evaluate(&self.left_keys[ki], &merged, &self.left_schema, &[])?;
                     owned_key_cols.push(col);
                 }
             }
@@ -992,7 +992,7 @@ impl Operator for HashJoinOperator {
                 for (ki, src) in self.probe_key_col_indices.iter().enumerate() {
                     if src.is_none() {
                         let col =
-                            evaluate(&self.right_keys[ki], &merged_probe, &self.right_schema)?;
+                            evaluate(&self.right_keys[ki], &merged_probe, &self.right_schema, &[])?;
                         owned_probe_keys.push(col);
                     }
                 }
@@ -1064,6 +1064,7 @@ impl Operator for HashJoinOperator {
                                 self.remaining_condition.as_ref().unwrap(),
                                 &combined,
                                 &self.input_schema,
+                                &[],
                             )?;
                             if !mask.is_null(0) && mask.get_bool(0) {
                                 matched = true;

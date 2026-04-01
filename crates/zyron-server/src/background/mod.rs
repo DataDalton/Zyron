@@ -4,8 +4,11 @@
 //! in the correct order. On shutdown, runs a final checkpoint for
 //! zero-replay restart.
 
+pub mod cdc_writer;
 pub mod checkpoint;
+pub mod mv_refresh;
 pub mod stats;
+pub mod stream_monitor;
 pub mod vacuum;
 pub mod wal_archiver;
 
@@ -24,8 +27,11 @@ use zyron_wal::WalWriter;
 
 use zyron_buffer::BackgroundWriter;
 
+use self::cdc_writer::{CdcWriter, CdcWriterConfig};
 use self::checkpoint::{CheckpointWorker, CheckpointWorkerConfig};
+use self::mv_refresh::{MvRefreshConfig, MvRefreshWorker};
 use self::stats::{StatsCollector, StatsCollectorConfig};
+use self::stream_monitor::{StreamMonitor, StreamMonitorConfig};
 use self::vacuum::{VacuumWorker, VacuumWorkerConfig};
 use self::wal_archiver::{WalArchiver, WalArchiverConfig};
 
@@ -35,6 +41,9 @@ pub struct BackgroundWorkers {
     stats: StatsCollector,
     vacuum: VacuumWorker,
     wal_archiver: Option<WalArchiver>,
+    cdc_writer: CdcWriter,
+    mv_refresh: MvRefreshWorker,
+    stream_monitor: StreamMonitor,
 }
 
 impl BackgroundWorkers {
@@ -52,6 +61,8 @@ impl BackgroundWorkers {
         vacuum_config: VacuumWorkerConfig,
         wal_dir: PathBuf,
         archive_dir: Option<PathBuf>,
+        cdc_registry: Option<Arc<zyron_cdc::CdfRegistry>>,
+        stream_job_manager: Option<Arc<parking_lot::Mutex<zyron_streaming::job::StreamJobManager>>>,
     ) -> Self {
         info!("Starting background workers");
 
@@ -71,8 +82,14 @@ impl BackgroundWorkers {
 
         let checkpoint = CheckpointWorker::start(coordinator, wal.clone(), ckpt_config);
 
-        let stats = StatsCollector::start(catalog.clone(), stats_config);
+        let stats = StatsCollector::start(
+            catalog.clone(),
+            disk_manager.clone(),
+            buffer_pool.clone(),
+            stats_config,
+        );
 
+        let catalog_for_mv = catalog.clone();
         let vacuum = VacuumWorker::start(
             catalog,
             txn_manager,
@@ -91,6 +108,15 @@ impl BackgroundWorkers {
             })
         });
 
+        let cdc_writer =
+            CdcWriter::start_with_registry(CdcWriterConfig::default(), cdc_registry.clone());
+        let mv_refresh =
+            MvRefreshWorker::start_with_catalog(MvRefreshConfig::default(), Some(catalog_for_mv));
+        let stream_monitor = StreamMonitor::start_with_manager(
+            StreamMonitorConfig::default(),
+            stream_job_manager.clone(),
+        );
+
         info!("All background workers started");
 
         Self {
@@ -98,6 +124,9 @@ impl BackgroundWorkers {
             stats,
             vacuum,
             wal_archiver,
+            cdc_writer,
+            mv_refresh,
+            stream_monitor,
         }
     }
 
@@ -130,6 +159,9 @@ impl BackgroundWorkers {
         }
 
         // Stop workers in reverse dependency order
+        self.stream_monitor.shutdown();
+        self.mv_refresh.shutdown();
+        self.cdc_writer.shutdown();
         if let Some(ref mut archiver) = self.wal_archiver {
             archiver.shutdown();
         }

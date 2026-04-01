@@ -14,6 +14,10 @@ zyron-storage = { path = "../zyron-storage" }
 zyron-wal = { path = "../zyron-wal" }
 zyron-buffer = { path = "../zyron-buffer" }
 zyron-auth = { path = "../zyron-auth" }
+zyron-cdc = { path = "../zyron-cdc" }
+zyron-pipeline = { path = "../zyron-pipeline" }
+zyron-streaming = { path = "../zyron-streaming" }
+zyron-versioning = { path = "../zyron-versioning" }
 tokio.workspace = true
 bytes.workspace = true
 tracing.workspace = true
@@ -28,6 +32,7 @@ itoa.workspace = true
 ryu.workspace = true
 socket2.workspace = true
 crossbeam.workspace = true
+parking_lot.workspace = true
 mimalloc.workspace = true
 tokio-quiche.workspace = true
 futures.workspace = true

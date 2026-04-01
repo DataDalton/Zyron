@@ -291,7 +291,7 @@ impl HashAggregateOperator {
                     let group_cols: Vec<Column> = self
                         .group_by
                         .iter()
-                        .map(|expr| evaluate(expr, batch, &self.input_schema))
+                        .map(|expr| evaluate(expr, batch, &self.input_schema, &[]))
                         .collect::<Result<Vec<_>>>()?;
 
                     let agg_arg_cols: Vec<Option<Column>> = self
@@ -301,7 +301,12 @@ impl HashAggregateOperator {
                             if agg.args.is_empty() {
                                 Ok(None)
                             } else {
-                                Ok(Some(evaluate(&agg.args[0], batch, &self.input_schema)?))
+                                Ok(Some(evaluate(
+                                    &agg.args[0],
+                                    batch,
+                                    &self.input_schema,
+                                    &[],
+                                )?))
                             }
                         })
                         .collect::<Result<Vec<_>>>()?;

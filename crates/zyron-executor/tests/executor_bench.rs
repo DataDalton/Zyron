@@ -1159,7 +1159,7 @@ async fn test_expression_evaluation() {
         right: Box::new(col_ref(0, 1, TypeId::Int64)),
         type_id: TypeId::Int64,
     };
-    let result = evaluate(&add_expr, &batch, &schema).unwrap();
+    let result = evaluate(&add_expr, &batch, &schema, &[]).unwrap();
     assert_eq!(result.get_scalar(0), ScalarValue::Int64(15));
     assert_eq!(result.get_scalar(4), ScalarValue::Int64(95));
     tprintln!("  a + b: [15, 35, 55, 75, 95] [PASS]");
@@ -1171,7 +1171,7 @@ async fn test_expression_evaluation() {
         right: Box::new(lit_int(2)),
         type_id: TypeId::Int64,
     };
-    let result = evaluate(&mul_expr, &batch, &schema).unwrap();
+    let result = evaluate(&mul_expr, &batch, &schema, &[]).unwrap();
     assert_eq!(result.get_scalar(0), ScalarValue::Int64(20));
     assert_eq!(result.get_scalar(2), ScalarValue::Int64(60));
     tprintln!("  a * 2: [20, 40, 60, 80, 100] [PASS]");
@@ -1183,7 +1183,7 @@ async fn test_expression_evaluation() {
         right: Box::new(col_ref(0, 1, TypeId::Int64)),
         type_id: TypeId::Boolean,
     };
-    let result = evaluate(&cmp_expr, &batch, &schema).unwrap();
+    let result = evaluate(&cmp_expr, &batch, &schema, &[]).unwrap();
     // a > b for all rows since a is always > b
     for i in 0..5 {
         assert_eq!(
@@ -1214,7 +1214,7 @@ async fn test_expression_evaluation() {
         expr: Box::new(col_ref(0, 0, TypeId::Int64)),
         negated: false,
     };
-    let result = evaluate(&is_null_expr, &batch_with_null, &schema).unwrap();
+    let result = evaluate(&is_null_expr, &batch_with_null, &schema, &[]).unwrap();
     assert_eq!(result.get_scalar(0), ScalarValue::Boolean(false));
     assert_eq!(result.get_scalar(2), ScalarValue::Boolean(true));
     assert_eq!(result.get_scalar(4), ScalarValue::Boolean(false));
