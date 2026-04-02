@@ -358,6 +358,25 @@ pub enum ZyronError {
     #[error("Streaming job already exists: {0}")]
     StreamingJobAlreadyExists(String),
 
+    // Full-text search errors
+    #[error("FTS index not found: {0}")]
+    FtsIndexNotFound(String),
+
+    #[error("FTS index already exists: {0}")]
+    FtsIndexAlreadyExists(String),
+
+    #[error("FTS index corrupted for \"{index}\": {reason}")]
+    FtsIndexCorrupted { index: String, reason: String },
+
+    #[error("FTS query parse error: {0}")]
+    FtsQueryError(String),
+
+    #[error("FTS analyzer error: {0}")]
+    FtsAnalyzerError(String),
+
+    #[error("FTS unsupported language: {0}")]
+    FtsUnsupportedLanguage(String),
+
     // Internal errors
     #[error("Internal error: {0}")]
     Internal(String),
@@ -602,6 +621,42 @@ mod tests {
             err.to_string(),
             "Streaming job already exists: click_analytics"
         );
+    }
+
+    #[test]
+    fn test_fts_errors_display() {
+        let err = ZyronError::FtsIndexNotFound("idx_articles_content".to_string());
+        assert_eq!(err.to_string(), "FTS index not found: idx_articles_content");
+
+        let err = ZyronError::FtsIndexAlreadyExists("idx_articles_content".to_string());
+        assert_eq!(
+            err.to_string(),
+            "FTS index already exists: idx_articles_content"
+        );
+
+        let err = ZyronError::FtsIndexCorrupted {
+            index: "idx_articles_content".to_string(),
+            reason: "invalid postings offset".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "FTS index corrupted for \"idx_articles_content\": invalid postings offset"
+        );
+
+        let err = ZyronError::FtsQueryError("unexpected token at position 5".to_string());
+        assert_eq!(
+            err.to_string(),
+            "FTS query parse error: unexpected token at position 5"
+        );
+
+        let err = ZyronError::FtsAnalyzerError("unknown tokenizer: custom_v2".to_string());
+        assert_eq!(
+            err.to_string(),
+            "FTS analyzer error: unknown tokenizer: custom_v2"
+        );
+
+        let err = ZyronError::FtsUnsupportedLanguage("klingon".to_string());
+        assert_eq!(err.to_string(), "FTS unsupported language: klingon");
     }
 
     #[test]

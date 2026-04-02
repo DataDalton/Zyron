@@ -129,6 +129,32 @@ fn build_operator_tree(
                 Ok(br.with_metrics("IndexScan", analyze, vec![]))
             }
 
+            PhysicalPlan::FulltextScan {
+                table_id,
+                index_id,
+                columns,
+                match_expr,
+                remaining_predicate,
+                ..
+            } => {
+                let output_schema = columns.clone();
+                let op = crate::operator::fts_scan::FulltextScanOperator::new(
+                    ctx.clone(),
+                    table_id,
+                    index_id,
+                    columns,
+                    match_expr,
+                )
+                .await?;
+                let mut br = BuildResult::new(Box::new(op));
+                // Apply remaining predicate as a filter on top of the FTS scan.
+                if let Some(pred) = remaining_predicate {
+                    br =
+                        BuildResult::new(Box::new(FilterOperator::new(br.op, pred, output_schema)));
+                }
+                Ok(br.with_metrics("FulltextScan", analyze, vec![]))
+            }
+
             PhysicalPlan::Filter {
                 predicate, child, ..
             } => {

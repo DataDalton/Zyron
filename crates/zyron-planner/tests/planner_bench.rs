@@ -256,6 +256,7 @@ fn physical_op_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::Values { .. } => "Values",
         PhysicalPlan::Update { .. } => "Update",
         PhysicalPlan::Delete { .. } => "Delete",
+        _ => "Other",
     }
 }
 
@@ -284,6 +285,7 @@ fn physical_contains(plan: &PhysicalPlan, check: &dyn Fn(&PhysicalPlan) -> bool)
         PhysicalPlan::SeqScan { .. }
         | PhysicalPlan::IndexScan { .. }
         | PhysicalPlan::Values { .. } => false,
+        _ => false,
     }
 }
 

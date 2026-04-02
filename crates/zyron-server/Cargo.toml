@@ -17,6 +17,7 @@ zyron-pipeline = { path = "../zyron-pipeline" }
 zyron-streaming = { path = "../zyron-streaming" }
 zyron-versioning = { path = "../zyron-versioning" }
 zyron-executor = { path = "../zyron-executor" }
+zyron-search = { path = "../zyron-search" }
 tokio.workspace = true
 async-trait.workspace = true
 tracing.workspace = true

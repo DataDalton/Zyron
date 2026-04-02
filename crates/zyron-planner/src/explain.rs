@@ -404,6 +404,24 @@ impl ExplainNode {
                 actual_metrics: None,
                 children: vec![Self::from_physical_plan(child)],
             },
+
+            PhysicalPlan::FulltextScan {
+                table_id,
+                index_id,
+                columns,
+                cost,
+                ..
+            } => Self {
+                operator_name: "FulltextScan".to_string(),
+                details: vec![
+                    ("table_id".to_string(), format!("{}", table_id.0)),
+                    ("index_id".to_string(), format!("{}", index_id.0)),
+                    ("columns".to_string(), format!("{}", columns.len())),
+                ],
+                estimated_cost: Some(*cost),
+                actual_metrics: None,
+                children: Vec::new(),
+            },
         }
     }
 

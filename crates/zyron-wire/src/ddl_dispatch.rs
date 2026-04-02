@@ -101,8 +101,8 @@ pub async fn try_handle_ddl_utility(
         }
 
         // -- Search Indexes --
-        Statement::CreateFulltextIndex(_) => {
-            Some(Ok(DdlResult::Tag("CREATE INDEX".to_string())))
+        Statement::CreateFulltextIndex(s) => {
+            Some(handle_create_fulltext_index(s, server, session).await)
         }
         Statement::CreateVectorIndex(_) => {
             Some(Ok(DdlResult::Tag("CREATE INDEX".to_string())))
@@ -486,8 +486,24 @@ async fn handle_drop_index(
                 schema_id.0,
             )?;
 
+            // Check if this is an FTS index so we can clean up the FTS manager.
+            let fts_index_id = server
+                .catalog
+                .get_indexes_for_table(table_id)
+                .iter()
+                .find(|idx| {
+                    idx.name == stmt.name && idx.index_type == zyron_catalog::IndexType::Fulltext
+                })
+                .map(|idx| idx.id.0);
+
             match server.catalog.drop_index(table_id, &stmt.name).await {
-                Ok(()) => Ok(DdlResult::Tag("DROP INDEX".to_string())),
+                Ok(()) => {
+                    // Remove from FTS manager if it was a fulltext index.
+                    if let (Some(id), Some(fts_mgr)) = (fts_index_id, &server.fts_manager) {
+                        let _ = fts_mgr.drop_index(id);
+                    }
+                    Ok(DdlResult::Tag("DROP INDEX".to_string()))
+                }
                 Err(e) => Err(ProtocolError::Database(e)),
             }
         }
@@ -860,6 +876,65 @@ fn get_session_schema(
         .map_err(ProtocolError::Database)?;
 
     Ok((db_id, schema.id))
+}
+
+async fn handle_create_fulltext_index(
+    stmt: &zyron_parser::ast::CreateFulltextIndexStatement,
+    server: &Arc<ServerState>,
+    session: &mut Option<Session>,
+) -> Result<DdlResult, ProtocolError> {
+    // Resolve table from the default schema
+    let schema_id = zyron_catalog::SchemaId(1); // default public schema
+
+    // Privilege check: require CREATE on schema (same as regular index creation)
+    check_ddl_privilege(
+        server,
+        session,
+        zyron_auth::PrivilegeType::Create,
+        zyron_auth::ObjectType::Schema,
+        schema_id.0,
+    )?;
+
+    let table = server
+        .catalog
+        .get_table(schema_id, &stmt.table)
+        .map_err(ProtocolError::Database)?;
+
+    // Register index in the catalog with IndexType::Fulltext
+    let index_id = server
+        .catalog
+        .create_index(
+            table.id,
+            schema_id,
+            &stmt.name,
+            &stmt.columns,
+            false,
+            zyron_catalog::IndexType::Fulltext,
+        )
+        .await
+        .map_err(ProtocolError::Database)?;
+
+    // Create live FTS index via the FTS manager if available.
+    // On failure, roll back the catalog entry to prevent orphaned metadata.
+    if let Some(ref fts_mgr) = server.fts_manager {
+        let col_ids: Vec<u16> = stmt
+            .columns
+            .iter()
+            .filter_map(|name| {
+                table
+                    .columns
+                    .iter()
+                    .find(|c| c.name == *name)
+                    .map(|c| c.id.0)
+            })
+            .collect();
+        if let Err(e) = fts_mgr.create_index(index_id.0, table.id.0, col_ids) {
+            let _ = server.catalog.drop_index(table.id, &stmt.name).await;
+            return Err(ProtocolError::Database(e));
+        }
+    }
+
+    Ok(DdlResult::Tag("CREATE INDEX".to_string()))
 }
 
 /// Returns a reference to the SecurityManager or an error.

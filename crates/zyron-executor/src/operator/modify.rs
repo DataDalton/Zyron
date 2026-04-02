@@ -17,6 +17,41 @@ use crate::context::ExecutionContext;
 use crate::expr::evaluate;
 use crate::operator::{ExecutionBatch, Operator, OperatorResult};
 
+/// Extracts text content from a DataBatch row for FTS indexing into a reusable buffer.
+/// Concatenates all text-type columns (Varchar, Text, Char) for the given row
+/// into the buffer, separated by spaces. The caller should call buf.clear() between rows.
+fn extract_fts_text_into(
+    batch: &DataBatch,
+    row_idx: usize,
+    columns: &[zyron_catalog::ColumnEntry],
+    buf: &mut String,
+) {
+    for (col_idx, col_entry) in columns.iter().enumerate() {
+        match col_entry.type_id {
+            TypeId::Varchar | TypeId::Text | TypeId::Char => {}
+            _ => continue,
+        }
+        if col_idx >= batch.columns.len() {
+            continue;
+        }
+        let col = &batch.columns[col_idx];
+        if row_idx >= col.data.len() {
+            continue;
+        }
+        if col.nulls.is_null(row_idx) {
+            continue;
+        }
+        if let ColumnData::Utf8(ref strings) = col.data {
+            if row_idx < strings.len() {
+                if !buf.is_empty() {
+                    buf.push(' ');
+                }
+                buf.push_str(&strings[row_idx]);
+            }
+        }
+    }
+}
+
 /// Serializes a TupleId into bytes for WAL payload.
 fn tuple_id_payload(tid: &TupleId) -> Vec<u8> {
     let mut buf = Vec::with_capacity(14);
@@ -183,6 +218,35 @@ impl Operator for InsertOperator {
 
                 total_inserted += tuples.len() as i64;
 
+                // Maintain FTS indexes: add each inserted document.
+                let fts_indexes = self.ctx.fts_indexes_for_table(self.table_id.0);
+                if !fts_indexes.is_empty() {
+                    let analyzer = zyron_search::SimpleAnalyzer;
+                    let mut fts_buf = zyron_search::AnalysisBuffer::new();
+                    let mut text_buf = String::with_capacity(256);
+                    for (row_idx, tid) in tuple_ids.iter().enumerate() {
+                        let doc_id =
+                            zyron_search::encode_doc_id(tid.page_id.page_num, tid.slot_id)?;
+                        text_buf.clear();
+                        extract_fts_text_into(
+                            &exec_batch.batch,
+                            row_idx,
+                            &table_entry.columns,
+                            &mut text_buf,
+                        );
+                        for (idx_id, fts_idx) in &fts_indexes {
+                            if let Err(e) = fts_idx.add_document_with_buf(
+                                doc_id,
+                                &text_buf,
+                                &analyzer,
+                                &mut fts_buf,
+                            ) {
+                                eprintln!("FTS index {} insert failed: {e}", idx_id.0);
+                            }
+                        }
+                    }
+                }
+
                 // Notify CDC hook if present.
                 if let Some(ref hook) = self.ctx.cdc_hook {
                     let tuple_refs: Vec<&[u8]> = tuples.iter().map(|t| t.data()).collect();
@@ -295,6 +359,22 @@ impl Operator for DeleteOperator {
                 }
 
                 total_deleted += deleted as i64;
+
+                // Maintain FTS indexes: remove deleted documents.
+                let fts_indexes = self.ctx.fts_indexes_for_table(self.table_id.0);
+                if !fts_indexes.is_empty() {
+                    for tid in &tuple_ids {
+                        if let Ok(doc_id) =
+                            zyron_search::encode_doc_id(tid.page_id.page_num, tid.slot_id)
+                        {
+                            for (idx_id, fts_idx) in &fts_indexes {
+                                if let Err(e) = fts_idx.delete_document(doc_id) {
+                                    eprintln!("FTS index {} delete failed: {e}", idx_id.0);
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Notify CDC hook if present.
                 if let Some(ref hook) = self.ctx.cdc_hook {
@@ -452,6 +532,48 @@ impl Operator for UpdateOperator {
                 }
 
                 total_updated += tuple_ids.len() as i64;
+
+                // Maintain FTS indexes: delete old docs, add new docs.
+                let fts_indexes = self.ctx.fts_indexes_for_table(self.table_id.0);
+                if !fts_indexes.is_empty() {
+                    let analyzer = zyron_search::SimpleAnalyzer;
+                    let mut fts_buf = zyron_search::AnalysisBuffer::new();
+                    // Delete old documents
+                    for tid in &tuple_ids {
+                        if let Ok(doc_id) =
+                            zyron_search::encode_doc_id(tid.page_id.page_num, tid.slot_id)
+                        {
+                            for (idx_id, fts_idx) in &fts_indexes {
+                                if let Err(e) = fts_idx.delete_document(doc_id) {
+                                    eprintln!("FTS index {} update-delete failed: {e}", idx_id.0);
+                                }
+                            }
+                        }
+                    }
+                    // Add new documents
+                    let mut text_buf = String::with_capacity(256);
+                    for (row_idx, tid) in new_tuple_ids.iter().enumerate() {
+                        let doc_id =
+                            zyron_search::encode_doc_id(tid.page_id.page_num, tid.slot_id)?;
+                        text_buf.clear();
+                        extract_fts_text_into(
+                            &updated_batch,
+                            row_idx,
+                            &table_entry.columns,
+                            &mut text_buf,
+                        );
+                        for (idx_id, fts_idx) in &fts_indexes {
+                            if let Err(e) = fts_idx.add_document_with_buf(
+                                doc_id,
+                                &text_buf,
+                                &analyzer,
+                                &mut fts_buf,
+                            ) {
+                                eprintln!("FTS index {} update-insert failed: {e}", idx_id.0);
+                            }
+                        }
+                    }
+                }
 
                 // Notify CDC hook if present.
                 if let Some(ref hook) = self.ctx.cdc_hook {

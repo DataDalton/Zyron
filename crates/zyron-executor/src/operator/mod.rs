@@ -7,6 +7,7 @@
 pub mod aggregate;
 pub mod distinct;
 pub mod filter;
+pub mod fts_scan;
 pub mod join;
 pub mod limit;
 pub mod modify;

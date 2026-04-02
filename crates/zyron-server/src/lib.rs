@@ -398,6 +398,28 @@ impl Server {
         let branch_mgr_arc = Arc::new(zyron_versioning::BranchManager::new(data_dir.clone()));
         let notif_arc = Arc::new(zyron_wire::notifications::NotificationChannels::new());
 
+        // Full-text search manager: load persisted FTS indexes from catalog.
+        let fts_mgr_arc = {
+            let fts_dir = data_dir.join("fts");
+            let _ = std::fs::create_dir_all(&fts_dir);
+            let mgr = zyron_search::FtsManager::with_data_dir(fts_dir.clone());
+            let mut fts_entries: Vec<(u32, u32, Vec<u16>)> = Vec::new();
+            for table in catalog.list_all_tables() {
+                for idx in catalog.get_indexes_for_table(table.id) {
+                    if idx.index_type == zyron_catalog::IndexType::Fulltext {
+                        let col_ids: Vec<u16> = idx.columns.iter().map(|c| c.column_id.0).collect();
+                        fts_entries.push((idx.id.0, table.id.0, col_ids));
+                    }
+                }
+            }
+            if !fts_entries.is_empty() {
+                if let Err(e) = mgr.load_indexes(&fts_dir, &fts_entries) {
+                    error!("FTS index loading failed: {e}");
+                }
+            }
+            Arc::new(mgr)
+        };
+
         // 11. Start background workers
         let ckpt_config = CheckpointWorkerConfig {
             wal_bytes_threshold: self.config.checkpoint.wal_bytes_threshold,
@@ -587,6 +609,8 @@ impl Server {
             stream_job_manager: Some(stream_mgr_arc),
             // Versioning
             branch_manager: Some(branch_mgr_arc),
+            // Full-text search
+            fts_manager: Some(Arc::clone(&fts_mgr_arc)),
             // DML hooks: CDC capture + trigger dispatch
             cdc_hook: Some(Arc::new(hooks::CdcHookBridge::new(
                 Arc::clone(&cdc_registry_arc),
@@ -646,6 +670,14 @@ impl Server {
                 "Shutdown timeout: {} sessions still active, aborting",
                 self.session_mgr.active_count()
             );
+        }
+
+        // Persist FTS indexes to disk before stopping workers.
+        {
+            let fts_dir = self.config.storage.data_dir.join("fts");
+            if let Err(e) = fts_mgr_arc.save_all(&fts_dir) {
+                error!("FTS index persistence failed during shutdown: {e}");
+            }
         }
 
         // Stop background workers (runs final checkpoint)

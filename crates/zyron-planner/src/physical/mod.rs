@@ -205,6 +205,18 @@ pub enum PhysicalPlan {
         num_workers: usize,
         cost: PlanCost,
     },
+
+    /// Full-text search scan using an inverted index.
+    FulltextScan {
+        table_id: TableId,
+        index_id: IndexId,
+        columns: Vec<LogicalColumn>,
+        /// The match_against function call containing column refs and query.
+        match_expr: BoundExpr,
+        /// Additional predicates to apply after FTS scoring.
+        remaining_predicate: Option<BoundExpr>,
+        cost: PlanCost,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,7 +250,8 @@ impl PhysicalPlan {
             | PhysicalPlan::ParallelHashJoin { cost, .. }
             | PhysicalPlan::Gather { cost, .. }
             | PhysicalPlan::Repartition { cost, .. }
-            | PhysicalPlan::Broadcast { cost, .. } => cost,
+            | PhysicalPlan::Broadcast { cost, .. }
+            | PhysicalPlan::FulltextScan { cost, .. } => cost,
         }
     }
 
@@ -321,6 +334,7 @@ impl PhysicalPlan {
             | PhysicalPlan::Update { .. }
             | PhysicalPlan::Delete { .. } => Vec::new(),
             PhysicalPlan::Values { schema, .. } => schema.clone(),
+            PhysicalPlan::FulltextScan { columns, .. } => columns.clone(),
         }
     }
 
@@ -331,7 +345,8 @@ impl PhysicalPlan {
             PhysicalPlan::SeqScan { .. }
             | PhysicalPlan::IndexScan { .. }
             | PhysicalPlan::Values { .. }
-            | PhysicalPlan::ParallelSeqScan { .. } => PlanCost::zero(),
+            | PhysicalPlan::ParallelSeqScan { .. }
+            | PhysicalPlan::FulltextScan { .. } => PlanCost::zero(),
             PhysicalPlan::Filter { child, .. }
             | PhysicalPlan::Project { child, .. }
             | PhysicalPlan::HashAggregate { child, .. }

@@ -150,6 +150,7 @@ async fn create_test_server(db_name: &str) -> (Arc<ServerState>, tempfile::TempD
         mv_manager: None,
         stream_job_manager: None,
         branch_manager: None,
+        fts_manager: None,
         cdc_hook: None,
         dml_hook: None,
         notification_channels: None,

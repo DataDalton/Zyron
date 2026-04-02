@@ -1,0 +1,102 @@
+
+=== Validation: ALTER SYSTEM SET writes auto.conf ===
+  Wrote 4 ALTER SYSTEM SET overrides: PASS
+  zyrondb.auto.conf created: PASS
+  server.port = 9999: PASS
+  vacuum.enabled = false: PASS
+  query.default_isolation = serializable: PASS
+  compaction.max_concurrent = 8: PASS
+  Overwrite server.port = 7777: PASS
+
+=== Validation: Backup Manifest Checksum Integrity ===
+  Backup created with 1 files
+  Restore with valid checksums: PASS
+  Restore with corrupt checksum rejected: PASS
+
+=== Validation: Config Invalid Value Rejection ===
+  Invalid sync_mode parsed but not yet validated: PASS
+  Invalid dead_tuple_threshold (-0.5) would be rejected by validate(): PASS
+  logging.output='file' without file_path would be rejected: PASS
+  Invalid eviction_policy 'random' would be rejected: PASS
+
+=== Validation: Parser Admin Statements ===
+  ALTER SYSTEM SET parses: PASS
+  ANALYZE (no table) parses: PASS
+  ANALYZE my_table parses: PASS
+  SHOW ALL parses: PASS
+  SHOW server_version parses: PASS
+  CHECKPOINT parses: PASS
+  VACUUM parses: PASS
+  VACUUM users parses: PASS
+
+=== Validation: SHOW ALL Returns Complete Config ===
+  Total config entries: 41
+  server_version present: PASS
+  All entries have key and description: PASS
+  server.port = 5432: PASS
+  query.default_isolation = snapshot: PASS
+
+=== Benchmark: Backup/Restore Throughput ===
+  Generating 72 MB of test data...
+  Backup throughput (MB/sec) [PASS/OK]:
+    Runs: [2,343, 2,481, 2,433, 2,410, 2,490]
+    Average: 2,431 >= 500 (target)
+    Min/Max: 2,343 / 2,490, StdDev: 53
+  Restore throughput (MB/sec) [PASS/OK]:
+    Runs: [2,806, 2,846, 2,803, 2,620, 2,786]
+    Average: 2,772 >= 500 (target)
+    Min/Max: 2,620 / 2,846, StdDev: 79
+
+=== Benchmark: Config Load (valid TOML with all sections) ===
+  Load latency (ms) [PASS/OK]:
+    Runs: [1, 0, 0, 0, 0]
+    Average: 0 <= 10 (target)
+    Min/Max: 0 / 1, StdDev: 0
+
+=== Validation: IO Stats Registry ===
+  Arc identity for same table_id: PASS
+  Counter increments and iteration: PASS
+  Index stats registry: PASS
+
+=== Benchmark: SET Command Latency ===
+  Set+Get latency (us/op) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 20 (target)
+    Min/Max: 0 / 0, StdDev: 0
+
+=== Validation: Config Environment Variable Override ===
+  ZYRON_PORT=5555 override: PASS (port = 5555)
+
+=== Benchmark: SHOW Command Latency ===
+  Lookup latency (us/op) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 10 (target)
+    Min/Max: 0 / 0, StdDev: 0
+  Correctness: all lookups return expected values: PASS
+
+=== Validation: Config Introspection (all keys) ===
+  26/26 config keys verified: PASS
+  Shorthand aliases (port, max_connections, server_version): PASS
+  Unknown keys return None: PASS
+
+=== Benchmark: Tab Completion Latency ===
+  Completion latency (ms/op) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 20 (target)
+    Min/Max: 0 / 0, StdDev: 0
+  'SEL' -> ["SELECT"]: PASS
+  '\d' -> ["\\dt", "\\d", "\\di", "\\du", "\\dp"]: PASS
+
+=== Benchmark: Stat View Query Latency ===
+  View build latency (us/op) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 200 (target)
+    Min/Max: 0 / 0, StdDev: 0
+  Stat view name recognition: PASS
+
+=== Validation: WAL Stats Counters ===
+  Initial counters at zero: PASS
+  After 1000 inserts:
+    wal_records_written = 1000
+    wal_bytes_written = 46000
+  WAL stats counters increment correctly: PASS

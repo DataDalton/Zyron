@@ -244,7 +244,31 @@ impl<'a> PhysicalPlanner<'a> {
         // Get available indexes
         let indexes = self.catalog.get_indexes_for_table(table_id);
 
-        // Try to find an index scan opportunity
+        // Check for full-text search predicates (MATCH AGAINST -> match_against function)
+        if let Some(pred) = &predicate {
+            if let Some((fts_expr, remaining)) = extract_match_against(pred) {
+                // Find a Fulltext index covering the referenced columns
+                for index in &indexes {
+                    if index.index_type == zyron_catalog::IndexType::Fulltext {
+                        let cost = PlanCost {
+                            io_cost: 1.0,
+                            cpu_cost: 10.0,
+                            row_count: 100.0,
+                        };
+                        return Ok(PhysicalPlan::FulltextScan {
+                            table_id,
+                            index_id: index.id,
+                            columns,
+                            match_expr: fts_expr.clone(),
+                            remaining_predicate: remaining.cloned(),
+                            cost,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Try to find a B-tree index scan opportunity
         if let Some(pred) = &predicate {
             if let Some((ts, cs)) = &table_stats {
                 for index in &indexes {
@@ -636,6 +660,29 @@ fn match_index(
             } else {
                 None
             }
+        }
+        _ => None,
+    }
+}
+
+/// Extracts a match_against function call from a predicate tree.
+/// Returns the FTS expression and any remaining non-FTS predicate.
+fn extract_match_against(predicate: &BoundExpr) -> Option<(&BoundExpr, Option<&BoundExpr>)> {
+    match predicate {
+        BoundExpr::Function { name, .. } if name == "match_against" => Some((predicate, None)),
+        BoundExpr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+            ..
+        } => {
+            if let Some((fts, _)) = extract_match_against(left) {
+                return Some((fts, Some(right)));
+            }
+            if let Some((fts, _)) = extract_match_against(right) {
+                return Some((fts, Some(left)));
+            }
+            None
         }
         _ => None,
     }

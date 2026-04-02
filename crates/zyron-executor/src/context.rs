@@ -109,6 +109,12 @@ pub struct ExecutionContext {
     /// Live B+ tree index instances keyed by IndexId. Registered by the
     /// server layer so the index scan operator can perform actual tree lookups.
     indexes: HashMap<IndexId, Arc<BTreeIndex>>,
+    /// Live full-text search index instances keyed by IndexId. Registered by
+    /// the server layer after creating or loading fulltext indexes.
+    fts_indexes: HashMap<IndexId, Arc<zyron_search::InvertedIndex>>,
+    /// FTS manager reference for DML index maintenance. DML operators use this
+    /// to look up which FTS indexes exist for a table and update them.
+    pub fts_manager: Option<Arc<zyron_search::FtsManager>>,
 }
 
 impl ExecutionContext {
@@ -136,6 +142,8 @@ impl ExecutionContext {
             params: Vec::new(),
             security_context: None,
             indexes: HashMap::new(),
+            fts_indexes: HashMap::new(),
+            fts_manager: None,
         }
     }
 
@@ -188,5 +196,44 @@ impl ExecutionContext {
     /// Returns the B+ tree index instance for the given IndexId, if registered.
     pub fn get_index(&self, index_id: IndexId) -> Option<Arc<BTreeIndex>> {
         self.indexes.get(&index_id).cloned()
+    }
+
+    /// Registers a live full-text search index instance for use by FTS scan operators.
+    pub fn register_fts_index(&mut self, index_id: IndexId, fts: Arc<zyron_search::InvertedIndex>) {
+        self.fts_indexes.insert(index_id, fts);
+    }
+
+    /// Returns the FTS index instance for the given IndexId.
+    /// Checks local cache first, then falls through to the FTS manager.
+    pub fn get_fts_index(&self, index_id: IndexId) -> Option<Arc<zyron_search::InvertedIndex>> {
+        if let Some(idx) = self.fts_indexes.get(&index_id) {
+            return Some(idx.clone());
+        }
+        if let Some(ref mgr) = self.fts_manager {
+            return mgr.get_index(index_id.0);
+        }
+        None
+    }
+
+    /// Sets the FTS manager reference. Scan operators look up indexes
+    /// through the manager on demand. DML operators use fts_indexes_for_table().
+    pub fn set_fts_manager(&mut self, mgr: Arc<zyron_search::FtsManager>) {
+        self.fts_manager = Some(mgr);
+    }
+
+    /// Returns all live FTS indexes for the given table. Used by DML operators
+    /// to maintain FTS indexes on INSERT/UPDATE/DELETE.
+    pub fn fts_indexes_for_table(
+        &self,
+        table_id: u32,
+    ) -> Vec<(IndexId, Arc<zyron_search::InvertedIndex>)> {
+        match &self.fts_manager {
+            Some(mgr) => mgr
+                .indexes_for_table(table_id)
+                .into_iter()
+                .filter_map(|id| mgr.get_index(id).map(|idx| (IndexId(id), idx)))
+                .collect(),
+            None => Vec::new(),
+        }
     }
 }

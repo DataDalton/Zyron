@@ -116,6 +116,10 @@ pub struct ServerState {
     /// Data branch manager for version branching.
     pub branch_manager: Option<Arc<zyron_versioning::BranchManager>>,
 
+    // -- Full-text search --
+    /// FTS index manager for fulltext search operations.
+    pub fts_manager: Option<Arc<zyron_search::FtsManager>>,
+
     // -- DML hooks --
     /// CDC hook invoked by DML operators after mutations.
     pub cdc_hook: Option<Arc<dyn CdcHook>>,
@@ -862,6 +866,10 @@ impl<T: WireTransport> Connection<T> {
                     }
                     if let Some(ref hook) = self.server.dml_hook {
                         ctx.dml_hook = Some(Arc::clone(hook));
+                    }
+                    // Register live FTS indexes so scan operators and DML can access them.
+                    if let Some(ref fts_mgr) = self.server.fts_manager {
+                        ctx.set_fts_manager(Arc::clone(fts_mgr));
                     }
                     let ctx = Arc::new(ctx);
 

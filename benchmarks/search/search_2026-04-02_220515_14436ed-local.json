@@ -1,0 +1,23 @@
+{
+  "id": "2026-04-02_220515_14436ed-local",
+  "date": "2026-04-02 22:05:15Z",
+  "ts": 1775167515,
+  "commit": "14436ed-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Autocomplete": {
+      "Latency (ms)": {
+        "average": 0.375960,
+        "runs": [0.46, 0.42, 0.36, 0.32, 0.32],
+        "target": 2.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    }
+  }
+}
