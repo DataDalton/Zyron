@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use zyron_common::Result;
+use zyron_common::{Result, ZyronError};
 use zyron_planner::logical::AsOfTarget;
 use zyron_planner::physical::PhysicalPlan;
 
@@ -153,6 +153,116 @@ fn build_operator_tree(
                         BuildResult::new(Box::new(FilterOperator::new(br.op, pred, output_schema)));
                 }
                 Ok(br.with_metrics("FulltextScan", analyze, vec![]))
+            }
+
+            PhysicalPlan::VectorScan {
+                table_id,
+                index_id,
+                columns,
+                query_vector,
+                k,
+                remaining_predicate,
+                ..
+            } => {
+                let output_schema = columns.clone();
+                let ef_search = 64u16; // default ef_search
+                let op = crate::operator::vector_scan::VectorScanOperator::new(
+                    ctx.clone(),
+                    table_id,
+                    index_id,
+                    columns,
+                    query_vector,
+                    k,
+                    ef_search,
+                )
+                .await?;
+                let mut br = BuildResult::new(Box::new(op));
+                if let Some(pred) = remaining_predicate {
+                    br =
+                        BuildResult::new(Box::new(FilterOperator::new(br.op, pred, output_schema)));
+                }
+                Ok(br.with_metrics("VectorScan", analyze, vec![]))
+            }
+
+            PhysicalPlan::GraphAlgorithm {
+                algorithm,
+                schema_name,
+                params,
+                output_columns,
+                ..
+            } => {
+                use crate::operator::graph_scan::{GraphAlgorithmKind, GraphAlgorithmOperator};
+                use zyron_planner::physical::GraphAlgorithmType;
+
+                // Extract algorithm-specific parameters from bound expressions.
+                let extract_f64 = |ps: &[(String, zyron_planner::binder::BoundExpr)],
+                                   name: &str,
+                                   default: f64|
+                 -> f64 {
+                    ps.iter()
+                        .find(|(n, _)| n == name)
+                        .and_then(|(_, e)| match e {
+                            zyron_planner::binder::BoundExpr::Literal {
+                                value: zyron_parser::ast::LiteralValue::Float(v),
+                                ..
+                            } => Some(*v),
+                            zyron_planner::binder::BoundExpr::Literal {
+                                value: zyron_parser::ast::LiteralValue::Integer(v),
+                                ..
+                            } => Some(*v as f64),
+                            _ => None,
+                        })
+                        .unwrap_or(default)
+                };
+                let extract_u64 = |ps: &[(String, zyron_planner::binder::BoundExpr)],
+                                   name: &str,
+                                   default: u64|
+                 -> u64 {
+                    ps.iter()
+                        .find(|(n, _)| n == name)
+                        .and_then(|(_, e)| match e {
+                            zyron_planner::binder::BoundExpr::Literal {
+                                value: zyron_parser::ast::LiteralValue::Integer(v),
+                                ..
+                            } => Some(*v as u64),
+                            _ => None,
+                        })
+                        .unwrap_or(default)
+                };
+
+                let kind = match algorithm {
+                    GraphAlgorithmType::PageRank => GraphAlgorithmKind::PageRank {
+                        damping: extract_f64(&params, "damping", 0.85),
+                        iterations: extract_f64(&params, "iterations", 20.0) as usize,
+                    },
+                    GraphAlgorithmType::ShortestPath => GraphAlgorithmKind::ShortestPath {
+                        source_id: extract_u64(&params, "source", 0),
+                        target_id: extract_u64(&params, "target", 0),
+                    },
+                    GraphAlgorithmType::Bfs => GraphAlgorithmKind::Bfs {
+                        source_id: extract_u64(&params, "source", 0),
+                        max_depth: extract_u64(&params, "max_depth", 100) as u32,
+                    },
+                    GraphAlgorithmType::ConnectedComponents => {
+                        GraphAlgorithmKind::ConnectedComponents
+                    }
+                    GraphAlgorithmType::CommunityDetection => {
+                        GraphAlgorithmKind::CommunityDetection
+                    }
+                    GraphAlgorithmType::BetweennessCentrality => {
+                        GraphAlgorithmKind::BetweennessCentrality
+                    }
+                };
+
+                let op = GraphAlgorithmOperator::new(
+                    Arc::clone(&ctx),
+                    schema_name,
+                    kind,
+                    output_columns,
+                )
+                .await?;
+                let br = BuildResult::new(Box::new(op));
+                Ok(br.with_metrics("GraphAlgorithm", analyze, vec![]))
             }
 
             PhysicalPlan::Filter {

@@ -4,6 +4,7 @@
 //! (OID-based references with resolved types). This is the semantic analysis phase
 //! that validates column existence, type compatibility, and resolves ambiguity.
 
+use crate::logical::LogicalColumn;
 use std::collections::HashMap;
 use std::sync::Arc;
 use zyron_catalog::{Catalog, ColumnId, NameResolver, TableEntry, TableId};
@@ -482,6 +483,13 @@ pub enum BoundFromItem {
         table_idx: usize,
         query: Box<BoundSelect>,
     },
+    GraphQuery {
+        table_idx: usize,
+        schema_name: String,
+        algorithm: String,
+        params: Vec<(String, BoundExpr)>,
+        output_columns: Vec<LogicalColumn>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -819,6 +827,172 @@ impl<'a> Binder<'a> {
                     // Treat LATERAL as a regular subquery for now
                     self.bind_table_ref(ctx, subquery).await
                 }
+                TableRef::TableFunction { name, args, alias } => {
+                    // Check if this is a graph algorithm table function.
+                    let algo = name.to_lowercase();
+                    let graph_algos = [
+                        "pagerank",
+                        "shortest_path",
+                        "bfs",
+                        "connected_components",
+                        "community_detection",
+                        "betweenness_centrality",
+                    ];
+                    if !graph_algos.contains(&algo.as_str()) {
+                        return Err(ZyronError::PlanError(format!(
+                            "table function '{}' is not supported",
+                            name
+                        )));
+                    }
+
+                    // First positional arg is the graph schema name.
+                    let schema_name = match args.first() {
+                        Some(FunctionArg::Unnamed(Expr::Literal(LiteralValue::String(s)))) => {
+                            s.clone()
+                        }
+                        Some(FunctionArg::Unnamed(Expr::Identifier(s))) => s.clone(),
+                        _ => {
+                            return Err(ZyronError::PlanError(format!(
+                                "{}() requires a graph schema name as first argument",
+                                name
+                            )));
+                        }
+                    };
+
+                    // Collect named parameters (remaining args after schema name).
+                    let mut params: Vec<(String, BoundExpr)> = Vec::new();
+                    for arg in args.iter().skip(1) {
+                        match arg {
+                            FunctionArg::Named {
+                                name: param_name,
+                                value,
+                            } => {
+                                let bound = self.bind_expr(ctx, value).await?;
+                                params.push((param_name.clone(), bound));
+                            }
+                            FunctionArg::Unnamed(value) => {
+                                let bound = self.bind_expr(ctx, value).await?;
+                                params.push((String::new(), bound));
+                            }
+                        }
+                    }
+
+                    // Build output columns based on algorithm type.
+                    let output_columns = match algo.as_str() {
+                        "pagerank" => vec![
+                            LogicalColumn {
+                                table_idx: None,
+                                column_id: ColumnId(0),
+                                name: "node_id".to_string(),
+                                type_id: TypeId::Int64,
+                                nullable: false,
+                            },
+                            LogicalColumn {
+                                table_idx: None,
+                                column_id: ColumnId(1),
+                                name: "score".to_string(),
+                                type_id: TypeId::Float64,
+                                nullable: false,
+                            },
+                        ],
+                        "shortest_path" => vec![
+                            LogicalColumn {
+                                table_idx: None,
+                                column_id: ColumnId(0),
+                                name: "step".to_string(),
+                                type_id: TypeId::Int32,
+                                nullable: false,
+                            },
+                            LogicalColumn {
+                                table_idx: None,
+                                column_id: ColumnId(1),
+                                name: "node_id".to_string(),
+                                type_id: TypeId::Int64,
+                                nullable: false,
+                            },
+                        ],
+                        "bfs" => vec![
+                            LogicalColumn {
+                                table_idx: None,
+                                column_id: ColumnId(0),
+                                name: "node_id".to_string(),
+                                type_id: TypeId::Int64,
+                                nullable: false,
+                            },
+                            LogicalColumn {
+                                table_idx: None,
+                                column_id: ColumnId(1),
+                                name: "depth".to_string(),
+                                type_id: TypeId::Int32,
+                                nullable: false,
+                            },
+                        ],
+                        "betweenness_centrality" => vec![
+                            LogicalColumn {
+                                table_idx: None,
+                                column_id: ColumnId(0),
+                                name: "node_id".to_string(),
+                                type_id: TypeId::Int64,
+                                nullable: false,
+                            },
+                            LogicalColumn {
+                                table_idx: None,
+                                column_id: ColumnId(1),
+                                name: "centrality".to_string(),
+                                type_id: TypeId::Float64,
+                                nullable: false,
+                            },
+                        ],
+                        // connected_components and community_detection share
+                        // the (node_id, component) output schema.
+                        _ => vec![
+                            LogicalColumn {
+                                table_idx: None,
+                                column_id: ColumnId(0),
+                                name: "node_id".to_string(),
+                                type_id: TypeId::Int64,
+                                nullable: false,
+                            },
+                            LogicalColumn {
+                                table_idx: None,
+                                column_id: ColumnId(1),
+                                name: "component".to_string(),
+                                type_id: TypeId::Int64,
+                                nullable: false,
+                            },
+                        ],
+                    };
+
+                    let idx = self.alloc_table_idx();
+                    let tbl_alias = alias.clone().unwrap_or_else(|| algo.clone());
+                    let bound_cols: Vec<BoundColumnDef> = output_columns
+                        .iter()
+                        .enumerate()
+                        .map(|(i, lc)| BoundColumnDef {
+                            column_id: lc.column_id,
+                            name: lc.name.clone(),
+                            type_id: lc.type_id,
+                            nullable: lc.nullable,
+                            ordinal: i as u16,
+                        })
+                        .collect();
+                    let bound_table = BoundTableRef {
+                        table_idx: idx,
+                        table_id: None,
+                        alias: tbl_alias,
+                        columns: bound_cols,
+                        entry: None,
+                    };
+                    ctx.tables.push(bound_table);
+
+                    Ok(BoundFromItem::GraphQuery {
+                        table_idx: idx,
+                        schema_name,
+                        algorithm: algo,
+                        params,
+                        output_columns,
+                    })
+                }
             }
         }) // end Box::pin
     }
@@ -1133,17 +1307,31 @@ impl<'a> Binder<'a> {
                     index: *idx,
                     type_id: TypeId::Null, // Resolved at execution time
                 }),
-                // JSON, array, vector operators: bind as generic binary ops for now
+                // JSON and array operators: bind as generic binary ops for now
                 Expr::JsonAccess { left, right, .. }
                 | Expr::JsonContains { left, right, .. }
-                | Expr::JsonExists { left, right, .. }
-                | Expr::VectorDistance { left, right, .. } => {
+                | Expr::JsonExists { left, right, .. } => {
                     let bound_left = self.bind_expr(ctx, left).await?;
-                    let _bound_right = self.bind_expr(ctx, right).await?;
+                    let bound_right = self.bind_expr(ctx, right).await?;
                     Ok(BoundExpr::Function {
                         name: "json_op".to_string(),
-                        args: vec![bound_left, _bound_right],
+                        args: vec![bound_left, bound_right],
                         return_type: TypeId::Jsonb,
+                        distinct: false,
+                    })
+                }
+                Expr::VectorDistance { left, op, right } => {
+                    let bound_left = self.bind_expr(ctx, left).await?;
+                    let bound_right = self.bind_expr(ctx, right).await?;
+                    let func_name = match op {
+                        VectorDistanceOp::Cosine => "vector_distance_cosine",
+                        VectorDistanceOp::L2 => "vector_distance_l2",
+                        VectorDistanceOp::DotProduct => "vector_distance_dot",
+                    };
+                    Ok(BoundExpr::Function {
+                        name: func_name.to_string(),
+                        args: vec![bound_left, bound_right],
+                        return_type: TypeId::Float64,
                         distinct: false,
                     })
                 }

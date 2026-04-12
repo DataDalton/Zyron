@@ -12,13 +12,13 @@
 //! Reads -> check buffer first, then ───────────────────────────┘
 //! ```
 //!
-//! Performance characteristics:
-//! - Insert: ~100ns (buffer insert with binary search)
-//! - Lookup: ~80ns (buffer check + B+Tree with height=2)
-//! - Range scan: Merges results from buffer and B+Tree
+//! Operation shape:
+//! - Insert: buffered insert into a partitioned write buffer.
+//! - Lookup: buffer check, then a B+Tree traversal on miss.
+//! - Range scan: merges results from the buffer and the B+Tree.
 //!
-//! The write buffer absorbs high-frequency inserts, while the B+Tree uses
-//! 32KB nodes for shallow height (2 levels for 1M keys) and fast lookups.
+//! The write buffer absorbs high-frequency inserts. The B+Tree uses 32KB
+//! nodes so the tree stays shallow, which keeps the lookup path short.
 //!
 //! ## BTreeArenaIndex (Direct B+Tree)
 //!

@@ -559,6 +559,26 @@ impl CostModel {
             LogicalPlan::Insert { source, .. } => self.estimate_plan_cost(source, catalog),
             LogicalPlan::Update { child, .. } => self.estimate_plan_cost(child, catalog),
             LogicalPlan::Delete { child, .. } => self.estimate_plan_cost(child, catalog),
+            LogicalPlan::GraphAlgorithm { algorithm, .. } => {
+                // Mirrors the physical builder's per-algorithm estimates using
+                // a nominal graph of V=10_000 nodes and E=100_000 edges.
+                let v: f64 = 10_000.0;
+                let e: f64 = 100_000.0;
+                let (cpu, row_count) = match algorithm.as_str() {
+                    "pagerank" => (20.0 * (v + e), v),
+                    "shortest_path" => (v + e, v.sqrt()),
+                    "bfs" => (v + e, v),
+                    "connected_components" => (v + e, v),
+                    "community_detection" => (10.0 * (v + e), v),
+                    "betweenness_centrality" => (v * (v + e), v),
+                    _ => (v + e, v),
+                };
+                PlanCost {
+                    io_cost: v,
+                    cpu_cost: cpu,
+                    row_count,
+                }
+            }
         }
     }
 }

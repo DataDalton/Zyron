@@ -212,8 +212,8 @@ fn test_rollback_abort() {
         );
     }
 
-    // Verify that without xmax marking, a committed-looking tuple IS visible
-    // (this validates that the abort handler MUST set xmax)
+    // Verify that without xmax marking, a committed-looking tuple is visible.
+    // This validates that the abort handler sets xmax.
     let live_header = TupleHeader::new(8, xmin_a);
     // xmin_a < txn_b.txn_id, xmin_a not in active set -> visible
     // This is expected: the TransactionManager removes from active set on abort,
@@ -427,7 +427,9 @@ fn test_isolation_levels() {
 
     tprintln!("\n=== Transaction: Read Committed vs Snapshot Isolation ===");
 
-    // --- Snapshot Isolation ---
+    // -----------------------------------------------------------------------
+    // Snapshot Isolation
+    // -----------------------------------------------------------------------
     let mut txn_writer = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
     let xmin_w = txn_writer.txn_id_u32().unwrap();
     let header = TupleHeader::new(8, xmin_w);
@@ -1163,8 +1165,12 @@ fn test_transaction_microbenchmarks() {
 
     let perf_util_before = take_util_snapshot();
 
-    // --- WAL drop isolation test ---
-    // --- begin() latency ---
+    // -----------------------------------------------------------------------
+    // WAL drop isolation test
+    // -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // begin() latency
+    // -----------------------------------------------------------------------
     // Measure begin() with immediate commit to avoid accumulating active txns.
     // Each iteration does begin+commit but we only time the begin.
     let mut begin_runs = Vec::with_capacity(VALIDATION_RUNS);
@@ -1197,7 +1203,9 @@ fn test_transaction_microbenchmarks() {
         false,
     );
 
-    // --- commit() latency ---
+    // -----------------------------------------------------------------------
+    // commit() latency
+    // -----------------------------------------------------------------------
     // Batch: create 1000 txns, commit all, repeat to reach total ops.
     let mut commit_runs = Vec::with_capacity(VALIDATION_RUNS);
     for _ in 0..VALIDATION_RUNS {
@@ -1227,7 +1235,9 @@ fn test_transaction_microbenchmarks() {
         false,
     );
 
-    // --- is_visible() latency ---
+    // -----------------------------------------------------------------------
+    // is_visible() latency
+    // -----------------------------------------------------------------------
     let mut vis_runs = Vec::with_capacity(VALIDATION_RUNS);
     for _ in 0..VALIDATION_RUNS {
         const OPS: usize = 1_000_000;
@@ -1255,7 +1265,9 @@ fn test_transaction_microbenchmarks() {
         false,
     );
 
-    // --- lock_row() latency (uncontended) ---
+    // -----------------------------------------------------------------------
+    // lock_row() latency (uncontended)
+    // -----------------------------------------------------------------------
     let mut lock_runs = Vec::with_capacity(VALIDATION_RUNS);
     for _ in 0..VALIDATION_RUNS {
         const OPS: usize = 100_000;
@@ -1278,7 +1290,9 @@ fn test_transaction_microbenchmarks() {
         false,
     );
 
-    // --- Snapshot::new() creation latency ---
+    // -----------------------------------------------------------------------
+    // Snapshot::new() creation latency
+    // -----------------------------------------------------------------------
     let mut snap_runs = Vec::with_capacity(VALIDATION_RUNS);
     for _ in 0..VALIDATION_RUNS {
         const OPS: usize = 100_000;
@@ -1300,7 +1314,9 @@ fn test_transaction_microbenchmarks() {
         false,
     );
 
-    // --- GC sweep throughput ---
+    // -----------------------------------------------------------------------
+    // GC sweep throughput
+    // -----------------------------------------------------------------------
     let mut gc_runs = Vec::with_capacity(VALIDATION_RUNS);
     for _ in 0..VALIDATION_RUNS {
         const TUPLES: usize = 1_000_000;

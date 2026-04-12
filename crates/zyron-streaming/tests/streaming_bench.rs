@@ -929,7 +929,9 @@ fn test_state_backend_operations() {
     tprintln!("\n=== State Backend: HeapStateBackend + DiskStateBackend ===");
     let before = take_util_snapshot();
 
-    // --- HeapStateBackend CRUD ---
+    // -----------------------------------------------------------------------
+    // HeapStateBackend CRUD
+    // -----------------------------------------------------------------------
     let heap = HeapStateBackend::new();
     let ns = b"test_ns";
 
@@ -993,7 +995,9 @@ fn test_state_backend_operations() {
     let expected_val = (500u32 * 100).to_le_bytes().to_vec();
     assert_eq!(sample_val.unwrap(), expected_val);
 
-    // --- DiskStateBackend CRUD ---
+    // -----------------------------------------------------------------------
+    // DiskStateBackend CRUD
+    // -----------------------------------------------------------------------
     let tmp = TempDir::new().unwrap();
     let disk = DiskStateBackend::new(tmp.path(), 1024 * 1024).unwrap();
 

@@ -11,7 +11,9 @@ use zyron_common::{Result, ZyronError};
 
 use crate::balloon::{self, BalloonParams};
 
-// ---- PasswordCredential ----
+// ---------------------------------------------------------------------------
+// PasswordCredential
+// ---------------------------------------------------------------------------
 
 /// Stores a Balloon-hashed password in PHC string format.
 pub struct PasswordCredential {
@@ -47,7 +49,9 @@ impl PasswordCredential {
     }
 }
 
-// ---- ApiKeyCredential ----
+// ---------------------------------------------------------------------------
+// ApiKeyCredential
+// ---------------------------------------------------------------------------
 
 /// Stores a hashed API key with a readable prefix for identification.
 /// The full key is never stored, only its SHA-256 hash.
@@ -99,7 +103,9 @@ impl ApiKeyCredential {
     }
 }
 
-// ---- JWT types ----
+// ---------------------------------------------------------------------------
+// JWT types
+// ---------------------------------------------------------------------------
 
 /// HMAC signing algorithm for JWT tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,7 +367,9 @@ impl JwtCredential {
     }
 }
 
-// ---- TOTP (RFC 6238) ----
+// ---------------------------------------------------------------------------
+// TOTP (RFC 6238)
+// ---------------------------------------------------------------------------
 
 /// Time-based One-Time Password credential using HMAC-SHA1.
 /// Implements RFC 6238 with configurable digits and period.
@@ -468,7 +476,9 @@ impl TotpCredential {
     }
 }
 
-// ---- Helper functions ----
+// ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
 
 /// SHA-256 hash of a byte slice.
 fn sha256_hash(data: &[u8]) -> [u8; 32] {

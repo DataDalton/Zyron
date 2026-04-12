@@ -187,6 +187,18 @@ fn build_from_item(item: &BoundFromItem) -> Result<LogicalPlan> {
             })
         }
         BoundFromItem::Subquery { query, .. } => build_select_plan(query),
+        BoundFromItem::GraphQuery {
+            schema_name,
+            algorithm,
+            params,
+            output_columns,
+            ..
+        } => Ok(LogicalPlan::GraphAlgorithm {
+            schema_name: schema_name.clone(),
+            algorithm: algorithm.clone(),
+            params: params.clone(),
+            output_columns: output_columns.clone(),
+        }),
     }
 }
 

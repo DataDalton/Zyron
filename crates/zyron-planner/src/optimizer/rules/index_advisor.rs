@@ -64,7 +64,9 @@ impl IndexAdvisor {
                 }
                 self.walk_and_record(child);
             }
-            LogicalPlan::Scan { .. } | LogicalPlan::Values { .. } => {}
+            LogicalPlan::Scan { .. }
+            | LogicalPlan::Values { .. }
+            | LogicalPlan::GraphAlgorithm { .. } => {}
             LogicalPlan::Project { child, .. }
             | LogicalPlan::Sort { child, .. }
             | LogicalPlan::Limit { child, .. }

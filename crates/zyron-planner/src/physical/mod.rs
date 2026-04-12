@@ -217,6 +217,37 @@ pub enum PhysicalPlan {
         remaining_predicate: Option<BoundExpr>,
         cost: PlanCost,
     },
+
+    /// Approximate nearest neighbor scan using a vector index.
+    VectorScan {
+        table_id: TableId,
+        index_id: IndexId,
+        columns: Vec<LogicalColumn>,
+        query_vector: Vec<f32>,
+        metric: u8,
+        k: usize,
+        remaining_predicate: Option<BoundExpr>,
+        cost: PlanCost,
+    },
+
+    /// Graph algorithm execution over a schema's edge/vertex tables.
+    GraphAlgorithm {
+        algorithm: GraphAlgorithmType,
+        schema_name: String,
+        params: Vec<(String, BoundExpr)>,
+        output_columns: Vec<LogicalColumn>,
+        cost: PlanCost,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum GraphAlgorithmType {
+    PageRank,
+    ShortestPath,
+    Bfs,
+    ConnectedComponents,
+    CommunityDetection,
+    BetweennessCentrality,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,7 +282,9 @@ impl PhysicalPlan {
             | PhysicalPlan::Gather { cost, .. }
             | PhysicalPlan::Repartition { cost, .. }
             | PhysicalPlan::Broadcast { cost, .. }
-            | PhysicalPlan::FulltextScan { cost, .. } => cost,
+            | PhysicalPlan::FulltextScan { cost, .. }
+            | PhysicalPlan::VectorScan { cost, .. }
+            | PhysicalPlan::GraphAlgorithm { cost, .. } => cost,
         }
     }
 
@@ -334,7 +367,9 @@ impl PhysicalPlan {
             | PhysicalPlan::Update { .. }
             | PhysicalPlan::Delete { .. } => Vec::new(),
             PhysicalPlan::Values { schema, .. } => schema.clone(),
-            PhysicalPlan::FulltextScan { columns, .. } => columns.clone(),
+            PhysicalPlan::FulltextScan { columns, .. }
+            | PhysicalPlan::VectorScan { columns, .. } => columns.clone(),
+            PhysicalPlan::GraphAlgorithm { output_columns, .. } => output_columns.clone(),
         }
     }
 
@@ -346,7 +381,9 @@ impl PhysicalPlan {
             | PhysicalPlan::IndexScan { .. }
             | PhysicalPlan::Values { .. }
             | PhysicalPlan::ParallelSeqScan { .. }
-            | PhysicalPlan::FulltextScan { .. } => PlanCost::zero(),
+            | PhysicalPlan::FulltextScan { .. }
+            | PhysicalPlan::VectorScan { .. }
+            | PhysicalPlan::GraphAlgorithm { .. } => PlanCost::zero(),
             PhysicalPlan::Filter { child, .. }
             | PhysicalPlan::Project { child, .. }
             | PhysicalPlan::HashAggregate { child, .. }

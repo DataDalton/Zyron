@@ -187,7 +187,7 @@ pub struct WalWriter {
     /// Ring buffer for pending records.
     ring_buffer: Arc<RingBuffer>,
     /// Flush thread handle for unpark-based wakeup. Set by the flush thread on
-    /// startup via OnceLock, so get() is a single atomic load (~1ns).
+    /// startup via OnceLock so get() is a single atomic Acquire load.
     flush_thread_waker: Arc<OnceLock<std::thread::Thread>>,
     /// Signal from flush thread to waiters when a flush cycle completes.
     flush_done: Arc<(Mutex<bool>, Condvar)>,
@@ -330,9 +330,9 @@ impl WalWriter {
         wal_syncs_counter: Arc<AtomicU64>,
     ) -> JoinHandle<()> {
         std::thread::spawn(move || {
-            // Register this thread for unpark wakeup. OnceLock::get() is a
-            // single atomic Acquire load, so the append() hot path pays ~1ns
-            // instead of tokio::sync::Notify's internal locking (~15-25ns).
+            // Register this thread for unpark wakeup. The waker is stored in
+            // an OnceLock so the append() hot path reads it with a single
+            // atomic Acquire load and calls std::thread::unpark directly.
             flush_thread_waker.set(std::thread::current()).ok();
 
             let mut batch_buffer = Vec::with_capacity(64 * 1024);
@@ -656,7 +656,7 @@ impl WalWriter {
     }
 
     /// Wakes the flush thread via std::thread::unpark.
-    /// OnceLock::get() is a single atomic Acquire load (~1ns).
+    /// OnceLock::get() is a single atomic Acquire load on the hot path.
     #[inline(always)]
     fn wake_flush_thread(&self) {
         if let Some(t) = self.flush_thread_waker.get() {
@@ -665,8 +665,8 @@ impl WalWriter {
     }
 
     /// Wakes the flush thread only for large records that should be flushed
-    /// immediately. Small records rely on the flush thread's park_timeout(50us)
-    /// for batching, avoiding per-record unpark syscalls.
+    /// immediately. Small records rely on the flush thread's park_timeout
+    /// loop for batching, avoiding per-record unpark syscalls.
     #[inline(always)]
     fn maybe_wake_flush_thread(&self, record_size: usize) {
         if record_size >= 4096 {

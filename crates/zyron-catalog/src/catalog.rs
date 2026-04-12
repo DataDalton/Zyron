@@ -121,7 +121,9 @@ impl Catalog {
         )
     }
 
-    // --- Database operations ---
+    // -----------------------------------------------------------------------
+    // Database operations
+    // -----------------------------------------------------------------------
 
     pub async fn create_database(&self, name: &str, owner: &str) -> Result<DatabaseId> {
         if self.cache.get_database_by_name(name).is_some() {
@@ -164,7 +166,9 @@ impl Catalog {
             .ok_or_else(|| ZyronError::DatabaseNotFound(name.to_string()))
     }
 
-    // --- Schema operations ---
+    // -----------------------------------------------------------------------
+    // Schema operations
+    // -----------------------------------------------------------------------
 
     pub async fn create_schema(
         &self,
@@ -211,7 +215,9 @@ impl Catalog {
             .ok_or_else(|| ZyronError::SchemaNotFound(name.to_string()))
     }
 
-    // --- Table operations ---
+    // -----------------------------------------------------------------------
+    // Table operations
+    // -----------------------------------------------------------------------
 
     pub async fn create_table(
         &self,
@@ -380,7 +386,9 @@ impl Catalog {
         self.cache.list_all_tables()
     }
 
-    // --- Index operations ---
+    // -----------------------------------------------------------------------
+    // Index operations
+    // -----------------------------------------------------------------------
 
     pub async fn create_index(
         &self,
@@ -427,6 +435,7 @@ impl Catalog {
             unique,
             index_file_id,
             index_type,
+            parameters: None,
         };
 
         self.log_ddl(DDL_CREATE_INDEX, &entry.to_bytes())?;
@@ -455,7 +464,9 @@ impl Catalog {
         self.cache.get_indexes_for_table(table_id)
     }
 
-    // --- Statistics ---
+    // -----------------------------------------------------------------------
+    // Statistics
+    // -----------------------------------------------------------------------
 
     /// Stores pre-computed statistics for a table.
     pub fn put_stats(
@@ -474,7 +485,9 @@ impl Catalog {
         self.stats.read().get(&table_id).cloned()
     }
 
-    // --- WAL integration ---
+    // -----------------------------------------------------------------------
+    // WAL integration
+    // -----------------------------------------------------------------------
 
     /// Logs a DDL operation to the WAL as a transactional insert.
     /// Returns the commit LSN.

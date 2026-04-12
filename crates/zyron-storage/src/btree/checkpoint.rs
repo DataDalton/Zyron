@@ -27,11 +27,10 @@ const SLOT_ARRAY_START: usize = PageHeader::SIZE + LeafPageHeader::SIZE;
 const SLOT_SIZE: usize = 4;
 
 /// 4-lane parallel multiply-XOR checksum over header and data regions.
-/// Processes 32 bytes per iteration with independent multiply chains.
-/// The CPU pipelines all 4 lanes (3-cycle multiply latency, 4 independent
-/// chains), reaching ~40 GB/s vs CRC32C's ~20 GB/s on modern x86.
-/// Covers all bytes (no sampling). Detects bit flips, zeroed regions,
-/// truncation, and byte shifts.
+/// Processes 32 bytes per iteration with four independent multiply chains
+/// the CPU can dispatch in parallel, which keeps the checksum off the
+/// critical path during writes. Covers all bytes (no sampling) and detects
+/// bit flips, zeroed regions, truncation, and byte shifts.
 fn checkpoint_checksum(header: &[u8], data: &[u8]) -> u32 {
     // Odd primes with good bit distribution for multiply-XOR mixing.
     const P0: u64 = 0x517cc1b727220a95;
@@ -644,8 +643,8 @@ impl CheckpointTrigger {
     }
     /// Checks if a checkpoint should be triggered. The wal_bytes parameter
     /// comes from the lock-free AtomicU64 counter on BTreeIndex.
-    /// Checks wal_bytes first to avoid Instant::elapsed() syscall
-    /// (~15-20ns on Windows) on the common path where no checkpoint is needed.
+    /// Checks wal_bytes first to avoid the Instant::elapsed() syscall on the
+    /// common path where no checkpoint is needed.
     #[inline]
     pub fn should_checkpoint(&self, wal_bytes: u64) -> bool {
         if wal_bytes >= self.config.wal_bytes_threshold {

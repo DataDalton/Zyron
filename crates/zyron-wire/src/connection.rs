@@ -116,9 +116,13 @@ pub struct ServerState {
     /// Data branch manager for version branching.
     pub branch_manager: Option<Arc<zyron_versioning::BranchManager>>,
 
-    // -- Full-text search --
+    // -- Search indexes --
     /// FTS index manager for fulltext search operations.
     pub fts_manager: Option<Arc<zyron_search::FtsManager>>,
+    /// Vector index manager for vector similarity search.
+    pub vector_manager: Option<Arc<zyron_search::vector::VectorIndexManager>>,
+    /// Graph schema manager for graph traversal and algorithms.
+    pub graph_manager: Option<Arc<zyron_search::graph::GraphManager>>,
 
     // -- DML hooks --
     /// CDC hook invoked by DML operators after mutations.
@@ -867,9 +871,18 @@ impl<T: WireTransport> Connection<T> {
                     if let Some(ref hook) = self.server.dml_hook {
                         ctx.dml_hook = Some(Arc::clone(hook));
                     }
-                    // Register live FTS indexes so scan operators and DML can access them.
+                    // Register live search indexes so scan operators and DML can access them.
                     if let Some(ref fts_mgr) = self.server.fts_manager {
                         ctx.set_fts_manager(Arc::clone(fts_mgr));
+                    }
+                    if let Some(ref vec_mgr) = self.server.vector_manager {
+                        ctx.set_vector_manager(Arc::clone(vec_mgr));
+                    }
+                    if let Some(ref graph_mgr) = self.server.graph_manager {
+                        ctx.set_graph_manager(Arc::clone(graph_mgr));
+                    }
+                    if let Some(ref sec_mgr) = self.server.security_manager {
+                        ctx.set_security_manager(Arc::clone(sec_mgr));
                     }
                     let ctx = Arc::new(ctx);
 
@@ -2427,7 +2440,7 @@ impl<T: WireTransport> Connection<T> {
     async fn send_data_rows(
         &mut self,
         batches: &[DataBatch],
-        _schema: &[LogicalColumn],
+        schema: &[LogicalColumn],
         formats: &[i16],
     ) -> Result<usize, ProtocolError> {
         use bytes::BufMut;
@@ -2500,7 +2513,22 @@ impl<T: WireTransport> Connection<T> {
                     buf.put_i32(0); // value length placeholder
                     let before = buf.len();
 
-                    if col_formats[col_idx] == 1 {
+                    // Vector columns are stored as Binary (raw f32 bytes) but
+                    // need special text formatting as bracket notation [0.1,0.2,0.3].
+                    let is_vector = col_idx < schema.len()
+                        && schema[col_idx].type_id == zyron_common::TypeId::Vector;
+
+                    if is_vector {
+                        if let ScalarValue::Binary(ref v) = scalar {
+                            if col_formats[col_idx] == 1 {
+                                types::write_vector_binary(v, &mut buf);
+                            } else {
+                                types::write_vector_text(v, &mut buf);
+                            }
+                        } else {
+                            types::scalar_write_text(&scalar, &mut buf);
+                        }
+                    } else if col_formats[col_idx] == 1 {
                         types::scalar_write_binary(&scalar, &mut buf);
                     } else {
                         types::scalar_write_text(&scalar, &mut buf);

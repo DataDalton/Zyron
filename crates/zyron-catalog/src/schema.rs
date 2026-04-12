@@ -408,6 +408,7 @@ pub struct IndexEntry {
     pub unique: bool,
     pub index_file_id: u32,
     pub index_type: IndexType,
+    pub parameters: Option<Vec<u8>>,
 }
 
 impl IndexEntry {
@@ -426,6 +427,16 @@ impl IndexEntry {
         write_bool(&mut buf, self.unique);
         write_u32(&mut buf, self.index_file_id);
         write_u8(&mut buf, self.index_type as u8);
+        match &self.parameters {
+            Some(params) => {
+                write_u8(&mut buf, 1);
+                write_u32(&mut buf, params.len() as u32);
+                buf.extend_from_slice(params);
+            }
+            None => {
+                write_u8(&mut buf, 0);
+            }
+        }
         buf
     }
 
@@ -451,6 +462,24 @@ impl IndexEntry {
         let index_file_id = read_u32(data, &mut off)?;
         let it = read_u8(data, &mut off)?;
         let index_type = index_type_from_u8(it)?;
+        let parameters = if off < data.len() {
+            let has_params = read_u8(data, &mut off)?;
+            if has_params == 1 {
+                let param_len = read_u32(data, &mut off)? as usize;
+                if off + param_len > data.len() {
+                    return Err(zyron_common::ZyronError::CatalogCorrupted(
+                        "IndexEntry parameters truncated".to_string(),
+                    ));
+                }
+                let params = data[off..off + param_len].to_vec();
+                off += param_len;
+                Some(params)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         Ok(Self {
             id,
             table_id,
@@ -460,6 +489,7 @@ impl IndexEntry {
             unique,
             index_file_id,
             index_type,
+            parameters,
         })
     }
 }
@@ -702,6 +732,7 @@ mod tests {
             unique: true,
             index_file_id: 10000,
             index_type: IndexType::BTree,
+            parameters: None,
         };
         let bytes = entry.to_bytes();
         let decoded = IndexEntry::from_bytes(&bytes).unwrap();

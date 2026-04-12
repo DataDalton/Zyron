@@ -702,6 +702,29 @@ impl<'a> Parser<'a> {
 
         let name = self.parse_ident()?;
 
+        // Table-valued function call: name(args...) [AS alias]
+        if self.at_token(&Token::LParen) {
+            self.advance()?;
+            let args = if self.at_token(&Token::RParen) {
+                vec![]
+            } else {
+                self.parse_comma_separated(|p| p.parse_function_arg())?
+            };
+            self.expect_token(&Token::RParen)?;
+            let alias = if self.consume_keyword(Keyword::As)? {
+                Some(self.parse_ident()?)
+            } else if let Token::Ident(_) = &self.current.token {
+                if !self.is_clause_keyword() {
+                    Some(self.parse_ident()?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            return Ok(TableRef::TableFunction { name, args, alias });
+        }
+
         // Check for time travel: AS OF TIMESTAMP expr, VERSION AS OF expr,
         // FOR SYSTEM_TIME BETWEEN, FOR APPLICATION_TIME, FOR PORTION OF
         let as_of = if self.at_keyword(Keyword::Version)
@@ -989,6 +1012,7 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::User) => self.parse_create_user(),
             Token::Keyword(Keyword::Role) => self.parse_create_role(),
             Token::Keyword(Keyword::Pipeline) => self.parse_create_pipeline(),
+            Token::Keyword(Keyword::Graph) => self.parse_create_graph_schema(),
             Token::Keyword(Keyword::Fulltext) => self.parse_create_fulltext_index(),
             Token::Keyword(Keyword::Vector) => self.parse_create_vector_index(),
             Token::Keyword(Keyword::Branch) => self.parse_create_branch(),
@@ -1002,7 +1026,7 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Procedure) => self.parse_create_procedure(false),
             Token::Keyword(Keyword::Event) => self.parse_create_event_handler(),
             _ => Err(self.error(&format!(
-                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, PIPELINE, FULLTEXT, VECTOR, BRANCH, VERSION, REPLICATION, CDC, PUBLICATION, TRIGGER, FUNCTION, AGGREGATE, PROCEDURE, or EVENT after CREATE, found {}",
+                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, PIPELINE, GRAPH, FULLTEXT, VECTOR, BRANCH, VERSION, REPLICATION, CDC, PUBLICATION, TRIGGER, FUNCTION, AGGREGATE, PROCEDURE, or EVENT after CREATE, found {}",
                 self.current.token
             ))),
         }
@@ -1099,6 +1123,7 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::User) => self.parse_drop_user(),
             Token::Keyword(Keyword::Role) => self.parse_drop_role(),
             Token::Keyword(Keyword::Pipeline) => self.parse_drop_pipeline(),
+            Token::Keyword(Keyword::Graph) => self.parse_drop_graph_schema(),
             Token::Keyword(Keyword::Branch) => self.parse_drop_branch(),
             Token::Keyword(Keyword::Replication) => self.parse_drop_replication_slot(),
             Token::Keyword(Keyword::Cdc) => self.parse_drop_cdc(),
@@ -1109,7 +1134,7 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Procedure) => self.parse_drop_procedure(),
             Token::Keyword(Keyword::Event) => self.parse_drop_event_handler(),
             _ => Err(self.error(&format!(
-                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, PIPELINE, BRANCH, REPLICATION, CDC, PUBLICATION, TRIGGER, FUNCTION, AGGREGATE, PROCEDURE, or EVENT after DROP, found {}",
+                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, PIPELINE, GRAPH, BRANCH, REPLICATION, CDC, PUBLICATION, TRIGGER, FUNCTION, AGGREGATE, PROCEDURE, or EVENT after DROP, found {}",
                 self.current.token
             ))),
         }
@@ -4971,6 +4996,86 @@ impl<'a> Parser<'a> {
             },
         )))
     }
+
+    // -----------------------------------------------------------------------
+    // Graph schema
+    // -----------------------------------------------------------------------
+
+    fn parse_create_graph_schema(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Graph)?;
+        self.expect_keyword(Keyword::Schema)?;
+
+        let if_not_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Not)?;
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+
+        let name = self.parse_ident()?;
+        self.expect_token(&Token::LParen)?;
+        let elements = self.parse_comma_separated(|p| p.parse_graph_schema_element())?;
+        self.expect_token(&Token::RParen)?;
+
+        Ok(Statement::CreateGraphSchema(Box::new(
+            CreateGraphSchemaStatement {
+                name,
+                elements,
+                if_not_exists,
+            },
+        )))
+    }
+
+    fn parse_graph_schema_element(&mut self) -> Result<GraphSchemaElement> {
+        if self.at_keyword(Keyword::Node) {
+            self.advance()?;
+            let label = self.parse_ident()?;
+            self.expect_token(&Token::LParen)?;
+            let properties = self.parse_comma_separated(|p| p.parse_column_def())?;
+            self.expect_token(&Token::RParen)?;
+            Ok(GraphSchemaElement::Node { label, properties })
+        } else if self.at_keyword(Keyword::Edge) {
+            self.advance()?;
+            let label = self.parse_ident()?;
+            self.expect_keyword(Keyword::From)?;
+            let from_label = self.parse_ident()?;
+            self.expect_keyword(Keyword::To)?;
+            let to_label = self.parse_ident()?;
+            self.expect_token(&Token::LParen)?;
+            let properties = self.parse_comma_separated(|p| p.parse_column_def())?;
+            self.expect_token(&Token::RParen)?;
+            Ok(GraphSchemaElement::Edge {
+                label,
+                from_label,
+                to_label,
+                properties,
+            })
+        } else {
+            Err(self.error(&format!(
+                "Expected NODE or EDGE in graph schema definition, found {}",
+                self.current.token
+            )))
+        }
+    }
+
+    fn parse_drop_graph_schema(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Graph)?;
+        self.expect_keyword(Keyword::Schema)?;
+
+        let if_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+
+        let name = self.parse_ident()?;
+
+        Ok(Statement::DropGraphSchema(Box::new(
+            DropGraphSchemaStatement { name, if_exists },
+        )))
+    }
 }
 
 /// Maps keywords that can be used as identifiers in non-keyword position.
@@ -5257,6 +5362,10 @@ fn keyword_to_ident_str(kw: Keyword) -> Option<&'static str> {
         Keyword::Symbol => Some("symbol"),
         Keyword::Rust => Some("rust"),
         Keyword::RustVectorized => Some("rust_vectorized"),
+        // Graph
+        Keyword::Graph => Some("graph"),
+        Keyword::Node => Some("node"),
+        Keyword::Edge => Some("edge"),
         _ => None,
     }
 }
@@ -9575,6 +9684,155 @@ mod tests {
                 assert_eq!(p.name, "my_pub");
             }
             _ => panic!("Expected DropPublication"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // CREATE / DROP GRAPH SCHEMA
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_graph_schema() {
+        let stmt = parse_one(
+            "CREATE GRAPH SCHEMA social (
+                NODE Person (id INT, name VARCHAR),
+                NODE Company (id INT, name VARCHAR),
+                EDGE WorksAt FROM Person TO Company (since DATE)
+            )",
+        );
+        match stmt {
+            Statement::CreateGraphSchema(g) => {
+                assert_eq!(g.name, "social");
+                assert!(!g.if_not_exists);
+                assert_eq!(g.elements.len(), 3);
+                match &g.elements[0] {
+                    GraphSchemaElement::Node { label, properties } => {
+                        assert_eq!(label, "Person");
+                        assert_eq!(properties.len(), 2);
+                    }
+                    _ => panic!("Expected Node"),
+                }
+                match &g.elements[1] {
+                    GraphSchemaElement::Node { label, properties } => {
+                        assert_eq!(label, "Company");
+                        assert_eq!(properties.len(), 2);
+                    }
+                    _ => panic!("Expected Node"),
+                }
+                match &g.elements[2] {
+                    GraphSchemaElement::Edge {
+                        label,
+                        from_label,
+                        to_label,
+                        properties,
+                    } => {
+                        assert_eq!(label, "WorksAt");
+                        assert_eq!(from_label, "Person");
+                        assert_eq!(to_label, "Company");
+                        assert_eq!(properties.len(), 1);
+                    }
+                    _ => panic!("Expected Edge"),
+                }
+            }
+            _ => panic!("Expected CreateGraphSchema"),
+        }
+    }
+
+    #[test]
+    fn test_create_graph_schema_if_not_exists() {
+        let stmt = parse_one("CREATE GRAPH SCHEMA IF NOT EXISTS social (NODE Person (id INT))");
+        match stmt {
+            Statement::CreateGraphSchema(g) => {
+                assert_eq!(g.name, "social");
+                assert!(g.if_not_exists);
+                assert_eq!(g.elements.len(), 1);
+            }
+            _ => panic!("Expected CreateGraphSchema"),
+        }
+    }
+
+    #[test]
+    fn test_drop_graph_schema() {
+        let stmt = parse_one("DROP GRAPH SCHEMA social");
+        match stmt {
+            Statement::DropGraphSchema(g) => {
+                assert_eq!(g.name, "social");
+                assert!(!g.if_exists);
+            }
+            _ => panic!("Expected DropGraphSchema"),
+        }
+    }
+
+    #[test]
+    fn test_drop_graph_schema_if_exists() {
+        let stmt = parse_one("DROP GRAPH SCHEMA IF EXISTS social");
+        match stmt {
+            Statement::DropGraphSchema(g) => {
+                assert_eq!(g.name, "social");
+                assert!(g.if_exists);
+            }
+            _ => panic!("Expected DropGraphSchema"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Table function in FROM clause
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_table_function_in_from() {
+        let stmt = parse_one("SELECT * FROM pagerank(0.85, 20) AS pr");
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.from.len(), 1);
+                match &s.from[0] {
+                    TableRef::TableFunction { name, args, alias } => {
+                        assert_eq!(name, "pagerank");
+                        assert_eq!(args.len(), 2);
+                        assert_eq!(alias.as_deref(), Some("pr"));
+                    }
+                    _ => panic!("Expected TableFunction"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_table_function_no_alias() {
+        let stmt = parse_one("SELECT * FROM generate_series(1, 10)");
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.from.len(), 1);
+                match &s.from[0] {
+                    TableRef::TableFunction { name, args, alias } => {
+                        assert_eq!(name, "generate_series");
+                        assert_eq!(args.len(), 2);
+                        assert!(alias.is_none());
+                    }
+                    _ => panic!("Expected TableFunction"),
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_table_function_no_args() {
+        let stmt = parse_one("SELECT * FROM now_table()");
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.from.len(), 1);
+                match &s.from[0] {
+                    TableRef::TableFunction { name, args, alias } => {
+                        assert_eq!(name, "now_table");
+                        assert!(args.is_empty());
+                        assert!(alias.is_none());
+                    }
+                    _ => panic!("Expected TableFunction"),
+                }
+            }
+            _ => panic!("Expected Select"),
         }
     }
 }

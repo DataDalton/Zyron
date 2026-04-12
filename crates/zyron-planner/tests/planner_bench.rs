@@ -10,17 +10,17 @@
 //! - Cost estimation (selectivity, cardinality, IO/CPU costs)
 //!
 //! Performance Targets:
-//! | Test             | Metric     | Minimum Threshold | Hardware Ceiling                              |
-//! |------------------|------------|-------------------|-----------------------------------------------|
-//! | Binding          | latency    | 2us               | ~200ns (hash lookups in L1-resident catalog)  |
-//! | Logical plan     | latency    | 5us               | ~500ns (AST walk + node allocation)           |
-//! | Optimization     | latency    | 25us              | ~2us (rule application on small plan tree)    |
-//! | Physical plan    | latency    | 10us              | ~1us (operator selection + cost compare)      |
-//! | Join reorder     | latency    | 100us             | ~5us (dynamic programming, 5 tables)          |
-//! | Index selection  | latency    | 5us               | ~500ns (cost comparison, cached stats)        |
-//! | Cardinality est  | accuracy   | 2x error          | ~1.1x (with histograms + correlation)         |
-//! | Plan cache       | hit rate   | 98%               | 99.9% (parameterized queries)                 |
-//! | Full pipeline    | latency    | 50us              | ~5us (parse through physical plan)            |
+//! | Test             | Metric     | Minimum Threshold |
+//! |------------------|------------|-------------------|
+//! | Binding          | latency    | 2us               |
+//! | Logical plan     | latency    | 5us               |
+//! | Optimization     | latency    | 25us              |
+//! | Physical plan    | latency    | 10us              |
+//! | Join reorder     | latency    | 100us             |
+//! | Index selection  | latency    | 5us               |
+//! | Cardinality est  | accuracy   | 2x error          |
+//! | Plan cache       | hit rate   | 98%               |
+//! | Full pipeline    | latency    | 50us              |
 //!
 //! Validation Requirements:
 //! - Each test runs 5 iterations

@@ -115,6 +115,17 @@ pub struct ExecutionContext {
     /// FTS manager reference for DML index maintenance. DML operators use this
     /// to look up which FTS indexes exist for a table and update them.
     pub fts_manager: Option<Arc<zyron_search::FtsManager>>,
+    /// Security manager reference for search privilege checks at query time.
+    /// Operators use this to verify FulltextSearch, VectorSearch, GraphTraverse,
+    /// and GraphAlgorithm privileges before executing search operations.
+    pub security_manager: Option<Arc<zyron_auth::SecurityManager>>,
+    /// Vector index manager reference for DML index maintenance and query-time
+    /// index lookup. DML operators use this to maintain vector indexes on
+    /// INSERT/UPDATE/DELETE. Scan operators use it to find vector indexes.
+    pub vector_manager: Option<Arc<zyron_search::vector::VectorIndexManager>>,
+    /// Graph manager reference for graph algorithm execution. Graph scan
+    /// operators use this to look up graph schemas and build CSR representations.
+    pub graph_manager: Option<Arc<zyron_search::graph::GraphManager>>,
 }
 
 impl ExecutionContext {
@@ -144,6 +155,9 @@ impl ExecutionContext {
             indexes: HashMap::new(),
             fts_indexes: HashMap::new(),
             fts_manager: None,
+            security_manager: None,
+            vector_manager: None,
+            graph_manager: None,
         }
     }
 
@@ -221,6 +235,52 @@ impl ExecutionContext {
         self.fts_manager = Some(mgr);
     }
 
+    /// Sets the security manager for search privilege checks at query time.
+    pub fn set_security_manager(&mut self, mgr: Arc<zyron_auth::SecurityManager>) {
+        self.security_manager = Some(mgr);
+    }
+
+    /// Checks whether the current session has the given search privilege on an object.
+    /// When security is not configured (no SecurityManager or no SecurityContext),
+    /// access is allowed by default. Uses the PrivilegeStore directly to avoid
+    /// needing mutable access to the SecurityContext cache.
+    pub fn check_search_privilege(
+        &self,
+        privilege: zyron_auth::PrivilegeType,
+        object_id: u32,
+    ) -> Result<()> {
+        let sm = match self.security_manager.as_ref() {
+            Some(sm) => sm,
+            None => return Ok(()),
+        };
+        let ctx = match self.security_context.as_ref() {
+            Some(ctx) => ctx,
+            None => return Ok(()),
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let decision = sm.privilege_store.check_privilege(
+            &ctx.effective_roles,
+            privilege,
+            zyron_auth::ObjectType::Table,
+            object_id,
+            None,
+            now,
+        );
+        if decision == zyron_auth::PrivilegeDecision::Allow
+            || decision == zyron_auth::PrivilegeDecision::Unset
+        {
+            Ok(())
+        } else {
+            Err(ZyronError::PermissionDenied(format!(
+                "permission denied: {:?} on table {}",
+                privilege, object_id
+            )))
+        }
+    }
+
     /// Returns all live FTS indexes for the given table. Used by DML operators
     /// to maintain FTS indexes on INSERT/UPDATE/DELETE.
     pub fn fts_indexes_for_table(
@@ -235,5 +295,34 @@ impl ExecutionContext {
                 .collect(),
             None => Vec::new(),
         }
+    }
+
+    /// Sets the vector index manager for DML maintenance and query-time lookups.
+    pub fn set_vector_manager(&mut self, mgr: Arc<zyron_search::vector::VectorIndexManager>) {
+        self.vector_manager = Some(mgr);
+    }
+
+    /// Returns the vector index with the given ID from the vector manager.
+    pub fn get_vector_index(
+        &self,
+        index_id: u32,
+    ) -> Option<Arc<zyron_search::vector::VectorIndex>> {
+        self.vector_manager
+            .as_ref()
+            .and_then(|mgr| mgr.get_index(index_id))
+    }
+
+    /// Returns all vector index IDs for the given table. Used by DML operators
+    /// to maintain vector indexes on INSERT/UPDATE/DELETE.
+    pub fn vector_indexes_for_table(&self, table_id: u32) -> Vec<u32> {
+        match &self.vector_manager {
+            Some(mgr) => mgr.indexes_for_table(table_id),
+            None => Vec::new(),
+        }
+    }
+
+    /// Sets the graph manager for algorithm execution.
+    pub fn set_graph_manager(&mut self, mgr: Arc<zyron_search::graph::GraphManager>) {
+        self.graph_manager = Some(mgr);
     }
 }

@@ -52,6 +52,50 @@ fn extract_fts_text_into(
     }
 }
 
+/// Extracts the raw vector bytes for a specific column from a DataBatch row.
+/// The target column is identified by its catalog ColumnId rather than by
+/// position, so tables with multiple vector columns correctly route each
+/// index's maintenance to its own column. Returns None if the column is not
+/// present in the batch, is null, or is not a Vector column.
+fn extract_vector_bytes<'a>(
+    batch: &'a DataBatch,
+    row_idx: usize,
+    columns: &[zyron_catalog::ColumnEntry],
+    target_column_id: u16,
+) -> Option<&'a [u8]> {
+    let col_idx = columns
+        .iter()
+        .position(|c| c.id.0 == target_column_id && c.type_id == TypeId::Vector)?;
+    if col_idx >= batch.columns.len() {
+        return None;
+    }
+    let col = &batch.columns[col_idx];
+    if row_idx >= col.data.len() || col.nulls.is_null(row_idx) {
+        return None;
+    }
+    match &col.data {
+        ColumnData::Binary(blobs) if row_idx < blobs.len() => Some(&blobs[row_idx]),
+        _ => None,
+    }
+}
+
+/// Reinterprets a byte slice as a slice of f32 values. Each 4 bytes in
+/// little-endian order represent one f32. Returns an empty slice if the
+/// input length is not a multiple of 4.
+fn bytes_to_f32_slice(bytes: &[u8]) -> &[f32] {
+    if bytes.len() % 4 != 0 || bytes.is_empty() {
+        return &[];
+    }
+    // The vector column stores raw f32 bytes in native endianness (LE on x86).
+    // Alignment is guaranteed by Vec<u8> backing store on all supported platforms.
+    let (prefix, floats, suffix) = unsafe { bytes.align_to::<f32>() };
+    if !prefix.is_empty() || !suffix.is_empty() {
+        // Fallback: not aligned, should not happen in practice.
+        return &[];
+    }
+    floats
+}
+
 /// Serializes a TupleId into bytes for WAL payload.
 fn tuple_id_payload(tid: &TupleId) -> Vec<u8> {
     let mut buf = Vec::with_capacity(14);
@@ -247,6 +291,37 @@ impl Operator for InsertOperator {
                     }
                 }
 
+                // Maintain vector indexes: insert each new vector into every
+                // vector index on the table, sourced from that index's column.
+                let vec_index_ids = self.ctx.vector_indexes_for_table(self.table_id.0);
+                if !vec_index_ids.is_empty() {
+                    for (row_idx, tid) in tuple_ids.iter().enumerate() {
+                        let vec_id =
+                            zyron_search::encode_doc_id(tid.page_id.page_num, tid.slot_id)?;
+                        for &idx_id in &vec_index_ids {
+                            let Some(vec_idx) = self.ctx.get_vector_index(idx_id) else {
+                                continue;
+                            };
+                            let col_id = vec_idx.column_id();
+                            if let Some(vec_bytes) = extract_vector_bytes(
+                                &exec_batch.batch,
+                                row_idx,
+                                &table_entry.columns,
+                                col_id,
+                            ) {
+                                let vec_data = bytes_to_f32_slice(vec_bytes);
+                                if let Err(e) = zyron_search::vector::VectorSearch::insert(
+                                    vec_idx.as_ref(),
+                                    vec_id,
+                                    vec_data,
+                                ) {
+                                    eprintln!("vector index {} insert failed: {e}", idx_id);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Notify CDC hook if present.
                 if let Some(ref hook) = self.ctx.cdc_hook {
                     let tuple_refs: Vec<&[u8]> = tuples.iter().map(|t| t.data()).collect();
@@ -370,6 +445,27 @@ impl Operator for DeleteOperator {
                             for (idx_id, fts_idx) in &fts_indexes {
                                 if let Err(e) = fts_idx.delete_document(doc_id) {
                                     eprintln!("FTS index {} delete failed: {e}", idx_id.0);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Maintain vector indexes: delete vectors for removed rows.
+                let vec_index_ids = self.ctx.vector_indexes_for_table(self.table_id.0);
+                if !vec_index_ids.is_empty() {
+                    for tid in &tuple_ids {
+                        if let Ok(vec_id) =
+                            zyron_search::encode_doc_id(tid.page_id.page_num, tid.slot_id)
+                        {
+                            for &idx_id in &vec_index_ids {
+                                if let Some(vec_idx) = self.ctx.get_vector_index(idx_id) {
+                                    if let Err(e) = zyron_search::vector::VectorSearch::delete(
+                                        vec_idx.as_ref(),
+                                        vec_id,
+                                    ) {
+                                        eprintln!("vector index {} delete failed: {e}", idx_id);
+                                    }
                                 }
                             }
                         }
@@ -570,6 +666,57 @@ impl Operator for UpdateOperator {
                                 &mut fts_buf,
                             ) {
                                 eprintln!("FTS index {} update-insert failed: {e}", idx_id.0);
+                            }
+                        }
+                    }
+                }
+
+                // Maintain vector indexes: delete old vectors, insert new vectors.
+                let vec_index_ids = self.ctx.vector_indexes_for_table(self.table_id.0);
+                if !vec_index_ids.is_empty() {
+                    // Delete old vectors
+                    for tid in &tuple_ids {
+                        if let Ok(vec_id) =
+                            zyron_search::encode_doc_id(tid.page_id.page_num, tid.slot_id)
+                        {
+                            for &idx_id in &vec_index_ids {
+                                if let Some(vec_idx) = self.ctx.get_vector_index(idx_id) {
+                                    if let Err(e) = zyron_search::vector::VectorSearch::delete(
+                                        vec_idx.as_ref(),
+                                        vec_id,
+                                    ) {
+                                        eprintln!(
+                                            "vector index {} update-delete failed: {e}",
+                                            idx_id
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Insert new vectors, routing each index to its own column.
+                    for (row_idx, tid) in new_tuple_ids.iter().enumerate() {
+                        let vec_id =
+                            zyron_search::encode_doc_id(tid.page_id.page_num, tid.slot_id)?;
+                        for &idx_id in &vec_index_ids {
+                            let Some(vec_idx) = self.ctx.get_vector_index(idx_id) else {
+                                continue;
+                            };
+                            let col_id = vec_idx.column_id();
+                            if let Some(vec_bytes) = extract_vector_bytes(
+                                &updated_batch,
+                                row_idx,
+                                &table_entry.columns,
+                                col_id,
+                            ) {
+                                let vec_data = bytes_to_f32_slice(vec_bytes);
+                                if let Err(e) = zyron_search::vector::VectorSearch::insert(
+                                    vec_idx.as_ref(),
+                                    vec_id,
+                                    vec_data,
+                                ) {
+                                    eprintln!("vector index {} update-insert failed: {e}", idx_id);
+                                }
                             }
                         }
                     }

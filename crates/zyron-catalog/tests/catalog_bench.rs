@@ -11,16 +11,16 @@
 //! - Cache performance (lookup latency, hit rate)
 //!
 //! Performance Targets:
-//! | Test             | Metric     | Minimum Threshold | Hardware Ceiling                          |
-//! |------------------|------------|-------------------|-------------------------------------------|
-//! | Table lookup     | latency    | 50ns              | ~5ns (hash map lookup, L1 cache hit)      |
-//! | Schema resolve   | latency    | 100ns             | ~10ns (search path walk + hash lookup)    |
-//! | DDL create       | latency    | 200us             | ~10us (WAL append + catalog insert)       |
-//! | DDL drop         | latency    | 80us              | ~5us (WAL append + catalog remove)        |
-//! | ANALYZE          | throughput | 8M rows/sec       | ~375M rows/sec (DDR5 sequential scan)     |
-//! | Histogram build  | latency    | 10ms/col          | ~500us/col (sort-based, 100K samples)     |
-//! | Cache hit rate   | ratio      | 100%              | 100% (catalog fits in memory)             |
-//! | Recovery         | time       | 1ms               | ~100us (small WAL replay for metadata)    |
+//! | Test             | Metric     | Minimum Threshold |
+//! |------------------|------------|-------------------|
+//! | Table lookup     | latency    | 50ns              |
+//! | Schema resolve   | latency    | 100ns             |
+//! | DDL create       | latency    | 200us             |
+//! | DDL drop         | latency    | 80us              |
+//! | ANALYZE          | throughput | 8M rows/sec       |
+//! | Histogram build  | latency    | 10ms/col          |
+//! | Cache hit rate   | ratio      | 100%              |
+//! | Recovery         | time       | 1ms               |
 //!
 //! Validation Requirements:
 //! - Each test runs 5 iterations

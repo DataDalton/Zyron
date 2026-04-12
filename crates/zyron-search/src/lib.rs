@@ -4,7 +4,9 @@
 //! query parsing, result highlighting, autocomplete, and synonym expansion.
 //! All text processing is hand-rolled with no external NLP dependencies.
 
+pub mod graph;
 pub mod text;
+pub mod vector;
 
 pub use text::analyzer::{
     AnalysisBuffer, Analyzer, CustomAnalyzer, SimpleAnalyzer, StandardAnalyzer, Token, TokenFilter,

@@ -962,7 +962,7 @@ fn test_bloom_filter() {
         );
     }
 
-    // High-cardinality: segment SHOULD build bloom filter
+    // High-cardinality: segment should build a bloom filter.
     {
         let vals: Vec<[u8; 4]> = (0..200u32).map(|v| v.to_le_bytes()).collect();
         let values: Vec<Option<&[u8]>> = vals.iter().map(|v| Some(v.as_slice())).collect();

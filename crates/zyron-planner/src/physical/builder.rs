@@ -223,6 +223,62 @@ impl<'a> PhysicalPlanner<'a> {
                     cost,
                 })
             }
+            LogicalPlan::GraphAlgorithm {
+                schema_name,
+                algorithm,
+                params,
+                output_columns,
+            } => {
+                let algo_type = match algorithm.as_str() {
+                    "pagerank" => GraphAlgorithmType::PageRank,
+                    "shortest_path" => GraphAlgorithmType::ShortestPath,
+                    "bfs" => GraphAlgorithmType::Bfs,
+                    "connected_components" => GraphAlgorithmType::ConnectedComponents,
+                    "community_detection" => GraphAlgorithmType::CommunityDetection,
+                    "betweenness_centrality" => GraphAlgorithmType::BetweennessCentrality,
+                    other => {
+                        return Err(zyron_common::ZyronError::PlanError(format!(
+                            "unknown graph algorithm '{}'",
+                            other
+                        )));
+                    }
+                };
+
+                // Cost estimates are tied to big-O complexity of each algorithm.
+                // Without edge/node counts at plan time, we use a nominal graph
+                // size of V=10_000 nodes and E=100_000 edges so the optimizer
+                // can at least rank graph queries against each other.
+                let v: f64 = 10_000.0;
+                let e: f64 = 100_000.0;
+                let pagerank_iters: f64 = 20.0;
+                let (cpu, row_count) = match algo_type {
+                    // O(iter * (V + E))
+                    GraphAlgorithmType::PageRank => (pagerank_iters * (v + e), v),
+                    // O(V + E) Dijkstra-equivalent, one path out
+                    GraphAlgorithmType::ShortestPath => (v + e, v.sqrt()),
+                    // O(V + E) level-limited, bounded by reachable subgraph
+                    GraphAlgorithmType::Bfs => (v + e, v),
+                    // O(V + E) union-find
+                    GraphAlgorithmType::ConnectedComponents => (v + e, v),
+                    // O(iter * (V + E)) Louvain-style
+                    GraphAlgorithmType::CommunityDetection => (10.0 * (v + e), v),
+                    // O(V * (V + E)) Brandes' algorithm, worst-case of the set
+                    GraphAlgorithmType::BetweennessCentrality => (v * (v + e), v),
+                };
+                let cost = PlanCost {
+                    io_cost: v, // single pass to read the graph backing tables
+                    cpu_cost: cpu,
+                    row_count,
+                };
+
+                Ok(PhysicalPlan::GraphAlgorithm {
+                    algorithm: algo_type,
+                    schema_name,
+                    params,
+                    output_columns,
+                    cost,
+                })
+            }
         }
     }
 
@@ -260,6 +316,32 @@ impl<'a> PhysicalPlanner<'a> {
                             index_id: index.id,
                             columns,
                             match_expr: fts_expr.clone(),
+                            remaining_predicate: remaining.cloned(),
+                            cost,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Check for vector distance predicates (vector_distance_* function calls)
+        if let Some(pred) = &predicate {
+            if let Some((vec_expr, remaining)) = extract_vector_distance(pred) {
+                for index in &indexes {
+                    if index.index_type == zyron_catalog::IndexType::Vector {
+                        let cost = PlanCost {
+                            io_cost: 1.0,
+                            cpu_cost: 5.0,
+                            row_count: 10.0,
+                        };
+                        let _ = vec_expr; // Referenced columns extracted at execution time
+                        return Ok(PhysicalPlan::VectorScan {
+                            table_id,
+                            index_id: index.id,
+                            columns,
+                            query_vector: Vec::new(), // Populated at execution time from bound expr
+                            metric: 0,                // Populated from index config
+                            k: 10,                    // Default, overridden by LIMIT
                             remaining_predicate: remaining.cloned(),
                             cost,
                         });
@@ -681,6 +763,31 @@ fn extract_match_against(predicate: &BoundExpr) -> Option<(&BoundExpr, Option<&B
             }
             if let Some((fts, _)) = extract_match_against(right) {
                 return Some((fts, Some(left)));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Extracts a vector_distance_* function call from a predicate tree.
+/// Returns the vector distance expression and any remaining non-vector predicate.
+fn extract_vector_distance(predicate: &BoundExpr) -> Option<(&BoundExpr, Option<&BoundExpr>)> {
+    match predicate {
+        BoundExpr::Function { name, .. } if name.starts_with("vector_distance_") => {
+            Some((predicate, None))
+        }
+        BoundExpr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+            ..
+        } => {
+            if let Some((vec_expr, _)) = extract_vector_distance(left) {
+                return Some((vec_expr, Some(right)));
+            }
+            if let Some((vec_expr, _)) = extract_vector_distance(right) {
+                return Some((vec_expr, Some(left)));
             }
             None
         }

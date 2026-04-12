@@ -55,7 +55,9 @@ pub fn type_id_to_pg_oid(type_id: TypeId) -> i32 {
         TypeId::Uuid => PG_UUID_OID,
         TypeId::Json => PG_JSON_OID,
         TypeId::Jsonb => PG_JSONB_OID,
-        TypeId::Array | TypeId::Composite | TypeId::Vector => PG_TEXT_OID,
+        TypeId::Array | TypeId::Composite => PG_TEXT_OID,
+        // Custom OID for vector type (matches pgvector convention).
+        TypeId::Vector => 16385,
     }
 }
 
@@ -384,6 +386,37 @@ fn write_bytea_hex(bytes: &[u8], buf: &mut BytesMut) {
             hex[i * 2 + 1] = HEX_CHARS[(b & 0x0f) as usize];
         }
         buf.extend_from_slice(&hex[..chunk.len() * 2]);
+    }
+}
+
+/// Writes a vector value in text format as bracket notation: [0.1,0.2,0.3].
+/// The input bytes are raw little-endian f32 values from the storage layer.
+/// A trailing partial f32 (bytes.len() % 4 != 0) is ignored rather than
+/// panicking so a corrupt row can't crash the wire layer.
+pub fn write_vector_text(bytes: &[u8], buf: &mut BytesMut) {
+    buf.put_u8(b'[');
+    let mut rb = ryu::Buffer::new();
+    let mut first = true;
+    for chunk in bytes.chunks_exact(4) {
+        if !first {
+            buf.put_u8(b',');
+        }
+        first = false;
+        let val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        buf.extend_from_slice(rb.format(val as f64).as_bytes());
+    }
+    buf.put_u8(b']');
+}
+
+/// Writes a vector value in binary format: u16 dimension count followed by
+/// big-endian f32 values (matching pgvector binary format). Partial trailing
+/// bytes are ignored.
+pub fn write_vector_binary(bytes: &[u8], buf: &mut BytesMut) {
+    let dims = (bytes.len() / 4) as u16;
+    buf.put_u16(dims);
+    for chunk in bytes.chunks_exact(4) {
+        let val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        buf.put_f32(val);
     }
 }
 

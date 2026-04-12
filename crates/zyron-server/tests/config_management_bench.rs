@@ -10,15 +10,15 @@
 //! - CLI tab completion latency (prefix matching)
 //!
 //! Performance Targets (average of 5 runs):
-//! | Test              | Metric     | Minimum Threshold | Hardware Ceiling                       | Bottleneck          |
-//! |-------------------|------------|-------------------|----------------------------------------|---------------------|
-//! | Config load       | latency    | 10ms              | ~500us (TOML parse, small file)        | CPU (TOML parsing)  |
-//! | SHOW command      | latency    | 10us              | ~500ns (hash map lookup)               | L2 cache latency    |
-//! | SET command       | latency    | 20us              | ~1us (hash map insert + validation)    | CPU (validation)    |
-//! | Stat view query   | latency    | 200us             | ~10us (atomic reads + formatting)      | CPU (formatting)    |
-//! | Backup throughput | throughput | 500 MB/sec        | ~4 GB/s (NVMe seq read + write)        | NVMe I/O bandwidth  |
-//! | Restore throughput| throughput | 500 MB/sec        | ~4 GB/s (NVMe seq write)               | NVMe I/O bandwidth  |
-//! | Tab completion    | latency    | 20ms              | ~1ms (prefix match in keyword list)    | CPU (string compare) |
+//! | Test              | Metric     | Minimum Threshold |
+//! |-------------------|------------|-------------------|
+//! | Config load       | latency    | 10ms              |
+//! | SHOW command      | latency    | 10us              |
+//! | SET command       | latency    | 20us              |
+//! | Stat view query   | latency    | 200us             |
+//! | Backup throughput | throughput | 500 MB/sec        |
+//! | Restore throughput| throughput | 500 MB/sec        |
+//! | Tab completion    | latency    | 20ms              |
 //!
 //! Validation Requirements:
 //! - Each test runs 5 iterations

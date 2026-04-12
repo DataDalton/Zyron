@@ -125,8 +125,9 @@ fn test_balloon_hash_timing() {
 
     assert_eq!(hash.len(), 32, "Balloon hash must produce 32 bytes");
 
-    // With AES-based compression, test params (1024 blocks) complete in ~100us.
-    // Production params (64MB/3 rounds) are validated in test_password_authentication.
+    // Test params (1024 blocks) keep the AES-based compression step fast
+    // enough for unit-test turnaround. Production params (64MB, 3 rounds)
+    // are validated in test_password_authentication.
     let elapsed_us = elapsed.as_micros() as f64;
     tprintln!("  Elapsed: {:.0} us", elapsed_us);
 

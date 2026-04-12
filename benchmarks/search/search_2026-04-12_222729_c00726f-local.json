@@ -1,0 +1,138 @@
+{
+  "id": "2026-04-12_222729_c00726f-local",
+  "date": "2026-04-12 22:31:23Z",
+  "ts": 1776033083,
+  "commit": "c00726f-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Autocomplete": {
+      "Latency (ms)": {
+        "average": 0.341540,
+        "runs": [0.34, 0.41, 0.33, 0.30, 0.32],
+        "target": 2.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Performance": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 13.18 },
+      "util_after": { "cpu_pct": 6.0, "ram_used_gb": 14.38 },
+      "Indexing throughput SimpleAnalyzer (docs/sec)": {
+        "average": 189748.830957,
+        "runs": [198217.43, 175979.63, 212018.03, 187804.06, 174725.01],
+        "target": 300000.000000,
+        "passed": false,
+        "higher_is_better": true
+      },
+      "Indexing throughput StandardAnalyzer (docs/sec)": {
+        "average": 146586.536161,
+        "runs": [158946.39, 133759.17, 138830.30, 160937.67, 140459.15],
+        "target": 300000.000000,
+        "passed": false,
+        "higher_is_better": true
+      },
+      "Index size ratio": {
+        "average": 0.219516,
+        "runs": [0.22],
+        "target": 0.250000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Single-term query latency (ms)": {
+        "average": 4.889920,
+        "runs": [5.72, 4.47, 5.01, 4.58, 4.68],
+        "target": 3.000000,
+        "passed": false,
+        "higher_is_better": false
+      },
+      "Phrase query latency (ms)": {
+        "average": 9.649880,
+        "runs": [8.48, 9.36, 17.27, 6.58, 6.56],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Boolean query latency (ms)": {
+        "average": 11.136220,
+        "runs": [10.11, 14.14, 10.20, 10.17, 11.06],
+        "target": 8.000000,
+        "passed": false,
+        "higher_is_better": false
+      },
+      "Fuzzy query latency (ms)": {
+        "average": 4.340660,
+        "runs": [4.76, 4.94, 4.23, 3.86, 3.91],
+        "target": 20.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Top-10 ranking latency (ms)": {
+        "average": 4.030460,
+        "runs": [3.95, 4.10, 3.99, 3.91, 4.21],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Highlight latency (us)": {
+        "average": 2.822020,
+        "runs": [2.82, 2.83, 2.92, 2.78, 2.76],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "test_ann_recall": {
+      "recall@100_default": {
+        "average": 0.999200,
+        "runs": [1.00],
+        "target": 0.900000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "recall@100_high": {
+        "average": 0.999200,
+        "runs": [1.00],
+        "target": 0.990000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "test_distance": {
+      "cosine_1536d_us": {
+        "average": 0.117073,
+        "runs": [0.12],
+        "target": 2.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "test_quantized": {
+      "recall@10_probes110": {
+        "average": 0.768000,
+        "runs": [0.77],
+        "target": 0.500000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "recall@10_probes221": {
+        "average": 0.972000,
+        "runs": [0.97],
+        "target": 0.850000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "recall@10_probes134": {
+        "average": 0.830000,
+        "runs": [0.83],
+        "target": 0.500000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}

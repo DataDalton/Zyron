@@ -420,6 +420,70 @@ impl Server {
             Arc::new(mgr)
         };
 
+        // Vector index manager: load persisted vector indexes from catalog.
+        let vec_mgr_arc = {
+            let vec_dir = data_dir.join("vector");
+            let _ = std::fs::create_dir_all(&vec_dir);
+            let mgr = zyron_search::vector::VectorIndexManager::with_data_dir(vec_dir.clone());
+            let mut vec_entries: Vec<(u32, u32, u16, u16, zyron_search::vector::HnswConfig)> =
+                Vec::new();
+            for table in catalog.list_all_tables() {
+                for idx in catalog.get_indexes_for_table(table.id) {
+                    if idx.index_type == zyron_catalog::IndexType::Vector {
+                        let col_id = idx.columns.first().map(|c| c.column_id.0).unwrap_or(0);
+                        let (dims, config) = if let Some(ref param_bytes) = idx.parameters {
+                            match zyron_search::vector::VectorIndexParams::fromBytes(param_bytes) {
+                                Ok(zyron_search::vector::VectorIndexParams::Hnsw {
+                                    m,
+                                    efConstruction,
+                                    efSearch,
+                                    metric,
+                                    dimensions,
+                                }) => {
+                                    let dist = match metric {
+                                        1 => zyron_search::vector::DistanceMetric::Euclidean,
+                                        2 => zyron_search::vector::DistanceMetric::DotProduct,
+                                        3 => zyron_search::vector::DistanceMetric::Manhattan,
+                                        _ => zyron_search::vector::DistanceMetric::Cosine,
+                                    };
+                                    (
+                                        dimensions,
+                                        zyron_search::vector::HnswConfig {
+                                            m,
+                                            efConstruction,
+                                            efSearch,
+                                            metric: dist,
+                                        },
+                                    )
+                                }
+                                _ => (0, zyron_search::vector::HnswConfig::default()),
+                            }
+                        } else {
+                            (0, zyron_search::vector::HnswConfig::default())
+                        };
+                        vec_entries.push((idx.id.0, table.id.0, col_id, dims, config));
+                    }
+                }
+            }
+            if !vec_entries.is_empty() {
+                if let Err(e) = mgr.load_indexes(&vec_dir, &vec_entries) {
+                    error!("Vector index loading failed: {e}");
+                }
+            }
+            Arc::new(mgr)
+        };
+
+        // Graph schema manager. Load persisted schemas from disk.
+        let graph_mgr_arc = {
+            let graph_dir = data_dir.join("graph");
+            let _ = std::fs::create_dir_all(&graph_dir);
+            let mgr = zyron_search::graph::GraphManager::new();
+            if let Err(e) = mgr.load_all(&graph_dir) {
+                error!("Graph schema loading failed: {e}");
+            }
+            Arc::new(mgr)
+        };
+
         // 11. Start background workers
         let ckpt_config = CheckpointWorkerConfig {
             wal_bytes_threshold: self.config.checkpoint.wal_bytes_threshold,
@@ -609,8 +673,10 @@ impl Server {
             stream_job_manager: Some(stream_mgr_arc),
             // Versioning
             branch_manager: Some(branch_mgr_arc),
-            // Full-text search
+            // Search indexes
             fts_manager: Some(Arc::clone(&fts_mgr_arc)),
+            vector_manager: Some(Arc::clone(&vec_mgr_arc)),
+            graph_manager: Some(Arc::clone(&graph_mgr_arc)),
             // DML hooks: CDC capture + trigger dispatch
             cdc_hook: Some(Arc::new(hooks::CdcHookBridge::new(
                 Arc::clone(&cdc_registry_arc),
@@ -677,6 +743,22 @@ impl Server {
             let fts_dir = self.config.storage.data_dir.join("fts");
             if let Err(e) = fts_mgr_arc.save_all(&fts_dir) {
                 error!("FTS index persistence failed during shutdown: {e}");
+            }
+        }
+
+        // Persist vector indexes to disk before stopping workers.
+        {
+            let vec_dir = self.config.storage.data_dir.join("vector");
+            if let Err(e) = vec_mgr_arc.save_all(&vec_dir) {
+                error!("Vector index persistence failed during shutdown: {e}");
+            }
+        }
+
+        // Persist graph schemas to disk before stopping workers.
+        {
+            let graph_dir = self.config.storage.data_dir.join("graph");
+            if let Err(e) = graph_mgr_arc.save_all(&graph_dir) {
+                error!("Graph schema persistence failed during shutdown: {e}");
             }
         }
 

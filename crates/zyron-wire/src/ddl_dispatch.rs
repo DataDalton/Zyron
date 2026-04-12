@@ -104,8 +104,8 @@ pub async fn try_handle_ddl_utility(
         Statement::CreateFulltextIndex(s) => {
             Some(handle_create_fulltext_index(s, server, session).await)
         }
-        Statement::CreateVectorIndex(_) => {
-            Some(Ok(DdlResult::Tag("CREATE INDEX".to_string())))
+        Statement::CreateVectorIndex(s) => {
+            Some(handle_create_vector_index(s, server, session).await)
         }
 
         // -- Auth/Roles --
@@ -241,6 +241,14 @@ pub async fn try_handle_ddl_utility(
 
         // -- Utility --
         Statement::DoBlock(_) => Some(Ok(DdlResult::Tag("DO".to_string()))),
+
+        // -- Graph schema --
+        Statement::CreateGraphSchema(stmt) => {
+            Some(handle_create_graph_schema(stmt, server))
+        }
+        Statement::DropGraphSchema(stmt) => {
+            Some(handle_drop_graph_schema(stmt, server))
+        }
     }
 }
 
@@ -486,14 +494,14 @@ async fn handle_drop_index(
                 schema_id.0,
             )?;
 
-            // Check if this is an FTS index so we can clean up the FTS manager.
-            let fts_index_id = server
-                .catalog
-                .get_indexes_for_table(table_id)
-                .iter()
-                .find(|idx| {
-                    idx.name == stmt.name && idx.index_type == zyron_catalog::IndexType::Fulltext
-                })
+            // Identify index type before dropping so we can clean up the right manager.
+            let indexes = server.catalog.get_indexes_for_table(table_id);
+            let matched = indexes.iter().find(|idx| idx.name == stmt.name);
+            let fts_index_id = matched
+                .filter(|idx| idx.index_type == zyron_catalog::IndexType::Fulltext)
+                .map(|idx| idx.id.0);
+            let vec_index_id = matched
+                .filter(|idx| idx.index_type == zyron_catalog::IndexType::Vector)
                 .map(|idx| idx.id.0);
 
             match server.catalog.drop_index(table_id, &stmt.name).await {
@@ -501,6 +509,10 @@ async fn handle_drop_index(
                     // Remove from FTS manager if it was a fulltext index.
                     if let (Some(id), Some(fts_mgr)) = (fts_index_id, &server.fts_manager) {
                         let _ = fts_mgr.drop_index(id);
+                    }
+                    // Remove from vector manager if it was a vector index.
+                    if let (Some(id), Some(vec_mgr)) = (vec_index_id, &server.vector_manager) {
+                        let _ = vec_mgr.drop_index(id);
                     }
                     Ok(DdlResult::Tag("DROP INDEX".to_string()))
                 }
@@ -886,19 +898,19 @@ async fn handle_create_fulltext_index(
     // Resolve table from the default schema
     let schema_id = zyron_catalog::SchemaId(1); // default public schema
 
-    // Privilege check: require CREATE on schema (same as regular index creation)
-    check_ddl_privilege(
-        server,
-        session,
-        zyron_auth::PrivilegeType::Create,
-        zyron_auth::ObjectType::Schema,
-        schema_id.0,
-    )?;
-
     let table = server
         .catalog
         .get_table(schema_id, &stmt.table)
         .map_err(ProtocolError::Database)?;
+
+    // Privilege check: require CREATE on the table (index is table-scoped)
+    check_ddl_privilege(
+        server,
+        session,
+        zyron_auth::PrivilegeType::Create,
+        zyron_auth::ObjectType::Table,
+        table.id.0,
+    )?;
 
     // Register index in the catalog with IndexType::Fulltext
     let index_id = server
@@ -935,6 +947,224 @@ async fn handle_create_fulltext_index(
     }
 
     Ok(DdlResult::Tag("CREATE INDEX".to_string()))
+}
+
+async fn handle_create_vector_index(
+    stmt: &zyron_parser::ast::CreateVectorIndexStatement,
+    server: &Arc<ServerState>,
+    session: &mut Option<Session>,
+) -> Result<DdlResult, ProtocolError> {
+    let schema_id = zyron_catalog::SchemaId(1); // default public schema
+
+    let table = server
+        .catalog
+        .get_table(schema_id, &stmt.table)
+        .map_err(ProtocolError::Database)?;
+
+    // Privilege check: require CREATE on the table
+    check_ddl_privilege(
+        server,
+        session,
+        zyron_auth::PrivilegeType::Create,
+        zyron_auth::ObjectType::Table,
+        table.id.0,
+    )?;
+
+    // Parse distance metric and index parameters from options
+    let mut distance_metric = "cosine".to_string();
+    let mut m: u16 = 16;
+    let mut ef_construction: u16 = 200;
+    for opt in &stmt.options {
+        let key = opt.key.to_lowercase();
+        let val_str = match &opt.value {
+            zyron_parser::ast::TableOptionValue::String(s) => s.to_lowercase(),
+            zyron_parser::ast::TableOptionValue::Identifier(s) => s.to_lowercase(),
+            zyron_parser::ast::TableOptionValue::Integer(n) => n.to_string(),
+            zyron_parser::ast::TableOptionValue::Boolean(b) => b.to_string(),
+            zyron_parser::ast::TableOptionValue::StringList(_) => String::new(),
+        };
+        match key.as_str() {
+            "distance_metric" => distance_metric = val_str,
+            "m" => {
+                m = val_str.parse().unwrap_or(16);
+            }
+            "ef_construction" => {
+                ef_construction = val_str.parse().unwrap_or(200);
+            }
+            _ => {}
+        }
+    }
+
+    // Find the column to determine dimensions
+    let col = table
+        .columns
+        .iter()
+        .find(|c| c.name == stmt.column)
+        .ok_or_else(|| {
+            ProtocolError::Database(ZyronError::ExecutionError(format!(
+                "column '{}' not found in table '{}'",
+                stmt.column, stmt.table
+            )))
+        })?;
+
+    let dimensions = col.max_length.unwrap_or(128) as u16;
+
+    // Register in catalog with IndexType::Vector
+    let index_id = server
+        .catalog
+        .create_index(
+            table.id,
+            schema_id,
+            &stmt.name,
+            &[stmt.column.clone()],
+            false,
+            zyron_catalog::IndexType::Vector,
+        )
+        .await
+        .map_err(ProtocolError::Database)?;
+
+    // Create live vector index via the vector manager if available
+    if let Some(ref vec_mgr) = server.vector_manager {
+        let metric = match distance_metric.as_str() {
+            "euclidean" | "l2" => zyron_search::vector::DistanceMetric::Euclidean,
+            "dot_product" | "dot" => zyron_search::vector::DistanceMetric::DotProduct,
+            "manhattan" | "l1" => zyron_search::vector::DistanceMetric::Manhattan,
+            _ => zyron_search::vector::DistanceMetric::Cosine,
+        };
+        let config = zyron_search::vector::HnswConfig {
+            m,
+            efConstruction: ef_construction,
+            efSearch: 64,
+            metric,
+        };
+        if let Err(e) = vec_mgr.create_index(index_id.0, table.id.0, col.id.0, dimensions, config) {
+            let _ = server.catalog.drop_index(table.id, &stmt.name).await;
+            return Err(ProtocolError::Database(e));
+        }
+    }
+
+    Ok(DdlResult::Tag("CREATE INDEX".to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Graph schema DDL
+// ---------------------------------------------------------------------------
+
+fn handle_create_graph_schema(
+    stmt: &zyron_parser::ast::CreateGraphSchemaStatement,
+    server: &Arc<ServerState>,
+) -> Result<DdlResult, ProtocolError> {
+    let graph_mgr = server.graph_manager.as_ref().ok_or_else(|| {
+        ProtocolError::Database(ZyronError::GraphSchemaNotFound(
+            "graph manager not configured".to_string(),
+        ))
+    })?;
+
+    if graph_mgr.get_schema(&stmt.name).is_some() {
+        if stmt.if_not_exists {
+            return Ok(DdlResult::Tag("CREATE GRAPH SCHEMA".to_string()));
+        }
+        return Err(ProtocolError::Database(ZyronError::GraphQueryError(
+            format!("graph schema '{}' already exists", stmt.name),
+        )));
+    }
+
+    let schema_oid = server.catalog.next_oid();
+    let mut schema = zyron_search::graph::GraphSchema::new(stmt.name.clone(), schema_oid);
+
+    // First pass: register all node labels so edge labels can reference them.
+    for elem in &stmt.elements {
+        if let zyron_parser::ast::GraphSchemaElement::Node { label, properties } = elem {
+            let props: Vec<zyron_search::graph::PropertyDef> = properties
+                .iter()
+                .map(|col| zyron_search::graph::PropertyDef {
+                    name: col.name.clone(),
+                    type_id: col.data_type.to_type_id(),
+                    nullable: col.nullable.unwrap_or(true),
+                })
+                .collect();
+            schema.add_node_label(label.clone(), props, 0);
+        }
+    }
+
+    // Second pass: register edge labels with resolved node label IDs.
+    for elem in &stmt.elements {
+        if let zyron_parser::ast::GraphSchemaElement::Edge {
+            label,
+            from_label,
+            to_label,
+            properties,
+        } = elem
+        {
+            let from_id = schema
+                .get_node_label(from_label)
+                .map(|nl| nl.label_id)
+                .ok_or_else(|| {
+                    ProtocolError::Database(ZyronError::GraphQueryError(format!(
+                        "source node label '{}' not found in schema",
+                        from_label
+                    )))
+                })?;
+            let to_id = schema
+                .get_node_label(to_label)
+                .map(|nl| nl.label_id)
+                .ok_or_else(|| {
+                    ProtocolError::Database(ZyronError::GraphQueryError(format!(
+                        "target node label '{}' not found in schema",
+                        to_label
+                    )))
+                })?;
+            let props: Vec<zyron_search::graph::PropertyDef> = properties
+                .iter()
+                .map(|col| zyron_search::graph::PropertyDef {
+                    name: col.name.clone(),
+                    type_id: col.data_type.to_type_id(),
+                    nullable: col.nullable.unwrap_or(true),
+                })
+                .collect();
+            schema
+                .add_edge_label(label.clone(), from_id, to_id, props, 0, true)
+                .map_err(ProtocolError::Database)?;
+        }
+    }
+
+    graph_mgr
+        .create_schema(schema)
+        .map_err(ProtocolError::Database)?;
+
+    // Persist to disk immediately so the schema survives restarts. If the
+    // write fails, roll back the in-memory create so the catalog state
+    // matches what's on disk.
+    let graph_dir = server.data_dir.join("graph");
+    if let Err(e) = graph_mgr.save_all(&graph_dir) {
+        let _ = graph_mgr.drop_schema(&stmt.name);
+        return Err(ProtocolError::Database(e));
+    }
+
+    Ok(DdlResult::Tag("CREATE GRAPH SCHEMA".to_string()))
+}
+
+fn handle_drop_graph_schema(
+    stmt: &zyron_parser::ast::DropGraphSchemaStatement,
+    server: &Arc<ServerState>,
+) -> Result<DdlResult, ProtocolError> {
+    let graph_mgr = server.graph_manager.as_ref().ok_or_else(|| {
+        ProtocolError::Database(ZyronError::GraphSchemaNotFound(
+            "graph manager not configured".to_string(),
+        ))
+    })?;
+
+    match graph_mgr.drop_schema(&stmt.name) {
+        Ok(()) => {
+            let graph_dir = server.data_dir.join("graph");
+            graph_mgr
+                .save_all(&graph_dir)
+                .map_err(ProtocolError::Database)?;
+            Ok(DdlResult::Tag("DROP GRAPH SCHEMA".to_string()))
+        }
+        Err(_) if stmt.if_exists => Ok(DdlResult::Tag("DROP GRAPH SCHEMA".to_string())),
+        Err(e) => Err(ProtocolError::Database(e)),
+    }
 }
 
 /// Returns a reference to the SecurityManager or an error.

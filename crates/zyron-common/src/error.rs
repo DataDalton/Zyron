@@ -25,6 +25,21 @@ pub enum ZyronError {
     #[error("Buffer pool full, unable to allocate frame")]
     BufferPoolFull,
 
+    // Memory safety errors
+    #[error("Memory allocation failed: requested {bytes} bytes")]
+    MemoryAllocationFailed { bytes: u64 },
+
+    #[error(
+        "Vector memory budget exceeded: requested {requested} bytes, available {available} bytes"
+    )]
+    VectorMemoryBudgetExceeded { requested: u64, available: u64 },
+
+    #[error("Vector index too large: estimated {estimated} bytes exceeds limit {limit} bytes")]
+    VectorIndexTooLarge { estimated: u64, limit: u64 },
+
+    #[error("Corrupt vector index file: declared size {declared} bytes exceeds reasonable bounds")]
+    VectorIndexFileCorrupt { declared: u64 },
+
     #[error("Page full, unable to insert tuple")]
     PageFull,
 
@@ -376,6 +391,29 @@ pub enum ZyronError {
 
     #[error("FTS unsupported language: {0}")]
     FtsUnsupportedLanguage(String),
+
+    // Vector search errors
+    #[error("Vector dimension mismatch: expected {expected}, got {got}")]
+    VectorDimensionMismatch { expected: u16, got: u16 },
+
+    #[error("Vector index not found: {0}")]
+    VectorIndexNotFound(String),
+
+    #[error("Vector index corrupted for \"{index}\": {reason}")]
+    VectorIndexCorrupted { index: String, reason: String },
+
+    // Graph search errors
+    #[error("Graph schema not found: {0}")]
+    GraphSchemaNotFound(String),
+
+    #[error("Graph schema already exists: {0}")]
+    GraphSchemaAlreadyExists(String),
+
+    #[error("Graph query error: {0}")]
+    GraphQueryError(String),
+
+    #[error("Graph algorithm error: {0}")]
+    GraphAlgorithmError(String),
 
     // Internal errors
     #[error("Internal error: {0}")]

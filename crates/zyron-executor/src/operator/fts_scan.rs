@@ -43,6 +43,9 @@ impl FulltextScanOperator {
         columns: Vec<LogicalColumn>,
         match_expr: BoundExpr,
     ) -> Result<Self> {
+        // Privilege check: require FulltextSearch on the table
+        ctx.check_search_privilege(zyron_auth::PrivilegeType::FulltextSearch, table_id.0)?;
+
         let fts_index = ctx
             .get_fts_index(index_id)
             .ok_or_else(|| ZyronError::FtsIndexNotFound(format!("IndexId({})", index_id.0)))?;

@@ -162,6 +162,10 @@ pub enum Statement {
     CreateEventHandler(Box<CreateEventHandlerStatement>),
     /// DROP EVENT HANDLER [IF EXISTS] name
     DropEventHandler(Box<DropEventHandlerStatement>),
+    /// CREATE GRAPH SCHEMA name (NODE Label(...), EDGE Label FROM X TO Y (...))
+    CreateGraphSchema(Box<CreateGraphSchemaStatement>),
+    /// DROP GRAPH SCHEMA [IF EXISTS] name
+    DropGraphSchema(Box<DropGraphSchemaStatement>),
 }
 
 // ---------------------------------------------------------------------------
@@ -1220,6 +1224,40 @@ pub struct CreateVectorIndexStatement {
 }
 
 // ---------------------------------------------------------------------------
+// Graph schema
+// ---------------------------------------------------------------------------
+
+/// CREATE GRAPH SCHEMA name (NODE Label(...), EDGE Label FROM X TO Y (...))
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateGraphSchemaStatement {
+    pub name: String,
+    pub elements: Vec<GraphSchemaElement>,
+    pub if_not_exists: bool,
+}
+
+/// Element within a CREATE GRAPH SCHEMA definition.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GraphSchemaElement {
+    Node {
+        label: String,
+        properties: Vec<ColumnDef>,
+    },
+    Edge {
+        label: String,
+        from_label: String,
+        to_label: String,
+        properties: Vec<ColumnDef>,
+    },
+}
+
+/// DROP GRAPH SCHEMA [IF EXISTS] name
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropGraphSchemaStatement {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+// ---------------------------------------------------------------------------
 // GROUP BY ROLLUP / CUBE / GROUPING SETS
 // ---------------------------------------------------------------------------
 
@@ -1559,6 +1597,12 @@ pub enum TableRef {
     },
     /// LATERAL subquery or function call in FROM
     Lateral { subquery: Box<TableRef> },
+    /// Table-valued function call in FROM clause: FUNC_NAME(args...)
+    TableFunction {
+        name: String,
+        args: Vec<FunctionArg>,
+        alias: Option<String>,
+    },
 }
 
 /// Join data extracted to a separate struct for boxing inside TableRef.

@@ -422,6 +422,40 @@ impl ExplainNode {
                 actual_metrics: None,
                 children: Vec::new(),
             },
+            PhysicalPlan::VectorScan {
+                table_id,
+                index_id,
+                columns,
+                cost,
+                k,
+                ..
+            } => Self {
+                operator_name: "VectorScan".to_string(),
+                details: vec![
+                    ("table_id".to_string(), format!("{}", table_id.0)),
+                    ("index_id".to_string(), format!("{}", index_id.0)),
+                    ("columns".to_string(), format!("{}", columns.len())),
+                    ("k".to_string(), format!("{}", k)),
+                ],
+                estimated_cost: Some(*cost),
+                actual_metrics: None,
+                children: Vec::new(),
+            },
+            PhysicalPlan::GraphAlgorithm {
+                schema_name,
+                algorithm,
+                cost,
+                ..
+            } => Self {
+                operator_name: "GraphAlgorithm".to_string(),
+                details: vec![
+                    ("schema".to_string(), schema_name.clone()),
+                    ("algorithm".to_string(), format!("{:?}", algorithm)),
+                ],
+                estimated_cost: Some(*cost),
+                actual_metrics: None,
+                children: Vec::new(),
+            },
         }
     }
 

@@ -136,6 +136,14 @@ pub enum LogicalPlan {
         table_id: TableId,
         child: Box<LogicalPlan>,
     },
+
+    /// Graph algorithm execution over a named graph schema.
+    GraphAlgorithm {
+        schema_name: String,
+        algorithm: String,
+        params: Vec<(String, BoundExpr)>,
+        output_columns: Vec<LogicalColumn>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -235,13 +243,16 @@ impl LogicalPlan {
             LogicalPlan::Values { schema, .. } => schema.clone(),
             LogicalPlan::Update { .. } => Vec::new(),
             LogicalPlan::Delete { .. } => Vec::new(),
+            LogicalPlan::GraphAlgorithm { output_columns, .. } => output_columns.clone(),
         }
     }
 
     /// Returns all child plan nodes.
     pub fn children(&self) -> Vec<&LogicalPlan> {
         match self {
-            LogicalPlan::Scan { .. } | LogicalPlan::Values { .. } => vec![],
+            LogicalPlan::Scan { .. }
+            | LogicalPlan::Values { .. }
+            | LogicalPlan::GraphAlgorithm { .. } => vec![],
             LogicalPlan::Filter { child, .. }
             | LogicalPlan::Project { child, .. }
             | LogicalPlan::Aggregate { child, .. }
@@ -260,7 +271,9 @@ impl LogicalPlan {
     /// Returns mutable references to all child plan nodes.
     pub fn children_mut(&mut self) -> Vec<&mut LogicalPlan> {
         match self {
-            LogicalPlan::Scan { .. } | LogicalPlan::Values { .. } => vec![],
+            LogicalPlan::Scan { .. }
+            | LogicalPlan::Values { .. }
+            | LogicalPlan::GraphAlgorithm { .. } => vec![],
             LogicalPlan::Filter { child, .. }
             | LogicalPlan::Project { child, .. }
             | LogicalPlan::Aggregate { child, .. }

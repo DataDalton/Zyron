@@ -107,7 +107,7 @@ impl OldNewResolver {
                     .map(|v| v.as_slice()),
                 ReturnSource::Expr => {
                     // Expression evaluation is handled by the executor.
-                    // The resolver returns None; the caller evaluates the expression.
+                    // The resolver returns None, and the caller evaluates the expression.
                     None
                 }
             };

@@ -18,9 +18,9 @@ fn partition_of(key: u64) -> usize {
 /// based on the top 8 bits of each key. Each partition is a Vec that stays
 /// small enough to fit in L1/L2 cache during sort and scan operations.
 ///
-/// Insert: ~3-5ns (Vec push into a small partition, cache-hot).
-/// Search: linear scan of one partition (~512 entries average).
-/// Flush: sort each partition independently, concatenate in order (globally sorted).
+/// Insert: Vec push into one partition, selected by the top 8 bits.
+/// Search: linear scan of one partition.
+/// Flush: sort each partition independently, concatenate in key order.
 struct PartitionedBuffer {
     /// 256 partitions, each a Vec<(key, packed_tuple_id)>.
     partitions: Vec<Vec<(u64, u64)>>,
@@ -138,10 +138,10 @@ impl PartitionedBuffer {
 /// Buffered B+Tree index with write buffer for high insert throughput.
 ///
 /// Architecture:
-/// - Writes go to an in-memory partitioned write buffer (~3-5ns insert)
-/// - When buffer is full, entries are bulk-merged into the B+Tree
-/// - Reads check the write buffer first, then the B+Tree
-/// - B+Tree uses 32KB nodes for shallow height (height=2 for 1M keys)
+/// - Writes go to an in-memory partitioned write buffer.
+/// - When the buffer is full, entries are bulk-merged into the B+Tree.
+/// - Reads check the write buffer first, then the B+Tree on miss.
+/// - The B+Tree uses 32KB nodes to keep the tree shallow.
 pub struct BufferedBTreeIndex {
     /// The underlying B+Tree (read-optimized with 32KB nodes).
     btree: BTreeArenaIndex,
@@ -215,7 +215,7 @@ impl BufferedBTreeIndex {
     }
 
     /// Insert a key-value pair.
-    /// Goes to write buffer first; flushes to B+Tree when buffer is full.
+    /// Goes to the write buffer first, then flushes to the B+Tree when full.
     #[inline(always)]
     pub fn insert(&mut self, key: &[u8], tuple_id: TupleId) -> Result<()> {
         if self.buffer.is_full() {

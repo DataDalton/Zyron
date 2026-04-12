@@ -12,14 +12,14 @@
 //! - Round-trip (parse -> print -> re-parse -> verify AST equality)
 //!
 //! Performance Targets:
-//! | Test             | Metric     | Minimum Threshold | Hardware Ceiling                      |
-//! |------------------|------------|-------------------|---------------------------------------|
-//! | Lexer            | throughput | 200 MB/sec        | ~5 GB/s (L3 bandwidth, byte-at-a-time)|
-//! | Parser (simple)  | latency    | 1000 ns           | ~50 ns (small AST, L1/L2 resident)    |
-//! | Parser (complex) | latency    | 20 us             | ~2 us (large AST with many nodes)     |
-//! | Parser (batch)   | throughput | 1M stmts/sec      | ~20M/sec (simple, amortized alloc)    |
-//! | Memory           | per-parse  | 1 KB              | ~256 B (arena alloc, minimal overhead)|
-//! | Error recovery   | latency    | 2 us              | ~200 ns (early exit on first error)   |
+//! | Test             | Metric     | Minimum Threshold |
+//! |------------------|------------|-------------------|
+//! | Lexer            | throughput | 200 MB/sec        |
+//! | Parser (simple)  | latency    | 1000 ns           |
+//! | Parser (complex) | latency    | 20 us             |
+//! | Parser (batch)   | throughput | 1M stmts/sec      |
+//! | Memory           | per-parse  | 1 KB              |
+//! | Error recovery   | latency    | 2 us              |
 //!
 //! Validation Requirements:
 //! - Each test runs 5 iterations
@@ -974,6 +974,13 @@ fn table_ref_to_sql(tr: &TableRef) -> String {
         }
         TableRef::Subquery { alias, .. } => format!("(...) AS {}", alias),
         TableRef::Lateral { .. } => "LATERAL (...)".into(),
+        TableRef::TableFunction { name, alias, .. } => {
+            if let Some(a) = alias {
+                format!("{}(...) AS {}", name, a)
+            } else {
+                format!("{}(...)", name)
+            }
+        }
     }
 }
 

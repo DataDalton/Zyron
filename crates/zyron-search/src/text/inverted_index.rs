@@ -755,8 +755,7 @@ impl InvertedIndex {
 
         // Sort token indices by term text for grouping. Uses a u64 prefix key
         // for O(1) comparison in the common case, falling back to full string
-        // comparison only when prefixes collide. This is ~5x faster than
-        // sorting by string comparison directly.
+        // comparison only when prefixes collide.
         let mut indices: Vec<(u64, usize, u32)> = (0..buf.len())
             .map(|i| {
                 let t = buf.term_at(i).as_bytes();
@@ -1633,10 +1632,9 @@ impl InvertedIndex {
 /// Version 4 postings encoding. Splits postings into tf=1 and tf>1 groups.
 ///
 /// tf=1 postings use a bitset for doc_ids (1 bit per potential doc_id) and
-/// 6-bit packed positions. For dense terms (appearing in most docs), the bitset
-/// is much smaller than VByte delta encoding. A term in 500K of 1M docs uses
-/// 125KB bitset vs ~500KB VByte deltas. Positions at 6 bits each save 25%
-/// over 8-bit VByte.
+/// 6-bit packed positions. When a term appears in a large fraction of the
+/// corpus, a bitset is denser than VByte delta encoding because each
+/// doc_id costs one bit regardless of gap size.
 ///
 /// tf>1 postings use VByte delta doc_ids, VByte tf, delta-encoded positions.
 ///

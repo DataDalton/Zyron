@@ -361,6 +361,11 @@ pub enum Keyword {
     Match,
     Against,
 
+    // Graph
+    Graph,
+    Node,
+    Edge,
+
     // CDC / Feature toggles
     Enable,
     Disable,
@@ -907,6 +912,11 @@ pub fn lookup_keyword(word: &str) -> Option<Keyword> {
         "FULLTEXT" => Some(Keyword::Fulltext),
         "MATCH" => Some(Keyword::Match),
         "AGAINST" => Some(Keyword::Against),
+
+        // Graph
+        "GRAPH" => Some(Keyword::Graph),
+        "NODE" => Some(Keyword::Node),
+        "EDGE" => Some(Keyword::Edge),
 
         // CDC
         "ENABLE" => Some(Keyword::Enable),

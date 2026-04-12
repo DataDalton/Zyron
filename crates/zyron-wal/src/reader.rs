@@ -174,7 +174,7 @@ impl WalReader {
 
     /// Calls f for each record at or after start_lsn, in segment order.
     ///
-    /// Avoids building an intermediate Vec<LogRecord> — each record is processed
+    /// Avoids building an intermediate Vec<LogRecord>. Each record is processed
     /// as it is parsed, which reduces allocations and struct copies for callers
     /// that only need to accumulate a filtered subset.
     #[inline]

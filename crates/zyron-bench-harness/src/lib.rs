@@ -18,7 +18,7 @@ static SUITE_NAME: OnceLock<String> = OnceLock::new();
 
 /// Registers the suite name that determines the output subdirectory and file prefix.
 /// Call this once at the top of each test file (typically inside a test or helper).
-/// Subsequent calls with the same name are harmless; calls with a different name panic.
+/// Subsequent calls with the same name are harmless. Calls with a different name panic.
 pub fn init(name: &str) {
     SUITE_NAME.get_or_init(|| name.to_string());
 }

@@ -168,7 +168,9 @@ impl CatalogCache {
         }
     }
 
-    // --- Database operations ---
+    // -----------------------------------------------------------------------
+    // Database operations
+    // -----------------------------------------------------------------------
 
     pub fn get_database(&self, id: DatabaseId) -> Option<Arc<DatabaseEntry>> {
         self.databases.read().get(&id).cloned()
@@ -203,7 +205,9 @@ impl CatalogCache {
         }
     }
 
-    // --- Schema operations ---
+    // -----------------------------------------------------------------------
+    // Schema operations
+    // -----------------------------------------------------------------------
 
     pub fn get_schema(&self, id: SchemaId) -> Option<Arc<SchemaEntry>> {
         self.schemas.read().get(&id).cloned()
@@ -239,7 +243,9 @@ impl CatalogCache {
         }
     }
 
-    // --- Table operations ---
+    // -----------------------------------------------------------------------
+    // Table operations
+    // -----------------------------------------------------------------------
 
     pub fn get_table(&self, id: TableId) -> Option<Arc<TableEntry>> {
         self.tables.read().get(&id).cloned()
@@ -294,7 +300,9 @@ impl CatalogCache {
         self.tables.read().values().cloned().collect()
     }
 
-    // --- Index operations ---
+    // -----------------------------------------------------------------------
+    // Index operations
+    // -----------------------------------------------------------------------
 
     pub fn get_index(&self, id: IndexId) -> Option<Arc<IndexEntry>> {
         self.indexes.read().get(&id).cloned()
@@ -411,6 +419,7 @@ mod tests {
             unique: false,
             index_file_id: 10000,
             index_type: IndexType::BTree,
+            parameters: None,
         }
     }
 

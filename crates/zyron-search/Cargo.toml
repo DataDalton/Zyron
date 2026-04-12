@@ -9,6 +9,7 @@ zyron-common = { path = "../zyron-common" }
 parking_lot.workspace = true
 scc.workspace = true
 serde.workspace = true
+sysinfo.workspace = true
 
 [dev-dependencies]
 zyron-bench-harness = { path = "../zyron-bench-harness" }

@@ -122,8 +122,9 @@ impl Encoding for RleEncoding {
             }
 
             // Write the first value, then use doubling memcpy to fill the rest.
-            // LLVM turns large copy_nonoverlapping into SIMD stores or rep movsb,
-            // achieving 50-100 GB/s fill bandwidth on modern CPUs.
+            // LLVM lowers large copy_nonoverlapping into SIMD stores or rep
+            // movsb, so the inner loop does a handful of wide memcpys instead
+            // of a per-element store loop.
             unsafe {
                 std::ptr::copy_nonoverlapping(value.as_ptr(), outPtr.add(writePos), value_size);
             }

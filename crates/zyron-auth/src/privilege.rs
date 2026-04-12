@@ -49,6 +49,10 @@ pub enum PrivilegeType {
     ManageAuthRules = 22,
     ViewAuthAttempts = 23,
     ManageBruteForcePolicy = 24,
+    FulltextSearch = 25,
+    VectorSearch = 26,
+    GraphTraverse = 27,
+    GraphAlgorithm = 28,
     All = 255,
 }
 
@@ -81,6 +85,10 @@ impl PrivilegeType {
             22 => Ok(Self::ManageAuthRules),
             23 => Ok(Self::ViewAuthAttempts),
             24 => Ok(Self::ManageBruteForcePolicy),
+            25 => Ok(Self::FulltextSearch),
+            26 => Ok(Self::VectorSearch),
+            27 => Ok(Self::GraphTraverse),
+            28 => Ok(Self::GraphAlgorithm),
             255 => Ok(Self::All),
             _ => Err(ZyronError::CatalogCorrupted(format!(
                 "invalid PrivilegeType value {}",
@@ -117,6 +125,10 @@ impl PrivilegeType {
             PrivilegeType::ManageAuthRules,
             PrivilegeType::ViewAuthAttempts,
             PrivilegeType::ManageBruteForcePolicy,
+            PrivilegeType::FulltextSearch,
+            PrivilegeType::VectorSearch,
+            PrivilegeType::GraphTraverse,
+            PrivilegeType::GraphAlgorithm,
         ]
     }
 

@@ -7,3 +7,4 @@ rustflags = ["-C", "target-feature=+avx2,+bmi2"]
 [alias]
 zyron = "run --release --bin zyrondb-server --"
 cli = "run --release --bin zyrondb-cli --"
+bench-search = "test -p zyron-search --test search_bench --release -- --nocapture --test-threads=1"

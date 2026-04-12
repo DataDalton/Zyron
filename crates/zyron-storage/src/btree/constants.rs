@@ -10,10 +10,10 @@ pub const MIN_FILL_FACTOR: f64 = 0.5;
 
 // Arena-based B+Tree constants
 
-/// 32KB nodes hold ~2046 keys per node, achieving height=2 for 1M keys.
-/// With a write buffer in front, the B+Tree is read-optimized. Large nodes
-/// reduce tree height for faster lookups (~74ns). The write buffer handles
-/// insert throughput, so node size is tuned purely for read performance.
+/// 32KB nodes. With a write buffer in front, the B+Tree is read-optimized.
+/// Large nodes keep the tree shallow so lookups traverse fewer levels.
+/// The write buffer handles insert throughput, so node size is tuned purely
+/// for read performance.
 pub(crate) const ARENA_NODE_SIZE: usize = 32768;
 
 /// Write buffer capacity (number of entries before flush to B+Tree).

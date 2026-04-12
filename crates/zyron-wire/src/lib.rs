@@ -70,8 +70,8 @@ enum ConnectionTask {
 /// Starts the wire protocol server on the configured address.
 /// Pre-spawns a pool of worker threads, each with a persistent tokio runtime
 /// and LocalSet (required for the planner's !Send futures). The accept loop
-/// distributes connections round-robin via a crossbeam channel, eliminating
-/// per-connection thread spawn and runtime creation overhead (~200us each).
+/// distributes connections round-robin via a crossbeam channel, so each
+/// connection reuses an existing runtime instead of spawning a new thread.
 ///
 /// When QUIC is enabled, listens on both TCP and UDP simultaneously.
 /// Both transports feed into the same worker pool.
