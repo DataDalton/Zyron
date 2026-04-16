@@ -184,15 +184,18 @@ impl DataProfile {
     /// Unstructured data (high intrinsicDim) spreads mass across many
     /// directions and needs more connections per node.
     ///
-    /// Formula: m = intrinsicDim * 1.2.
-    /// Lower bound 16 prevents degenerate m on trivially-separable data.
-    /// Upper bound is the vector's own dimensionality, since there cannot
-    /// be more meaningful orthogonal connections than directions in the
-    /// embedding space. The formula drives m directly from data geometry
-    /// so the graph is sized for the recall the data actually requires,
-    /// rather than capped at an arbitrary fixed number.
+    /// Formula: m = 13 + intrinsicDim * 0.5 + log2(N / 100_000) * 2.
+    /// The intrinsicDim term sizes the graph for the data's local geometry.
+    /// The log(N) term grows m with dataset size so HNSW's required edge
+    /// count for constant recall is satisfied at any scale.
+    /// The floor of 16 prevents degenerate m on trivially-separable data.
+    /// The upper bound is the vector's own dimensionality since there can
+    /// be no more meaningful orthogonal connections than directions in
+    /// the embedding space.
     pub fn hnswM(&self) -> u16 {
-        let m = (self.intrinsicDim as f64 * 1.2).round();
+        let m_base = 13.0 + self.intrinsicDim as f64 * 0.5;
+        let n_scale = (self.n as f64 / 100_000.0).max(1.0).log2() * 2.0;
+        let m = (m_base + n_scale).round();
         let upper = (self.d as f64).max(16.0);
         m.clamp(16.0, upper) as u16
     }

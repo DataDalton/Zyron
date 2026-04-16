@@ -1,0 +1,26 @@
+
+=== Vector and Graph Performance Benchmarks ===
+  Generating 1000000 vectors (128-dim)...
+  DataProfile: n=1000000, d=128, distSpread=0.1359, intrinsicDim=54.2, clustered=false
+  HNSW auto: m=47, efC=722, efS=7859
+  IVF-PQ auto: centroids=850, subs=16, probes=391
+
+  --- ANN Build (1M, 128d) ---
+    Run 1: 356.98s
+  ann_build_sec [FAIL/REGR!]:
+    Runs: [357]
+    Average: 357 <= 40 (target)
+    Min/Max: 357 / 357, StdDev: 0
+
+  --- ANN Search QPS ---
+    Run 1: 63 QPS
+  ann_search_qps [FAIL/REGR!]:
+    Runs: [63]
+    Average: 63 >= 8,000 (target)
+    Min/Max: 63 / 63, StdDev: 0
+
+  --- ANN Recall@10 ---
+  ANN Recall@10: 1.0000
+  ann_recall@10 [PASS]: 1 >= 1 (target)
+
+  --- IVF-PQ Build (1M, 128d) ---

@@ -1,0 +1,350 @@
+
+=== Test 1: Basic Search ===
+  Query: 'database performance'
+  Results: 100 documents
+  Top-5 scores: [0.00015713107234490052, 0.00015713107234490052, 0.00015713107234490052, 0.00015713107234490052, 0.00015713107234490052]
+  Result count is reasonable (not all 10K): PASS
+  Relevance ordering verified: PASS
+
+=== Test 2: Boolean Search ===
+  Query: '+postgresql +performance -mysql'
+  Results: 2 documents
+  Boolean must/must_not verified: PASS
+
+=== Test 3: Phrase Search ===
+  Query: '"distributed database"'
+  Results: 2 documents
+  Phrase adjacency and word order verified: PASS
+
+=== Test 4: Fuzzy Search ===
+  Query: 'databse~2'
+  Results: 1 documents
+  Query: 'komputar~1'
+  Results: 0 documents
+  Fuzzy edit distance thresholds verified: PASS
+
+=== Test 5: Proximity Search ===
+  Query: '"query optimization"~5'
+  Results: 2 documents
+  Proximity distance verification: PASS
+
+=== Test 6: Highlighting ===
+  Input: 'A database is a collection of organized data. The database stores records efficiently.'
+  Output: 'A <b>database</b> is a collection of organized data. The <b>database</b> stores records efficiently.'
+  Tag wrapping verified: PASS
+  Context inclusion verified: PASS
+
+=== Test 7: Autocomplete ===
+  Indexed 10005 product names
+  Query: 'lap' (limit=10)
+  Suggestions: ["laptop", "lapel", "laptop_0", "laptop_100", "laptop_1000", "laptop_1050", "laptop_1100", "laptop_1150", "laptop_1200", "laptop_1250"]
+  Suggestions contain 'laptop' and 'lapel': PASS
+
+=== Autocomplete Performance ===
+  Latency (ms) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 2 (target)
+    Min/Max: 0 / 0, StdDev: 0
+
+=== Test 8: Field Boosting ===
+  Doc 1 (title match, boost=2.0): score=1.3863
+  Doc 2 (body match, boost=1.0): score=0.7199
+  Title boost ranks higher: PASS
+
+=== Test 9: Synonym Expansion ===
+  Synonym group: database -> ["datastore", "db"]
+  Results: 3 documents, IDs: [1, 2, 3]
+  Synonym expansion covers all group terms: PASS
+
+=== Test 10: Performance (1M documents) ===
+
+--- Indexing Throughput ---
+  [SimpleAnalyzer]
+  Run 1: 383,219 docs/sec (2.6094763s)
+  Run 2: 383,024 docs/sec (2.6108023s)
+  Run 3: 387,051 docs/sec (2.5836384s)
+  Run 4: 384,200 docs/sec (2.6028099s)
+  Run 5: 386,411 docs/sec (2.5879154s)
+
+  SimpleAnalyzer index stats: 1000000 documents, avg_dl=44.0
+  Indexing throughput SimpleAnalyzer (docs/sec) [PASS/OK]:
+    Runs: [383,219, 383,024, 387,051, 384,200, 386,411]
+    Average: 384,781 >= 300,000 (target)
+    Min/Max: 383,024 / 387,051, StdDev: 1,654
+
+  [StandardAnalyzer]
+  Run 1: 295,910 docs/sec (3.3794049s)
+  Run 2: 299,005 docs/sec (3.3444258s)
+  Run 3: 298,874 docs/sec (3.3458904s)
+  Run 4: 297,379 docs/sec (3.3627103s)
+  Run 5: 298,193 docs/sec (3.3535368s)
+
+  StandardAnalyzer index stats: 1000000 documents, avg_dl=36.0
+  Indexing throughput StandardAnalyzer (docs/sec) [FAIL/OK]:
+    Runs: [295,910, 299,005, 298,874, 297,379, 298,193]
+    Average: 297,872 >= 300,000 (target)
+    Min/Max: 295,910 / 299,005, StdDev: 1,139
+
+--- Index Size ---
+  Raw data size: 359,700,004 bytes
+  Index file size: 78,959,872 bytes
+  Ratio: 22.0%
+  Index size ratio [PASS]: 0 <= 0 (target)
+
+--- Single-Term Query Latency ---
+  Results: 10 documents
+  Single-term query latency (ms) [FAIL/OK]:
+    Runs: [3, 3, 3, 3, 3]
+    Average: 3 <= 3 (target)
+    Min/Max: 3 / 3, StdDev: 0
+
+--- Phrase Query Latency ---
+  Phrase query latency (ms) [PASS/OK]:
+    Runs: [4, 4, 4, 3, 4]
+    Average: 4 <= 10 (target)
+    Min/Max: 3 / 4, StdDev: 0
+
+--- Boolean Query Latency (3 terms) ---
+  Boolean query latency (ms) [PASS/OK]:
+    Runs: [6, 6, 6, 6, 6]
+    Average: 6 <= 8 (target)
+    Min/Max: 6 / 6, StdDev: 0
+
+--- Fuzzy Query Latency (edit=2) ---
+  Fuzzy query latency (ms) [PASS/OK]:
+    Runs: [3, 3, 3, 3, 3]
+    Average: 3 <= 20 (target)
+    Min/Max: 3 / 3, StdDev: 0
+
+--- Top-10 Ranking Latency ---
+  Top-10 ranking latency (ms) [PASS/OK]:
+    Runs: [4, 3, 3, 3, 3]
+    Average: 3 <= 5 (target)
+    Min/Max: 3 / 4, StdDev: 0
+
+--- Highlight Latency ---
+  Highlight latency (us) [PASS/OK]:
+    Runs: [1, 1, 1, 1, 1]
+    Average: 1 <= 500 (target)
+    Min/Max: 1 / 1, StdDev: 0
+
+=== Performance Summary ===
+
+=== ANN Recall (100K vectors) ===
+  Generating 100000 vectors (128-dim)...
+  Auto config: m=40, efC=614, efS=2115
+  Building HNSW index...
+  Build time: 13.71s
+  Recall@100 (efS=2115): 0.9992
+  Recall@100 (efS=2048):    0.9992
+  recall@100_default [PASS]: 1 >= 1 (target)
+  recall@100_high [PASS]: 1 >= 1 (target)
+
+=== Clustered Scale: N=100000 clusters=64 ===
+  Profile: distSpread=0.2344 intrinsicDim=18.2 clustered=true
+  Config:  m=22 efC=270 efS=733
+  Build time: 2.18s
+    efSearch  recall@10
+         200     0.9980
+         500     0.9960
+        1000     0.9960
+        2000     0.9960
+        5000     0.9980
+
+=== Clustered Scale: N=1000000 clusters=64 ===
+  Profile: distSpread=0.2344 intrinsicDim=18.2 clustered=true
+  Config:  m=29 efC=356 efS=3055
+  Build time: 88.18s
+    efSearch  recall@10
+         200     1.0000
+         500     1.0000
+        1000     1.0000
+        2000     1.0000
+        5000     1.0000
+
+=== Clustered Scale: N=200000 clusters=64 ===
+  Profile: distSpread=0.2344 intrinsicDim=18.2 clustered=true
+  Config:  m=24 efC=294 efS=1130
+  Build time: 6.74s
+    efSearch  recall@10
+         200     1.0000
+         500     1.0000
+        1000     1.0000
+        2000     1.0000
+        5000     1.0000
+
+=== Clustered Scale: N=300000 clusters=64 ===
+  Profile: distSpread=0.2344 intrinsicDim=18.2 clustered=true
+  Config:  m=25 efC=307 efS=1442
+  Build time: 12.85s
+    efSearch  recall@10
+         200     0.9980
+         500     0.9980
+        1000     0.9980
+        2000     0.9980
+        5000     0.9980
+
+=== Clustered Scale: N=400000 clusters=64 ===
+  Profile: distSpread=0.2344 intrinsicDim=18.2 clustered=true
+  Config:  m=26 efC=319 efS=1732
+  Build time: 20.65s
+    efSearch  recall@10
+         200     1.0000
+         500     1.0000
+        1000     1.0000
+        2000     1.0000
+        5000     1.0000
+
+=== Clustered Scale: N=500000 clusters=64 ===
+  Profile: distSpread=0.2344 intrinsicDim=18.2 clustered=true
+  Config:  m=27 efC=331 efS=2011
+  Build time: 30.45s
+    efSearch  recall@10
+         200     1.0000
+         500     1.0000
+        1000     1.0000
+        2000     1.0000
+        5000     1.0000
+
+=== Connected Components ===
+  Found 2 components
+    Component 0: [1, 2, 3]
+    Component 1: [4, 5, 6]
+  Found 2 communities
+  Betweenness centrality:
+    Node 1: 0.000000
+    Node 2: 0.000000
+    Node 3: 0.000000
+    Node 4: 0.000000
+    Node 5: 0.000000
+    Node 6: 0.000000
+  PASSED: connected components and community detection correct
+
+=== Distance Metrics ===
+  Cosine(identical): 0.000000
+  Cosine(orthogonal): 1.000000
+  Euclidean(identical): 0.000000
+  Euclidean([1,0,0],[0,1,0]): 1.414214
+  DotProduct([1,2,3],[4,5,6]): -32.000000
+  Manhattan([1,0,0],[0,1,0]): 2.000000
+  Dims=128: cosine=0.8732, euclidean=8.9012, dot=-5.7519, manhattan=83.3464
+  Dims=1536: cosine=0.9943, euclidean=31.7347, dot=-2.8621, manhattan=1015.9681
+  Cosine 1536d: 0.121us per call (100000 calls)
+  cosine_1536d_us [PASS]: 0 <= 2 (target)
+  PASSED: all distance metrics correct
+
+=== Graph Schema ===
+  Person label ID: 1
+  Company label ID: 2
+  WORKS_AT label ID: 3
+  PASSED: graph schema creation, validation, serialization
+
+=== Graph Traversal ===
+  Built chain graph: 5 nodes, 4 edges
+  shortest_path(1, 5): Some([1, 2, 3, 4, 5])
+  shortest_path(1, 1): Some([1])
+  shortest_path(1, 11) [disconnected]: None
+  bfs(1, depth=2): [(1, 0), (2, 1), (3, 2)]
+  PASSED: graph traversal correct
+
+=== Hybrid Search (FTS + Vector) ===
+  Hybrid results (alpha=0.5): [(1, 0.8571428656578064), (3, 0.7597402334213257), (5, 0.6331169009208679), (2, 0.5292207598686218), (10, 0.3538960814476013)]
+  Top IDs: [1, 3, 5, 2, 10]
+  FTS-only top-3 (alpha=0.0): [1, 2, 3]
+  Vec-only top-3 (alpha=1.0): [3, 5, 1]
+  PASSED: hybrid search rank fusion works correctly
+
+=== PageRank ===
+  PageRank results:
+    Node 1: 0.250000
+    Node 2: 0.250000
+    Node 3: 0.250000
+    Node 4: 0.250000
+  Star PageRank:
+    Node 0: 0.030000
+    Node 1: 0.036375
+    Node 2: 0.036375
+    Node 3: 0.036375
+    Node 4: 0.036375
+  PASSED: PageRank produces correct results
+
+=== Quantized Index (IVF-PQ) ===
+  Generating 100000 vectors (128-dim)...
+  Auto config: centroids=269, subs=16, probes=221
+  Building IVF-PQ index...
+  Build time: 4.87s
+  Recall@10 (probes=110): 0.7680
+  recall@10_probes110 [PASS]: 1 >= 0 (target)
+  Recall@10 (probes=221): 0.9720
+  recall@10_probes221 [PASS]: 1 >= 1 (target)
+  Recall@10 (probes=134): 0.8300
+  recall@10_probes134 [PASS]: 1 >= 0 (target)
+
+=== Recall Diagnostic ===
+
+  --- Test 1: efSearch Sweep (50K, m=32, efC=200) ---
+  Built 50K index (m=32, efC=200)
+    efSearch  recall@10
+          50     0.6380
+         100     0.8300
+         200     0.9380
+         500     0.9940
+        1000     1.0000
+        2000     1.0000
+
+  --- Test 2: Single-Thread vs Parallel (50K) ---
+  Single-thread (10K): recall@10 = 0.9960
+  Parallel      (50K): recall@10 = 0.9220
+  Delta: -0.0740 (negative = parallel is worse)
+
+  --- Test 3: N Scaling (efSearch = N/50) ---
+           N   efSearch  recall@10
+       10000        200     0.9960
+       50000       1000     0.9980
+      100000       2000     0.9980
+
+  --- Test 3b: Cosine vs Euclidean on Same Normalized Data (50K) ---
+  [Euclidean] m=20, efC=234, efS=421, distSpread=0.270
+    efSearch  recall@10
+         200     0.9960
+         500     1.0000
+        1000     1.0000
+        2000     1.0000
+  [Cosine] m=20, efC=234, efS=421, distSpread=0.270
+    efSearch  recall@10
+         200     0.9980
+         500     1.0000
+        1000     1.0000
+        2000     1.0000
+
+  --- Test 4: IVF-PQ Probe Sweep (50K) ---
+  Auto config: centroids=190, subs=16, probes=188
+  Built 50K IVF-PQ index
+      probes  recall@10
+          10     0.2400
+          25     0.4340
+          50     0.6100
+         100     0.8600
+         200     0.9960
+
+  --- Test 5: IVF-PQ N Scaling ---
+           N  centroids     probes  recall@10
+       10000         85         85     0.9720
+       50000        190        187     0.9980
+
+  === Diagnostic Complete ===
+
+=== Uniform Random Scale: N=100000 ===
+  Profile: distSpread=0.1359 intrinsicDim=54.1 clustered=false
+  Config:  m=40 efC=614 efS=2115
+  Build time: 13.60s
+    efSearch  recall@10
+         200     0.9960
+         500     1.0000
+        1000     1.0000
+        2000     1.0000
+        5000     1.0000
+
+=== Uniform Random Scale: N=1000000 ===
+  Profile: distSpread=0.1359 intrinsicDim=54.1 clustered=false
+  Config:  m=47 efC=722 efS=7857

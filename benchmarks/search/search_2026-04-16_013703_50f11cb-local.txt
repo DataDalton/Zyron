@@ -1,0 +1,56 @@
+
+=== Vector and Graph Performance Benchmarks ===
+  Generating 1000000 vectors (128-dim)...
+  DataProfile: n=1000000, d=128, distSpread=0.1359, intrinsicDim=54.2, clustered=false
+  HNSW auto: m=47, efC=722, efS=7859
+  IVF-PQ auto: centroids=850, subs=16, probes=391
+
+  --- ANN Build (1M, 128d) ---
+
+=== Vector Performance (Clustered Data) ===
+  Generating 1000000 clustered vectors (128-dim, 64 clusters, stdDev 0.2)...
+  DataProfile: n=1000000, d=128, distSpread=0.2344, intrinsicDim=18.2, clustered=true
+  HNSW auto: m=29, efC=356, efS=3055
+  IVF-PQ auto: centroids=1500, subs=16, probes=255
+
+  --- ANN Build (1M clustered) ---
+    Run 1: 88.69s
+  ann_build_sec [FAIL/REGR!]:
+    Runs: [89]
+    Average: 89 <= 25 (target)
+    Min/Max: 89 / 89, StdDev: 0
+
+  --- ANN Search QPS (clustered) ---
+    Run 1: 408 QPS
+  ann_search_qps [FAIL/REGR!]:
+    Runs: [408]
+    Average: 408 >= 5,000 (target)
+    Min/Max: 408 / 408, StdDev: 0
+
+  --- ANN Recall@10 (clustered) ---
+  ANN Recall@10: 0.6040
+  ann_recall@10 [FAIL]: 1 >= 1 (target)
+
+  --- IVF-PQ Build (1M clustered) ---
+    Run 1: 114.29s
+  pq_build_sec [FAIL/REGR!]:
+    Runs: [114]
+    Average: 114 <= 30 (target)
+    Min/Max: 114 / 114, StdDev: 0
+
+  --- IVF-PQ Search QPS (clustered) ---
+    Run 1: 132 QPS
+  pq_search_qps [FAIL/REGR!]:
+    Runs: [132]
+    Average: 132 >= 8,000 (target)
+    Min/Max: 132 / 132, StdDev: 0
+
+  === Realistic Benchmark Summary ===
+  Data: clustered (distSpread=0.234)
+  Recall@10: 0.6040 (target >= 0.90)
+
+=== Vector Insert and Query ===
+  Build time: 689.82ms for 10000 vectors
+  Top-10 results for independent query: [(1438, 0.6711954), (9159, 0.7017988), (6009, 0.70481664), (7659, 0.7065468), (5783, 0.7085358), (5792, 0.71121013), (6317, 0.7170224), (3266, 0.71905565), (7531, 0.72137856), (5599, 0.7229142)]
+  Recall@10: 1.000
+  recall@10 [PASS]: 1 >= 1 (target)

@@ -431,13 +431,20 @@ impl Drop for MemoryReservation {
 // ---------------------------------------------------------------------------
 
 /// Estimates the steady-state memory footprint of an HNSW index.
-/// Formula components (derived from the allocation audit):
+/// Formula components match the NodeStore flat-arena layout:
 ///   - vector arena: n * dims * 4 bytes
 ///   - quantized arena: n * dims * 1 byte
-///   - node metadata: n * ~64 bytes (HnswNode struct overhead)
-///   - connections: average ~(m * 2 + m * 4) connections per node, 4 bytes each
-///     plus Vec<Vec<u32>> overhead (~24 bytes per layer * ~4 layers avg)
-///   - idMap (scc::HashMap): ~32 bytes per entry
+///   - node metadata arrays: ids (n * 8), levels (n * 1), deleted (n * 1)
+///   - conn_data: layer 0 always holds a (2m + 1)-u32 slot. Each higher
+///     layer a node reaches adds (m + 1) u32s. The per-node upper-layer
+///     count follows a geometric distribution with P(level >= l) = m^-l,
+///     whose sum over l >= 1 is 1 / (m - 1). Per-node expected slot
+///     count is therefore (2m + 1) + (m + 1) / (m - 1). The estimator
+///     uses a slightly larger fixed overhead of 3 * (m + 1) to stay on
+///     the safe side of graphs that happen to produce above-expected
+///     levels, making the return value an upper bound on typical builds.
+///   - node_offsets table: n * 8 bytes
+///   - idMap: per-entry overhead from the scc::HashMap implementation
 pub fn estimate_hnsw_memory(n: usize, dims: usize, m: u16) -> u64 {
     let n = n as u64;
     let dims = dims as u64;
@@ -445,36 +452,47 @@ pub fn estimate_hnsw_memory(n: usize, dims: usize, m: u16) -> u64 {
 
     let arena = n * dims * 4;
     let quantized = n * dims;
-    let node_meta = n * 64;
-    // Layer 0 has 2m connections, upper layers average ~m each, ~4 layers.
-    let avg_conns_per_node = 2 * m + 3 * m;
-    let connections = n * (avg_conns_per_node * 4 + 4 * 24); // data + Vec headers
+    // NodeStore stores ids, levels, and deleted as three separate Vecs.
+    // Combined per-node footprint is 8 + 1 + 1 = 10 bytes, rounded to
+    // 16 to leave slack for Vec growth and allocator alignment.
+    let node_meta = n * 16;
+    // Upper bound on per-node slot count: layer 0 plus a conservative
+    // fixed three upper-layer slots. See doc comment above for why this
+    // overshoots the geometric expectation.
+    let per_node_slots = (2 * m + 1) + 3 * (m + 1);
+    let conn_data = n * per_node_slots * 4;
+    let node_offsets = n * 8;
     let id_map = n * 32;
 
-    arena + quantized + node_meta + connections + id_map
+    arena + quantized + node_meta + conn_data + node_offsets + id_map
 }
 
 /// Estimates peak memory during HNSW parallel build.
-/// Peak includes: final merged arena + sub-graph temporary arenas that exist
-/// simultaneously before merge + visited buffers per thread + quantization
-/// temporaries. Adds a 30% safety margin for allocator fragmentation and
-/// Vec growth overallocation.
+/// Peak includes the steady-state footprint plus transient build state:
+///   - BuildGraph conn_data of AtomicU32 cells coexists with the finalized
+///     NodeStore during the flatten step, bounded above by a second copy
+///     of conn_data.
+///   - Per-node RwLock instances in BuildGraph: n * 8 bytes.
+///   - Per-thread VisitedSet is sized by efConstruction, not by n, and is
+///     a fixed tens-of-KB per thread. Included in the workspace allowance.
+///   - Per-thread SearchState heaps and scratch buffers.
+/// The 30% margin accounts for allocator fragmentation and Vec growth
+/// slack beyond these line items.
 pub fn estimate_hnsw_build_peak(n: usize, dims: usize, m: u16, cores: usize) -> u64 {
     let steady = estimate_hnsw_memory(n, dims, m);
     let n_u64 = n as u64;
 
-    // Sub-graph arenas: cores * (n/cores) * dims * 4 = n * dims * 4
-    // (same total bytes as merged arena, held simultaneously before merge)
-    let subgraph_arenas = n_u64 * dims as u64 * 4;
+    // BuildGraph conn_data coexists with the finalized NodeStore during
+    // flatten. Upper bound: a second copy of conn_data.
+    let build_transients = n_u64 * ((2 * m as u64 + 1) + 3 * (m as u64 + 1)) * 4;
 
-    // Per-thread visited buffers during cross-link
-    let visited_buffers = cores as u64 * n_u64 * 4;
+    // Per-node RwLock instances in BuildGraph.
+    let node_locks = n_u64 * 8;
 
-    // Transient workspace (search state heaps, candidate lists, etc.)
-    let workspace = 64 * 1024 * 1024; // ~64MB
+    // Search-state heaps, visited sets, and scratch buffers across all threads.
+    let workspace = (cores as u64 * 4 * 1024 * 1024).max(64 * 1024 * 1024);
 
-    let peak = steady + subgraph_arenas + visited_buffers + workspace;
-    // 30% safety margin for allocator overhead and temporary spikes.
+    let peak = steady + build_transients + node_locks + workspace;
     peak + peak / 3
 }
 

@@ -1801,16 +1801,23 @@ fn runClusteredScale(n: usize, numClusters: usize, stdDev: f32, seed: u64) {
         n,
         numClusters
     );
-    let vecs = generateClusteredVectors(n, dims, numClusters, stdDev, seed);
-    let refs: Vec<(u64, &[f32])> = vecs
-        .iter()
-        .enumerate()
-        .map(|(i, v)| (i as u64, v.as_slice()))
+    // Generate into separate Vecs then flatten into one contiguous buffer.
+    // Avoids N small heap allocations persisting alongside the build.
+    let flatArena: Vec<f32> = {
+        let clustered = generateClusteredVectors(n, dims, numClusters, stdDev, seed);
+        let mut flat: Vec<f32> = Vec::with_capacity(n * dims);
+        for v in &clustered {
+            flat.extend_from_slice(v);
+        }
+        flat
+    };
+    let refs: Vec<(u64, &[f32])> = (0..n)
+        .map(|i| (i as u64, &flatArena[i * dims..(i + 1) * dims]))
         .collect();
 
-    let sample: Vec<&[f32]> = vecs[..vecs.len().min(1000)]
-        .iter()
-        .map(|v| v.as_slice())
+    let sampleSize = n.min(1000);
+    let sample: Vec<&[f32]> = (0..sampleSize)
+        .map(|i| &flatArena[i * dims..(i + 1) * dims])
         .collect();
     let profile = DataProfile::compute(&sample, n, dims as u16, DistanceMetric::Cosine);
     let cfg = HnswConfig::auto(&profile, DistanceMetric::Cosine);
@@ -1833,17 +1840,14 @@ fn runClusteredScale(n: usize, numClusters: usize, stdDev: f32, seed: u64) {
 
     let numQueries = 50;
     let k = 10;
-    let mut queryRng = 0xFACEFEED ^ (n as u64);
+    // Use data-matched queries: a subset of the dataset so recall measurement
+    // tests the graph's ability to find known-present vectors.
     let queries: Vec<Vec<f32>> = (0..numQueries)
-        .map(|_| generateRandomVector(&mut queryRng, dims))
+        .map(|i| {
+            let idx = (i * n / numQueries).min(n - 1);
+            flatArena[idx * dims..(idx + 1) * dims].to_vec()
+        })
         .collect();
-    // Use cluster-matched queries: a subset of the dataset itself as queries so
-    // recall is actually meaningful (otherwise queries come from different
-    // cluster centers than the data).
-    let queries: Vec<Vec<f32>> = (0..numQueries)
-        .map(|i| vecs[(i * n / numQueries).min(n - 1)].clone())
-        .collect();
-    let _ = queryRng;
 
     tprintln!("  {:>10} {:>10}", "efSearch", "recall@10");
     for &ef in &[200u16, 500, 1000, 2000, 5000] {
@@ -1894,18 +1898,19 @@ fn runUniformScale(n: usize, seed: u64) {
     let dims = 128usize;
     tprintln!("\n=== Uniform Random Scale: N={} ===", n);
     let mut rng = seed;
-    let vecs: Vec<Vec<f32>> = (0..n)
-        .map(|_| generateRandomVector(&mut rng, dims))
-        .collect();
-    let refs: Vec<(u64, &[f32])> = vecs
-        .iter()
-        .enumerate()
-        .map(|(i, v)| (i as u64, v.as_slice()))
+    let mut flatArena: Vec<f32> = Vec::with_capacity(n * dims);
+    for _ in 0..n {
+        for _ in 0..dims {
+            flatArena.push(randomF32(&mut rng));
+        }
+    }
+    let refs: Vec<(u64, &[f32])> = (0..n)
+        .map(|i| (i as u64, &flatArena[i * dims..(i + 1) * dims]))
         .collect();
 
-    let sample: Vec<&[f32]> = vecs[..vecs.len().min(1000)]
-        .iter()
-        .map(|v| v.as_slice())
+    let sampleSize = n.min(1000);
+    let sample: Vec<&[f32]> = (0..sampleSize)
+        .map(|i| &flatArena[i * dims..(i + 1) * dims])
         .collect();
     let profile = DataProfile::compute(&sample, n, dims as u16, DistanceMetric::Euclidean);
     let cfg = HnswConfig::auto(&profile, DistanceMetric::Euclidean);
@@ -1929,7 +1934,10 @@ fn runUniformScale(n: usize, seed: u64) {
     let numQueries = 50;
     let k = 10;
     let queries: Vec<Vec<f32>> = (0..numQueries)
-        .map(|i| vecs[(i * n / numQueries).min(n - 1)].clone())
+        .map(|i| {
+            let idx = (i * n / numQueries).min(n - 1);
+            flatArena[idx * dims..(idx + 1) * dims].to_vec()
+        })
         .collect();
 
     tprintln!("  {:>10} {:>10}", "efSearch", "recall@10");
@@ -2396,22 +2404,27 @@ fn test_vector_graph_performance() {
     let numRuns = 1;
 
     // -----------------------------------------------------------------------
-    // Generate 1M vectors (reused across all vector benchmarks)
+    // Generate vectors into a single flat buffer. One contiguous allocation
+    // instead of N separate Vec<f32> heap objects, avoiding heap fragmentation
+    // that can destabilise the OS under large N on Windows.
     // -----------------------------------------------------------------------
     tprintln!("  Generating {} vectors ({}-dim)...", vectorCount, dims);
     let mut rng = 314159u64;
-    let vectors: Vec<Vec<f32>> = (0..vectorCount)
-        .map(|_| generateRandomVector(&mut rng, dims))
-        .collect();
-    let vecWithIds: Vec<(u64, &[f32])> = vectors
-        .iter()
-        .enumerate()
-        .map(|(i, v)| (i as u64, v.as_slice()))
+    let mut flatArena: Vec<f32> = Vec::with_capacity(vectorCount as usize * dims);
+    for _ in 0..vectorCount {
+        for _ in 0..dims {
+            flatArena.push(randomF32(&mut rng));
+        }
+    }
+    let vecWithIds: Vec<(u64, &[f32])> = (0..vectorCount as usize)
+        .map(|i| (i as u64, &flatArena[i * dims..(i + 1) * dims]))
         .collect();
 
     // Compute DataProfile from a sample, then derive configs automatically.
-    let sampleSize = vectorCount.min(1000) as usize;
-    let sampleSlices: Vec<&[f32]> = vectors[..sampleSize].iter().map(|v| v.as_slice()).collect();
+    let sampleSize = (vectorCount as usize).min(1000);
+    let sampleSlices: Vec<&[f32]> = (0..sampleSize)
+        .map(|i| &flatArena[i * dims..(i + 1) * dims])
+        .collect();
     let profile = DataProfile::compute(
         &sampleSlices,
         vectorCount as usize,
@@ -2512,11 +2525,8 @@ fn test_vector_graph_performance() {
     // -----------------------------------------------------------------------
     tprintln!("\n  --- ANN Recall@10 ---");
     let mut totalRecall = 0.0;
-    // Reference slice (no clone needed - bruteForceKnn accepts refs).
-    let vecRefsForTruth: Vec<(u64, &[f32])> = vectors
-        .iter()
-        .enumerate()
-        .map(|(i, v)| (i as u64, v.as_slice()))
+    let vecRefsForTruth: Vec<(u64, &[f32])> = (0..vectorCount as usize)
+        .map(|i| (i as u64, &flatArena[i * dims..(i + 1) * dims]))
         .collect();
     for q in 0..recallQueries {
         let query = &recallQueryList[q];
@@ -2756,16 +2766,27 @@ fn test_vector_graph_performance_realistic() {
         numClusters,
         clusterStdDev,
     );
-    let vectors = generateClusteredVectors(vectorCount, dims, numClusters, clusterStdDev, 271828);
-    let vecWithIds: Vec<(u64, &[f32])> = vectors
-        .iter()
-        .enumerate()
-        .map(|(i, v)| (i as u64, v.as_slice()))
+    // Generate into separate Vecs then flatten into a single contiguous buffer
+    // and drop the originals. Avoids 1M small heap allocations persisting
+    // alongside the build's large contiguous allocations.
+    let flatArena: Vec<f32> = {
+        let clustered =
+            generateClusteredVectors(vectorCount, dims, numClusters, clusterStdDev, 271828);
+        let mut flat: Vec<f32> = Vec::with_capacity(vectorCount * dims);
+        for v in &clustered {
+            flat.extend_from_slice(v);
+        }
+        flat
+    };
+    let vecWithIds: Vec<(u64, &[f32])> = (0..vectorCount)
+        .map(|i| (i as u64, &flatArena[i * dims..(i + 1) * dims]))
         .collect();
 
     // Compute DataProfile and derive configs automatically.
     let sampleSize = vectorCount.min(1000);
-    let sampleSlices: Vec<&[f32]> = vectors[..sampleSize].iter().map(|v| v.as_slice()).collect();
+    let sampleSlices: Vec<&[f32]> = (0..sampleSize)
+        .map(|i| &flatArena[i * dims..(i + 1) * dims])
+        .collect();
     let profile = DataProfile::compute(
         &sampleSlices,
         vectorCount,
@@ -2865,10 +2886,8 @@ fn test_vector_graph_performance_realistic() {
     // -----------------------------------------------------------------------
     tprintln!("\n  --- ANN Recall@10 (clustered) ---");
     let mut totalRecall = 0.0;
-    let vecRefsForTruth: Vec<(u64, &[f32])> = vectors
-        .iter()
-        .enumerate()
-        .map(|(i, v)| (i as u64, v.as_slice()))
+    let vecRefsForTruth: Vec<(u64, &[f32])> = (0..vectorCount)
+        .map(|i| (i as u64, &flatArena[i * dims..(i + 1) * dims]))
         .collect();
     for q in 0..recallQueries {
         let query = &recallQueryList[q];
