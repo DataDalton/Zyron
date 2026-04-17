@@ -238,6 +238,19 @@ pub enum PhysicalPlan {
         output_columns: Vec<LogicalColumn>,
         cost: PlanCost,
     },
+
+    /// Window function evaluation over partitioned and ordered input.
+    /// Drains the child, sorts by (partition_by, order_by), applies each
+    /// window function per-partition, and appends result columns.
+    Window {
+        /// Each entry is a `BoundExpr::WindowFunction` node describing
+        /// a function call with its partition_by/order_by keys.
+        window_exprs: Vec<BoundExpr>,
+        /// Column name for each window expression output.
+        window_names: Vec<String>,
+        child: Box<PhysicalPlan>,
+        cost: PlanCost,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -284,7 +297,8 @@ impl PhysicalPlan {
             | PhysicalPlan::Broadcast { cost, .. }
             | PhysicalPlan::FulltextScan { cost, .. }
             | PhysicalPlan::VectorScan { cost, .. }
-            | PhysicalPlan::GraphAlgorithm { cost, .. } => cost,
+            | PhysicalPlan::GraphAlgorithm { cost, .. }
+            | PhysicalPlan::Window { cost, .. } => cost,
         }
     }
 
@@ -370,6 +384,28 @@ impl PhysicalPlan {
             PhysicalPlan::FulltextScan { columns, .. }
             | PhysicalPlan::VectorScan { columns, .. } => columns.clone(),
             PhysicalPlan::GraphAlgorithm { output_columns, .. } => output_columns.clone(),
+            PhysicalPlan::Window {
+                window_exprs,
+                window_names,
+                child,
+                ..
+            } => {
+                let mut schema = child.output_schema();
+                for (i, expr) in window_exprs.iter().enumerate() {
+                    let name = window_names
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| format!("window{}", i));
+                    schema.push(LogicalColumn {
+                        table_idx: None,
+                        column_id: ColumnId((schema.len()) as u16),
+                        name,
+                        type_id: expr.type_id(),
+                        nullable: true,
+                    });
+                }
+                schema
+            }
         }
     }
 
@@ -396,7 +432,8 @@ impl PhysicalPlan {
             | PhysicalPlan::Delete { child, .. }
             | PhysicalPlan::Gather { child, .. }
             | PhysicalPlan::Repartition { child, .. }
-            | PhysicalPlan::Broadcast { child, .. } => child.total_cost(),
+            | PhysicalPlan::Broadcast { child, .. }
+            | PhysicalPlan::Window { child, .. } => child.total_cost(),
             PhysicalPlan::NestedLoopJoin { left, right, .. }
             | PhysicalPlan::HashJoin { left, right, .. }
             | PhysicalPlan::MergeJoin { left, right, .. }

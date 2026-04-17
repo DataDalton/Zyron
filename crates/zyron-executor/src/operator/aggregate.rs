@@ -227,7 +227,121 @@ fn create_accumulator(name: &str, args_count: usize) -> Box<dyn Accumulator> {
         "avg" => Box::new(AvgAccumulator { sum: 0.0, count: 0 }),
         "min" => Box::new(MinAccumulator { min: None }),
         "max" => Box::new(MaxAccumulator { max: None }),
+        "first" => Box::new(FirstAccumulator { value: None }),
+        "last" => Box::new(LastAccumulator { value: None }),
+        "stddev_agg" | "stddev" | "stddev_sample_agg" => Box::new(StddevAccumulator {
+            count: 0,
+            mean: 0.0,
+            m2: 0.0,
+        }),
+        "variance_agg" | "variance" => Box::new(VarianceAccumulator {
+            count: 0,
+            mean: 0.0,
+            m2: 0.0,
+        }),
         _ => Box::new(CountAccumulator { count: 0 }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Additional accumulators for Phase 14
+// ---------------------------------------------------------------------------
+
+/// First value seen (in input order). For two-arg first(value, time),
+/// the operator currently passes only the first arg.
+struct FirstAccumulator {
+    value: Option<ScalarValue>,
+}
+
+impl Accumulator for FirstAccumulator {
+    fn update(&mut self, value: &ScalarValue) {
+        if self.value.is_none() && !value.is_null() {
+            self.value = Some(value.clone());
+        }
+    }
+    fn finalize(&self) -> ScalarValue {
+        self.value.clone().unwrap_or(ScalarValue::Null)
+    }
+}
+
+/// Last value seen (in input order).
+struct LastAccumulator {
+    value: Option<ScalarValue>,
+}
+
+impl Accumulator for LastAccumulator {
+    fn update(&mut self, value: &ScalarValue) {
+        if !value.is_null() {
+            self.value = Some(value.clone());
+        }
+    }
+    fn finalize(&self) -> ScalarValue {
+        self.value.clone().unwrap_or(ScalarValue::Null)
+    }
+}
+
+/// Sample standard deviation via Welford's online algorithm.
+struct StddevAccumulator {
+    count: u64,
+    mean: f64,
+    m2: f64,
+}
+
+impl Accumulator for StddevAccumulator {
+    fn update(&mut self, value: &ScalarValue) {
+        let x = match value {
+            ScalarValue::Float64(v) => *v,
+            ScalarValue::Float32(v) => *v as f64,
+            ScalarValue::Int64(v) => *v as f64,
+            ScalarValue::Int32(v) => *v as f64,
+            ScalarValue::Int16(v) => *v as f64,
+            ScalarValue::Int8(v) => *v as f64,
+            _ => return,
+        };
+        self.count += 1;
+        let delta = x - self.mean;
+        self.mean += delta / self.count as f64;
+        let delta2 = x - self.mean;
+        self.m2 += delta * delta2;
+    }
+    fn finalize(&self) -> ScalarValue {
+        if self.count < 2 {
+            return ScalarValue::Null;
+        }
+        let variance = self.m2 / (self.count - 1) as f64;
+        ScalarValue::Float64(variance.sqrt())
+    }
+}
+
+/// Sample variance via Welford's online algorithm.
+struct VarianceAccumulator {
+    count: u64,
+    mean: f64,
+    m2: f64,
+}
+
+impl Accumulator for VarianceAccumulator {
+    fn update(&mut self, value: &ScalarValue) {
+        let x = match value {
+            ScalarValue::Float64(v) => *v,
+            ScalarValue::Float32(v) => *v as f64,
+            ScalarValue::Int64(v) => *v as f64,
+            ScalarValue::Int32(v) => *v as f64,
+            ScalarValue::Int16(v) => *v as f64,
+            ScalarValue::Int8(v) => *v as f64,
+            _ => return,
+        };
+        self.count += 1;
+        let delta = x - self.mean;
+        self.mean += delta / self.count as f64;
+        let delta2 = x - self.mean;
+        self.m2 += delta * delta2;
+    }
+    fn finalize(&self) -> ScalarValue {
+        if self.count < 2 {
+            return ScalarValue::Null;
+        }
+        ScalarValue::Float64(self.m2 / (self.count - 1) as f64)
     }
 }
 

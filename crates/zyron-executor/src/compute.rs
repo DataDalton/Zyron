@@ -860,6 +860,7 @@ fn compare_column_values(data: &ColumnData, a: usize, b: usize) -> Ordering {
         ColumnData::Utf8(v) => v[a].cmp(&v[b]),
         ColumnData::Binary(v) => v[a].cmp(&v[b]),
         ColumnData::FixedBinary16(v) => v[a].cmp(&v[b]),
+        ColumnData::Interval(v) => v[a].cmp(&v[b]),
     }
 }
 
@@ -1446,6 +1447,13 @@ pub fn sort_column_inplace(data: &mut ColumnData, ascending: bool) {
                 v.sort_unstable_by(|a, b| b.cmp(a));
             }
         }
+        ColumnData::Interval(v) => {
+            if ascending {
+                v.sort_unstable();
+            } else {
+                v.sort_unstable_by(|a, b| b.cmp(a));
+            }
+        }
     }
 }
 
@@ -1733,6 +1741,12 @@ pub fn hash_row(columns: &[&Column], row: usize) -> u64 {
                     let hi = u64::from_le_bytes(v[row][8..16].try_into().unwrap());
                     hash_combine(hash_combine(h, lo), hi)
                 }
+                ColumnData::Interval(v) => {
+                    let i = v[row];
+                    let packed =
+                        (i.months as u64) ^ ((i.days as u64) << 32) ^ (i.nanoseconds as u64);
+                    hash_combine(h, packed)
+                }
             };
         }
     }
@@ -1880,6 +1894,24 @@ pub fn hash_column_batch_into(columns: &[&Column], num_rows: usize, hashes: &mut
                     }
                 }
             }
+            ColumnData::Interval(v) => {
+                let mix = |iv: &zyron_common::Interval| -> u64 {
+                    (iv.months as u64) ^ ((iv.days as u64) << 32) ^ (iv.nanoseconds as u64)
+                };
+                if has_nulls {
+                    for i in 0..num_rows {
+                        if col.nulls.is_null(i) {
+                            hashes[i] = hash_combine(hashes[i], HASH_GOLDEN);
+                        } else {
+                            hashes[i] = hash_combine(hashes[i], mix(&v[i]));
+                        }
+                    }
+                } else {
+                    for i in 0..num_rows {
+                        hashes[i] = hash_combine(hashes[i], mix(&v[i]));
+                    }
+                }
+            }
         }
     }
 
@@ -1912,6 +1944,7 @@ fn column_values_equal(data: &ColumnData, a: usize, b: usize) -> bool {
         ColumnData::Utf8(v) => v[a] == v[b],
         ColumnData::Binary(v) => v[a] == v[b],
         ColumnData::FixedBinary16(v) => v[a] == v[b],
+        ColumnData::Interval(v) => v[a] == v[b],
     }
 }
 

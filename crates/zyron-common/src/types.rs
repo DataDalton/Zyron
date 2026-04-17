@@ -68,6 +68,41 @@ pub enum TypeId {
 
     // Vector (fixed-dimension float array for similarity search)
     Vector = 120,
+
+    // Geospatial (WKB binary, variable length)
+    Geometry = 130,
+
+    // Matrix (row-major f64 array with dimension header, variable length)
+    Matrix = 140,
+
+    // Color (RGBA packed into u32, 4 bytes)
+    Color = 150,
+
+    // Semantic versioning (packed u64: major|minor|patch|pre-release flag)
+    SemVer = 160,
+
+    // Network types
+    Inet = 170,
+    Cidr = 171,
+    MacAddr = 172,
+
+    // Currency-aware fixed-point money (i64 minor units + u16 currency code)
+    Money = 180,
+
+    // Range (element type stored separately in catalog, variable length)
+    Range = 190,
+
+    // Probabilistic data structures (variable length binary)
+    HyperLogLog = 210,
+    BloomFilter = 211,
+    TDigest = 212,
+    CountMinSketch = 213,
+
+    // Bitfield (named bit positions in u64)
+    Bitfield = 220,
+
+    // Unit-aware quantity (f64 value + u16 unit identifier)
+    Quantity = 240,
 }
 
 impl TypeId {
@@ -90,6 +125,13 @@ impl TypeId {
 
             TypeId::Uuid => Some(16),
 
+            // Extended fixed-size types
+            TypeId::Color => Some(4),
+            TypeId::SemVer | TypeId::Bitfield => Some(8),
+            TypeId::MacAddr => Some(6),
+            TypeId::Inet | TypeId::Cidr => Some(18),
+            TypeId::Money | TypeId::Quantity => Some(10),
+
             // Variable-length types
             TypeId::Char
             | TypeId::Varchar
@@ -101,7 +143,14 @@ impl TypeId {
             | TypeId::Jsonb
             | TypeId::Array
             | TypeId::Composite
-            | TypeId::Vector => None,
+            | TypeId::Vector
+            | TypeId::Geometry
+            | TypeId::Matrix
+            | TypeId::Range
+            | TypeId::HyperLogLog
+            | TypeId::BloomFilter
+            | TypeId::TDigest
+            | TypeId::CountMinSketch => None,
         }
     }
 
@@ -162,6 +211,41 @@ impl TypeId {
         matches!(self, TypeId::Binary | TypeId::Varbinary | TypeId::Bytea)
     }
 
+    /// Returns true if this type is an extended type added in Phase 14.
+    pub fn is_extended_type(&self) -> bool {
+        matches!(
+            self,
+            TypeId::Geometry
+                | TypeId::Matrix
+                | TypeId::Color
+                | TypeId::SemVer
+                | TypeId::Inet
+                | TypeId::Cidr
+                | TypeId::MacAddr
+                | TypeId::Money
+                | TypeId::Range
+                | TypeId::HyperLogLog
+                | TypeId::BloomFilter
+                | TypeId::TDigest
+                | TypeId::CountMinSketch
+                | TypeId::Bitfield
+                | TypeId::Quantity
+        )
+    }
+
+    /// Returns true if this type is a probabilistic data structure.
+    pub fn is_probabilistic(&self) -> bool {
+        matches!(
+            self,
+            TypeId::HyperLogLog | TypeId::BloomFilter | TypeId::TDigest | TypeId::CountMinSketch
+        )
+    }
+
+    /// Returns true if this type is a network address type.
+    pub fn is_network(&self) -> bool {
+        matches!(self, TypeId::Inet | TypeId::Cidr | TypeId::MacAddr)
+    }
+
     /// Returns true if this type is a temporal type.
     pub fn is_temporal(&self) -> bool {
         matches!(
@@ -210,6 +294,21 @@ impl std::fmt::Display for TypeId {
             TypeId::Array => "ARRAY",
             TypeId::Composite => "COMPOSITE",
             TypeId::Vector => "VECTOR",
+            TypeId::Geometry => "GEOMETRY",
+            TypeId::Matrix => "MATRIX",
+            TypeId::Color => "COLOR",
+            TypeId::SemVer => "SEMVER",
+            TypeId::Inet => "INET",
+            TypeId::Cidr => "CIDR",
+            TypeId::MacAddr => "MACADDR",
+            TypeId::Money => "MONEY",
+            TypeId::Range => "RANGE",
+            TypeId::HyperLogLog => "HYPERLOGLOG",
+            TypeId::BloomFilter => "BLOOMFILTER",
+            TypeId::TDigest => "TDIGEST",
+            TypeId::CountMinSketch => "COUNTMINSKETCH",
+            TypeId::Bitfield => "BITFIELD",
+            TypeId::Quantity => "QUANTITY",
         };
         write!(f, "{}", name)
     }
@@ -270,6 +369,25 @@ mod tests {
         assert_eq!(TypeId::Array.fixed_size(), None);
         assert_eq!(TypeId::Composite.fixed_size(), None);
         assert_eq!(TypeId::Vector.fixed_size(), None);
+        assert_eq!(TypeId::Geometry.fixed_size(), None);
+        assert_eq!(TypeId::Matrix.fixed_size(), None);
+        assert_eq!(TypeId::Range.fixed_size(), None);
+        assert_eq!(TypeId::HyperLogLog.fixed_size(), None);
+        assert_eq!(TypeId::BloomFilter.fixed_size(), None);
+        assert_eq!(TypeId::TDigest.fixed_size(), None);
+        assert_eq!(TypeId::CountMinSketch.fixed_size(), None);
+    }
+
+    #[test]
+    fn test_extended_fixed_size_types() {
+        assert_eq!(TypeId::Color.fixed_size(), Some(4));
+        assert_eq!(TypeId::SemVer.fixed_size(), Some(8));
+        assert_eq!(TypeId::Bitfield.fixed_size(), Some(8));
+        assert_eq!(TypeId::MacAddr.fixed_size(), Some(6));
+        assert_eq!(TypeId::Inet.fixed_size(), Some(18));
+        assert_eq!(TypeId::Cidr.fixed_size(), Some(18));
+        assert_eq!(TypeId::Money.fixed_size(), Some(10));
+        assert_eq!(TypeId::Quantity.fixed_size(), Some(10));
     }
 
     #[test]
@@ -379,6 +497,58 @@ mod tests {
         assert_eq!(TypeId::Array.to_string(), "ARRAY");
         assert_eq!(TypeId::Composite.to_string(), "COMPOSITE");
         assert_eq!(TypeId::Vector.to_string(), "VECTOR");
+        assert_eq!(TypeId::Geometry.to_string(), "GEOMETRY");
+        assert_eq!(TypeId::Matrix.to_string(), "MATRIX");
+        assert_eq!(TypeId::Color.to_string(), "COLOR");
+        assert_eq!(TypeId::SemVer.to_string(), "SEMVER");
+        assert_eq!(TypeId::Inet.to_string(), "INET");
+        assert_eq!(TypeId::Cidr.to_string(), "CIDR");
+        assert_eq!(TypeId::MacAddr.to_string(), "MACADDR");
+        assert_eq!(TypeId::Money.to_string(), "MONEY");
+        assert_eq!(TypeId::Range.to_string(), "RANGE");
+        assert_eq!(TypeId::HyperLogLog.to_string(), "HYPERLOGLOG");
+        assert_eq!(TypeId::BloomFilter.to_string(), "BLOOMFILTER");
+        assert_eq!(TypeId::TDigest.to_string(), "TDIGEST");
+        assert_eq!(TypeId::CountMinSketch.to_string(), "COUNTMINSKETCH");
+        assert_eq!(TypeId::Bitfield.to_string(), "BITFIELD");
+        assert_eq!(TypeId::Quantity.to_string(), "QUANTITY");
+    }
+
+    #[test]
+    fn test_is_extended_type() {
+        assert!(TypeId::Geometry.is_extended_type());
+        assert!(TypeId::Matrix.is_extended_type());
+        assert!(TypeId::Color.is_extended_type());
+        assert!(TypeId::SemVer.is_extended_type());
+        assert!(TypeId::Money.is_extended_type());
+        assert!(TypeId::HyperLogLog.is_extended_type());
+        assert!(TypeId::Bitfield.is_extended_type());
+        assert!(TypeId::Quantity.is_extended_type());
+
+        assert!(!TypeId::Int64.is_extended_type());
+        assert!(!TypeId::Varchar.is_extended_type());
+        assert!(!TypeId::Vector.is_extended_type());
+    }
+
+    #[test]
+    fn test_is_probabilistic() {
+        assert!(TypeId::HyperLogLog.is_probabilistic());
+        assert!(TypeId::BloomFilter.is_probabilistic());
+        assert!(TypeId::TDigest.is_probabilistic());
+        assert!(TypeId::CountMinSketch.is_probabilistic());
+
+        assert!(!TypeId::Geometry.is_probabilistic());
+        assert!(!TypeId::Int64.is_probabilistic());
+    }
+
+    #[test]
+    fn test_is_network() {
+        assert!(TypeId::Inet.is_network());
+        assert!(TypeId::Cidr.is_network());
+        assert!(TypeId::MacAddr.is_network());
+
+        assert!(!TypeId::Varchar.is_network());
+        assert!(!TypeId::Geometry.is_network());
     }
 
     #[test]
@@ -397,6 +567,21 @@ mod tests {
         assert_eq!(TypeId::Array as u8, 100);
         assert_eq!(TypeId::Composite as u8, 110);
         assert_eq!(TypeId::Vector as u8, 120);
+        assert_eq!(TypeId::Geometry as u8, 130);
+        assert_eq!(TypeId::Matrix as u8, 140);
+        assert_eq!(TypeId::Color as u8, 150);
+        assert_eq!(TypeId::SemVer as u8, 160);
+        assert_eq!(TypeId::Inet as u8, 170);
+        assert_eq!(TypeId::Cidr as u8, 171);
+        assert_eq!(TypeId::MacAddr as u8, 172);
+        assert_eq!(TypeId::Money as u8, 180);
+        assert_eq!(TypeId::Range as u8, 190);
+        assert_eq!(TypeId::HyperLogLog as u8, 210);
+        assert_eq!(TypeId::BloomFilter as u8, 211);
+        assert_eq!(TypeId::TDigest as u8, 212);
+        assert_eq!(TypeId::CountMinSketch as u8, 213);
+        assert_eq!(TypeId::Bitfield as u8, 220);
+        assert_eq!(TypeId::Quantity as u8, 240);
     }
 
     #[test]
@@ -467,6 +652,21 @@ mod tests {
             TypeId::Array,
             TypeId::Composite,
             TypeId::Vector,
+            TypeId::Geometry,
+            TypeId::Matrix,
+            TypeId::Color,
+            TypeId::SemVer,
+            TypeId::Inet,
+            TypeId::Cidr,
+            TypeId::MacAddr,
+            TypeId::Money,
+            TypeId::Range,
+            TypeId::HyperLogLog,
+            TypeId::BloomFilter,
+            TypeId::TDigest,
+            TypeId::CountMinSketch,
+            TypeId::Bitfield,
+            TypeId::Quantity,
         ];
 
         for type_id in all_types {

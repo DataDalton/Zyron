@@ -552,9 +552,13 @@ pub struct BoundDelete {
 const AGGREGATE_FUNCTIONS: &[&str] = &["count", "sum", "avg", "min", "max"];
 
 fn is_aggregate_function(name: &str) -> bool {
-    AGGREGATE_FUNCTIONS
+    if AGGREGATE_FUNCTIONS
         .iter()
         .any(|&f| f.eq_ignore_ascii_case(name))
+    {
+        return true;
+    }
+    zyron_types::is_types_aggregate_function(name)
 }
 
 // ---------------------------------------------------------------------------
@@ -1778,6 +1782,7 @@ fn literal_type(lit: &LiteralValue) -> TypeId {
         LiteralValue::String(_) => TypeId::Varchar,
         LiteralValue::Boolean(_) => TypeId::Boolean,
         LiteralValue::Null => TypeId::Null,
+        LiteralValue::Interval(_) => TypeId::Interval,
     }
 }
 
@@ -1798,12 +1803,49 @@ fn infer_binary_type(op: &BinaryOperator, left: TypeId, right: TypeId) -> Result
         // Concatenation produces Varchar
         BinaryOperator::Concat => Ok(TypeId::Varchar),
 
-        // Arithmetic operators: promote to the wider numeric type
-        BinaryOperator::Plus
-        | BinaryOperator::Minus
-        | BinaryOperator::Multiply
-        | BinaryOperator::Divide
-        | BinaryOperator::Modulo => Ok(promote_numeric(left, right)),
+        // Arithmetic operators: handle interval arithmetic, then fall back to numeric promotion
+        BinaryOperator::Plus | BinaryOperator::Minus => {
+            match (left, right) {
+                // timestamp +/- interval -> timestamp
+                (TypeId::Timestamp, TypeId::Interval) | (TypeId::Interval, TypeId::Timestamp)
+                    if matches!(op, BinaryOperator::Plus) =>
+                {
+                    Ok(TypeId::Timestamp)
+                }
+                (TypeId::Timestamp, TypeId::Interval) if matches!(op, BinaryOperator::Minus) => {
+                    Ok(TypeId::Timestamp)
+                }
+                (TypeId::TimestampTz, TypeId::Interval)
+                | (TypeId::Interval, TypeId::TimestampTz)
+                    if matches!(op, BinaryOperator::Plus) =>
+                {
+                    Ok(TypeId::TimestampTz)
+                }
+                (TypeId::TimestampTz, TypeId::Interval) if matches!(op, BinaryOperator::Minus) => {
+                    Ok(TypeId::TimestampTz)
+                }
+                (TypeId::Date, TypeId::Interval) | (TypeId::Interval, TypeId::Date)
+                    if matches!(op, BinaryOperator::Plus) =>
+                {
+                    Ok(TypeId::Timestamp)
+                }
+                (TypeId::Date, TypeId::Interval) if matches!(op, BinaryOperator::Minus) => {
+                    Ok(TypeId::Timestamp)
+                }
+                // interval +/- interval -> interval
+                (TypeId::Interval, TypeId::Interval) => Ok(TypeId::Interval),
+                _ => Ok(promote_numeric(left, right)),
+            }
+        }
+        BinaryOperator::Multiply => {
+            match (left, right) {
+                // interval * numeric -> interval (scalar multiplication)
+                (TypeId::Interval, r) if r.is_numeric() => Ok(TypeId::Interval),
+                (l, TypeId::Interval) if l.is_numeric() => Ok(TypeId::Interval),
+                _ => Ok(promote_numeric(left, right)),
+            }
+        }
+        BinaryOperator::Divide | BinaryOperator::Modulo => Ok(promote_numeric(left, right)),
     }
 }
 
@@ -1875,10 +1917,16 @@ fn infer_aggregate_type(name: &str, arg_types: &[TypeId]) -> Result<TypeId> {
                 Ok(TypeId::Null)
             }
         }
-        _ => Err(ZyronError::PlanError(format!(
-            "unknown aggregate function: {}",
-            name
-        ))),
+        _ => {
+            // Delegate to zyron-types for extended aggregates (first, last, time_weight, etc.)
+            if let Some(t) = zyron_types::infer_types_aggregate_return_type(&lower, arg_types) {
+                return Ok(t);
+            }
+            Err(ZyronError::PlanError(format!(
+                "unknown aggregate function: {}",
+                name
+            )))
+        }
     }
 }
 
@@ -1900,7 +1948,13 @@ fn infer_function_type(name: &str, arg_types: &[TypeId]) -> TypeId {
         "coalesce" => arg_types.first().copied().unwrap_or(TypeId::Null),
         "nullif" => arg_types.first().copied().unwrap_or(TypeId::Null),
         "greatest" | "least" => arg_types.first().copied().unwrap_or(TypeId::Null),
-        _ => arg_types.first().copied().unwrap_or(TypeId::Null),
+        _ => {
+            // Delegate to zyron-types registry for extended scalar functions
+            if let Some(t) = zyron_types::infer_types_scalar_return_type(&lower, arg_types) {
+                return t;
+            }
+            arg_types.first().copied().unwrap_or(TypeId::Null)
+        }
     }
 }
 

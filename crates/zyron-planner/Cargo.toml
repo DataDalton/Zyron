@@ -8,6 +8,7 @@ rust-version.workspace = true
 zyron-common = { path = "../zyron-common" }
 zyron-parser = { path = "../zyron-parser" }
 zyron-catalog = { path = "../zyron-catalog" }
+zyron-types = { path = "../zyron-types" }
 tokio.workspace = true
 
 [dev-dependencies]

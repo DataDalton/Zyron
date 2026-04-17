@@ -214,8 +214,10 @@ fn decode_fixed_scalar(type_id: TypeId, bytes: &[u8]) -> ScalarValue {
         }
         TypeId::Float32 => ScalarValue::Float32(f32::from_le_bytes(bytes[..4].try_into().unwrap())),
         TypeId::Float64 => ScalarValue::Float64(f64::from_le_bytes(bytes[..8].try_into().unwrap())),
-        TypeId::Uuid | TypeId::Interval => {
-            ScalarValue::FixedBinary16(bytes[..16].try_into().unwrap())
+        TypeId::Uuid => ScalarValue::FixedBinary16(bytes[..16].try_into().unwrap()),
+        TypeId::Interval => {
+            let arr: [u8; 16] = bytes[..16].try_into().unwrap();
+            ScalarValue::Interval(zyron_common::Interval::from_le_bytes(&arr))
         }
         _ => ScalarValue::Null,
     }
@@ -295,9 +297,8 @@ fn encode_fixed_scalar(buf: &mut Vec<u8>, type_id: TypeId, scalar: &ScalarValue)
         (TypeId::UInt64, ScalarValue::UInt64(v)) => buf.extend_from_slice(&v.to_le_bytes()),
         (TypeId::Float32, ScalarValue::Float32(v)) => buf.extend_from_slice(&v.to_le_bytes()),
         (TypeId::Float64, ScalarValue::Float64(v)) => buf.extend_from_slice(&v.to_le_bytes()),
-        (TypeId::Uuid | TypeId::Interval, ScalarValue::FixedBinary16(v)) => {
-            buf.extend_from_slice(v)
-        }
+        (TypeId::Uuid, ScalarValue::FixedBinary16(v)) => buf.extend_from_slice(v),
+        (TypeId::Interval, ScalarValue::Interval(i)) => buf.extend_from_slice(&i.to_le_bytes()),
         _ => {
             if let Some(size) = type_id.fixed_size() {
                 buf.extend(std::iter::repeat(0u8).take(size));

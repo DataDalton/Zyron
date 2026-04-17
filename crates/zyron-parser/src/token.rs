@@ -310,6 +310,22 @@ pub enum Keyword {
     // Vector type
     Vector,
 
+    // Extended types (Phase 14)
+    Geometry,
+    Matrix,
+    Color,
+    Semver,
+    Inet,
+    Cidr,
+    Macaddr,
+    Money,
+    HyperLogLog,
+    BloomFilter,
+    Tdigest,
+    CountMinSketch,
+    Bitfield,
+    Quantity,
+
     // Analytics (ROLLUP, CUBE, GROUPING SETS, QUALIFY)
     Rollup,
     Cube,
@@ -861,6 +877,22 @@ pub fn lookup_keyword(word: &str) -> Option<Keyword> {
 
         // Vector
         "VECTOR" => Some(Keyword::Vector),
+
+        // Extended types (Phase 14)
+        "GEOMETRY" => Some(Keyword::Geometry),
+        "MATRIX" => Some(Keyword::Matrix),
+        "COLOR" => Some(Keyword::Color),
+        "SEMVER" => Some(Keyword::Semver),
+        "INET" => Some(Keyword::Inet),
+        "CIDR" => Some(Keyword::Cidr),
+        "MACADDR" => Some(Keyword::Macaddr),
+        "MONEY" => Some(Keyword::Money),
+        "HYPERLOGLOG" => Some(Keyword::HyperLogLog),
+        "BLOOMFILTER" | "BLOOM_FILTER" => Some(Keyword::BloomFilter),
+        "TDIGEST" | "T_DIGEST" => Some(Keyword::Tdigest),
+        "COUNTMINSKETCH" | "COUNT_MIN_SKETCH" => Some(Keyword::CountMinSketch),
+        "BITFIELD" => Some(Keyword::Bitfield),
+        "QUANTITY" => Some(Keyword::Quantity),
 
         // Analytics
         "ROLLUP" => Some(Keyword::Rollup),

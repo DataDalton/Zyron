@@ -2800,6 +2800,7 @@ fn expr_to_string(expr: &zyron_parser::Expr) -> String {
             zyron_parser::LiteralValue::String(s) => s.clone(),
             zyron_parser::LiteralValue::Boolean(b) => if *b { "on" } else { "off" }.into(),
             zyron_parser::LiteralValue::Null => "".into(),
+            zyron_parser::LiteralValue::Interval(i) => i.to_string(),
         },
         zyron_parser::Expr::Identifier(name) => name.clone(),
         _ => format!("{:?}", expr),

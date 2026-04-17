@@ -17,6 +17,7 @@ pub mod scan;
 pub mod setop;
 pub mod sort;
 pub mod vector_scan;
+pub mod window;
 
 use std::future::Future;
 use std::pin::Pin;

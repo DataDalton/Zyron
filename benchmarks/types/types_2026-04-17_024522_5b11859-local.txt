@@ -1,0 +1,8 @@
+
+=== Gap Fill ===
+  LOCF: hour 3 = 20 (expected 20) PASS
+  INTERPOLATE: hour 3 = 30 (expected 30) PASS
+
+=== ID Generation ===
+  100000 UUID v7 values unique + time-ordered PASS
+  100000 Snowflake IDs unique + monotonically increasing PASS

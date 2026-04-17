@@ -187,6 +187,10 @@ fn evaluate_literal(value: &LiteralValue, type_id: TypeId, num_rows: usize) -> R
             TypeId::Boolean,
         )),
         LiteralValue::Null => Ok(Column::null_column(type_id, num_rows)),
+        LiteralValue::Interval(i) => Ok(Column::new(
+            ColumnData::Interval(vec![*i; num_rows]),
+            TypeId::Interval,
+        )),
     }
 }
 
@@ -205,6 +209,16 @@ fn evaluate_binary_op(
     let left_col = evaluate(left, batch, schema, params)?;
     let right_col = evaluate(right, batch, schema, params)?;
 
+    // Intercept interval arithmetic before falling into the generic numeric path.
+    if matches!(
+        op,
+        BinaryOperator::Plus | BinaryOperator::Minus | BinaryOperator::Multiply
+    ) {
+        if let Some(result) = try_interval_arithmetic(op, &left_col, &right_col)? {
+            return Ok(result);
+        }
+    }
+
     match op {
         BinaryOperator::Plus => compute::arithmetic(&left_col, &right_col, ArithOp::Add),
         BinaryOperator::Minus => compute::arithmetic(&left_col, &right_col, ArithOp::Sub),
@@ -221,6 +235,170 @@ fn evaluate_binary_op(
         BinaryOperator::Or => bool_or(&left_col, &right_col),
         BinaryOperator::Concat => concat_strings(&left_col, &right_col),
     }
+}
+
+/// Handles arithmetic involving intervals: timestamp +/- interval, interval +/- interval,
+/// interval * numeric. Returns Ok(None) when neither operand is an interval (fall through).
+fn try_interval_arithmetic(
+    op: BinaryOperator,
+    left: &Column,
+    right: &Column,
+) -> Result<Option<Column>> {
+    use zyron_common::{Interval, TypeId as TI};
+
+    let is_timestamp =
+        |t: TypeId| matches!(t, TI::Timestamp | TI::TimestampTz | TI::Time | TI::Date);
+
+    // interval +/- interval -> interval
+    if left.type_id == TI::Interval && right.type_id == TI::Interval {
+        let la = match &left.data {
+            ColumnData::Interval(v) => v,
+            _ => return Ok(None),
+        };
+        let ra = match &right.data {
+            ColumnData::Interval(v) => v,
+            _ => return Ok(None),
+        };
+        let n = la.len().min(ra.len());
+        let mut out: Vec<Interval> = Vec::with_capacity(n);
+        for i in 0..n {
+            let v = match op {
+                BinaryOperator::Plus => la[i].add(ra[i]),
+                BinaryOperator::Minus => la[i].subtract(ra[i]),
+                _ => return Ok(None),
+            };
+            out.push(v);
+        }
+        return Ok(Some(Column::new(ColumnData::Interval(out), TI::Interval)));
+    }
+
+    // timestamp +/- interval -> timestamp (micros-based i64 columns)
+    if is_timestamp(left.type_id) && right.type_id == TI::Interval {
+        return Ok(Some(timestamp_interval_op(left, right, op, false)?));
+    }
+    if is_timestamp(right.type_id)
+        && left.type_id == TI::Interval
+        && matches!(op, BinaryOperator::Plus)
+    {
+        // interval + timestamp -> timestamp (commutative)
+        return Ok(Some(timestamp_interval_op(right, left, op, true)?));
+    }
+
+    // interval * numeric -> interval
+    if left.type_id == TI::Interval && right.type_id.is_numeric() {
+        return Ok(Some(interval_scalar_mul(left, right)?));
+    }
+    if right.type_id == TI::Interval && left.type_id.is_numeric() {
+        return Ok(Some(interval_scalar_mul(right, left)?));
+    }
+
+    Ok(None)
+}
+
+fn timestamp_interval_op(
+    ts: &Column,
+    iv: &Column,
+    op: BinaryOperator,
+    iv_on_left: bool,
+) -> Result<Column> {
+    let ts_values: &[i64] = match &ts.data {
+        ColumnData::Int64(v) => v,
+        ColumnData::Int32(v) => {
+            // Date column: rare, but promote to timestamp-micros by scaling days -> us
+            let promoted: Vec<i64> = v.iter().map(|&d| (d as i64) * 86_400_000_000).collect();
+            let mut result: Vec<i64> = Vec::with_capacity(promoted.len());
+            let iv_values = match &iv.data {
+                ColumnData::Interval(v) => v,
+                _ => {
+                    return Err(zyron_common::ZyronError::ExecutionError(
+                        "Interval column expected".into(),
+                    ));
+                }
+            };
+            let n = promoted.len().min(iv_values.len());
+            for i in 0..n {
+                let base = promoted[i];
+                let adjusted = match (op, iv_on_left) {
+                    (BinaryOperator::Plus, _) => iv_values[i].add_to_timestamp_micros(base),
+                    (BinaryOperator::Minus, false) => {
+                        iv_values[i].subtract_from_timestamp_micros(base)
+                    }
+                    _ => base,
+                };
+                result.push(adjusted);
+            }
+            return Ok(Column::new(
+                ColumnData::Int64(result),
+                zyron_common::TypeId::Timestamp,
+            ));
+        }
+        _ => {
+            return Err(zyron_common::ZyronError::ExecutionError(
+                "Timestamp column must be Int64 or Int32".into(),
+            ));
+        }
+    };
+
+    let iv_values = match &iv.data {
+        ColumnData::Interval(v) => v,
+        _ => {
+            return Err(zyron_common::ZyronError::ExecutionError(
+                "Interval column expected".into(),
+            ));
+        }
+    };
+
+    let n = ts_values.len().min(iv_values.len());
+    let mut result: Vec<i64> = Vec::with_capacity(n);
+    for i in 0..n {
+        let base = ts_values[i];
+        let adjusted = match (op, iv_on_left) {
+            (BinaryOperator::Plus, _) => iv_values[i].add_to_timestamp_micros(base),
+            (BinaryOperator::Minus, false) => iv_values[i].subtract_from_timestamp_micros(base),
+            _ => base,
+        };
+        result.push(adjusted);
+    }
+
+    Ok(Column::new(ColumnData::Int64(result), ts.type_id))
+}
+
+fn interval_scalar_mul(iv: &Column, scalar: &Column) -> Result<Column> {
+    let iv_values = match &iv.data {
+        ColumnData::Interval(v) => v,
+        _ => {
+            return Err(zyron_common::ZyronError::ExecutionError(
+                "Interval column expected".into(),
+            ));
+        }
+    };
+    let scalar_as_i64: Vec<i64> = match &scalar.data {
+        ColumnData::Int8(v) => v.iter().map(|&x| x as i64).collect(),
+        ColumnData::Int16(v) => v.iter().map(|&x| x as i64).collect(),
+        ColumnData::Int32(v) => v.iter().map(|&x| x as i64).collect(),
+        ColumnData::Int64(v) => v.clone(),
+        ColumnData::UInt8(v) => v.iter().map(|&x| x as i64).collect(),
+        ColumnData::UInt16(v) => v.iter().map(|&x| x as i64).collect(),
+        ColumnData::UInt32(v) => v.iter().map(|&x| x as i64).collect(),
+        ColumnData::UInt64(v) => v.iter().map(|&x| x as i64).collect(),
+        ColumnData::Float32(v) => v.iter().map(|&x| x as i64).collect(),
+        ColumnData::Float64(v) => v.iter().map(|&x| x as i64).collect(),
+        _ => {
+            return Err(zyron_common::ZyronError::ExecutionError(
+                "Scalar must be numeric for interval multiplication".into(),
+            ));
+        }
+    };
+
+    let n = iv_values.len().min(scalar_as_i64.len());
+    let mut out: Vec<zyron_common::Interval> = Vec::with_capacity(n);
+    for i in 0..n {
+        out.push(iv_values[i].multiply_by(scalar_as_i64[i]));
+    }
+    Ok(Column::new(
+        ColumnData::Interval(out),
+        zyron_common::TypeId::Interval,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -419,9 +597,7 @@ fn evaluate_function(
             let b = evaluate(&args[1], batch, schema, params)?;
             eval_nullif(&a, &b)
         }
-        _ => Err(ZyronError::ExecutionError(format!(
-            "unknown function: {name}"
-        ))),
+        _ => crate::types_bridge::evaluate_types_function(name, args, batch, schema, params),
     }
 }
 

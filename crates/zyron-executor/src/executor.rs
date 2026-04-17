@@ -576,6 +576,22 @@ fn build_operator_tree(
                 let child_m = collect_metrics(&[&child_br.metrics]);
                 Ok(BuildResult::new(child_br.op).with_metrics("Broadcast", analyze, child_m))
             }
+
+            PhysicalPlan::Window {
+                window_exprs,
+                child,
+                ..
+            } => {
+                let input_schema = child.output_schema();
+                let child_br = build_operator_tree(*child, ctx).await?;
+                let child_m = collect_metrics(&[&child_br.metrics]);
+                let op = crate::operator::window::WindowOperator::new(
+                    child_br.op,
+                    window_exprs,
+                    input_schema,
+                );
+                Ok(BuildResult::new(Box::new(op)).with_metrics("Window", analyze, child_m))
+            }
         };
         result
     })

@@ -1477,6 +1477,8 @@ pub enum LiteralValue {
     String(String),
     Boolean(bool),
     Null,
+    /// SQL INTERVAL literal - composite (months, days, nanoseconds) value.
+    Interval(zyron_common::Interval),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1566,8 +1568,12 @@ pub enum WindowFrameBound {
     CurrentRow,
     /// UNBOUNDED PRECEDING / UNBOUNDED FOLLOWING
     Unbounded(WindowFrameDirection),
-    /// N PRECEDING / N FOLLOWING
+    /// N PRECEDING / N FOLLOWING (row count in ROWS mode, numeric offset in RANGE mode)
     Offset(u64, WindowFrameDirection),
+    /// INTERVAL 'N unit' PRECEDING / FOLLOWING.
+    /// Only valid in RANGE mode. The comparison uses calendar-aware arithmetic
+    /// against the ORDER BY column's timestamp values.
+    IntervalBound(zyron_common::Interval, WindowFrameDirection),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1704,6 +1710,36 @@ pub enum DataType {
     Array(Box<DataType>),
     /// Vector type: VECTOR(dimensions)
     Vector(Option<usize>),
+    /// Geospatial geometry type (WKB storage)
+    Geometry,
+    /// Dense matrix type (row-major f64 array)
+    Matrix,
+    /// RGBA color type (packed u32)
+    Color,
+    /// Semantic versioning type
+    SemVer,
+    /// IPv4/IPv6 host address with optional prefix
+    Inet,
+    /// IPv4/IPv6 network address (CIDR notation)
+    Cidr,
+    /// MAC address (6 bytes)
+    MacAddr,
+    /// Currency-aware money type (fixed-point with currency code)
+    Money,
+    /// Range type parameterized by element type
+    Range(Box<DataType>),
+    /// HyperLogLog approximate cardinality sketch
+    HyperLogLog,
+    /// Bloom filter for probabilistic set membership
+    BloomFilter,
+    /// T-Digest for approximate quantile estimation
+    TDigest,
+    /// Count-Min Sketch for approximate frequency counting
+    CountMinSketch,
+    /// Named bitfield (u64 with named bit positions)
+    Bitfield,
+    /// Unit-aware quantity (value + unit)
+    Quantity,
 }
 
 impl DataType {
@@ -1748,6 +1784,21 @@ impl DataType {
             DataType::Jsonb => TypeId::Jsonb,
             DataType::Array(_) => TypeId::Array,
             DataType::Vector(_) => TypeId::Vector,
+            DataType::Geometry => TypeId::Geometry,
+            DataType::Matrix => TypeId::Matrix,
+            DataType::Color => TypeId::Color,
+            DataType::SemVer => TypeId::SemVer,
+            DataType::Inet => TypeId::Inet,
+            DataType::Cidr => TypeId::Cidr,
+            DataType::MacAddr => TypeId::MacAddr,
+            DataType::Money => TypeId::Money,
+            DataType::Range(_) => TypeId::Range,
+            DataType::HyperLogLog => TypeId::HyperLogLog,
+            DataType::BloomFilter => TypeId::BloomFilter,
+            DataType::TDigest => TypeId::TDigest,
+            DataType::CountMinSketch => TypeId::CountMinSketch,
+            DataType::Bitfield => TypeId::Bitfield,
+            DataType::Quantity => TypeId::Quantity,
         }
     }
 }

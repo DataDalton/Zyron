@@ -211,6 +211,7 @@ pub enum ScalarValue {
     Utf8(String),
     Binary(Vec<u8>),
     FixedBinary16([u8; 16]),
+    Interval(zyron_common::Interval),
 }
 
 impl PartialEq for ScalarValue {
@@ -232,6 +233,7 @@ impl PartialEq for ScalarValue {
             (ScalarValue::Utf8(a), ScalarValue::Utf8(b)) => a == b,
             (ScalarValue::Binary(a), ScalarValue::Binary(b)) => a == b,
             (ScalarValue::FixedBinary16(a), ScalarValue::FixedBinary16(b)) => a == b,
+            (ScalarValue::Interval(a), ScalarValue::Interval(b)) => a == b,
             _ => false,
         }
     }
@@ -259,6 +261,7 @@ impl std::hash::Hash for ScalarValue {
             ScalarValue::Utf8(v) => v.hash(state),
             ScalarValue::Binary(v) => v.hash(state),
             ScalarValue::FixedBinary16(v) => v.hash(state),
+            ScalarValue::Interval(v) => v.hash(state),
         }
     }
 }
@@ -284,6 +287,7 @@ impl PartialOrd for ScalarValue {
             (ScalarValue::Utf8(a), ScalarValue::Utf8(b)) => a.partial_cmp(b),
             (ScalarValue::Binary(a), ScalarValue::Binary(b)) => a.partial_cmp(b),
             (ScalarValue::FixedBinary16(a), ScalarValue::FixedBinary16(b)) => a.partial_cmp(b),
+            (ScalarValue::Interval(a), ScalarValue::Interval(b)) => a.partial_cmp(b),
             _ => None,
         }
     }
@@ -309,6 +313,7 @@ impl ScalarValue {
             ScalarValue::Utf8(_) => TypeId::Text,
             ScalarValue::Binary(_) => TypeId::Bytea,
             ScalarValue::FixedBinary16(_) => TypeId::Uuid,
+            ScalarValue::Interval(_) => TypeId::Interval,
         }
     }
 
@@ -355,6 +360,7 @@ impl fmt::Display for ScalarValue {
             ScalarValue::Utf8(v) => write!(f, "{v}"),
             ScalarValue::Binary(v) => write!(f, "<{} bytes>", v.len()),
             ScalarValue::FixedBinary16(_) => write!(f, "<16 bytes>"),
+            ScalarValue::Interval(i) => write!(f, "{i}"),
         }
     }
 }
@@ -382,6 +388,7 @@ pub enum ColumnData {
     Utf8(Vec<String>),
     Binary(Vec<Vec<u8>>),
     FixedBinary16(Vec<[u8; 16]>),
+    Interval(Vec<zyron_common::Interval>),
 }
 
 /// Applies an operation to each ColumnData variant, returning a new ColumnData.
@@ -403,6 +410,7 @@ macro_rules! dispatch_column {
             ColumnData::Utf8($v) => ColumnData::Utf8($body),
             ColumnData::Binary($v) => ColumnData::Binary($body),
             ColumnData::FixedBinary16($v) => ColumnData::FixedBinary16($body),
+            ColumnData::Interval($v) => ColumnData::Interval($body),
         }
     };
 }
@@ -426,8 +434,10 @@ impl ColumnData {
             TypeId::Int128 | TypeId::Decimal => ColumnData::Int128(Vec::with_capacity(cap)),
             TypeId::UInt8 => ColumnData::UInt8(Vec::with_capacity(cap)),
             TypeId::UInt16 => ColumnData::UInt16(Vec::with_capacity(cap)),
-            TypeId::UInt32 => ColumnData::UInt32(Vec::with_capacity(cap)),
-            TypeId::UInt64 => ColumnData::UInt64(Vec::with_capacity(cap)),
+            TypeId::UInt32 | TypeId::Color => ColumnData::UInt32(Vec::with_capacity(cap)),
+            TypeId::UInt64 | TypeId::SemVer | TypeId::Bitfield => {
+                ColumnData::UInt64(Vec::with_capacity(cap))
+            }
             TypeId::UInt128 => ColumnData::Int128(Vec::with_capacity(cap)),
             TypeId::Float32 => ColumnData::Float32(Vec::with_capacity(cap)),
             TypeId::Float64 => ColumnData::Float64(Vec::with_capacity(cap)),
@@ -439,8 +449,21 @@ impl ColumnData {
             | TypeId::Bytea
             | TypeId::Array
             | TypeId::Composite
-            | TypeId::Vector => ColumnData::Binary(Vec::with_capacity(cap)),
-            TypeId::Uuid | TypeId::Interval => ColumnData::FixedBinary16(Vec::with_capacity(cap)),
+            | TypeId::Vector
+            | TypeId::Geometry
+            | TypeId::Matrix
+            | TypeId::Range
+            | TypeId::HyperLogLog
+            | TypeId::BloomFilter
+            | TypeId::TDigest
+            | TypeId::CountMinSketch
+            | TypeId::Inet
+            | TypeId::Cidr
+            | TypeId::Money
+            | TypeId::Quantity
+            | TypeId::MacAddr => ColumnData::Binary(Vec::with_capacity(cap)),
+            TypeId::Uuid => ColumnData::FixedBinary16(Vec::with_capacity(cap)),
+            TypeId::Interval => ColumnData::Interval(Vec::with_capacity(cap)),
             TypeId::Null => ColumnData::Boolean(Vec::with_capacity(cap)),
         }
     }
@@ -462,6 +485,7 @@ impl ColumnData {
             ColumnData::Utf8(v) => v.len(),
             ColumnData::Binary(v) => v.len(),
             ColumnData::FixedBinary16(v) => v.len(),
+            ColumnData::Interval(v) => v.len(),
         }
     }
 
@@ -509,6 +533,7 @@ impl ColumnData {
             ColumnData::Utf8(v) => ScalarValue::Utf8(v[row].clone()),
             ColumnData::Binary(v) => ScalarValue::Binary(v[row].clone()),
             ColumnData::FixedBinary16(v) => ScalarValue::FixedBinary16(v[row]),
+            ColumnData::Interval(v) => ScalarValue::Interval(v[row]),
         }
     }
 
@@ -545,6 +570,8 @@ impl ColumnData {
             (ColumnData::Binary(v), _) => v.push(Vec::new()),
             (ColumnData::FixedBinary16(v), ScalarValue::FixedBinary16(s)) => v.push(*s),
             (ColumnData::FixedBinary16(v), _) => v.push([0u8; 16]),
+            (ColumnData::Interval(v), ScalarValue::Interval(s)) => v.push(*s),
+            (ColumnData::Interval(v), _) => v.push(zyron_common::Interval::ZERO),
         }
     }
 
@@ -706,8 +733,8 @@ impl ColumnData {
             TypeId::Int128 | TypeId::Decimal | TypeId::UInt128 => ColumnData::Int128(vec![0; len]),
             TypeId::UInt8 => ColumnData::UInt8(vec![0; len]),
             TypeId::UInt16 => ColumnData::UInt16(vec![0; len]),
-            TypeId::UInt32 => ColumnData::UInt32(vec![0; len]),
-            TypeId::UInt64 => ColumnData::UInt64(vec![0; len]),
+            TypeId::UInt32 | TypeId::Color => ColumnData::UInt32(vec![0; len]),
+            TypeId::UInt64 | TypeId::SemVer | TypeId::Bitfield => ColumnData::UInt64(vec![0; len]),
             TypeId::Float32 => ColumnData::Float32(vec![0.0; len]),
             TypeId::Float64 => ColumnData::Float64(vec![0.0; len]),
             TypeId::Char | TypeId::Varchar | TypeId::Text | TypeId::Json | TypeId::Jsonb => {
@@ -718,8 +745,21 @@ impl ColumnData {
             | TypeId::Bytea
             | TypeId::Array
             | TypeId::Composite
-            | TypeId::Vector => ColumnData::Binary(vec![Vec::new(); len]),
-            TypeId::Uuid | TypeId::Interval => ColumnData::FixedBinary16(vec![[0u8; 16]; len]),
+            | TypeId::Vector
+            | TypeId::Geometry
+            | TypeId::Matrix
+            | TypeId::Range
+            | TypeId::HyperLogLog
+            | TypeId::BloomFilter
+            | TypeId::TDigest
+            | TypeId::CountMinSketch
+            | TypeId::Inet
+            | TypeId::Cidr
+            | TypeId::MacAddr
+            | TypeId::Money
+            | TypeId::Quantity => ColumnData::Binary(vec![Vec::new(); len]),
+            TypeId::Uuid => ColumnData::FixedBinary16(vec![[0u8; 16]; len]),
+            TypeId::Interval => ColumnData::Interval(vec![zyron_common::Interval::ZERO; len]),
             TypeId::Null => ColumnData::Boolean(vec![false; len]),
         }
     }
@@ -743,6 +783,7 @@ impl ColumnData {
             ColumnData::Utf8(v) => v.push(String::new()),
             ColumnData::Binary(v) => v.push(Vec::new()),
             ColumnData::FixedBinary16(v) => v.push([0u8; 16]),
+            ColumnData::Interval(v) => v.push(zyron_common::Interval::ZERO),
         }
     }
 
@@ -765,6 +806,7 @@ impl ColumnData {
             ScalarValue::Utf8(v) => ColumnData::Utf8(vec![v.clone(); len]),
             ScalarValue::Binary(v) => ColumnData::Binary(vec![v.clone(); len]),
             ScalarValue::FixedBinary16(v) => ColumnData::FixedBinary16(vec![*v; len]),
+            ScalarValue::Interval(v) => ColumnData::Interval(vec![*v; len]),
         }
     }
 }

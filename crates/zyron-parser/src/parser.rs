@@ -1819,6 +1819,69 @@ impl<'a> Parser<'a> {
                 };
                 Ok(DataType::Vector(dim))
             }
+            Token::Keyword(Keyword::Geometry) => {
+                self.advance()?;
+                Ok(DataType::Geometry)
+            }
+            Token::Keyword(Keyword::Matrix) => {
+                self.advance()?;
+                Ok(DataType::Matrix)
+            }
+            Token::Keyword(Keyword::Color) => {
+                self.advance()?;
+                Ok(DataType::Color)
+            }
+            Token::Keyword(Keyword::Semver) => {
+                self.advance()?;
+                Ok(DataType::SemVer)
+            }
+            Token::Keyword(Keyword::Inet) => {
+                self.advance()?;
+                Ok(DataType::Inet)
+            }
+            Token::Keyword(Keyword::Cidr) => {
+                self.advance()?;
+                Ok(DataType::Cidr)
+            }
+            Token::Keyword(Keyword::Macaddr) => {
+                self.advance()?;
+                Ok(DataType::MacAddr)
+            }
+            Token::Keyword(Keyword::Money) => {
+                self.advance()?;
+                Ok(DataType::Money)
+            }
+            Token::Keyword(Keyword::Range) => {
+                self.advance()?;
+                self.expect_token(&Token::LParen)?;
+                let elem_type = self.parse_data_type()?;
+                self.expect_token(&Token::RParen)?;
+                Ok(DataType::Range(Box::new(elem_type)))
+            }
+            Token::Keyword(Keyword::HyperLogLog) => {
+                self.advance()?;
+                Ok(DataType::HyperLogLog)
+            }
+            Token::Keyword(Keyword::BloomFilter) => {
+                self.advance()?;
+                Ok(DataType::BloomFilter)
+            }
+            Token::Keyword(Keyword::Tdigest) => {
+                self.advance()?;
+                Ok(DataType::TDigest)
+            }
+            Token::Keyword(Keyword::CountMinSketch) => {
+                self.advance()?;
+                Ok(DataType::CountMinSketch)
+            }
+            Token::Keyword(Keyword::Bitfield) => {
+                self.advance()?;
+                Ok(DataType::Bitfield)
+            }
+            Token::Keyword(Keyword::Quantity) => {
+                self.advance()?;
+                Ok(DataType::Quantity)
+            }
             _ => Err(self.error(&format!("Expected data type, found {}", self.current.token))),
         }
     }
@@ -2012,6 +2075,22 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Null) => {
                 self.advance()?;
                 Ok(Expr::Literal(LiteralValue::Null))
+            }
+            Token::Keyword(Keyword::Interval) if matches!(&self.peek.token, Token::String(_)) => {
+                // INTERVAL 'string' literal.
+                // NOTE: INTERVAL as a type name (e.g. in CAST, column types) is
+                // still handled by parse_base_data_type because those contexts
+                // consume INTERVAL without a following string literal.
+                self.advance()?; // consume INTERVAL
+                let s = if let Token::String(s) = &self.current.token {
+                    s.clone()
+                } else {
+                    return Err(self.error("Expected string literal after INTERVAL"));
+                };
+                self.advance()?; // consume string
+                let interval = zyron_common::parse_interval_string(&s)
+                    .map_err(|e| self.error(&format!("Invalid INTERVAL '{}': {}", s, e)))?;
+                Ok(Expr::Literal(LiteralValue::Interval(interval)))
             }
             Token::Ident(_) => {
                 let name = self.parse_ident()?;
@@ -2313,6 +2392,21 @@ impl<'a> Parser<'a> {
             self.advance()?;
             let direction = self.parse_frame_direction()?;
             return Ok(WindowFrameBound::Unbounded(direction));
+        }
+
+        // INTERVAL 'N unit' PRECEDING/FOLLOWING
+        if self.at_keyword(Keyword::Interval) {
+            self.advance()?; // consume INTERVAL
+            let s = if let Token::String(s) = &self.current.token {
+                s.clone()
+            } else {
+                return Err(self.error("Expected string literal after INTERVAL in frame bound"));
+            };
+            self.advance()?; // consume string
+            let interval = zyron_common::parse_interval_string(&s)
+                .map_err(|e| self.error(&format!("Invalid INTERVAL '{}': {}", s, e)))?;
+            let direction = self.parse_frame_direction()?;
+            return Ok(WindowFrameBound::IntervalBound(interval, direction));
         }
 
         // N PRECEDING/FOLLOWING
@@ -9833,6 +9927,116 @@ mod tests {
                 }
             }
             _ => panic!("Expected Select"),
+        }
+    }
+
+    // ----- INTERVAL literal parsing -----
+
+    fn extract_interval_literal(sql: &str) -> zyron_common::Interval {
+        let stmts = parse_all(sql);
+        let s = match &stmts[0] {
+            Statement::Select(s) => s,
+            other => panic!("Expected Select, got {:?}", other),
+        };
+        match &s.projections[0] {
+            SelectItem::Expr(Expr::Literal(LiteralValue::Interval(i)), _) => *i,
+            other => panic!("Expected INTERVAL literal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_interval_literal_in_select() {
+        let i = extract_interval_literal("SELECT INTERVAL '1 hour'");
+        assert_eq!(i.nanoseconds, 3_600_000_000_000);
+        assert_eq!(i.days, 0);
+        assert_eq!(i.months, 0);
+    }
+
+    #[test]
+    fn test_parse_interval_compound() {
+        let i = extract_interval_literal("SELECT INTERVAL '1 year 3 months 2 days'");
+        assert_eq!(i.months, 15);
+        assert_eq!(i.days, 2);
+        assert_eq!(i.nanoseconds, 0);
+    }
+
+    #[test]
+    fn test_parse_interval_colon_form() {
+        let i = extract_interval_literal("SELECT INTERVAL '02:30:00'");
+        let expected = 2 * 3_600_000_000_000 + 30 * 60_000_000_000;
+        assert_eq!(i.nanoseconds, expected);
+    }
+
+    #[test]
+    fn test_parse_interval_picosecond_via_word_form() {
+        let i = extract_interval_literal("SELECT INTERVAL '2000 picoseconds'");
+        // 2000 ps = 2 ns
+        assert_eq!(i.nanoseconds, 2);
+    }
+
+    #[test]
+    fn test_parse_interval_millennium() {
+        let i = extract_interval_literal("SELECT INTERVAL '1 millennium'");
+        assert_eq!(i.months, 12_000);
+    }
+
+    #[test]
+    fn test_parse_interval_mixed_calendar_and_colon() {
+        let i = extract_interval_literal("SELECT INTERVAL '1 year 2 months 3 days 04:05:06.789'");
+        let expected_nanos =
+            4 * 3_600_000_000_000 + 5 * 60_000_000_000 + 6 * 1_000_000_000 + 789_000_000;
+        assert_eq!(i.months, 14);
+        assert_eq!(i.days, 3);
+        assert_eq!(i.nanoseconds, expected_nanos);
+    }
+
+    #[test]
+    fn test_parse_interval_bad_string() {
+        let mut parser = Parser::new("SELECT INTERVAL 'not a valid interval'").unwrap();
+        assert!(parser.parse_statement().is_err());
+    }
+
+    #[test]
+    fn test_parse_range_between_interval() {
+        let sql = "SELECT AVG(x) OVER (ORDER BY t RANGE BETWEEN INTERVAL '1 hour' PRECEDING AND CURRENT ROW) FROM m";
+        let stmts = parse_all(sql);
+        let s = match &stmts[0] {
+            Statement::Select(s) => s,
+            _ => panic!("Expected Select"),
+        };
+        match &s.projections[0] {
+            SelectItem::Expr(Expr::WindowFunction { frame, .. }, _) => {
+                let f = frame.as_ref().expect("frame present");
+                assert_eq!(f.mode, WindowFrameMode::Range);
+                match f.start {
+                    WindowFrameBound::IntervalBound(i, WindowFrameDirection::Preceding) => {
+                        assert_eq!(i.nanoseconds, 3_600_000_000_000);
+                    }
+                    other => panic!("Expected IntervalBound Preceding, got {:?}", other),
+                }
+            }
+            other => panic!("Expected WindowFunction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_rows_between_numeric_still_works() {
+        let sql = "SELECT AVG(x) OVER (ORDER BY t ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) FROM m";
+        let stmts = parse_all(sql);
+        let s = match &stmts[0] {
+            Statement::Select(s) => s,
+            _ => panic!("Expected Select"),
+        };
+        match &s.projections[0] {
+            SelectItem::Expr(Expr::WindowFunction { frame, .. }, _) => {
+                let f = frame.as_ref().expect("frame present");
+                assert_eq!(f.mode, WindowFrameMode::Rows);
+                assert!(matches!(
+                    f.start,
+                    WindowFrameBound::Offset(5, WindowFrameDirection::Preceding)
+                ));
+            }
+            other => panic!("Expected WindowFunction, got {:?}", other),
         }
     }
 }

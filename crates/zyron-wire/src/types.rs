@@ -58,6 +58,21 @@ pub fn type_id_to_pg_oid(type_id: TypeId) -> i32 {
         TypeId::Array | TypeId::Composite => PG_TEXT_OID,
         // Custom OID for vector type (matches pgvector convention).
         TypeId::Vector => 16385,
+        // Extended types: map to bytea for binary types, text for text-representable types.
+        TypeId::Geometry
+        | TypeId::Matrix
+        | TypeId::Range
+        | TypeId::HyperLogLog
+        | TypeId::BloomFilter
+        | TypeId::TDigest
+        | TypeId::CountMinSketch
+        | TypeId::Inet
+        | TypeId::Cidr
+        | TypeId::MacAddr
+        | TypeId::Money
+        | TypeId::Quantity => PG_BYTEA_OID,
+        TypeId::Color | TypeId::Bitfield => PG_INT4_OID,
+        TypeId::SemVer => PG_TEXT_OID,
     }
 }
 
@@ -254,6 +269,11 @@ pub fn scalar_write_text(scalar: &ScalarValue, buf: &mut BytesMut) -> bool {
             write_uuid(v, buf);
             true
         }
+        ScalarValue::Interval(i) => {
+            // Use our Interval Display impl (PostgreSQL-style text format)
+            buf.extend_from_slice(i.to_string().as_bytes());
+            true
+        }
     }
 }
 
@@ -324,6 +344,11 @@ pub fn scalar_write_binary(scalar: &ScalarValue, buf: &mut BytesMut) -> bool {
         }
         ScalarValue::FixedBinary16(v) => {
             buf.extend_from_slice(v);
+            true
+        }
+        ScalarValue::Interval(i) => {
+            // Our 16-byte LE layout: [months: i32][days: i32][nanoseconds: i64]
+            buf.extend_from_slice(&i.to_le_bytes());
             true
         }
     }
@@ -477,7 +502,10 @@ pub fn text_to_scalar(bytes: &[u8], type_oid: i32) -> Result<ScalarValue, Protoc
             Ok(ScalarValue::FixedBinary16(uuid_bytes))
         }
         PG_JSON_OID | PG_JSONB_OID => Ok(ScalarValue::Utf8(text.to_string())),
-        PG_DATE_OID | PG_TIME_OID | PG_TIMESTAMP_OID | PG_TIMESTAMPTZ_OID | PG_INTERVAL_OID => {
+        PG_INTERVAL_OID => zyron_common::parse_interval_string(text)
+            .map(ScalarValue::Interval)
+            .map_err(|e| ProtocolError::Malformed(format!("Invalid interval: {}", e))),
+        PG_DATE_OID | PG_TIME_OID | PG_TIMESTAMP_OID | PG_TIMESTAMPTZ_OID => {
             // Store temporal types as strings for now.
             // Full temporal type handling requires date/time parsing.
             Ok(ScalarValue::Utf8(text.to_string()))
@@ -546,6 +574,18 @@ pub fn binary_to_scalar(bytes: &[u8], type_oid: i32) -> Result<ScalarValue, Prot
             let mut arr = [0u8; 16];
             arr.copy_from_slice(bytes);
             Ok(ScalarValue::FixedBinary16(arr))
+        }
+        PG_INTERVAL_OID => {
+            if bytes.len() != 16 {
+                return Err(ProtocolError::Malformed(
+                    "Interval requires 16 bytes".into(),
+                ));
+            }
+            let mut arr = [0u8; 16];
+            arr.copy_from_slice(bytes);
+            Ok(ScalarValue::Interval(
+                zyron_common::Interval::from_le_bytes(&arr),
+            ))
         }
         _ => {
             // Fall back to text interpretation. Validate UTF-8 in-place, then allocate once.

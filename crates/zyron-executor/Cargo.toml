@@ -13,6 +13,7 @@ zyron-wal = { path = "../zyron-wal" }
 zyron-buffer = { path = "../zyron-buffer" }
 zyron-auth = { path = "../zyron-auth" }
 zyron-search = { path = "../zyron-search" }
+zyron-types = { path = "../zyron-types" }
 tokio.workspace = true
 hashbrown.workspace = true
 parking_lot.workspace = true

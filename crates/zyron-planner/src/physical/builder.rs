@@ -88,6 +88,51 @@ impl<'a> PhysicalPlanner<'a> {
                     cpu_cost: child_cost.row_count * self.cost_model.cpu_operator_cost,
                     row_count: child_cost.row_count,
                 };
+
+                // Collect window functions from expressions. If any exist, we
+                // insert a Window node between the child and Project, and rewrite
+                // each WindowFunction occurrence as a ColumnRef pointing to the
+                // appended window output column.
+                let mut window_exprs: Vec<crate::binder::BoundExpr> = Vec::new();
+                let mut window_names: Vec<String> = Vec::new();
+                let input_schema = child_plan.output_schema();
+
+                let rewritten: Vec<crate::binder::BoundExpr> = expressions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| {
+                        rewrite_window_refs(
+                            e,
+                            &mut window_exprs,
+                            &mut window_names,
+                            input_schema.len(),
+                            aliases.get(i).and_then(|a| a.clone()),
+                        )
+                    })
+                    .collect();
+
+                if !window_exprs.is_empty() {
+                    let window_cost = PlanCost {
+                        io_cost: 0.0,
+                        cpu_cost: child_cost.row_count
+                            * self.cost_model.cpu_operator_cost
+                            * window_exprs.len() as f64,
+                        row_count: child_cost.row_count,
+                    };
+                    let window_plan = PhysicalPlan::Window {
+                        window_exprs,
+                        window_names,
+                        child: Box::new(child_plan),
+                        cost: window_cost,
+                    };
+                    return Ok(PhysicalPlan::Project {
+                        expressions: rewritten,
+                        aliases,
+                        child: Box::new(window_plan),
+                        cost,
+                    });
+                }
+
                 Ok(PhysicalPlan::Project {
                     expressions,
                     aliases,
@@ -882,6 +927,275 @@ fn combine_conjuncts(mut conjuncts: Vec<BoundExpr>) -> BoundExpr {
 
 fn is_column_ref(expr: &BoundExpr) -> bool {
     matches!(expr, BoundExpr::ColumnRef(_))
+}
+
+/// Walks a BoundExpr tree and replaces WindowFunction nodes with ColumnRefs
+/// pointing to positions in an auxiliary window-output column list.
+/// Collects the WindowFunction expressions into `collected`.
+fn rewrite_window_refs(
+    expr: &BoundExpr,
+    collected: &mut Vec<BoundExpr>,
+    names: &mut Vec<String>,
+    input_schema_len: usize,
+    alias_hint: Option<String>,
+) -> BoundExpr {
+    use crate::binder::{BoundExpr as BE, BoundWhen, ColumnRef};
+    use zyron_catalog::ColumnId;
+
+    match expr {
+        BE::WindowFunction { type_id, .. } => {
+            let idx = collected.len();
+            collected.push(expr.clone());
+            let name = alias_hint.unwrap_or_else(|| format!("window_{}", idx));
+            names.push(name);
+            // Window output columns are appended after input_schema_len input columns.
+            // Column indices in the batch are 0..N, but ColumnRef is by (table_idx, column_id).
+            // The executor's expr resolver uses column_id to index into schema. Window
+            // columns in the Window output schema have column_id = (input_schema_len + idx).
+            BE::ColumnRef(ColumnRef {
+                table_idx: 0,
+                column_id: ColumnId((input_schema_len + idx) as u16),
+                type_id: *type_id,
+                nullable: true,
+            })
+        }
+        BE::ColumnRef(_) | BE::Literal { .. } | BE::Parameter { .. } => expr.clone(),
+        BE::BinaryOp {
+            left,
+            op,
+            right,
+            type_id,
+        } => BE::BinaryOp {
+            left: Box::new(rewrite_window_refs(
+                left,
+                collected,
+                names,
+                input_schema_len,
+                None,
+            )),
+            op: op.clone(),
+            right: Box::new(rewrite_window_refs(
+                right,
+                collected,
+                names,
+                input_schema_len,
+                None,
+            )),
+            type_id: *type_id,
+        },
+        BE::UnaryOp {
+            op,
+            expr: inner,
+            type_id,
+        } => BE::UnaryOp {
+            op: op.clone(),
+            expr: Box::new(rewrite_window_refs(
+                inner,
+                collected,
+                names,
+                input_schema_len,
+                None,
+            )),
+            type_id: *type_id,
+        },
+        BE::IsNull {
+            expr: inner,
+            negated,
+        } => BE::IsNull {
+            expr: Box::new(rewrite_window_refs(
+                inner,
+                collected,
+                names,
+                input_schema_len,
+                None,
+            )),
+            negated: *negated,
+        },
+        BE::InList {
+            expr: inner,
+            list,
+            negated,
+        } => BE::InList {
+            expr: Box::new(rewrite_window_refs(
+                inner,
+                collected,
+                names,
+                input_schema_len,
+                None,
+            )),
+            list: list
+                .iter()
+                .map(|e| rewrite_window_refs(e, collected, names, input_schema_len, None))
+                .collect(),
+            negated: *negated,
+        },
+        BE::Between {
+            expr: inner,
+            low,
+            high,
+            negated,
+        } => BE::Between {
+            expr: Box::new(rewrite_window_refs(
+                inner,
+                collected,
+                names,
+                input_schema_len,
+                None,
+            )),
+            low: Box::new(rewrite_window_refs(
+                low,
+                collected,
+                names,
+                input_schema_len,
+                None,
+            )),
+            high: Box::new(rewrite_window_refs(
+                high,
+                collected,
+                names,
+                input_schema_len,
+                None,
+            )),
+            negated: *negated,
+        },
+        BE::Like {
+            expr: inner,
+            pattern,
+            negated,
+        } => BE::Like {
+            expr: Box::new(rewrite_window_refs(
+                inner,
+                collected,
+                names,
+                input_schema_len,
+                None,
+            )),
+            pattern: Box::new(rewrite_window_refs(
+                pattern,
+                collected,
+                names,
+                input_schema_len,
+                None,
+            )),
+            negated: *negated,
+        },
+        BE::ILike {
+            expr: inner,
+            pattern,
+            negated,
+        } => BE::ILike {
+            expr: Box::new(rewrite_window_refs(
+                inner,
+                collected,
+                names,
+                input_schema_len,
+                None,
+            )),
+            pattern: Box::new(rewrite_window_refs(
+                pattern,
+                collected,
+                names,
+                input_schema_len,
+                None,
+            )),
+            negated: *negated,
+        },
+        BE::Function {
+            name,
+            args,
+            return_type,
+            distinct,
+        } => BE::Function {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| rewrite_window_refs(a, collected, names, input_schema_len, None))
+                .collect(),
+            return_type: *return_type,
+            distinct: *distinct,
+        },
+        BE::AggregateFunction {
+            name,
+            args,
+            distinct,
+            return_type,
+        } => BE::AggregateFunction {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| rewrite_window_refs(a, collected, names, input_schema_len, None))
+                .collect(),
+            distinct: *distinct,
+            return_type: *return_type,
+        },
+        BE::Cast {
+            expr: inner,
+            target_type,
+        } => BE::Cast {
+            expr: Box::new(rewrite_window_refs(
+                inner,
+                collected,
+                names,
+                input_schema_len,
+                None,
+            )),
+            target_type: *target_type,
+        },
+        BE::Case {
+            operand,
+            conditions,
+            else_result,
+            type_id,
+        } => BE::Case {
+            operand: operand.as_ref().map(|o| {
+                Box::new(rewrite_window_refs(
+                    o,
+                    collected,
+                    names,
+                    input_schema_len,
+                    None,
+                ))
+            }),
+            conditions: conditions
+                .iter()
+                .map(|w| BoundWhen {
+                    condition: rewrite_window_refs(
+                        &w.condition,
+                        collected,
+                        names,
+                        input_schema_len,
+                        None,
+                    ),
+                    result: rewrite_window_refs(
+                        &w.result,
+                        collected,
+                        names,
+                        input_schema_len,
+                        None,
+                    ),
+                })
+                .collect(),
+            else_result: else_result.as_ref().map(|e| {
+                Box::new(rewrite_window_refs(
+                    e,
+                    collected,
+                    names,
+                    input_schema_len,
+                    None,
+                ))
+            }),
+            type_id: *type_id,
+        },
+        BE::Nested(inner) => BE::Nested(Box::new(rewrite_window_refs(
+            inner,
+            collected,
+            names,
+            input_schema_len,
+            None,
+        ))),
+        // Subqueries don't participate in window rewriting at this level.
+        BE::Subquery { .. } | BE::Exists { .. } | BE::InSubquery { .. } => expr.clone(),
+    }
 }
 
 #[cfg(test)]

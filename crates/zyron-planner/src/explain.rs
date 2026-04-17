@@ -456,6 +456,18 @@ impl ExplainNode {
                 actual_metrics: None,
                 children: Vec::new(),
             },
+            PhysicalPlan::Window {
+                window_exprs,
+                child,
+                cost,
+                ..
+            } => Self {
+                operator_name: "Window".to_string(),
+                details: vec![("functions".to_string(), format!("{}", window_exprs.len()))],
+                estimated_cost: Some(*cost),
+                actual_metrics: None,
+                children: vec![Self::from_physical_plan(child)],
+            },
         }
     }
 

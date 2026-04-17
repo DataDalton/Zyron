@@ -366,6 +366,7 @@ fn extract_literal_bytes(expr: &BoundExpr) -> Option<Vec<u8>> {
             LiteralValue::String(v) => Some(v.as_bytes().to_vec()),
             LiteralValue::Boolean(v) => Some(vec![*v as u8]),
             LiteralValue::Null => None,
+            LiteralValue::Interval(i) => Some(i.to_le_bytes().to_vec()),
         },
         BoundExpr::Nested(inner) => extract_literal_bytes(inner),
         _ => None,

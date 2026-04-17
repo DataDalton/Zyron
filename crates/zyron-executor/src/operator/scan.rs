@@ -390,6 +390,7 @@ fn literal_to_key_bytes(value: &LiteralValue) -> Option<Vec<u8>> {
         LiteralValue::String(s) => Some(s.as_bytes().to_vec()),
         LiteralValue::Boolean(b) => Some(vec![*b as u8]),
         LiteralValue::Null => None,
+        LiteralValue::Interval(i) => Some(i.to_le_bytes().to_vec()),
     }
 }
 
