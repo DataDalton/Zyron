@@ -37,10 +37,6 @@ pub trait SinkConnector: Send {
 /// Configuration for different sink types.
 #[derive(Debug, Clone)]
 pub enum SinkConfig {
-    Kafka {
-        brokers: String,
-        topic: String,
-    },
     S3 {
         bucket: String,
         prefix: String,
@@ -63,56 +59,12 @@ pub enum WriteMode {
 }
 
 // ---------------------------------------------------------------------------
-// StreamKafkaSink (stub)
-// ---------------------------------------------------------------------------
-
-/// Kafka sink connector stub.
-pub struct StreamKafkaSink {
-    brokers: String,
-    topic: String,
-    records_written: u64,
-}
-
-impl StreamKafkaSink {
-    pub fn new(brokers: String, topic: String) -> Self {
-        Self {
-            brokers,
-            topic,
-            records_written: 0,
-        }
-    }
-
-    pub fn records_written(&self) -> u64 {
-        self.records_written
-    }
-}
-
-impl SinkConnector for StreamKafkaSink {
-    fn write_batch(&mut self, records: &[StreamRecord]) -> Result<()> {
-        for record in records {
-            self.records_written += record.num_rows() as u64;
-        }
-        Ok(())
-    }
-
-    fn commit(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    fn rollback(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    fn close(&mut self) -> Result<()> {
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
 // StreamS3Sink (stub)
 // ---------------------------------------------------------------------------
 
-/// S3 sink connector stub.
+/// S3 sink connector stub. Fields are placeholders for the real S3 client
+/// wiring; the stub impl only counts records.
+#[allow(dead_code)]
 pub struct StreamS3Sink {
     bucket: String,
     prefix: String,

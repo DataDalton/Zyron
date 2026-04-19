@@ -163,6 +163,27 @@ async fn create_index(
         .unwrap()
 }
 
+/// Creates a Spatial (R-tree) index entry in the catalog.
+async fn create_spatial_index(
+    catalog: &Catalog,
+    table_id: TableId,
+    schema_id: SchemaId,
+    name: &str,
+    columns: &[String],
+) -> IndexId {
+    catalog
+        .create_index(
+            table_id,
+            schema_id,
+            name,
+            columns,
+            false,
+            IndexType::Spatial,
+        )
+        .await
+        .unwrap()
+}
+
 /// Parses SQL and returns the Statement.
 fn parse_sql(sql: &str) -> zyron_parser::Statement {
     zyron_parser::parse(sql)
@@ -233,6 +254,7 @@ fn logical_op_name(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::Values { .. } => "Values",
         LogicalPlan::Update { .. } => "Update",
         LogicalPlan::Delete { .. } => "Delete",
+        LogicalPlan::GraphAlgorithm { .. } => "GraphAlgorithm",
     }
 }
 
@@ -1495,6 +1517,66 @@ async fn test_bench_planner_performance() {
 // =============================================================================
 // 10. Summary Test (metadata)
 // =============================================================================
+
+/// End-to-end planner test for spatial predicates: parse SQL with
+/// ST_DWithin, plan through the full pipeline, and verify the physical
+/// plan contains a SpatialScan operator pointing at the registered
+/// Spatial index.
+#[tokio::test]
+async fn test_spatial_predicate_picks_spatial_scan() {
+    zyron_bench_harness::init("planner");
+    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempdir().unwrap();
+    let (_disk, _pool, _wal, catalog) = setup_catalog(dir.path()).await;
+
+    tprintln!("\n=== Spatial Predicate -> SpatialScan ===");
+
+    let schema_id = DEFAULT_SCHEMA_ID;
+    let cols = vec![
+        ColumnDef {
+            name: "id".to_string(),
+            data_type: DataType::Int,
+            nullable: Some(false),
+            default: None,
+            constraints: vec![ColumnConstraint::PrimaryKey],
+        },
+        ColumnDef {
+            name: "location".to_string(),
+            // WKB-encoded geometry lives in a Binary column.
+            data_type: DataType::Bytea,
+            nullable: Some(false),
+            default: None,
+            constraints: vec![],
+        },
+    ];
+    let table_id = create_table(&catalog, schema_id, "events", cols).await;
+    put_table_stats(&catalog, table_id, 10_000, 2);
+
+    let _idx = create_spatial_index(
+        &catalog,
+        table_id,
+        schema_id,
+        "events_geo",
+        &["location".to_string()],
+    )
+    .await;
+
+    let sql =
+        "SELECT id FROM events WHERE st_dwithin(location, st_make_point(-74.0, 40.7), 5000.0)";
+    tprintln!("  SQL: {}", sql);
+
+    let physical = plan_sql(&catalog, sql).await;
+    tprintln!("  Physical plan top: {}", physical_op_name(&physical));
+
+    let has_spatial = physical_contains(&physical, &|p| {
+        matches!(p, PhysicalPlan::SpatialScan { .. })
+    });
+    assert!(
+        has_spatial,
+        "expected SpatialScan in plan when Spatial index and ST_DWithin are present"
+    );
+    tprintln!("  SpatialScan present in physical plan: PASS");
+}
 
 #[tokio::test]
 async fn test_planner_summary() {

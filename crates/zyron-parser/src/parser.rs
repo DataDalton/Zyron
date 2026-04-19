@@ -1015,6 +1015,7 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Graph) => self.parse_create_graph_schema(),
             Token::Keyword(Keyword::Fulltext) => self.parse_create_fulltext_index(),
             Token::Keyword(Keyword::Vector) => self.parse_create_vector_index(),
+            Token::Keyword(Keyword::Spatial) => self.parse_create_spatial_index(),
             Token::Keyword(Keyword::Branch) => self.parse_create_branch(),
             Token::Keyword(Keyword::Version) => self.parse_create_version(),
             Token::Keyword(Keyword::Replication) => self.parse_create_replication_slot(),
@@ -2813,6 +2814,28 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Delete) => {
                 p.advance()?;
                 Ok(Privilege::Delete)
+            }
+            Token::Keyword(Keyword::Create) => {
+                // CREATE INDEX
+                p.advance()?;
+                p.expect_keyword(Keyword::Index)?;
+                Ok(Privilege::CreateIndex)
+            }
+            Token::Keyword(Keyword::Drop) => {
+                // DROP INDEX
+                p.advance()?;
+                p.expect_keyword(Keyword::Index)?;
+                Ok(Privilege::DropIndex)
+            }
+            Token::Keyword(Keyword::Alter) => {
+                // ALTER INDEX
+                p.advance()?;
+                p.expect_keyword(Keyword::Index)?;
+                Ok(Privilege::AlterIndex)
+            }
+            Token::Keyword(Keyword::Reindex) => {
+                p.advance()?;
+                Ok(Privilege::Reindex)
             }
             _ => Err(p.error(&format!("Expected privilege, found {}", p.current.token))),
         })
@@ -5041,6 +5064,7 @@ impl<'a> Parser<'a> {
     // Search indexes
     // -----------------------------------------------------------------------
 
+    #[cold]
     fn parse_create_fulltext_index(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Fulltext)?;
         self.expect_keyword(Keyword::Index)?;
@@ -5066,6 +5090,7 @@ impl<'a> Parser<'a> {
         )))
     }
 
+    #[cold]
     fn parse_create_vector_index(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Vector)?;
         self.expect_keyword(Keyword::Index)?;
@@ -5091,10 +5116,44 @@ impl<'a> Parser<'a> {
         )))
     }
 
+    fn parse_create_spatial_index(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Spatial)?;
+        self.expect_keyword(Keyword::Index)?;
+        let if_not_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Not)?;
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_ident()?;
+        self.expect_keyword(Keyword::On)?;
+        let table = self.parse_ident()?;
+        self.expect_token(&Token::LParen)?;
+        let column = self.parse_ident()?;
+        self.expect_token(&Token::RParen)?;
+        let mut options = vec![];
+        if self.consume_keyword(Keyword::With)? {
+            self.expect_token(&Token::LParen)?;
+            options = self.parse_comma_separated(|p| p.parse_table_option())?;
+            self.expect_token(&Token::RParen)?;
+        }
+        Ok(Statement::CreateSpatialIndex(Box::new(
+            CreateSpatialIndexStatement {
+                name,
+                table,
+                column,
+                if_not_exists,
+                options,
+            },
+        )))
+    }
+
     // -----------------------------------------------------------------------
     // Graph schema
     // -----------------------------------------------------------------------
 
+    #[cold]
     fn parse_create_graph_schema(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Graph)?;
         self.expect_keyword(Keyword::Schema)?;
@@ -5121,6 +5180,7 @@ impl<'a> Parser<'a> {
         )))
     }
 
+    #[cold]
     fn parse_graph_schema_element(&mut self) -> Result<GraphSchemaElement> {
         if self.at_keyword(Keyword::Node) {
             self.advance()?;
@@ -5153,6 +5213,7 @@ impl<'a> Parser<'a> {
         }
     }
 
+    #[cold]
     fn parse_drop_graph_schema(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Graph)?;
         self.expect_keyword(Keyword::Schema)?;
@@ -7445,6 +7506,47 @@ mod tests {
     }
 
     #[test]
+    fn test_grant_index_privileges() {
+        let stmt = parse_one("GRANT CREATE INDEX ON events TO ops");
+        match stmt {
+            Statement::Grant(g) => {
+                assert_eq!(g.privileges, vec![Privilege::CreateIndex]);
+                assert_eq!(g.on_table, "events");
+                assert_eq!(g.to, "ops");
+            }
+            _ => panic!("Expected GRANT"),
+        }
+
+        let stmt = parse_one("GRANT DROP INDEX, REINDEX, ALTER INDEX ON events TO dba");
+        match stmt {
+            Statement::Grant(g) => {
+                assert_eq!(
+                    g.privileges,
+                    vec![
+                        Privilege::DropIndex,
+                        Privilege::Reindex,
+                        Privilege::AlterIndex,
+                    ]
+                );
+            }
+            _ => panic!("Expected GRANT"),
+        }
+    }
+
+    #[test]
+    fn test_revoke_index_privileges() {
+        let stmt = parse_one("REVOKE CREATE INDEX ON events FROM ops");
+        match stmt {
+            Statement::Revoke(g) => {
+                assert_eq!(g.privileges, vec![Privilege::CreateIndex]);
+                assert_eq!(g.on_table, "events");
+                assert_eq!(g.from, "ops");
+            }
+            _ => panic!("Expected REVOKE"),
+        }
+    }
+
+    #[test]
     fn test_revoke() {
         let stmt = parse_one("REVOKE DELETE ON users FROM reader");
         match stmt {
@@ -9394,6 +9496,36 @@ mod tests {
                 assert!(v.options.is_empty());
             }
             _ => panic!("Expected CREATE VECTOR INDEX"),
+        }
+    }
+
+    #[test]
+    fn test_create_spatial_index() {
+        let stmt = parse_one(
+            "CREATE SPATIAL INDEX geo_idx ON locations (point) WITH (dims = 2, srid = 4326)",
+        );
+        match stmt {
+            Statement::CreateSpatialIndex(s) => {
+                assert_eq!(s.name, "geo_idx");
+                assert_eq!(s.table, "locations");
+                assert_eq!(s.column, "point");
+                assert!(!s.if_not_exists);
+                assert_eq!(s.options.len(), 2);
+            }
+            _ => panic!("Expected CREATE SPATIAL INDEX"),
+        }
+    }
+
+    #[test]
+    fn test_create_spatial_index_if_not_exists() {
+        let stmt = parse_one("CREATE SPATIAL INDEX IF NOT EXISTS geo_idx ON locations (point)");
+        match stmt {
+            Statement::CreateSpatialIndex(s) => {
+                assert_eq!(s.name, "geo_idx");
+                assert!(s.if_not_exists);
+                assert!(s.options.is_empty());
+            }
+            _ => panic!("Expected CREATE SPATIAL INDEX"),
         }
     }
 

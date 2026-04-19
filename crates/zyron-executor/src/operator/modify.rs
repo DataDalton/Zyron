@@ -96,6 +96,96 @@ fn bytes_to_f32_slice(bytes: &[u8]) -> &[f32] {
     floats
 }
 
+/// Extracts a column's raw byte payload regardless of its declared type.
+/// Used for spatial index maintenance to read the WKB-encoded geometry
+/// payload out of either a Binary or Geometry-typed column.
+fn extract_column_bytes<'a>(
+    batch: &'a DataBatch,
+    row_idx: usize,
+    columns: &[zyron_catalog::ColumnEntry],
+    target_column_id: zyron_catalog::ColumnId,
+) -> Option<&'a [u8]> {
+    let col_idx = columns.iter().position(|c| c.id == target_column_id)?;
+    if col_idx >= batch.columns.len() {
+        return None;
+    }
+    let col = &batch.columns[col_idx];
+    if row_idx >= col.data.len() || col.nulls.is_null(row_idx) {
+        return None;
+    }
+    match &col.data {
+        ColumnData::Binary(blobs) if row_idx < blobs.len() => Some(&blobs[row_idx]),
+        _ => None,
+    }
+}
+
+/// Computes the bounding box of a Geometry as an MBR with the given dim
+/// count. Currently supports Point, LineString, Polygon, and the Multi*
+/// variants by walking their coordinate sets.
+fn geometry_to_mbr(
+    geom: &zyron_types::geospatial::Geometry,
+    dims: u8,
+) -> zyron_types::spatial_index::Mbr {
+    use zyron_types::geospatial::Point;
+    let mut mins = [f64::INFINITY; 4];
+    let mut maxs = [f64::NEG_INFINITY; 4];
+    let d = dims as usize;
+    let mut visit = |p: &Point| {
+        let coords = [p.x, p.y, 0.0, 0.0];
+        for i in 0..d {
+            if coords[i] < mins[i] {
+                mins[i] = coords[i];
+            }
+            if coords[i] > maxs[i] {
+                maxs[i] = coords[i];
+            }
+        }
+    };
+    walk_points(&geom.kind, &mut visit);
+
+    if mins[0].is_infinite() {
+        // Empty geometry: produce an empty MBR placeholder (all zeros, both bounds equal).
+        return zyron_types::spatial_index::Mbr::point(&vec![0.0; d]);
+    }
+    zyron_types::spatial_index::Mbr::from_extents(&mins[..d], &maxs[..d])
+}
+
+fn walk_points(
+    kind: &zyron_types::geospatial::GeometryKind,
+    visit: &mut impl FnMut(&zyron_types::geospatial::Point),
+) {
+    use zyron_types::geospatial::GeometryKind;
+    match kind {
+        GeometryKind::Point(p) => visit(p),
+        GeometryKind::LineString(ls) => ls.points.iter().for_each(visit),
+        GeometryKind::Polygon(p) => {
+            p.exterior.iter().for_each(&mut *visit);
+            for hole in &p.holes {
+                hole.iter().for_each(&mut *visit);
+            }
+        }
+        GeometryKind::MultiPoint(mp) => mp.points.iter().for_each(visit),
+        GeometryKind::MultiLineString(ml) => {
+            for ls in &ml.lines {
+                ls.points.iter().for_each(&mut *visit);
+            }
+        }
+        GeometryKind::MultiPolygon(mp) => {
+            for poly in &mp.polygons {
+                poly.exterior.iter().for_each(&mut *visit);
+                for hole in &poly.holes {
+                    hole.iter().for_each(&mut *visit);
+                }
+            }
+        }
+        GeometryKind::GeometryCollection(items) => {
+            for g in items {
+                walk_points(&g.kind, visit);
+            }
+        }
+    }
+}
+
 /// Serializes a TupleId into bytes for WAL payload.
 fn tuple_id_payload(tid: &TupleId) -> Vec<u8> {
     let mut buf = Vec::with_capacity(14);
@@ -322,6 +412,42 @@ impl Operator for InsertOperator {
                     }
                 }
 
+                // Maintain spatial (R-tree) indexes: for each indexed
+                // geometry column, decode WKB to a Geometry, take its MBR,
+                // and insert (mbr, rowid) into the live R-tree.
+                let spatial_indexes = self.ctx.spatial_indexes_for_table(self.table_id.0);
+                if !spatial_indexes.is_empty() {
+                    if let Some(ref spatial_mgr) = self.ctx.spatial_manager {
+                        for (row_idx, tid) in tuple_ids.iter().enumerate() {
+                            let rowid =
+                                zyron_search::encode_doc_id(tid.page_id.page_num, tid.slot_id)?;
+                            for (idx_id, col_id) in &spatial_indexes {
+                                let Some(tree) = spatial_mgr.get(*idx_id) else {
+                                    continue;
+                                };
+                                let Some(geom_bytes) = extract_column_bytes(
+                                    &exec_batch.batch,
+                                    row_idx,
+                                    &table_entry.columns,
+                                    *col_id,
+                                ) else {
+                                    continue;
+                                };
+                                let Ok(geom) = zyron_types::geospatial::decode_wkb(geom_bytes)
+                                else {
+                                    continue;
+                                };
+                                let mbr = geometry_to_mbr(&geom, tree.dims());
+                                tree.insert(zyron_types::spatial_index::LeafEntry {
+                                    mbr,
+                                    data: rowid,
+                                    deleted: false,
+                                });
+                            }
+                        }
+                    }
+                }
+
                 // Notify CDC hook if present.
                 if let Some(ref hook) = self.ctx.cdc_hook {
                     let tuple_refs: Vec<&[u8]> = tuples.iter().map(|t| t.data()).collect();
@@ -465,6 +591,24 @@ impl Operator for DeleteOperator {
                                         vec_id,
                                     ) {
                                         eprintln!("vector index {} delete failed: {e}", idx_id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Maintain spatial indexes: remove entries by rowid.
+                let spatial_indexes = self.ctx.spatial_indexes_for_table(self.table_id.0);
+                if !spatial_indexes.is_empty() {
+                    if let Some(ref spatial_mgr) = self.ctx.spatial_manager {
+                        for tid in &tuple_ids {
+                            if let Ok(rowid) =
+                                zyron_search::encode_doc_id(tid.page_id.page_num, tid.slot_id)
+                            {
+                                for (idx_id, _col_id) in &spatial_indexes {
+                                    if let Some(tree) = spatial_mgr.get(*idx_id) {
+                                        let _ = tree.delete_by_data(&rowid);
                                     }
                                 }
                             }

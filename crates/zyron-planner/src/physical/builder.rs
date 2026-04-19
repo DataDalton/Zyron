@@ -395,6 +395,46 @@ impl<'a> PhysicalPlanner<'a> {
             }
         }
 
+        // Check for spatial predicates (st_dwithin / st_intersects / st_contains)
+        // and route to a SpatialScan when the predicate shape is recognized
+        // and a Spatial index is present on the table.
+        if let Some(pred) = &predicate {
+            if let Some((sp_expr, remaining)) = extract_spatial_predicate(pred) {
+                if let Some(kind) = build_spatial_scan_kind(sp_expr) {
+                    for index in &indexes {
+                        if index.index_type == zyron_catalog::IndexType::Spatial {
+                            // KNN cost: exactly k rows by definition.
+                            // DWithin / Range cost: start with a static
+                            // default and let the executor refine at runtime.
+                            // A full cardinality walk would require reaching
+                            // into the live spatial manager here, which the
+                            // planner does not currently reference; the cost
+                            // model is good enough to prefer the index over
+                            // SeqScan when a predicate matches.
+                            let row_count = match &kind {
+                                SpatialScanKind::Knn { k, .. } => *k as f64,
+                                SpatialScanKind::DWithin { .. } => 100.0,
+                                SpatialScanKind::Range { .. } => 100.0,
+                            };
+                            let cost = PlanCost {
+                                io_cost: 2.0,
+                                cpu_cost: 8.0,
+                                row_count,
+                            };
+                            return Ok(PhysicalPlan::SpatialScan {
+                                table_id,
+                                index_id: index.id,
+                                columns,
+                                kind,
+                                remaining_predicate: remaining.cloned(),
+                                cost,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         // Try to find a B-tree index scan opportunity
         if let Some(pred) = &predicate {
             if let Some((ts, cs)) = &table_stats {
@@ -813,6 +853,116 @@ fn extract_match_against(predicate: &BoundExpr) -> Option<(&BoundExpr, Option<&B
         }
         _ => None,
     }
+}
+
+/// Extracts a spatial predicate (st_dwithin / st_intersects / st_contains)
+/// from a conjunction tree. Returns the spatial expression and any
+/// remaining non-spatial predicate so the caller can wrap a Filter on top.
+fn extract_spatial_predicate(predicate: &BoundExpr) -> Option<(&BoundExpr, Option<&BoundExpr>)> {
+    match predicate {
+        BoundExpr::Function { name, .. }
+            if matches!(
+                name.as_str(),
+                "st_dwithin" | "st_intersects" | "st_contains"
+            ) =>
+        {
+            Some((predicate, None))
+        }
+        BoundExpr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+            ..
+        } => {
+            if let Some((sp, _)) = extract_spatial_predicate(left) {
+                return Some((sp, Some(right)));
+            }
+            if let Some((sp, _)) = extract_spatial_predicate(right) {
+                return Some((sp, Some(left)));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Reads a literal `f64` out of a `BoundExpr::Literal`, transparently
+/// handling `UnaryOp::Minus` wrappers the binder emits for negative number
+/// literals (the parser represents `-74.0` as `- 74.0`).
+fn extract_f64_literal(expr: &BoundExpr) -> Option<f64> {
+    use zyron_parser::ast::{LiteralValue, UnaryOperator};
+    match expr {
+        BoundExpr::Literal { value, .. } => match value {
+            LiteralValue::Float(f) => Some(*f),
+            LiteralValue::Integer(i) => Some(*i as f64),
+            _ => None,
+        },
+        BoundExpr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: inner,
+            ..
+        } => extract_f64_literal(inner).map(|v| -v),
+        BoundExpr::Nested(inner) => extract_f64_literal(inner),
+        _ => None,
+    }
+}
+
+/// Builds a SpatialScanKind from a recognized spatial function call.
+/// Returns None when the call shape doesn't match the supported patterns.
+fn build_spatial_scan_kind(call: &BoundExpr) -> Option<SpatialScanKind> {
+    if let BoundExpr::Function { name, args, .. } = call {
+        match name.as_str() {
+            "st_dwithin" if args.len() == 3 => {
+                // Signature: st_dwithin(geom_col, point_literal_or_geom, radius_meters)
+                // For the optimizer to recognize, point and radius must be literals.
+                let radius = extract_f64_literal(&args[2])?;
+                // Best-effort point extraction: support [x, y] literal arrays
+                // or st_makepoint(x_lit, y_lit). Anything else => unrecognized.
+                let qp = extract_point_from_expr(&args[1])?;
+                Some(SpatialScanKind::DWithin {
+                    query_point: qp,
+                    radius_meters: radius,
+                })
+            }
+            "st_intersects" | "st_contains" if args.len() == 2 => {
+                // Use the bounding box of the second argument as the query envelope.
+                // Only supports a literal envelope or st_makepoint pattern for now.
+                let env = extract_envelope_from_expr(&args[1])?;
+                Some(SpatialScanKind::Range {
+                    mbr_min: env.0,
+                    mbr_max: env.1,
+                })
+            }
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+fn extract_point_from_expr(expr: &BoundExpr) -> Option<Vec<f64>> {
+    if let BoundExpr::Function { name, args, .. } = expr {
+        if (name == "st_make_point" || name == "st_makepoint") && args.len() >= 2 {
+            let x = extract_f64_literal(&args[0])?;
+            let y = extract_f64_literal(&args[1])?;
+            return Some(vec![x, y]);
+        }
+    }
+    None
+}
+
+fn extract_envelope_from_expr(expr: &BoundExpr) -> Option<(Vec<f64>, Vec<f64>)> {
+    // st_makeenvelope(min_x, min_y, max_x, max_y) or st_make_envelope.
+    if let BoundExpr::Function { name, args, .. } = expr {
+        if (name == "st_make_envelope" || name == "st_makeenvelope") && args.len() == 4 {
+            let min_x = extract_f64_literal(&args[0])?;
+            let min_y = extract_f64_literal(&args[1])?;
+            let max_x = extract_f64_literal(&args[2])?;
+            let max_y = extract_f64_literal(&args[3])?;
+            return Some((vec![min_x, min_y], vec![max_x, max_y]));
+        }
+    }
+    None
 }
 
 /// Extracts a vector_distance_* function call from a predicate tree.

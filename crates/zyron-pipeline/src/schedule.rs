@@ -204,7 +204,7 @@ impl ScheduleManager {
 
     pub fn pause_schedule(&self, name: &str) -> Result<()> {
         let mut found = false;
-        self.schedules.entry_sync(name.to_string()).and_modify(|e| {
+        let _ = self.schedules.entry_sync(name.to_string()).and_modify(|e| {
             e.state = ScheduleState::Paused;
             found = true;
         });
@@ -216,7 +216,7 @@ impl ScheduleManager {
 
     pub fn resume_schedule(&self, name: &str) -> Result<()> {
         let mut found = false;
-        self.schedules.entry_sync(name.to_string()).and_modify(|e| {
+        let _ = self.schedules.entry_sync(name.to_string()).and_modify(|e| {
             e.state = ScheduleState::Active;
             found = true;
         });

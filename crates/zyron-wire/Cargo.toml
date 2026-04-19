@@ -19,6 +19,7 @@ zyron-pipeline = { path = "../zyron-pipeline" }
 zyron-streaming = { path = "../zyron-streaming" }
 zyron-versioning = { path = "../zyron-versioning" }
 zyron-search = { path = "../zyron-search" }
+zyron-types = { path = "../zyron-types" }
 tokio.workspace = true
 bytes.workspace = true
 tracing.workspace = true
@@ -37,6 +38,7 @@ parking_lot.workspace = true
 mimalloc.workspace = true
 tokio-quiche.workspace = true
 futures.workspace = true
+memchr = "2"
 
 [dev-dependencies]
 tempfile = "3"

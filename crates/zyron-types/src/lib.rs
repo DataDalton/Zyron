@@ -41,6 +41,7 @@ pub mod rating;
 pub mod regex_type;
 pub mod semver;
 pub mod similarity;
+pub mod spatial_index;
 pub mod state_machine;
 pub mod statistics;
 pub mod string_ops;

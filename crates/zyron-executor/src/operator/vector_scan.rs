@@ -11,7 +11,6 @@ use zyron_catalog::IndexId;
 use zyron_common::Result;
 use zyron_common::ZyronError;
 use zyron_common::page::{PAGE_SIZE, PageId};
-use zyron_planner::binder::BoundExpr;
 use zyron_planner::logical::LogicalColumn;
 use zyron_search::decode_doc_id;
 use zyron_storage::{HeapPage, TupleId};

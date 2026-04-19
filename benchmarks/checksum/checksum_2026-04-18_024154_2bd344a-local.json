@@ -1,0 +1,51 @@
+{
+  "id": "2026-04-18_024154_2bd344a-local",
+  "date": "2026-04-18 02:41:58Z",
+  "ts": 1776480118,
+  "commit": "2bd344a-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Performance": {
+      "hash32 <=32B latency (ns)": {
+        "average": 9.127686,
+        "runs": [9.20, 9.17, 8.99, 9.09, 9.19],
+        "target": 120.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "hash32 16MB throughput (MB/s)": {
+        "average": 73866.759319,
+        "runs": [65893.52, 75111.02, 76006.61, 75892.69, 76429.96],
+        "target": 6000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "hash32 1KB throughput (MB/s)": {
+        "average": 57326.201287,
+        "runs": [56676.55, 57876.03, 58011.83, 56912.72, 57153.87],
+        "target": 3000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "hash32 1MB throughput (MB/s)": {
+        "average": 96681.251673,
+        "runs": [98001.74, 97303.71, 93871.59, 96446.43, 97782.78],
+        "target": 6000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "streaming 1MB throughput (MB/s)": {
+        "average": 57031.344592,
+        "runs": [59294.22, 56492.23, 56411.76, 56950.85, 56007.66],
+        "target": 5000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}

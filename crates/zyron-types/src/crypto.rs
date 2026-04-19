@@ -89,7 +89,7 @@ pub fn consistent_hash(key: &[u8], num_buckets: u32) -> u32 {
     }
 
     // Hash the key to a u64 seed
-    let mut seed = xxhash_rust::xxh3::xxh3_64(key);
+    let mut seed = zyron_common::hash64(key);
 
     let mut b: i64 = -1;
     let mut j: i64 = 0;

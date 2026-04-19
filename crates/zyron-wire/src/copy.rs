@@ -190,12 +190,14 @@ impl CopyInHandler {
 
     /// Feeds a CopyData chunk. Parses complete lines into rows.
     /// Uses cursor-based splitting with deferred compaction to minimize byte shifting.
+    #[inline]
     pub fn feed(&mut self, data: &[u8]) -> Result<(), ProtocolError> {
         self.buffer.extend_from_slice(data);
 
-        // Process complete lines using a cursor to avoid per-line reallocation.
+        // Process complete lines using a cursor. memchr on x86_64 scans up to 32
+        // bytes per cycle, vs ~1 byte/cycle for iter().position().
         let mut consumed = 0;
-        while let Some(rel_pos) = self.buffer[consumed..].iter().position(|&b| b == b'\n') {
+        while let Some(rel_pos) = memchr::memchr(b'\n', &self.buffer[consumed..]) {
             let newline_pos = consumed + rel_pos;
             let line = &self.buffer[consumed..newline_pos];
             consumed = newline_pos + 1;
@@ -245,6 +247,7 @@ impl CopyInHandler {
     /// Parses a single line directly into column values.
     /// Inlines field splitting and null detection in a single pass,
     /// avoiding the intermediate Vec<Vec<u8>> from split_text_line/split_csv_line.
+    #[inline]
     fn parse_line(&self, line: &[u8]) -> Result<Vec<Option<Vec<u8>>>, ProtocolError> {
         let num_cols = self.columns.len();
         let mut row = Vec::with_capacity(num_cols);

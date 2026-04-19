@@ -108,6 +108,7 @@ pub enum Statement {
     CreateFulltextIndex(Box<CreateFulltextIndexStatement>),
     /// CREATE VECTOR INDEX name ON table(column) [WITH (options)]
     CreateVectorIndex(Box<CreateVectorIndexStatement>),
+    CreateSpatialIndex(Box<CreateSpatialIndexStatement>),
     /// ALTER SYSTEM SET name = value
     AlterSystemSet(Box<AlterSystemSetStatement>),
     /// ANALYZE [table_name]
@@ -446,6 +447,10 @@ pub enum Privilege {
     Insert,
     Update,
     Delete,
+    CreateIndex,
+    DropIndex,
+    Reindex,
+    AlterIndex,
     All,
 }
 
@@ -1220,6 +1225,16 @@ pub struct CreateVectorIndexStatement {
     pub name: String,
     pub table: String,
     pub column: String,
+    pub options: Vec<TableOption>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateSpatialIndexStatement {
+    pub name: String,
+    pub table: String,
+    pub column: String,
+    pub if_not_exists: bool,
+    /// Optional WITH (key = value, ...) tuning, e.g. WITH (dims = 3, srid = 4326).
     pub options: Vec<TableOption>,
 }
 

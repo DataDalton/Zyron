@@ -208,10 +208,11 @@ pub struct WalWriter {
     /// Set to true by the flush thread when an I/O error occurs during flush.
     /// Checked by append() to fail fast instead of buffering into a broken WAL.
     flush_io_error: Arc<AtomicBool>,
-    /// Total records written (for zyron_stat_wal).
-    pub wal_records_written: AtomicU64,
-    /// Total bytes written (for zyron_stat_wal).
-    pub wal_bytes_written: AtomicU64,
+    /// Total records written (for zyron_stat_wal). Maintained by the flush
+    /// thread in one atomic-add per drained batch (amortized across all
+    /// records in that batch) instead of per-record in the append() hot path.
+    /// Arc-shared with the flush thread.
+    pub wal_records_written: Arc<AtomicU64>,
     /// Total fsync calls (for zyron_stat_wal). Arc-shared with the flush thread.
     pub wal_syncs: Arc<AtomicU64>,
     /// Retention hook that returns the minimum LSN that must be retained.
@@ -242,6 +243,7 @@ impl WalWriter {
         let rotation = Arc::new(AtomicRotationState::new());
         let flush_io_error = Arc::new(AtomicBool::new(false));
         let wal_syncs = Arc::new(AtomicU64::new(0));
+        let wal_records_written = Arc::new(AtomicU64::new(0));
         let flush_thread = Self::spawn_flush_thread(
             ring_buffer.clone(),
             segment.clone(),
@@ -256,6 +258,7 @@ impl WalWriter {
             config.segment_size,
             flush_io_error.clone(),
             wal_syncs.clone(),
+            wal_records_written.clone(),
         );
 
         Ok(Self {
@@ -271,8 +274,7 @@ impl WalWriter {
             config,
             rotation,
             flush_io_error,
-            wal_records_written: AtomicU64::new(0),
-            wal_bytes_written: AtomicU64::new(0),
+            wal_records_written,
             wal_syncs,
             retention_hook: parking_lot::RwLock::new(None),
         })
@@ -328,6 +330,7 @@ impl WalWriter {
         segment_size: u32,
         flush_io_error: Arc<AtomicBool>,
         wal_syncs_counter: Arc<AtomicU64>,
+        wal_records_counter: Arc<AtomicU64>,
     ) -> JoinHandle<()> {
         std::thread::spawn(move || {
             // Register this thread for unpark wakeup. The waker is stored in
@@ -377,6 +380,7 @@ impl WalWriter {
                         fsync_enabled,
                         &flush_io_error,
                         &wal_syncs_counter,
+                        &wal_records_counter,
                     );
                     break;
                 }
@@ -391,6 +395,7 @@ impl WalWriter {
                     fsync_enabled,
                     &flush_io_error,
                     &wal_syncs_counter,
+                    &wal_records_counter,
                 );
 
                 // Handle segment rotation only when requested by append().
@@ -492,6 +497,7 @@ impl WalWriter {
         fsync_enabled: bool,
         flush_io_error: &AtomicBool,
         wal_syncs_counter: &AtomicU64,
+        wal_records_counter: &AtomicU64,
     ) {
         batch_buffer.clear();
         let max_lsn = ring_buffer.drain_into(batch_buffer);
@@ -507,7 +513,10 @@ impl WalWriter {
 
         // Compute checksums for all records in the batch before writing to disk.
         // Deferred from append() hot path to amortize checksum cost in the flush thread.
-        backfill_checksums(batch_buffer);
+        // The returned count also serves as the records-written counter, avoiding
+        // a per-record `lock xadd` on `wal_records_written` in every append().
+        let records_in_batch = backfill_checksums(batch_buffer);
+        wal_records_counter.fetch_add(records_in_batch as u64, Ordering::Relaxed);
 
         // Write to segment
         {
@@ -612,9 +621,6 @@ impl WalWriter {
                     }
                     self.ring_buffer.commit_write(record_size as usize, lsn);
                     self.wake_flush_thread();
-                    self.wal_records_written.fetch_add(1, Ordering::Relaxed);
-                    self.wal_bytes_written
-                        .fetch_add(record_size as u64, Ordering::Relaxed);
                     return Ok(lsn);
                 }
 
@@ -648,9 +654,6 @@ impl WalWriter {
 
             self.ring_buffer.commit_write(record_size as usize, lsn);
             self.maybe_wake_flush_thread(record_size as usize);
-            self.wal_records_written.fetch_add(1, Ordering::Relaxed);
-            self.wal_bytes_written
-                .fetch_add(record_size as u64, Ordering::Relaxed);
             return Ok(lsn);
         }
     }
@@ -692,6 +695,14 @@ impl WalWriter {
     #[inline]
     pub fn flushed_lsn(&self) -> Lsn {
         Lsn(self.flushed_lsn.load(Ordering::Acquire))
+    }
+
+    /// Total bytes written across the writer's lifetime. Served from the
+    /// ring buffer's existing committed-cursor atomic so the hot write path
+    /// doesn't maintain a duplicate counter.
+    #[inline]
+    pub fn wal_bytes_written(&self) -> u64 {
+        self.ring_buffer.total_committed_bytes()
     }
 
     /// Allocates a new transaction ID.

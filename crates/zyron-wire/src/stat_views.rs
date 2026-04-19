@@ -183,6 +183,7 @@ fn build_stat_indexes(server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<O
                 zyron_catalog::IndexType::BTree => "btree",
                 zyron_catalog::IndexType::Fulltext => "fulltext",
                 zyron_catalog::IndexType::Vector => "vector",
+                zyron_catalog::IndexType::Spatial => "spatial",
             };
             rows.push(vec![
                 Some(idx.name.as_bytes().to_vec()),
@@ -213,7 +214,7 @@ fn build_stat_wal(server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<Optio
     ];
 
     let wal_records = server.wal.wal_records_written.load(Ordering::Relaxed);
-    let wal_bytes = server.wal.wal_bytes_written.load(Ordering::Relaxed);
+    let wal_bytes = server.wal.wal_bytes_written();
     let wal_syncs = server.wal.wal_syncs.load(Ordering::Relaxed);
     let flushed_lsn = server.wal.flushed_lsn().0;
     let current_segment = server

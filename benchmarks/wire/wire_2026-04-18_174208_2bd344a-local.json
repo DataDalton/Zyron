@@ -1,0 +1,235 @@
+{
+  "id": "2026-04-18_174208_2bd344a-local",
+  "date": "2026-04-18 17:42:59Z",
+  "ts": 1776534179,
+  "commit": "2bd344a-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "QUIC Channel Bridge": {
+      "QUIC channel write throughput (MB/s)": {
+        "average": 20076.653985,
+        "runs": [18914.21, 20121.36, 20355.59, 20103.03, 20889.09],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "QUIC channel read throughput (MB/s)": {
+        "average": 9266.694392,
+        "runs": [8723.27, 8558.67, 9028.20, 9716.55, 10306.79],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "QUIC Handshake": {
+      "QUIC handshake latency (us)": {
+        "average": 2881.861000,
+        "runs": [2953.05, 2852.66, 2843.29, 2899.95, 2860.34],
+        "target": 10000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "QUIC PG Handshake": {
+      "QUIC PG handshake latency (us)": {
+        "average": 4.869080,
+        "runs": [4.92, 5.03, 4.80, 4.79, 4.80],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "QUIC PG Simple Query": {
+      "QUIC PG simple query throughput (qps)": {
+        "average": 273443.475734,
+        "runs": [263998.52, 279842.39, 279170.53, 266372.59, 277833.34],
+        "target": 10000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "QUIC Transport Properties": {
+      "QUIC channel round-trip throughput (ops/sec)": {
+        "average": 4161098.355772,
+        "runs": [4245130.83, 4121722.72, 4219249.06, 4144957.45, 4074431.72],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "API Key Auth": {
+      "API key verify throughput (ops/sec)": {
+        "average": 29568381.187774,
+        "runs": [28884787.25, 29694561.74, 29736858.54, 29913967.43, 29611730.98],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Bind Message": {
+      "Bind message decode latency (us)": {
+        "average": 0.090021,
+        "runs": [0.09, 0.09, 0.09, 0.09, 0.09],
+        "target": 4.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Concurrent Connections": {
+      "Connection establishment rate (conns/sec)": {
+        "average": 386.664640,
+        "runs": [385.50, 387.97, 386.79, 384.34, 388.72],
+        "target": 1000.000000,
+        "passed": false,
+        "higher_is_better": true
+      }
+    },
+    "Connection Handshake": {
+      "Handshake latency (us)": {
+        "average": 279.136920,
+        "runs": [362.70, 272.26, 234.88, 259.32, 266.52],
+        "target": 50.000000,
+        "passed": false,
+        "higher_is_better": false
+      }
+    },
+    "COPY FROM": {
+      "COPY FROM (CSV) throughput (rows/sec)": {
+        "average": 25961305.685724,
+        "runs": [17421602.79, 28693416.58, 27646304.24, 27777932.10, 28267272.72],
+        "target": 3000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "COPY TO": {
+      "COPY TO (text) throughput (rows/sec)": {
+        "average": 24650794.663706,
+        "runs": [22342663.14, 25409429.28, 25321839.59, 25352307.95, 24827733.35],
+        "target": 5000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "DataRow Encode": {
+      "DataRow encode throughput (rows/sec)": {
+        "average": 13271867.602160,
+        "runs": [13194265.77, 13366839.54, 13447963.78, 13015664.35, 13334604.57],
+        "target": 8000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "DDL Dispatch": {
+      "DDL parse throughput (ops/sec)": {
+        "average": 4616820.397146,
+        "runs": [4583310.61, 4583894.67, 4630626.50, 4651376.97, 4634893.24],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Execute Message": {
+      "Execute message decode latency (us)": {
+        "average": 0.028383,
+        "runs": [0.03, 0.03, 0.03, 0.03, 0.03],
+        "target": 20.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "JWT Auth": {
+      "JWT decode throughput (ops/sec)": {
+        "average": 120711.789257,
+        "runs": [122043.54, 121672.90, 119532.01, 120586.03, 119724.47],
+        "target": 200000.000000,
+        "passed": false,
+        "higher_is_better": true
+      }
+    },
+    "Message Decode": {
+      "FrontendMessage decode throughput (ops/sec)": {
+        "average": 25648479.996375,
+        "runs": [26318074.99, 23514860.22, 26129445.27, 25902172.67, 26377846.83],
+        "target": 2000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Message Encode": {
+      "BackendMessage encode throughput (ops/sec)": {
+        "average": 29990942.269078,
+        "runs": [30124928.08, 29921844.14, 30028947.91, 30188132.44, 29690858.78],
+        "target": 2000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Notification Channel": {
+      "notify() throughput (ops/sec)": {
+        "average": 25658353.457893,
+        "runs": [25705222.79, 25622367.30, 25829715.02, 25345779.80, 25788682.38],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Parse Message": {
+      "Parse message decode latency (us)": {
+        "average": 0.058022,
+        "runs": [0.06, 0.06, 0.06, 0.06, 0.06],
+        "target": 8.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Row Serialization": {
+      "Row serialization throughput (rows/sec)": {
+        "average": 18182405.750848,
+        "runs": [18149544.99, 18123657.72, 18241817.18, 18226456.43, 18170552.44],
+        "target": 8000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Simple Query": {
+      "Simple query message latency (us)": {
+        "average": 0.049068,
+        "runs": [0.05, 0.05, 0.05, 0.05, 0.05],
+        "target": 20.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "TOTP Auth": {
+      "TOTP verify throughput (ops/sec)": {
+        "average": 14758666.918297,
+        "runs": [14779999.70, 14790273.92, 14825313.33, 14613836.67, 14783910.97],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Type Serialization": {
+      "scalar_to_text throughput (ops/sec)": {
+        "average": 146171549.835624,
+        "runs": [144207751.46, 144159105.52, 147516558.73, 147016448.20, 147957885.27],
+        "target": 8000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "scalar_to_binary throughput (ops/sec)": {
+        "average": 264775384.013869,
+        "runs": [254892664.70, 266244934.69, 268072079.22, 268453493.12, 266213748.34],
+        "target": 8000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}

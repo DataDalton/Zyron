@@ -1013,11 +1013,7 @@ async fn test_wal_stats_counters() {
             .load(std::sync::atomic::Ordering::Relaxed),
         0
     );
-    assert_eq!(
-        wal.wal_bytes_written
-            .load(std::sync::atomic::Ordering::Relaxed),
-        0
-    );
+    assert_eq!(wal.wal_bytes_written(), 0);
     tprintln!("  Initial counters at zero: PASS");
 
     // Write some records
@@ -1031,9 +1027,7 @@ async fn test_wal_stats_counters() {
     let records_written = wal
         .wal_records_written
         .load(std::sync::atomic::Ordering::Relaxed);
-    let bytes_written = wal
-        .wal_bytes_written
-        .load(std::sync::atomic::Ordering::Relaxed);
+    let bytes_written = wal.wal_bytes_written();
 
     tprintln!("  After {} inserts:", num_records);
     tprintln!("    wal_records_written = {}", records_written);

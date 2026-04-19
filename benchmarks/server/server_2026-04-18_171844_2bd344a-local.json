@@ -1,0 +1,130 @@
+{
+  "id": "2026-04-18_171844_2bd344a-local",
+  "date": "2026-04-18 17:19:08Z",
+  "ts": 1776532748,
+  "commit": "2bd344a-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Server Startup": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 12.78 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 12.91 },
+      "Cold start latency (ms)": {
+        "average": 6.752680,
+        "runs": [13.64, 5.38, 5.01, 4.50, 5.23],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Warm start latency (ms)": {
+        "average": 5.308220,
+        "runs": [9.90, 4.38, 4.06, 4.01, 4.19],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Concurrent Connections": {
+      "Max connections capacity": {
+        "average": 100000.000000,
+        "runs": [100000.00],
+        "target": 100000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Checkpoint": {
+      "util_before": { "cpu_pct": 10.0, "ram_used_gb": 12.80 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 12.89 },
+      "Checkpoint latency (ms)": {
+        "average": 0.061160,
+        "runs": [0.06, 0.06, 0.06, 0.06, 0.06],
+        "target": 3.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Graceful Shutdown": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 12.84 },
+      "util_after": { "cpu_pct": 11.0, "ram_used_gb": 12.87 },
+      "Shutdown latency (ms)": {
+        "average": 0.054340,
+        "runs": [0.06, 0.06, 0.05, 0.05, 0.05],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Crash Recovery": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 12.83 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 12.84 },
+      "1MB WAL recovery latency (ms)": {
+        "average": 3.315340,
+        "runs": [4.07, 3.13, 3.20, 3.03, 3.16],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Clean recovery latency (ms)": {
+        "average": 0.896300,
+        "runs": [2.80, 0.41, 0.41, 0.45, 0.41],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Metrics": {
+      "util_before": { "cpu_pct": 15.0, "ram_used_gb": 12.83 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 12.82 },
+      "Metrics scrape latency (us)": {
+        "average": 6.140000,
+        "runs": [20.90, 3.00, 2.40, 2.20, 2.20],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Health Checks": {
+      "util_before": { "cpu_pct": 5.0, "ram_used_gb": 12.82 },
+      "util_after": { "cpu_pct": 7.0, "ram_used_gb": 12.80 },
+      "Health check latency (us)": {
+        "average": 134.840000,
+        "runs": [300.60, 101.50, 92.70, 90.50, 88.90],
+        "target": 100.000000,
+        "passed": false,
+        "higher_is_better": false
+      },
+      "Health endpoint round-trip (us)": {
+        "average": 134.840000,
+        "runs": [134.84],
+        "target": 10000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "End-to-End Wire": {
+      "util_before": { "cpu_pct": 5.0, "ram_used_gb": 12.81 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 12.81 },
+      "Handshake latency (us)": {
+        "average": 338.524000,
+        "runs": [348.39, 455.09, 270.34, 294.91, 323.89],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Memory Baseline": {
+      "Core struct overhead (bytes)": {
+        "average": 1128.000000,
+        "runs": [1128.00],
+        "target": 10000000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    }
+  }
+}

@@ -3,7 +3,7 @@
 //! All structures are serialized to bytes so they can be stored as column values
 //! and merged across rows.
 
-use crate::encoding::xxhash64;
+use zyron_common::hash64;
 use zyron_common::{Result, ZyronError};
 
 // ---------------------------------------------------------------------------
@@ -53,7 +53,7 @@ fn hll_validate(sketch: &[u8]) -> Result<(u8, usize)> {
 pub fn hll_add(sketch: &mut [u8], value: &[u8]) -> Result<()> {
     let (precision, _m) = hll_validate(sketch)?;
 
-    let hash = xxhash64(value);
+    let hash = hash64(value);
     let p = precision as u32;
     let bucket = (hash >> (64 - p)) as usize;
     // Count leading zeros of the remaining bits (after the bucket bits)
@@ -171,8 +171,8 @@ fn bloom_validate(filter: &[u8]) -> Result<(u32, u32)> {
 /// Adds an element to the Bloom filter.
 pub fn bloom_add(filter: &mut [u8], value: &[u8]) -> Result<()> {
     let (k, m) = bloom_validate(filter)?;
-    let hash = xxhash64(value);
-    let hash2 = xxhash64(&hash.to_le_bytes());
+    let hash = hash64(value);
+    let hash2 = hash64(&hash.to_le_bytes());
 
     for i in 0..k {
         let combined = hash.wrapping_add((i as u64).wrapping_mul(hash2));
@@ -185,8 +185,8 @@ pub fn bloom_add(filter: &mut [u8], value: &[u8]) -> Result<()> {
 /// Returns true if the value may be in the set (false positives possible).
 pub fn bloom_contains(filter: &[u8], value: &[u8]) -> Result<bool> {
     let (k, m) = bloom_validate(filter)?;
-    let hash = xxhash64(value);
-    let hash2 = xxhash64(&hash.to_le_bytes());
+    let hash = hash64(value);
+    let hash2 = hash64(&hash.to_le_bytes());
 
     for i in 0..k {
         let combined = hash.wrapping_add((i as u64).wrapping_mul(hash2));
@@ -426,7 +426,7 @@ fn cms_validate(sketch: &[u8]) -> Result<(u32, u32)> {
 
 fn cms_index(value: &[u8], row: u32, width: u32) -> usize {
     let seed = row as u64;
-    let h = xxhash64(value).wrapping_add(seed.wrapping_mul(0x9E3779B97F4A7C15));
+    let h = hash64(value).wrapping_add(seed.wrapping_mul(0x9E3779B97F4A7C15));
     (h % width as u64) as usize
 }
 

@@ -759,27 +759,29 @@ pub unsafe fn serialize_raw_deferred(
 
     let payload_len = payload.len() as u16;
 
-    let header = PackedHeader {
-        lsn: lsn.0.to_le(),
-        prev_lsn: prev_lsn.0.to_le(),
-        txn_id: txn_id.to_le(),
-        record_type,
-        flags,
-        payload_len: payload_len.to_le(),
-    };
+    // Direct unaligned writes from registers skip the intermediate
+    // PackedHeader stack allocation + copy_from_slice that the previous
+    // implementation went through. Each write becomes a single MOV on x86.
+    // Header layout: lsn(8) prev_lsn(8) txn_id(4) record_type(1) flags(1) payload_len(2) = 24 bytes.
+    unsafe {
+        std::ptr::write_unaligned(buf as *mut u64, lsn.0.to_le());
+        std::ptr::write_unaligned(buf.add(8) as *mut u64, prev_lsn.0.to_le());
+        std::ptr::write_unaligned(buf.add(16) as *mut u32, txn_id.to_le());
+        *buf.add(20) = record_type;
+        *buf.add(21) = flags;
+        std::ptr::write_unaligned(buf.add(22) as *mut u16, payload_len.to_le());
 
-    let buf_slice =
-        unsafe { std::slice::from_raw_parts_mut(buf, record_size_for_payload(payload.len())) };
-    let mut offset = header.write_to(buf_slice, 0);
+        // Payload copy. Nonoverlapping because `buf` is writer-owned space in
+        // the ring buffer and `payload` is caller-provided input.
+        if !payload.is_empty() {
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), buf.add(24), payload.len());
+        }
 
-    if !payload.is_empty() {
-        buf_slice[offset..offset + payload.len()].copy_from_slice(payload);
-        offset += payload.len();
+        // Zero checksum placeholder (filled by backfill_checksums in flush thread).
+        std::ptr::write_unaligned(buf.add(24 + payload.len()) as *mut u32, 0u32);
     }
 
-    // Write zero checksum placeholder
-    buf_slice[offset..offset + CHECKSUM_SIZE].copy_from_slice(&0u32.to_le_bytes());
-    offset + CHECKSUM_SIZE
+    HEADER_SIZE + payload.len() + CHECKSUM_SIZE
 }
 
 /// Walks a contiguous buffer of serialized WAL records and computes + writes
@@ -789,9 +791,10 @@ pub unsafe fn serialize_raw_deferred(
 /// Each record's checksum is computed from its header + payload bytes using
 /// `wal_checksum`, then written into the 4-byte placeholder at the end of
 /// each record.
-pub fn backfill_checksums(buf: &mut [u8]) {
+pub fn backfill_checksums(buf: &mut [u8]) -> usize {
     let len = buf.len();
     let mut offset = 0;
+    let mut count = 0usize;
 
     while offset + HEADER_SIZE + CHECKSUM_SIZE <= len {
         // Read payload_len from header
@@ -814,7 +817,9 @@ pub fn backfill_checksums(buf: &mut [u8]) {
         buf[checksum_offset..checksum_offset + 4].copy_from_slice(&checksum.to_le_bytes());
 
         offset += record_size;
+        count += 1;
     }
+    count
 }
 
 #[cfg(test)]

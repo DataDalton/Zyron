@@ -4,7 +4,7 @@
 //! Specialized similarity functions for addresses, names, and company names.
 
 use crate::fuzzy::{FuzzyBuffer, jaro_winkler};
-use crate::similarity::{FuzzyJoinAlgo, fuzzy_join_candidates};
+use crate::similarity::FuzzyJoinAlgo;
 use zyron_common::{Result, ZyronError};
 
 // ---------------------------------------------------------------------------

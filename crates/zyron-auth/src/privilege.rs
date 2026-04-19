@@ -53,6 +53,10 @@ pub enum PrivilegeType {
     VectorSearch = 26,
     GraphTraverse = 27,
     GraphAlgorithm = 28,
+    CreateIndex = 29,
+    DropIndex = 30,
+    Reindex = 31,
+    AlterIndex = 32,
     All = 255,
 }
 
@@ -89,6 +93,10 @@ impl PrivilegeType {
             26 => Ok(Self::VectorSearch),
             27 => Ok(Self::GraphTraverse),
             28 => Ok(Self::GraphAlgorithm),
+            29 => Ok(Self::CreateIndex),
+            30 => Ok(Self::DropIndex),
+            31 => Ok(Self::Reindex),
+            32 => Ok(Self::AlterIndex),
             255 => Ok(Self::All),
             _ => Err(ZyronError::CatalogCorrupted(format!(
                 "invalid PrivilegeType value {}",
@@ -129,6 +137,10 @@ impl PrivilegeType {
             PrivilegeType::VectorSearch,
             PrivilegeType::GraphTraverse,
             PrivilegeType::GraphAlgorithm,
+            PrivilegeType::CreateIndex,
+            PrivilegeType::DropIndex,
+            PrivilegeType::Reindex,
+            PrivilegeType::AlterIndex,
         ]
     }
 

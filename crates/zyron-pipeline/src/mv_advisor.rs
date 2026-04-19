@@ -1,7 +1,6 @@
 //! Auto-materialize advisor: tracks query patterns and recommends materialized views.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use zyron_common::hash64;
 
 /// Execution statistics for a query pattern.
 #[derive(Debug, Clone)]
@@ -149,9 +148,7 @@ impl MaterializeAdvisor {
             .split_whitespace()
             .collect::<Vec<&str>>()
             .join(" ");
-        let mut hasher = DefaultHasher::new();
-        normalized.hash(&mut hasher);
-        hasher.finish()
+        hash64(normalized.as_bytes())
     }
 }
 

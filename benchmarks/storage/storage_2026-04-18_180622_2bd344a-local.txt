@@ -1,0 +1,34 @@
+
+=== WAL Write/Replay Performance Test ===
+Records per run: 10000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Write: 33,322,226 ops/sec (300.1µs)
+  Replay: 28,801,843 ops/sec (347.2µs)
+
+--- Run 2/5 ---
+  Write: 33,322,226 ops/sec (300.1µs)
+  Replay: 28,145,229 ops/sec (355.3µs)
+
+--- Run 3/5 ---
+  Write: 28,918,450 ops/sec (345.8µs)
+  Replay: 27,412,281 ops/sec (364.8µs)
+
+--- Run 4/5 ---
+  Write: 35,637,919 ops/sec (280.6µs)
+  Replay: 29,629,630 ops/sec (337.5µs)
+
+--- Run 5/5 ---
+  Write: 35,063,114 ops/sec (285.2µs)
+  Replay: 28,224,668 ops/sec (354.3µs)
+
+=== WAL Validation Results ===
+  Write throughput (ops/sec) [PASS/OK]:
+    Runs: [33,322,226, 33,322,226, 28,918,450, 35,637,919, 35,063,114]
+    Average: 33,252,787 >= 8,000,000 (target)
+    Min/Max: 28,918,450 / 35,637,919, StdDev: 2,356,364
+  Replay throughput (ops/sec) [PASS/OK]:
+    Runs: [28,801,843, 28,145,229, 27,412,281, 29,629,630, 28,224,668]
+    Average: 28,442,730 >= 12,000,000 (target)
+    Min/Max: 27,412,281 / 29,629,630, StdDev: 739,672

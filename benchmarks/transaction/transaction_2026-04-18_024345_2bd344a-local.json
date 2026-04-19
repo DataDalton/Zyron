@@ -1,0 +1,113 @@
+{
+  "id": "2026-04-18_024345_2bd344a-local",
+  "date": "2026-04-18 02:44:04Z",
+  "ts": 1776480244,
+  "commit": "2bd344a-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "B+Tree Split Under Concurrency": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 14.44 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 14.38 },
+      "Split insert throughput (ops/sec)": {
+        "average": 6999491.766612,
+        "runs": [7523286.92, 7315188.62, 6861681.37, 6654356.11, 6642945.81],
+        "target": 4000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Concurrent B+Tree Insert": {
+      "util_before": { "cpu_pct": 4.0, "ram_used_gb": 14.40 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 14.39 },
+      "Insert throughput (ops/sec)": {
+        "average": 6666308.889499,
+        "runs": [6647996.88, 6853070.18, 6430945.71, 6919936.34, 6479595.35],
+        "target": 4000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Concurrent Txns": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 14.39 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 14.40 },
+      "Throughput (txn/sec)": {
+        "average": 3509600.882900,
+        "runs": [3642406.72, 3638430.93, 3655638.82, 3084813.08, 3526714.87],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "NodeLatch Stress": {
+      "Reader retry rate (%)": {
+        "average": 58.541438,
+        "runs": [54.16, 45.48, 68.52, 62.92, 61.62],
+        "target": 5.000000,
+        "passed": false,
+        "higher_is_better": false
+      }
+    },
+    "Optimistic Read Under Contention": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 14.38 },
+      "util_after": { "cpu_pct": 19.0, "ram_used_gb": 14.44 },
+      "Max read latency (us)": {
+        "average": 2005.200000,
+        "runs": [2005.20],
+        "target": 10.000000,
+        "passed": false,
+        "higher_is_better": false
+      }
+    },
+    "Phase 1.5 Microbenchmarks": {
+      "util_before": { "cpu_pct": 7.0, "ram_used_gb": 14.44 },
+      "util_after": { "cpu_pct": 6.0, "ram_used_gb": 14.44 },
+      "begin()+commit() cycle (ns/op)": {
+        "average": 483.874000,
+        "runs": [457.95, 522.77, 593.01, 411.97, 433.67],
+        "target": 250.000000,
+        "passed": false,
+        "higher_is_better": false
+      },
+      "commit() latency (ns/op)": {
+        "average": 2320.254400,
+        "runs": [2452.53, 2312.08, 2278.48, 2242.86, 2315.31],
+        "target": 200.000000,
+        "passed": false,
+        "higher_is_better": false
+      },
+      "is_visible() latency (ns/op)": {
+        "average": 1.352440,
+        "runs": [1.34, 1.37, 1.36, 1.36, 1.34],
+        "target": 15.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "lock_row() latency (ns/op)": {
+        "average": 74.600800,
+        "runs": [76.75, 72.51, 75.28, 73.08, 75.39],
+        "target": 80.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Snapshot::new() latency (ns/op)": {
+        "average": 22.027400,
+        "runs": [22.45, 21.66, 22.06, 22.19, 21.78],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "GC sweep throughput (tuples/sec)": {
+        "average": 1956009224.486826,
+        "runs": [1967729240.46, 1924557351.81, 1958863858.96, 1967342120.79, 1961553550.41],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}

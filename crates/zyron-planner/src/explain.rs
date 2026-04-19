@@ -441,6 +441,34 @@ impl ExplainNode {
                 actual_metrics: None,
                 children: Vec::new(),
             },
+            PhysicalPlan::SpatialScan {
+                table_id,
+                index_id,
+                columns,
+                kind,
+                cost,
+                ..
+            } => {
+                let kind_str = match kind {
+                    super::physical::SpatialScanKind::Knn { k, .. } => format!("knn(k={})", k),
+                    super::physical::SpatialScanKind::DWithin { radius_meters, .. } => {
+                        format!("dwithin(radius={:.1}m)", radius_meters)
+                    }
+                    super::physical::SpatialScanKind::Range { .. } => "range".to_string(),
+                };
+                Self {
+                    operator_name: "SpatialScan".to_string(),
+                    details: vec![
+                        ("table_id".to_string(), format!("{}", table_id.0)),
+                        ("index_id".to_string(), format!("{}", index_id.0)),
+                        ("columns".to_string(), format!("{}", columns.len())),
+                        ("kind".to_string(), kind_str),
+                    ],
+                    estimated_cost: Some(*cost),
+                    actual_metrics: None,
+                    children: Vec::new(),
+                }
+            }
             PhysicalPlan::GraphAlgorithm {
                 schema_name,
                 algorithm,

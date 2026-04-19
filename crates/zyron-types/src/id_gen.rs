@@ -3,7 +3,6 @@
 //! UUID v4 (random), UUID v7 (time-ordered, RFC 9562), ULID, Snowflake,
 //! CUID2, NanoID, KSUID, TSID. All functions are thread-safe.
 
-use rand::Rng;
 use rand::RngExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};

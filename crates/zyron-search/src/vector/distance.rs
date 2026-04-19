@@ -244,7 +244,6 @@ unsafe fn euclideanQuantizedAvx2(a: &[u8], b: &[u8]) -> u32 {
     use std::arch::x86_64::*;
     let len = a.len();
     let mut acc = _mm256_setzero_si256();
-    let zero = _mm256_setzero_si256();
     let chunks = len / 16;
 
     // Process 16 u8 bytes per iteration. Unpack to i16, compute diff, square via pmaddwd.

@@ -1,0 +1,25 @@
+{
+  "id": "2026-04-18_172821_2bd344a-local",
+  "date": "2026-04-18 17:28:31Z",
+  "ts": 1776533311,
+  "commit": "2bd344a-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Limit": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 13.25 },
+      "util_after": { "cpu_pct": 45.0, "ram_used_gb": 13.19 },
+      "Limit throughput (rows/sec)": {
+        "average": 726159285453.503906,
+        "runs": [658327847267.94, 787711697518.71, 645994832041.34, 812017864393.02, 726744186046.51],
+        "target": 200000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}

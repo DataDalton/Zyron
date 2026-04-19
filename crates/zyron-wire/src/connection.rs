@@ -77,7 +77,9 @@ pub struct ServerState {
     /// CDC ingest stats: Vec<(name, table_id, active, records_applied, records_failed)>
     pub cdc_ingest_stats: Option<Arc<dyn Fn() -> Vec<(String, u32, bool, u64, u64)> + Send + Sync>>,
 
-    // -- CDC managers --
+    // -----------------------------------------------------------------------
+    // CDC managers
+    // -----------------------------------------------------------------------
     /// Change Data Feed registry for tracking table change feeds.
     pub cdc_registry: Option<Arc<zyron_cdc::CdfRegistry>>,
     /// Replication slot manager.
@@ -89,7 +91,9 @@ pub struct ServerState {
     /// Inbound CDC ingestion manager.
     pub cdc_ingest_manager: Option<Arc<zyron_cdc::CdcIngestManager>>,
 
-    // -- Pipeline managers --
+    // -----------------------------------------------------------------------
+    // Pipeline managers
+    // -----------------------------------------------------------------------
     /// Trigger registry indexed by table and event type.
     pub trigger_manager: Option<Arc<zyron_pipeline::trigger::TriggerManager>>,
     /// User-defined function registry.
@@ -107,30 +111,42 @@ pub struct ServerState {
     /// Materialized view refresh manager.
     pub mv_manager: Option<Arc<zyron_pipeline::materialized_view::MaterializedViewManager>>,
 
-    // -- Streaming --
+    // -----------------------------------------------------------------------
+    // Streaming
+    // -----------------------------------------------------------------------
     /// Streaming job lifecycle manager. Wrapped in Mutex because StreamOperator
     /// trait objects are Send but not Sync.
     pub stream_job_manager: Option<Arc<parking_lot::Mutex<zyron_streaming::job::StreamJobManager>>>,
 
-    // -- Versioning --
+    // -----------------------------------------------------------------------
+    // Versioning
+    // -----------------------------------------------------------------------
     /// Data branch manager for version branching.
     pub branch_manager: Option<Arc<zyron_versioning::BranchManager>>,
 
-    // -- Search indexes --
+    // -----------------------------------------------------------------------
+    // Search indexes
+    // -----------------------------------------------------------------------
     /// FTS index manager for fulltext search operations.
     pub fts_manager: Option<Arc<zyron_search::FtsManager>>,
     /// Vector index manager for vector similarity search.
     pub vector_manager: Option<Arc<zyron_search::vector::VectorIndexManager>>,
     /// Graph schema manager for graph traversal and algorithms.
     pub graph_manager: Option<Arc<zyron_search::graph::GraphManager>>,
+    /// Spatial (R-tree) index manager for KNN, range, ST_DWithin, ST_Intersects.
+    pub spatial_manager: Option<Arc<zyron_types::spatial_index::SpatialIndexManager>>,
 
-    // -- DML hooks --
+    // -----------------------------------------------------------------------
+    // DML hooks
+    // -----------------------------------------------------------------------
     /// CDC hook invoked by DML operators after mutations.
     pub cdc_hook: Option<Arc<dyn CdcHook>>,
     /// DML hook invoked by DML operators before mutations (BEFORE triggers).
     pub dml_hook: Option<Arc<dyn zyron_executor::context::DmlHook>>,
 
-    // -- Notification channels for LISTEN/NOTIFY --
+    // -----------------------------------------------------------------------
+    // Notification channels for LISTEN/NOTIFY
+    // -----------------------------------------------------------------------
     pub notification_channels: Option<Arc<crate::notifications::NotificationChannels>>,
 }
 
@@ -880,6 +896,9 @@ impl<T: WireTransport> Connection<T> {
                     }
                     if let Some(ref graph_mgr) = self.server.graph_manager {
                         ctx.set_graph_manager(Arc::clone(graph_mgr));
+                    }
+                    if let Some(ref spatial_mgr) = self.server.spatial_manager {
+                        ctx.set_spatial_manager(Arc::clone(spatial_mgr));
                     }
                     if let Some(ref sec_mgr) = self.server.security_manager {
                         ctx.set_security_manager(Arc::clone(sec_mgr));
@@ -2492,6 +2511,13 @@ impl<T: WireTransport> Connection<T> {
         const FLUSH_THRESHOLD: usize = 65536;
         let mut buf = BytesMut::with_capacity(FLUSH_THRESHOLD + 4096);
 
+        // Precompute which columns are vectors so the per-row loop skips a
+        // schema lookup + enum compare on every column. Adds up on wide
+        // COPY TO workloads (e.g. 20M rows/sec × N cols).
+        let vector_cols: Vec<bool> = (0..num_cols)
+            .map(|i| i < schema.len() && schema[i].type_id == zyron_common::TypeId::Vector)
+            .collect();
+
         for batch in batches {
             for row in 0..batch.num_rows {
                 // DataRow: type 'D' + 4-byte length + 2-byte column count + per-column data
@@ -2515,8 +2541,7 @@ impl<T: WireTransport> Connection<T> {
 
                     // Vector columns are stored as Binary (raw f32 bytes) but
                     // need special text formatting as bracket notation [0.1,0.2,0.3].
-                    let is_vector = col_idx < schema.len()
-                        && schema[col_idx].type_id == zyron_common::TypeId::Vector;
+                    let is_vector = vector_cols[col_idx];
 
                     if is_vector {
                         if let ScalarValue::Binary(ref v) = scalar {

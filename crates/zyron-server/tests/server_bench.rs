@@ -176,6 +176,9 @@ async fn create_test_state(
         stream_job_manager: None,
         branch_manager: None,
         fts_manager: None,
+        vector_manager: None,
+        graph_manager: None,
+        spatial_manager: None,
         cdc_hook: None,
         dml_hook: None,
         notification_channels: Some(Arc::new(

@@ -12,8 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use zyron_common::{Result, ZyronError};
-use zyron_wal::checksum::WalHasher;
+use zyron_common::{Hasher, Result, ZyronError};
 
 /// Size of the read/write buffer used when copying files and computing checksums.
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
@@ -190,7 +189,7 @@ impl BackupManager {
 
         let mut reader = BufReader::with_capacity(COPY_BUFFER_SIZE, srcFile);
         let mut writer = BufWriter::with_capacity(COPY_BUFFER_SIZE, dstFile);
-        let mut hasher = WalHasher::new(0);
+        let mut hasher = Hasher::new();
         let mut buffer = [0u8; COPY_BUFFER_SIZE];
         let mut totalBytes: u64 = 0;
 
@@ -201,7 +200,7 @@ impl BackupManager {
             if bytesRead == 0 {
                 break;
             }
-            hasher.write_payload(&buffer[..bytesRead]);
+            hasher.update(&buffer[..bytesRead]);
             writer.write_all(&buffer[..bytesRead]).map_err(|e| {
                 ZyronError::IoError(format!("write error for {}: {}", dst.display(), e))
             })?;
@@ -212,7 +211,7 @@ impl BackupManager {
             ZyronError::IoError(format!("flush error for {}: {}", dst.display(), e))
         })?;
 
-        let hexChecksum = format!("{:08x}", hasher.finish());
+        let hexChecksum = format!("{:08x}", hasher.finish32());
 
         Ok((totalBytes, hexChecksum))
     }
@@ -341,12 +340,12 @@ impl RestoreManager {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Compute a hex checksum of a file using the WAL two-lane hasher.
+/// Compute a hex checksum of a file using the central hash primitive.
 fn checksumFile(path: &Path) -> Result<String> {
     let file = fs::File::open(path)
         .map_err(|e| ZyronError::IoError(format!("failed to open {}: {}", path.display(), e)))?;
     let mut reader = BufReader::with_capacity(COPY_BUFFER_SIZE, file);
-    let mut hasher = WalHasher::new(0);
+    let mut hasher = Hasher::new();
     let mut buffer = [0u8; COPY_BUFFER_SIZE];
     loop {
         let bytesRead = reader.read(&mut buffer).map_err(|e| {
@@ -355,9 +354,9 @@ fn checksumFile(path: &Path) -> Result<String> {
         if bytesRead == 0 {
             break;
         }
-        hasher.write_payload(&buffer[..bytesRead]);
+        hasher.update(&buffer[..bytesRead]);
     }
-    Ok(format!("{:08x}", hasher.finish()))
+    Ok(format!("{:08x}", hasher.finish32()))
 }
 
 /// Format the current wall-clock time as an ISO 8601 string: YYYY-MM-DDTHH:MM:SSZ.

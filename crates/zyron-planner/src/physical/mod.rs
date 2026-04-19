@@ -230,6 +230,17 @@ pub enum PhysicalPlan {
         cost: PlanCost,
     },
 
+    /// Spatial scan over an R-tree index. Serves KNN, ST_DWithin,
+    /// ST_Intersects, and bounding-box range queries.
+    SpatialScan {
+        table_id: TableId,
+        index_id: IndexId,
+        columns: Vec<LogicalColumn>,
+        kind: SpatialScanKind,
+        remaining_predicate: Option<BoundExpr>,
+        cost: PlanCost,
+    },
+
     /// Graph algorithm execution over a schema's edge/vertex tables.
     GraphAlgorithm {
         algorithm: GraphAlgorithmType,
@@ -250,6 +261,25 @@ pub enum PhysicalPlan {
         window_names: Vec<String>,
         child: Box<PhysicalPlan>,
         cost: PlanCost,
+    },
+}
+
+/// Mode of a spatial index scan, set at plan time from the matched predicate
+/// or sort+limit pattern. The executor reads this to dispatch the right
+/// R-tree query method.
+#[derive(Debug, Clone)]
+pub enum SpatialScanKind {
+    /// K-nearest-neighbor: ORDER BY ST_Distance(col, query) [ASC] LIMIT k.
+    Knn { query_point: Vec<f64>, k: usize },
+    /// Distance filter: WHERE ST_DWithin(col, query, radius).
+    DWithin {
+        query_point: Vec<f64>,
+        radius_meters: f64,
+    },
+    /// Bounding-box range: WHERE ST_Intersects(col, env_mbr) or equivalent.
+    Range {
+        mbr_min: Vec<f64>,
+        mbr_max: Vec<f64>,
     },
 }
 
@@ -297,6 +327,7 @@ impl PhysicalPlan {
             | PhysicalPlan::Broadcast { cost, .. }
             | PhysicalPlan::FulltextScan { cost, .. }
             | PhysicalPlan::VectorScan { cost, .. }
+            | PhysicalPlan::SpatialScan { cost, .. }
             | PhysicalPlan::GraphAlgorithm { cost, .. }
             | PhysicalPlan::Window { cost, .. } => cost,
         }
@@ -382,7 +413,8 @@ impl PhysicalPlan {
             | PhysicalPlan::Delete { .. } => Vec::new(),
             PhysicalPlan::Values { schema, .. } => schema.clone(),
             PhysicalPlan::FulltextScan { columns, .. }
-            | PhysicalPlan::VectorScan { columns, .. } => columns.clone(),
+            | PhysicalPlan::VectorScan { columns, .. }
+            | PhysicalPlan::SpatialScan { columns, .. } => columns.clone(),
             PhysicalPlan::GraphAlgorithm { output_columns, .. } => output_columns.clone(),
             PhysicalPlan::Window {
                 window_exprs,
@@ -419,6 +451,7 @@ impl PhysicalPlan {
             | PhysicalPlan::ParallelSeqScan { .. }
             | PhysicalPlan::FulltextScan { .. }
             | PhysicalPlan::VectorScan { .. }
+            | PhysicalPlan::SpatialScan { .. }
             | PhysicalPlan::GraphAlgorithm { .. } => PlanCost::zero(),
             PhysicalPlan::Filter { child, .. }
             | PhysicalPlan::Project { child, .. }

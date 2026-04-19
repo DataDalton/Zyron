@@ -107,6 +107,9 @@ pub async fn try_handle_ddl_utility(
         Statement::CreateVectorIndex(s) => {
             Some(handle_create_vector_index(s, server, session).await)
         }
+        Statement::CreateSpatialIndex(s) => {
+            Some(handle_create_spatial_index(s, server, session).await)
+        }
 
         // -- Auth/Roles --
         Statement::CreateUser(s) => Some(handle_create_user(s, server).await),
@@ -485,13 +488,13 @@ async fn handle_drop_index(
 
     match found_table_id {
         Some(table_id) => {
-            // Check CREATE privilege on the schema (index owner must have schema-level rights)
+            // Privilege: dedicated DropIndex on the table.
             check_ddl_privilege(
                 server,
                 session,
-                zyron_auth::PrivilegeType::Create,
-                zyron_auth::ObjectType::Schema,
-                schema_id.0,
+                zyron_auth::PrivilegeType::DropIndex,
+                zyron_auth::ObjectType::Table,
+                table_id.0,
             )?;
 
             // Identify index type before dropping so we can clean up the right manager.
@@ -503,16 +506,22 @@ async fn handle_drop_index(
             let vec_index_id = matched
                 .filter(|idx| idx.index_type == zyron_catalog::IndexType::Vector)
                 .map(|idx| idx.id.0);
+            let spatial_index_id = matched
+                .filter(|idx| idx.index_type == zyron_catalog::IndexType::Spatial)
+                .map(|idx| idx.id.0);
 
             match server.catalog.drop_index(table_id, &stmt.name).await {
                 Ok(()) => {
-                    // Remove from FTS manager if it was a fulltext index.
                     if let (Some(id), Some(fts_mgr)) = (fts_index_id, &server.fts_manager) {
                         let _ = fts_mgr.drop_index(id);
                     }
-                    // Remove from vector manager if it was a vector index.
                     if let (Some(id), Some(vec_mgr)) = (vec_index_id, &server.vector_manager) {
                         let _ = vec_mgr.drop_index(id);
+                    }
+                    if let (Some(id), Some(spatial_mgr)) =
+                        (spatial_index_id, &server.spatial_manager)
+                    {
+                        spatial_mgr.drop_index(id);
                     }
                     Ok(DdlResult::Tag("DROP INDEX".to_string()))
                 }
@@ -669,18 +678,29 @@ async fn handle_drop_role(
 // ---------------------------------------------------------------------------
 
 /// Maps a parser Privilege variant to the corresponding auth PrivilegeType.
-/// ALL expands to Select, Insert, Update, Delete.
+/// ALL expands to Select, Insert, Update, Delete plus the four index DDL
+/// privileges so a table owner with ALL can manage indexes on the table.
 fn map_privilege(p: zyron_parser::ast::Privilege) -> Vec<zyron_auth::PrivilegeType> {
     match p {
         zyron_parser::ast::Privilege::Select => vec![zyron_auth::PrivilegeType::Select],
         zyron_parser::ast::Privilege::Insert => vec![zyron_auth::PrivilegeType::Insert],
         zyron_parser::ast::Privilege::Update => vec![zyron_auth::PrivilegeType::Update],
         zyron_parser::ast::Privilege::Delete => vec![zyron_auth::PrivilegeType::Delete],
+        zyron_parser::ast::Privilege::CreateIndex => {
+            vec![zyron_auth::PrivilegeType::CreateIndex]
+        }
+        zyron_parser::ast::Privilege::DropIndex => vec![zyron_auth::PrivilegeType::DropIndex],
+        zyron_parser::ast::Privilege::Reindex => vec![zyron_auth::PrivilegeType::Reindex],
+        zyron_parser::ast::Privilege::AlterIndex => vec![zyron_auth::PrivilegeType::AlterIndex],
         zyron_parser::ast::Privilege::All => vec![
             zyron_auth::PrivilegeType::Select,
             zyron_auth::PrivilegeType::Insert,
             zyron_auth::PrivilegeType::Update,
             zyron_auth::PrivilegeType::Delete,
+            zyron_auth::PrivilegeType::CreateIndex,
+            zyron_auth::PrivilegeType::DropIndex,
+            zyron_auth::PrivilegeType::Reindex,
+            zyron_auth::PrivilegeType::AlterIndex,
         ],
     }
 }
@@ -1044,6 +1064,101 @@ async fn handle_create_vector_index(
     }
 
     Ok(DdlResult::Tag("CREATE INDEX".to_string()))
+}
+
+async fn handle_create_spatial_index(
+    stmt: &zyron_parser::ast::CreateSpatialIndexStatement,
+    server: &Arc<ServerState>,
+    session: &mut Option<Session>,
+) -> Result<DdlResult, ProtocolError> {
+    let schema_id = zyron_catalog::SchemaId(1); // default public schema
+
+    let table = server
+        .catalog
+        .get_table(schema_id, &stmt.table)
+        .map_err(ProtocolError::Database)?;
+
+    // IF NOT EXISTS: short-circuit if an index of this name already exists.
+    if stmt.if_not_exists
+        && server
+            .catalog
+            .get_indexes_for_table(table.id)
+            .iter()
+            .any(|idx| idx.name == stmt.name)
+    {
+        return Ok(DdlResult::Tag("CREATE SPATIAL INDEX".to_string()));
+    }
+
+    // Privilege check: dedicated CreateIndex privilege on the table.
+    check_ddl_privilege(
+        server,
+        session,
+        zyron_auth::PrivilegeType::CreateIndex,
+        zyron_auth::ObjectType::Table,
+        table.id.0,
+    )?;
+
+    // Parse spatial-specific tuning options.
+    let mut dims: u8 = 2;
+    let mut srid: u32 = 4326;
+    for opt in &stmt.options {
+        let key = opt.key.to_lowercase();
+        let val_str = match &opt.value {
+            zyron_parser::ast::TableOptionValue::String(s) => s.clone(),
+            zyron_parser::ast::TableOptionValue::Identifier(s) => s.clone(),
+            zyron_parser::ast::TableOptionValue::Integer(n) => n.to_string(),
+            zyron_parser::ast::TableOptionValue::Boolean(b) => b.to_string(),
+            zyron_parser::ast::TableOptionValue::StringList(_) => String::new(),
+        };
+        match key.as_str() {
+            "dims" | "dimensions" => {
+                let parsed: u8 = val_str.parse().unwrap_or(2);
+                if parsed < 1 || parsed > 4 {
+                    return Err(ProtocolError::Database(ZyronError::ExecutionError(
+                        format!("spatial index dims must be 1..=4, got {}", parsed),
+                    )));
+                }
+                dims = parsed;
+            }
+            "srid" => {
+                srid = val_str.parse().unwrap_or(4326);
+            }
+            _ => {}
+        }
+    }
+
+    // Verify the indexed column exists.
+    let _col = table
+        .columns
+        .iter()
+        .find(|c| c.name == stmt.column)
+        .ok_or_else(|| {
+            ProtocolError::Database(ZyronError::ExecutionError(format!(
+                "column '{}' not found in table '{}'",
+                stmt.column, stmt.table
+            )))
+        })?;
+
+    // Register in catalog.
+    let index_id = server
+        .catalog
+        .create_index(
+            table.id,
+            schema_id,
+            &stmt.name,
+            &[stmt.column.clone()],
+            false,
+            zyron_catalog::IndexType::Spatial,
+        )
+        .await
+        .map_err(ProtocolError::Database)?;
+
+    // Create the live R-tree if a spatial manager is configured.
+    if let Some(ref spatial_mgr) = server.spatial_manager {
+        spatial_mgr.create_index(index_id.0, dims, srid);
+    }
+
+    Ok(DdlResult::Tag("CREATE SPATIAL INDEX".to_string()))
 }
 
 // ---------------------------------------------------------------------------

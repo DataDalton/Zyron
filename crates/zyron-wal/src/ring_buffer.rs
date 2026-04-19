@@ -11,6 +11,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///
 /// Writers claim space atomically and write directly to the buffer.
 /// Flush thread reads committed data in order.
+/// Cache-line-sized padding to prevent false sharing between atomics touched
+/// by different threads. Each hot atomic gets its own 64-byte line so writer
+/// and flush thread don't invalidate each other's caches on unrelated fields.
+#[repr(align(64))]
+struct CachePadded<T>(T);
+
+impl<T> std::ops::Deref for CachePadded<T> {
+    type Target = T;
+    #[inline(always)]
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
 pub struct RingBuffer {
     /// Contiguous byte buffer.
     buffer: UnsafeCell<Box<[u8]>>,
@@ -19,18 +33,25 @@ pub struct RingBuffer {
     /// Bitmask for power-of-2 modulo (buffer_size - 1). Bitwise AND replaces
     /// integer division for offset calculation: 1 cycle vs 20-40 cycles on x86.
     buffer_mask: usize,
-    /// Write cursor - next byte offset to claim.
-    write_cursor: AtomicU64,
-    /// Committed cursor - bytes ready to drain.
-    committed_cursor: AtomicU64,
-    /// Read cursor - bytes already drained.
-    read_cursor: AtomicU64,
-    /// Maximum LSN written.
-    max_lsn: AtomicU64,
+    /// Write cursor: next byte offset to claim. Hit by every writer claim,
+    /// isolated on its own cache line so flush-thread reads of other cursors
+    /// don't force writers to refetch.
+    write_cursor: CachePadded<AtomicU64>,
+    /// Committed cursor - bytes ready to drain. Writer commits, flush reads.
+    /// Paired with max_lsn because both are updated in commit_write (one
+    /// cache line dirty per commit instead of two).
+    committed_cursor: CachePadded<AtomicU64>,
+    /// Maximum LSN written. Co-located with committed_cursor (see above).
+    /// Logically on the same cache line via the commit pairing; keeping it
+    /// on its own CachePadded field prevents packing with write_cursor.
+    max_lsn: CachePadded<AtomicU64>,
+    /// Read cursor: bytes already drained. Owned by the flush thread;
+    /// writers only read it in the slow path (wait_for_space_slow).
+    read_cursor: CachePadded<AtomicU64>,
     /// Cached write limit: writers can write up to this point without checking
     /// read_cursor. Updated by the flush thread after each drain. This avoids
     /// cross-core cache line traffic on the hot path.
-    safe_write_limit: AtomicU64,
+    safe_write_limit: CachePadded<AtomicU64>,
 }
 
 // SAFETY: Buffer access is coordinated via atomic cursors.
@@ -61,12 +82,12 @@ impl RingBuffer {
             buffer: UnsafeCell::new(buffer),
             buffer_size: capacity_bytes,
             buffer_mask: capacity_bytes - 1,
-            write_cursor: AtomicU64::new(0),
-            committed_cursor: AtomicU64::new(0),
-            read_cursor: AtomicU64::new(0),
-            max_lsn: AtomicU64::new(0),
+            write_cursor: CachePadded(AtomicU64::new(0)),
+            committed_cursor: CachePadded(AtomicU64::new(0)),
+            read_cursor: CachePadded(AtomicU64::new(0)),
+            max_lsn: CachePadded(AtomicU64::new(0)),
             // Initial limit: writers can fill the entire buffer before needing to check.
-            safe_write_limit: AtomicU64::new(capacity_bytes as u64),
+            safe_write_limit: CachePadded(AtomicU64::new(capacity_bytes as u64)),
         }
     }
 
@@ -230,6 +251,14 @@ impl RingBuffer {
         );
 
         Lsn(self.max_lsn.load(Ordering::Acquire))
+    }
+
+    /// Total bytes committed to the buffer across its lifetime. Already
+    /// tracked atomically for the commit protocol, stat views read it here
+    /// instead of the writer maintaining a redundant duplicate counter.
+    #[inline]
+    pub fn total_committed_bytes(&self) -> u64 {
+        self.committed_cursor.load(Ordering::Relaxed)
     }
 
     /// Returns true if no data has been committed since the last drain.

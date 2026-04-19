@@ -126,6 +126,10 @@ pub struct ExecutionContext {
     /// Graph manager reference for graph algorithm execution. Graph scan
     /// operators use this to look up graph schemas and build CSR representations.
     pub graph_manager: Option<Arc<zyron_search::graph::GraphManager>>,
+    /// Spatial (R-tree) index manager. Spatial scan operators look up
+    /// indexes by id; DML operators use it to maintain indexes on
+    /// INSERT/UPDATE/DELETE of indexed geometry columns.
+    pub spatial_manager: Option<Arc<zyron_types::spatial_index::SpatialIndexManager>>,
 }
 
 impl ExecutionContext {
@@ -158,6 +162,7 @@ impl ExecutionContext {
             security_manager: None,
             vector_manager: None,
             graph_manager: None,
+            spatial_manager: None,
         }
     }
 
@@ -324,5 +329,28 @@ impl ExecutionContext {
     /// Sets the graph manager for algorithm execution.
     pub fn set_graph_manager(&mut self, mgr: Arc<zyron_search::graph::GraphManager>) {
         self.graph_manager = Some(mgr);
+    }
+
+    /// Sets the spatial index manager for R-tree-backed scan operators.
+    pub fn set_spatial_manager(
+        &mut self,
+        mgr: Arc<zyron_types::spatial_index::SpatialIndexManager>,
+    ) {
+        self.spatial_manager = Some(mgr);
+    }
+
+    /// Returns all (index_id, indexed column_id) pairs for spatial indexes
+    /// on the given table. Used by DML operators to maintain spatial indexes
+    /// on INSERT/UPDATE/DELETE. Reads catalog directly because the spatial
+    /// manager only stores trees keyed by index_id and doesn't carry the
+    /// column mapping.
+    pub fn spatial_indexes_for_table(&self, table_id: u32) -> Vec<(u32, zyron_catalog::ColumnId)> {
+        let table_id = zyron_catalog::TableId(table_id);
+        self.catalog
+            .get_indexes_for_table(table_id)
+            .iter()
+            .filter(|idx| idx.index_type == zyron_catalog::IndexType::Spatial)
+            .filter_map(|idx| idx.columns.first().map(|c| (idx.id.0, c.column_id)))
+            .collect()
     }
 }

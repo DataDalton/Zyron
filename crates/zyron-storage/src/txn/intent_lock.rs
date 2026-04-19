@@ -85,12 +85,11 @@ impl IntentLockTable {
         self.locks.len()
     }
 
-    /// Hashes a (table_id, key) pair to a u64 using xxh3.
+    /// Hashes a (table_id, key) pair to a u64 using the central hash primitive.
     #[inline]
     fn hash_key(table_id: u32, key: &[u8]) -> u64 {
         // Seed with table_id so identical keys in different tables produce different hashes.
-        let seed = table_id as u64;
-        xxhash_rust::xxh3::xxh3_64_with_seed(key, seed)
+        zyron_common::hash64_seeded(key, table_id as u64)
     }
 }
 

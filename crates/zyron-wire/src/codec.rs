@@ -51,6 +51,7 @@ impl PostgresCodec {
 
     /// Tries to decode one complete message from the buffer.
     /// Returns Ok(None) if not enough data is available yet.
+    #[inline]
     pub fn decode(&mut self, src: &mut BytesMut) -> Result<Option<FrontendMessage>, ProtocolError> {
         if self.startup_phase {
             // Startup messages have no type byte.

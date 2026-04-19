@@ -31,6 +31,46 @@ use zyron_common::{Result, ZyronError};
 /// Maximum allowed record size (64 MB). Prevents OOM from corrupt files.
 const MAX_RECORD_SIZE: u64 = 64 * 1024 * 1024;
 
+/// Inline 2-lane multiply-xor checksum specialized for CDF record headers
+/// and payloads. Avoids the central Hasher's 5-10 ns dispatch+lane-init
+/// overhead that regressed per-row insert by 14% on this hot path.
+#[inline(always)]
+fn cdf_hash32(data: &[u8]) -> u32 {
+    const MIX_A: u64 = 0x517cc1b727220a95;
+    const MIX_B: u64 = 0xff51afd7ed558ccd;
+    let len = data.len();
+    let ptr = data.as_ptr();
+    let mut la = MIX_A ^ len as u64;
+    let mut lb = MIX_A.rotate_left(32) ^ (len as u64).wrapping_mul(MIX_A);
+    let mut i = 0;
+    while i + 16 <= len {
+        let w0 = unsafe { (ptr.add(i) as *const u64).read_unaligned() };
+        let w1 = unsafe { (ptr.add(i + 8) as *const u64).read_unaligned() };
+        la = (la ^ w0).wrapping_mul(MIX_A);
+        lb = (lb ^ w1).wrapping_mul(MIX_A);
+        i += 16;
+    }
+    if i + 8 <= len {
+        let w = unsafe { (ptr.add(i) as *const u64).read_unaligned() };
+        la = (la ^ w).wrapping_mul(MIX_A);
+        i += 8;
+    }
+    if i + 4 <= len {
+        let w = unsafe { (ptr.add(i) as *const u32).read_unaligned() } as u64;
+        lb = (lb ^ w).wrapping_mul(MIX_A);
+        i += 4;
+    }
+    while i < len {
+        la = (la ^ unsafe { *ptr.add(i) } as u64).wrapping_mul(MIX_A);
+        i += 1;
+    }
+    let mut h = la ^ lb;
+    h ^= h >> 33;
+    h = h.wrapping_mul(MIX_B);
+    h ^= h >> 33;
+    h as u32
+}
+
 /// File header: magic (8) + format_version (4) + table_id (4) + header_checksum (4) = 20 bytes.
 const FILE_HEADER_SIZE: usize = 20;
 const FILE_MAGIC: &[u8; 8] = b"ZYCDF\0\0\0";
@@ -245,7 +285,7 @@ fn write_file_header(w: &mut impl Write, table_id: u32) -> Result<()> {
     header[0..8].copy_from_slice(FILE_MAGIC);
     header[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
     header[12..16].copy_from_slice(&table_id.to_le_bytes());
-    let checksum = zyron_wal::data_checksum(&header[0..16]);
+    let checksum = cdf_hash32(&header[0..16]);
     header[16..20].copy_from_slice(&checksum.to_le_bytes());
     w.write_all(&header)?;
     Ok(())
@@ -264,7 +304,7 @@ fn read_file_header(data: &[u8]) -> Result<u32> {
     let _version = u32::from_le_bytes(data[8..12].try_into().unwrap_or([0; 4]));
     let table_id = u32::from_le_bytes(data[12..16].try_into().unwrap_or([0; 4]));
     let stored_checksum = u32::from_le_bytes(data[16..20].try_into().unwrap_or([0; 4]));
-    let computed = zyron_wal::data_checksum(&data[0..16]);
+    let computed = cdf_hash32(&data[0..16]);
     if stored_checksum != computed {
         return Err(ZyronError::CdcDecoderError(
             "CDF header checksum mismatch".into(),
@@ -375,7 +415,7 @@ impl ChangeDataFeed {
                     let record_data = &data[record_start..record_end];
                     let stored_crc =
                         u32::from_le_bytes(data[record_end..crc_end].try_into().unwrap_or([0; 4]));
-                    let computed_crc = zyron_wal::data_checksum(record_data);
+                    let computed_crc = cdf_hash32(record_data);
                     if stored_crc != computed_crc {
                         break;
                     }
@@ -458,7 +498,7 @@ impl ChangeDataFeed {
         }
 
         let data = record.serialize();
-        let checksum = zyron_wal::data_checksum(&data);
+        let checksum = cdf_hash32(&data);
 
         let mut inner = self.inner.lock();
         Self::open_writer(&mut inner, &self.file_path)?;
@@ -499,7 +539,7 @@ impl ChangeDataFeed {
         for record in records {
             let start = batch_buf.len();
             let data = record.serialize();
-            let checksum = zyron_wal::data_checksum(&data);
+            let checksum = cdf_hash32(&data);
             batch_buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
             batch_buf.extend_from_slice(&data);
             batch_buf.extend_from_slice(&checksum.to_le_bytes());
@@ -617,7 +657,7 @@ impl ChangeDataFeed {
                     .try_into()
                     .unwrap_or([0; 4]),
             );
-            let computed_crc = zyron_wal::data_checksum(record_data);
+            let computed_crc = cdf_hash32(record_data);
             if stored_crc != computed_crc {
                 return Err(ZyronError::CdcDecoderError(format!(
                     "checksum mismatch at offset {offset}"
@@ -692,7 +732,7 @@ impl ChangeDataFeed {
 
             for record in &records {
                 let data = record.serialize();
-                let checksum = zyron_wal::data_checksum(&data);
+                let checksum = cdf_hash32(&data);
                 let offset = new_file_size;
                 new_file_size += write_record(&mut writer, &data, checksum)?;
                 new_index.push(CdfIndexEntry {

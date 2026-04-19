@@ -26,70 +26,6 @@ const ZYIDX_HEADER_SIZE: usize = 32;
 const SLOT_ARRAY_START: usize = PageHeader::SIZE + LeafPageHeader::SIZE;
 const SLOT_SIZE: usize = 4;
 
-/// 4-lane parallel multiply-XOR checksum over header and data regions.
-/// Processes 32 bytes per iteration with four independent multiply chains
-/// the CPU can dispatch in parallel, which keeps the checksum off the
-/// critical path during writes. Covers all bytes (no sampling) and detects
-/// bit flips, zeroed regions, truncation, and byte shifts.
-fn checkpoint_checksum(header: &[u8], data: &[u8]) -> u32 {
-    // Odd primes with good bit distribution for multiply-XOR mixing.
-    const P0: u64 = 0x517cc1b727220a95;
-    const P1: u64 = 0x6c62272e07bb0143;
-    const P2: u64 = 0x8ebc6af09c88c6e3;
-    const P3: u64 = 0x305f1d4b1e0e2a6f;
-    const FINAL: u64 = 0xff51afd7ed558ccd;
-
-    // Seed lane 0 with data length to distinguish different-sized inputs.
-    let mut s0: u64 = P0 ^ (data.len() as u64);
-    let mut s1: u64 = P1;
-    let mut s2: u64 = P2;
-    let mut s3: u64 = P3;
-
-    // Mix header (28 bytes = 3 x u64 + 1 x u32).
-    let hp = header.as_ptr();
-    unsafe {
-        s0 = (s0 ^ (hp as *const u64).read_unaligned()).wrapping_mul(P0);
-        s1 = (s1 ^ (hp.add(8) as *const u64).read_unaligned()).wrapping_mul(P1);
-        s2 = (s2 ^ (hp.add(16) as *const u64).read_unaligned()).wrapping_mul(P2);
-        s3 = (s3 ^ ((hp.add(24) as *const u32).read_unaligned() as u64)).wrapping_mul(P3);
-    }
-
-    // Process data in 32-byte chunks (4 independent multiply chains).
-    let ptr = data.as_ptr();
-    let len = data.len();
-    let mut i = 0;
-    while i + 32 <= len {
-        unsafe {
-            s0 = (s0 ^ (ptr.add(i) as *const u64).read_unaligned()).wrapping_mul(P0);
-            s1 = (s1 ^ (ptr.add(i + 8) as *const u64).read_unaligned()).wrapping_mul(P1);
-            s2 = (s2 ^ (ptr.add(i + 16) as *const u64).read_unaligned()).wrapping_mul(P2);
-            s3 = (s3 ^ (ptr.add(i + 24) as *const u64).read_unaligned()).wrapping_mul(P3);
-        }
-        i += 32;
-    }
-
-    // Tail: remaining 8-byte words into lane 0.
-    while i + 8 <= len {
-        s0 = (s0 ^ unsafe { (ptr.add(i) as *const u64).read_unaligned() }).wrapping_mul(P0);
-        i += 8;
-    }
-    // Tail: remaining < 8 bytes.
-    if i < len {
-        let mut tail: u64 = 0;
-        unsafe {
-            std::ptr::copy_nonoverlapping(ptr.add(i), &mut tail as *mut u64 as *mut u8, len - i);
-        }
-        s0 = (s0 ^ tail).wrapping_mul(P0);
-    }
-
-    // Combine all 4 lanes and finalize to 32 bits.
-    let mut h = s0 ^ s1 ^ s2 ^ s3;
-    h ^= h >> 33;
-    h = h.wrapping_mul(FINAL);
-    h ^= h >> 33;
-    h as u32
-}
-
 pub fn write_checkpoint_from_store(
     path: &Path,
     store: &InMemoryPageStore,
@@ -231,8 +167,14 @@ pub fn write_checkpoint_from_store(
         }
     }
 
-    // Checksum
-    let checksum = checkpoint_checksum(&buf[..28], &buf[ZYIDX_HEADER_SIZE..]);
+    // Checksum: header section, phase separator, then data section.
+    let checksum = {
+        let mut h = zyron_common::Hasher::new();
+        h.update(&buf[..28]);
+        h.finish_phase();
+        h.update(&buf[ZYIDX_HEADER_SIZE..]);
+        h.finish32()
+    };
     unsafe {
         (bp.add(28) as *mut u32).write_unaligned(checksum);
     }
@@ -254,7 +196,12 @@ fn write_empty_checkpoint(path: &Path, checkpoint_lsn: u64, fsync: bool) -> Resu
     buf[0..8].copy_from_slice(&ZYIDX_MAGIC);
     buf[8..12].copy_from_slice(&ZYIDX_FORMAT_VERSION.to_le_bytes());
     buf[12..20].copy_from_slice(&checkpoint_lsn.to_le_bytes());
-    let checksum = checkpoint_checksum(&buf[..28], &[]);
+    let checksum = {
+        let mut h = zyron_common::Hasher::new();
+        h.update(&buf[..28]);
+        h.finish_phase();
+        h.finish32()
+    };
     buf[28..32].copy_from_slice(&checksum.to_le_bytes());
     std::fs::write(path, buf)?;
     if fsync {
@@ -333,11 +280,14 @@ pub fn load_checkpoint_into_store(
         ));
     }
 
-    // Validate checksum
-    let computed = checkpoint_checksum(
-        &buf[..28],
-        &buf[ZYIDX_HEADER_SIZE..ZYIDX_HEADER_SIZE + data_size],
-    );
+    // Validate checksum: header section, phase separator, then data section.
+    let computed = {
+        let mut h = zyron_common::Hasher::new();
+        h.update(&buf[..28]);
+        h.finish_phase();
+        h.update(&buf[ZYIDX_HEADER_SIZE..ZYIDX_HEADER_SIZE + data_size]);
+        h.finish32()
+    };
     if stored_checksum != computed {
         return Err(ZyronError::RecoveryFailed(
             "checkpoint checksum mismatch".into(),

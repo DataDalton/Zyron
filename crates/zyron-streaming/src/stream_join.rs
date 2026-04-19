@@ -9,11 +9,8 @@
 use zyron_common::Result;
 
 use crate::checkpoint::CheckpointBarrier;
-use crate::column::{ScalarValue, StreamBatch, StreamColumn, StreamColumnData};
-use crate::hash::{
-    FlatU64Map, hash_column_batch, hash_column_batch_into, hash_multi_column_batch,
-    hash_multi_column_batch_into,
-};
+use crate::column::{StreamBatch, StreamColumn, StreamColumnData};
+use crate::hash::{FlatU64Map, hash_column_batch_into, hash_multi_column_batch_into};
 use crate::record::{ChangeFlag, StreamRecord};
 use crate::state::StateSnapshot;
 use crate::stream_operator::{OperatorMetrics, StreamOperator};

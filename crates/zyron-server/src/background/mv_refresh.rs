@@ -9,7 +9,7 @@ use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use tracing::{debug, info};
+use tracing::debug;
 use zyron_catalog::Catalog;
 
 /// Configuration for the materialized view refresh worker.

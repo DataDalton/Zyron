@@ -1,0 +1,25 @@
+
+=== Limit Throughput Performance Test ===
+Rows: 1000000, Limit: 100
+Validation runs: 5
+
+--- Run 1/5 ---
+  Limit: 658,327,847,268 rows/sec (303.8µs for 200 samples)
+
+--- Run 2/5 ---
+  Limit: 787,711,697,519 rows/sec (253.9µs for 200 samples)
+
+--- Run 3/5 ---
+  Limit: 645,994,832,041 rows/sec (309.6µs for 200 samples)
+
+--- Run 4/5 ---
+  Limit: 812,017,864,393 rows/sec (246.3µs for 200 samples)
+
+--- Run 5/5 ---
+  Limit: 726,744,186,047 rows/sec (275.2µs for 200 samples)
+
+=== Limit Validation Results ===
+  Limit throughput (rows/sec) [PASS/OK]:
+    Runs: [658,327,847,268, 787,711,697,519, 645,994,832,041, 812,017,864,393, 726,744,186,047]
+    Average: 726,159,285,454 >= 200,000,000 (target)
+    Min/Max: 645,994,832,041 / 812,017,864,393, StdDev: 66,615,584,835

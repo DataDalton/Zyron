@@ -376,6 +376,7 @@ pub enum Keyword {
     Fulltext,
     Match,
     Against,
+    Spatial,
 
     // Graph
     Graph,
@@ -944,6 +945,7 @@ pub fn lookup_keyword(word: &str) -> Option<Keyword> {
         "FULLTEXT" => Some(Keyword::Fulltext),
         "MATCH" => Some(Keyword::Match),
         "AGAINST" => Some(Keyword::Against),
+        "SPATIAL" => Some(Keyword::Spatial),
 
         // Graph
         "GRAPH" => Some(Keyword::Graph),

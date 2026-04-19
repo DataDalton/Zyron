@@ -6,7 +6,7 @@
 //! enum, const, oneOf, anyOf, allOf, not, and local $ref.
 
 use crate::diff::JsonValue;
-use zyron_common::{Result, ZyronError};
+use zyron_common::Result;
 
 /// Validates JSON against a schema. Returns true if valid.
 pub fn json_schema_validate(json: &str, schema: &str) -> Result<bool> {

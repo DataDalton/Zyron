@@ -4,7 +4,7 @@
 //! SimHash: 64-bit Charikar fingerprint for fast near-duplicate detection
 //! via Hamming distance.
 
-use crate::encoding::xxhash64;
+use zyron_common::hash64;
 use zyron_common::{Result, ZyronError};
 
 // ---------------------------------------------------------------------------
@@ -27,13 +27,13 @@ pub fn minhash_signature(tokens: &[&str], num_hashes: u32) -> Vec<u64> {
     let mut coefficients: Vec<(u64, u64)> = Vec::with_capacity(num_hashes as usize);
     for i in 0..num_hashes as u64 {
         // Use xxhash to generate pseudorandom but deterministic coefficients
-        let a = xxhash64(&(i * 2).to_le_bytes()) | 1; // odd to ensure coprime
-        let b = xxhash64(&(i * 2 + 1).to_le_bytes());
+        let a = hash64(&(i * 2).to_le_bytes()) | 1; // odd to ensure coprime
+        let b = hash64(&(i * 2 + 1).to_le_bytes());
         coefficients.push((a % PRIME, b % PRIME));
     }
 
     for token in tokens {
-        let h = xxhash64(token.as_bytes()) % PRIME;
+        let h = hash64(token.as_bytes()) % PRIME;
         for (i, &(a, b)) in coefficients.iter().enumerate() {
             // Mod-p multiplication with overflow protection
             let h_i = mul_mod_p(a, h, PRIME).wrapping_add(b) % PRIME;
@@ -113,7 +113,7 @@ pub fn simhash_tokens(tokens: &[&str]) -> u64 {
     let mut vector = [0i32; 64];
 
     for token in tokens {
-        let h = xxhash64(token.as_bytes());
+        let h = hash64(token.as_bytes());
         for bit in 0..64 {
             if (h >> bit) & 1 == 1 {
                 vector[bit] += 1;

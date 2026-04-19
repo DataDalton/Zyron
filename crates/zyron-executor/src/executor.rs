@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use zyron_common::{Result, ZyronError};
+use zyron_common::Result;
 use zyron_planner::logical::AsOfTarget;
 use zyron_planner::physical::PhysicalPlan;
 
@@ -182,6 +182,31 @@ fn build_operator_tree(
                         BuildResult::new(Box::new(FilterOperator::new(br.op, pred, output_schema)));
                 }
                 Ok(br.with_metrics("VectorScan", analyze, vec![]))
+            }
+
+            PhysicalPlan::SpatialScan {
+                table_id,
+                index_id,
+                columns,
+                kind,
+                remaining_predicate,
+                ..
+            } => {
+                let output_schema = columns.clone();
+                let op = crate::operator::spatial_scan::SpatialScanOperator::new(
+                    ctx.clone(),
+                    table_id,
+                    index_id,
+                    columns,
+                    kind,
+                )
+                .await?;
+                let mut br = BuildResult::new(Box::new(op));
+                if let Some(pred) = remaining_predicate {
+                    br =
+                        BuildResult::new(Box::new(FilterOperator::new(br.op, pred, output_schema)));
+                }
+                Ok(br.with_metrics("SpatialScan", analyze, vec![]))
             }
 
             PhysicalPlan::GraphAlgorithm {

@@ -522,7 +522,7 @@ impl Server {
 
         let session_mgr_for_view = Arc::clone(&self.session_mgr);
         let ckpt_wake = {
-            let ckpt_ref = background.checkpoint();
+            let _ckpt_ref = background.checkpoint();
             let waker: Option<Arc<dyn Fn() + Send + Sync>> = None;
             // CheckpointWorker does not expose a wake method via Arc. Skip for now.
             waker
@@ -677,6 +677,9 @@ impl Server {
             fts_manager: Some(Arc::clone(&fts_mgr_arc)),
             vector_manager: Some(Arc::clone(&vec_mgr_arc)),
             graph_manager: Some(Arc::clone(&graph_mgr_arc)),
+            spatial_manager: Some(Arc::new(
+                zyron_types::spatial_index::SpatialIndexManager::new(),
+            )),
             // DML hooks: CDC capture + trigger dispatch
             cdc_hook: Some(Arc::new(hooks::CdcHookBridge::new(
                 Arc::clone(&cdc_registry_arc),

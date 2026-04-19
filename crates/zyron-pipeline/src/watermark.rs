@@ -1,7 +1,7 @@
 //! Watermark tracking for incremental pipeline processing.
 
 use crate::ids::PipelineId;
-use zyron_common::{Result, ZyronError};
+use zyron_common::Result;
 
 /// Strategy for detecting incremental changes in source data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

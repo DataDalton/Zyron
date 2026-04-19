@@ -16,6 +16,7 @@ pub mod project;
 pub mod scan;
 pub mod setop;
 pub mod sort;
+pub mod spatial_scan;
 pub mod vector_scan;
 pub mod window;
 

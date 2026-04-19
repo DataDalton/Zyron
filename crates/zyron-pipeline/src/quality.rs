@@ -1,7 +1,5 @@
 //! Data quality check evaluation for pipeline stages.
 
-use zyron_common::Result;
-
 /// Severity level for a quality check failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QualitySeverity {

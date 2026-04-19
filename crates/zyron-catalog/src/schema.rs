@@ -387,6 +387,7 @@ pub enum IndexType {
     BTree = 0,
     Fulltext = 1,
     Vector = 2,
+    Spatial = 3,
 }
 
 /// A column participating in an index.
@@ -556,6 +557,7 @@ fn index_type_from_u8(val: u8) -> Result<IndexType> {
         0 => Ok(IndexType::BTree),
         1 => Ok(IndexType::Fulltext),
         2 => Ok(IndexType::Vector),
+        3 => Ok(IndexType::Spatial),
         _ => Err(zyron_common::ZyronError::CatalogCorrupted(format!(
             "unknown IndexType value: {val}"
         ))),

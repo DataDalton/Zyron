@@ -1,0 +1,94 @@
+
+=== Bulk load 100K points ===
+  Run 1: 4,733,974 points/sec (21.1 ms build)
+  Run 2: 5,105,636 points/sec (19.6 ms build)
+  Run 3: 5,772,639 points/sec (17.3 ms build)
+  Run 4: 5,744,815 points/sec (17.4 ms build)
+  Run 5: 5,790,857 points/sec (17.3 ms build)
+  bulk_load 100K points/sec [PASS/OK]:
+    Runs: [4,733,974, 5,105,636, 5,772,639, 5,744,815, 5,790,857]
+    Average: 5,429,584 >= 1,500,000 (target)
+    Min/Max: 4,733,974 / 5,790,857, StdDev: 432,757
+
+=== Bulk load 1M points (parallel STR) ===
+  Run 1: 4,022,976 points/sec (0.25 s build)
+  Run 2: 4,131,021 points/sec (0.24 s build)
+  Run 3: 4,133,442 points/sec (0.24 s build)
+  Run 4: 4,041,356 points/sec (0.25 s build)
+  Run 5: 4,128,720 points/sec (0.24 s build)
+  bulk_load 1M points/sec (parallel STR) [PASS/OK]:
+    Runs: [4,022,976, 4,131,021, 4,133,442, 4,041,356, 4,128,720]
+    Average: 4,091,503 >= 2,000,000 (target)
+    Min/Max: 4,022,976 / 4,133,442, StdDev: 48,819
+
+=== Concurrent 4-reader throughput during 1 writer (50K inserts) ===
+  Reader queries completed during writer: 1,351 in 0.31 s -> 4,363 q/s
+
+=== delete_by_data throughput (10K deletes on 100K tree) ===
+  Run 1: 699,262 deletes/sec (14.30 ms)
+  Run 2: 683,999 deletes/sec (14.62 ms)
+  Run 3: 747,792 deletes/sec (13.37 ms)
+  Run 4: 737,528 deletes/sec (13.56 ms)
+  Run 5: 738,520 deletes/sec (13.54 ms)
+  delete_by_data/sec [PASS/OK]:
+    Runs: [699,262, 683,999, 747,792, 737,528, 738,520]
+    Average: 721,420 >= 500,000 (target)
+    Min/Max: 683,999 / 747,792, StdDev: 25,055
+
+=== DWithin latency on 100K-point tree (radius=500) ===
+  Run 1: 6.10 us/query
+  Run 2: 6.04 us/query
+  Run 3: 5.94 us/query
+  Run 4: 7.16 us/query
+  Run 5: 7.23 us/query
+  dwithin 100K r=500 (us) [PASS/OK]:
+    Runs: [6, 6, 6, 7, 7]
+    Average: 6 <= 1,500 (target)
+    Min/Max: 6 / 7, StdDev: 1
+
+=== Dynamic insert throughput (50K points) ===
+  Run 1: 184,238 points/sec (0.27 s)
+  Run 2: 190,955 points/sec (0.26 s)
+  Run 3: 178,474 points/sec (0.28 s)
+  Run 4: 183,652 points/sec (0.27 s)
+  Run 5: 180,117 points/sec (0.28 s)
+  insert points/sec [FAIL/OK]:
+    Runs: [184,238, 190,955, 178,474, 183,652, 180,117]
+    Average: 183,487 >= 300,000 (target)
+    Min/Max: 178,474 / 190,955, StdDev: 4,309
+
+=== KNN latency on 100K-point tree (k=10) ===
+  Run 1: 3.99 us/query
+  Run 2: 3.97 us/query
+  Run 3: 4.10 us/query
+  Run 4: 4.05 us/query
+  Run 5: 3.89 us/query
+  KNN 100K k=10 (us) [PASS/OK]:
+    Runs: [4, 4, 4, 4, 4]
+    Average: 4 <= 500 (target)
+    Min/Max: 4 / 4, StdDev: 0
+
+=== Range query latency on 100K-point tree (1% area) ===
+  Run 1: 6.48 us/query
+  Run 2: 6.49 us/query
+  Run 3: 6.71 us/query
+  Run 4: 6.42 us/query
+  Run 5: 6.67 us/query
+  range 100K 1% area (us) [PASS/OK]:
+    Runs: [6, 6, 7, 6, 7]
+    Average: 7 <= 1,500 (target)
+    Min/Max: 6 / 7, StdDev: 0
+
+=== Small-fanout stress (max_fill=8, 50K inserts) ===
+  50K inserts in 97.6 ms (height=7, splits=10849)
+
+=== Snapshot save+load roundtrip (100K points) ===
+  Run 1: save 5.8 ms, load 12.7 ms, total 18.4 ms
+  Run 2: save 6.1 ms, load 12.8 ms, total 18.9 ms
+  Run 3: save 5.3 ms, load 11.5 ms, total 16.9 ms
+  Run 4: save 5.3 ms, load 11.5 ms, total 16.8 ms
+  Run 5: save 5.4 ms, load 12.6 ms, total 18.0 ms
+  snapshot roundtrip 100K (ms) [PASS/OK]:
+    Runs: [18, 19, 17, 17, 18]
+    Average: 18 <= 1,000 (target)
+    Min/Max: 17 / 19, StdDev: 1

@@ -970,23 +970,38 @@ async fn test_limit_throughput() {
     let mut limit_results = Vec::with_capacity(VALIDATION_RUNS);
 
     let util_before = take_util_snapshot();
+    // The actual limit-of-100 work completes in sub-microseconds, so a single
+    // OS preemption during one sample throws the rows/sec average off by 5x+.
+    // Amortize by running many limit operators per measurement window. The
+    // operators must be pre-built outside the timer because `batches.clone()`
+    // deep-copies the column vectors and would dominate the measurement.
+    const SAMPLES_PER_RUN: usize = 200;
     for run in 0..VALIDATION_RUNS {
         tprintln!("\n--- Run {}/{} ---", run + 1, VALIDATION_RUNS);
 
-        let child = MemoryOperator::boxed(batches.clone());
-        let mut limit_op = LimitOperator::new(child, Some(100), None);
+        // Pre-build SAMPLES_PER_RUN limit operators before starting the timer.
+        let mut ops: Vec<_> = (0..SAMPLES_PER_RUN)
+            .map(|_| {
+                let child = MemoryOperator::boxed(batches.clone());
+                LimitOperator::new(child, Some(100), None)
+            })
+            .collect();
 
         let start = Instant::now();
-        let rows = drain_operator(&mut limit_op).await;
+        let mut total_rows = 0usize;
+        for op in ops.iter_mut() {
+            total_rows += drain_operator(op).await;
+        }
         let duration = start.elapsed();
 
-        assert_eq!(rows, 100);
-        // Measure based on total input (operator should stop early).
-        let rows_sec = ROW_COUNT as f64 / duration.as_secs_f64();
+        assert_eq!(total_rows, 100 * SAMPLES_PER_RUN);
+        // Each sample processed ROW_COUNT rows of input; rows/sec across all samples.
+        let rows_sec = (ROW_COUNT * SAMPLES_PER_RUN) as f64 / duration.as_secs_f64();
         tprintln!(
-            "  Limit: {} rows/sec ({:?})",
+            "  Limit: {} rows/sec ({:?} for {} samples)",
             format_with_commas(rows_sec),
-            duration
+            duration,
+            SAMPLES_PER_RUN,
         );
         limit_results.push(rows_sec);
     }

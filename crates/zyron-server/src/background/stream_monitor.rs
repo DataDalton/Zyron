@@ -10,7 +10,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use tracing::{debug, info};
+use tracing::debug;
 use zyron_streaming::job::StreamJobManager;
 
 /// Configuration for the stream monitor worker.

@@ -135,7 +135,7 @@ impl MaterializedViewManager {
             .ok_or_else(|| ZyronError::MaterializedViewNotFound(name.to_string()))?;
         let mut updated = (*current).clone();
         updated.last_refreshed = Some(timestamp);
-        self.views.entry_sync(name.to_string()).and_modify(|v| {
+        let _ = self.views.entry_sync(name.to_string()).and_modify(|v| {
             *v = Arc::new(updated);
         });
         Ok(())
