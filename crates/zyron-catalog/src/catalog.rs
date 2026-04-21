@@ -27,6 +27,15 @@ const DDL_CREATE_TABLE: u8 = 0x05;
 const DDL_DROP_TABLE: u8 = 0x06;
 const DDL_CREATE_INDEX: u8 = 0x07;
 const DDL_DROP_INDEX: u8 = 0x08;
+const DDL_CREATE_STREAMING_JOB: u8 = 0x09;
+const DDL_DROP_STREAMING_JOB: u8 = 0x0A;
+const DDL_ALTER_STREAMING_JOB: u8 = 0x0B;
+const DDL_CREATE_EXTERNAL_SOURCE: u8 = 0x0C;
+const DDL_DROP_EXTERNAL_SOURCE: u8 = 0x0D;
+const DDL_ALTER_EXTERNAL_SOURCE: u8 = 0x0E;
+const DDL_CREATE_EXTERNAL_SINK: u8 = 0x0F;
+const DDL_DROP_EXTERNAL_SINK: u8 = 0x10;
+const DDL_ALTER_EXTERNAL_SINK: u8 = 0x11;
 
 /// Central catalog manager.
 pub struct Catalog {
@@ -65,12 +74,16 @@ impl Catalog {
     pub async fn load(&self) -> Result<()> {
         self.cache.invalidate_all();
 
-        let (databases, schemas, tables, indexes) = tokio::try_join!(
-            self.storage.load_databases(),
-            self.storage.load_schemas(),
-            self.storage.load_tables(),
-            self.storage.load_indexes(),
-        )?;
+        let (databases, schemas, tables, indexes, streaming_jobs, external_sources, external_sinks) =
+            tokio::try_join!(
+                self.storage.load_databases(),
+                self.storage.load_schemas(),
+                self.storage.load_tables(),
+                self.storage.load_indexes(),
+                self.storage.load_streaming_jobs(),
+                self.storage.load_external_sources(),
+                self.storage.load_external_sinks(),
+            )?;
 
         let mut max_oid: u32 = USER_OID_START;
 
@@ -100,6 +113,27 @@ impl Catalog {
                 max_oid = index.id.0 + 1;
             }
             self.cache.put_index(index);
+        }
+
+        for job in streaming_jobs {
+            if job.id.0 >= max_oid {
+                max_oid = job.id.0 + 1;
+            }
+            self.cache.put_streaming_job(job);
+        }
+
+        for src in external_sources {
+            if src.id.0 >= max_oid {
+                max_oid = src.id.0 + 1;
+            }
+            self.cache.put_external_source(src);
+        }
+
+        for sink in external_sinks {
+            if sink.id.0 >= max_oid {
+                max_oid = sink.id.0 + 1;
+            }
+            self.cache.put_external_sink(sink);
         }
 
         self.oid_allocator.reset(max_oid);
@@ -444,6 +478,63 @@ impl Catalog {
         Ok(index_id)
     }
 
+    /// Like create_index, but also stores the opaque parameters blob on the
+    /// index entry. Used by spatial and vector indexes that persist tuning
+    /// options (dims, srid, HNSW config, etc.) so startup recovery can
+    /// reconstruct live state without re-reading the CREATE statement.
+    pub async fn create_index_with_params(
+        &self,
+        table_id: TableId,
+        schema_id: SchemaId,
+        name: &str,
+        column_names: &[String],
+        unique: bool,
+        index_type: IndexType,
+        parameters: Option<Vec<u8>>,
+    ) -> Result<IndexId> {
+        let existing = self.cache.get_indexes_for_table(table_id);
+        for idx in &existing {
+            if idx.name == name {
+                return Err(ZyronError::IndexAlreadyExists(name.to_string()));
+            }
+        }
+
+        let table = self.get_table_by_id(table_id)?;
+        let index_id = IndexId(self.oid_allocator.next());
+        let index_file_id = self.storage.next_index_file_id();
+
+        let mut columns = Vec::with_capacity(column_names.len());
+        for (ordinal, col_name) in column_names.iter().enumerate() {
+            let col = table
+                .columns
+                .iter()
+                .find(|c| c.name == *col_name)
+                .ok_or_else(|| ZyronError::ColumnNotFound(col_name.clone()))?;
+            columns.push(IndexColumnEntry {
+                column_id: col.id,
+                ordinal: ordinal as u16,
+                descending: false,
+            });
+        }
+
+        let entry = IndexEntry {
+            id: index_id,
+            table_id,
+            schema_id,
+            name: name.to_string(),
+            columns,
+            unique,
+            index_file_id,
+            index_type,
+            parameters,
+        };
+
+        self.log_ddl(DDL_CREATE_INDEX, &entry.to_bytes())?;
+        self.storage.store_index(&entry).await?;
+        self.cache.put_index(entry);
+        Ok(index_id)
+    }
+
     pub async fn drop_index(&self, table_id: TableId, name: &str) -> Result<()> {
         let indexes = self.cache.get_indexes_for_table(table_id);
         let idx = indexes
@@ -462,6 +553,232 @@ impl Catalog {
 
     pub fn get_indexes_for_table(&self, table_id: TableId) -> Vec<Arc<IndexEntry>> {
         self.cache.get_indexes_for_table(table_id)
+    }
+
+    // -----------------------------------------------------------------------
+    // Streaming job operations
+    // -----------------------------------------------------------------------
+
+    pub async fn create_streaming_job(
+        &self,
+        mut entry: StreamingJobEntry,
+    ) -> Result<StreamingJobId> {
+        if self
+            .cache
+            .get_streaming_job_by_name(entry.source_schema_id, &entry.name)
+            .is_some()
+        {
+            return Err(ZyronError::Internal(format!(
+                "streaming job '{}' already exists",
+                entry.name
+            )));
+        }
+
+        if entry.id.0 == 0 {
+            entry.id = StreamingJobId(self.oid_allocator.next());
+        }
+
+        let id = entry.id;
+        self.log_ddl(DDL_CREATE_STREAMING_JOB, &entry.to_bytes())?;
+        self.storage.store_streaming_job(&entry).await?;
+        self.cache.put_streaming_job(entry);
+        Ok(id)
+    }
+
+    pub fn get_streaming_job(
+        &self,
+        schema_id: SchemaId,
+        name: &str,
+    ) -> Option<Arc<StreamingJobEntry>> {
+        self.cache.get_streaming_job_by_name(schema_id, name)
+    }
+
+    pub fn get_streaming_job_by_id(&self, id: StreamingJobId) -> Option<Arc<StreamingJobEntry>> {
+        self.cache.get_streaming_job(id)
+    }
+
+    pub fn list_streaming_jobs(&self) -> Vec<Arc<StreamingJobEntry>> {
+        self.cache.list_streaming_jobs()
+    }
+
+    pub async fn drop_streaming_job(&self, schema_id: SchemaId, name: &str) -> Result<()> {
+        let job = self
+            .cache
+            .get_streaming_job_by_name(schema_id, name)
+            .ok_or_else(|| ZyronError::Internal(format!("streaming job '{name}' not found")))?;
+
+        let id = job.id;
+        let mut payload = vec![0u8; 4];
+        payload[..4].copy_from_slice(&id.0.to_le_bytes());
+        self.log_ddl(DDL_DROP_STREAMING_JOB, &payload)?;
+        self.storage.delete_streaming_job(id).await?;
+        self.cache.invalidate_streaming_job(id);
+        Ok(())
+    }
+
+    pub async fn update_streaming_job_status(
+        &self,
+        id: StreamingJobId,
+        status: StreamingJobStatus,
+        last_error: Option<String>,
+    ) -> Result<()> {
+        let current = self
+            .cache
+            .get_streaming_job(id)
+            .ok_or_else(|| ZyronError::Internal("streaming job not found".to_string()))?;
+
+        let mut updated = (*current).clone();
+        updated.status = status;
+        updated.last_error = last_error;
+
+        self.log_ddl(DDL_ALTER_STREAMING_JOB, &updated.to_bytes())?;
+        self.storage.update_streaming_job(&updated).await?;
+        self.cache.invalidate_streaming_job(id);
+        self.cache.put_streaming_job(updated);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // External source operations
+    // -----------------------------------------------------------------------
+
+    pub async fn create_external_source(
+        &self,
+        mut entry: ExternalSourceEntry,
+    ) -> Result<ExternalSourceId> {
+        if self
+            .cache
+            .get_external_source_by_name(entry.schema_id, &entry.name)
+            .is_some()
+        {
+            return Err(ZyronError::Internal(format!(
+                "external source '{}' already exists",
+                entry.name
+            )));
+        }
+
+        if entry.id.0 == 0 {
+            entry.id = ExternalSourceId(self.oid_allocator.next());
+        }
+
+        let id = entry.id;
+        self.log_ddl(DDL_CREATE_EXTERNAL_SOURCE, &entry.to_bytes())?;
+        self.storage.store_external_source(&entry).await?;
+        self.cache.put_external_source(entry);
+        Ok(id)
+    }
+
+    pub fn get_external_source(
+        &self,
+        schema_id: SchemaId,
+        name: &str,
+    ) -> Option<Arc<ExternalSourceEntry>> {
+        self.cache.get_external_source_by_name(schema_id, name)
+    }
+
+    pub fn get_external_source_by_id(
+        &self,
+        id: ExternalSourceId,
+    ) -> Option<Arc<ExternalSourceEntry>> {
+        self.cache.get_external_source(id)
+    }
+
+    pub fn list_external_sources(&self) -> Vec<Arc<ExternalSourceEntry>> {
+        self.cache.list_external_sources()
+    }
+
+    pub async fn drop_external_source(&self, schema_id: SchemaId, name: &str) -> Result<()> {
+        let src = self
+            .cache
+            .get_external_source_by_name(schema_id, name)
+            .ok_or_else(|| ZyronError::Internal(format!("external source '{name}' not found")))?;
+
+        let id = src.id;
+        let mut payload = vec![0u8; 4];
+        payload[..4].copy_from_slice(&id.0.to_le_bytes());
+        self.log_ddl(DDL_DROP_EXTERNAL_SOURCE, &payload)?;
+        self.storage.delete_external_source(id).await?;
+        self.cache.invalidate_external_source(id);
+        Ok(())
+    }
+
+    pub async fn update_external_source(&self, entry: ExternalSourceEntry) -> Result<()> {
+        let id = entry.id;
+        self.log_ddl(DDL_ALTER_EXTERNAL_SOURCE, &entry.to_bytes())?;
+        self.storage.update_external_source(&entry).await?;
+        self.cache.invalidate_external_source(id);
+        self.cache.put_external_source(entry);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // External sink operations
+    // -----------------------------------------------------------------------
+
+    pub async fn create_external_sink(
+        &self,
+        mut entry: ExternalSinkEntry,
+    ) -> Result<ExternalSinkId> {
+        if self
+            .cache
+            .get_external_sink_by_name(entry.schema_id, &entry.name)
+            .is_some()
+        {
+            return Err(ZyronError::Internal(format!(
+                "external sink '{}' already exists",
+                entry.name
+            )));
+        }
+
+        if entry.id.0 == 0 {
+            entry.id = ExternalSinkId(self.oid_allocator.next());
+        }
+
+        let id = entry.id;
+        self.log_ddl(DDL_CREATE_EXTERNAL_SINK, &entry.to_bytes())?;
+        self.storage.store_external_sink(&entry).await?;
+        self.cache.put_external_sink(entry);
+        Ok(id)
+    }
+
+    pub fn get_external_sink(
+        &self,
+        schema_id: SchemaId,
+        name: &str,
+    ) -> Option<Arc<ExternalSinkEntry>> {
+        self.cache.get_external_sink_by_name(schema_id, name)
+    }
+
+    pub fn get_external_sink_by_id(&self, id: ExternalSinkId) -> Option<Arc<ExternalSinkEntry>> {
+        self.cache.get_external_sink(id)
+    }
+
+    pub fn list_external_sinks(&self) -> Vec<Arc<ExternalSinkEntry>> {
+        self.cache.list_external_sinks()
+    }
+
+    pub async fn drop_external_sink(&self, schema_id: SchemaId, name: &str) -> Result<()> {
+        let sink = self
+            .cache
+            .get_external_sink_by_name(schema_id, name)
+            .ok_or_else(|| ZyronError::Internal(format!("external sink '{name}' not found")))?;
+
+        let id = sink.id;
+        let mut payload = vec![0u8; 4];
+        payload[..4].copy_from_slice(&id.0.to_le_bytes());
+        self.log_ddl(DDL_DROP_EXTERNAL_SINK, &payload)?;
+        self.storage.delete_external_sink(id).await?;
+        self.cache.invalidate_external_sink(id);
+        Ok(())
+    }
+
+    pub async fn update_external_sink(&self, entry: ExternalSinkEntry) -> Result<()> {
+        let id = entry.id;
+        self.log_ddl(DDL_ALTER_EXTERNAL_SINK, &entry.to_bytes())?;
+        self.storage.update_external_sink(&entry).await?;
+        self.cache.invalidate_external_sink(id);
+        self.cache.put_external_sink(entry);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------

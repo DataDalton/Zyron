@@ -924,7 +924,7 @@ mod tests {
 
     #[test]
     fn test_version_index_segment_growth() {
-        let index = VersionIndex::new();
+        let index = VersionIndex::with_entries(Vec::new());
 
         // Push more entries than one segment
         for i in 0..(SEGMENT_SIZE as u64 + 100) {

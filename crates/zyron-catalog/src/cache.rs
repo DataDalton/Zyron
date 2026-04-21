@@ -91,6 +91,17 @@ pub struct CatalogCache {
     // Index entries (keyed by IndexId, with table_id reverse index)
     indexes: RwLock<HashMap<IndexId, Arc<IndexEntry>>>,
     table_indexes: RwLock<HashMap<TableId, Vec<IndexId>>>,
+
+    // Streaming job entries. The name-index keys on the job's source_schema_id
+    // since streaming jobs do not have a dedicated owning schema yet.
+    streaming_jobs: RwLock<HashMap<StreamingJobId, Arc<StreamingJobEntry>>>,
+    streaming_jobs_by_name: RwLock<HashMap<(SchemaId, String), StreamingJobId>>,
+
+    // External source and sink entries, keyed by ID with name-based reverse maps.
+    external_sources: RwLock<HashMap<ExternalSourceId, Arc<ExternalSourceEntry>>>,
+    external_sources_by_name: RwLock<HashMap<(SchemaId, String), ExternalSourceId>>,
+    external_sinks: RwLock<HashMap<ExternalSinkId, Arc<ExternalSinkEntry>>>,
+    external_sinks_by_name: RwLock<HashMap<(SchemaId, String), ExternalSinkId>>,
 }
 
 /// Simple LRU map using a HashMap with access timestamps.
@@ -165,6 +176,12 @@ impl CatalogCache {
             table_by_name: new_name_map(),
             indexes: RwLock::new(HashMap::new()),
             table_indexes: RwLock::new(HashMap::new()),
+            streaming_jobs: RwLock::new(HashMap::new()),
+            streaming_jobs_by_name: RwLock::new(HashMap::new()),
+            external_sources: RwLock::new(HashMap::new()),
+            external_sources_by_name: RwLock::new(HashMap::new()),
+            external_sinks: RwLock::new(HashMap::new()),
+            external_sinks_by_name: RwLock::new(HashMap::new()),
         }
     }
 
@@ -341,6 +358,140 @@ impl CatalogCache {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Streaming job operations
+    // -----------------------------------------------------------------------
+
+    pub fn put_streaming_job(&self, entry: StreamingJobEntry) {
+        let id = entry.id;
+        // Owning schema for name lookup uses source_schema_id since streaming
+        // jobs do not have a dedicated owning schema field.
+        let key = (entry.source_schema_id, entry.name.clone());
+        let arc = Arc::new(entry);
+        self.streaming_jobs.write().insert(id, arc);
+        self.streaming_jobs_by_name.write().insert(key, id);
+    }
+
+    pub fn get_streaming_job(&self, id: StreamingJobId) -> Option<Arc<StreamingJobEntry>> {
+        self.streaming_jobs.read().get(&id).cloned()
+    }
+
+    pub fn get_streaming_job_by_name(
+        &self,
+        schema_id: SchemaId,
+        name: &str,
+    ) -> Option<Arc<StreamingJobEntry>> {
+        let id = {
+            let map = self.streaming_jobs_by_name.read();
+            map.get(&(schema_id, name.to_string())).copied()
+        }?;
+        self.streaming_jobs.read().get(&id).cloned()
+    }
+
+    pub fn list_streaming_jobs(&self) -> Vec<Arc<StreamingJobEntry>> {
+        self.streaming_jobs.read().values().cloned().collect()
+    }
+
+    pub fn invalidate_streaming_job(&self, id: StreamingJobId) {
+        if let Some(entry) = self.streaming_jobs.write().remove(&id) {
+            let key = (entry.source_schema_id, entry.name.clone());
+            let mut name_map = self.streaming_jobs_by_name.write();
+            if let Some(existing) = name_map.get(&key) {
+                if *existing == id {
+                    name_map.remove(&key);
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // External source operations
+    // -----------------------------------------------------------------------
+
+    pub fn put_external_source(&self, entry: ExternalSourceEntry) {
+        let id = entry.id;
+        let key = (entry.schema_id, entry.name.clone());
+        let arc = Arc::new(entry);
+        self.external_sources.write().insert(id, arc);
+        self.external_sources_by_name.write().insert(key, id);
+    }
+
+    pub fn get_external_source(&self, id: ExternalSourceId) -> Option<Arc<ExternalSourceEntry>> {
+        self.external_sources.read().get(&id).cloned()
+    }
+
+    pub fn get_external_source_by_name(
+        &self,
+        schema_id: SchemaId,
+        name: &str,
+    ) -> Option<Arc<ExternalSourceEntry>> {
+        let id = {
+            let map = self.external_sources_by_name.read();
+            map.get(&(schema_id, name.to_string())).copied()
+        }?;
+        self.external_sources.read().get(&id).cloned()
+    }
+
+    pub fn list_external_sources(&self) -> Vec<Arc<ExternalSourceEntry>> {
+        self.external_sources.read().values().cloned().collect()
+    }
+
+    pub fn invalidate_external_source(&self, id: ExternalSourceId) {
+        if let Some(entry) = self.external_sources.write().remove(&id) {
+            let key = (entry.schema_id, entry.name.clone());
+            let mut name_map = self.external_sources_by_name.write();
+            if let Some(existing) = name_map.get(&key) {
+                if *existing == id {
+                    name_map.remove(&key);
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // External sink operations
+    // -----------------------------------------------------------------------
+
+    pub fn put_external_sink(&self, entry: ExternalSinkEntry) {
+        let id = entry.id;
+        let key = (entry.schema_id, entry.name.clone());
+        let arc = Arc::new(entry);
+        self.external_sinks.write().insert(id, arc);
+        self.external_sinks_by_name.write().insert(key, id);
+    }
+
+    pub fn get_external_sink(&self, id: ExternalSinkId) -> Option<Arc<ExternalSinkEntry>> {
+        self.external_sinks.read().get(&id).cloned()
+    }
+
+    pub fn get_external_sink_by_name(
+        &self,
+        schema_id: SchemaId,
+        name: &str,
+    ) -> Option<Arc<ExternalSinkEntry>> {
+        let id = {
+            let map = self.external_sinks_by_name.read();
+            map.get(&(schema_id, name.to_string())).copied()
+        }?;
+        self.external_sinks.read().get(&id).cloned()
+    }
+
+    pub fn list_external_sinks(&self) -> Vec<Arc<ExternalSinkEntry>> {
+        self.external_sinks.read().values().cloned().collect()
+    }
+
+    pub fn invalidate_external_sink(&self, id: ExternalSinkId) {
+        if let Some(entry) = self.external_sinks.write().remove(&id) {
+            let key = (entry.schema_id, entry.name.clone());
+            let mut name_map = self.external_sinks_by_name.write();
+            if let Some(existing) = name_map.get(&key) {
+                if *existing == id {
+                    name_map.remove(&key);
+                }
+            }
+        }
+    }
+
     /// Clears all cached entries.
     pub fn invalidate_all(&self) {
         self.databases.write().clear();
@@ -351,6 +502,12 @@ impl CatalogCache {
         self.table_by_name.retain_sync(|_, _| false);
         self.indexes.write().clear();
         self.table_indexes.write().clear();
+        self.streaming_jobs.write().clear();
+        self.streaming_jobs_by_name.write().clear();
+        self.external_sources.write().clear();
+        self.external_sources_by_name.write().clear();
+        self.external_sinks.write().clear();
+        self.external_sinks_by_name.write().clear();
     }
 }
 

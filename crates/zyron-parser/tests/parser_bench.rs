@@ -729,6 +729,7 @@ fn expr_to_sql(expr: &Expr) -> String {
             LiteralValue::Boolean(true) => "TRUE".to_string(),
             LiteralValue::Boolean(false) => "FALSE".to_string(),
             LiteralValue::Null => "NULL".to_string(),
+            LiteralValue::Interval(i) => format!("INTERVAL '{}'", i),
         },
         Expr::BinaryOp { left, op, right } => {
             let op_str = match op {
@@ -913,6 +914,21 @@ fn datatype_to_sql(dt: &DataType) -> String {
         DataType::Array(inner) => format!("{}[]", datatype_to_sql(inner)),
         DataType::Vector(None) => "VECTOR".into(),
         DataType::Vector(Some(n)) => format!("VECTOR({})", n),
+        DataType::Geometry => "GEOMETRY".into(),
+        DataType::Matrix => "MATRIX".into(),
+        DataType::Color => "COLOR".into(),
+        DataType::SemVer => "SEMVER".into(),
+        DataType::Inet => "INET".into(),
+        DataType::Cidr => "CIDR".into(),
+        DataType::MacAddr => "MACADDR".into(),
+        DataType::Money => "MONEY".into(),
+        DataType::HyperLogLog => "HYPERLOGLOG".into(),
+        DataType::BloomFilter => "BLOOMFILTER".into(),
+        DataType::TDigest => "TDIGEST".into(),
+        DataType::CountMinSketch => "COUNTMINSKETCH".into(),
+        DataType::Bitfield => "BITFIELD".into(),
+        DataType::Quantity => "QUANTITY".into(),
+        DataType::Range(inner) => format!("RANGE({})", datatype_to_sql(inner)),
     }
 }
 

@@ -30,11 +30,11 @@ impl Watermark {
 }
 
 // ---------------------------------------------------------------------------
-// WatermarkGenerator trait
+// WatermarkPolicy trait
 // ---------------------------------------------------------------------------
 
 /// Generates watermarks from observed event timestamps.
-pub trait WatermarkGenerator: Send + Sync {
+pub trait WatermarkPolicy: Send + Sync {
     /// Called for each event to update internal state.
     fn on_event(&mut self, event_time_ms: i64);
 
@@ -63,7 +63,7 @@ impl BoundedOutOfOrderWatermark {
     }
 }
 
-impl WatermarkGenerator for BoundedOutOfOrderWatermark {
+impl WatermarkPolicy for BoundedOutOfOrderWatermark {
     #[inline]
     fn on_event(&mut self, event_time_ms: i64) {
         if event_time_ms > self.max_observed_ms {
@@ -88,14 +88,14 @@ impl WatermarkGenerator for BoundedOutOfOrderWatermark {
 /// Wraps an inner WatermarkGenerator and only updates the emitted
 /// watermark every N events.
 pub struct PeriodicWatermark {
-    inner: Box<dyn WatermarkGenerator>,
+    inner: Box<dyn WatermarkPolicy>,
     emit_interval: u64,
     event_count: u64,
     last_emitted: Watermark,
 }
 
 impl PeriodicWatermark {
-    pub fn new(inner: Box<dyn WatermarkGenerator>, emit_interval: u64) -> Self {
+    pub fn new(inner: Box<dyn WatermarkPolicy>, emit_interval: u64) -> Self {
         Self {
             inner,
             emit_interval: emit_interval.max(1),
@@ -105,7 +105,7 @@ impl PeriodicWatermark {
     }
 }
 
-impl WatermarkGenerator for PeriodicWatermark {
+impl WatermarkPolicy for PeriodicWatermark {
     fn on_event(&mut self, event_time_ms: i64) {
         self.inner.on_event(event_time_ms);
         self.event_count += 1;
@@ -126,7 +126,7 @@ impl WatermarkGenerator for PeriodicWatermark {
 /// Advances watermark when a source is idle (no events for a timeout period).
 /// This prevents idle sources from holding back the global watermark.
 pub struct IdleSourceWatermark {
-    inner: Box<dyn WatermarkGenerator>,
+    inner: Box<dyn WatermarkPolicy>,
     idle_timeout_ms: u64,
     last_event_wall_clock: Instant,
     last_event_time_ms: i64,
@@ -134,7 +134,7 @@ pub struct IdleSourceWatermark {
 }
 
 impl IdleSourceWatermark {
-    pub fn new(inner: Box<dyn WatermarkGenerator>, idle_timeout_ms: u64) -> Self {
+    pub fn new(inner: Box<dyn WatermarkPolicy>, idle_timeout_ms: u64) -> Self {
         Self {
             inner,
             idle_timeout_ms,
@@ -153,7 +153,7 @@ impl IdleSourceWatermark {
     }
 }
 
-impl WatermarkGenerator for IdleSourceWatermark {
+impl WatermarkPolicy for IdleSourceWatermark {
     fn on_event(&mut self, event_time_ms: i64) {
         self.inner.on_event(event_time_ms);
         self.last_event_wall_clock = Instant::now();
@@ -236,6 +236,66 @@ impl StreamWatermarkTracker {
 }
 
 // ---------------------------------------------------------------------------
+// WatermarkStrategy and WatermarkGenerator (microsecond event-time API)
+// ---------------------------------------------------------------------------
+
+/// Strategy that a WatermarkGenerator uses to translate observed event
+/// timestamps into a watermark value. Times are in microseconds to match
+/// CdfChange.commit_timestamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatermarkStrategy {
+    /// Watermark is max_event_time - allowed_lateness.
+    BoundedOutOfOrderness { allowed_lateness_us: i64 },
+    /// Watermark is max_event_time. Zero tolerance for late data.
+    Punctual,
+}
+
+/// Thread-safe watermark generator. Tracks the current watermark (greatest t
+/// such that no more events with event_time less than t are expected) and
+/// advances as events are observed.
+pub struct WatermarkGenerator {
+    strategy: WatermarkStrategy,
+    max_event_time: AtomicI64,
+    current: AtomicI64,
+}
+
+impl WatermarkGenerator {
+    pub fn new(strategy: WatermarkStrategy) -> Self {
+        Self {
+            strategy,
+            max_event_time: AtomicI64::new(i64::MIN),
+            current: AtomicI64::new(i64::MIN),
+        }
+    }
+
+    /// Observes an event time and returns the, possibly advanced, watermark.
+    /// The watermark is monotonic. It never decreases.
+    pub fn observe(&self, event_time_us: i64) -> i64 {
+        let prev_max = self.max_event_time.fetch_max(event_time_us, Ordering::AcqRel);
+        let new_max = prev_max.max(event_time_us);
+        let candidate = match self.strategy {
+            WatermarkStrategy::BoundedOutOfOrderness { allowed_lateness_us } => {
+                new_max.saturating_sub(allowed_lateness_us)
+            }
+            WatermarkStrategy::Punctual => new_max,
+        };
+        // Monotonic advance via fetch_max.
+        let prev = self.current.fetch_max(candidate, Ordering::AcqRel);
+        prev.max(candidate)
+    }
+
+    /// Returns the current watermark without observing a new event.
+    pub fn current(&self) -> i64 {
+        self.current.load(Ordering::Acquire)
+    }
+
+    /// Returns the configured strategy.
+    pub fn strategy(&self) -> WatermarkStrategy {
+        self.strategy
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -306,6 +366,35 @@ mod tests {
         assert!(a < b);
         assert!(b > a);
         assert_eq!(a, Watermark::new(100));
+    }
+
+    #[test]
+    fn bounded_out_of_orderness_tolerates_lateness() {
+        let g = WatermarkGenerator::new(WatermarkStrategy::BoundedOutOfOrderness {
+            allowed_lateness_us: 1_000,
+        });
+        assert_eq!(g.observe(10_000), 9_000);
+        // A lower event time does not pull the watermark backward.
+        assert_eq!(g.observe(5_000), 9_000);
+        assert_eq!(g.observe(12_000), 11_000);
+    }
+
+    #[test]
+    fn punctual_advances_with_every_event() {
+        let g = WatermarkGenerator::new(WatermarkStrategy::Punctual);
+        assert_eq!(g.observe(100), 100);
+        assert_eq!(g.observe(200), 200);
+        // Out-of-order event does not move watermark.
+        assert_eq!(g.observe(150), 200);
+    }
+
+    #[test]
+    fn watermark_never_goes_backward() {
+        let g = WatermarkGenerator::new(WatermarkStrategy::Punctual);
+        g.observe(1_000);
+        g.observe(500);
+        g.observe(750);
+        assert_eq!(g.current(), 1_000);
     }
 
     #[test]

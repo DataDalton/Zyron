@@ -214,6 +214,42 @@ mod tests {
         async fn delete_index(&self, _: IndexId) -> Result<bool> {
             unimplemented!()
         }
+        async fn load_streaming_jobs(&self) -> Result<Vec<StreamingJobEntry>> {
+            Ok(vec![])
+        }
+        async fn store_streaming_job(&self, _: &StreamingJobEntry) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn update_streaming_job(&self, _: &StreamingJobEntry) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn delete_streaming_job(&self, _: StreamingJobId) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn load_external_sources(&self) -> Result<Vec<ExternalSourceEntry>> {
+            Ok(vec![])
+        }
+        async fn store_external_source(&self, _: &ExternalSourceEntry) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn update_external_source(&self, _: &ExternalSourceEntry) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn delete_external_source(&self, _: ExternalSourceId) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn load_external_sinks(&self) -> Result<Vec<ExternalSinkEntry>> {
+            Ok(vec![])
+        }
+        async fn store_external_sink(&self, _: &ExternalSinkEntry) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn update_external_sink(&self, _: &ExternalSinkEntry) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn delete_external_sink(&self, _: ExternalSinkId) -> Result<bool> {
+            unimplemented!()
+        }
         async fn is_bootstrapped(&self) -> Result<bool> {
             Ok(true)
         }

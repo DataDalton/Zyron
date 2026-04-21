@@ -49,6 +49,9 @@ pub struct ServerState {
     pub disk_manager: Arc<DiskManager>,
     pub txn_manager: Arc<TransactionManager>,
     pub security_manager: Option<Arc<zyron_auth::SecurityManager>>,
+    /// Key store for sealing and opening external-source/sink credentials.
+    /// Populated by the server binary from a data-dir-derived master key.
+    pub key_store: Arc<dyn zyron_auth::KeyStore>,
     /// Config value lookup: returns (key, value) for a dotted key.
     pub config_lookup: Option<Arc<dyn Fn(&str) -> Option<String> + Send + Sync>>,
     /// Config entries for SHOW ALL: returns vec of (key, value, description).
@@ -719,6 +722,7 @@ impl<T: WireTransport> Connection<T> {
                 &mut self.session,
                 &mut self.transaction,
                 &mut self.active_branch,
+                &sql,
             )
             .await
             {
@@ -1159,89 +1163,46 @@ impl<T: WireTransport> Connection<T> {
             // COPY
             // ---------------------------------------------------------------
             if let zyron_parser::Statement::Copy(copy_stmt) = stmt {
-                match copy_stmt.direction {
-                    zyron_parser::ast::CopyDirection::To(_target) => {
-                        // Build a SELECT * FROM table query, plan and execute,
-                        // then stream results through CopyOutHandler.
-                        let select_sql = if copy_stmt.columns.is_empty() {
-                            format!("SELECT * FROM {}", copy_stmt.table)
-                        } else {
-                            format!(
-                                "SELECT {} FROM {}",
-                                copy_stmt.columns.join(", "),
-                                copy_stmt.table
-                            )
-                        };
-                        let stmts = match zyron_parser::parse(&select_sql) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                self.send_error(&e).await?;
-                                self.mark_failed_if_in_transaction();
-                                continue;
-                            }
-                        };
-                        let select_stmt = stmts.into_iter().next().unwrap();
-
-                        let session = match self.session.as_ref() {
-                            Some(s) => s,
-                            None => {
-                                self.send_error(&ZyronError::Internal(
-                                    "no session established".into(),
-                                ))
-                                .await?;
-                                self.mark_failed_if_in_transaction();
-                                continue;
-                            }
-                        };
-                        let db_id = session.database_id;
-                        let search_path = session.search_path.clone();
-
-                        match zyron_planner::plan(
+                // The wire layer only implements the PostgreSQL simple-query
+                // COPY TO STDOUT / COPY FROM STDIN forms plus the legacy
+                // local-file path for parity. External endpoints, including
+                // named catalog entries and inline backend/format specs, are
+                // routed through the planner and executor instead.
+                let (copy_table, copy_columns, copy_is_to, copy_external) = match &copy_stmt.kind {
+                    zyron_parser::ast::CopyKind::IntoTable {
+                        table,
+                        columns,
+                        source,
+                    } => (table.clone(), columns.clone(), false, source.clone()),
+                    zyron_parser::ast::CopyKind::FromTable {
+                        table,
+                        columns,
+                        sink,
+                    } => (table.clone(), columns.clone(), true, sink.clone()),
+                    zyron_parser::ast::CopyKind::ExternalToExternal { source, sink } => {
+                        // External-to-external COPY runs the streaming
+                        // executor inline. No Zyron transaction is started
+                        // because no Zyron table is read or written.
+                        let res = crate::copy_external_dispatch::dispatch_external_to_external(
                             &self.server.catalog,
-                            db_id,
-                            search_path,
-                            select_stmt,
+                            source,
+                            sink,
+                            &copy_stmt.options,
                         )
-                        .await
-                        {
-                            Ok(plan) => {
-                                let output_schema = plan.output_schema();
-                                let (txn_id, snapshot) = self.ensure_transaction()?;
-                                let ctx = Arc::new(ExecutionContext::new(
-                                    self.server.catalog.clone(),
-                                    self.server.wal.clone(),
-                                    self.server.buffer_pool.clone(),
-                                    self.server.disk_manager.clone(),
-                                    txn_id as u32,
-                                    snapshot,
-                                ));
-
-                                match execute(plan, &ctx).await {
-                                    Ok(batches) => {
-                                        let handler = crate::copy::CopyOutHandler::new(
-                                            output_schema,
-                                            crate::copy::CopyFormat::Text,
-                                        );
-                                        self.feed(handler.header_message()).await?;
-                                        for batch in &batches {
-                                            let msgs = handler.format_batch(batch);
-                                            for msg in msgs {
-                                                self.feed(msg).await?;
-                                            }
-                                        }
-                                        self.feed(handler.done_message()).await?;
-                                        let total: usize = batches.iter().map(|b| b.num_rows).sum();
-                                        self.feed(BackendMessage::CommandComplete {
-                                            tag: format!("COPY {}", total),
-                                        })
-                                        .await?;
-                                    }
-                                    Err(e) => {
-                                        self.send_protocol_error(&ProtocolError::Database(e))
-                                            .await?;
-                                        self.mark_failed_if_in_transaction();
-                                    }
-                                }
+                        .await;
+                        match res {
+                            Ok(r) => {
+                                tracing::info!(
+                                    target: "zyron::audit",
+                                    rows = r.rows_written,
+                                    batches = r.batches,
+                                    elapsed_ms = r.elapsed_ms,
+                                    "CopyExecuted external-to-external"
+                                );
+                                self.feed(BackendMessage::CommandComplete {
+                                    tag: format!("COPY {}", r.rows_written),
+                                })
+                                .await?;
                             }
                             Err(e) => {
                                 self.send_error(&e).await?;
@@ -1250,162 +1211,249 @@ impl<T: WireTransport> Connection<T> {
                         }
                         continue;
                     }
-                    zyron_parser::ast::CopyDirection::From(ref target) => {
-                        // COPY FROM STDIN: read CopyData messages from client
-                        if !matches!(target, zyron_parser::ast::CopyTarget::Stdin) {
-                            self.send_error(&ZyronError::Internal(
-                                "COPY FROM only supports STDIN in wire protocol".into(),
-                            ))
-                            .await?;
+                };
+                let is_stdio = matches!(copy_external, zyron_parser::ast::CopyExternal::Stdio);
+                if copy_is_to {
+                    // COPY <table> TO STDOUT (or STDOUT-like sink). Any other
+                    // sink kind is rejected here because full external-sink
+                    // dispatch lives in the streaming executor.
+                    if !is_stdio {
+                        self.send_error(&ZyronError::Internal(
+                            "COPY TO over the wire protocol only supports STDOUT".into(),
+                        ))
+                        .await?;
+                        self.mark_failed_if_in_transaction();
+                        continue;
+                    }
+                    // Build a SELECT * FROM table query, plan and execute,
+                    // then stream results through CopyOutHandler.
+                    let select_sql = if copy_columns.is_empty() {
+                        format!("SELECT * FROM {}", copy_table)
+                    } else {
+                        format!("SELECT {} FROM {}", copy_columns.join(", "), copy_table)
+                    };
+                    let stmts = match zyron_parser::parse(&select_sql) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            self.send_error(&e).await?;
                             self.mark_failed_if_in_transaction();
                             continue;
                         }
+                    };
+                    let select_stmt = stmts.into_iter().next().unwrap();
 
-                        // Resolve table columns from catalog
-                        let session = match self.session.as_ref() {
-                            Some(s) => s,
-                            None => {
-                                self.send_error(&ZyronError::Internal(
-                                    "no session established".into(),
-                                ))
+                    let session = match self.session.as_ref() {
+                        Some(s) => s,
+                        None => {
+                            self.send_error(&ZyronError::Internal("no session established".into()))
                                 .await?;
-                                self.mark_failed_if_in_transaction();
-                                continue;
-                            }
-                        };
-                        let db_id = session.database_id;
-                        let search_path = session.search_path.clone();
+                            self.mark_failed_if_in_transaction();
+                            continue;
+                        }
+                    };
+                    let db_id = session.database_id;
+                    let search_path = session.search_path.clone();
 
-                        // Build column schema by planning a SELECT query
-                        let probe_sql = format!("SELECT * FROM {} LIMIT 0", copy_stmt.table);
-                        let probe_stmts = match zyron_parser::parse(&probe_sql) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                self.send_error(&e).await?;
-                                self.mark_failed_if_in_transaction();
-                                continue;
-                            }
-                        };
-                        let probe_stmt = probe_stmts.into_iter().next().unwrap();
-                        let columns = match zyron_planner::plan(
-                            &self.server.catalog,
-                            db_id,
-                            search_path,
-                            probe_stmt,
-                        )
+                    match zyron_planner::plan(&self.server.catalog, db_id, search_path, select_stmt)
                         .await
-                        {
-                            Ok(plan) => plan.output_schema(),
-                            Err(e) => {
-                                self.send_error(&e).await?;
-                                self.mark_failed_if_in_transaction();
-                                continue;
-                            }
-                        };
+                    {
+                        Ok(plan) => {
+                            let output_schema = plan.output_schema();
+                            let (txn_id, snapshot) = self.ensure_transaction()?;
+                            let ctx = Arc::new(ExecutionContext::new(
+                                self.server.catalog.clone(),
+                                self.server.wal.clone(),
+                                self.server.buffer_pool.clone(),
+                                self.server.disk_manager.clone(),
+                                txn_id as u32,
+                                snapshot,
+                            ));
 
-                        let mut handler = crate::copy::CopyInHandler::new(
-                            columns.clone(),
-                            crate::copy::CopyFormat::Text,
-                        );
-
-                        // Send CopyInResponse to tell client to start sending data
-                        self.feed(handler.header_message()).await?;
-                        self.flush().await?;
-
-                        // Read CopyData messages until CopyDone or CopyFail
-                        loop {
-                            let msg = self.read_message().await?;
-                            match msg {
-                                FrontendMessage::CopyData(data) => {
-                                    if let Err(e) = handler.feed(&data) {
-                                        self.send_protocol_error(&e).await?;
-                                        self.mark_failed_if_in_transaction();
-                                        break;
+                            match execute(plan, &ctx).await {
+                                Ok(batches) => {
+                                    let handler = crate::copy::CopyOutHandler::new(
+                                        output_schema,
+                                        crate::copy::CopyFormat::Text,
+                                    );
+                                    self.feed(handler.header_message()).await?;
+                                    for batch in &batches {
+                                        let msgs = handler.format_batch(batch);
+                                        for msg in msgs {
+                                            self.feed(msg).await?;
+                                        }
                                     }
-                                }
-                                FrontendMessage::CopyDone => {
-                                    break;
-                                }
-                                _ => {
-                                    // CopyFail or unexpected message
-                                    self.send_error(&ZyronError::Internal(
-                                        "COPY FROM aborted".into(),
-                                    ))
+                                    self.feed(handler.done_message()).await?;
+                                    let total: usize = batches.iter().map(|b| b.num_rows).sum();
+                                    self.feed(BackendMessage::CommandComplete {
+                                        tag: format!("COPY {}", total),
+                                    })
                                     .await?;
+                                }
+                                Err(e) => {
+                                    self.send_protocol_error(&ProtocolError::Database(e))
+                                        .await?;
+                                    self.mark_failed_if_in_transaction();
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.send_error(&e).await?;
+                            self.mark_failed_if_in_transaction();
+                        }
+                    }
+                    continue;
+                } else {
+                    // COPY <table> FROM STDIN path. Any other external source
+                    // kind is rejected here because the executor owns full
+                    // external-source dispatch.
+                    if !is_stdio {
+                        self.send_error(&ZyronError::Internal(
+                            "COPY FROM only supports STDIN in wire protocol".into(),
+                        ))
+                        .await?;
+                        self.mark_failed_if_in_transaction();
+                        continue;
+                    }
+
+                    // Resolve table columns from catalog
+                    let session = match self.session.as_ref() {
+                        Some(s) => s,
+                        None => {
+                            self.send_error(&ZyronError::Internal("no session established".into()))
+                                .await?;
+                            self.mark_failed_if_in_transaction();
+                            continue;
+                        }
+                    };
+                    let db_id = session.database_id;
+                    let search_path = session.search_path.clone();
+
+                    // Build column schema by planning a SELECT query
+                    let probe_sql = format!("SELECT * FROM {} LIMIT 0", copy_table);
+                    let probe_stmts = match zyron_parser::parse(&probe_sql) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            self.send_error(&e).await?;
+                            self.mark_failed_if_in_transaction();
+                            continue;
+                        }
+                    };
+                    let probe_stmt = probe_stmts.into_iter().next().unwrap();
+                    let columns = match zyron_planner::plan(
+                        &self.server.catalog,
+                        db_id,
+                        search_path,
+                        probe_stmt,
+                    )
+                    .await
+                    {
+                        Ok(plan) => plan.output_schema(),
+                        Err(e) => {
+                            self.send_error(&e).await?;
+                            self.mark_failed_if_in_transaction();
+                            continue;
+                        }
+                    };
+
+                    let mut handler = crate::copy::CopyInHandler::new(
+                        columns.clone(),
+                        crate::copy::CopyFormat::Text,
+                    );
+
+                    // Send CopyInResponse to tell client to start sending data
+                    self.feed(handler.header_message()).await?;
+                    self.flush().await?;
+
+                    // Read CopyData messages until CopyDone or CopyFail
+                    loop {
+                        let msg = self.read_message().await?;
+                        match msg {
+                            FrontendMessage::CopyData(data) => {
+                                if let Err(e) = handler.feed(&data) {
+                                    self.send_protocol_error(&e).await?;
                                     self.mark_failed_if_in_transaction();
                                     break;
                                 }
                             }
+                            FrontendMessage::CopyDone => {
+                                break;
+                            }
+                            _ => {
+                                // CopyFail or unexpected message
+                                self.send_error(&ZyronError::Internal("COPY FROM aborted".into()))
+                                    .await?;
+                                self.mark_failed_if_in_transaction();
+                                break;
+                            }
                         }
+                    }
 
-                        let _row_count = handler.row_count();
-                        match handler.finish() {
-                            Ok(rows) => {
-                                if !rows.is_empty() {
-                                    // Build INSERT for the rows via plan_and_execute
-                                    let col_names = if copy_stmt.columns.is_empty() {
-                                        columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
-                                    } else {
-                                        copy_stmt.columns.clone()
-                                    };
-                                    let col_list = col_names.join(", ");
+                    let _row_count = handler.row_count();
+                    match handler.finish() {
+                        Ok(rows) => {
+                            if !rows.is_empty() {
+                                // Build INSERT for the rows via plan_and_execute
+                                let col_names = if copy_columns.is_empty() {
+                                    columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+                                } else {
+                                    copy_columns.clone()
+                                };
+                                let col_list = col_names.join(", ");
 
-                                    let mut values_parts = Vec::with_capacity(rows.len());
-                                    for row in &rows {
-                                        let vals: Vec<String> = row
-                                            .iter()
-                                            .map(|v| match v {
-                                                Some(bytes) => {
-                                                    let s = String::from_utf8_lossy(bytes);
-                                                    format!("'{}'", s.replace('\'', "''"))
-                                                }
-                                                None => "NULL".to_string(),
-                                            })
-                                            .collect();
-                                        values_parts.push(format!("({})", vals.join(", ")));
-                                    }
-                                    let insert_sql = format!(
-                                        "INSERT INTO {} ({}) VALUES {}",
-                                        copy_stmt.table,
-                                        col_list,
-                                        values_parts.join(", ")
-                                    );
-                                    match zyron_parser::parse(&insert_sql) {
-                                        Ok(stmts) if !stmts.is_empty() => {
-                                            let insert_stmt = stmts.into_iter().next().unwrap();
-                                            match self.plan_and_execute_statement(insert_stmt).await
-                                            {
-                                                Ok(()) => {
-                                                    // Override the INSERT tag with COPY tag
-                                                }
-                                                Err(e) => {
-                                                    self.send_protocol_error(&e).await?;
-                                                    self.mark_failed_if_in_transaction();
-                                                    continue;
-                                                }
+                                let mut values_parts = Vec::with_capacity(rows.len());
+                                for row in &rows {
+                                    let vals: Vec<String> = row
+                                        .iter()
+                                        .map(|v| match v {
+                                            Some(bytes) => {
+                                                let s = String::from_utf8_lossy(bytes);
+                                                format!("'{}'", s.replace('\'', "''"))
+                                            }
+                                            None => "NULL".to_string(),
+                                        })
+                                        .collect();
+                                    values_parts.push(format!("({})", vals.join(", ")));
+                                }
+                                let insert_sql = format!(
+                                    "INSERT INTO {} ({}) VALUES {}",
+                                    copy_table,
+                                    col_list,
+                                    values_parts.join(", ")
+                                );
+                                match zyron_parser::parse(&insert_sql) {
+                                    Ok(stmts) if !stmts.is_empty() => {
+                                        let insert_stmt = stmts.into_iter().next().unwrap();
+                                        match self.plan_and_execute_statement(insert_stmt).await {
+                                            Ok(()) => {
+                                                // plan_and_execute already emitted a tag.
+                                            }
+                                            Err(e) => {
+                                                self.send_protocol_error(&e).await?;
+                                                self.mark_failed_if_in_transaction();
+                                                continue;
                                             }
                                         }
-                                        Ok(_) => {}
-                                        Err(e) => {
-                                            self.send_error(&e).await?;
-                                            self.mark_failed_if_in_transaction();
-                                            continue;
-                                        }
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        self.send_error(&e).await?;
+                                        self.mark_failed_if_in_transaction();
+                                        continue;
                                     }
                                 }
-                                // The plan_and_execute_statement already sent CommandComplete
-                                // with INSERT tag. For COPY, we want COPY tag instead.
-                                // Since we cannot unsend the INSERT tag, we accept the INSERT
-                                // tag from plan_and_execute. A more refined implementation
-                                // would bypass plan_and_execute for direct tuple insertion.
                             }
-                            Err(e) => {
-                                self.send_protocol_error(&e).await?;
-                                self.mark_failed_if_in_transaction();
-                            }
+                            // The plan_and_execute_statement already sent CommandComplete
+                            // with INSERT tag. For COPY, we want COPY tag instead.
+                            // Since we cannot unsend the INSERT tag, we accept the INSERT
+                            // tag from plan_and_execute. A more refined implementation
+                            // would bypass plan_and_execute for direct tuple insertion.
                         }
-                        continue;
+                        Err(e) => {
+                            self.send_protocol_error(&e).await?;
+                            self.mark_failed_if_in_transaction();
+                        }
                     }
+                    continue;
                 }
             }
 

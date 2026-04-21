@@ -24,6 +24,19 @@ pub enum LateDataPolicy {
     Drop,
     /// Route late records to a side output channel.
     SideOutput,
+    /// Apply the event to its window even if closed. Triggers re-emission of
+    /// the affected window. Semantically similar to Update but named to match
+    /// the CREATE STREAMING JOB grammar keyword REOPEN.
+    ReopenWindow,
+}
+
+/// Snapshot of LateDataHandler atomic counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LateDataStats {
+    pub dropped: u64,
+    pub updated: u64,
+    pub side_output: u64,
+    pub reopened: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -79,6 +92,8 @@ pub struct LateDataHandler {
     pub updated_count: AtomicU64,
     /// Count of records routed to the side output.
     pub side_output_count: AtomicU64,
+    /// Count of records that forced a closed window to reopen.
+    pub reopened_count: AtomicU64,
 }
 
 impl LateDataHandler {
@@ -91,6 +106,59 @@ impl LateDataHandler {
             dropped_count: AtomicU64::new(0),
             updated_count: AtomicU64::new(0),
             side_output_count: AtomicU64::new(0),
+            reopened_count: AtomicU64::new(0),
+        }
+    }
+
+    /// Creates a handler with default lateness (zero) and no side-output
+    /// channel. Matches the streaming runner constructor contract.
+    pub fn with_policy(policy: LateDataPolicy) -> Self {
+        Self::new(policy, AllowedLateness::none())
+    }
+
+    /// Returns true if the event should flow through to the aggregator,
+    /// false if the handler has absorbed it (Drop policy or unrouted late
+    /// event). For SideOutput, returns false because the event is shunted
+    /// to the side channel and the main flow should skip it. For
+    /// ReopenWindow, returns true so the aggregator re-enters the closed
+    /// window with the late event applied.
+    pub fn should_process(
+        &self,
+        event_time_ms: i64,
+        watermark_ms: i64,
+        window_closed: bool,
+    ) -> bool {
+        let is_late = event_time_ms < watermark_ms;
+        if !is_late && !window_closed {
+            return true;
+        }
+        match self.policy {
+            LateDataPolicy::Drop => {
+                self.dropped_count.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            LateDataPolicy::Update => {
+                self.updated_count.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            LateDataPolicy::ReopenWindow => {
+                self.reopened_count.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            LateDataPolicy::SideOutput => {
+                self.side_output_count.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
+    /// Snapshot of counter state for metrics export.
+    pub fn stats(&self) -> LateDataStats {
+        LateDataStats {
+            dropped: self.dropped_count.load(Ordering::Relaxed),
+            updated: self.updated_count.load(Ordering::Relaxed),
+            side_output: self.side_output_count.load(Ordering::Relaxed),
+            reopened: self.reopened_count.load(Ordering::Relaxed),
         }
     }
 
@@ -136,6 +204,10 @@ impl LateDataHandler {
                 }
                 false
             }
+            LateDataPolicy::ReopenWindow => {
+                self.reopened_count.fetch_add(1, Ordering::Relaxed);
+                true
+            }
         }
     }
 
@@ -165,6 +237,10 @@ impl LateDataHandler {
             LateDataPolicy::Update => {
                 self.updated_count.fetch_add(late_count, Ordering::Relaxed);
                 // For Update policy, return all records (late ones trigger updates).
+                return record.clone();
+            }
+            LateDataPolicy::ReopenWindow => {
+                self.reopened_count.fetch_add(late_count, Ordering::Relaxed);
                 return record.clone();
             }
             LateDataPolicy::Drop => {
@@ -389,6 +465,40 @@ mod tests {
         assert_eq!(filter.len(), 3);
         filter.cleanup(6_500); // Should remove entry 1 (expired at 6_000).
         assert_eq!(filter.len(), 2);
+    }
+
+    #[test]
+    fn should_process_drop_policy() {
+        let h = LateDataHandler::with_policy(LateDataPolicy::Drop);
+        // On-time event passes.
+        assert!(h.should_process(100, 50, false));
+        // Late event dropped.
+        assert!(!h.should_process(40, 50, false));
+        // Event for closed window dropped.
+        assert!(!h.should_process(60, 50, true));
+        let s = h.stats();
+        assert_eq!(s.dropped, 2);
+    }
+
+    #[test]
+    fn should_process_reopen_policy() {
+        let h = LateDataHandler::with_policy(LateDataPolicy::ReopenWindow);
+        assert!(h.should_process(100, 50, false));
+        // Late event forces reopen and is processed.
+        assert!(h.should_process(40, 50, false));
+        // Closed window reopens.
+        assert!(h.should_process(100, 50, true));
+        let s = h.stats();
+        assert_eq!(s.reopened, 2);
+    }
+
+    #[test]
+    fn should_process_side_output_policy() {
+        let h = LateDataHandler::with_policy(LateDataPolicy::SideOutput);
+        assert!(h.should_process(100, 50, false));
+        assert!(!h.should_process(40, 50, false));
+        let s = h.stats();
+        assert_eq!(s.side_output, 1);
     }
 
     #[test]

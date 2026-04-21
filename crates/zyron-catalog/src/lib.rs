@@ -17,13 +17,16 @@ pub mod storage;
 pub use cache::CatalogCache;
 pub use catalog::Catalog;
 pub use ids::{
-    CATALOG_SCHEMA_ID, ColumnId, DEFAULT_SCHEMA_ID, DatabaseId, IndexId, Oid, OidAllocator,
-    SYSTEM_DATABASE_ID, SchemaId, SequenceId, TableId, USER_OID_START,
+    CATALOG_SCHEMA_ID, ColumnId, DEFAULT_SCHEMA_ID, DatabaseId, ExternalSinkId, ExternalSourceId,
+    IndexId, Oid, OidAllocator, SYSTEM_DATABASE_ID, SchemaId, SequenceId, StreamingJobId, TableId,
+    USER_OID_START,
 };
 pub use resolver::NameResolver;
 pub use schema::{
-    ColumnEntry, ConstraintEntry, ConstraintType, DatabaseEntry, IndexColumnEntry, IndexEntry,
-    IndexType, SchemaEntry, TableEntry,
+    CatalogClassification, CatalogStreamingWriteMode, ColumnEntry, ConstraintEntry, ConstraintType,
+    DatabaseEntry, ExternalBackend, ExternalFormat, ExternalMode, ExternalSinkEntry,
+    ExternalSourceEntry, IndexColumnEntry, IndexEntry, IndexType, SchemaEntry, StreamingJobEntry,
+    StreamingJobStatus, TableEntry,
 };
 pub use stats::{ColumnStats, Histogram, TableStats, analyze_table};
 pub use storage::{CatalogStorage, HeapCatalogStorage};

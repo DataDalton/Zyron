@@ -247,6 +247,7 @@ pub enum Keyword {
     Scroll,
     Hold,
     Without,
+    Within,
     Absolute,
     Relative,
     Forward,
@@ -310,7 +311,46 @@ pub enum Keyword {
     // Vector type
     Vector,
 
-    // Extended types (Phase 14)
+    // Streaming jobs
+    Streaming,
+    Job,
+    Write,
+    Append,
+    Upsert,
+
+    // Streaming windowing and watermarks
+    Tumble,
+    Hop,
+    Session,
+    Watermark,
+    Late,
+    Data,
+    Policy,
+    Reopen,
+    Side,
+    Output,
+
+    // External sources and sinks
+    External,
+    Sink,
+    Credentials,
+    OneShot,
+    Scheduled,
+    Watch,
+    File,
+    S3,
+    Gcs,
+    Azure,
+    Http,
+    Options,
+    Columns,
+    JsonLines,
+    Csv,
+    Parquet,
+    Arrow,
+    Avro,
+
+    // Extended types (spatial, temporal, probabilistic, semantic)
     Geometry,
     Matrix,
     Color,
@@ -586,6 +626,13 @@ impl std::fmt::Display for Token {
     }
 }
 
+// Auto-generated list of every keyword string accepted by `lookup_keyword`,
+// produced at build time by `build.rs` scraping the match arms below. Tools
+// that need to enumerate the SQL vocabulary (CLI tab completion, syntax
+// highlighters, docs) read from `KEYWORD_STRINGS` so there is exactly one
+// source of truth and no parallel list to keep in sync.
+include!(concat!(env!("OUT_DIR"), "/keyword_strings.rs"));
+
 /// Looks up a keyword from a word string. Case-insensitive.
 /// Returns None if the word is not a recognized SQL keyword.
 /// Uses a stack-allocated buffer to avoid heap allocation per call.
@@ -817,6 +864,7 @@ pub fn lookup_keyword(word: &str) -> Option<Keyword> {
         "SCROLL" => Some(Keyword::Scroll),
         "HOLD" => Some(Keyword::Hold),
         "WITHOUT" => Some(Keyword::Without),
+        "WITHIN" => Some(Keyword::Within),
         "ABSOLUTE" => Some(Keyword::Absolute),
         "RELATIVE" => Some(Keyword::Relative),
         "FORWARD" => Some(Keyword::Forward),
@@ -879,7 +927,7 @@ pub fn lookup_keyword(word: &str) -> Option<Keyword> {
         // Vector
         "VECTOR" => Some(Keyword::Vector),
 
-        // Extended types (Phase 14)
+        // Extended types (spatial, temporal, probabilistic, semantic)
         "GEOMETRY" => Some(Keyword::Geometry),
         "MATRIX" => Some(Keyword::Matrix),
         "COLOR" => Some(Keyword::Color),
@@ -962,6 +1010,43 @@ pub fn lookup_keyword(word: &str) -> Option<Keyword> {
         "PLUGIN" => Some(Keyword::Plugin),
         "CDC" => Some(Keyword::Cdc),
         "STREAM" => Some(Keyword::Stream),
+        "STREAMING" => Some(Keyword::Streaming),
+        "JOB" => Some(Keyword::Job),
+        "WRITE" => Some(Keyword::Write),
+        "APPEND" => Some(Keyword::Append),
+        "UPSERT" => Some(Keyword::Upsert),
+
+        // Streaming windowing and watermarks
+        "TUMBLE" => Some(Keyword::Tumble),
+        "HOP" => Some(Keyword::Hop),
+        "SESSION" => Some(Keyword::Session),
+        "WATERMARK" => Some(Keyword::Watermark),
+        "LATE" => Some(Keyword::Late),
+        "DATA" => Some(Keyword::Data),
+        "POLICY" => Some(Keyword::Policy),
+        "REOPEN" => Some(Keyword::Reopen),
+        "SIDE" => Some(Keyword::Side),
+        "OUTPUT" => Some(Keyword::Output),
+
+        // External sources and sinks
+        "EXTERNAL" => Some(Keyword::External),
+        "SINK" => Some(Keyword::Sink),
+        "CREDENTIALS" => Some(Keyword::Credentials),
+        "ONESHOT" => Some(Keyword::OneShot),
+        "SCHEDULED" => Some(Keyword::Scheduled),
+        "WATCH" => Some(Keyword::Watch),
+        "FILE" => Some(Keyword::File),
+        "S3" => Some(Keyword::S3),
+        "GCS" => Some(Keyword::Gcs),
+        "AZURE" => Some(Keyword::Azure),
+        "HTTP" => Some(Keyword::Http),
+        "OPTIONS" => Some(Keyword::Options),
+        "COLUMNS" => Some(Keyword::Columns),
+        "JSONLINES" => Some(Keyword::JsonLines),
+        "CSV" => Some(Keyword::Csv),
+        "PARQUET" => Some(Keyword::Parquet),
+        "ARROW" => Some(Keyword::Arrow),
+        "AVRO" => Some(Keyword::Avro),
         "INGEST" => Some(Keyword::Ingest),
         "PUBLICATION" => Some(Keyword::Publication),
         "INCLUDE" => Some(Keyword::Include),

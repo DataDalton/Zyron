@@ -484,6 +484,72 @@ impl Server {
             Arc::new(mgr)
         };
 
+        // -------------------------------------------------------------------
+        // Spatial index manager: load persisted R-trees or rebuild from the
+        // base table for every Spatial catalog entry. Snapshot loads are a
+        // fast-path optimization. When a snapshot is missing, stale, or fails
+        // the checksum, recovery falls back to a full heap scan and re-inserts
+        // every geometry so queries and DML maintenance stay correct.
+        // -------------------------------------------------------------------
+        let spatial_mgr_arc = {
+            let spatial_dir = data_dir.join("spatial");
+            let _ = std::fs::create_dir_all(&spatial_dir);
+            let mgr = zyron_types::spatial_index::SpatialIndexManager::new();
+
+            for table in catalog.list_all_tables() {
+                for idx in catalog.get_indexes_for_table(table.id) {
+                    if idx.index_type != zyron_catalog::IndexType::Spatial {
+                        continue;
+                    }
+                    let (dims, srid) = parse_spatial_params(idx.parameters.as_deref());
+                    mgr.create_index(idx.id.0, dims, srid);
+
+                    let saved = spatial_dir.join(format!("{}.rtree", idx.id.0));
+                    if saved.exists() {
+                        match mgr.restore_from_file(idx.id.0, &saved) {
+                            Ok(()) => {
+                                info!(
+                                    target: "zyron::recovery",
+                                    "spatial index {} restored from disk",
+                                    idx.id.0
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    target: "zyron::recovery",
+                                    "spatial index {} disk load failed ({}), rebuilding from table",
+                                    idx.id.0,
+                                    e
+                                );
+                            }
+                        }
+                    }
+
+                    if let Err(e) = rebuild_spatial_index_from_table(
+                        &mgr,
+                        idx.id.0,
+                        dims,
+                        &buffer_pool,
+                        &disk_manager,
+                        idx.as_ref(),
+                        table.as_ref(),
+                    )
+                    .await
+                    {
+                        error!(
+                            target: "zyron::recovery",
+                            "spatial index {} rebuild failed: {}",
+                            idx.id.0,
+                            e
+                        );
+                    }
+                }
+            }
+
+            Arc::new(mgr)
+        };
+
         // 11. Start background workers
         let ckpt_config = CheckpointWorkerConfig {
             wal_bytes_threshold: self.config.checkpoint.wal_bytes_threshold,
@@ -536,6 +602,19 @@ impl Server {
             disk_manager: Arc::clone(&disk_manager),
             txn_manager: Arc::clone(&txn_manager),
             security_manager: Some(Arc::new(security_manager)),
+            key_store: {
+                // Derive a stable master key from the data-dir path. Survives
+                // restarts for the same data directory. An ops deployment
+                // replaces this with a KMS-backed KeyStore via the trait.
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(data_dir.to_string_lossy().as_bytes());
+                hasher.update(b"external-credentials-kek-v1");
+                let digest = hasher.finalize();
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&digest);
+                Arc::new(zyron_auth::LocalKeyStore::new(key))
+            },
             config_lookup: Some(Arc::new(move |key: &str| -> Option<String> {
                 config_for_lookup.get_config_value(key)
             })),
@@ -677,9 +756,7 @@ impl Server {
             fts_manager: Some(Arc::clone(&fts_mgr_arc)),
             vector_manager: Some(Arc::clone(&vec_mgr_arc)),
             graph_manager: Some(Arc::clone(&graph_mgr_arc)),
-            spatial_manager: Some(Arc::new(
-                zyron_types::spatial_index::SpatialIndexManager::new(),
-            )),
+            spatial_manager: Some(Arc::clone(&spatial_mgr_arc)),
             // DML hooks: CDC capture + trigger dispatch
             cdc_hook: Some(Arc::new(hooks::CdcHookBridge::new(
                 Arc::clone(&cdc_registry_arc),
@@ -692,6 +769,24 @@ impl Server {
             // Notification channels
             notification_channels: Some(notif_arc),
         });
+
+        // -------------------------------------------------------------------
+        // External endpoint probes.
+        // Walks the catalog external source and sink lists and verifies each
+        // one can be opened. Probe failures log a warning and do not abort
+        // startup so a single broken endpoint does not block the server.
+        // -------------------------------------------------------------------
+        verify_external_endpoints(&server_state).await;
+
+        // -------------------------------------------------------------------
+        // Streaming-job recovery.
+        // Walks the catalog streaming-job list and respawns every Active job
+        // so restarts do not lose running pipelines. Paused jobs stay paused
+        // and only resume via ALTER STREAMING JOB RESUME.
+        // -------------------------------------------------------------------
+        if let Err(e) = recover_streaming_jobs(&server_state).await {
+            error!("streaming job recovery failed: {}", e);
+        }
 
         // 11. Start health/metrics HTTP server
         let health_port = self.config.metrics.port;
@@ -715,6 +810,9 @@ impl Server {
         self.health_state.mark_accepting();
 
         let wire_config = self.config.to_server_config();
+        // Retain a reference for shutdown so the streaming-job stop path can
+        // still reach the manager after the wire server task takes ownership.
+        let state_for_shutdown = Arc::clone(&server_state);
         let wire_handle = tokio::spawn(async move {
             if let Err(e) = zyron_wire::start_server(&wire_config, server_state).await {
                 error!("Wire protocol server error: {}", e);
@@ -765,6 +863,34 @@ impl Server {
             }
         }
 
+        // Persist spatial R-trees to disk before stopping workers. Save
+        // errors are logged per index and do not abort shutdown, startup
+        // rebuilds from the base table when a snapshot is missing.
+        {
+            let spatial_dir = self.config.storage.data_dir.join("spatial");
+            let errors = spatial_mgr_arc.save_all(&spatial_dir);
+            for (idx_id, err) in errors {
+                warn!(
+                    target: "zyron::shutdown",
+                    "spatial index {} save failed: {}",
+                    idx_id,
+                    err
+                );
+            }
+        }
+
+        // Stop all running streaming jobs before shutting down background
+        // workers so runner threads exit cleanly. shutdown_all drains the
+        // handle map and joins every runner thread. External sink runners
+        // call flush on their sink before breaking out of the loop so any
+        // buffered rows are written out before the process exits.
+        if let Some(ref mgr) = state_for_shutdown.stream_job_manager {
+            let stopped = mgr.lock().shutdown_all();
+            if stopped > 0 {
+                info!("stopped {} streaming runner(s) during shutdown", stopped);
+            }
+        }
+
         // Stop background workers (runs final checkpoint)
         background.shutdown();
 
@@ -774,4 +900,369 @@ impl Server {
         info!("ZyronDB shut down");
         Ok(())
     }
+}
+
+// -----------------------------------------------------------------------------
+// Streaming-job startup recovery
+// -----------------------------------------------------------------------------
+
+/// Walks the catalog streaming-job list and respawns every Active job. Jobs in
+/// the Paused or Failed state are skipped. A job that fails to respawn is
+/// transitioned to Failed with the error string stored in last_error.
+async fn recover_streaming_jobs(
+    state: &Arc<zyron_wire::connection::ServerState>,
+) -> zyron_common::Result<()> {
+    let jobs = state.catalog.list_streaming_jobs();
+    if jobs.is_empty() {
+        return Ok(());
+    }
+
+    if state.stream_job_manager.is_none() {
+        info!("streaming job manager not configured, skipping recovery");
+        return Ok(());
+    }
+
+    let mut recovered = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+
+    for entry in jobs {
+        if entry.status != zyron_catalog::StreamingJobStatus::Active {
+            skipped += 1;
+            continue;
+        }
+        match respawn_streaming_job(&entry, state).await {
+            Ok(()) => recovered += 1,
+            Err(e) => {
+                warn!("streaming job {} failed to restart: {}", entry.name, e);
+                failed += 1;
+                let _ = state
+                    .catalog
+                    .update_streaming_job_status(
+                        entry.id,
+                        zyron_catalog::StreamingJobStatus::Failed,
+                        Some(e.to_string()),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    info!(
+        "streaming job recovery: {} respawned, {} skipped, {} failed",
+        recovered, skipped, failed
+    );
+    Ok(())
+}
+
+/// Re-parses the stored CREATE STREAMING JOB SQL, re-binds it through the
+/// planner, rehydrates the creator security context from the stored snapshot,
+/// and hands the bound plan to the shared wire-level dispatch helper. The
+/// helper covers every topology: Zyron-to-Zyron, external-to-Zyron,
+/// Zyron-to-external, and external-to-external.
+async fn respawn_streaming_job(
+    entry: &zyron_catalog::StreamingJobEntry,
+    state: &Arc<zyron_wire::connection::ServerState>,
+) -> zyron_common::Result<()> {
+    use zyron_common::ZyronError;
+
+    let statements = zyron_parser::parse(&entry.select_sql)
+        .map_err(|e| ZyronError::PlanError(format!("recovery parse failed: {e}")))?;
+    let stmt = statements
+        .into_iter()
+        .find(|s| matches!(s, zyron_parser::Statement::CreateStreamingJob(_)))
+        .ok_or_else(|| {
+            ZyronError::PlanError("recovery: stored SQL has no CREATE STREAMING JOB".to_string())
+        })?;
+
+    let resolver = state.catalog.resolver(
+        zyron_catalog::SYSTEM_DATABASE_ID,
+        vec!["public".to_string()],
+    );
+    let mut binder = zyron_planner::Binder::new(resolver, &state.catalog);
+    let bound = binder.bind(stmt).await?;
+    let bsj = match bound {
+        zyron_planner::BoundStatement::CreateStreamingJob(b) => b,
+        _ => {
+            return Err(ZyronError::PlanError(
+                "recovery: unexpected bound variant".to_string(),
+            ));
+        }
+    };
+
+    // Rehydrate the creator security context from the stored snapshot.
+    let security_manager = state.security_manager.as_ref().cloned().ok_or_else(|| {
+        ZyronError::AuthenticationFailed("security manager not configured".to_string())
+    })?;
+    let mut off = 0usize;
+    let snap =
+        zyron_auth::SecurityContextSnapshot::from_bytes(&entry.creator_snapshot_bytes, &mut off)?;
+    let limits = security_manager
+        .query_limits
+        .get_limits(&snap.effective_roles);
+    let security_ctx = snap.into_context(limits);
+
+    let spec = zyron_wire::ddl_dispatch::lower_bsj_to_spec(&bsj)?;
+
+    let cdc_registry = state
+        .cdc_registry
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| ZyronError::StreamingError("CDC registry not configured".to_string()))?;
+
+    zyron_wire::ddl_dispatch::spawn_bound_streaming_job(
+        &bsj,
+        entry,
+        spec,
+        security_ctx,
+        security_manager,
+        cdc_registry,
+        state,
+    )
+    .map_err(|e| match e {
+        zyron_wire::messages::ProtocolError::Database(err) => err,
+        other => ZyronError::StreamingError(format!("recovery dispatch failed: {other}")),
+    })?;
+
+    tracing::info!(
+        target: "zyron::audit",
+        event = "StreamingJobRespawned",
+        job_id = entry.id.0,
+        job_name = %entry.name,
+        reason = "startup-recovery",
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// External endpoint probes
+// ---------------------------------------------------------------------------
+
+/// Walks the catalog external source and sink lists and calls the streaming
+/// probe helpers. A probe construct the OpenDAL operator locally, it does
+/// not touch the remote endpoint. Probe failures log a warning and do not
+/// abort startup. Credentials that must be unsealed are emitted as an audit
+/// event so operators can trace credential access at boot.
+async fn verify_external_endpoints(state: &Arc<zyron_wire::connection::ServerState>) {
+    for entry in state.catalog.list_external_sources() {
+        let creds = match unseal_entry_credentials_for_probe(
+            entry.credential_key_id,
+            entry.credential_ciphertext.as_deref(),
+            state,
+            &entry.name,
+            true,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    "external source '{}' credential unseal failed: {}",
+                    entry.name, e
+                );
+                continue;
+            }
+        };
+        if let Err(e) = zyron_streaming::external_source::probe_external_source(&entry, creds) {
+            warn!("external source '{}' may be unavailable: {}", entry.name, e);
+        }
+    }
+    for entry in state.catalog.list_external_sinks() {
+        let creds = match unseal_entry_credentials_for_probe(
+            entry.credential_key_id,
+            entry.credential_ciphertext.as_deref(),
+            state,
+            &entry.name,
+            false,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    "external sink '{}' credential unseal failed: {}",
+                    entry.name, e
+                );
+                continue;
+            }
+        };
+        if let Err(e) = zyron_streaming::external_sink::ExternalRowSink::probe(&entry, creds) {
+            warn!("external sink '{}' may be unavailable: {}", entry.name, e);
+        }
+    }
+}
+
+/// Probe-side credential unsealer. Emits an audit event so credential reads
+/// during startup recovery are visible to operators.
+fn unseal_entry_credentials_for_probe(
+    key_id: Option<u32>,
+    ciphertext: Option<&[u8]>,
+    state: &Arc<zyron_wire::connection::ServerState>,
+    object_name: &str,
+    is_source: bool,
+) -> zyron_common::Result<std::collections::HashMap<String, String>> {
+    match (key_id, ciphertext) {
+        (Some(kid), Some(ct)) => {
+            let sealed = zyron_auth::SealedCredentials {
+                key_id: kid,
+                ciphertext: ct.to_vec(),
+            };
+            let opened = zyron_auth::open_credentials(&sealed, state.key_store.as_ref())?;
+            tracing::info!(
+                target: "zyron::audit",
+                event = "ExternalCredentialRead",
+                key_id = kid,
+                object = %object_name,
+                kind = if is_source { "source" } else { "sink" },
+                reason = "startup-probe",
+            );
+            Ok(opened)
+        }
+        _ => Ok(std::collections::HashMap::new()),
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Spatial index startup recovery
+// -----------------------------------------------------------------------------
+
+/// Extracts dims and srid from an IndexEntry parameters blob. Layout written
+/// by handle_create_spatial_index is [u8 dims][u32 srid little-endian]. When
+/// the blob is missing or too short the function falls back to a 2D, srid=0
+/// index so recovery still runs against legacy entries.
+fn parse_spatial_params(params: Option<&[u8]>) -> (u8, u32) {
+    match params {
+        Some(b) if b.len() >= 5 => {
+            let dims = b[0].clamp(1, 4);
+            let srid = u32::from_le_bytes([b[1], b[2], b[3], b[4]]);
+            (dims, srid)
+        }
+        _ => (2, 0),
+    }
+}
+
+/// Rebuilds a spatial index by scanning the base table's heap file, decoding
+/// the geometry column of every live tuple, and inserting (mbr, rowid) pairs
+/// into the live R-tree. Used when no snapshot file exists or when the saved
+/// snapshot failed to load. Visibility filtering is deferred to query time,
+/// this pass simply repopulates the tree with every reachable geometry.
+async fn rebuild_spatial_index_from_table(
+    mgr: &zyron_types::spatial_index::SpatialIndexManager,
+    index_id: u32,
+    dims: u8,
+    buffer_pool: &Arc<BufferPool>,
+    disk: &Arc<DiskManager>,
+    idx: &zyron_catalog::schema::IndexEntry,
+    table: &zyron_catalog::schema::TableEntry,
+) -> zyron_common::Result<()> {
+    use zyron_common::ZyronError;
+
+    let col_id = idx.columns.first().map(|c| c.column_id).ok_or_else(|| {
+        ZyronError::ExecutionError(format!("spatial index {} has no indexed column", index_id))
+    })?;
+
+    let col_ordinal = table
+        .columns
+        .iter()
+        .position(|c| c.id == col_id)
+        .ok_or_else(|| {
+            ZyronError::ExecutionError(format!(
+                "spatial index {} references unknown column {}",
+                index_id, col_id.0
+            ))
+        })?;
+
+    let heap = zyron_storage::HeapFile::new(
+        Arc::clone(disk),
+        Arc::clone(buffer_pool),
+        zyron_storage::HeapFileConfig {
+            heap_file_id: table.heap_file_id,
+            fsm_file_id: table.fsm_file_id,
+        },
+    )?;
+    heap.init_cache().await?;
+
+    let guard = heap.scan()?;
+    let mut count: u64 = 0;
+    guard.for_each(|tid, view| {
+        let data = view.data;
+        let Some(geom_bytes) = column_bytes_at(data, col_ordinal, &table.columns) else {
+            return;
+        };
+        let Ok(geom) = zyron_types::geospatial::decode_wkb(geom_bytes) else {
+            return;
+        };
+        let mbr = zyron_types::spatial_index::mbr_from_geometry(&geom, dims);
+        let rowid = match zyron_search::encode_doc_id(tid.page_id.page_num, tid.slot_id) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        if mgr.insert_mbr(index_id, mbr, rowid).is_ok() {
+            count += 1;
+        }
+    });
+
+    info!(
+        target: "zyron::recovery",
+        "spatial index {} rebuilt from table scan, rows {}",
+        index_id,
+        count
+    );
+    Ok(())
+}
+
+/// Extracts the raw bytes of the column at `ordinal` from an NSM-encoded
+/// tuple data slice. Skips preceding columns using each type's fixed size or
+/// the 4-byte length prefix used for variable-length columns. Returns None
+/// when the column is null or when the tuple data is shorter than expected.
+fn column_bytes_at<'a>(
+    data: &'a [u8],
+    ordinal: usize,
+    columns: &[zyron_catalog::ColumnEntry],
+) -> Option<&'a [u8]> {
+    let num_cols = columns.len();
+    if ordinal >= num_cols {
+        return None;
+    }
+    let null_bitmap_len = (num_cols + 7) / 8;
+    if data.len() < null_bitmap_len {
+        return None;
+    }
+    let null_bitmap = &data[..null_bitmap_len];
+    let mut offset = null_bitmap_len;
+
+    for (i, col) in columns.iter().enumerate() {
+        let is_null = (null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+
+        if let Some(fixed_size) = col.type_id.fixed_size() {
+            if offset + fixed_size > data.len() {
+                return None;
+            }
+            if i == ordinal {
+                if is_null {
+                    return None;
+                }
+                return Some(&data[offset..offset + fixed_size]);
+            }
+            offset += fixed_size;
+        } else {
+            if offset + 4 > data.len() {
+                return None;
+            }
+            let len = u32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]) as usize;
+            offset += 4;
+            if offset + len > data.len() {
+                return None;
+            }
+            if i == ordinal {
+                if is_null {
+                    return None;
+                }
+                return Some(&data[offset..offset + len]);
+            }
+            offset += len;
+        }
+    }
+    None
 }

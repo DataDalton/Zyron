@@ -244,7 +244,7 @@ fn create_accumulator(name: &str, args_count: usize) -> Box<dyn Accumulator> {
 }
 
 // ---------------------------------------------------------------------------
-// Additional accumulators for Phase 14
+// Extended accumulators (first/last, approximate, temporal)
 // ---------------------------------------------------------------------------
 
 /// First value seen (in input order). For two-arg first(value, time),

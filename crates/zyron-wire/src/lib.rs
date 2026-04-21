@@ -12,6 +12,7 @@ pub mod auth;
 pub mod codec;
 pub mod connection;
 pub mod copy;
+pub mod copy_external_dispatch;
 pub mod ddl_dispatch;
 pub mod messages;
 pub mod notifications;

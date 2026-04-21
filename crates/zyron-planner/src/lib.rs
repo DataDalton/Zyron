@@ -11,7 +11,7 @@ pub mod optimizer;
 pub mod physical;
 pub mod statistics;
 
-pub use binder::{BindContext, Binder, BoundStatement};
+pub use binder::{BindContext, Binder, BoundStatement, BoundStreamingJob};
 pub use cost::{CostModel, PlanCost};
 pub use explain::{ExplainFormat, ExplainNode, ExplainOptions};
 pub use logical::LogicalPlan;

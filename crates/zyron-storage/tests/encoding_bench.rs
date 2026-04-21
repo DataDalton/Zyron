@@ -43,7 +43,7 @@ fn test_encoding_round_trip_correctness() {
     let _benchGuard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     const ROW_COUNT: usize = 100_000;
 
-    tprintln!("\n=== Phase 1.7: Encoding Round-Trip Correctness ===");
+    tprintln!("\n=== Encoding Round-Trip Correctness ===");
     tprintln!("Rows per encoding: {}", ROW_COUNT);
 
     let utilBefore = take_util_snapshot();
@@ -425,7 +425,7 @@ fn test_encoding_selection() {
     zyron_bench_harness::init("encoding");
     let _benchGuard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    tprintln!("\n=== Phase 1.7: Encoding Selection ===");
+    tprintln!("\n=== Encoding Selection ===");
 
     let utilBefore = take_util_snapshot();
 
@@ -600,7 +600,7 @@ fn test_query_on_compressed() {
     let _benchGuard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     const ROW_COUNT: usize = 100_000;
 
-    tprintln!("\n=== Phase 1.7: Query-on-Compressed ===");
+    tprintln!("\n=== Query-on-Compressed ===");
     tprintln!("Rows: {}", ROW_COUNT);
 
     let utilBefore = take_util_snapshot();

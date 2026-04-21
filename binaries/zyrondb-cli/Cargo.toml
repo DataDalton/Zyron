@@ -11,5 +11,11 @@ path = "src/main.rs"
 [dependencies]
 zyron-wire = { path = "../../crates/zyron-wire" }
 zyron-common = { path = "../../crates/zyron-common" }
+zyron-parser = { path = "../../crates/zyron-parser" }
 tokio.workspace = true
 bytes.workspace = true
+rustyline = { version = "14", default-features = false, features = [
+    "with-file-history",
+    "custom-bindings",
+] }
+ctrlc = "3"

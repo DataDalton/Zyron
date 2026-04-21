@@ -119,72 +119,9 @@ fn extract_column_bytes<'a>(
     }
 }
 
-/// Computes the bounding box of a Geometry as an MBR with the given dim
-/// count. Currently supports Point, LineString, Polygon, and the Multi*
-/// variants by walking their coordinate sets.
-fn geometry_to_mbr(
-    geom: &zyron_types::geospatial::Geometry,
-    dims: u8,
-) -> zyron_types::spatial_index::Mbr {
-    use zyron_types::geospatial::Point;
-    let mut mins = [f64::INFINITY; 4];
-    let mut maxs = [f64::NEG_INFINITY; 4];
-    let d = dims as usize;
-    let mut visit = |p: &Point| {
-        let coords = [p.x, p.y, 0.0, 0.0];
-        for i in 0..d {
-            if coords[i] < mins[i] {
-                mins[i] = coords[i];
-            }
-            if coords[i] > maxs[i] {
-                maxs[i] = coords[i];
-            }
-        }
-    };
-    walk_points(&geom.kind, &mut visit);
-
-    if mins[0].is_infinite() {
-        // Empty geometry: produce an empty MBR placeholder (all zeros, both bounds equal).
-        return zyron_types::spatial_index::Mbr::point(&vec![0.0; d]);
-    }
-    zyron_types::spatial_index::Mbr::from_extents(&mins[..d], &maxs[..d])
-}
-
-fn walk_points(
-    kind: &zyron_types::geospatial::GeometryKind,
-    visit: &mut impl FnMut(&zyron_types::geospatial::Point),
-) {
-    use zyron_types::geospatial::GeometryKind;
-    match kind {
-        GeometryKind::Point(p) => visit(p),
-        GeometryKind::LineString(ls) => ls.points.iter().for_each(visit),
-        GeometryKind::Polygon(p) => {
-            p.exterior.iter().for_each(&mut *visit);
-            for hole in &p.holes {
-                hole.iter().for_each(&mut *visit);
-            }
-        }
-        GeometryKind::MultiPoint(mp) => mp.points.iter().for_each(visit),
-        GeometryKind::MultiLineString(ml) => {
-            for ls in &ml.lines {
-                ls.points.iter().for_each(&mut *visit);
-            }
-        }
-        GeometryKind::MultiPolygon(mp) => {
-            for poly in &mp.polygons {
-                poly.exterior.iter().for_each(&mut *visit);
-                for hole in &poly.holes {
-                    hole.iter().for_each(&mut *visit);
-                }
-            }
-        }
-        GeometryKind::GeometryCollection(items) => {
-            for g in items {
-                walk_points(&g.kind, visit);
-            }
-        }
-    }
-}
+// MBR computation from a decoded Geometry lives in zyron-types so startup
+// recovery in zyron-server can call the same logic. See
+// zyron_types::spatial_index::mbr_from_geometry.
 
 /// Serializes a TupleId into bytes for WAL payload.
 fn tuple_id_payload(tid: &TupleId) -> Vec<u8> {
@@ -437,7 +374,10 @@ impl Operator for InsertOperator {
                                 else {
                                     continue;
                                 };
-                                let mbr = geometry_to_mbr(&geom, tree.dims());
+                                let mbr = zyron_types::spatial_index::mbr_from_geometry(
+                                    &geom,
+                                    tree.dims(),
+                                );
                                 tree.insert(zyron_types::spatial_index::LeafEntry {
                                     mbr,
                                     data: rowid,

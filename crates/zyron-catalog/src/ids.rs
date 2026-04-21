@@ -73,6 +73,9 @@ define_id!(TableId, u32, "TableId");
 define_id!(IndexId, u32, "IndexId");
 define_id!(SequenceId, u32, "SequenceId");
 define_id!(ColumnId, u16, "ColumnId");
+define_id!(StreamingJobId, u32, "StreamingJobId");
+define_id!(ExternalSourceId, u32, "ExternalSourceId");
+define_id!(ExternalSinkId, u32, "ExternalSinkId");
 
 #[cfg(test)]
 mod tests {

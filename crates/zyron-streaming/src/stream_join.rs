@@ -1091,4 +1091,113 @@ mod tests {
         let output = join.process(right).expect("process should succeed");
         assert!(!output.is_empty());
     }
+
+    // -----------------------------------------------------------------
+    // Streaming-job JOIN tests covering the brief's five scenarios.
+    // -----------------------------------------------------------------
+
+    /// Left row at t=0 and right row at t=2000ms share the same key, with
+    /// a symmetric window of 5000ms. The join emits exactly one joined
+    /// record on the right-side insert.
+    #[test]
+    fn test_interval_join_matches_within_window() {
+        let mut join = StreamStreamJoin::new(100, vec![0], vec![0], 5_000);
+
+        join.set_input_side(true);
+        let left = make_keyed_record(vec![42], vec![10], vec![0]);
+        let output = join.process(left).expect("left process");
+        assert!(output.is_empty());
+
+        join.set_input_side(false);
+        let right = make_keyed_record(vec![42], vec![99], vec![2_000]);
+        let output = join.process(right).expect("right process");
+        let rows: usize = output.iter().map(|r| r.num_rows()).sum();
+        assert_eq!(rows, 1, "expected exactly one joined row within the window");
+    }
+
+    /// Left row at t=0 and right row at t=10000ms with a symmetric window
+    /// of 5000ms fall outside the window. The join emits zero records.
+    #[test]
+    fn test_interval_join_drops_outside_window() {
+        let mut join = StreamStreamJoin::new(101, vec![0], vec![0], 5_000);
+
+        join.set_input_side(true);
+        let left = make_keyed_record(vec![7], vec![10], vec![0]);
+        join.process(left).expect("left process");
+
+        join.set_input_side(false);
+        let right = make_keyed_record(vec![7], vec![99], vec![10_000]);
+        let output = join.process(right).expect("right process");
+        let rows: usize = output.iter().map(|r| r.num_rows()).sum();
+        assert_eq!(rows, 0, "outside-window records must not join");
+    }
+
+    /// Advancing the watermark past the retention horizon evicts buffered
+    /// left-side state. A subsequent right-side row with a matching key
+    /// therefore finds no buffered opposite and emits nothing.
+    #[test]
+    fn test_interval_join_evicts_on_watermark() {
+        let mut join = StreamStreamJoin::new(102, vec![0], vec![0], 1_000);
+
+        join.set_input_side(true);
+        let left = make_keyed_record(vec![3], vec![10], vec![0]);
+        join.process(left).expect("left process");
+
+        // Watermark advances past 0 + 1000 so the left row is evicted.
+        join.on_watermark(Watermark::new(5_000))
+            .expect("watermark advance");
+
+        join.set_input_side(false);
+        let right = make_keyed_record(vec![3], vec![99], vec![4_500]);
+        let output = join.process(right).expect("right process");
+        let rows: usize = output.iter().map(|r| r.num_rows()).sum();
+        assert_eq!(rows, 0, "state must be evicted past watermark horizon");
+    }
+
+    /// Temporal-join lookup finds the latest version at or before the
+    /// probe event time and emits a joined row carrying the build batch's
+    /// payload. Confirms AS OF semantics for stream-table joins.
+    #[test]
+    fn test_temporal_join_lookup() {
+        let mut join = TemporalJoin::new(103, vec![0]);
+
+        let key_hash = crate::hash::hash_int(77);
+        let build = StreamBatch::new(vec![StreamColumn::from_data(StreamColumnData::Int64(
+            vec![555],
+        ))]);
+        join.add_version(key_hash, 100, build);
+
+        let probe = make_keyed_record(vec![77], vec![10], vec![500]);
+        let output = join.process(probe).expect("probe process");
+        assert_eq!(output.len(), 1);
+        let last = output[0].batch.columns.last().expect("last column");
+        if let StreamColumnData::Int64(v) = &last.data {
+            assert_eq!(v[0], 555);
+        } else {
+            panic!("expected Int64 build column on output");
+        }
+    }
+
+    /// Temporal-join without a matching version at the probe event time
+    /// emits nothing. Inner-join semantics are the only supported form,
+    /// so unmatched rows are dropped.
+    #[test]
+    fn test_temporal_join_no_match_emits_nothing_by_default() {
+        let mut join = TemporalJoin::new(104, vec![0]);
+
+        let key_hash = crate::hash::hash_int(88);
+        let build = StreamBatch::new(vec![StreamColumn::from_data(StreamColumnData::Int64(
+            vec![999],
+        ))]);
+        // Version is at t=5000, probe is at t=1000, so no version exists
+        // at or before the probe time.
+        join.add_version(key_hash, 5_000, build);
+
+        let probe = make_keyed_record(vec![88], vec![10], vec![1_000]);
+        let output = join.process(probe).expect("probe process");
+        assert!(
+            output.is_empty(),
+            "inner temporal join must drop unmatched rows"
+        );
+    }
 }

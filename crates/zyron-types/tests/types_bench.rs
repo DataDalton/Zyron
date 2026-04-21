@@ -424,7 +424,7 @@ fn test_point_in_polygon() {
 }
 
 // =============================================================================
-// Spatial "index" KNN (brute-force - no spatial index in Phase 14)
+// Spatial "index" KNN (brute-force scan used by this bench)
 // =============================================================================
 
 #[test]
@@ -433,7 +433,7 @@ fn test_spatial_knn() {
     let _guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     tprintln!("\n=== Spatial KNN (100K points) ===");
-    tprintln!("  NOTE: Phase 14 does not ship a spatial index; using brute-force scan.");
+    tprintln!("  NOTE: this bench uses a brute-force scan rather than a spatial index.");
 
     const N: usize = 100_000;
 

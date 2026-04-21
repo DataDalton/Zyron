@@ -6,12 +6,35 @@ rust-version.workspace = true
 
 [dependencies]
 zyron-common = { path = "../zyron-common" }
+zyron-cdc = { path = "../zyron-cdc" }
+zyron-catalog = { path = "../zyron-catalog" }
+zyron-storage = { path = "../zyron-storage" }
+zyron-auth = { path = "../zyron-auth" }
 parking_lot = { workspace = true }
 scc = { workspace = true }
 crossbeam = { workspace = true }
 hashbrown = { workspace = true }
 xxhash-rust = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+csv = "1"
+parquet = { version = "55", default-features = false, features = ["arrow"] }
+arrow = { version = "55", default-features = false, features = ["ipc", "csv"] }
+apache-avro = { version = "0.19", default-features = false }
+bytes = { workspace = true }
+opendal = { version = "0.55", default-features = false, features = [
+    "services-s3",
+    "services-fs",
+    "services-gcs",
+    "services-azblob",
+    "services-http",
+    "services-memory",
+] }
+globset = "0.4"
+cron = "0.16"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"

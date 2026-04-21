@@ -2085,6 +2085,128 @@ impl SpatialIndexManager {
     pub fn index_ids(&self) -> Vec<u32> {
         self.indexes.read().keys().copied().collect()
     }
+
+    // -----------------------------------------------------------------------
+    // Persistence and recovery
+    // -----------------------------------------------------------------------
+
+    /// Persists every live index to `dir/<index_id>.rtree`. Returns a map of
+    /// index_id to PersistError for any indexes that failed to save. Callers
+    /// log these and continue, shutdown does not abort on individual failures.
+    pub fn save_all(&self, dir: &std::path::Path) -> std::collections::HashMap<u32, PersistError> {
+        let _ = std::fs::create_dir_all(dir);
+        let snapshot: Vec<(u32, Arc<RTree<u64>>)> = {
+            let g = self.indexes.read();
+            g.iter().map(|(k, v)| (*k, v.clone())).collect()
+        };
+        let mut errors = std::collections::HashMap::new();
+        for (id, tree) in snapshot {
+            let path = dir.join(format!("{}.rtree", id));
+            if let Err(e) = tree.save_to(&path) {
+                errors.insert(id, e);
+            }
+        }
+        errors
+    }
+
+    /// Replaces an existing index with one loaded from disk. The index id
+    /// must already be registered via create_index so startup recovery can
+    /// set dims and srid from the catalog before reading the file.
+    pub fn restore_from_file(
+        &self,
+        index_id: u32,
+        path: &std::path::Path,
+    ) -> Result<(), PersistError> {
+        let loaded = RTree::<u64>::load_from(path)?;
+        self.indexes.write().insert(index_id, Arc::new(loaded));
+        Ok(())
+    }
+
+    /// Inserts a pre-computed (mbr, rowid) entry into an existing index.
+    /// Returns an error string if the index id is not registered. Used by
+    /// the rebuild-from-scan path when no persisted snapshot is available.
+    pub fn insert_mbr(&self, index_id: u32, mbr: Mbr, rowid: u64) -> Result<(), String> {
+        let tree = self
+            .get(index_id)
+            .ok_or_else(|| format!("spatial index {} not registered", index_id))?;
+        tree.insert(LeafEntry {
+            mbr,
+            data: rowid,
+            deleted: false,
+        });
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Geometry to MBR helper
+// ---------------------------------------------------------------------------
+
+/// Computes the axis-aligned bounding rectangle of a decoded Geometry in the
+/// requested dimensionality. Walks every point of every constituent shape
+/// (Point, LineString, Polygon exterior and holes, Multi*, GeometryCollection)
+/// and takes componentwise min and max. For a geometry with no points the
+/// function returns a degenerate point MBR at the origin.
+pub fn mbr_from_geometry(geom: &crate::geospatial::Geometry, dims: u8) -> Mbr {
+    use crate::geospatial::Point;
+    let mut mins = [f64::INFINITY; MAX_DIMS];
+    let mut maxs = [f64::NEG_INFINITY; MAX_DIMS];
+    let d = dims as usize;
+    let mut visit = |p: &Point| {
+        let coords = [p.x, p.y, 0.0, 0.0];
+        for i in 0..d {
+            if coords[i] < mins[i] {
+                mins[i] = coords[i];
+            }
+            if coords[i] > maxs[i] {
+                maxs[i] = coords[i];
+            }
+        }
+    };
+    visit_geometry_points(&geom.kind, &mut visit);
+
+    if mins[0].is_infinite() {
+        return Mbr::point(&vec![0.0; d]);
+    }
+    Mbr::from_extents(&mins[..d], &maxs[..d])
+}
+
+/// Visits every Point contained in a GeometryKind. Recurses through
+/// collections so callers pass a single closure and receive every coordinate.
+pub fn visit_geometry_points(
+    kind: &crate::geospatial::GeometryKind,
+    visit: &mut impl FnMut(&crate::geospatial::Point),
+) {
+    use crate::geospatial::GeometryKind;
+    match kind {
+        GeometryKind::Point(p) => visit(p),
+        GeometryKind::LineString(ls) => ls.points.iter().for_each(visit),
+        GeometryKind::Polygon(p) => {
+            p.exterior.iter().for_each(&mut *visit);
+            for hole in &p.holes {
+                hole.iter().for_each(&mut *visit);
+            }
+        }
+        GeometryKind::MultiPoint(mp) => mp.points.iter().for_each(visit),
+        GeometryKind::MultiLineString(ml) => {
+            for ls in &ml.lines {
+                ls.points.iter().for_each(&mut *visit);
+            }
+        }
+        GeometryKind::MultiPolygon(mp) => {
+            for poly in &mp.polygons {
+                poly.exterior.iter().for_each(&mut *visit);
+                for hole in &poly.holes {
+                    hole.iter().for_each(&mut *visit);
+                }
+            }
+        }
+        GeometryKind::GeometryCollection(items) => {
+            for g in items {
+                visit_geometry_points(&g.kind, visit);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3024,5 +3146,66 @@ mod tests {
         assert_eq!(loaded.len(), 0);
         assert!(loaded.is_empty());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_save_all_then_restore() {
+        // Build two indexes in one manager, save_all to a tempdir, then load
+        // into a fresh manager via restore_from_file and verify point membership
+        // plus total live entry counts match across both trees.
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "zyron_spatial_save_all_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let mgr = SpatialIndexManager::new();
+        mgr.create_index(1, 2, 4326);
+        mgr.create_index(2, 2, 0);
+
+        for i in 0..100u64 {
+            let x = (i % 10) as f64;
+            let y = (i / 10) as f64;
+            mgr.insert_mbr(1, Mbr::point(&[x, y]), i).expect("insert 1");
+        }
+        for i in 0..50u64 {
+            let x = (i % 5) as f64 + 100.0;
+            let y = (i / 5) as f64 + 100.0;
+            mgr.insert_mbr(2, Mbr::point(&[x, y]), i + 1000)
+                .expect("insert 2");
+        }
+
+        let errors = mgr.save_all(&dir);
+        assert!(errors.is_empty(), "save_all errors: {:?}", errors);
+        assert!(dir.join("1.rtree").exists());
+        assert!(dir.join("2.rtree").exists());
+
+        // Fresh manager: register empty indexes at the same ids, restore, verify.
+        let restored = SpatialIndexManager::new();
+        restored.create_index(1, 2, 4326);
+        restored.create_index(2, 2, 0);
+        restored
+            .restore_from_file(1, &dir.join("1.rtree"))
+            .expect("restore 1");
+        restored
+            .restore_from_file(2, &dir.join("2.rtree"))
+            .expect("restore 2");
+
+        let t1 = restored.get(1).expect("index 1");
+        let t2 = restored.get(2).expect("index 2");
+        assert_eq!(t1.len(), 100);
+        assert_eq!(t2.len(), 50);
+
+        let hits = t1.range(&Mbr::from_extents(&[0.0, 0.0], &[9.0, 9.0]));
+        assert_eq!(hits.len(), 100);
+        let hits2 = t2.range(&Mbr::from_extents(&[100.0, 100.0], &[200.0, 200.0]));
+        assert_eq!(hits2.len(), 50);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

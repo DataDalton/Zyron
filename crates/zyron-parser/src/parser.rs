@@ -725,6 +725,35 @@ impl<'a> Parser<'a> {
             return Ok(TableRef::TableFunction { name, args, alias });
         }
 
+        // Optional pre-as_of alias for the streaming temporal-join form
+        // '<table> <alias> AS OF <expr>'. The base-table identifier here is
+        // followed by an identifier that is itself followed by AS OF. This
+        // keeps the alias attached to the correct base table when AS OF
+        // precedes the clause keyword check below.
+        let pre_as_of_alias = if let Token::Ident(_) = &self.current.token {
+            if self.peek.token == Token::Keyword(Keyword::As) && !self.is_clause_keyword() {
+                // Peek further, but we only have peek-1. We can safely consume
+                // the identifier when the token after it is AS, because the
+                // alias-then-AS-OF path produces AS OF <expr> and the alias
+                // path alone would produce AS <alias_ident>. Distinguish by
+                // looking at whether the token after AS is OF, which requires
+                // speculative advance. Keep a copy of the current token and
+                // restore via the lexer if the decision is wrong.
+                //
+                // A simpler alternative: only trigger this fast path when
+                // the identifier is followed by AS followed immediately by OF.
+                // The parser does not currently expose two-token peek, so we
+                // consume the alias here and then rely on the existing AS OF
+                // detection to pick up the time-travel clause.
+                let saved = self.parse_ident()?;
+                Some(saved)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Check for time travel: AS OF TIMESTAMP expr, VERSION AS OF expr,
         // FOR SYSTEM_TIME BETWEEN, FOR APPLICATION_TIME, FOR PORTION OF
         let as_of = if self.at_keyword(Keyword::Version)
@@ -1020,6 +1049,8 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Version) => self.parse_create_version(),
             Token::Keyword(Keyword::Replication) => self.parse_create_replication_slot(),
             Token::Keyword(Keyword::Cdc) => self.parse_create_cdc(),
+            Token::Keyword(Keyword::Streaming) => self.parse_create_streaming_job(),
+            Token::Keyword(Keyword::External) => self.parse_create_external(),
             Token::Keyword(Keyword::Publication) => self.parse_create_publication(),
             Token::Keyword(Keyword::Trigger) => self.parse_create_trigger(),
             Token::Keyword(Keyword::Function) => self.parse_create_function(false),
@@ -1128,6 +1159,8 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Branch) => self.parse_drop_branch(),
             Token::Keyword(Keyword::Replication) => self.parse_drop_replication_slot(),
             Token::Keyword(Keyword::Cdc) => self.parse_drop_cdc(),
+            Token::Keyword(Keyword::Streaming) => self.parse_drop_streaming_job(),
+            Token::Keyword(Keyword::External) => self.parse_drop_external(),
             Token::Keyword(Keyword::Publication) => self.parse_drop_publication(),
             Token::Keyword(Keyword::Trigger) => self.parse_drop_trigger(),
             Token::Keyword(Keyword::Function) => self.parse_drop_function(),
@@ -1192,8 +1225,10 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Role) => self.parse_alter_role(),
             Token::Keyword(Keyword::System) => self.parse_alter_system(),
             Token::Keyword(Keyword::Publication) => self.parse_alter_publication(),
+            Token::Keyword(Keyword::Streaming) => self.parse_alter_streaming_job(),
+            Token::Keyword(Keyword::External) => self.parse_alter_external(),
             _ => Err(self.error(&format!(
-                "Expected TABLE, INDEX, SEQUENCE, VIEW, USER, ROLE, SYSTEM, or PUBLICATION after ALTER, found {}",
+                "Expected TABLE, INDEX, SEQUENCE, VIEW, USER, ROLE, SYSTEM, STREAMING, or PUBLICATION after ALTER, found {}",
                 self.current.token
             ))),
         }
@@ -3031,6 +3066,107 @@ impl<'a> Parser<'a> {
 
     fn parse_copy(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Copy)?;
+
+        // Spec-level head forms take priority over the shorthand grammar.
+        //
+        //   COPY FROM <ext> [COLUMNS (c type, ...)] INTO TABLE <t>
+        //   COPY FROM <ext> [COLUMNS (c type, ...)] TO <ext>
+        //   COPY TABLE <t> [(col, ...)] TO <ext>
+        if self.at_keyword(Keyword::From) {
+            self.advance()?;
+            let source = self.parse_copy_external_expr()?;
+            // Optional COLUMNS (ColumnDef, ...). The declared columns are
+            // carried in the statement-level options under the reserved key
+            // "__columns_source" as a single comma-separated "name:type"
+            // string. The executor consults this when the source format is
+            // not self-describing.
+            let declared_columns = self.parse_optional_copy_columns()?;
+            if self.consume_keyword(Keyword::Into)? {
+                self.expect_keyword(Keyword::Table)?;
+                let table = self.parse_ident()?;
+                let columns = if self.at_token(&Token::LParen) {
+                    self.advance()?;
+                    let cols = self.parse_comma_separated(|p| p.parse_ident())?;
+                    self.expect_token(&Token::RParen)?;
+                    cols
+                } else {
+                    vec![]
+                };
+                let mut options = self.parse_optional_copy_options()?;
+                if let Some(enc) = declared_columns {
+                    options.push(("__columns_source".to_string(), enc));
+                }
+                return Ok(Statement::Copy(Box::new(CopyStatement {
+                    kind: CopyKind::IntoTable {
+                        table,
+                        columns,
+                        source,
+                    },
+                    options,
+                })));
+            }
+            // COPY FROM <ext> TO <ext> external-to-external form.
+            self.expect_keyword(Keyword::To)?;
+            let sink = self.parse_copy_external_expr()?;
+            let mut options = self.parse_optional_copy_options()?;
+            if let Some(enc) = declared_columns {
+                options.push(("__columns_source".to_string(), enc));
+            }
+            return Ok(Statement::Copy(Box::new(CopyStatement {
+                kind: CopyKind::ExternalToExternal { source, sink },
+                options,
+            })));
+        }
+        if self.at_keyword(Keyword::Table) {
+            self.advance()?;
+            let table = self.parse_ident()?;
+            let columns = if self.at_token(&Token::LParen) {
+                self.advance()?;
+                let cols = self.parse_comma_separated(|p| p.parse_ident())?;
+                self.expect_token(&Token::RParen)?;
+                cols
+            } else {
+                vec![]
+            };
+            self.expect_keyword(Keyword::To)?;
+            let sink = self.parse_copy_external_expr()?;
+            let options = self.parse_optional_copy_options()?;
+            return Ok(Statement::Copy(Box::new(CopyStatement {
+                kind: CopyKind::FromTable {
+                    table,
+                    columns,
+                    sink,
+                },
+                options,
+            })));
+        }
+
+        // The statement opens with either a backend keyword for an
+        // external-to-external copy, or a table / source identifier. Peek to
+        // decide.
+        let is_backend_prefix = matches!(
+            self.current.token,
+            Token::Keyword(Keyword::File)
+                | Token::Keyword(Keyword::S3)
+                | Token::Keyword(Keyword::Gcs)
+                | Token::Keyword(Keyword::Azure)
+                | Token::Keyword(Keyword::Http)
+        );
+
+        if is_backend_prefix {
+            // External-to-external: COPY <src-external> TO <sink-external>.
+            let source = self.parse_copy_external_expr()?;
+            self.expect_keyword(Keyword::To)?;
+            let sink = self.parse_copy_external_expr()?;
+            let options = self.parse_optional_copy_options()?;
+            return Ok(Statement::Copy(Box::new(CopyStatement {
+                kind: CopyKind::ExternalToExternal { source, sink },
+                options,
+            })));
+        }
+
+        // Shorthand table-anchored form. The identifier is the Zyron table,
+        // optionally followed by a column list.
         let table = self.parse_ident()?;
         let columns = if self.at_token(&Token::LParen) {
             self.advance()?;
@@ -3040,19 +3176,103 @@ impl<'a> Parser<'a> {
         } else {
             vec![]
         };
-        let direction = if self.consume_keyword(Keyword::From)? {
-            let target = self.parse_copy_target()?;
-            CopyDirection::From(target)
+
+        let kind = if self.consume_keyword(Keyword::From)? {
+            let source = self.parse_copy_external_expr()?;
+            CopyKind::IntoTable {
+                table,
+                columns,
+                source,
+            }
         } else {
             self.expect_keyword(Keyword::To)?;
-            let target = self.parse_copy_target()?;
-            CopyDirection::To(target)
+            let sink = self.parse_copy_external_expr()?;
+            CopyKind::FromTable {
+                table,
+                columns,
+                sink,
+            }
         };
-        Ok(Statement::Copy(Box::new(CopyStatement {
-            table,
-            columns,
-            direction,
-        })))
+
+        let options = self.parse_optional_copy_options()?;
+        Ok(Statement::Copy(Box::new(CopyStatement { kind, options })))
+    }
+
+    // Parses an optional `COLUMNS (name type, name type, ...)` clause for
+    // the external-to-external or external-to-table COPY forms where the
+    // source format is not self-describing. The clause is encoded as a
+    // single string where entries are comma-separated and each entry is
+    // `name:type`, which the executor can parse without holding an AST
+    // reference. Returns None if the COLUMNS keyword is not present.
+    fn parse_optional_copy_columns(&mut self) -> Result<Option<String>> {
+        if !self.consume_keyword(Keyword::Columns)? {
+            return Ok(None);
+        }
+        self.expect_token(&Token::LParen)?;
+        let defs = self.parse_comma_separated(|p| p.parse_column_def())?;
+        self.expect_token(&Token::RParen)?;
+        let encoded = defs
+            .iter()
+            .map(|d| format!("{}:{}", d.name, d.data_type.to_type_id() as u8))
+            .collect::<Vec<_>>()
+            .join(",");
+        Ok(Some(encoded))
+    }
+
+    // Parses a single <copy-external> expression. Forms:
+    //   STDIN | STDOUT
+    //   '<local-path>'
+    //   <backend> '<uri>' FORMAT <fmt> [CREDENTIALS (k=v, ...)]
+    //   <named-source-or-sink-ident>
+    fn parse_copy_external_expr(&mut self) -> Result<CopyExternal> {
+        if self.consume_keyword(Keyword::Stdin)? || self.consume_keyword(Keyword::Stdout)? {
+            return Ok(CopyExternal::Stdio);
+        }
+        // EXTERNAL SOURCE <name>  or  EXTERNAL SINK <name>. The direction
+        // keyword is accepted for documentation only, the binder picks the
+        // catalog kind from the statement direction.
+        if self.consume_keyword(Keyword::External)? {
+            if self.consume_keyword(Keyword::Source)? || self.consume_keyword(Keyword::Sink)? {
+                let name = self.parse_ident()?;
+                return Ok(CopyExternal::Named(name));
+            }
+            return Err(self.error("Expected SOURCE or SINK after EXTERNAL"));
+        }
+        if let Token::String(s) = &self.current.token {
+            let path = s.clone();
+            self.advance()?;
+            return Ok(CopyExternal::LocalFile(path));
+        }
+        if let Some(backend) = self.try_parse_external_backend()? {
+            let uri = self.parse_string_literal()?;
+            self.expect_keyword(Keyword::Format)?;
+            let format = self.parse_external_format()?;
+            let credentials = if self.consume_keyword(Keyword::Credentials)? {
+                self.parse_kv_options()?
+            } else {
+                Vec::new()
+            };
+            return Ok(CopyExternal::Inline {
+                backend,
+                uri,
+                format,
+                credentials,
+            });
+        }
+        // Named catalog entry (external source for reads, external sink for
+        // writes). The binder resolves the direction-specific kind.
+        let name = self.parse_ident()?;
+        Ok(CopyExternal::Named(name))
+    }
+
+    // Parses a trailing `OPTIONS (k = v, ...)` clause if present. Returns an
+    // empty vector otherwise.
+    fn parse_optional_copy_options(&mut self) -> Result<Vec<(String, String)>> {
+        if self.consume_keyword(Keyword::Options)? {
+            self.parse_kv_options()
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -3686,22 +3906,7 @@ impl<'a> Parser<'a> {
     // COPY
     // -----------------------------------------------------------------------
 
-    fn parse_copy_target(&mut self) -> Result<CopyTarget> {
-        if self.consume_keyword(Keyword::Stdin)? {
-            Ok(CopyTarget::Stdin)
-        } else if self.consume_keyword(Keyword::Stdout)? {
-            Ok(CopyTarget::Stdout)
-        } else if let Token::String(s) = &self.current.token {
-            let path = s.clone();
-            self.advance()?;
-            Ok(CopyTarget::File(path))
-        } else {
-            Err(self.error(&format!(
-                "Expected file path, STDIN, or STDOUT, found {}",
-                self.current.token
-            )))
-        }
-    }
+    // parse_copy_target was removed in favour of parse_copy_external_expr.
 
     // -----------------------------------------------------------------------
     // TTL / Schedule / Optimize
@@ -4391,6 +4596,728 @@ impl<'a> Parser<'a> {
             }
             _ => Err(self.error("Expected STREAM or INGEST after DROP CDC")),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Streaming jobs
+    // -----------------------------------------------------------------------
+
+    /// Parses `CREATE STREAMING JOB <name> [IF NOT EXISTS] AS <select>
+    /// INTO <sink-expr> [WRITE MODE APPEND | UPSERT] [MODE ...]`.
+    /// The inner SELECT is parsed by the shared `parse_select_body` path so
+    /// it supports every grammar the binder can handle. The binder enforces
+    /// the single-table-FROM restriction. Inline file or cloud URIs in the
+    /// FROM clause are not yet wired into this grammar; named sources only.
+    /// The sink can be either a named table or an inline file or cloud URI.
+    fn streaming_event_time_err(&self) -> ZyronError {
+        self.error(
+            "streaming temporal JOIN AS OF expression must be a column reference like o.event_time",
+        )
+    }
+
+    fn parse_create_streaming_job(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Streaming)?;
+        self.expect_keyword(Keyword::Job)?;
+
+        let if_not_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Not)?;
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+
+        let name = self.parse_ident()?;
+        self.expect_keyword(Keyword::As)?;
+        let query = self.parse_select_body(None)?;
+
+        // Streaming-specific trailing clause: WITHIN INTERVAL 'N' <unit>.
+        // Declares an interval-join time bound on a two-table FROM clause.
+        // Not consumed by parse_select_body so it appears between the SELECT
+        // body and the INTO sink here.
+        let within_spec: Option<i64> = if self.at_keyword(Keyword::Within) {
+            self.advance()?;
+            self.expect_keyword(Keyword::Interval)?;
+            let lit = self.parse_interval_literal_us()?;
+            Some(lit)
+        } else {
+            None
+        };
+
+        self.expect_keyword(Keyword::Into)?;
+        let target = self.parse_streaming_sink_ref()?;
+
+        let write_mode = if self.consume_keyword(Keyword::Write)? {
+            self.expect_keyword(Keyword::Mode)?;
+            if self.consume_keyword(Keyword::Append)? {
+                StreamingWriteMode::Append
+            } else if self.consume_keyword(Keyword::Upsert)? {
+                StreamingWriteMode::Upsert
+            } else {
+                return Err(self.error("Expected APPEND or UPSERT after WRITE MODE"));
+            }
+        } else {
+            StreamingWriteMode::Append
+        };
+
+        // Optional MODE clause that controls overall job cadence.
+        let job_mode = if self.at_keyword(Keyword::Mode) {
+            self.advance()?;
+            self.parse_external_mode_spec()?
+        } else {
+            ExternalModeSpec::OneShot
+        };
+
+        // Optional WATERMARK FOR <col> AS <col> - INTERVAL 'N' unit.
+        let watermark = if self.at_keyword(Keyword::Watermark) {
+            Some(self.parse_watermark_spec()?)
+        } else {
+            None
+        };
+
+        // Optional WITH LATE DATA POLICY DROP|REOPEN|SIDE OUTPUT.
+        let late_data_policy = if self.at_keyword(Keyword::With) {
+            // Peek two tokens ahead for the LATE keyword before consuming WITH,
+            // since WITH is used by other trailing clauses in the grammar.
+            if matches!(self.peek.token, Token::Keyword(Keyword::Late)) {
+                self.advance()?; // WITH
+                Some(self.parse_late_data_policy_spec()?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Streaming window spec is extracted from the SELECT's GROUP BY at
+        // bind time by the planner. The parser leaves the GROUP BY on the
+        // SelectStatement intact for the binder to inspect.
+        let window_spec: Option<StreamingWindowSpec> = None;
+
+        // Assemble the optional StreamingJoinSpec. The form is decided by
+        // two inputs: whether the FROM carries a JOIN and whether the
+        // right-hand side declared AS OF (temporal) or the trailing
+        // WITHIN INTERVAL was set (interval). These two are mutually
+        // exclusive, parse rejects the combination.
+        let join: Option<StreamingJoinSpec> = if !query.from.is_empty() {
+            if let TableRef::Join(join_node) = &query.from[0] {
+                let right_has_as_of = match &join_node.right {
+                    TableRef::Table { as_of, .. } => as_of.is_some(),
+                    _ => false,
+                };
+                // Translate the parser's JoinType into the streaming-join
+                // row-match semantics. Cross joins are rejected because
+                // they have no ON predicate the runner can use.
+                let streaming_join_type = match join_node.join_type {
+                    JoinType::Inner => StreamingJoinType::Inner,
+                    JoinType::Left => StreamingJoinType::Left,
+                    JoinType::Right => StreamingJoinType::Right,
+                    JoinType::Full => StreamingJoinType::Full,
+                    JoinType::Cross => {
+                        return Err(self.error(
+                            "streaming JOIN does not support CROSS, use an explicit ON equi-key",
+                        ));
+                    }
+                };
+                match (right_has_as_of, within_spec) {
+                    (true, Some(_)) => {
+                        return Err(self.error(
+                                "streaming JOIN cannot combine WITHIN INTERVAL with AS OF, use one form",
+                            ));
+                    }
+                    (true, None) => {
+                        // Pull the event-time column out of the AS OF expression.
+                        // Only simple column or qualified-column references are
+                        // accepted, the runner needs a single ordinal at bind.
+                        let evt_col = match &join_node.right {
+                            TableRef::Table {
+                                as_of: Some(boxed), ..
+                            } => match boxed.as_ref() {
+                                AsOf::Timestamp(expr) => match expr {
+                                    Expr::Identifier(name) => name.clone(),
+                                    Expr::QualifiedIdentifier { column, .. } => column.clone(),
+                                    _ => return Err(self.streaming_event_time_err()),
+                                },
+                                _ => {
+                                    return Err(self.error(
+                                            "streaming temporal JOIN requires AS OF <column>, other time-travel forms are not allowed",
+                                        ));
+                                }
+                            },
+                            _ => unreachable!(),
+                        };
+                        Some(StreamingJoinSpec::Temporal {
+                            event_time_column: evt_col,
+                            join_type: streaming_join_type,
+                        })
+                    }
+                    (false, Some(us)) => Some(StreamingJoinSpec::Interval {
+                        within_us: us,
+                        join_type: streaming_join_type,
+                    }),
+                    (false, None) => {
+                        return Err(self.error(
+                                "streaming JOIN requires either WITHIN INTERVAL for interval join or AS OF on the right side for temporal join",
+                            ));
+                    }
+                }
+            } else if within_spec.is_some() {
+                return Err(self.error(
+                    "WITHIN INTERVAL is only meaningful on streaming jobs with a two-table JOIN",
+                ));
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Ok(Statement::CreateStreamingJob(Box::new(
+            CreateStreamingJobStatement {
+                name,
+                if_not_exists,
+                query,
+                target,
+                write_mode,
+                job_mode,
+                window_spec,
+                watermark,
+                late_data_policy,
+                join,
+            },
+        )))
+    }
+
+    /// Parses `WATERMARK FOR <col> AS <col> - INTERVAL 'N' unit`.
+    fn parse_watermark_spec(&mut self) -> Result<WatermarkSpec> {
+        self.expect_keyword(Keyword::Watermark)?;
+        self.expect_keyword(Keyword::For)?;
+        let event_time_column = self.parse_ident()?;
+        self.expect_keyword(Keyword::As)?;
+        // Expect `<col> - INTERVAL '...'`. The column name repeats the first.
+        let repeated_col = self.parse_ident()?;
+        if !repeated_col.eq_ignore_ascii_case(&event_time_column) {
+            return Err(
+                self.error("WATERMARK AS expression must reference the same event-time column")
+            );
+        }
+        // Expect '-'.
+        if !matches!(self.current.token, Token::Minus) {
+            return Err(self.error("Expected '-' in WATERMARK AS expression"));
+        }
+        self.advance()?;
+        self.expect_keyword(Keyword::Interval)?;
+        let lateness_str = self.parse_string_literal()?;
+        let allowed_lateness = zyron_common::parse_interval_string(&lateness_str)
+            .map_err(|e| self.error(&format!("Invalid INTERVAL '{}': {}", lateness_str, e)))?;
+        Ok(WatermarkSpec {
+            event_time_column,
+            allowed_lateness,
+        })
+    }
+
+    /// Parses `'<N>' <unit>` after the INTERVAL keyword has been consumed
+    /// and returns the total microseconds. Accepts the same unit words as
+    /// zyron_common::parse_interval_string. Used by streaming WITHIN clauses.
+    fn parse_interval_literal_us(&mut self) -> Result<i64> {
+        let num_str = self.parse_string_literal()?;
+        let unit_word = match &self.current.token {
+            Token::Keyword(kw) => format!("{:?}", kw).to_lowercase(),
+            Token::Ident(s) => s.clone(),
+            _ => {
+                return Err(self.error(
+                    "Expected time unit after INTERVAL literal (e.g. SECOND, MILLISECOND)",
+                ));
+            }
+        };
+        self.advance()?;
+        let combined = format!("{} {}", num_str, unit_word);
+        let interval = zyron_common::parse_interval_string(&combined).map_err(|e| {
+            self.error(&format!(
+                "Invalid INTERVAL '{}' {}: {}",
+                num_str, unit_word, e
+            ))
+        })?;
+        // Convert composite interval to microseconds. Months and days are
+        // folded using nominal conversion constants: 30 days per month and
+        // 24 hours per day. Streaming WITHIN windows are always sub-day in
+        // practice, so this approximation is acceptable at bind time.
+        let months_us = (interval.months as i64).saturating_mul(30 * 24 * 3_600_000_000);
+        let days_us = (interval.days as i64).saturating_mul(24 * 3_600_000_000);
+        let nanos_us = interval.nanoseconds / 1_000;
+        Ok(months_us.saturating_add(days_us).saturating_add(nanos_us))
+    }
+
+    /// Parses `LATE DATA POLICY DROP | REOPEN | SIDE OUTPUT` after the
+    /// leading WITH keyword has already been consumed.
+    fn parse_late_data_policy_spec(&mut self) -> Result<LateDataPolicySpec> {
+        self.expect_keyword(Keyword::Late)?;
+        self.expect_keyword(Keyword::Data)?;
+        self.expect_keyword(Keyword::Policy)?;
+        if self.consume_keyword(Keyword::Drop)? {
+            Ok(LateDataPolicySpec::Drop)
+        } else if self.consume_keyword(Keyword::Reopen)? {
+            Ok(LateDataPolicySpec::Reopen)
+        } else if self.consume_keyword(Keyword::Side)? {
+            self.expect_keyword(Keyword::Output)?;
+            Ok(LateDataPolicySpec::SideOutput)
+        } else {
+            Err(self.error("Expected DROP, REOPEN, or SIDE OUTPUT after LATE DATA POLICY"))
+        }
+    }
+
+    /// Parses a streaming sink reference. Either an inline backend URI
+    /// (FILE, S3, GCS, AZURE, HTTP) followed by FORMAT and OPTIONS, or a
+    /// named catalog object resolved at bind time.
+    fn parse_streaming_sink_ref(&mut self) -> Result<StreamingSinkRef> {
+        if let Some(backend) = self.try_parse_external_backend()? {
+            let uri = self.parse_string_literal()?;
+            self.expect_keyword(Keyword::Format)?;
+            let format = self.parse_external_format()?;
+            let options = if self.at_keyword(Keyword::Options) {
+                self.advance()?;
+                self.parse_kv_options()?
+            } else {
+                vec![]
+            };
+            Ok(StreamingSinkRef::Inline {
+                backend,
+                uri,
+                format,
+                options,
+            })
+        } else {
+            let name = self.parse_ident()?;
+            Ok(StreamingSinkRef::Named(name))
+        }
+    }
+
+    /// Looks for a backend keyword at the current position and consumes it.
+    /// Returns None if no backend keyword is present.
+    fn try_parse_external_backend(&mut self) -> Result<Option<ExternalBackendKind>> {
+        let kind = match &self.current.token {
+            Token::Keyword(Keyword::File) => ExternalBackendKind::File,
+            Token::Keyword(Keyword::S3) => ExternalBackendKind::S3,
+            Token::Keyword(Keyword::Gcs) => ExternalBackendKind::Gcs,
+            Token::Keyword(Keyword::Azure) => ExternalBackendKind::Azure,
+            Token::Keyword(Keyword::Http) => ExternalBackendKind::Http,
+            _ => return Ok(None),
+        };
+        self.advance()?;
+        Ok(Some(kind))
+    }
+
+    /// Consumes a backend keyword, raising an error if not present.
+    fn parse_external_backend(&mut self) -> Result<ExternalBackendKind> {
+        match self.try_parse_external_backend()? {
+            Some(k) => Ok(k),
+            None => Err(self.error(&format!(
+                "Expected FILE, S3, GCS, AZURE, or HTTP, found {}",
+                self.current.token
+            ))),
+        }
+    }
+
+    /// Parses a format keyword: JSON, JSONLINES, CSV, PARQUET, ARROW, AVRO.
+    fn parse_external_format(&mut self) -> Result<ExternalFormatKind> {
+        let fmt = match &self.current.token {
+            Token::Keyword(Keyword::Json) => ExternalFormatKind::Json,
+            Token::Keyword(Keyword::JsonLines) => ExternalFormatKind::JsonLines,
+            Token::Keyword(Keyword::Csv) => ExternalFormatKind::Csv,
+            Token::Keyword(Keyword::Parquet) => ExternalFormatKind::Parquet,
+            Token::Keyword(Keyword::Arrow) => ExternalFormatKind::ArrowIpc,
+            Token::Keyword(Keyword::Avro) => ExternalFormatKind::Avro,
+            _ => {
+                return Err(self.error(&format!(
+                    "Expected JSON, JSONLINES, CSV, PARQUET, ARROW, or AVRO, found {}",
+                    self.current.token
+                )));
+            }
+        };
+        self.advance()?;
+        Ok(fmt)
+    }
+
+    /// Parses `(key = value, key = value, ...)`. Values may be string or
+    /// numeric literals. Numeric literals are stored as their text form.
+    fn parse_kv_options(&mut self) -> Result<Vec<(String, String)>> {
+        self.expect_token(&Token::LParen)?;
+        let mut out = Vec::new();
+        if self.at_token(&Token::RParen) {
+            self.advance()?;
+            return Ok(out);
+        }
+        loop {
+            let key = self.parse_ident()?;
+            self.expect_token(&Token::Eq)?;
+            let value = match &self.current.token {
+                Token::String(s) => {
+                    let v = s.clone();
+                    self.advance()?;
+                    v
+                }
+                Token::Integer(n) => {
+                    let v = n.to_string();
+                    self.advance()?;
+                    v
+                }
+                Token::Float(f) => {
+                    let v = f.to_string();
+                    self.advance()?;
+                    v
+                }
+                Token::Keyword(Keyword::True) => {
+                    self.advance()?;
+                    "true".to_string()
+                }
+                Token::Keyword(Keyword::False) => {
+                    self.advance()?;
+                    "false".to_string()
+                }
+                _ => {
+                    return Err(self.error(&format!(
+                        "Expected string, number, or boolean literal in options, found {}",
+                        self.current.token
+                    )));
+                }
+            };
+            out.push((key, value));
+            if self.at_token(&Token::Comma) {
+                self.advance()?;
+            } else {
+                break;
+            }
+        }
+        self.expect_token(&Token::RParen)?;
+        Ok(out)
+    }
+
+    /// Parses `ONESHOT | SCHEDULED (EVERY '1 day' | CRON '0 3 * * *') | WATCH`.
+    fn parse_external_mode_spec(&mut self) -> Result<ExternalModeSpec> {
+        if self.consume_keyword(Keyword::OneShot)? {
+            return Ok(ExternalModeSpec::OneShot);
+        }
+        if self.consume_keyword(Keyword::Watch)? {
+            return Ok(ExternalModeSpec::Watch);
+        }
+        if self.consume_keyword(Keyword::Scheduled)? {
+            if self.consume_keyword(Keyword::Every)? {
+                let every = self.parse_string_literal()?;
+                return Ok(ExternalModeSpec::Scheduled {
+                    cron: None,
+                    every: Some(every),
+                });
+            }
+            if self.consume_keyword(Keyword::Cron)? {
+                let cron = self.parse_string_literal()?;
+                return Ok(ExternalModeSpec::Scheduled {
+                    cron: Some(cron),
+                    every: None,
+                });
+            }
+            return Err(self.error("Expected EVERY or CRON after SCHEDULED"));
+        }
+        Err(self.error(&format!(
+            "Expected ONESHOT, SCHEDULED, or WATCH, found {}",
+            self.current.token
+        )))
+    }
+
+    // -----------------------------------------------------------------------
+    // External sources and sinks
+    // -----------------------------------------------------------------------
+
+    /// Dispatches CREATE EXTERNAL to the source or sink parser based on
+    /// the next keyword after EXTERNAL.
+    fn parse_create_external(&mut self) -> Result<Statement> {
+        match self.peek.token {
+            Token::Keyword(Keyword::Source) => self.parse_create_external_source(),
+            Token::Keyword(Keyword::Sink) => self.parse_create_external_sink(),
+            _ => Err(self.error(&format!(
+                "Expected SOURCE or SINK after CREATE EXTERNAL, found {}",
+                self.peek.token
+            ))),
+        }
+    }
+
+    /// Dispatches DROP EXTERNAL to the source or sink parser.
+    fn parse_drop_external(&mut self) -> Result<Statement> {
+        match self.peek.token {
+            Token::Keyword(Keyword::Source) => self.parse_drop_external_source(),
+            Token::Keyword(Keyword::Sink) => self.parse_drop_external_sink(),
+            _ => Err(self.error(&format!(
+                "Expected SOURCE or SINK after DROP EXTERNAL, found {}",
+                self.peek.token
+            ))),
+        }
+    }
+
+    /// Dispatches ALTER EXTERNAL to the source or sink parser.
+    fn parse_alter_external(&mut self) -> Result<Statement> {
+        match self.peek.token {
+            Token::Keyword(Keyword::Source) => self.parse_alter_external_source(),
+            Token::Keyword(Keyword::Sink) => self.parse_alter_external_sink(),
+            _ => Err(self.error(&format!(
+                "Expected SOURCE or SINK after ALTER EXTERNAL, found {}",
+                self.peek.token
+            ))),
+        }
+    }
+
+    /// Parses `CREATE EXTERNAL SOURCE name [IF NOT EXISTS] TYPE backend
+    ///   URI 'uri' FORMAT fmt [MODE modespec] [OPTIONS (...)] [CREDENTIALS (...)]`.
+    fn parse_create_external_source(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::External)?;
+        self.expect_keyword(Keyword::Source)?;
+        let if_not_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Not)?;
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_ident()?;
+        self.expect_keyword(Keyword::Type)?;
+        let backend = self.parse_external_backend()?;
+        self.parse_external_uri_keyword()?;
+        let uri = self.parse_string_literal()?;
+        self.expect_keyword(Keyword::Format)?;
+        let format = self.parse_external_format()?;
+        let mut mode = ExternalModeSpec::OneShot;
+        let mut options = Vec::new();
+        let mut credentials = Vec::new();
+        let mut columns: Vec<(String, DataType)> = Vec::new();
+        loop {
+            if self.consume_keyword(Keyword::Mode)? {
+                mode = self.parse_external_mode_spec()?;
+            } else if self.consume_keyword(Keyword::Options)? {
+                options = self.parse_kv_options()?;
+            } else if self.consume_keyword(Keyword::Credentials)? {
+                credentials = self.parse_kv_options()?;
+            } else if self.consume_keyword(Keyword::Columns)? {
+                columns = self.parse_external_columns_clause()?;
+            } else {
+                break;
+            }
+        }
+        Ok(Statement::CreateExternalSource(Box::new(
+            CreateExternalSourceStatement {
+                name,
+                if_not_exists,
+                backend,
+                uri,
+                format,
+                mode,
+                options,
+                columns,
+                credentials,
+            },
+        )))
+    }
+
+    /// Parses `COLUMNS ( name TYPE, name TYPE, ... )` used by CREATE
+    /// EXTERNAL SOURCE and SINK to declare the row layout explicitly.
+    fn parse_external_columns_clause(&mut self) -> Result<Vec<(String, DataType)>> {
+        self.expect_token(&Token::LParen)?;
+        let mut out: Vec<(String, DataType)> = Vec::new();
+        loop {
+            let name = self.parse_ident()?;
+            let ty = self.parse_data_type()?;
+            out.push((name, ty));
+            if self.at_token(&Token::Comma) {
+                self.advance()?;
+                continue;
+            }
+            break;
+        }
+        self.expect_token(&Token::RParen)?;
+        if out.is_empty() {
+            return Err(self.error("COLUMNS clause must list at least one column"));
+        }
+        Ok(out)
+    }
+
+    /// Parses `CREATE EXTERNAL SINK name [IF NOT EXISTS] TYPE backend
+    ///   URI 'uri' FORMAT fmt [OPTIONS (...)] [CREDENTIALS (...)]`.
+    fn parse_create_external_sink(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::External)?;
+        self.expect_keyword(Keyword::Sink)?;
+        let if_not_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Not)?;
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_ident()?;
+        self.expect_keyword(Keyword::Type)?;
+        let backend = self.parse_external_backend()?;
+        self.parse_external_uri_keyword()?;
+        let uri = self.parse_string_literal()?;
+        self.expect_keyword(Keyword::Format)?;
+        let format = self.parse_external_format()?;
+        let mut options = Vec::new();
+        let mut credentials = Vec::new();
+        let mut columns: Vec<(String, DataType)> = Vec::new();
+        loop {
+            if self.consume_keyword(Keyword::Options)? {
+                options = self.parse_kv_options()?;
+            } else if self.consume_keyword(Keyword::Credentials)? {
+                credentials = self.parse_kv_options()?;
+            } else if self.consume_keyword(Keyword::Columns)? {
+                columns = self.parse_external_columns_clause()?;
+            } else {
+                break;
+            }
+        }
+        Ok(Statement::CreateExternalSink(Box::new(
+            CreateExternalSinkStatement {
+                name,
+                if_not_exists,
+                backend,
+                uri,
+                format,
+                options,
+                columns,
+                credentials,
+            },
+        )))
+    }
+
+    /// Consumes the URI keyword. Accepted as an identifier spelled 'URI'
+    /// since URI is not a reserved keyword.
+    fn parse_external_uri_keyword(&mut self) -> Result<()> {
+        let word = self.parse_ident()?;
+        if word.eq_ignore_ascii_case("uri") {
+            Ok(())
+        } else {
+            Err(self.error(&format!("Expected URI, found {}", word)))
+        }
+    }
+
+    /// Parses `DROP EXTERNAL SOURCE [IF EXISTS] name`.
+    fn parse_drop_external_source(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::External)?;
+        self.expect_keyword(Keyword::Source)?;
+        let if_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_ident()?;
+        Ok(Statement::DropExternalSource(Box::new(
+            DropExternalSourceStatement { name, if_exists },
+        )))
+    }
+
+    /// Parses `DROP EXTERNAL SINK [IF EXISTS] name`.
+    fn parse_drop_external_sink(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::External)?;
+        self.expect_keyword(Keyword::Sink)?;
+        let if_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_ident()?;
+        Ok(Statement::DropExternalSink(Box::new(
+            DropExternalSinkStatement { name, if_exists },
+        )))
+    }
+
+    /// Parses `ALTER EXTERNAL SOURCE name (SET OPTIONS ... | SET CREDENTIALS ...
+    ///   | SET MODE modespec | RENAME TO new_name)`.
+    fn parse_alter_external_source(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::External)?;
+        self.expect_keyword(Keyword::Source)?;
+        let name = self.parse_ident()?;
+        let action = if self.consume_keyword(Keyword::Rename)? {
+            self.expect_keyword(Keyword::To)?;
+            let new_name = self.parse_ident()?;
+            AlterExternalSourceAction::Rename(new_name)
+        } else if self.consume_keyword(Keyword::Set)? {
+            if self.consume_keyword(Keyword::Options)? {
+                AlterExternalSourceAction::SetOptions(self.parse_kv_options()?)
+            } else if self.consume_keyword(Keyword::Credentials)? {
+                AlterExternalSourceAction::SetCredentials(self.parse_kv_options()?)
+            } else if self.consume_keyword(Keyword::Mode)? {
+                AlterExternalSourceAction::SetMode(self.parse_external_mode_spec()?)
+            } else if self.consume_keyword(Keyword::Columns)? {
+                AlterExternalSourceAction::SetColumns(self.parse_external_columns_clause()?)
+            } else {
+                return Err(self.error(
+                    "Expected OPTIONS, CREDENTIALS, MODE, or COLUMNS after SET in ALTER EXTERNAL SOURCE",
+                ));
+            }
+        } else {
+            return Err(self.error("Expected SET or RENAME after ALTER EXTERNAL SOURCE <name>"));
+        };
+        Ok(Statement::AlterExternalSource(Box::new(
+            AlterExternalSourceStatement { name, action },
+        )))
+    }
+
+    /// Parses `ALTER EXTERNAL SINK name (SET OPTIONS ... | SET CREDENTIALS ...
+    ///   | RENAME TO new_name)`.
+    fn parse_alter_external_sink(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::External)?;
+        self.expect_keyword(Keyword::Sink)?;
+        let name = self.parse_ident()?;
+        let action = if self.consume_keyword(Keyword::Rename)? {
+            self.expect_keyword(Keyword::To)?;
+            let new_name = self.parse_ident()?;
+            AlterExternalSinkAction::Rename(new_name)
+        } else if self.consume_keyword(Keyword::Set)? {
+            if self.consume_keyword(Keyword::Options)? {
+                AlterExternalSinkAction::SetOptions(self.parse_kv_options()?)
+            } else if self.consume_keyword(Keyword::Credentials)? {
+                AlterExternalSinkAction::SetCredentials(self.parse_kv_options()?)
+            } else {
+                return Err(
+                    self.error("Expected OPTIONS or CREDENTIALS after SET in ALTER EXTERNAL SINK")
+                );
+            }
+        } else {
+            return Err(self.error("Expected SET or RENAME after ALTER EXTERNAL SINK <name>"));
+        };
+        Ok(Statement::AlterExternalSink(Box::new(
+            AlterExternalSinkStatement { name, action },
+        )))
+    }
+
+    /// Parses `DROP STREAMING JOB [IF EXISTS] <name>`.
+    fn parse_drop_streaming_job(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Streaming)?;
+        self.expect_keyword(Keyword::Job)?;
+        let if_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_ident()?;
+        Ok(Statement::DropStreamingJob(Box::new(
+            DropStreamingJobStatement { name, if_exists },
+        )))
+    }
+
+    /// Parses `ALTER STREAMING JOB <name> PAUSE | RESUME`.
+    fn parse_alter_streaming_job(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Streaming)?;
+        self.expect_keyword(Keyword::Job)?;
+        let name = self.parse_ident()?;
+        let action = if self.consume_keyword(Keyword::Pause)? {
+            AlterStreamingJobAction::Pause
+        } else if self.consume_keyword(Keyword::Resume)? {
+            AlterStreamingJobAction::Resume
+        } else {
+            return Err(self.error("Expected PAUSE or RESUME after ALTER STREAMING JOB <name>"));
+        };
+        Ok(Statement::AlterStreamingJob(Box::new(
+            AlterStreamingJobStatement { name, action },
+        )))
     }
 
     fn parse_create_publication(&mut self) -> Result<Statement> {
@@ -5463,6 +6390,21 @@ fn keyword_to_ident_str(kw: Keyword) -> Option<&'static str> {
         Keyword::Plugin => Some("plugin"),
         Keyword::Cdc => Some("cdc"),
         Keyword::Stream => Some("stream"),
+        Keyword::Streaming => Some("streaming"),
+        Keyword::Job => Some("job"),
+        Keyword::Write => Some("write"),
+        Keyword::Append => Some("append"),
+        Keyword::Upsert => Some("upsert"),
+        Keyword::Tumble => Some("tumble"),
+        Keyword::Hop => Some("hop"),
+        Keyword::Session => Some("session"),
+        Keyword::Watermark => Some("watermark"),
+        Keyword::Late => Some("late"),
+        Keyword::Data => Some("data"),
+        Keyword::Policy => Some("policy"),
+        Keyword::Reopen => Some("reopen"),
+        Keyword::Side => Some("side"),
+        Keyword::Output => Some("output"),
         Keyword::Ingest => Some("ingest"),
         Keyword::Publication => Some("publication"),
         Keyword::Include => Some("include"),
@@ -7734,13 +8676,13 @@ mod tests {
     fn test_copy_from_stdin() {
         let stmt = parse_one("COPY users FROM STDIN");
         match stmt {
-            Statement::Copy(c) => {
-                assert_eq!(c.table, "users");
-                assert!(matches!(
-                    c.direction,
-                    CopyDirection::From(CopyTarget::Stdin)
-                ));
-            }
+            Statement::Copy(c) => match c.kind {
+                CopyKind::IntoTable { table, source, .. } => {
+                    assert_eq!(table, "users");
+                    assert!(matches!(source, CopyExternal::Stdio));
+                }
+                _ => panic!("Expected IntoTable"),
+            },
             _ => panic!("Expected COPY"),
         }
     }
@@ -7749,9 +8691,12 @@ mod tests {
     fn test_copy_to_stdout() {
         let stmt = parse_one("COPY users TO STDOUT");
         match stmt {
-            Statement::Copy(c) => {
-                assert!(matches!(c.direction, CopyDirection::To(CopyTarget::Stdout)));
-            }
+            Statement::Copy(c) => match c.kind {
+                CopyKind::FromTable { sink, .. } => {
+                    assert!(matches!(sink, CopyExternal::Stdio));
+                }
+                _ => panic!("Expected FromTable"),
+            },
             _ => panic!("Expected COPY"),
         }
     }
@@ -7760,9 +8705,12 @@ mod tests {
     fn test_copy_from_file() {
         let stmt = parse_one("COPY users FROM '/tmp/data.csv'");
         match stmt {
-            Statement::Copy(c) => match &c.direction {
-                CopyDirection::From(CopyTarget::File(p)) => assert_eq!(p, "/tmp/data.csv"),
-                _ => panic!("Expected FROM file"),
+            Statement::Copy(c) => match c.kind {
+                CopyKind::IntoTable { source, .. } => match source {
+                    CopyExternal::LocalFile(p) => assert_eq!(p, "/tmp/data.csv"),
+                    _ => panic!("Expected LocalFile"),
+                },
+                _ => panic!("Expected IntoTable"),
             },
             _ => panic!("Expected COPY"),
         }
@@ -7772,7 +8720,211 @@ mod tests {
     fn test_copy_with_columns() {
         let stmt = parse_one("COPY users (name, email) FROM STDIN");
         match stmt {
-            Statement::Copy(c) => assert_eq!(c.columns, vec!["name", "email"]),
+            Statement::Copy(c) => match c.kind {
+                CopyKind::IntoTable { columns, .. } => {
+                    assert_eq!(columns, vec!["name", "email"]);
+                }
+                _ => panic!("Expected IntoTable"),
+            },
+            _ => panic!("Expected COPY"),
+        }
+    }
+
+    #[test]
+    fn test_copy_into_table_inline_external() {
+        let stmt = parse_one(
+            "COPY events FROM S3 's3://bucket/data/' FORMAT PARQUET CREDENTIALS (access_key = 'ak', secret_key = 'sk')",
+        );
+        match stmt {
+            Statement::Copy(c) => match c.kind {
+                CopyKind::IntoTable { table, source, .. } => {
+                    assert_eq!(table, "events");
+                    match source {
+                        CopyExternal::Inline {
+                            backend,
+                            uri,
+                            format,
+                            credentials,
+                        } => {
+                            assert_eq!(backend, ExternalBackendKind::S3);
+                            assert_eq!(uri, "s3://bucket/data/");
+                            assert_eq!(format, ExternalFormatKind::Parquet);
+                            assert_eq!(credentials.len(), 2);
+                        }
+                        _ => panic!("Expected Inline external"),
+                    }
+                }
+                _ => panic!("Expected IntoTable"),
+            },
+            _ => panic!("Expected COPY"),
+        }
+    }
+
+    #[test]
+    fn test_copy_from_table_named_sink() {
+        let stmt = parse_one("COPY events TO my_sink OPTIONS (batch_size = 1000)");
+        match stmt {
+            Statement::Copy(c) => {
+                assert_eq!(c.options.len(), 1);
+                match c.kind {
+                    CopyKind::FromTable { table, sink, .. } => {
+                        assert_eq!(table, "events");
+                        assert_eq!(sink, CopyExternal::Named("my_sink".to_string()));
+                    }
+                    _ => panic!("Expected FromTable"),
+                }
+            }
+            _ => panic!("Expected COPY"),
+        }
+    }
+
+    #[test]
+    fn test_copy_external_to_external() {
+        let stmt = parse_one(
+            "COPY FILE '/tmp/in.parquet' FORMAT PARQUET TO FILE '/tmp/out.jsonl' FORMAT JSONLINES",
+        );
+        match stmt {
+            Statement::Copy(c) => match c.kind {
+                CopyKind::ExternalToExternal { source, sink } => {
+                    assert!(matches!(
+                        source,
+                        CopyExternal::Inline {
+                            backend: ExternalBackendKind::File,
+                            format: ExternalFormatKind::Parquet,
+                            ..
+                        }
+                    ));
+                    assert!(matches!(
+                        sink,
+                        CopyExternal::Inline {
+                            backend: ExternalBackendKind::File,
+                            format: ExternalFormatKind::JsonLines,
+                            ..
+                        }
+                    ));
+                }
+                _ => panic!("Expected ExternalToExternal"),
+            },
+            _ => panic!("Expected COPY"),
+        }
+    }
+
+    #[test]
+    fn test_copy_spec_from_external_into_table() {
+        // Spec-style: COPY FROM <ext> INTO TABLE <t>.
+        let stmt = parse_one("COPY FROM S3 's3://bucket/in/' FORMAT PARQUET INTO TABLE customers");
+        match stmt {
+            Statement::Copy(c) => match c.kind {
+                CopyKind::IntoTable { table, source, .. } => {
+                    assert_eq!(table, "customers");
+                    assert!(matches!(
+                        source,
+                        CopyExternal::Inline {
+                            backend: ExternalBackendKind::S3,
+                            format: ExternalFormatKind::Parquet,
+                            ..
+                        }
+                    ));
+                }
+                _ => panic!("Expected IntoTable"),
+            },
+            _ => panic!("Expected COPY"),
+        }
+    }
+
+    #[test]
+    fn test_copy_spec_from_named_source_into_table() {
+        let stmt = parse_one("COPY FROM EXTERNAL SOURCE my_s3 INTO TABLE customers");
+        match stmt {
+            Statement::Copy(c) => match c.kind {
+                CopyKind::IntoTable { table, source, .. } => {
+                    assert_eq!(table, "customers");
+                    assert_eq!(source, CopyExternal::Named("my_s3".to_string()));
+                }
+                _ => panic!("Expected IntoTable"),
+            },
+            _ => panic!("Expected COPY"),
+        }
+    }
+
+    #[test]
+    fn test_copy_spec_table_to_external() {
+        // Spec-style: COPY TABLE <t> TO <ext>.
+        let stmt = parse_one("COPY TABLE orders TO S3 's3://bucket/out.parquet' FORMAT PARQUET");
+        match stmt {
+            Statement::Copy(c) => match c.kind {
+                CopyKind::FromTable { table, sink, .. } => {
+                    assert_eq!(table, "orders");
+                    assert!(matches!(
+                        sink,
+                        CopyExternal::Inline {
+                            backend: ExternalBackendKind::S3,
+                            format: ExternalFormatKind::Parquet,
+                            ..
+                        }
+                    ));
+                }
+                _ => panic!("Expected FromTable"),
+            },
+            _ => panic!("Expected COPY"),
+        }
+    }
+
+    #[test]
+    fn test_copy_spec_table_to_named_sink() {
+        let stmt = parse_one("COPY TABLE orders TO EXTERNAL SINK my_s3_out");
+        match stmt {
+            Statement::Copy(c) => match c.kind {
+                CopyKind::FromTable { table, sink, .. } => {
+                    assert_eq!(table, "orders");
+                    assert_eq!(sink, CopyExternal::Named("my_s3_out".to_string()));
+                }
+                _ => panic!("Expected FromTable"),
+            },
+            _ => panic!("Expected COPY"),
+        }
+    }
+
+    #[test]
+    fn test_copy_spec_external_to_external_with_columns() {
+        // Spec-style: COPY FROM <ext> COLUMNS (...) TO <ext>.
+        let stmt = parse_one(
+            "COPY FROM FILE '/tmp/in.csv' FORMAT CSV COLUMNS (id BIGINT, name VARCHAR) TO FILE '/tmp/out/' FORMAT PARQUET",
+        );
+        match stmt {
+            Statement::Copy(c) => {
+                // The COLUMNS clause is carried in statement options under the
+                // reserved key "__columns_source".
+                let cols = c
+                    .options
+                    .iter()
+                    .find(|(k, _)| k == "__columns_source")
+                    .map(|(_, v)| v.clone())
+                    .expect("missing __columns_source option");
+                assert!(cols.contains("id:"));
+                assert!(cols.contains("name:"));
+                match c.kind {
+                    CopyKind::ExternalToExternal { source, sink } => {
+                        assert!(matches!(
+                            source,
+                            CopyExternal::Inline {
+                                backend: ExternalBackendKind::File,
+                                format: ExternalFormatKind::Csv,
+                                ..
+                            }
+                        ));
+                        assert!(matches!(
+                            sink,
+                            CopyExternal::Inline {
+                                backend: ExternalBackendKind::File,
+                                format: ExternalFormatKind::Parquet,
+                                ..
+                            }
+                        ));
+                    }
+                    _ => panic!("Expected ExternalToExternal"),
+                }
+            }
             _ => panic!("Expected COPY"),
         }
     }
@@ -10169,6 +11321,341 @@ mod tests {
                 ));
             }
             other => panic!("Expected WindowFunction, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // External source and sink DDL tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_external_source_file_oneshot() {
+        let stmt = parse_one(
+            "CREATE EXTERNAL SOURCE x TYPE FILE URI '/data/*.jsonl' FORMAT JSONLINES MODE ONESHOT",
+        );
+        match stmt {
+            Statement::CreateExternalSource(s) => {
+                assert_eq!(s.name, "x");
+                assert!(!s.if_not_exists);
+                assert_eq!(s.backend, ExternalBackendKind::File);
+                assert_eq!(s.uri, "/data/*.jsonl");
+                assert_eq!(s.format, ExternalFormatKind::JsonLines);
+                assert_eq!(s.mode, ExternalModeSpec::OneShot);
+                assert!(s.options.is_empty());
+                assert!(s.credentials.is_empty());
+            }
+            _ => panic!("Expected CreateExternalSource"),
+        }
+    }
+
+    #[test]
+    fn test_create_external_source_s3_scheduled_with_options_and_creds() {
+        let stmt = parse_one(
+            "CREATE EXTERNAL SOURCE s3_logs TYPE S3 URI 's3://bucket/logs' FORMAT PARQUET \
+             MODE SCHEDULED EVERY '1 hour' \
+             OPTIONS (region='us-east-1') \
+             CREDENTIALS (aws_access_key_id='x', aws_secret_access_key='y')",
+        );
+        match stmt {
+            Statement::CreateExternalSource(s) => {
+                assert_eq!(s.name, "s3_logs");
+                assert_eq!(s.backend, ExternalBackendKind::S3);
+                assert_eq!(s.uri, "s3://bucket/logs");
+                assert_eq!(s.format, ExternalFormatKind::Parquet);
+                match &s.mode {
+                    ExternalModeSpec::Scheduled { cron, every } => {
+                        assert!(cron.is_none());
+                        assert_eq!(every.as_deref(), Some("1 hour"));
+                    }
+                    other => panic!("Expected Scheduled, got {:?}", other),
+                }
+                assert_eq!(s.options.len(), 1);
+                assert_eq!(
+                    s.options[0],
+                    ("region".to_string(), "us-east-1".to_string())
+                );
+                assert_eq!(s.credentials.len(), 2);
+                assert_eq!(
+                    s.credentials[0],
+                    ("aws_access_key_id".to_string(), "x".to_string())
+                );
+            }
+            _ => panic!("Expected CreateExternalSource"),
+        }
+    }
+
+    #[test]
+    fn test_create_external_sink_s3_jsonlines() {
+        let stmt =
+            parse_one("CREATE EXTERNAL SINK s3_out TYPE S3 URI 's3://bucket/out' FORMAT JSONLINES");
+        match stmt {
+            Statement::CreateExternalSink(s) => {
+                assert_eq!(s.name, "s3_out");
+                assert_eq!(s.backend, ExternalBackendKind::S3);
+                assert_eq!(s.uri, "s3://bucket/out");
+                assert_eq!(s.format, ExternalFormatKind::JsonLines);
+                assert!(s.options.is_empty());
+                assert!(s.credentials.is_empty());
+            }
+            _ => panic!("Expected CreateExternalSink"),
+        }
+    }
+
+    #[test]
+    fn test_alter_external_source_set_credentials() {
+        let stmt = parse_one("ALTER EXTERNAL SOURCE x SET CREDENTIALS (aws_access_key_id='new')");
+        match stmt {
+            Statement::AlterExternalSource(s) => {
+                assert_eq!(s.name, "x");
+                match s.action {
+                    AlterExternalSourceAction::SetCredentials(kv) => {
+                        assert_eq!(kv.len(), 1);
+                        assert_eq!(kv[0], ("aws_access_key_id".to_string(), "new".to_string()));
+                    }
+                    other => panic!("Expected SetCredentials, got {:?}", other),
+                }
+            }
+            _ => panic!("Expected AlterExternalSource"),
+        }
+    }
+
+    #[test]
+    fn test_drop_external_source() {
+        let stmt = parse_one("DROP EXTERNAL SOURCE x");
+        match stmt {
+            Statement::DropExternalSource(s) => {
+                assert_eq!(s.name, "x");
+                assert!(!s.if_exists);
+            }
+            _ => panic!("Expected DropExternalSource"),
+        }
+    }
+
+    #[test]
+    fn test_drop_external_source_if_exists() {
+        let stmt = parse_one("DROP EXTERNAL SOURCE IF EXISTS x");
+        match stmt {
+            Statement::DropExternalSource(s) => {
+                assert_eq!(s.name, "x");
+                assert!(s.if_exists);
+            }
+            _ => panic!("Expected DropExternalSource"),
+        }
+    }
+
+    #[test]
+    fn test_create_external_source_with_columns_clause() {
+        let stmt = parse_one(
+            "CREATE EXTERNAL SOURCE x TYPE FILE URI '/tmp' FORMAT CSV \
+             COLUMNS (id BIGINT, name VARCHAR)",
+        );
+        match stmt {
+            Statement::CreateExternalSource(s) => {
+                assert_eq!(s.name, "x");
+                assert_eq!(s.columns.len(), 2);
+                assert_eq!(s.columns[0].0, "id");
+                assert_eq!(s.columns[0].1, DataType::BigInt);
+                assert_eq!(s.columns[1].0, "name");
+                assert_eq!(s.columns[1].1, DataType::Varchar(None));
+            }
+            _ => panic!("Expected CreateExternalSource"),
+        }
+    }
+
+    #[test]
+    fn test_alter_external_source_set_columns() {
+        let stmt = parse_one("ALTER EXTERNAL SOURCE x SET COLUMNS (id BIGINT, ts TIMESTAMP)");
+        match stmt {
+            Statement::AlterExternalSource(s) => {
+                assert_eq!(s.name, "x");
+                match s.action {
+                    AlterExternalSourceAction::SetColumns(cols) => {
+                        assert_eq!(cols.len(), 2);
+                        assert_eq!(cols[0].0, "id");
+                        assert_eq!(cols[0].1, DataType::BigInt);
+                        assert_eq!(cols[1].0, "ts");
+                    }
+                    other => panic!("Expected SetColumns, got {:?}", other),
+                }
+            }
+            _ => panic!("Expected AlterExternalSource"),
+        }
+    }
+
+    #[test]
+    fn test_create_streaming_job_with_job_mode() {
+        let stmt = parse_one(
+            "CREATE STREAMING JOB j AS SELECT id FROM orders INTO orders_vip \
+             MODE SCHEDULED EVERY '1 day'",
+        );
+        match stmt {
+            Statement::CreateStreamingJob(s) => {
+                assert_eq!(s.name, "j");
+                match &s.target {
+                    StreamingSinkRef::Named(n) => assert_eq!(n, "orders_vip"),
+                    other => panic!("Expected Named sink, got {:?}", other),
+                }
+                match &s.job_mode {
+                    ExternalModeSpec::Scheduled { cron, every } => {
+                        assert!(cron.is_none());
+                        assert_eq!(every.as_deref(), Some("1 day"));
+                    }
+                    other => panic!("Expected Scheduled job_mode, got {:?}", other),
+                }
+            }
+            _ => panic!("Expected CreateStreamingJob"),
+        }
+    }
+
+    #[test]
+    fn test_streaming_job_group_by_tumble() {
+        let stmt = parse_one(
+            "CREATE STREAMING JOB j AS \
+             SELECT product_id, COUNT(*) FROM orders \
+             GROUP BY product_id, TUMBLE(event_time, INTERVAL '1 hour') \
+             INTO sales_rollup",
+        );
+        match stmt {
+            Statement::CreateStreamingJob(s) => {
+                assert_eq!(s.name, "j");
+                assert_eq!(s.query.group_by.len(), 2);
+            }
+            _ => panic!("Expected CreateStreamingJob"),
+        }
+    }
+
+    #[test]
+    fn test_streaming_job_watermark() {
+        let stmt = parse_one(
+            "CREATE STREAMING JOB j AS SELECT id FROM orders INTO sales_rollup \
+             WATERMARK FOR event_time AS event_time - INTERVAL '30 seconds'",
+        );
+        match stmt {
+            Statement::CreateStreamingJob(s) => {
+                let w = s.watermark.expect("watermark should be present");
+                assert_eq!(w.event_time_column, "event_time");
+                assert_eq!(w.allowed_lateness.nanoseconds, 30 * 1_000_000_000);
+            }
+            _ => panic!("Expected CreateStreamingJob"),
+        }
+    }
+
+    #[test]
+    fn test_streaming_job_late_data_policy_drop() {
+        let stmt = parse_one(
+            "CREATE STREAMING JOB j AS SELECT id FROM orders INTO sales_rollup \
+             WITH LATE DATA POLICY DROP",
+        );
+        match stmt {
+            Statement::CreateStreamingJob(s) => {
+                assert_eq!(s.late_data_policy, Some(LateDataPolicySpec::Drop));
+            }
+            _ => panic!("Expected CreateStreamingJob"),
+        }
+    }
+
+    #[test]
+    fn test_streaming_job_late_data_policy_side_output() {
+        let stmt = parse_one(
+            "CREATE STREAMING JOB j AS SELECT id FROM orders INTO sales_rollup \
+             WITH LATE DATA POLICY SIDE OUTPUT",
+        );
+        match stmt {
+            Statement::CreateStreamingJob(s) => {
+                assert_eq!(s.late_data_policy, Some(LateDataPolicySpec::SideOutput));
+            }
+            _ => panic!("Expected CreateStreamingJob"),
+        }
+    }
+
+    #[test]
+    fn test_streaming_job_interval_join_parses() {
+        let stmt = parse_one(
+            "CREATE STREAMING JOB enriched AS \
+             SELECT o.id FROM orders o JOIN customers c \
+             ON o.customer_id = c.id \
+             WITHIN INTERVAL '5' SECOND \
+             INTO enriched_table",
+        );
+        match stmt {
+            Statement::CreateStreamingJob(s) => {
+                assert!(matches!(
+                    s.join,
+                    Some(StreamingJoinSpec::Interval {
+                        within_us: 5_000_000,
+                        join_type: StreamingJoinType::Inner
+                    })
+                ));
+            }
+            _ => panic!("Expected CreateStreamingJob with Interval join"),
+        }
+    }
+
+    #[test]
+    fn test_streaming_job_left_outer_interval_join_parses() {
+        let stmt = parse_one(
+            "CREATE STREAMING JOB enriched AS \
+             SELECT o.id FROM orders o LEFT OUTER JOIN customers c \
+             ON o.customer_id = c.id \
+             WITHIN INTERVAL '5' SECOND \
+             INTO enriched_table",
+        );
+        match stmt {
+            Statement::CreateStreamingJob(s) => {
+                assert!(matches!(
+                    s.join,
+                    Some(StreamingJoinSpec::Interval {
+                        within_us: 5_000_000,
+                        join_type: StreamingJoinType::Left
+                    })
+                ));
+            }
+            _ => panic!("Expected CreateStreamingJob with LEFT OUTER Interval join"),
+        }
+    }
+
+    #[test]
+    fn test_streaming_job_full_outer_interval_join_parses() {
+        let stmt = parse_one(
+            "CREATE STREAMING JOB enriched AS \
+             SELECT o.id FROM orders o FULL OUTER JOIN customers c \
+             ON o.customer_id = c.id \
+             WITHIN INTERVAL '5' SECOND \
+             INTO enriched_table",
+        );
+        match stmt {
+            Statement::CreateStreamingJob(s) => {
+                assert!(matches!(
+                    s.join,
+                    Some(StreamingJoinSpec::Interval {
+                        within_us: 5_000_000,
+                        join_type: StreamingJoinType::Full
+                    })
+                ));
+            }
+            _ => panic!("Expected CreateStreamingJob with FULL OUTER Interval join"),
+        }
+    }
+
+    #[test]
+    fn test_streaming_job_temporal_join_parses() {
+        let stmt = parse_one(
+            "CREATE STREAMING JOB enriched AS \
+             SELECT o.id FROM orders o JOIN customers c AS OF o.event_time \
+             ON o.customer_id = c.id \
+             INTO enriched_table",
+        );
+        match stmt {
+            Statement::CreateStreamingJob(s) => match s.join {
+                Some(StreamingJoinSpec::Temporal {
+                    event_time_column,
+                    join_type: StreamingJoinType::Inner,
+                }) => {
+                    assert_eq!(event_time_column, "event_time");
+                }
+                other => panic!("Expected Temporal join, got {:?}", other),
+            },
+            _ => panic!("Expected CreateStreamingJob"),
         }
     }
 }

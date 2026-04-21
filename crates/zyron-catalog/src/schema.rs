@@ -564,6 +564,490 @@ fn index_type_from_u8(val: u8) -> Result<IndexType> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// StreamingJobEntry
+// ---------------------------------------------------------------------------
+
+/// Runtime status of a streaming job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum StreamingJobStatus {
+    Active = 0,
+    Paused = 1,
+    Failed = 2,
+}
+
+impl StreamingJobStatus {
+    pub fn from_u8(val: u8) -> Result<Self> {
+        match val {
+            0 => Ok(StreamingJobStatus::Active),
+            1 => Ok(StreamingJobStatus::Paused),
+            2 => Ok(StreamingJobStatus::Failed),
+            _ => Err(zyron_common::ZyronError::CatalogCorrupted(format!(
+                "unknown StreamingJobStatus value: {val}"
+            ))),
+        }
+    }
+}
+
+/// Write mode for a streaming job sink. Mirrors the parser's StreamingWriteMode
+/// so the catalog crate does not depend on parser types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum CatalogStreamingWriteMode {
+    Append = 0,
+    Upsert = 1,
+}
+
+impl CatalogStreamingWriteMode {
+    pub fn from_u8(val: u8) -> Result<Self> {
+        match val {
+            0 => Ok(CatalogStreamingWriteMode::Append),
+            1 => Ok(CatalogStreamingWriteMode::Upsert),
+            _ => Err(zyron_common::ZyronError::CatalogCorrupted(format!(
+                "unknown CatalogStreamingWriteMode value: {val}"
+            ))),
+        }
+    }
+}
+
+/// Catalog entry for a streaming job. The creator's security context is
+/// persisted as opaque bytes produced by SecurityContextSnapshot::to_bytes.
+#[derive(Debug, Clone)]
+pub struct StreamingJobEntry {
+    pub id: StreamingJobId,
+    pub name: String,
+    pub source_table_id: TableId,
+    pub target_table_id: TableId,
+    pub source_schema_id: SchemaId,
+    pub target_schema_id: SchemaId,
+    pub select_sql: String,
+    pub write_mode: CatalogStreamingWriteMode,
+    pub status: StreamingJobStatus,
+    pub creator_snapshot_bytes: Vec<u8>,
+    pub created_at: u64,
+    pub last_error: Option<String>,
+}
+
+impl StreamingJobEntry {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(128);
+        write_u32(&mut buf, self.id.0);
+        write_string(&mut buf, &self.name);
+        write_u32(&mut buf, self.source_table_id.0);
+        write_u32(&mut buf, self.target_table_id.0);
+        write_u32(&mut buf, self.source_schema_id.0);
+        write_u32(&mut buf, self.target_schema_id.0);
+        write_string(&mut buf, &self.select_sql);
+        write_u8(&mut buf, self.write_mode as u8);
+        write_u8(&mut buf, self.status as u8);
+        write_u32(&mut buf, self.creator_snapshot_bytes.len() as u32);
+        buf.extend_from_slice(&self.creator_snapshot_bytes);
+        write_u64(&mut buf, self.created_at);
+        write_option_string(&mut buf, &self.last_error);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut off = 0;
+        let id = StreamingJobId(read_u32(data, &mut off)?);
+        let name = read_string(data, &mut off)?;
+        let source_table_id = TableId(read_u32(data, &mut off)?);
+        let target_table_id = TableId(read_u32(data, &mut off)?);
+        let source_schema_id = SchemaId(read_u32(data, &mut off)?);
+        let target_schema_id = SchemaId(read_u32(data, &mut off)?);
+        let select_sql = read_string(data, &mut off)?;
+        let write_mode = CatalogStreamingWriteMode::from_u8(read_u8(data, &mut off)?)?;
+        let status = StreamingJobStatus::from_u8(read_u8(data, &mut off)?)?;
+        let snap_len = read_u32(data, &mut off)? as usize;
+        if off + snap_len > data.len() {
+            return Err(zyron_common::ZyronError::CatalogCorrupted(format!(
+                "streaming job snapshot length {snap_len} exceeds remaining data at offset {off}"
+            )));
+        }
+        let creator_snapshot_bytes = Vec::from(&data[off..off + snap_len]);
+        off += snap_len;
+        let created_at = read_u64(data, &mut off)?;
+        let last_error = read_option_string(data, &mut off)?;
+        Ok(Self {
+            id,
+            name,
+            source_table_id,
+            target_table_id,
+            source_schema_id,
+            target_schema_id,
+            select_sql,
+            write_mode,
+            status,
+            creator_snapshot_bytes,
+            created_at,
+            last_error,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// External source and sink catalog entries
+// ---------------------------------------------------------------------------
+
+// Mirror of the streaming-layer backend kind enum. Duplicated here so the
+// catalog crate does not depend on zyron-streaming.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExternalBackend {
+    File = 0,
+    S3 = 1,
+    Gcs = 2,
+    Azure = 3,
+    Http = 4,
+}
+
+impl ExternalBackend {
+    pub fn from_u8(val: u8) -> Result<Self> {
+        match val {
+            0 => Ok(ExternalBackend::File),
+            1 => Ok(ExternalBackend::S3),
+            2 => Ok(ExternalBackend::Gcs),
+            3 => Ok(ExternalBackend::Azure),
+            4 => Ok(ExternalBackend::Http),
+            _ => Err(zyron_common::ZyronError::CatalogCorrupted(format!(
+                "unknown ExternalBackend value: {val}"
+            ))),
+        }
+    }
+}
+
+// Mirror of the streaming-layer format enum.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExternalFormat {
+    Json = 0,
+    JsonLines = 1,
+    Csv = 2,
+    Parquet = 3,
+    ArrowIpc = 4,
+    Avro = 5,
+}
+
+impl ExternalFormat {
+    pub fn from_u8(val: u8) -> Result<Self> {
+        match val {
+            0 => Ok(ExternalFormat::Json),
+            1 => Ok(ExternalFormat::JsonLines),
+            2 => Ok(ExternalFormat::Csv),
+            3 => Ok(ExternalFormat::Parquet),
+            4 => Ok(ExternalFormat::ArrowIpc),
+            5 => Ok(ExternalFormat::Avro),
+            _ => Err(zyron_common::ZyronError::CatalogCorrupted(format!(
+                "unknown ExternalFormat value: {val}"
+            ))),
+        }
+    }
+}
+
+// Ingestion mode for an external source.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExternalMode {
+    OneShot = 0,
+    Scheduled = 1,
+    Watch = 2,
+}
+
+impl ExternalMode {
+    pub fn from_u8(val: u8) -> Result<Self> {
+        match val {
+            0 => Ok(ExternalMode::OneShot),
+            1 => Ok(ExternalMode::Scheduled),
+            2 => Ok(ExternalMode::Watch),
+            _ => Err(zyron_common::ZyronError::CatalogCorrupted(format!(
+                "unknown ExternalMode value: {val}"
+            ))),
+        }
+    }
+}
+
+// Catalog classification mirror. Avoids a dependency on zyron-auth from the
+// catalog crate. Values match ClassificationLevel Public=0 .. Restricted=3.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CatalogClassification {
+    Public = 0,
+    Internal = 1,
+    Confidential = 2,
+    Restricted = 3,
+}
+
+impl CatalogClassification {
+    pub fn from_u8(val: u8) -> Result<Self> {
+        match val {
+            0 => Ok(CatalogClassification::Public),
+            1 => Ok(CatalogClassification::Internal),
+            2 => Ok(CatalogClassification::Confidential),
+            3 => Ok(CatalogClassification::Restricted),
+            _ => Err(zyron_common::ZyronError::CatalogCorrupted(format!(
+                "unknown CatalogClassification value: {val}"
+            ))),
+        }
+    }
+}
+
+/// Catalog entry for an external data source.
+#[derive(Debug, Clone)]
+pub struct ExternalSourceEntry {
+    pub id: ExternalSourceId,
+    pub schema_id: SchemaId,
+    pub name: String,
+    pub backend: ExternalBackend,
+    pub uri: String,
+    pub format: ExternalFormat,
+    pub mode: ExternalMode,
+    // Non-empty only when mode == Scheduled.
+    pub schedule_cron: Option<String>,
+    // Non-secret config, key-value pairs.
+    pub options: Vec<(String, String)>,
+    // Column layout declared at CREATE time or inferred from the first
+    // matching file. Empty when the source's column shape is unknown at
+    // CREATE time.
+    pub columns: Vec<(String, TypeId)>,
+    // None if no credentials are needed (local file, public http).
+    pub credential_key_id: Option<u32>,
+    pub credential_ciphertext: Option<Vec<u8>>,
+    pub classification: CatalogClassification,
+    pub tags: Vec<String>,
+    pub owner_role_id: u32,
+    pub created_at: u64,
+}
+
+impl ExternalSourceEntry {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(128);
+        write_u32(&mut buf, self.id.0);
+        write_u32(&mut buf, self.schema_id.0);
+        write_string(&mut buf, &self.name);
+        write_u8(&mut buf, self.backend as u8);
+        write_string(&mut buf, &self.uri);
+        write_u8(&mut buf, self.format as u8);
+        write_u8(&mut buf, self.mode as u8);
+        write_option_string(&mut buf, &self.schedule_cron);
+        write_u32(&mut buf, self.options.len() as u32);
+        for (k, v) in &self.options {
+            write_string(&mut buf, k);
+            write_string(&mut buf, v);
+        }
+        write_u32(&mut buf, self.columns.len() as u32);
+        for (name, type_id) in &self.columns {
+            write_string(&mut buf, name);
+            write_u8(&mut buf, *type_id as u8);
+        }
+        // Credentials: both fields present together (both Some, or both None).
+        let has_cred = self.credential_key_id.is_some() && self.credential_ciphertext.is_some();
+        write_u8(&mut buf, has_cred as u8);
+        if has_cred {
+            write_u32(&mut buf, self.credential_key_id.unwrap());
+            let ct = self.credential_ciphertext.as_ref().unwrap();
+            write_u32(&mut buf, ct.len() as u32);
+            buf.extend_from_slice(ct);
+        }
+        write_u8(&mut buf, self.classification as u8);
+        write_u32(&mut buf, self.tags.len() as u32);
+        for t in &self.tags {
+            write_string(&mut buf, t);
+        }
+        write_u32(&mut buf, self.owner_role_id);
+        write_u64(&mut buf, self.created_at);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut off = 0;
+        let id = ExternalSourceId(read_u32(data, &mut off)?);
+        let schema_id = SchemaId(read_u32(data, &mut off)?);
+        let name = read_string(data, &mut off)?;
+        let backend = ExternalBackend::from_u8(read_u8(data, &mut off)?)?;
+        let uri = read_string(data, &mut off)?;
+        let format = ExternalFormat::from_u8(read_u8(data, &mut off)?)?;
+        let mode = ExternalMode::from_u8(read_u8(data, &mut off)?)?;
+        let schedule_cron = read_option_string(data, &mut off)?;
+        let opt_count = read_u32(data, &mut off)? as usize;
+        let mut options = Vec::with_capacity(opt_count);
+        for _ in 0..opt_count {
+            let k = read_string(data, &mut off)?;
+            let v = read_string(data, &mut off)?;
+            options.push((k, v));
+        }
+        let col_count = read_u32(data, &mut off)? as usize;
+        let mut columns: Vec<(String, TypeId)> = Vec::with_capacity(col_count);
+        for _ in 0..col_count {
+            let name = read_string(data, &mut off)?;
+            let type_id = type_id_from_u8(read_u8(data, &mut off)?)?;
+            columns.push((name, type_id));
+        }
+        let has_cred = read_u8(data, &mut off)?;
+        let (credential_key_id, credential_ciphertext) = if has_cred != 0 {
+            let kid = read_u32(data, &mut off)?;
+            let ct_len = read_u32(data, &mut off)? as usize;
+            if off + ct_len > data.len() {
+                return Err(zyron_common::ZyronError::CatalogCorrupted(format!(
+                    "external source credential length {ct_len} exceeds remaining data at offset {off}"
+                )));
+            }
+            let ct = data[off..off + ct_len].to_vec();
+            off += ct_len;
+            (Some(kid), Some(ct))
+        } else {
+            (None, None)
+        };
+        let classification = CatalogClassification::from_u8(read_u8(data, &mut off)?)?;
+        let tag_count = read_u32(data, &mut off)? as usize;
+        let mut tags = Vec::with_capacity(tag_count);
+        for _ in 0..tag_count {
+            tags.push(read_string(data, &mut off)?);
+        }
+        let owner_role_id = read_u32(data, &mut off)?;
+        let created_at = read_u64(data, &mut off)?;
+        Ok(Self {
+            id,
+            schema_id,
+            name,
+            backend,
+            uri,
+            format,
+            mode,
+            schedule_cron,
+            options,
+            columns,
+            credential_key_id,
+            credential_ciphertext,
+            classification,
+            tags,
+            owner_role_id,
+            created_at,
+        })
+    }
+}
+
+/// Catalog entry for an external data sink.
+#[derive(Debug, Clone)]
+pub struct ExternalSinkEntry {
+    pub id: ExternalSinkId,
+    pub schema_id: SchemaId,
+    pub name: String,
+    pub backend: ExternalBackend,
+    pub uri: String,
+    pub format: ExternalFormat,
+    pub options: Vec<(String, String)>,
+    // Column layout declared at CREATE time. Empty when unknown.
+    pub columns: Vec<(String, TypeId)>,
+    pub credential_key_id: Option<u32>,
+    pub credential_ciphertext: Option<Vec<u8>>,
+    pub classification: CatalogClassification,
+    pub tags: Vec<String>,
+    pub owner_role_id: u32,
+    pub created_at: u64,
+}
+
+impl ExternalSinkEntry {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(128);
+        write_u32(&mut buf, self.id.0);
+        write_u32(&mut buf, self.schema_id.0);
+        write_string(&mut buf, &self.name);
+        write_u8(&mut buf, self.backend as u8);
+        write_string(&mut buf, &self.uri);
+        write_u8(&mut buf, self.format as u8);
+        write_u32(&mut buf, self.options.len() as u32);
+        for (k, v) in &self.options {
+            write_string(&mut buf, k);
+            write_string(&mut buf, v);
+        }
+        write_u32(&mut buf, self.columns.len() as u32);
+        for (name, type_id) in &self.columns {
+            write_string(&mut buf, name);
+            write_u8(&mut buf, *type_id as u8);
+        }
+        let has_cred = self.credential_key_id.is_some() && self.credential_ciphertext.is_some();
+        write_u8(&mut buf, has_cred as u8);
+        if has_cred {
+            write_u32(&mut buf, self.credential_key_id.unwrap());
+            let ct = self.credential_ciphertext.as_ref().unwrap();
+            write_u32(&mut buf, ct.len() as u32);
+            buf.extend_from_slice(ct);
+        }
+        write_u8(&mut buf, self.classification as u8);
+        write_u32(&mut buf, self.tags.len() as u32);
+        for t in &self.tags {
+            write_string(&mut buf, t);
+        }
+        write_u32(&mut buf, self.owner_role_id);
+        write_u64(&mut buf, self.created_at);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut off = 0;
+        let id = ExternalSinkId(read_u32(data, &mut off)?);
+        let schema_id = SchemaId(read_u32(data, &mut off)?);
+        let name = read_string(data, &mut off)?;
+        let backend = ExternalBackend::from_u8(read_u8(data, &mut off)?)?;
+        let uri = read_string(data, &mut off)?;
+        let format = ExternalFormat::from_u8(read_u8(data, &mut off)?)?;
+        let opt_count = read_u32(data, &mut off)? as usize;
+        let mut options = Vec::with_capacity(opt_count);
+        for _ in 0..opt_count {
+            let k = read_string(data, &mut off)?;
+            let v = read_string(data, &mut off)?;
+            options.push((k, v));
+        }
+        let col_count = read_u32(data, &mut off)? as usize;
+        let mut columns: Vec<(String, TypeId)> = Vec::with_capacity(col_count);
+        for _ in 0..col_count {
+            let cname = read_string(data, &mut off)?;
+            let type_id = type_id_from_u8(read_u8(data, &mut off)?)?;
+            columns.push((cname, type_id));
+        }
+        let has_cred = read_u8(data, &mut off)?;
+        let (credential_key_id, credential_ciphertext) = if has_cred != 0 {
+            let kid = read_u32(data, &mut off)?;
+            let ct_len = read_u32(data, &mut off)? as usize;
+            if off + ct_len > data.len() {
+                return Err(zyron_common::ZyronError::CatalogCorrupted(format!(
+                    "external sink credential length {ct_len} exceeds remaining data at offset {off}"
+                )));
+            }
+            let ct = data[off..off + ct_len].to_vec();
+            off += ct_len;
+            (Some(kid), Some(ct))
+        } else {
+            (None, None)
+        };
+        let classification = CatalogClassification::from_u8(read_u8(data, &mut off)?)?;
+        let tag_count = read_u32(data, &mut off)? as usize;
+        let mut tags = Vec::with_capacity(tag_count);
+        for _ in 0..tag_count {
+            tags.push(read_string(data, &mut off)?);
+        }
+        let owner_role_id = read_u32(data, &mut off)?;
+        let created_at = read_u64(data, &mut off)?;
+        Ok(Self {
+            id,
+            schema_id,
+            name,
+            backend,
+            uri,
+            format,
+            options,
+            columns,
+            credential_key_id,
+            credential_ciphertext,
+            classification,
+            tags,
+            owner_role_id,
+            created_at,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -835,5 +1319,125 @@ mod tests {
         let decoded = TableEntry::from_bytes(&bytes).unwrap();
         assert_eq!(decoded.columns.len(), 0);
         assert_eq!(decoded.constraints.len(), 0);
+    }
+
+    #[test]
+    fn test_streaming_job_entry_roundtrip() {
+        let entry = StreamingJobEntry {
+            id: StreamingJobId(42),
+            name: "orders_to_warehouse".to_string(),
+            source_table_id: TableId(100),
+            target_table_id: TableId(200),
+            source_schema_id: SchemaId(1),
+            target_schema_id: SchemaId(2),
+            select_sql: "SELECT id, amount FROM orders WHERE amount > 0".to_string(),
+            write_mode: CatalogStreamingWriteMode::Upsert,
+            status: StreamingJobStatus::Paused,
+            creator_snapshot_bytes: vec![0x01, 0x02, 0x03, 0xde, 0xad, 0xbe, 0xef],
+            created_at: 1_700_000_000,
+            last_error: Some("connection reset".to_string()),
+        };
+        let bytes = entry.to_bytes();
+        let decoded = StreamingJobEntry::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.id, entry.id);
+        assert_eq!(decoded.name, entry.name);
+        assert_eq!(decoded.source_table_id, entry.source_table_id);
+        assert_eq!(decoded.target_table_id, entry.target_table_id);
+        assert_eq!(decoded.source_schema_id, entry.source_schema_id);
+        assert_eq!(decoded.target_schema_id, entry.target_schema_id);
+        assert_eq!(decoded.select_sql, entry.select_sql);
+        assert_eq!(decoded.write_mode, entry.write_mode);
+        assert_eq!(decoded.status, entry.status);
+        assert_eq!(decoded.creator_snapshot_bytes, entry.creator_snapshot_bytes);
+        assert_eq!(decoded.created_at, entry.created_at);
+        assert_eq!(decoded.last_error, entry.last_error);
+    }
+
+    #[test]
+    fn test_external_source_entry_roundtrip() {
+        let entry = ExternalSourceEntry {
+            id: ExternalSourceId(77),
+            schema_id: SchemaId(3),
+            name: "orders_source".to_string(),
+            backend: ExternalBackend::S3,
+            uri: "s3://bucket/prefix/".to_string(),
+            format: ExternalFormat::Parquet,
+            mode: ExternalMode::Scheduled,
+            schedule_cron: Some("0 */5 * * *".to_string()),
+            options: vec![
+                ("region".to_string(), "us-west-2".to_string()),
+                ("batch_size".to_string(), "1024".to_string()),
+            ],
+            columns: vec![
+                ("order_id".to_string(), TypeId::Int64),
+                ("amount".to_string(), TypeId::Decimal),
+            ],
+            credential_key_id: Some(42),
+            credential_ciphertext: Some(vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
+            classification: CatalogClassification::Confidential,
+            tags: vec!["pii".to_string(), "prod".to_string()],
+            owner_role_id: 9,
+            created_at: 1_700_000_000,
+        };
+        let bytes = entry.to_bytes();
+        let decoded = ExternalSourceEntry::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.id, entry.id);
+        assert_eq!(decoded.schema_id, entry.schema_id);
+        assert_eq!(decoded.name, entry.name);
+        assert_eq!(decoded.backend, entry.backend);
+        assert_eq!(decoded.uri, entry.uri);
+        assert_eq!(decoded.format, entry.format);
+        assert_eq!(decoded.mode, entry.mode);
+        assert_eq!(decoded.schedule_cron, entry.schedule_cron);
+        assert_eq!(decoded.options, entry.options);
+        assert_eq!(decoded.columns, entry.columns);
+        assert_eq!(decoded.credential_key_id, entry.credential_key_id);
+        assert_eq!(decoded.credential_ciphertext, entry.credential_ciphertext);
+        assert_eq!(decoded.classification, entry.classification);
+        assert_eq!(decoded.tags, entry.tags);
+        assert_eq!(decoded.owner_role_id, entry.owner_role_id);
+        assert_eq!(decoded.created_at, entry.created_at);
+    }
+
+    #[test]
+    fn test_external_sink_entry_roundtrip() {
+        let entry = ExternalSinkEntry {
+            id: ExternalSinkId(88),
+            schema_id: SchemaId(4),
+            name: "warehouse_sink".to_string(),
+            backend: ExternalBackend::Gcs,
+            uri: "gs://bucket/out/".to_string(),
+            format: ExternalFormat::JsonLines,
+            options: vec![
+                ("compression".to_string(), "gzip".to_string()),
+                ("flush_ms".to_string(), "500".to_string()),
+            ],
+            columns: vec![
+                ("event_id".to_string(), TypeId::Int64),
+                ("name".to_string(), TypeId::Text),
+            ],
+            credential_key_id: Some(7),
+            credential_ciphertext: Some(vec![0x01, 0x02, 0x03, 0x04]),
+            classification: CatalogClassification::Restricted,
+            tags: vec!["export".to_string()],
+            owner_role_id: 3,
+            created_at: 1_700_000_123,
+        };
+        let bytes = entry.to_bytes();
+        let decoded = ExternalSinkEntry::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.id, entry.id);
+        assert_eq!(decoded.schema_id, entry.schema_id);
+        assert_eq!(decoded.name, entry.name);
+        assert_eq!(decoded.backend, entry.backend);
+        assert_eq!(decoded.uri, entry.uri);
+        assert_eq!(decoded.format, entry.format);
+        assert_eq!(decoded.options, entry.options);
+        assert_eq!(decoded.columns, entry.columns);
+        assert_eq!(decoded.credential_key_id, entry.credential_key_id);
+        assert_eq!(decoded.credential_ciphertext, entry.credential_ciphertext);
+        assert_eq!(decoded.classification, entry.classification);
+        assert_eq!(decoded.tags, entry.tags);
+        assert_eq!(decoded.owner_role_id, entry.owner_role_id);
+        assert_eq!(decoded.created_at, entry.created_at);
     }
 }

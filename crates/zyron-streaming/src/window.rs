@@ -449,6 +449,106 @@ impl Default for SessionMerger {
 }
 
 // ---------------------------------------------------------------------------
+// SessionAssigner: per-key stateful session window tracker
+// ---------------------------------------------------------------------------
+
+/// Per-key stateful session window assigner. Keeps one open WindowRange per
+/// key. Each observed event extends the key's open window to cover the event
+/// and the trailing inactivity gap. Closed sessions are drained via
+/// drain_closed once the watermark passes their end.
+///
+/// This is distinct from SessionWindowAssigner (which is stateless and used by
+/// the older operator pipeline). SessionAssigner matches the streaming runner
+/// contract where each event routes to exactly one live session per key.
+pub struct SessionAssigner {
+    gap_ms: i64,
+    /// Per-key open-window tracker. Maps the caller-supplied key bytes to the
+    /// currently open window.
+    open: scc::HashMap<Vec<u8>, WindowRange>,
+}
+
+impl SessionAssigner {
+    /// Creates a new assigner. gap_ms is the inactivity gap after which a
+    /// session closes. Panics if gap_ms is not positive.
+    pub fn new(gap_ms: i64) -> Self {
+        assert!(gap_ms > 0, "session gap must be positive");
+        Self {
+            gap_ms,
+            open: scc::HashMap::new(),
+        }
+    }
+
+    /// Extends the open window for `key` to include event_time_ms. Returns the
+    /// updated WindowRange. If no open window exists, or if the previous
+    /// window's end is at or before the event time, starts a new session
+    /// covering [event_time_ms, event_time_ms + gap_ms).
+    pub fn assign(&self, key: &[u8], event_time_ms: i64) -> WindowRange {
+        let mut result = WindowRange::new(event_time_ms, event_time_ms + self.gap_ms);
+        let key_vec = key.to_vec();
+        // entry_sync gives us upsert semantics.
+        let entry = self.open.entry_sync(key_vec);
+        match entry {
+            scc::hash_map::Entry::Occupied(mut occ) => {
+                let existing = *occ.get();
+                if existing.end_ms <= event_time_ms {
+                    // Previous session already lapsed, start a fresh one.
+                    occ.insert(result);
+                } else {
+                    // Extend to cover the new event plus a trailing gap.
+                    let extended = WindowRange::new(
+                        existing.start_ms.min(event_time_ms),
+                        (event_time_ms + self.gap_ms).max(existing.end_ms),
+                    );
+                    occ.insert(extended);
+                    result = extended;
+                }
+            }
+            scc::hash_map::Entry::Vacant(vac) => {
+                vac.insert_entry(result);
+            }
+        }
+        result
+    }
+
+    /// Returns and removes any sessions where end_ms is at or before the
+    /// watermark. Drained entries are returned as (key, window) pairs so the
+    /// caller can emit final aggregates and release state.
+    pub fn drain_closed(&self, watermark_ms: i64) -> Vec<(Vec<u8>, WindowRange)> {
+        let mut to_remove = Vec::new();
+        self.open.iter_sync(|k, v| {
+            if v.end_ms <= watermark_ms {
+                to_remove.push((k.clone(), *v));
+            }
+            true
+        });
+        let mut drained = Vec::with_capacity(to_remove.len());
+        for (k, v) in to_remove {
+            if self.open.remove_sync(&k).is_some() {
+                drained.push((k, v));
+            }
+        }
+        drained
+    }
+
+    /// Number of currently open sessions.
+    pub fn open_count(&self) -> usize {
+        self.open.len()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Watermark-based closure check
+// ---------------------------------------------------------------------------
+
+/// Returns true if `window` has been fully covered by the watermark, i.e. the
+/// window's end is at or before the watermark and no further events can arrive
+/// that would land inside it.
+#[inline]
+pub fn window_is_closed(window: &WindowRange, watermark_ms: i64) -> bool {
+    window.end_ms <= watermark_ms
+}
+
+// ---------------------------------------------------------------------------
 // SQL window accessor functions
 // ---------------------------------------------------------------------------
 
@@ -609,6 +709,67 @@ mod tests {
         assert_eq!(window_end(&w), 180_000);
         assert_eq!(window_rowtime(&w), 179_999);
         assert_eq!(session_id(&w), 120_000);
+    }
+
+    #[test]
+    fn tumbling_assigns_one_window_per_event() {
+        let a = TumblingWindowAssigner::new(1_000);
+        for t in [0, 1, 999, 1_000, 5_500] {
+            let ws = a.assign_windows(t);
+            assert_eq!(ws.len(), 1, "tumbling must produce exactly one window");
+        }
+    }
+
+    #[test]
+    fn hopping_overlap_at_size_gt_slide() {
+        // Size 300, slide 100: each event lands in 3 overlapping windows.
+        let a = SlidingWindowAssigner::new(300, 100);
+        let ws = a.assign_windows(500);
+        assert!(ws.len() >= 2, "overlap requires at least two windows");
+        for w in &ws {
+            assert!(w.contains(500));
+        }
+        // When slide == size, behaves like tumbling (one window).
+        let same = SlidingWindowAssigner::new(200, 200);
+        assert_eq!(same.assign_windows(500).len(), 1);
+    }
+
+    #[test]
+    fn session_extends_open_window_within_gap() {
+        let a = SessionAssigner::new(50);
+        let r1 = a.assign(b"user-1", 100);
+        assert_eq!(r1, WindowRange::new(100, 150));
+        // Event within the gap extends the window.
+        let r2 = a.assign(b"user-1", 120);
+        assert_eq!(r2.start_ms, 100);
+        assert_eq!(r2.end_ms, 170);
+    }
+
+    #[test]
+    fn session_starts_new_window_after_gap() {
+        let a = SessionAssigner::new(50);
+        let _ = a.assign(b"user-1", 100);
+        // Event past end (150) starts a fresh session.
+        let r = a.assign(b"user-1", 200);
+        assert_eq!(r, WindowRange::new(200, 250));
+    }
+
+    #[test]
+    fn watermark_closes_past_windows() {
+        let w = WindowRange::new(100, 200);
+        assert!(!window_is_closed(&w, 150));
+        assert!(!window_is_closed(&w, 199));
+        assert!(window_is_closed(&w, 200));
+        assert!(window_is_closed(&w, 201));
+
+        // SessionAssigner drains closed sessions.
+        let a = SessionAssigner::new(30);
+        a.assign(b"k1", 100);
+        a.assign(b"k2", 500);
+        let drained = a.drain_closed(200);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].0, b"k1".to_vec());
+        assert_eq!(a.open_count(), 1);
     }
 
     #[test]

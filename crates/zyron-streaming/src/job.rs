@@ -257,10 +257,12 @@ impl StreamJob {
 // ---------------------------------------------------------------------------
 
 /// Manages the lifecycle of all streaming jobs.
-/// Uses scc::HashMap for lock-free concurrent job tracking.
+/// Uses scc::HashMap for lock-free concurrent job tracking. The handles
+/// map tracks live runner threads keyed by catalog StreamingJobId.
 pub struct StreamJobManager {
     jobs: scc::HashMap<u32, Arc<StreamJob>>,
     next_id: AtomicU32,
+    runner_handles: scc::HashMap<u32, crate::job_runner::StreamJobHandle>,
 }
 
 impl StreamJobManager {
@@ -268,7 +270,26 @@ impl StreamJobManager {
         Self {
             jobs: scc::HashMap::new(),
             next_id: AtomicU32::new(1),
+            runner_handles: scc::HashMap::new(),
         }
+    }
+
+    /// Stores a runner handle under its catalog StreamingJobId. Called by
+    /// the job_runner module after a successful spawn.
+    pub(crate) fn register_handle(
+        &self,
+        id: zyron_catalog::StreamingJobId,
+        handle: crate::job_runner::StreamJobHandle,
+    ) {
+        let _ = self.runner_handles.insert_sync(id.0, handle);
+    }
+
+    /// Removes and returns the runner handle for a given StreamingJobId.
+    pub(crate) fn take_handle(
+        &self,
+        id: zyron_catalog::StreamingJobId,
+    ) -> Option<crate::job_runner::StreamJobHandle> {
+        self.runner_handles.remove_sync(&id.0).map(|(_, v)| v)
     }
 
     /// Creates and registers a new streaming job. Returns the job ID.
@@ -337,6 +358,29 @@ impl StreamJobManager {
     fn get_job(&self, job_id: StreamJobId) -> Result<Arc<StreamJob>> {
         let result = self.jobs.read_sync(&job_id.0, |_, v| Arc::clone(v));
         result.ok_or_else(|| ZyronError::StreamingError(format!("job {} not found", job_id)))
+    }
+
+    // -----------------------------------------------------------------------
+    // Coordinated shutdown
+    // -----------------------------------------------------------------------
+
+    /// Signals every registered runner to stop and waits for each thread to
+    /// exit. External sinks flush any buffered rows before the thread returns.
+    /// Returns the number of runners that were actively stopped.
+    pub fn shutdown_all(&self) -> usize {
+        let mut ids: Vec<u32> = Vec::new();
+        self.runner_handles.iter_sync(|k, _| {
+            ids.push(*k);
+            true
+        });
+        let mut stopped = 0usize;
+        for raw in ids {
+            if let Some((_, mut handle)) = self.runner_handles.remove_sync(&raw) {
+                handle.stop();
+                stopped += 1;
+            }
+        }
+        stopped
     }
 }
 

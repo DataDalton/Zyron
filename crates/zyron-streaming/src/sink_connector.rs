@@ -1,14 +1,17 @@
 //! Sink connectors for writing streaming output.
 //!
 //! Provides the SinkConnector trait for writing StreamRecord micro-batches
-//! to external systems. Includes stubs for Kafka and S3, and functional
-//! implementations for ZyronTableSink and InMemorySink.
+//! to external systems. Includes an S3 stub, a functional InMemorySink,
+//! a counting ZyronTableSink (for trait-level pipelines), and a
+//! ZyronRowSink that inserts raw CDC row bytes through the transaction
+//! and storage layers with a privilege check.
 
 use std::sync::Arc;
 
-use zyron_common::Result;
+use zyron_common::{Result, ZyronError};
 
 use crate::record::{ChangeFlag, StreamRecord};
+use crate::source_connector::CdfChange;
 
 // ---------------------------------------------------------------------------
 // SinkConnector trait
@@ -264,6 +267,145 @@ impl SinkConnector for InMemorySink {
 }
 
 // ---------------------------------------------------------------------------
+// ZyronRowSink
+// ---------------------------------------------------------------------------
+
+/// Sink that inserts raw CDC row bytes into a ZyronDB target table through
+/// the transaction manager and heap file. Runs an Insert privilege check
+/// against the captured SecurityContext before opening a transaction.
+///
+/// write_batch signature differs from the SinkConnector trait because this
+/// sink operates on CdfChange rows (one row_data payload per change),
+/// not columnar StreamRecord batches.
+pub struct ZyronRowSink {
+    target_table_id: u32,
+    write_mode: zyron_catalog::schema::CatalogStreamingWriteMode,
+    catalog: Arc<zyron_catalog::Catalog>,
+    heap: Arc<zyron_storage::HeapFile>,
+    txn_manager: Arc<zyron_storage::txn::TransactionManager>,
+    security_ctx: Arc<parking_lot::Mutex<zyron_auth::SecurityContext>>,
+    security_manager: Arc<zyron_auth::SecurityManager>,
+}
+
+impl ZyronRowSink {
+    pub fn new(
+        target_table_id: u32,
+        write_mode: zyron_catalog::schema::CatalogStreamingWriteMode,
+        catalog: Arc<zyron_catalog::Catalog>,
+        heap: Arc<zyron_storage::HeapFile>,
+        txn_manager: Arc<zyron_storage::txn::TransactionManager>,
+        security_ctx: Arc<parking_lot::Mutex<zyron_auth::SecurityContext>>,
+        security_manager: Arc<zyron_auth::SecurityManager>,
+    ) -> Self {
+        Self {
+            target_table_id,
+            write_mode,
+            catalog,
+            heap,
+            txn_manager,
+            security_ctx,
+            security_manager,
+        }
+    }
+
+    /// Returns the target table id configured for this sink.
+    pub fn target_table_id(&self) -> u32 {
+        self.target_table_id
+    }
+
+    /// Inserts each CdfChange as a new heap tuple inside a single transaction.
+    /// Empty input is a no-op. This sink handles Append write mode only;
+    /// UPSERT is dispatched to ZyronUpsertSink by the runner. The privilege
+    /// check runs once per batch, outside the transaction, so an unauthorized
+    /// sink fails fast without touching the WAL.
+    pub fn write_batch(&self, records: Vec<CdfChange>) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        if self.write_mode == zyron_catalog::schema::CatalogStreamingWriteMode::Upsert {
+            return Err(ZyronError::StreamingError(
+                "ZyronRowSink received Upsert mode, use ZyronUpsertSink".to_string(),
+            ));
+        }
+
+        // Verify the creator still has INSERT on the target table.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        {
+            let mut ctx = self.security_ctx.lock();
+            let allowed = ctx.has_privilege(
+                &self.security_manager.privilege_store,
+                zyron_auth::privilege::PrivilegeType::Insert,
+                zyron_auth::privilege::ObjectType::Table,
+                self.target_table_id,
+                None,
+                now,
+            );
+            if !allowed {
+                return Err(ZyronError::PermissionDenied(format!(
+                    "streaming job sink lacks INSERT on table {}",
+                    self.target_table_id
+                )));
+            }
+        }
+
+        // Look up the target table to verify it still exists at insert time.
+        let _target = self
+            .catalog
+            .get_table_by_id(zyron_catalog::TableId(self.target_table_id))?;
+
+        // Begin a transaction, build tuples, insert, commit. Any error aborts.
+        let mut txn = self
+            .txn_manager
+            .begin(zyron_storage::txn::IsolationLevel::SnapshotIsolation)?;
+        let txn_id_u32 = match u32::try_from(txn.txn_id) {
+            Ok(v) => v,
+            Err(_) => {
+                let _ = self.txn_manager.abort(&mut txn);
+                return Err(ZyronError::Internal(
+                    "txn_id exceeds u32::MAX in streaming sink".to_string(),
+                ));
+            }
+        };
+
+        let tuples: Vec<zyron_storage::Tuple> = records
+            .iter()
+            .map(|c| zyron_storage::Tuple::new(c.row_data.clone(), txn_id_u32))
+            .collect();
+
+        // The heap insert is async. Block on a small local runtime since the
+        // job runner thread sits outside the main tokio runtime.
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = self.txn_manager.abort(&mut txn);
+                return Err(ZyronError::Internal(format!(
+                    "failed to build tokio runtime for sink insert: {e}"
+                )));
+            }
+        };
+
+        let insert_result = rt.block_on(async { self.heap.insert_batch(&tuples).await });
+        match insert_result {
+            Ok(_) => {
+                self.txn_manager.commit(&mut txn)?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.txn_manager.abort(&mut txn);
+                Err(e)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -342,15 +484,6 @@ mod tests {
 
         sink.rollback().expect("rollback should succeed");
         assert_eq!(sink.rows_written(), 0);
-    }
-
-    #[test]
-    fn test_kafka_sink_stub() {
-        let mut sink = StreamKafkaSink::new("localhost:9092".into(), "output-topic".into());
-        let record = make_test_record(10);
-        sink.write_batch(&[record]).expect("write should succeed");
-        assert_eq!(sink.records_written(), 10);
-        sink.close().expect("close should succeed");
     }
 
     #[test]

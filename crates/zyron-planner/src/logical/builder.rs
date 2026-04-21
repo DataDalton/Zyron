@@ -7,7 +7,7 @@
 use crate::binder::*;
 use crate::logical::*;
 use zyron_catalog::ColumnId;
-use zyron_common::{Result, TypeId};
+use zyron_common::{Result, TypeId, ZyronError};
 use zyron_parser::ast::LiteralValue;
 
 /// Converts a bound statement into a logical plan tree.
@@ -17,6 +17,21 @@ pub fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
         BoundStatement::Insert(insert) => build_insert_plan(insert),
         BoundStatement::Update(update) => build_update_plan(update),
         BoundStatement::Delete(delete) => build_delete_plan(delete),
+        BoundStatement::CreateStreamingJob(_)
+        | BoundStatement::DropStreamingJob { .. }
+        | BoundStatement::AlterStreamingJob { .. } => Err(ZyronError::PlanError(
+            "streaming jobs are dispatched directly from wire, not through physical planner"
+                .to_string(),
+        )),
+        BoundStatement::CreateExternalSource(_)
+        | BoundStatement::CreateExternalSink(_)
+        | BoundStatement::DropExternalSource { .. }
+        | BoundStatement::DropExternalSink { .. }
+        | BoundStatement::AlterExternalSource(_)
+        | BoundStatement::AlterExternalSink(_) => Err(ZyronError::PlanError(
+            "external source and sink DDL is dispatched directly from wire, not through physical planner"
+                .to_string(),
+        )),
     }
 }
 

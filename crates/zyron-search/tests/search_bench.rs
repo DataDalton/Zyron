@@ -2,7 +2,7 @@
 
 //! Full-Text Search and Vector/Graph Search Benchmark Suite
 //!
-//! Integration tests for ZyronDB FTS engine and Phase 13.5 vector/graph search:
+//! Integration tests for ZyronDB FTS engine and vector/graph search:
 //! - Basic search correctness and relevance ordering
 //! - Boolean search (must/must_not/should)
 //! - Phrase search with positional verification
@@ -1079,10 +1079,10 @@ fn test_10_performance() {
 }
 
 // =============================================================================
-// Phase 13.5: Vector and Graph Search Validation Tests
+// Vector and Graph Search Validation Tests
 // =============================================================================
 //
-// Performance Targets (Phase 13.5):
+// Performance Targets:
 // | Test                     | Metric    | Minimum Threshold |
 // |--------------------------|-----------|-------------------|
 // | ANN build (1M, 128d)    | latency   | <=40s             |
@@ -1103,7 +1103,7 @@ use zyron_search::vector::{
     VectorSearch, computeDistance,
 };
 
-// Phase 13.5 performance target constants
+// Performance target constants
 const ANN_BUILD_TARGET_SEC: f64 = 40.0;
 const ANN_SEARCH_QPS_TARGET: f64 = 8000.0;
 const ANN_RECALL_TARGET: f64 = 0.95;

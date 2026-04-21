@@ -6,6 +6,8 @@
 //! that bypasses ScalarValue on the hot path.
 
 use crate::column::{ScalarValue, StreamColumn, StreamColumnData};
+use crate::row_codec::StreamValue;
+use zyron_common::{Result, TypeId, ZyronError};
 
 // ---------------------------------------------------------------------------
 // StreamAccumulator trait
@@ -596,6 +598,775 @@ impl StreamAccumulator for MaxAccumulator {
 
     fn name(&self) -> &'static str {
         "max"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WindowAccumulator trait and registry for streaming aggregates
+// ---------------------------------------------------------------------------
+//
+// This is the runner-facing accumulator surface. Each window-key pair holds
+// an opaque Vec<u8> state. The runner decodes state, calls update with one
+// decoded StreamValue, and writes the updated state back to WindowStateStore.
+// At window close, finalize produces the StreamValue the sink receives. The
+// typed ScalarValue accumulators above serve a separate vectorized operator
+// pipeline and are kept intact.
+
+/// Window-aggregate accumulator contract used by the streaming runner.
+pub trait WindowAccumulator: Send + Sync {
+    /// Initial state bytes for a fresh (window, key) pair.
+    fn init(&self) -> Vec<u8>;
+
+    /// Folds one input value into the existing state bytes.
+    fn update(&self, state: &mut Vec<u8>, value: &StreamValue) -> Result<()>;
+
+    /// Produces the finalized StreamValue from the state at window close.
+    fn finalize(&self, state: &[u8]) -> Result<StreamValue>;
+
+    /// TypeId of the finalized output column.
+    fn output_type(&self) -> TypeId;
+}
+
+/// Returns the window accumulator for a named aggregate function and its
+/// input TypeId. Returns None for unknown names or unsupported type pairs.
+/// Names are matched case-insensitively. COUNT(*) is represented by name
+/// "COUNT" with a TypeId::Null input to distinguish it from COUNT(col).
+pub fn get_accumulator(name: &str, input: TypeId) -> Option<Box<dyn WindowAccumulator>> {
+    let upper = name.to_ascii_uppercase();
+    match upper.as_str() {
+        "COUNT" => {
+            if input == TypeId::Null {
+                Some(Box::new(CountStarWindowAcc))
+            } else {
+                Some(Box::new(CountColWindowAcc))
+            }
+        }
+        "SUM" => {
+            if is_float(input) {
+                Some(Box::new(SumF64WindowAcc))
+            } else if is_int(input) {
+                Some(Box::new(SumI64WindowAcc))
+            } else {
+                None
+            }
+        }
+        "AVG" => {
+            if is_numeric(input) {
+                Some(Box::new(AvgWindowAcc))
+            } else {
+                None
+            }
+        }
+        "MIN" => {
+            if is_numeric(input) {
+                Some(Box::new(MinWindowAcc {
+                    use_float: is_float(input),
+                    out_type: narrow_numeric(input),
+                }))
+            } else {
+                None
+            }
+        }
+        "MAX" => {
+            if is_numeric(input) {
+                Some(Box::new(MaxWindowAcc {
+                    use_float: is_float(input),
+                    out_type: narrow_numeric(input),
+                }))
+            } else {
+                None
+            }
+        }
+        "FIRST" => Some(Box::new(FirstWindowAcc { out_type: input })),
+        "LAST" => Some(Box::new(LastWindowAcc { out_type: input })),
+        _ => None,
+    }
+}
+
+#[inline]
+fn is_int(t: TypeId) -> bool {
+    matches!(
+        t,
+        TypeId::Int8
+            | TypeId::Int16
+            | TypeId::Int32
+            | TypeId::Int64
+            | TypeId::UInt8
+            | TypeId::UInt16
+            | TypeId::UInt32
+            | TypeId::UInt64
+    )
+}
+
+#[inline]
+fn is_float(t: TypeId) -> bool {
+    matches!(t, TypeId::Float32 | TypeId::Float64)
+}
+
+#[inline]
+fn is_numeric(t: TypeId) -> bool {
+    is_int(t) || is_float(t)
+}
+
+#[inline]
+fn narrow_numeric(t: TypeId) -> TypeId {
+    if is_float(t) {
+        TypeId::Float64
+    } else {
+        TypeId::Int64
+    }
+}
+
+fn sv_as_i64(v: &StreamValue) -> Option<i64> {
+    match v {
+        StreamValue::I64(x) => Some(*x),
+        StreamValue::I128(x) => i64::try_from(*x).ok(),
+        StreamValue::F64(x) => Some(*x as i64),
+        StreamValue::Bool(b) => Some(if *b { 1 } else { 0 }),
+        _ => None,
+    }
+}
+
+fn sv_as_f64(v: &StreamValue) -> Option<f64> {
+    match v {
+        StreamValue::F64(x) => Some(*x),
+        StreamValue::I64(x) => Some(*x as f64),
+        StreamValue::I128(x) => Some(*x as f64),
+        _ => None,
+    }
+}
+
+// -----
+// COUNT(*) accumulator. 8-byte little-endian i64 counter.
+// -----
+
+pub struct CountStarWindowAcc;
+
+impl WindowAccumulator for CountStarWindowAcc {
+    fn init(&self) -> Vec<u8> {
+        0i64.to_le_bytes().to_vec()
+    }
+    fn update(&self, state: &mut Vec<u8>, _value: &StreamValue) -> Result<()> {
+        let mut c = read_i64(state)?;
+        c += 1;
+        write_i64(state, c);
+        Ok(())
+    }
+    fn finalize(&self, state: &[u8]) -> Result<StreamValue> {
+        Ok(StreamValue::I64(read_i64(state)?))
+    }
+    fn output_type(&self) -> TypeId {
+        TypeId::Int64
+    }
+}
+
+// -----
+// COUNT(col) accumulator. Skips nulls.
+// -----
+
+pub struct CountColWindowAcc;
+
+impl WindowAccumulator for CountColWindowAcc {
+    fn init(&self) -> Vec<u8> {
+        0i64.to_le_bytes().to_vec()
+    }
+    fn update(&self, state: &mut Vec<u8>, value: &StreamValue) -> Result<()> {
+        if matches!(value, StreamValue::Null) {
+            return Ok(());
+        }
+        let mut c = read_i64(state)?;
+        c += 1;
+        write_i64(state, c);
+        Ok(())
+    }
+    fn finalize(&self, state: &[u8]) -> Result<StreamValue> {
+        Ok(StreamValue::I64(read_i64(state)?))
+    }
+    fn output_type(&self) -> TypeId {
+        TypeId::Int64
+    }
+}
+
+// -----
+// SUM over integers. i64 state.
+// -----
+
+pub struct SumI64WindowAcc;
+
+impl WindowAccumulator for SumI64WindowAcc {
+    fn init(&self) -> Vec<u8> {
+        0i64.to_le_bytes().to_vec()
+    }
+    fn update(&self, state: &mut Vec<u8>, value: &StreamValue) -> Result<()> {
+        if matches!(value, StreamValue::Null) {
+            return Ok(());
+        }
+        let n = sv_as_i64(value)
+            .ok_or_else(|| ZyronError::StreamingError("SUM input is not integral".to_string()))?;
+        let mut s = read_i64(state)?;
+        s = s.wrapping_add(n);
+        write_i64(state, s);
+        Ok(())
+    }
+    fn finalize(&self, state: &[u8]) -> Result<StreamValue> {
+        Ok(StreamValue::I64(read_i64(state)?))
+    }
+    fn output_type(&self) -> TypeId {
+        TypeId::Int64
+    }
+}
+
+// -----
+// SUM over floats. f64 state.
+// -----
+
+pub struct SumF64WindowAcc;
+
+impl WindowAccumulator for SumF64WindowAcc {
+    fn init(&self) -> Vec<u8> {
+        0.0f64.to_le_bytes().to_vec()
+    }
+    fn update(&self, state: &mut Vec<u8>, value: &StreamValue) -> Result<()> {
+        if matches!(value, StreamValue::Null) {
+            return Ok(());
+        }
+        let n = sv_as_f64(value)
+            .ok_or_else(|| ZyronError::StreamingError("SUM input is not numeric".to_string()))?;
+        let mut s = read_f64(state)?;
+        s += n;
+        write_f64(state, s);
+        Ok(())
+    }
+    fn finalize(&self, state: &[u8]) -> Result<StreamValue> {
+        Ok(StreamValue::F64(read_f64(state)?))
+    }
+    fn output_type(&self) -> TypeId {
+        TypeId::Float64
+    }
+}
+
+// -----
+// AVG accumulator. 16 bytes: i64 count + f64 sum.
+// -----
+
+pub struct AvgWindowAcc;
+
+impl WindowAccumulator for AvgWindowAcc {
+    fn init(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(16);
+        v.extend_from_slice(&0i64.to_le_bytes());
+        v.extend_from_slice(&0.0f64.to_le_bytes());
+        v
+    }
+    fn update(&self, state: &mut Vec<u8>, value: &StreamValue) -> Result<()> {
+        if matches!(value, StreamValue::Null) {
+            return Ok(());
+        }
+        let n = sv_as_f64(value)
+            .ok_or_else(|| ZyronError::StreamingError("AVG input is not numeric".to_string()))?;
+        if state.len() < 16 {
+            return Err(ZyronError::StreamingError(
+                "AVG state truncated".to_string(),
+            ));
+        }
+        let mut count = i64::from_le_bytes(state[0..8].try_into().unwrap());
+        let mut sum = f64::from_le_bytes(state[8..16].try_into().unwrap());
+        count += 1;
+        sum += n;
+        state[0..8].copy_from_slice(&count.to_le_bytes());
+        state[8..16].copy_from_slice(&sum.to_le_bytes());
+        Ok(())
+    }
+    fn finalize(&self, state: &[u8]) -> Result<StreamValue> {
+        if state.len() < 16 {
+            return Err(ZyronError::StreamingError(
+                "AVG state truncated".to_string(),
+            ));
+        }
+        let count = i64::from_le_bytes(state[0..8].try_into().unwrap());
+        let sum = f64::from_le_bytes(state[8..16].try_into().unwrap());
+        if count == 0 {
+            Ok(StreamValue::Null)
+        } else {
+            Ok(StreamValue::F64(sum / count as f64))
+        }
+    }
+    fn output_type(&self) -> TypeId {
+        TypeId::Float64
+    }
+}
+
+// -----
+// MIN accumulator. State is 1 byte has_value flag + f64 or i64 current best.
+// -----
+
+pub struct MinWindowAcc {
+    use_float: bool,
+    out_type: TypeId,
+}
+
+impl WindowAccumulator for MinWindowAcc {
+    fn init(&self) -> Vec<u8> {
+        vec![0u8; 9]
+    }
+    fn update(&self, state: &mut Vec<u8>, value: &StreamValue) -> Result<()> {
+        if matches!(value, StreamValue::Null) {
+            return Ok(());
+        }
+        if state.len() < 9 {
+            return Err(ZyronError::StreamingError(
+                "MIN state truncated".to_string(),
+            ));
+        }
+        let has = state[0] != 0;
+        if self.use_float {
+            let incoming = sv_as_f64(value).ok_or_else(|| {
+                ZyronError::StreamingError("MIN input is not numeric".to_string())
+            })?;
+            let current = f64::from_le_bytes(state[1..9].try_into().unwrap());
+            let new = if !has || incoming < current {
+                incoming
+            } else {
+                current
+            };
+            state[0] = 1;
+            state[1..9].copy_from_slice(&new.to_le_bytes());
+        } else {
+            let incoming = sv_as_i64(value).ok_or_else(|| {
+                ZyronError::StreamingError("MIN input is not integral".to_string())
+            })?;
+            let current = i64::from_le_bytes(state[1..9].try_into().unwrap());
+            let new = if !has || incoming < current {
+                incoming
+            } else {
+                current
+            };
+            state[0] = 1;
+            state[1..9].copy_from_slice(&new.to_le_bytes());
+        }
+        Ok(())
+    }
+    fn finalize(&self, state: &[u8]) -> Result<StreamValue> {
+        if state.len() < 9 {
+            return Err(ZyronError::StreamingError(
+                "MIN state truncated".to_string(),
+            ));
+        }
+        if state[0] == 0 {
+            return Ok(StreamValue::Null);
+        }
+        if self.use_float {
+            Ok(StreamValue::F64(f64::from_le_bytes(
+                state[1..9].try_into().unwrap(),
+            )))
+        } else {
+            Ok(StreamValue::I64(i64::from_le_bytes(
+                state[1..9].try_into().unwrap(),
+            )))
+        }
+    }
+    fn output_type(&self) -> TypeId {
+        self.out_type
+    }
+}
+
+// -----
+// MAX accumulator. Mirror of MinWindowAcc.
+// -----
+
+pub struct MaxWindowAcc {
+    use_float: bool,
+    out_type: TypeId,
+}
+
+impl WindowAccumulator for MaxWindowAcc {
+    fn init(&self) -> Vec<u8> {
+        vec![0u8; 9]
+    }
+    fn update(&self, state: &mut Vec<u8>, value: &StreamValue) -> Result<()> {
+        if matches!(value, StreamValue::Null) {
+            return Ok(());
+        }
+        if state.len() < 9 {
+            return Err(ZyronError::StreamingError(
+                "MAX state truncated".to_string(),
+            ));
+        }
+        let has = state[0] != 0;
+        if self.use_float {
+            let incoming = sv_as_f64(value).ok_or_else(|| {
+                ZyronError::StreamingError("MAX input is not numeric".to_string())
+            })?;
+            let current = f64::from_le_bytes(state[1..9].try_into().unwrap());
+            let new = if !has || incoming > current {
+                incoming
+            } else {
+                current
+            };
+            state[0] = 1;
+            state[1..9].copy_from_slice(&new.to_le_bytes());
+        } else {
+            let incoming = sv_as_i64(value).ok_or_else(|| {
+                ZyronError::StreamingError("MAX input is not integral".to_string())
+            })?;
+            let current = i64::from_le_bytes(state[1..9].try_into().unwrap());
+            let new = if !has || incoming > current {
+                incoming
+            } else {
+                current
+            };
+            state[0] = 1;
+            state[1..9].copy_from_slice(&new.to_le_bytes());
+        }
+        Ok(())
+    }
+    fn finalize(&self, state: &[u8]) -> Result<StreamValue> {
+        if state.len() < 9 {
+            return Err(ZyronError::StreamingError(
+                "MAX state truncated".to_string(),
+            ));
+        }
+        if state[0] == 0 {
+            return Ok(StreamValue::Null);
+        }
+        if self.use_float {
+            Ok(StreamValue::F64(f64::from_le_bytes(
+                state[1..9].try_into().unwrap(),
+            )))
+        } else {
+            Ok(StreamValue::I64(i64::from_le_bytes(
+                state[1..9].try_into().unwrap(),
+            )))
+        }
+    }
+    fn output_type(&self) -> TypeId {
+        self.out_type
+    }
+}
+
+// -----
+// FIRST and LAST accumulators. State format:
+//   [1 byte has_value] [1 byte tag] [variable payload]
+// Tags: 0 = Null, 1 = Bool, 2 = I64, 3 = F64, 4 = I128, 5 = Utf8, 6 = Binary
+// -----
+
+pub struct FirstWindowAcc {
+    out_type: TypeId,
+}
+
+impl WindowAccumulator for FirstWindowAcc {
+    fn init(&self) -> Vec<u8> {
+        vec![0u8]
+    }
+    fn update(&self, state: &mut Vec<u8>, value: &StreamValue) -> Result<()> {
+        if !state.is_empty() && state[0] != 0 {
+            return Ok(());
+        }
+        let mut buf = Vec::with_capacity(32);
+        buf.push(1u8);
+        encode_sv(&mut buf, value);
+        *state = buf;
+        Ok(())
+    }
+    fn finalize(&self, state: &[u8]) -> Result<StreamValue> {
+        if state.is_empty() || state[0] == 0 {
+            return Ok(StreamValue::Null);
+        }
+        decode_sv(&state[1..])
+    }
+    fn output_type(&self) -> TypeId {
+        self.out_type
+    }
+}
+
+pub struct LastWindowAcc {
+    out_type: TypeId,
+}
+
+impl WindowAccumulator for LastWindowAcc {
+    fn init(&self) -> Vec<u8> {
+        vec![0u8]
+    }
+    fn update(&self, state: &mut Vec<u8>, value: &StreamValue) -> Result<()> {
+        let mut buf = Vec::with_capacity(32);
+        buf.push(1u8);
+        encode_sv(&mut buf, value);
+        *state = buf;
+        Ok(())
+    }
+    fn finalize(&self, state: &[u8]) -> Result<StreamValue> {
+        if state.is_empty() || state[0] == 0 {
+            return Ok(StreamValue::Null);
+        }
+        decode_sv(&state[1..])
+    }
+    fn output_type(&self) -> TypeId {
+        self.out_type
+    }
+}
+
+// -----
+// Low-level state helpers
+// -----
+
+#[inline]
+fn read_i64(state: &[u8]) -> Result<i64> {
+    if state.len() < 8 {
+        return Err(ZyronError::StreamingError(
+            "accumulator state too short for i64".to_string(),
+        ));
+    }
+    Ok(i64::from_le_bytes(state[..8].try_into().unwrap()))
+}
+
+#[inline]
+fn write_i64(state: &mut Vec<u8>, v: i64) {
+    if state.len() < 8 {
+        state.resize(8, 0);
+    }
+    state[..8].copy_from_slice(&v.to_le_bytes());
+}
+
+#[inline]
+fn read_f64(state: &[u8]) -> Result<f64> {
+    if state.len() < 8 {
+        return Err(ZyronError::StreamingError(
+            "accumulator state too short for f64".to_string(),
+        ));
+    }
+    Ok(f64::from_le_bytes(state[..8].try_into().unwrap()))
+}
+
+#[inline]
+fn write_f64(state: &mut Vec<u8>, v: f64) {
+    if state.len() < 8 {
+        state.resize(8, 0);
+    }
+    state[..8].copy_from_slice(&v.to_le_bytes());
+}
+
+fn encode_sv(buf: &mut Vec<u8>, v: &StreamValue) {
+    match v {
+        StreamValue::Null => buf.push(0),
+        StreamValue::Bool(b) => {
+            buf.push(1);
+            buf.push(if *b { 1 } else { 0 });
+        }
+        StreamValue::I64(x) => {
+            buf.push(2);
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
+        StreamValue::F64(x) => {
+            buf.push(3);
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
+        StreamValue::I128(x) => {
+            buf.push(4);
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
+        StreamValue::Utf8(s) => {
+            buf.push(5);
+            let bytes = s.as_bytes();
+            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(bytes);
+        }
+        StreamValue::Binary(b) => {
+            buf.push(6);
+            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(b);
+        }
+    }
+}
+
+fn decode_sv(bytes: &[u8]) -> Result<StreamValue> {
+    if bytes.is_empty() {
+        return Err(ZyronError::StreamingError("empty StreamValue".to_string()));
+    }
+    match bytes[0] {
+        0 => Ok(StreamValue::Null),
+        1 => {
+            if bytes.len() < 2 {
+                return Err(ZyronError::StreamingError("Bool truncated".to_string()));
+            }
+            Ok(StreamValue::Bool(bytes[1] != 0))
+        }
+        2 => {
+            if bytes.len() < 9 {
+                return Err(ZyronError::StreamingError("I64 truncated".to_string()));
+            }
+            Ok(StreamValue::I64(i64::from_le_bytes(
+                bytes[1..9].try_into().unwrap(),
+            )))
+        }
+        3 => {
+            if bytes.len() < 9 {
+                return Err(ZyronError::StreamingError("F64 truncated".to_string()));
+            }
+            Ok(StreamValue::F64(f64::from_le_bytes(
+                bytes[1..9].try_into().unwrap(),
+            )))
+        }
+        4 => {
+            if bytes.len() < 17 {
+                return Err(ZyronError::StreamingError("I128 truncated".to_string()));
+            }
+            Ok(StreamValue::I128(i128::from_le_bytes(
+                bytes[1..17].try_into().unwrap(),
+            )))
+        }
+        5 => {
+            if bytes.len() < 5 {
+                return Err(ZyronError::StreamingError("Utf8 truncated".to_string()));
+            }
+            let len = u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
+            if bytes.len() < 5 + len {
+                return Err(ZyronError::StreamingError(
+                    "Utf8 payload truncated".to_string(),
+                ));
+            }
+            Ok(StreamValue::Utf8(
+                String::from_utf8_lossy(&bytes[5..5 + len]).into_owned(),
+            ))
+        }
+        6 => {
+            if bytes.len() < 5 {
+                return Err(ZyronError::StreamingError("Binary truncated".to_string()));
+            }
+            let len = u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
+            if bytes.len() < 5 + len {
+                return Err(ZyronError::StreamingError(
+                    "Binary payload truncated".to_string(),
+                ));
+            }
+            Ok(StreamValue::Binary(bytes[5..5 + len].to_vec()))
+        }
+        other => Err(ZyronError::StreamingError(format!(
+            "unknown StreamValue tag {other}"
+        ))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod window_accumulator_tests {
+    use super::*;
+
+    #[test]
+    fn count_star_increments_on_every_row() {
+        let acc = get_accumulator("COUNT", TypeId::Null).unwrap();
+        let mut s = acc.init();
+        for _ in 0..5 {
+            acc.update(&mut s, &StreamValue::Null).unwrap();
+        }
+        let v = acc.finalize(&s).unwrap();
+        assert!(matches!(v, StreamValue::I64(5)));
+    }
+
+    #[test]
+    fn count_col_skips_null() {
+        let acc = get_accumulator("COUNT", TypeId::Int64).unwrap();
+        let mut s = acc.init();
+        acc.update(&mut s, &StreamValue::I64(1)).unwrap();
+        acc.update(&mut s, &StreamValue::Null).unwrap();
+        acc.update(&mut s, &StreamValue::I64(3)).unwrap();
+        assert!(matches!(acc.finalize(&s).unwrap(), StreamValue::I64(2)));
+    }
+
+    #[test]
+    fn sum_i64_accumulates() {
+        let acc = get_accumulator("SUM", TypeId::Int64).unwrap();
+        let mut s = acc.init();
+        for v in [1i64, 2, 3, 4] {
+            acc.update(&mut s, &StreamValue::I64(v)).unwrap();
+        }
+        assert!(matches!(acc.finalize(&s).unwrap(), StreamValue::I64(10)));
+    }
+
+    #[test]
+    fn sum_f64_accumulates() {
+        let acc = get_accumulator("SUM", TypeId::Float64).unwrap();
+        let mut s = acc.init();
+        for v in [0.5f64, 1.5, 2.0] {
+            acc.update(&mut s, &StreamValue::F64(v)).unwrap();
+        }
+        match acc.finalize(&s).unwrap() {
+            StreamValue::F64(x) => assert!((x - 4.0).abs() < 1e-9),
+            other => panic!("expected F64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn avg_returns_null_when_empty() {
+        let acc = get_accumulator("AVG", TypeId::Int64).unwrap();
+        let s = acc.init();
+        assert!(matches!(acc.finalize(&s).unwrap(), StreamValue::Null));
+    }
+
+    #[test]
+    fn avg_divides_sum_by_count() {
+        let acc = get_accumulator("AVG", TypeId::Int64).unwrap();
+        let mut s = acc.init();
+        for v in [10i64, 20, 30] {
+            acc.update(&mut s, &StreamValue::I64(v)).unwrap();
+        }
+        match acc.finalize(&s).unwrap() {
+            StreamValue::F64(x) => assert!((x - 20.0).abs() < 1e-9),
+            other => panic!("expected F64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn min_tracks_smallest() {
+        let acc = get_accumulator("MIN", TypeId::Int64).unwrap();
+        let mut s = acc.init();
+        for v in [30i64, 10, 20] {
+            acc.update(&mut s, &StreamValue::I64(v)).unwrap();
+        }
+        assert!(matches!(acc.finalize(&s).unwrap(), StreamValue::I64(10)));
+    }
+
+    #[test]
+    fn max_tracks_largest() {
+        let acc = get_accumulator("MAX", TypeId::Float64).unwrap();
+        let mut s = acc.init();
+        for v in [1.0f64, 5.5, 3.0] {
+            acc.update(&mut s, &StreamValue::F64(v)).unwrap();
+        }
+        match acc.finalize(&s).unwrap() {
+            StreamValue::F64(x) => assert!((x - 5.5).abs() < 1e-9),
+            other => panic!("expected F64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn first_retains_earliest_value() {
+        let acc = get_accumulator("FIRST", TypeId::Int64).unwrap();
+        let mut s = acc.init();
+        acc.update(&mut s, &StreamValue::I64(7)).unwrap();
+        acc.update(&mut s, &StreamValue::I64(11)).unwrap();
+        assert!(matches!(acc.finalize(&s).unwrap(), StreamValue::I64(7)));
+    }
+
+    #[test]
+    fn last_retains_final_value() {
+        let acc = get_accumulator("LAST", TypeId::Varchar).unwrap();
+        let mut s = acc.init();
+        acc.update(&mut s, &StreamValue::Utf8("a".to_string()))
+            .unwrap();
+        acc.update(&mut s, &StreamValue::Utf8("z".to_string()))
+            .unwrap();
+        match acc.finalize(&s).unwrap() {
+            StreamValue::Utf8(ref z) => assert_eq!(z, "z"),
+            other => panic!("expected Utf8, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_aggregate_returns_none() {
+        assert!(get_accumulator("WEIRD", TypeId::Int64).is_none());
     }
 }
 

@@ -1,9 +1,9 @@
-//! Phase 9 optimizer validation and benchmark suite.
+//! Optimizer validation and benchmark suite.
 //!
 //! Covers histogram accuracy, MCV skewed distributions, join cardinality,
 //! parallel plan selection, encoding pushdown speedup, EXPLAIN ANALYZE,
-//! index advisor accumulation, auto-analyze triggers, and all performance
-//! targets from the Phase 9 specification.
+//! index advisor accumulation, auto-analyze triggers, and the optimizer
+//! performance targets.
 //!
 //! Run: cargo test -p zyron-planner --test optimizer_bench --release -- --nocapture
 
@@ -631,7 +631,7 @@ fn test_mcv_build_and_lookup() {
 }
 
 // =============================================================================
-// Phase 9 Validation 1: Histogram Accuracy (1M rows, uniform, 20% tolerance)
+// Validation 1: Histogram Accuracy (1M rows, uniform, 20% tolerance)
 // =============================================================================
 
 #[test]
@@ -701,7 +701,7 @@ fn test_v1_histogram_accuracy_1m() {
 }
 
 // =============================================================================
-// Phase 9 Validation 2: MCV Skewed Distribution (10%/50% tolerance)
+// Validation 2: MCV Skewed Distribution (10%/50% tolerance)
 // =============================================================================
 
 #[test]
@@ -803,7 +803,7 @@ fn test_v2_mcv_skewed_distribution() {
 }
 
 // =============================================================================
-// Phase 9 Validation 3: Join Cardinality (FK relationship, 3x tolerance)
+// Validation 3: Join Cardinality (FK relationship, 3x tolerance)
 // =============================================================================
 
 #[test]
@@ -911,7 +911,7 @@ fn test_v3_join_cardinality_fk() {
 }
 
 // =============================================================================
-// Phase 9 Validation 4: Parallel Plan Selection
+// Validation 4: Parallel Plan Selection
 // =============================================================================
 
 #[test]
@@ -1010,7 +1010,7 @@ fn test_v4_parallel_plan_selection() {
 }
 
 // =============================================================================
-// Phase 9 Validation 5: Encoding Pushdown Speedup
+// Validation 5: Encoding Pushdown Speedup
 // =============================================================================
 
 #[test]
@@ -1107,7 +1107,7 @@ fn test_v5_encoding_pushdown_speedup() {
 }
 
 // =============================================================================
-// Phase 9 Validation 6: EXPLAIN ANALYZE
+// Validation 6: EXPLAIN ANALYZE
 // =============================================================================
 
 #[test]
@@ -1275,7 +1275,7 @@ fn test_v6_explain_analyze() {
 }
 
 // =============================================================================
-// Phase 9 Validation 7: Index Advisor
+// Validation 7: Index Advisor
 // =============================================================================
 
 #[test]
@@ -1360,7 +1360,7 @@ fn extract_columns_and_record(advisor: &IndexAdvisor, expr: &BoundExpr, table_id
 }
 
 // =============================================================================
-// Phase 9 Validation 8: Auto-Analyze Trigger
+// Validation 8: Auto-Analyze Trigger
 // =============================================================================
 
 #[test]
@@ -1435,7 +1435,7 @@ fn test_v8_auto_analyze_trigger() {
 }
 
 // =============================================================================
-// Phase 9 Performance Targets (5-run averages)
+// Optimizer performance targets (5-run averages)
 // =============================================================================
 
 #[test]

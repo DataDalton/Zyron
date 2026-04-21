@@ -123,6 +123,7 @@ async fn create_test_server(db_name: &str) -> (Arc<ServerState>, tempfile::TempD
         disk_manager: disk,
         txn_manager,
         security_manager: None,
+        key_store: Arc::new(zyron_auth::LocalKeyStore::new([0u8; 32])),
         config_lookup: None,
         config_all: None,
         data_dir: std::path::PathBuf::from(tmp.path()),
@@ -3333,9 +3334,18 @@ fn statement_variant_name(stmt: &zyron_parser::Statement) -> &'static str {
         Statement::DropCdcStream(_) => "DropCdcStream",
         Statement::CreateCdcIngest(_) => "CreateCdcIngest",
         Statement::DropCdcIngest(_) => "DropCdcIngest",
+        Statement::CreateStreamingJob(_) => "CreateStreamingJob",
+        Statement::DropStreamingJob(_) => "DropStreamingJob",
+        Statement::AlterStreamingJob(_) => "AlterStreamingJob",
         Statement::CreateSpatialIndex(_) => "CreateSpatialIndex",
         Statement::CreateGraphSchema(_) => "CreateGraphSchema",
         Statement::DropGraphSchema(_) => "DropGraphSchema",
+        Statement::CreateExternalSource(_) => "CreateExternalSource",
+        Statement::CreateExternalSink(_) => "CreateExternalSink",
+        Statement::DropExternalSource(_) => "DropExternalSource",
+        Statement::DropExternalSink(_) => "DropExternalSink",
+        Statement::AlterExternalSource(_) => "AlterExternalSource",
+        Statement::AlterExternalSink(_) => "AlterExternalSink",
     }
 }
 

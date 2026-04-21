@@ -148,6 +148,7 @@ async fn create_test_state(
                 .expect("SecurityManager creation failed");
             Some(Arc::new(sm))
         },
+        key_store: Arc::new(zyron_auth::LocalKeyStore::new([0u8; 32])),
         config_lookup: None,
         config_all: None,
         data_dir: std::path::PathBuf::from(tmp.path()),
@@ -1546,7 +1547,7 @@ fn test_14_memory_baseline() {
 }
 
 // ===========================================================================
-// Phase 12.5 Integration Tests (15-25)
+// Integration Tests (15-25)
 // ===========================================================================
 
 /// Reads all backend messages until ReadyForQuery, returning full payloads.

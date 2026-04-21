@@ -24,6 +24,12 @@ const COLUMNS_HEAP_FILE_ID: u32 = 106;
 const COLUMNS_FSM_FILE_ID: u32 = 107;
 const INDEXES_HEAP_FILE_ID: u32 = 108;
 const INDEXES_FSM_FILE_ID: u32 = 109;
+const STREAMING_JOBS_HEAP_FILE_ID: u32 = 132;
+const STREAMING_JOBS_FSM_FILE_ID: u32 = 133;
+const EXTERNAL_SOURCES_HEAP_FILE_ID: u32 = 134;
+const EXTERNAL_SOURCES_FSM_FILE_ID: u32 = 135;
+const EXTERNAL_SINKS_HEAP_FILE_ID: u32 = 136;
+const EXTERNAL_SINKS_FSM_FILE_ID: u32 = 137;
 
 /// Starting file ID for user-created heap files (heap=200, fsm=201, ...).
 const USER_HEAP_FILE_START: u32 = 200;
@@ -59,6 +65,24 @@ pub trait CatalogStorage: Send + Sync {
     async fn store_index(&self, entry: &IndexEntry) -> Result<TupleId>;
     async fn delete_index(&self, id: IndexId) -> Result<bool>;
 
+    // Streaming job operations
+    async fn load_streaming_jobs(&self) -> Result<Vec<StreamingJobEntry>>;
+    async fn store_streaming_job(&self, entry: &StreamingJobEntry) -> Result<TupleId>;
+    async fn update_streaming_job(&self, entry: &StreamingJobEntry) -> Result<bool>;
+    async fn delete_streaming_job(&self, id: StreamingJobId) -> Result<bool>;
+
+    // External source operations
+    async fn load_external_sources(&self) -> Result<Vec<ExternalSourceEntry>>;
+    async fn store_external_source(&self, entry: &ExternalSourceEntry) -> Result<TupleId>;
+    async fn update_external_source(&self, entry: &ExternalSourceEntry) -> Result<bool>;
+    async fn delete_external_source(&self, id: ExternalSourceId) -> Result<bool>;
+
+    // External sink operations
+    async fn load_external_sinks(&self) -> Result<Vec<ExternalSinkEntry>>;
+    async fn store_external_sink(&self, entry: &ExternalSinkEntry) -> Result<TupleId>;
+    async fn update_external_sink(&self, entry: &ExternalSinkEntry) -> Result<bool>;
+    async fn delete_external_sink(&self, id: ExternalSinkId) -> Result<bool>;
+
     // Bootstrap and recovery
     async fn is_bootstrapped(&self) -> Result<bool>;
     async fn bootstrap(&self) -> Result<()>;
@@ -76,6 +100,9 @@ pub struct HeapCatalogStorage {
     tables_heap: HeapFile,
     columns_heap: HeapFile,
     indexes_heap: HeapFile,
+    streaming_jobs_heap: HeapFile,
+    external_sources_heap: HeapFile,
+    external_sinks_heap: HeapFile,
     next_heap_file: AtomicU32,
     next_index_file: AtomicU32,
 }
@@ -123,6 +150,30 @@ impl HeapCatalogStorage {
                 fsm_file_id: INDEXES_FSM_FILE_ID,
             },
         )?;
+        let streaming_jobs_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: STREAMING_JOBS_HEAP_FILE_ID,
+                fsm_file_id: STREAMING_JOBS_FSM_FILE_ID,
+            },
+        )?;
+        let external_sources_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: EXTERNAL_SOURCES_HEAP_FILE_ID,
+                fsm_file_id: EXTERNAL_SOURCES_FSM_FILE_ID,
+            },
+        )?;
+        let external_sinks_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: EXTERNAL_SINKS_HEAP_FILE_ID,
+                fsm_file_id: EXTERNAL_SINKS_FSM_FILE_ID,
+            },
+        )?;
 
         Ok(Self {
             databases_heap,
@@ -130,6 +181,9 @@ impl HeapCatalogStorage {
             tables_heap,
             columns_heap,
             indexes_heap,
+            streaming_jobs_heap,
+            external_sources_heap,
+            external_sinks_heap,
             next_heap_file: AtomicU32::new(USER_HEAP_FILE_START),
             next_index_file: AtomicU32::new(USER_INDEX_FILE_START),
         })
@@ -144,6 +198,9 @@ impl HeapCatalogStorage {
             self.tables_heap.init_cache(),
             self.columns_heap.init_cache(),
             self.indexes_heap.init_cache(),
+            self.streaming_jobs_heap.init_cache(),
+            self.external_sources_heap.init_cache(),
+            self.external_sinks_heap.init_cache(),
         )?;
         Ok(())
     }
@@ -354,6 +411,177 @@ impl CatalogStorage for HeapCatalogStorage {
         });
         match target {
             Some(tid) => self.indexes_heap.delete(tid).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn load_streaming_jobs(&self) -> Result<Vec<StreamingJobEntry>> {
+        let mut entries = Vec::new();
+        let guard = self.streaming_jobs_heap.scan()?;
+        guard.for_each(|_tid, view| {
+            if let Ok(entry) = StreamingJobEntry::from_bytes(view.data) {
+                entries.push(entry);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_streaming_job(&self, entry: &StreamingJobEntry) -> Result<TupleId> {
+        let bytes = entry.to_bytes();
+        let tuple = Tuple::new(bytes, 0);
+        let ids = self.streaming_jobs_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
+    }
+
+    async fn update_streaming_job(&self, entry: &StreamingJobEntry) -> Result<bool> {
+        let mut target = None;
+        let guard = self.streaming_jobs_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(existing) = StreamingJobEntry::from_bytes(view.data) {
+                if existing.id == entry.id {
+                    target = Some(tid);
+                }
+            }
+        });
+        drop(guard);
+        match target {
+            Some(tid) => {
+                self.streaming_jobs_heap.delete(tid).await?;
+                let bytes = entry.to_bytes();
+                let tuple = Tuple::new(bytes, 0);
+                self.streaming_jobs_heap.insert_batch(&[tuple]).await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn delete_streaming_job(&self, id: StreamingJobId) -> Result<bool> {
+        let mut target = None;
+        let guard = self.streaming_jobs_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(entry) = StreamingJobEntry::from_bytes(view.data) {
+                if entry.id == id {
+                    target = Some(tid);
+                }
+            }
+        });
+        match target {
+            Some(tid) => self.streaming_jobs_heap.delete(tid).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn load_external_sources(&self) -> Result<Vec<ExternalSourceEntry>> {
+        let mut entries = Vec::new();
+        let guard = self.external_sources_heap.scan()?;
+        guard.for_each(|_tid, view| {
+            if let Ok(entry) = ExternalSourceEntry::from_bytes(view.data) {
+                entries.push(entry);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_external_source(&self, entry: &ExternalSourceEntry) -> Result<TupleId> {
+        let bytes = entry.to_bytes();
+        let tuple = Tuple::new(bytes, 0);
+        let ids = self.external_sources_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
+    }
+
+    async fn update_external_source(&self, entry: &ExternalSourceEntry) -> Result<bool> {
+        let mut target = None;
+        let guard = self.external_sources_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(existing) = ExternalSourceEntry::from_bytes(view.data) {
+                if existing.id == entry.id {
+                    target = Some(tid);
+                }
+            }
+        });
+        drop(guard);
+        match target {
+            Some(tid) => {
+                self.external_sources_heap.delete(tid).await?;
+                let bytes = entry.to_bytes();
+                let tuple = Tuple::new(bytes, 0);
+                self.external_sources_heap.insert_batch(&[tuple]).await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn delete_external_source(&self, id: ExternalSourceId) -> Result<bool> {
+        let mut target = None;
+        let guard = self.external_sources_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(entry) = ExternalSourceEntry::from_bytes(view.data) {
+                if entry.id == id {
+                    target = Some(tid);
+                }
+            }
+        });
+        match target {
+            Some(tid) => self.external_sources_heap.delete(tid).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn load_external_sinks(&self) -> Result<Vec<ExternalSinkEntry>> {
+        let mut entries = Vec::new();
+        let guard = self.external_sinks_heap.scan()?;
+        guard.for_each(|_tid, view| {
+            if let Ok(entry) = ExternalSinkEntry::from_bytes(view.data) {
+                entries.push(entry);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_external_sink(&self, entry: &ExternalSinkEntry) -> Result<TupleId> {
+        let bytes = entry.to_bytes();
+        let tuple = Tuple::new(bytes, 0);
+        let ids = self.external_sinks_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
+    }
+
+    async fn update_external_sink(&self, entry: &ExternalSinkEntry) -> Result<bool> {
+        let mut target = None;
+        let guard = self.external_sinks_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(existing) = ExternalSinkEntry::from_bytes(view.data) {
+                if existing.id == entry.id {
+                    target = Some(tid);
+                }
+            }
+        });
+        drop(guard);
+        match target {
+            Some(tid) => {
+                self.external_sinks_heap.delete(tid).await?;
+                let bytes = entry.to_bytes();
+                let tuple = Tuple::new(bytes, 0);
+                self.external_sinks_heap.insert_batch(&[tuple]).await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn delete_external_sink(&self, id: ExternalSinkId) -> Result<bool> {
+        let mut target = None;
+        let guard = self.external_sinks_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(entry) = ExternalSinkEntry::from_bytes(view.data) {
+                if entry.id == id {
+                    target = Some(tid);
+                }
+            }
+        });
+        match target {
+            Some(tid) => self.external_sinks_heap.delete(tid).await,
             None => Ok(false),
         }
     }

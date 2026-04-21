@@ -91,7 +91,7 @@ impl Transaction {
     }
 
     /// Returns the transaction's txn_id as u32 for WAL/TupleHeader writes.
-    /// Panics if txn_id exceeds u32::MAX (should not happen in Phase 1.5).
+    /// Errors if txn_id exceeds u32::MAX, which the sequencer does not permit.
     #[inline]
     pub fn txn_id_u32(&self) -> Result<u32> {
         u32::try_from(self.txn_id).map_err(|_| {

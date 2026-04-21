@@ -2765,7 +2765,7 @@ fn test_serialization_roundtrips() {
 }
 
 // ===========================================================================
-// Phase 8.5: Row-Level Security
+// Row-Level Security
 // ===========================================================================
 
 #[test]
@@ -3055,7 +3055,7 @@ fn test_rls_serialization_roundtrip() {
 }
 
 // ===========================================================================
-// Phase 8.5: Column Masking Policies
+// Column Masking Policies
 // ===========================================================================
 
 #[test]
@@ -3270,7 +3270,7 @@ fn test_column_masking_policy_serialization() {
 }
 
 // ===========================================================================
-// Phase 8.5: ABAC Rule Evaluation
+// ABAC Rule Evaluation
 // ===========================================================================
 
 #[test]
@@ -3516,7 +3516,7 @@ fn test_abac_rule_serialization() {
 }
 
 // ===========================================================================
-// Phase 8.5: Encryption Round-Trip
+// Encryption Round-Trip
 // ===========================================================================
 
 #[test]
@@ -3779,7 +3779,7 @@ fn test_encryption_column_config_serialization() {
 }
 
 // ===========================================================================
-// Phase 8.5: Security Labels (Mandatory Access Control)
+// Security Labels (Mandatory Access Control)
 // ===========================================================================
 
 #[test]
@@ -3970,7 +3970,7 @@ fn test_security_label_serialization() {
 }
 
 // ===========================================================================
-// Phase 8.5: Webhook Verification
+// Webhook Verification
 // ===========================================================================
 
 #[test]
@@ -4120,7 +4120,7 @@ fn test_webhook_verify_latency() {
 }
 
 // ===========================================================================
-// Phase 8.5: Crypto SQL Functions
+// Crypto SQL Functions
 // ===========================================================================
 
 #[test]

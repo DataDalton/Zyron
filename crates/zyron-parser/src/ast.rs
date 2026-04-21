@@ -135,6 +135,12 @@ pub enum Statement {
     CreateCdcIngest(Box<CreateCdcIngestStatement>),
     /// DROP CDC INGEST name
     DropCdcIngest(Box<DropCdcIngestStatement>),
+    /// CREATE STREAMING JOB name AS <select> INTO target [WRITE MODE APPEND|UPSERT]
+    CreateStreamingJob(Box<CreateStreamingJobStatement>),
+    /// DROP STREAMING JOB [IF EXISTS] name
+    DropStreamingJob(Box<DropStreamingJobStatement>),
+    /// ALTER STREAMING JOB name PAUSE | RESUME
+    AlterStreamingJob(Box<AlterStreamingJobStatement>),
     /// CREATE PUBLICATION name FOR TABLE t1, t2, ...
     CreatePublication(Box<CreatePublicationStatement>),
     /// ALTER PUBLICATION name ADD/DROP TABLE t
@@ -167,6 +173,18 @@ pub enum Statement {
     CreateGraphSchema(Box<CreateGraphSchemaStatement>),
     /// DROP GRAPH SCHEMA [IF EXISTS] name
     DropGraphSchema(Box<DropGraphSchemaStatement>),
+    /// CREATE EXTERNAL SOURCE name TYPE backend URI uri FORMAT fmt ...
+    CreateExternalSource(Box<CreateExternalSourceStatement>),
+    /// CREATE EXTERNAL SINK name TYPE backend URI uri FORMAT fmt ...
+    CreateExternalSink(Box<CreateExternalSinkStatement>),
+    /// DROP EXTERNAL SOURCE [IF EXISTS] name
+    DropExternalSource(Box<DropExternalSourceStatement>),
+    /// DROP EXTERNAL SINK [IF EXISTS] name
+    DropExternalSink(Box<DropExternalSinkStatement>),
+    /// ALTER EXTERNAL SOURCE name ...
+    AlterExternalSource(Box<AlterExternalSourceStatement>),
+    /// ALTER EXTERNAL SINK name ...
+    AlterExternalSink(Box<AlterExternalSinkStatement>),
 }
 
 // ---------------------------------------------------------------------------
@@ -534,25 +552,57 @@ pub struct ShowStatement {
 // Bulk copy
 // ---------------------------------------------------------------------------
 
-/// COPY table [(columns)] FROM/TO target
+/// COPY statement in one of three shapes. Legacy STDIN / STDOUT / local-file
+/// targets are represented as `CopyExternal::Stdio` or `CopyExternal::LocalFile`
+/// inside `CopyKind::IntoTable` or `CopyKind::FromTable`, so the wire layer
+/// continues to recognise the PostgreSQL simple-query forms while the binder
+/// and executor can distinguish true external endpoints.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CopyStatement {
-    pub table: String,
-    pub columns: Vec<String>,
-    pub direction: CopyDirection,
+    pub kind: CopyKind,
+    pub options: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum CopyDirection {
-    From(CopyTarget),
-    To(CopyTarget),
+pub enum CopyKind {
+    /// External endpoint (or STDIN, or a local file path) into a Zyron table.
+    IntoTable {
+        table: String,
+        columns: Vec<String>,
+        source: CopyExternal,
+    },
+    /// Zyron table into an external endpoint (or STDOUT, or a local file path).
+    FromTable {
+        table: String,
+        columns: Vec<String>,
+        sink: CopyExternal,
+    },
+    /// External endpoint into another external endpoint with no Zyron table
+    /// on either side. Runs as a one-shot streaming copy in the session.
+    ExternalToExternal {
+        source: CopyExternal,
+        sink: CopyExternal,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum CopyTarget {
-    Stdin,
-    Stdout,
-    File(String),
+pub enum CopyExternal {
+    /// Fully inline external endpoint: BACKEND 'uri' FORMAT fmt
+    /// [CREDENTIALS (k=v, ...)]. The credentials list is consumed unsealed.
+    Inline {
+        backend: ExternalBackendKind,
+        uri: String,
+        format: ExternalFormatKind,
+        credentials: Vec<(String, String)>,
+    },
+    /// Catalog-registered external source or sink referenced by name.
+    Named(String),
+    /// PostgreSQL STDIN or STDOUT, selected by surrounding direction.
+    Stdio,
+    /// Legacy local file path with no backend or format keywords. The wire
+    /// layer rejects this for transport but it is retained for parity with
+    /// `COPY t FROM '/tmp/data.csv'` where the path alone implies local file.
+    LocalFile(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -1114,6 +1164,175 @@ pub struct CreateCdcIngestStatement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropCdcIngestStatement {
     pub name: String,
+}
+
+/// CREATE STREAMING JOB <name> AS <select> INTO <sink-expr>
+///                      [WRITE MODE APPEND | UPSERT]
+///                      [MODE ONESHOT | SCHEDULED EVERY '...' | SCHEDULED CRON '...' | WATCH]
+///
+/// A streaming job tails the FROM-clause table's change-data-feed and
+/// applies the SELECT's filter+project to every incoming row, writing
+/// the result into the sink. Supports multi-row pipelines by chaining
+/// source/target pairs through successive jobs. Single-table FROM runs
+/// the pure filter+project loop. Two-table FROM with a JOIN runs the
+/// interval-join or temporal-join pipeline, selected by the trailing
+/// WITHIN INTERVAL clause or an AS OF expression on the right side.
+/// Inline FROM file or cloud URI support is not yet wired into the grammar.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateStreamingJobStatement {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub query: SelectStatement,
+    pub target: StreamingSinkRef,
+    pub write_mode: StreamingWriteMode,
+    pub job_mode: ExternalModeSpec,
+    /// Streaming window spec extracted from the GROUP BY clause, if any.
+    pub window_spec: Option<StreamingWindowSpec>,
+    /// Watermark specification attached to the job body.
+    pub watermark: Option<WatermarkSpec>,
+    /// Late-data policy attached to the job body.
+    pub late_data_policy: Option<LateDataPolicySpec>,
+    /// Join shape when the FROM clause joins two sources. None for
+    /// single-table FROM. The parser fills this from the SELECT's FROM
+    /// join node plus the trailing WITHIN INTERVAL or AS OF clause.
+    pub join: Option<StreamingJoinSpec>,
+}
+
+/// Streaming-join row-match semantics. Mirrors the outer-form enumeration
+/// used on base-table joins but kept local to streaming so the runner does
+/// not depend on planner or parser join-type enums.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamingJoinType {
+    Inner,
+    Left,
+    Right,
+    Full,
+}
+
+/// Shape of a streaming-job JOIN. Carries everything the binder and
+/// runner need beyond the bare JOIN already represented in the SELECT's
+/// FROM clause.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamingJoinSpec {
+    /// Stream-stream interval join. Both sides are live feeds. Rows match
+    /// when the equi-key matches and the event times fall within the
+    /// symmetric window bound.
+    Interval {
+        /// Symmetric time window in microseconds. A row on one side matches
+        /// any opposite-side row whose event time is within +/- within_us.
+        within_us: i64,
+        /// Inner, Left, Right, or Full outer. Outer forms flush unmatched
+        /// rows on watermark advance past event_time + within_us.
+        join_type: StreamingJoinType,
+    },
+    /// Stream-table temporal join. The left side is a live feed, the
+    /// right side is a Zyron table looked up per incoming row.
+    Temporal {
+        /// Column on the left side carrying the event time used for
+        /// AS OF semantics. Parsed from the FOR SYSTEM_TIME AS OF clause
+        /// on the right table reference.
+        event_time_column: String,
+        /// Only Inner and Left are meaningful for temporal joins. Right
+        /// and Full are rejected at bind time because the right side is
+        /// a static lookup.
+        join_type: StreamingJoinType,
+    },
+}
+
+/// Streaming windowing spec parsed from GROUP BY TUMBLE/HOP/SESSION(...).
+/// Durations are parsed as Interval literals and normalized to microseconds
+/// at bind time by the planner.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamingWindowSpec {
+    /// TUMBLE(<event_time_col>, INTERVAL 'N' unit)
+    Tumbling {
+        event_time_column: String,
+        size: zyron_common::Interval,
+    },
+    /// HOP(<event_time_col>, INTERVAL 'N' unit, INTERVAL 'N' unit)
+    Hopping {
+        event_time_column: String,
+        size: zyron_common::Interval,
+        slide: zyron_common::Interval,
+    },
+    /// SESSION(<event_time_col>, INTERVAL 'N' unit)
+    Session {
+        event_time_column: String,
+        gap: zyron_common::Interval,
+    },
+}
+
+/// Watermark spec: WATERMARK FOR <col> AS <col> - INTERVAL 'N' unit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WatermarkSpec {
+    pub event_time_column: String,
+    pub allowed_lateness: zyron_common::Interval,
+}
+
+/// Late-data handling policy declared on a streaming job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LateDataPolicySpec {
+    Drop,
+    Reopen,
+    SideOutput,
+}
+
+/// Streaming job source reference. The parser currently only produces
+/// Named; Inline is reserved for a future FROM-clause grammar extension
+/// that accepts file or cloud URIs directly in the FROM position.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamingSourceRef {
+    /// A table or named external source, resolved at bind time.
+    Named(String),
+    /// Inline file or cloud URI. No credentials allowed inline. The
+    /// binder rejects inline use for backends that require credentials.
+    Inline {
+        backend: ExternalBackendKind,
+        uri: String,
+        format: ExternalFormatKind,
+        options: Vec<(String, String)>,
+        mode: ExternalModeSpec,
+    },
+}
+
+/// Streaming job sink reference. A sink is either a named catalog object,
+/// a named table, or an inline file or cloud URI.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamingSinkRef {
+    Named(String),
+    Inline {
+        backend: ExternalBackendKind,
+        uri: String,
+        format: ExternalFormatKind,
+        options: Vec<(String, String)>,
+    },
+}
+
+/// Target-side write semantics. Append always INSERTs; Upsert merges on
+/// primary key when the target has one, falling back to INSERT otherwise
+/// (runtime error if no PK exists).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamingWriteMode {
+    Append,
+    Upsert,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropStreamingJobStatement {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterStreamingJobStatement {
+    pub name: String,
+    pub action: AlterStreamingJobAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterStreamingJobAction {
+    Pause,
+    Resume,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2037,6 +2256,115 @@ pub struct CreateEventHandlerStatement {
 pub struct DropEventHandlerStatement {
     pub name: String,
     pub if_exists: bool,
+}
+
+// -----------------------------------------------------------------------------
+// External source and sink DDL
+// -----------------------------------------------------------------------------
+
+/// Storage backend for an external source or sink.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExternalBackendKind {
+    File,
+    S3,
+    Gcs,
+    Azure,
+    Http,
+}
+
+/// On-disk row format for an external source or sink.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExternalFormatKind {
+    Json,
+    JsonLines,
+    Csv,
+    Parquet,
+    ArrowIpc,
+    Avro,
+}
+
+/// Ingest or emit cadence for an external source or streaming job.
+/// OneShot runs a single pass, Scheduled fires on a cron or interval,
+/// Watch tails the backend for new objects as they arrive.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExternalModeSpec {
+    OneShot,
+    Scheduled {
+        cron: Option<String>,
+        every: Option<String>,
+    },
+    Watch,
+}
+
+/// CREATE EXTERNAL SOURCE name TYPE backend URI uri FORMAT fmt
+///   [MODE modespec] [OPTIONS (k=v, ...)] [CREDENTIALS (k=v, ...)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateExternalSourceStatement {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub backend: ExternalBackendKind,
+    pub uri: String,
+    pub format: ExternalFormatKind,
+    pub mode: ExternalModeSpec,
+    pub options: Vec<(String, String)>,
+    pub credentials: Vec<(String, String)>,
+    // Optional explicit column layout. Empty when the user omits the clause.
+    pub columns: Vec<(String, DataType)>,
+}
+
+/// CREATE EXTERNAL SINK name TYPE backend URI uri FORMAT fmt
+///   [OPTIONS (k=v, ...)] [CREDENTIALS (k=v, ...)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateExternalSinkStatement {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub backend: ExternalBackendKind,
+    pub uri: String,
+    pub format: ExternalFormatKind,
+    pub options: Vec<(String, String)>,
+    pub credentials: Vec<(String, String)>,
+    // Optional explicit column layout. Empty when the user omits the clause.
+    pub columns: Vec<(String, DataType)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropExternalSourceStatement {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropExternalSinkStatement {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterExternalSourceAction {
+    SetOptions(Vec<(String, String)>),
+    SetCredentials(Vec<(String, String)>),
+    SetMode(ExternalModeSpec),
+    SetColumns(Vec<(String, DataType)>),
+    Rename(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterExternalSourceStatement {
+    pub name: String,
+    pub action: AlterExternalSourceAction,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterExternalSinkAction {
+    SetOptions(Vec<(String, String)>),
+    SetCredentials(Vec<(String, String)>),
+    Rename(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterExternalSinkStatement {
+    pub name: String,
+    pub action: AlterExternalSinkAction,
 }
 
 #[cfg(test)]

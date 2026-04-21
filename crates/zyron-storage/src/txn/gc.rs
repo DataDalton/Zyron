@@ -66,8 +66,9 @@ impl GcConfig {
 /// active transaction. The oldest active transaction ID determines the
 /// reclamation boundary: any tuple with xmax < oldest_active is safe to reclaim.
 ///
-/// Integration with TransactionManager, DiskManager, and BufferPool is
-/// deferred to Phase 2. This struct provides the core GC logic and statistics.
+/// This struct provides the core GC logic and statistics. Wiring of the
+/// actual reclamation pass through TransactionManager, DiskManager, and
+/// BufferPool is done by callers that drive the GC loop.
 pub struct MvccGc {
     config: GcConfig,
 }

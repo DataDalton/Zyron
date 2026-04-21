@@ -179,6 +179,61 @@ impl TypeId {
         )
     }
 
+    /// Maps a discriminant byte back to a TypeId. Returns None for bytes
+    /// that do not correspond to a known variant.
+    pub fn from_u8(byte: u8) -> Option<Self> {
+        Some(match byte {
+            0 => TypeId::Null,
+            1 => TypeId::Boolean,
+            10 => TypeId::Int8,
+            11 => TypeId::Int16,
+            12 => TypeId::Int32,
+            13 => TypeId::Int64,
+            14 => TypeId::Int128,
+            20 => TypeId::UInt8,
+            21 => TypeId::UInt16,
+            22 => TypeId::UInt32,
+            23 => TypeId::UInt64,
+            24 => TypeId::UInt128,
+            30 => TypeId::Float32,
+            31 => TypeId::Float64,
+            40 => TypeId::Decimal,
+            50 => TypeId::Char,
+            51 => TypeId::Varchar,
+            52 => TypeId::Text,
+            60 => TypeId::Binary,
+            61 => TypeId::Varbinary,
+            62 => TypeId::Bytea,
+            70 => TypeId::Date,
+            71 => TypeId::Time,
+            72 => TypeId::Timestamp,
+            73 => TypeId::TimestampTz,
+            74 => TypeId::Interval,
+            80 => TypeId::Uuid,
+            90 => TypeId::Json,
+            91 => TypeId::Jsonb,
+            100 => TypeId::Array,
+            110 => TypeId::Composite,
+            120 => TypeId::Vector,
+            130 => TypeId::Geometry,
+            140 => TypeId::Matrix,
+            150 => TypeId::Color,
+            160 => TypeId::SemVer,
+            170 => TypeId::Inet,
+            171 => TypeId::Cidr,
+            172 => TypeId::MacAddr,
+            180 => TypeId::Money,
+            190 => TypeId::Range,
+            210 => TypeId::HyperLogLog,
+            211 => TypeId::BloomFilter,
+            212 => TypeId::TDigest,
+            213 => TypeId::CountMinSketch,
+            220 => TypeId::Bitfield,
+            240 => TypeId::Quantity,
+            _ => return None,
+        })
+    }
+
     /// Returns true if this type is an integer type (signed or unsigned).
     pub fn is_integer(&self) -> bool {
         matches!(
@@ -211,7 +266,8 @@ impl TypeId {
         matches!(self, TypeId::Binary | TypeId::Varbinary | TypeId::Bytea)
     }
 
-    /// Returns true if this type is an extended type added in Phase 14.
+    /// Returns true if this type is one of the extended types (spatial,
+    /// temporal, probabilistic, etc.) that sit outside the core SQL type set.
     pub fn is_extended_type(&self) -> bool {
         matches!(
             self,

@@ -57,6 +57,16 @@ pub enum PrivilegeType {
     DropIndex = 30,
     Reindex = 31,
     AlterIndex = 32,
+    CreateStreamingJob = 33,
+    AlterStreamingJob = 34,
+    DropStreamingJob = 35,
+    CreateExternalSource = 36,
+    AlterExternalSource = 37,
+    DropExternalSource = 38,
+    CreateExternalSink = 39,
+    AlterExternalSink = 40,
+    DropExternalSink = 41,
+    ManageExternalCredentials = 42,
     All = 255,
 }
 
@@ -97,6 +107,16 @@ impl PrivilegeType {
             30 => Ok(Self::DropIndex),
             31 => Ok(Self::Reindex),
             32 => Ok(Self::AlterIndex),
+            33 => Ok(Self::CreateStreamingJob),
+            34 => Ok(Self::AlterStreamingJob),
+            35 => Ok(Self::DropStreamingJob),
+            36 => Ok(Self::CreateExternalSource),
+            37 => Ok(Self::AlterExternalSource),
+            38 => Ok(Self::DropExternalSource),
+            39 => Ok(Self::CreateExternalSink),
+            40 => Ok(Self::AlterExternalSink),
+            41 => Ok(Self::DropExternalSink),
+            42 => Ok(Self::ManageExternalCredentials),
             255 => Ok(Self::All),
             _ => Err(ZyronError::CatalogCorrupted(format!(
                 "invalid PrivilegeType value {}",
@@ -141,6 +161,16 @@ impl PrivilegeType {
             PrivilegeType::DropIndex,
             PrivilegeType::Reindex,
             PrivilegeType::AlterIndex,
+            PrivilegeType::CreateStreamingJob,
+            PrivilegeType::AlterStreamingJob,
+            PrivilegeType::DropStreamingJob,
+            PrivilegeType::CreateExternalSource,
+            PrivilegeType::AlterExternalSource,
+            PrivilegeType::DropExternalSource,
+            PrivilegeType::CreateExternalSink,
+            PrivilegeType::AlterExternalSink,
+            PrivilegeType::DropExternalSink,
+            PrivilegeType::ManageExternalCredentials,
         ]
     }
 
@@ -161,6 +191,9 @@ pub enum ObjectType {
     Sequence = 4,
     Function = 5,
     Type = 6,
+    StreamingJob = 7,
+    ExternalSource = 8,
+    ExternalSink = 9,
 }
 
 impl ObjectType {
@@ -174,6 +207,9 @@ impl ObjectType {
             4 => Ok(Self::Sequence),
             5 => Ok(Self::Function),
             6 => Ok(Self::Type),
+            7 => Ok(Self::StreamingJob),
+            8 => Ok(Self::ExternalSource),
+            9 => Ok(Self::ExternalSink),
             _ => Err(ZyronError::CatalogCorrupted(format!(
                 "invalid ObjectType value {}",
                 val

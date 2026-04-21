@@ -7,7 +7,11 @@
 use crate::logical::LogicalColumn;
 use std::collections::HashMap;
 use std::sync::Arc;
-use zyron_catalog::{Catalog, ColumnId, NameResolver, TableEntry, TableId};
+use zyron_catalog::schema::{CatalogClassification, CatalogStreamingWriteMode, ColumnEntry};
+use zyron_catalog::{
+    Catalog, ColumnId, ExternalSinkId, ExternalSourceId, NameResolver, SchemaId, TableEntry,
+    TableId,
+};
 use zyron_common::{Result, TypeId, ZyronError};
 use zyron_parser::ast::*;
 
@@ -441,6 +445,344 @@ pub enum BoundStatement {
     Insert(BoundInsert),
     Update(BoundUpdate),
     Delete(BoundDelete),
+    CreateStreamingJob(BoundStreamingJob),
+    DropStreamingJob {
+        name: String,
+        if_exists: bool,
+    },
+    AlterStreamingJob {
+        name: String,
+        action: AlterStreamingJobAction,
+    },
+    CreateExternalSource(Box<BoundCreateExternalSource>),
+    CreateExternalSink(Box<BoundCreateExternalSink>),
+    DropExternalSource {
+        name: String,
+        schema_id: SchemaId,
+        if_exists: bool,
+    },
+    DropExternalSink {
+        name: String,
+        schema_id: SchemaId,
+        if_exists: bool,
+    },
+    AlterExternalSource(Box<BoundAlterExternalSource>),
+    AlterExternalSink(Box<BoundAlterExternalSink>),
+}
+
+// ---------------------------------------------------------------------------
+// Bound external source and sink DDL
+// ---------------------------------------------------------------------------
+
+/// Bound form of CREATE EXTERNAL SOURCE. The binder resolves the target
+/// schema and passes parser-level backend, format, and mode enums through
+/// without further translation. The catalog layer converts those to its
+/// own enum space when the wire dispatcher persists the entry.
+#[derive(Debug, Clone)]
+pub struct BoundCreateExternalSource {
+    pub schema_id: SchemaId,
+    pub name: String,
+    pub if_not_exists: bool,
+    pub backend: zyron_parser::ast::ExternalBackendKind,
+    pub uri: String,
+    pub format: zyron_parser::ast::ExternalFormatKind,
+    pub mode: zyron_parser::ast::ExternalModeSpec,
+    pub options: Vec<(String, String)>,
+    pub credentials: Vec<(String, String)>,
+    // Explicit COLUMNS clause resolved to TypeIds. Empty when the user did
+    // not supply a columns clause, in which case the dispatcher may infer
+    // the schema from the first matching file.
+    pub columns: Vec<(String, zyron_common::TypeId)>,
+}
+
+/// Bound form of CREATE EXTERNAL SINK. Same fields as the source shape
+/// with no ingest cadence, sinks emit on the stream's own cadence.
+#[derive(Debug, Clone)]
+pub struct BoundCreateExternalSink {
+    pub schema_id: SchemaId,
+    pub name: String,
+    pub if_not_exists: bool,
+    pub backend: zyron_parser::ast::ExternalBackendKind,
+    pub uri: String,
+    pub format: zyron_parser::ast::ExternalFormatKind,
+    pub options: Vec<(String, String)>,
+    pub credentials: Vec<(String, String)>,
+    // Explicit COLUMNS clause resolved to TypeIds.
+    pub columns: Vec<(String, zyron_common::TypeId)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BoundAlterExternalSource {
+    pub schema_id: SchemaId,
+    pub name: String,
+    pub action: zyron_parser::ast::AlterExternalSourceAction,
+}
+
+#[derive(Debug, Clone)]
+pub struct BoundAlterExternalSink {
+    pub schema_id: SchemaId,
+    pub name: String,
+    pub action: zyron_parser::ast::AlterExternalSinkAction,
+}
+
+// ---------------------------------------------------------------------------
+// Bound streaming job
+// ---------------------------------------------------------------------------
+
+/// Resolved streaming source. Either a Zyron table with change-data-feed, a
+/// named external source from the catalog, or an inline endpoint embedded in
+/// the statement. ExternalNamed carries the source's catalog classification so
+/// the binder can enforce downstream clearance checks.
+#[derive(Debug, Clone)]
+pub enum BoundStreamingSource {
+    ZyronTable {
+        table_id: TableId,
+        schema_id: SchemaId,
+        columns: Vec<ColumnEntry>,
+    },
+    ExternalNamed {
+        source_id: ExternalSourceId,
+        schema_id: SchemaId,
+        /// Column schema derived from the target table. External sources do
+        /// not store their own column schema in the catalog, the binder uses
+        /// the target columns' types in projection order and names.
+        columns: Vec<ColumnEntry>,
+        classification: CatalogClassification,
+    },
+    ExternalInline {
+        backend: zyron_parser::ast::ExternalBackendKind,
+        uri: String,
+        format: zyron_parser::ast::ExternalFormatKind,
+        options: Vec<(String, String)>,
+        mode: zyron_parser::ast::ExternalModeSpec,
+        columns: Vec<ColumnEntry>,
+    },
+}
+
+/// Resolved streaming sink. Mirrors BoundStreamingSource for the output side.
+#[derive(Debug, Clone)]
+pub enum BoundStreamingSink {
+    ZyronTable {
+        table_id: TableId,
+        schema_id: SchemaId,
+        columns: Vec<ColumnEntry>,
+    },
+    ExternalNamed {
+        sink_id: ExternalSinkId,
+        schema_id: SchemaId,
+        columns: Vec<ColumnEntry>,
+        classification: CatalogClassification,
+    },
+    ExternalInline {
+        backend: zyron_parser::ast::ExternalBackendKind,
+        uri: String,
+        format: zyron_parser::ast::ExternalFormatKind,
+        options: Vec<(String, String)>,
+        columns: Vec<ColumnEntry>,
+    },
+}
+
+/// Validated CREATE STREAMING JOB form. Produced by the binder and consumed by
+/// the wire-layer dispatcher. The binder enforces single-table FROM with an
+/// optional WHERE predicate. Projections must match the target column arity
+/// and types exactly. Source and target may each be a Zyron table or an
+/// external endpoint.
+#[derive(Debug, Clone)]
+pub struct BoundStreamingJob {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub source: BoundStreamingSource,
+    pub target: BoundStreamingSink,
+    pub projections: Vec<BoundExpr>,
+    pub predicate: Option<BoundExpr>,
+    pub write_mode: CatalogStreamingWriteMode,
+    pub job_mode: zyron_parser::ast::ExternalModeSpec,
+    // -----
+    // Primary key column ids of the target table for UPSERT write mode.
+    // Empty for Append mode or when the target is external. The binder
+    // populates this from the target's catalog constraints whenever the
+    // write mode is Upsert.
+    pub target_pk_columns: Vec<ColumnId>,
+    // -----
+    // Windowed-aggregate configuration derived from GROUP BY + WATERMARK +
+    // late-data policy. None when the job is a pure filter+project pipeline.
+    pub aggregate: Option<BoundAggregateSpec>,
+    // -----
+    // Join configuration for two-source streaming jobs. None for single-table
+    // FROM. When set, the runner uses the interval or temporal join engine
+    // instead of the plain filter+project loop.
+    pub join: Option<BoundStreamingJoinSpec>,
+}
+
+/// Outer-join semantics carried by the bound streaming spec. Mirrors the
+/// parser's StreamingJoinType, kept as a planner-local type so downstream
+/// crates (wire, streaming) can match on it without pulling the parser in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundStreamingJoinType {
+    Inner,
+    Left,
+    Right,
+    Full,
+}
+
+/// Resolved streaming-job join. Interval form carries two stream sources and
+/// a symmetric time window. Temporal form carries one stream source and a
+/// Zyron table looked up per incoming row by primary key.
+#[derive(Debug, Clone)]
+pub enum BoundStreamingJoinSpec {
+    Interval {
+        right_source: BoundStreamingSource,
+        right_alias: String,
+        /// Equi-key ordinals on the left source. Matches right_key_ordinals
+        /// pairwise, and each pair must share a TypeId.
+        left_key_ordinals: Vec<u16>,
+        right_key_ordinals: Vec<u16>,
+        left_event_time_ordinal: u16,
+        right_event_time_ordinal: u16,
+        within_us: i64,
+        /// Inner emits only matching rows. Left, Right, Full flush
+        /// unmatched rows on each side with NULLs on the opposite side
+        /// when the watermark advances past event_time + within_us.
+        join_type: BoundStreamingJoinType,
+        combined_columns: Vec<ColumnEntry>,
+    },
+    Temporal {
+        right_table_id: TableId,
+        right_schema_id: SchemaId,
+        right_alias: String,
+        right_pk_ordinals: Vec<u16>,
+        left_key_ordinals: Vec<u16>,
+        left_event_time_ordinal: u16,
+        /// Only Inner or Left are allowed on temporal joins. Right and Full
+        /// are rejected at bind time.
+        join_type: BoundStreamingJoinType,
+        combined_columns: Vec<ColumnEntry>,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// BoundAggregateSpec: windowed aggregation for streaming jobs
+// ---------------------------------------------------------------------------
+
+/// Resolved aggregate section of a streaming job. The binder produces this
+/// when the job's SELECT declares a GROUP BY with a window expression and
+/// the job carries a WATERMARK clause.
+#[derive(Debug, Clone)]
+pub struct BoundAggregateSpec {
+    pub window_type: BoundStreamingWindowType,
+    pub event_time_column_id: ColumnId,
+    pub event_time_scale: BoundEventTimeScale,
+    pub group_by_column_ids: Vec<ColumnId>,
+    pub aggregations: Vec<BoundAggregateItem>,
+    pub watermark: BoundWatermark,
+    pub late_data_policy: BoundLateDataPolicy,
+}
+
+/// Event-time normalization. Mirrors zyron_streaming::EventTimeScale but
+/// keeps the planner free of the streaming-crate dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundEventTimeScale {
+    Microseconds,
+    Milliseconds,
+    Seconds,
+}
+
+/// Watermark configuration resolved from the WATERMARK FOR clause. The
+/// planner captures the strategy parameters and the wire layer builds the
+/// concrete WatermarkStrategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundWatermark {
+    BoundedOutOfOrderness { allowed_lateness_us: i64 },
+    Punctual,
+}
+
+/// Late-data handling mirror of zyron_streaming::LateDataPolicy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundLateDataPolicy {
+    Drop,
+    ReopenWindow,
+    SideOutput,
+    Update,
+}
+
+/// Concrete window shape resolved at bind time. All durations are already
+/// normalized to milliseconds so the runner assigners consume them directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundStreamingWindowType {
+    Tumbling { size_ms: i64 },
+    Hopping { size_ms: i64, slide_ms: i64 },
+    Session { gap_ms: i64 },
+}
+
+/// One aggregate output column. input_column_id is None for COUNT(*).
+#[derive(Debug, Clone)]
+pub struct BoundAggregateItem {
+    pub function: String,
+    pub input_column_id: Option<ColumnId>,
+    pub output_type: TypeId,
+}
+
+impl BoundStreamingJob {
+    /// Returns the source's effective schema id. Inline sources have no
+    /// schema binding, so this falls back to the target's schema.
+    pub fn source_schema_id(&self) -> SchemaId {
+        match &self.source {
+            BoundStreamingSource::ZyronTable { schema_id, .. } => *schema_id,
+            BoundStreamingSource::ExternalNamed { schema_id, .. } => *schema_id,
+            BoundStreamingSource::ExternalInline { .. } => self.target_schema_id(),
+        }
+    }
+
+    /// Returns the target's effective schema id. Inline sinks reuse the
+    /// source's schema when the source is internal, else the catalog's
+    /// default schema. Inline-both is rejected at bind time.
+    pub fn target_schema_id(&self) -> SchemaId {
+        match &self.target {
+            BoundStreamingSink::ZyronTable { schema_id, .. } => *schema_id,
+            BoundStreamingSink::ExternalNamed { schema_id, .. } => *schema_id,
+            BoundStreamingSink::ExternalInline { .. } => match &self.source {
+                BoundStreamingSource::ZyronTable { schema_id, .. } => *schema_id,
+                BoundStreamingSource::ExternalNamed { schema_id, .. } => *schema_id,
+                BoundStreamingSource::ExternalInline { .. } => SchemaId(0),
+            },
+        }
+    }
+
+    /// Returns the source columns regardless of variant.
+    pub fn source_columns(&self) -> &[ColumnEntry] {
+        match &self.source {
+            BoundStreamingSource::ZyronTable { columns, .. } => columns,
+            BoundStreamingSource::ExternalNamed { columns, .. } => columns,
+            BoundStreamingSource::ExternalInline { columns, .. } => columns,
+        }
+    }
+
+    /// Returns the target columns regardless of variant.
+    pub fn target_columns(&self) -> &[ColumnEntry] {
+        match &self.target {
+            BoundStreamingSink::ZyronTable { columns, .. } => columns,
+            BoundStreamingSink::ExternalNamed { columns, .. } => columns,
+            BoundStreamingSink::ExternalInline { columns, .. } => columns,
+        }
+    }
+
+    /// Returns the source table id when the source is a Zyron table.
+    /// Returns None for external source variants.
+    pub fn source_table_id(&self) -> Option<TableId> {
+        match &self.source {
+            BoundStreamingSource::ZyronTable { table_id, .. } => Some(*table_id),
+            _ => None,
+        }
+    }
+
+    /// Returns the target table id when the target is a Zyron table.
+    /// Returns None for external sink variants.
+    pub fn target_table_id(&self) -> Option<TableId> {
+        match &self.target {
+            BoundStreamingSink::ZyronTable { table_id, .. } => Some(*table_id),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -607,6 +949,62 @@ impl<'a> Binder<'a> {
             Statement::Delete(s) => {
                 let bound = self.bind_delete(&s).await?;
                 Ok(BoundStatement::Delete(bound))
+            }
+            Statement::CreateStreamingJob(s) => {
+                let bound = self.bind_create_streaming_job(&s).await?;
+                Ok(BoundStatement::CreateStreamingJob(bound))
+            }
+            Statement::DropStreamingJob(s) => Ok(BoundStatement::DropStreamingJob {
+                name: s.name.clone(),
+                if_exists: s.if_exists,
+            }),
+            Statement::AlterStreamingJob(s) => Ok(BoundStatement::AlterStreamingJob {
+                name: s.name.clone(),
+                action: s.action,
+            }),
+            Statement::CreateExternalSource(s) => {
+                let bound = self.bind_create_external_source(&s).await?;
+                Ok(BoundStatement::CreateExternalSource(Box::new(bound)))
+            }
+            Statement::CreateExternalSink(s) => {
+                let bound = self.bind_create_external_sink(&s).await?;
+                Ok(BoundStatement::CreateExternalSink(Box::new(bound)))
+            }
+            Statement::DropExternalSource(s) => {
+                let schema_id = self.current_schema_id().await?;
+                Ok(BoundStatement::DropExternalSource {
+                    name: s.name.clone(),
+                    schema_id,
+                    if_exists: s.if_exists,
+                })
+            }
+            Statement::DropExternalSink(s) => {
+                let schema_id = self.current_schema_id().await?;
+                Ok(BoundStatement::DropExternalSink {
+                    name: s.name.clone(),
+                    schema_id,
+                    if_exists: s.if_exists,
+                })
+            }
+            Statement::AlterExternalSource(s) => {
+                let schema_id = self.current_schema_id().await?;
+                Ok(BoundStatement::AlterExternalSource(Box::new(
+                    BoundAlterExternalSource {
+                        schema_id,
+                        name: s.name.clone(),
+                        action: s.action.clone(),
+                    },
+                )))
+            }
+            Statement::AlterExternalSink(s) => {
+                let schema_id = self.current_schema_id().await?;
+                Ok(BoundStatement::AlterExternalSink(Box::new(
+                    BoundAlterExternalSink {
+                        schema_id,
+                        name: s.name.clone(),
+                        action: s.action.clone(),
+                    },
+                )))
             }
             other => Err(ZyronError::PlanError(format!(
                 "unsupported statement type for planning: {:?}",
@@ -1768,6 +2166,1468 @@ impl<'a> Binder<'a> {
             returning,
         })
     }
+
+    // -----------------------------------------------------------------------
+    // CREATE STREAMING JOB binding
+    // -----------------------------------------------------------------------
+
+    /// Resolves the first schema in the resolver's search path. External DDL
+    /// does not carry a qualified schema, so the binder uses the session's
+    /// current schema when storing the bound form.
+    async fn current_schema_id(&self) -> Result<SchemaId> {
+        let search = self.resolver.search_path();
+        let first = search
+            .first()
+            .ok_or_else(|| ZyronError::PlanError("search path is empty".to_string()))?;
+        let entry = self.resolver.resolve_schema(first).await?;
+        Ok(entry.id)
+    }
+
+    /// Binds CREATE EXTERNAL SOURCE by resolving the current schema and
+    /// sanity-checking backend/credential combinations.
+    async fn bind_create_external_source(
+        &self,
+        stmt: &CreateExternalSourceStatement,
+    ) -> Result<BoundCreateExternalSource> {
+        let schema_id = self.current_schema_id().await?;
+        // Local file backends have no credentials to carry.
+        if matches!(stmt.backend, ExternalBackendKind::File) && !stmt.credentials.is_empty() {
+            return Err(ZyronError::PlanError(
+                "CREATE EXTERNAL SOURCE with backend FILE cannot declare CREDENTIALS".to_string(),
+            ));
+        }
+        let columns: Vec<(String, zyron_common::TypeId)> = stmt
+            .columns
+            .iter()
+            .map(|(n, dt)| (n.clone(), dt.to_type_id()))
+            .collect();
+        Ok(BoundCreateExternalSource {
+            schema_id,
+            name: stmt.name.clone(),
+            if_not_exists: stmt.if_not_exists,
+            backend: stmt.backend.clone(),
+            uri: stmt.uri.clone(),
+            format: stmt.format.clone(),
+            mode: stmt.mode.clone(),
+            options: stmt.options.clone(),
+            columns,
+            credentials: stmt.credentials.clone(),
+        })
+    }
+
+    /// Binds CREATE EXTERNAL SINK with the same schema and backend checks as
+    /// the source form. Sinks have no ingest mode.
+    async fn bind_create_external_sink(
+        &self,
+        stmt: &CreateExternalSinkStatement,
+    ) -> Result<BoundCreateExternalSink> {
+        let schema_id = self.current_schema_id().await?;
+        if matches!(stmt.backend, ExternalBackendKind::File) && !stmt.credentials.is_empty() {
+            return Err(ZyronError::PlanError(
+                "CREATE EXTERNAL SINK with backend FILE cannot declare CREDENTIALS".to_string(),
+            ));
+        }
+        let columns: Vec<(String, zyron_common::TypeId)> = stmt
+            .columns
+            .iter()
+            .map(|(n, dt)| (n.clone(), dt.to_type_id()))
+            .collect();
+        Ok(BoundCreateExternalSink {
+            schema_id,
+            name: stmt.name.clone(),
+            if_not_exists: stmt.if_not_exists,
+            backend: stmt.backend.clone(),
+            uri: stmt.uri.clone(),
+            format: stmt.format.clone(),
+            options: stmt.options.clone(),
+            columns,
+            credentials: stmt.credentials.clone(),
+        })
+    }
+
+    /// Validates and binds a CREATE STREAMING JOB statement.
+    /// Rules: single-table FROM, no joins, no subqueries, no LATERAL,
+    /// projection arity and types must match the target column layout, Zyron
+    /// source tables must have CDC enabled, UPSERT write mode is not yet
+    /// supported by the runner and is rejected here.
+    async fn bind_create_streaming_job(
+        &mut self,
+        stmt: &CreateStreamingJobStatement,
+    ) -> Result<BoundStreamingJob> {
+        // Flag whether the job declares a windowed aggregate. This governs
+        // several branches below, including the JOIN-vs-aggregate conflict
+        // check in step 1.
+        let agg_has_group = !stmt.query.group_by.is_empty()
+            || stmt.watermark.is_some()
+            || stmt.late_data_policy.is_some();
+
+        // Step 1, single-table FROM with no join or subquery shapes for
+        // pure filter+project jobs. Two-table JOIN drives the interval or
+        // temporal join pipelines resolved later in this function.
+        if stmt.query.from.len() != 1 {
+            return Err(ZyronError::PlanError(
+                "streaming jobs support a single FROM entry, either a base table or a two-table JOIN".to_string(),
+            ));
+        }
+        // Classify the FROM shape up front. Joined forms defer the full
+        // right-side resolution until after the left source is bound, so
+        // both sides share the same scope-building path.
+        let right_join_info: Option<StreamingJoinBindInput> = match (
+            &stmt.query.from[0],
+            &stmt.join,
+        ) {
+            (TableRef::Table { .. }, None) => None,
+            (TableRef::Join(join_node), Some(spec)) => {
+                // JOIN + GROUP BY is supported: the runner composes the
+                // join engine with the aggregating engine, feeding joined
+                // rows into the window state. The combined schema drives
+                // the aggregate's column resolution, built later.
+                // The parser's JoinType drives outer-emission semantics.
+                // Cross is rejected because streaming requires an ON
+                // equi-key to index the per-side state.
+                if matches!(join_node.join_type, JoinType::Cross) {
+                    return Err(ZyronError::PlanError(
+                        "streaming JOIN does not support CROSS, use an explicit ON equi-key"
+                            .to_string(),
+                    ));
+                }
+                let (left_name, left_alias_opt) = match &join_node.left {
+                    TableRef::Table { name, alias, .. } => (name.clone(), alias.clone()),
+                    _ => {
+                        return Err(ZyronError::PlanError(
+                            "streaming JOIN left side must be a base table".to_string(),
+                        ));
+                    }
+                };
+                let (right_name, right_alias_opt) = match &join_node.right {
+                    TableRef::Table { name, alias, .. } => (name.clone(), alias.clone()),
+                    _ => {
+                        return Err(ZyronError::PlanError(
+                            "streaming JOIN right side must be a base table".to_string(),
+                        ));
+                    }
+                };
+                // Self-joins are allowed, but each side must carry a
+                // distinct alias so the ON predicate can name them.
+                let is_self_join = left_name.eq_ignore_ascii_case(&right_name);
+                if is_self_join {
+                    match (&left_alias_opt, &right_alias_opt) {
+                        (Some(la), Some(ra)) if !la.eq_ignore_ascii_case(ra) => {}
+                        _ => {
+                            return Err(ZyronError::PlanError(
+                                    "streaming self-join requires distinct aliases on both sides, for example 'orders o1 JOIN orders o2'"
+                                        .to_string(),
+                                ));
+                        }
+                    }
+                }
+                let left_alias = left_alias_opt.unwrap_or_else(|| left_name.clone());
+                let right_alias = right_alias_opt.unwrap_or_else(|| right_name.clone());
+                let (l_cols, r_cols) = match &join_node.condition {
+                    JoinCondition::On(expr) => {
+                        extract_equi_key_pairs(expr, &left_alias, &right_alias)?
+                    }
+                    _ => {
+                        return Err(ZyronError::PlanError(
+                                "streaming JOIN requires ON <left>.<col> = <right>.<col> with optional AND of additional equi-keys"
+                                    .to_string(),
+                            ));
+                    }
+                };
+                Some(StreamingJoinBindInput {
+                    left_name,
+                    left_alias,
+                    right_name,
+                    right_alias,
+                    left_key_cols: l_cols,
+                    right_key_cols: r_cols,
+                    spec: spec.clone(),
+                })
+            }
+            (TableRef::Table { .. }, Some(_)) => {
+                return Err(ZyronError::PlanError(
+                    "streaming JOIN spec set but FROM has a single table".to_string(),
+                ));
+            }
+            (TableRef::Join(_), None) => {
+                return Err(ZyronError::PlanError(
+                    "streaming FROM with JOIN requires WITHIN INTERVAL or AS OF on the right side"
+                        .to_string(),
+                ));
+            }
+            _ => {
+                return Err(ZyronError::PlanError(
+                    "streaming jobs support a single base table or two-table JOIN only".to_string(),
+                ));
+            }
+        };
+        let source_name = match &right_join_info {
+            Some(j) => j.left_name.clone(),
+            None => match &stmt.query.from[0] {
+                TableRef::Table { name, .. } => name.clone(),
+                _ => {
+                    return Err(ZyronError::PlanError(
+                        "streaming jobs support a base table or JOIN only".to_string(),
+                    ));
+                }
+            },
+        };
+
+        // Reject HAVING, ORDER BY, LIMIT, CTEs, set ops, DISTINCT. These do not
+        // make sense on streaming jobs today. GROUP BY and watermark are kept
+        // and drive the aggregating pipeline below.
+        if stmt.query.with.is_some()
+            || stmt.query.having.is_some()
+            || !stmt.query.order_by.is_empty()
+            || stmt.query.limit.is_some()
+            || stmt.query.offset.is_some()
+            || stmt.query.distinct
+            || !stmt.query.set_ops.is_empty()
+        {
+            return Err(ZyronError::PlanError(
+                "streaming jobs support single-table FROM only in this release".to_string(),
+            ));
+        }
+
+        // Step 2, resolve the target first. The target's column schema drives
+        // the expected projection layout and may supply column names for an
+        // external source that does not declare its own schema.
+        let (target_kind, target_columns, target_schema_id): (
+            BoundStreamingSinkKind,
+            Vec<ColumnEntry>,
+            SchemaId,
+        ) = match &stmt.target {
+            zyron_parser::StreamingSinkRef::Named(name) => {
+                let (tgt_schema_opt, tgt_tbl) = split_qualified(name);
+                // Named form: try Zyron table first, then external sink.
+                let zyron_tbl = self.resolver.resolve_table(tgt_schema_opt, tgt_tbl).await;
+                match zyron_tbl {
+                    Ok(entry) => (
+                        BoundStreamingSinkKind::Zyron {
+                            table_id: entry.id,
+                            schema_id: entry.schema_id,
+                        },
+                        entry.columns.clone(),
+                        entry.schema_id,
+                    ),
+                    Err(_) => {
+                        let schema_id = match tgt_schema_opt {
+                            Some(s) => self.resolver.resolve_schema(s).await?.id,
+                            None => self.current_schema_id().await?,
+                        };
+                        match self.catalog.get_external_sink(schema_id, tgt_tbl) {
+                            Some(sink) => (
+                                BoundStreamingSinkKind::ExternalNamed {
+                                    sink_id: sink.id,
+                                    schema_id: sink.schema_id,
+                                    classification: sink.classification,
+                                },
+                                Vec::new(),
+                                sink.schema_id,
+                            ),
+                            None => {
+                                return Err(ZyronError::TableNotFound(format!(
+                                    "target '{name}' not found as table or external sink"
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+            zyron_parser::StreamingSinkRef::Inline {
+                backend,
+                uri,
+                format,
+                options,
+            } => (
+                BoundStreamingSinkKind::ExternalInline {
+                    backend: backend.clone(),
+                    uri: uri.clone(),
+                    format: format.clone(),
+                    options: options.clone(),
+                },
+                Vec::new(),
+                SchemaId(0),
+            ),
+        };
+
+        // Step 3, resolve the source. Try Zyron table first, then fall back to
+        // external source lookup in the session's schema.
+        let (src_schema_opt, src_tbl) = split_qualified(&source_name);
+        let source_resolved: SourceResolution = {
+            let zyron_tbl = self.resolver.resolve_table(src_schema_opt, src_tbl).await;
+            match zyron_tbl {
+                Ok(entry) => SourceResolution::Zyron(entry),
+                Err(_) => {
+                    let schema_id = match src_schema_opt {
+                        Some(s) => self.resolver.resolve_schema(s).await?.id,
+                        None => self.current_schema_id().await?,
+                    };
+                    match self.catalog.get_external_source(schema_id, src_tbl) {
+                        Some(src) => SourceResolution::External(src),
+                        None => {
+                            return Err(ZyronError::TableNotFound(format!(
+                                "source '{source_name}' not found as table or external source"
+                            )));
+                        }
+                    }
+                }
+            }
+        };
+
+        // Step 4, the source columns come from the catalog for Zyron tables,
+        // or from the target column layout for external sources that carry
+        // no column schema of their own.
+        let (source_kind, source_columns, source_classification): (
+            BoundStreamingSourceKind,
+            Vec<ColumnEntry>,
+            Option<CatalogClassification>,
+        ) = match &source_resolved {
+            SourceResolution::Zyron(entry) => (
+                BoundStreamingSourceKind::Zyron {
+                    table_id: entry.id,
+                    schema_id: entry.schema_id,
+                },
+                entry.columns.clone(),
+                None,
+            ),
+            SourceResolution::External(src) => {
+                // Inline sink plus Confidential/Restricted external source is
+                // rejected on classification grounds before the column layout
+                // check fires. This keeps the error message specific.
+                if matches!(&target_kind, BoundStreamingSinkKind::ExternalInline { .. })
+                    && matches!(
+                        src.classification,
+                        CatalogClassification::Confidential | CatalogClassification::Restricted
+                    )
+                {
+                    return Err(ZyronError::PermissionDenied(format!(
+                        "inline external sink cannot be used with classification {:?} source, use CREATE EXTERNAL SINK with explicit classification",
+                        src.classification
+                    )));
+                }
+                // Prefer the external source's own catalog columns when
+                // present (set either by an explicit COLUMNS clause on
+                // CREATE EXTERNAL SOURCE or by schema inference from the
+                // first matching file). Fall back to the target layout
+                // when the source has no recorded columns and the target
+                // is a Zyron table. Reject when both ends are external and
+                // neither side supplies a layout.
+                let src_cols: Vec<ColumnEntry> = src
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, (name, type_id))| ColumnEntry {
+                        id: ColumnId(idx as u16),
+                        table_id: TableId(0),
+                        name: name.clone(),
+                        type_id: *type_id,
+                        ordinal: idx as u16,
+                        nullable: true,
+                        default_expr: None,
+                        max_length: None,
+                    })
+                    .collect();
+                if matches!(&target_kind, BoundStreamingSinkKind::ExternalInline { .. })
+                    && target_columns.is_empty()
+                    && src_cols.is_empty()
+                {
+                    return Err(ZyronError::PlanError(
+                        "cannot use inline external sink with external source, declare a COLUMNS clause on the external source or use a Zyron table on one side".to_string(),
+                    ));
+                }
+                let cols = if !src_cols.is_empty() {
+                    src_cols
+                } else if !target_columns.is_empty() {
+                    target_columns.clone()
+                } else {
+                    Vec::new()
+                };
+                (
+                    BoundStreamingSourceKind::ExternalNamed {
+                        source_id: src.id,
+                        schema_id: src.schema_id,
+                    },
+                    cols,
+                    Some(src.classification),
+                )
+            }
+        };
+
+        // Step 5, register a scope that uses the source columns for expression
+        // binding. External sources reuse the target column names and types.
+        let mut ctx = BindContext::new();
+        let idx = self.alloc_table_idx();
+        let col_defs: Vec<BoundColumnDef> = source_columns
+            .iter()
+            .map(|c| BoundColumnDef {
+                column_id: c.id,
+                name: c.name.clone(),
+                type_id: c.type_id,
+                nullable: c.nullable,
+                ordinal: c.ordinal,
+            })
+            .collect();
+        let source_table_id_for_scope = match &source_kind {
+            BoundStreamingSourceKind::Zyron { table_id, .. } => Some(*table_id),
+            _ => None,
+        };
+        let source_entry_for_scope = match &source_resolved {
+            SourceResolution::Zyron(e) => Some(Arc::clone(e)),
+            _ => None,
+        };
+        // Override the left-side alias when the streaming job is a JOIN, so
+        // the projection binder sees the user-declared alias like 'o' for
+        // 'orders o'. Falls back to the default source-name alias otherwise.
+        let left_scope_alias = match &right_join_info {
+            Some(info) => info.left_alias.clone(),
+            None => tgt_or_src_alias(&source_name),
+        };
+        ctx.tables.push(BoundTableRef {
+            table_idx: idx,
+            table_id: source_table_id_for_scope,
+            alias: left_scope_alias,
+            columns: col_defs,
+            entry: source_entry_for_scope,
+        });
+
+        // For JOIN shapes, push the right-side table into the same scope so
+        // projections and predicates can reference right-side columns by the
+        // right alias. The right side is resolved eagerly here because the
+        // binder needs the column list for expression binding.
+        // combined_source_columns is the join's output-row shape: left source
+        // columns followed by right source columns. Used by the aggregate
+        // builder so GROUP BY terms can reference right-side columns.
+        let mut combined_source_columns: Vec<ColumnEntry> = source_columns.clone();
+        if let Some(info) = &right_join_info {
+            let (r_schema_opt, r_tbl) = split_qualified(&info.right_name);
+            let right_entry = self
+                .resolver
+                .resolve_table(r_schema_opt, r_tbl)
+                .await
+                .map_err(|_| {
+                    ZyronError::TableNotFound(format!(
+                        "streaming JOIN right source '{}' not found",
+                        info.right_name
+                    ))
+                })?;
+            let right_cols: Vec<BoundColumnDef> = right_entry
+                .columns
+                .iter()
+                .map(|c| BoundColumnDef {
+                    column_id: c.id,
+                    name: c.name.clone(),
+                    type_id: c.type_id,
+                    nullable: c.nullable,
+                    ordinal: c.ordinal,
+                })
+                .collect();
+            let r_idx = self.alloc_table_idx();
+            ctx.tables.push(BoundTableRef {
+                table_idx: r_idx,
+                table_id: Some(right_entry.id),
+                alias: info.right_alias.clone(),
+                columns: right_cols,
+                entry: Some(Arc::clone(&right_entry)),
+            });
+            combined_source_columns.extend(right_entry.columns.iter().cloned());
+        }
+
+        // Expand wildcard projections into one BoundExpr per source column.
+        // Aggregating jobs skip the SELECT-to-BoundExpr binding because the
+        // aggregate pipeline lives in BoundAggregateSpec and the SELECT list
+        // there is validated by build_streaming_aggregate_spec instead.
+        let mut projections: Vec<BoundExpr> = Vec::new();
+        if !agg_has_group {
+            // Wildcard expands over the combined join schema when a JOIN is
+            // present, and over the source alone otherwise.
+            let wildcard_columns: &[ColumnEntry] = if right_join_info.is_some() {
+                &combined_source_columns
+            } else {
+                &source_columns
+            };
+            for item in &stmt.query.projections {
+                match item {
+                    SelectItem::Wildcard => {
+                        for col in wildcard_columns {
+                            projections.push(BoundExpr::ColumnRef(ColumnRef {
+                                table_idx: idx,
+                                column_id: col.id,
+                                type_id: col.type_id,
+                                nullable: col.nullable,
+                            }));
+                        }
+                    }
+                    SelectItem::QualifiedWildcard(_) => {
+                        for col in wildcard_columns {
+                            projections.push(BoundExpr::ColumnRef(ColumnRef {
+                                table_idx: idx,
+                                column_id: col.id,
+                                type_id: col.type_id,
+                                nullable: col.nullable,
+                            }));
+                        }
+                    }
+                    SelectItem::Expr(expr, _alias) => {
+                        let bound = self.bind_expr(&ctx, expr).await?;
+                        projections.push(bound);
+                    }
+                }
+            }
+        }
+
+        // Step 6, bind optional WHERE predicate against the source scope.
+        let predicate = if let Some(expr) = &stmt.query.where_clause {
+            Some(self.bind_expr(&ctx, expr).await?)
+        } else {
+            None
+        };
+
+        // Step 7, arity and type match against the target columns. Inline
+        // sinks have no declared column schema, so the binder uses the
+        // source column layout as the effective sink layout.
+        let effective_target_columns: Vec<ColumnEntry> = if target_columns.is_empty() {
+            source_columns.clone()
+        } else {
+            target_columns.clone()
+        };
+        // Aggregating jobs use BoundAggregateSpec to describe their output
+        // row shape. The target arity check for aggregates runs inside
+        // build_streaming_aggregate_spec against group-by + aggregate columns.
+        if !agg_has_group {
+            if projections.len() != effective_target_columns.len() {
+                return Err(ZyronError::PlanError(format!(
+                    "streaming job projection arity {} does not match target with {} columns",
+                    projections.len(),
+                    effective_target_columns.len()
+                )));
+            }
+            for (i, (proj, target_col)) in projections
+                .iter()
+                .zip(effective_target_columns.iter())
+                .enumerate()
+            {
+                let proj_type = proj.type_id();
+                if proj_type != target_col.type_id {
+                    return Err(ZyronError::PlanError(format!(
+                        "streaming job projection column {} type mismatch: got {:?}, target expects {:?}",
+                        i, proj_type, target_col.type_id
+                    )));
+                }
+            }
+        }
+
+        // Step 8, Zyron-table sources must have change data feed enabled.
+        if let SourceResolution::Zyron(entry) = &source_resolved {
+            if !entry.cdf_enabled {
+                return Err(ZyronError::PlanError(format!(
+                    "source table '{}' does not have CDC enabled, run ALTER TABLE {} SET (cdc_enabled = true) first",
+                    entry.name, entry.name
+                )));
+            }
+        }
+
+        // Step 9, classification checks. Named external sink at a lower
+        // classification than the source is rejected to prevent exfiltration.
+        // Inline sinks carry no classification, so Confidential and Restricted
+        // sources cannot flow to them at all.
+        let max_source_cls = match &source_resolved {
+            SourceResolution::External(src) => Some(src.classification),
+            SourceResolution::Zyron(_) => source_classification_from_columns(&source_columns),
+        };
+        if let Some(src_cls) = max_source_cls {
+            match &target_kind {
+                BoundStreamingSinkKind::ExternalNamed {
+                    classification: sink_cls,
+                    ..
+                } => {
+                    if (*sink_cls as u8) < (src_cls as u8) {
+                        return Err(ZyronError::PermissionDenied(format!(
+                            "cannot stream data at classification {:?} into sink classified {:?}",
+                            src_cls, sink_cls
+                        )));
+                    }
+                }
+                BoundStreamingSinkKind::ExternalInline { .. } => {
+                    if matches!(
+                        src_cls,
+                        CatalogClassification::Confidential | CatalogClassification::Restricted
+                    ) {
+                        return Err(ZyronError::PermissionDenied(format!(
+                            "inline external sink cannot be used with classification {:?} source, use CREATE EXTERNAL SINK with explicit classification",
+                            src_cls
+                        )));
+                    }
+                }
+                BoundStreamingSinkKind::Zyron { .. } => {
+                    // Flow into a Zyron table is fine, column-level classification
+                    // is enforced at query time by the security context.
+                }
+            }
+        }
+
+        // Step 10, translate parser write mode to catalog write mode. UPSERT
+        // requires the target to be a Zyron table with a declared primary key
+        // so the sink can look up existing rows. External sinks and tables
+        // without a PK are rejected here with a precise message.
+        let (write_mode, target_pk_columns) = match stmt.write_mode {
+            StreamingWriteMode::Append => (CatalogStreamingWriteMode::Append, Vec::new()),
+            StreamingWriteMode::Upsert => {
+                let target_table_id = match &target_kind {
+                    BoundStreamingSinkKind::Zyron { table_id, .. } => *table_id,
+                    _ => {
+                        return Err(ZyronError::PlanError(
+                            "UPSERT write mode requires a Zyron table target".to_string(),
+                        ));
+                    }
+                };
+                let target_entry = self.catalog.get_table_by_id(target_table_id).map_err(|_| {
+                    ZyronError::PlanError("UPSERT target table not found in catalog".to_string())
+                })?;
+                let pk_cols: Vec<ColumnId> = target_entry
+                    .constraints
+                    .iter()
+                    .find(|c| {
+                        c.constraint_type == zyron_catalog::schema::ConstraintType::PrimaryKey
+                    })
+                    .map(|c| c.columns.clone())
+                    .unwrap_or_default();
+                if pk_cols.is_empty() {
+                    return Err(ZyronError::PlanError(
+                        "UPSERT write mode requires the target table to have a primary key"
+                            .to_string(),
+                    ));
+                }
+                (CatalogStreamingWriteMode::Upsert, pk_cols)
+            }
+        };
+
+        // Final assembly: convert the intermediate kinds plus column lists
+        // into the public BoundStreamingSource and BoundStreamingSink shapes.
+        let source = match source_kind {
+            BoundStreamingSourceKind::Zyron {
+                table_id,
+                schema_id,
+            } => BoundStreamingSource::ZyronTable {
+                table_id,
+                schema_id,
+                columns: source_columns.clone(),
+            },
+            BoundStreamingSourceKind::ExternalNamed {
+                source_id,
+                schema_id,
+            } => BoundStreamingSource::ExternalNamed {
+                source_id,
+                schema_id,
+                columns: source_columns.clone(),
+                classification: source_classification.unwrap_or(CatalogClassification::Public),
+            },
+        };
+        let target = match target_kind {
+            BoundStreamingSinkKind::Zyron {
+                table_id,
+                schema_id,
+            } => BoundStreamingSink::ZyronTable {
+                table_id,
+                schema_id,
+                columns: target_columns.clone(),
+            },
+            BoundStreamingSinkKind::ExternalNamed {
+                sink_id,
+                schema_id,
+                classification,
+            } => BoundStreamingSink::ExternalNamed {
+                sink_id,
+                schema_id,
+                columns: effective_target_columns.clone(),
+                classification,
+            },
+            BoundStreamingSinkKind::ExternalInline {
+                backend,
+                uri,
+                format,
+                options,
+            } => BoundStreamingSink::ExternalInline {
+                backend,
+                uri,
+                format,
+                options,
+                columns: effective_target_columns.clone(),
+            },
+        };
+        let _ = target_schema_id; // Avoid warn, value is encoded inside target.
+
+        // Build the aggregate section when the SELECT declares a window GROUP
+        // BY. A streaming job either has zero aggregates (pure filter/project)
+        // or at least one window function in the GROUP BY plus a matching
+        // WATERMARK clause.
+        let aggregate = if agg_has_group {
+            // When the job is a JOIN + GROUP BY composition, GROUP BY columns
+            // and aggregate inputs resolve against the join's combined output
+            // schema (left columns followed by right columns). Pure jobs use
+            // just the source columns.
+            let agg_source: &[ColumnEntry] = if right_join_info.is_some() {
+                &combined_source_columns
+            } else {
+                &source_columns
+            };
+            Some(build_streaming_aggregate_spec(
+                stmt,
+                agg_source,
+                &effective_target_columns,
+                &ctx,
+                idx,
+            )?)
+        } else {
+            None
+        };
+
+        // Resolve the right side of a streaming JOIN, if present. Produces
+        // a BoundStreamingJoinSpec that carries the column ordinals and the
+        // resolved right table or stream source for the runner to open.
+        let join: Option<BoundStreamingJoinSpec> = if let Some(info) = &right_join_info {
+            // Resolve every left-side equi-key column name to its ordinal on
+            // the already-bound source. Empty is impossible because the
+            // parser's extract_equi_key_pairs rejects zero-conjunct shapes.
+            let mut left_key_ordinals: Vec<u16> = Vec::with_capacity(info.left_key_cols.len());
+            for name in &info.left_key_cols {
+                let ord = source_columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(name))
+                    .map(|c| c.ordinal)
+                    .ok_or_else(|| {
+                        ZyronError::PlanError(format!(
+                            "streaming JOIN left key column '{}' not found on source '{}'",
+                            name, info.left_name
+                        ))
+                    })?;
+                left_key_ordinals.push(ord);
+            }
+            let left_key_ordinal = left_key_ordinals[0];
+            match &info.spec {
+                zyron_parser::ast::StreamingJoinSpec::Interval {
+                    within_us,
+                    join_type,
+                } => {
+                    // Resolve the right side as a Zyron table with CDC. A
+                    // two-stream interval join requires both sides to be CDC
+                    // sources, external sources are rejected for the interval
+                    // form in this release to keep the runtime surface small.
+                    let (r_schema_opt, r_tbl) = split_qualified(&info.right_name);
+                    let right_entry = self
+                        .resolver
+                        .resolve_table(r_schema_opt, r_tbl)
+                        .await
+                        .map_err(|_| {
+                            ZyronError::TableNotFound(format!(
+                                "streaming JOIN right source '{}' not found as a Zyron table",
+                                info.right_name
+                            ))
+                        })?;
+                    if !right_entry.cdf_enabled {
+                        return Err(ZyronError::PlanError(format!(
+                            "streaming JOIN right source '{}' does not have CDC enabled",
+                            right_entry.name
+                        )));
+                    }
+                    let right_cols = right_entry.columns.clone();
+                    if info.right_key_cols.len() != info.left_key_cols.len() {
+                        return Err(ZyronError::PlanError(format!(
+                            "streaming JOIN key count mismatch: left has {}, right has {}",
+                            info.left_key_cols.len(),
+                            info.right_key_cols.len()
+                        )));
+                    }
+                    let mut right_key_ordinals: Vec<u16> =
+                        Vec::with_capacity(info.right_key_cols.len());
+                    for name in &info.right_key_cols {
+                        let ord = right_cols
+                            .iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(name))
+                            .map(|c| c.ordinal)
+                            .ok_or_else(|| {
+                                ZyronError::PlanError(format!(
+                                    "streaming JOIN right key column '{}' not found on '{}'",
+                                    name, right_entry.name
+                                ))
+                            })?;
+                        right_key_ordinals.push(ord);
+                    }
+                    let right_key_ordinal = right_key_ordinals[0];
+                    // Every key pair must share a TypeId. The runtime encodes
+                    // the key as a concatenation of column bytes, so a type
+                    // mismatch would break equality semantics silently.
+                    for (i, (lo, ro)) in left_key_ordinals
+                        .iter()
+                        .zip(right_key_ordinals.iter())
+                        .enumerate()
+                    {
+                        let lt = source_columns[*lo as usize].type_id;
+                        let rt = right_cols[*ro as usize].type_id;
+                        if lt != rt {
+                            return Err(ZyronError::PlanError(format!(
+                                "streaming JOIN key pair {} types differ: left {:?}, right {:?}",
+                                i, lt, rt
+                            )));
+                        }
+                    }
+                    // Event-time columns resolve to the named event-time
+                    // column on each side. Fall back to the equi-key column
+                    // ordinal when no event-time column is declared, matching
+                    // the pure-filter WATERMARK convention.
+                    let left_event_time_ordinal = match &stmt.watermark {
+                        Some(w) => source_columns
+                            .iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(&w.event_time_column))
+                            .map(|c| c.ordinal)
+                            .unwrap_or(left_key_ordinal),
+                        None => left_key_ordinal,
+                    };
+                    let right_event_time_ordinal = right_cols
+                        .iter()
+                        .position(|c| {
+                            c.name.to_lowercase().contains("event_time")
+                                || c.name.to_lowercase().contains("ts")
+                        })
+                        .map(|i| i as u16)
+                        .unwrap_or(right_key_ordinal);
+                    let mut combined: Vec<ColumnEntry> = source_columns.clone();
+                    combined.extend(right_cols.iter().cloned());
+                    let _ = right_key_ordinal; // reserved for engine lookups
+                    Some(BoundStreamingJoinSpec::Interval {
+                        right_source: BoundStreamingSource::ZyronTable {
+                            table_id: right_entry.id,
+                            schema_id: right_entry.schema_id,
+                            columns: right_cols,
+                        },
+                        right_alias: info.right_alias.clone(),
+                        left_key_ordinals,
+                        right_key_ordinals,
+                        left_event_time_ordinal,
+                        right_event_time_ordinal,
+                        within_us: *within_us,
+                        join_type: map_streaming_join_type(*join_type),
+                        combined_columns: combined,
+                    })
+                }
+                zyron_parser::ast::StreamingJoinSpec::Temporal {
+                    event_time_column,
+                    join_type,
+                } => {
+                    if matches!(
+                        *join_type,
+                        zyron_parser::ast::StreamingJoinType::Right
+                            | zyron_parser::ast::StreamingJoinType::Full
+                    ) {
+                        return Err(ZyronError::PlanError(
+                            "temporal joins support only INNER and LEFT OUTER, the right side is a static lookup"
+                                .to_string(),
+                        ));
+                    }
+                    // Right side must be a Zyron table with a primary key.
+                    let (r_schema_opt, r_tbl) = split_qualified(&info.right_name);
+                    let right_entry = self
+                        .resolver
+                        .resolve_table(r_schema_opt, r_tbl)
+                        .await
+                        .map_err(|_| {
+                            ZyronError::TableNotFound(format!(
+                                "streaming temporal JOIN right table '{}' not found",
+                                info.right_name
+                            ))
+                        })?;
+                    let right_cols = right_entry.columns.clone();
+                    let pk_col_ids: Vec<ColumnId> = right_entry
+                        .constraints
+                        .iter()
+                        .find(|c| {
+                            c.constraint_type == zyron_catalog::schema::ConstraintType::PrimaryKey
+                        })
+                        .map(|c| c.columns.clone())
+                        .unwrap_or_default();
+                    if pk_col_ids.is_empty() {
+                        return Err(ZyronError::PlanError(format!(
+                            "streaming temporal JOIN requires right table '{}' to declare a PRIMARY KEY",
+                            right_entry.name
+                        )));
+                    }
+                    let pk_ordinals: Vec<u16> = pk_col_ids
+                        .iter()
+                        .filter_map(|id| right_cols.iter().find(|c| c.id == *id).map(|c| c.ordinal))
+                        .collect();
+                    let left_event_time_ordinal = source_columns
+                        .iter()
+                        .find(|c| c.name.eq_ignore_ascii_case(event_time_column))
+                        .map(|c| c.ordinal)
+                        .ok_or_else(|| {
+                            ZyronError::PlanError(format!(
+                                "streaming temporal JOIN event-time column '{}' not found on left source",
+                                event_time_column
+                            ))
+                        })?;
+                    let mut combined: Vec<ColumnEntry> = source_columns.clone();
+                    combined.extend(right_cols.iter().cloned());
+                    let _ = left_key_ordinal; // kept as the first left key
+                    Some(BoundStreamingJoinSpec::Temporal {
+                        right_table_id: right_entry.id,
+                        right_schema_id: right_entry.schema_id,
+                        right_alias: info.right_alias.clone(),
+                        right_pk_ordinals: pk_ordinals,
+                        left_key_ordinals,
+                        left_event_time_ordinal,
+                        join_type: map_streaming_join_type(*join_type),
+                        combined_columns: combined,
+                    })
+                }
+            }
+        } else {
+            None
+        };
+
+        Ok(BoundStreamingJob {
+            name: stmt.name.clone(),
+            if_not_exists: stmt.if_not_exists,
+            source,
+            target,
+            projections,
+            predicate,
+            write_mode,
+            job_mode: stmt.job_mode.clone(),
+            target_pk_columns,
+            aggregate,
+            join,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming aggregate binding
+// ---------------------------------------------------------------------------
+
+/// Extracts TUMBLE/HOP/SESSION from the GROUP BY list, binds the remaining
+/// group-by columns, validates the SELECT list as a mix of group-by column
+/// references and aggregate function calls, and assembles a BoundAggregateSpec.
+/// Returns a PlanError when any rule is violated.
+fn build_streaming_aggregate_spec(
+    stmt: &CreateStreamingJobStatement,
+    source_columns: &[ColumnEntry],
+    target_columns: &[ColumnEntry],
+    ctx: &BindContext,
+    table_idx: usize,
+) -> Result<BoundAggregateSpec> {
+    // The SELECT must contain at least one aggregate or the GROUP BY is a
+    // misuse of streaming windowing semantics.
+    if stmt.query.group_by.is_empty() {
+        return Err(ZyronError::PlanError(
+            "streaming window requires GROUP BY with TUMBLE, HOP, or SESSION".to_string(),
+        ));
+    }
+
+    // Walk the GROUP BY list. Exactly one entry must be a window function
+    // call. The rest are treated as grouping columns.
+    let mut window_type: Option<BoundStreamingWindowType> = None;
+    let mut group_cols: Vec<ColumnId> = Vec::new();
+    let mut event_time_column_name: Option<String> = None;
+    for gexp in &stmt.query.group_by {
+        if let Some((wt, ev_col)) = try_parse_window_fn(gexp)? {
+            if window_type.is_some() {
+                return Err(ZyronError::PlanError(
+                    "streaming GROUP BY allows at most one window function".to_string(),
+                ));
+            }
+            window_type = Some(wt);
+            event_time_column_name = Some(ev_col);
+            continue;
+        }
+        // Plain column reference.
+        let name = match gexp {
+            Expr::Identifier(n) => n.clone(),
+            Expr::QualifiedIdentifier { column, .. } => column.clone(),
+            _ => {
+                return Err(ZyronError::PlanError(
+                    "streaming GROUP BY terms must be column references or a window function"
+                        .to_string(),
+                ));
+            }
+        };
+        let col = source_columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(&name))
+            .ok_or_else(|| {
+                ZyronError::PlanError(format!("GROUP BY column '{}' not found in source", name))
+            })?;
+        group_cols.push(col.id);
+    }
+    let window_type = window_type.ok_or_else(|| {
+        ZyronError::PlanError(
+            "streaming GROUP BY must contain a TUMBLE, HOP, or SESSION call".to_string(),
+        )
+    })?;
+    let event_time_column_name = event_time_column_name.unwrap();
+    let event_time_col = source_columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(&event_time_column_name))
+        .ok_or_else(|| {
+            ZyronError::PlanError(format!(
+                "event-time column '{}' not found in source",
+                event_time_column_name
+            ))
+        })?;
+    let event_time_scale = infer_event_time_scale(event_time_col.type_id);
+
+    // Bind each SELECT item. Plain column refs must reference a group-by
+    // column. Function calls are aggregates and must resolve to a known
+    // accumulator keyed by (name, input_type).
+    let mut aggregations: Vec<BoundAggregateItem> = Vec::new();
+    for item in &stmt.query.projections {
+        match item {
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
+                return Err(ZyronError::PlanError(
+                    "wildcard SELECT is not supported in aggregating streaming jobs".to_string(),
+                ));
+            }
+            SelectItem::Expr(expr, _alias) => match expr {
+                Expr::Identifier(_) | Expr::QualifiedIdentifier { .. } => {
+                    let name = match expr {
+                        Expr::Identifier(n) => n.clone(),
+                        Expr::QualifiedIdentifier { column, .. } => column.clone(),
+                        _ => unreachable!(),
+                    };
+                    let col = source_columns
+                        .iter()
+                        .find(|c| c.name.eq_ignore_ascii_case(&name))
+                        .ok_or_else(|| {
+                            ZyronError::PlanError(format!(
+                                "SELECT column '{}' not found in source",
+                                name
+                            ))
+                        })?;
+                    if !group_cols.iter().any(|id| *id == col.id) {
+                        return Err(ZyronError::PlanError(format!(
+                            "SELECT column '{}' must appear in GROUP BY or be inside an aggregate",
+                            name
+                        )));
+                    }
+                }
+                Expr::Function { name, args, .. } => {
+                    let (input_col, input_type) = resolve_agg_input(name, args, source_columns)?;
+                    let output_type = infer_agg_output(name, input_type);
+                    aggregations.push(BoundAggregateItem {
+                        function: name.to_ascii_uppercase(),
+                        input_column_id: input_col,
+                        output_type,
+                    });
+                }
+                _ => {
+                    return Err(ZyronError::PlanError(
+                        "streaming aggregate SELECT items must be group-by columns or aggregate calls".to_string(),
+                    ));
+                }
+            },
+        }
+    }
+
+    // WATERMARK is required whenever an aggregate runs. Without it, the
+    // runner has no signal for window closure.
+    let watermark = if let Some(wm) = &stmt.watermark {
+        if !wm
+            .event_time_column
+            .eq_ignore_ascii_case(&event_time_column_name)
+        {
+            return Err(ZyronError::PlanError(format!(
+                "WATERMARK column '{}' must match GROUP BY event-time column '{}'",
+                wm.event_time_column, event_time_column_name
+            )));
+        }
+        let micros = interval_to_micros(&wm.allowed_lateness)?;
+        if micros == 0 {
+            BoundWatermark::Punctual
+        } else {
+            BoundWatermark::BoundedOutOfOrderness {
+                allowed_lateness_us: micros,
+            }
+        }
+    } else {
+        BoundWatermark::Punctual
+    };
+
+    let late_data_policy = match stmt.late_data_policy {
+        Some(LateDataPolicySpec::Drop) => BoundLateDataPolicy::Drop,
+        Some(LateDataPolicySpec::Reopen) => BoundLateDataPolicy::ReopenWindow,
+        Some(LateDataPolicySpec::SideOutput) => BoundLateDataPolicy::SideOutput,
+        None => BoundLateDataPolicy::Drop,
+    };
+
+    // Silence the unused-warnings for ctx and table_idx parameters. They are
+    // plumbed in so future aggregate argument forms (CAST, arithmetic inside
+    // the aggregate) can reuse the full expression binder if needed.
+    let _ = ctx;
+    let _ = table_idx;
+
+    // Target arity check: N group-by columns + M aggregate outputs must equal
+    // the target column count. Empty target column list means the target is
+    // an inline external sink, which does not enforce arity here.
+    if !target_columns.is_empty() {
+        let expected = group_cols.len() + aggregations.len();
+        if expected != target_columns.len() {
+            return Err(ZyronError::PlanError(format!(
+                "streaming aggregate output arity {} does not match target with {} columns",
+                expected,
+                target_columns.len()
+            )));
+        }
+    }
+
+    Ok(BoundAggregateSpec {
+        window_type,
+        event_time_column_id: event_time_col.id,
+        event_time_scale,
+        group_by_column_ids: group_cols,
+        aggregations,
+        watermark,
+        late_data_policy,
+    })
+}
+
+/// Attempts to interpret a GROUP BY expression as TUMBLE/HOP/SESSION. Returns
+/// Ok(None) when the expression is not a window function call.
+fn try_parse_window_fn(expr: &Expr) -> Result<Option<(BoundStreamingWindowType, String)>> {
+    let (name, args) = match expr {
+        Expr::Function { name, args, .. } => (name.to_ascii_uppercase(), args),
+        _ => return Ok(None),
+    };
+    match name.as_str() {
+        "TUMBLE" => {
+            if args.len() != 2 {
+                return Err(ZyronError::PlanError(
+                    "TUMBLE(event_time, INTERVAL 'N unit') requires exactly 2 arguments"
+                        .to_string(),
+                ));
+            }
+            let col = extract_column_name(&args[0])?;
+            let size = extract_interval_micros(&args[1])?;
+            let size_ms = (size / 1_000).max(1);
+            Ok(Some((BoundStreamingWindowType::Tumbling { size_ms }, col)))
+        }
+        "HOP" | "HOPPING" => {
+            if args.len() != 3 {
+                return Err(ZyronError::PlanError(
+                    "HOP(event_time, slide, size) requires exactly 3 arguments".to_string(),
+                ));
+            }
+            let col = extract_column_name(&args[0])?;
+            let slide = extract_interval_micros(&args[1])?;
+            let size = extract_interval_micros(&args[2])?;
+            let slide_ms = (slide / 1_000).max(1);
+            let size_ms = (size / 1_000).max(1);
+            Ok(Some((
+                BoundStreamingWindowType::Hopping { size_ms, slide_ms },
+                col,
+            )))
+        }
+        "SESSION" => {
+            if args.len() != 2 {
+                return Err(ZyronError::PlanError(
+                    "SESSION(event_time, INTERVAL 'N unit') requires exactly 2 arguments"
+                        .to_string(),
+                ));
+            }
+            let col = extract_column_name(&args[0])?;
+            let gap = extract_interval_micros(&args[1])?;
+            let gap_ms = (gap / 1_000).max(1);
+            Ok(Some((BoundStreamingWindowType::Session { gap_ms }, col)))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn extract_column_name(arg: &FunctionArg) -> Result<String> {
+    match arg {
+        FunctionArg::Unnamed(expr) | FunctionArg::Named { value: expr, .. } => match expr {
+            Expr::Identifier(n) => Ok(n.clone()),
+            Expr::QualifiedIdentifier { column, .. } => Ok(column.clone()),
+            _ => Err(ZyronError::PlanError(
+                "expected a column reference as the window function's first argument".to_string(),
+            )),
+        },
+    }
+}
+
+fn extract_interval_micros(arg: &FunctionArg) -> Result<i64> {
+    match arg {
+        FunctionArg::Unnamed(expr) | FunctionArg::Named { value: expr, .. } => match expr {
+            Expr::Literal(LiteralValue::Interval(interval)) => interval_to_micros(interval),
+            _ => Err(ZyronError::PlanError(
+                "expected an INTERVAL literal for the window duration".to_string(),
+            )),
+        },
+    }
+}
+
+fn interval_to_micros(iv: &zyron_common::Interval) -> Result<i64> {
+    // Only the nanoseconds component is honored for sub-day durations. Days
+    // fold into 24-hour multiples. Months are rejected because streaming
+    // windows must have an exact duration in microseconds.
+    if iv.months != 0 {
+        return Err(ZyronError::PlanError(
+            "streaming window durations cannot use month-based intervals".to_string(),
+        ));
+    }
+    let ns_from_days: i64 = (iv.days as i64).saturating_mul(86_400_000_000_000i64);
+    let total_ns = iv.nanoseconds.saturating_add(ns_from_days);
+    Ok(total_ns / 1_000)
+}
+
+fn resolve_agg_input(
+    name: &str,
+    args: &[FunctionArg],
+    source_columns: &[ColumnEntry],
+) -> Result<(Option<ColumnId>, TypeId)> {
+    let upper = name.to_ascii_uppercase();
+    // COUNT(*) is parsed as a single positional argument that is the string
+    // identifier "*".
+    if upper == "COUNT" && args.len() == 1 {
+        if let FunctionArg::Unnamed(Expr::Identifier(n)) = &args[0] {
+            if n == "*" {
+                return Ok((None, TypeId::Null));
+            }
+        }
+    }
+    if args.len() != 1 {
+        return Err(ZyronError::PlanError(format!(
+            "aggregate {name} requires exactly one argument"
+        )));
+    }
+    let col_name = match &args[0] {
+        FunctionArg::Unnamed(expr) | FunctionArg::Named { value: expr, .. } => match expr {
+            Expr::Identifier(n) => n.clone(),
+            Expr::QualifiedIdentifier { column, .. } => column.clone(),
+            _ => {
+                return Err(ZyronError::PlanError(format!(
+                    "aggregate {name} argument must be a column reference"
+                )));
+            }
+        },
+    };
+    let col = source_columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(&col_name))
+        .ok_or_else(|| {
+            ZyronError::PlanError(format!(
+                "aggregate {name} references unknown column '{col_name}'"
+            ))
+        })?;
+    Ok((Some(col.id), col.type_id))
+}
+
+fn infer_agg_output(name: &str, input_type: TypeId) -> TypeId {
+    let upper = name.to_ascii_uppercase();
+    match upper.as_str() {
+        "COUNT" => TypeId::Int64,
+        "SUM" => match input_type {
+            TypeId::Float32 | TypeId::Float64 => TypeId::Float64,
+            _ => TypeId::Int64,
+        },
+        "AVG" => TypeId::Float64,
+        "MIN" | "MAX" => match input_type {
+            TypeId::Float32 | TypeId::Float64 => TypeId::Float64,
+            _ => TypeId::Int64,
+        },
+        "FIRST" | "LAST" => input_type,
+        _ => input_type,
+    }
+}
+
+/// Picks a sensible event-time scale based on the column's TypeId. Timestamp
+/// columns are already in microseconds. Date is interpreted as days (seconds
+/// multiplier then days*86400 fits one more step up). Plain integers default
+/// to milliseconds, which is the standard Kafka and CDC timestamp unit.
+fn infer_event_time_scale(type_id: TypeId) -> BoundEventTimeScale {
+    match type_id {
+        TypeId::Timestamp | TypeId::TimestampTz => BoundEventTimeScale::Microseconds,
+        TypeId::Time => BoundEventTimeScale::Microseconds,
+        _ => BoundEventTimeScale::Milliseconds,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Intermediate resolution shapes used only inside bind_create_streaming_job.
+// ---------------------------------------------------------------------------
+
+enum SourceResolution {
+    Zyron(Arc<TableEntry>),
+    External(Arc<zyron_catalog::schema::ExternalSourceEntry>),
+}
+
+enum BoundStreamingSourceKind {
+    Zyron {
+        table_id: TableId,
+        schema_id: SchemaId,
+    },
+    ExternalNamed {
+        source_id: ExternalSourceId,
+        schema_id: SchemaId,
+    },
+}
+
+enum BoundStreamingSinkKind {
+    Zyron {
+        table_id: TableId,
+        schema_id: SchemaId,
+    },
+    ExternalNamed {
+        sink_id: ExternalSinkId,
+        schema_id: SchemaId,
+        classification: CatalogClassification,
+    },
+    ExternalInline {
+        backend: zyron_parser::ast::ExternalBackendKind,
+        uri: String,
+        format: zyron_parser::ast::ExternalFormatKind,
+        options: Vec<(String, String)>,
+    },
+}
+
+/// Zyron tables do not carry a table-level classification today. The binder
+/// currently returns None, meaning no downstream clearance constraint is
+/// applied. Widening this to scan per-column classifications from the catalog
+/// is a follow-up once the ClassificationStore is queryable from here.
+fn source_classification_from_columns(_cols: &[ColumnEntry]) -> Option<CatalogClassification> {
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Streaming job binding helpers
+// ---------------------------------------------------------------------------
+
+/// Carries the parser-level JOIN information into the binder step where the
+/// right-hand source is resolved. Holds the raw names plus the single
+/// equi-key pair already validated from the ON expression.
+#[derive(Debug, Clone)]
+struct StreamingJoinBindInput {
+    left_name: String,
+    left_alias: String,
+    right_name: String,
+    right_alias: String,
+    left_key_cols: Vec<String>,
+    right_key_cols: Vec<String>,
+    spec: zyron_parser::ast::StreamingJoinSpec,
+}
+
+/// Accepts ON expressions of the shape
+/// `<l>.<col> = <r>.<col> [AND <l>.<col> = <r>.<col>]...` and returns the
+/// two parallel column-name vectors. Rejects every other shape with a
+/// specific error so multi-key mistakes surface precisely.
+fn extract_equi_key_pairs(
+    expr: &Expr,
+    left_alias: &str,
+    right_alias: &str,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let mut left_cols = Vec::new();
+    let mut right_cols = Vec::new();
+    collect_equi_conjuncts(
+        expr,
+        left_alias,
+        right_alias,
+        &mut left_cols,
+        &mut right_cols,
+    )?;
+    if left_cols.is_empty() {
+        return Err(ZyronError::PlanError(
+            "streaming JOIN ON must contain at least one equality of two qualified columns"
+                .to_string(),
+        ));
+    }
+    Ok((left_cols, right_cols))
+}
+
+/// Walks a flat AND-chain of equality predicates. Every leaf must be an
+/// equality of two qualified column references, one from each side. Any
+/// non-equality or cross-side mismatch is rejected.
+fn collect_equi_conjuncts(
+    expr: &Expr,
+    left_alias: &str,
+    right_alias: &str,
+    left_cols: &mut Vec<String>,
+    right_cols: &mut Vec<String>,
+) -> Result<()> {
+    match expr {
+        Expr::BinaryOp {
+            op: BinaryOperator::And,
+            left,
+            right,
+        } => {
+            collect_equi_conjuncts(left, left_alias, right_alias, left_cols, right_cols)?;
+            collect_equi_conjuncts(right, left_alias, right_alias, left_cols, right_cols)?;
+            Ok(())
+        }
+        Expr::BinaryOp {
+            op: BinaryOperator::Eq,
+            left,
+            right,
+        } => {
+            let l_ref = as_qualified_col(left)?;
+            let r_ref = as_qualified_col(right)?;
+            if l_ref.0.eq_ignore_ascii_case(left_alias) && r_ref.0.eq_ignore_ascii_case(right_alias)
+            {
+                left_cols.push(l_ref.1);
+                right_cols.push(r_ref.1);
+                Ok(())
+            } else if l_ref.0.eq_ignore_ascii_case(right_alias)
+                && r_ref.0.eq_ignore_ascii_case(left_alias)
+            {
+                left_cols.push(r_ref.1);
+                right_cols.push(l_ref.1);
+                Ok(())
+            } else {
+                Err(ZyronError::PlanError(format!(
+                    "streaming JOIN ON must reference both sides, got '{}' and '{}'",
+                    l_ref.0, r_ref.0
+                )))
+            }
+        }
+        Expr::Nested(inner) => {
+            collect_equi_conjuncts(inner, left_alias, right_alias, left_cols, right_cols)
+        }
+        _ => Err(ZyronError::PlanError(
+            "streaming JOIN ON must be equi-key equalities, optionally AND-chained".to_string(),
+        )),
+    }
+}
+
+/// Reads a qualified column reference (alias.column) out of an Expr. Returns
+/// the alias and column names as a pair.
+fn as_qualified_col(expr: &Expr) -> Result<(String, String)> {
+    match expr {
+        Expr::QualifiedIdentifier { table, column } => Ok((table.clone(), column.clone())),
+        _ => Err(ZyronError::PlanError(
+            "streaming JOIN ON must reference qualified columns like 'o.customer_id'".to_string(),
+        )),
+    }
+}
+
+/// Splits an optionally schema-qualified name into (schema, table) pieces.
+fn split_qualified(name: &str) -> (Option<&str>, &str) {
+    if let Some(pos) = name.find('.') {
+        (Some(&name[..pos]), &name[pos + 1..])
+    } else {
+        (None, name)
+    }
+}
+
+/// Returns the alias to register for a streaming source table scope.
+fn tgt_or_src_alias(name: &str) -> String {
+    name.to_string()
+}
+
+/// Maps the parser's StreamingJoinType to the binder-local enum.
+fn map_streaming_join_type(t: zyron_parser::ast::StreamingJoinType) -> BoundStreamingJoinType {
+    match t {
+        zyron_parser::ast::StreamingJoinType::Inner => BoundStreamingJoinType::Inner,
+        zyron_parser::ast::StreamingJoinType::Left => BoundStreamingJoinType::Left,
+        zyron_parser::ast::StreamingJoinType::Right => BoundStreamingJoinType::Right,
+        zyron_parser::ast::StreamingJoinType::Full => BoundStreamingJoinType::Full,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1966,6 +3826,101 @@ fn infer_function_type(name: &str, arg_types: &[TypeId]) -> TypeId {
 mod tests {
     use super::*;
 
+    // -----
+    // Streaming-join helper tests
+    // -----
+
+    #[test]
+    fn test_extract_equi_key_pairs_single() {
+        let expr = Expr::BinaryOp {
+            op: BinaryOperator::Eq,
+            left: Box::new(Expr::QualifiedIdentifier {
+                table: "o".to_string(),
+                column: "customer_id".to_string(),
+            }),
+            right: Box::new(Expr::QualifiedIdentifier {
+                table: "c".to_string(),
+                column: "id".to_string(),
+            }),
+        };
+        let (l, r) = extract_equi_key_pairs(&expr, "o", "c").unwrap();
+        assert_eq!(l, vec!["customer_id".to_string()]);
+        assert_eq!(r, vec!["id".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_equi_key_pairs_multi() {
+        // Two-column equi-key: l.a = r.x AND l.b = r.y.
+        let eq_a = Expr::BinaryOp {
+            op: BinaryOperator::Eq,
+            left: Box::new(Expr::QualifiedIdentifier {
+                table: "l".to_string(),
+                column: "a".to_string(),
+            }),
+            right: Box::new(Expr::QualifiedIdentifier {
+                table: "r".to_string(),
+                column: "x".to_string(),
+            }),
+        };
+        let eq_b = Expr::BinaryOp {
+            op: BinaryOperator::Eq,
+            left: Box::new(Expr::QualifiedIdentifier {
+                table: "l".to_string(),
+                column: "b".to_string(),
+            }),
+            right: Box::new(Expr::QualifiedIdentifier {
+                table: "r".to_string(),
+                column: "y".to_string(),
+            }),
+        };
+        let and_expr = Expr::BinaryOp {
+            op: BinaryOperator::And,
+            left: Box::new(eq_a),
+            right: Box::new(eq_b),
+        };
+        let (l, r) = extract_equi_key_pairs(&and_expr, "l", "r").unwrap();
+        assert_eq!(l, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(r, vec!["x".to_string(), "y".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_equi_key_pairs_rejects_non_equi() {
+        // Greater-than instead of equality must be rejected.
+        let expr = Expr::BinaryOp {
+            op: BinaryOperator::Gt,
+            left: Box::new(Expr::QualifiedIdentifier {
+                table: "l".to_string(),
+                column: "a".to_string(),
+            }),
+            right: Box::new(Expr::QualifiedIdentifier {
+                table: "r".to_string(),
+                column: "x".to_string(),
+            }),
+        };
+        assert!(extract_equi_key_pairs(&expr, "l", "r").is_err());
+    }
+
+    #[test]
+    fn test_map_bound_streaming_join_type_roundtrip() {
+        use zyron_parser::ast::StreamingJoinType as P;
+        assert_eq!(
+            map_streaming_join_type(P::Inner),
+            BoundStreamingJoinType::Inner
+        );
+        assert_eq!(
+            map_streaming_join_type(P::Left),
+            BoundStreamingJoinType::Left
+        );
+        assert_eq!(
+            map_streaming_join_type(P::Right),
+            BoundStreamingJoinType::Right
+        );
+        assert_eq!(
+            map_streaming_join_type(P::Full),
+            BoundStreamingJoinType::Full
+        );
+    }
+
     #[test]
     fn test_literal_type_inference() {
         assert_eq!(literal_type(&LiteralValue::Integer(42)), TypeId::Int64);
@@ -2060,5 +4015,455 @@ mod tests {
         assert!(is_aggregate_function("max"));
         assert!(!is_aggregate_function("length"));
         assert!(!is_aggregate_function("lower"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Streaming job bind tests
+    // -----------------------------------------------------------------------
+
+    use zyron_buffer::{BufferPool, BufferPoolConfig};
+    use zyron_catalog::cache::CatalogCache;
+    use zyron_catalog::storage::{CatalogStorage, HeapCatalogStorage};
+    use zyron_catalog::{Catalog, DatabaseId};
+    use zyron_parser::ast::{ColumnDef, DataType};
+    use zyron_storage::{DiskManager, DiskManagerConfig};
+    use zyron_wal::{WalWriter, WalWriterConfig};
+
+    /// Builds a temp-dir backed catalog, one database, the public schema,
+    /// and two tables (orders, orders_vip). Returns the catalog plus the
+    /// table ids. The orders table has cdf_enabled forced to match the
+    /// caller's argument by rewriting the cache entry.
+    async fn build_streaming_test_catalog(
+        orders_cdf_enabled: bool,
+    ) -> (
+        Catalog,
+        Arc<CatalogCache>,
+        DatabaseId,
+        SchemaId,
+        TableId,
+        TableId,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let wal_dir = dir.path().join("wal");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let disk = Arc::new(
+            DiskManager::new(DiskManagerConfig {
+                data_dir,
+                fsync_enabled: false,
+            })
+            .await
+            .unwrap(),
+        );
+        let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 1024 }));
+        let wal = Arc::new(
+            WalWriter::new(WalWriterConfig {
+                wal_dir,
+                fsync_enabled: false,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
+        storage.init_cache().await.unwrap();
+        let storage: Arc<dyn CatalogStorage> = Arc::new(storage);
+        let cache = Arc::new(CatalogCache::new(1024, 256));
+        let catalog = Catalog::new(storage, Arc::clone(&cache), Arc::clone(&wal))
+            .await
+            .unwrap();
+
+        let db_id = catalog.create_database("streamdb", "tester").await.unwrap();
+        let schema_id = catalog
+            .create_schema(db_id, "public", "tester")
+            .await
+            .unwrap();
+
+        // orders(id BIGINT, amount DOUBLE)
+        let orders_cols = vec![
+            ColumnDef {
+                name: "id".to_string(),
+                data_type: DataType::BigInt,
+                nullable: Some(true),
+                default: None,
+                constraints: vec![],
+            },
+            ColumnDef {
+                name: "amount".to_string(),
+                data_type: DataType::DoublePrecision,
+                nullable: Some(true),
+                default: None,
+                constraints: vec![],
+            },
+        ];
+        let orders_id = catalog
+            .create_table(schema_id, "orders", &orders_cols, &[])
+            .await
+            .unwrap();
+
+        // orders_vip(id BIGINT, amount DOUBLE)
+        let vip_cols = vec![
+            ColumnDef {
+                name: "id".to_string(),
+                data_type: DataType::BigInt,
+                nullable: Some(true),
+                default: None,
+                constraints: vec![],
+            },
+            ColumnDef {
+                name: "amount".to_string(),
+                data_type: DataType::DoublePrecision,
+                nullable: Some(true),
+                default: None,
+                constraints: vec![],
+            },
+        ];
+        let vip_id = catalog
+            .create_table(schema_id, "orders_vip", &vip_cols, &[])
+            .await
+            .unwrap();
+
+        // Patch orders.cdf_enabled in the cache so resolver sees the desired state.
+        // The cache's put_table does not replace on name collisions, so invalidate first.
+        if let Some(existing) = cache.get_table_by_name(schema_id, "orders") {
+            let mut updated = (*existing).clone();
+            updated.cdf_enabled = orders_cdf_enabled;
+            cache.invalidate_table(existing.id);
+            cache.put_table(updated);
+        }
+
+        (catalog, cache, db_id, schema_id, orders_id, vip_id)
+    }
+
+    #[tokio::test]
+    async fn test_bind_streaming_job_single_table_ok() {
+        let (catalog, _cache, db_id, _schema_id, orders_id, vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql = "CREATE STREAMING JOB j AS SELECT id, amount FROM orders WHERE amount > 100 INTO orders_vip";
+        let stmt = zyron_parser::parse(sql)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let resolver = catalog.resolver(db_id, vec!["public".to_string()]);
+        let mut binder = Binder::new(resolver, &catalog);
+        let bound = binder.bind(stmt).await.unwrap();
+        match bound {
+            BoundStatement::CreateStreamingJob(job) => {
+                assert_eq!(job.source_table_id(), Some(orders_id));
+                assert_eq!(job.target_table_id(), Some(vip_id));
+                assert_eq!(job.projections.len(), 2);
+                assert!(job.predicate.is_some());
+                assert!(matches!(job.write_mode, CatalogStreamingWriteMode::Append));
+            }
+            other => panic!("expected CreateStreamingJob, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_streaming_job_upsert_requires_pk() {
+        // Target table without a primary key: bind must reject UPSERT.
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql = "CREATE STREAMING JOB j AS SELECT id, amount FROM orders WHERE amount > 100 INTO orders_vip WRITE MODE UPSERT";
+        let stmt = zyron_parser::parse(sql)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let resolver = catalog.resolver(db_id, vec!["public".to_string()]);
+        let mut binder = Binder::new(resolver, &catalog);
+        let err = binder.bind(stmt).await.expect_err("bind should fail");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("requires the target table to have a primary key"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bind_streaming_job_upsert_with_pk_ok() {
+        // Build a catalog with orders_vip_pk that has a PK on id.
+        let (catalog, _cache, db_id, schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let pk_cols = vec![
+            ColumnDef {
+                name: "id".to_string(),
+                data_type: DataType::BigInt,
+                nullable: Some(false),
+                default: None,
+                constraints: vec![ColumnConstraint::PrimaryKey],
+            },
+            ColumnDef {
+                name: "amount".to_string(),
+                data_type: DataType::DoublePrecision,
+                nullable: Some(true),
+                default: None,
+                constraints: vec![],
+            },
+        ];
+        let pk_table_id = catalog
+            .create_table(schema_id, "orders_vip_pk", &pk_cols, &[])
+            .await
+            .unwrap();
+        let sql = "CREATE STREAMING JOB jpk AS SELECT id, amount FROM orders INTO orders_vip_pk WRITE MODE UPSERT";
+        let stmt = zyron_parser::parse(sql)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let resolver = catalog.resolver(db_id, vec!["public".to_string()]);
+        let mut binder = Binder::new(resolver, &catalog);
+        let bound = binder.bind(stmt).await.expect("bind should succeed");
+        match bound {
+            BoundStatement::CreateStreamingJob(job) => {
+                assert_eq!(job.target_table_id(), Some(pk_table_id));
+                assert!(matches!(job.write_mode, CatalogStreamingWriteMode::Upsert));
+                assert_eq!(job.target_pk_columns.len(), 1);
+                assert_eq!(job.target_pk_columns[0].0, 0);
+            }
+            other => panic!("expected CreateStreamingJob, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_streaming_job_requires_cdc() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(false).await;
+        let sql = "CREATE STREAMING JOB j AS SELECT id, amount FROM orders WHERE amount > 100 INTO orders_vip";
+        let stmt = zyron_parser::parse(sql)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let resolver = catalog.resolver(db_id, vec!["public".to_string()]);
+        let mut binder = Binder::new(resolver, &catalog);
+        let err = binder.bind(stmt).await.expect_err("bind should fail");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("does not have CDC enabled"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // External source and sink bind tests
+    // -----------------------------------------------------------------------
+
+    /// Builds and registers a named external source under the public schema
+    /// using the given name and classification. Matches the column layout
+    /// of orders_vip so downstream arity checks succeed.
+    async fn register_external_source(
+        catalog: &Catalog,
+        schema_id: SchemaId,
+        name: &str,
+        classification: CatalogClassification,
+    ) -> ExternalSourceId {
+        use zyron_catalog::schema::{
+            ExternalBackend, ExternalFormat, ExternalMode, ExternalSourceEntry,
+        };
+        let entry = ExternalSourceEntry {
+            id: ExternalSourceId(0),
+            schema_id,
+            name: name.to_string(),
+            backend: ExternalBackend::File,
+            uri: "/tmp/in".to_string(),
+            format: ExternalFormat::JsonLines,
+            mode: ExternalMode::OneShot,
+            schedule_cron: None,
+            options: vec![],
+            columns: vec![],
+            credential_key_id: None,
+            credential_ciphertext: None,
+            classification,
+            tags: vec![],
+            owner_role_id: 0,
+            created_at: 0,
+        };
+        catalog.create_external_source(entry).await.unwrap()
+    }
+
+    /// Builds and registers a named external sink under the public schema.
+    async fn register_external_sink(
+        catalog: &Catalog,
+        schema_id: SchemaId,
+        name: &str,
+        classification: CatalogClassification,
+    ) -> ExternalSinkId {
+        use zyron_catalog::schema::{ExternalBackend, ExternalFormat, ExternalSinkEntry};
+        let entry = ExternalSinkEntry {
+            id: ExternalSinkId(0),
+            schema_id,
+            name: name.to_string(),
+            backend: ExternalBackend::File,
+            uri: "/tmp/out".to_string(),
+            format: ExternalFormat::JsonLines,
+            options: vec![],
+            columns: vec![],
+            credential_key_id: None,
+            credential_ciphertext: None,
+            classification,
+            tags: vec![],
+            owner_role_id: 0,
+            created_at: 0,
+        };
+        catalog.create_external_sink(entry).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_bind_streaming_job_external_source_named() {
+        let (catalog, _cache, db_id, schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        register_external_source(&catalog, schema_id, "ext_in", CatalogClassification::Public)
+            .await;
+        let sql = "CREATE STREAMING JOB j AS SELECT * FROM ext_in INTO orders_vip";
+        let stmt = zyron_parser::parse(sql)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let resolver = catalog.resolver(db_id, vec!["public".to_string()]);
+        let mut binder = Binder::new(resolver, &catalog);
+        let bound = binder.bind(stmt).await.unwrap();
+        match bound {
+            BoundStatement::CreateStreamingJob(job) => {
+                assert!(matches!(
+                    job.source,
+                    BoundStreamingSource::ExternalNamed { .. }
+                ));
+                assert!(matches!(job.target, BoundStreamingSink::ZyronTable { .. }));
+            }
+            other => panic!("expected CreateStreamingJob, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_streaming_job_inline_file_source() {
+        // The parser does not support inline FILE references in the FROM
+        // clause today. This test exercises the inline-sink branch with a
+        // named Zyron source, which is the symmetrical shape the binder
+        // supports end-to-end through the parser.
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql = "CREATE STREAMING JOB j AS SELECT id, amount FROM orders INTO FILE '/tmp/out.jsonl' FORMAT JSONLINES";
+        let stmt = zyron_parser::parse(sql)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let resolver = catalog.resolver(db_id, vec!["public".to_string()]);
+        let mut binder = Binder::new(resolver, &catalog);
+        let bound = binder.bind(stmt).await.unwrap();
+        match bound {
+            BoundStatement::CreateStreamingJob(job) => {
+                assert!(matches!(
+                    job.source,
+                    BoundStreamingSource::ZyronTable { .. }
+                ));
+                assert!(matches!(
+                    job.target,
+                    BoundStreamingSink::ExternalInline { .. }
+                ));
+            }
+            other => panic!("expected CreateStreamingJob, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_streaming_job_classification_mismatch() {
+        let (catalog, _cache, db_id, schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        register_external_source(
+            &catalog,
+            schema_id,
+            "ext_in",
+            CatalogClassification::Restricted,
+        )
+        .await;
+        register_external_sink(
+            &catalog,
+            schema_id,
+            "ext_out",
+            CatalogClassification::Internal,
+        )
+        .await;
+        let sql = "CREATE STREAMING JOB j AS SELECT * FROM ext_in INTO ext_out";
+        let stmt = zyron_parser::parse(sql)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let resolver = catalog.resolver(db_id, vec!["public".to_string()]);
+        let mut binder = Binder::new(resolver, &catalog);
+        let err = binder
+            .bind(stmt)
+            .await
+            .expect_err("classification mismatch");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("classification") && msg.contains("Restricted"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bind_inline_sink_rejected_for_restricted_source() {
+        let (catalog, _cache, db_id, schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        register_external_source(
+            &catalog,
+            schema_id,
+            "ext_in",
+            CatalogClassification::Restricted,
+        )
+        .await;
+        let sql = "CREATE STREAMING JOB j AS SELECT * FROM ext_in INTO S3 's3://bucket/out' FORMAT JSONLINES";
+        let stmt = zyron_parser::parse(sql)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let resolver = catalog.resolver(db_id, vec!["public".to_string()]);
+        let mut binder = Binder::new(resolver, &catalog);
+        let err = binder
+            .bind(stmt)
+            .await
+            .expect_err("inline sink should be rejected for restricted source");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("inline external sink") && msg.contains("Restricted"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bind_create_external_source_basic() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql = "CREATE EXTERNAL SOURCE x TYPE FILE URI '/tmp' FORMAT JSONLINES";
+        let stmt = zyron_parser::parse(sql)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let resolver = catalog.resolver(db_id, vec!["public".to_string()]);
+        let mut binder = Binder::new(resolver, &catalog);
+        let bound = binder.bind(stmt).await.unwrap();
+        match bound {
+            BoundStatement::CreateExternalSource(b) => {
+                assert_eq!(b.name, "x");
+                assert!(matches!(
+                    b.backend,
+                    zyron_parser::ast::ExternalBackendKind::File
+                ));
+                assert!(matches!(
+                    b.format,
+                    zyron_parser::ast::ExternalFormatKind::JsonLines
+                ));
+                assert!(b.credentials.is_empty());
+            }
+            other => panic!("expected CreateExternalSource, got {:?}", other),
+        }
     }
 }

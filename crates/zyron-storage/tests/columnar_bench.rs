@@ -69,7 +69,7 @@ fn test_column_segment_format() {
     let _benchGuard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     const ROW_COUNT: usize = 10_000;
 
-    tprintln!("\n=== Phase 1.7: Column Segment Format ===");
+    tprintln!("\n=== Column Segment Format ===");
     tprintln!("Rows: {}, Columns: 5", ROW_COUNT);
 
     let utilBefore = take_util_snapshot();
@@ -240,7 +240,7 @@ fn test_compaction_pipeline() {
     let _benchGuard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     const ROW_COUNT: usize = 100_000;
 
-    tprintln!("\n=== Phase 1.7: Compaction Pipeline ===");
+    tprintln!("\n=== Compaction Pipeline ===");
     tprintln!("Rows: {}", ROW_COUNT);
 
     let utilBefore = take_util_snapshot();
@@ -384,7 +384,7 @@ fn test_segment_cache() {
     zyron_bench_harness::init("columnar");
     let _benchGuard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    tprintln!("\n=== Phase 1.7: Segment Cache ===");
+    tprintln!("\n=== Segment Cache ===");
 
     let utilBefore = take_util_snapshot();
 
@@ -486,7 +486,7 @@ fn test_htap_hybrid_scan() {
     const HEAP_ROWS: usize = 10_000;
     const TOTAL_ROWS: usize = COLUMNAR_ROWS + HEAP_ROWS;
 
-    tprintln!("\n=== Phase 1.7: HTAP Hybrid Scan ===");
+    tprintln!("\n=== HTAP Hybrid Scan ===");
     tprintln!(
         "Columnar: {} rows, Heap: {} rows, Total: {}",
         COLUMNAR_ROWS,
@@ -701,7 +701,7 @@ fn test_txn_aware_pruning() {
     zyron_bench_harness::init("columnar");
     let _benchGuard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    tprintln!("\n=== Phase 1.7: Transaction-Aware Pruning ===");
+    tprintln!("\n=== Transaction-Aware Pruning ===");
 
     let utilBefore = take_util_snapshot();
     let dir = tempdir().expect("failed to create temp dir");
@@ -856,7 +856,7 @@ fn test_bloom_filter() {
     zyron_bench_harness::init("columnar");
     let _benchGuard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    tprintln!("\n=== Phase 1.7: Bloom Filter ===");
+    tprintln!("\n=== Bloom Filter ===");
 
     let utilBefore = take_util_snapshot();
 
@@ -1027,7 +1027,7 @@ fn test_micro_batch_zone_map() {
     zyron_bench_harness::init("columnar");
     let _benchGuard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    tprintln!("\n=== Phase 1.7: Micro-Batch Zone Map ===");
+    tprintln!("\n=== Micro-Batch Zone Map ===");
 
     let utilBefore = take_util_snapshot();
 
@@ -1209,7 +1209,7 @@ fn test_sorted_segment() {
     let _benchGuard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     const ROWS_PER_FILE: usize = 10_000;
 
-    tprintln!("\n=== Phase 1.7: Sorted Segment ===");
+    tprintln!("\n=== Sorted Segment ===");
     tprintln!("Files: 3, Rows per file: {}", ROWS_PER_FILE);
 
     let utilBefore = take_util_snapshot();
@@ -1450,7 +1450,7 @@ fn test_parallel_column_encoding() {
     const ROW_COUNT: usize = 100_000;
     const COL_COUNT: usize = 8;
 
-    tprintln!("\n=== Phase 1.7: Parallel Column Encoding ===");
+    tprintln!("\n=== Parallel Column Encoding ===");
     tprintln!("Rows: {}, Columns: {}", ROW_COUNT, COL_COUNT);
 
     let utilBefore = take_util_snapshot();

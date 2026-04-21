@@ -17,6 +17,7 @@ pub mod context;
 pub mod credentials;
 pub mod crypto_functions;
 pub mod encryption;
+pub mod external_credentials;
 pub mod governance;
 pub mod heap_storage;
 pub mod ip_management;
@@ -28,6 +29,7 @@ pub mod role;
 pub mod row_ownership;
 pub mod security_label;
 pub mod session_binding;
+pub mod snapshot;
 pub mod storage;
 pub mod tagging;
 pub mod user;
@@ -55,6 +57,9 @@ pub use credentials::{
 pub use encryption::{
     ColumnEncryption, EncryptionAlgorithm, EncryptionStore, KeyStore, LocalKeyStore,
 };
+pub use external_credentials::{
+    SealedCredentials, open_credentials, rotate_credentials, seal_credentials,
+};
 pub use governance::{
     DelegationEdge, DelegationTracker, GovernanceManager, PendingApproval, PrivilegeAnalytics,
     TwoPersonManager, TwoPersonOperation,
@@ -72,6 +77,7 @@ pub use security_label::{
     MandatoryAccessControl, ObjectSecurityLabel, SecurityLabel, SecurityLevel, SubjectSecurityLabel,
 };
 pub use session_binding::{QueryLimitStore, QueryLimits, SessionBinding, TimeWindow};
+pub use snapshot::SecurityContextSnapshot;
 pub use tagging::{ObjectTag, TagStore};
 pub use user::{User, UserRoleMembership};
 pub use webauthn::{
