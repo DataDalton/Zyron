@@ -4,10 +4,27 @@
 //! startup handshake (no type byte), SSL/cancel requests, authentication
 //! responses, simple query, extended query protocol, and COPY data.
 
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use std::collections::HashMap;
 
 use super::ProtocolError;
+
+// ----------------------------------------------------------------------------
+// Zyron subscription extension message type codes
+// ----------------------------------------------------------------------------
+
+/// Subscribe request byte (Y). Client asks producer to stream a publication.
+pub const SUBSCRIBE_MSG_TYPE: u8 = b'Y';
+
+/// Flow control byte (W). Client grants additional delivery credit.
+pub const FLOW_CONTROL_MSG_TYPE: u8 = b'W';
+
+/// Subscription ack byte (A). Client acknowledges processed LSN.
+pub const SUBSCRIPTION_ACK_MSG_TYPE: u8 = b'A';
+
+/// End subscription byte (0x6A, lowercase j). Distinct from PG ErrorResponse
+/// which uses uppercase E. Client requests graceful termination.
+pub const END_SUBSCRIPTION_MSG_TYPE: u8 = 0x6A;
 
 // SSL and cancel request magic numbers in the protocol version field.
 const SSL_REQUEST_CODE: i32 = 80877103;
@@ -64,6 +81,182 @@ pub enum FrontendMessage {
     CopyDone,
     /// COPY failure from client.
     CopyFail { message: String },
+    /// Y: Subscribe to a publication.
+    Subscribe(SubscribeMessage),
+    /// W: Grant additional delivery credit in bytes.
+    FlowControl(FlowControlMessage),
+    /// A: Acknowledge processing up to a given LSN.
+    SubscriptionAck(SubscriptionAckMessage),
+    /// j: End a subscription gracefully, reporting the final processed LSN.
+    EndSubscription(EndSubscriptionMessage),
+}
+
+/// Y body. Initiates a push subscription on an established connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscribeMessage {
+    /// Publication name as registered in the producer's catalog.
+    pub publication: String,
+    /// Starting LSN. Zero means resume from the producer's last checkpoint.
+    pub from_lsn: u64,
+    /// Initial delivery credit in bytes, not in row count.
+    pub initial_credit: u32,
+    /// Consumer identifier used by the catalog to persist checkpoints.
+    pub consumer_id: String,
+    /// Optional pin on the schema fingerprint seen by the consumer.
+    pub schema_fingerprint_pin: Option<[u8; 32]>,
+    /// Client-advertised feature bit flags.
+    pub features: u32,
+    /// Hint for the number of rows the producer should pack per X batch.
+    pub batch_size_hint: u32,
+}
+
+/// W body. Adds bytes of delivery credit for the active subscription.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlowControlMessage {
+    pub credit_bytes: u32,
+}
+
+/// A body. Tells the producer which LSN the consumer has durably processed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscriptionAckMessage {
+    pub acked_lsn: u64,
+}
+
+/// j body. Requests a graceful end of the subscription with a final LSN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EndSubscriptionMessage {
+    pub final_lsn: u64,
+}
+
+impl SubscribeMessage {
+    /// Encodes a full Y message including type byte and length prefix.
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(SUBSCRIBE_MSG_TYPE);
+        let len_pos = buf.len();
+        buf.put_i32(0);
+        put_cstring(buf, &self.publication);
+        buf.put_u64(self.from_lsn);
+        buf.put_u32(self.initial_credit);
+        put_cstring(buf, &self.consumer_id);
+        match self.schema_fingerprint_pin {
+            None => buf.put_u8(0),
+            Some(fp) => {
+                buf.put_u8(1);
+                buf.put_slice(&fp);
+            }
+        }
+        buf.put_u32(self.features);
+        buf.put_u32(self.batch_size_hint);
+        patch_length(buf, len_pos);
+    }
+
+    /// Decodes the body after the type byte and length have been stripped.
+    pub fn decode(payload: &mut BytesMut) -> Result<Self, ProtocolError> {
+        let publication = read_cstring(payload)?;
+        ensure_remaining(payload, 8 + 4)?;
+        let from_lsn = payload.get_u64();
+        let initial_credit = payload.get_u32();
+        let consumer_id = read_cstring(payload)?;
+        ensure_remaining(payload, 1)?;
+        let flag = payload.get_u8();
+        let schema_fingerprint_pin = match flag {
+            0 => None,
+            1 => {
+                ensure_remaining(payload, 32)?;
+                let mut fp = [0u8; 32];
+                payload.copy_to_slice(&mut fp);
+                Some(fp)
+            }
+            _ => {
+                return Err(ProtocolError::Malformed(
+                    "subscribe fingerprint flag invalid".into(),
+                ));
+            }
+        };
+        ensure_remaining(payload, 8)?;
+        let features = payload.get_u32();
+        let batch_size_hint = payload.get_u32();
+        Ok(SubscribeMessage {
+            publication,
+            from_lsn,
+            initial_credit,
+            consumer_id,
+            schema_fingerprint_pin,
+            features,
+            batch_size_hint,
+        })
+    }
+}
+
+impl FlowControlMessage {
+    /// Encodes a full W message. Fixed 8-byte payload.
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(FLOW_CONTROL_MSG_TYPE);
+        buf.put_i32(8);
+        buf.put_u32(self.credit_bytes);
+    }
+
+    /// Decodes the body after type byte and length have been stripped.
+    pub fn decode(payload: &mut BytesMut) -> Result<Self, ProtocolError> {
+        ensure_remaining(payload, 4)?;
+        Ok(FlowControlMessage {
+            credit_bytes: payload.get_u32(),
+        })
+    }
+}
+
+impl SubscriptionAckMessage {
+    /// Encodes a full A message. Fixed 12-byte payload.
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(SUBSCRIPTION_ACK_MSG_TYPE);
+        buf.put_i32(12);
+        buf.put_u64(self.acked_lsn);
+    }
+
+    /// Decodes the body after type byte and length have been stripped.
+    pub fn decode(payload: &mut BytesMut) -> Result<Self, ProtocolError> {
+        ensure_remaining(payload, 8)?;
+        Ok(SubscriptionAckMessage {
+            acked_lsn: payload.get_u64(),
+        })
+    }
+}
+
+impl EndSubscriptionMessage {
+    /// Encodes a full j message. Fixed 12-byte payload.
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(END_SUBSCRIPTION_MSG_TYPE);
+        buf.put_i32(12);
+        buf.put_u64(self.final_lsn);
+    }
+
+    /// Decodes the body after type byte and length have been stripped.
+    pub fn decode(payload: &mut BytesMut) -> Result<Self, ProtocolError> {
+        ensure_remaining(payload, 8)?;
+        Ok(EndSubscriptionMessage {
+            final_lsn: payload.get_u64(),
+        })
+    }
+}
+
+fn ensure_remaining(buf: &BytesMut, needed: usize) -> Result<(), ProtocolError> {
+    if buf.remaining() < needed {
+        return Err(ProtocolError::Malformed(format!(
+            "truncated message, need {} more bytes",
+            needed
+        )));
+    }
+    Ok(())
+}
+
+fn put_cstring(buf: &mut BytesMut, s: &str) {
+    buf.put_slice(s.as_bytes());
+    buf.put_u8(0);
+}
+
+fn patch_length(buf: &mut BytesMut, len_pos: usize) {
+    let total = (buf.len() - len_pos) as i32;
+    buf[len_pos..len_pos + 4].copy_from_slice(&total.to_be_bytes());
 }
 
 /// Initial startup message with protocol version and connection parameters.
@@ -300,6 +493,45 @@ impl FrontendMessage {
                 Ok(FrontendMessage::CopyFail { message })
             }
 
+            SUBSCRIBE_MSG_TYPE => {
+                Ok(FrontendMessage::Subscribe(SubscribeMessage::decode(payload)?))
+            }
+
+            FLOW_CONTROL_MSG_TYPE => Ok(FrontendMessage::FlowControl(
+                FlowControlMessage::decode(payload)?,
+            )),
+
+            SUBSCRIPTION_ACK_MSG_TYPE => Ok(FrontendMessage::SubscriptionAck(
+                SubscriptionAckMessage::decode(payload)?,
+            )),
+
+            END_SUBSCRIPTION_MSG_TYPE => Ok(FrontendMessage::EndSubscription(
+                EndSubscriptionMessage::decode(payload)?,
+            )),
+
+            _ => Err(ProtocolError::InvalidMessageType(msg_type)),
+        }
+    }
+
+    /// Decodes a frontend message restricted to the subscription-mode
+    /// protocol. Accepts W, A, and j only. The pre-subscribe codes like Q
+    /// (simple query) and E (execute) would collide with backend subscription
+    /// bytes if mixed, so callers that have already transitioned a connection
+    /// into subscription mode must use this narrower dispatcher.
+    pub fn decode_subscription(
+        msg_type: u8,
+        payload: &mut BytesMut,
+    ) -> Result<Self, ProtocolError> {
+        match msg_type {
+            FLOW_CONTROL_MSG_TYPE => Ok(FrontendMessage::FlowControl(
+                FlowControlMessage::decode(payload)?,
+            )),
+            SUBSCRIPTION_ACK_MSG_TYPE => Ok(FrontendMessage::SubscriptionAck(
+                SubscriptionAckMessage::decode(payload)?,
+            )),
+            END_SUBSCRIPTION_MSG_TYPE => Ok(FrontendMessage::EndSubscription(
+                EndSubscriptionMessage::decode(payload)?,
+            )),
             _ => Err(ProtocolError::InvalidMessageType(msg_type)),
         }
     }

@@ -76,6 +76,10 @@ define_id!(ColumnId, u16, "ColumnId");
 define_id!(StreamingJobId, u32, "StreamingJobId");
 define_id!(ExternalSourceId, u32, "ExternalSourceId");
 define_id!(ExternalSinkId, u32, "ExternalSinkId");
+define_id!(PublicationId, u32, "PublicationId");
+define_id!(SubscriptionId, u32, "SubscriptionId");
+define_id!(EndpointId, u32, "EndpointId");
+define_id!(SecurityMapId, u32, "SecurityMapId");
 
 #[cfg(test)]
 mod tests {

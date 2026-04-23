@@ -747,7 +747,7 @@ impl ZyronConfig {
             (
                 "storage.buffer_pool_size".into(),
                 self.storage.buffer_pool_size.to_string(),
-                "Legacy buffer pool size in bytes".into(),
+                "Buffer pool size in bytes".into(),
             ),
             (
                 "storage.temp_dir".into(),

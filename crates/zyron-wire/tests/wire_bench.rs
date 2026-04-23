@@ -158,6 +158,10 @@ async fn create_test_server(db_name: &str) -> (Arc<ServerState>, tempfile::TempD
         cdc_hook: None,
         dml_hook: None,
         notification_channels: None,
+        tls_mode: zyron_wire::tls::TlsMode::Disabled,
+        tls_acceptor: None,
+        endpoint_registrar: None,
+        subscription_runtimes: Arc::new(scc::HashMap::new()),
     });
 
     (state, tmp)
@@ -3346,6 +3350,15 @@ fn statement_variant_name(stmt: &zyron_parser::Statement) -> &'static str {
         Statement::DropExternalSink(_) => "DropExternalSink",
         Statement::AlterExternalSource(_) => "AlterExternalSource",
         Statement::AlterExternalSink(_) => "AlterExternalSink",
+        Statement::CreateEndpoint(_) => "CreateEndpoint",
+        Statement::CreateStreamingEndpoint(_) => "CreateStreamingEndpoint",
+        Statement::AlterEndpoint(_) => "AlterEndpoint",
+        Statement::DropEndpoint(_) => "DropEndpoint",
+        Statement::AlterSecurityMap(_) => "AlterSecurityMap",
+        Statement::DropSecurityMap(_) => "DropSecurityMap",
+        Statement::TagPublication(_) => "TagPublication",
+        Statement::UntagPublication(_) => "UntagPublication",
+        Statement::CreateAbacPolicy(_) => "CreateAbacPolicy",
     }
 }
 

@@ -25,8 +25,13 @@ tokio.workspace = true
 tracing.workspace = true
 p256.workspace = true
 ed25519-dalek.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+aws-sdk-sts = "1"
+aws-sdk-secretsmanager = "1"
+aws-config = { version = "1", default-features = false, features = ["rustls", "rt-tokio"] }
 
 [dev-dependencies]
 tempfile = "3"
 mimalloc.workspace = true
 zyron-bench-harness = { path = "../zyron-bench-harness" }
+httpmock = "0.7"

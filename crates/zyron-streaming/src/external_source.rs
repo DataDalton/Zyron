@@ -420,6 +420,9 @@ fn build_operator_and_key(
             let (prefix, glob) = split_prefix_and_glob(&path);
             Ok((op, prefix, glob))
         }
+        ExternalBackend::Zyron => Err(ZyronError::StreamingError(
+            "zyron:// backend is handled by the Zyron source runtime, not OpenDAL".to_string(),
+        )),
     }
 }
 

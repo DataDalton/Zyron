@@ -736,9 +736,9 @@ fn sv_as_f64(v: &StreamValue) -> Option<f64> {
     }
 }
 
-// -----
+// -----------------------------------------------------------------------------
 // COUNT(*) accumulator. 8-byte little-endian i64 counter.
-// -----
+// -----------------------------------------------------------------------------
 
 pub struct CountStarWindowAcc;
 
@@ -760,9 +760,9 @@ impl WindowAccumulator for CountStarWindowAcc {
     }
 }
 
-// -----
+// -----------------------------------------------------------------------------
 // COUNT(col) accumulator. Skips nulls.
-// -----
+// -----------------------------------------------------------------------------
 
 pub struct CountColWindowAcc;
 
@@ -787,9 +787,9 @@ impl WindowAccumulator for CountColWindowAcc {
     }
 }
 
-// -----
+// -----------------------------------------------------------------------------
 // SUM over integers. i64 state.
-// -----
+// -----------------------------------------------------------------------------
 
 pub struct SumI64WindowAcc;
 
@@ -816,9 +816,9 @@ impl WindowAccumulator for SumI64WindowAcc {
     }
 }
 
-// -----
+// -----------------------------------------------------------------------------
 // SUM over floats. f64 state.
-// -----
+// -----------------------------------------------------------------------------
 
 pub struct SumF64WindowAcc;
 
@@ -845,9 +845,9 @@ impl WindowAccumulator for SumF64WindowAcc {
     }
 }
 
-// -----
+// -----------------------------------------------------------------------------
 // AVG accumulator. 16 bytes: i64 count + f64 sum.
-// -----
+// -----------------------------------------------------------------------------
 
 pub struct AvgWindowAcc;
 
@@ -896,9 +896,9 @@ impl WindowAccumulator for AvgWindowAcc {
     }
 }
 
-// -----
+// -----------------------------------------------------------------------------
 // MIN accumulator. State is 1 byte has_value flag + f64 or i64 current best.
-// -----
+// -----------------------------------------------------------------------------
 
 pub struct MinWindowAcc {
     use_float: bool,
@@ -970,9 +970,9 @@ impl WindowAccumulator for MinWindowAcc {
     }
 }
 
-// -----
+// -----------------------------------------------------------------------------
 // MAX accumulator. Mirror of MinWindowAcc.
-// -----
+// -----------------------------------------------------------------------------
 
 pub struct MaxWindowAcc {
     use_float: bool,
@@ -1044,11 +1044,11 @@ impl WindowAccumulator for MaxWindowAcc {
     }
 }
 
-// -----
+// -----------------------------------------------------------------------------
 // FIRST and LAST accumulators. State format:
 //   [1 byte has_value] [1 byte tag] [variable payload]
 // Tags: 0 = Null, 1 = Bool, 2 = I64, 3 = F64, 4 = I128, 5 = Utf8, 6 = Binary
-// -----
+// -----------------------------------------------------------------------------
 
 pub struct FirstWindowAcc {
     out_type: TypeId,
@@ -1105,9 +1105,9 @@ impl WindowAccumulator for LastWindowAcc {
     }
 }
 
-// -----
+// -----------------------------------------------------------------------------
 // Low-level state helpers
-// -----
+// -----------------------------------------------------------------------------
 
 #[inline]
 fn read_i64(state: &[u8]) -> Result<i64> {

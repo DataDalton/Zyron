@@ -7,6 +7,7 @@
 pub mod background;
 pub mod backup;
 pub mod config;
+pub mod gateway;
 pub mod health;
 pub mod hooks;
 pub mod io_stats;
@@ -594,6 +595,23 @@ impl Server {
             waker
         };
 
+        // -------------------------------------------------------------------
+        // Gateway router + registrar.
+        // The router holds compiled routes. The registrar wraps the router in
+        // a trait object so ddl_dispatch can mutate it without depending on
+        // zyron-server. Startup recovery below populates it from the catalog.
+        // -------------------------------------------------------------------
+        let gateway_router = Arc::new(crate::gateway::router::Router::new());
+        let endpoint_registrar: Arc<
+            dyn zyron_wire::EndpointRegistrar,
+        > = Arc::new(crate::gateway::router::CatalogEndpointRegistrar::new(
+            Arc::clone(&gateway_router),
+        ));
+
+        // Wrap the SecurityManager in an Arc once so both ServerState and the
+        // admin executor share the same instance.
+        let security_manager_arc = Arc::new(security_manager);
+
         // Build ServerState for zyron-wire
         let server_state = Arc::new(ServerState {
             catalog: Arc::clone(&catalog),
@@ -601,7 +619,7 @@ impl Server {
             buffer_pool: Arc::clone(&buffer_pool),
             disk_manager: Arc::clone(&disk_manager),
             txn_manager: Arc::clone(&txn_manager),
-            security_manager: Some(Arc::new(security_manager)),
+            security_manager: Some(Arc::clone(&security_manager_arc)),
             key_store: {
                 // Derive a stable master key from the data-dir path. Survives
                 // restarts for the same data directory. An ops deployment
@@ -768,7 +786,51 @@ impl Server {
             ),
             // Notification channels
             notification_channels: Some(notif_arc),
+            // TLS upgrade support (disabled by default; enable via config).
+            tls_mode: zyron_wire::tls::TlsMode::Disabled,
+            tls_acceptor: None,
+            endpoint_registrar: Some(Arc::clone(&endpoint_registrar)),
+            subscription_runtimes: Arc::new(scc::HashMap::new()),
         });
+
+        // -------------------------------------------------------------------
+        // Install the admin executor on the shared HealthState so /admin/*
+        // HTTP routes run against the live catalog, security manager,
+        // endpoint registrar, and CDC registry.
+        // -------------------------------------------------------------------
+        {
+            let admin_executor = Arc::new(
+                crate::gateway::AdminExecutor::new(
+                    Arc::clone(&catalog),
+                    Some(Arc::clone(&security_manager_arc)),
+                    Some(Arc::clone(&endpoint_registrar)),
+                    Some(Arc::clone(&cdc_registry_arc)),
+                )
+                .with_storage(
+                    Arc::clone(&disk_manager),
+                    Arc::clone(&buffer_pool),
+                    Arc::clone(&server_state.key_store),
+                ),
+            );
+            self.health_state.set_admin_executor(admin_executor);
+        }
+
+        // -------------------------------------------------------------------
+        // Install the dynamic endpoint SQL executor on the HealthState so
+        // registered REST endpoints run against the real catalog, buffer
+        // pool, disk manager, WAL, transaction manager, and security manager.
+        // -------------------------------------------------------------------
+        {
+            let endpoint_executor = Arc::new(crate::gateway::endpoint_exec::EndpointExecutor::new(
+                Arc::clone(&catalog),
+                Arc::clone(&buffer_pool),
+                Arc::clone(&disk_manager),
+                Arc::clone(&wal),
+                Arc::clone(&txn_manager),
+                Some(Arc::clone(&security_manager_arc)),
+            ));
+            self.health_state.set_endpoint_executor(endpoint_executor);
+        }
 
         // -------------------------------------------------------------------
         // External endpoint probes.
@@ -786,6 +848,80 @@ impl Server {
         // -------------------------------------------------------------------
         if let Err(e) = recover_streaming_jobs(&server_state).await {
             error!("streaming job recovery failed: {}", e);
+        }
+
+        // -------------------------------------------------------------------
+        // Zyron-to-Zyron startup recovery.
+        // Walks the catalog publication, subscription, and endpoint lists so
+        // restarts do not lose declarative state. Subscriptions that fail to
+        // resume are marked Failed with the error stored on the entry.
+        // -------------------------------------------------------------------
+        recover_zyron_to_zyron(&server_state).await;
+
+        // -------------------------------------------------------------------
+        // Spawn Zyron-to-Zyron background workers. Each loop honors the
+        // shared shutdown flag and exits cleanly when the server stops.
+        // -------------------------------------------------------------------
+        {
+            use std::time::Duration;
+            let catalog_ret = Arc::clone(&catalog);
+            let cdc_reg_ret = Some(Arc::clone(&cdc_registry_arc));
+            let sh_ret = Arc::clone(&self.shutdown);
+            tokio::spawn(async move {
+                background::publication_retention::publication_retention_loop(
+                    catalog_ret,
+                    cdc_reg_ret,
+                    sh_ret,
+                    background::publication_retention::DEFAULT_INTERVAL_SECS,
+                )
+                .await;
+            });
+
+            let catalog_reap = Arc::clone(&catalog);
+            let sh_reap = Arc::clone(&self.shutdown);
+            tokio::spawn(async move {
+                background::dead_subscriber_reaper::dead_subscriber_reaper_loop(
+                    catalog_reap,
+                    sh_reap,
+                    background::dead_subscriber_reaper::DEFAULT_INTERVAL_SECS,
+                    Duration::from_secs(3600),
+                )
+                .await;
+            });
+
+            let sh_cred = Arc::clone(&self.shutdown);
+            tokio::spawn(async move {
+                background::credential_refresh::credential_refresh_loop(
+                    sh_cred,
+                    background::credential_refresh::DEFAULT_INTERVAL_SECS,
+                    Duration::from_secs(
+                        background::credential_refresh::DEFAULT_REFRESH_WINDOW_SECS,
+                    ),
+                    |_win| {},
+                )
+                .await;
+            });
+
+            let sh_dlq = Arc::clone(&self.shutdown);
+            tokio::spawn(async move {
+                background::dlq_ttl::dlq_ttl_loop(
+                    sh_dlq,
+                    background::dlq_ttl::DEFAULT_INTERVAL_SECS,
+                    30,
+                    |_cutoff| {},
+                )
+                .await;
+            });
+
+            let sh_host = Arc::clone(&self.shutdown);
+            tokio::spawn(async move {
+                background::host_health::host_health_monitor_loop(
+                    sh_host,
+                    background::host_health::DEFAULT_INTERVAL_SECS,
+                    || {},
+                )
+                .await;
+            });
         }
 
         // 11. Start health/metrics HTTP server
@@ -891,6 +1027,56 @@ impl Server {
             }
         }
 
+        // Stop every subscription runtime spawned by recovery or runtime DDL.
+        // The tokio tasks cooperatively observe shutdown via their ZyronSource
+        // pull loop, so abort is the definitive signal here. A short per-task
+        // timeout bounds the wait so one stuck adapter cannot block process
+        // exit. The adapter already persists last_seen_lsn into the catalog
+        // as batches flow, so aborting mid-batch is safe: the next start
+        // resumes from the last checkpointed LSN.
+        {
+            let mut keys: Vec<zyron_catalog::SubscriptionId> = Vec::new();
+            state_for_shutdown.subscription_runtimes.iter_sync(|k, _| {
+                keys.push(*k);
+                true
+            });
+            let mut drained: Vec<(
+                zyron_catalog::SubscriptionId,
+                tokio::task::JoinHandle<()>,
+            )> = Vec::with_capacity(keys.len());
+            for k in keys {
+                if let Some((_, h)) = state_for_shutdown
+                    .subscription_runtimes
+                    .remove_sync(&k)
+                {
+                    drained.push((k, h));
+                }
+            }
+            let count = drained.len();
+            for (id, handle) in drained {
+                handle.abort();
+                let waited = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    handle,
+                )
+                .await;
+                if let Err(_elapsed) = waited {
+                    warn!(
+                        target: "zyron::shutdown",
+                        subscription_id = id.0,
+                        "subscription task did not stop within timeout"
+                    );
+                }
+            }
+            if count > 0 {
+                info!(
+                    target: "zyron::shutdown",
+                    "stopped {} subscription runtime(s) during shutdown",
+                    count
+                );
+            }
+        }
+
         // Stop background workers (runs final checkpoint)
         background.shutdown();
 
@@ -899,6 +1085,144 @@ impl Server {
 
         info!("ZyronDB shut down");
         Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Zyron-to-Zyron startup recovery
+// -----------------------------------------------------------------------------
+
+/// Re-warms Zyron-to-Zyron catalog state after a restart. Publications carry
+/// no runtime state, subscriptions marked Failed are left as-is for the reaper
+/// or an admin resume, and endpoints stay enabled so the gateway picks them
+/// up on its next router rebuild. Security map entries are reloaded into the
+/// in-memory auth store so request paths can resolve external identities.
+pub async fn recover_zyron_to_zyron(state: &Arc<zyron_wire::connection::ServerState>) {
+    let publications = state.catalog.list_publications();
+    info!(
+        target: "zyron::recovery",
+        count = publications.len(),
+        "loaded publications"
+    );
+
+    let subscriptions = state.catalog.list_subscriptions();
+    info!(
+        target: "zyron::recovery",
+        count = subscriptions.len(),
+        "loaded subscriptions"
+    );
+
+    // -------------------------------------------------------------------
+    // Subscription resumption runs inside streaming-job recovery. A Zyron
+    // subscription only has a meaningful destination when it is part of a
+    // streaming job, so recover_streaming_jobs handles reopening the
+    // connection, re-binding the job, and dispatching rows into the target
+    // sink. Recovering the subscription here on its own would advance the
+    // catalog LSN without delivering rows anywhere, silently dropping data
+    // across restart. Standalone recovery is intentionally absent.
+    // -------------------------------------------------------------------
+    #[allow(clippy::collapsible_if)]
+    {
+        let active_count = subscriptions
+            .iter()
+            .filter(|s| s.state == zyron_catalog::SubscriptionState::Active)
+            .count();
+        if active_count > 0 {
+            info!(
+                target: "zyron::recovery",
+                active_count,
+                "subscriptions will resume through streaming job recovery"
+            );
+        }
+    }
+
+    let endpoints = state.catalog.list_endpoints();
+    let enabled = endpoints.iter().filter(|e| e.enabled).count();
+    info!(
+        target: "zyron::recovery",
+        total = endpoints.len(),
+        enabled,
+        "loaded endpoints"
+    );
+
+    // Register every enabled endpoint with the live gateway router. A failed
+    // registration is logged and the loop continues so one bad entry does
+    // not block the rest of the server.
+    if let Some(ref registrar) = state.endpoint_registrar {
+        let mut registered = 0usize;
+        let mut failed = 0usize;
+        for entry in &endpoints {
+            if !entry.enabled {
+                continue;
+            }
+            match registrar.register(entry).await {
+                Ok(()) => registered += 1,
+                Err(e) => {
+                    failed += 1;
+                    warn!(
+                        target: "zyron::recovery",
+                        name = %entry.name,
+                        path = %entry.path,
+                        error = %e,
+                        "endpoint registration failed"
+                    );
+                }
+            }
+        }
+        info!(
+            target: "zyron::recovery",
+            registered,
+            failed,
+            "gateway router populated from catalog"
+        );
+    }
+
+    if let Some(ref sm) = state.security_manager {
+        let entries: Vec<zyron_auth::SecurityMapEntry> = state
+            .catalog
+            .list_security_maps()
+            .iter()
+            .map(|e| zyron_auth::SecurityMapEntry {
+                kind: map_cat_to_auth_kind(e.kind),
+                key: e.key.clone(),
+                role: zyron_auth::RoleId(e.role_id),
+            })
+            .collect();
+        sm.security_map.load(entries);
+    }
+
+    for entry in state.catalog.list_external_sources() {
+        if !matches!(entry.backend, zyron_catalog::ExternalBackend::Zyron) {
+            continue;
+        }
+        info!(
+            target: "zyron::recovery",
+            name = %entry.name,
+            uri = %entry.uri,
+            "remote Zyron source observed"
+        );
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Catalog to auth security-map kind conversion
+// -----------------------------------------------------------------------------
+
+/// Maps the catalog's SecurityMapKind enum to the auth crate's equivalent.
+/// Required because the two crates own parallel enum definitions so the
+/// catalog does not take a dependency on auth.
+fn map_cat_to_auth_kind(
+    k: zyron_catalog::SecurityMapKind,
+) -> zyron_auth::security_map::SecurityMapKind {
+    match k {
+        zyron_catalog::SecurityMapKind::K8sSa => zyron_auth::security_map::SecurityMapKind::K8sSa,
+        zyron_catalog::SecurityMapKind::Jwt => zyron_auth::security_map::SecurityMapKind::Jwt,
+        zyron_catalog::SecurityMapKind::MtlsSubject => {
+            zyron_auth::security_map::SecurityMapKind::MtlsSubject
+        }
+        zyron_catalog::SecurityMapKind::MtlsFingerprint => {
+            zyron_auth::security_map::SecurityMapKind::MtlsFingerprint
+        }
     }
 }
 
@@ -1125,7 +1449,8 @@ fn unseal_entry_credentials_for_probe(
 /// Extracts dims and srid from an IndexEntry parameters blob. Layout written
 /// by handle_create_spatial_index is [u8 dims][u32 srid little-endian]. When
 /// the blob is missing or too short the function falls back to a 2D, srid=0
-/// index so recovery still runs against legacy entries.
+/// index so recovery still runs against entries written before the header
+/// was introduced.
 fn parse_spatial_params(params: Option<&[u8]>) -> (u8, u32) {
     match params {
         Some(b) if b.len() >= 5 => {
@@ -1266,3 +1591,7 @@ fn column_bytes_at<'a>(
     }
     None
 }
+
+// -----------------------------------------------------------------------------
+// Subscription recovery tests
+// -----------------------------------------------------------------------------

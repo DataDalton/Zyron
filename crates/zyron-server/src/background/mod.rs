@@ -6,7 +6,12 @@
 
 pub mod cdc_writer;
 pub mod checkpoint;
+pub mod credential_refresh;
+pub mod dead_subscriber_reaper;
+pub mod dlq_ttl;
+pub mod host_health;
 pub mod mv_refresh;
+pub mod publication_retention;
 pub mod stats;
 pub mod stream_monitor;
 pub mod vacuum;

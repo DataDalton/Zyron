@@ -35,6 +35,74 @@ pub fn transport_name<T: WireTransport>(stream: &T) -> &'static str {
     if stream.is_encrypted() { "QUIC" } else { "TCP" }
 }
 
+/// Metadata reported by a transport about its TLS session, if any.
+pub trait TlsTransportInfo {
+    /// Returns the negotiated cipher suite name in a stable form.
+    fn negotiated_cipher(&self) -> Option<&'static str>;
+    /// Returns the peer's leaf certificate as DER bytes.
+    fn peer_cert_der(&self) -> Option<Vec<u8>>;
+    /// Returns the SHA-256 fingerprint of the peer's leaf certificate.
+    fn peer_cert_fingerprint_sha256(&self) -> Option<[u8; 32]>;
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send> WireTransport
+    for tokio_rustls::server::TlsStream<S>
+{
+    fn is_encrypted(&self) -> bool {
+        true
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsTransportInfo
+    for tokio_rustls::server::TlsStream<S>
+{
+    fn negotiated_cipher(&self) -> Option<&'static str> {
+        let (_, conn) = self.get_ref();
+        conn.negotiated_cipher_suite()
+            .map(|c| c.suite().as_str().unwrap_or("unknown"))
+    }
+
+    fn peer_cert_der(&self) -> Option<Vec<u8>> {
+        let (_, conn) = self.get_ref();
+        conn.peer_certificates()
+            .and_then(|c| c.first().map(|c| c.as_ref().to_vec()))
+    }
+
+    fn peer_cert_fingerprint_sha256(&self) -> Option<[u8; 32]> {
+        self.peer_cert_der()
+            .map(|der| crate::tls::sha256_fingerprint(&der))
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send> WireTransport
+    for tokio_rustls::client::TlsStream<S>
+{
+    fn is_encrypted(&self) -> bool {
+        true
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsTransportInfo
+    for tokio_rustls::client::TlsStream<S>
+{
+    fn negotiated_cipher(&self) -> Option<&'static str> {
+        let (_, conn) = self.get_ref();
+        conn.negotiated_cipher_suite()
+            .map(|c| c.suite().as_str().unwrap_or("unknown"))
+    }
+
+    fn peer_cert_der(&self) -> Option<Vec<u8>> {
+        let (_, conn) = self.get_ref();
+        conn.peer_certificates()
+            .and_then(|c| c.first().map(|c| c.as_ref().to_vec()))
+    }
+
+    fn peer_cert_fingerprint_sha256(&self) -> Option<[u8; 32]> {
+        self.peer_cert_der()
+            .map(|der| crate::tls::sha256_fingerprint(&der))
+    }
+}
+
 impl WireTransport for TcpStream {
     fn is_encrypted(&self) -> bool {
         false

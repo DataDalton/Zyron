@@ -185,6 +185,27 @@ pub enum Statement {
     AlterExternalSource(Box<AlterExternalSourceStatement>),
     /// ALTER EXTERNAL SINK name ...
     AlterExternalSink(Box<AlterExternalSinkStatement>),
+
+    // Zyron-to-Zyron data plane DDL.
+    /// CREATE ENDPOINT name ON PATH '/...' METHOD ... USING <sql> ...
+    CreateEndpoint(Box<CreateEndpointStatement>),
+    /// CREATE STREAMING ENDPOINT name ON PATH '/...' PROTOCOL ws|sse ...
+    CreateStreamingEndpoint(Box<CreateStreamingEndpointStatement>),
+    /// ALTER ENDPOINT name (ENABLE | DISABLE | SET OPTIONS (...))
+    AlterEndpoint(Box<AlterEndpointStatement>),
+    /// DROP ENDPOINT [IF EXISTS] name
+    DropEndpoint(Box<DropEndpointStatement>),
+    /// ALTER SECURITY MAP (KUBERNETES SA 'ns/sa' | JWT ISSUER '..' SUBJECT '..' |
+    ///   MTLS CERT SUBJECT '..' | MTLS CERT FINGERPRINT '..') TO ROLE '..'
+    AlterSecurityMap(Box<AlterSecurityMapStatement>),
+    /// DROP SECURITY MAP ...
+    DropSecurityMap(Box<DropSecurityMapStatement>),
+    /// TAG PUBLICATION name WITH 'tag1', 'tag2'
+    TagPublication(Box<TagPublicationStatement>),
+    /// UNTAG PUBLICATION name 'tag'
+    UntagPublication(Box<UntagPublicationStatement>),
+    /// CREATE ABAC POLICY name ON <object-type> <name> WHERE <expr>
+    CreateAbacPolicy(Box<CreateAbacPolicyStatement>),
 }
 
 // ---------------------------------------------------------------------------
@@ -448,7 +469,12 @@ pub struct DropViewStatement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct GrantStatement {
     pub privileges: Vec<Privilege>,
+    /// Target table name when granting on a table.
+    /// Empty when the object is not a table.
     pub on_table: String,
+    /// Structured object reference. Tables still populate on_table for
+    /// backward compatibility and object == GrantObject::Table(name).
+    pub object: GrantObject,
     pub to: String,
 }
 
@@ -456,7 +482,20 @@ pub struct GrantStatement {
 pub struct RevokeStatement {
     pub privileges: Vec<Privilege>,
     pub on_table: String,
+    pub object: GrantObject,
     pub from: String,
+}
+
+/// Target of a GRANT or REVOKE. Supports individual tables, specific
+/// publications, pattern-matched publications, tag-matched publications,
+/// and individual endpoints.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GrantObject {
+    Table(String),
+    Publication(String),
+    PublicationsLike(String),
+    PublicationsTagged(String),
+    Endpoint(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -469,6 +508,8 @@ pub enum Privilege {
     DropIndex,
     Reindex,
     AlterIndex,
+    Subscribe,
+    Invoke,
     All,
 }
 
@@ -552,11 +593,11 @@ pub struct ShowStatement {
 // Bulk copy
 // ---------------------------------------------------------------------------
 
-/// COPY statement in one of three shapes. Legacy STDIN / STDOUT / local-file
+/// COPY statement in one of three shapes. STDIN / STDOUT / local-file
 /// targets are represented as `CopyExternal::Stdio` or `CopyExternal::LocalFile`
 /// inside `CopyKind::IntoTable` or `CopyKind::FromTable`, so the wire layer
-/// continues to recognise the PostgreSQL simple-query forms while the binder
-/// and executor can distinguish true external endpoints.
+/// recognises the PostgreSQL simple-query forms while the binder and
+/// executor distinguish external endpoints.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CopyStatement {
     pub kind: CopyKind,
@@ -599,9 +640,10 @@ pub enum CopyExternal {
     Named(String),
     /// PostgreSQL STDIN or STDOUT, selected by surrounding direction.
     Stdio,
-    /// Legacy local file path with no backend or format keywords. The wire
-    /// layer rejects this for transport but it is retained for parity with
-    /// `COPY t FROM '/tmp/data.csv'` where the path alone implies local file.
+    /// Bare local file path with no backend or format keywords. The wire
+    /// layer rejects this for transport but the parser retains it so
+    /// `COPY t FROM '/tmp/data.csv'` where the path alone implies local file
+    /// continues to bind.
     LocalFile(String),
 }
 
@@ -1335,18 +1377,27 @@ pub enum AlterStreamingJobAction {
     Resume,
 }
 
+// -----------------------------------------------------------------------------
+// Publications
+// -----------------------------------------------------------------------------
+
+/// CREATE PUBLICATION name FOR TABLE <t1> [(cols) [WHERE <e>]], ...
+///   [WHERE <e>] [WITH (key = value, ...)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreatePublicationStatement {
     pub name: String,
-    pub tables: Vec<String>,
-    pub all_tables: bool,
-    pub include_ddl: bool,
+    pub if_not_exists: bool,
+    pub tables: Vec<PublicationTableRef>,
+    pub where_predicate: Option<Expr>,
+    pub options: Vec<(String, String)>,
 }
 
+/// One table in a publication with optional projection and per-table WHERE.
 #[derive(Debug, Clone, PartialEq)]
-pub enum AlterPublicationAction {
-    AddTable(String),
-    DropTable(String),
+pub struct PublicationTableRef {
+    pub table_name: String,
+    pub columns: Vec<String>,
+    pub where_predicate: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1356,8 +1407,208 @@ pub struct AlterPublicationStatement {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum AlterPublicationAction {
+    AddTable(PublicationTableRef),
+    DropTable(String),
+    SetOptions(Vec<(String, String)>),
+    SetWhere(Expr),
+    Rename(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct DropPublicationStatement {
     pub name: String,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+/// TAG PUBLICATION name WITH 'tag1', 'tag2'
+#[derive(Debug, Clone, PartialEq)]
+pub struct TagPublicationStatement {
+    pub name: String,
+    pub tags: Vec<String>,
+}
+
+/// UNTAG PUBLICATION name 'tag'
+#[derive(Debug, Clone, PartialEq)]
+pub struct UntagPublicationStatement {
+    pub name: String,
+    pub tag: String,
+}
+
+// -----------------------------------------------------------------------------
+// Endpoints
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateEndpointStatement {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub path: String,
+    pub methods: Vec<String>,
+    pub sql: String,
+    pub auth: EndpointAuthSpec,
+    pub required_scopes: Vec<String>,
+    pub rate_limit: Option<EndpointRateLimitSpec>,
+    pub output_format: EndpointOutputFormatSpec,
+    pub cors_origins: Vec<String>,
+    pub cache_seconds: u32,
+    pub timeout_seconds: u32,
+    pub max_body_kb: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointAuthSpec {
+    None,
+    Jwt,
+    ApiKey,
+    OAuth2,
+    Basic,
+    Mtls,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EndpointRateLimitSpec {
+    pub count: u64,
+    pub per_seconds: u32,
+    pub scope: EndpointRateLimitScope,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointRateLimitScope {
+    Global,
+    PerIp,
+    PerUser,
+    PerApiKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointOutputFormatSpec {
+    Json,
+    JsonLines,
+    Csv,
+    Parquet,
+    Arrow,
+    Protobuf,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateStreamingEndpointStatement {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub path: String,
+    pub protocol: StreamingEndpointProtocol,
+    pub backing_publication: String,
+    pub auth: EndpointAuthSpec,
+    pub required_scopes: Vec<String>,
+    pub max_connections_per_ip: Option<u32>,
+    pub message_format: StreamingMessageFormat,
+    pub heartbeat_seconds: u32,
+    pub backpressure: BackpressurePolicySpec,
+    pub max_connections: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamingEndpointProtocol {
+    Websocket,
+    Sse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamingMessageFormat {
+    Json,
+    JsonLines,
+    Protobuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackpressurePolicySpec {
+    DropOldest,
+    CloseSlow,
+    Block,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterEndpointStatement {
+    pub name: String,
+    pub action: AlterEndpointAction,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterEndpointAction {
+    Enable,
+    Disable,
+    SetOptions(Vec<(String, String)>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropEndpointStatement {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+// -----------------------------------------------------------------------------
+// Security map
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterSecurityMapStatement {
+    pub kind: SecurityMapKindSpec,
+    pub identity: String,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropSecurityMapStatement {
+    pub kind: SecurityMapKindSpec,
+    pub identity: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SecurityMapKindSpec {
+    KubernetesSa { ns_and_name: String },
+    JwtIssuerSubject { issuer: String, subject: String },
+    MtlsCertSubject { subject_dn: String },
+    MtlsCertFingerprint { fingerprint_sha256: String },
+}
+
+// -----------------------------------------------------------------------------
+// Credential provider clause (extends CREATE EXTERNAL SOURCE/SINK)
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CredentialProviderSpec {
+    pub provider_type: CredentialProviderType,
+    pub options: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialProviderType {
+    Vault,
+    AwsSecretsManager,
+    GcpSecretManager,
+    AzureKeyVault,
+    OAuth2ClientCredentials,
+    AwsIamAssumeRole,
+    K8sSaToken,
+}
+
+// -----------------------------------------------------------------------------
+// ABAC policy DDL
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateAbacPolicyStatement {
+    pub name: String,
+    pub target: AbacPolicyTarget,
+    pub target_name: String,
+    pub predicate: Expr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbacPolicyTarget {
+    Table,
+    Publication,
 }
 
 // ---------------------------------------------------------------------------
@@ -2270,6 +2521,7 @@ pub enum ExternalBackendKind {
     Gcs,
     Azure,
     Http,
+    Zyron,
 }
 
 /// On-disk row format for an external source or sink.
@@ -2308,6 +2560,8 @@ pub struct CreateExternalSourceStatement {
     pub mode: ExternalModeSpec,
     pub options: Vec<(String, String)>,
     pub credentials: Vec<(String, String)>,
+    /// Optional dynamic credential provider. Mutually exclusive with credentials.
+    pub credential_provider: Option<CredentialProviderSpec>,
     // Optional explicit column layout. Empty when the user omits the clause.
     pub columns: Vec<(String, DataType)>,
 }
@@ -2323,6 +2577,8 @@ pub struct CreateExternalSinkStatement {
     pub format: ExternalFormatKind,
     pub options: Vec<(String, String)>,
     pub credentials: Vec<(String, String)>,
+    /// Optional dynamic credential provider. Mutually exclusive with credentials.
+    pub credential_provider: Option<CredentialProviderSpec>,
     // Optional explicit column layout. Empty when the user omits the clause.
     pub columns: Vec<(String, DataType)>,
 }
@@ -2343,9 +2599,22 @@ pub struct DropExternalSinkStatement {
 pub enum AlterExternalSourceAction {
     SetOptions(Vec<(String, String)>),
     SetCredentials(Vec<(String, String)>),
+    SetCredentialProvider(CredentialProviderSpec),
     SetMode(ExternalModeSpec),
     SetColumns(Vec<(String, DataType)>),
     Rename(String),
+    RefreshSchema,
+    ResetLsn(LsnResetSpec),
+    Pause,
+    Resume,
+}
+
+/// Specification for ALTER EXTERNAL SOURCE ... RESET LSN TO ...
+#[derive(Debug, Clone, PartialEq)]
+pub enum LsnResetSpec {
+    Earliest,
+    Latest,
+    Explicit(u64),
 }
 
 #[derive(Debug, Clone, PartialEq)]

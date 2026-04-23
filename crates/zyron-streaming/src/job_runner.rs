@@ -35,13 +35,19 @@ use crate::upsert_sink::ZyronUpsertSink;
 pub enum RunnerSink {
     Append(ZyronRowSink),
     Upsert(ZyronUpsertSink),
+    // -----------------------------------------------------------------------------
+    // Remote variant dispatches to a ZyronSinkAdapter trait object, letting
+    // the runner push rows to a remote Zyron instance over the PG wire
+    // protocol through a concrete client in the zyron-wire crate.
+    Remote(Arc<dyn crate::sink_connector::ZyronSinkAdapter>),
 }
 
 impl RunnerSink {
-    pub(crate) fn write_batch(&self, records: Vec<CdfChange>) -> Result<()> {
+    pub(crate) async fn write_batch(&self, records: Vec<CdfChange>) -> Result<()> {
         match self {
             RunnerSink::Append(s) => s.write_batch(records),
             RunnerSink::Upsert(s) => s.write_batch(records),
+            RunnerSink::Remote(adapter) => adapter.write_batch(records).await,
         }
     }
 }
@@ -67,19 +73,19 @@ pub struct StreamingJobSpec {
     /// row encoder to repack projection outputs into a tuple the target
     /// heap can accept.
     pub target_types: Vec<TypeId>,
-    // -----
+    // -----------------------------------------------------------------------------
     // Target-table ordinals for the primary-key columns. Populated only when
     // write_mode is Upsert, empty otherwise. Used by ZyronUpsertSink to
     // derive the PK lookup key from each decoded source row. The wire layer
     // resolves BoundStreamingJob.target_pk_columns to ordinals here.
     pub target_pk_ordinals: Vec<u16>,
-    // -----
+    // -----------------------------------------------------------------------------
     // Aggregate pipeline. When None, the runner runs the filter+project loop.
     // When Some, the runner uses the aggregating loop that assigns events to
     // windows, maintains per (window, key) accumulators, and emits finalized
     // rows as watermarks close windows.
     pub aggregate: Option<AggregateSpec>,
-    // -----
+    // -----------------------------------------------------------------------------
     // Join pipeline. When set, the runner drives the stream-stream interval
     // join or stream-table temporal join instead of the plain filter+project
     // loop. Populated by the wire lowering step from the bound plan.
@@ -369,8 +375,10 @@ fn run_loop(
             continue;
         }
 
-        // Write to sink.
-        if let Err(e) = sink.write_batch(filtered) {
+        // Write to sink. RunnerSink::write_batch is async to support Remote
+        // adapters, so block on the current-thread runtime owned by the
+        // runner thread.
+        if let Err(e) = rt.block_on(async { sink.write_batch(filtered).await }) {
             mark_failed(&rt, &catalog, entry.id, format!("sink error: {e}"));
             break;
         }
@@ -557,6 +565,73 @@ impl StreamJobManager {
 // Runner end-to-end coverage lives at the integration level in
 // zyron-server/tests. Unit tests for the decoded-row filter and project path
 // live in row_codec.rs.
+
+#[cfg(test)]
+mod remote_sink_tests {
+    use super::*;
+    use crate::source_connector::CdfChange;
+    use std::sync::Mutex as StdMutex;
+
+    struct MockAdapter {
+        calls: StdMutex<Vec<Vec<CdfChange>>>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::sink_connector::ZyronSinkAdapter for MockAdapter {
+        async fn write_batch(&self, records: Vec<CdfChange>) -> Result<()> {
+            if self.fail {
+                return Err(ZyronError::StreamingError("mock failure".into()));
+            }
+            self.calls.lock().unwrap().push(records);
+            Ok(())
+        }
+        async fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn mk_change(v: u64) -> CdfChange {
+        CdfChange {
+            commit_version: v,
+            commit_timestamp: 0,
+            change_type: zyron_cdc::ChangeType::Insert,
+            row_data: vec![0],
+            primary_key_data: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_sink_remote_delegates_to_adapter() {
+        let mock = Arc::new(MockAdapter {
+            calls: StdMutex::new(Vec::new()),
+            fail: false,
+        });
+        let sink =
+            RunnerSink::Remote(mock.clone() as Arc<dyn crate::sink_connector::ZyronSinkAdapter>);
+        sink.write_batch(vec![mk_change(1), mk_change(2)])
+            .await
+            .unwrap();
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].len(), 2);
+        assert_eq!(calls[0][0].commit_version, 1);
+    }
+
+    #[tokio::test]
+    async fn runner_remote_adapter_errors_propagate() {
+        let mock = Arc::new(MockAdapter {
+            calls: StdMutex::new(Vec::new()),
+            fail: true,
+        });
+        let sink = RunnerSink::Remote(mock as Arc<dyn crate::sink_connector::ZyronSinkAdapter>);
+        let res = sink.write_batch(vec![mk_change(1)]).await;
+        assert!(res.is_err());
+    }
+}
 
 // ---------------------------------------------------------------------------
 // External source and sink spawn methods
@@ -988,7 +1063,7 @@ fn run_external_to_zyron_loop(
                 });
             }
             if !changes.is_empty() {
-                if let Err(e) = sink.write_batch(changes) {
+                if let Err(e) = rt.block_on(async { sink.write_batch(changes).await }) {
                     mark_failed(&rt, &catalog, entry.id, format!("sink error: {e}"));
                     break;
                 }
@@ -1110,4 +1185,179 @@ fn run_zyron_to_external_loop(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Local CDF source to RunnerSink spawn
+// ---------------------------------------------------------------------------
+
+impl StreamJobManager {
+    /// Spawns a runner that reads from a local ZyronTableSource and writes
+    /// into a pre-built RunnerSink. Used when the sink is a Remote adapter
+    /// rather than a local ZyronRowSink/ZyronUpsertSink, so the caller has
+    /// already constructed the sink and does not need the heap or txn
+    /// dependencies that spawn_zyron_table_job requires.
+    pub fn spawn_zyron_source_to_runner_sink_job(
+        &self,
+        entry: StreamingJobEntry,
+        spec: StreamingJobSpec,
+        source: ZyronTableSource,
+        sink: RunnerSink,
+        catalog: Arc<Catalog>,
+    ) -> Result<()> {
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop_flag);
+        let entry_for_thread = entry.clone();
+        let spec_for_thread = spec.clone();
+        let catalog_for_thread = Arc::clone(&catalog);
+
+        let thread = std::thread::Builder::new()
+            .name(format!("zyron-src-runner-{}", entry.id.0))
+            .spawn(move || {
+                if let Some(agg) = spec_for_thread.aggregate.clone() {
+                    crate::agg_runner::run_aggregating_loop(
+                        entry_for_thread,
+                        spec_for_thread.source_types.clone(),
+                        agg,
+                        source,
+                        sink,
+                        catalog_for_thread,
+                        stop_for_thread,
+                    );
+                } else {
+                    run_loop(
+                        entry_for_thread,
+                        spec_for_thread,
+                        source,
+                        sink,
+                        catalog_for_thread,
+                        stop_for_thread,
+                    );
+                }
+            })
+            .map_err(|e| ZyronError::StreamingError(format!("spawn src-runner: {e}")))?;
+        self.register_handle(
+            entry.id,
+            StreamJobHandle {
+                stop_flag,
+                thread: Some(thread),
+            },
+        );
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Remote Zyron source spawn
+// ---------------------------------------------------------------------------
+
+impl StreamJobManager {
+    /// Spawns a runner that reads from a remote Zyron publication through a
+    /// ZyronSourceAdapter trait object and writes into a local RunnerSink.
+    /// The adapter's run method owns the pull loop. on_batch forwards each
+    /// batch through the spec's filter and project stages into the sink on
+    /// the runner's tokio runtime.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_remote_source_to_zyron_job(
+        &self,
+        entry: StreamingJobEntry,
+        spec: StreamingJobSpec,
+        source: Arc<dyn crate::source_connector::ZyronSourceAdapter>,
+        sink: RunnerSink,
+        catalog: Arc<Catalog>,
+        start_lsn: u64,
+    ) -> Result<()> {
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop_flag);
+        let entry_for_thread = entry.clone();
+        let spec_for_thread = spec.clone();
+        let catalog_for_thread = Arc::clone(&catalog);
+
+        let thread = std::thread::Builder::new()
+            .name(format!("zyron-remote-src-{}", entry.id.0))
+            .spawn(move || {
+                run_remote_source_to_zyron_loop(
+                    entry_for_thread,
+                    spec_for_thread,
+                    source,
+                    sink,
+                    catalog_for_thread,
+                    stop_for_thread,
+                    start_lsn,
+                );
+            })
+            .map_err(|e| ZyronError::StreamingError(format!("spawn remote-src: {e}")))?;
+        self.register_handle(
+            entry.id,
+            StreamJobHandle {
+                stop_flag,
+                thread: Some(thread),
+            },
+        );
+        Ok(())
+    }
+}
+
+fn run_remote_source_to_zyron_loop(
+    entry: StreamingJobEntry,
+    spec: StreamingJobSpec,
+    source: Arc<dyn crate::source_connector::ZyronSourceAdapter>,
+    sink: RunnerSink,
+    catalog: Arc<Catalog>,
+    stop_flag: Arc<AtomicBool>,
+    start_lsn: u64,
+) {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(job_id = entry.id.0, "failed to build runtime: {e}");
+            return;
+        }
+    };
+
+    // The adapter's run loop is async and owns its own pull cadence. Route
+    // every batch through filter+project, then into the sink. Errors from
+    // the callback bubble back out through the adapter's return value.
+    let sink_arc: Arc<RunnerSink> = Arc::new(sink);
+    let sink_for_cb = Arc::clone(&sink_arc);
+    let spec_for_cb = spec.clone();
+    let catalog_for_cb = Arc::clone(&catalog);
+    let entry_id = entry.id;
+
+    // The callback pushes filtered batches into the sink using a fresh
+    // per-callback current-thread runtime. block_on on the adapter's runtime
+    // would deadlock since the adapter itself is driven on that runtime.
+    let on_batch: Box<dyn Fn(Vec<CdfChange>) -> Result<()> + Send + Sync> =
+        Box::new(move |records: Vec<CdfChange>| -> Result<()> {
+            if records.is_empty() {
+                return Ok(());
+            }
+            let filtered = apply_filter_project(&records, &spec_for_cb)?;
+            if filtered.is_empty() {
+                return Ok(());
+            }
+            // Use a local runtime here. The adapter's async context already holds
+            // one runtime, and calling block_on from inside a runtime panics.
+            let local_rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    ZyronError::StreamingError(format!(
+                        "remote-source callback runtime build failed: {e}"
+                    ))
+                })?;
+            local_rt.block_on(async { sink_for_cb.write_batch(filtered).await })?;
+            let _ = &catalog_for_cb;
+            let _ = entry_id;
+            Ok(())
+        });
+
+    let res = rt.block_on(async { source.run(start_lsn, on_batch, stop_flag).await });
+    if let Err(e) = res {
+        mark_failed(&rt, &catalog, entry.id, format!("remote source: {e}"));
+    }
+    let _ = &sink_arc;
 }

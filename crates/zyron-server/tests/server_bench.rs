@@ -185,6 +185,10 @@ async fn create_test_state(
         notification_channels: Some(Arc::new(
             zyron_wire::notifications::NotificationChannels::new(),
         )),
+        tls_mode: zyron_wire::tls::TlsMode::Disabled,
+        tls_acceptor: None,
+        endpoint_registrar: None,
+        subscription_runtimes: Arc::new(scc::HashMap::new()),
     });
 
     (state, wal, pool, disk, bg_writer, catalog)

@@ -17,16 +17,19 @@ pub mod storage;
 pub use cache::CatalogCache;
 pub use catalog::Catalog;
 pub use ids::{
-    CATALOG_SCHEMA_ID, ColumnId, DEFAULT_SCHEMA_ID, DatabaseId, ExternalSinkId, ExternalSourceId,
-    IndexId, Oid, OidAllocator, SYSTEM_DATABASE_ID, SchemaId, SequenceId, StreamingJobId, TableId,
-    USER_OID_START,
+    CATALOG_SCHEMA_ID, ColumnId, DEFAULT_SCHEMA_ID, DatabaseId, EndpointId, ExternalSinkId,
+    ExternalSourceId, IndexId, Oid, OidAllocator, PublicationId, SYSTEM_DATABASE_ID, SchemaId,
+    SecurityMapId, SequenceId, StreamingJobId, SubscriptionId, TableId, USER_OID_START,
 };
 pub use resolver::NameResolver;
 pub use schema::{
-    CatalogClassification, CatalogStreamingWriteMode, ColumnEntry, ConstraintEntry, ConstraintType,
-    DatabaseEntry, ExternalBackend, ExternalFormat, ExternalMode, ExternalSinkEntry,
-    ExternalSourceEntry, IndexColumnEntry, IndexEntry, IndexType, SchemaEntry, StreamingJobEntry,
-    StreamingJobStatus, TableEntry,
+    BackpressurePolicy, CatalogClassification, CatalogStreamingWriteMode, ColumnEntry,
+    ConstraintEntry, ConstraintType, DatabaseEntry, EndpointAuthMode, EndpointEntry, EndpointKind,
+    EndpointMessageFormat, EndpointOutputFormat, ExternalBackend, ExternalFormat, ExternalMode,
+    ExternalSinkEntry, ExternalSourceEntry, HttpMethod, IndexColumnEntry, IndexEntry, IndexType,
+    PublicationEntry, PublicationTableEntry, RateLimitPeriod, RateLimitScope, RateLimitSpec,
+    RowFormat, SchemaEntry, SecurityMapEntry, SecurityMapKind, StreamingJobEntry,
+    StreamingJobStatus, SubscriptionEntry, SubscriptionMode, SubscriptionState, TableEntry,
 };
 pub use stats::{ColumnStats, Histogram, TableStats, analyze_table};
 pub use storage::{CatalogStorage, HeapCatalogStorage};

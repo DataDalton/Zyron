@@ -102,6 +102,19 @@ pub struct CatalogCache {
     external_sources_by_name: RwLock<HashMap<(SchemaId, String), ExternalSourceId>>,
     external_sinks: RwLock<HashMap<ExternalSinkId, Arc<ExternalSinkEntry>>>,
     external_sinks_by_name: RwLock<HashMap<(SchemaId, String), ExternalSinkId>>,
+
+    // Publication, subscription, endpoint, security-map entries (Zyron-to-Zyron).
+    publications: RwLock<HashMap<PublicationId, Arc<PublicationEntry>>>,
+    publications_by_name: RwLock<HashMap<(SchemaId, String), PublicationId>>,
+    publication_tables: RwLock<HashMap<u32, Arc<PublicationTableEntry>>>,
+    publication_tables_by_pub: RwLock<HashMap<PublicationId, Vec<u32>>>,
+    subscriptions: RwLock<HashMap<SubscriptionId, Arc<SubscriptionEntry>>>,
+    subscriptions_by_pub: RwLock<HashMap<PublicationId, Vec<SubscriptionId>>>,
+    endpoints: RwLock<HashMap<EndpointId, Arc<EndpointEntry>>>,
+    endpoints_by_name: RwLock<HashMap<(SchemaId, String), EndpointId>>,
+    endpoints_by_path: RwLock<HashMap<String, EndpointId>>,
+    security_maps: RwLock<HashMap<SecurityMapId, Arc<SecurityMapEntry>>>,
+    security_map_lookup: RwLock<HashMap<(SecurityMapKind, String), SecurityMapId>>,
 }
 
 /// Simple LRU map using a HashMap with access timestamps.
@@ -182,6 +195,17 @@ impl CatalogCache {
             external_sources_by_name: RwLock::new(HashMap::new()),
             external_sinks: RwLock::new(HashMap::new()),
             external_sinks_by_name: RwLock::new(HashMap::new()),
+            publications: RwLock::new(HashMap::new()),
+            publications_by_name: RwLock::new(HashMap::new()),
+            publication_tables: RwLock::new(HashMap::new()),
+            publication_tables_by_pub: RwLock::new(HashMap::new()),
+            subscriptions: RwLock::new(HashMap::new()),
+            subscriptions_by_pub: RwLock::new(HashMap::new()),
+            endpoints: RwLock::new(HashMap::new()),
+            endpoints_by_name: RwLock::new(HashMap::new()),
+            endpoints_by_path: RwLock::new(HashMap::new()),
+            security_maps: RwLock::new(HashMap::new()),
+            security_map_lookup: RwLock::new(HashMap::new()),
         }
     }
 
@@ -492,6 +516,267 @@ impl CatalogCache {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Publication operations
+    // -----------------------------------------------------------------------
+
+    pub fn put_publication(&self, entry: PublicationEntry) {
+        let id = entry.id;
+        let key = (entry.schema_id, entry.name.clone());
+        let arc = Arc::new(entry);
+        self.publications.write().insert(id, arc);
+        self.publications_by_name.write().insert(key, id);
+    }
+
+    pub fn get_publication(&self, id: PublicationId) -> Option<Arc<PublicationEntry>> {
+        self.publications.read().get(&id).cloned()
+    }
+
+    pub fn get_publication_by_name(
+        &self,
+        schema_id: SchemaId,
+        name: &str,
+    ) -> Option<Arc<PublicationEntry>> {
+        let id = {
+            let map = self.publications_by_name.read();
+            map.get(&(schema_id, name.to_string())).copied()
+        }?;
+        self.publications.read().get(&id).cloned()
+    }
+
+    pub fn list_publications(&self) -> Vec<Arc<PublicationEntry>> {
+        self.publications.read().values().cloned().collect()
+    }
+
+    pub fn invalidate_publication(&self, id: PublicationId) {
+        if let Some(entry) = self.publications.write().remove(&id) {
+            let key = (entry.schema_id, entry.name.clone());
+            let mut name_map = self.publications_by_name.write();
+            if let Some(existing) = name_map.get(&key) {
+                if *existing == id {
+                    name_map.remove(&key);
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Publication table junction operations
+    // -----------------------------------------------------------------------
+
+    pub fn put_publication_table(&self, entry: PublicationTableEntry) {
+        let id = entry.id;
+        let pub_id = entry.publication_id;
+        let arc = Arc::new(entry);
+        self.publication_tables.write().insert(id, arc);
+        let mut by_pub = self.publication_tables_by_pub.write();
+        let list = by_pub.entry(pub_id).or_default();
+        if !list.contains(&id) {
+            list.push(id);
+        }
+    }
+
+    pub fn get_publication_tables(
+        &self,
+        publication_id: PublicationId,
+    ) -> Vec<Arc<PublicationTableEntry>> {
+        let ids = {
+            let by_pub = self.publication_tables_by_pub.read();
+            by_pub.get(&publication_id).cloned().unwrap_or_default()
+        };
+        let store = self.publication_tables.read();
+        ids.iter()
+            .filter_map(|id| store.get(id).cloned())
+            .collect()
+    }
+
+    pub fn invalidate_publication_table(
+        &self,
+        publication_id: PublicationId,
+        table_id: TableId,
+    ) {
+        let mut drop_id: Option<u32> = None;
+        {
+            let store = self.publication_tables.read();
+            let by_pub = self.publication_tables_by_pub.read();
+            if let Some(ids) = by_pub.get(&publication_id) {
+                for id in ids {
+                    if let Some(entry) = store.get(id) {
+                        if entry.table_id == table_id {
+                            drop_id = Some(*id);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(id) = drop_id {
+            self.publication_tables.write().remove(&id);
+            let mut by_pub = self.publication_tables_by_pub.write();
+            if let Some(list) = by_pub.get_mut(&publication_id) {
+                list.retain(|x| *x != id);
+            }
+        }
+    }
+
+    pub fn invalidate_publication_tables_for(&self, publication_id: PublicationId) {
+        let ids = {
+            let mut by_pub = self.publication_tables_by_pub.write();
+            by_pub.remove(&publication_id).unwrap_or_default()
+        };
+        let mut store = self.publication_tables.write();
+        for id in ids {
+            store.remove(&id);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Subscription operations
+    // -----------------------------------------------------------------------
+
+    pub fn put_subscription(&self, entry: SubscriptionEntry) {
+        let id = entry.id;
+        let pub_id = entry.publication_id;
+        let arc = Arc::new(entry);
+        self.subscriptions.write().insert(id, arc);
+        let mut by_pub = self.subscriptions_by_pub.write();
+        let list = by_pub.entry(pub_id).or_default();
+        if !list.contains(&id) {
+            list.push(id);
+        }
+    }
+
+    pub fn get_subscription(&self, id: SubscriptionId) -> Option<Arc<SubscriptionEntry>> {
+        self.subscriptions.read().get(&id).cloned()
+    }
+
+    pub fn list_subscriptions(&self) -> Vec<Arc<SubscriptionEntry>> {
+        self.subscriptions.read().values().cloned().collect()
+    }
+
+    pub fn list_publication_subscribers(
+        &self,
+        pub_id: PublicationId,
+    ) -> Vec<Arc<SubscriptionEntry>> {
+        let ids = {
+            let by_pub = self.subscriptions_by_pub.read();
+            by_pub.get(&pub_id).cloned().unwrap_or_default()
+        };
+        let store = self.subscriptions.read();
+        ids.iter()
+            .filter_map(|id| store.get(id).cloned())
+            .collect()
+    }
+
+    pub fn invalidate_subscription(&self, id: SubscriptionId) {
+        if let Some(entry) = self.subscriptions.write().remove(&id) {
+            let mut by_pub = self.subscriptions_by_pub.write();
+            if let Some(list) = by_pub.get_mut(&entry.publication_id) {
+                list.retain(|x| *x != id);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Endpoint operations
+    // -----------------------------------------------------------------------
+
+    pub fn put_endpoint(&self, entry: EndpointEntry) {
+        let id = entry.id;
+        let name_key = (entry.schema_id, entry.name.clone());
+        let path_key = entry.path.clone();
+        let arc = Arc::new(entry);
+        self.endpoints.write().insert(id, arc);
+        self.endpoints_by_name.write().insert(name_key, id);
+        self.endpoints_by_path.write().insert(path_key, id);
+    }
+
+    pub fn get_endpoint(&self, id: EndpointId) -> Option<Arc<EndpointEntry>> {
+        self.endpoints.read().get(&id).cloned()
+    }
+
+    pub fn get_endpoint_by_name(
+        &self,
+        schema_id: SchemaId,
+        name: &str,
+    ) -> Option<Arc<EndpointEntry>> {
+        let id = {
+            let map = self.endpoints_by_name.read();
+            map.get(&(schema_id, name.to_string())).copied()
+        }?;
+        self.endpoints.read().get(&id).cloned()
+    }
+
+    pub fn get_endpoint_by_path(&self, path: &str) -> Option<Arc<EndpointEntry>> {
+        let id = {
+            let map = self.endpoints_by_path.read();
+            map.get(path).copied()
+        }?;
+        self.endpoints.read().get(&id).cloned()
+    }
+
+    pub fn list_endpoints(&self) -> Vec<Arc<EndpointEntry>> {
+        self.endpoints.read().values().cloned().collect()
+    }
+
+    pub fn invalidate_endpoint(&self, id: EndpointId) {
+        if let Some(entry) = self.endpoints.write().remove(&id) {
+            let name_key = (entry.schema_id, entry.name.clone());
+            let mut name_map = self.endpoints_by_name.write();
+            if let Some(existing) = name_map.get(&name_key) {
+                if *existing == id {
+                    name_map.remove(&name_key);
+                }
+            }
+            let mut path_map = self.endpoints_by_path.write();
+            if let Some(existing) = path_map.get(&entry.path) {
+                if *existing == id {
+                    path_map.remove(&entry.path);
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Security map operations
+    // -----------------------------------------------------------------------
+
+    pub fn put_security_map(&self, entry: SecurityMapEntry) {
+        let id = entry.id;
+        let lookup_key = (entry.kind, entry.key.clone());
+        let arc = Arc::new(entry);
+        self.security_maps.write().insert(id, arc);
+        self.security_map_lookup.write().insert(lookup_key, id);
+    }
+
+    pub fn get_security_map(&self, id: SecurityMapId) -> Option<Arc<SecurityMapEntry>> {
+        self.security_maps.read().get(&id).cloned()
+    }
+
+    pub fn list_security_maps(&self) -> Vec<Arc<SecurityMapEntry>> {
+        self.security_maps.read().values().cloned().collect()
+    }
+
+    pub fn resolve_security_map(&self, kind: SecurityMapKind, key: &str) -> Option<u32> {
+        let id = {
+            let map = self.security_map_lookup.read();
+            map.get(&(kind, key.to_string())).copied()
+        }?;
+        self.security_maps.read().get(&id).map(|e| e.role_id)
+    }
+
+    pub fn invalidate_security_map(&self, id: SecurityMapId) {
+        if let Some(entry) = self.security_maps.write().remove(&id) {
+            let key = (entry.kind, entry.key.clone());
+            let mut map = self.security_map_lookup.write();
+            if let Some(existing) = map.get(&key) {
+                if *existing == id {
+                    map.remove(&key);
+                }
+            }
+        }
+    }
+
     /// Clears all cached entries.
     pub fn invalidate_all(&self) {
         self.databases.write().clear();
@@ -508,6 +793,17 @@ impl CatalogCache {
         self.external_sources_by_name.write().clear();
         self.external_sinks.write().clear();
         self.external_sinks_by_name.write().clear();
+        self.publications.write().clear();
+        self.publications_by_name.write().clear();
+        self.publication_tables.write().clear();
+        self.publication_tables_by_pub.write().clear();
+        self.subscriptions.write().clear();
+        self.subscriptions_by_pub.write().clear();
+        self.endpoints.write().clear();
+        self.endpoints_by_name.write().clear();
+        self.endpoints_by_path.write().clear();
+        self.security_maps.write().clear();
+        self.security_map_lookup.write().clear();
     }
 }
 

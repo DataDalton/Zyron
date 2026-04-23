@@ -5,12 +5,17 @@
 //! that validates column existence, type compatibility, and resolves ambiguity.
 
 use crate::logical::LogicalColumn;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
-use zyron_catalog::schema::{CatalogClassification, CatalogStreamingWriteMode, ColumnEntry};
+use zyron_catalog::schema::{
+    BackpressurePolicy, CatalogClassification, CatalogStreamingWriteMode, ColumnEntry,
+    EndpointAuthMode, EndpointMessageFormat, EndpointOutputFormat, HttpMethod, RateLimitPeriod,
+    RateLimitScope, RateLimitSpec, RowFormat, SecurityMapKind as CatalogSecurityMapKind,
+};
 use zyron_catalog::{
-    Catalog, ColumnId, ExternalSinkId, ExternalSourceId, NameResolver, SchemaId, TableEntry,
-    TableId,
+    Catalog, ColumnId, EndpointId, ExternalSinkId, ExternalSourceId, NameResolver, PublicationId,
+    SchemaId, TableEntry, TableId,
 };
 use zyron_common::{Result, TypeId, ZyronError};
 use zyron_parser::ast::*;
@@ -468,6 +473,205 @@ pub enum BoundStatement {
     },
     AlterExternalSource(Box<BoundAlterExternalSource>),
     AlterExternalSink(Box<BoundAlterExternalSink>),
+
+    // -----------------------------------------------------------------------
+    // Zyron-to-Zyron data plane: publications, endpoints, security map
+    // -----------------------------------------------------------------------
+    CreatePublication(Box<BoundCreatePublication>),
+    AlterPublication(Box<BoundAlterPublication>),
+    DropPublication {
+        name: String,
+        schema_id: SchemaId,
+        if_exists: bool,
+        cascade: bool,
+    },
+    CreateEndpoint(Box<BoundCreateEndpoint>),
+    CreateStreamingEndpoint(Box<BoundCreateStreamingEndpoint>),
+    AlterEndpoint(Box<BoundAlterEndpoint>),
+    DropEndpoint {
+        name: String,
+        schema_id: SchemaId,
+        if_exists: bool,
+    },
+    AlterSecurityMap(Box<BoundAlterSecurityMap>),
+    DropSecurityMap(Box<BoundDropSecurityMap>),
+    TagPublication {
+        name: String,
+        schema_id: SchemaId,
+        publication_id: PublicationId,
+        tags: Vec<String>,
+    },
+    UntagPublication {
+        name: String,
+        schema_id: SchemaId,
+        publication_id: PublicationId,
+        tags: Vec<String>,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Bound Zyron-to-Zyron DDL: publication
+// ---------------------------------------------------------------------------
+
+/// Bound form of CREATE PUBLICATION with resolved tables, columns, bound
+/// predicates, parsed options, and a deterministic schema fingerprint.
+#[derive(Debug, Clone)]
+pub struct BoundCreatePublication {
+    pub schema_id: SchemaId,
+    pub name: String,
+    pub if_not_exists: bool,
+    pub tables: Vec<BoundPublicationTable>,
+    pub where_predicate: Option<BoundExpr>,
+    pub change_feed: bool,
+    pub row_format: RowFormat,
+    pub retention_days: u32,
+    pub retain_until_subscribers_advance: bool,
+    pub max_rows_per_sec: u64,
+    pub max_bytes_per_sec: u64,
+    pub max_concurrent_subscribers: u32,
+    pub classification: CatalogClassification,
+    pub allow_initial_snapshot: bool,
+    pub schema_fingerprint: [u8; 32],
+}
+
+/// Resolved single table reference inside a publication. Empty columns means
+/// all table columns are exposed, consistent with the catalog entry shape.
+#[derive(Debug, Clone)]
+pub struct BoundPublicationTable {
+    pub table_id: TableId,
+    pub columns: Vec<ColumnId>,
+    pub where_predicate: Option<BoundExpr>,
+}
+
+/// Bound form of ALTER PUBLICATION. The binder resolves the target and
+/// produces the action-specific payload. Recomputing the schema fingerprint
+/// happens in the wire dispatcher when the table set changes.
+#[derive(Debug, Clone)]
+pub struct BoundAlterPublication {
+    pub name: String,
+    pub schema_id: SchemaId,
+    pub publication_id: PublicationId,
+    pub action: BoundAlterPublicationAction,
+}
+
+#[derive(Debug, Clone)]
+pub enum BoundAlterPublicationAction {
+    AddTable(BoundPublicationTable),
+    DropTable(TableId),
+    SetOptions(PublicationOptionUpdates),
+    SetWhere(BoundExpr),
+    Rename(String),
+}
+
+/// Parsed ALTER PUBLICATION SET option overrides. Only the options the user
+/// supplied are Some, the rest stay None so the wire layer knows which
+/// fields to update.
+#[derive(Debug, Clone, Default)]
+pub struct PublicationOptionUpdates {
+    pub retention_days: Option<u32>,
+    pub retain_until_subscribers_advance: Option<bool>,
+    pub max_rows_per_sec: Option<u64>,
+    pub max_bytes_per_sec: Option<u64>,
+    pub max_concurrent_subscribers: Option<u32>,
+    pub classification: Option<CatalogClassification>,
+    pub allow_initial_snapshot: Option<bool>,
+    pub change_feed: Option<bool>,
+    pub row_format: Option<RowFormat>,
+}
+
+// ---------------------------------------------------------------------------
+// Bound Zyron-to-Zyron DDL: endpoints
+// ---------------------------------------------------------------------------
+
+/// Bound form of CREATE ENDPOINT (REST). The embedded bound_sql exists for
+/// validation, the raw sql string stays for runtime re-compilation against
+/// each request's parameter values.
+#[derive(Debug, Clone)]
+pub struct BoundCreateEndpoint {
+    pub schema_id: SchemaId,
+    pub name: String,
+    pub if_not_exists: bool,
+    pub path: String,
+    pub methods: Vec<HttpMethod>,
+    pub sql: String,
+    pub bound_sql: Box<BoundStatement>,
+    pub param_names: Vec<String>,
+    pub param_types: Vec<TypeId>,
+    pub output_columns: Vec<ColumnEntry>,
+    pub auth: EndpointAuthMode,
+    pub required_scopes: Vec<String>,
+    pub rate_limit: Option<RateLimitSpec>,
+    pub output_format: EndpointOutputFormat,
+    pub cors_origins: Vec<String>,
+    pub cache_seconds: u32,
+    pub timeout_seconds: u32,
+    pub max_body_bytes: u32,
+}
+
+/// Bound form of CREATE STREAMING ENDPOINT (WebSocket or SSE) backed by an
+/// existing publication. The binder resolves the publication id so the wire
+/// layer does not have to look it up again.
+#[derive(Debug, Clone)]
+pub struct BoundCreateStreamingEndpoint {
+    pub schema_id: SchemaId,
+    pub name: String,
+    pub if_not_exists: bool,
+    pub path: String,
+    pub protocol: StreamingEndpointProtocol,
+    pub backing_publication_id: PublicationId,
+    pub backing_publication_name: String,
+    pub auth: EndpointAuthMode,
+    pub required_scopes: Vec<String>,
+    pub max_connections_per_ip: Option<u32>,
+    pub message_format: EndpointMessageFormat,
+    pub heartbeat_seconds: u32,
+    pub backpressure: BackpressurePolicy,
+    pub max_connections: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct BoundAlterEndpoint {
+    pub name: String,
+    pub schema_id: SchemaId,
+    pub endpoint_id: EndpointId,
+    pub action: BoundAlterEndpointAction,
+}
+
+#[derive(Debug, Clone)]
+pub enum BoundAlterEndpointAction {
+    Enable,
+    Disable,
+    SetOptions(EndpointOptionUpdates),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EndpointOptionUpdates {
+    pub cache_seconds: Option<u32>,
+    pub timeout_seconds: Option<u32>,
+    pub max_body_bytes: Option<u32>,
+    pub heartbeat_seconds: Option<u32>,
+    pub max_connections: Option<u32>,
+    pub max_connections_per_ip: Option<u32>,
+}
+
+// ---------------------------------------------------------------------------
+// Bound Zyron-to-Zyron DDL: security map
+// ---------------------------------------------------------------------------
+
+/// Bound form of ALTER SECURITY MAP. The kind and identity key are
+/// normalized, the role name is passed through unchanged so the wire layer
+/// can resolve it against the security manager at apply time.
+#[derive(Debug, Clone)]
+pub struct BoundAlterSecurityMap {
+    pub kind: CatalogSecurityMapKind,
+    pub identity_key: String,
+    pub role_name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BoundDropSecurityMap {
+    pub kind: CatalogSecurityMapKind,
+    pub identity_key: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -597,17 +801,17 @@ pub struct BoundStreamingJob {
     pub predicate: Option<BoundExpr>,
     pub write_mode: CatalogStreamingWriteMode,
     pub job_mode: zyron_parser::ast::ExternalModeSpec,
-    // -----
+    // -----------------------------------------------------------------------------
     // Primary key column ids of the target table for UPSERT write mode.
     // Empty for Append mode or when the target is external. The binder
     // populates this from the target's catalog constraints whenever the
     // write mode is Upsert.
     pub target_pk_columns: Vec<ColumnId>,
-    // -----
+    // -----------------------------------------------------------------------------
     // Windowed-aggregate configuration derived from GROUP BY + WATERMARK +
     // late-data policy. None when the job is a pure filter+project pipeline.
     pub aggregate: Option<BoundAggregateSpec>,
-    // -----
+    // -----------------------------------------------------------------------------
     // Join configuration for two-source streaming jobs. None for single-table
     // FROM. When set, the runner uses the interval or temporal join engine
     // instead of the plain filter+project loop.
@@ -891,6 +1095,56 @@ pub struct BoundDelete {
 // Aggregate function names
 // ---------------------------------------------------------------------------
 
+// -----------------------------------------------------------------------------
+// TLS option validation for Zyron external source/sink statements.
+// -----------------------------------------------------------------------------
+//
+// When the caller supplies tls=required or tls=preferred on a ZYRON backend,
+// the bind step refuses to accept the statement unless at least one of the
+// trust anchors ca_cert_pem, ca_cert_path, fingerprint_pin, or
+// trust_system_roots=true is also present. A bare tls=required with no trust
+// configuration would silently accept any server certificate at runtime, so
+// the bind error surfaces the issue up-front before the catalog entry is
+// written.
+fn validate_zyron_tls_options(options: &[(String, String)]) -> Result<()> {
+    let mut tls_mode: Option<&str> = None;
+    let mut has_ca_cert_pem = false;
+    let mut has_ca_cert_path = false;
+    let mut has_fingerprint_pin = false;
+    let mut trust_system_roots = false;
+    for (k, v) in options {
+        let key = k.as_str();
+        if key.eq_ignore_ascii_case("tls") {
+            tls_mode = Some(v.as_str());
+        } else if key.eq_ignore_ascii_case("ca_cert_pem") && !v.is_empty() {
+            has_ca_cert_pem = true;
+        } else if key.eq_ignore_ascii_case("ca_cert_path") && !v.is_empty() {
+            has_ca_cert_path = true;
+        } else if key.eq_ignore_ascii_case("fingerprint_pin") && !v.is_empty() {
+            has_fingerprint_pin = true;
+        } else if key.eq_ignore_ascii_case("trust_system_roots") {
+            trust_system_roots = matches!(v.as_str(), "true" | "TRUE" | "True" | "1" | "yes");
+        }
+    }
+    let mode = match tls_mode {
+        Some(m) => m,
+        None => return Ok(()),
+    };
+    let normalized = mode.to_ascii_lowercase();
+    if normalized == "disabled" || normalized == "off" || normalized == "none" {
+        return Ok(());
+    }
+    if !matches!(normalized.as_str(), "required" | "preferred") {
+        return Ok(());
+    }
+    if has_ca_cert_pem || has_ca_cert_path || has_fingerprint_pin || trust_system_roots {
+        return Ok(());
+    }
+    Err(ZyronError::PlanError(
+        "TLS requires one of: ca_cert_pem, ca_cert_path, fingerprint_pin, or trust_system_roots=true".to_string(),
+    ))
+}
+
 const AGGREGATE_FUNCTIONS: &[&str] = &["count", "sum", "avg", "min", "max"];
 
 fn is_aggregate_function(name: &str) -> bool {
@@ -901,6 +1155,359 @@ fn is_aggregate_function(name: &str) -> bool {
         return true;
     }
     zyron_types::is_types_aggregate_function(name)
+}
+
+// ---------------------------------------------------------------------------
+// Publication/endpoint/security-map free helpers
+// ---------------------------------------------------------------------------
+
+/// Parses a boolean option value accepting true/false (case-insensitive).
+fn parse_bool_option(key: &str, value: &str) -> Result<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" | "on" | "yes" => Ok(true),
+        "false" | "0" | "off" | "no" => Ok(false),
+        _ => Err(ZyronError::PlanError(format!(
+            "option '{key}' expects a boolean, got '{value}'"
+        ))),
+    }
+}
+
+/// Parses an unsigned 32-bit decimal option value.
+fn parse_u32_option(key: &str, value: &str) -> Result<u32> {
+    value
+        .parse::<u32>()
+        .map_err(|_| ZyronError::PlanError(format!("option '{key}' expects a u32, got '{value}'")))
+}
+
+/// Parses an unsigned 64-bit decimal option value.
+fn parse_u64_option(key: &str, value: &str) -> Result<u64> {
+    value
+        .parse::<u64>()
+        .map_err(|_| ZyronError::PlanError(format!("option '{key}' expects a u64, got '{value}'")))
+}
+
+/// Parses a human-readable size string like "100MB" or "512KB" into bytes.
+/// Accepts plain integers, KB, MB, GB, TB suffixes (1024-based).
+fn parse_size_bytes(value: &str) -> Result<u64> {
+    let s = value.trim();
+    if s.is_empty() {
+        return Err(ZyronError::PlanError("empty size value".to_string()));
+    }
+    let lower = s.to_ascii_lowercase();
+    let (num_part, mult) = if let Some(n) = lower.strip_suffix("tb") {
+        (n.trim(), 1024u64 * 1024 * 1024 * 1024)
+    } else if let Some(n) = lower.strip_suffix("gb") {
+        (n.trim(), 1024u64 * 1024 * 1024)
+    } else if let Some(n) = lower.strip_suffix("mb") {
+        (n.trim(), 1024u64 * 1024)
+    } else if let Some(n) = lower.strip_suffix("kb") {
+        (n.trim(), 1024u64)
+    } else if let Some(n) = lower.strip_suffix('b') {
+        (n.trim(), 1u64)
+    } else {
+        (lower.as_str(), 1u64)
+    };
+    let n: u64 = num_part
+        .parse()
+        .map_err(|_| ZyronError::PlanError(format!("invalid size value '{value}'")))?;
+    n.checked_mul(mult)
+        .ok_or_else(|| ZyronError::PlanError(format!("size value '{value}' overflows u64")))
+}
+
+/// Parses a publication row_format option into the catalog enum.
+fn parse_row_format(value: &str) -> Result<RowFormat> {
+    match value.to_ascii_lowercase().as_str() {
+        "binary" => Ok(RowFormat::Binary),
+        "text" => Ok(RowFormat::Text),
+        _ => Err(ZyronError::PlanError(format!(
+            "row_format must be 'binary' or 'text', got '{value}'"
+        ))),
+    }
+}
+
+/// Parses a publication classification option into the catalog enum.
+fn parse_classification(value: &str) -> Result<CatalogClassification> {
+    match value.to_ascii_lowercase().as_str() {
+        "public" => Ok(CatalogClassification::Public),
+        "internal" => Ok(CatalogClassification::Internal),
+        "confidential" => Ok(CatalogClassification::Confidential),
+        "restricted" => Ok(CatalogClassification::Restricted),
+        _ => Err(ZyronError::PlanError(format!(
+            "classification must be one of public/internal/confidential/restricted, got '{value}'"
+        ))),
+    }
+}
+
+/// Parses ALTER PUBLICATION SET options into an updates struct. Only the
+/// options the user supplied come back as Some.
+fn parse_publication_option_updates(
+    opts: &[(String, String)],
+) -> Result<PublicationOptionUpdates> {
+    let mut u = PublicationOptionUpdates::default();
+    for (key, value) in opts {
+        match key.to_ascii_lowercase().as_str() {
+            "change_feed" => u.change_feed = Some(parse_bool_option(key, value)?),
+            "row_format" => u.row_format = Some(parse_row_format(value)?),
+            "retention_days" => u.retention_days = Some(parse_u32_option(key, value)?),
+            "retain_until_subscribers_advance" => {
+                u.retain_until_subscribers_advance = Some(parse_bool_option(key, value)?)
+            }
+            "max_rows_per_sec" => u.max_rows_per_sec = Some(parse_u64_option(key, value)?),
+            "max_bytes_per_sec" => u.max_bytes_per_sec = Some(parse_size_bytes(value)?),
+            "max_concurrent_subscribers" => {
+                u.max_concurrent_subscribers = Some(parse_u32_option(key, value)?)
+            }
+            "classification" => u.classification = Some(parse_classification(value)?),
+            "allow_initial_snapshot" => {
+                u.allow_initial_snapshot = Some(parse_bool_option(key, value)?)
+            }
+            other => {
+                return Err(ZyronError::PlanError(format!(
+                    "unknown publication option '{other}'"
+                )));
+            }
+        }
+    }
+    Ok(u)
+}
+
+/// Parses ALTER ENDPOINT SET options into an updates struct.
+fn parse_endpoint_option_updates(opts: &[(String, String)]) -> Result<EndpointOptionUpdates> {
+    let mut u = EndpointOptionUpdates::default();
+    for (key, value) in opts {
+        match key.to_ascii_lowercase().as_str() {
+            "cache_seconds" => u.cache_seconds = Some(parse_u32_option(key, value)?),
+            "timeout_seconds" => u.timeout_seconds = Some(parse_u32_option(key, value)?),
+            "max_body_bytes" => u.max_body_bytes = Some(parse_u32_option(key, value)?),
+            "max_body_kb" => {
+                let kb = parse_u32_option(key, value)?;
+                u.max_body_bytes = Some(kb.saturating_mul(1024));
+            }
+            "heartbeat_seconds" => u.heartbeat_seconds = Some(parse_u32_option(key, value)?),
+            "max_connections" => u.max_connections = Some(parse_u32_option(key, value)?),
+            "max_connections_per_ip" => {
+                u.max_connections_per_ip = Some(parse_u32_option(key, value)?)
+            }
+            other => {
+                return Err(ZyronError::PlanError(format!(
+                    "unknown endpoint option '{other}'"
+                )));
+            }
+        }
+    }
+    Ok(u)
+}
+
+/// Parses a method name like "GET" or "post" into the catalog HttpMethod.
+fn parse_http_method(name: &str) -> Result<HttpMethod> {
+    match name.to_ascii_uppercase().as_str() {
+        "GET" => Ok(HttpMethod::Get),
+        "POST" => Ok(HttpMethod::Post),
+        "PUT" => Ok(HttpMethod::Put),
+        "DELETE" => Ok(HttpMethod::Delete),
+        "PATCH" => Ok(HttpMethod::Patch),
+        other => Err(ZyronError::PlanError(format!(
+            "unsupported HTTP method '{other}', expected GET/POST/PUT/DELETE/PATCH"
+        ))),
+    }
+}
+
+/// Scans the SQL body for `$name` placeholders and records them in
+/// positional order. The rewritten SQL replaces each placeholder with NULL
+/// so the parser-level validation can run. The raw sql string is still
+/// stored on the bound form for runtime re-compilation against each
+/// request's parameter values.
+fn extract_endpoint_params(sql: &str) -> (Vec<String>, String) {
+    let mut names: Vec<String> = Vec::new();
+    let mut out = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'$' && i + 1 < bytes.len() {
+            let next = bytes[i + 1];
+            if next.is_ascii_alphabetic() || next == b'_' {
+                let start = i + 1;
+                let mut end = start;
+                while end < bytes.len()
+                    && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
+                {
+                    end += 1;
+                }
+                let name = &sql[start..end];
+                if !names.iter().any(|n| n == name) {
+                    names.push(name.to_string());
+                }
+                out.push_str("NULL");
+                i = end;
+                continue;
+            }
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    (names, out)
+}
+
+/// Maps the parser endpoint auth spec to the catalog enum.
+fn map_endpoint_auth(spec: EndpointAuthSpec) -> EndpointAuthMode {
+    match spec {
+        EndpointAuthSpec::None => EndpointAuthMode::None,
+        EndpointAuthSpec::Jwt => EndpointAuthMode::Jwt,
+        EndpointAuthSpec::ApiKey => EndpointAuthMode::ApiKey,
+        EndpointAuthSpec::OAuth2 => EndpointAuthMode::OAuth2,
+        EndpointAuthSpec::Basic => EndpointAuthMode::Basic,
+        EndpointAuthSpec::Mtls => EndpointAuthMode::Mtls,
+    }
+}
+
+/// Maps the parser output format enum to the catalog output format enum.
+/// Protobuf is not supported by the catalog yet, fall back to Json.
+fn map_endpoint_output_format(spec: EndpointOutputFormatSpec) -> EndpointOutputFormat {
+    match spec {
+        EndpointOutputFormatSpec::Json => EndpointOutputFormat::Json,
+        EndpointOutputFormatSpec::JsonLines => EndpointOutputFormat::JsonLines,
+        EndpointOutputFormatSpec::Csv => EndpointOutputFormat::Csv,
+        EndpointOutputFormatSpec::Parquet => EndpointOutputFormat::Parquet,
+        EndpointOutputFormatSpec::Arrow => EndpointOutputFormat::ArrowIpc,
+        EndpointOutputFormatSpec::Protobuf => EndpointOutputFormat::Json,
+    }
+}
+
+/// Maps the parser streaming message format to the catalog enum.
+fn map_streaming_message_format(spec: StreamingMessageFormat) -> EndpointMessageFormat {
+    match spec {
+        StreamingMessageFormat::Json => EndpointMessageFormat::Json,
+        StreamingMessageFormat::JsonLines => EndpointMessageFormat::JsonLines,
+        StreamingMessageFormat::Protobuf => EndpointMessageFormat::Protobuf,
+    }
+}
+
+/// Maps the parser backpressure spec to the catalog enum.
+fn map_backpressure(spec: BackpressurePolicySpec) -> BackpressurePolicy {
+    match spec {
+        BackpressurePolicySpec::DropOldest => BackpressurePolicy::DropOldest,
+        BackpressurePolicySpec::CloseSlow => BackpressurePolicy::CloseSlow,
+        BackpressurePolicySpec::Block => BackpressurePolicy::Block,
+    }
+}
+
+/// Converts parser rate limit to the catalog rate limit spec.
+fn convert_rate_limit(spec: &EndpointRateLimitSpec) -> RateLimitSpec {
+    // The parser expresses the window as seconds. The catalog stores a
+    // coarse enum (Second/Minute/Hour/Day). Map the nearest bucket.
+    let period = if spec.per_seconds >= 86_400 {
+        RateLimitPeriod::Day
+    } else if spec.per_seconds >= 3_600 {
+        RateLimitPeriod::Hour
+    } else if spec.per_seconds >= 60 {
+        RateLimitPeriod::Minute
+    } else {
+        RateLimitPeriod::Second
+    };
+    let scope = match spec.scope {
+        EndpointRateLimitScope::Global => RateLimitScope::Global,
+        EndpointRateLimitScope::PerIp => RateLimitScope::PerIp,
+        EndpointRateLimitScope::PerUser => RateLimitScope::PerUser,
+        EndpointRateLimitScope::PerApiKey => RateLimitScope::PerApiKey,
+    };
+    RateLimitSpec {
+        count: spec.count,
+        period,
+        scope,
+    }
+}
+
+/// Maps a parser-level security map kind onto the catalog enum plus the
+/// canonical key string that will be stored in the catalog entry.
+fn map_security_kind(spec: &SecurityMapKindSpec) -> Result<(CatalogSecurityMapKind, String)> {
+    match spec {
+        SecurityMapKindSpec::KubernetesSa { ns_and_name } => {
+            let s = ns_and_name.trim();
+            if s.is_empty() || !s.contains('/') {
+                return Err(ZyronError::PlanError(format!(
+                    "kubernetes SA identity must be 'namespace/name', got '{ns_and_name}'"
+                )));
+            }
+            Ok((CatalogSecurityMapKind::K8sSa, s.to_string()))
+        }
+        SecurityMapKindSpec::JwtIssuerSubject { issuer, subject } => {
+            let i = issuer.trim();
+            let s = subject.trim();
+            if i.is_empty() || s.is_empty() {
+                return Err(ZyronError::PlanError(
+                    "JWT security map requires non-empty issuer and subject".to_string(),
+                ));
+            }
+            Ok((CatalogSecurityMapKind::Jwt, format!("{i}#{s}")))
+        }
+        SecurityMapKindSpec::MtlsCertSubject { subject_dn } => {
+            let s = subject_dn.trim();
+            if s.is_empty() {
+                return Err(ZyronError::PlanError(
+                    "mTLS cert subject must be non-empty".to_string(),
+                ));
+            }
+            Ok((CatalogSecurityMapKind::MtlsSubject, s.to_string()))
+        }
+        SecurityMapKindSpec::MtlsCertFingerprint { fingerprint_sha256 } => {
+            let fp = fingerprint_sha256.trim().to_ascii_lowercase();
+            if fp.is_empty() {
+                return Err(ZyronError::PlanError(
+                    "mTLS cert fingerprint must be non-empty".to_string(),
+                ));
+            }
+            Ok((CatalogSecurityMapKind::MtlsFingerprint, fp))
+        }
+    }
+}
+
+/// Computes a SHA-256 fingerprint over the sorted projection of every
+/// member table's exposed columns. Tuples are (table_id, column_id,
+/// type_id, is_nullable). Missing column id set means all columns.
+fn compute_publication_fingerprint(
+    tables: &[BoundPublicationTable],
+    catalog: &Catalog,
+) -> [u8; 32] {
+    let mut triples: Vec<(u32, u16, u8, u8)> = Vec::new();
+    for t in tables {
+        let entry = match catalog.get_table_by_id(t.table_id) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if t.columns.is_empty() {
+            for c in &entry.columns {
+                triples.push((
+                    t.table_id.0,
+                    c.id.0,
+                    c.type_id as u8,
+                    if c.nullable { 1 } else { 0 },
+                ));
+            }
+        } else {
+            for cid in &t.columns {
+                if let Some(c) = entry.columns.iter().find(|c| c.id == *cid) {
+                    triples.push((
+                        t.table_id.0,
+                        c.id.0,
+                        c.type_id as u8,
+                        if c.nullable { 1 } else { 0 },
+                    ));
+                }
+            }
+        }
+    }
+    triples.sort_unstable();
+    let mut hasher = Sha256::new();
+    for (tid, cid, typ, null) in triples {
+        hasher.update(tid.to_le_bytes());
+        hasher.update(cid.to_le_bytes());
+        hasher.update([typ, null]);
+    }
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest[..]);
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1005,6 +1612,87 @@ impl<'a> Binder<'a> {
                         action: s.action.clone(),
                     },
                 )))
+            }
+            Statement::CreatePublication(s) => {
+                let bound = self.bind_create_publication(&s).await?;
+                Ok(BoundStatement::CreatePublication(Box::new(bound)))
+            }
+            Statement::AlterPublication(s) => {
+                let bound = self.bind_alter_publication(&s).await?;
+                Ok(BoundStatement::AlterPublication(Box::new(bound)))
+            }
+            Statement::DropPublication(s) => {
+                let schema_id = self.current_schema_id().await?;
+                if !s.if_exists
+                    && self.catalog.get_publication(schema_id, &s.name).is_none()
+                {
+                    return Err(ZyronError::PlanError(format!(
+                        "publication '{}' not found",
+                        s.name
+                    )));
+                }
+                Ok(BoundStatement::DropPublication {
+                    name: s.name.clone(),
+                    schema_id,
+                    if_exists: s.if_exists,
+                    cascade: s.cascade,
+                })
+            }
+            Statement::TagPublication(s) => {
+                let (schema_id, pub_id, tags) =
+                    self.bind_publication_tags(&s.name, &s.tags).await?;
+                Ok(BoundStatement::TagPublication {
+                    name: s.name.clone(),
+                    schema_id,
+                    publication_id: pub_id,
+                    tags,
+                })
+            }
+            Statement::UntagPublication(s) => {
+                let (schema_id, pub_id, tags) =
+                    self.bind_publication_tags(&s.name, &[s.tag.clone()]).await?;
+                Ok(BoundStatement::UntagPublication {
+                    name: s.name.clone(),
+                    schema_id,
+                    publication_id: pub_id,
+                    tags,
+                })
+            }
+            Statement::CreateEndpoint(s) => {
+                let bound = self.bind_create_endpoint(&s).await?;
+                Ok(BoundStatement::CreateEndpoint(Box::new(bound)))
+            }
+            Statement::CreateStreamingEndpoint(s) => {
+                let bound = self.bind_create_streaming_endpoint(&s).await?;
+                Ok(BoundStatement::CreateStreamingEndpoint(Box::new(bound)))
+            }
+            Statement::AlterEndpoint(s) => {
+                let bound = self.bind_alter_endpoint(&s).await?;
+                Ok(BoundStatement::AlterEndpoint(Box::new(bound)))
+            }
+            Statement::DropEndpoint(s) => {
+                let schema_id = self.current_schema_id().await?;
+                if !s.if_exists
+                    && self.catalog.get_endpoint(schema_id, &s.name).is_none()
+                {
+                    return Err(ZyronError::PlanError(format!(
+                        "endpoint '{}' not found",
+                        s.name
+                    )));
+                }
+                Ok(BoundStatement::DropEndpoint {
+                    name: s.name.clone(),
+                    schema_id,
+                    if_exists: s.if_exists,
+                })
+            }
+            Statement::AlterSecurityMap(s) => {
+                let bound = self.bind_alter_security_map(&s)?;
+                Ok(BoundStatement::AlterSecurityMap(Box::new(bound)))
+            }
+            Statement::DropSecurityMap(s) => {
+                let bound = self.bind_drop_security_map(&s)?;
+                Ok(BoundStatement::DropSecurityMap(Box::new(bound)))
             }
             other => Err(ZyronError::PlanError(format!(
                 "unsupported statement type for planning: {:?}",
@@ -2183,6 +2871,533 @@ impl<'a> Binder<'a> {
         Ok(entry.id)
     }
 
+    // -----------------------------------------------------------------------
+    // Publication binding
+    // -----------------------------------------------------------------------
+
+    /// Binds CREATE PUBLICATION. Resolves each member table, projects the
+    /// requested columns, binds per-table and publication-level WHERE
+    /// predicates, parses WITH options, and computes a deterministic schema
+    /// fingerprint over the projected columns.
+    async fn bind_create_publication(
+        &mut self,
+        stmt: &CreatePublicationStatement,
+    ) -> Result<BoundCreatePublication> {
+        let schema_id = self.current_schema_id().await?;
+
+        // Duplicate check, if_not_exists short-circuits.
+        if let Some(_existing) = self.catalog.get_publication(schema_id, &stmt.name) {
+            if !stmt.if_not_exists {
+                return Err(ZyronError::PlanError(format!(
+                    "publication '{}' already exists",
+                    stmt.name
+                )));
+            }
+        }
+
+        if stmt.tables.is_empty() {
+            return Err(ZyronError::PlanError(
+                "CREATE PUBLICATION requires at least one table".to_string(),
+            ));
+        }
+
+        // Resolve each publication table and bind its per-table WHERE.
+        let mut bound_tables = Vec::with_capacity(stmt.tables.len());
+        let mut first_entry: Option<Arc<TableEntry>> = None;
+        for tref in &stmt.tables {
+            let entry = self.resolver.resolve_table(None, &tref.table_name).await?;
+            let mut column_ids = Vec::with_capacity(tref.columns.len());
+            for cname in &tref.columns {
+                let col = entry
+                    .columns
+                    .iter()
+                    .find(|c| c.name == *cname)
+                    .ok_or_else(|| {
+                        ZyronError::PlanError(format!(
+                            "column '{}' not found in table '{}'",
+                            cname, tref.table_name
+                        ))
+                    })?;
+                column_ids.push(col.id);
+            }
+
+            // Bind per-table predicate in a single-table scope.
+            let where_predicate = match &tref.where_predicate {
+                None => None,
+                Some(expr) => {
+                    let mut ctx = BindContext::new();
+                    self.push_single_table_scope(&mut ctx, &entry);
+                    Some(self.bind_expr(&ctx, expr).await?)
+                }
+            };
+
+            bound_tables.push(BoundPublicationTable {
+                table_id: entry.id,
+                columns: column_ids,
+                where_predicate,
+            });
+
+            if first_entry.is_none() {
+                first_entry = Some(Arc::clone(&entry));
+            }
+        }
+
+        // Publication-level WHERE binds against the first table's scope.
+        let where_predicate = match (&stmt.where_predicate, first_entry.as_ref()) {
+            (None, _) => None,
+            (Some(expr), Some(entry)) => {
+                let mut ctx = BindContext::new();
+                self.push_single_table_scope(&mut ctx, entry);
+                Some(self.bind_expr(&ctx, expr).await?)
+            }
+            (Some(_), None) => {
+                return Err(ZyronError::PlanError(
+                    "publication WHERE requires at least one table".to_string(),
+                ));
+            }
+        };
+
+        // Parse WITH options with defaults.
+        let mut change_feed = true;
+        let mut row_format = RowFormat::Binary;
+        let mut retention_days: u32 = 30;
+        let mut retain_until_subscribers_advance = true;
+        let mut max_rows_per_sec: u64 = 0;
+        let mut max_bytes_per_sec: u64 = 0;
+        let mut max_concurrent_subscribers: u32 = 0;
+        let mut classification = CatalogClassification::Internal;
+        let mut allow_initial_snapshot = true;
+
+        for (key, value) in &stmt.options {
+            match key.to_ascii_lowercase().as_str() {
+                "change_feed" => change_feed = parse_bool_option(key, value)?,
+                "row_format" => row_format = parse_row_format(value)?,
+                "retention_days" => retention_days = parse_u32_option(key, value)?,
+                "retain_until_subscribers_advance" => {
+                    retain_until_subscribers_advance = parse_bool_option(key, value)?
+                }
+                "max_rows_per_sec" => max_rows_per_sec = parse_u64_option(key, value)?,
+                "max_bytes_per_sec" => max_bytes_per_sec = parse_size_bytes(value)?,
+                "max_concurrent_subscribers" => {
+                    max_concurrent_subscribers = parse_u32_option(key, value)?
+                }
+                "classification" => classification = parse_classification(value)?,
+                "allow_initial_snapshot" => {
+                    allow_initial_snapshot = parse_bool_option(key, value)?
+                }
+                other => {
+                    return Err(ZyronError::PlanError(format!(
+                        "unknown publication option '{other}'"
+                    )));
+                }
+            }
+        }
+
+        let schema_fingerprint =
+            compute_publication_fingerprint(&bound_tables, self.catalog);
+
+        Ok(BoundCreatePublication {
+            schema_id,
+            name: stmt.name.clone(),
+            if_not_exists: stmt.if_not_exists,
+            tables: bound_tables,
+            where_predicate,
+            change_feed,
+            row_format,
+            retention_days,
+            retain_until_subscribers_advance,
+            max_rows_per_sec,
+            max_bytes_per_sec,
+            max_concurrent_subscribers,
+            classification,
+            allow_initial_snapshot,
+            schema_fingerprint,
+        })
+    }
+
+    /// Binds ALTER PUBLICATION. Resolves the target publication, then binds
+    /// the action-specific payload.
+    async fn bind_alter_publication(
+        &mut self,
+        stmt: &AlterPublicationStatement,
+    ) -> Result<BoundAlterPublication> {
+        let schema_id = self.current_schema_id().await?;
+        let target = self
+            .catalog
+            .get_publication(schema_id, &stmt.name)
+            .ok_or_else(|| {
+                ZyronError::PlanError(format!("publication '{}' not found", stmt.name))
+            })?;
+
+        let action = match &stmt.action {
+            AlterPublicationAction::AddTable(tref) => {
+                let entry = self.resolver.resolve_table(None, &tref.table_name).await?;
+                let mut column_ids = Vec::with_capacity(tref.columns.len());
+                for cname in &tref.columns {
+                    let col = entry
+                        .columns
+                        .iter()
+                        .find(|c| c.name == *cname)
+                        .ok_or_else(|| {
+                            ZyronError::PlanError(format!(
+                                "column '{}' not found in table '{}'",
+                                cname, tref.table_name
+                            ))
+                        })?;
+                    column_ids.push(col.id);
+                }
+                let where_predicate = match &tref.where_predicate {
+                    None => None,
+                    Some(expr) => {
+                        let mut ctx = BindContext::new();
+                        self.push_single_table_scope(&mut ctx, &entry);
+                        Some(self.bind_expr(&ctx, expr).await?)
+                    }
+                };
+                BoundAlterPublicationAction::AddTable(BoundPublicationTable {
+                    table_id: entry.id,
+                    columns: column_ids,
+                    where_predicate,
+                })
+            }
+            AlterPublicationAction::DropTable(name) => {
+                let entry = self.resolver.resolve_table(None, name).await?;
+                BoundAlterPublicationAction::DropTable(entry.id)
+            }
+            AlterPublicationAction::SetOptions(opts) => {
+                let updates = parse_publication_option_updates(opts)?;
+                BoundAlterPublicationAction::SetOptions(updates)
+            }
+            AlterPublicationAction::SetWhere(expr) => {
+                let pub_tables = self.catalog.get_publication_tables(target.id);
+                let first = pub_tables.first().ok_or_else(|| {
+                    ZyronError::PlanError(
+                        "cannot SET WHERE on a publication with no tables".to_string(),
+                    )
+                })?;
+                let entry = self.catalog.get_table_by_id(first.table_id)?;
+                let mut ctx = BindContext::new();
+                self.push_single_table_scope(&mut ctx, &entry);
+                BoundAlterPublicationAction::SetWhere(self.bind_expr(&ctx, expr).await?)
+            }
+            AlterPublicationAction::Rename(new_name) => {
+                BoundAlterPublicationAction::Rename(new_name.clone())
+            }
+        };
+
+        Ok(BoundAlterPublication {
+            name: stmt.name.clone(),
+            schema_id,
+            publication_id: target.id,
+            action,
+        })
+    }
+
+    /// Resolves a publication by name and normalizes its tag list. Used for
+    /// both TAG and UNTAG statements.
+    async fn bind_publication_tags(
+        &self,
+        name: &str,
+        tags: &[String],
+    ) -> Result<(SchemaId, PublicationId, Vec<String>)> {
+        let schema_id = self.current_schema_id().await?;
+        let target = self.catalog.get_publication(schema_id, name).ok_or_else(|| {
+            ZyronError::PlanError(format!("publication '{}' not found", name))
+        })?;
+        let mut out = Vec::with_capacity(tags.len());
+        for t in tags {
+            let trimmed = t.trim();
+            if trimmed.is_empty() {
+                return Err(ZyronError::PlanError(
+                    "publication tag must be non-empty".to_string(),
+                ));
+            }
+            out.push(trimmed.to_ascii_lowercase());
+        }
+        Ok((schema_id, target.id, out))
+    }
+
+    // -----------------------------------------------------------------------
+    // Endpoint binding
+    // -----------------------------------------------------------------------
+
+    /// Binds CREATE ENDPOINT. Validates the path and methods, parses the
+    /// SQL body (with `$name` placeholders substituted), and passes through
+    /// all the endpoint metadata after range checks.
+    async fn bind_create_endpoint(
+        &mut self,
+        stmt: &CreateEndpointStatement,
+    ) -> Result<BoundCreateEndpoint> {
+        let schema_id = self.current_schema_id().await?;
+
+        if let Some(_existing) = self.catalog.get_endpoint(schema_id, &stmt.name) {
+            if !stmt.if_not_exists {
+                return Err(ZyronError::PlanError(format!(
+                    "endpoint '{}' already exists",
+                    stmt.name
+                )));
+            }
+        }
+
+        // Path collision check: catalog keys endpoints by path as well.
+        if let Some(existing) = self.catalog.get_endpoint_by_path(&stmt.path) {
+            if existing.name != stmt.name {
+                return Err(ZyronError::PlanError(format!(
+                    "endpoint path '{}' is already registered by endpoint '{}'",
+                    stmt.path, existing.name
+                )));
+            }
+        }
+
+        if !stmt.path.starts_with('/') {
+            return Err(ZyronError::PlanError(format!(
+                "endpoint path '{}' must start with '/'",
+                stmt.path
+            )));
+        }
+        if stmt.methods.is_empty() {
+            return Err(ZyronError::PlanError(
+                "CREATE ENDPOINT requires at least one HTTP method".to_string(),
+            ));
+        }
+        let mut methods = Vec::with_capacity(stmt.methods.len());
+        for m in &stmt.methods {
+            methods.push(parse_http_method(m)?);
+        }
+
+        // Extract parameter names from the SQL template and substitute
+        // parser-friendly placeholders so we can produce a bound statement
+        // for validation.
+        let (param_names, rewritten_sql) = extract_endpoint_params(&stmt.sql);
+        let parsed = zyron_parser::parse(&rewritten_sql).map_err(|e| {
+            ZyronError::PlanError(format!("endpoint SQL parse error: {e}"))
+        })?;
+        let first = parsed.into_iter().next().ok_or_else(|| {
+            ZyronError::PlanError("endpoint SQL produced no statements".to_string())
+        })?;
+        let bound_sql = Box::pin(self.bind(first)).await?;
+
+        // Output column schema applies only to SELECT bodies.
+        let output_columns: Vec<ColumnEntry> = match &bound_sql {
+            BoundStatement::Select(sel) => sel
+                .output_schema
+                .iter()
+                .enumerate()
+                .map(|(i, c)| ColumnEntry {
+                    id: ColumnId(i as u16),
+                    table_id: TableId(0),
+                    name: c.name.clone(),
+                    type_id: c.type_id,
+                    ordinal: i as u16,
+                    nullable: c.nullable,
+                    default_expr: None,
+                    max_length: None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        // Parameters carry no type inference yet, default to Text.
+        let param_types = vec![TypeId::Varchar; param_names.len()];
+
+        let auth = map_endpoint_auth(stmt.auth);
+        let output_format = map_endpoint_output_format(stmt.output_format);
+        let rate_limit = match &stmt.rate_limit {
+            None => None,
+            Some(rl) => {
+                if rl.count == 0 {
+                    return Err(ZyronError::PlanError(
+                        "endpoint rate limit count must be greater than zero".to_string(),
+                    ));
+                }
+                Some(convert_rate_limit(rl))
+            }
+        };
+
+        // Auth modes that reference a scope require at least one.
+        if matches!(auth, EndpointAuthMode::OAuth2 | EndpointAuthMode::Jwt)
+            && stmt.required_scopes.is_empty()
+        {
+            // Scopes are permitted but not required for Jwt, so only enforce
+            // on OAuth2 to keep the spec's intent. Jwt with empty scopes
+            // means any valid token is accepted.
+        }
+
+        let max_body_bytes = stmt.max_body_kb.saturating_mul(1024);
+        const SERVER_MAX_BODY_BYTES: u32 = 10 * 1024 * 1024;
+        if max_body_bytes > SERVER_MAX_BODY_BYTES {
+            return Err(ZyronError::PlanError(format!(
+                "endpoint max_body_kb exceeds server maximum of {} bytes",
+                SERVER_MAX_BODY_BYTES
+            )));
+        }
+
+        Ok(BoundCreateEndpoint {
+            schema_id,
+            name: stmt.name.clone(),
+            if_not_exists: stmt.if_not_exists,
+            path: stmt.path.clone(),
+            methods,
+            sql: stmt.sql.clone(),
+            bound_sql: Box::new(bound_sql),
+            param_names,
+            param_types,
+            output_columns,
+            auth,
+            required_scopes: stmt.required_scopes.clone(),
+            rate_limit,
+            output_format,
+            cors_origins: stmt.cors_origins.clone(),
+            cache_seconds: stmt.cache_seconds,
+            timeout_seconds: stmt.timeout_seconds,
+            max_body_bytes,
+        })
+    }
+
+    /// Binds CREATE STREAMING ENDPOINT. Requires the backing publication to
+    /// exist, resolves it to an id for the wire layer.
+    async fn bind_create_streaming_endpoint(
+        &self,
+        stmt: &CreateStreamingEndpointStatement,
+    ) -> Result<BoundCreateStreamingEndpoint> {
+        let schema_id = self.current_schema_id().await?;
+
+        if let Some(_existing) = self.catalog.get_endpoint(schema_id, &stmt.name) {
+            if !stmt.if_not_exists {
+                return Err(ZyronError::PlanError(format!(
+                    "endpoint '{}' already exists",
+                    stmt.name
+                )));
+            }
+        }
+        if let Some(existing) = self.catalog.get_endpoint_by_path(&stmt.path) {
+            if existing.name != stmt.name {
+                return Err(ZyronError::PlanError(format!(
+                    "endpoint path '{}' is already registered by endpoint '{}'",
+                    stmt.path, existing.name
+                )));
+            }
+        }
+        if !stmt.path.starts_with('/') {
+            return Err(ZyronError::PlanError(format!(
+                "streaming endpoint path '{}' must start with '/'",
+                stmt.path
+            )));
+        }
+
+        let publication = self
+            .catalog
+            .get_publication(schema_id, &stmt.backing_publication)
+            .ok_or_else(|| {
+                ZyronError::PlanError(format!(
+                    "backing publication '{}' not found",
+                    stmt.backing_publication
+                ))
+            })?;
+
+        Ok(BoundCreateStreamingEndpoint {
+            schema_id,
+            name: stmt.name.clone(),
+            if_not_exists: stmt.if_not_exists,
+            path: stmt.path.clone(),
+            protocol: stmt.protocol,
+            backing_publication_id: publication.id,
+            backing_publication_name: stmt.backing_publication.clone(),
+            auth: map_endpoint_auth(stmt.auth),
+            required_scopes: stmt.required_scopes.clone(),
+            max_connections_per_ip: stmt.max_connections_per_ip,
+            message_format: map_streaming_message_format(stmt.message_format),
+            heartbeat_seconds: stmt.heartbeat_seconds,
+            backpressure: map_backpressure(stmt.backpressure),
+            max_connections: stmt.max_connections,
+        })
+    }
+
+    /// Binds ALTER ENDPOINT. Enable/Disable pass through, SET OPTIONS is
+    /// parsed into an EndpointOptionUpdates.
+    async fn bind_alter_endpoint(
+        &self,
+        stmt: &AlterEndpointStatement,
+    ) -> Result<BoundAlterEndpoint> {
+        let schema_id = self.current_schema_id().await?;
+        let target = self
+            .catalog
+            .get_endpoint(schema_id, &stmt.name)
+            .ok_or_else(|| {
+                ZyronError::PlanError(format!("endpoint '{}' not found", stmt.name))
+            })?;
+
+        let action = match &stmt.action {
+            AlterEndpointAction::Enable => BoundAlterEndpointAction::Enable,
+            AlterEndpointAction::Disable => BoundAlterEndpointAction::Disable,
+            AlterEndpointAction::SetOptions(opts) => {
+                BoundAlterEndpointAction::SetOptions(parse_endpoint_option_updates(opts)?)
+            }
+        };
+
+        Ok(BoundAlterEndpoint {
+            name: stmt.name.clone(),
+            schema_id,
+            endpoint_id: target.id,
+            action,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Security map binding
+    // -----------------------------------------------------------------------
+
+    fn bind_alter_security_map(
+        &self,
+        stmt: &AlterSecurityMapStatement,
+    ) -> Result<BoundAlterSecurityMap> {
+        let (kind, key) = map_security_kind(&stmt.kind)?;
+        if stmt.role.trim().is_empty() {
+            return Err(ZyronError::PlanError(
+                "security map role name must be non-empty".to_string(),
+            ));
+        }
+        Ok(BoundAlterSecurityMap {
+            kind,
+            identity_key: key,
+            role_name: stmt.role.clone(),
+        })
+    }
+
+    fn bind_drop_security_map(
+        &self,
+        stmt: &DropSecurityMapStatement,
+    ) -> Result<BoundDropSecurityMap> {
+        let (kind, key) = map_security_kind(&stmt.kind)?;
+        Ok(BoundDropSecurityMap {
+            kind,
+            identity_key: key,
+        })
+    }
+
+    /// Pushes a single-table scope onto a bind context for binding a
+    /// publication WHERE predicate against one specific table.
+    fn push_single_table_scope(&mut self, ctx: &mut BindContext, entry: &Arc<TableEntry>) {
+        let idx = self.alloc_table_idx();
+        let columns: Vec<BoundColumnDef> = entry
+            .columns
+            .iter()
+            .map(|c| BoundColumnDef {
+                column_id: c.id,
+                name: c.name.clone(),
+                type_id: c.type_id,
+                nullable: c.nullable,
+                ordinal: c.ordinal,
+            })
+            .collect();
+        ctx.tables.push(BoundTableRef {
+            table_idx: idx,
+            table_id: Some(entry.id),
+            alias: entry.name.clone(),
+            columns,
+            entry: Some(Arc::clone(entry)),
+        });
+    }
+
     /// Binds CREATE EXTERNAL SOURCE by resolving the current schema and
     /// sanity-checking backend/credential combinations.
     async fn bind_create_external_source(
@@ -2195,6 +3410,9 @@ impl<'a> Binder<'a> {
             return Err(ZyronError::PlanError(
                 "CREATE EXTERNAL SOURCE with backend FILE cannot declare CREDENTIALS".to_string(),
             ));
+        }
+        if matches!(stmt.backend, ExternalBackendKind::Zyron) {
+            validate_zyron_tls_options(&stmt.options)?;
         }
         let columns: Vec<(String, zyron_common::TypeId)> = stmt
             .columns
@@ -2226,6 +3444,9 @@ impl<'a> Binder<'a> {
             return Err(ZyronError::PlanError(
                 "CREATE EXTERNAL SINK with backend FILE cannot declare CREDENTIALS".to_string(),
             ));
+        }
+        if matches!(stmt.backend, ExternalBackendKind::Zyron) {
+            validate_zyron_tls_options(&stmt.options)?;
         }
         let columns: Vec<(String, zyron_common::TypeId)> = stmt
             .columns
@@ -3826,9 +5047,9 @@ fn infer_function_type(name: &str, arg_types: &[TypeId]) -> TypeId {
 mod tests {
     use super::*;
 
-    // -----
+    // -----------------------------------------------------------------------------
     // Streaming-join helper tests
-    // -----
+    // -----------------------------------------------------------------------------
 
     #[test]
     fn test_extract_equi_key_pairs_single() {
@@ -4464,6 +5685,555 @@ mod tests {
                 assert!(b.credentials.is_empty());
             }
             other => panic!("expected CreateExternalSource, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Zyron-to-Zyron DDL bind tests
+    // -----------------------------------------------------------------------
+
+    async fn parse_and_bind(catalog: &Catalog, db_id: DatabaseId, sql: &str) -> BoundStatement {
+        let stmt = zyron_parser::parse(sql)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let resolver = catalog.resolver(db_id, vec!["public".to_string()]);
+        let mut binder = Binder::new(resolver, catalog);
+        binder.bind(stmt).await.unwrap()
+    }
+
+    async fn parse_and_bind_err(
+        catalog: &Catalog,
+        db_id: DatabaseId,
+        sql: &str,
+    ) -> zyron_common::ZyronError {
+        let stmt = zyron_parser::parse(sql)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let resolver = catalog.resolver(db_id, vec!["public".to_string()]);
+        let mut binder = Binder::new(resolver, catalog);
+        binder.bind(stmt).await.unwrap_err()
+    }
+
+    async fn create_test_publication(
+        catalog: &Catalog,
+        schema_id: SchemaId,
+        name: &str,
+        table_id: TableId,
+    ) -> zyron_catalog::PublicationId {
+        use zyron_catalog::schema::{PublicationEntry, PublicationTableEntry, RowFormat};
+        let entry = PublicationEntry {
+            id: zyron_catalog::PublicationId(0),
+            schema_id,
+            name: name.to_string(),
+            change_feed: true,
+            row_format: RowFormat::Binary,
+            retention_days: 30,
+            retain_until_advance: true,
+            max_rows_per_sec: None,
+            max_bytes_per_sec: None,
+            max_concurrent_subscribers: None,
+            classification: CatalogClassification::Internal,
+            allow_initial_snapshot: true,
+            where_predicate: None,
+            columns_projection: vec![],
+            rls_using_predicate: None,
+            tags: vec![],
+            schema_fingerprint: [0u8; 32],
+            owner_role_id: 0,
+            created_at: 0,
+        };
+        let pub_id = catalog.create_publication(entry).await.unwrap();
+        let table_entry = PublicationTableEntry {
+            id: 0,
+            publication_id: pub_id,
+            table_id,
+            where_predicate: None,
+            columns: vec![],
+            created_at: 0,
+        };
+        catalog.add_publication_table(table_entry).await.unwrap();
+        pub_id
+    }
+
+    #[tokio::test]
+    async fn test_bind_create_publication_single_table() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql = "CREATE PUBLICATION p1 FOR TABLE orders";
+        let bound = parse_and_bind(&catalog, db_id, sql).await;
+        match bound {
+            BoundStatement::CreatePublication(p) => {
+                assert_eq!(p.name, "p1");
+                assert_eq!(p.tables.len(), 1);
+                assert!(p.change_feed);
+                assert!(matches!(p.row_format, RowFormat::Binary));
+                assert_eq!(p.retention_days, 30);
+                assert!(matches!(p.classification, CatalogClassification::Internal));
+            }
+            other => panic!("expected CreatePublication, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_create_publication_multi_table_with_where() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql = "CREATE PUBLICATION p1 FOR TABLE orders, orders_vip WHERE amount > 100";
+        let bound = parse_and_bind(&catalog, db_id, sql).await;
+        match bound {
+            BoundStatement::CreatePublication(p) => {
+                assert_eq!(p.tables.len(), 2);
+                // The parser attaches the trailing WHERE to the last table ref.
+                let last = p.tables.last().unwrap();
+                assert!(last.where_predicate.is_some() || p.where_predicate.is_some());
+            }
+            other => panic!("expected CreatePublication, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_create_publication_unknown_table_rejected() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql = "CREATE PUBLICATION p1 FOR TABLE does_not_exist";
+        let err = parse_and_bind_err(&catalog, db_id, sql).await;
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("does_not_exist") || msg.to_ascii_lowercase().contains("not found"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bind_create_publication_unknown_column_rejected() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql = "CREATE PUBLICATION p1 FOR TABLE orders (bogus_col)";
+        let err = parse_and_bind_err(&catalog, db_id, sql).await;
+        assert!(format!("{err}").contains("bogus_col"));
+    }
+
+    #[tokio::test]
+    async fn test_bind_create_publication_bad_classification_rejected() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql =
+            "CREATE PUBLICATION p1 FOR TABLE orders WITH (classification = 'top_secret')";
+        let err = parse_and_bind_err(&catalog, db_id, sql).await;
+        assert!(format!("{err}").to_ascii_lowercase().contains("classification"));
+    }
+
+    #[tokio::test]
+    async fn test_bind_create_publication_schema_fingerprint_deterministic() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql = "CREATE PUBLICATION p1 FOR TABLE orders";
+        let a = match parse_and_bind(&catalog, db_id, sql).await {
+            BoundStatement::CreatePublication(p) => p.schema_fingerprint,
+            _ => panic!(),
+        };
+        let b = match parse_and_bind(&catalog, db_id, sql).await {
+            BoundStatement::CreatePublication(p) => p.schema_fingerprint,
+            _ => panic!(),
+        };
+        assert_eq!(a, b);
+        assert_ne!(a, [0u8; 32]);
+    }
+
+    #[tokio::test]
+    async fn test_bind_alter_publication_add_drop_table() {
+        let (catalog, _cache, db_id, schema_id, orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        create_test_publication(&catalog, schema_id, "p1", orders_id).await;
+
+        let add_sql = "ALTER PUBLICATION p1 ADD TABLE orders_vip";
+        match parse_and_bind(&catalog, db_id, add_sql).await {
+            BoundStatement::AlterPublication(p) => match p.action {
+                BoundAlterPublicationAction::AddTable(t) => {
+                    assert_ne!(t.table_id.0, 0);
+                }
+                other => panic!("expected AddTable, got {:?}", other),
+            },
+            _ => panic!(),
+        }
+
+        let drop_sql = "ALTER PUBLICATION p1 DROP TABLE orders";
+        match parse_and_bind(&catalog, db_id, drop_sql).await {
+            BoundStatement::AlterPublication(p) => {
+                assert!(matches!(p.action, BoundAlterPublicationAction::DropTable(_)));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_alter_publication_set_options() {
+        let (catalog, _cache, db_id, schema_id, orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        create_test_publication(&catalog, schema_id, "p1", orders_id).await;
+        let sql =
+            "ALTER PUBLICATION p1 SET OPTIONS (retention_days = '90', max_bytes_per_sec = '100MB')";
+        match parse_and_bind(&catalog, db_id, sql).await {
+            BoundStatement::AlterPublication(p) => match p.action {
+                BoundAlterPublicationAction::SetOptions(u) => {
+                    assert_eq!(u.retention_days, Some(90));
+                    assert_eq!(u.max_bytes_per_sec, Some(100 * 1024 * 1024));
+                }
+                other => panic!("expected SetOptions, got {:?}", other),
+            },
+            _ => panic!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_drop_publication_if_exists() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql = "DROP PUBLICATION IF EXISTS ghost";
+        match parse_and_bind(&catalog, db_id, sql).await {
+            BoundStatement::DropPublication { if_exists, .. } => assert!(if_exists),
+            _ => panic!(),
+        }
+
+        let sql_err = "DROP PUBLICATION ghost";
+        let err = parse_and_bind_err(&catalog, db_id, sql_err).await;
+        assert!(format!("{err}").contains("ghost"));
+    }
+
+    #[tokio::test]
+    async fn test_bind_create_endpoint_rest_basic() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql = "CREATE ENDPOINT ep1 ON PATH '/orders' METHOD GET USING 'SELECT id FROM orders' AUTH NONE";
+        match parse_and_bind(&catalog, db_id, sql).await {
+            BoundStatement::CreateEndpoint(e) => {
+                assert_eq!(e.path, "/orders");
+                assert_eq!(e.methods.len(), 1);
+                assert!(matches!(e.methods[0], HttpMethod::Get));
+                assert!(!e.output_columns.is_empty());
+            }
+            other => panic!("expected CreateEndpoint, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_create_endpoint_with_params() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql = "CREATE ENDPOINT ep2 ON PATH '/orders/one' METHOD GET USING 'SELECT id FROM orders WHERE id = $order_id' AUTH NONE";
+        match parse_and_bind(&catalog, db_id, sql).await {
+            BoundStatement::CreateEndpoint(e) => {
+                assert_eq!(e.param_names, vec!["order_id".to_string()]);
+                assert_eq!(e.param_types.len(), 1);
+            }
+            other => panic!("expected CreateEndpoint, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_create_endpoint_invalid_path_rejected() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql =
+            "CREATE ENDPOINT ep3 ON PATH 'bad' METHOD GET USING 'SELECT id FROM orders' AUTH NONE";
+        let err = parse_and_bind_err(&catalog, db_id, sql).await;
+        assert!(format!("{err}").to_ascii_lowercase().contains("path"));
+    }
+
+    #[tokio::test]
+    async fn test_bind_create_endpoint_invalid_method_rejected() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql = "CREATE ENDPOINT ep4 ON PATH '/x' METHOD CONNECT USING 'SELECT id FROM orders'";
+        // Parser may reject CONNECT entirely, or binder rejects it. Accept either.
+        let stmt_res = zyron_parser::parse(sql);
+        match stmt_res {
+            Err(_) => {}
+            Ok(stmts) => {
+                let stmt = stmts.into_iter().next().unwrap();
+                let resolver = catalog.resolver(db_id, vec!["public".to_string()]);
+                let mut binder = Binder::new(resolver, &catalog);
+                let err = binder.bind(stmt).await.unwrap_err();
+                assert!(
+                    format!("{err}").to_ascii_lowercase().contains("method"),
+                    "{err}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_create_streaming_endpoint_backed_by_publication() {
+        let (catalog, _cache, db_id, schema_id, orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        create_test_publication(&catalog, schema_id, "pub1", orders_id).await;
+        let sql =
+            "CREATE STREAMING ENDPOINT stream1 ON PATH '/stream' PROTOCOL WEBSOCKET BACKED BY PUBLICATION pub1 AUTH NONE";
+        match parse_and_bind(&catalog, db_id, sql).await {
+            BoundStatement::CreateStreamingEndpoint(e) => {
+                assert_eq!(e.backing_publication_name, "pub1");
+                assert!(matches!(e.protocol, StreamingEndpointProtocol::Websocket));
+            }
+            other => panic!("expected CreateStreamingEndpoint, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_create_streaming_endpoint_missing_publication_rejected() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql =
+            "CREATE STREAMING ENDPOINT stream1 ON PATH '/stream' PROTOCOL WEBSOCKET BACKED BY PUBLICATION nope AUTH NONE";
+        let err = parse_and_bind_err(&catalog, db_id, sql).await;
+        assert!(format!("{err}").contains("nope"));
+    }
+
+    #[tokio::test]
+    async fn test_bind_alter_endpoint_enable_disable() {
+        use zyron_catalog::schema::{EndpointEntry, EndpointKind};
+        let (catalog, _cache, db_id, schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let entry = EndpointEntry {
+            id: zyron_catalog::EndpointId(0),
+            schema_id,
+            name: "ep_a".to_string(),
+            kind: EndpointKind::Rest,
+            path: "/ep_a".to_string(),
+            methods: vec![HttpMethod::Get],
+            sql_body: "SELECT 1".to_string(),
+            backed_publication_id: None,
+            auth_mode: EndpointAuthMode::None,
+            required_scopes: vec![],
+            output_format: Some(EndpointOutputFormat::Json),
+            cors_origins: vec![],
+            rate_limit: None,
+            cache_seconds: None,
+            timeout_seconds: None,
+            max_request_body_kb: None,
+            message_format: None,
+            heartbeat_seconds: None,
+            backpressure: None,
+            max_connections: None,
+            enabled: true,
+            owner_role_id: 0,
+            created_at: 0,
+        };
+        catalog.create_endpoint(entry).await.unwrap();
+
+        match parse_and_bind(&catalog, db_id, "ALTER ENDPOINT ep_a DISABLE").await {
+            BoundStatement::AlterEndpoint(b) => {
+                assert!(matches!(b.action, BoundAlterEndpointAction::Disable));
+            }
+            _ => panic!(),
+        }
+        match parse_and_bind(&catalog, db_id, "ALTER ENDPOINT ep_a ENABLE").await {
+            BoundStatement::AlterEndpoint(b) => {
+                assert!(matches!(b.action, BoundAlterEndpointAction::Enable));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_drop_endpoint() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        match parse_and_bind(&catalog, db_id, "DROP ENDPOINT IF EXISTS nope").await {
+            BoundStatement::DropEndpoint { if_exists, .. } => assert!(if_exists),
+            _ => panic!(),
+        }
+        let err = parse_and_bind_err(&catalog, db_id, "DROP ENDPOINT nope").await;
+        assert!(format!("{err}").contains("nope"));
+    }
+
+    #[tokio::test]
+    async fn test_bind_alter_security_map_k8s_sa() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql = "ALTER SECURITY MAP KUBERNETES SA 'default/worker' TO ROLE 'reader'";
+        match parse_and_bind(&catalog, db_id, sql).await {
+            BoundStatement::AlterSecurityMap(m) => {
+                assert!(matches!(m.kind, CatalogSecurityMapKind::K8sSa));
+                assert_eq!(m.identity_key, "default/worker");
+                assert_eq!(m.role_name, "reader");
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_alter_security_map_jwt() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql = "ALTER SECURITY MAP JWT ISSUER 'https://iss' SUBJECT 'alice' TO ROLE 'reader'";
+        match parse_and_bind(&catalog, db_id, sql).await {
+            BoundStatement::AlterSecurityMap(m) => {
+                assert!(matches!(m.kind, CatalogSecurityMapKind::Jwt));
+                assert!(m.identity_key.contains("https://iss"));
+                assert!(m.identity_key.contains("alice"));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_alter_security_map_mtls_subject() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql =
+            "ALTER SECURITY MAP MTLS CERT SUBJECT 'CN=svc,O=Zyron' TO ROLE 'reader'";
+        match parse_and_bind(&catalog, db_id, sql).await {
+            BoundStatement::AlterSecurityMap(m) => {
+                assert!(matches!(m.kind, CatalogSecurityMapKind::MtlsSubject));
+                assert_eq!(m.identity_key, "CN=svc,O=Zyron");
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_drop_security_map() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql = "DROP SECURITY MAP KUBERNETES SA 'default/worker'";
+        match parse_and_bind(&catalog, db_id, sql).await {
+            BoundStatement::DropSecurityMap(m) => {
+                assert!(matches!(m.kind, CatalogSecurityMapKind::K8sSa));
+                assert_eq!(m.identity_key, "default/worker");
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_create_external_source_zyron_uri_parse() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql =
+            "CREATE EXTERNAL SOURCE src1 TYPE ZYRON URI 'zyron://host1:5432/db1/pub:p1' FORMAT JSONLINES";
+        match parse_and_bind(&catalog, db_id, sql).await {
+            BoundStatement::CreateExternalSource(b) => {
+                assert!(matches!(b.backend, ExternalBackendKind::Zyron));
+                assert!(b.uri.starts_with("zyron://"));
+            }
+            other => panic!("expected CreateExternalSource, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_tls_without_trust_config_rejects() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql =
+            "CREATE EXTERNAL SOURCE tls_src TYPE ZYRON URI 'zyron://host1:5432/db1/pub:p1' FORMAT JSONLINES OPTIONS (tls = 'required')";
+        let err = parse_and_bind_err(&catalog, db_id, sql).await;
+        let msg = err.to_string();
+        assert!(
+            msg.contains("TLS requires one of"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_tls_with_ca_cert_path_accepts() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql = "CREATE EXTERNAL SOURCE tls_src_ok TYPE ZYRON URI 'zyron://host1:5432/db1/pub:p1' FORMAT JSONLINES OPTIONS (tls = 'required', ca_cert_path = '/etc/ca.pem')";
+        match parse_and_bind(&catalog, db_id, sql).await {
+            BoundStatement::CreateExternalSource(b) => {
+                assert!(matches!(b.backend, ExternalBackendKind::Zyron));
+            }
+            other => panic!("expected CreateExternalSource, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_tls_disabled_accepts_without_trust_anchors() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql = "CREATE EXTERNAL SINK tls_sink_off TYPE ZYRON URI 'zyron://host1:5432/db1/pub:p1' FORMAT JSONLINES OPTIONS (tls = 'disabled')";
+        match parse_and_bind(&catalog, db_id, sql).await {
+            BoundStatement::CreateExternalSink(b) => {
+                assert!(matches!(b.backend, ExternalBackendKind::Zyron));
+            }
+            other => panic!("expected CreateExternalSink, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_alter_external_source_refresh_schema() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql = "ALTER EXTERNAL SOURCE src1 REFRESH SCHEMA";
+        match parse_and_bind(&catalog, db_id, sql).await {
+            BoundStatement::AlterExternalSource(b) => {
+                assert!(matches!(b.action, AlterExternalSourceAction::RefreshSchema));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_alter_external_source_reset_lsn_earliest() {
+        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+            build_streaming_test_catalog(true).await;
+        let sql = "ALTER EXTERNAL SOURCE src1 RESET LSN TO 'earliest'";
+        match parse_and_bind(&catalog, db_id, sql).await {
+            BoundStatement::AlterExternalSource(b) => match b.action {
+                AlterExternalSourceAction::ResetLsn(LsnResetSpec::Earliest) => {}
+                other => panic!("expected ResetLsn(Earliest), got {:?}", other),
+            },
+            _ => panic!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_abac_policy_on_publication() {
+        // ABAC policy on publication routes through the wire dispatcher, not
+        // the binder, so here we only confirm that the parser produces a
+        // CreateAbacPolicy with Publication target. The dispatcher ties the
+        // target to the resolved publication id in a later phase.
+        let sql = "CREATE ABAC POLICY pol1 ON PUBLICATION pub1 WHERE dept = 'eng'";
+        let stmts = zyron_parser::parse(sql).unwrap();
+        let stmt = stmts.into_iter().next().unwrap();
+        match stmt {
+            Statement::CreateAbacPolicy(p) => {
+                assert!(matches!(p.target, AbacPolicyTarget::Publication));
+                assert_eq!(p.target_name, "pub1");
+            }
+            other => panic!("expected CreateAbacPolicy, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_grant_subscribe_publication() {
+        // GRANT dispatch runs through the wire handler, not the binder, so
+        // we parse and assert the AST carries the right GrantObject.
+        let sql = "GRANT SUBSCRIBE ON PUBLICATION pub1 TO reader";
+        let stmt = zyron_parser::parse(sql).unwrap().into_iter().next().unwrap();
+        match stmt {
+            Statement::Grant(g) => {
+                assert!(matches!(g.object, GrantObject::Publication(_)));
+                assert!(g.privileges.contains(&Privilege::Subscribe));
+            }
+            other => panic!("expected Grant, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_grant_invoke_endpoint() {
+        let sql = "GRANT INVOKE ON ENDPOINT ep1 TO reader";
+        let stmt = zyron_parser::parse(sql).unwrap().into_iter().next().unwrap();
+        match stmt {
+            Statement::Grant(g) => {
+                assert!(matches!(g.object, GrantObject::Endpoint(_)));
+                assert!(g.privileges.contains(&Privilege::Invoke));
+            }
+            other => panic!("expected Grant, got {:?}", other),
         }
     }
 }

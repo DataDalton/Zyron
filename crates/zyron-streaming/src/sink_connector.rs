@@ -406,6 +406,28 @@ impl ZyronRowSink {
 }
 
 // ---------------------------------------------------------------------------
+// ZyronSinkAdapter trait
+// ---------------------------------------------------------------------------
+
+/// Adapter trait for sinks that deliver rows from a streaming job to a remote
+/// Zyron instance over the PG wire protocol. The concrete implementation lives
+/// in the zyron-wire crate as ZyronSinkClient. The trait object form lets the
+/// runner in this crate dispatch to the remote sink without taking a build
+/// dependency on zyron-wire, preserving the streaming to wire direction of
+/// the dep graph.
+#[async_trait::async_trait]
+pub trait ZyronSinkAdapter: Send + Sync {
+    /// Writes a batch of change records to the remote Zyron instance.
+    async fn write_batch(&self, records: Vec<CdfChange>) -> Result<()>;
+
+    /// Flushes any pending rows held in the adapter's buffers.
+    async fn flush(&self) -> Result<()>;
+
+    /// Shuts the adapter down, draining any remaining rows before return.
+    async fn shutdown(&self) -> Result<()>;
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

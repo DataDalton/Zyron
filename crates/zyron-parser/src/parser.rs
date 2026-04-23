@@ -74,6 +74,8 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Analyze) => self.parse_analyze(),
             Token::Keyword(Keyword::Use) => self.parse_use_branch(),
             Token::Keyword(Keyword::Call) => self.parse_call(),
+            Token::Keyword(Keyword::Tag) => self.parse_tag_publication(),
+            Token::Keyword(Keyword::Untag) => self.parse_untag_publication(),
             _ => Err(self.error(&format!(
                 "Expected a statement, found {}",
                 self.current.token
@@ -155,6 +157,15 @@ impl<'a> Parser<'a> {
 
     fn at_token(&self, token: &Token) -> bool {
         &self.current.token == token
+    }
+
+    /// True when the current token is an identifier matching the given word
+    /// case-insensitively.
+    fn at_ident_ignore_case(&self, word: &str) -> bool {
+        match &self.current.token {
+            Token::Ident(s) => s.eq_ignore_ascii_case(word),
+            _ => false,
+        }
     }
 
     fn parse_ident(&mut self) -> Result<String> {
@@ -1049,7 +1060,6 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Version) => self.parse_create_version(),
             Token::Keyword(Keyword::Replication) => self.parse_create_replication_slot(),
             Token::Keyword(Keyword::Cdc) => self.parse_create_cdc(),
-            Token::Keyword(Keyword::Streaming) => self.parse_create_streaming_job(),
             Token::Keyword(Keyword::External) => self.parse_create_external(),
             Token::Keyword(Keyword::Publication) => self.parse_create_publication(),
             Token::Keyword(Keyword::Trigger) => self.parse_create_trigger(),
@@ -1057,8 +1067,16 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Aggregate) => self.parse_create_aggregate(),
             Token::Keyword(Keyword::Procedure) => self.parse_create_procedure(false),
             Token::Keyword(Keyword::Event) => self.parse_create_event_handler(),
+            Token::Keyword(Keyword::Endpoint) => self.parse_create_endpoint(),
+            Token::Keyword(Keyword::Streaming)
+                if self.peek.token == Token::Keyword(Keyword::Endpoint) =>
+            {
+                self.parse_create_streaming_endpoint()
+            }
+            Token::Keyword(Keyword::Streaming) => self.parse_create_streaming_job(),
+            Token::Keyword(Keyword::Abac) => self.parse_create_abac_policy(),
             _ => Err(self.error(&format!(
-                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, PIPELINE, GRAPH, FULLTEXT, VECTOR, BRANCH, VERSION, REPLICATION, CDC, PUBLICATION, TRIGGER, FUNCTION, AGGREGATE, PROCEDURE, or EVENT after CREATE, found {}",
+                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, PIPELINE, GRAPH, FULLTEXT, VECTOR, BRANCH, VERSION, REPLICATION, CDC, PUBLICATION, ENDPOINT, STREAMING, ABAC, TRIGGER, FUNCTION, AGGREGATE, PROCEDURE, or EVENT after CREATE, found {}",
                 self.current.token
             ))),
         }
@@ -1167,8 +1185,10 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Aggregate) => self.parse_drop_aggregate(),
             Token::Keyword(Keyword::Procedure) => self.parse_drop_procedure(),
             Token::Keyword(Keyword::Event) => self.parse_drop_event_handler(),
+            Token::Keyword(Keyword::Endpoint) => self.parse_drop_endpoint(),
+            Token::Keyword(Keyword::Security) => self.parse_drop_security_map(),
             _ => Err(self.error(&format!(
-                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, PIPELINE, GRAPH, BRANCH, REPLICATION, CDC, PUBLICATION, TRIGGER, FUNCTION, AGGREGATE, PROCEDURE, or EVENT after DROP, found {}",
+                "Expected TABLE, INDEX, VIEW, SCHEMA, SEQUENCE, MATERIALIZED, SCHEDULE, USER, ROLE, PIPELINE, GRAPH, BRANCH, REPLICATION, CDC, PUBLICATION, ENDPOINT, SECURITY, TRIGGER, FUNCTION, AGGREGATE, PROCEDURE, or EVENT after DROP, found {}",
                 self.current.token
             ))),
         }
@@ -1227,8 +1247,10 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Publication) => self.parse_alter_publication(),
             Token::Keyword(Keyword::Streaming) => self.parse_alter_streaming_job(),
             Token::Keyword(Keyword::External) => self.parse_alter_external(),
+            Token::Keyword(Keyword::Endpoint) => self.parse_alter_endpoint(),
+            Token::Keyword(Keyword::Security) => self.parse_alter_security_map(),
             _ => Err(self.error(&format!(
-                "Expected TABLE, INDEX, SEQUENCE, VIEW, USER, ROLE, SYSTEM, STREAMING, or PUBLICATION after ALTER, found {}",
+                "Expected TABLE, INDEX, SEQUENCE, VIEW, USER, ROLE, SYSTEM, STREAMING, ENDPOINT, SECURITY, or PUBLICATION after ALTER, found {}",
                 self.current.token
             ))),
         }
@@ -1521,7 +1543,7 @@ impl<'a> Parser<'a> {
             }
             self.expect_token(&Token::RParen)?;
         } else {
-            // Legacy syntax: EXPLAIN [ANALYZE] <statement>
+            // Bare form: EXPLAIN [ANALYZE] <statement>
             analyze = self.consume_keyword(Keyword::Analyze)?;
         }
 
@@ -2801,13 +2823,17 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::Grant)?;
         let privileges = self.parse_privilege_list()?;
         self.expect_keyword(Keyword::On)?;
-        self.consume_keyword(Keyword::Table)?;
-        let on_table = self.parse_ident()?;
+        let object = self.parse_grant_object()?;
         self.expect_keyword(Keyword::To)?;
         let to = self.parse_ident()?;
+        let on_table = match &object {
+            GrantObject::Table(name) => name.clone(),
+            _ => String::new(),
+        };
         Ok(Statement::Grant(Box::new(GrantStatement {
             privileges,
             on_table,
+            object,
             to,
         })))
     }
@@ -2816,15 +2842,48 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::Revoke)?;
         let privileges = self.parse_privilege_list()?;
         self.expect_keyword(Keyword::On)?;
-        self.consume_keyword(Keyword::Table)?;
-        let on_table = self.parse_ident()?;
+        let object = self.parse_grant_object()?;
         self.expect_keyword(Keyword::From)?;
         let from = self.parse_ident()?;
+        let on_table = match &object {
+            GrantObject::Table(name) => name.clone(),
+            _ => String::new(),
+        };
         Ok(Statement::Revoke(Box::new(RevokeStatement {
             privileges,
             on_table,
+            object,
             from,
         })))
+    }
+
+    /// Parses the object clause that follows ON in GRANT and REVOKE.
+    /// Supports TABLE <name> (default when no target keyword),
+    /// PUBLICATION <name>, PUBLICATIONS LIKE '<pattern>',
+    /// PUBLICATIONS TAGGED '<tag>', and ENDPOINT <name>.
+    fn parse_grant_object(&mut self) -> Result<GrantObject> {
+        if self.consume_keyword(Keyword::Publication)? {
+            let name = self.parse_ident()?;
+            return Ok(GrantObject::Publication(name));
+        }
+        if self.consume_keyword(Keyword::Publications)? {
+            if self.consume_keyword(Keyword::Like)? {
+                let pattern = self.parse_string_literal()?;
+                return Ok(GrantObject::PublicationsLike(pattern));
+            }
+            if self.consume_keyword(Keyword::Tagged)? {
+                let tag = self.parse_string_literal()?;
+                return Ok(GrantObject::PublicationsTagged(tag));
+            }
+            return Err(self.error("Expected LIKE or TAGGED after PUBLICATIONS in GRANT/REVOKE"));
+        }
+        if self.consume_keyword(Keyword::Endpoint)? {
+            let name = self.parse_ident()?;
+            return Ok(GrantObject::Endpoint(name));
+        }
+        self.consume_keyword(Keyword::Table)?;
+        let name = self.parse_ident()?;
+        Ok(GrantObject::Table(name))
     }
 
     fn parse_privilege_list(&mut self) -> Result<Vec<Privilege>> {
@@ -2871,6 +2930,14 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Reindex) => {
                 p.advance()?;
                 Ok(Privilege::Reindex)
+            }
+            Token::Keyword(Keyword::Subscribe) => {
+                p.advance()?;
+                Ok(Privilege::Subscribe)
+            }
+            Token::Keyword(Keyword::Invoke) => {
+                p.advance()?;
+                Ok(Privilege::Invoke)
             }
             _ => Err(p.error(&format!("Expected privilege, found {}", p.current.token))),
         })
@@ -4901,6 +4968,7 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Gcs) => ExternalBackendKind::Gcs,
             Token::Keyword(Keyword::Azure) => ExternalBackendKind::Azure,
             Token::Keyword(Keyword::Http) => ExternalBackendKind::Http,
+            Token::Keyword(Keyword::Zyron) => ExternalBackendKind::Zyron,
             _ => return Ok(None),
         };
         self.advance()?;
@@ -5081,11 +5149,22 @@ impl<'a> Parser<'a> {
         let backend = self.parse_external_backend()?;
         self.parse_external_uri_keyword()?;
         let uri = self.parse_string_literal()?;
-        self.expect_keyword(Keyword::Format)?;
-        let format = self.parse_external_format()?;
+        // ZYRON backend communicates via PG wire, so FORMAT is not meaningful
+        // and we default to a JSON placeholder. Other backends require FORMAT.
+        let format = if backend == ExternalBackendKind::Zyron {
+            if self.consume_keyword(Keyword::Format)? {
+                self.parse_external_format()?
+            } else {
+                ExternalFormatKind::Json
+            }
+        } else {
+            self.expect_keyword(Keyword::Format)?;
+            self.parse_external_format()?
+        };
         let mut mode = ExternalModeSpec::OneShot;
         let mut options = Vec::new();
         let mut credentials = Vec::new();
+        let mut credential_provider: Option<CredentialProviderSpec> = None;
         let mut columns: Vec<(String, DataType)> = Vec::new();
         loop {
             if self.consume_keyword(Keyword::Mode)? {
@@ -5094,6 +5173,8 @@ impl<'a> Parser<'a> {
                 options = self.parse_kv_options()?;
             } else if self.consume_keyword(Keyword::Credentials)? {
                 credentials = self.parse_kv_options()?;
+            } else if self.consume_keyword(Keyword::CredentialProvider)? {
+                credential_provider = Some(self.parse_credential_provider_clause()?);
             } else if self.consume_keyword(Keyword::Columns)? {
                 columns = self.parse_external_columns_clause()?;
             } else {
@@ -5109,8 +5190,9 @@ impl<'a> Parser<'a> {
                 format,
                 mode,
                 options,
-                columns,
                 credentials,
+                credential_provider,
+                columns,
             },
         )))
     }
@@ -5154,16 +5236,27 @@ impl<'a> Parser<'a> {
         let backend = self.parse_external_backend()?;
         self.parse_external_uri_keyword()?;
         let uri = self.parse_string_literal()?;
-        self.expect_keyword(Keyword::Format)?;
-        let format = self.parse_external_format()?;
+        let format = if backend == ExternalBackendKind::Zyron {
+            if self.consume_keyword(Keyword::Format)? {
+                self.parse_external_format()?
+            } else {
+                ExternalFormatKind::Json
+            }
+        } else {
+            self.expect_keyword(Keyword::Format)?;
+            self.parse_external_format()?
+        };
         let mut options = Vec::new();
         let mut credentials = Vec::new();
+        let mut credential_provider: Option<CredentialProviderSpec> = None;
         let mut columns: Vec<(String, DataType)> = Vec::new();
         loop {
             if self.consume_keyword(Keyword::Options)? {
                 options = self.parse_kv_options()?;
             } else if self.consume_keyword(Keyword::Credentials)? {
                 credentials = self.parse_kv_options()?;
+            } else if self.consume_keyword(Keyword::CredentialProvider)? {
+                credential_provider = Some(self.parse_credential_provider_clause()?);
             } else if self.consume_keyword(Keyword::Columns)? {
                 columns = self.parse_external_columns_clause()?;
             } else {
@@ -5178,8 +5271,9 @@ impl<'a> Parser<'a> {
                 uri,
                 format,
                 options,
-                columns,
                 credentials,
+                credential_provider,
+                columns,
             },
         )))
     }
@@ -5237,22 +5331,48 @@ impl<'a> Parser<'a> {
             self.expect_keyword(Keyword::To)?;
             let new_name = self.parse_ident()?;
             AlterExternalSourceAction::Rename(new_name)
+        } else if self.consume_keyword(Keyword::Refresh)? {
+            // ALTER EXTERNAL SOURCE name REFRESH SCHEMA
+            let word = self.parse_ident()?;
+            if !word.eq_ignore_ascii_case("schema") {
+                return Err(self.error("Expected SCHEMA after REFRESH in ALTER EXTERNAL SOURCE"));
+            }
+            AlterExternalSourceAction::RefreshSchema
+        } else if self.consume_keyword(Keyword::Reset)? {
+            // ALTER EXTERNAL SOURCE name RESET LSN TO 'earliest' | 'latest' | 'lsn:<N>'
+            self.expect_keyword(Keyword::Lsn)?;
+            self.expect_keyword(Keyword::To)?;
+            let literal = self.parse_string_literal()?;
+            let reset = parse_lsn_reset_spec(&literal).ok_or_else(|| {
+                self.error("Expected 'earliest', 'latest', or 'lsn:<N>' in RESET LSN TO")
+            })?;
+            AlterExternalSourceAction::ResetLsn(reset)
+        } else if self.consume_keyword(Keyword::Pause)? {
+            AlterExternalSourceAction::Pause
+        } else if self.consume_keyword(Keyword::Resume)? {
+            AlterExternalSourceAction::Resume
         } else if self.consume_keyword(Keyword::Set)? {
             if self.consume_keyword(Keyword::Options)? {
                 AlterExternalSourceAction::SetOptions(self.parse_kv_options()?)
             } else if self.consume_keyword(Keyword::Credentials)? {
                 AlterExternalSourceAction::SetCredentials(self.parse_kv_options()?)
+            } else if self.consume_keyword(Keyword::CredentialProvider)? {
+                AlterExternalSourceAction::SetCredentialProvider(
+                    self.parse_credential_provider_clause()?,
+                )
             } else if self.consume_keyword(Keyword::Mode)? {
                 AlterExternalSourceAction::SetMode(self.parse_external_mode_spec()?)
             } else if self.consume_keyword(Keyword::Columns)? {
                 AlterExternalSourceAction::SetColumns(self.parse_external_columns_clause()?)
             } else {
                 return Err(self.error(
-                    "Expected OPTIONS, CREDENTIALS, MODE, or COLUMNS after SET in ALTER EXTERNAL SOURCE",
+                    "Expected OPTIONS, CREDENTIALS, CREDENTIAL_PROVIDER, MODE, or COLUMNS after SET in ALTER EXTERNAL SOURCE",
                 ));
             }
         } else {
-            return Err(self.error("Expected SET or RENAME after ALTER EXTERNAL SOURCE <name>"));
+            return Err(self.error(
+                "Expected SET, RENAME, REFRESH, RESET, PAUSE, or RESUME after ALTER EXTERNAL SOURCE <name>",
+            ));
         };
         Ok(Statement::AlterExternalSource(Box::new(
             AlterExternalSourceStatement { name, action },
@@ -5320,60 +5440,118 @@ impl<'a> Parser<'a> {
         )))
     }
 
+    /// Parses `CREATE PUBLICATION [IF NOT EXISTS] name FOR TABLE t1 [(cols)] [WHERE e],
+    /// t2 ... [WHERE e] [WITH (k = v, ...)]`.
     fn parse_create_publication(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Publication)?;
-        let name = self.parse_ident()?;
-        self.expect_keyword(Keyword::For)?;
-        let mut tables = vec![];
-        let mut all_tables = false;
-        if self.consume_keyword(Keyword::All)? {
-            self.expect_keyword(Keyword::Table)?;
-            all_tables = true;
-        } else {
-            self.expect_keyword(Keyword::Table)?;
-            tables = self.parse_comma_separated(|p| p.parse_ident())?;
-        }
-        let include_ddl = if self.consume_keyword(Keyword::Include)? {
-            self.expect_keyword(Keyword::Ddl)?;
+        let if_not_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Not)?;
+            self.expect_keyword(Keyword::Exists)?;
             true
         } else {
             false
         };
+        let name = self.parse_ident()?;
+        self.expect_keyword(Keyword::For)?;
+        self.expect_keyword(Keyword::Table)?;
+        let tables = self.parse_comma_separated(|p| p.parse_publication_table_ref())?;
+        let where_predicate = if self.at_keyword(Keyword::Where) {
+            self.advance()?;
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        let mut options = Vec::new();
+        if self.consume_keyword(Keyword::With)? {
+            options = self.parse_kv_options()?;
+        }
         Ok(Statement::CreatePublication(Box::new(
             CreatePublicationStatement {
                 name,
+                if_not_exists,
                 tables,
-                all_tables,
-                include_ddl,
+                where_predicate,
+                options,
             },
         )))
     }
 
+    /// Parses a single entry in a publication table list.
+    /// Accepts `<table> [ ( col1, col2, ... ) ] [ WHERE <expr> ]`.
+    fn parse_publication_table_ref(&mut self) -> Result<PublicationTableRef> {
+        let table_name = self.parse_ident()?;
+        let mut columns = Vec::new();
+        if self.at_token(&Token::LParen) {
+            self.advance()?;
+            columns = self.parse_comma_separated(|p| p.parse_ident())?;
+            self.expect_token(&Token::RParen)?;
+        }
+        let where_predicate = if self.at_keyword(Keyword::Where) {
+            self.advance()?;
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(PublicationTableRef {
+            table_name,
+            columns,
+            where_predicate,
+        })
+    }
+
+    /// Parses `ALTER PUBLICATION name (ADD TABLE t [(cols) [WHERE e]] |
+    ///   DROP TABLE t | SET OPTIONS (...) | SET WHERE <expr> | RENAME TO new)`.
     fn parse_alter_publication(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Publication)?;
         let name = self.parse_ident()?;
         let action = if self.consume_keyword(Keyword::Add)? {
             self.expect_keyword(Keyword::Table)?;
-            let table = self.parse_ident()?;
-            AlterPublicationAction::AddTable(table)
+            let table_ref = self.parse_publication_table_ref()?;
+            AlterPublicationAction::AddTable(table_ref)
         } else if self.at_keyword(Keyword::Drop) {
             self.advance()?;
             self.expect_keyword(Keyword::Table)?;
             let table = self.parse_ident()?;
             AlterPublicationAction::DropTable(table)
+        } else if self.consume_keyword(Keyword::Rename)? {
+            self.expect_keyword(Keyword::To)?;
+            let new_name = self.parse_ident()?;
+            AlterPublicationAction::Rename(new_name)
+        } else if self.consume_keyword(Keyword::Set)? {
+            if self.consume_keyword(Keyword::Options)? {
+                AlterPublicationAction::SetOptions(self.parse_kv_options()?)
+            } else if self.consume_keyword(Keyword::Where)? {
+                AlterPublicationAction::SetWhere(self.parse_expr()?)
+            } else {
+                return Err(self.error("Expected OPTIONS or WHERE after SET in ALTER PUBLICATION"));
+            }
         } else {
-            return Err(self.error("Expected ADD or DROP after ALTER PUBLICATION name"));
+            return Err(
+                self.error("Expected ADD, DROP, SET, or RENAME after ALTER PUBLICATION <name>")
+            );
         };
         Ok(Statement::AlterPublication(Box::new(
             AlterPublicationStatement { name, action },
         )))
     }
 
+    /// Parses `DROP PUBLICATION [IF EXISTS] name [CASCADE]`.
     fn parse_drop_publication(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Publication)?;
+        let if_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
         let name = self.parse_ident()?;
+        let cascade = self.consume_keyword(Keyword::Cascade)?;
         Ok(Statement::DropPublication(Box::new(
-            DropPublicationStatement { name },
+            DropPublicationStatement {
+                name,
+                if_exists,
+                cascade,
+            },
         )))
     }
 
@@ -6158,6 +6336,579 @@ impl<'a> Parser<'a> {
             DropGraphSchemaStatement { name, if_exists },
         )))
     }
+
+    // -----------------------------------------------------------------------
+    // Zyron-to-Zyron data plane parsers
+    // -----------------------------------------------------------------------
+
+    /// Parses `CREDENTIAL_PROVIDER (type = 'vault'|..., key = value, ...)`.
+    /// The `type` entry is required and selects the provider variant.
+    /// Remaining entries are stored verbatim as options.
+    fn parse_credential_provider_clause(&mut self) -> Result<CredentialProviderSpec> {
+        let kvs = self.parse_kv_options()?;
+        let mut provider_type_raw: Option<String> = None;
+        let mut options: Vec<(String, String)> = Vec::new();
+        for (k, v) in kvs {
+            if k.eq_ignore_ascii_case("type") {
+                provider_type_raw = Some(v);
+            } else {
+                options.push((k, v));
+            }
+        }
+        let raw = provider_type_raw.ok_or_else(|| {
+            self.error(
+                "CREDENTIAL_PROVIDER clause requires a 'type' entry identifying the provider",
+            )
+        })?;
+        let provider_type = match raw.to_ascii_lowercase().as_str() {
+            "vault" => CredentialProviderType::Vault,
+            "aws_secrets_manager" => CredentialProviderType::AwsSecretsManager,
+            "gcp_secret_manager" => CredentialProviderType::GcpSecretManager,
+            "azure_key_vault" => CredentialProviderType::AzureKeyVault,
+            "oauth2_client_credentials" => CredentialProviderType::OAuth2ClientCredentials,
+            "aws_iam_assume_role" => CredentialProviderType::AwsIamAssumeRole,
+            "k8s_sa_token" => CredentialProviderType::K8sSaToken,
+            other => {
+                return Err(self.error(&format!("Unknown credential provider type '{}'", other)));
+            }
+        };
+        Ok(CredentialProviderSpec {
+            provider_type,
+            options,
+        })
+    }
+
+    /// Parses an HTTP method name (GET, POST, ...) as either a keyword or
+    /// identifier and returns its uppercase string form.
+    fn parse_http_method_name(&mut self) -> Result<String> {
+        let name = self.parse_ident()?;
+        let up = name.to_ascii_uppercase();
+        match up.as_str() {
+            "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "HEAD" | "OPTIONS" => Ok(up),
+            _ => Err(self.error(&format!("Unknown HTTP method '{}'", name))),
+        }
+    }
+
+    /// Parses `AUTH <method> [REQUIRE SCOPE '<s>' [, '<s>']]`.
+    fn parse_endpoint_auth_clause(&mut self) -> Result<(EndpointAuthSpec, Vec<String>)> {
+        let auth = match &self.current.token {
+            Token::Keyword(Keyword::Null) => EndpointAuthSpec::None,
+            Token::Keyword(Keyword::Jwt) => EndpointAuthSpec::Jwt,
+            Token::Keyword(Keyword::ApiKey) => EndpointAuthSpec::ApiKey,
+            Token::Keyword(Keyword::OAuth2) => EndpointAuthSpec::OAuth2,
+            Token::Keyword(Keyword::Basic) => EndpointAuthSpec::Basic,
+            Token::Keyword(Keyword::Mtls) => EndpointAuthSpec::Mtls,
+            Token::Ident(s) if s.eq_ignore_ascii_case("none") => EndpointAuthSpec::None,
+            _ => {
+                return Err(self.error(&format!(
+                    "Expected NONE, JWT, API_KEY, OAUTH2, BASIC, or MTLS after AUTH, found {}",
+                    self.current.token
+                )));
+            }
+        };
+        self.advance()?;
+        let mut scopes = Vec::new();
+        if self.consume_keyword(Keyword::Require)? {
+            self.expect_keyword(Keyword::Scope)?;
+            scopes = self.parse_comma_separated(|p| p.parse_string_literal())?;
+        }
+        Ok((auth, scopes))
+    }
+
+    /// Parses `RATE LIMIT <count> / <unit> [PER IP | PER USER | PER API_KEY]`.
+    /// Returns count, per_seconds, and scope.
+    fn parse_rate_limit_clause(&mut self) -> Result<EndpointRateLimitSpec> {
+        self.expect_keyword(Keyword::Limit)?;
+        let count = match &self.current.token {
+            Token::Integer(n) if *n >= 0 => *n as u64,
+            _ => {
+                return Err(self.error("Expected non-negative integer count after RATE LIMIT"));
+            }
+        };
+        self.advance()?;
+        self.expect_token(&Token::Slash)?;
+        let per_seconds = self.parse_rate_limit_unit()?;
+        let scope = if self.consume_keyword(Keyword::Per)? {
+            if self.consume_keyword(Keyword::Ip)? {
+                EndpointRateLimitScope::PerIp
+            } else if self.consume_keyword(Keyword::User)? {
+                EndpointRateLimitScope::PerUser
+            } else if self.consume_keyword(Keyword::ApiKey)? {
+                EndpointRateLimitScope::PerApiKey
+            } else {
+                return Err(self.error("Expected IP, USER, or API_KEY after PER"));
+            }
+        } else {
+            EndpointRateLimitScope::Global
+        };
+        Ok(EndpointRateLimitSpec {
+            count,
+            per_seconds,
+            scope,
+        })
+    }
+
+    /// Parses a rate-limit time unit name: second, minute, hour, day.
+    fn parse_rate_limit_unit(&mut self) -> Result<u32> {
+        let word = self.parse_ident()?;
+        match word.to_ascii_lowercase().as_str() {
+            "second" | "sec" | "s" => Ok(1),
+            "minute" | "min" | "m" => Ok(60),
+            "hour" | "hr" | "h" => Ok(3600),
+            "day" | "d" => Ok(86_400),
+            _ => Err(self.error(&format!(
+                "Expected second, minute, hour, or day in rate limit, found {}",
+                word
+            ))),
+        }
+    }
+
+    /// Parses `CREATE ENDPOINT name [IF NOT EXISTS] ON PATH '<p>' METHOD m1 [,m2..]
+    ///   USING '<sql>' AUTH <a> [REQUIRE SCOPE '<s>', ...]
+    ///   [RATE LIMIT <N>/<unit> [PER ...]] [OUTPUT FORMAT <fmt>]
+    ///   [CORS ORIGINS '<o>', ...] [CACHE <N> SECONDS] [TIMEOUT <N> SECONDS]
+    ///   [MAX REQUEST BODY <N>KB]`.
+    fn parse_create_endpoint(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Endpoint)?;
+        let if_not_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Not)?;
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_ident()?;
+        self.expect_keyword(Keyword::On)?;
+        let word = self.parse_ident()?;
+        if !word.eq_ignore_ascii_case("path") {
+            return Err(self.error("Expected PATH after ON in CREATE ENDPOINT"));
+        }
+        let path = self.parse_string_literal()?;
+        // METHOD m1 [, m2 ...]
+        let methods_kw = self.parse_ident()?;
+        if !methods_kw.eq_ignore_ascii_case("method") {
+            return Err(self.error("Expected METHOD after PATH in CREATE ENDPOINT"));
+        }
+        let methods = self.parse_comma_separated(|p| p.parse_http_method_name())?;
+        // USING '<sql>'
+        let using_kw = self.parse_ident()?;
+        if !using_kw.eq_ignore_ascii_case("using") {
+            return Err(self.error("Expected USING after METHOD in CREATE ENDPOINT"));
+        }
+        let sql = self.parse_string_literal()?;
+        // AUTH <method> [REQUIRE SCOPE ...]
+        let auth_kw = self.parse_ident()?;
+        if !auth_kw.eq_ignore_ascii_case("auth") {
+            return Err(self.error("Expected AUTH after USING in CREATE ENDPOINT"));
+        }
+        let (auth, required_scopes) = self.parse_endpoint_auth_clause()?;
+        // Optional trailing clauses in any order.
+        let mut rate_limit = None;
+        let mut output_format = EndpointOutputFormatSpec::Json;
+        let mut cors_origins: Vec<String> = Vec::new();
+        let mut cache_seconds: u32 = 0;
+        let mut timeout_seconds: u32 = 0;
+        let mut max_body_kb: u32 = 0;
+        loop {
+            if self.consume_keyword(Keyword::Rate)? {
+                rate_limit = Some(self.parse_rate_limit_clause()?);
+            } else if self.consume_keyword(Keyword::Output)? {
+                self.expect_keyword(Keyword::Format)?;
+                output_format = self.parse_endpoint_output_format()?;
+            } else if self.consume_keyword(Keyword::Cors)? {
+                self.expect_keyword(Keyword::Origins)?;
+                cors_origins = self.parse_comma_separated(|p| p.parse_string_literal())?;
+            } else if self.consume_keyword(Keyword::Cache)? {
+                cache_seconds = self.parse_u32_literal()?;
+                self.expect_keyword(Keyword::Seconds)?;
+            } else if self.at_ident_ignore_case("timeout") {
+                self.advance()?;
+                timeout_seconds = self.parse_u32_literal()?;
+                self.expect_keyword(Keyword::Seconds)?;
+            } else if self.consume_keyword(Keyword::Max)? {
+                self.expect_keyword(Keyword::Request)?;
+                self.expect_keyword(Keyword::Body)?;
+                max_body_kb = self.parse_u32_literal()?;
+                // optional KB suffix as identifier
+                if let Token::Ident(s) = &self.current.token {
+                    if s.eq_ignore_ascii_case("kb") {
+                        self.advance()?;
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(Statement::CreateEndpoint(Box::new(
+            CreateEndpointStatement {
+                name,
+                if_not_exists,
+                path,
+                methods,
+                sql,
+                auth,
+                required_scopes,
+                rate_limit,
+                output_format,
+                cors_origins,
+                cache_seconds,
+                timeout_seconds,
+                max_body_kb,
+            },
+        )))
+    }
+
+    fn parse_u32_literal(&mut self) -> Result<u32> {
+        match &self.current.token {
+            Token::Integer(n) if *n >= 0 && *n <= u32::MAX as i64 => {
+                let v = *n as u32;
+                self.advance()?;
+                Ok(v)
+            }
+            _ => Err(self.error("Expected non-negative 32-bit integer literal")),
+        }
+    }
+
+    /// Parses an endpoint output format keyword: JSON, JSONL/JSONLINES,
+    /// CSV, PARQUET, ARROW, PROTOBUF.
+    fn parse_endpoint_output_format(&mut self) -> Result<EndpointOutputFormatSpec> {
+        let fmt = match &self.current.token {
+            Token::Keyword(Keyword::Json) => EndpointOutputFormatSpec::Json,
+            Token::Keyword(Keyword::JsonLines) => EndpointOutputFormatSpec::JsonLines,
+            Token::Keyword(Keyword::Csv) => EndpointOutputFormatSpec::Csv,
+            Token::Keyword(Keyword::Parquet) => EndpointOutputFormatSpec::Parquet,
+            Token::Keyword(Keyword::Arrow) => EndpointOutputFormatSpec::Arrow,
+            Token::Ident(s) if s.eq_ignore_ascii_case("protobuf") => {
+                EndpointOutputFormatSpec::Protobuf
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("jsonl") => {
+                EndpointOutputFormatSpec::JsonLines
+            }
+            _ => {
+                return Err(self.error(&format!(
+                    "Expected JSON, JSONL, JSONLINES, CSV, PARQUET, ARROW, or PROTOBUF, found {}",
+                    self.current.token
+                )));
+            }
+        };
+        self.advance()?;
+        Ok(fmt)
+    }
+
+    /// Parses `CREATE STREAMING ENDPOINT name [IF NOT EXISTS] ON PATH '<p>'
+    ///   PROTOCOL WEBSOCKET|SSE BACKED BY PUBLICATION <pub> AUTH <a>
+    ///   [RATE LIMIT <N> CONNECTIONS PER IP] [MESSAGE FORMAT <f>]
+    ///   [HEARTBEAT <N> SECONDS] [BACKPRESSURE <policy>]
+    ///   [MAX CONNECTIONS <N>]`.
+    fn parse_create_streaming_endpoint(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Streaming)?;
+        self.expect_keyword(Keyword::Endpoint)?;
+        let if_not_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Not)?;
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_ident()?;
+        self.expect_keyword(Keyword::On)?;
+        let word = self.parse_ident()?;
+        if !word.eq_ignore_ascii_case("path") {
+            return Err(self.error("Expected PATH after ON in CREATE STREAMING ENDPOINT"));
+        }
+        let path = self.parse_string_literal()?;
+        self.expect_keyword(Keyword::Protocol)?;
+        let protocol = if self.consume_keyword(Keyword::Websocket)? {
+            StreamingEndpointProtocol::Websocket
+        } else if self.consume_keyword(Keyword::Sse)? {
+            StreamingEndpointProtocol::Sse
+        } else {
+            return Err(self.error("Expected WEBSOCKET or SSE after PROTOCOL"));
+        };
+        self.expect_keyword(Keyword::Backed)?;
+        self.expect_keyword(Keyword::By)?;
+        self.expect_keyword(Keyword::Publication)?;
+        let backing_publication = self.parse_ident()?;
+        // AUTH <method>
+        let auth_kw = self.parse_ident()?;
+        if !auth_kw.eq_ignore_ascii_case("auth") {
+            return Err(self
+                .error("Expected AUTH after BACKED BY PUBLICATION in CREATE STREAMING ENDPOINT"));
+        }
+        let (auth, required_scopes) = self.parse_endpoint_auth_clause()?;
+        let mut max_connections_per_ip: Option<u32> = None;
+        let mut message_format = StreamingMessageFormat::Json;
+        let mut heartbeat_seconds: u32 = 30;
+        let mut backpressure = BackpressurePolicySpec::Block;
+        let mut max_connections: u32 = 0;
+        loop {
+            if self.consume_keyword(Keyword::Rate)? {
+                self.expect_keyword(Keyword::Limit)?;
+                let n = self.parse_u32_literal()?;
+                self.expect_keyword(Keyword::Connections)?;
+                self.expect_keyword(Keyword::Per)?;
+                self.expect_keyword(Keyword::Ip)?;
+                max_connections_per_ip = Some(n);
+            } else if self.at_ident_ignore_case("message") {
+                self.advance()?;
+                self.expect_keyword(Keyword::Format)?;
+                message_format = self.parse_streaming_message_format()?;
+            } else if self.consume_keyword(Keyword::Heartbeat)? {
+                heartbeat_seconds = self.parse_u32_literal()?;
+                self.expect_keyword(Keyword::Seconds)?;
+            } else if self.consume_keyword(Keyword::Backpressure)? {
+                backpressure = self.parse_backpressure_policy()?;
+            } else if self.consume_keyword(Keyword::Max)? {
+                self.expect_keyword(Keyword::Connections)?;
+                max_connections = self.parse_u32_literal()?;
+            } else {
+                break;
+            }
+        }
+        Ok(Statement::CreateStreamingEndpoint(Box::new(
+            CreateStreamingEndpointStatement {
+                name,
+                if_not_exists,
+                path,
+                protocol,
+                backing_publication,
+                auth,
+                required_scopes,
+                max_connections_per_ip,
+                message_format,
+                heartbeat_seconds,
+                backpressure,
+                max_connections,
+            },
+        )))
+    }
+
+    fn parse_streaming_message_format(&mut self) -> Result<StreamingMessageFormat> {
+        let fmt = match &self.current.token {
+            Token::Keyword(Keyword::Json) => StreamingMessageFormat::Json,
+            Token::Keyword(Keyword::JsonLines) => StreamingMessageFormat::JsonLines,
+            Token::Ident(s) if s.eq_ignore_ascii_case("jsonl") => StreamingMessageFormat::JsonLines,
+            Token::Ident(s) if s.eq_ignore_ascii_case("protobuf") => {
+                StreamingMessageFormat::Protobuf
+            }
+            _ => {
+                return Err(self.error(&format!(
+                    "Expected JSON, JSONL, JSONLINES, or PROTOBUF, found {}",
+                    self.current.token
+                )));
+            }
+        };
+        self.advance()?;
+        Ok(fmt)
+    }
+
+    fn parse_backpressure_policy(&mut self) -> Result<BackpressurePolicySpec> {
+        if self.consume_keyword(Keyword::DropOldest)? {
+            Ok(BackpressurePolicySpec::DropOldest)
+        } else if self.consume_keyword(Keyword::CloseSlow)? {
+            Ok(BackpressurePolicySpec::CloseSlow)
+        } else if self.consume_keyword(Keyword::Block)? {
+            Ok(BackpressurePolicySpec::Block)
+        } else {
+            Err(self.error(&format!(
+                "Expected DROP_OLDEST, CLOSE_SLOW, or BLOCK after BACKPRESSURE, found {}",
+                self.current.token
+            )))
+        }
+    }
+
+    /// Parses `ALTER ENDPOINT name (ENABLE | DISABLE | SET OPTIONS (...))`.
+    fn parse_alter_endpoint(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Endpoint)?;
+        let name = self.parse_ident()?;
+        let action = if self.consume_keyword(Keyword::Enable)? {
+            AlterEndpointAction::Enable
+        } else if self.consume_keyword(Keyword::Disable)? {
+            AlterEndpointAction::Disable
+        } else if self.consume_keyword(Keyword::Set)? {
+            self.expect_keyword(Keyword::Options)?;
+            AlterEndpointAction::SetOptions(self.parse_kv_options()?)
+        } else {
+            return Err(
+                self.error("Expected ENABLE, DISABLE, or SET OPTIONS after ALTER ENDPOINT <name>")
+            );
+        };
+        Ok(Statement::AlterEndpoint(Box::new(AlterEndpointStatement {
+            name,
+            action,
+        })))
+    }
+
+    /// Parses `DROP ENDPOINT [IF EXISTS] name`.
+    fn parse_drop_endpoint(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Endpoint)?;
+        let if_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_ident()?;
+        Ok(Statement::DropEndpoint(Box::new(DropEndpointStatement {
+            name,
+            if_exists,
+        })))
+    }
+
+    /// Parses the identity clause of ALTER/DROP SECURITY MAP.
+    /// Returns the parsed kind + identity string.
+    fn parse_security_map_identity(&mut self) -> Result<(SecurityMapKindSpec, String)> {
+        if self.consume_keyword(Keyword::Kubernetes)? {
+            // KUBERNETES SA 'ns/sa'
+            let sa_word = self.parse_ident()?;
+            if !sa_word.eq_ignore_ascii_case("sa") {
+                return Err(self.error("Expected SA after KUBERNETES"));
+            }
+            let ident = self.parse_string_literal()?;
+            return Ok((
+                SecurityMapKindSpec::KubernetesSa {
+                    ns_and_name: ident.clone(),
+                },
+                ident,
+            ));
+        }
+        if self.consume_keyword(Keyword::Jwt)? {
+            // JWT ISSUER '<iss>' SUBJECT '<sub>'
+            self.expect_keyword(Keyword::Issuer)?;
+            let issuer = self.parse_string_literal()?;
+            self.expect_keyword(Keyword::Subject)?;
+            let subject = self.parse_string_literal()?;
+            let ident = format!("{}|{}", issuer, subject);
+            return Ok((
+                SecurityMapKindSpec::JwtIssuerSubject { issuer, subject },
+                ident,
+            ));
+        }
+        if self.consume_keyword(Keyword::Mtls)? {
+            self.expect_keyword(Keyword::Cert)?;
+            if self.consume_keyword(Keyword::Subject)? {
+                let dn = self.parse_string_literal()?;
+                return Ok((
+                    SecurityMapKindSpec::MtlsCertSubject {
+                        subject_dn: dn.clone(),
+                    },
+                    dn,
+                ));
+            }
+            if self.consume_keyword(Keyword::Fingerprint)? {
+                let fp = self.parse_string_literal()?;
+                return Ok((
+                    SecurityMapKindSpec::MtlsCertFingerprint {
+                        fingerprint_sha256: fp.clone(),
+                    },
+                    fp,
+                ));
+            }
+            return Err(self.error("Expected SUBJECT or FINGERPRINT after MTLS CERT"));
+        }
+        Err(self.error(&format!(
+            "Expected KUBERNETES, JWT, or MTLS after SECURITY MAP, found {}",
+            self.current.token
+        )))
+    }
+
+    /// Parses `ALTER SECURITY MAP <identity> TO ROLE '<role>'`.
+    fn parse_alter_security_map(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Security)?;
+        self.expect_keyword(Keyword::Map)?;
+        let (kind, identity) = self.parse_security_map_identity()?;
+        self.expect_keyword(Keyword::To)?;
+        self.expect_keyword(Keyword::Role)?;
+        let role = self.parse_string_literal()?;
+        Ok(Statement::AlterSecurityMap(Box::new(
+            AlterSecurityMapStatement {
+                kind,
+                identity,
+                role,
+            },
+        )))
+    }
+
+    /// Parses `DROP SECURITY MAP <identity>`.
+    fn parse_drop_security_map(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Security)?;
+        self.expect_keyword(Keyword::Map)?;
+        let (kind, identity) = self.parse_security_map_identity()?;
+        Ok(Statement::DropSecurityMap(Box::new(
+            DropSecurityMapStatement { kind, identity },
+        )))
+    }
+
+    /// Parses `TAG PUBLICATION name WITH '<tag>' [, '<tag>' ...]`.
+    fn parse_tag_publication(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Tag)?;
+        self.expect_keyword(Keyword::Publication)?;
+        let name = self.parse_ident()?;
+        self.expect_keyword(Keyword::With)?;
+        let tags = self.parse_comma_separated(|p| p.parse_string_literal())?;
+        Ok(Statement::TagPublication(Box::new(
+            TagPublicationStatement { name, tags },
+        )))
+    }
+
+    /// Parses `UNTAG PUBLICATION name '<tag>'`.
+    fn parse_untag_publication(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Untag)?;
+        self.expect_keyword(Keyword::Publication)?;
+        let name = self.parse_ident()?;
+        let tag = self.parse_string_literal()?;
+        Ok(Statement::UntagPublication(Box::new(
+            UntagPublicationStatement { name, tag },
+        )))
+    }
+
+    /// Parses `CREATE ABAC POLICY name ON (TABLE | PUBLICATION) target WHERE <expr>`.
+    fn parse_create_abac_policy(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Abac)?;
+        self.expect_keyword(Keyword::Policy)?;
+        let name = self.parse_ident()?;
+        self.expect_keyword(Keyword::On)?;
+        let target = if self.consume_keyword(Keyword::Publication)? {
+            AbacPolicyTarget::Publication
+        } else if self.consume_keyword(Keyword::Table)? {
+            AbacPolicyTarget::Table
+        } else {
+            return Err(self.error("Expected TABLE or PUBLICATION after ON in CREATE ABAC POLICY"));
+        };
+        let target_name = self.parse_ident()?;
+        self.expect_keyword(Keyword::Where)?;
+        let predicate = self.parse_expr()?;
+        Ok(Statement::CreateAbacPolicy(Box::new(
+            CreateAbacPolicyStatement {
+                name,
+                target,
+                target_name,
+                predicate,
+            },
+        )))
+    }
+}
+
+/// Parses a RESET LSN TO argument. Accepts 'earliest', 'latest', or 'lsn:<N>'.
+fn parse_lsn_reset_spec(literal: &str) -> Option<LsnResetSpec> {
+    let trimmed = literal.trim();
+    if trimmed.eq_ignore_ascii_case("earliest") {
+        return Some(LsnResetSpec::Earliest);
+    }
+    if trimmed.eq_ignore_ascii_case("latest") {
+        return Some(LsnResetSpec::Latest);
+    }
+    if let Some(rest) = trimmed.strip_prefix("lsn:") {
+        if let Ok(n) = rest.parse::<u64>() {
+            return Some(LsnResetSpec::Explicit(n));
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("LSN:") {
+        if let Ok(n) = rest.parse::<u64>() {
+            return Some(LsnResetSpec::Explicit(n));
+        }
+    }
+    None
 }
 
 /// Maps keywords that can be used as identifiers in non-keyword position.
@@ -6463,6 +7214,64 @@ fn keyword_to_ident_str(kw: Keyword) -> Option<&'static str> {
         Keyword::Graph => Some("graph"),
         Keyword::Node => Some("node"),
         Keyword::Edge => Some("edge"),
+        // Zyron-to-Zyron new keywords that can appear in positions where
+        // an identifier is expected (option keys, column names, aliases).
+        Keyword::Publications => Some("publications"),
+        Keyword::Subscribe => Some("subscribe"),
+        Keyword::Invoke => Some("invoke"),
+        Keyword::Endpoint => Some("endpoint"),
+        Keyword::Endpoints => Some("endpoints"),
+        Keyword::Audience => Some("audience"),
+        Keyword::Scope => Some("scope"),
+        Keyword::Scopes => Some("scopes"),
+        Keyword::Rate => Some("rate"),
+        Keyword::Cors => Some("cors"),
+        Keyword::Origins => Some("origins"),
+        Keyword::CredentialProvider => Some("credential_provider"),
+        Keyword::Websocket => Some("websocket"),
+        Keyword::Sse => Some("sse"),
+        Keyword::Backed => Some("backed"),
+        Keyword::Heartbeat => Some("heartbeat"),
+        Keyword::Backpressure => Some("backpressure"),
+        Keyword::Mtls => Some("mtls"),
+        Keyword::Fingerprint => Some("fingerprint"),
+        Keyword::Map => Some("map"),
+        Keyword::Reset => Some("reset"),
+        Keyword::Lsn => Some("lsn"),
+        Keyword::Tag => Some("tag"),
+        Keyword::Untag => Some("untag"),
+        Keyword::Tagged => Some("tagged"),
+        Keyword::Inherit => Some("inherit"),
+        Keyword::Retention => Some("retention"),
+        Keyword::ChangeFeed => Some("change_feed"),
+        Keyword::AllowInitialSnapshot => Some("allow_initial_snapshot"),
+        Keyword::Vault => Some("vault"),
+        Keyword::IamAssumeRole => Some("iam_assume_role"),
+        Keyword::K8sSaToken => Some("k8s_sa_token"),
+        Keyword::AwsSecretsManager => Some("aws_secrets_manager"),
+        Keyword::GcpSecretManager => Some("gcp_secret_manager"),
+        Keyword::AzureKeyVault => Some("azure_key_vault"),
+        Keyword::DropOldest => Some("drop_oldest"),
+        Keyword::CloseSlow => Some("close_slow"),
+        Keyword::Block => Some("block"),
+        Keyword::Abac => Some("abac"),
+        Keyword::Jwt => Some("jwt"),
+        Keyword::ApiKey => Some("api_key"),
+        Keyword::OAuth2 => Some("oauth2"),
+        Keyword::Basic => Some("basic"),
+        Keyword::Kubernetes => Some("kubernetes"),
+        Keyword::Issuer => Some("issuer"),
+        Keyword::Subject => Some("subject"),
+        Keyword::Cert => Some("cert"),
+        Keyword::Require => Some("require"),
+        Keyword::Body => Some("body"),
+        Keyword::Request => Some("request"),
+        Keyword::Max => Some("max"),
+        Keyword::Ip => Some("ip"),
+        Keyword::Per => Some("per"),
+        Keyword::Connections => Some("connections"),
+        Keyword::Protocol => Some("protocol"),
+        Keyword::Zyron => Some("zyron"),
         _ => None,
     }
 }
@@ -10984,67 +11793,77 @@ mod tests {
     }
 
     #[test]
-    fn test_create_publication_for_tables() {
+    fn test_create_publication_basic() {
         let stmt = parse_one("CREATE PUBLICATION my_pub FOR TABLE orders, users");
         match stmt {
             Statement::CreatePublication(p) => {
                 assert_eq!(p.name, "my_pub");
-                assert_eq!(p.tables, vec!["orders", "users"]);
-                assert!(!p.all_tables);
-                assert!(!p.include_ddl);
+                assert_eq!(p.tables.len(), 2);
+                assert_eq!(p.tables[0].table_name, "orders");
+                assert_eq!(p.tables[1].table_name, "users");
+                assert!(!p.if_not_exists);
+                assert!(p.where_predicate.is_none());
+                assert!(p.options.is_empty());
             }
             _ => panic!("Expected CreatePublication"),
         }
     }
 
     #[test]
-    fn test_create_publication_all_tables() {
-        let stmt = parse_one("CREATE PUBLICATION my_pub FOR ALL TABLE");
+    fn test_create_publication_with_where_and_columns() {
+        let stmt = parse_one(
+            "CREATE PUBLICATION p FOR TABLE orders (id, customer_id) WHERE region = 'us'",
+        );
         match stmt {
             Statement::CreatePublication(p) => {
-                assert_eq!(p.name, "my_pub");
-                assert!(p.all_tables);
-                assert!(p.tables.is_empty());
-                assert!(!p.include_ddl);
+                assert_eq!(p.name, "p");
+                assert_eq!(p.tables.len(), 1);
+                assert_eq!(p.tables[0].table_name, "orders");
+                assert_eq!(p.tables[0].columns, vec!["id", "customer_id"]);
+                assert!(p.tables[0].where_predicate.is_some());
             }
             _ => panic!("Expected CreatePublication"),
         }
     }
 
     #[test]
-    fn test_create_publication_include_ddl() {
-        let stmt = parse_one("CREATE PUBLICATION my_pub FOR TABLE orders INCLUDE DDL");
+    fn test_create_publication_with_all_options() {
+        let stmt = parse_one(
+            "CREATE PUBLICATION p FOR TABLE orders WITH (change_feed = true, retention_days = 7, max_rows_per_sec = 1000)",
+        );
         match stmt {
             Statement::CreatePublication(p) => {
-                assert_eq!(p.name, "my_pub");
-                assert_eq!(p.tables, vec!["orders"]);
-                assert!(p.include_ddl);
+                assert_eq!(p.options.len(), 3);
+                assert_eq!(p.options[0].0, "change_feed");
+                assert_eq!(p.options[0].1, "true");
+                assert_eq!(p.options[1].0, "retention_days");
+                assert_eq!(p.options[1].1, "7");
+                assert_eq!(p.options[2].0, "max_rows_per_sec");
+                assert_eq!(p.options[2].1, "1000");
             }
             _ => panic!("Expected CreatePublication"),
         }
     }
 
     #[test]
-    fn test_alter_publication_add_table() {
+    fn test_alter_publication_add_drop_table() {
         let stmt = parse_one("ALTER PUBLICATION my_pub ADD TABLE users");
         match stmt {
             Statement::AlterPublication(a) => {
                 assert_eq!(a.name, "my_pub");
-                assert_eq!(
-                    a.action,
-                    AlterPublicationAction::AddTable("users".to_string())
-                );
+                match a.action {
+                    AlterPublicationAction::AddTable(t) => {
+                        assert_eq!(t.table_name, "users");
+                    }
+                    _ => panic!("Expected AddTable"),
+                }
             }
             _ => panic!("Expected AlterPublication"),
         }
-    }
 
-    #[test]
-    fn test_alter_publication_drop_table() {
         let stmt = parse_one("ALTER PUBLICATION my_pub DROP TABLE users");
         match stmt {
             Statement::AlterPublication(a) => {
-                assert_eq!(a.name, "my_pub");
                 assert_eq!(
                     a.action,
                     AlterPublicationAction::DropTable("users".to_string())
@@ -11055,13 +11874,429 @@ mod tests {
     }
 
     #[test]
-    fn test_drop_publication() {
-        let stmt = parse_one("DROP PUBLICATION my_pub");
+    fn test_alter_publication_set_options() {
+        let stmt = parse_one("ALTER PUBLICATION my_pub SET OPTIONS (retention_days = 30)");
+        match stmt {
+            Statement::AlterPublication(a) => match a.action {
+                AlterPublicationAction::SetOptions(opts) => {
+                    assert_eq!(opts.len(), 1);
+                    assert_eq!(opts[0].0, "retention_days");
+                    assert_eq!(opts[0].1, "30");
+                }
+                _ => panic!("Expected SetOptions"),
+            },
+            _ => panic!("Expected AlterPublication"),
+        }
+    }
+
+    #[test]
+    fn test_drop_publication_if_exists_cascade() {
+        let stmt = parse_one("DROP PUBLICATION IF EXISTS my_pub CASCADE");
         match stmt {
             Statement::DropPublication(p) => {
                 assert_eq!(p.name, "my_pub");
+                assert!(p.if_exists);
+                assert!(p.cascade);
             }
             _ => panic!("Expected DropPublication"),
+        }
+    }
+
+    #[test]
+    fn test_grant_subscribe_on_publication() {
+        let stmt = parse_one("GRANT SUBSCRIBE ON PUBLICATION orders_pub TO analytics");
+        match stmt {
+            Statement::Grant(g) => {
+                assert_eq!(g.privileges, vec![Privilege::Subscribe]);
+                assert_eq!(g.to, "analytics");
+                assert_eq!(g.object, GrantObject::Publication("orders_pub".to_string()));
+            }
+            _ => panic!("Expected Grant"),
+        }
+    }
+
+    #[test]
+    fn test_grant_subscribe_on_publications_like() {
+        let stmt = parse_one("GRANT SUBSCRIBE ON PUBLICATIONS LIKE 'partner_%' TO partner_role");
+        match stmt {
+            Statement::Grant(g) => {
+                assert_eq!(
+                    g.object,
+                    GrantObject::PublicationsLike("partner_%".to_string())
+                );
+            }
+            _ => panic!("Expected Grant"),
+        }
+    }
+
+    #[test]
+    fn test_grant_subscribe_on_publications_tagged() {
+        let stmt = parse_one("GRANT SUBSCRIBE ON PUBLICATIONS TAGGED '#partner' TO partner_role");
+        match stmt {
+            Statement::Grant(g) => {
+                assert_eq!(
+                    g.object,
+                    GrantObject::PublicationsTagged("#partner".to_string())
+                );
+            }
+            _ => panic!("Expected Grant"),
+        }
+    }
+
+    #[test]
+    fn test_revoke_subscribe_on_publication() {
+        let stmt = parse_one("REVOKE SUBSCRIBE ON PUBLICATION orders_pub FROM analytics");
+        match stmt {
+            Statement::Revoke(r) => {
+                assert_eq!(r.privileges, vec![Privilege::Subscribe]);
+                assert_eq!(r.from, "analytics");
+                assert_eq!(r.object, GrantObject::Publication("orders_pub".to_string()));
+            }
+            _ => panic!("Expected Revoke"),
+        }
+    }
+
+    #[test]
+    fn test_grant_invoke_on_endpoint() {
+        let stmt = parse_one("GRANT INVOKE ON ENDPOINT get_orders TO api_role");
+        match stmt {
+            Statement::Grant(g) => {
+                assert_eq!(g.privileges, vec![Privilege::Invoke]);
+                assert_eq!(g.object, GrantObject::Endpoint("get_orders".to_string()));
+            }
+            _ => panic!("Expected Grant"),
+        }
+    }
+
+    #[test]
+    fn test_tag_publication() {
+        let stmt = parse_one("TAG PUBLICATION p WITH '#pii', '#external'");
+        match stmt {
+            Statement::TagPublication(t) => {
+                assert_eq!(t.name, "p");
+                assert_eq!(t.tags, vec!["#pii", "#external"]);
+            }
+            _ => panic!("Expected TagPublication"),
+        }
+    }
+
+    #[test]
+    fn test_untag_publication() {
+        let stmt = parse_one("UNTAG PUBLICATION p '#pii'");
+        match stmt {
+            Statement::UntagPublication(t) => {
+                assert_eq!(t.name, "p");
+                assert_eq!(t.tag, "#pii");
+            }
+            _ => panic!("Expected UntagPublication"),
+        }
+    }
+
+    #[test]
+    fn test_create_endpoint_full() {
+        let stmt = parse_one(
+            "CREATE ENDPOINT get_orders ON PATH '/api/orders' METHOD GET USING 'SELECT * FROM orders' AUTH JWT REQUIRE SCOPE 'orders:read'",
+        );
+        match stmt {
+            Statement::CreateEndpoint(e) => {
+                assert_eq!(e.name, "get_orders");
+                assert_eq!(e.path, "/api/orders");
+                assert_eq!(e.methods, vec!["GET"]);
+                assert_eq!(e.sql, "SELECT * FROM orders");
+                assert_eq!(e.auth, EndpointAuthSpec::Jwt);
+                assert_eq!(e.required_scopes, vec!["orders:read"]);
+            }
+            _ => panic!("Expected CreateEndpoint"),
+        }
+    }
+
+    #[test]
+    fn test_create_endpoint_rate_limit_scopes() {
+        let stmt = parse_one(
+            "CREATE ENDPOINT e1 ON PATH '/p' METHOD GET USING 'SELECT 1' AUTH NONE RATE LIMIT 100/minute PER IP",
+        );
+        match stmt {
+            Statement::CreateEndpoint(e) => {
+                let rl = e.rate_limit.expect("rate_limit");
+                assert_eq!(rl.count, 100);
+                assert_eq!(rl.per_seconds, 60);
+                assert_eq!(rl.scope, EndpointRateLimitScope::PerIp);
+            }
+            _ => panic!("Expected CreateEndpoint"),
+        }
+    }
+
+    #[test]
+    fn test_create_endpoint_cors() {
+        let stmt = parse_one(
+            "CREATE ENDPOINT e1 ON PATH '/p' METHOD GET USING 'SELECT 1' AUTH NONE CORS ORIGINS 'https://example.com', '*'",
+        );
+        match stmt {
+            Statement::CreateEndpoint(e) => {
+                assert_eq!(e.cors_origins, vec!["https://example.com", "*"]);
+            }
+            _ => panic!("Expected CreateEndpoint"),
+        }
+    }
+
+    #[test]
+    fn test_alter_endpoint_disable_enable() {
+        match parse_one("ALTER ENDPOINT e1 DISABLE") {
+            Statement::AlterEndpoint(a) => {
+                assert_eq!(a.action, AlterEndpointAction::Disable);
+            }
+            _ => panic!("Expected AlterEndpoint"),
+        }
+        match parse_one("ALTER ENDPOINT e1 ENABLE") {
+            Statement::AlterEndpoint(a) => {
+                assert_eq!(a.action, AlterEndpointAction::Enable);
+            }
+            _ => panic!("Expected AlterEndpoint"),
+        }
+    }
+
+    #[test]
+    fn test_drop_endpoint() {
+        let stmt = parse_one("DROP ENDPOINT IF EXISTS e1");
+        match stmt {
+            Statement::DropEndpoint(d) => {
+                assert_eq!(d.name, "e1");
+                assert!(d.if_exists);
+            }
+            _ => panic!("Expected DropEndpoint"),
+        }
+    }
+
+    #[test]
+    fn test_create_streaming_endpoint_websocket() {
+        let stmt = parse_one(
+            "CREATE STREAMING ENDPOINT live ON PATH '/live' PROTOCOL WEBSOCKET BACKED BY PUBLICATION orders_pub AUTH JWT BACKPRESSURE DROP_OLDEST MAX CONNECTIONS 100",
+        );
+        match stmt {
+            Statement::CreateStreamingEndpoint(e) => {
+                assert_eq!(e.name, "live");
+                assert_eq!(e.protocol, StreamingEndpointProtocol::Websocket);
+                assert_eq!(e.backing_publication, "orders_pub");
+                assert_eq!(e.backpressure, BackpressurePolicySpec::DropOldest);
+                assert_eq!(e.max_connections, 100);
+            }
+            _ => panic!("Expected CreateStreamingEndpoint"),
+        }
+    }
+
+    #[test]
+    fn test_create_streaming_endpoint_sse() {
+        let stmt = parse_one(
+            "CREATE STREAMING ENDPOINT live ON PATH '/live' PROTOCOL SSE BACKED BY PUBLICATION p AUTH NONE HEARTBEAT 15 SECONDS",
+        );
+        match stmt {
+            Statement::CreateStreamingEndpoint(e) => {
+                assert_eq!(e.protocol, StreamingEndpointProtocol::Sse);
+                assert_eq!(e.heartbeat_seconds, 15);
+            }
+            _ => panic!("Expected CreateStreamingEndpoint"),
+        }
+    }
+
+    #[test]
+    fn test_alter_security_map_k8s_sa() {
+        let stmt = parse_one("ALTER SECURITY MAP KUBERNETES SA 'default/app' TO ROLE 'reader'");
+        match stmt {
+            Statement::AlterSecurityMap(a) => {
+                assert_eq!(
+                    a.kind,
+                    SecurityMapKindSpec::KubernetesSa {
+                        ns_and_name: "default/app".to_string(),
+                    }
+                );
+                assert_eq!(a.role, "reader");
+            }
+            _ => panic!("Expected AlterSecurityMap"),
+        }
+    }
+
+    #[test]
+    fn test_alter_security_map_jwt() {
+        let stmt = parse_one(
+            "ALTER SECURITY MAP JWT ISSUER 'https://iss' SUBJECT 'alice' TO ROLE 'reader'",
+        );
+        match stmt {
+            Statement::AlterSecurityMap(a) => match a.kind {
+                SecurityMapKindSpec::JwtIssuerSubject { issuer, subject } => {
+                    assert_eq!(issuer, "https://iss");
+                    assert_eq!(subject, "alice");
+                }
+                _ => panic!("Expected JwtIssuerSubject"),
+            },
+            _ => panic!("Expected AlterSecurityMap"),
+        }
+    }
+
+    #[test]
+    fn test_alter_security_map_mtls_subject() {
+        let stmt = parse_one("ALTER SECURITY MAP MTLS CERT SUBJECT 'CN=svc' TO ROLE 'svc_role'");
+        match stmt {
+            Statement::AlterSecurityMap(a) => match a.kind {
+                SecurityMapKindSpec::MtlsCertSubject { subject_dn } => {
+                    assert_eq!(subject_dn, "CN=svc");
+                }
+                _ => panic!("Expected MtlsCertSubject"),
+            },
+            _ => panic!("Expected AlterSecurityMap"),
+        }
+    }
+
+    #[test]
+    fn test_alter_security_map_mtls_fingerprint() {
+        let stmt =
+            parse_one("ALTER SECURITY MAP MTLS CERT FINGERPRINT 'sha256:abc123' TO ROLE 'r'");
+        match stmt {
+            Statement::AlterSecurityMap(a) => match a.kind {
+                SecurityMapKindSpec::MtlsCertFingerprint { fingerprint_sha256 } => {
+                    assert_eq!(fingerprint_sha256, "sha256:abc123");
+                }
+                _ => panic!("Expected MtlsCertFingerprint"),
+            },
+            _ => panic!("Expected AlterSecurityMap"),
+        }
+    }
+
+    #[test]
+    fn test_drop_security_map() {
+        let stmt = parse_one("DROP SECURITY MAP KUBERNETES SA 'default/app'");
+        match stmt {
+            Statement::DropSecurityMap(d) => {
+                assert_eq!(d.identity, "default/app");
+            }
+            _ => panic!("Expected DropSecurityMap"),
+        }
+    }
+
+    #[test]
+    fn test_credential_provider_vault() {
+        let stmt = parse_one(
+            "CREATE EXTERNAL SOURCE s TYPE ZYRON URI 'zyron://a@h/db/pub:p' CREDENTIAL_PROVIDER (type = 'vault', path = 'secret/data/x', auth = 'kubernetes')",
+        );
+        match stmt {
+            Statement::CreateExternalSource(s) => {
+                let cp = s.credential_provider.expect("credential_provider");
+                assert_eq!(cp.provider_type, CredentialProviderType::Vault);
+                assert_eq!(cp.options.len(), 2);
+                assert_eq!(cp.options[0].0, "path");
+                assert_eq!(cp.options[0].1, "secret/data/x");
+            }
+            _ => panic!("Expected CreateExternalSource"),
+        }
+    }
+
+    #[test]
+    fn test_credential_provider_aws_secrets_manager() {
+        let stmt = parse_one(
+            "CREATE EXTERNAL SINK k TYPE ZYRON URI 'zyron://a@h/db/s.t' CREDENTIAL_PROVIDER (type = 'aws_secrets_manager', region = 'us-east-1')",
+        );
+        match stmt {
+            Statement::CreateExternalSink(s) => {
+                let cp = s.credential_provider.expect("credential_provider");
+                assert_eq!(cp.provider_type, CredentialProviderType::AwsSecretsManager);
+            }
+            _ => panic!("Expected CreateExternalSink"),
+        }
+    }
+
+    #[test]
+    fn test_credential_provider_oauth2() {
+        let stmt = parse_one(
+            "CREATE EXTERNAL SOURCE s TYPE ZYRON URI 'zyron://a@h/db/pub:p' CREDENTIAL_PROVIDER (type = 'oauth2_client_credentials', client_id = 'abc')",
+        );
+        match stmt {
+            Statement::CreateExternalSource(s) => {
+                let cp = s.credential_provider.expect("credential_provider");
+                assert_eq!(
+                    cp.provider_type,
+                    CredentialProviderType::OAuth2ClientCredentials
+                );
+            }
+            _ => panic!("Expected CreateExternalSource"),
+        }
+    }
+
+    #[test]
+    fn test_create_external_source_type_zyron() {
+        let stmt = parse_one(
+            "CREATE EXTERNAL SOURCE src TYPE ZYRON URI 'zyron://user@h:5432/db/pub:orders'",
+        );
+        match stmt {
+            Statement::CreateExternalSource(s) => {
+                assert_eq!(s.backend, ExternalBackendKind::Zyron);
+                assert_eq!(s.uri, "zyron://user@h:5432/db/pub:orders");
+            }
+            _ => panic!("Expected CreateExternalSource"),
+        }
+    }
+
+    #[test]
+    fn test_create_external_sink_type_zyron() {
+        let stmt =
+            parse_one("CREATE EXTERNAL SINK snk TYPE ZYRON URI 'zyron://user@h:5432/db/s.t'");
+        match stmt {
+            Statement::CreateExternalSink(s) => {
+                assert_eq!(s.backend, ExternalBackendKind::Zyron);
+                assert_eq!(s.uri, "zyron://user@h:5432/db/s.t");
+            }
+            _ => panic!("Expected CreateExternalSink"),
+        }
+    }
+
+    #[test]
+    fn test_alter_external_source_refresh_schema() {
+        let stmt = parse_one("ALTER EXTERNAL SOURCE s REFRESH SCHEMA");
+        match stmt {
+            Statement::AlterExternalSource(a) => {
+                assert_eq!(a.action, AlterExternalSourceAction::RefreshSchema);
+            }
+            _ => panic!("Expected AlterExternalSource"),
+        }
+    }
+
+    #[test]
+    fn test_alter_external_source_reset_lsn_earliest() {
+        let stmt = parse_one("ALTER EXTERNAL SOURCE s RESET LSN TO 'earliest'");
+        match stmt {
+            Statement::AlterExternalSource(a) => {
+                assert_eq!(
+                    a.action,
+                    AlterExternalSourceAction::ResetLsn(LsnResetSpec::Earliest)
+                );
+            }
+            _ => panic!("Expected AlterExternalSource"),
+        }
+    }
+
+    #[test]
+    fn test_alter_external_source_reset_lsn_explicit() {
+        let stmt = parse_one("ALTER EXTERNAL SOURCE s RESET LSN TO 'lsn:12345'");
+        match stmt {
+            Statement::AlterExternalSource(a) => {
+                assert_eq!(
+                    a.action,
+                    AlterExternalSourceAction::ResetLsn(LsnResetSpec::Explicit(12345))
+                );
+            }
+            _ => panic!("Expected AlterExternalSource"),
+        }
+    }
+
+    #[test]
+    fn test_abac_policy_on_publication() {
+        let stmt =
+            parse_one("CREATE ABAC POLICY p1 ON PUBLICATION orders_pub WHERE region = 'us-east-1'");
+        match stmt {
+            Statement::CreateAbacPolicy(a) => {
+                assert_eq!(a.name, "p1");
+                assert_eq!(a.target, AbacPolicyTarget::Publication);
+                assert_eq!(a.target_name, "orders_pub");
+            }
+            _ => panic!("Expected CreateAbacPolicy"),
         }
     }
 

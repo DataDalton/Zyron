@@ -30,6 +30,16 @@ const EXTERNAL_SOURCES_HEAP_FILE_ID: u32 = 134;
 const EXTERNAL_SOURCES_FSM_FILE_ID: u32 = 135;
 const EXTERNAL_SINKS_HEAP_FILE_ID: u32 = 136;
 const EXTERNAL_SINKS_FSM_FILE_ID: u32 = 137;
+const PUBLICATIONS_HEAP_FILE_ID: u32 = 138;
+const PUBLICATIONS_FSM_FILE_ID: u32 = 139;
+const PUBLICATION_TABLES_HEAP_FILE_ID: u32 = 140;
+const PUBLICATION_TABLES_FSM_FILE_ID: u32 = 141;
+const SUBSCRIPTIONS_HEAP_FILE_ID: u32 = 142;
+const SUBSCRIPTIONS_FSM_FILE_ID: u32 = 143;
+const ENDPOINTS_HEAP_FILE_ID: u32 = 144;
+const ENDPOINTS_FSM_FILE_ID: u32 = 145;
+const SECURITY_MAPS_HEAP_FILE_ID: u32 = 146;
+const SECURITY_MAPS_FSM_FILE_ID: u32 = 147;
 
 /// Starting file ID for user-created heap files (heap=200, fsm=201, ...).
 const USER_HEAP_FILE_START: u32 = 200;
@@ -83,6 +93,40 @@ pub trait CatalogStorage: Send + Sync {
     async fn update_external_sink(&self, entry: &ExternalSinkEntry) -> Result<bool>;
     async fn delete_external_sink(&self, id: ExternalSinkId) -> Result<bool>;
 
+    // Publication operations
+    async fn load_publications(&self) -> Result<Vec<PublicationEntry>>;
+    async fn store_publication(&self, entry: &PublicationEntry) -> Result<TupleId>;
+    async fn update_publication(&self, entry: &PublicationEntry) -> Result<bool>;
+    async fn delete_publication(&self, id: PublicationId) -> Result<bool>;
+
+    // Publication-table junction operations
+    async fn load_publication_tables(&self) -> Result<Vec<PublicationTableEntry>>;
+    async fn store_publication_table(&self, entry: &PublicationTableEntry) -> Result<TupleId>;
+    async fn update_publication_table(&self, entry: &PublicationTableEntry) -> Result<bool>;
+    async fn delete_publication_table(
+        &self,
+        publication_id: PublicationId,
+        table_id: TableId,
+    ) -> Result<bool>;
+
+    // Subscription operations
+    async fn load_subscriptions(&self) -> Result<Vec<SubscriptionEntry>>;
+    async fn store_subscription(&self, entry: &SubscriptionEntry) -> Result<TupleId>;
+    async fn update_subscription(&self, entry: &SubscriptionEntry) -> Result<bool>;
+    async fn delete_subscription(&self, id: SubscriptionId) -> Result<bool>;
+
+    // Endpoint operations
+    async fn load_endpoints(&self) -> Result<Vec<EndpointEntry>>;
+    async fn store_endpoint(&self, entry: &EndpointEntry) -> Result<TupleId>;
+    async fn update_endpoint(&self, entry: &EndpointEntry) -> Result<bool>;
+    async fn delete_endpoint(&self, id: EndpointId) -> Result<bool>;
+
+    // Security map operations
+    async fn load_security_maps(&self) -> Result<Vec<SecurityMapEntry>>;
+    async fn store_security_map(&self, entry: &SecurityMapEntry) -> Result<TupleId>;
+    async fn update_security_map(&self, entry: &SecurityMapEntry) -> Result<bool>;
+    async fn delete_security_map(&self, id: SecurityMapId) -> Result<bool>;
+
     // Bootstrap and recovery
     async fn is_bootstrapped(&self) -> Result<bool>;
     async fn bootstrap(&self) -> Result<()>;
@@ -103,6 +147,11 @@ pub struct HeapCatalogStorage {
     streaming_jobs_heap: HeapFile,
     external_sources_heap: HeapFile,
     external_sinks_heap: HeapFile,
+    publications_heap: HeapFile,
+    publication_tables_heap: HeapFile,
+    subscriptions_heap: HeapFile,
+    endpoints_heap: HeapFile,
+    security_maps_heap: HeapFile,
     next_heap_file: AtomicU32,
     next_index_file: AtomicU32,
 }
@@ -174,6 +223,46 @@ impl HeapCatalogStorage {
                 fsm_file_id: EXTERNAL_SINKS_FSM_FILE_ID,
             },
         )?;
+        let publications_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: PUBLICATIONS_HEAP_FILE_ID,
+                fsm_file_id: PUBLICATIONS_FSM_FILE_ID,
+            },
+        )?;
+        let publication_tables_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: PUBLICATION_TABLES_HEAP_FILE_ID,
+                fsm_file_id: PUBLICATION_TABLES_FSM_FILE_ID,
+            },
+        )?;
+        let subscriptions_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: SUBSCRIPTIONS_HEAP_FILE_ID,
+                fsm_file_id: SUBSCRIPTIONS_FSM_FILE_ID,
+            },
+        )?;
+        let endpoints_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: ENDPOINTS_HEAP_FILE_ID,
+                fsm_file_id: ENDPOINTS_FSM_FILE_ID,
+            },
+        )?;
+        let security_maps_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: SECURITY_MAPS_HEAP_FILE_ID,
+                fsm_file_id: SECURITY_MAPS_FSM_FILE_ID,
+            },
+        )?;
 
         Ok(Self {
             databases_heap,
@@ -184,6 +273,11 @@ impl HeapCatalogStorage {
             streaming_jobs_heap,
             external_sources_heap,
             external_sinks_heap,
+            publications_heap,
+            publication_tables_heap,
+            subscriptions_heap,
+            endpoints_heap,
+            security_maps_heap,
             next_heap_file: AtomicU32::new(USER_HEAP_FILE_START),
             next_index_file: AtomicU32::new(USER_INDEX_FILE_START),
         })
@@ -201,6 +295,11 @@ impl HeapCatalogStorage {
             self.streaming_jobs_heap.init_cache(),
             self.external_sources_heap.init_cache(),
             self.external_sinks_heap.init_cache(),
+            self.publications_heap.init_cache(),
+            self.publication_tables_heap.init_cache(),
+            self.subscriptions_heap.init_cache(),
+            self.endpoints_heap.init_cache(),
+            self.security_maps_heap.init_cache(),
         )?;
         Ok(())
     }
@@ -582,6 +681,295 @@ impl CatalogStorage for HeapCatalogStorage {
         });
         match target {
             Some(tid) => self.external_sinks_heap.delete(tid).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn load_publications(&self) -> Result<Vec<PublicationEntry>> {
+        let mut entries = Vec::new();
+        let guard = self.publications_heap.scan()?;
+        guard.for_each(|_tid, view| {
+            if let Ok(entry) = PublicationEntry::from_bytes(view.data) {
+                entries.push(entry);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_publication(&self, entry: &PublicationEntry) -> Result<TupleId> {
+        let bytes = entry.to_bytes();
+        let tuple = Tuple::new(bytes, 0);
+        let ids = self.publications_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
+    }
+
+    async fn update_publication(&self, entry: &PublicationEntry) -> Result<bool> {
+        let mut target = None;
+        let guard = self.publications_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(existing) = PublicationEntry::from_bytes(view.data) {
+                if existing.id == entry.id {
+                    target = Some(tid);
+                }
+            }
+        });
+        drop(guard);
+        match target {
+            Some(tid) => {
+                self.publications_heap.delete(tid).await?;
+                let bytes = entry.to_bytes();
+                let tuple = Tuple::new(bytes, 0);
+                self.publications_heap.insert_batch(&[tuple]).await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn delete_publication(&self, id: PublicationId) -> Result<bool> {
+        let mut target = None;
+        let guard = self.publications_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(entry) = PublicationEntry::from_bytes(view.data) {
+                if entry.id == id {
+                    target = Some(tid);
+                }
+            }
+        });
+        match target {
+            Some(tid) => self.publications_heap.delete(tid).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn load_publication_tables(&self) -> Result<Vec<PublicationTableEntry>> {
+        let mut entries = Vec::new();
+        let guard = self.publication_tables_heap.scan()?;
+        guard.for_each(|_tid, view| {
+            if let Ok(entry) = PublicationTableEntry::from_bytes(view.data) {
+                entries.push(entry);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_publication_table(&self, entry: &PublicationTableEntry) -> Result<TupleId> {
+        let bytes = entry.to_bytes();
+        let tuple = Tuple::new(bytes, 0);
+        let ids = self.publication_tables_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
+    }
+
+    async fn update_publication_table(&self, entry: &PublicationTableEntry) -> Result<bool> {
+        let mut target = None;
+        let guard = self.publication_tables_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(existing) = PublicationTableEntry::from_bytes(view.data) {
+                if existing.id == entry.id {
+                    target = Some(tid);
+                }
+            }
+        });
+        drop(guard);
+        match target {
+            Some(tid) => {
+                self.publication_tables_heap.delete(tid).await?;
+                let bytes = entry.to_bytes();
+                let tuple = Tuple::new(bytes, 0);
+                self.publication_tables_heap.insert_batch(&[tuple]).await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn delete_publication_table(
+        &self,
+        publication_id: PublicationId,
+        table_id: TableId,
+    ) -> Result<bool> {
+        let mut target = None;
+        let guard = self.publication_tables_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(entry) = PublicationTableEntry::from_bytes(view.data) {
+                if entry.publication_id == publication_id && entry.table_id == table_id {
+                    target = Some(tid);
+                }
+            }
+        });
+        match target {
+            Some(tid) => self.publication_tables_heap.delete(tid).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn load_subscriptions(&self) -> Result<Vec<SubscriptionEntry>> {
+        let mut entries = Vec::new();
+        let guard = self.subscriptions_heap.scan()?;
+        guard.for_each(|_tid, view| {
+            if let Ok(entry) = SubscriptionEntry::from_bytes(view.data) {
+                entries.push(entry);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_subscription(&self, entry: &SubscriptionEntry) -> Result<TupleId> {
+        let bytes = entry.to_bytes();
+        let tuple = Tuple::new(bytes, 0);
+        let ids = self.subscriptions_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
+    }
+
+    async fn update_subscription(&self, entry: &SubscriptionEntry) -> Result<bool> {
+        let mut target = None;
+        let guard = self.subscriptions_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(existing) = SubscriptionEntry::from_bytes(view.data) {
+                if existing.id == entry.id {
+                    target = Some(tid);
+                }
+            }
+        });
+        drop(guard);
+        match target {
+            Some(tid) => {
+                self.subscriptions_heap.delete(tid).await?;
+                let bytes = entry.to_bytes();
+                let tuple = Tuple::new(bytes, 0);
+                self.subscriptions_heap.insert_batch(&[tuple]).await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn delete_subscription(&self, id: SubscriptionId) -> Result<bool> {
+        let mut target = None;
+        let guard = self.subscriptions_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(entry) = SubscriptionEntry::from_bytes(view.data) {
+                if entry.id == id {
+                    target = Some(tid);
+                }
+            }
+        });
+        match target {
+            Some(tid) => self.subscriptions_heap.delete(tid).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn load_endpoints(&self) -> Result<Vec<EndpointEntry>> {
+        let mut entries = Vec::new();
+        let guard = self.endpoints_heap.scan()?;
+        guard.for_each(|_tid, view| {
+            if let Ok(entry) = EndpointEntry::from_bytes(view.data) {
+                entries.push(entry);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_endpoint(&self, entry: &EndpointEntry) -> Result<TupleId> {
+        let bytes = entry.to_bytes();
+        let tuple = Tuple::new(bytes, 0);
+        let ids = self.endpoints_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
+    }
+
+    async fn update_endpoint(&self, entry: &EndpointEntry) -> Result<bool> {
+        let mut target = None;
+        let guard = self.endpoints_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(existing) = EndpointEntry::from_bytes(view.data) {
+                if existing.id == entry.id {
+                    target = Some(tid);
+                }
+            }
+        });
+        drop(guard);
+        match target {
+            Some(tid) => {
+                self.endpoints_heap.delete(tid).await?;
+                let bytes = entry.to_bytes();
+                let tuple = Tuple::new(bytes, 0);
+                self.endpoints_heap.insert_batch(&[tuple]).await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn delete_endpoint(&self, id: EndpointId) -> Result<bool> {
+        let mut target = None;
+        let guard = self.endpoints_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(entry) = EndpointEntry::from_bytes(view.data) {
+                if entry.id == id {
+                    target = Some(tid);
+                }
+            }
+        });
+        match target {
+            Some(tid) => self.endpoints_heap.delete(tid).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn load_security_maps(&self) -> Result<Vec<SecurityMapEntry>> {
+        let mut entries = Vec::new();
+        let guard = self.security_maps_heap.scan()?;
+        guard.for_each(|_tid, view| {
+            if let Ok(entry) = SecurityMapEntry::from_bytes(view.data) {
+                entries.push(entry);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_security_map(&self, entry: &SecurityMapEntry) -> Result<TupleId> {
+        let bytes = entry.to_bytes();
+        let tuple = Tuple::new(bytes, 0);
+        let ids = self.security_maps_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
+    }
+
+    async fn update_security_map(&self, entry: &SecurityMapEntry) -> Result<bool> {
+        let mut target = None;
+        let guard = self.security_maps_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(existing) = SecurityMapEntry::from_bytes(view.data) {
+                if existing.id == entry.id {
+                    target = Some(tid);
+                }
+            }
+        });
+        drop(guard);
+        match target {
+            Some(tid) => {
+                self.security_maps_heap.delete(tid).await?;
+                let bytes = entry.to_bytes();
+                let tuple = Tuple::new(bytes, 0);
+                self.security_maps_heap.insert_batch(&[tuple]).await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn delete_security_map(&self, id: SecurityMapId) -> Result<bool> {
+        let mut target = None;
+        let guard = self.security_maps_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(entry) = SecurityMapEntry::from_bytes(view.data) {
+                if entry.id == id {
+                    target = Some(tid);
+                }
+            }
+        });
+        match target {
+            Some(tid) => self.security_maps_heap.delete(tid).await,
             None => Ok(false),
         }
     }

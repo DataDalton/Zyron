@@ -36,6 +36,19 @@ const DDL_ALTER_EXTERNAL_SOURCE: u8 = 0x0E;
 const DDL_CREATE_EXTERNAL_SINK: u8 = 0x0F;
 const DDL_DROP_EXTERNAL_SINK: u8 = 0x10;
 const DDL_ALTER_EXTERNAL_SINK: u8 = 0x11;
+const DDL_CREATE_PUBLICATION: u8 = 0x12;
+const DDL_DROP_PUBLICATION: u8 = 0x13;
+const DDL_ALTER_PUBLICATION: u8 = 0x14;
+const DDL_CREATE_SUBSCRIPTION: u8 = 0x15;
+const DDL_DROP_SUBSCRIPTION: u8 = 0x16;
+const DDL_UPDATE_SUBSCRIPTION: u8 = 0x17;
+const DDL_CREATE_ENDPOINT: u8 = 0x18;
+const DDL_DROP_ENDPOINT: u8 = 0x19;
+const DDL_ALTER_ENDPOINT: u8 = 0x1A;
+const DDL_CREATE_SECURITY_MAP: u8 = 0x1B;
+const DDL_DROP_SECURITY_MAP: u8 = 0x1C;
+const DDL_ADD_PUBLICATION_TABLE: u8 = 0x1D;
+const DDL_REMOVE_PUBLICATION_TABLE: u8 = 0x1E;
 
 /// Central catalog manager.
 pub struct Catalog {
@@ -74,16 +87,33 @@ impl Catalog {
     pub async fn load(&self) -> Result<()> {
         self.cache.invalidate_all();
 
-        let (databases, schemas, tables, indexes, streaming_jobs, external_sources, external_sinks) =
-            tokio::try_join!(
-                self.storage.load_databases(),
-                self.storage.load_schemas(),
-                self.storage.load_tables(),
-                self.storage.load_indexes(),
-                self.storage.load_streaming_jobs(),
-                self.storage.load_external_sources(),
-                self.storage.load_external_sinks(),
-            )?;
+        let (
+            databases,
+            schemas,
+            tables,
+            indexes,
+            streaming_jobs,
+            external_sources,
+            external_sinks,
+            publications,
+            publication_tables,
+            subscriptions,
+            endpoints,
+            security_maps,
+        ) = tokio::try_join!(
+            self.storage.load_databases(),
+            self.storage.load_schemas(),
+            self.storage.load_tables(),
+            self.storage.load_indexes(),
+            self.storage.load_streaming_jobs(),
+            self.storage.load_external_sources(),
+            self.storage.load_external_sinks(),
+            self.storage.load_publications(),
+            self.storage.load_publication_tables(),
+            self.storage.load_subscriptions(),
+            self.storage.load_endpoints(),
+            self.storage.load_security_maps(),
+        )?;
 
         let mut max_oid: u32 = USER_OID_START;
 
@@ -134,6 +164,41 @@ impl Catalog {
                 max_oid = sink.id.0 + 1;
             }
             self.cache.put_external_sink(sink);
+        }
+
+        for pubn in publications {
+            if pubn.id.0 >= max_oid {
+                max_oid = pubn.id.0 + 1;
+            }
+            self.cache.put_publication(pubn);
+        }
+
+        for pt in publication_tables {
+            if pt.id >= max_oid {
+                max_oid = pt.id + 1;
+            }
+            self.cache.put_publication_table(pt);
+        }
+
+        for sub in subscriptions {
+            if sub.id.0 >= max_oid {
+                max_oid = sub.id.0 + 1;
+            }
+            self.cache.put_subscription(sub);
+        }
+
+        for ep in endpoints {
+            if ep.id.0 >= max_oid {
+                max_oid = ep.id.0 + 1;
+            }
+            self.cache.put_endpoint(ep);
+        }
+
+        for sm in security_maps {
+            if sm.id.0 >= max_oid {
+                max_oid = sm.id.0 + 1;
+            }
+            self.cache.put_security_map(sm);
         }
 
         self.oid_allocator.reset(max_oid);
@@ -778,6 +843,313 @@ impl Catalog {
         self.storage.update_external_sink(&entry).await?;
         self.cache.invalidate_external_sink(id);
         self.cache.put_external_sink(entry);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Publication operations
+    // -----------------------------------------------------------------------
+
+    pub async fn create_publication(&self, mut entry: PublicationEntry) -> Result<PublicationId> {
+        if self
+            .cache
+            .get_publication_by_name(entry.schema_id, &entry.name)
+            .is_some()
+        {
+            return Err(ZyronError::Internal(format!(
+                "publication '{}' already exists",
+                entry.name
+            )));
+        }
+
+        if entry.id.0 == 0 {
+            entry.id = PublicationId(self.oid_allocator.next());
+        }
+
+        let id = entry.id;
+        self.log_ddl(DDL_CREATE_PUBLICATION, &entry.to_bytes())?;
+        self.storage.store_publication(&entry).await?;
+        self.cache.put_publication(entry);
+        Ok(id)
+    }
+
+    pub fn get_publication(
+        &self,
+        schema_id: SchemaId,
+        name: &str,
+    ) -> Option<Arc<PublicationEntry>> {
+        self.cache.get_publication_by_name(schema_id, name)
+    }
+
+    pub fn get_publication_by_id(&self, id: PublicationId) -> Option<Arc<PublicationEntry>> {
+        self.cache.get_publication(id)
+    }
+
+    pub fn list_publications(&self) -> Vec<Arc<PublicationEntry>> {
+        self.cache.list_publications()
+    }
+
+    pub async fn drop_publication(&self, schema_id: SchemaId, name: &str) -> Result<()> {
+        let pubn = self
+            .cache
+            .get_publication_by_name(schema_id, name)
+            .ok_or_else(|| ZyronError::Internal(format!("publication '{name}' not found")))?;
+
+        let id = pubn.id;
+        let mut payload = vec![0u8; 4];
+        payload[..4].copy_from_slice(&id.0.to_le_bytes());
+        self.log_ddl(DDL_DROP_PUBLICATION, &payload)?;
+        self.storage.delete_publication(id).await?;
+        self.cache.invalidate_publication(id);
+        self.cache.invalidate_publication_tables_for(id);
+        Ok(())
+    }
+
+    pub async fn update_publication(&self, entry: PublicationEntry) -> Result<()> {
+        let id = entry.id;
+        self.log_ddl(DDL_ALTER_PUBLICATION, &entry.to_bytes())?;
+        self.storage.update_publication(&entry).await?;
+        self.cache.invalidate_publication(id);
+        self.cache.put_publication(entry);
+        Ok(())
+    }
+
+    pub async fn add_publication_table(&self, mut entry: PublicationTableEntry) -> Result<u32> {
+        if entry.id == 0 {
+            entry.id = self.oid_allocator.next();
+        }
+        let id = entry.id;
+        self.log_ddl(DDL_ADD_PUBLICATION_TABLE, &entry.to_bytes())?;
+        self.storage.store_publication_table(&entry).await?;
+        self.cache.put_publication_table(entry);
+        Ok(id)
+    }
+
+    pub fn get_publication_tables(
+        &self,
+        publication_id: PublicationId,
+    ) -> Vec<Arc<PublicationTableEntry>> {
+        self.cache.get_publication_tables(publication_id)
+    }
+
+    pub async fn remove_publication_table(
+        &self,
+        publication_id: PublicationId,
+        table_id: TableId,
+    ) -> Result<()> {
+        let mut payload = Vec::with_capacity(8);
+        payload.extend_from_slice(&publication_id.0.to_le_bytes());
+        payload.extend_from_slice(&table_id.0.to_le_bytes());
+        self.log_ddl(DDL_REMOVE_PUBLICATION_TABLE, &payload)?;
+        self.storage
+            .delete_publication_table(publication_id, table_id)
+            .await?;
+        self.cache
+            .invalidate_publication_table(publication_id, table_id);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Subscription operations
+    // -----------------------------------------------------------------------
+
+    pub async fn create_subscription(
+        &self,
+        mut entry: SubscriptionEntry,
+    ) -> Result<SubscriptionId> {
+        if entry.id.0 == 0 {
+            entry.id = SubscriptionId(self.oid_allocator.next());
+        }
+        let id = entry.id;
+        self.log_ddl(DDL_CREATE_SUBSCRIPTION, &entry.to_bytes())?;
+        self.storage.store_subscription(&entry).await?;
+        self.cache.put_subscription(entry);
+        Ok(id)
+    }
+
+    pub fn get_subscription(&self, id: SubscriptionId) -> Option<Arc<SubscriptionEntry>> {
+        self.cache.get_subscription(id)
+    }
+
+    pub fn list_subscriptions(&self) -> Vec<Arc<SubscriptionEntry>> {
+        self.cache.list_subscriptions()
+    }
+
+    pub fn list_publication_subscribers(
+        &self,
+        pub_id: PublicationId,
+    ) -> Vec<Arc<SubscriptionEntry>> {
+        self.cache.list_publication_subscribers(pub_id)
+    }
+
+    pub async fn update_subscription(&self, entry: SubscriptionEntry) -> Result<()> {
+        let id = entry.id;
+        self.log_ddl(DDL_UPDATE_SUBSCRIPTION, &entry.to_bytes())?;
+        self.storage.update_subscription(&entry).await?;
+        self.cache.invalidate_subscription(id);
+        self.cache.put_subscription(entry);
+        Ok(())
+    }
+
+    pub async fn update_subscription_lsn(&self, id: SubscriptionId, new_lsn: u64) -> Result<()> {
+        let current = self
+            .cache
+            .get_subscription(id)
+            .ok_or_else(|| ZyronError::Internal(format!("subscription {} not found", id.0)))?;
+        let mut updated = (*current).clone();
+        updated.last_seen_lsn = new_lsn;
+        updated.last_poll_at = current_timestamp();
+        self.log_ddl(DDL_UPDATE_SUBSCRIPTION, &updated.to_bytes())?;
+        self.storage.update_subscription(&updated).await?;
+        self.cache.invalidate_subscription(id);
+        self.cache.put_subscription(updated);
+        Ok(())
+    }
+
+    pub async fn update_subscription_state(
+        &self,
+        id: SubscriptionId,
+        state: SubscriptionState,
+        last_error: Option<String>,
+    ) -> Result<()> {
+        let current = self
+            .cache
+            .get_subscription(id)
+            .ok_or_else(|| ZyronError::Internal(format!("subscription {} not found", id.0)))?;
+        let mut updated = (*current).clone();
+        updated.state = state;
+        updated.last_error = last_error;
+        self.log_ddl(DDL_UPDATE_SUBSCRIPTION, &updated.to_bytes())?;
+        self.storage.update_subscription(&updated).await?;
+        self.cache.invalidate_subscription(id);
+        self.cache.put_subscription(updated);
+        Ok(())
+    }
+
+    pub async fn drop_subscription(&self, id: SubscriptionId) -> Result<()> {
+        let mut payload = vec![0u8; 4];
+        payload[..4].copy_from_slice(&id.0.to_le_bytes());
+        self.log_ddl(DDL_DROP_SUBSCRIPTION, &payload)?;
+        self.storage.delete_subscription(id).await?;
+        self.cache.invalidate_subscription(id);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Endpoint operations
+    // -----------------------------------------------------------------------
+
+    pub async fn create_endpoint(&self, mut entry: EndpointEntry) -> Result<EndpointId> {
+        if self
+            .cache
+            .get_endpoint_by_name(entry.schema_id, &entry.name)
+            .is_some()
+        {
+            return Err(ZyronError::Internal(format!(
+                "endpoint '{}' already exists",
+                entry.name
+            )));
+        }
+        if self.cache.get_endpoint_by_path(&entry.path).is_some() {
+            return Err(ZyronError::Internal(format!(
+                "endpoint path '{}' already in use",
+                entry.path
+            )));
+        }
+
+        if entry.id.0 == 0 {
+            entry.id = EndpointId(self.oid_allocator.next());
+        }
+
+        let id = entry.id;
+        self.log_ddl(DDL_CREATE_ENDPOINT, &entry.to_bytes())?;
+        self.storage.store_endpoint(&entry).await?;
+        self.cache.put_endpoint(entry);
+        Ok(id)
+    }
+
+    pub fn get_endpoint(&self, schema_id: SchemaId, name: &str) -> Option<Arc<EndpointEntry>> {
+        self.cache.get_endpoint_by_name(schema_id, name)
+    }
+
+    pub fn get_endpoint_by_id(&self, id: EndpointId) -> Option<Arc<EndpointEntry>> {
+        self.cache.get_endpoint(id)
+    }
+
+    pub fn get_endpoint_by_path(&self, path: &str) -> Option<Arc<EndpointEntry>> {
+        self.cache.get_endpoint_by_path(path)
+    }
+
+    pub fn list_endpoints(&self) -> Vec<Arc<EndpointEntry>> {
+        self.cache.list_endpoints()
+    }
+
+    pub async fn drop_endpoint(&self, schema_id: SchemaId, name: &str) -> Result<()> {
+        let ep = self
+            .cache
+            .get_endpoint_by_name(schema_id, name)
+            .ok_or_else(|| ZyronError::Internal(format!("endpoint '{name}' not found")))?;
+        let id = ep.id;
+        let mut payload = vec![0u8; 4];
+        payload[..4].copy_from_slice(&id.0.to_le_bytes());
+        self.log_ddl(DDL_DROP_ENDPOINT, &payload)?;
+        self.storage.delete_endpoint(id).await?;
+        self.cache.invalidate_endpoint(id);
+        Ok(())
+    }
+
+    pub async fn update_endpoint(&self, entry: EndpointEntry) -> Result<()> {
+        let id = entry.id;
+        self.log_ddl(DDL_ALTER_ENDPOINT, &entry.to_bytes())?;
+        self.storage.update_endpoint(&entry).await?;
+        self.cache.invalidate_endpoint(id);
+        self.cache.put_endpoint(entry);
+        Ok(())
+    }
+
+    pub async fn set_endpoint_enabled(&self, id: EndpointId, enabled: bool) -> Result<()> {
+        let current = self
+            .cache
+            .get_endpoint(id)
+            .ok_or_else(|| ZyronError::Internal(format!("endpoint {} not found", id.0)))?;
+        let mut updated = (*current).clone();
+        updated.enabled = enabled;
+        self.log_ddl(DDL_ALTER_ENDPOINT, &updated.to_bytes())?;
+        self.storage.update_endpoint(&updated).await?;
+        self.cache.invalidate_endpoint(id);
+        self.cache.put_endpoint(updated);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Security map operations
+    // -----------------------------------------------------------------------
+
+    pub async fn create_security_map(&self, mut entry: SecurityMapEntry) -> Result<SecurityMapId> {
+        if entry.id.0 == 0 {
+            entry.id = SecurityMapId(self.oid_allocator.next());
+        }
+        let id = entry.id;
+        self.log_ddl(DDL_CREATE_SECURITY_MAP, &entry.to_bytes())?;
+        self.storage.store_security_map(&entry).await?;
+        self.cache.put_security_map(entry);
+        Ok(id)
+    }
+
+    pub fn list_security_maps(&self) -> Vec<Arc<SecurityMapEntry>> {
+        self.cache.list_security_maps()
+    }
+
+    pub fn resolve_security_map(&self, kind: SecurityMapKind, key: &str) -> Option<u32> {
+        self.cache.resolve_security_map(kind, key)
+    }
+
+    pub async fn drop_security_map(&self, id: SecurityMapId) -> Result<()> {
+        let mut payload = vec![0u8; 4];
+        payload[..4].copy_from_slice(&id.0.to_le_bytes());
+        self.log_ddl(DDL_DROP_SECURITY_MAP, &payload)?;
+        self.storage.delete_security_map(id).await?;
+        self.cache.invalidate_security_map(id);
         Ok(())
     }
 

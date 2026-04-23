@@ -7,6 +7,7 @@
 
 pub mod abac;
 pub mod auth_rules;
+pub mod aws_auth;
 pub mod balloon;
 pub mod breakglass;
 pub mod brute_force;
@@ -14,6 +15,7 @@ pub mod cbor;
 pub mod classification;
 pub mod column_security;
 pub mod context;
+pub mod credential_provider;
 pub mod credentials;
 pub mod crypto_functions;
 pub mod encryption;
@@ -21,13 +23,18 @@ pub mod external_credentials;
 pub mod governance;
 pub mod heap_storage;
 pub mod ip_management;
+pub mod k8s_auth;
 pub mod masking;
+pub mod mtls_pinning;
+pub mod oauth2_client;
 pub mod privilege;
 pub mod rcu;
 pub mod rls;
 pub mod role;
 pub mod row_ownership;
+pub mod secret_providers;
 pub mod security_label;
+pub mod security_map;
 pub mod session_binding;
 pub mod snapshot;
 pub mod storage;
@@ -85,6 +92,23 @@ pub use webauthn::{
 };
 pub use webauthn_store::WebAuthnCredentialStore;
 
+pub use aws_auth::{
+    AwsSecretsManagerProvider, AwsStsAssumeRoleProvider, AwsStsWebIdentityProvider,
+};
+pub use credential_provider::{
+    CacheStats, CredentialCache, CredentialProvider, StaticCredentialProvider,
+};
+pub use k8s_auth::{K8sTokenProvider, K8sTokenReviewer, TokenReviewResult};
+pub use mtls_pinning::{
+    CertFingerprintStore, CrlOcspChecker, CrlStatus, RevocationStatus, Sha256Fingerprint,
+    fingerprint_of, format_pin, parse_pin,
+};
+pub use oauth2_client::OAuth2ClientCredentialsProvider;
+pub use secret_providers::{
+    AzureKeyVaultProvider, GcpSecretManagerProvider, VaultAuth, VaultEngine, VaultProvider,
+};
+pub use security_map::{SecurityMapEntry, SecurityMapKind, SecurityMapStore};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -134,6 +158,14 @@ pub struct SecurityManager {
     /// Monotonic counter for generating unique role IDs. Initialized from
     /// the max existing role ID at startup to survive restarts.
     next_role_id: std::sync::atomic::AtomicU32,
+    /// TTL-aware cache shared across dynamic credential providers.
+    pub credential_cache: Arc<CredentialCache>,
+    /// mTLS certificate fingerprint pinning, subject-id keyed.
+    pub mtls_pinning: CertFingerprintStore,
+    /// CRL-backed revocation checker used during TLS handshakes.
+    pub crl_ocsp: CrlOcspChecker,
+    /// Identity-to-role map for K8s service accounts, JWT, and mTLS subjects.
+    pub security_map: SecurityMapStore,
 }
 
 impl SecurityManager {
@@ -194,6 +226,10 @@ impl SecurityManager {
             webauthn_rp_config,
             auth_storage,
             next_role_id: std::sync::atomic::AtomicU32::new(1),
+            credential_cache: Arc::new(CredentialCache::new()),
+            mtls_pinning: CertFingerprintStore::new(),
+            crl_ocsp: CrlOcspChecker::new(None)?,
+            security_map: SecurityMapStore::new(),
         };
 
         manager.load_from_storage().await?;

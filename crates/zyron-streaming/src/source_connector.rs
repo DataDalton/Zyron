@@ -421,6 +421,32 @@ impl ZyronTableSource {
 }
 
 // ---------------------------------------------------------------------------
+// ZyronSourceAdapter trait
+// ---------------------------------------------------------------------------
+
+/// Adapter trait for sources that pull rows from a remote Zyron publication
+/// and forward them to a streaming job as CdfChange batches. The concrete
+/// implementation lives in the zyron-wire crate as ZyronSourceClient. The
+/// trait object form lets the runner dispatch to the remote source without
+/// taking a build dependency on zyron-wire.
+#[async_trait::async_trait]
+pub trait ZyronSourceAdapter: Send + Sync {
+    /// Runs the source loop. The adapter pulls rows from its remote, converts
+    /// them to CdfChange batches, and invokes on_batch for each batch. The
+    /// loop exits when shutdown is set or the remote signals end-of-stream.
+    /// start_lsn is the LSN to resume from, zero means start from earliest.
+    async fn run(
+        &self,
+        start_lsn: u64,
+        on_batch: Box<dyn Fn(Vec<CdfChange>) -> zyron_common::Result<()> + Send + Sync>,
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> zyron_common::Result<()>;
+
+    /// Closes the adapter and releases any held resources.
+    async fn close(&self) -> zyron_common::Result<()>;
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

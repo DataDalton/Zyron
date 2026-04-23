@@ -17,6 +17,7 @@ hashbrown = { workspace = true }
 xxhash-rust = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+async-trait = { workspace = true }
 serde_json = { workspace = true }
 csv = "1"
 parquet = { version = "55", default-features = false, features = ["arrow"] }

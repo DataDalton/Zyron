@@ -1153,4 +1153,25 @@ mod tests {
         // Matching resource, should deny
         assert!(!store.evaluate_abac(&attrs, Some("sensitive_table"), None));
     }
+
+    #[test]
+    fn abac_policy_attaches_to_publication_object_id() {
+        // Publications share the same u32 ID namespace as the ABAC store's
+        // table_id slot, so the same evaluation path that gates tables also
+        // gates publications.
+        let store = AbacStore::new();
+        let policy = AbacPolicy {
+            id: 1,
+            name: "partner_region_lock".to_string(),
+            table_id: 501,
+            predicate: "region = 'us-east-1'".to_string(),
+            enabled: true,
+            permissive: true,
+            roles: vec![RoleId(7)],
+        };
+        store.add_policy(policy).expect("attach");
+        let got = store.policies_for_table(501);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "partner_region_lock");
+    }
 }

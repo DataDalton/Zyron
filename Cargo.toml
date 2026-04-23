@@ -70,6 +70,10 @@ serde_json = "1"
 p256 = { version = "0.13", features = ["ecdsa"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 
+# TLS
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "ring"] }
+
 # Testing
 rcgen = "0.13"
 

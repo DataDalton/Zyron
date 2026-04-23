@@ -365,6 +365,119 @@ impl JwtCredential {
             }
         }
     }
+
+    // -----------------------------------------------------------------------------
+    // Audience and scope validation
+    // -----------------------------------------------------------------------------
+
+    /// Decodes the token and confirms the `aud` claim matches `required_aud`.
+    /// The `aud` claim may be a single string or a JSON array of strings.
+    pub fn verify_with_audience(&self, token: &str, required_aud: &str) -> Result<JwtClaims> {
+        let claims = self.decode(token)?;
+        check_audience(&claims, required_aud)?;
+        Ok(claims)
+    }
+
+    /// Decodes the token and confirms the `scope` claim contains
+    /// `required_scope`. The `scope` claim may be a space-separated string or
+    /// a JSON array of strings.
+    pub fn verify_with_scope(&self, token: &str, required_scope: &str) -> Result<JwtClaims> {
+        let claims = self.decode(token)?;
+        check_scopes(&claims, &[required_scope])?;
+        Ok(claims)
+    }
+
+    /// Decodes the token and applies the configured subset of audience,
+    /// scope, and issuer checks.
+    pub fn verify_full(
+        &self,
+        token: &str,
+        required_aud: Option<&str>,
+        required_scopes: &[&str],
+        required_iss: Option<&str>,
+    ) -> Result<JwtClaims> {
+        let claims = self.decode(token)?;
+        if let Some(aud) = required_aud {
+            check_audience(&claims, aud)?;
+        }
+        if !required_scopes.is_empty() {
+            check_scopes(&claims, required_scopes)?;
+        }
+        if let Some(iss) = required_iss {
+            match &claims.iss {
+                Some(got) if got == iss => {}
+                _ => {
+                    return Err(ZyronError::InvalidCredential(
+                        "JWT issuer does not match required value".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(claims)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Claim matchers shared by verify_with_audience / verify_with_scope / verify_full
+// -----------------------------------------------------------------------------
+
+/// Checks that the claims include the required audience. Accepts either a
+/// single string `aud` claim or a JSON array encoded as the custom field.
+fn check_audience(claims: &JwtClaims, required: &str) -> Result<()> {
+    if let Some(aud) = claims.custom.get("aud") {
+        if aud == required {
+            return Ok(());
+        }
+        // Array form. The JWT parser stores a raw array as the verbatim text
+        // `["a","b"]` in a custom field, so split by `"` and scan tokens.
+        if aud.starts_with('[') && aud.ends_with(']') {
+            let inner = &aud[1..aud.len() - 1];
+            for part in inner.split(',') {
+                let p = part.trim().trim_matches('"');
+                if p == required {
+                    return Ok(());
+                }
+            }
+        }
+        return Err(ZyronError::InvalidCredential(format!(
+            "JWT audience does not include {}",
+            required
+        )));
+    }
+    Err(ZyronError::InvalidCredential(
+        "JWT missing aud claim".to_string(),
+    ))
+}
+
+/// Checks that the claims include every requested scope. The `scope` claim is
+/// space-separated per RFC 8693. Array form is accepted as a tolerant
+/// fallback.
+fn check_scopes(claims: &JwtClaims, required: &[&str]) -> Result<()> {
+    let scope = claims
+        .custom
+        .get("scope")
+        .or_else(|| claims.custom.get("scp"))
+        .ok_or_else(|| ZyronError::InvalidCredential("JWT missing scope claim".to_string()))?;
+    let mut have: Vec<&str> = Vec::new();
+    if scope.starts_with('[') && scope.ends_with(']') {
+        let inner = &scope[1..scope.len() - 1];
+        for part in inner.split(',') {
+            have.push(part.trim().trim_matches('"'));
+        }
+    } else {
+        for part in scope.split_whitespace() {
+            have.push(part);
+        }
+    }
+    for r in required {
+        if !have.iter().any(|h| h == r) {
+            return Err(ZyronError::InvalidCredential(format!(
+                "JWT scope missing required {}",
+                r
+            )));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -717,7 +830,10 @@ fn json_to_claims(json: &str) -> Result<JwtClaims> {
                 }
             }
         } else if bytes[pos] == b'[' {
-            // Array value (only roles uses this)
+            // Array value. `roles` decomposes into the typed Vec. Other
+            // arrays (for example `aud`, `scp`) land in custom as the raw
+            // JSON text so claim validators can inspect them.
+            let arr_start = pos;
             pos += 1;
             if key == "roles" {
                 while pos < len && bytes[pos] != b']' {
@@ -745,6 +861,9 @@ fn json_to_claims(json: &str) -> Result<JwtClaims> {
             }
             if pos < len {
                 pos += 1;
+            }
+            if key != "roles" && key != "sub" && key != "iss" && key != "exp" && key != "iat" {
+                custom.insert(key.to_string(), inner[arr_start..pos].to_string());
             }
         } else {
             // Number or other literal
@@ -862,7 +981,6 @@ fn extract_json_string(json: &str, key: &str) -> Result<Option<String>> {
 
     Ok(Some(result))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1212,5 +1330,111 @@ mod tests {
         assert_eq!(h1, h2);
         let h3 = sha256_hash(b"different");
         assert_ne!(h1, h3);
+    }
+
+    fn make_claims(
+        custom: std::collections::HashMap<String, String>,
+        issuer: Option<String>,
+    ) -> JwtClaims {
+        JwtClaims {
+            sub: "svc".to_string(),
+            iss: issuer,
+            exp: 9999999999,
+            iat: 0,
+            roles: Vec::new(),
+            custom,
+        }
+    }
+
+    fn issue_token(claims: &JwtClaims) -> (JwtCredential, String) {
+        let cred = JwtCredential::new(vec![0xa1; 32], JwtAlgorithm::Hs256).expect("cred");
+        let token = cred.encode(claims).expect("encode");
+        (cred, token)
+    }
+
+    #[test]
+    fn verify_audience_single_string_match() {
+        let mut custom = std::collections::HashMap::new();
+        custom.insert("aud".to_string(), "zyron-prod".to_string());
+        let (cred, tok) = issue_token(&make_claims(custom, None));
+        let c = cred
+            .verify_with_audience(&tok, "zyron-prod")
+            .expect("verify");
+        assert_eq!(c.sub, "svc");
+    }
+
+    #[test]
+    fn verify_audience_string_mismatch() {
+        let mut custom = std::collections::HashMap::new();
+        custom.insert("aud".to_string(), "zyron-dev".to_string());
+        let (cred, tok) = issue_token(&make_claims(custom, None));
+        assert!(cred.verify_with_audience(&tok, "zyron-prod").is_err());
+    }
+
+    #[test]
+    fn verify_audience_array_match() {
+        // Construct JWT with array audience by hand-crafting payload JSON.
+        let cred = JwtCredential::new(vec![0xa2; 32], JwtAlgorithm::Hs256).expect("cred");
+        let payload = r#"{"sub":"svc","exp":9999999999,"aud":["a","zyron-prod","b"]}"#;
+        let header_b64 = base64url_encode(b"{\"alg\":\"HS256\",\"typ\":\"JWT\"}");
+        let payload_b64 = base64url_encode(payload.as_bytes());
+        let signing_input = format!("{}.{}", header_b64, payload_b64);
+        let sig = cred.sign(signing_input.as_bytes()).expect("sign");
+        let sig_b64 = base64url_encode(&sig);
+        let token = format!("{}.{}", signing_input, sig_b64);
+
+        let c = cred
+            .verify_with_audience(&token, "zyron-prod")
+            .expect("verify");
+        assert_eq!(c.sub, "svc");
+    }
+
+    #[test]
+    fn verify_scope_single_present() {
+        let mut custom = std::collections::HashMap::new();
+        custom.insert(
+            "scope".to_string(),
+            "read:publications write:subs".to_string(),
+        );
+        let (cred, tok) = issue_token(&make_claims(custom, None));
+        cred.verify_with_scope(&tok, "read:publications")
+            .expect("verify");
+    }
+
+    #[test]
+    fn verify_scope_missing() {
+        let mut custom = std::collections::HashMap::new();
+        custom.insert("scope".to_string(), "read:publications".to_string());
+        let (cred, tok) = issue_token(&make_claims(custom, None));
+        assert!(
+            cred.verify_with_scope(&tok, "publication.subscribe:alpha")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn verify_full_all_checks() {
+        let mut custom = std::collections::HashMap::new();
+        custom.insert("aud".to_string(), "zyron".to_string());
+        custom.insert(
+            "scope".to_string(),
+            "read:publications publication.subscribe:alpha".to_string(),
+        );
+        let (cred, tok) = issue_token(&make_claims(custom, Some("issuer-x".to_string())));
+        let c = cred
+            .verify_full(
+                &tok,
+                Some("zyron"),
+                &["publication.subscribe:alpha"],
+                Some("issuer-x"),
+            )
+            .expect("verify");
+        assert_eq!(c.sub, "svc");
+    }
+
+    #[test]
+    fn verify_full_missing_aud_errors() {
+        let (cred, tok) = issue_token(&make_claims(std::collections::HashMap::new(), None));
+        assert!(cred.verify_full(&tok, Some("zyron"), &[], None).is_err());
     }
 }

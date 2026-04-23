@@ -827,6 +827,25 @@ impl CdfRegistry {
         self.disable_for_table(table_id, true)
     }
 
+    // -------------------------------------------------------------------
+    // LSN-based truncation for publication retention
+    // -------------------------------------------------------------------
+
+    /// Removes CDF records whose commit_version is at or below target_lsn.
+    /// Returns the number of records removed. Returns 0 if the table has no
+    /// feed registered or no records qualify for removal.
+    pub async fn truncate_before(&self, table_id: u32, lsn: u64) -> Result<u64> {
+        let feed = match self.get_feed(table_id) {
+            Some(f) => f,
+            None => return Ok(0),
+        };
+        // purge_before_version keeps records with version >= min_version.
+        // We want to drop records with commit_version <= lsn, so the
+        // minimum retained version is lsn + 1.
+        let min_version = lsn.saturating_add(1);
+        feed.purge_before_version(min_version)
+    }
+
     pub fn list_feeds(&self) -> Vec<(u32, u64, u64, u32)> {
         let mut result = Vec::new();
         self.feeds.iter_sync(|table_id, feed| {
@@ -1047,6 +1066,54 @@ mod tests {
 
         registry.remove_table(42).unwrap();
         assert!(!file_path.exists());
+    }
+
+    #[tokio::test]
+    async fn truncate_before_removes_old_records() {
+        let tmp = TempDir::new().unwrap();
+        let registry = CdfRegistry::new(tmp.path().to_path_buf());
+        let feed = registry.enable_for_table(7, 30).unwrap();
+
+        let records: Vec<ChangeRecord> = (1..=100)
+            .map(|i| make_record(i, i as i64 * 1000, ChangeType::Insert))
+            .collect();
+        feed.append_batch(&records).unwrap();
+        assert_eq!(feed.record_count(), 100);
+
+        // Drop records with commit_version <= 50, keeping 51..=100.
+        let removed = registry.truncate_before(7, 50).await.unwrap();
+        assert_eq!(removed, 50);
+        assert_eq!(feed.record_count(), 50);
+
+        let remaining = feed.query_changes(0, u64::MAX).unwrap();
+        assert_eq!(remaining.len(), 50);
+        assert_eq!(remaining.first().unwrap().commit_version, 51);
+        assert_eq!(remaining.last().unwrap().commit_version, 100);
+    }
+
+    #[tokio::test]
+    async fn truncate_before_unknown_table_returns_zero() {
+        let tmp = TempDir::new().unwrap();
+        let registry = CdfRegistry::new(tmp.path().to_path_buf());
+        assert_eq!(registry.truncate_before(999, 100).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn truncate_before_second_call_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let registry = CdfRegistry::new(tmp.path().to_path_buf());
+        let feed = registry.enable_for_table(9, 30).unwrap();
+
+        let records: Vec<ChangeRecord> = (1..=20)
+            .map(|i| make_record(i, i as i64 * 1000, ChangeType::Insert))
+            .collect();
+        feed.append_batch(&records).unwrap();
+
+        let first = registry.truncate_before(9, 10).await.unwrap();
+        assert_eq!(first, 10);
+        let second = registry.truncate_before(9, 10).await.unwrap();
+        assert_eq!(second, 0);
+        assert_eq!(feed.record_count(), 10);
     }
 
     #[test]

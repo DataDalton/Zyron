@@ -151,6 +151,31 @@ pub struct ServerState {
     // Notification channels for LISTEN/NOTIFY
     // -----------------------------------------------------------------------
     pub notification_channels: Option<Arc<crate::notifications::NotificationChannels>>,
+
+    // -----------------------------------------------------------------------
+    // TLS upgrade support
+    // -----------------------------------------------------------------------
+    /// TLS mode for plain-text startup: Disabled, Optional, Required.
+    pub tls_mode: crate::tls::TlsMode,
+    /// Server TLS acceptor, if TLS is enabled for inbound connections.
+    pub tls_acceptor: Option<Arc<crate::tls::ServerTlsAcceptor>>,
+
+    // -----------------------------------------------------------------------
+    // Gateway router registration
+    // -----------------------------------------------------------------------
+    /// Live HTTP gateway router used by CREATE/ALTER/DROP ENDPOINT handlers
+    /// and startup recovery. When None, DDL still persists to the catalog but
+    /// no runtime route is compiled.
+    pub endpoint_registrar: Option<Arc<dyn crate::endpoint_registrar::EndpointRegistrar>>,
+
+    // -----------------------------------------------------------------------
+    // Subscription runtime map
+    // -----------------------------------------------------------------------
+    /// Active subscription runtime tasks, keyed by SubscriptionId. Populated by
+    /// recover_zyron_to_zyron at startup and by CREATE EXTERNAL SOURCE at
+    /// runtime. Drained and joined on graceful shutdown.
+    pub subscription_runtimes:
+        Arc<scc::HashMap<zyron_catalog::SubscriptionId, tokio::task::JoinHandle<()>>>,
 }
 
 /// Cached prepared statement.
@@ -322,6 +347,19 @@ impl<T: WireTransport> Connection<T> {
 
             match msg {
                 FrontendMessage::SslRequest => {
+                    // Plain-path: reply 'N'. If the server wants TLS, the
+                    // lib.rs accept loop performs an in-place upgrade before
+                    // Connection is constructed, so SslRequest is never seen
+                    // here unless TLS is Disabled.
+                    if matches!(self.server.tls_mode, crate::tls::TlsMode::Required) {
+                        self.stream
+                            .write_all(b"N")
+                            .await
+                            .map_err(ProtocolError::Io)?;
+                        return Err(ProtocolError::AuthFailed(
+                            "TLS required but client did not request TLS".into(),
+                        ));
+                    }
                     self.stream
                         .write_all(b"N")
                         .await
@@ -329,6 +367,13 @@ impl<T: WireTransport> Connection<T> {
                     continue;
                 }
                 FrontendMessage::Startup(startup) => {
+                    if matches!(self.server.tls_mode, crate::tls::TlsMode::Required)
+                        && !self.stream.is_encrypted()
+                    {
+                        return Err(ProtocolError::AuthFailed(
+                            "TLS required for this listener".into(),
+                        ));
+                    }
                     self.process_startup(startup).await?;
                     break;
                 }
@@ -1164,10 +1209,11 @@ impl<T: WireTransport> Connection<T> {
             // ---------------------------------------------------------------
             if let zyron_parser::Statement::Copy(copy_stmt) = stmt {
                 // The wire layer only implements the PostgreSQL simple-query
-                // COPY TO STDOUT / COPY FROM STDIN forms plus the legacy
-                // local-file path for parity. External endpoints, including
-                // named catalog entries and inline backend/format specs, are
-                // routed through the planner and executor instead.
+                // COPY TO STDOUT / COPY FROM STDIN forms plus the bare
+                // local-file path (`COPY t FROM '/path'`). External
+                // endpoints, including named catalog entries and inline
+                // backend/format specs, are routed through the planner and
+                // executor instead.
                 let (copy_table, copy_columns, copy_is_to, copy_external) = match &copy_stmt.kind {
                     zyron_parser::ast::CopyKind::IntoTable {
                         table,

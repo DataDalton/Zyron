@@ -451,7 +451,7 @@ pub fn run_aggregating_loop(
                     primary_key_data: Vec::new(),
                 })
                 .collect();
-            if let Err(e) = sink.write_batch(changes) {
+            if let Err(e) = rt.block_on(async { sink.write_batch(changes).await }) {
                 mark_failed(&rt, &catalog, entry.id, format!("sink error: {e}"));
                 break;
             }

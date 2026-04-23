@@ -10,6 +10,7 @@ zyron-parser = { path = "../zyron-parser" }
 zyron-catalog = { path = "../zyron-catalog" }
 zyron-types = { path = "../zyron-types" }
 tokio.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 zyron-buffer = { path = "../zyron-buffer" }

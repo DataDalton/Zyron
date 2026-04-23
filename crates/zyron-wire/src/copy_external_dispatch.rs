@@ -342,6 +342,7 @@ fn parser_backend_to_catalog(b: ExternalBackendKind) -> zyron_catalog::ExternalB
         ExternalBackendKind::Gcs => zyron_catalog::ExternalBackend::Gcs,
         ExternalBackendKind::Azure => zyron_catalog::ExternalBackend::Azure,
         ExternalBackendKind::Http => zyron_catalog::ExternalBackend::Http,
+        ExternalBackendKind::Zyron => zyron_catalog::ExternalBackend::Zyron,
     }
 }
 

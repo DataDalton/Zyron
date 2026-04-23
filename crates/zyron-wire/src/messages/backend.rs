@@ -4,7 +4,29 @@
 //! authentication responses, query results, error/notice reporting, and
 //! the extended query protocol acknowledgments.
 
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
+
+use super::ProtocolError;
+
+// ----------------------------------------------------------------------------
+// Zyron subscription extension message type codes
+// ----------------------------------------------------------------------------
+
+/// Change batch byte (X). Carries one or more row deltas to the consumer.
+pub const CHANGE_BATCH_MSG_TYPE: u8 = b'X';
+
+/// Subscription status byte (Q). Periodic heartbeat from producer.
+pub const SUBSCRIPTION_STATUS_MSG_TYPE: u8 = b'Q';
+
+/// Schema update byte (0x76, lowercase v). Distinct from ParameterStatus
+/// which also uses uppercase S, so the lowercase byte avoids any collision
+/// in shared inspection code paths.
+pub const SCHEMA_UPDATE_MSG_TYPE: u8 = 0x76;
+
+/// Subscribe acknowledgement byte (K). Server's response to a Y request.
+/// PG assigns K to BackendKeyData, which is only valid during startup, so
+/// post-startup the byte is unambiguous inside subscription mode.
+pub const SUBSCRIBE_OK_MSG_TYPE: u8 = b'K';
 
 /// Messages sent from server to client.
 #[derive(Debug, Clone)]
@@ -55,6 +77,77 @@ pub enum BackendMessage {
     CopyData(Vec<u8>),
     /// COPY operation complete from server.
     CopyDone,
+    /// X: Change batch delivery with one or more row deltas.
+    ChangeBatch(ChangeBatchMessage),
+    /// Q: Subscription status heartbeat from producer.
+    SubscriptionStatus(SubscriptionStatusMessage),
+    /// v: Schema fingerprint change notification.
+    SchemaUpdate(SchemaUpdateMessage),
+    /// K: Subscribe acknowledgement carrying initial schema and resume LSN.
+    SubscribeOk(SubscribeOkMessage),
+}
+
+/// One change row inside a ChangeBatchMessage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowDelta {
+    /// 0 = Insert, 1 = Delete, 2 = UpdateBefore, 3 = UpdateAfter.
+    pub change_type: u8,
+    /// Source table OID.
+    pub table_id: u32,
+    /// LSN at which this row was produced.
+    pub lsn: u64,
+    /// Row payload encoded per the publication's NSM layout.
+    pub row_bytes: Vec<u8>,
+    /// Optional primary key bytes for UPSERT dedup on the consumer side.
+    pub primary_key_bytes: Vec<u8>,
+}
+
+/// X body. A contiguous batch of changes between two LSNs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeBatchMessage {
+    /// Smallest LSN in the batch.
+    pub start_lsn: u64,
+    /// Largest LSN in the batch.
+    pub end_lsn: u64,
+    /// Number of row deltas.
+    pub row_count: u32,
+    pub rows: Vec<RowDelta>,
+    /// Producer's commit time in microseconds since Unix epoch.
+    pub commit_timestamp_us: i64,
+}
+
+/// Q body. Heartbeat with producer's current committed LSN and wall clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscriptionStatusMessage {
+    pub committed_lsn: u64,
+    pub producer_now_us: i64,
+}
+
+/// One column definition inside a schema notification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedColumn {
+    pub name: String,
+    /// Compact TypeId value as a single byte for on-the-wire size.
+    pub type_id: u8,
+    pub nullable: bool,
+    pub ordinal: u16,
+}
+
+/// v body. Fires when the publication's schema fingerprint changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaUpdateMessage {
+    pub publication: String,
+    pub new_fingerprint: [u8; 32],
+    pub columns: Vec<PublishedColumn>,
+}
+
+/// K body. Initial response to Y with the active schema and resume LSN.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscribeOkMessage {
+    pub schema_fingerprint: [u8; 32],
+    pub columns: Vec<PublishedColumn>,
+    pub resumed_at_lsn: u64,
+    pub features: u32,
 }
 
 /// Authentication message variants.
@@ -329,8 +422,281 @@ impl BackendMessage {
                 buf.put_u8(b'c');
                 buf.put_i32(4);
             }
+
+            BackendMessage::ChangeBatch(msg) => msg.encode(buf),
+            BackendMessage::SubscriptionStatus(msg) => msg.encode(buf),
+            BackendMessage::SchemaUpdate(msg) => msg.encode(buf),
+            BackendMessage::SubscribeOk(msg) => msg.encode(buf),
         }
     }
+}
+
+impl ChangeBatchMessage {
+    /// Encodes a full X message including type byte and length prefix.
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(CHANGE_BATCH_MSG_TYPE);
+        let len_pos = buf.len();
+        buf.put_i32(0);
+        buf.put_u64(self.start_lsn);
+        buf.put_u64(self.end_lsn);
+        buf.put_u32(self.row_count);
+        buf.put_i64(self.commit_timestamp_us);
+        for row in &self.rows {
+            buf.put_u8(row.change_type);
+            buf.put_u32(row.table_id);
+            buf.put_u64(row.lsn);
+            buf.put_u32(row.row_bytes.len() as u32);
+            buf.put_slice(&row.row_bytes);
+            buf.put_u32(row.primary_key_bytes.len() as u32);
+            buf.put_slice(&row.primary_key_bytes);
+        }
+        patch_length(buf, len_pos);
+    }
+
+    /// Decodes the body after type byte and length have been stripped.
+    pub fn decode(payload: &mut BytesMut) -> Result<Self, ProtocolError> {
+        ensure_remaining(payload, 8 + 8 + 4 + 8)?;
+        let start_lsn = payload.get_u64();
+        let end_lsn = payload.get_u64();
+        let row_count = payload.get_u32();
+        let commit_timestamp_us = payload.get_i64();
+        let mut rows = Vec::with_capacity(row_count as usize);
+        for _ in 0..row_count {
+            ensure_remaining(payload, 1 + 4 + 8 + 4)?;
+            let change_type = payload.get_u8();
+            let table_id = payload.get_u32();
+            let lsn = payload.get_u64();
+            let row_len = payload.get_u32() as usize;
+            ensure_remaining(payload, row_len + 4)?;
+            let row_bytes = payload.split_to(row_len).to_vec();
+            let pk_len = payload.get_u32() as usize;
+            ensure_remaining(payload, pk_len)?;
+            let primary_key_bytes = payload.split_to(pk_len).to_vec();
+            rows.push(RowDelta {
+                change_type,
+                table_id,
+                lsn,
+                row_bytes,
+                primary_key_bytes,
+            });
+        }
+        Ok(ChangeBatchMessage {
+            start_lsn,
+            end_lsn,
+            row_count,
+            rows,
+            commit_timestamp_us,
+        })
+    }
+}
+
+impl SubscriptionStatusMessage {
+    /// Encodes a full Q message. Fixed 20-byte payload.
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(SUBSCRIPTION_STATUS_MSG_TYPE);
+        buf.put_i32(20);
+        buf.put_u64(self.committed_lsn);
+        buf.put_i64(self.producer_now_us);
+    }
+
+    /// Decodes the body after type byte and length have been stripped.
+    pub fn decode(payload: &mut BytesMut) -> Result<Self, ProtocolError> {
+        ensure_remaining(payload, 16)?;
+        let committed_lsn = payload.get_u64();
+        let producer_now_us = payload.get_i64();
+        Ok(SubscriptionStatusMessage {
+            committed_lsn,
+            producer_now_us,
+        })
+    }
+}
+
+impl SchemaUpdateMessage {
+    /// Encodes a full v message including type byte and length prefix.
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(SCHEMA_UPDATE_MSG_TYPE);
+        let len_pos = buf.len();
+        buf.put_i32(0);
+        put_cstring(buf, &self.publication);
+        buf.put_slice(&self.new_fingerprint);
+        buf.put_u32(self.columns.len() as u32);
+        for col in &self.columns {
+            encode_column(buf, col);
+        }
+        patch_length(buf, len_pos);
+    }
+
+    /// Decodes the body after type byte and length have been stripped.
+    pub fn decode(payload: &mut BytesMut) -> Result<Self, ProtocolError> {
+        let publication = read_cstring(payload)?;
+        ensure_remaining(payload, 32 + 4)?;
+        let mut new_fingerprint = [0u8; 32];
+        payload.copy_to_slice(&mut new_fingerprint);
+        let col_count = payload.get_u32();
+        let mut columns = Vec::with_capacity(col_count as usize);
+        for _ in 0..col_count {
+            columns.push(decode_column(payload)?);
+        }
+        Ok(SchemaUpdateMessage {
+            publication,
+            new_fingerprint,
+            columns,
+        })
+    }
+}
+
+impl SubscribeOkMessage {
+    /// Encodes a full K message including type byte and length prefix.
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(SUBSCRIBE_OK_MSG_TYPE);
+        let len_pos = buf.len();
+        buf.put_i32(0);
+        buf.put_slice(&self.schema_fingerprint);
+        buf.put_u32(self.columns.len() as u32);
+        for col in &self.columns {
+            encode_column(buf, col);
+        }
+        buf.put_u64(self.resumed_at_lsn);
+        buf.put_u32(self.features);
+        patch_length(buf, len_pos);
+    }
+
+    /// Decodes the body after type byte and length have been stripped.
+    pub fn decode(payload: &mut BytesMut) -> Result<Self, ProtocolError> {
+        ensure_remaining(payload, 32 + 4)?;
+        let mut schema_fingerprint = [0u8; 32];
+        payload.copy_to_slice(&mut schema_fingerprint);
+        let col_count = payload.get_u32();
+        let mut columns = Vec::with_capacity(col_count as usize);
+        for _ in 0..col_count {
+            columns.push(decode_column(payload)?);
+        }
+        ensure_remaining(payload, 12)?;
+        let resumed_at_lsn = payload.get_u64();
+        let features = payload.get_u32();
+        Ok(SubscribeOkMessage {
+            schema_fingerprint,
+            columns,
+            resumed_at_lsn,
+            features,
+        })
+    }
+}
+
+fn encode_column(buf: &mut BytesMut, col: &PublishedColumn) {
+    put_cstring(buf, &col.name);
+    buf.put_u8(col.type_id);
+    buf.put_u8(u8::from(col.nullable));
+    buf.put_u16(col.ordinal);
+}
+
+fn decode_column(payload: &mut BytesMut) -> Result<PublishedColumn, ProtocolError> {
+    let name = read_cstring(payload)?;
+    ensure_remaining(payload, 1 + 1 + 2)?;
+    let type_id = payload.get_u8();
+    let nullable = payload.get_u8() != 0;
+    let ordinal = payload.get_u16();
+    Ok(PublishedColumn {
+        name,
+        type_id,
+        nullable,
+        ordinal,
+    })
+}
+
+fn ensure_remaining(buf: &BytesMut, needed: usize) -> Result<(), ProtocolError> {
+    if buf.remaining() < needed {
+        return Err(ProtocolError::Malformed(format!(
+            "truncated backend message, need {} more bytes",
+            needed
+        )));
+    }
+    Ok(())
+}
+
+fn read_cstring(buf: &mut BytesMut) -> Result<String, ProtocolError> {
+    let bytes = buf.as_ref();
+    let null_pos = memchr::memchr(0, bytes)
+        .ok_or_else(|| ProtocolError::Malformed("missing null terminator".into()))?;
+    let s = std::str::from_utf8(&bytes[..null_pos])
+        .map_err(|e| ProtocolError::Malformed(format!("invalid UTF-8: {}", e)))?
+        .to_string();
+    buf.advance(null_pos + 1);
+    Ok(s)
+}
+
+impl BackendMessage {
+    /// Decodes a backend message restricted to the subscription-mode
+    /// protocol. Accepts X, Q, v, K, and ErrorResponse only.
+    pub fn decode_subscription(
+        msg_type: u8,
+        payload: &mut BytesMut,
+    ) -> Result<Self, ProtocolError> {
+        match msg_type {
+            CHANGE_BATCH_MSG_TYPE => Ok(BackendMessage::ChangeBatch(ChangeBatchMessage::decode(
+                payload,
+            )?)),
+            SUBSCRIPTION_STATUS_MSG_TYPE => Ok(BackendMessage::SubscriptionStatus(
+                SubscriptionStatusMessage::decode(payload)?,
+            )),
+            SCHEMA_UPDATE_MSG_TYPE => Ok(BackendMessage::SchemaUpdate(
+                SchemaUpdateMessage::decode(payload)?,
+            )),
+            SUBSCRIBE_OK_MSG_TYPE => Ok(BackendMessage::SubscribeOk(SubscribeOkMessage::decode(
+                payload,
+            )?)),
+            b'E' => {
+                let fields = decode_error_response(payload)?;
+                Ok(BackendMessage::ErrorResponse(fields))
+            }
+            _ => Err(ProtocolError::InvalidMessageType(msg_type)),
+        }
+    }
+}
+
+/// Parses an ErrorResponse body. Used during subscription-mode dispatch so
+/// the consumer can surface producer-side failures as typed errors.
+fn decode_error_response(payload: &mut BytesMut) -> Result<ErrorFields, ProtocolError> {
+    let mut severity = String::new();
+    let mut code = String::new();
+    let mut message = String::new();
+    let mut detail = None;
+    let mut hint = None;
+    let mut position = None;
+    loop {
+        ensure_remaining(payload, 1)?;
+        let tag = payload.get_u8();
+        if tag == 0 {
+            break;
+        }
+        let value = read_cstring(payload)?;
+        match tag {
+            b'S' => severity = value,
+            b'V' => {
+                if severity.is_empty() {
+                    severity = value;
+                }
+            }
+            b'C' => code = value,
+            b'M' => message = value,
+            b'D' => detail = Some(value),
+            b'H' => hint = Some(value),
+            b'P' => {
+                if let Ok(n) = value.parse::<i32>() {
+                    position = Some(n);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(ErrorFields {
+        severity,
+        code,
+        message,
+        detail,
+        hint,
+        position,
+    })
 }
 
 /// Encodes an ErrorResponse or NoticeResponse message.

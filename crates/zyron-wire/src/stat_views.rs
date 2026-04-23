@@ -34,6 +34,13 @@ const STAT_VIEW_NAMES: &[&str] = &[
     "zyron_stat_streaming_jobs",
     "zyron_stat_triggers",
     "zyron_stat_branches",
+    "zyron_stat_publications",
+    "zyron_stat_subscriptions",
+    "zyron_stat_endpoints",
+    "zyron_stat_dead_letters",
+    "zyron_stat_zyron_sinks",
+    "zyron_stat_zyron_sources",
+    "zyron_stat_credential_cache",
 ];
 
 /// Returns true if the given name matches a virtual statistics view.
@@ -60,8 +67,198 @@ pub fn query_stat_view(
         "zyron_stat_streaming_jobs" => Some(build_stat_streaming_jobs(server)),
         "zyron_stat_triggers" => Some(build_stat_triggers(server)),
         "zyron_stat_branches" => Some(build_stat_branches(server)),
+        "zyron_stat_publications" => Some(build_stat_publications(server)),
+        "zyron_stat_subscriptions" => Some(build_stat_subscriptions(server)),
+        "zyron_stat_endpoints" => Some(build_stat_endpoints(server)),
+        "zyron_stat_dead_letters" => Some(build_stat_dead_letters(server)),
+        "zyron_stat_zyron_sinks" => Some(build_stat_zyron_sinks(server)),
+        "zyron_stat_zyron_sources" => Some(build_stat_zyron_sources(server)),
+        "zyron_stat_credential_cache" => Some(build_stat_credential_cache(server)),
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Zyron-to-Zyron stat views
+// ---------------------------------------------------------------------------
+
+/// Builds zyron_stat_publications.
+/// Columns: name, schema_id, change_feed, retention_days, classification,
+///          allow_initial_snapshot, created_at.
+fn build_stat_publications(
+    server: &ServerState,
+) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+    let fields = vec![
+        make_field("name", PG_TEXT_OID, -1),
+        make_field("schema_id", PG_INT4_OID, 4),
+        make_field("change_feed", PG_TEXT_OID, -1),
+        make_field("retention_days", PG_INT4_OID, 4),
+        make_field("classification", PG_TEXT_OID, -1),
+        make_field("allow_initial_snapshot", PG_TEXT_OID, -1),
+        make_field("created_at", PG_INT8_OID, 8),
+    ];
+    let rows = server
+        .catalog
+        .list_publications()
+        .into_iter()
+        .map(|p| {
+            vec![
+                Some(p.name.as_bytes().to_vec()),
+                Some(p.schema_id.0.to_string().into_bytes()),
+                Some(p.change_feed.to_string().into_bytes()),
+                Some(p.retention_days.to_string().into_bytes()),
+                Some(format!("{:?}", p.classification).into_bytes()),
+                Some(p.allow_initial_snapshot.to_string().into_bytes()),
+                Some(p.created_at.to_string().into_bytes()),
+            ]
+        })
+        .collect();
+    (fields, rows)
+}
+
+/// Builds zyron_stat_subscriptions.
+/// Columns: id, publication_id, consumer_id, mode, state, last_seen_lsn, last_poll_at.
+fn build_stat_subscriptions(
+    server: &ServerState,
+) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+    let fields = vec![
+        make_field("id", PG_INT4_OID, 4),
+        make_field("publication_id", PG_INT4_OID, 4),
+        make_field("consumer_id", PG_TEXT_OID, -1),
+        make_field("mode", PG_TEXT_OID, -1),
+        make_field("state", PG_TEXT_OID, -1),
+        make_field("last_seen_lsn", PG_INT8_OID, 8),
+        make_field("last_poll_at", PG_INT8_OID, 8),
+    ];
+    let rows = server
+        .catalog
+        .list_subscriptions()
+        .into_iter()
+        .map(|s| {
+            vec![
+                Some(s.id.0.to_string().into_bytes()),
+                Some(s.publication_id.0.to_string().into_bytes()),
+                Some(s.consumer_id.as_bytes().to_vec()),
+                Some(format!("{:?}", s.mode).into_bytes()),
+                Some(format!("{:?}", s.state).into_bytes()),
+                Some(s.last_seen_lsn.to_string().into_bytes()),
+                Some(s.last_poll_at.to_string().into_bytes()),
+            ]
+        })
+        .collect();
+    (fields, rows)
+}
+
+/// Builds zyron_stat_endpoints.
+/// Columns: name, path, kind, enabled, auth_mode, created_at.
+fn build_stat_endpoints(
+    server: &ServerState,
+) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+    let fields = vec![
+        make_field("name", PG_TEXT_OID, -1),
+        make_field("path", PG_TEXT_OID, -1),
+        make_field("kind", PG_TEXT_OID, -1),
+        make_field("enabled", PG_TEXT_OID, -1),
+        make_field("auth_mode", PG_TEXT_OID, -1),
+        make_field("created_at", PG_INT8_OID, 8),
+    ];
+    let rows = server
+        .catalog
+        .list_endpoints()
+        .into_iter()
+        .map(|e| {
+            vec![
+                Some(e.name.as_bytes().to_vec()),
+                Some(e.path.as_bytes().to_vec()),
+                Some(format!("{:?}", e.kind).into_bytes()),
+                Some(e.enabled.to_string().into_bytes()),
+                Some(format!("{:?}", e.auth_mode).into_bytes()),
+                Some(e.created_at.to_string().into_bytes()),
+            ]
+        })
+        .collect();
+    (fields, rows)
+}
+
+/// Builds zyron_stat_dead_letters. Runtime DLQ contents are collected by the
+/// streaming crate, this view reports zero rows until the registry callback is
+/// wired through ServerState in a later phase.
+fn build_stat_dead_letters(
+    _server: &ServerState,
+) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+    let fields = vec![
+        make_field("queue", PG_TEXT_OID, -1),
+        make_field("pending", PG_INT8_OID, 8),
+        make_field("oldest_ts", PG_INT8_OID, 8),
+    ];
+    (fields, Vec::new())
+}
+
+/// Builds zyron_stat_zyron_sinks. Lists remote Zyron sink entries from the
+/// external-sink catalog whose backend is Zyron.
+fn build_stat_zyron_sinks(
+    server: &ServerState,
+) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+    let fields = vec![
+        make_field("name", PG_TEXT_OID, -1),
+        make_field("uri", PG_TEXT_OID, -1),
+        make_field("mode", PG_TEXT_OID, -1),
+    ];
+    let rows = server
+        .catalog
+        .list_external_sinks()
+        .into_iter()
+        .filter(|e| matches!(e.backend, zyron_catalog::ExternalBackend::Zyron))
+        .map(|e| {
+            vec![
+                Some(e.name.as_bytes().to_vec()),
+                Some(e.uri.as_bytes().to_vec()),
+                Some(format!("{:?}", e.format).into_bytes()),
+            ]
+        })
+        .collect();
+    (fields, rows)
+}
+
+/// Builds zyron_stat_zyron_sources. Lists remote Zyron source entries from the
+/// external-source catalog whose backend is Zyron.
+fn build_stat_zyron_sources(
+    server: &ServerState,
+) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+    let fields = vec![
+        make_field("name", PG_TEXT_OID, -1),
+        make_field("uri", PG_TEXT_OID, -1),
+        make_field("mode", PG_TEXT_OID, -1),
+    ];
+    let rows = server
+        .catalog
+        .list_external_sources()
+        .into_iter()
+        .filter(|e| matches!(e.backend, zyron_catalog::ExternalBackend::Zyron))
+        .map(|e| {
+            vec![
+                Some(e.name.as_bytes().to_vec()),
+                Some(e.uri.as_bytes().to_vec()),
+                Some(format!("{:?}", e.mode).into_bytes()),
+            ]
+        })
+        .collect();
+    (fields, rows)
+}
+
+/// Builds zyron_stat_credential_cache. Reports zero rows until the credential
+/// cache registry is wired through ServerState.
+fn build_stat_credential_cache(
+    _server: &ServerState,
+) -> (Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>) {
+    let fields = vec![
+        make_field("provider", PG_TEXT_OID, -1),
+        make_field("entries", PG_INT8_OID, 8),
+        make_field("hits", PG_INT8_OID, 8),
+        make_field("misses", PG_INT8_OID, 8),
+        make_field("refreshes", PG_INT8_OID, 8),
+    ];
+    (fields, Vec::new())
 }
 
 /// Creates a FieldDescription with default values for virtual view columns.
@@ -523,6 +720,66 @@ mod tests {
         assert!(!is_stat_view("zyron_stat_unknown"));
         assert!(!is_stat_view("pg_stat_activity"));
         assert!(!is_stat_view(""));
+    }
+
+    #[test]
+    fn test_is_stat_view_publications_recognized() {
+        assert!(is_stat_view("zyron_stat_publications"));
+        assert!(is_stat_view("zyron_stat_subscriptions"));
+        assert!(is_stat_view("zyron_stat_endpoints"));
+    }
+
+    #[test]
+    fn test_is_stat_view_z2z_runtime_recognized() {
+        assert!(is_stat_view("zyron_stat_dead_letters"));
+        assert!(is_stat_view("zyron_stat_zyron_sinks"));
+        assert!(is_stat_view("zyron_stat_zyron_sources"));
+        assert!(is_stat_view("zyron_stat_credential_cache"));
+    }
+
+    #[test]
+    fn test_publications_schema_has_seven_columns() {
+        let fields = vec![
+            make_field("name", PG_TEXT_OID, -1),
+            make_field("schema_id", PG_INT4_OID, 4),
+            make_field("change_feed", PG_TEXT_OID, -1),
+            make_field("retention_days", PG_INT4_OID, 4),
+            make_field("classification", PG_TEXT_OID, -1),
+            make_field("allow_initial_snapshot", PG_TEXT_OID, -1),
+            make_field("created_at", PG_INT8_OID, 8),
+        ];
+        assert_eq!(fields.len(), 7);
+        assert_eq!(fields[0].name, "name");
+        assert_eq!(fields[6].name, "created_at");
+    }
+
+    #[test]
+    fn test_subscriptions_schema_has_seven_columns() {
+        let fields = vec![
+            make_field("id", PG_INT4_OID, 4),
+            make_field("publication_id", PG_INT4_OID, 4),
+            make_field("consumer_id", PG_TEXT_OID, -1),
+            make_field("mode", PG_TEXT_OID, -1),
+            make_field("state", PG_TEXT_OID, -1),
+            make_field("last_seen_lsn", PG_INT8_OID, 8),
+            make_field("last_poll_at", PG_INT8_OID, 8),
+        ];
+        assert_eq!(fields.len(), 7);
+        assert_eq!(fields[3].name, "mode");
+    }
+
+    #[test]
+    fn test_endpoints_schema_has_six_columns() {
+        let fields = vec![
+            make_field("name", PG_TEXT_OID, -1),
+            make_field("path", PG_TEXT_OID, -1),
+            make_field("kind", PG_TEXT_OID, -1),
+            make_field("enabled", PG_TEXT_OID, -1),
+            make_field("auth_mode", PG_TEXT_OID, -1),
+            make_field("created_at", PG_INT8_OID, 8),
+        ];
+        assert_eq!(fields.len(), 6);
+        assert_eq!(fields[1].name, "path");
     }
 
     #[test]

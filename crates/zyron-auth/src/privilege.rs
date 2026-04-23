@@ -67,6 +67,13 @@ pub enum PrivilegeType {
     AlterExternalSink = 40,
     DropExternalSink = 41,
     ManageExternalCredentials = 42,
+    CreatePublication = 43,
+    AlterPublication = 44,
+    DropPublication = 45,
+    Subscribe = 46,
+    ManagePublicationCredentials = 47,
+    InvokeEndpoint = 48,
+    AdminAccess = 49,
     All = 255,
 }
 
@@ -117,6 +124,13 @@ impl PrivilegeType {
             40 => Ok(Self::AlterExternalSink),
             41 => Ok(Self::DropExternalSink),
             42 => Ok(Self::ManageExternalCredentials),
+            43 => Ok(Self::CreatePublication),
+            44 => Ok(Self::AlterPublication),
+            45 => Ok(Self::DropPublication),
+            46 => Ok(Self::Subscribe),
+            47 => Ok(Self::ManagePublicationCredentials),
+            48 => Ok(Self::InvokeEndpoint),
+            49 => Ok(Self::AdminAccess),
             255 => Ok(Self::All),
             _ => Err(ZyronError::CatalogCorrupted(format!(
                 "invalid PrivilegeType value {}",
@@ -171,6 +185,13 @@ impl PrivilegeType {
             PrivilegeType::AlterExternalSink,
             PrivilegeType::DropExternalSink,
             PrivilegeType::ManageExternalCredentials,
+            PrivilegeType::CreatePublication,
+            PrivilegeType::AlterPublication,
+            PrivilegeType::DropPublication,
+            PrivilegeType::Subscribe,
+            PrivilegeType::ManagePublicationCredentials,
+            PrivilegeType::InvokeEndpoint,
+            PrivilegeType::AdminAccess,
         ]
     }
 
@@ -194,6 +215,9 @@ pub enum ObjectType {
     StreamingJob = 7,
     ExternalSource = 8,
     ExternalSink = 9,
+    Publication = 10,
+    System = 11,
+    Endpoint = 12,
 }
 
 impl ObjectType {
@@ -210,6 +234,9 @@ impl ObjectType {
             7 => Ok(Self::StreamingJob),
             8 => Ok(Self::ExternalSource),
             9 => Ok(Self::ExternalSink),
+            10 => Ok(Self::Publication),
+            11 => Ok(Self::System),
+            12 => Ok(Self::Endpoint),
             _ => Err(ZyronError::CatalogCorrupted(format!(
                 "invalid ObjectType value {}",
                 val
@@ -1297,6 +1324,95 @@ mod tests {
     #[test]
     fn test_object_type_from_u8_invalid() {
         assert!(ObjectType::from_u8(99).is_err());
+    }
+
+    #[test]
+    fn test_new_privilege_types_roundtrip() {
+        for p in [
+            PrivilegeType::CreatePublication,
+            PrivilegeType::AlterPublication,
+            PrivilegeType::DropPublication,
+            PrivilegeType::Subscribe,
+            PrivilegeType::ManagePublicationCredentials,
+            PrivilegeType::InvokeEndpoint,
+            PrivilegeType::AdminAccess,
+        ] {
+            let v = p as u8;
+            let back = PrivilegeType::from_u8(v).expect("from_u8");
+            assert_eq!(back, p);
+        }
+    }
+
+    #[test]
+    fn test_new_object_types_roundtrip() {
+        for o in [
+            ObjectType::Publication,
+            ObjectType::System,
+            ObjectType::Endpoint,
+        ] {
+            let v = o as u8;
+            let back = ObjectType::from_u8(v).expect("from_u8");
+            assert_eq!(back, o);
+        }
+    }
+
+    #[test]
+    fn test_grant_on_publication() {
+        let store = PrivilegeStore::new();
+        let entry = make_grant(1, PrivilegeType::Subscribe, ObjectType::Publication, 42);
+        store.grant(entry).expect("grant failed");
+        let result = store.check_privilege(
+            &[RoleId(1)],
+            PrivilegeType::Subscribe,
+            ObjectType::Publication,
+            42,
+            None,
+            1000,
+        );
+        assert_eq!(result, PrivilegeDecision::Allow);
+    }
+
+    #[test]
+    fn test_grant_on_endpoint_and_system() {
+        let store = PrivilegeStore::new();
+        store
+            .grant(make_grant(
+                1,
+                PrivilegeType::InvokeEndpoint,
+                ObjectType::Endpoint,
+                7,
+            ))
+            .expect("grant failed");
+        store
+            .grant(make_grant(
+                1,
+                PrivilegeType::AdminAccess,
+                ObjectType::System,
+                0,
+            ))
+            .expect("grant failed");
+        assert_eq!(
+            store.check_privilege(
+                &[RoleId(1)],
+                PrivilegeType::InvokeEndpoint,
+                ObjectType::Endpoint,
+                7,
+                None,
+                1000,
+            ),
+            PrivilegeDecision::Allow
+        );
+        assert_eq!(
+            store.check_privilege(
+                &[RoleId(1)],
+                PrivilegeType::AdminAccess,
+                ObjectType::System,
+                0,
+                None,
+                1000,
+            ),
+            PrivilegeDecision::Allow
+        );
     }
 
     #[test]

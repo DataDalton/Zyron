@@ -250,6 +250,66 @@ mod tests {
         async fn delete_external_sink(&self, _: ExternalSinkId) -> Result<bool> {
             unimplemented!()
         }
+        async fn load_publications(&self) -> Result<Vec<PublicationEntry>> {
+            Ok(vec![])
+        }
+        async fn store_publication(&self, _: &PublicationEntry) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn update_publication(&self, _: &PublicationEntry) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn delete_publication(&self, _: PublicationId) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn load_publication_tables(&self) -> Result<Vec<PublicationTableEntry>> {
+            Ok(vec![])
+        }
+        async fn store_publication_table(&self, _: &PublicationTableEntry) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn update_publication_table(&self, _: &PublicationTableEntry) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn delete_publication_table(&self, _: PublicationId, _: TableId) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn load_subscriptions(&self) -> Result<Vec<SubscriptionEntry>> {
+            Ok(vec![])
+        }
+        async fn store_subscription(&self, _: &SubscriptionEntry) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn update_subscription(&self, _: &SubscriptionEntry) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn delete_subscription(&self, _: SubscriptionId) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn load_endpoints(&self) -> Result<Vec<EndpointEntry>> {
+            Ok(vec![])
+        }
+        async fn store_endpoint(&self, _: &EndpointEntry) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn update_endpoint(&self, _: &EndpointEntry) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn delete_endpoint(&self, _: EndpointId) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn load_security_maps(&self) -> Result<Vec<SecurityMapEntry>> {
+            Ok(vec![])
+        }
+        async fn store_security_map(&self, _: &SecurityMapEntry) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn update_security_map(&self, _: &SecurityMapEntry) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn delete_security_map(&self, _: SecurityMapId) -> Result<bool> {
+            unimplemented!()
+        }
         async fn is_bootstrapped(&self) -> Result<bool> {
             Ok(true)
         }

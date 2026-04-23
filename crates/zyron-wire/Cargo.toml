@@ -38,6 +38,10 @@ parking_lot.workspace = true
 mimalloc.workspace = true
 tokio-quiche.workspace = true
 futures.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+async-trait.workspace = true
+scc.workspace = true
 memchr = "2"
 
 [dev-dependencies]

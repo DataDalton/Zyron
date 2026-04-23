@@ -32,6 +32,20 @@ pub fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             "external source and sink DDL is dispatched directly from wire, not through physical planner"
                 .to_string(),
         )),
+        BoundStatement::CreatePublication(_)
+        | BoundStatement::AlterPublication(_)
+        | BoundStatement::DropPublication { .. }
+        | BoundStatement::TagPublication { .. }
+        | BoundStatement::UntagPublication { .. }
+        | BoundStatement::CreateEndpoint(_)
+        | BoundStatement::CreateStreamingEndpoint(_)
+        | BoundStatement::AlterEndpoint(_)
+        | BoundStatement::DropEndpoint { .. }
+        | BoundStatement::AlterSecurityMap(_)
+        | BoundStatement::DropSecurityMap(_) => Err(ZyronError::PlanError(
+            "Zyron-to-Zyron DDL is dispatched directly from wire, not through physical planner"
+                .to_string(),
+        )),
     }
 }
 
