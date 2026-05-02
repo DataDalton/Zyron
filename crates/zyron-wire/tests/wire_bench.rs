@@ -162,6 +162,8 @@ async fn create_test_server(db_name: &str) -> (Arc<ServerState>, tempfile::TempD
         tls_acceptor: None,
         endpoint_registrar: None,
         subscription_runtimes: Arc::new(scc::HashMap::new()),
+        heap_files: Arc::new(scc::HashMap::new()),
+        btree_indexes: Arc::new(scc::HashMap::new()),
     });
 
     (state, tmp)

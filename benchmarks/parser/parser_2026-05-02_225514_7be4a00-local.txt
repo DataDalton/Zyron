@@ -1,0 +1,7 @@
+
+=== Memory per Parse Performance Test ===
+  Statement enum: 16 bytes
+  SelectStatement: 304 bytes
+  Expr enum: 112 bytes
+  TableRef enum: 72 bytes
+  Estimated per-parse (bytes) [FAIL]: 1,136 <= 1,024 (target)

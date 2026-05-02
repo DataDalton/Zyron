@@ -1,0 +1,530 @@
+{
+  "id": "2026-05-02_225703_7be4a00-local",
+  "date": "2026-05-02 22:58:00Z",
+  "ts": 1777762680,
+  "commit": "7be4a00-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "abac_evaluate": {
+      "latency_ns": {
+        "average": 75.691000,
+        "runs": [75.69],
+        "target": 2000.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "latency_ns": {
+        "average": 75.691000,
+        "runs": [75.69],
+        "target": 2000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "api_key_correctness": {
+      "lookup_ns": {
+        "average": 37.407600,
+        "runs": [37.41],
+        "target": 50000.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "lookup_ns": {
+        "average": 37.407600,
+        "runs": [37.41],
+        "target": 50000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "api_key_throughput": {
+      "combined_ops_sec": {
+        "average": 12966804.979253,
+        "runs": [12966804.98],
+        "target": 100000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "combined_ops_sec": {
+        "average": 12966804.979253,
+        "runs": [12966804.98],
+        "target": 100000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "credential_cache_lookup": {
+      "ops_per_sec": {
+        "average": 10489448.139644,
+        "runs": [10489448.14],
+        "target": 3000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "credential_seal": {
+      "ops_per_sec": {
+        "average": 2172.500493,
+        "runs": [2172.50],
+        "target": 300000.000000,
+        "passed": false,
+        "higher_is_better": true
+      }
+    },
+    "credential_open": {
+      "ops_per_sec": {
+        "average": 3156177.112035,
+        "runs": [3156177.11],
+        "target": 300000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "jwt_encode_verify": {
+      "ops_per_sec": {
+        "average": 44767.452558,
+        "runs": [44767.45],
+        "target": 100000.000000,
+        "passed": false,
+        "higher_is_better": true
+      }
+    },
+    "mtls_fingerprint_verify": {
+      "ops_per_sec": {
+        "average": 1393250.537098,
+        "runs": [1393250.54],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "security_map_resolve": {
+      "ops_per_sec": {
+        "average": 18204093.372436,
+        "runs": [18204093.37],
+        "target": 5000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "balloon_hash_timing": {
+      "hash_time_us": {
+        "average": 73.000000,
+        "runs": [73.00],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "memory_hard_minimum": {
+        "average": 73.000000,
+        "runs": [73.00],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "challenge_response": {
+      "verify_latency_ms": {
+        "average": 0.066100,
+        "runs": [0.07],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "verify_latency_ms": {
+        "average": 0.066100,
+        "runs": [0.07],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "classification_check": {
+      "ops_sec": {
+        "average": 83660305.694757,
+        "runs": [83660305.69],
+        "target": 10000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "ops_sec": {
+        "average": 83660305.694757,
+        "runs": [83660305.69],
+        "target": 10000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "column_mask_partial": {
+      "ops_per_sec": {
+        "average": 47507518.064734,
+        "runs": [47507518.06],
+        "target": 30000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "ops_per_sec": {
+        "average": 47507518.064734,
+        "runs": [47507518.06],
+        "target": 30000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "column_mask_hash": {
+      "ops_per_sec": {
+        "average": 21830962.854617,
+        "runs": [21830962.85],
+        "target": 15000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "ops_per_sec": {
+        "average": 21830962.854617,
+        "runs": [21830962.85],
+        "target": 15000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "concurrent_auth": {
+      "auth_per_sec": {
+        "average": 97263.018655,
+        "runs": [97263.02],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "auth_per_sec": {
+        "average": 97263.018655,
+        "runs": [97263.02],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "concurrent_privilege": {
+      "scaling_factor": {
+        "average": 6.613383,
+        "runs": [6.61],
+        "target": 2.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "scaling_factor": {
+        "average": 6.613383,
+        "runs": [6.61],
+        "target": 2.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "data_mask": {
+      "email_ops_sec": {
+        "average": 49351033.904160,
+        "runs": [49351033.90],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "email_ops_sec": {
+        "average": 49351033.904160,
+        "runs": [49351033.90],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "authenticated_encrypt": {
+      "gb_per_sec": {
+        "average": 4.612405,
+        "runs": [4.61],
+        "target": 4.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "gb_per_sec": {
+        "average": 4.612405,
+        "runs": [4.61],
+        "target": 4.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "authenticated_decrypt": {
+      "gb_per_sec": {
+        "average": 4.638311,
+        "runs": [4.64],
+        "target": 4.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "gb_per_sec": {
+        "average": 4.638311,
+        "runs": [4.64],
+        "target": 4.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "governance_usage": {
+      "record_ops_sec": {
+        "average": 22491065.424260,
+        "runs": [22491065.42],
+        "target": 5000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "record_ops_sec": {
+        "average": 22491065.424260,
+        "runs": [22491065.42],
+        "target": 5000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "jwt_correctness": {
+      "verify_latency_us": {
+        "average": 8.227252,
+        "runs": [8.23],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "verify_latency_us": {
+        "average": 8.227252,
+        "runs": [8.23],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "jwt_throughput": {
+      "combined_ops_sec": {
+        "average": 118348.587480,
+        "runs": [118348.59],
+        "target": 50000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "combined_ops_sec": {
+        "average": 118348.587480,
+        "runs": [118348.59],
+        "target": 50000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "password_auth": {
+      "hash_time_ms": {
+        "average": 191.564000,
+        "runs": [191.56],
+        "target": 80.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "hash_time_ms": {
+        "average": 191.564000,
+        "runs": [191.56],
+        "target": 80.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "verify_time_ms": {
+        "average": 188.993600,
+        "runs": [188.99],
+        "target": 80.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "verify_time_ms": {
+        "average": 188.993600,
+        "runs": [188.99],
+        "target": 80.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "privilege_latency": {
+      "per_check_ns": {
+        "average": 17.844400,
+        "runs": [17.84],
+        "target": 80.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "per_check_ns": {
+        "average": 17.844400,
+        "runs": [17.84],
+        "target": 80.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "privilege_check": {
+      "ops_sec": {
+        "average": 68484238.352543,
+        "runs": [68484238.35],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "ops_sec": {
+        "average": 68484238.352543,
+        "runs": [68484238.35],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "privilege_deny_wins": {
+      "deny_ops_sec": {
+        "average": 66854751.367180,
+        "runs": [66854751.37],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "deny_ops_sec": {
+        "average": 66854751.367180,
+        "runs": [66854751.37],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "rls_predicate_inject": {
+      "latency_ns": {
+        "average": 230.383300,
+        "runs": [230.38],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "latency_ns": {
+        "average": 230.383300,
+        "runs": [230.38],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "role_hierarchy_correctness": {
+      "traversal_ns": {
+        "average": 106.199000,
+        "runs": [106.20],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "traversal_ns": {
+        "average": 106.199000,
+        "runs": [106.20],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "role_hierarchy": {
+      "traversal_us": {
+        "average": 0.281614,
+        "runs": [0.28],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "traversal_us": {
+        "average": 0.281614,
+        "runs": [0.28],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "security_label_check": {
+      "latency_ns": {
+        "average": 32.643560,
+        "runs": [32.64],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "latency_ns": {
+        "average": 32.643560,
+        "runs": [32.64],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "time_window": {
+      "eval_ops_sec": {
+        "average": 991178511.249876,
+        "runs": [991178511.25],
+        "target": 10000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "eval_ops_sec": {
+        "average": 991178511.249876,
+        "runs": [991178511.25],
+        "target": 10000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "totp_correctness": {
+      "verify_ns": {
+        "average": 156.404100,
+        "runs": [156.40],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "verify_ns": {
+        "average": 156.404100,
+        "runs": [156.40],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "totp_throughput": {
+      "combined_ops_sec": {
+        "average": 8279139.466244,
+        "runs": [8279139.47],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "combined_ops_sec": {
+        "average": 8279139.466244,
+        "runs": [8279139.47],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "webhook_signature_verify": {
+      "latency_us": {
+        "average": 8.925780,
+        "runs": [8.93],
+        "target": 20.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "latency_us": {
+        "average": 8.925780,
+        "runs": [8.93],
+        "target": 20.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    }
+  }
+}

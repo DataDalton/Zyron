@@ -21,9 +21,17 @@ pub struct Snapshot {
 
 impl Snapshot {
     /// Creates a new snapshot with the given active transaction set.
-    /// Sorts the active list for binary search.
-    pub fn new(txn_id: u64, mut active_txns: Vec<u64>) -> Self {
-        active_txns.sort_unstable();
+    ///
+    /// `active_txns` must already be sorted in ascending order; the visibility
+    /// fast paths use binary search and corruption is silent if the invariant
+    /// is broken. The transaction manager is the only producer and now
+    /// returns a pre-sorted vec (`active_txn_ids`), so this constructor no
+    /// longer re-sorts.
+    pub fn new(txn_id: u64, active_txns: Vec<u64>) -> Self {
+        debug_assert!(
+            active_txns.windows(2).all(|w| w[0] <= w[1]),
+            "Snapshot::new requires a sorted active_txn list"
+        );
         Self {
             txn_id,
             active_txn_ids: active_txns,

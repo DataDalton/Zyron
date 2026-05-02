@@ -10,21 +10,52 @@
 
 use std::sync::Arc;
 
+use zyron_buffer::BufferPool;
 use zyron_catalog::{IndexEntry, TableEntry};
 use zyron_common::Result;
 use zyron_common::page::{PAGE_SIZE, PageId};
 use zyron_parser::ast::{BinaryOperator, LiteralValue};
 use zyron_planner::binder::BoundExpr;
 use zyron_planner::logical::LogicalColumn;
-use zyron_storage::{BTreeIndex, HeapPage, TupleId};
+use zyron_storage::{BTreeIndex, DiskManager, HeapPage, TupleId};
 
 use crate::batch::{
-    BATCH_SIZE, DataBatch, create_builders, decode_tuple_into_builders, finalize_builders,
+    BATCH_SIZE, DataBatch, build_column_to_builder_map, create_builders,
+    decode_tuple_into_builders, finalize_builders,
 };
 use crate::compute::column_to_mask;
 use crate::context::ExecutionContext;
 use crate::expr::evaluate;
 use crate::operator::{ExecutionBatch, Operator, OperatorResult};
+
+/// Reads a heap page through the buffer pool: serves the buffer-pool copy
+/// when present (and freshly inserted pages live there before the background
+/// writer flushes them), otherwise loads from disk into the pool and returns
+/// the loaded data. Any dirty page evicted during the load is written back.
+async fn read_page_through_pool(
+    pool: &BufferPool,
+    disk: &DiskManager,
+    page_id: PageId,
+) -> Result<[u8; PAGE_SIZE]> {
+    if let Some(frame) = pool.fetch_page(page_id) {
+        let guard = frame.read_data();
+        let data: [u8; PAGE_SIZE] = **guard;
+        drop(guard);
+        pool.unpin_page(page_id, false);
+        return Ok(data);
+    }
+    let disk_data = disk.read_page(page_id).await?;
+    let (frame, evicted) = pool.load_page(page_id, &disk_data)?;
+    if let Some(evicted_page) = evicted {
+        disk.write_page(evicted_page.page_id, &evicted_page.data)
+            .await?;
+    }
+    let guard = frame.read_data();
+    let data: [u8; PAGE_SIZE] = **guard;
+    drop(guard);
+    pool.unpin_page(page_id, false);
+    Ok(data)
+}
 
 /// Minimum number of pages before parallel scan is used.
 /// Below this threshold, the task spawn overhead outweighs the benefit.
@@ -41,8 +72,16 @@ pub struct SeqScanOperator {
     ctx: Arc<ExecutionContext>,
     table_entry: Arc<TableEntry>,
     output_columns: Vec<LogicalColumn>,
+    /// Per-table-column index into `output_columns`. Built once at
+    /// construction so the per-row decoder does an O(1) lookup instead of
+    /// scanning the projection list.
+    column_to_builder: Vec<Option<u16>>,
     predicate: Option<BoundExpr>,
     page_cursor: u64,
+    /// Resume position within the current page when a previous next() call
+    /// stopped mid-page after filling its output batch. Zero means start from
+    /// the first slot of the page identified by page_cursor.
+    slot_cursor: u16,
     num_pages: u64,
     finished: bool,
     track_tuple_ids: bool,
@@ -61,14 +100,22 @@ impl SeqScanOperator {
         as_of_version: Option<u64>,
     ) -> Result<Self> {
         let table_entry = ctx.get_table_entry(table_id)?;
-        let num_pages = ctx.disk_manager.num_pages(table_entry.heap_file_id).await?;
+        // cached atomic load instead of disk_manager.num_pages which would
+        // queue on the per-file tokio Mutex under concurrency
+        let num_pages = ctx.get_heap_file(table_id).await?.num_pages_cached() as u64;
+        let output_ids: Vec<zyron_catalog::ColumnId> =
+            columns.iter().map(|c| c.column_id).collect();
+        let column_to_builder =
+            build_column_to_builder_map(&table_entry.columns, &output_ids);
 
         Ok(Self {
             ctx,
             table_entry,
             output_columns: columns,
+            column_to_builder,
             predicate,
             page_cursor: 0,
+            slot_cursor: 0,
             num_pages,
             finished: false,
             track_tuple_ids,
@@ -96,42 +143,66 @@ impl Operator for SeqScanOperator {
 
             while row_count < batch_size && self.page_cursor < self.num_pages {
                 let page_id = PageId::new(self.table_entry.heap_file_id, self.page_cursor);
-                self.page_cursor += 1;
 
-                let page_data: [u8; PAGE_SIZE] = self.ctx.disk_manager.read_page(page_id).await?;
+                let page_data: [u8; PAGE_SIZE] = read_page_through_pool(
+                    &self.ctx.buffer_pool,
+                    &self.ctx.disk_manager,
+                    page_id,
+                )
+                .await?;
+
+                // Empty page fast path, avoid HeapPage box allocation when
+                // the page has zero slots (freshly allocated, never written)
+                let header = HeapPage::heap_header_from_slice(&page_data);
+                if header.slot_count == 0 {
+                    self.page_cursor += 1;
+                    self.slot_cursor = 0;
+                    continue;
+                }
+
                 let page = HeapPage::from_bytes(page_data);
+                let slot_count = header.slot_count;
+                let mut slot_idx = self.slot_cursor;
+                let mut filled_batch = false;
 
-                for (slot_id, tuple) in page.iter() {
+                while slot_idx < slot_count {
+                    let slot_id = zyron_storage::SlotId(slot_idx);
+                    slot_idx += 1;
+                    let Some(tuple) = page.get_tuple_view(slot_id) else {
+                        continue;
+                    };
                     if tuple.is_deleted() {
                         continue;
                     }
                     // Version-based visibility for time travel queries,
-                    // MVCC snapshot visibility for normal queries.
+                    // MVCC snapshot visibility for normal queries
                     //
                     // When as_of_version is set, the tuple's base header
                     // xmin/xmax are reinterpreted as version bounds via
-                    // is_visible (version_id <= target, deleted_at > target).
+                    // is_visible (version_id <= target, deleted_at > target)
                     // This works because versioned tables store version_id
                     // in xmin and deleted_at_version in xmax on the base
-                    // TupleHeader, keeping the same visibility predicate shape.
+                    // TupleHeader, keeping the same visibility predicate shape
                     //
                     // Non-versioned tuples in a time travel query fall back
-                    // to MVCC snapshot visibility as a safety measure.
+                    // to MVCC snapshot visibility as a safety measure
+                    let hdr = tuple.header;
                     if let Some(target_version) = self.as_of_version {
-                        if tuple.header().flags.has_version() {
-                            if !tuple.header().is_visible(target_version as u32) {
+                        if hdr.flags.has_version() {
+                            if !hdr.is_visible(target_version as u32) {
                                 continue;
                             }
-                        } else if !tuple.header().is_visible_to(&self.ctx.snapshot) {
+                        } else if !hdr.is_visible_to(&self.ctx.snapshot) {
                             continue;
                         }
-                    } else if !tuple.header().is_visible_to(&self.ctx.snapshot) {
+                    } else if !hdr.is_visible_to(&self.ctx.snapshot) {
                         continue;
                     }
 
                     decode_tuple_into_builders(
-                        tuple.data(),
+                        tuple.data,
                         &self.table_entry.columns,
+                        &self.column_to_builder,
                         &mut builders,
                     );
 
@@ -141,8 +212,17 @@ impl Operator for SeqScanOperator {
 
                     row_count += 1;
                     if row_count >= batch_size {
+                        filled_batch = true;
                         break;
                     }
+                }
+
+                if filled_batch && slot_idx < slot_count {
+                    // Resume from slot_idx on this same page in the next batch
+                    self.slot_cursor = slot_idx;
+                } else {
+                    self.page_cursor += 1;
+                    self.slot_cursor = 0;
                 }
             }
 
@@ -155,7 +235,8 @@ impl Operator for SeqScanOperator {
 
             // Apply predicate filter if present.
             if let Some(ref predicate) = self.predicate {
-                let mask_col = evaluate(predicate, &batch, &self.output_columns, &[])?;
+                let mask_col =
+                    evaluate(predicate, &batch, &self.output_columns, &self.ctx.params)?;
                 let mask = column_to_mask(&mask_col);
 
                 let filtered = batch.filter(&mask);
@@ -207,7 +288,7 @@ impl ParallelSeqScanOperator {
         predicate: Option<BoundExpr>,
     ) -> Result<Self> {
         let table_entry = ctx.get_table_entry(table_id)?;
-        let num_pages = ctx.disk_manager.num_pages(table_entry.heap_file_id).await?;
+        let num_pages = ctx.get_heap_file(table_id).await?.num_pages_cached() as u64;
 
         let num_workers = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -274,6 +355,14 @@ async fn scan_page_range(
 ) -> Result<()> {
     let batch_size = BATCH_SIZE;
     let mut page_cursor = start_page;
+    // Resume position within the current page when a batch fills mid-page.
+    // Without this, slots after the break would be skipped because page_cursor
+    // already advanced
+    let mut slot_cursor: u16 = 0;
+
+    let output_ids: Vec<zyron_catalog::ColumnId> =
+        output_columns.iter().map(|c| c.column_id).collect();
+    let column_to_builder = build_column_to_builder_map(&table_entry.columns, &output_ids);
 
     while page_cursor < end_page {
         ctx.check_cancelled()?;
@@ -283,25 +372,55 @@ async fn scan_page_range(
 
         while row_count < batch_size && page_cursor < end_page {
             let page_id = PageId::new(table_entry.heap_file_id, page_cursor);
-            page_cursor += 1;
 
-            let page_data: [u8; PAGE_SIZE] = ctx.disk_manager.read_page(page_id).await?;
+            let page_data: [u8; PAGE_SIZE] =
+                read_page_through_pool(&ctx.buffer_pool, &ctx.disk_manager, page_id).await?;
+
+            let header = HeapPage::heap_header_from_slice(&page_data);
+            if header.slot_count == 0 {
+                page_cursor += 1;
+                slot_cursor = 0;
+                continue;
+            }
+
             let page = HeapPage::from_bytes(page_data);
+            let slot_count = header.slot_count;
+            let mut slot_idx = slot_cursor;
+            let mut filled_batch = false;
 
-            for (_slot_id, tuple) in page.iter() {
+            while slot_idx < slot_count {
+                let slot_id = zyron_storage::SlotId(slot_idx);
+                slot_idx += 1;
+                let Some(tuple) = page.get_tuple_view(slot_id) else {
+                    continue;
+                };
                 if tuple.is_deleted() {
                     continue;
                 }
-                if !tuple.header().is_visible_to(&ctx.snapshot) {
+                let hdr = tuple.header;
+                if !hdr.is_visible_to(&ctx.snapshot) {
                     continue;
                 }
 
-                decode_tuple_into_builders(tuple.data(), &table_entry.columns, &mut builders);
+                decode_tuple_into_builders(
+                    tuple.data,
+                    &table_entry.columns,
+                    &column_to_builder,
+                    &mut builders,
+                );
 
                 row_count += 1;
                 if row_count >= batch_size {
+                    filled_batch = true;
                     break;
                 }
+            }
+
+            if filled_batch && slot_idx < slot_count {
+                slot_cursor = slot_idx;
+            } else {
+                page_cursor += 1;
+                slot_cursor = 0;
             }
         }
 
@@ -311,9 +430,8 @@ async fn scan_page_range(
 
         let batch = finalize_builders(builders);
 
-        // Apply predicate filter if present.
         let output = if let Some(pred) = predicate {
-            let mask_col = evaluate(pred, &batch, output_columns, &[])?;
+            let mask_col = evaluate(pred, &batch, output_columns, &ctx.params)?;
             let mask = column_to_mask(&mask_col);
             let filtered = batch.filter(&mask);
             if filtered.num_rows == 0 {
@@ -324,7 +442,6 @@ async fn scan_page_range(
             batch
         };
 
-        // If the receiver has been dropped (query cancelled), stop scanning.
         if tx.send(Ok(output)).await.is_err() {
             break;
         }
@@ -667,6 +784,8 @@ struct IndexScanState {
     ctx: Arc<ExecutionContext>,
     table_entry: Arc<TableEntry>,
     output_columns: Vec<LogicalColumn>,
+    /// Per-table-column index into `output_columns`, precomputed once.
+    column_to_builder: Vec<Option<u16>>,
     remaining_predicate: Option<BoundExpr>,
     track_tuple_ids: bool,
     /// Pre-collected TupleIds from the B+ tree range scan.
@@ -698,14 +817,11 @@ impl IndexScanOperator {
             let table_entry = ctx.get_table_entry(table_id)?;
             let heap_file_id = table_entry.heap_file_id;
 
-            // Collect matching TupleIds from the B+ tree.
             let mut tuple_ids = Vec::new();
             btree_index.range_scan_for_each(
                 bounds.start_key.as_deref(),
                 bounds.end_key.as_deref(),
                 |_key, tid| {
-                    // The B+ tree stores page numbers with file_id=0.
-                    // Reconstruct the correct PageId using the heap file ID.
                     let corrected_tid =
                         TupleId::new(PageId::new(heap_file_id, tid.page_id.page_num), tid.slot_id);
                     tuple_ids.push(corrected_tid);
@@ -713,11 +829,17 @@ impl IndexScanOperator {
                 },
             );
 
+            let output_ids: Vec<zyron_catalog::ColumnId> =
+                columns.iter().map(|c| c.column_id).collect();
+            let column_to_builder =
+                build_column_to_builder_map(&table_entry.columns, &output_ids);
+
             return Ok(Self {
                 index_state: Some(IndexScanState {
                     ctx,
                     table_entry,
                     output_columns: columns,
+                    column_to_builder,
                     remaining_predicate,
                     track_tuple_ids,
                     tuple_ids,
@@ -782,33 +904,67 @@ impl Operator for IndexScanOperator {
             let mut row_count: usize = 0;
 
             // Fetch tuples from the heap using pre-collected TupleIds.
+            // Read directly from the buffer pool frame's data via the read
+            // lock, avoids the 16KB stack copy + Box allocation that
+            // read_page_through_pool would do per call. Concurrent atomic
+            // inserts coordinate via the slot's AtomicU32 commit so our
+            // read sees either uncommitted (length=0, skip) or committed
+            // bytes consistently
             while row_count < batch_size && state.cursor < state.tuple_ids.len() {
                 let tid = state.tuple_ids[state.cursor];
                 state.cursor += 1;
 
-                let page_data: [u8; PAGE_SIZE] =
-                    state.ctx.disk_manager.read_page(tid.page_id).await?;
-                let page = HeapPage::from_bytes(page_data);
+                let frame_present =
+                    state.ctx.buffer_pool.fetch_page(tid.page_id).is_some();
+                if !frame_present {
+                    let disk_data =
+                        state.ctx.disk_manager.read_page(tid.page_id).await?;
+                    let (_, evicted) =
+                        state.ctx.buffer_pool.load_page(tid.page_id, &disk_data)?;
+                    if let Some(ev) = evicted {
+                        state.ctx.disk_manager.write_page(ev.page_id, &ev.data).await?;
+                    }
+                    // load_page pinned, frame_present path's fetch_page also
+                    // pinned, in both cases we have one extra pin to balance
+                }
 
-                let slot_id = zyron_storage::SlotId(tid.slot_id);
-                let Some(tuple) = page.get_tuple(slot_id) else {
-                    continue;
+                let frame = state
+                    .ctx
+                    .buffer_pool
+                    .fetch_page(tid.page_id)
+                    .expect("just pinned this page");
+                state.ctx.buffer_pool.unpin_page(tid.page_id, false);
+
+                let visible = {
+                    let guard = frame.read_data();
+                    let slot_id = zyron_storage::SlotId(tid.slot_id);
+                    match HeapPage::get_tuple_view_from_slice(&**guard, slot_id) {
+                        None => false,
+                        Some(view) => {
+                            if view.is_deleted()
+                                || !view.header.is_visible_to(&state.ctx.snapshot)
+                            {
+                                false
+                            } else {
+                                decode_tuple_into_builders(
+                                    view.data,
+                                    &state.table_entry.columns,
+                                    &state.column_to_builder,
+                                    &mut builders,
+                                );
+                                true
+                            }
+                        }
+                    }
                 };
+                state.ctx.buffer_pool.unpin_page(tid.page_id, false);
 
-                if tuple.is_deleted() {
-                    continue;
+                if visible {
+                    if state.track_tuple_ids {
+                        result_tuple_ids.push(tid);
+                    }
+                    row_count += 1;
                 }
-                if !tuple.header().is_visible_to(&state.ctx.snapshot) {
-                    continue;
-                }
-
-                decode_tuple_into_builders(tuple.data(), &state.table_entry.columns, &mut builders);
-
-                if state.track_tuple_ids {
-                    result_tuple_ids.push(tid);
-                }
-
-                row_count += 1;
             }
 
             if row_count == 0 {
@@ -820,7 +976,8 @@ impl Operator for IndexScanOperator {
 
             // Apply remaining predicate as a post-filter.
             if let Some(ref pred) = state.remaining_predicate {
-                let mask_col = evaluate(pred, &batch, &state.output_columns, &[])?;
+                let mask_col =
+                    evaluate(pred, &batch, &state.output_columns, &state.ctx.params)?;
                 let mask = column_to_mask(&mask_col);
                 let filtered = batch.filter(&mask);
 

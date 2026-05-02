@@ -1782,10 +1782,12 @@ pub enum AsOf {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FunctionArg {
-    /// Positional argument
+    /// Positional argument.
     Unnamed(Expr),
-    /// Named argument: name => value
+    /// Named argument: `name => value`.
     Named { name: String, value: Expr },
+    /// `*` inside an aggregate call: `COUNT(*)`. Only valid for aggregates.
+    Wildcard,
 }
 
 // ---------------------------------------------------------------------------

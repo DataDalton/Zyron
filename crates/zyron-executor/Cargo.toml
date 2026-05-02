@@ -17,6 +17,7 @@ zyron-types = { path = "../zyron-types" }
 tokio.workspace = true
 hashbrown.workspace = true
 parking_lot.workspace = true
+scc.workspace = true
 
 [dev-dependencies]
 rand = "0.10"

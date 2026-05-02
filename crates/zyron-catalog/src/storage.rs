@@ -994,23 +994,17 @@ impl CatalogStorage for HeapCatalogStorage {
         };
         self.store_database(&db).await?;
 
-        // Create "public" schema
-        let public_schema = SchemaEntry {
-            id: DEFAULT_SCHEMA_ID,
+        // Create the internal system schema. Only Zyron's own bookkeeping
+        // tables live here (database list, schema list, table list, columns,
+        // indexes, roles, privileges, replication slots, etc). User writes
+        // to this schema are rejected by the catalog.
+        let system_schema = SchemaEntry {
+            id: SYSTEM_SCHEMA_ID,
             database_id: SYSTEM_DATABASE_ID,
-            name: "public".to_string(),
+            name: SYSTEM_SCHEMA_NAME.to_string(),
             owner: "system".to_string(),
         };
-        self.store_schema(&public_schema).await?;
-
-        // Create "zyron_catalog" internal schema
-        let catalog_schema = SchemaEntry {
-            id: CATALOG_SCHEMA_ID,
-            database_id: SYSTEM_DATABASE_ID,
-            name: "zyron_catalog".to_string(),
-            owner: "system".to_string(),
-        };
-        self.store_schema(&catalog_schema).await?;
+        self.store_schema(&system_schema).await?;
 
         Ok(())
     }

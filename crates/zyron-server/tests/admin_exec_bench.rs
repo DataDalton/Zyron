@@ -272,9 +272,14 @@ async fn admin_replay_dlq_returns_501_when_no_sink_client_registry() {
     let resp = exec
         .execute(AdminAction::ReplayDlq {
             sink: "s3_bad".into(),
+            limit: 1000,
+            offset: 0,
         })
         .await;
-    assert_eq!(resp.status, 501);
+    // The non-Zyron backend branch rejects with 400, and a missing sink
+    // resolves to 404. Either is acceptable non-501 behavior here; the
+    // legacy 501-stub path has been removed.
+    assert!(resp.status == 400 || resp.status == 404);
 }
 
 #[tokio::test]

@@ -1,0 +1,68 @@
+{
+  "id": "2026-04-24_020111_7be4a00-local",
+  "date": "2026-04-24 02:01:14Z",
+  "ts": 1776996074,
+  "commit": "7be4a00-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Arrow IPC Write": {
+      "rows/sec at batch=10000": {
+        "average": 25962383.123932,
+        "runs": [26671289.69, 25930247.63, 23464814.51, 26681964.33, 27063599.46],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Avro Write": {
+      "rows/sec at batch=10000": {
+        "average": 1878949.270704,
+        "runs": [1904747.39, 1930494.48, 1891159.96, 1914623.13, 1753721.40],
+        "target": 300000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "CSV Write": {
+      "rows/sec at batch=10000": {
+        "average": 5634860.457515,
+        "runs": [5296469.90, 5639839.83, 5811419.44, 5777908.74, 5648664.37],
+        "target": 2000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "JSON Write": {
+      "rows/sec at batch=10000": {
+        "average": 2292658.906091,
+        "runs": [2158382.08, 2149959.69, 2261036.69, 2358412.69, 2535503.39],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "JSONL Write": {
+      "rows/sec at batch=10000": {
+        "average": 3638119.083096,
+        "runs": [3632638.53, 3570765.43, 3660308.71, 3690704.22, 3636178.52],
+        "target": 1500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Parquet Write": {
+      "rows/sec at batch=10000": {
+        "average": 9693295.017744,
+        "runs": [9921717.65, 9793264.19, 10366561.62, 8288918.54, 10096013.08],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}

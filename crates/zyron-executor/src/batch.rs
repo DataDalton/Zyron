@@ -5,7 +5,7 @@
 //! format used by the storage engine and the columnar batch format used
 //! for query processing.
 
-use zyron_catalog::ColumnEntry;
+use zyron_catalog::{ColumnEntry, ColumnId};
 use zyron_common::TypeId;
 use zyron_planner::logical::LogicalColumn;
 use zyron_storage::Tuple;
@@ -136,6 +136,25 @@ pub fn finalize_builders(builders: Vec<ColumnBuilder>) -> DataBatch {
 // Tuple decode: NSM bytes -> column builders
 // ---------------------------------------------------------------------------
 
+/// Builds the per-column-ordinal lookup table used by
+/// `decode_tuple_into_builders`: index `i` is `Some(b)` if the table column
+/// at ordinal `i` maps to builder `b`, or `None` if the projection skips it.
+///
+/// The decoder iterates table columns in declaration order, so this map turns
+/// the per-row "is column projected?" question into an O(1) array lookup.
+pub fn build_column_to_builder_map(
+    columns: &[ColumnEntry],
+    output_column_ids: &[ColumnId],
+) -> Vec<Option<u16>> {
+    let mut map = vec![None; columns.len()];
+    for (b, oid) in output_column_ids.iter().enumerate() {
+        if let Some(i) = columns.iter().position(|c| c.id == *oid) {
+            map[i] = Some(b as u16);
+        }
+    }
+    map
+}
+
 /// Decodes one tuple's data bytes into column builders.
 ///
 /// Tuple data layout (NSM, little-endian):
@@ -143,11 +162,19 @@ pub fn finalize_builders(builders: Vec<ColumnBuilder>) -> DataBatch {
 /// - Column values in ordinal order:
 ///   - Fixed-size types: inline at TypeId::fixed_size() bytes (zeroed if null)
 ///   - Variable-length types: 4-byte LE length prefix + data bytes (length=0, no data if null)
+///
+/// `column_to_builder` is the precomputed per-ordinal lookup produced by
+/// `build_column_to_builder_map`. The decoder walks every table column to
+/// keep the offset cursor aligned with the encoded row, but only touches
+/// `builders[b]` when `column_to_builder[i] == Some(b)`. Pass the table's
+/// full column list as `columns` even when the scan projects a subset.
 pub fn decode_tuple_into_builders(
     data: &[u8],
     columns: &[ColumnEntry],
+    column_to_builder: &[Option<u16>],
     builders: &mut [ColumnBuilder],
 ) {
+    debug_assert_eq!(column_to_builder.len(), columns.len());
     let num_cols = columns.len();
     let null_bitmap_len = (num_cols + 7) / 8;
     let null_bitmap = &data[..null_bitmap_len];
@@ -155,15 +182,20 @@ pub fn decode_tuple_into_builders(
 
     for (i, col) in columns.iter().enumerate() {
         let is_null = (null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+        let builder_idx = column_to_builder[i].map(|b| b as usize);
 
         if let Some(fixed_size) = col.type_id.fixed_size() {
             if is_null {
-                builders[i].push_null();
+                if let Some(b) = builder_idx {
+                    builders[b].push_null();
+                }
                 offset += fixed_size;
             } else {
                 let value_bytes = &data[offset..offset + fixed_size];
-                let scalar = decode_fixed_scalar(col.type_id, value_bytes);
-                builders[i].push(&scalar);
+                if let Some(b) = builder_idx {
+                    let scalar = decode_fixed_scalar(col.type_id, value_bytes);
+                    builders[b].push(&scalar);
+                }
                 offset += fixed_size;
             }
         } else {
@@ -177,12 +209,16 @@ pub fn decode_tuple_into_builders(
             offset += 4;
 
             if is_null {
-                builders[i].push_null();
+                if let Some(b) = builder_idx {
+                    builders[b].push_null();
+                }
                 offset += len;
             } else {
                 let value_bytes = &data[offset..offset + len];
-                let scalar = decode_varlen_scalar(col.type_id, value_bytes);
-                builders[i].push(&scalar);
+                if let Some(b) = builder_idx {
+                    let scalar = decode_varlen_scalar(col.type_id, value_bytes);
+                    builders[b].push(&scalar);
+                }
                 offset += len;
             }
         }

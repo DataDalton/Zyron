@@ -1,0 +1,236 @@
+
+=== INSERT VALUES vs COPY BINARY encode crossover ===
+--- Run 1/5 ---
+
+  batch=   10: INSERT  24,407,686 rows/sec (25,588,890 bytes), COPY 222,340,804 rows/sec (40,100,000 bytes)
+  batch=  100: INSERT  25,081,578 rows/sec (23,158,890 bytes), COPY 384,941,104 rows/sec (38,210,000 bytes)
+  batch=  500: INSERT  25,572,962 rows/sec (22,942,890 bytes), COPY 364,750,511 rows/sec (38,042,000 bytes)
+  batch= 1000: INSERT  25,975,578 rows/sec (22,915,890 bytes), COPY 351,580,354 rows/sec (38,021,000 bytes)
+  batch= 5000: INSERT  25,411,152 rows/sec (22,894,290 bytes), COPY 340,901,343 rows/sec (38,004,200 bytes)
+  batch=10000: INSERT  25,589,060 rows/sec (22,891,590 bytes), COPY 332,391,557 rows/sec (38,002,100 bytes)
+
+--- Run 2/5 ---
+
+  batch=   10: INSERT  24,197,022 rows/sec (25,588,890 bytes), COPY 225,270,888 rows/sec (40,100,000 bytes)
+  batch=  100: INSERT  25,215,975 rows/sec (23,158,890 bytes), COPY 377,557,955 rows/sec (38,210,000 bytes)
+  batch=  500: INSERT  25,473,488 rows/sec (22,942,890 bytes), COPY 349,149,820 rows/sec (38,042,000 bytes)
+  batch= 1000: INSERT  25,072,208 rows/sec (22,915,890 bytes), COPY 314,861,461 rows/sec (38,021,000 bytes)
+  batch= 5000: INSERT  25,381,290 rows/sec (22,894,290 bytes), COPY 333,912,114 rows/sec (38,004,200 bytes)
+  batch=10000: INSERT  25,595,806 rows/sec (22,891,590 bytes), COPY 324,917,958 rows/sec (38,002,100 bytes)
+
+--- Run 3/5 ---
+
+  batch=   10: INSERT  24,043,432 rows/sec (25,588,890 bytes), COPY 225,815,193 rows/sec (40,100,000 bytes)
+  batch=  100: INSERT  25,061,526 rows/sec (23,158,890 bytes), COPY 387,626,948 rows/sec (38,210,000 bytes)
+  batch=  500: INSERT  25,427,629 rows/sec (22,942,890 bytes), COPY 352,559,583 rows/sec (38,042,000 bytes)
+  batch= 1000: INSERT  25,280,040 rows/sec (22,915,890 bytes), COPY 343,394,801 rows/sec (38,021,000 bytes)
+  batch= 5000: INSERT  25,314,597 rows/sec (22,894,290 bytes), COPY 288,892,099 rows/sec (38,004,200 bytes)
+  batch=10000: INSERT  25,462,073 rows/sec (22,891,590 bytes), COPY 226,024,456 rows/sec (38,002,100 bytes)
+
+--- Run 4/5 ---
+
+  batch=   10: INSERT  24,450,117 rows/sec (25,588,890 bytes), COPY 225,917,224 rows/sec (40,100,000 bytes)
+  batch=  100: INSERT  24,953,711 rows/sec (23,158,890 bytes), COPY 386,160,025 rows/sec (38,210,000 bytes)
+  batch=  500: INSERT  25,054,117 rows/sec (22,942,890 bytes), COPY 331,477,062 rows/sec (38,042,000 bytes)
+  batch= 1000: INSERT  25,078,684 rows/sec (22,915,890 bytes), COPY 254,187,743 rows/sec (38,021,000 bytes)
+  batch= 5000: INSERT  25,592,138 rows/sec (22,894,290 bytes), COPY 272,064,425 rows/sec (38,004,200 bytes)
+  batch=10000: INSERT  25,481,602 rows/sec (22,891,590 bytes), COPY 334,795,273 rows/sec (38,002,100 bytes)
+
+--- Run 5/5 ---
+
+  batch=   10: INSERT  24,381,621 rows/sec (25,588,890 bytes), COPY 220,046,210 rows/sec (40,100,000 bytes)
+  batch=  100: INSERT  25,377,426 rows/sec (23,158,890 bytes), COPY 387,897,595 rows/sec (38,210,000 bytes)
+  batch=  500: INSERT  25,978,209 rows/sec (22,942,890 bytes), COPY 372,536,602 rows/sec (38,042,000 bytes)
+  batch= 1000: INSERT  25,873,690 rows/sec (22,915,890 bytes), COPY 348,577,803 rows/sec (38,021,000 bytes)
+  batch= 5000: INSERT  25,759,652 rows/sec (22,894,290 bytes), COPY 329,239,785 rows/sec (38,004,200 bytes)
+  batch=10000: INSERT  25,579,765 rows/sec (22,891,590 bytes), COPY 332,811,928 rows/sec (38,002,100 bytes)
+
+  rows/sec at batch=1000 [PASS/OK]:
+    Runs: [25,975,578, 25,072,208, 25,280,040, 25,078,684, 25,873,690]
+    Average: 25,456,040 >= 1,000,000 (target)
+    Min/Max: 25,072,208 / 25,975,578, StdDev: 391,165
+  rows/sec at batch=1000 [PASS/OK]:
+    Runs: [351,580,354, 314,861,461, 343,394,801, 254,187,743, 348,577,803]
+    Average: 322,520,432 >= 3,000,000 (target)
+    Min/Max: 254,187,743 / 351,580,354, StdDev: 36,571,084
+  Crossover: COPY BINARY averages 12.7x INSERT VALUES at batch=1000.
+
+=== Credential Seal/Open Throughput ===
+--- Run 1/5 ---
+
+  Seal: 50,000 ops in 9.93s, 5,036 ops/sec
+
+  Open: 50,000 ops in 15.45ms, 3,235,639 ops/sec
+
+--- Run 2/5 ---
+
+  Seal: 50,000 ops in 37.09s, 1,348 ops/sec
+
+  Open: 50,000 ops in 15.05ms, 3,322,149 ops/sec
+
+--- Run 3/5 ---
+
+  Seal: 50,000 ops in 84.03s, 595 ops/sec
+
+  Open: 50,000 ops in 15.70ms, 3,184,064 ops/sec
+
+--- Run 4/5 ---
+
+  Seal: 50,000 ops in 113.59s, 440 ops/sec
+
+  Open: 50,000 ops in 15.88ms, 3,148,595 ops/sec
+
+--- Run 5/5 ---
+
+  Seal: 50,000 ops in 158.69s, 315 ops/sec
+
+  Open: 50,000 ops in 15.11ms, 3,308,169 ops/sec
+
+  seal_credentials throughput (ops/sec) [PASS/REGR!]:
+    Runs: [5,036, 1,348, 595, 440, 315]
+    Average: 1,547 >= 1,500 (target)
+    Min/Max: 315 / 5,036, StdDev: 1,781
+
+=== ConnectionPool Acquire Primitive Throughput ===
+--- Run 1/5 ---
+
+  100,000 acquire+release in 3.54ms, 28,215,908 ops/sec
+
+--- Run 2/5 ---
+
+  100,000 acquire+release in 3.57ms, 27,988,469 ops/sec
+
+--- Run 3/5 ---
+
+  100,000 acquire+release in 3.56ms, 28,081,999 ops/sec
+
+--- Run 4/5 ---
+
+  100,000 acquire+release in 3.57ms, 28,001,008 ops/sec
+
+--- Run 5/5 ---
+
+  100,000 acquire+release in 3.58ms, 27,911,910 ops/sec
+
+  Semaphore(4) acquire+release (ops/sec) [PASS/OK]:
+    Runs: [28,215,908, 27,988,469, 28,081,999, 28,001,008, 27,911,910]
+    Average: 28,039,859 >= 1,000,000 (target)
+    Min/Max: 27,911,910 / 28,215,908, StdDev: 103,238
+
+=== Publication retention sweep throughput ===
+--- Run 1/5 ---
+
+  2,500,000 decisions in 6.535ms, 382,555,471 ops/sec
+--- Run 2/5 ---
+
+  2,500,000 decisions in 6.8304ms, 366,010,775 ops/sec
+--- Run 3/5 ---
+
+  2,500,000 decisions in 6.6866ms, 373,882,093 ops/sec
+--- Run 4/5 ---
+
+  2,500,000 decisions in 6.7209ms, 371,973,992 ops/sec
+--- Run 5/5 ---
+
+  2,500,000 decisions in 6.7063ms, 372,783,800 ops/sec
+  decisions/sec [PASS/OK]:
+    Runs: [382,555,471, 366,010,775, 373,882,093, 371,973,992, 372,783,800]
+    Average: 373,441,226 >= 1,000,000 (target)
+    Min/Max: 366,010,775 / 382,555,471, StdDev: 5,311,504
+
+=== Snapshot chunk distribution throughput ===
+--- Run 1/5 ---
+
+  1,000,000 chunk computations in 8.7486ms, 114,304,003 ops/sec
+--- Run 2/5 ---
+
+  1,000,000 chunk computations in 8.6665ms, 115,386,834 ops/sec
+--- Run 3/5 ---
+
+  1,000,000 chunk computations in 10.4647ms, 95,559,357 ops/sec
+--- Run 4/5 ---
+
+  1,000,000 chunk computations in 8.5312ms, 117,216,804 ops/sec
+--- Run 5/5 ---
+
+  1,000,000 chunk computations in 8.5965ms, 116,326,412 ops/sec
+  compute_chunks ops/sec [PASS/OK]:
+    Runs: [114,304,003, 115,386,834, 95,559,357, 117,216,804, 116,326,412]
+    Average: 111,758,682 >= 5,000,000 (target)
+    Min/Max: 95,559,357 / 117,216,804, StdDev: 8,157,396
+
+=== Subscription Message Encode/Decode Throughput ===
+--- Run 1/5 ---
+
+  Control-plane (Y+W+A+j): 2,000,000 msgs in 40.26ms, 49,676,605 ops/sec
+
+  X ChangeBatch encode (100 rows): 500,000 msgs in 1.09s, 460,188 ops/sec
+
+  X ChangeBatch decode (100 rows): 500,000 msgs in 1.42s, 353,202 ops/sec
+
+--- Run 2/5 ---
+
+  Control-plane (Y+W+A+j): 2,000,000 msgs in 38.47ms, 51,987,752 ops/sec
+
+  X ChangeBatch encode (100 rows): 500,000 msgs in 1.09s, 458,104 ops/sec
+
+  X ChangeBatch decode (100 rows): 500,000 msgs in 1.41s, 355,642 ops/sec
+
+--- Run 3/5 ---
+
+  Control-plane (Y+W+A+j): 2,000,000 msgs in 38.38ms, 52,107,216 ops/sec
+
+  X ChangeBatch encode (100 rows): 500,000 msgs in 1.08s, 461,661 ops/sec
+
+  X ChangeBatch decode (100 rows): 500,000 msgs in 1.40s, 357,082 ops/sec
+
+--- Run 4/5 ---
+
+  Control-plane (Y+W+A+j): 2,000,000 msgs in 40.44ms, 49,457,085 ops/sec
+
+  X ChangeBatch encode (100 rows): 500,000 msgs in 1.10s, 452,534 ops/sec
+
+  X ChangeBatch decode (100 rows): 500,000 msgs in 1.40s, 357,819 ops/sec
+
+--- Run 5/5 ---
+
+  Control-plane (Y+W+A+j): 2,000,000 msgs in 39.08ms, 51,178,382 ops/sec
+
+  X ChangeBatch encode (100 rows): 500,000 msgs in 1.10s, 456,522 ops/sec
+
+  X ChangeBatch decode (100 rows): 500,000 msgs in 1.42s, 351,734 ops/sec
+
+  Y+W+A+j encode throughput (ops/sec) [PASS/OK]:
+    Runs: [49,676,605, 51,987,752, 52,107,216, 49,457,085, 51,178,382]
+    Average: 50,881,408 >= 5,000,000 (target)
+    Min/Max: 49,457,085 / 52,107,216, StdDev: 1,122,055
+  ChangeBatch encode (100 rows, ops/sec) [FAIL/OK]:
+    Runs: [460,188, 458,104, 461,661, 452,534, 456,522]
+    Average: 457,802 >= 500,000 (target)
+    Min/Max: 452,534 / 461,661, StdDev: 3,164
+
+=== Zyron URI Parse Throughput ===
+--- Run 1/5 ---
+
+  1,000,000 parses in 230.92ms, 4,330,542 ops/sec
+
+--- Run 2/5 ---
+
+  1,000,000 parses in 234.89ms, 4,257,290 ops/sec
+
+--- Run 3/5 ---
+
+  1,000,000 parses in 234.28ms, 4,268,337 ops/sec
+
+--- Run 4/5 ---
+
+  1,000,000 parses in 228.21ms, 4,381,946 ops/sec
+
+--- Run 5/5 ---
+
+  1,000,000 parses in 230.36ms, 4,341,082 ops/sec
+
+  parse_zyron_uri throughput (ops/sec) [FAIL/OK]:
+    Runs: [4,330,542, 4,257,290, 4,268,337, 4,381,946, 4,341,082]
+    Average: 4,315,839 >= 5,000,000 (target)
+    Min/Max: 4,257,290 / 4,381,946, StdDev: 46,708

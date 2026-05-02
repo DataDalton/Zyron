@@ -1,0 +1,171 @@
+
+=== Transaction: B+Tree Split Under Concurrency Test ===
+
+--- Run 1/5 ---
+  160000 keys with interleaved inserts in 24.1316ms (6,630,310 ops/sec), height=2
+
+--- Run 2/5 ---
+  160000 keys with interleaved inserts in 25.0612ms (6,384,371 ops/sec), height=2
+
+--- Run 3/5 ---
+  160000 keys with interleaved inserts in 24.2102ms (6,608,785 ops/sec), height=2
+
+--- Run 4/5 ---
+  160000 keys with interleaved inserts in 24.8208ms (6,446,206 ops/sec), height=2
+
+--- Run 5/5 ---
+  160000 keys with interleaved inserts in 23.7004ms (6,750,941 ops/sec), height=2
+  Split insert throughput (ops/sec) [PASS/OK]:
+    Runs: [6,630,310, 6,384,371, 6,608,785, 6,446,206, 6,750,941]
+    Average: 6,564,123 >= 4,000,000 (target)
+    Min/Max: 6,384,371 / 6,750,941, StdDev: 132,281
+
+=== Transaction: Concurrent B+Tree Latch Coupling Test ===
+Threads: 16, Keys per thread: 10000, Total: 160000
+
+--- Run 1/5 ---
+  160000 keys in 18.5452ms (8,627,569 ops/sec), height=2
+
+--- Run 2/5 ---
+  160000 keys in 19.7904ms (8,084,728 ops/sec), height=2
+
+--- Run 3/5 ---
+  160000 keys in 23.5787ms (6,785,785 ops/sec), height=2
+
+--- Run 4/5 ---
+  160000 keys in 22.7639ms (7,028,673 ops/sec), height=2
+
+--- Run 5/5 ---
+  160000 keys in 23.9139ms (6,690,669 ops/sec), height=2
+  Insert throughput (ops/sec) [PASS/OK]:
+    Runs: [8,627,569, 8,084,728, 6,785,785, 7,028,673, 6,690,669]
+    Average: 7,443,485 >= 4,000,000 (target)
+    Min/Max: 6,690,669 / 8,627,569, StdDev: 772,608
+
+=== Transaction: Concurrent Transaction Test ===
+Threads: 16, Txns per thread: 1000
+
+--- Run 1/5 ---
+  16000 txns in 9.3247ms (1,715,873 ops/sec)
+
+--- Run 2/5 ---
+  16000 txns in 15.7764ms (1,014,173 ops/sec)
+
+--- Run 3/5 ---
+  16000 txns in 21.0209ms (761,147 ops/sec)
+
+--- Run 4/5 ---
+  16000 txns in 21.9749ms (728,103 ops/sec)
+
+--- Run 5/5 ---
+  16000 txns in 21.9432ms (729,155 ops/sec)
+  Throughput (txn/sec) [FAIL/OK]:
+    Runs: [1,715,873, 1,014,173, 761,147, 728,103, 729,155]
+    Average: 989,690 >= 1,000,000 (target)
+    Min/Max: 728,103 / 1,715,873, StdDev: 378,544
+
+=== Transaction: Intent Lock Conflict Test ===
+  Intent lock conflict: PASS
+    Intent lock acquired by first txn: verified
+    Conflict returned for second txn: verified
+    Lock released on commit, retry succeeds: verified
+    Consistent row + intent lock ordering: verified
+
+=== Transaction: Read Committed vs Snapshot Isolation ===
+  Isolation levels: PASS
+    SnapshotIsolation: committed data invisible to older snapshot: verified
+    ReadCommitted: refreshed snapshot sees committed data: verified
+
+=== Transaction: MVCC GC Test ===
+  MVCC GC: PASS
+    Dead tuples (xmax < oldest_active) reclaimable: verified
+    Live tuples (xmax=0) not reclaimable: verified
+    No active txns -> all deleted reclaimable: verified
+    Threshold-based page selection: verified
+    Reclaimed 5000 / 10000 dead tuples
+
+=== Transaction: NodeLatch Concurrent Stress Test ===
+
+--- Run 1/5 ---
+  Writes: 400000, read retries: 3308744 (52.45%), write CAS retries: 1218864
+
+--- Run 2/5 ---
+  Writes: 400000, read retries: 5635670 (65.26%), write CAS retries: 960839
+
+--- Run 3/5 ---
+  Writes: 400000, read retries: 7567992 (71.61%), write CAS retries: 1438844
+
+--- Run 4/5 ---
+  Writes: 400000, read retries: 4043407 (57.41%), write CAS retries: 609918
+
+--- Run 5/5 ---
+  Writes: 400000, read retries: 3156096 (51.27%), write CAS retries: 1171278
+  Reader retry rate (%) [FAIL/REGR!]:
+    Runs: [52, 65, 72, 57, 51]
+    Average: 60 <= 5 (target)
+    Min/Max: 51 / 72, StdDev: 8
+  Retry rate target: < 5% (result: 59.60%)
+
+=== Transaction: Optimistic Read Under Contention Test ===
+  Writer completed 100000 latch cycles during reader load
+  Total reads: 750000, retries: 283868 (27.46%)
+  Max read latency: 4860.50 us (target: < 10 us)
+  Max read latency (us) [FAIL]: 4,860 <= 10 (target)
+  Reader retry rate: 27.46% (indicates write contention frequency)
+
+=== Transaction: PageId u64 Addressing Test ===
+  PageId u64 addressing: PASS
+    PageId::new with u64 page_num: verified
+    as_u64 / from_u64 round-trip: verified
+    B+Tree leaf pointers store u64 page references: verified
+    Range scan packed values decode correctly: verified
+
+=== Transaction: Rollback (Abort) Test ===
+  Rollback (abort): PASS
+    Aborted txn removed from active set: verified
+    xmax=xmin marking makes aborted rows invisible: verified
+    Physical layer must set xmax on abort: verified
+
+=== Transaction: Snapshot Isolation Test ===
+  Snapshot isolation: PASS
+    Uncommitted insert invisible to concurrent txn: verified
+    Committed insert invisible to txn with older snapshot: verified
+    Committed insert visible to txn with newer snapshot: verified
+
+=== Transaction: Transaction Performance Microbenchmarks ===
+  begin()+commit() cycle (ns/op) [FAIL/REGR!]:
+    Runs: [297, 274, 581, 603, 621]
+    Average: 475 <= 250 (target)
+    Min/Max: 274 / 621, StdDev: 156
+  commit() latency (ns/op) [FAIL/REGR!]:
+    Runs: [802, 834, 865, 796, 816]
+    Average: 823 <= 200 (target)
+    Min/Max: 796 / 865, StdDev: 25
+  is_visible() latency (ns/op) [PASS/OK]:
+    Runs: [1, 1, 1, 1, 1]
+    Average: 1 <= 15 (target)
+    Min/Max: 1 / 1, StdDev: 0
+  lock_row() latency (ns/op) [PASS/OK]:
+    Runs: [72, 72, 73, 70, 69]
+    Average: 71 <= 80 (target)
+    Min/Max: 69 / 73, StdDev: 1
+  Snapshot::new() latency (ns/op) [PASS/OK]:
+    Runs: [19, 20, 20, 19, 20]
+    Average: 20 <= 200 (target)
+    Min/Max: 19 / 20, StdDev: 0
+  GC sweep throughput (tuples/sec) [PASS/OK]:
+    Runs: [1,934,984,520, 1,953,888,238, 1,962,708,538, 1,946,282,600, 1,954,652,072]
+    Average: 1,950,503,194 >= 500,000 (target)
+    Min/Max: 1,934,984,520 / 1,962,708,538, StdDev: 9,341,143
+
+=== Transaction: WAL Transaction Integration Test ===
+  WAL transaction integration: PASS
+    5 Begin, 3 Commit, 2 Abort records: verified
+    Committed txn WAL records: verified
+    Aborted txn WAL records: verified
+
+=== Transaction: Write-Write Conflict Test ===
+  Write-write conflict: PASS
+    First writer acquires lock: verified
+    Second writer gets TransactionConflict: verified
+    Retry after first writer commits: verified

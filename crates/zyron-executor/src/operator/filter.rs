@@ -6,6 +6,7 @@
 use zyron_planner::binder::BoundExpr;
 use zyron_planner::logical::LogicalColumn;
 
+use crate::column::ScalarValue;
 use crate::compute::column_to_mask;
 use crate::expr::evaluate;
 use crate::operator::{ExecutionBatch, Operator, OperatorResult};
@@ -17,6 +18,10 @@ pub struct FilterOperator {
     child: Box<dyn Operator>,
     predicate: BoundExpr,
     input_schema: Vec<LogicalColumn>,
+    /// Bound parameter values from the extended query protocol. Passed to
+    /// every `evaluate` call so a predicate that references `$1`, `$2`, ...
+    /// resolves against the values supplied at Bind time.
+    params: Vec<ScalarValue>,
 }
 
 impl FilterOperator {
@@ -29,6 +34,23 @@ impl FilterOperator {
             child,
             predicate,
             input_schema,
+            params: Vec::new(),
+        }
+    }
+
+    /// Builds a filter that evaluates its predicate against the given bound
+    /// parameter set.
+    pub fn with_params(
+        child: Box<dyn Operator>,
+        predicate: BoundExpr,
+        input_schema: Vec<LogicalColumn>,
+        params: Vec<ScalarValue>,
+    ) -> Self {
+        Self {
+            child,
+            predicate,
+            input_schema,
+            params,
         }
     }
 }
@@ -42,8 +64,12 @@ impl Operator for FilterOperator {
                     return Ok(None);
                 };
 
-                let mask_col =
-                    evaluate(&self.predicate, &exec_batch.batch, &self.input_schema, &[])?;
+                let mask_col = evaluate(
+                    &self.predicate,
+                    &exec_batch.batch,
+                    &self.input_schema,
+                    &self.params,
+                )?;
                 let mask = column_to_mask(&mask_col);
 
                 let filtered = exec_batch.batch.filter(&mask);

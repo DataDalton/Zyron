@@ -829,6 +829,7 @@ fn expr_to_sql(expr: &Expr) -> String {
                     FunctionArg::Named { name, value } => {
                         format!("{} => {}", name, expr_to_sql(value))
                     }
+                    FunctionArg::Wildcard => "*".to_string(),
                 })
                 .collect();
             if *distinct {

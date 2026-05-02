@@ -17,6 +17,52 @@ use crate::context::ExecutionContext;
 use crate::expr::evaluate;
 use crate::operator::{ExecutionBatch, Operator, OperatorResult};
 
+/// Encodes a row's value at the given column position into bytes suitable
+/// for B+Tree key comparison. Big-endian for integers (matches the literal
+/// path in extract_scan_bounds), Utf8 as raw bytes
+fn encode_btree_key(
+    batch: &DataBatch,
+    row_idx: usize,
+    col_pos: usize,
+    type_id: TypeId,
+) -> Option<Vec<u8>> {
+    let col = batch.columns.get(col_pos)?;
+    if col.is_null(row_idx) {
+        return None;
+    }
+    match (&col.data, type_id) {
+        (ColumnData::Int8(v), _) => Some((v[row_idx] as i64 as u64).to_be_bytes().to_vec()),
+        (ColumnData::Int16(v), _) => Some((v[row_idx] as i64 as u64).to_be_bytes().to_vec()),
+        (ColumnData::Int32(v), _) => Some((v[row_idx] as i64 as u64).to_be_bytes().to_vec()),
+        (ColumnData::Int64(v), _) => Some((v[row_idx] as u64).to_be_bytes().to_vec()),
+        (ColumnData::UInt8(v), _) => Some((v[row_idx] as u64).to_be_bytes().to_vec()),
+        (ColumnData::UInt16(v), _) => Some((v[row_idx] as u64).to_be_bytes().to_vec()),
+        (ColumnData::UInt32(v), _) => Some((v[row_idx] as u64).to_be_bytes().to_vec()),
+        (ColumnData::UInt64(v), _) => Some(v[row_idx].to_be_bytes().to_vec()),
+        (ColumnData::Float64(v), _) => {
+            let bits = v[row_idx].to_bits();
+            let sortable = if bits >> 63 == 1 {
+                !bits
+            } else {
+                bits ^ (1u64 << 63)
+            };
+            Some(sortable.to_be_bytes().to_vec())
+        }
+        (ColumnData::Float32(v), _) => {
+            let bits = (v[row_idx] as f64).to_bits();
+            let sortable = if bits >> 63 == 1 {
+                !bits
+            } else {
+                bits ^ (1u64 << 63)
+            };
+            Some(sortable.to_be_bytes().to_vec())
+        }
+        (ColumnData::Utf8(v), _) => Some(v[row_idx].as_bytes().to_vec()),
+        (ColumnData::Binary(v), _) => Some(v[row_idx].clone()),
+        _ => None,
+    }
+}
+
 /// Extracts text content from a DataBatch row for FTS indexing into a reusable buffer.
 /// Concatenates all text-type columns (Varchar, Text, Char) for the given row
 /// into the buffer, separated by spaces. The caller should call buf.clear() between rows.
@@ -152,6 +198,10 @@ fn count_batch(count: i64) -> DataBatch {
 pub struct ValuesOperator {
     rows: Vec<Vec<BoundExpr>>,
     schema: Vec<LogicalColumn>,
+    /// Bound parameters from the extended query protocol. The single-row
+    /// evaluator passes these to every `evaluate` call so VALUES expressions
+    /// containing `$1`, `$2`, ... resolve correctly.
+    params: Vec<ScalarValue>,
     emitted: bool,
 }
 
@@ -160,6 +210,23 @@ impl ValuesOperator {
         Self {
             rows,
             schema,
+            params: Vec::new(),
+            emitted: false,
+        }
+    }
+
+    /// Builds a values operator that evaluates against the given bound
+    /// parameter set. Used by the extended query protocol to thread
+    /// `$1`, `$2`, ... values into VALUES.
+    pub fn with_params(
+        rows: Vec<Vec<BoundExpr>>,
+        schema: Vec<LogicalColumn>,
+        params: Vec<ScalarValue>,
+    ) -> Self {
+        Self {
+            rows,
+            schema,
+            params,
             emitted: false,
         }
     }
@@ -189,7 +256,7 @@ impl Operator for ValuesOperator {
 
             for row_exprs in &self.rows {
                 for (c, expr) in row_exprs.iter().enumerate() {
-                    let col = evaluate(expr, &dummy, &self.schema, &[])?;
+                    let col = evaluate(expr, &dummy, &self.schema, &self.params)?;
                     let scalar = if col.len() > 0 {
                         col.get_scalar(0)
                     } else {
@@ -249,7 +316,7 @@ impl Operator for InsertOperator {
             self.finished = true;
 
             let table_entry = self.ctx.get_table_entry(self.table_id)?;
-            let heap_file = self.ctx.get_heap_file(self.table_id)?;
+            let heap_file = self.ctx.get_heap_file(self.table_id).await?;
             let mut total_inserted: i64 = 0;
             let txn_id = self.ctx.txn_id;
 
@@ -388,6 +455,28 @@ impl Operator for InsertOperator {
                     }
                 }
 
+                // Maintain B+Tree indexes
+                let btree_indexes = self.ctx.btree_indexes_for_table(self.table_id.0);
+                for (idx_id, col_id) in &btree_indexes {
+                    let Some(btree) = self.ctx.get_index(zyron_catalog::IndexId(*idx_id)) else {
+                        continue;
+                    };
+                    let col_pos = table_entry.columns.iter().position(|c| c.id == *col_id);
+                    let Some(col_pos) = col_pos else { continue };
+                    let col_entry = &table_entry.columns[col_pos];
+                    for (row_idx, tid) in tuple_ids.iter().enumerate() {
+                        if let Some(key) =
+                            encode_btree_key(&exec_batch.batch, row_idx, col_pos, col_entry.type_id)
+                        {
+                            let normalized = TupleId::new(
+                                zyron_common::page::PageId::new(0, tid.page_id.page_num),
+                                tid.slot_id,
+                            );
+                            let _ = btree.insert_sync(&key, normalized);
+                        }
+                    }
+                }
+
                 // Notify CDC hook if present.
                 if let Some(ref hook) = self.ctx.cdc_hook {
                     let tuple_refs: Vec<&[u8]> = tuples.iter().map(|t| t.data()).collect();
@@ -444,7 +533,7 @@ impl Operator for DeleteOperator {
             }
             self.finished = true;
 
-            let heap_file = self.ctx.get_heap_file(self.table_id)?;
+            let heap_file = self.ctx.get_heap_file(self.table_id).await?;
             let mut total_deleted: i64 = 0;
             let txn_id = self.ctx.txn_id;
 
@@ -622,7 +711,7 @@ impl Operator for UpdateOperator {
             self.finished = true;
 
             let table_entry = self.ctx.get_table_entry(self.table_id)?;
-            let heap_file = self.ctx.get_heap_file(self.table_id)?;
+            let heap_file = self.ctx.get_heap_file(self.table_id).await?;
             let mut total_updated: i64 = 0;
             let txn_id = self.ctx.txn_id;
 
@@ -646,7 +735,7 @@ impl Operator for UpdateOperator {
                         &assignment.value,
                         &exec_batch.batch,
                         &self.input_schema,
-                        &[],
+                        &self.ctx.params,
                     )?;
 
                     // Find the column index matching this assignment's column_id.

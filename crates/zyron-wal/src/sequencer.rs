@@ -38,28 +38,33 @@ impl LsnSequencer {
     /// before retrying. The LSN returned in this case is the current position
     /// (not advanced).
     ///
-    /// Uses fetch_add instead of CAS for the hot path. fetch_add always succeeds
-    /// on the first attempt, eliminating the retry loop and the Acquire load.
-    /// Rotation detection uses the post-add offset: if the new offset exceeds the
-    /// segment boundary, the record_size is subtracted back (another fetch_add)
-    /// and rotation is signaled.
+    /// CAS loop reserves an LSN only if the new offset fits in the current
+    /// segment. fetch_add + fetch_sub-on-overflow races with concurrent
+    /// reservations that can read a pre-undo position and commit past the
+    /// segment boundary, so this path is CAS-only
     #[inline]
     pub fn reserve(&self, record_size: u32) -> (Lsn, bool) {
-        let prev = self
-            .next_lsn
-            .fetch_add(record_size as u64, Ordering::Relaxed);
-        let segment_id = (prev >> 32) as u32;
-        let offset = prev as u32;
-
-        if offset + record_size > self.segment_size {
-            // Record does not fit. Undo the advance so the offset stays at the
-            // segment boundary for the rotation path.
-            self.next_lsn
-                .fetch_sub(record_size as u64, Ordering::Relaxed);
-            return (Lsn::new(segment_id, offset), true);
+        let mut prev = self.next_lsn.load(Ordering::Acquire);
+        loop {
+            let segment_id = (prev >> 32) as u32;
+            let offset = prev as u32;
+            if offset.saturating_add(record_size) > self.segment_size {
+                return (Lsn::new(segment_id, offset), true);
+            }
+            let new = prev + record_size as u64;
+            match self.next_lsn.compare_exchange_weak(
+                prev,
+                new,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return (Lsn::new(segment_id, offset), false),
+                Err(observed) => {
+                    prev = observed;
+                    std::hint::spin_loop();
+                }
+            }
         }
-
-        (Lsn::new(segment_id, offset), false)
     }
 
     /// Advances to the next segment.

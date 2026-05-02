@@ -382,7 +382,7 @@ impl PhysicalPlan {
                 let mut schema = Vec::new();
                 for (i, expr) in group_by.iter().enumerate() {
                     schema.push(LogicalColumn {
-                        table_idx: None,
+                        table_idx: Some(crate::logical::AGGREGATE_TABLE_IDX),
                         column_id: ColumnId(i as u16),
                         name: format!("group{}", i),
                         type_id: expr.type_id(),
@@ -392,7 +392,7 @@ impl PhysicalPlan {
                 for (i, agg) in aggregates.iter().enumerate() {
                     let idx = group_by.len() + i;
                     schema.push(LogicalColumn {
-                        table_idx: None,
+                        table_idx: Some(crate::logical::AGGREGATE_TABLE_IDX),
                         column_id: ColumnId(idx as u16),
                         name: agg.function_name.clone(),
                         type_id: agg.return_type,

@@ -17,6 +17,15 @@ use zyron_parser::ast::{JoinType, SetOpType};
 // Logical column
 // ---------------------------------------------------------------------------
 
+/// Synthetic table index assigned to every column produced by an Aggregate
+/// node's output schema. The post-aggregate projection rewriter creates
+/// `ColumnRef`s with this `table_idx` so the executor's resolver matches
+/// them to the aggregate's output regardless of the original table layout.
+///
+/// `usize::MAX` is well outside any real bind-context table index space, so
+/// it cannot collide with a base-table or subquery alias.
+pub const AGGREGATE_TABLE_IDX: usize = usize::MAX;
+
 /// A column in the output schema of a logical plan node.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogicalColumn {

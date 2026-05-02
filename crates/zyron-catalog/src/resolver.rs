@@ -61,6 +61,17 @@ impl NameResolver {
             return self.find_table_in_schema(schema_entry.id, table_name).await;
         }
 
+        // No qualifier and empty search path is a programming or user error.
+        // Be explicit so the client can fix it rather than chasing a generic
+        // "table not found" message.
+        if self.search_path.is_empty() {
+            return Err(ZyronError::PlanError(format!(
+                "cannot resolve unqualified name `{}`: search_path is empty. \
+                 Qualify it as `schema.{}` or run `SET search_path = your_schema` first.",
+                table_name, table_name,
+            )));
+        }
+
         for path_schema in &self.search_path {
             if let Some(schema_entry) = self.cache.get_schema_by_name(self.database_id, path_schema)
             {

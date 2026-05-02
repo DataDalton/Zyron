@@ -97,10 +97,11 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
 
     // 3. GROUP BY + aggregates -> Aggregate
     let (has_aggregates, aggregates) = extract_aggregates(&select.projections);
-    if !select.group_by.is_empty() || has_aggregates {
+    let aggregate_pushed = !select.group_by.is_empty() || has_aggregates;
+    if aggregate_pushed {
         plan = LogicalPlan::Aggregate {
             group_by: select.group_by.clone(),
-            aggregates,
+            aggregates: aggregates.clone(),
             child: Box::new(plan),
         };
     }
@@ -114,7 +115,18 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
     }
 
     // 5. SELECT -> Project
-    let (expressions, aliases) = build_projection_list(&select.projections);
+    //
+    // When an aggregate is in scope, the projection list still references
+    // the original `AggregateFunction` and group-by expressions. Those
+    // cannot be evaluated by the projection operator: the aggregate has
+    // already collapsed the rows. Rewrite each occurrence into a column
+    // reference into the aggregate node's output schema.
+    let (mut expressions, aliases) = build_projection_list(&select.projections);
+    if aggregate_pushed {
+        for expr in expressions.iter_mut() {
+            rewrite_post_aggregate(expr, &select.group_by, &aggregates);
+        }
+    }
     if !expressions.is_empty() {
         plan = LogicalPlan::Project {
             expressions,
@@ -250,6 +262,101 @@ fn extract_aggregates(projections: &[BoundSelectItem]) -> (bool, Vec<AggregateEx
     (has_agg, aggregates)
 }
 
+/// Walks a projection expression that sits above an `Aggregate` plan node and
+/// rewrites every `AggregateFunction` and group-by sub-expression into a
+/// `ColumnRef` that points at the aggregate's output schema.
+///
+/// Aggregate output column layout: `group_by[0..n]` first, then
+/// `aggregates[0..m]` at indices `n..(n+m)`. The `table_idx` on each
+/// generated `ColumnRef` is `AGGREGATE_TABLE_IDX`, which matches the
+/// synthetic table_idx that `HashAggregate` and `SortAggregate` set on
+/// their output schemas.
+fn rewrite_post_aggregate(
+    expr: &mut BoundExpr,
+    group_by: &[BoundExpr],
+    aggregates: &[AggregateExpr],
+) {
+    // Group-by exprs at the top level of the projection collapse to a
+    // ColumnRef into the i-th group output column.
+    if let Some(i) = group_by.iter().position(|g| g == expr) {
+        let g = &group_by[i];
+        *expr = BoundExpr::ColumnRef(crate::binder::ColumnRef {
+            table_idx: AGGREGATE_TABLE_IDX,
+            column_id: ColumnId(i as u16),
+            type_id: g.type_id(),
+            nullable: g.nullable(),
+        });
+        return;
+    }
+
+    match expr {
+        BoundExpr::AggregateFunction {
+            name,
+            args,
+            distinct,
+            return_type,
+        } => {
+            let needle = AggregateExpr {
+                function_name: name.clone(),
+                args: args.clone(),
+                distinct: *distinct,
+                return_type: *return_type,
+            };
+            let agg_idx = aggregates
+                .iter()
+                .position(|a| {
+                    a.function_name == needle.function_name
+                        && a.args == needle.args
+                        && a.distinct == needle.distinct
+                })
+                .expect("aggregate referenced in projection must exist in plan's aggregate list");
+            let column_idx = group_by.len() + agg_idx;
+            *expr = BoundExpr::ColumnRef(crate::binder::ColumnRef {
+                table_idx: AGGREGATE_TABLE_IDX,
+                column_id: ColumnId(column_idx as u16),
+                type_id: *return_type,
+                nullable: true,
+            });
+        }
+        BoundExpr::BinaryOp { left, right, .. } => {
+            rewrite_post_aggregate(left, group_by, aggregates);
+            rewrite_post_aggregate(right, group_by, aggregates);
+        }
+        BoundExpr::UnaryOp { expr: inner, .. } => {
+            rewrite_post_aggregate(inner, group_by, aggregates);
+        }
+        BoundExpr::Function { args, .. } => {
+            for arg in args.iter_mut() {
+                rewrite_post_aggregate(arg, group_by, aggregates);
+            }
+        }
+        BoundExpr::Nested(inner) => {
+            rewrite_post_aggregate(inner, group_by, aggregates);
+        }
+        BoundExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand.as_mut() {
+                rewrite_post_aggregate(op, group_by, aggregates);
+            }
+            for wc in conditions.iter_mut() {
+                rewrite_post_aggregate(&mut wc.condition, group_by, aggregates);
+                rewrite_post_aggregate(&mut wc.result, group_by, aggregates);
+            }
+            if let Some(e) = else_result.as_mut() {
+                rewrite_post_aggregate(e, group_by, aggregates);
+            }
+        }
+        BoundExpr::Cast { expr: inner, .. } => {
+            rewrite_post_aggregate(inner, group_by, aggregates);
+        }
+        _ => {}
+    }
+}
+
 fn collect_aggregates_from_expr(
     expr: &BoundExpr,
     out: &mut Vec<AggregateExpr>,
@@ -370,13 +477,16 @@ fn build_insert_plan(insert: &BoundInsert) -> Result<LogicalPlan> {
 }
 
 fn build_update_plan(update: &BoundUpdate) -> Result<LogicalPlan> {
-    // Scan the target table
+    // Scan the target table. The columns must carry the same `table_idx` as
+    // the Scan node so column references in WHERE and SET resolve through
+    // the executor's `(table_idx, column_id)` lookup.
+    const TABLE_IDX: usize = 0;
     let columns: Vec<LogicalColumn> = update
         .table_entry
         .columns
         .iter()
         .map(|c| LogicalColumn {
-            table_idx: None,
+            table_idx: Some(TABLE_IDX),
             column_id: c.id,
             name: c.name.clone(),
             type_id: c.type_id,
@@ -386,7 +496,7 @@ fn build_update_plan(update: &BoundUpdate) -> Result<LogicalPlan> {
 
     let mut plan = LogicalPlan::Scan {
         table_id: update.table_id,
-        table_idx: 0,
+        table_idx: TABLE_IDX,
         columns,
         alias: update.table_entry.name.clone(),
         encoding_hints: None,
@@ -409,12 +519,14 @@ fn build_update_plan(update: &BoundUpdate) -> Result<LogicalPlan> {
 }
 
 fn build_delete_plan(delete: &BoundDelete) -> Result<LogicalPlan> {
+    // Same column->scan table_idx alignment as build_update_plan.
+    const TABLE_IDX: usize = 0;
     let columns: Vec<LogicalColumn> = delete
         .table_entry
         .columns
         .iter()
         .map(|c| LogicalColumn {
-            table_idx: None,
+            table_idx: Some(TABLE_IDX),
             column_id: c.id,
             name: c.name.clone(),
             type_id: c.type_id,
@@ -424,7 +536,7 @@ fn build_delete_plan(delete: &BoundDelete) -> Result<LogicalPlan> {
 
     let mut plan = LogicalPlan::Scan {
         table_id: delete.table_id,
-        table_idx: 0,
+        table_idx: TABLE_IDX,
         columns,
         alias: delete.table_entry.name.clone(),
         encoding_hints: None,

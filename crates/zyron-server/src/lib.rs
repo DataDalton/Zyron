@@ -602,11 +602,9 @@ impl Server {
         // zyron-server. Startup recovery below populates it from the catalog.
         // -------------------------------------------------------------------
         let gateway_router = Arc::new(crate::gateway::router::Router::new());
-        let endpoint_registrar: Arc<
-            dyn zyron_wire::EndpointRegistrar,
-        > = Arc::new(crate::gateway::router::CatalogEndpointRegistrar::new(
-            Arc::clone(&gateway_router),
-        ));
+        let endpoint_registrar: Arc<dyn zyron_wire::EndpointRegistrar> = Arc::new(
+            crate::gateway::router::CatalogEndpointRegistrar::new(Arc::clone(&gateway_router)),
+        );
 
         // Wrap the SecurityManager in an Arc once so both ServerState and the
         // admin executor share the same instance.
@@ -791,6 +789,8 @@ impl Server {
             tls_acceptor: None,
             endpoint_registrar: Some(Arc::clone(&endpoint_registrar)),
             subscription_runtimes: Arc::new(scc::HashMap::new()),
+            heap_files: Arc::new(scc::HashMap::new()),
+            btree_indexes: Arc::new(scc::HashMap::new()),
         });
 
         // -------------------------------------------------------------------
@@ -1040,26 +1040,18 @@ impl Server {
                 keys.push(*k);
                 true
             });
-            let mut drained: Vec<(
-                zyron_catalog::SubscriptionId,
-                tokio::task::JoinHandle<()>,
-            )> = Vec::with_capacity(keys.len());
+            let mut drained: Vec<(zyron_catalog::SubscriptionId, tokio::task::JoinHandle<()>)> =
+                Vec::with_capacity(keys.len());
             for k in keys {
-                if let Some((_, h)) = state_for_shutdown
-                    .subscription_runtimes
-                    .remove_sync(&k)
-                {
+                if let Some((_, h)) = state_for_shutdown.subscription_runtimes.remove_sync(&k) {
                     drained.push((k, h));
                 }
             }
             let count = drained.len();
             for (id, handle) in drained {
                 handle.abort();
-                let waited = tokio::time::timeout(
-                    std::time::Duration::from_millis(500),
-                    handle,
-                )
-                .await;
+                let waited =
+                    tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
                 if let Err(_elapsed) = waited {
                     warn!(
                         target: "zyron::shutdown",
@@ -1299,10 +1291,12 @@ async fn respawn_streaming_job(
             ZyronError::PlanError("recovery: stored SQL has no CREATE STREAMING JOB".to_string())
         })?;
 
-    let resolver = state.catalog.resolver(
-        zyron_catalog::SYSTEM_DATABASE_ID,
-        vec!["public".to_string()],
-    );
+    // Recovery binder runs against fully-qualified identifiers stored in the
+    // streaming job entry, so no default search path is needed. Any
+    // unqualified identifier in recovered SQL is a bug that should surface.
+    let resolver = state
+        .catalog
+        .resolver(zyron_catalog::SYSTEM_DATABASE_ID, Vec::new());
     let mut binder = zyron_planner::Binder::new(resolver, &state.catalog);
     let bound = binder.bind(stmt).await?;
     let bsj = match bound {

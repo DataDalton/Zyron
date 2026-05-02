@@ -17,8 +17,8 @@ pub mod storage;
 pub use cache::CatalogCache;
 pub use catalog::Catalog;
 pub use ids::{
-    CATALOG_SCHEMA_ID, ColumnId, DEFAULT_SCHEMA_ID, DatabaseId, EndpointId, ExternalSinkId,
-    ExternalSourceId, IndexId, Oid, OidAllocator, PublicationId, SYSTEM_DATABASE_ID, SchemaId,
+    ColumnId, DatabaseId, EndpointId, ExternalSinkId, ExternalSourceId, IndexId, Oid, OidAllocator,
+    PublicationId, SYSTEM_DATABASE_ID, SYSTEM_SCHEMA_ID, SYSTEM_SCHEMA_NAME, SchemaId,
     SecurityMapId, SequenceId, StreamingJobId, SubscriptionId, TableId, USER_OID_START,
 };
 pub use resolver::NameResolver;

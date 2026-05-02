@@ -234,7 +234,10 @@ impl EndpointExecutor {
         let submit_result = self.worker.submit(move || {
             Box::pin(async move {
                 let db_id = SYSTEM_DATABASE_ID;
-                let search_path = vec!["public".to_string()];
+                // Endpoint SQL is authored by the endpoint creator and is
+                // expected to be schema-qualified. No default search_path is
+                // injected; unqualified names will fail with a clear error.
+                let search_path: Vec<String> = Vec::new();
                 let plan = match zyron_planner::plan(&catalog, db_id, search_path, stmt).await {
                     Ok(p) => p,
                     Err(e) => {

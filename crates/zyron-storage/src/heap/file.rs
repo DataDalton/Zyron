@@ -139,6 +139,23 @@ impl AtomicHintSlots {
         }
         None
     }
+
+    /// Sums the conservative min free space across every cached slot.
+    /// Used by `insert_batch` to predict how many bytes can be reused
+    /// from existing pages before deciding how many to allocate
+    #[inline]
+    fn estimated_total_min_space(&self) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut total = 0usize;
+        for slot in &self.slots {
+            let current = slot.load(Relaxed);
+            if current != HINT_EMPTY {
+                let (_, cat) = Self::unpack(current);
+                total += category_to_min_space(cat as u8);
+            }
+        }
+        total
+    }
 }
 
 /// HeapFile manages tuple storage with buffer pool caching.
@@ -163,6 +180,8 @@ pub struct HeapFile {
     /// Pending FSM updates. Uses Mutex because Vec append is not lock-free.
     /// Only contended during FSM flush and page boundary transitions.
     pending_fsm: parking_lot::Mutex<Vec<PendingFsmUpdate>>,
+    /// Active insertion page for the atomic insert path, u32::MAX = none yet
+    current_insert_page: std::sync::atomic::AtomicU32,
 }
 
 impl HeapFile {
@@ -184,6 +203,7 @@ impl HeapFile {
             cached_fsm_pages: AtomicU32::new(0),
             hint_slots: AtomicHintSlots::new(),
             pending_fsm: parking_lot::Mutex::new(Vec::with_capacity(64)),
+            current_insert_page: AtomicU32::new(u32::MAX),
         })
     }
 
@@ -196,6 +216,12 @@ impl HeapFile {
             .store(heap_pages as u32, Ordering::Relaxed);
         self.cached_fsm_pages
             .store(fsm_pages as u32, Ordering::Relaxed);
+        // Resume appending into the last existing page if any. The first
+        // insert will atomically detect PageFull and roll over via CAS
+        if heap_pages > 0 {
+            self.current_insert_page
+                .store((heap_pages - 1) as u32, Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -463,6 +489,13 @@ impl HeapFile {
         Ok(self.heap_page_count())
     }
 
+    /// Lock-free atomic read of the cached page count for hot paths
+    /// that cannot afford async or fallible API
+    #[inline]
+    pub fn num_pages_cached(&self) -> u32 {
+        self.heap_page_count()
+    }
+
     /// Flushes all dirty heap pages to disk.
     /// Uses synchronous I/O because flush_all's closure cannot await.
     pub async fn flush(&self) -> Result<()> {
@@ -619,59 +652,152 @@ impl HeapFile {
         Ok(updates.len())
     }
 
-    /// Batch insert multiple tuples.
+    /// Batch insert via the lock-free atomic burst path
     ///
-    /// Pre-allocates pages in bulk based on total tuple data size, reducing
-    /// per-page mutex acquisition from N calls to 1. Falls back to single
-    /// allocation when the pre-allocated pool runs out (rare, only when
-    /// tuple sizes vary significantly from the estimate).
+    /// Multi-page batches pre-allocate locally in one allocate_pages_batch
+    /// call and consume from a local Vec, single-page batches go through
+    /// the shared current_insert_page CAS path
     pub async fn insert_batch(&self, tuples: &[Tuple]) -> Result<Vec<TupleId>> {
+        use std::sync::atomic::Ordering;
+
         if tuples.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Estimate pages needed from total data size. Each tuple needs
-        // size_on_disk + slot overhead. Usable space per fresh page is
-        // PAGE_SIZE minus page header and heap header.
         let usable_per_page = PAGE_SIZE - DATA_START;
         let total_bytes: usize = tuples
             .iter()
             .map(|t| t.size_on_disk() + TUPLE_SLOT_SIZE)
             .sum();
-        let estimated_pages = (total_bytes / usable_per_page + 1) as u32;
+        let estimated_pages = ((total_bytes + usable_per_page - 1) / usable_per_page).max(1) as u64;
 
-        // Pre-allocate pages in one mutex acquisition.
-        let pre_alloc = self
-            .disk
-            .allocate_pages_batch(self.config.heap_file_id, estimated_pages as u64)
-            .await?;
-        self.cached_heap_pages
-            .fetch_add(estimated_pages, std::sync::atomic::Ordering::Relaxed);
-        let mut pre_alloc_idx: usize = 0;
+        let mut local_pages: Vec<PageId> = if estimated_pages > 1 {
+            let alloc = self
+                .disk
+                .allocate_pages_batch(self.config.heap_file_id, estimated_pages)
+                .await?;
+            self.cached_heap_pages
+                .fetch_add(estimated_pages as u32, Ordering::Relaxed);
+            alloc
+        } else {
+            Vec::new()
+        };
+        // pop() yields in allocation order
+        local_pages.reverse();
 
-        // Pre-reserve buffer pool frames in a single free-list lock acquisition.
-        // Eliminates per-page mutex lock during the insert loop.
-        let reserved_frames = self.pool.reserve_frames(estimated_pages as usize);
-        let mut reserved_idx: usize = 0;
+        let mut results = Vec::with_capacity(tuples.len());
+        let mut cursor = 0usize;
+        let mut last_used_page: Option<u32> = None;
 
-        let result = self
-            .insert_batch_inner(
-                tuples,
-                &pre_alloc,
-                &mut pre_alloc_idx,
-                &reserved_frames,
-                &mut reserved_idx,
-                estimated_pages,
-            )
-            .await;
+        while cursor < tuples.len() {
+            let (page_id, is_fresh) = if let Some(pid) = local_pages.pop() {
+                (pid, true)
+            } else {
+                let mut page_num = self.current_insert_page.load(Ordering::Acquire);
+                if page_num == u32::MAX {
+                    page_num = self.advance_insert_page(u32::MAX).await?;
+                }
+                (
+                    PageId::new(self.config.heap_file_id, page_num as u64),
+                    false,
+                )
+            };
 
-        // Release unused reserved frames on both success and error paths.
-        if reserved_idx < reserved_frames.len() {
-            self.pool
-                .release_reserved_frames(&reserved_frames[reserved_idx..]);
+            if is_fresh {
+                let mut buf = [0u8; PAGE_SIZE];
+                HeapPage::init_fresh_slice_reuse(&mut buf, page_id);
+                let (_, evicted) = self.pool.load_page(page_id, &buf)?;
+                if let Some(ev) = evicted {
+                    self.disk.write_page(ev.page_id, &ev.data).await?;
+                }
+            } else if self.pool.fetch_page(page_id).is_none() {
+                let disk_data = self.disk.read_page(page_id).await?;
+                let (_, evicted) = self.pool.load_page(page_id, &disk_data)?;
+                if let Some(ev) = evicted {
+                    self.disk.write_page(ev.page_id, &ev.data).await?;
+                }
+            }
+
+            let inserted = unsafe {
+                let frame = self
+                    .pool
+                    .fetch_page(page_id)
+                    .expect("just pinned this page");
+                // balance the extra pin from this fetch
+                self.pool.unpin_page(page_id, false);
+                let raw: *mut [u8; PAGE_SIZE] = frame.data_ptr_mut();
+                HeapPage::insert_tuples_burst(
+                    raw as *mut u8,
+                    page_id,
+                    &tuples[cursor..],
+                    &mut results,
+                )
+            };
+
+            if inserted == 0 {
+                self.pool.unpin_page(page_id, false);
+                if !is_fresh {
+                    let _ = self.advance_insert_page(page_id.page_num as u32).await?;
+                }
+                continue;
+            }
+
+            self.pool.unpin_page(page_id, true);
+            cursor += inserted;
+            last_used_page = Some(page_id.page_num as u32);
         }
 
-        result
+        // monotonic publish of the last used page for future single-tuple inserts
+        if let Some(last) = last_used_page {
+            let mut current = self.current_insert_page.load(Ordering::Acquire);
+            while current == u32::MAX || last > current {
+                match self.current_insert_page.compare_exchange_weak(
+                    current,
+                    last,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => current = observed,
+                }
+            }
+        }
+
+        // unused pre-alloc tail stays as empty pages, SeqScan empty-page skip filters them
+        Ok(results)
+    }
+
+    /// Allocates a successor page and publishes it via CAS, losers leak an
+    /// empty page that SeqScan filters via slot_count == 0
+    async fn advance_insert_page(&self, observed_page: u32) -> Result<u32> {
+        use std::sync::atomic::Ordering;
+
+        let current = self.current_insert_page.load(Ordering::Acquire);
+        if current != observed_page {
+            return Ok(current);
+        }
+
+        let new_page_id = self.disk.allocate_page(self.config.heap_file_id).await?;
+        let new_page_num = new_page_id.page_num as u32;
+        self.cached_heap_pages.fetch_add(1, Ordering::Relaxed);
+
+        let mut buf = [0u8; PAGE_SIZE];
+        HeapPage::init_fresh_slice_reuse(&mut buf, new_page_id);
+        let (_, evicted) = self.pool.load_page(new_page_id, &buf)?;
+        if let Some(ev) = evicted {
+            self.disk.write_page(ev.page_id, &ev.data).await?;
+        }
+        self.pool.unpin_page(new_page_id, true);
+
+        match self.current_insert_page.compare_exchange(
+            observed_page,
+            new_page_num,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(new_page_num),
+            Err(other) => Ok(other),
+        }
     }
 
     /// Core insert loop, separated so the caller can release reserved frames
@@ -743,6 +869,10 @@ impl HeapFile {
                         buf_active = true;
                         is_fresh_page = false;
                     } else {
+                        // Hint cache promised more space than the page has,
+                        // remove the stale entry so we don't pay the wasted
+                        // fetch on the next tuple in this batch
+                        self.hint_slots.remove(page_num);
                         let pid = if *pre_alloc_idx < pre_alloc.len() {
                             let p = pre_alloc[*pre_alloc_idx];
                             *pre_alloc_idx += 1;

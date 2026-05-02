@@ -46,7 +46,15 @@ impl<'a> Optimizer<'a> {
     }
 
     /// Runs all rules repeatedly until no rule produces a change.
+    ///
+    /// Trivial plan shapes that no rule can improve (a bare `Insert(Values)`
+    /// or `Values` row source) bypass the rule loop entirely, sparing
+    /// `INSERT INTO t VALUES (...)` queries the per-row tree walks that
+    /// `ConstantFolding` and friends would otherwise do for nothing.
     pub fn optimize(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        if !plan_is_optimizable(&plan) {
+            return Ok(plan);
+        }
         let mut current = plan;
         for _ in 0..self.max_iterations {
             let mut changed = false;
@@ -61,5 +69,26 @@ impl<'a> Optimizer<'a> {
             }
         }
         Ok(current)
+    }
+}
+
+/// Returns true when at least one rule could meaningfully alter the plan.
+///
+/// Conservative: returns true for any shape that contains a Filter, Project,
+/// Join, Aggregate, Sort, Distinct, SetOp, Subquery, or Scan — i.e. anything
+/// where predicate/projection/encoding/index-advisor logic could fire.
+/// Returns false for plans whose entire body is `Insert{Values}` or `Values`
+/// without further structure on top.
+fn plan_is_optimizable(plan: &LogicalPlan) -> bool {
+    match plan {
+        // Pure value-producer with no upstream structure.
+        LogicalPlan::Values { .. } => false,
+        // INSERT-from-VALUES has no filter/project/scan to rewrite. INSERT
+        // with a SELECT source still walks into the source plan below.
+        LogicalPlan::Insert { source, .. } => match source.as_ref() {
+            LogicalPlan::Values { .. } => false,
+            other => plan_is_optimizable(other),
+        },
+        _ => true,
     }
 }

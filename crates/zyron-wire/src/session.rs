@@ -53,7 +53,9 @@ impl Session {
             ("TimeZone".into(), String::from("UTC")),
             ("integer_datetimes".into(), String::from("on")),
             ("standard_conforming_strings".into(), String::from("on")),
-            ("search_path".into(), String::from("\"$user\", public")),
+            // Empty default: Zyron does not auto-create a user schema. The
+            // client must set search_path or fully qualify identifiers.
+            ("search_path".into(), String::new()),
             ("is_superuser".into(), String::from(superuser_str)),
             ("session_authorization".into(), user.clone()),
         ]);
@@ -64,7 +66,7 @@ impl Session {
             database,
             user,
             database_id,
-            search_path: vec!["public".into()],
+            search_path: Vec::new(),
             security_context,
         }
     }
@@ -209,6 +211,7 @@ mod tests {
     #[test]
     fn test_default_search_path() {
         let session = test_session();
-        assert_eq!(session.search_path, vec!["public"]);
+        assert!(session.search_path.is_empty());
+        assert_eq!(session.get_variable("search_path"), Some(""));
     }
 }

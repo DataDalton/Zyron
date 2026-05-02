@@ -484,7 +484,34 @@ async fn handle_create_index(
         )
         .await
     {
-        Ok(_) => Ok(DdlResult::Tag("CREATE INDEX".to_string())),
+        Ok(index_id) => {
+            let checkpoint_dir = server.data_dir.join("indexes");
+            let _ = std::fs::create_dir_all(&checkpoint_dir);
+            let entry = server
+                .catalog
+                .get_indexes_for_table(table.id)
+                .into_iter()
+                .find(|e| e.id == index_id)
+                .ok_or_else(|| {
+                    ProtocolError::Database(ZyronError::Internal(format!(
+                        "newly created index {} not found in catalog",
+                        index_id.0
+                    )))
+                })?;
+            let btree = zyron_storage::BTreeIndex::create(
+                Arc::clone(&server.disk_manager),
+                Arc::clone(&server.buffer_pool),
+                entry.index_file_id,
+                checkpoint_dir,
+            )
+            .await
+            .map_err(ProtocolError::Database)?;
+            let _ = server
+                .btree_indexes
+                .insert_async(index_id.0, Arc::new(btree))
+                .await;
+            Ok(DdlResult::Tag("CREATE INDEX".to_string()))
+        }
         Err(ZyronError::IndexAlreadyExists(_)) => {
             // CreateIndexStatement does not have if_not_exists, treat as error
             Err(ProtocolError::Database(ZyronError::IndexAlreadyExists(
@@ -569,7 +596,7 @@ async fn handle_create_schema(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (db_id, _) = get_session_schema(session, server, None)?;
+    let db_id = get_session_database(session)?;
 
     // Check CREATE privilege on the database for schema creation
     check_ddl_privilege(
@@ -598,7 +625,7 @@ async fn handle_drop_schema(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (db_id, _) = get_session_schema(session, server, None)?;
+    let db_id = get_session_database(session)?;
 
     // Check CREATE privilege on the database (schema owners can drop their schemas)
     check_ddl_privilege(
@@ -917,7 +944,11 @@ fn eval_literal_expr(expr: &zyron_parser::ast::Expr) -> String {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Gets the database ID and default schema ID from the active session.
+/// Gets the database ID and the active schema ID from the session.
+///
+/// Zyron has no default user schema, so this returns an error when the
+/// session's search_path is empty. Callers must either qualify DDL
+/// identifiers or have the client set a search_path first.
 fn get_session_schema(
     session: &Option<Session>,
     server: &Arc<ServerState>,
@@ -931,7 +962,13 @@ fn get_session_schema(
         .search_path
         .first()
         .map(|s| s.as_str())
-        .unwrap_or("public");
+        .ok_or_else(|| {
+            ProtocolError::Malformed(
+                "no target schema: session search_path is empty. \
+             Qualify the object as `schema.name` or run `SET search_path = your_schema` first."
+                    .into(),
+            )
+        })?;
 
     let schema = server
         .catalog
@@ -939,6 +976,20 @@ fn get_session_schema(
         .map_err(ProtocolError::Database)?;
 
     Ok((db_id, schema.id))
+}
+
+/// Returns the database ID bound to the active session.
+///
+/// Used by DDL handlers that operate at the database scope (CREATE SCHEMA,
+/// DROP SCHEMA, streaming-job dispatch, etc.) and therefore do not need a
+/// target schema in the session's search_path.
+fn get_session_database(
+    session: &Option<Session>,
+) -> Result<zyron_catalog::DatabaseId, ProtocolError> {
+    let session = session
+        .as_ref()
+        .ok_or(ProtocolError::Malformed("no active session".into()))?;
+    Ok(session.database_id)
 }
 
 async fn handle_create_fulltext_index(
@@ -1346,11 +1397,11 @@ async fn dispatch_streaming_statement(
     session: &mut Option<Session>,
     raw_sql: &str,
 ) -> Result<DdlResult, ProtocolError> {
-    let (db_id, _) = get_session_schema(session, server, None)?;
+    let db_id = get_session_database(session)?;
     let search_path = session
         .as_ref()
         .map(|s| s.search_path.clone())
-        .unwrap_or_else(|| vec!["public".to_string()]);
+        .unwrap_or_default();
 
     let resolver = server.catalog.resolver(db_id, search_path);
     let mut binder = zyron_planner::Binder::new(resolver, &server.catalog);
@@ -2800,11 +2851,11 @@ async fn dispatch_external_statement(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (db_id, _) = get_session_schema(session, server, None)?;
+    let db_id = get_session_database(session)?;
     let search_path = session
         .as_ref()
         .map(|s| s.search_path.clone())
-        .unwrap_or_else(|| vec!["public".to_string()]);
+        .unwrap_or_default();
 
     let resolver = server.catalog.resolver(db_id, search_path);
     let mut binder = zyron_planner::Binder::new(resolver, &server.catalog);
@@ -3165,10 +3216,10 @@ async fn external_endpoint_in_use(
             Some(s) => s,
             None => continue,
         };
-        let resolver = server.catalog.resolver(
-            zyron_catalog::SYSTEM_DATABASE_ID,
-            vec!["public".to_string()],
-        );
+        // Recovery path: stored SQL is expected to be fully schema-qualified.
+        let resolver = server
+            .catalog
+            .resolver(zyron_catalog::SYSTEM_DATABASE_ID, Vec::new());
         let mut binder = zyron_planner::Binder::new(resolver, &server.catalog);
         let bound = match binder.bind(stmt).await {
             Ok(b) => b,
@@ -3524,11 +3575,11 @@ async fn dispatch_z2z_statement(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let (db_id, _) = get_session_schema(session, server, None)?;
+    let db_id = get_session_database(session)?;
     let search_path = session
         .as_ref()
         .map(|s| s.search_path.clone())
-        .unwrap_or_else(|| vec!["public".to_string()]);
+        .unwrap_or_default();
 
     let resolver = server.catalog.resolver(db_id, search_path);
     let mut binder = zyron_planner::Binder::new(resolver, &server.catalog);

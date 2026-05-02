@@ -588,6 +588,10 @@ pub enum Token {
     /// Identifier (unquoted or double-quoted).
     Ident(String),
 
+    /// Bind parameter, written as `$N` in SQL. The inner value is the 1-based
+    /// index, e.g. `$1` becomes `Token::Parameter(1)`.
+    Parameter(usize),
+
     // Arithmetic operators
     Plus,
     Minus,
@@ -647,6 +651,7 @@ impl std::fmt::Display for Token {
             Token::Float(n) => write!(f, "{n}"),
             Token::String(s) => write!(f, "'{s}'"),
             Token::Ident(s) => write!(f, "{s}"),
+            Token::Parameter(n) => write!(f, "${n}"),
             Token::Plus => f.write_str("+"),
             Token::Minus => f.write_str("-"),
             Token::Star => f.write_str("*"),

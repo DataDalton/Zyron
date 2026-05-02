@@ -1709,7 +1709,7 @@ impl<'a> Binder<'a> {
         &'b mut self,
         ctx: &'b mut BindContext,
         stmt: &'b SelectStatement,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BoundSelect>> + 'b>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BoundSelect>> + Send + 'b>> {
         Box::pin(async move {
             // Bind CTEs first
             let mut bound_ctes = Vec::new();
@@ -1825,7 +1825,7 @@ impl<'a> Binder<'a> {
         &'b mut self,
         ctx: &'b mut BindContext,
         table_ref: &'b TableRef,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BoundFromItem>> + 'b>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BoundFromItem>> + Send + 'b>> {
         Box::pin(async move {
             match table_ref {
                 TableRef::Table { name, alias, .. } => {
@@ -1963,6 +1963,12 @@ impl<'a> Binder<'a> {
                             FunctionArg::Unnamed(value) => {
                                 let bound = self.bind_expr(ctx, value).await?;
                                 params.push((String::new(), bound));
+                            }
+                            FunctionArg::Wildcard => {
+                                return Err(ZyronError::PlanError(format!(
+                                    "table function `{}()` does not accept `*`",
+                                    name
+                                )));
                             }
                         }
                     }
@@ -2129,7 +2135,7 @@ impl<'a> Binder<'a> {
         &'b mut self,
         ctx: &'b BindContext,
         expr: &'b Expr,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BoundExpr>> + 'b>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BoundExpr>> + Send + 'b>> {
         Box::pin(async move {
             match expr {
                 Expr::Identifier(name) => {
@@ -2244,18 +2250,43 @@ impl<'a> Binder<'a> {
                     args,
                     distinct,
                 } => {
+                    let is_agg = is_aggregate_function(name);
+                    let has_wildcard = args.iter().any(|a| matches!(a, FunctionArg::Wildcard));
+
+                    if has_wildcard {
+                        // `*` is only meaningful in `COUNT(*)`. Every other
+                        // aggregate and every scalar function must reject it
+                        // rather than treating it as a missing argument.
+                        if !is_agg || name.to_lowercase() != "count" || args.len() != 1 {
+                            return Err(ZyronError::PlanError(format!(
+                                "`*` is only valid as the sole argument to COUNT; got `{}`",
+                                name
+                            )));
+                        }
+                        // COUNT(*) counts input rows. The binder shapes this
+                        // as an aggregate with zero argument expressions; the
+                        // executor produces one Int64 per group regardless.
+                        return Ok(BoundExpr::AggregateFunction {
+                            name: "count".to_string(),
+                            args: Vec::new(),
+                            distinct: *distinct,
+                            return_type: TypeId::Int64,
+                        });
+                    }
+
                     let mut bound_args = Vec::with_capacity(args.len());
                     for a in args {
                         let e = match a {
                             FunctionArg::Unnamed(e) => e,
                             FunctionArg::Named { value, .. } => value,
+                            FunctionArg::Wildcard => unreachable!("wildcard handled above"),
                         };
                         bound_args.push(self.bind_expr(ctx, e).await?);
                     }
 
                     let arg_types: Vec<TypeId> = bound_args.iter().map(|a| a.type_id()).collect();
 
-                    if is_aggregate_function(name) {
+                    if is_agg {
                         let return_type = infer_aggregate_type(name, &arg_types)?;
                         Ok(BoundExpr::AggregateFunction {
                             name: name.to_lowercase(),
@@ -4571,6 +4602,9 @@ fn extract_column_name(arg: &FunctionArg) -> Result<String> {
                 "expected a column reference as the window function's first argument".to_string(),
             )),
         },
+        FunctionArg::Wildcard => Err(ZyronError::PlanError(
+            "`*` is not valid as a window function argument".to_string(),
+        )),
     }
 }
 
@@ -4582,6 +4616,9 @@ fn extract_interval_micros(arg: &FunctionArg) -> Result<i64> {
                 "expected an INTERVAL literal for the window duration".to_string(),
             )),
         },
+        FunctionArg::Wildcard => Err(ZyronError::PlanError(
+            "`*` is not valid in place of an INTERVAL literal".to_string(),
+        )),
     }
 }
 
@@ -4605,14 +4642,9 @@ fn resolve_agg_input(
     source_columns: &[ColumnEntry],
 ) -> Result<(Option<ColumnId>, TypeId)> {
     let upper = name.to_ascii_uppercase();
-    // COUNT(*) is parsed as a single positional argument that is the string
-    // identifier "*".
-    if upper == "COUNT" && args.len() == 1 {
-        if let FunctionArg::Unnamed(Expr::Identifier(n)) = &args[0] {
-            if n == "*" {
-                return Ok((None, TypeId::Null));
-            }
-        }
+    // COUNT(*) carries no column reference: it counts input rows.
+    if upper == "COUNT" && args.len() == 1 && matches!(&args[0], FunctionArg::Wildcard) {
+        return Ok((None, TypeId::Null));
     }
     if args.len() != 1 {
         return Err(ZyronError::PlanError(format!(
@@ -4629,6 +4661,11 @@ fn resolve_agg_input(
                 )));
             }
         },
+        FunctionArg::Wildcard => {
+            return Err(ZyronError::PlanError(format!(
+                "`*` is only valid as the sole argument to COUNT, not {name}"
+            )));
+        }
     };
     let col = source_columns
         .iter()

@@ -1,0 +1,95 @@
+{
+  "id": "2026-05-02_231616_7be4a00-local",
+  "date": "2026-05-02 23:23:16Z",
+  "ts": 1777764196,
+  "commit": "7be4a00-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "INSERT VALUES encode": {
+      "rows/sec at batch=1000": {
+        "average": 25456039.910612,
+        "runs": [25975577.76, 25072207.96, 25280039.64, 25078684.37, 25873689.82],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "COPY BINARY encode": {
+      "rows/sec at batch=1000": {
+        "average": 322520432.256458,
+        "runs": [351580353.69, 314861460.96, 343394801.00, 254187743.07, 348577802.57],
+        "target": 3000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Credential Seal": {
+      "seal_credentials throughput (ops/sec)": {
+        "average": 1546.746494,
+        "runs": [5035.50, 1347.95, 595.02, 440.19, 315.07],
+        "target": 1500.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Pool Acquire Primitive": {
+      "Semaphore(4) acquire+release (ops/sec)": {
+        "average": 28039858.873306,
+        "runs": [28215908.13, 27988468.75, 28081999.44, 28001008.04, 27911910.01],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Publication Retention Sweep": {
+      "decisions/sec": {
+        "average": 373441226.065887,
+        "runs": [382555470.54, 366010775.36, 373882092.54, 371973991.58, 372783800.31],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Snapshot Chunk Distribution": {
+      "compute_chunks ops/sec": {
+        "average": 111758682.019133,
+        "runs": [114304002.93, 115386834.36, 95559356.69, 117216804.20, 116326411.91],
+        "target": 5000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Subscription Control": {
+      "Y+W+A+j encode throughput (ops/sec)": {
+        "average": 50881407.978967,
+        "runs": [49676605.30, 51987751.69, 52107215.81, 49457084.85, 51178382.25],
+        "target": 5000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Subscription X Encode": {
+      "ChangeBatch encode (100 rows, ops/sec)": {
+        "average": 457801.625104,
+        "runs": [460188.37, 458103.96, 461660.61, 452533.65, 456521.53],
+        "target": 500000.000000,
+        "passed": false,
+        "higher_is_better": true
+      }
+    },
+    "URI Parse": {
+      "parse_zyron_uri throughput (ops/sec)": {
+        "average": 4315839.389033,
+        "runs": [4330541.58, 4257290.18, 4268336.67, 4381946.21, 4341082.31],
+        "target": 5000000.000000,
+        "passed": false,
+        "higher_is_better": true
+      }
+    }
+  }
+}

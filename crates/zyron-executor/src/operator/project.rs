@@ -7,6 +7,7 @@ use zyron_planner::binder::BoundExpr;
 use zyron_planner::logical::LogicalColumn;
 
 use crate::batch::DataBatch;
+use crate::column::ScalarValue;
 use crate::expr::evaluate;
 use crate::operator::{ExecutionBatch, Operator, OperatorResult};
 
@@ -16,6 +17,10 @@ pub struct ProjectOperator {
     child: Box<dyn Operator>,
     expressions: Vec<BoundExpr>,
     input_schema: Vec<LogicalColumn>,
+    /// Bound parameter values from the extended query protocol. Passed to
+    /// each evaluator call so projection expressions referencing `$1`, `$2`,
+    /// ... resolve against the values supplied at Bind time.
+    params: Vec<ScalarValue>,
 }
 
 impl ProjectOperator {
@@ -28,6 +33,21 @@ impl ProjectOperator {
             child,
             expressions,
             input_schema,
+            params: Vec::new(),
+        }
+    }
+
+    pub fn with_params(
+        child: Box<dyn Operator>,
+        expressions: Vec<BoundExpr>,
+        input_schema: Vec<LogicalColumn>,
+        params: Vec<ScalarValue>,
+    ) -> Self {
+        Self {
+            child,
+            expressions,
+            input_schema,
+            params,
         }
     }
 }
@@ -42,7 +62,7 @@ impl Operator for ProjectOperator {
 
             let mut columns = Vec::with_capacity(self.expressions.len());
             for expr in &self.expressions {
-                let col = evaluate(expr, &exec_batch.batch, &self.input_schema, &[])?;
+                let col = evaluate(expr, &exec_batch.batch, &self.input_schema, &self.params)?;
                 columns.push(col);
             }
 

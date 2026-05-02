@@ -75,7 +75,13 @@ static BENCHMARK_LOCK: Mutex<()> = Mutex::new(());
 
 async fn setup_catalog(
     dir: &std::path::Path,
-) -> (Arc<DiskManager>, Arc<BufferPool>, Arc<WalWriter>, Catalog) {
+) -> (
+    Arc<DiskManager>,
+    Arc<BufferPool>,
+    Arc<WalWriter>,
+    Catalog,
+    SchemaId,
+) {
     let data_dir = dir.join("data");
     let wal_dir = dir.join("wal");
     std::fs::create_dir_all(&data_dir).unwrap();
@@ -106,8 +112,11 @@ async fn setup_catalog(
     let catalog = Catalog::new(storage, cache, Arc::clone(&wal))
         .await
         .unwrap();
-
-    (disk, pool, wal, catalog)
+    let public_schema_id = catalog
+        .create_schema(SYSTEM_DATABASE_ID, "public", "system")
+        .await
+        .unwrap();
+    (disk, pool, wal, catalog, public_schema_id)
 }
 
 /// Creates a table with given columns and returns its TableId.
@@ -433,11 +442,11 @@ async fn test_binding() {
     zyron_bench_harness::init("planner");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
-    let (_disk, _pool, _wal, catalog) = setup_catalog(dir.path()).await;
+    let (_disk, _pool, _wal, catalog, public_schema_id) = setup_catalog(dir.path()).await;
 
     tprintln!("\n=== Binding ===");
 
-    let schema_id = DEFAULT_SCHEMA_ID;
+    let schema_id = public_schema_id;
     let table_id = create_table(&catalog, schema_id, "users", users_columns()).await;
     put_table_stats(&catalog, table_id, 10_000, 3);
 
@@ -498,11 +507,11 @@ async fn test_logical_plan() {
     zyron_bench_harness::init("planner");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
-    let (_disk, _pool, _wal, catalog) = setup_catalog(dir.path()).await;
+    let (_disk, _pool, _wal, catalog, public_schema_id) = setup_catalog(dir.path()).await;
 
     tprintln!("\n=== Logical Plan Structure ===");
 
-    let schema_id = DEFAULT_SCHEMA_ID;
+    let schema_id = public_schema_id;
     let users_id = create_table(&catalog, schema_id, "users", users_columns()).await;
     put_table_stats(&catalog, users_id, 10_000, 3);
 
@@ -593,11 +602,11 @@ async fn test_predicate_pushdown() {
     zyron_bench_harness::init("planner");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
-    let (_disk, _pool, _wal, catalog) = setup_catalog(dir.path()).await;
+    let (_disk, _pool, _wal, catalog, public_schema_id) = setup_catalog(dir.path()).await;
 
     tprintln!("\n=== Predicate Pushdown ===");
 
-    let schema_id = DEFAULT_SCHEMA_ID;
+    let schema_id = public_schema_id;
     let cols_a = vec![
         ColumnDef {
             name: "id".to_string(),
@@ -677,11 +686,11 @@ async fn test_projection_pushdown() {
     zyron_bench_harness::init("planner");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
-    let (_disk, _pool, _wal, catalog) = setup_catalog(dir.path()).await;
+    let (_disk, _pool, _wal, catalog, public_schema_id) = setup_catalog(dir.path()).await;
 
     tprintln!("\n=== Projection Pushdown ===");
 
-    let schema_id = DEFAULT_SCHEMA_ID;
+    let schema_id = public_schema_id;
     let wide_id = create_table(&catalog, schema_id, "wide_table", wide_table_columns(20)).await;
     put_table_stats(&catalog, wide_id, 100_000, 20);
 
@@ -728,11 +737,11 @@ async fn test_join_ordering() {
     zyron_bench_harness::init("planner");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
-    let (_disk, _pool, _wal, catalog) = setup_catalog(dir.path()).await;
+    let (_disk, _pool, _wal, catalog, public_schema_id) = setup_catalog(dir.path()).await;
 
     tprintln!("\n=== Join Ordering ===");
 
-    let schema_id = DEFAULT_SCHEMA_ID;
+    let schema_id = public_schema_id;
 
     // Create small, medium, large tables
     let small_cols = join_table_columns("small");
@@ -782,11 +791,11 @@ async fn test_index_selection() {
     zyron_bench_harness::init("planner");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
-    let (_disk, _pool, _wal, catalog) = setup_catalog(dir.path()).await;
+    let (_disk, _pool, _wal, catalog, public_schema_id) = setup_catalog(dir.path()).await;
 
     tprintln!("\n=== Index Selection ===");
 
-    let schema_id = DEFAULT_SCHEMA_ID;
+    let schema_id = public_schema_id;
     let orders_id = create_table(&catalog, schema_id, "orders", orders_columns()).await;
 
     // Create index on status column
@@ -910,11 +919,11 @@ async fn test_cost_estimation() {
     zyron_bench_harness::init("planner");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
-    let (_disk, _pool, _wal, catalog) = setup_catalog(dir.path()).await;
+    let (_disk, _pool, _wal, catalog, public_schema_id) = setup_catalog(dir.path()).await;
 
     tprintln!("\n=== Cost Estimation ===");
 
-    let schema_id = DEFAULT_SCHEMA_ID;
+    let schema_id = public_schema_id;
 
     // Create tables with different sizes
     let small_id = create_table(&catalog, schema_id, "t_small", wide_table_columns(5)).await;
@@ -1000,11 +1009,11 @@ async fn test_complex_queries() {
     zyron_bench_harness::init("planner");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
-    let (_disk, _pool, _wal, catalog) = setup_catalog(dir.path()).await;
+    let (_disk, _pool, _wal, catalog, public_schema_id) = setup_catalog(dir.path()).await;
 
     tprintln!("\n=== Complex Queries (TPC-H style) ===");
 
-    let schema_id = DEFAULT_SCHEMA_ID;
+    let schema_id = public_schema_id;
 
     // Create TPC-H-like tables
     let lineitem_cols = vec![
@@ -1180,12 +1189,12 @@ async fn test_bench_planner_performance() {
     zyron_bench_harness::init("planner");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
-    let (_disk, _pool, _wal, catalog) = setup_catalog(dir.path()).await;
+    let (_disk, _pool, _wal, catalog, public_schema_id) = setup_catalog(dir.path()).await;
 
     tprintln!("\n=== Planner Performance Benchmarks ===");
     tprintln!("Validation runs: {}", VALIDATION_RUNS);
 
-    let schema_id = DEFAULT_SCHEMA_ID;
+    let schema_id = public_schema_id;
     let users_id = create_table(&catalog, schema_id, "users", users_columns()).await;
     put_table_stats(&catalog, users_id, 10_000, 3);
 
@@ -1527,11 +1536,11 @@ async fn test_spatial_predicate_picks_spatial_scan() {
     zyron_bench_harness::init("planner");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
-    let (_disk, _pool, _wal, catalog) = setup_catalog(dir.path()).await;
+    let (_disk, _pool, _wal, catalog, public_schema_id) = setup_catalog(dir.path()).await;
 
     tprintln!("\n=== Spatial Predicate -> SpatialScan ===");
 
-    let schema_id = DEFAULT_SCHEMA_ID;
+    let schema_id = public_schema_id;
     let cols = vec![
         ColumnDef {
             name: "id".to_string(),

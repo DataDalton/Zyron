@@ -339,12 +339,15 @@ impl WalWriter {
             flush_thread_waker.set(std::thread::current()).ok();
 
             let mut batch_buffer = Vec::with_capacity(64 * 1024);
+            // Bytes that did not fit in the current segment, carried over to
+            // the next flush iteration after rotation installs a new segment
+            let mut leftover: Vec<u8> = Vec::new();
 
             loop {
                 // Check for work before parking. This prevents missed wakeups:
                 // if unpark() fires between our last drain_into() and park(),
                 // the token is consumed and park() returns immediately.
-                let has_data = !ring_buffer.is_empty();
+                let has_data = !ring_buffer.is_empty() || !leftover.is_empty();
                 let has_rotation = rotation.is_rotating();
 
                 if !has_data && !has_rotation && !shutdown.load(Ordering::Acquire) {
@@ -375,6 +378,8 @@ impl WalWriter {
                         &ring_buffer,
                         &segment,
                         &mut batch_buffer,
+                        &mut leftover,
+                        &rotation,
                         &flushed_lsn,
                         &flush_done,
                         fsync_enabled,
@@ -390,6 +395,8 @@ impl WalWriter {
                     &ring_buffer,
                     &segment,
                     &mut batch_buffer,
+                    &mut leftover,
+                    &rotation,
                     &flushed_lsn,
                     &flush_done,
                     fsync_enabled,
@@ -448,7 +455,15 @@ impl WalWriter {
         if !residual.is_empty() {
             let mut seg_guard = segment.lock();
             if let Some(ref mut seg) = *seg_guard {
-                let _ = seg.append_batch(&residual);
+                if let Err(e) = seg.append_batch(&residual) {
+                    eprintln!(
+                        "WAL rotation residual append failed seg={:?} write_off={} residual={} err={:?}",
+                        seg.segment_id(),
+                        seg.write_offset(),
+                        residual.len(),
+                        e,
+                    );
+                }
             }
         }
 
@@ -488,10 +503,20 @@ impl WalWriter {
     }
 
     /// Flushes records from ring buffer to disk. Fully synchronous.
+    ///
+    /// `leftover` carries bytes that did not fit in the previous flush's
+    /// segment. They are prepended to the current drain and written to the
+    /// freshly rotated segment. When the combined batch overflows the current
+    /// segment (which can happen when ring-buffer straddle padding inflates
+    /// drained bytes beyond the LSN range), the function writes what fits,
+    /// stores the tail in `leftover`, and triggers rotation
+    #[allow(clippy::too_many_arguments)]
     fn flush_records_sync(
         ring_buffer: &RingBuffer,
         segment: &Mutex<Option<LogSegment>>,
         batch_buffer: &mut Vec<u8>,
+        leftover: &mut Vec<u8>,
+        rotation: &Arc<AtomicRotationState>,
         flushed_lsn: &AtomicU64,
         flush_done: &Arc<(Mutex<bool>, Condvar)>,
         fsync_enabled: bool,
@@ -500,7 +525,17 @@ impl WalWriter {
         wal_records_counter: &AtomicU64,
     ) {
         batch_buffer.clear();
-        let max_lsn = ring_buffer.drain_into(batch_buffer);
+        // Stage previous-iteration overflow bytes ahead of any new drain
+        if !leftover.is_empty() {
+            batch_buffer.extend_from_slice(leftover);
+            leftover.clear();
+        }
+        let drained_lsn = ring_buffer.drain_into(batch_buffer);
+        let max_lsn = if drained_lsn.0 != 0 {
+            drained_lsn
+        } else {
+            Lsn(flushed_lsn.load(Ordering::Acquire))
+        };
 
         if batch_buffer.is_empty() {
             // Signal waiters even when empty so flush() callers don't hang
@@ -512,27 +547,44 @@ impl WalWriter {
         }
 
         // Compute checksums for all records in the batch before writing to disk.
-        // Deferred from append() hot path to amortize checksum cost in the flush thread.
-        // The returned count also serves as the records-written counter, avoiding
-        // a per-record `lock xadd` on `wal_records_written` in every append().
+        // Deferred from append() hot path to amortize checksum cost in the flush thread
         let records_in_batch = backfill_checksums(batch_buffer);
         wal_records_counter.fetch_add(records_in_batch as u64, Ordering::Relaxed);
 
-        // Write to segment
+        let mut current_seg_id: u32 = 0;
+        let mut overflow = false;
         {
             let mut seg_guard = segment.lock();
             if let Some(ref mut seg) = *seg_guard {
-                if let Err(e) = seg.append_batch(batch_buffer) {
-                    eprintln!("WAL flush error: {:?}", e);
-                    flush_io_error.store(true, Ordering::Release);
-                    let (lock, condvar) = flush_done.as_ref();
-                    let mut done = lock.lock();
-                    *done = true;
-                    condvar.notify_all();
-                    return;
+                current_seg_id = seg.segment_id().0;
+                let remaining = seg.remaining_space() as usize;
+                let to_write_len = batch_buffer.len().min(remaining);
+
+                if to_write_len > 0 {
+                    if let Err(e) = seg.append_batch(&batch_buffer[..to_write_len]) {
+                        eprintln!(
+                            "WAL flush error seg={} write_off={} chunk={} err={:?}",
+                            current_seg_id,
+                            seg.write_offset(),
+                            to_write_len,
+                            e,
+                        );
+                        flush_io_error.store(true, Ordering::Release);
+                        let (lock, condvar) = flush_done.as_ref();
+                        let mut done = lock.lock();
+                        *done = true;
+                        condvar.notify_all();
+                        return;
+                    }
                 }
 
-                if fsync_enabled {
+                if to_write_len < batch_buffer.len() {
+                    // Tail overflowed, stash it and trigger rotation
+                    leftover.extend_from_slice(&batch_buffer[to_write_len..]);
+                    overflow = true;
+                }
+
+                if fsync_enabled && to_write_len > 0 {
                     if let Err(e) = seg.sync() {
                         eprintln!("WAL sync error: {:?}", e);
                         flush_io_error.store(true, Ordering::Release);
@@ -545,6 +597,10 @@ impl WalWriter {
                     wal_syncs_counter.fetch_add(1, Ordering::Relaxed);
                 }
             }
+        }
+
+        if overflow {
+            rotation.request_rotation(current_seg_id);
         }
 
         flushed_lsn.store(max_lsn.0, Ordering::Release);
@@ -628,12 +684,17 @@ impl WalWriter {
                 self.rotation.request_rotation(lsn.segment_id());
                 self.wake_flush_thread();
 
-                // Spin-wait until the flush thread completes rotation (Done state).
-                while !self.rotation.is_done() {
+                // Spin while rotation is in progress (REQUESTED or IN_PROGRESS)
+                // Exit on either DONE (we got the wakeup) or IDLE (another waiter
+                // already observed DONE and acknowledged it). Spinning on
+                // !is_done() alone deadlocks late waiters, the first waiter
+                // would ack DONE -> IDLE, and the rest would never see DONE again
+                while self.rotation.is_rotating() {
                     std::thread::park_timeout(std::time::Duration::from_micros(10));
                 }
 
                 // Acknowledge Done -> Idle so the next rotation cycle can proceed.
+                // Late waiters observing IDLE short-circuit inside acknowledge_done.
                 self.rotation.acknowledge_done();
                 continue;
             }

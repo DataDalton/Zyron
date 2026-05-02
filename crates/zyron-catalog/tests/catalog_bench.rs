@@ -65,10 +65,18 @@ static BENCHMARK_LOCK: Mutex<()> = Mutex::new(());
 // Helper functions
 // =============================================================================
 
-/// Creates a temporary catalog test environment with DiskManager, BufferPool, WAL, and Catalog.
+/// Builds a temporary catalog test environment (DiskManager, BufferPool, WAL,
+/// Catalog) and creates a `public` schema inside the bootstrap `zyron`
+/// database. The returned `SchemaId` addresses that schema for user tables.
 async fn setup_catalog(
     dir: &std::path::Path,
-) -> (Arc<DiskManager>, Arc<BufferPool>, Arc<WalWriter>, Catalog) {
+) -> (
+    Arc<DiskManager>,
+    Arc<BufferPool>,
+    Arc<WalWriter>,
+    Catalog,
+    SchemaId,
+) {
     let data_dir = dir.join("data");
     let wal_dir = dir.join("wal");
     std::fs::create_dir_all(&data_dir).unwrap();
@@ -99,8 +107,11 @@ async fn setup_catalog(
     let catalog = Catalog::new(storage, cache, Arc::clone(&wal))
         .await
         .unwrap();
-
-    (disk, pool, wal, catalog)
+    let public_schema_id = catalog
+        .create_schema(SYSTEM_DATABASE_ID, "public", "system")
+        .await
+        .unwrap();
+    (disk, pool, wal, catalog, public_schema_id)
 }
 
 /// Column definitions for a 10-column test table.
@@ -561,12 +572,12 @@ async fn test_name_resolution() {
     let before = take_util_snapshot();
 
     let dir = tempdir().unwrap();
-    let (_disk, _pool, wal, catalog) = setup_catalog(dir.path()).await;
+    let (_disk, _pool, wal, catalog, public_schema_id) = setup_catalog(dir.path()).await;
 
     // "zyron" database is bootstrapped with id=SYSTEM_DATABASE_ID
     let db_id = SYSTEM_DATABASE_ID;
 
-    // "public" schema is bootstrapped as DEFAULT_SCHEMA_ID
+    // "public" schema is bootstrapped as public_schema_id
     let app_schema_id = catalog.create_schema(db_id, "app", "system").await.unwrap();
 
     // Create public.users
@@ -578,7 +589,7 @@ async fn test_name_resolution() {
         constraints: vec![],
     }];
     let public_users_id = catalog
-        .create_table(DEFAULT_SCHEMA_ID, "users", &public_users_cols, &[])
+        .create_table(public_schema_id, "users", &public_users_cols, &[])
         .await
         .unwrap();
 
@@ -628,7 +639,7 @@ async fn test_name_resolution() {
         .await
         .unwrap();
     assert_eq!(resolved.id, public_users_id);
-    assert_eq!(resolved.schema_id, DEFAULT_SCHEMA_ID);
+    assert_eq!(resolved.schema_id, public_schema_id);
     tprintln!("  Resolve 'public.users' -> public.users: PASS");
 
     // Resolve 'nonexistent' -> should return error
@@ -664,7 +675,7 @@ async fn test_column_types() {
     let before = take_util_snapshot();
 
     let dir = tempdir().unwrap();
-    let (_disk, _pool, wal, catalog) = setup_catalog(dir.path()).await;
+    let (_disk, _pool, wal, catalog, public_schema_id) = setup_catalog(dir.path()).await;
 
     let col_defs = make_all_types_column_defs();
     let expected_types = vec![
@@ -700,7 +711,7 @@ async fn test_column_types() {
     ];
 
     let table_id = catalog
-        .create_table(DEFAULT_SCHEMA_ID, "all_types", &col_defs, &[])
+        .create_table(public_schema_id, "all_types", &col_defs, &[])
         .await
         .unwrap();
 
@@ -742,7 +753,7 @@ async fn test_column_types() {
     }];
     let tid = catalog
         .create_table(
-            DEFAULT_SCHEMA_ID,
+            public_schema_id,
             "defaults_test",
             &col_defs_with_default,
             &[],
@@ -770,7 +781,7 @@ async fn test_constraints() {
     let before = take_util_snapshot();
 
     let dir = tempdir().unwrap();
-    let (_disk, _pool, wal, catalog) = setup_catalog(dir.path()).await;
+    let (_disk, _pool, wal, catalog, public_schema_id) = setup_catalog(dir.path()).await;
 
     // Table with PRIMARY KEY column constraint
     let pk_cols = vec![ColumnDef {
@@ -781,7 +792,7 @@ async fn test_constraints() {
         constraints: vec![ColumnConstraint::PrimaryKey],
     }];
     let pk_table_id = catalog
-        .create_table(DEFAULT_SCHEMA_ID, "pk_test", &pk_cols, &[])
+        .create_table(public_schema_id, "pk_test", &pk_cols, &[])
         .await
         .unwrap();
     let pk_table = catalog.get_table_by_id(pk_table_id).unwrap();
@@ -816,7 +827,7 @@ async fn test_constraints() {
     ])];
     let cpk_table_id = catalog
         .create_table(
-            DEFAULT_SCHEMA_ID,
+            public_schema_id,
             "cpk_test",
             &composite_cols,
             &composite_constraints,
@@ -850,7 +861,7 @@ async fn test_constraints() {
         },
     ];
     let uq_table_id = catalog
-        .create_table(DEFAULT_SCHEMA_ID, "unique_test", &unique_cols, &[])
+        .create_table(public_schema_id, "unique_test", &unique_cols, &[])
         .await
         .unwrap();
     let uq_table = catalog.get_table_by_id(uq_table_id).unwrap();
@@ -870,7 +881,7 @@ async fn test_constraints() {
         constraints: vec![ColumnConstraint::NotNull],
     }];
     let nn_table_id = catalog
-        .create_table(DEFAULT_SCHEMA_ID, "notnull_test", &nn_cols, &[])
+        .create_table(public_schema_id, "notnull_test", &nn_cols, &[])
         .await
         .unwrap();
     let nn_table = catalog.get_table_by_id(nn_table_id).unwrap();
@@ -891,7 +902,7 @@ async fn test_constraints() {
         constraints: vec![],
     }];
     let def_table_id = catalog
-        .create_table(DEFAULT_SCHEMA_ID, "default_test", &def_cols, &[])
+        .create_table(public_schema_id, "default_test", &def_cols, &[])
         .await
         .unwrap();
     let def_table = catalog.get_table_by_id(def_table_id).unwrap();
@@ -899,7 +910,7 @@ async fn test_constraints() {
     tprintln!("  DEFAULT value: PASS");
 
     // Verify constraints survive reload
-    let tables = catalog.list_tables(DEFAULT_SCHEMA_ID);
+    let tables = catalog.list_tables(public_schema_id);
     assert!(
         tables.len() >= 5,
         "expected at least 5 tables, got {}",
@@ -927,7 +938,7 @@ async fn test_ddl_create_drop() {
     let before = take_util_snapshot();
 
     let dir = tempdir().unwrap();
-    let (_disk, _pool, wal, catalog) = setup_catalog(dir.path()).await;
+    let (_disk, _pool, wal, catalog, public_schema_id) = setup_catalog(dir.path()).await;
 
     // Create and verify table exists
     let col_defs = vec![ColumnDef {
@@ -938,17 +949,17 @@ async fn test_ddl_create_drop() {
         constraints: vec![],
     }];
     let tid = catalog
-        .create_table(DEFAULT_SCHEMA_ID, "temp_table", &col_defs, &[])
+        .create_table(public_schema_id, "temp_table", &col_defs, &[])
         .await
         .unwrap();
-    assert!(catalog.get_table(DEFAULT_SCHEMA_ID, "temp_table").is_ok());
+    assert!(catalog.get_table(public_schema_id, "temp_table").is_ok());
     tprintln!("  Create table: PASS");
 
     // Create index
     let _idx_id = catalog
         .create_index(
             tid,
-            DEFAULT_SCHEMA_ID,
+            public_schema_id,
             "idx_temp",
             &["id".to_string()],
             false,
@@ -966,10 +977,10 @@ async fn test_ddl_create_drop() {
 
     // Drop table
     catalog
-        .drop_table(DEFAULT_SCHEMA_ID, "temp_table")
+        .drop_table(public_schema_id, "temp_table")
         .await
         .unwrap();
-    assert!(catalog.get_table(DEFAULT_SCHEMA_ID, "temp_table").is_err());
+    assert!(catalog.get_table(public_schema_id, "temp_table").is_err());
     tprintln!("  Drop table: PASS");
 
     // Create and drop schema
@@ -1043,6 +1054,10 @@ async fn test_statistics() {
     let catalog = Catalog::new(Arc::clone(&storage), cache, Arc::clone(&wal))
         .await
         .unwrap();
+    let public_schema_id = catalog
+        .create_schema(SYSTEM_DATABASE_ID, "public", "system")
+        .await
+        .unwrap();
 
     // Create a table for statistics
     let col_defs = vec![ColumnDef {
@@ -1053,7 +1068,7 @@ async fn test_statistics() {
         constraints: vec![],
     }];
     let table_id = catalog
-        .create_table(DEFAULT_SCHEMA_ID, "stats_test", &col_defs, &[])
+        .create_table(public_schema_id, "stats_test", &col_defs, &[])
         .await
         .unwrap();
     let table = catalog.get_table_by_id(table_id).unwrap();
@@ -1293,7 +1308,7 @@ async fn test_bench_table_lookup() {
     let before = take_util_snapshot();
 
     let dir = tempdir().unwrap();
-    let (_disk, _pool, wal, catalog) = setup_catalog(dir.path()).await;
+    let (_disk, _pool, wal, catalog, public_schema_id) = setup_catalog(dir.path()).await;
 
     // Create a table to look up
     let col_defs = vec![ColumnDef {
@@ -1304,13 +1319,13 @@ async fn test_bench_table_lookup() {
         constraints: vec![],
     }];
     catalog
-        .create_table(DEFAULT_SCHEMA_ID, "bench_table", &col_defs, &[])
+        .create_table(public_schema_id, "bench_table", &col_defs, &[])
         .await
         .unwrap();
 
     // Warm the cache
     for _ in 0..100 {
-        let _ = catalog.get_table(DEFAULT_SCHEMA_ID, "bench_table").unwrap();
+        let _ = catalog.get_table(public_schema_id, "bench_table").unwrap();
     }
 
     let iterations = 1_000_000u64;
@@ -1319,7 +1334,7 @@ async fn test_bench_table_lookup() {
     for _ in 0..VALIDATION_RUNS {
         let start = Instant::now();
         for _ in 0..iterations {
-            let _ = std::hint::black_box(catalog.get_table(DEFAULT_SCHEMA_ID, "bench_table"));
+            let _ = std::hint::black_box(catalog.get_table(public_schema_id, "bench_table"));
         }
         let elapsed_ns = start.elapsed().as_nanos() as f64;
         let ns_per_op = elapsed_ns / iterations as f64;
@@ -1349,7 +1364,7 @@ async fn test_bench_schema_resolve() {
     let before = take_util_snapshot();
 
     let dir = tempdir().unwrap();
-    let (_disk, _pool, wal, catalog) = setup_catalog(dir.path()).await;
+    let (_disk, _pool, wal, catalog, _public_schema_id) = setup_catalog(dir.path()).await;
 
     let db_id = SYSTEM_DATABASE_ID;
     let app_id = catalog.create_schema(db_id, "app", "admin").await.unwrap();
@@ -1408,7 +1423,7 @@ async fn test_bench_ddl_create() {
     let before = take_util_snapshot();
 
     let dir = tempdir().unwrap();
-    let (_disk, _pool, wal, catalog) = setup_catalog(dir.path()).await;
+    let (_disk, _pool, wal, catalog, public_schema_id) = setup_catalog(dir.path()).await;
 
     let col_defs = vec![ColumnDef {
         name: "id".to_string(),
@@ -1427,7 +1442,7 @@ async fn test_bench_ddl_create() {
             let table_name = format!("create_bench_{run}_{i}");
             let start = Instant::now();
             catalog
-                .create_table(DEFAULT_SCHEMA_ID, &table_name, &col_defs, &[])
+                .create_table(public_schema_id, &table_name, &col_defs, &[])
                 .await
                 .unwrap();
             total_us += start.elapsed().as_micros() as f64;
@@ -1458,7 +1473,7 @@ async fn test_bench_ddl_drop() {
     let before = take_util_snapshot();
 
     let dir = tempdir().unwrap();
-    let (_disk, _pool, wal, catalog) = setup_catalog(dir.path()).await;
+    let (_disk, _pool, wal, catalog, public_schema_id) = setup_catalog(dir.path()).await;
 
     let col_defs = vec![ColumnDef {
         name: "id".to_string(),
@@ -1476,7 +1491,7 @@ async fn test_bench_ddl_drop() {
         for i in 0..iterations {
             let table_name = format!("drop_bench_{run}_{i}");
             catalog
-                .create_table(DEFAULT_SCHEMA_ID, &table_name, &col_defs, &[])
+                .create_table(public_schema_id, &table_name, &col_defs, &[])
                 .await
                 .unwrap();
         }
@@ -1486,7 +1501,7 @@ async fn test_bench_ddl_drop() {
             let table_name = format!("drop_bench_{run}_{i}");
             let start = Instant::now();
             catalog
-                .drop_table(DEFAULT_SCHEMA_ID, &table_name)
+                .drop_table(public_schema_id, &table_name)
                 .await
                 .unwrap();
             total_us += start.elapsed().as_micros() as f64;
@@ -1547,6 +1562,10 @@ async fn test_bench_analyze() {
     let catalog = Catalog::new(Arc::clone(&storage), cache, Arc::clone(&wal))
         .await
         .unwrap();
+    let public_schema_id = catalog
+        .create_schema(SYSTEM_DATABASE_ID, "public", "system")
+        .await
+        .unwrap();
 
     let col_defs = vec![ColumnDef {
         name: "value".to_string(),
@@ -1556,7 +1575,7 @@ async fn test_bench_analyze() {
         constraints: vec![],
     }];
     let table_id = catalog
-        .create_table(DEFAULT_SCHEMA_ID, "analyze_bench", &col_defs, &[])
+        .create_table(public_schema_id, "analyze_bench", &col_defs, &[])
         .await
         .unwrap();
     let table = catalog.get_table_by_id(table_id).unwrap();
@@ -1653,7 +1672,7 @@ async fn test_bench_cache_hit_rate() {
     let before = take_util_snapshot();
 
     let dir = tempdir().unwrap();
-    let (_disk, _pool, wal, catalog) = setup_catalog(dir.path()).await;
+    let (_disk, _pool, wal, catalog, public_schema_id) = setup_catalog(dir.path()).await;
 
     // Create 50 tables
     let num_tables = 50;
@@ -1666,14 +1685,14 @@ async fn test_bench_cache_hit_rate() {
             constraints: vec![],
         }];
         catalog
-            .create_table(DEFAULT_SCHEMA_ID, &format!("cache_t{}", i), &col_defs, &[])
+            .create_table(public_schema_id, &format!("cache_t{}", i), &col_defs, &[])
             .await
             .unwrap();
     }
 
     // Warm cache
     for i in 0..num_tables {
-        let _ = catalog.get_table(DEFAULT_SCHEMA_ID, &format!("cache_t{}", i));
+        let _ = catalog.get_table(public_schema_id, &format!("cache_t{}", i));
     }
 
     // Measure hit rate: all lookups should succeed from cache
@@ -1685,7 +1704,7 @@ async fn test_bench_cache_hit_rate() {
         for i in 0..num_tables {
             total += 1;
             if catalog
-                .get_table(DEFAULT_SCHEMA_ID, &format!("cache_t{}", i))
+                .get_table(public_schema_id, &format!("cache_t{}", i))
                 .is_ok()
             {
                 hits += 1;

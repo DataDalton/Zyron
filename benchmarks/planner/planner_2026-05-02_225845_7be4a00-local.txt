@@ -1,0 +1,176 @@
+
+=== Planner Performance Benchmarks ===
+Validation runs: 5
+
+--- Run 1/5 ---
+  Binding: 2.29 us/op
+  Logical plan: 0.04 us/op (pure, excl. binding)
+  Optimization: 24.38 us/op (pure, excl. logical)
+  Physical plan: 0.71 us/op (pure, excl. optimization)
+  Join reorder (5 tables): 26.55 us/op
+  Index selection: 16.80 us/op
+  Full pipeline: 50.94 us/op
+
+--- Run 2/5 ---
+  Binding: 1.75 us/op
+  Logical plan: 0.74 us/op (pure, excl. binding)
+  Optimization: 29.81 us/op (pure, excl. logical)
+  Physical plan: 0.01 us/op (pure, excl. optimization)
+  Join reorder (5 tables): 25.15 us/op
+  Index selection: 17.00 us/op
+  Full pipeline: 47.60 us/op
+
+--- Run 3/5 ---
+  Binding: 1.69 us/op
+  Logical plan: 0.37 us/op (pure, excl. binding)
+  Optimization: 24.91 us/op (pure, excl. logical)
+  Physical plan: 0.27 us/op (pure, excl. optimization)
+  Join reorder (5 tables): 24.81 us/op
+  Index selection: 16.71 us/op
+  Full pipeline: 45.54 us/op
+
+--- Run 4/5 ---
+  Binding: 1.71 us/op
+  Logical plan: 0.35 us/op (pure, excl. binding)
+  Optimization: 24.74 us/op (pure, excl. logical)
+  Physical plan: 0.01 us/op (pure, excl. optimization)
+  Join reorder (5 tables): 25.80 us/op
+  Index selection: 16.54 us/op
+  Full pipeline: 45.66 us/op
+
+--- Run 5/5 ---
+  Binding: 1.69 us/op
+  Logical plan: 0.40 us/op (pure, excl. binding)
+  Optimization: 24.75 us/op (pure, excl. logical)
+  Physical plan: 0.42 us/op (pure, excl. optimization)
+  Join reorder (5 tables): 25.26 us/op
+  Index selection: 16.46 us/op
+  Full pipeline: 45.95 us/op
+
+=== Planner Performance Results ===
+  Binding latency (us) [PASS/OK]:
+    Runs: [2, 2, 2, 2, 2]
+    Average: 2 <= 2 (target)
+    Min/Max: 2 / 2, StdDev: 0
+  Logical plan latency (us) [PASS/OK]:
+    Runs: [0, 1, 0, 0, 0]
+    Average: 0 <= 5 (target)
+    Min/Max: 0 / 1, StdDev: 0
+  Optimization latency (us) [FAIL/OK]:
+    Runs: [24, 30, 25, 25, 25]
+    Average: 26 <= 25 (target)
+    Min/Max: 24 / 30, StdDev: 2
+  Physical plan latency (us) [PASS/OK]:
+    Runs: [1, 0, 0, 0, 0]
+    Average: 0 <= 10 (target)
+    Min/Max: 0 / 1, StdDev: 0
+  Join reorder latency (us, 5 tables) [PASS/OK]:
+    Runs: [27, 25, 25, 26, 25]
+    Average: 26 <= 100 (target)
+    Min/Max: 25 / 27, StdDev: 1
+  Index selection latency (us) [FAIL/REGR!]:
+    Runs: [17, 17, 17, 17, 16]
+    Average: 17 <= 5 (target)
+    Min/Max: 16 / 17, StdDev: 0
+  Full pipeline latency (us) [PASS/OK]:
+    Runs: [51, 48, 46, 46, 46]
+    Average: 47 <= 50 (target)
+    Min/Max: 46 / 51, StdDev: 2
+
+--- Plan Cache Simulation ---
+  Plan cache hit rate [PASS]: 1 >= 1 (target)
+
+--- Cardinality Estimation Accuracy ---
+  Cardinality estimation error factor [PASS]: 1 <= 2 (target)
+
+=== Binding ===
+  Binding: SELECT id, name FROM users WHERE age > 21
+    Projections: 2 (expected 2)
+    Table resolved to OID TableId(10001)
+    WHERE type: Boolean (expected Boolean)
+  Binding: SELECT nonexistent FROM users (expect error)
+    Error: Column not found: nonexistent
+  Binding: SELECT id FROM nonexistent (expect error)
+    Error: Table not found: nonexistent
+  Binding test: PASS
+
+=== Complex Queries (TPC-H style) ===
+  TPC-H Q1 (aggregation + filter):
+    Top operator: Sort
+    Total cost: 9847.40
+    Contains aggregate: true
+  TPC-H Q3 (3-way join):
+    Top operator: Limit
+    Total cost: 12736.54
+    Contains join: true
+  Complex query test: PASS
+
+=== Cost Estimation ===
+  Full scan cost (1K rows): 10.10
+  Full scan cost (1M rows): 0.00
+  Cost ratio: 0.0x
+
+=== Index Selection ===
+  Planning: SELECT * FROM orders WHERE status = 'pending' (low selectivity, expect IndexScan)
+  Physical operator: IndexScan
+  Cost: 401.50
+  Uses IndexScan: true
+  Planning: SELECT * FROM orders WHERE status != 'pending' (high selectivity, expect SeqScan)
+  Physical operator: Other
+  Cost: 0.00
+  Uses SeqScan: false
+
+=== Join Ordering ===
+  Planning: SELECT * FROM large JOIN medium ON large.id = medium.id JOIN small ON medium.id = small.id
+  Top-level operator: Join
+  Physical plan top: HashJoin
+  Physical plan cost: 1972.81
+  Join ordering test: PASS
+
+=== Logical Plan Structure ===
+  Planning: SELECT * FROM users WHERE age > 21 ORDER BY name LIMIT 10
+  Top-level operator: Limit
+  Child of Limit: Sort
+  Child of Sort: Filter
+    Contains Filter: true
+    Contains Scan: true
+  Planning: SELECT * FROM a JOIN b ON a.id = b.a_id
+  Contains Join: true
+  Logical plan structure test: PASS
+
+============================================
+  Planner Benchmark Suite - All Tests Complete
+============================================
+  Cores: 32
+  OS: windows/x86_64
+  Run ID: 2026-05-02_225845_7be4a00-local
+  Output:  benchmarks/planner/planner_2026-05-02_225845_7be4a00-local.json
+  Log:     benchmarks/planner/planner_2026-05-02_225845_7be4a00-local.txt
+  Binding:     1 correctness test
+  Logical:     1 correctness test
+  Predicate:   1 correctness test
+  Projection:  1 correctness test
+  Join Order:  1 correctness test
+  Index Sel:   1 correctness test
+  Cost Model:  1 correctness test
+  Complex:     1 correctness test (TPC-H Q1, Q3)
+  Benchmarks:  1 performance test (9 metrics)
+============================================
+
+=== Predicate Pushdown ===
+  Planning: SELECT * FROM a JOIN b ON a.id = b.id WHERE a.x > 10 AND b.y < 5
+  Filter nodes in optimized plan: 2
+  Top-level operator: Join
+  Predicate pushdown test: PASS
+
+=== Projection Pushdown ===
+  Planning: SELECT col1, col2 FROM wide_table
+  Scan column counts: [2]
+  Narrowest scan reads 2 columns (originally 20)
+  Projection pushed down to scan level
+  Projection pushdown test: PASS
+
+=== Spatial Predicate -> SpatialScan ===
+  SQL: SELECT id FROM events WHERE st_dwithin(location, st_make_point(-74.0, 40.7), 5000.0)
+  Physical plan top: Project
+  SpatialScan present in physical plan: PASS

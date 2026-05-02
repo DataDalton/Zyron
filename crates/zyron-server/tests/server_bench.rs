@@ -189,6 +189,8 @@ async fn create_test_state(
         tls_acceptor: None,
         endpoint_registrar: None,
         subscription_runtimes: Arc::new(scc::HashMap::new()),
+        heap_files: Arc::new(scc::HashMap::new()),
+        btree_indexes: Arc::new(scc::HashMap::new()),
     });
 
     (state, wal, pool, disk, bg_writer, catalog)

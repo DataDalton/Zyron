@@ -385,83 +385,116 @@ impl HashAggregateOperator {
     }
 
     async fn materialize(&mut self) -> Result<()> {
-        // group_index maps hash -> list of (group_idx, first occurrence row data).
-        // We store group keys in columnar builders for collision resolution.
         let num_group_cols = self.group_by.len();
         let num_agg_cols = self.aggregates.len();
 
-        // Accumulated group key columns for collision checking.
+        // Materialized group state. For grouped aggregates this is built up by
+        // hashing keys and resolving collisions; for global aggregates the
+        // store stays empty and only `group_accumulators[0]` is touched.
         let mut group_key_store: Vec<Column> = Vec::new();
         let mut group_accumulators: Vec<Vec<Box<dyn Accumulator>>> = Vec::new();
         let mut hash_to_groups: PreHashMap<u64, Vec<usize>> = PreHashMap::default();
         let mut num_groups = 0usize;
 
-        loop {
-            match self.child.next().await? {
-                Some(eb) => {
-                    let batch = &eb.batch;
-                    let num_rows = batch.num_rows;
+        // Global-aggregate fast path: no GROUP BY means exactly one output row.
+        // Pre-create the single accumulator vector and skip every hashing,
+        // group-store, and collision-check step in the inner loop.
+        if num_group_cols == 0 {
+            let accs: Vec<Box<dyn Accumulator>> = self
+                .aggregates
+                .iter()
+                .map(|agg| create_accumulator(&agg.function_name, agg.args.len()))
+                .collect();
+            group_accumulators.push(accs);
+            num_groups = 1;
 
-                    let group_cols: Vec<Column> = self
-                        .group_by
-                        .iter()
-                        .map(|expr| evaluate(expr, batch, &self.input_schema, &[]))
-                        .collect::<Result<Vec<_>>>()?;
+            loop {
+                match self.child.next().await? {
+                    Some(eb) => {
+                        let batch = &eb.batch;
+                        let num_rows = batch.num_rows;
+                        if num_rows == 0 {
+                            continue;
+                        }
 
-                    let agg_arg_cols: Vec<Option<Column>> = self
-                        .aggregates
-                        .iter()
-                        .map(|agg| {
-                            if agg.args.is_empty() {
-                                Ok(None)
-                            } else {
-                                Ok(Some(evaluate(
-                                    &agg.args[0],
-                                    batch,
-                                    &self.input_schema,
-                                    &[],
-                                )?))
+                        // Resolve each aggregate's input column (or None for COUNT(*)).
+                        let agg_arg_cols: Vec<Option<Column>> = self
+                            .aggregates
+                            .iter()
+                            .map(|agg| {
+                                if agg.args.is_empty() {
+                                    Ok(None)
+                                } else {
+                                    Ok(Some(evaluate(
+                                        &agg.args[0],
+                                        batch,
+                                        &self.input_schema,
+                                        &[],
+                                    )?))
+                                }
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+
+                        let accs = &mut group_accumulators[0];
+                        for row in 0..num_rows {
+                            for (i, acc) in accs.iter_mut().enumerate() {
+                                match &agg_arg_cols[i] {
+                                    Some(col) => acc.update_typed(col, row),
+                                    None => acc.update(&ScalarValue::Int64(1)),
+                                }
                             }
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-
-                    // Batch hash group keys.
-                    let group_refs: Vec<&Column> = group_cols.iter().collect();
-                    let hashes = if !group_cols.is_empty() {
-                        compute::hash_column_batch(&group_refs, num_rows)
-                    } else {
-                        vec![0u64; num_rows]
-                    };
-
-                    // Initialize group key store on first batch.
-                    if group_key_store.is_empty() && !group_cols.is_empty() {
-                        for gc in &group_cols {
-                            group_key_store.push(Column::new(
-                                ColumnData::with_capacity(gc.type_id, 64),
-                                gc.type_id,
-                            ));
                         }
                     }
+                    None => break,
+                }
+            }
+        } else {
+            loop {
+                match self.child.next().await? {
+                    Some(eb) => {
+                        let batch = &eb.batch;
+                        let num_rows = batch.num_rows;
 
-                    for row in 0..num_rows {
-                        let hash = hashes[row];
+                        let group_cols: Vec<Column> = self
+                            .group_by
+                            .iter()
+                            .map(|expr| evaluate(expr, batch, &self.input_schema, &[]))
+                            .collect::<Result<Vec<_>>>()?;
 
-                        // Find or create group.
-                        let group_idx = if num_group_cols == 0 {
-                            // Global aggregate: single group.
-                            if num_groups == 0 {
-                                let accs = self
-                                    .aggregates
-                                    .iter()
-                                    .map(|agg| {
-                                        create_accumulator(&agg.function_name, agg.args.len())
-                                    })
-                                    .collect();
-                                group_accumulators.push(accs);
-                                num_groups = 1;
+                        let agg_arg_cols: Vec<Option<Column>> = self
+                            .aggregates
+                            .iter()
+                            .map(|agg| {
+                                if agg.args.is_empty() {
+                                    Ok(None)
+                                } else {
+                                    Ok(Some(evaluate(
+                                        &agg.args[0],
+                                        batch,
+                                        &self.input_schema,
+                                        &[],
+                                    )?))
+                                }
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+
+                        // Batch hash group keys.
+                        let group_refs: Vec<&Column> = group_cols.iter().collect();
+                        let hashes = compute::hash_column_batch(&group_refs, num_rows);
+
+                        // Initialize group key store on first batch.
+                        if group_key_store.is_empty() {
+                            for gc in &group_cols {
+                                group_key_store.push(Column::new(
+                                    ColumnData::with_capacity(gc.type_id, 64),
+                                    gc.type_id,
+                                ));
                             }
-                            0
-                        } else {
+                        }
+
+                        for row in 0..num_rows {
+                            let hash = hashes[row];
+
                             // Lookup by hash, then check for collision.
                             let candidates = hash_to_groups.entry(hash).or_default();
                             let mut found = None;
@@ -469,7 +502,6 @@ impl HashAggregateOperator {
                                 let mut eq = true;
                                 for (ci, gc) in group_cols.iter().enumerate() {
                                     let store_col = &group_key_store[ci];
-                                    // Compare group_cols[ci][row] vs store_col[gidx].
                                     let a_null = gc.is_null(row);
                                     let b_null = store_col.is_null(gidx);
                                     if a_null != b_null {
@@ -494,13 +526,12 @@ impl HashAggregateOperator {
                                     break;
                                 }
                             }
-                            match found {
+                            let group_idx = match found {
                                 Some(gidx) => gidx,
                                 None => {
                                     let gidx = num_groups;
                                     num_groups += 1;
                                     candidates.push(gidx);
-                                    // Append group key to store.
                                     for (ci, gc) in group_cols.iter().enumerate() {
                                         group_key_store[ci].push_row_from(gc, row);
                                     }
@@ -514,32 +545,20 @@ impl HashAggregateOperator {
                                     group_accumulators.push(accs);
                                     gidx
                                 }
-                            }
-                        };
+                            };
 
-                        // Update accumulators using typed access.
-                        let accs = &mut group_accumulators[group_idx];
-                        for (i, acc) in accs.iter_mut().enumerate() {
-                            match &agg_arg_cols[i] {
-                                Some(col) => acc.update_typed(col, row),
-                                None => acc.update(&ScalarValue::Int64(1)),
+                            let accs = &mut group_accumulators[group_idx];
+                            for (i, acc) in accs.iter_mut().enumerate() {
+                                match &agg_arg_cols[i] {
+                                    Some(col) => acc.update_typed(col, row),
+                                    None => acc.update(&ScalarValue::Int64(1)),
+                                }
                             }
                         }
                     }
+                    None => break,
                 }
-                None => break,
             }
-        }
-
-        // For global aggregates with no groups, insert a single entry.
-        if num_groups == 0 && self.group_by.is_empty() {
-            let accs: Vec<Box<dyn Accumulator>> = self
-                .aggregates
-                .iter()
-                .map(|agg| create_accumulator(&agg.function_name, agg.args.len()))
-                .collect();
-            group_accumulators.push(accs);
-            num_groups = 1;
         }
 
         if num_groups == 0 {

@@ -435,29 +435,42 @@ impl<'a> PhysicalPlanner<'a> {
             }
         }
 
-        // Try to find a B-tree index scan opportunity
+        // Try to find a B-tree index scan opportunity. Equality on indexed
+        // columns prefers IndexScan even without stats, since index lookup
+        // is by definition more selective than a full table scan
         if let Some(pred) = &predicate {
-            if let Some((ts, cs)) = &table_stats {
-                for index in &indexes {
-                    if let Some((index_pred, remaining)) = match_index(pred, index) {
-                        let selectivity =
-                            self.cost_model
-                                .estimate_selectivity(&index_pred, Some(ts), Some(cs));
-
-                        if selectivity < INDEX_SCAN_SELECTIVITY_THRESHOLD {
-                            let cost = self.cost_model.cost_index_scan(ts, selectivity);
-                            return Ok(PhysicalPlan::IndexScan {
-                                table_id,
-                                index_id: index.id,
-                                index: Arc::clone(index),
-                                columns,
-                                predicate: index_pred,
-                                remaining_predicate: remaining,
-                                scan_direction: ScanDirection::Forward,
-                                cost,
-                                as_of: as_of.clone(),
-                            });
-                        }
+            for index in &indexes {
+                if let Some((index_pred, remaining)) = match_index(pred, index) {
+                    let (selectivity, cost) = if let Some((ts, cs)) = &table_stats {
+                        let sel = self.cost_model.estimate_selectivity(
+                            &index_pred,
+                            Some(ts),
+                            Some(cs),
+                        );
+                        (sel, self.cost_model.cost_index_scan(ts, sel))
+                    } else {
+                        let sel = 0.001f64;
+                        (
+                            sel,
+                            PlanCost {
+                                io_cost: 1.0,
+                                cpu_cost: 5.0,
+                                row_count: 10.0,
+                            },
+                        )
+                    };
+                    if selectivity < INDEX_SCAN_SELECTIVITY_THRESHOLD {
+                        return Ok(PhysicalPlan::IndexScan {
+                            table_id,
+                            index_id: index.id,
+                            index: Arc::clone(index),
+                            columns,
+                            predicate: index_pred,
+                            remaining_predicate: remaining,
+                            scan_direction: ScanDirection::Forward,
+                            cost,
+                            as_of: as_of.clone(),
+                        });
                     }
                 }
             }

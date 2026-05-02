@@ -16,7 +16,9 @@ use zyron_planner::logical::LogicalColumn;
 use zyron_search::{Bm25Scorer, FtsQueryParser, SimpleAnalyzer};
 use zyron_storage::{HeapPage, TupleId};
 
-use crate::batch::{create_builders, decode_tuple_into_builders, finalize_builders};
+use crate::batch::{
+    build_column_to_builder_map, create_builders, decode_tuple_into_builders, finalize_builders,
+};
 use crate::context::ExecutionContext;
 use crate::operator::{ExecutionBatch, Operator, OperatorResult};
 
@@ -85,6 +87,10 @@ impl Operator for FulltextScanOperator {
             let table_entry = self.ctx.get_table_entry(self.table_id)?;
 
             let mut builders = create_builders(&self.output_columns, batch_size);
+            let output_ids: Vec<zyron_catalog::ColumnId> =
+                self.output_columns.iter().map(|c| c.column_id).collect();
+            let column_to_builder =
+                build_column_to_builder_map(&table_entry.columns, &output_ids);
             let mut scores: Vec<f64> = Vec::with_capacity(batch_size);
             let mut row_count = 0usize;
 
@@ -114,7 +120,12 @@ impl Operator for FulltextScanOperator {
                     continue;
                 }
 
-                decode_tuple_into_builders(tuple.data(), &table_entry.columns, &mut builders);
+                decode_tuple_into_builders(
+                    tuple.data(),
+                    &table_entry.columns,
+                    &column_to_builder,
+                    &mut builders,
+                );
                 scores.push(score);
                 row_count += 1;
             }

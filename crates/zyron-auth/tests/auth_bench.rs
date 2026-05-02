@@ -4183,3 +4183,322 @@ fn test_crypto_key_generation() {
         public_key.len()
     );
 }
+
+// ===========================================================================
+// Zyron-to-Zyron Auth Hot Paths
+// ===========================================================================
+//
+// Covers credential sealing and opening, credential cache lookup, mTLS
+// fingerprint verification, identity-to-role SecurityMap resolution, and
+// JWT encode + verify. These paths are hit on every zyron-to-zyron handshake
+// and every cross-cloud credential acquisition.
+
+// Targets for the Zyron-to-Zyron auth path, ops/sec unless noted.
+const AUTH_CRED_SEAL_TARGET_OPS: f64 = 300_000.0;
+const AUTH_CRED_CACHE_TARGET_OPS: f64 = 3_000_000.0;
+const AUTH_MTLS_FP_TARGET_OPS: f64 = 500_000.0;
+const AUTH_SECURITY_MAP_TARGET_OPS: f64 = 5_000_000.0;
+const AUTH_JWT_ENCODE_VERIFY_TARGET_OPS: f64 = 100_000.0;
+
+#[test]
+fn test_auth_credential_seal_roundtrip() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- Credential Seal/Open Roundtrip ---");
+
+    use zyron_auth::external_credentials::{open_credentials, seal_credentials};
+
+    let ks = LocalKeyStore::new([0x5Au8; 32]);
+    let mut creds: HashMap<String, String> = HashMap::new();
+    creds.insert("aws_access_key_id".to_string(), "AKIAEXAMPLE".to_string());
+    creds.insert(
+        "aws_secret_access_key".to_string(),
+        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+    );
+    creds.insert("region".to_string(), "us-west-2".to_string());
+
+    let iterations = 100_000usize;
+
+    // Seal leg.
+    let start = Instant::now();
+    for _ in 0..iterations {
+        let s = seal_credentials(&creds, &ks).expect("seal");
+        std::hint::black_box(&s);
+    }
+    let seal_elapsed = start.elapsed();
+    let seal_ops = iterations as f64 / seal_elapsed.as_secs_f64();
+    tprintln!(
+        "  Seal: {} iters in {:.2?}, {:.0} ops/sec",
+        iterations,
+        seal_elapsed,
+        seal_ops
+    );
+
+    // Open leg. Reuse a single sealed blob so the cost reflects open-only.
+    let sealed = seal_credentials(&creds, &ks).expect("seal");
+    let start = Instant::now();
+    for _ in 0..iterations {
+        let m = open_credentials(&sealed, &ks).expect("open");
+        std::hint::black_box(&m);
+    }
+    let open_elapsed = start.elapsed();
+    let open_ops = iterations as f64 / open_elapsed.as_secs_f64();
+    tprintln!(
+        "  Open: {} iters in {:.2?}, {:.0} ops/sec",
+        iterations,
+        open_elapsed,
+        open_ops
+    );
+
+    validate_metric(
+        "credential_seal",
+        "ops_per_sec",
+        vec![seal_ops],
+        AUTH_CRED_SEAL_TARGET_OPS,
+        true,
+    );
+    validate_metric(
+        "credential_open",
+        "ops_per_sec",
+        vec![open_ops],
+        AUTH_CRED_SEAL_TARGET_OPS,
+        true,
+    );
+    // Roundtrip equality must still hold.
+    let opened = open_credentials(&sealed, &ks).expect("open");
+    assert_eq!(opened, creds);
+}
+
+#[test]
+fn test_auth_credential_cache_lookup() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- Credential Cache Lookup ---");
+
+    use std::time::Duration;
+    use zyron_auth::credential_provider::{CredentialCache, StaticCredentialProvider};
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+
+    let cache = CredentialCache::new();
+
+    // Prepopulate with 100 entries, each under a distinct key, TTL 1 hour so
+    // the bench loop never triggers refresh.
+    rt.block_on(async {
+        for i in 0..100 {
+            let mut m = HashMap::new();
+            m.insert("token".to_string(), format!("tok-{}", i));
+            let provider = StaticCredentialProvider::new(m, Duration::from_secs(3600));
+            let _ = cache
+                .get_or_fetch(&format!("k{}", i), &provider, Duration::from_secs(1))
+                .await
+                .expect("prefetch");
+        }
+    });
+
+    let iterations = 1_000_000usize;
+    let keys: Vec<String> = (0..100).map(|i| format!("k{}", i)).collect();
+    // Background provider used for any refresh path, though TTL keeps it cold.
+    let provider = StaticCredentialProvider::new(HashMap::new(), Duration::from_secs(3600));
+
+    let start = Instant::now();
+    rt.block_on(async {
+        for i in 0..iterations {
+            let k = &keys[i % keys.len()];
+            let got = cache
+                .get_or_fetch(k, &provider, Duration::from_secs(1))
+                .await
+                .expect("cached");
+            std::hint::black_box(&got);
+        }
+    });
+    let elapsed = start.elapsed();
+    let ops = iterations as f64 / elapsed.as_secs_f64();
+    tprintln!(
+        "  {} lookups in {:.2?}, {:.0} ops/sec",
+        iterations,
+        elapsed,
+        ops
+    );
+    validate_metric(
+        "credential_cache_lookup",
+        "ops_per_sec",
+        vec![ops],
+        AUTH_CRED_CACHE_TARGET_OPS,
+        true,
+    );
+}
+
+#[test]
+fn test_auth_mtls_fingerprint_verify() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- mTLS Fingerprint Verify ---");
+
+    use zyron_auth::mtls_pinning::{Sha256Fingerprint, fingerprint_of};
+
+    // Synthesize a 2 KB DER blob. Real certs vary, but the hash cost is
+    // dominated by the input length so a fixed 2 KB buffer is representative.
+    let cert_der: Vec<u8> = (0..2048).map(|i| (i * 31) as u8).collect();
+    let pinned: Sha256Fingerprint = fingerprint_of(&cert_der);
+
+    let iterations = 100_000usize;
+    let start = Instant::now();
+    let mut matches = 0usize;
+    for _ in 0..iterations {
+        let observed = fingerprint_of(&cert_der);
+        if observed == pinned {
+            matches += 1;
+        }
+    }
+    let elapsed = start.elapsed();
+    let ops = iterations as f64 / elapsed.as_secs_f64();
+    assert_eq!(matches, iterations);
+    tprintln!(
+        "  {} verifies in {:.2?}, {:.0} ops/sec",
+        iterations,
+        elapsed,
+        ops
+    );
+    validate_metric(
+        "mtls_fingerprint_verify",
+        "ops_per_sec",
+        vec![ops],
+        AUTH_MTLS_FP_TARGET_OPS,
+        true,
+    );
+}
+
+#[test]
+fn test_auth_security_map_resolve() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- Security Map Resolve ---");
+
+    use zyron_auth::security_map::SecurityMapStore;
+
+    let store = SecurityMapStore::new();
+    for i in 0..100 {
+        store.map_k8s_sa(&format!("prod/sa-{}", i), RoleId(1_000 + i));
+        store.map_jwt(
+            &format!("https://issuer-{}.example", i),
+            &format!("subject-{}", i),
+            RoleId(2_000 + i),
+        );
+        let mut fp = [0u8; 32];
+        fp[0] = (i & 0xFF) as u8;
+        fp[1] = ((i >> 8) & 0xFF) as u8;
+        store.map_mtls_fingerprint(fp, RoleId(3_000 + i));
+    }
+
+    let iterations = 1_000_000usize;
+    let start = Instant::now();
+    let mut hits = 0usize;
+    for i in 0..iterations {
+        let kind = i % 3;
+        let idx = (i / 3) % 100;
+        match kind {
+            0 => {
+                if store
+                    .resolve_k8s_sa("prod", &format!("sa-{}", idx))
+                    .is_some()
+                {
+                    hits += 1;
+                }
+            }
+            1 => {
+                if store
+                    .resolve_jwt(
+                        &format!("https://issuer-{}.example", idx),
+                        &format!("subject-{}", idx),
+                    )
+                    .is_some()
+                {
+                    hits += 1;
+                }
+            }
+            _ => {
+                let mut fp = [0u8; 32];
+                fp[0] = (idx & 0xFF) as u8;
+                fp[1] = ((idx >> 8) & 0xFF) as u8;
+                if store.resolve_mtls_fingerprint(&fp).is_some() {
+                    hits += 1;
+                }
+            }
+        }
+    }
+    let elapsed = start.elapsed();
+    let ops = iterations as f64 / elapsed.as_secs_f64();
+    tprintln!(
+        "  {} lookups ({} hits) in {:.2?}, {:.0} ops/sec",
+        iterations,
+        hits,
+        elapsed,
+        ops
+    );
+    // Every iter should resolve since all keys were pre-populated.
+    assert_eq!(hits, iterations);
+    validate_metric(
+        "security_map_resolve",
+        "ops_per_sec",
+        vec![ops],
+        AUTH_SECURITY_MAP_TARGET_OPS,
+        true,
+    );
+}
+
+#[test]
+fn test_auth_jwt_encode_verify() {
+    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init("auth");
+    tprintln!("--- JWT Encode + Verify (HS256) ---");
+
+    let secret = vec![0x7Au8; 32];
+    let jwt = JwtCredential::new(secret, JwtAlgorithm::Hs256)
+        .expect("jwt")
+        .with_issuer("zyron-test".to_string());
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut custom = HashMap::new();
+    custom.insert("region".to_string(), "us-west-2".to_string());
+    let claims = JwtClaims {
+        sub: "svc-account-42".to_string(),
+        iss: Some("zyron-test".to_string()),
+        exp: now + 3600,
+        iat: now,
+        roles: vec!["reader".to_string(), "writer".to_string()],
+        custom,
+    };
+
+    let iterations = 100_000usize;
+    let start = Instant::now();
+    let mut bytes_written = 0usize;
+    for _ in 0..iterations {
+        let token = jwt.encode(&claims).expect("encode");
+        bytes_written += token.len();
+        let decoded = jwt.decode(&token).expect("decode");
+        std::hint::black_box(&decoded);
+    }
+    let elapsed = start.elapsed();
+    let ops = iterations as f64 / elapsed.as_secs_f64();
+    tprintln!(
+        "  {} encode+verify cycles in {:.2?}, {:.0} ops/sec ({} bytes)",
+        iterations,
+        elapsed,
+        ops,
+        bytes_written
+    );
+    validate_metric(
+        "jwt_encode_verify",
+        "ops_per_sec",
+        vec![ops],
+        AUTH_JWT_ENCODE_VERIFY_TARGET_OPS,
+        true,
+    );
+}

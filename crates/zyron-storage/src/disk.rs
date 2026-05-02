@@ -157,11 +157,13 @@ impl DiskManager {
         Ok(())
     }
 
-    /// Allocates a new page in the specified file.
+    /// Allocates a new page in the specified file and extends the underlying
+    /// file so the page is physically addressable.
     ///
-    /// Returns the PageId of the newly allocated page.
-    /// Lazy allocation - only reserves the page number.
-    /// Actual disk write happens when write_page is called.
+    /// Extending the file here (rather than waiting for `write_page`) keeps
+    /// `read_page` honest: any page number less than `handle.num_pages` is
+    /// guaranteed to be readable and returns a zero-filled buffer if no
+    /// data has been written yet.
     pub async fn allocate_page(&self, file_id: u32) -> Result<PageId> {
         self.open_file(file_id).await?;
 
@@ -174,19 +176,17 @@ impl DiskManager {
         let mut handle = entry.get().lock().await;
 
         let page_num = handle.num_pages;
-        let page_id = PageId::new(file_id, page_num);
+        let new_num_pages = page_num + 1;
+        let new_len = new_num_pages * (PAGE_SIZE as u64);
+        handle.file.set_len(new_len).await?;
+        handle.num_pages = new_num_pages;
 
-        // Lazy allocation - just increment counter
-        // Actual disk write deferred to write_page
-        handle.num_pages = page_num + 1;
-
-        Ok(page_id)
+        Ok(PageId::new(file_id, page_num))
     }
 
-    /// Allocates multiple pages in a single operation.
-    ///
-    /// Single lock acquisition for all pages - eliminates sequential await overhead.
-    /// Lazy allocation - only reserves page numbers.
+    /// Allocates multiple pages in a single operation and extends the file to
+    /// the new page count. Every returned page is physically addressable even
+    /// before its first `write_page`.
     pub async fn allocate_pages_batch(&self, file_id: u32, count: u64) -> Result<Vec<PageId>> {
         if count == 0 {
             return Ok(Vec::new());
@@ -202,12 +202,16 @@ impl DiskManager {
 
         let mut handle = entry.get().lock().await;
 
-        let mut pages = Vec::with_capacity(count as usize);
         let start_page = handle.num_pages;
+        let new_num_pages = start_page + count;
+        let new_len = new_num_pages * (PAGE_SIZE as u64);
+        handle.file.set_len(new_len).await?;
+
+        let mut pages = Vec::with_capacity(count as usize);
         for i in 0..count {
             pages.push(PageId::new(file_id, start_page + i));
         }
-        handle.num_pages = start_page + count;
+        handle.num_pages = new_num_pages;
 
         Ok(pages)
     }

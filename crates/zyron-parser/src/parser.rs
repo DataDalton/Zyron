@@ -2122,6 +2122,11 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 Ok(Expr::Literal(LiteralValue::String(val)))
             }
+            Token::Parameter(idx) => {
+                let i = *idx;
+                self.advance()?;
+                Ok(Expr::Parameter(i))
+            }
             Token::Keyword(Keyword::True) => {
                 self.advance()?;
                 Ok(Expr::Literal(LiteralValue::Boolean(true)))
@@ -2314,13 +2319,15 @@ impl<'a> Parser<'a> {
             return Ok(func_expr);
         }
 
-        // Handle COUNT(*)
+        // Handle the `COUNT(*)` / `COUNT(DISTINCT *)` form. The wildcard is
+        // emitted as `FunctionArg::Wildcard` so the binder can accept it
+        // only inside aggregate calls rather than treating `*` as a column.
         if self.at_token(&Token::Star) {
             self.advance()?;
             self.expect_token(&Token::RParen)?;
             let func_expr = Expr::Function {
                 name,
-                args: vec![FunctionArg::Unnamed(Expr::Identifier("*".to_string()))],
+                args: vec![FunctionArg::Wildcard],
                 distinct,
             };
             if self.at_keyword(Keyword::Over) {

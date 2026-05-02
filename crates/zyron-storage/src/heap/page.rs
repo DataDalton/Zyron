@@ -17,6 +17,7 @@
 //! ```
 
 use super::constants::{DATA_START, HEAP_HEADER_OFFSET, HEAP_HEADER_SIZE, TUPLE_SLOT_SIZE};
+use crate::TupleId;
 use crate::tuple::{Tuple, TupleHeader, TupleView};
 use zyron_common::page::{PAGE_SIZE, PageHeader, PageId, PageType};
 use zyron_common::{Result, ZyronError};
@@ -148,6 +149,28 @@ impl HeapPageHeader {
             free_space_start: u16::from_le_bytes([buf[2], buf[3]]),
             free_space_end: u16::from_le_bytes([buf[4], buf[5]]),
             reserved: u16::from_le_bytes([buf[6], buf[7]]),
+        }
+    }
+
+    /// Packs the four u16 fields into one u64 in little-endian layout that
+    /// matches the on-disk serialization. Used by the lock-free insert path
+    /// for atomic CAS on the in-memory header bytes.
+    #[inline]
+    pub fn to_u64(self) -> u64 {
+        (self.slot_count as u64)
+            | ((self.free_space_start as u64) << 16)
+            | ((self.free_space_end as u64) << 32)
+            | ((self.reserved as u64) << 48)
+    }
+
+    /// Inverse of to_u64.
+    #[inline]
+    pub fn from_u64(v: u64) -> Self {
+        Self {
+            slot_count: v as u16,
+            free_space_start: (v >> 16) as u16,
+            free_space_end: (v >> 32) as u16,
+            reserved: (v >> 48) as u16,
         }
     }
 }
@@ -415,6 +438,175 @@ impl HeapPage {
         Self::set_heap_header_in_slice(data, header);
 
         Ok((slot_id, free_space))
+    }
+
+    /// Lock-free burst insert, one CAS reserves N slots and N tuple-byte
+    /// ranges, then writes tuple data and commits each slot via atomic
+    /// Release store
+    ///
+    /// Returns the count actually inserted, less than `tuples.len()` when
+    /// the page fills, 0 when nothing fits so the caller rolls over
+    ///
+    /// Concurrent writers on the same page interleave bursts, each CAS
+    /// claims a disjoint slot+byte range. Readers observing slot_count >= N
+    /// see either a non-zero slot length (committed) or zero (in flight)
+    ///
+    /// # Safety
+    /// `page_ptr` points to a PAGE_SIZE buffer with an 8-byte aligned
+    /// heap header at HEAP_HEADER_OFFSET, kept live and pinned through
+    /// the call
+    pub unsafe fn insert_tuples_burst(
+        page_ptr: *mut u8,
+        page_id: PageId,
+        tuples: &[Tuple],
+        results: &mut Vec<TupleId>,
+    ) -> usize {
+        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+        if tuples.is_empty() {
+            return 0;
+        }
+
+        let header_atomic = unsafe { &*(page_ptr.add(HEAP_HEADER_OFFSET) as *const AtomicU64) };
+
+        loop {
+            let packed = header_atomic.load(Ordering::Acquire);
+            let hdr = HeapPageHeader::from_u64(packed);
+            let mut free = hdr.free_space();
+
+            // Greedy fit, in input order
+            let mut n_fit: usize = 0;
+            let mut tuple_bytes_total: usize = 0;
+            for t in tuples {
+                let cost = t.size_on_disk() + TupleSlot::SIZE;
+                if free < cost {
+                    break;
+                }
+                free -= cost;
+                tuple_bytes_total += t.size_on_disk();
+                n_fit += 1;
+            }
+            if n_fit == 0 {
+                return 0;
+            }
+
+            let slot_bytes_total = n_fit * TupleSlot::SIZE;
+            let new_hdr = HeapPageHeader {
+                slot_count: hdr.slot_count + n_fit as u16,
+                free_space_start: hdr.free_space_start + slot_bytes_total as u16,
+                free_space_end: hdr.free_space_end - tuple_bytes_total as u16,
+                reserved: hdr.reserved,
+            };
+            let new_packed = new_hdr.to_u64();
+
+            match header_atomic.compare_exchange_weak(
+                packed,
+                new_packed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    // Claim succeeded, write each tuple in the reserved range
+                    let base_slot = hdr.slot_count;
+                    let mut tuple_offset = hdr.free_space_end;
+                    for (i, t) in tuples[..n_fit].iter().enumerate() {
+                        let ts = t.size_on_disk();
+                        tuple_offset -= ts as u16;
+                        unsafe {
+                            let tuple_dst = page_ptr.add(tuple_offset as usize);
+                            let hdr_bytes = t.header().to_bytes();
+                            std::ptr::copy_nonoverlapping(
+                                hdr_bytes.as_ptr(),
+                                tuple_dst,
+                                TupleHeader::SIZE,
+                            );
+                            let data = t.data();
+                            std::ptr::copy_nonoverlapping(
+                                data.as_ptr(),
+                                tuple_dst.add(TupleHeader::SIZE),
+                                data.len(),
+                            );
+
+                            let slot_id = base_slot + i as u16;
+                            let slot_addr =
+                                page_ptr.add(Self::DATA_START + slot_id as usize * TupleSlot::SIZE);
+                            let slot_atomic = &*(slot_addr as *const AtomicU32);
+                            let slot_packed = (tuple_offset as u32) | ((ts as u32) << 16);
+                            slot_atomic.store(slot_packed, Ordering::Release);
+                            results.push(TupleId::new(page_id, slot_id));
+                        }
+                    }
+                    return n_fit;
+                }
+                Err(_) => {
+                    std::hint::spin_loop();
+                    continue;
+                }
+            }
+        }
+    }
+
+    /// Single-tuple atomic insert, returns Err(PageFull) when the page
+    /// cannot fit the tuple
+    ///
+    /// # Safety
+    /// Same constraints as `insert_tuples_burst`
+    pub unsafe fn insert_tuple_atomic(page_ptr: *mut u8, tuple: &Tuple) -> Result<SlotId> {
+        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+        let tuple_size = tuple.size_on_disk();
+        let space_needed = tuple_size + TupleSlot::SIZE;
+
+        let header_atomic = unsafe { &*(page_ptr.add(HEAP_HEADER_OFFSET) as *const AtomicU64) };
+
+        let mut packed = header_atomic.load(Ordering::Acquire);
+        let (slot_id, tuple_offset) = loop {
+            let mut hdr = HeapPageHeader::from_u64(packed);
+            if hdr.free_space() < space_needed {
+                return Err(ZyronError::PageFull);
+            }
+            let slot_id = hdr.slot_count;
+            hdr.slot_count += 1;
+            hdr.free_space_start += TupleSlot::SIZE as u16;
+            hdr.free_space_end -= tuple_size as u16;
+            let tuple_offset = hdr.free_space_end;
+            let new_packed = hdr.to_u64();
+
+            match header_atomic.compare_exchange_weak(
+                packed,
+                new_packed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break (slot_id, tuple_offset),
+                Err(observed) => {
+                    packed = observed;
+                    std::hint::spin_loop();
+                }
+            }
+        };
+
+        // Phase 2, write tuple bytes, then commit slot entry with Release
+        unsafe {
+            let tuple_dst = page_ptr.add(tuple_offset as usize);
+            let hdr_bytes = tuple.header().to_bytes();
+            std::ptr::copy_nonoverlapping(hdr_bytes.as_ptr(), tuple_dst, TupleHeader::SIZE);
+            let data_src = tuple.data();
+            std::ptr::copy_nonoverlapping(
+                data_src.as_ptr(),
+                tuple_dst.add(TupleHeader::SIZE),
+                data_src.len(),
+            );
+
+            let slot_addr = page_ptr.add(Self::DATA_START + slot_id as usize * TupleSlot::SIZE);
+            let slot_atomic = &*(slot_addr as *const AtomicU32);
+            // Pack matches TupleSlot::to_bytes little-endian, offset in low
+            // 16 bits, length in high 16 bits
+            let slot_packed = (tuple_offset as u32) | ((tuple_size as u32) << 16);
+            slot_atomic.store(slot_packed, Ordering::Release);
+        }
+
+        Ok(SlotId(slot_id))
     }
 
     /// Append-only insert with caller-managed header.

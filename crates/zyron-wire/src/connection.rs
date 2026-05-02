@@ -176,6 +176,15 @@ pub struct ServerState {
     /// runtime. Drained and joined on graceful shutdown.
     pub subscription_runtimes:
         Arc<scc::HashMap<zyron_catalog::SubscriptionId, tokio::task::JoinHandle<()>>>,
+
+    /// Server-wide HeapFile cache keyed by heap_file_id. Reusing the same
+    /// `HeapFile` across queries keeps the per-file free-space hint cache
+    /// warm so single-row INSERTs land on the same hot page instead of
+    /// allocating a new one per call
+    pub heap_files: Arc<scc::HashMap<u32, Arc<zyron_storage::HeapFile>>>,
+    /// Live B+Tree indexes keyed by index_id, used by IndexScan and
+    /// maintained by INSERT/UPDATE/DELETE
+    pub btree_indexes: Arc<scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>>,
 }
 
 /// Cached prepared statement.
@@ -186,10 +195,11 @@ struct PreparedStatement {
     output_schema: Vec<LogicalColumn>,
 }
 
-/// Bound portal (prepared statement with parameter values).
+/// Bound portal: a prepared statement bound to concrete parameter values.
+/// The executor reads `params` through the per-query `ExecutionContext`
+/// to resolve `$1`, `$2`, ... references in the physical plan.
 struct Portal {
-    _statement_name: String,
-    _params: Vec<ScalarValue>,
+    params: Vec<ScalarValue>,
     result_formats: Vec<i16>,
     plan: Arc<PhysicalPlan>,
     output_schema: Vec<LogicalColumn>,
@@ -1562,6 +1572,8 @@ impl<T: WireTransport> Connection<T> {
             snapshot,
         );
         ctx.security_context = sec_ctx;
+        ctx.heap_files = Some(Arc::clone(&self.server.heap_files));
+        ctx.btree_indexes = Some(Arc::clone(&self.server.btree_indexes));
         if let Some(ref hook) = self.server.cdc_hook {
             ctx.cdc_hook = Some(Arc::clone(hook));
         }
@@ -1870,11 +1882,13 @@ impl<T: WireTransport> Connection<T> {
             }
         }
 
+        // stmt_name is retained through plan lookup above; the portal itself
+        // does not carry it because the plan is already resolved.
+        let _ = stmt_name;
         self.portals.insert(
             portal_name,
             Portal {
-                _statement_name: stmt_name,
-                _params: params,
+                params,
                 result_formats,
                 plan,
                 output_schema,
@@ -1907,9 +1921,9 @@ impl<T: WireTransport> Connection<T> {
         let plan = portal.plan.clone();
         let output_schema = portal.output_schema.clone();
         let result_formats = portal.result_formats.clone();
+        let params = portal.params.clone();
         let is_select = !output_schema.is_empty() && is_query_plan(&*plan);
 
-        // Ensure transaction
         let (txn_id, snapshot) = match self.ensure_transaction() {
             Ok(t) => t,
             Err(e) => {
@@ -1919,14 +1933,18 @@ impl<T: WireTransport> Connection<T> {
             }
         };
 
-        let ctx = Arc::new(ExecutionContext::new(
+        let mut ctx_owned = ExecutionContext::new(
             self.server.catalog.clone(),
             self.server.wal.clone(),
             self.server.buffer_pool.clone(),
             self.server.disk_manager.clone(),
             txn_id as u32,
             snapshot,
-        ));
+        );
+        ctx_owned.params = params;
+        ctx_owned.heap_files = Some(Arc::clone(&self.server.heap_files));
+        ctx_owned.btree_indexes = Some(Arc::clone(&self.server.btree_indexes));
+        let ctx = Arc::new(ctx_owned);
 
         match execute(Arc::unwrap_or_clone(plan), &ctx).await {
             Ok(batches) => {
@@ -2605,6 +2623,15 @@ impl<T: WireTransport> Connection<T> {
         const FLUSH_THRESHOLD: usize = 65536;
         let mut buf = BytesMut::with_capacity(FLUSH_THRESHOLD + 4096);
 
+        // Drain any messages the caller already buffered (RowDescription,
+        // ParameterStatus, etc.) into the head of `buf` so the wire order is
+        // RowDescription -> DataRows. This avoids an extra `flush().await`
+        // syscall before the DataRow stream starts.
+        if !self.write_buf.is_empty() {
+            buf.extend_from_slice(&self.write_buf);
+            self.write_buf.clear();
+        }
+
         // Precompute which columns are vectors so the per-row loop skips a
         // schema lookup + enum compare on every column. Adds up on wide
         // COPY TO workloads (e.g. 20M rows/sec × N cols).
@@ -2888,9 +2915,34 @@ fn is_query_plan(plan: &PhysicalPlan) -> bool {
     )
 }
 
-/// Counts total rows across all batches (for DML affected row count).
+/// Extracts the DML affected-row count produced by Insert/Update/Delete
+/// operators.
+///
+/// The executor builds a one-row, one-column `Int64` batch whose only cell
+/// holds the total rows the operator processed (see
+/// `zyron_executor::operator::modify::count_batch`). Summing `batch.num_rows`
+/// would always yield `1`, which is why multi-row INSERTs must read the cell
+/// instead.
 fn count_affected_rows(batches: &[DataBatch]) -> usize {
-    batches.iter().map(|b| b.num_rows).sum()
+    let mut total: i64 = 0;
+    for batch in batches {
+        let Some(col) = batch.columns.first() else {
+            continue;
+        };
+        match &col.data {
+            zyron_executor::column::ColumnData::Int64(values) => {
+                if let Some(v) = values.first() {
+                    total = total.saturating_add(*v);
+                }
+            }
+            _ => {
+                // Shape mismatch: fall back to row count so a misbehaving
+                // operator still produces a sensible tag instead of zero.
+                total = total.saturating_add(batch.num_rows as i64);
+            }
+        }
+    }
+    if total < 0 { 0 } else { total as usize }
 }
 
 /// Converts an AST expression to its string representation for SET commands.

@@ -147,13 +147,15 @@ impl Transaction {
 
 /// Manages transaction lifecycle: begin, commit, abort.
 ///
-/// Uses atomic operations for txn_id assignment and scc::HashMap for
-/// lock-free concurrent access to the active transaction set.
+/// Holds the active-transaction set in a `parking_lot::Mutex<BTreeSet<u64>>`.
+/// `begin` snapshots the set in sorted order with a single short-held lock
+/// so concurrent connections do not pay the cost of walking and re-sorting
+/// a hash map on every transaction start.
 pub struct TransactionManager {
     /// Monotonically increasing transaction ID counter.
     next_txn_id: AtomicU64,
-    /// Active transactions keyed by txn_id.
-    active_txns: scc::HashMap<u64, TransactionStatus>,
+    /// Sorted set of currently-active transaction IDs.
+    active_txns: parking_lot::Mutex<std::collections::BTreeSet<u64>>,
     /// WAL writer for durability.
     wal: Arc<WalWriter>,
     /// Row-level lock table for write-write conflict detection.
@@ -169,7 +171,7 @@ impl TransactionManager {
     pub fn new(wal: Arc<WalWriter>) -> Self {
         Self {
             next_txn_id: AtomicU64::new(1),
-            active_txns: scc::HashMap::new(),
+            active_txns: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
             wal,
             lock_table: LockTable::new(),
             intent_locks: IntentLockTable::new(),
@@ -182,7 +184,7 @@ impl TransactionManager {
     pub fn with_start_txn_id(wal: Arc<WalWriter>, start_txn_id: u64) -> Self {
         Self {
             next_txn_id: AtomicU64::new(start_txn_id),
-            active_txns: scc::HashMap::new(),
+            active_txns: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
             wal,
             lock_table: LockTable::new(),
             intent_locks: IntentLockTable::new(),
@@ -192,19 +194,21 @@ impl TransactionManager {
 
     /// Begins a new transaction with the given isolation level.
     ///
-    /// Atomically assigns a txn_id, captures a snapshot of active transactions,
-    /// and writes a Begin record to the WAL.
+    /// Captures the active-transaction snapshot under a single short-held
+    /// mutex acquisition, then registers this txn before writing the WAL
+    /// Begin record.
     pub fn begin(&self, isolation: IsolationLevel) -> Result<Transaction> {
         let txn_id = self.next_txn_id.fetch_add(1, Ordering::Relaxed);
 
-        // Capture snapshot of active transactions before adding ourselves
-        let active_ids = self.active_txn_ids();
+        let active_ids = {
+            let mut guard = self.active_txns.lock();
+            // BTreeSet::iter is in sorted order, so the resulting Vec is
+            // already sorted and `Snapshot::new` skips its sort.
+            let ids: Vec<u64> = guard.iter().copied().collect();
+            guard.insert(txn_id);
+            ids
+        };
         let snapshot = Snapshot::new(txn_id, active_ids);
-
-        // Add to active set
-        let _ = self
-            .active_txns
-            .insert_sync(txn_id, TransactionStatus::Active);
 
         // Write Begin record to WAL
         let txn_id_u32 = u32::try_from(txn_id)
@@ -246,7 +250,7 @@ impl TransactionManager {
         self.wait_for_graph.remove_transaction(txn.txn_id);
 
         // Remove from active set
-        let _ = self.active_txns.remove_sync(&txn.txn_id);
+        self.active_txns.lock().remove(&txn.txn_id);
 
         Ok(())
     }
@@ -276,23 +280,14 @@ impl TransactionManager {
         self.wait_for_graph.remove_transaction(txn.txn_id);
 
         // Remove from active set
-        let _ = self.active_txns.remove_sync(&txn.txn_id);
+        self.active_txns.lock().remove(&txn.txn_id);
 
         Ok(())
     }
 
     /// Returns a sorted snapshot of currently active transaction IDs.
-    /// Pre-allocates based on current active count to avoid reallocation.
     pub fn active_txn_ids(&self) -> Vec<u64> {
-        let mut ids = Vec::with_capacity(self.active_txns.len());
-        self.active_txns.iter_sync(|&txn_id, &status| {
-            if status == TransactionStatus::Active {
-                ids.push(txn_id);
-            }
-            true // continue iteration
-        });
-        ids.sort_unstable();
-        ids
+        self.active_txns.lock().iter().copied().collect()
     }
 
     /// Refreshes the snapshot for a ReadCommitted transaction.
@@ -319,7 +314,7 @@ impl TransactionManager {
 
     /// Returns the number of currently active transactions.
     pub fn active_count(&self) -> usize {
-        self.active_txns.len()
+        self.active_txns.lock().len()
     }
 
     /// Returns the next txn_id that will be assigned.

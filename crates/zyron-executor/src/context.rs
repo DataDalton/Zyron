@@ -130,6 +130,15 @@ pub struct ExecutionContext {
     /// indexes by id; DML operators use it to maintain indexes on
     /// INSERT/UPDATE/DELETE of indexed geometry columns.
     pub spatial_manager: Option<Arc<zyron_types::spatial_index::SpatialIndexManager>>,
+    /// Server-wide HeapFile cache keyed by TableId. Each `HeapFile` carries
+    /// its own free-space hint cache, so reusing one instance across queries
+    /// is what lets sequential single-row INSERTs land on the same hot page
+    /// instead of allocating a fresh one per call
+    pub heap_files: Option<Arc<scc::HashMap<u32, Arc<HeapFile>>>>,
+    /// Server-wide live B+Tree index cache keyed by index_id. IndexScan
+    /// operators look up here via get_index, DML operators maintain entries
+    /// here on insert/update/delete
+    pub btree_indexes: Option<Arc<scc::HashMap<u32, Arc<BTreeIndex>>>>,
 }
 
 impl ExecutionContext {
@@ -163,6 +172,8 @@ impl ExecutionContext {
             vector_manager: None,
             graph_manager: None,
             spatial_manager: None,
+            heap_files: None,
+            btree_indexes: None,
         }
     }
 
@@ -188,17 +199,56 @@ impl ExecutionContext {
         }
     }
 
-    /// Constructs a HeapFile handle for the given table.
-    pub fn get_heap_file(&self, table_id: TableId) -> Result<HeapFile> {
+    /// Returns the per-table cached `HeapFile` if the server-wide cache is
+    /// installed, otherwise constructs a fresh one. The cached instance keeps
+    /// hint_slots warm across queries so sequential single-row INSERTs land
+    /// on the same hot page instead of allocating a fresh one per call.
+    /// Cached_heap_pages and cached_fsm_pages are seeded from disk via
+    /// init_cache the first time a table is touched.
+    pub async fn get_heap_file(&self, table_id: TableId) -> Result<Arc<HeapFile>> {
         let entry = self.catalog.get_table_by_id(table_id)?;
-        HeapFile::new(
-            self.disk_manager.clone(),
-            self.buffer_pool.clone(),
-            HeapFileConfig {
-                heap_file_id: entry.heap_file_id,
-                fsm_file_id: entry.fsm_file_id,
-            },
-        )
+        if let Some(cache) = &self.heap_files {
+            if let Some(hit) = cache.get_async(&entry.heap_file_id).await {
+                return Ok(Arc::clone(hit.get()));
+            }
+            let hf = HeapFile::new(
+                self.disk_manager.clone(),
+                self.buffer_pool.clone(),
+                HeapFileConfig {
+                    heap_file_id: entry.heap_file_id,
+                    fsm_file_id: entry.fsm_file_id,
+                },
+            )?;
+            hf.init_cache().await?;
+            let arc = Arc::new(hf);
+            // Race tolerated, the loser's instance is dropped, ensuing
+            // calls converge on the winner. Init cost is one disk stat per
+            // file id, which is cheap relative to losing a race once
+            match cache
+                .insert_async(entry.heap_file_id, Arc::clone(&arc))
+                .await
+            {
+                Ok(()) => Ok(arc),
+                Err(_) => {
+                    let hit = cache
+                        .get_async(&entry.heap_file_id)
+                        .await
+                        .expect("racer just inserted");
+                    Ok(Arc::clone(hit.get()))
+                }
+            }
+        } else {
+            let hf = HeapFile::new(
+                self.disk_manager.clone(),
+                self.buffer_pool.clone(),
+                HeapFileConfig {
+                    heap_file_id: entry.heap_file_id,
+                    fsm_file_id: entry.fsm_file_id,
+                },
+            )?;
+            hf.init_cache().await?;
+            Ok(Arc::new(hf))
+        }
     }
 
     /// Returns the catalog TableEntry for the given table ID.
@@ -212,8 +262,15 @@ impl ExecutionContext {
         self.indexes.insert(index_id, btree);
     }
 
-    /// Returns the B+ tree index instance for the given IndexId, if registered.
+    /// Returns the B+ tree index instance for the given IndexId. Consults
+    /// the server-wide btree_indexes registry first (lock-free scc lookup),
+    /// then falls back to the per-context map for legacy registrations
     pub fn get_index(&self, index_id: IndexId) -> Option<Arc<BTreeIndex>> {
+        if let Some(server) = &self.btree_indexes {
+            if let Some(hit) = server.read_sync(&index_id.0, |_, v| Arc::clone(v)) {
+                return Some(hit);
+            }
+        }
         self.indexes.get(&index_id).cloned()
     }
 
@@ -350,6 +407,17 @@ impl ExecutionContext {
             .get_indexes_for_table(table_id)
             .iter()
             .filter(|idx| idx.index_type == zyron_catalog::IndexType::Spatial)
+            .filter_map(|idx| idx.columns.first().map(|c| (idx.id.0, c.column_id)))
+            .collect()
+    }
+
+    /// Returns (index_id, indexed column_id) for B+Tree indexes on the table
+    pub fn btree_indexes_for_table(&self, table_id: u32) -> Vec<(u32, zyron_catalog::ColumnId)> {
+        let table_id = zyron_catalog::TableId(table_id);
+        self.catalog
+            .get_indexes_for_table(table_id)
+            .iter()
+            .filter(|idx| idx.index_type == zyron_catalog::IndexType::BTree)
             .filter_map(|idx| idx.columns.first().map(|c| (idx.id.0, c.column_id)))
             .collect()
     }

@@ -275,6 +275,12 @@ impl Catalog {
         name: &str,
         owner: &str,
     ) -> Result<SchemaId> {
+        if name == SYSTEM_SCHEMA_NAME {
+            return Err(ZyronError::PermissionDenied(format!(
+                "schema name `{}` is reserved for Zyron internals",
+                SYSTEM_SCHEMA_NAME
+            )));
+        }
         if self.cache.get_schema_by_name(db_id, name).is_some() {
             return Err(ZyronError::SchemaAlreadyExists(name.to_string()));
         }
@@ -294,6 +300,12 @@ impl Catalog {
     }
 
     pub async fn drop_schema(&self, db_id: DatabaseId, name: &str) -> Result<()> {
+        if name == SYSTEM_SCHEMA_NAME {
+            return Err(ZyronError::PermissionDenied(format!(
+                "schema `{}` is reserved for Zyron internals and cannot be dropped",
+                SYSTEM_SCHEMA_NAME
+            )));
+        }
         let schema = self
             .cache
             .get_schema_by_name(db_id, name)
@@ -325,6 +337,12 @@ impl Catalog {
         column_defs: &[ColumnDef],
         table_constraints: &[TableConstraint],
     ) -> Result<TableId> {
+        if schema_id == SYSTEM_SCHEMA_ID {
+            return Err(ZyronError::PermissionDenied(format!(
+                "schema `{}` is reserved for Zyron internals and cannot hold user tables",
+                SYSTEM_SCHEMA_NAME
+            )));
+        }
         if self.cache.get_table_by_name(schema_id, name).is_some() {
             return Err(ZyronError::TableAlreadyExists(name.to_string()));
         }
@@ -450,6 +468,12 @@ impl Catalog {
     }
 
     pub async fn drop_table(&self, schema_id: SchemaId, name: &str) -> Result<()> {
+        if schema_id == SYSTEM_SCHEMA_ID {
+            return Err(ZyronError::PermissionDenied(format!(
+                "tables in `{}` are reserved for Zyron internals and cannot be dropped",
+                SYSTEM_SCHEMA_NAME
+            )));
+        }
         let table = self
             .cache
             .get_table_by_name(schema_id, name)

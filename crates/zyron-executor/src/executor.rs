@@ -78,10 +78,8 @@ fn build_operator_tree(
                     _ => None,
                 };
 
-                // Use parallel scan for large tables when not tracking tuple IDs.
-                // Parallel scan does not support as_of yet, fall back to serial.
-                let table_entry = ctx.get_table_entry(table_id)?;
-                let num_pages = ctx.disk_manager.num_pages(table_entry.heap_file_id).await?;
+                // ParallelSeqScan does not support as_of, fall back to serial in that case
+                let num_pages = ctx.get_heap_file(table_id).await?.num_pages_cached() as u64;
 
                 if as_of_version.is_none() && should_use_parallel_scan(num_pages, false) {
                     let op =
@@ -149,8 +147,12 @@ fn build_operator_tree(
                 let mut br = BuildResult::new(Box::new(op));
                 // Apply remaining predicate as a filter on top of the FTS scan.
                 if let Some(pred) = remaining_predicate {
-                    br =
-                        BuildResult::new(Box::new(FilterOperator::new(br.op, pred, output_schema)));
+                    br = BuildResult::new(Box::new(FilterOperator::with_params(
+                        br.op,
+                        pred,
+                        output_schema,
+                        ctx.params.clone(),
+                    )));
                 }
                 Ok(br.with_metrics("FulltextScan", analyze, vec![]))
             }
@@ -178,8 +180,12 @@ fn build_operator_tree(
                 .await?;
                 let mut br = BuildResult::new(Box::new(op));
                 if let Some(pred) = remaining_predicate {
-                    br =
-                        BuildResult::new(Box::new(FilterOperator::new(br.op, pred, output_schema)));
+                    br = BuildResult::new(Box::new(FilterOperator::with_params(
+                        br.op,
+                        pred,
+                        output_schema,
+                        ctx.params.clone(),
+                    )));
                 }
                 Ok(br.with_metrics("VectorScan", analyze, vec![]))
             }
@@ -203,8 +209,12 @@ fn build_operator_tree(
                 .await?;
                 let mut br = BuildResult::new(Box::new(op));
                 if let Some(pred) = remaining_predicate {
-                    br =
-                        BuildResult::new(Box::new(FilterOperator::new(br.op, pred, output_schema)));
+                    br = BuildResult::new(Box::new(FilterOperator::with_params(
+                        br.op,
+                        pred,
+                        output_schema,
+                        ctx.params.clone(),
+                    )));
                 }
                 Ok(br.with_metrics("SpatialScan", analyze, vec![]))
             }
@@ -294,12 +304,14 @@ fn build_operator_tree(
                 predicate, child, ..
             } => {
                 let input_schema = child.output_schema();
+                let params = ctx.params.clone();
                 let child_br = build_operator_tree(*child, ctx).await?;
                 let child_m = collect_metrics(&[&child_br.metrics]);
-                let br = BuildResult::new(Box::new(FilterOperator::new(
+                let br = BuildResult::new(Box::new(FilterOperator::with_params(
                     child_br.op,
                     predicate,
                     input_schema,
+                    params,
                 )));
                 Ok(br.with_metrics("Filter", analyze, child_m))
             }
@@ -308,12 +320,14 @@ fn build_operator_tree(
                 expressions, child, ..
             } => {
                 let input_schema = child.output_schema();
+                let params = ctx.params.clone();
                 let child_br = build_operator_tree(*child, ctx).await?;
                 let child_m = collect_metrics(&[&child_br.metrics]);
-                let br = BuildResult::new(Box::new(ProjectOperator::new(
+                let br = BuildResult::new(Box::new(ProjectOperator::with_params(
                     child_br.op,
                     expressions,
                     input_schema,
+                    params,
                 )));
                 Ok(br.with_metrics("Project", analyze, child_m))
             }
@@ -490,7 +504,11 @@ fn build_operator_tree(
             }
 
             PhysicalPlan::Values { rows, schema, .. } => {
-                let br = BuildResult::new(Box::new(ValuesOperator::new(rows, schema)));
+                let br = BuildResult::new(Box::new(ValuesOperator::with_params(
+                    rows,
+                    schema,
+                    ctx.params.clone(),
+                )));
                 Ok(br.with_metrics("Values", analyze, vec![]))
             }
 
@@ -630,7 +648,7 @@ fn build_aggregate_schema(
     let mut schema = Vec::new();
     for (i, expr) in group_by.iter().enumerate() {
         schema.push(zyron_planner::logical::LogicalColumn {
-            table_idx: None,
+            table_idx: Some(zyron_planner::logical::AGGREGATE_TABLE_IDX),
             column_id: zyron_catalog::ColumnId(i as u16),
             name: format!("group{}", i),
             type_id: expr.type_id(),
@@ -640,7 +658,7 @@ fn build_aggregate_schema(
     for (i, agg) in aggregates.iter().enumerate() {
         let idx = group_by.len() + i;
         schema.push(zyron_planner::logical::LogicalColumn {
-            table_idx: None,
+            table_idx: Some(zyron_planner::logical::AGGREGATE_TABLE_IDX),
             column_id: zyron_catalog::ColumnId(idx as u16),
             name: agg.function_name.clone(),
             type_id: agg.return_type,
@@ -712,12 +730,14 @@ fn build_scan_with_tuple_ids(
                 predicate, child, ..
             } => {
                 let input_schema = child.output_schema();
+                let params = ctx.params.clone();
                 let child_br = build_scan_with_tuple_ids(*child, ctx).await?;
                 let child_m = collect_metrics(&[&child_br.metrics]);
-                let br = BuildResult::new(Box::new(FilterOperator::new(
+                let br = BuildResult::new(Box::new(FilterOperator::with_params(
                     child_br.op,
                     predicate,
                     input_schema,
+                    params,
                 )));
                 Ok(br.with_metrics("Filter", analyze, child_m))
             }

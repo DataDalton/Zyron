@@ -16,11 +16,12 @@ pub const USER_OID_START: u32 = 10000;
 /// System database ID for the default "zyron" database.
 pub const SYSTEM_DATABASE_ID: DatabaseId = DatabaseId(1);
 
-/// Default schema ID for the "public" schema.
-pub const DEFAULT_SCHEMA_ID: SchemaId = SchemaId(1);
+/// Schema ID reserved for Zyron's internal system tables. The schema is
+/// named `zyron_sys` and is write-protected from user DDL and DML.
+pub const SYSTEM_SCHEMA_ID: SchemaId = SchemaId(1);
 
-/// Catalog schema ID for the "zyron_catalog" internal schema.
-pub const CATALOG_SCHEMA_ID: SchemaId = SchemaId(2);
+/// User-facing name of the internal system schema.
+pub const SYSTEM_SCHEMA_NAME: &str = "zyron_sys";
 
 /// Atomic counter for allocating globally unique OIDs.
 pub struct OidAllocator {
@@ -170,8 +171,8 @@ mod tests {
     #[test]
     fn test_well_known_constants() {
         assert_eq!(SYSTEM_DATABASE_ID, DatabaseId(1));
-        assert_eq!(DEFAULT_SCHEMA_ID, SchemaId(1));
-        assert_eq!(CATALOG_SCHEMA_ID, SchemaId(2));
+        assert_eq!(SYSTEM_SCHEMA_ID, SchemaId(1));
+        assert_eq!(SYSTEM_SCHEMA_NAME, "zyron_sys");
     }
 
     #[test]

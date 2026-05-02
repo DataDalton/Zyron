@@ -28,7 +28,9 @@ use zyron_search::decode_doc_id;
 use zyron_storage::{HeapPage, TupleId};
 use zyron_types::spatial_index::Mbr;
 
-use crate::batch::{create_builders, decode_tuple_into_builders, finalize_builders};
+use crate::batch::{
+    build_column_to_builder_map, create_builders, decode_tuple_into_builders, finalize_builders,
+};
 use crate::context::ExecutionContext;
 use crate::operator::{ExecutionBatch, Operator, OperatorResult};
 
@@ -121,6 +123,9 @@ impl Operator for SpatialScanOperator {
             let table_entry = self.ctx.get_table_entry(self.table_id)?;
 
             let mut builders = create_builders(&self.output_columns, batch_size);
+            let output_ids: Vec<zyron_catalog::ColumnId> =
+                self.output_columns.iter().map(|c| c.column_id).collect();
+            let column_to_builder = build_column_to_builder_map(&table_entry.columns, &output_ids);
             let mut row_count = 0usize;
 
             while row_count < batch_size && self.cursor < self.results.len() {
@@ -144,7 +149,12 @@ impl Operator for SpatialScanOperator {
                     continue;
                 }
 
-                decode_tuple_into_builders(tuple.data(), &table_entry.columns, &mut builders);
+                decode_tuple_into_builders(
+                    tuple.data(),
+                    &table_entry.columns,
+                    &column_to_builder,
+                    &mut builders,
+                );
                 row_count += 1;
             }
 

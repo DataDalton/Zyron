@@ -71,8 +71,47 @@ impl<'a> Lexer<'a> {
             b'"' => self.scan_quoted_ident(),
             b'0'..=b'9' => self.scan_number(),
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.scan_word(),
+            b'$' => self.scan_parameter(),
             _ => self.scan_operator_or_punctuation(),
         }
+    }
+
+    /// Scans a `$N` bind parameter, where `N` is a positive 1-based index.
+    /// Returns `Token::Parameter(N)`. A `$` not followed by digits is rejected.
+    fn scan_parameter(&mut self) -> Result<SpannedToken> {
+        let start = self.pos;
+        let start_line = self.line;
+        let start_col = self.column;
+        debug_assert_eq!(self.bytes[self.pos], b'$');
+        self.pos += 1;
+        self.column += 1;
+
+        let digits_start = self.pos;
+        while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
+            self.pos += 1;
+            self.column += 1;
+        }
+        if self.pos == digits_start {
+            return Err(ZyronError::ParseError(format!(
+                "Bind parameter requires a digit after `$` at line {}, column {}",
+                start_line, start_col
+            )));
+        }
+        let digits = &self.input[digits_start..self.pos];
+        let index: usize = digits.parse().map_err(|_| {
+            ZyronError::ParseError(format!(
+                "Bind parameter index `{}` is not a valid number at line {}, column {}",
+                digits, start_line, start_col
+            ))
+        })?;
+        if index == 0 {
+            return Err(ZyronError::ParseError(format!(
+                "Bind parameter index must be >= 1 at line {}, column {}",
+                start_line, start_col
+            )));
+        }
+        let span = Span::new(start, self.pos - start);
+        Ok(SpannedToken::new(Token::Parameter(index), span))
     }
 
     fn skip_whitespace_and_comments(&mut self) -> Result<()> {
