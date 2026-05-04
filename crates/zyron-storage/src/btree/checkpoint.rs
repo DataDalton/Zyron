@@ -215,8 +215,9 @@ pub fn load_checkpoint_into_store(
     store: &mut InMemoryPageStore,
     file_id: u32,
 ) -> Result<(u64, u32, u32, u32)> {
-    // Read file using pre-allocated uninitialized buffer + read_exact
-    // to avoid Vec zeroing overhead of std::fs::read.
+    // Read file via uninit Vec + read_exact, skipping the zero-fill pass that
+    // vec![0u8; len] would otherwise force, the read_exact loop covers every
+    // byte itself
     let buf = {
         use std::io::Read;
         let mut file = std::fs::File::open(path).map_err(|e| {
@@ -236,14 +237,20 @@ pub fn load_checkpoint_into_store(
                 ))
             })?
             .len() as usize;
-        let mut buf = vec![0u8; file_len];
-        file.read_exact(&mut buf).map_err(|e| {
+        let mut buf: Vec<u8> = Vec::with_capacity(file_len);
+        let spare = buf.spare_capacity_mut();
+        let slice =
+            unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, file_len) };
+        file.read_exact(slice).map_err(|e| {
             ZyronError::IoError(format!(
                 "failed to read checkpoint file {}: {}",
                 path.display(),
                 e
             ))
         })?;
+        unsafe {
+            buf.set_len(file_len);
+        }
         buf
     };
 

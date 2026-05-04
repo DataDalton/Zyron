@@ -184,9 +184,83 @@ pub fn hamming(a: &str, b: &str) -> Result<usize> {
 // Jaro similarity
 // ---------------------------------------------------------------------------
 
-/// Computes the Jaro similarity between two strings.
-/// Returns a value between 0.0 (completely different) and 1.0 (identical).
+/// Computes the Jaro similarity between two strings
+/// Returns a value between 0.0 (completely different) and 1.0 (identical)
+/// Fast path for ASCII strings up to 256 chars uses stack-allocated bitmaps,
+/// no heap allocations and no UTF-8 decoding, falls back to a char-based
+/// implementation for non-ASCII or longer strings
 pub fn jaro_similarity(a: &str, b: &str) -> f64 {
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    if ab.len() <= 256 && bb.len() <= 256 && a.is_ascii() && b.is_ascii() {
+        return jaro_similarity_ascii(ab, bb);
+    }
+    jaro_similarity_chars(a, b)
+}
+
+/// Zero-alloc ASCII Jaro path, four u64 stack words give 256 bits per
+/// matched-array, callers up to 256 chars never touch the heap
+#[inline]
+fn jaro_similarity_ascii(a: &[u8], b: &[u8]) -> f64 {
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+
+    let alen = a.len();
+    let blen = b.len();
+    let max_len = alen.max(blen);
+    let match_distance = (max_len / 2).saturating_sub(1);
+
+    let mut a_matched = [0u64; 4];
+    let mut b_matched = [0u64; 4];
+    let mut matches = 0usize;
+
+    // Find matching characters
+    for i in 0..alen {
+        let start = i.saturating_sub(match_distance);
+        let end = (i + match_distance + 1).min(blen);
+        let ai = a[i];
+        for j in start..end {
+            // Test b_matched bit j without branching on the slot index pattern
+            if (b_matched[j >> 6] >> (j & 63)) & 1 == 0 && ai == b[j] {
+                a_matched[i >> 6] |= 1u64 << (i & 63);
+                b_matched[j >> 6] |= 1u64 << (j & 63);
+                matches += 1;
+                break;
+            }
+        }
+    }
+
+    if matches == 0 {
+        return 0.0;
+    }
+
+    // Count transpositions
+    let mut transpositions = 0usize;
+    let mut k = 0usize;
+    for i in 0..alen {
+        if (a_matched[i >> 6] >> (i & 63)) & 1 == 0 {
+            continue;
+        }
+        while (b_matched[k >> 6] >> (k & 63)) & 1 == 0 {
+            k += 1;
+        }
+        if a[i] != b[k] {
+            transpositions += 1;
+        }
+        k += 1;
+    }
+
+    let m = matches as f64;
+    let t = transpositions as f64 / 2.0;
+    (m / alen as f64 + m / blen as f64 + (m - t) / m) / 3.0
+}
+
+/// Char-based fallback for non-ASCII inputs or strings longer than 256 chars
+fn jaro_similarity_chars(a: &str, b: &str) -> f64 {
     let a_chars: Vec<char> = a.chars().collect();
     let b_chars: Vec<char> = b.chars().collect();
 
@@ -203,7 +277,6 @@ pub fn jaro_similarity(a: &str, b: &str) -> f64 {
     let mut b_matched = vec![false; b_chars.len()];
     let mut matches = 0usize;
 
-    // Find matching characters
     for i in 0..a_chars.len() {
         let start = if i > match_distance {
             i - match_distance
@@ -226,7 +299,6 @@ pub fn jaro_similarity(a: &str, b: &str) -> f64 {
         return 0.0;
     }
 
-    // Count transpositions
     let mut transpositions = 0usize;
     let mut k = 0usize;
     for i in 0..a_chars.len() {
@@ -247,20 +319,30 @@ pub fn jaro_similarity(a: &str, b: &str) -> f64 {
     (m / a_chars.len() as f64 + m / b_chars.len() as f64 + (m - t) / m) / 3.0
 }
 
-/// Computes Jaro-Winkler similarity (Jaro with prefix bonus).
-/// The prefix bonus rewards common prefixes up to 4 characters.
+/// Computes Jaro-Winkler similarity (Jaro with prefix bonus)
+/// The prefix bonus rewards common prefixes up to 4 characters
+/// ASCII inputs use a tight byte loop for prefix counting, the char iterator
+/// chain is reserved for non-ASCII strings
 pub fn jaro_winkler(a: &str, b: &str) -> f64 {
     let jaro = jaro_similarity(a, b);
 
-    // Count common prefix (up to 4 characters)
-    let prefix_len = a
-        .chars()
-        .zip(b.chars())
-        .take(4)
-        .take_while(|(a, b)| a == b)
-        .count();
+    let prefix_len = if a.is_ascii() && b.is_ascii() {
+        let ab = a.as_bytes();
+        let bb = b.as_bytes();
+        let max = 4.min(ab.len()).min(bb.len());
+        let mut c = 0;
+        while c < max && ab[c] == bb[c] {
+            c += 1;
+        }
+        c
+    } else {
+        a.chars()
+            .zip(b.chars())
+            .take(4)
+            .take_while(|(a, b)| a == b)
+            .count()
+    };
 
-    // Winkler scaling factor (standard p = 0.1)
     jaro + (prefix_len as f64 * 0.1 * (1.0 - jaro))
 }
 

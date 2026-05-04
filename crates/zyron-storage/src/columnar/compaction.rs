@@ -280,43 +280,47 @@ pub fn run_compaction_cycle(
         (0..rowCount).collect()
     };
 
-    // Reorder column data by sort permutation.
-    // Applies the permutation in-place per column to avoid cloning Vec<u8> per row.
-    // Uses the standard cycle-leader algorithm: follow each permutation cycle,
-    // moving elements to their final position with O(1) extra space per column.
+    // Per-column work: apply the sort permutation in-place, then encode the
+    // segment, both steps run inside one worker so each column's permutation
+    // happens concurrently with the others, prior implementation ran
+    // permutation serially across all 8 columns before spawning encode
+    // threads, that left ~27% of total work on the serial path which capped
+    // Amdahl-bound speedup, the combined-pass keeps each thread busy for the
+    // full duration of its column
     let mut reorderedColumns = input.column_data;
-    if pkIndex.is_some() {
-        for colData in &mut reorderedColumns {
-            let mut perm = sortedIndices.clone();
-            apply_permutation_in_place(colData, &mut perm);
-        }
-    }
-
-    // Parallel column encoding via std::thread::scope
     let threadCount = encoding_thread_count(input.columns.len(), config.max_encoding_threads);
     let columns = &input.columns;
-    let reordered = &reorderedColumns;
+    let needs_perm = pkIndex.is_some();
 
     let segments: Vec<Result<ColumnSegment>> = if threadCount <= 1 || columns.len() <= 1 {
-        // Single-threaded path
+        // Single-threaded path: permute then encode each column in turn
         columns
             .iter()
             .enumerate()
             .map(|(colIdx, col)| {
-                let values: Vec<Option<&[u8]>> =
-                    reordered[colIdx].iter().map(|v| v.as_deref()).collect();
+                let colData = &mut reorderedColumns[colIdx];
+                if needs_perm {
+                    let mut perm = sortedIndices.clone();
+                    apply_permutation_in_place(colData, &mut perm);
+                }
+                let values: Vec<Option<&[u8]>> = colData.iter().map(|v| v.as_deref()).collect();
                 ColumnSegment::build(col.column_id, col.type_id, col.value_size, &values)
             })
             .collect()
     } else {
-        // Multi-threaded path
+        // Multi-threaded path: spawn one worker per column, each worker owns
+        // its column for both the permutation and the encode steps
         std::thread::scope(|s| {
-            let handles: Vec<_> = columns
-                .iter()
-                .enumerate()
-                .map(|(colIdx, col)| {
-                    let colData = &reordered[colIdx];
+            let perm_template = &sortedIndices;
+            let handles: Vec<_> = reorderedColumns
+                .iter_mut()
+                .zip(columns.iter())
+                .map(|(colData, col)| {
                     s.spawn(move || {
+                        if needs_perm {
+                            let mut perm = perm_template.clone();
+                            apply_permutation_in_place(colData, &mut perm);
+                        }
                         let values: Vec<Option<&[u8]>> =
                             colData.iter().map(|v| v.as_deref()).collect();
                         ColumnSegment::build(col.column_id, col.type_id, col.value_size, &values)

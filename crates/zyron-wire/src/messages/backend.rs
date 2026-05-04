@@ -434,6 +434,17 @@ impl BackendMessage {
 impl ChangeBatchMessage {
     /// Encodes a full X message including type byte and length prefix.
     pub fn encode(&self, buf: &mut BytesMut) {
+        // Pre-compute total size and reserve once so the per-put_* capacity
+        // checks become trivial branches the optimizer can hoist
+        // header: type(1) + length(4) + start_lsn(8) + end_lsn(8) +
+        //         row_count(4) + commit_ts(8) = 33
+        // per row: change_type(1) + table_id(4) + lsn(8) + row_len(4) +
+        //          row_bytes + pk_len(4) + pk_bytes = 21 + var
+        let mut total = 33usize;
+        for row in &self.rows {
+            total += 21 + row.row_bytes.len() + row.primary_key_bytes.len();
+        }
+        buf.reserve(total);
         buf.put_u8(CHANGE_BATCH_MSG_TYPE);
         let len_pos = buf.len();
         buf.put_i32(0);

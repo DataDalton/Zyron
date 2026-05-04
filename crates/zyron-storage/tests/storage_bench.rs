@@ -12,6 +12,9 @@
 //!
 //! Run: cargo test -p zyron-storage --test storage_bench --release -- --nocapture
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use zyron_bench_harness::*;
 
 use rand::RngExt;

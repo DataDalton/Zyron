@@ -182,57 +182,110 @@ impl CompiledRoute {
 
     /// Matches a request path against this route, returning the captured params
     /// when every static segment agrees.
+    /// Allocation-free fast paths: non-matching routes return None without
+    /// touching the heap, parameter-free routes return an empty HashMap
+    /// only on success
     pub fn match_path(&self, path: &str) -> Option<HashMap<String, String>> {
-        let mut captures = HashMap::new();
-        let mut pi = 0usize;
-        let path_parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        if path_parts.len() != self.path_segments.len() {
-            return None;
-        }
+        // Walk the request path segments and the route segments in lockstep
+        // without collecting into a Vec, so non-match cost stays under the
+        // allocator
+        let mut req_iter = path.split('/').filter(|s| !s.is_empty());
+        let mut param_count = 0usize;
         for seg in &self.path_segments {
-            let got = path_parts.get(pi)?;
+            let got = req_iter.next()?;
             match seg {
                 PathSegment::Static(s) => {
                     if s != got {
                         return None;
                     }
                 }
-                PathSegment::Param(name) => {
-                    captures.insert(name.clone(), (*got).to_string());
+                PathSegment::Param(_) => {
+                    param_count += 1;
                 }
             }
-            pi += 1;
+        }
+        if req_iter.next().is_some() {
+            // Request had more segments than the route
+            return None;
+        }
+        if param_count == 0 {
+            return Some(HashMap::new());
+        }
+        // Route has params, walk again to capture, sized exactly
+        let mut captures = HashMap::with_capacity(param_count);
+        let mut req_iter = path.split('/').filter(|s| !s.is_empty());
+        for seg in &self.path_segments {
+            let got = req_iter.next()?;
+            if let PathSegment::Param(name) = seg {
+                captures.insert(name.clone(), got.to_string());
+            }
         }
         Some(captures)
     }
 }
 
-/// Route registry. Holds a map from pattern to route plus a sorted lookup list
-/// ordered so static segments win over parameter segments.
+/// Route registry. Holds the canonical Vec of routes plus an O(1) hashmap
+/// keyed by exact path for routes whose pattern has no `:param` segments,
+/// so common static lookups skip the linear scan
 pub struct Router {
-    routes: RwLock<Vec<Arc<CompiledRoute>>>,
+    routes: RwLock<RouterIndex>,
+}
+
+struct RouterIndex {
+    /// Canonical insertion-ordered list, source of truth for list/iteration
+    all: Vec<Arc<CompiledRoute>>,
+    /// Static-only routes indexed by their full normalized path. Lookup
+    /// trims surrounding slashes to match the iterator-based comparison
+    static_idx: HashMap<String, Arc<CompiledRoute>>,
+    /// Routes that have at least one `:param` segment, scanned linearly
+    /// because they require pattern matching
+    param_routes: Vec<Arc<CompiledRoute>>,
 }
 
 impl Router {
     pub fn new() -> Self {
         Self {
-            routes: RwLock::new(Vec::new()),
+            routes: RwLock::new(RouterIndex {
+                all: Vec::new(),
+                static_idx: HashMap::new(),
+                param_routes: Vec::new(),
+            }),
         }
     }
 
     pub fn insert(&self, route: CompiledRoute) {
         let arc = Arc::new(route);
-        let mut routes = self.routes.write();
-        if let Some(idx) = routes
+        let mut idx = self.routes.write();
+        // Replace any existing route with the same pattern in all three views
+        if let Some(pos) = idx
+            .all
             .iter()
             .position(|r| r.path_pattern == arc.path_pattern)
         {
-            routes[idx] = arc;
+            let existing = idx.all[pos].clone();
+            idx.all[pos] = Arc::clone(&arc);
+            if Self::is_static_only(&existing) {
+                idx.static_idx
+                    .remove(&Self::canonical_path(&existing.path_pattern));
+            } else if let Some(pp) = idx
+                .param_routes
+                .iter()
+                .position(|r| Arc::ptr_eq(r, &existing))
+            {
+                idx.param_routes.swap_remove(pp);
+            }
         } else {
-            routes.push(arc);
+            idx.all.push(Arc::clone(&arc));
         }
-        // Order: routes with more static segments come first.
-        routes.sort_by_key(|r| {
+        if Self::is_static_only(&arc) {
+            idx.static_idx
+                .insert(Self::canonical_path(&arc.path_pattern), Arc::clone(&arc));
+        } else {
+            idx.param_routes.push(Arc::clone(&arc));
+        }
+        // Sort the canonical list so list() returns a stable ordering, more
+        // static segments first, fewer total segments first within that
+        idx.all.sort_by_key(|r| {
             let static_count = r
                 .path_segments
                 .iter()
@@ -242,10 +295,45 @@ impl Router {
         });
     }
 
+    fn is_static_only(route: &CompiledRoute) -> bool {
+        route
+            .path_segments
+            .iter()
+            .all(|s| matches!(s, PathSegment::Static(_)))
+    }
+
+    fn canonical_path(pattern: &str) -> String {
+        Self::canonical_path_str(pattern).into_owned()
+    }
+
+    /// Returns the canonical form of a path, borrowed when possible so the
+    /// hot lookup path skips a heap allocation for already-canonical input
+    fn canonical_path_str(pattern: &str) -> std::borrow::Cow<'_, str> {
+        let trimmed = pattern.trim_matches('/');
+        // Already canonical when there are no double slashes, just borrow
+        if !trimmed.contains("//") {
+            return std::borrow::Cow::Borrowed(trimmed);
+        }
+        let mut buf = String::with_capacity(trimmed.len());
+        for (i, seg) in trimmed.split('/').filter(|s| !s.is_empty()).enumerate() {
+            if i > 0 {
+                buf.push('/');
+            }
+            buf.push_str(seg);
+        }
+        std::borrow::Cow::Owned(buf)
+    }
+
     pub fn remove(&self, pattern: &str) -> bool {
-        let mut routes = self.routes.write();
-        if let Some(idx) = routes.iter().position(|r| r.path_pattern == pattern) {
-            routes.remove(idx);
+        let mut idx = self.routes.write();
+        if let Some(pos) = idx.all.iter().position(|r| r.path_pattern == pattern) {
+            let arc = idx.all.remove(pos);
+            if Self::is_static_only(&arc) {
+                idx.static_idx
+                    .remove(&Self::canonical_path(&arc.path_pattern));
+            } else if let Some(p) = idx.param_routes.iter().position(|r| Arc::ptr_eq(r, &arc)) {
+                idx.param_routes.swap_remove(p);
+            }
             true
         } else {
             false
@@ -255,9 +343,15 @@ impl Router {
     /// Removes the route that owns the given catalog endpoint id. Used when a
     /// DROP ENDPOINT or ALTER ENDPOINT DISABLE fires without the path on hand.
     pub fn remove_by_endpoint_id(&self, endpoint_id: EndpointId) -> bool {
-        let mut routes = self.routes.write();
-        if let Some(idx) = routes.iter().position(|r| r.endpoint_id == endpoint_id) {
-            routes.remove(idx);
+        let mut idx = self.routes.write();
+        if let Some(pos) = idx.all.iter().position(|r| r.endpoint_id == endpoint_id) {
+            let arc = idx.all.remove(pos);
+            if Self::is_static_only(&arc) {
+                idx.static_idx
+                    .remove(&Self::canonical_path(&arc.path_pattern));
+            } else if let Some(p) = idx.param_routes.iter().position(|r| Arc::ptr_eq(r, &arc)) {
+                idx.param_routes.swap_remove(p);
+            }
             true
         } else {
             false
@@ -269,8 +363,18 @@ impl Router {
         method: HttpMethod,
         path: &str,
     ) -> Option<(Arc<CompiledRoute>, HashMap<String, String>)> {
-        let routes = self.routes.read();
-        for r in routes.iter() {
+        let idx = self.routes.read();
+        // Static fast path: lookup the exact normalized path in the hashmap
+        // canonical_path_str borrows when the path is already canonical so
+        // the common request shape avoids a per-lookup heap allocation
+        let canonical = Self::canonical_path_str(path);
+        if let Some(r) = idx.static_idx.get(canonical.as_ref()) {
+            if r.accepts(method) {
+                return Some((Arc::clone(r), HashMap::new()));
+            }
+        }
+        // Fall back to scanning only the routes that actually have parameters
+        for r in &idx.param_routes {
             if !r.accepts(method) {
                 continue;
             }
@@ -282,12 +386,12 @@ impl Router {
     }
 
     pub fn list(&self) -> Vec<Arc<CompiledRoute>> {
-        self.routes.read().clone()
+        self.routes.read().all.clone()
     }
 
     pub fn set_enabled(&self, name: &str, enabled: bool) -> bool {
-        let routes = self.routes.read();
-        for r in routes.iter() {
+        let idx = self.routes.read();
+        for r in &idx.all {
             if r.name == name {
                 // CircuitBreaker holds interior mutability. Toggling enabled
                 // requires replacing the Arc, which we skip here because the

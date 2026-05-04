@@ -1917,7 +1917,10 @@ impl<'a> Binder<'a> {
                     // Treat LATERAL as a regular subquery for now
                     self.bind_table_ref(ctx, subquery).await
                 }
-                TableRef::TableFunction { name, args, alias } => {
+                TableRef::TableFunction(tf) => {
+                    let name = &tf.name;
+                    let args = &tf.args;
+                    let alias = &tf.alias;
                     // Check if this is a graph algorithm table function.
                     let algo = name.to_lowercase();
                     let graph_algos = [
@@ -2420,7 +2423,7 @@ impl<'a> Binder<'a> {
                         function: Box::new(bound_func),
                         partition_by: bound_partition,
                         order_by: bound_order,
-                        frame: frame.clone(),
+                        frame: frame.as_ref().map(|f| (**f).clone()),
                         type_id,
                     })
                 }

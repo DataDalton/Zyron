@@ -1,0 +1,23 @@
+{
+  "id": "2026-05-03_174448_b3020a2-local",
+  "date": "2026-05-03 17:44:48Z",
+  "ts": 1777830288,
+  "commit": "b3020a2-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "optimizer": {
+      "explain_analyze_overhead_pct": {
+        "average": 42.385007,
+        "runs": [42.11, 42.13, 46.01, 40.04, 41.64],
+        "target": 3.000000,
+        "passed": false,
+        "higher_is_better": false
+      }
+    }
+  }
+}

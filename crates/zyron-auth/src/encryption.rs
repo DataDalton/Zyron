@@ -9,6 +9,7 @@
 //! encryption keys with a master key derived from Balloon KDF.
 
 use crate::rcu::RcuMap;
+use scc::HashMap as SccHashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -147,10 +148,14 @@ struct EncryptedKey {
 }
 
 /// Local key store that keeps data encryption keys encrypted in memory
-/// with a master key derived from a passphrase via Balloon KDF.
+/// with a master key derived from a passphrase via Balloon KDF
+/// Backed by scc::HashMap so create_key, get_key, delete_key, and rotate_key
+/// stay O(1) regardless of how many keys the store accumulates over the
+/// lifetime of a deployment, multi-tenant fleets and rotation-heavy workloads
+/// would otherwise pay O(N) per insert under copy-on-write semantics
 pub struct LocalKeyStore {
     master_key: [u8; 32],
-    keys: RcuMap<u32, EncryptedKey>,
+    keys: SccHashMap<u32, EncryptedKey>,
     next_id: AtomicU32,
 }
 
@@ -159,7 +164,7 @@ impl LocalKeyStore {
     pub fn new(master_key: [u8; 32]) -> Self {
         Self {
             master_key,
-            keys: RcuMap::empty_map(),
+            keys: SccHashMap::new(),
             next_id: AtomicU32::new(1),
         }
     }
@@ -187,11 +192,11 @@ impl LocalKeyStore {
 
 impl KeyStore for LocalKeyStore {
     fn get_key(&self, key_id: u32) -> Result<Vec<u8>> {
-        let encrypted = self
+        let wrapped = self
             .keys
-            .get(&key_id)
+            .read_sync(&key_id, |_, v| v.encrypted_material.clone())
             .ok_or_else(|| ZyronError::EncryptionKeyNotFound(format!("key id {}", key_id)))?;
-        self.unwrap_key(&encrypted.encrypted_material)
+        self.unwrap_key(&wrapped)
     }
 
     fn create_key(&self, algorithm: EncryptionAlgorithm) -> Result<u32> {
@@ -206,12 +211,12 @@ impl KeyStore for LocalKeyStore {
             algorithm,
             encrypted_material,
         };
-        self.keys.insert(key_id, entry);
+        let _ = self.keys.insert_sync(key_id, entry);
         Ok(key_id)
     }
 
     fn delete_key(&self, key_id: u32) -> Result<()> {
-        if !self.keys.remove(&key_id) {
+        if self.keys.remove_sync(&key_id).is_none() {
             return Err(ZyronError::EncryptionKeyNotFound(format!(
                 "key id {}",
                 key_id
@@ -221,14 +226,14 @@ impl KeyStore for LocalKeyStore {
     }
 
     fn rotate_key(&self, key_id: u32) -> Result<u32> {
-        let old = self
+        let algorithm = self
             .keys
-            .get(&key_id)
+            .read_sync(&key_id, |_, v| v.algorithm)
             .ok_or_else(|| ZyronError::EncryptionKeyNotFound(format!("key id {}", key_id)))?;
-        let new_id = self.create_key(old.algorithm)?;
-        // Remove the old key. Data encrypted with it must be re-encrypted
-        // with the new key before this point.
-        self.keys.remove(&key_id);
+        let new_id = self.create_key(algorithm)?;
+        // Remove the old key, data encrypted with it must be re-encrypted
+        // with the new key before this point
+        let _ = self.keys.remove_sync(&key_id);
         Ok(new_id)
     }
 }

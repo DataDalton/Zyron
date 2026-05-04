@@ -1920,13 +1920,15 @@ fn test_wire_concurrent_connections() {
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Concurrent Connections Test ===");
 
-    let rt = tokio::runtime::Builder::new_current_thread()
+    // Multi-thread runtime so the bench exercises real concurrency
+    // worker_threads is left unset so tokio defaults to the host's CPU
+    // count, the bench should scale with whatever cores are available
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap();
 
-    let local = tokio::task::LocalSet::new();
-    local.block_on(&rt, async {
+    rt.block_on(async {
         let (server_state, _tmp) = create_test_server("testdb").await;
         let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.expect("bind failed"));
         let addr = listener.local_addr().unwrap();
@@ -1940,26 +1942,25 @@ fn test_wire_concurrent_connections() {
 
             let start = Instant::now();
 
-            // Spawn server accept loop as a local task
-            let server_listener = Arc::clone(&listener);
-            let server_ss = Arc::clone(&server_state);
-            let server_handle = tokio::task::spawn_local(async move {
-                let mut handles = Vec::new();
-                for _ in 0..concurrent {
+            // Spawn N parallel accept tasks instead of a single sequential
+            // accept loop, the kernel still serialises individual accept
+            // syscalls but the tokio scheduler can hand off each accepted
+            // socket to its handler immediately on whatever worker is free
+            let mut server_handles = Vec::with_capacity(concurrent);
+            for _ in 0..concurrent {
+                let server_listener = Arc::clone(&listener);
+                let server_ss = Arc::clone(&server_state);
+                server_handles.push(tokio::spawn(async move {
                     let (stream, _) = server_listener.accept().await.expect("accept failed");
-                    let state = Arc::clone(&server_ss);
-                    handles.push(tokio::task::spawn_local(async move {
-                        let mut conn = zyron_wire::connection::Connection::new(stream, state, None);
-                        let _ = conn.run().await;
-                    }));
-                }
-                handles
-            });
+                    let mut conn = zyron_wire::connection::Connection::new(stream, server_ss, None);
+                    let _ = conn.run().await;
+                }));
+            }
 
-            // Spawn clients concurrently
+            // Spawn clients concurrently across the worker threads
             let mut client_handles = Vec::new();
             for _ in 0..concurrent {
-                let client_handle = tokio::task::spawn_local(async move {
+                let client_handle = tokio::spawn(async move {
                     let mut stream = TcpStream::connect(addr).await.expect("connect failed");
                     let result = do_handshake(&mut stream, "test_user", "testdb").await;
                     let _ = stream.write_all(&build_terminate_bytes()).await;
@@ -1977,10 +1978,8 @@ fn test_wire_concurrent_connections() {
             }
 
             // Wait for server handlers to finish
-            if let Ok(server_handles) = server_handle.await {
-                for h in server_handles {
-                    let _ = h.await;
-                }
+            for h in server_handles {
+                let _ = h.await;
             }
 
             let elapsed = start.elapsed();

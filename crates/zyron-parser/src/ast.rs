@@ -1903,11 +1903,14 @@ pub enum Expr {
         negated: bool,
     },
     /// Window function: expr OVER (window_spec)
+    /// `frame` is boxed because WindowFrame inline made this variant the
+    /// largest in Expr (~112 bytes), boxing brings Expr down to ~64 bytes
+    /// which cuts every Expr field across the AST
     WindowFunction {
         function: Box<Expr>,
         partition_by: Vec<Expr>,
         order_by: Vec<OrderByExpr>,
-        frame: Option<WindowFrame>,
+        frame: Option<Box<WindowFrame>>,
     },
     /// Array constructor: ARRAY[expr, ...]
     ArrayConstructor(Vec<Expr>),
@@ -2091,11 +2094,18 @@ pub enum TableRef {
     /// LATERAL subquery or function call in FROM
     Lateral { subquery: Box<TableRef> },
     /// Table-valued function call in FROM clause: FUNC_NAME(args...)
-    TableFunction {
-        name: String,
-        args: Vec<FunctionArg>,
-        alias: Option<String>,
-    },
+    /// Boxed because the inline variant pushed TableRef from 56 to 72 bytes,
+    /// and TableRef is held in many AST nodes
+    TableFunction(Box<TableFunctionRef>),
+}
+
+/// Table-valued function call data, extracted so `TableRef::TableFunction` can
+/// stay pointer-sized. See `TableRef::TableFunction`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableFunctionRef {
+    pub name: String,
+    pub args: Vec<FunctionArg>,
+    pub alias: Option<String>,
 }
 
 /// Join data extracted to a separate struct for boxing inside TableRef.

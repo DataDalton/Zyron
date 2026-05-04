@@ -1,0 +1,28 @@
+
+=== Concurrent Connections Test ===
+  Server listening on 127.0.0.1:52383
+
+--- Run 1/5 ---
+
+  200 concurrent connections (200 success) in 518.90ms, 385 conns/sec
+
+--- Run 2/5 ---
+
+  200 concurrent connections (200 success) in 518.88ms, 385 conns/sec
+
+--- Run 3/5 ---
+
+  200 concurrent connections (200 success) in 513.64ms, 389 conns/sec
+
+--- Run 4/5 ---
+
+  200 concurrent connections (200 success) in 514.75ms, 389 conns/sec
+
+--- Run 5/5 ---
+
+  200 concurrent connections (200 success) in 518.03ms, 386 conns/sec
+
+  Connection establishment rate (conns/sec) [FAIL/REGR!]:
+    Runs: [385, 385, 389, 389, 386]
+    Average: 387 >= 1,000 (target)
+    Min/Max: 385 / 389, StdDev: 2

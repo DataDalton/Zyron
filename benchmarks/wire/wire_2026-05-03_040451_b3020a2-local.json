@@ -1,0 +1,23 @@
+{
+  "id": "2026-05-03_040451_b3020a2-local",
+  "date": "2026-05-03 04:04:54Z",
+  "ts": 1777781094,
+  "commit": "b3020a2-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Concurrent Connections": {
+      "Connection establishment rate (conns/sec)": {
+        "average": 386.974323,
+        "runs": [385.43, 385.45, 389.38, 388.54, 386.08],
+        "target": 1000.000000,
+        "passed": false,
+        "higher_is_better": true
+      }
+    }
+  }
+}

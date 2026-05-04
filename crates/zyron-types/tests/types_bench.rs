@@ -1330,17 +1330,18 @@ fn test_performance_sweep() {
     );
 
     // ---- UUID v7 10M throughput
+    // black_box the full 16 bytes per call so the optimizer cannot dead-code
+    // the random-byte writes, the prior id[0] accumulator made bytes 6-15
+    // unobservable and let the optimizer collapse the wyrand work
     tprintln!("\n--- UUID v7 10M IDs ---");
     let n_uuid = 10_000_000usize;
     let mut runs_per_sec = Vec::new();
     for run in 0..VALIDATION_RUNS {
         let start = Instant::now();
-        let mut sink = 0u8;
         for _ in 0..n_uuid {
             let id = uuid_v7();
-            sink = sink.wrapping_add(id[0]);
+            std::hint::black_box(&id);
         }
-        std::hint::black_box(sink);
         let sec = start.elapsed().as_secs_f64();
         let ps = n_uuid as f64 / sec;
         runs_per_sec.push(ps);

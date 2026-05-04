@@ -130,25 +130,20 @@ pub async fn start_health_server(port: u16, state: Arc<HealthState>, shutdown: A
 
     info!("Health/metrics server listening on {}", addr);
 
-    // Use a watch channel to signal shutdown without polling.
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-
-    // Background task that monitors the AtomicBool and sends via watch.
-    let shutdown_flag = Arc::clone(&shutdown);
-    tokio::spawn(async move {
-        loop {
-            if shutdown_flag.load(Ordering::Acquire) {
-                let _ = shutdown_tx.send(true);
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    });
-
+    // Inline polling via select! sleep beats a dedicated polling task,
+    // the prior implementation spawned a task that woke every 50ms to check
+    // the AtomicBool which competed with request handlers on the
+    // current_thread runtime and caused per-request latency outliers when a
+    // poll tick landed in the middle of an HTTP round trip, the inline
+    // sleep fires only when accept is also idle so request handling is
+    // never preempted by a stray shutdown poll
     loop {
+        if shutdown.load(Ordering::Acquire) {
+            break;
+        }
         let accept = tokio::select! {
             result = listener.accept() => result,
-            _ = shutdown_rx.changed() => break,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => continue,
         };
 
         let (mut stream, peer) = match accept {

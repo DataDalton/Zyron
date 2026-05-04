@@ -1,0 +1,46 @@
+{
+  "id": "2026-05-03_173951_b3020a2-local",
+  "date": "2026-05-03 17:40:07Z",
+  "ts": 1777830007,
+  "commit": "b3020a2-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Checkpoint": {
+      "util_before": { "cpu_pct": 6.0, "ram_used_gb": 15.22 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 19.19 },
+      "Write throughput (MB/sec)": {
+        "average": 1874.065889,
+        "runs": [1394.33, 2125.53, 2095.43, 1756.64, 1998.39],
+        "target": 2000.000000,
+        "passed": false,
+        "higher_is_better": true
+      },
+      "Write latency 1M keys (ms)": {
+        "average": 4.694200,
+        "runs": [6.16, 4.04, 4.10, 4.89, 4.29],
+        "target": 3.000000,
+        "passed": false,
+        "higher_is_better": false
+      },
+      "Load throughput (MB/sec)": {
+        "average": 819.783944,
+        "runs": [666.66, 856.12, 849.51, 870.97, 855.66],
+        "target": 3000.000000,
+        "passed": false,
+        "higher_is_better": true
+      },
+      "Load latency 1M keys (ms)": {
+        "average": 10.577920,
+        "runs": [12.87, 10.03, 10.10, 9.85, 10.03],
+        "target": 2.000000,
+        "passed": false,
+        "higher_is_better": false
+      }
+    }
+  }
+}

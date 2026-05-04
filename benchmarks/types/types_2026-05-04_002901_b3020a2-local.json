@@ -1,0 +1,100 @@
+{
+  "id": "2026-05-04_002901_b3020a2-local",
+  "date": "2026-05-04 00:39:53Z",
+  "ts": 1777855193,
+  "commit": "b3020a2-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Performance": {
+      "TIME_BUCKET throughput (rows/sec)": {
+        "average": 543758269.028958,
+        "runs": [534236549.26, 527930144.28, 562578409.37, 553654674.51, 540391567.73],
+        "target": 150000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "LOCF throughput (rows/sec)": {
+        "average": 522165983.893186,
+        "runs": [531606674.85, 576116513.80, 546421214.26, 491315989.88, 465369526.67],
+        "target": 80000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "ST_Distance (ns)": {
+        "average": 16.089700,
+        "runs": [14.63, 17.17, 16.78, 14.90, 16.97],
+        "target": 120.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Levenshtein 10-char (ns)": {
+        "average": 276.798320,
+        "runs": [274.52, 279.32, 278.34, 277.68, 274.14],
+        "target": 300.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Jaro-Winkler 10-char (ns)": {
+        "average": 42.671800,
+        "runs": [43.71, 43.66, 43.04, 41.30, 41.65],
+        "target": 150.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Soundex (ns)": {
+        "average": 45.336500,
+        "runs": [45.44, 45.12, 45.00, 46.10, 45.02],
+        "target": 80.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Entity resolve 100K (s)": {
+        "average": 124.294141,
+        "runs": [124.37, 124.29, 124.30, 124.16, 124.36],
+        "target": 12.000000,
+        "passed": false,
+        "higher_is_better": false
+      },
+      "UUID v7 throughput (IDs/sec)": {
+        "average": 558850452.319234,
+        "runs": [560001344.00, 562170427.59, 559609616.33, 556380853.82, 556090019.85],
+        "target": 80000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "SLUG 100-char (ns)": {
+        "average": 99.859800,
+        "runs": [98.53, 98.80, 98.40, 101.28, 102.28],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "format_number (ns)": {
+        "average": 74.951340,
+        "runs": [75.51, 74.68, 74.80, 74.84, 74.92],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "DATA_PROFILE 1M rows (s)": {
+        "average": 0.174026,
+        "runs": [0.18, 0.17, 0.17, 0.18, 0.17],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Fuzzy join 20K records (s)": {
+        "average": 4.882536,
+        "runs": [4.91, 4.88, 4.87, 4.88, 4.87],
+        "target": 20.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    }
+  }
+}

@@ -49,9 +49,15 @@ impl WaitForGraph {
         let _ = self.edges.remove_sync(&waiter);
     }
 
-    /// Removes all edges involving a transaction (as waiter or holder).
-    /// Called when a transaction commits or aborts.
+    /// Removes all edges involving a transaction (as waiter or holder)
+    /// Called when a transaction commits or aborts
+    /// Fast-path skips the iter+remove sweep when no transaction has ever
+    /// participated in deadlock detection, common in workloads without lock
+    /// waits where the graph stays empty for the lifetime of the manager
     pub fn remove_transaction(&self, txn_id: u64) {
+        if self.edges.is_empty() {
+            return;
+        }
         let _ = self.edges.remove_sync(&txn_id);
 
         let mut waiters_to_remove = Vec::new();

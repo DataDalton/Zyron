@@ -1,0 +1,13 @@
+
+=== Lexer Throughput Performance Test ===
+  Workload: 12300 bytes, 1000 iterations per run
+  Validation runs: 5
+  Run 1: 227.5 MB/sec
+  Run 2: 227.8 MB/sec
+  Run 3: 217.5 MB/sec
+  Run 4: 213.2 MB/sec
+  Run 5: 221.9 MB/sec
+  Throughput (MB/sec) [PASS/OK]:
+    Runs: [227, 228, 218, 213, 222]
+    Average: 222 >= 200 (target)
+    Min/Max: 213 / 228, StdDev: 6

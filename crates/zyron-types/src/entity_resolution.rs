@@ -4,7 +4,7 @@
 //! Specialized similarity functions for addresses, names, and company names.
 
 use crate::fuzzy::{FuzzyBuffer, jaro_winkler};
-use crate::similarity::FuzzyJoinAlgo;
+use crate::similarity::{FuzzyJoinAlgo, jaccard_similarity, ngram_similarity};
 use zyron_common::{Result, ZyronError};
 
 // ---------------------------------------------------------------------------
@@ -236,8 +236,17 @@ fn normalize_company(text: &str) -> String {
 // Entity resolution
 // ---------------------------------------------------------------------------
 
-/// Identifies matching records in a dataset based on the given configuration.
-/// Returns a list of (i, j, confidence) tuples where records[i] and records[j] match.
+/// Identifies matching records in a dataset based on the given configuration
+/// Returns a list of (i, j, confidence) tuples where records[i] and records[j] match
+///
+/// The single-rule path bypasses compute_record_score's per-pair dispatch and
+/// FuzzyBuffer init, the algorithm function pointer is hoisted out of the loop
+///
+/// When the rule uses Jaro/JaroWinkler/Levenshtein, blocks are sorted by the
+/// comparison field length and the inner loop applies a length-ratio filter,
+/// pairs whose lengths cannot meet the overall_threshold even with perfect
+/// matching are skipped, this is mathematically equivalent to running the full
+/// comparison and getting a sub-threshold score so recall is preserved
 pub fn entity_resolve(
     records: &[Vec<&str>],
     config: &DeduplicationConfig,
@@ -246,12 +255,91 @@ pub fn entity_resolve(
         return Ok(Vec::new());
     }
 
-    // Phase 1: Blocking - group records into blocks
     let blocks = phase_blocking(records, config)?;
-
-    // Phase 2 & 3: Comparison and classification
     let mut matches: Vec<(usize, usize, f64)> = Vec::new();
 
+    if config.comparison_rules.len() == 1 {
+        let rule = &config.comparison_rules[0];
+        let length_cutoff = length_filter_cutoff(rule.algorithm, config.overall_threshold);
+        let use_length_filter = length_cutoff > 0.0;
+
+        for block_members in blocks.values() {
+            // Build (idx, comparison-field-length) pairs once, sort by length so
+            // the inner loop can break as soon as the length ratio drops below
+            // the cutoff
+            let mut sorted: Vec<(usize, usize)> = block_members
+                .iter()
+                .map(|&idx| {
+                    let len = records[idx].get(rule.field_a).map(|s| s.len()).unwrap_or(0);
+                    (idx, len)
+                })
+                .collect();
+            if use_length_filter {
+                sorted.sort_unstable_by_key(|(_, len)| *len);
+            }
+
+            let mut buf = FuzzyBuffer::new();
+
+            for i in 0..sorted.len() {
+                let (idx_a, len_a) = sorted[i];
+                let a_record = &records[idx_a];
+                if rule.field_a >= a_record.len() {
+                    continue;
+                }
+                let a_field = a_record[rule.field_a];
+
+                for j in (i + 1)..sorted.len() {
+                    let (idx_b, len_b) = sorted[j];
+
+                    if use_length_filter && len_a > 0 && len_b > 0 {
+                        let (shorter, longer) = if len_a <= len_b {
+                            (len_a, len_b)
+                        } else {
+                            (len_b, len_a)
+                        };
+                        let ratio = shorter as f64 / longer as f64;
+                        if ratio < length_cutoff {
+                            // Sorted ascending, all subsequent j have larger len_b,
+                            // ratio only gets worse, safe to break
+                            break;
+                        }
+                    }
+
+                    let b_record = &records[idx_b];
+                    if rule.field_b >= b_record.len() {
+                        continue;
+                    }
+                    let b_field = b_record[rule.field_b];
+
+                    let sim = match rule.algorithm {
+                        FuzzyJoinAlgo::JaroWinkler => jaro_winkler(a_field, b_field),
+                        FuzzyJoinAlgo::Levenshtein => {
+                            crate::fuzzy::levenshtein_similarity(a_field, b_field, &mut buf)
+                        }
+                        FuzzyJoinAlgo::NGram(n) => ngram_similarity(a_field, b_field, n),
+                        FuzzyJoinAlgo::Jaccard => {
+                            let ta: Vec<&str> = a_field.split_whitespace().collect();
+                            let tb: Vec<&str> = b_field.split_whitespace().collect();
+                            jaccard_similarity(&ta, &tb)
+                        }
+                    };
+
+                    // Single-rule reduction of compute_record_score, when sim
+                    // clears the rule threshold the weighted/normalized score
+                    // is just sim, otherwise the score is 0 by the original
+                    // formula since weighted_sum stays 0 and total_weight
+                    // equals weight
+                    let score = if sim >= rule.threshold { sim } else { 0.0 };
+                    if score >= config.overall_threshold {
+                        matches.push((idx_a, idx_b, score));
+                    }
+                }
+            }
+        }
+        return Ok(matches);
+    }
+
+    // Multi-rule fallback path uses the generic per-pair scorer
     for block_members in blocks.values() {
         for i in 0..block_members.len() {
             for j in (i + 1)..block_members.len() {
@@ -266,6 +354,30 @@ pub fn entity_resolve(
     }
 
     Ok(matches)
+}
+
+/// Returns the strict length-ratio cutoff for a given algorithm and threshold
+/// Pairs whose shorter/longer ratio is below this value cannot reach the
+/// threshold even with perfect matching, so skipping them is equivalent to
+/// running the full comparison and rejecting it
+///
+/// Returns 0.0 when no safe length filter exists for the algorithm, in which
+/// case callers should not skip any pairs
+fn length_filter_cutoff(algorithm: FuzzyJoinAlgo, threshold: f64) -> f64 {
+    match algorithm {
+        FuzzyJoinAlgo::JaroWinkler => {
+            // jw_max = 0.4 + 0.6*jaro_max where jaro_max = (n/m + 2)/3 with n<=m
+            // jw_max >= T => jaro >= (T - 0.4)/0.6 => n/m >= 3*((T-0.4)/0.6) - 2
+            let jaro_required = ((threshold - 0.4) / 0.6).max(0.0);
+            (3.0 * jaro_required - 2.0).max(0.0).min(1.0)
+        }
+        FuzzyJoinAlgo::Levenshtein => {
+            // lev_sim = 1 - lev_distance/max(a,b), lev_distance >= |a-b|
+            // so lev_sim <= min(a,b)/max(a,b), required ratio = threshold
+            threshold.max(0.0).min(1.0)
+        }
+        FuzzyJoinAlgo::NGram(_) | FuzzyJoinAlgo::Jaccard => 0.0,
+    }
 }
 
 fn phase_blocking(

@@ -394,13 +394,18 @@ fn test_zyron_to_zyron_credential_seal() {
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Credential Seal/Open Throughput ===");
 
-    let ks = LocalKeyStore::new([0xA5u8; 32]);
     let creds = sample_credentials();
 
+    // Bench loop is sized for stable measurement, production keystores hold a
+    // small fixed key count so the iteration count here is an artifact of the
+    // measurement, not a production-realistic load. Keystore is shared across
+    // runs to avoid bursty 50K-entry drops that fragment the Windows allocator
+    // and slow every downstream test in the suite
     let iterations = 50_000usize;
     let mut seal_results = Vec::with_capacity(VALIDATION_RUNS);
     let mut open_results = Vec::with_capacity(VALIDATION_RUNS);
 
+    let ks = LocalKeyStore::new([0xA5u8; 32]);
     let pre_sealed = seal_credentials(&creds, &ks).expect("seal");
     let verify = open_credentials(&pre_sealed, &ks).expect("open");
     assert_eq!(verify, creds);
@@ -825,7 +830,7 @@ fn test_zyron_to_zyron_util_snapshot() {
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let before = take_util_snapshot();
     // Light work so the snapshot reflects the suite rather than pure idle.
-    let uri = "zyron://user@host1:5432,host2:5432/db/pub:orders?tls=required";
+    let uri = "zyron://user@host1:5432,host2:5432/db?pub=orders&tls=required";
     for _ in 0..10_000 {
         let _ = parse_zyron_uri(uri).unwrap();
     }

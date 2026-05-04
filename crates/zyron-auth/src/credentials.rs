@@ -147,6 +147,15 @@ impl JwtAlgorithm {
             JwtAlgorithm::Hs512 => 64,
         }
     }
+
+    /// HMAC output length in bytes for this algorithm
+    fn signature_len(&self) -> usize {
+        match self {
+            JwtAlgorithm::Hs256 => 32,
+            JwtAlgorithm::Hs384 => 48,
+            JwtAlgorithm::Hs512 => 64,
+        }
+    }
 }
 
 /// JWT header (alg + typ fields).
@@ -167,18 +176,35 @@ pub struct JwtClaims {
     pub custom: std::collections::HashMap<String, String>,
 }
 
-/// JWT credential that can encode and decode tokens using HMAC signing.
-/// Pre-computes the HMAC key schedule on construction to avoid per-call overhead.
+/// JWT credential that can encode and decode tokens using HMAC signing
+/// Pre-computes the HMAC key schedule on construction to avoid per-call overhead
 pub struct JwtCredential {
     secret: Vec<u8>,
     algorithm: JwtAlgorithm,
     issuer: Option<String>,
     max_age_secs: u64,
-    /// Pre-computed HMAC-SHA256 instance. Cloned per sign() call to skip key
-    /// derivation (inner/outer pad computation).
+    /// Pre-computed HMAC-SHA256 instance, cloned per sign() call to skip key
+    /// derivation (inner/outer pad computation)
     hmac256: Option<Hmac<sha2::Sha256>>,
     hmac384: Option<Hmac<sha2::Sha384>>,
     hmac512: Option<Hmac<sha2::Sha512>>,
+    /// Pre-computed base64url-encoded header for this algorithm, the header
+    /// JSON is constant per algorithm so encoding it once at construction
+    /// saves one format!, one base64 alloc, and one String alloc per encode
+    header_b64: String,
+}
+
+/// Stack-allocated signature buffer sized for the largest HMAC output (HS512 = 64 bytes)
+/// Avoids one heap allocation per sign() call on the encode/decode hot path
+struct SignatureBuf {
+    bytes: [u8; 64],
+    len: usize,
+}
+
+impl SignatureBuf {
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
 }
 
 impl JwtCredential {
@@ -218,6 +244,9 @@ impl JwtCredential {
         } else {
             None
         };
+        let header_json = format!("{{\"alg\":\"{}\",\"typ\":\"JWT\"}}", algorithm.as_str());
+        let header_b64 = base64url_encode(header_json.as_bytes());
+
         Ok(Self {
             secret,
             algorithm,
@@ -226,6 +255,7 @@ impl JwtCredential {
             hmac256,
             hmac384,
             hmac512,
+            header_b64,
         })
     }
 
@@ -241,22 +271,29 @@ impl JwtCredential {
         self
     }
 
-    /// Encodes the claims into a signed JWT string (header.payload.signature).
+    /// Encodes the claims into a signed JWT string (header.payload.signature)
+    /// Builds the token in a single output buffer with capacity reservation,
+    /// avoiding intermediate String/Vec allocations for header, payload b64,
+    /// signing input, signature, and sig b64
     pub fn encode(&self, claims: &JwtClaims) -> Result<String> {
-        let header_json = format!(
-            "{{\"alg\":\"{}\",\"typ\":\"JWT\"}}",
-            self.algorithm.as_str()
-        );
+        use base64::Engine;
         let payload_json = claims_to_json(claims);
+        let sig_b64_max = self.algorithm.signature_len() * 4 / 3 + 4;
+        let payload_b64_len = (payload_json.len() * 4 + 2) / 3;
+        let cap = self.header_b64.len() + 1 + payload_b64_len + 1 + sig_b64_max;
 
-        let header_b64 = base64url_encode(header_json.as_bytes());
-        let payload_b64 = base64url_encode(payload_json.as_bytes());
+        let mut token = String::with_capacity(cap);
+        token.push_str(&self.header_b64);
+        token.push('.');
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode_string(payload_json.as_bytes(), &mut token);
 
-        let signing_input = format!("{}.{}", header_b64, payload_b64);
-        let signature = self.sign(signing_input.as_bytes())?;
-        let sig_b64 = base64url_encode(&signature);
+        let signature = self.sign(token.as_bytes())?;
+        token.push('.');
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode_string(signature.as_slice(), &mut token);
 
-        Ok(format!("{}.{}", signing_input, sig_b64))
+        Ok(token)
     }
 
     /// Decodes and verifies a JWT token. Checks signature, expiration, and issuer.
@@ -278,7 +315,7 @@ impl JwtCredential {
         let presented_sig = base64url_decode(sig_b64)?;
         let expected_sig = self.sign(signing_input.as_bytes())?;
 
-        if !balloon::constant_time_eq(&presented_sig, &expected_sig) {
+        if !balloon::constant_time_eq(&presented_sig, expected_sig.as_slice()) {
             return Err(ZyronError::InvalidCredential(
                 "JWT signature verification failed".to_string(),
             ));
@@ -344,26 +381,38 @@ impl JwtCredential {
         Ok((header, claims))
     }
 
-    /// Computes HMAC signature over the input bytes using the pre-computed key schedule.
-    /// Cloning the pre-computed HMAC avoids re-deriving inner/outer pads per call.
-    fn sign(&self, input: &[u8]) -> Result<Vec<u8>> {
+    /// Computes HMAC signature into a stack-allocated SignatureBuf using
+    /// the pre-computed key schedule, cloning the pre-computed HMAC avoids
+    /// re-deriving inner/outer pads per call
+    fn sign(&self, input: &[u8]) -> Result<SignatureBuf> {
+        let mut buf = SignatureBuf {
+            bytes: [0u8; 64],
+            len: 0,
+        };
         match self.algorithm {
             JwtAlgorithm::Hs256 => {
                 let mut mac = self.hmac256.as_ref().unwrap().clone();
                 mac.update(input);
-                Ok(mac.finalize().into_bytes().to_vec())
+                let arr = mac.finalize().into_bytes();
+                buf.bytes[..32].copy_from_slice(&arr);
+                buf.len = 32;
             }
             JwtAlgorithm::Hs384 => {
                 let mut mac = self.hmac384.as_ref().unwrap().clone();
                 mac.update(input);
-                Ok(mac.finalize().into_bytes().to_vec())
+                let arr = mac.finalize().into_bytes();
+                buf.bytes[..48].copy_from_slice(&arr);
+                buf.len = 48;
             }
             JwtAlgorithm::Hs512 => {
                 let mut mac = self.hmac512.as_ref().unwrap().clone();
                 mac.update(input);
-                Ok(mac.finalize().into_bytes().to_vec())
+                let arr = mac.finalize().into_bytes();
+                buf.bytes[..64].copy_from_slice(&arr);
+                buf.len = 64;
             }
         }
+        Ok(buf)
     }
 
     // -----------------------------------------------------------------------------
@@ -642,8 +691,11 @@ fn base32_encode(data: &[u8]) -> String {
     result
 }
 
-/// Serializes JWT claims to a JSON string without serde_json.
+/// Serializes JWT claims to a JSON string without serde_json
+/// Uses fmt::Write for u64 fields to avoid intermediate String allocation
+/// from .to_string()
 fn claims_to_json(claims: &JwtClaims) -> String {
+    use std::fmt::Write;
     let mut s = String::with_capacity(256);
     s.push('{');
 
@@ -658,10 +710,10 @@ fn claims_to_json(claims: &JwtClaims) -> String {
     }
 
     s.push_str(",\"exp\":");
-    s.push_str(&claims.exp.to_string());
+    let _ = write!(&mut s, "{}", claims.exp);
 
     s.push_str(",\"iat\":");
-    s.push_str(&claims.iat.to_string());
+    let _ = write!(&mut s, "{}", claims.iat);
 
     if !claims.roles.is_empty() {
         s.push_str(",\"roles\":[");
@@ -1380,7 +1432,7 @@ mod tests {
         let payload_b64 = base64url_encode(payload.as_bytes());
         let signing_input = format!("{}.{}", header_b64, payload_b64);
         let sig = cred.sign(signing_input.as_bytes()).expect("sign");
-        let sig_b64 = base64url_encode(&sig);
+        let sig_b64 = base64url_encode(sig.as_slice());
         let token = format!("{}.{}", signing_input, sig_b64);
 
         let c = cred

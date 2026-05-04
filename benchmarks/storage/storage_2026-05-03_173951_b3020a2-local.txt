@@ -1,0 +1,49 @@
+
+=== Checkpoint Write/Load Round-Trip Test ===
+Keys: 1,000,000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Checkpoint size: 8.58 MB (3 pages)
+  Write: 6.16 ms (1394 MB/sec)
+  Load: 12.87 ms (667 MB/sec)
+
+--- Run 2/5 ---
+  Checkpoint size: 8.58 MB (3 pages)
+  Write: 4.04 ms (2126 MB/sec)
+  Load: 10.03 ms (856 MB/sec)
+
+--- Run 3/5 ---
+  Checkpoint size: 8.58 MB (3 pages)
+  Write: 4.10 ms (2095 MB/sec)
+  Load: 10.10 ms (850 MB/sec)
+
+--- Run 4/5 ---
+  Checkpoint size: 8.58 MB (3 pages)
+  Write: 4.89 ms (1757 MB/sec)
+  Load: 9.85 ms (871 MB/sec)
+
+--- Run 5/5 ---
+  Checkpoint size: 8.58 MB (3 pages)
+  Write: 4.29 ms (1998 MB/sec)
+  Load: 10.03 ms (856 MB/sec)
+
+=== Checkpoint Validation Results ===
+  Write throughput (MB/sec) [FAIL/OK]:
+    Runs: [1,394, 2,126, 2,095, 1,757, 1,998]
+    Average: 1,874 >= 2,000 (target)
+    Min/Max: 1,394 / 2,126, StdDev: 273
+  Write latency 1M keys (ms) [FAIL/REGR!]:
+    Runs: [6, 4, 4, 5, 4]
+    Average: 5 <= 3 (target)
+    Min/Max: 4 / 6, StdDev: 1
+  Load throughput (MB/sec) [FAIL/REGR!]:
+    Runs: [667, 856, 850, 871, 856]
+    Average: 820 >= 3,000 (target)
+    Min/Max: 667 / 871, StdDev: 77
+  Load latency 1M keys (ms) [FAIL/REGR!]:
+    Runs: [13, 10, 10, 10, 10]
+    Average: 11 <= 2 (target)
+    Min/Max: 10 / 13, StdDev: 1
+  Write: avg 4.69 ms, 1874 MB/sec
+  Load:  avg 10.58 ms, 820 MB/sec

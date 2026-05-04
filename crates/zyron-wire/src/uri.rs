@@ -4,8 +4,6 @@
 //! Either a `schema.table` path suffix or a `pub=name` query parameter may be
 //! provided to identify the target. Hosts may omit the port, defaulting to 5432.
 
-use std::collections::HashMap;
-
 /// One host entry parsed from the URI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UriHost {
@@ -13,7 +11,7 @@ pub struct UriHost {
     pub port: u16,
 }
 
-/// The identified target: either a sink table or a source publication.
+/// The identified target, either a sink table or a source publication
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ZyronUriTarget {
     Table { schema: String, table: String },
@@ -21,7 +19,7 @@ pub enum ZyronUriTarget {
     Database,
 }
 
-/// Parsed form of a zyron connection URI.
+/// Parsed form of a zyron connection URI
 #[derive(Debug, Clone)]
 pub struct ParsedZyronUri {
     pub hosts: Vec<UriHost>,
@@ -29,7 +27,20 @@ pub struct ParsedZyronUri {
     pub password: Option<String>,
     pub database: String,
     pub target: ZyronUriTarget,
-    pub query_params: HashMap<String, String>,
+    /// Stored as a flat key/value list, matching the convention used by the
+    /// gateway and HTTP layers, query strings have a handful of entries so
+    /// linear lookup beats hashing
+    pub query_params: Vec<(String, String)>,
+}
+
+impl ParsedZyronUri {
+    /// Looks up a query parameter by key, returns the first match
+    pub fn query_param(&self, key: &str) -> Option<&str> {
+        self.query_params
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 /// Error type for URI parsing.
@@ -79,7 +90,9 @@ pub fn parse_zyron_uri(uri: &str) -> Result<ParsedZyronUri> {
         return Err(UriError::MissingUser);
     }
 
-    let mut hosts = Vec::new();
+    // Pre-size by number of comma separators plus one to avoid re-grow
+    let host_hint = hostlist.bytes().filter(|b| *b == b',').count() + 1;
+    let mut hosts = Vec::with_capacity(host_hint);
     for entry in hostlist.split(',') {
         if entry.is_empty() {
             continue;
@@ -102,27 +115,34 @@ pub fn parse_zyron_uri(uri: &str) -> Result<ParsedZyronUri> {
         return Err(UriError::MissingHost);
     }
 
-    // Path: database[/schema.table]
-    let mut path_segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    let database = path_segments
-        .first()
-        .cloned()
-        .ok_or_else(|| UriError::Malformed("missing database".into()))?
-        .to_string();
-    path_segments.remove(0);
+    // Path: database[/schema.table], parse as two slice splits, no Vec
+    let path_trim = path.trim_start_matches('/');
+    let (database_slice, after_db) = match path_trim.split_once('/') {
+        Some((db, rest)) => (db, rest.trim_start_matches('/')),
+        None => (path_trim, ""),
+    };
+    if database_slice.is_empty() {
+        return Err(UriError::Malformed("missing database".into()));
+    }
+    let database = database_slice.to_string();
+    let table_segment = after_db.split('/').find(|s| !s.is_empty());
 
-    let mut query_params = HashMap::new();
+    // Pre-size the params Vec by the number of '&' separators plus one
+    let param_hint = query_part
+        .map(|q| q.bytes().filter(|b| *b == b'&').count() + 1)
+        .unwrap_or(0);
+    let mut query_params: Vec<(String, String)> = Vec::with_capacity(param_hint);
     if let Some(q) = query_part {
         for pair in q.split('&') {
             if pair.is_empty() {
                 continue;
             }
             let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-            query_params.insert(k.to_string(), v.to_string());
+            query_params.push((k.to_string(), v.to_string()));
         }
     }
 
-    let target = if let Some(seg) = path_segments.first() {
+    let target = if let Some(seg) = table_segment {
         let (schema, table) = seg
             .split_once('.')
             .ok_or_else(|| UriError::Malformed("expected schema.table".into()))?;
@@ -130,10 +150,12 @@ pub fn parse_zyron_uri(uri: &str) -> Result<ParsedZyronUri> {
             schema: schema.to_string(),
             table: table.to_string(),
         }
-    } else if let Some(pub_name) = query_params.get("pub") {
-        ZyronUriTarget::Publication {
-            name: pub_name.clone(),
-        }
+    } else if let Some(pub_name) = query_params
+        .iter()
+        .find(|(k, _)| k == "pub")
+        .map(|(_, v)| v.clone())
+    {
+        ZyronUriTarget::Publication { name: pub_name }
     } else {
         ZyronUriTarget::Database
     };
@@ -194,8 +216,8 @@ mod tests {
     #[test]
     fn test_parse_query_params() {
         let u = parse_zyron_uri("zyron://u@h/db?tls=required&pool_size=4").unwrap();
-        assert_eq!(u.query_params.get("tls").unwrap(), "required");
-        assert_eq!(u.query_params.get("pool_size").unwrap(), "4");
+        assert_eq!(u.query_param("tls"), Some("required"));
+        assert_eq!(u.query_param("pool_size"), Some("4"));
     }
 
     #[test]

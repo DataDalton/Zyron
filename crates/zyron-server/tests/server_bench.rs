@@ -1676,9 +1676,9 @@ macro_rules! server_test {
                 let (server_state, _wal, _pool, _disk, _bg, catalog) =
                     create_test_state(&tmp).await;
 
-                // Create "public" schema under the test database
+                // Create the bench's own schema, the bench owns its namespace
                 let testdb = catalog.get_database("testdb").expect("testdb should exist");
-                let _ = catalog.create_schema(testdb.id, "public", "zyron").await;
+                let _ = catalog.create_schema(testdb.id, "bench", "zyron").await;
 
                 let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
                 let addr = listener.local_addr().unwrap();
@@ -1696,6 +1696,17 @@ macro_rules! server_test {
                 do_handshake(&mut client, "test_user", "testdb")
                     .await
                     .expect("handshake");
+
+                // Sessions start with an empty search_path by design, point
+                // the test at the bench schema so unqualified DDL resolves
+                let set_msgs = query_full(&mut client, "SET search_path = bench")
+                    .await
+                    .expect("SET search_path");
+                assert!(
+                    !has_error(&set_msgs),
+                    "SET search_path failed: {}",
+                    extract_error_message(&set_msgs)
+                );
 
                 // Run the test body
                 let body: &dyn Fn(

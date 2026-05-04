@@ -83,10 +83,21 @@ pub fn matrix_identity(n: u32) -> Vec<u8> {
 // Matrix operations
 // ---------------------------------------------------------------------------
 
-/// Multiplies two matrices: result = a * b.
+/// Multiplies two matrices, result = a * b
+/// 4x4 input gets a specialized stack-allocated path that skips the two
+/// matrix_decode Vec allocations and reads f64 fields directly from the
+/// encoded byte slices, this is the common case for graphics/transform
+/// callers and the bench at the same time, the generic path is unchanged
 pub fn matrix_multiply(a: &[u8], b: &[u8]) -> Result<Vec<u8>> {
-    let (a_rows, a_cols, a_data) = matrix_decode(a)?;
-    let (b_rows, b_cols, b_data) = matrix_decode(b)?;
+    if a.len() < 8 || b.len() < 8 {
+        return Err(ZyronError::ExecutionError(
+            "Matrix bytes too short for header".into(),
+        ));
+    }
+    let a_rows = u32::from_le_bytes([a[0], a[1], a[2], a[3]]);
+    let a_cols = u32::from_le_bytes([a[4], a[5], a[6], a[7]]);
+    let b_rows = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    let b_cols = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
 
     if a_cols != b_rows {
         return Err(ZyronError::ExecutionError(format!(
@@ -95,6 +106,12 @@ pub fn matrix_multiply(a: &[u8], b: &[u8]) -> Result<Vec<u8>> {
         )));
     }
 
+    if a_rows == 4 && a_cols == 4 && b_cols == 4 {
+        return matrix_multiply_4x4(a, b);
+    }
+
+    let (_, _, a_data) = matrix_decode(a)?;
+    let (_, _, b_data) = matrix_decode(b)?;
     let m = a_rows as usize;
     let k = a_cols as usize;
     let n = b_cols as usize;
@@ -111,6 +128,62 @@ pub fn matrix_multiply(a: &[u8], b: &[u8]) -> Result<Vec<u8>> {
     }
 
     matrix_encode(a_rows, b_cols, &result)
+}
+
+/// 4x4 matrix multiply hot path, both inputs read into stack arrays via
+/// single unaligned 128-byte loads then multiplied with a fixed-size loop,
+/// output is built in a stack buffer with a single Vec::from copy to keep
+/// the per-call allocation count at one (the returned Vec) versus three for
+/// the generic path
+///
+/// Native LE byte order on x86_64 and aarch64, the encoded matrix already
+/// uses to_le_bytes so the unaligned reads here match without any swap
+fn matrix_multiply_4x4(a: &[u8], b: &[u8]) -> Result<Vec<u8>> {
+    const PAYLOAD_LEN: usize = 16 * 8;
+    const TOTAL_LEN: usize = 8 + PAYLOAD_LEN;
+
+    if a.len() < TOTAL_LEN || b.len() < TOTAL_LEN {
+        return Err(ZyronError::ExecutionError(
+            "Matrix bytes truncated for 4x4 payload".into(),
+        ));
+    }
+
+    // SAFETY, both slices are bounds-checked above to hold at least
+    // TOTAL_LEN bytes, the offset of 8 lands inside that range and
+    // read_unaligned tolerates any alignment of the source pointer
+    let a_arr: [f64; 16] = unsafe {
+        let src = a.as_ptr().add(8) as *const [f64; 16];
+        std::ptr::read_unaligned(src)
+    };
+    let b_arr: [f64; 16] = unsafe {
+        let src = b.as_ptr().add(8) as *const [f64; 16];
+        std::ptr::read_unaligned(src)
+    };
+
+    let mut result = [0.0f64; 16];
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut sum = 0.0;
+            for l in 0..4 {
+                sum += a_arr[i * 4 + l] * b_arr[l * 4 + j];
+            }
+            result[i * 4 + j] = sum;
+        }
+    }
+
+    let mut buf = [0u8; TOTAL_LEN];
+    buf[0..4].copy_from_slice(&4u32.to_le_bytes());
+    buf[4..8].copy_from_slice(&4u32.to_le_bytes());
+    // SAFETY, result is f64 little-endian payload by native LE convention,
+    // matches the to_le_bytes format used elsewhere, dst is in-bounds
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            result.as_ptr() as *const u8,
+            buf.as_mut_ptr().add(8),
+            PAYLOAD_LEN,
+        );
+    }
+    Ok(buf.to_vec())
 }
 
 /// Transposes a matrix.

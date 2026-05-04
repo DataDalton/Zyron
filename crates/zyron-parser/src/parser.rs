@@ -733,7 +733,9 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
-            return Ok(TableRef::TableFunction { name, args, alias });
+            return Ok(TableRef::TableFunction(Box::new(
+                crate::ast::TableFunctionRef { name, args, alias },
+            )));
         }
 
         // Optional pre-as_of alias for the streaming temporal-join form
@@ -2412,7 +2414,7 @@ impl<'a> Parser<'a> {
             function: Box::new(function),
             partition_by,
             order_by,
-            frame,
+            frame: frame.map(Box::new),
         })
     }
 
@@ -12406,7 +12408,10 @@ mod tests {
             Statement::Select(s) => {
                 assert_eq!(s.from.len(), 1);
                 match &s.from[0] {
-                    TableRef::TableFunction { name, args, alias } => {
+                    TableRef::TableFunction(tf) => {
+                        let name = &tf.name;
+                        let args = &tf.args;
+                        let alias = &tf.alias;
                         assert_eq!(name, "pagerank");
                         assert_eq!(args.len(), 2);
                         assert_eq!(alias.as_deref(), Some("pr"));
@@ -12425,7 +12430,10 @@ mod tests {
             Statement::Select(s) => {
                 assert_eq!(s.from.len(), 1);
                 match &s.from[0] {
-                    TableRef::TableFunction { name, args, alias } => {
+                    TableRef::TableFunction(tf) => {
+                        let name = &tf.name;
+                        let args = &tf.args;
+                        let alias = &tf.alias;
                         assert_eq!(name, "generate_series");
                         assert_eq!(args.len(), 2);
                         assert!(alias.is_none());
@@ -12444,7 +12452,10 @@ mod tests {
             Statement::Select(s) => {
                 assert_eq!(s.from.len(), 1);
                 match &s.from[0] {
-                    TableRef::TableFunction { name, args, alias } => {
+                    TableRef::TableFunction(tf) => {
+                        let name = &tf.name;
+                        let args = &tf.args;
+                        let alias = &tf.alias;
                         assert_eq!(name, "now_table");
                         assert!(args.is_empty());
                         assert!(alias.is_none());

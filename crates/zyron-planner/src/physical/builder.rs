@@ -442,11 +442,9 @@ impl<'a> PhysicalPlanner<'a> {
             for index in &indexes {
                 if let Some((index_pred, remaining)) = match_index(pred, index) {
                     let (selectivity, cost) = if let Some((ts, cs)) = &table_stats {
-                        let sel = self.cost_model.estimate_selectivity(
-                            &index_pred,
-                            Some(ts),
-                            Some(cs),
-                        );
+                        let sel =
+                            self.cost_model
+                                .estimate_selectivity(&index_pred, Some(ts), Some(cs));
                         (sel, self.cost_model.cost_index_scan(ts, sel))
                     } else {
                         let sel = 0.001f64;
@@ -508,14 +506,16 @@ impl<'a> PhysicalPlanner<'a> {
                     if predicate.is_some() {
                         parallel_cost.row_count = seq_cost.row_count;
                     }
-                    // Gather node adds minimal coordination cost (parallel_tuple_cost
-                    // is already included in cost_parallel_scan)
+                    // Gather rolls up the child's cost so the plan-level
+                    // cost reflects the actual work, the child's parallel
+                    // cost already includes parallel_tuple_cost so Gather
+                    // adds no further coordination overhead
                     let gather_cost = PlanCost {
-                        io_cost: 0.0,
-                        cpu_cost: 0.0,
+                        io_cost: parallel_cost.io_cost,
+                        cpu_cost: parallel_cost.cpu_cost,
                         row_count: parallel_cost.row_count,
                     };
-                    let total_parallel = parallel_cost.total() + gather_cost.total();
+                    let total_parallel = gather_cost.total();
                     if total_parallel < seq_cost.total() {
                         let parallel_scan = PhysicalPlan::ParallelSeqScan {
                             table_id,
@@ -640,9 +640,11 @@ impl<'a> PhysicalPlanner<'a> {
                                     num_workers,
                                 );
                                 if parallel_cost.total() < hash_cost.total() {
+                                    // Gather rolls up the child's cost so plan-level
+                                    // cost reflects the actual work
                                     let gather_cost = PlanCost {
-                                        io_cost: 0.0,
-                                        cpu_cost: 0.0,
+                                        io_cost: parallel_cost.io_cost,
+                                        cpu_cost: parallel_cost.cpu_cost,
                                         row_count: parallel_cost.row_count,
                                     };
                                     let par_join = PhysicalPlan::ParallelHashJoin {

@@ -1,11 +1,18 @@
 //! Number, currency, byte, duration, percentage, and ordinal formatting.
 //! Unit conversion between compatible measurement systems.
 
+use std::fmt::Write;
 use zyron_common::{Result, ZyronError};
 
-/// Formats a number with thousands separators.
-/// locale: "en" for comma separator and period decimal,
-/// "de" for period separator and comma decimal.
+/// Formats a number with thousands separators
+/// locale "en" gives comma separator and period decimal,
+/// "de" gives period separator and comma decimal
+///
+/// Builds the result in a single pre-sized String, integer formatting goes
+/// through a stack buffer, fractional digits are written into a stack buffer
+/// via fmt::Write so no intermediate heap String is allocated for the float
+/// portion either, the original implementation allocated four Strings per
+/// call (val.to_string + result + format! for float + format! for combine)
 pub fn format_number(value: f64, locale: &str) -> String {
     let (thousands_sep, decimal_sep) = separator_chars(locale);
     let is_negative = value < 0.0;
@@ -14,30 +21,84 @@ pub fn format_number(value: f64, locale: &str) -> String {
     let integer_part = abs_val.trunc() as u64;
     let fractional = abs_val - abs_val.trunc();
 
-    let int_str = format_integer_with_sep(integer_part, thousands_sep);
-
-    let result = if fractional.abs() < 1e-10 {
-        int_str
-    } else {
-        // Use ryu for precise float formatting, then extract fractional digits
-        let full = format!("{}", abs_val);
-        let frac_digits = if let Some(dot_pos) = full.find('.') {
-            let raw = &full[dot_pos + 1..];
-            raw.trim_end_matches('0')
-        } else {
-            ""
-        };
-        if frac_digits.is_empty() {
-            int_str
-        } else {
-            format!("{}{}{}", int_str, decimal_sep, frac_digits)
-        }
-    };
-
+    let mut out = String::with_capacity(32);
     if is_negative {
-        format!("-{}", result)
-    } else {
-        result
+        out.push('-');
+    }
+    push_integer_with_sep(&mut out, integer_part, thousands_sep);
+
+    if fractional.abs() >= 1e-10 {
+        let mut buf = [0u8; 64];
+        let mut writer = StackWriter::new(&mut buf);
+        let _ = write!(writer, "{}", abs_val);
+        let s = writer.as_str();
+        if let Some(dot_pos) = s.find('.') {
+            let raw = &s[dot_pos + 1..];
+            let digits = raw.trim_end_matches('0');
+            if !digits.is_empty() {
+                out.push(decimal_sep);
+                out.push_str(digits);
+            }
+        }
+    }
+
+    out
+}
+
+/// Stack-allocated fmt::Write target, lets callers write! into a fixed-size
+/// buffer without allocating a String, used by format_number for the float
+/// representation
+struct StackWriter<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+
+impl<'a> StackWriter<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn as_str(&self) -> &str {
+        // SAFETY, write_str only ever writes valid UTF-8 chunks via fmt::Write
+        unsafe { std::str::from_utf8_unchecked(&self.buf[..self.pos]) }
+    }
+}
+
+impl<'a> std::fmt::Write for StackWriter<'a> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let bytes = s.as_bytes();
+        let end = self.pos + bytes.len();
+        if end > self.buf.len() {
+            return Err(std::fmt::Error);
+        }
+        self.buf[self.pos..end].copy_from_slice(bytes);
+        self.pos = end;
+        Ok(())
+    }
+}
+
+/// Formats an integer into out with thousands separators, writes from a
+/// stack-allocated digit buffer so no intermediate String alloc is needed
+fn push_integer_with_sep(out: &mut String, val: u64, sep: char) {
+    if val == 0 {
+        out.push('0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut pos = 20usize;
+    let mut n = val;
+    while n > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    let digits = &buf[pos..];
+    let len = digits.len();
+    for (i, &d) in digits.iter().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            out.push(sep);
+        }
+        out.push(d as char);
     }
 }
 
@@ -48,22 +109,11 @@ fn separator_chars(locale: &str) -> (char, char) {
     }
 }
 
-fn format_integer_with_sep(val: u64, sep: char) -> String {
-    let s = val.to_string();
-    if s.len() <= 3 {
-        return s;
-    }
-    let mut result = String::with_capacity(s.len() + s.len() / 3);
-    for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
-            result.push(sep);
-        }
-        result.push(c);
-    }
-    result
-}
-
-/// Formats a value as currency with the given currency code and locale.
+/// Formats a value as currency with the given currency code and locale
+/// Same single-output-String pattern as format_number, prior implementation
+/// allocated up to six Strings per call (integer-with-sep result, fractional
+/// padded format!, the {} {} or {}{} combine, and the optional negative
+/// wrap), this version writes everything into one pre-sized buffer
 pub fn format_currency(value: f64, currency: &str, locale: &str) -> String {
     let (symbol, decimals, symbol_before) = currency_info(currency);
     let (thousands_sep, decimal_sep) = separator_chars(locale);
@@ -77,28 +127,50 @@ pub fn format_currency(value: f64, currency: &str, locale: &str) -> String {
     let integer_part = rounded.trunc() as u64;
     let fractional = ((rounded - rounded.trunc()) * factor).round() as u64;
 
-    let int_str = format_integer_with_sep(integer_part, thousands_sep);
-    let amount = if decimals > 0 {
-        format!(
-            "{}{}{}",
-            int_str,
-            decimal_sep,
-            format!("{:0>width$}", fractional, width = decimals as usize)
-        )
-    } else {
-        int_str
-    };
-
-    let formatted = if symbol_before {
-        format!("{}{}", symbol, amount)
-    } else {
-        format!("{} {}", amount, symbol)
-    };
-
+    let mut out = String::with_capacity(32);
     if is_negative {
-        format!("-{}", formatted)
-    } else {
-        formatted
+        out.push('-');
+    }
+    if symbol_before {
+        out.push_str(symbol);
+    }
+    push_integer_with_sep(&mut out, integer_part, thousands_sep);
+    if decimals > 0 {
+        out.push(decimal_sep);
+        push_zero_padded(&mut out, fractional, decimals as usize);
+    }
+    if !symbol_before {
+        out.push(' ');
+        out.push_str(symbol);
+    }
+    out
+}
+
+/// Formats an unsigned integer into out left-padded with zeros to width
+/// Stack-allocated digit buffer, no String alloc, used by format_currency
+/// for the fractional component
+fn push_zero_padded(out: &mut String, val: u64, width: usize) {
+    let mut buf = [0u8; 20];
+    let mut pos = 20usize;
+    let mut n = val;
+    if n == 0 {
+        for _ in 0..width {
+            out.push('0');
+        }
+        return;
+    }
+    while n > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    let actual_len = 20 - pos;
+    for _ in actual_len..width {
+        out.push('0');
+    }
+    let digits = &buf[pos..];
+    for &d in digits {
+        out.push(d as char);
     }
 }
 

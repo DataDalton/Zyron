@@ -1,0 +1,26 @@
+
+=== Transaction: Transaction Performance Microbenchmarks ===
+  begin()+commit() cycle (ns/op) [FAIL/REGR!]:
+    Runs: [266, 289, 577, 326, 257]
+    Average: 343 <= 250 (target)
+    Min/Max: 257 / 577, StdDev: 119
+  commit() latency (ns/op) [FAIL/REGR!]:
+    Runs: [834, 850, 826, 829, 838]
+    Average: 835 <= 200 (target)
+    Min/Max: 826 / 850, StdDev: 8
+  is_visible() latency (ns/op) [PASS/OK]:
+    Runs: [1, 1, 1, 1, 1]
+    Average: 1 <= 15 (target)
+    Min/Max: 1 / 1, StdDev: 0
+  lock_row() latency (ns/op) [PASS/OK]:
+    Runs: [79, 75, 72, 76, 74]
+    Average: 75 <= 80 (target)
+    Min/Max: 72 / 79, StdDev: 2
+  Snapshot::new() latency (ns/op) [PASS/OK]:
+    Runs: [19, 19, 19, 19, 19]
+    Average: 19 <= 200 (target)
+    Min/Max: 19 / 19, StdDev: 0
+  GC sweep throughput (tuples/sec) [PASS/OK]:
+    Runs: [1,950,458,358, 1,890,716,582, 1,954,652,072, 1,875,117,195, 1,958,480,219]
+    Average: 1,925,884,885 >= 500,000 (target)
+    Min/Max: 1,875,117,195 / 1,958,480,219, StdDev: 35,519,094

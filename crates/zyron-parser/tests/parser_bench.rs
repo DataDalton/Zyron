@@ -991,11 +991,11 @@ fn table_ref_to_sql(tr: &TableRef) -> String {
         }
         TableRef::Subquery { alias, .. } => format!("(...) AS {}", alias),
         TableRef::Lateral { .. } => "LATERAL (...)".into(),
-        TableRef::TableFunction { name, alias, .. } => {
-            if let Some(a) = alias {
-                format!("{}(...) AS {}", name, a)
+        TableRef::TableFunction(tf) => {
+            if let Some(a) = &tf.alias {
+                format!("{}(...) AS {}", tf.name, a)
             } else {
-                format!("{}(...)", name)
+                format!("{}(...)", tf.name)
             }
         }
     }

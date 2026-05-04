@@ -1,0 +1,17 @@
+
+=== Health Check Test ===
+  Pre-startup: startup=false, accepting=false: PASS
+  Post-startup: startup=true: PASS
+  Accepting: ready=true: PASS
+  /health/live: 200 OK: PASS
+  /health/ready: 200 OK: PASS
+  /health/startup: 200 OK: PASS
+  /metrics: 200 OK with Prometheus format: PASS
+  /unknown: 404: PASS
+
+=== Health Check Validation ===
+  Health check latency (us) [FAIL/REGR!]:
+    Runs: [363, 105, 88, 90, 84]
+    Average: 146 <= 100 (target)
+    Min/Max: 84 / 363, StdDev: 109
+  Health endpoint round-trip (us) [PASS]: 146 <= 10,000 (target)

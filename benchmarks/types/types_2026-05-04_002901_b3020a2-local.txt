@@ -1,0 +1,151 @@
+
+=== Performance Sweep ===
+
+--- TIME_BUCKET 10M rows ---
+  Run 1: 534,236,549 rows/sec
+  Run 2: 527,930,144 rows/sec
+  Run 3: 562,578,409 rows/sec
+  Run 4: 553,654,675 rows/sec
+  Run 5: 540,391,568 rows/sec
+  TIME_BUCKET throughput (rows/sec) [PASS/OK]:
+    Runs: [534,236,549, 527,930,144, 562,578,409, 553,654,675, 540,391,568]
+    Average: 543,758,269 >= 150,000,000 (target)
+    Min/Max: 527,930,144 / 562,578,409, StdDev: 12,685,928
+
+--- Gap fill LOCF (10M values, 5% gaps) ---
+  Run 1: 531,606,675 rows/sec
+  Run 2: 576,116,514 rows/sec
+  Run 3: 546,421,214 rows/sec
+  Run 4: 491,315,990 rows/sec
+  Run 5: 465,369,527 rows/sec
+  LOCF throughput (rows/sec) [PASS/OK]:
+    Runs: [531,606,675, 576,116,514, 546,421,214, 491,315,990, 465,369,527]
+    Average: 522,165,984 >= 80,000,000 (target)
+    Min/Max: 465,369,527 / 576,116,514, StdDev: 39,409,801
+
+--- ST_Distance 1M pairs ---
+  Run 1: 14.6 ns/call
+  Run 2: 17.2 ns/call
+  Run 3: 16.8 ns/call
+  Run 4: 14.9 ns/call
+  Run 5: 17.0 ns/call
+  ST_Distance (ns) [PASS/OK]:
+    Runs: [15, 17, 17, 15, 17]
+    Average: 16 <= 120 (target)
+    Min/Max: 15 / 17, StdDev: 1
+
+--- NPV 100K sets (360 cashflows each) ---
+  Run 1: 0.025 s total
+  Run 2: 0.025 s total
+  Run 3: 0.025 s total
+  Run 4: 0.025 s total
+  Run 5: 0.025 s total
+  Avg NPV per call: 0.249 us
+
+--- MATRIX_MULTIPLY 4x4 x 1000 ---
+  Run 1: 66.00 us total
+  Run 2: 59.00 us total
+  Run 3: 59.00 us total
+  Run 4: 59.00 us total
+  Run 5: 47.00 us total
+
+--- Levenshtein 1M pairs (10-char strings) ---
+  Run 1: 274.5 ns/call
+  Run 2: 279.3 ns/call
+  Run 3: 278.3 ns/call
+  Run 4: 277.7 ns/call
+  Run 5: 274.1 ns/call
+  Levenshtein 10-char (ns) [PASS/OK]:
+    Runs: [275, 279, 278, 278, 274]
+    Average: 277 <= 300 (target)
+    Min/Max: 274 / 279, StdDev: 2
+
+--- Jaro-Winkler 1M pairs ---
+  Run 1: 43.7 ns/call
+  Run 2: 43.7 ns/call
+  Run 3: 43.0 ns/call
+  Run 4: 41.3 ns/call
+  Run 5: 41.6 ns/call
+  Jaro-Winkler 10-char (ns) [PASS/OK]:
+    Runs: [44, 44, 43, 41, 42]
+    Average: 43 <= 150 (target)
+    Min/Max: 41 / 44, StdDev: 1
+
+--- Soundex 1M calls ---
+  Run 1: 45.4 ns/call
+  Run 2: 45.1 ns/call
+  Run 3: 45.0 ns/call
+  Run 4: 46.1 ns/call
+  Run 5: 45.0 ns/call
+  Soundex (ns) [PASS/OK]:
+    Runs: [45, 45, 45, 46, 45]
+    Average: 45 <= 80 (target)
+    Min/Max: 45 / 46, StdDev: 0
+
+--- Entity resolve 100K records (FirstLetter blocking) ---
+  Run 1: 124.37 s
+  Run 2: 124.29 s
+  Run 3: 124.30 s
+  Run 4: 124.16 s
+  Run 5: 124.36 s
+  Entity resolve 100K (s) [FAIL/REGR!]:
+    Runs: [124, 124, 124, 124, 124]
+    Average: 124 <= 12 (target)
+    Min/Max: 124 / 124, StdDev: 0
+
+--- UUID v7 10M IDs ---
+  Run 1: 560,001,344 IDs/sec
+  Run 2: 562,170,428 IDs/sec
+  Run 3: 559,609,616 IDs/sec
+  Run 4: 556,380,854 IDs/sec
+  Run 5: 556,090,020 IDs/sec
+  UUID v7 throughput (IDs/sec) [PASS/OK]:
+    Runs: [560,001,344, 562,170,428, 559,609,616, 556,380,854, 556,090,020]
+    Average: 558,850,452 >= 80,000,000 (target)
+    Min/Max: 556,090,020 / 562,170,428, StdDev: 2,308,334
+
+--- SLUG 100-char input ---
+  Run 1: 98.5 ns/call
+  Run 2: 98.8 ns/call
+  Run 3: 98.4 ns/call
+  Run 4: 101.3 ns/call
+  Run 5: 102.3 ns/call
+  SLUG 100-char (ns) [PASS/OK]:
+    Runs: [99, 99, 98, 101, 102]
+    Average: 100 <= 500 (target)
+    Min/Max: 98 / 102, StdDev: 2
+
+--- FORMAT_NUMBER ---
+  Run 1: 75.5 ns/call
+  Run 2: 74.7 ns/call
+  Run 3: 74.8 ns/call
+  Run 4: 74.8 ns/call
+  Run 5: 74.9 ns/call
+  format_number (ns) [PASS/OK]:
+    Runs: [76, 75, 75, 75, 75]
+    Average: 75 <= 200 (target)
+    Min/Max: 75 / 76, StdDev: 0
+
+--- DATA_PROFILE 1M rows ---
+  Run 1: 0.175 s
+  Run 2: 0.173 s
+  Run 3: 0.174 s
+  Run 4: 0.177 s
+  Run 5: 0.171 s
+  DATA_PROFILE 1M rows (s) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 5 (target)
+    Min/Max: 0 / 0, StdDev: 0
+
+--- Fuzzy join 10K x 10K (blocked by first letter) ---
+  Run 1: 4.91 s
+  Run 2: 4.88 s
+  Run 3: 4.87 s
+  Run 4: 4.88 s
+  Run 5: 4.87 s
+  Fuzzy join 20K records (s) [PASS/OK]:
+    Runs: [5, 5, 5, 5, 5]
+    Average: 5 <= 20 (target)
+    Min/Max: 5 / 5, StdDev: 0
+
+=== Performance sweep complete ===

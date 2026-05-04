@@ -566,18 +566,25 @@ impl ExplainNode {
             }
         }
 
-        // Actual metrics (ANALYZE)
-        if options.analyze {
-            if let Some(actual) = &self.actual_metrics {
-                let _ = write!(output, " (actual rows={}", actual.rows);
-                if options.timing {
-                    let _ = write!(output, " time={:.3}ms", actual.elapsed_ms);
-                }
-                let _ = write!(output, ")");
+        // Actual metrics (ANALYZE) folded into the trailing newline so the
+        // analyze path is a single writeln! instead of two write!s plus a
+        // writeln!, on tiny plans the per-call fmt::Arguments setup cost
+        // otherwise shows up as a multi-percent rendering overhead
+        match (options.analyze, &self.actual_metrics, options.timing) {
+            (true, Some(actual), true) => {
+                let _ = writeln!(
+                    output,
+                    " (actual rows={} time={:.3}ms)",
+                    actual.rows, actual.elapsed_ms
+                );
+            }
+            (true, Some(actual), false) => {
+                let _ = writeln!(output, " (actual rows={})", actual.rows);
+            }
+            _ => {
+                let _ = writeln!(output);
             }
         }
-
-        let _ = writeln!(output);
 
         for child in &self.children {
             child.write_text_node(output, options, depth + 1);

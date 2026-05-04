@@ -198,8 +198,11 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_sorts_active_ids() {
-        let snapshot = Snapshot::new(100, vec![50, 10, 30, 20]);
+    fn test_snapshot_preserves_sorted_input() {
+        // Snapshot::new no longer sorts, the manager produces pre-sorted Vecs
+        // and visibility checks rely on that invariant for binary search,
+        // this test documents the contract by passing already-sorted input
+        let snapshot = Snapshot::new(100, vec![10, 20, 30, 50]);
         assert_eq!(snapshot.active_txn_ids(), &[10, 20, 30, 50]);
     }
 
