@@ -1,0 +1,32 @@
+{
+  "id": "2026-05-05_020849_712d8e1-local",
+  "date": "2026-05-05 02:08:53Z",
+  "ts": 1777946933,
+  "commit": "712d8e1-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Parallel Column Encoding": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 10.82 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 10.83 },
+      "Parallel speedup (x)": {
+        "average": 2.634009,
+        "runs": [2.56, 2.86, 2.59, 2.59, 2.56],
+        "target": 3.000000,
+        "passed": false,
+        "higher_is_better": true
+      },
+      "Sequential compaction (rows/sec)": {
+        "average": 1446212.621880,
+        "runs": [1368067.66, 1402202.02, 1454746.47, 1546567.93, 1459479.02],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}

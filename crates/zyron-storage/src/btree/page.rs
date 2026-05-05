@@ -183,9 +183,14 @@ impl BTreeLeafPage {
         Self::get_in_slice(&*self.data, key)
     }
 
-    /// Gets the value for a key using slotted page format.
-    /// Binary search directly on slot array for O(log n) lookup - no offset building needed.
-    /// Returns TupleId with file_id=0. Caller sets file_id from index context.
+    /// Gets the value for a key using slotted page format
+    /// Binary search directly on slot array for O(log n) lookup, no offset building needed
+    /// Returns TupleId with file_id=0. Caller sets file_id from index context
+    ///
+    /// Search loop is structured for branchless lowering, the Less/Greater
+    /// arms become cmov pairs for low and high, only the rare Equal arm
+    /// takes a real branch which is well-predicted on the typical
+    /// either-found-once-or-not-at-all access pattern
     #[inline(always)]
     pub fn get_in_slice(data: &[u8], key: &[u8]) -> Option<TupleId> {
         // Parse header - read num_slots as single u16
@@ -196,7 +201,7 @@ impl BTreeLeafPage {
             return None;
         }
 
-        // Binary search with packed slot reads and u64 prefix comparison
+        // Branchless binary search with packed slot reads
         let mut low = 0usize;
         let mut high = num_slots;
 
@@ -217,32 +222,36 @@ impl BTreeLeafPage {
             let key_len = u16::from_le_bytes([data[entry_off], data[entry_off + 1]]) as usize;
             let entry_key = &data[entry_off + 2..entry_off + 2 + key_len];
 
-            match compare_keys(key, entry_key) {
-                std::cmp::Ordering::Equal => {
-                    let tuple_offset = entry_off + 2 + key_len;
-                    // Read page_num as u32, slot_id as u16
-                    let page_num = u32::from_le_bytes([
-                        data[tuple_offset],
-                        data[tuple_offset + 1],
-                        data[tuple_offset + 2],
-                        data[tuple_offset + 3],
-                    ]);
-                    let slot_id =
-                        u16::from_le_bytes([data[tuple_offset + 4], data[tuple_offset + 5]]);
-                    let page_id = PageId::new(0, page_num as u64);
-                    return Some(TupleId::new(page_id, slot_id));
-                }
-                std::cmp::Ordering::Less => high = mid,
-                std::cmp::Ordering::Greater => low = mid + 1,
+            let cmp = compare_keys(key, entry_key);
+            if cmp == std::cmp::Ordering::Equal {
+                let tuple_offset = entry_off + 2 + key_len;
+                let page_num = u32::from_le_bytes([
+                    data[tuple_offset],
+                    data[tuple_offset + 1],
+                    data[tuple_offset + 2],
+                    data[tuple_offset + 3],
+                ]);
+                let slot_id = u16::from_le_bytes([data[tuple_offset + 4], data[tuple_offset + 5]]);
+                let page_id = PageId::new(0, page_num as u64);
+                return Some(TupleId::new(page_id, slot_id));
             }
+            let is_less = cmp == std::cmp::Ordering::Less;
+            high = if is_less { mid } else { high };
+            low = if is_less { low } else { mid + 1 };
         }
         None
     }
 
-    /// Inserts a key-value pair using slotted page format.
-    /// Binary search for O(log n) lookup, only shift 4-byte slots instead of full entries.
-    /// Stores page_num (u32) + slot_id (u16) = 6 bytes per entry (file_id is implicit).
-    /// Returns Ok(()) on success, Err(NodeFull) if page is full, Err(DuplicateKey) if key exists.
+    /// Inserts a key-value pair using slotted page format
+    /// Binary search for O(log n) lookup, only shift 4-byte slots instead of full entries
+    /// Stores page_num (u32) + slot_id (u16) = 6 bytes per entry (file_id is implicit)
+    /// Returns Ok(()) on success, Err(NodeFull) if page is full, Err(DuplicateKey) if key exists
+    ///
+    /// Search loop is structured for branchless lowering, both low and high
+    /// are updated via plain assignments selected by the comparison result so
+    /// the compiler can emit cmov instead of conditional branches, only the
+    /// duplicate-key path takes a real branch and that one is correctly
+    /// predicted on the rare-Equal common case
     #[inline(always)]
     pub fn insert_in_slice(data: &mut [u8], key: &[u8], tuple_id: TupleId) -> Result<()> {
         // Parse header
@@ -270,7 +279,11 @@ impl BTreeLeafPage {
             return Err(ZyronError::NodeFull);
         }
 
-        // Binary search through slot array to find insertion point
+        // Branchless binary search through slot array to find insertion point
+        // The match-on-Ordering form had an unpredictable 3-way branch per
+        // iteration which mispredicted ~50% of the time on random keys, this
+        // form lowers to cmp + cmov for low/high updates and a single
+        // predictable branch for the rare duplicate-key path
         let mut low = 0usize;
         let mut high = num_slots;
 
@@ -290,11 +303,14 @@ impl BTreeLeafPage {
             let key_len = u16::from_le_bytes([data[entry_off], data[entry_off + 1]]) as usize;
             let entry_key = &data[entry_off + 2..entry_off + 2 + key_len];
 
-            match compare_keys(key, entry_key) {
-                std::cmp::Ordering::Equal => return Err(ZyronError::DuplicateKey),
-                std::cmp::Ordering::Less => high = mid,
-                std::cmp::Ordering::Greater => low = mid + 1,
+            let cmp = compare_keys(key, entry_key);
+            if cmp == std::cmp::Ordering::Equal {
+                return Err(ZyronError::DuplicateKey);
             }
+            let is_less = cmp == std::cmp::Ordering::Less;
+            // Both arms unconditional, compiler lowers to cmov pair
+            high = if is_less { mid } else { high };
+            low = if is_less { low } else { mid + 1 };
         }
 
         let insert_slot_idx = low;
@@ -447,10 +463,48 @@ impl BTreeLeafPage {
         self.free_space() >= entry_size
     }
 
-    /// Splits this leaf into two. Returns (split_key, new_right_page).
-    /// Uses entry_views to avoid Bytes allocation during read, materializes
-    /// both halves for the rewrite (required since write regions overlap reads).
+    /// Splits this leaf into two halves at the midpoint, returns
+    /// (split_key, new_right_page). Uses entry_views to avoid Bytes
+    /// allocation during read, materializes both halves for the rewrite
+    /// (required since write regions overlap reads)
     pub fn split(&mut self, new_page_id: PageId) -> (Bytes, BTreeLeafPage) {
+        self.split_for_key(None, new_page_id)
+    }
+
+    /// Splits this leaf, biasing the layout for an upcoming insert
+    ///
+    /// When `new_key` is given and is strictly greater than every key
+    /// already on this page, the page is performing a rightmost-insert
+    /// (auto-increment, time-ordered, UUID v7 with timestamp prefix, etc).
+    /// In that case the existing entries all stay on the left page and
+    /// the right page starts empty, so the next insert lands alone on
+    /// the right and existing pages stay densely packed near 100%
+    /// instead of the 50% utilization a midpoint split produces. The
+    /// detection costs one byte comparison per insert and is no-op for
+    /// random/non-monotonic key distributions which fall through to the
+    /// midpoint split
+    pub fn split_for_key(
+        &mut self,
+        new_key: Option<&[u8]>,
+        new_page_id: PageId,
+    ) -> (Bytes, BTreeLeafPage) {
+        if let Some(key) = new_key {
+            let views = self.entry_views();
+            if let Some(last) = views.last()
+                && compare_keys(key, last.key).is_gt()
+            {
+                // Right-bias split, leaf keeps every existing entry, the
+                // empty right page is sized to receive the incoming key
+                let split_key = Bytes::copy_from_slice(key);
+                drop(views);
+                let mut right_page = BTreeLeafPage::new(new_page_id);
+                let old_next = self.next_leaf();
+                self.set_next_leaf(Some(new_page_id));
+                right_page.set_next_leaf(old_next);
+                return (split_key, right_page);
+            }
+        }
+
         let views = self.entry_views();
         let mid = views.len() / 2;
         let split_key = Bytes::copy_from_slice(views[mid].key);
@@ -686,15 +740,28 @@ impl BTreeInternalPage {
             return last_child;
         }
 
-        // For larger pages, use binary search with offset indexing.
-        // Max entries per internal page: PAGE_SIZE / min_entry_size.
-        // min_entry_size = key_len(2) + key(1) + page_num(4) = 7 bytes.
-        // 16384 / 7 = 2340. Use 2048 (power of 2, fits comfortably).
-        let mut offsets = [0usize; 2048];
+        // For larger pages, use binary search with offset indexing
+        // Typical internal page holds ~200-400 entries (PAGE_SIZE/avg-entry),
+        // so a 256-entry inline buffer covers the common case without the
+        // 16 KB stack allocation that a fixed [usize; 2048] would force on
+        // every traversal frame, the heap-spill path activates only when a
+        // page exceeds the inline capacity which is rare in production
+        const INLINE_OFFSETS: usize = 256;
+        let mut inline_offsets = [0usize; INLINE_OFFSETS];
+        let mut spill_offsets: Vec<usize> = Vec::new();
         let limit = num_keys.min(2048);
+        if limit > INLINE_OFFSETS {
+            spill_offsets.reserve_exact(limit);
+        }
+        let offsets: &mut [usize] = if limit > INLINE_OFFSETS {
+            spill_offsets.resize(limit, 0);
+            &mut spill_offsets[..]
+        } else {
+            &mut inline_offsets[..limit]
+        };
         let mut offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
 
-        for o in offsets.iter_mut().take(limit) {
+        for o in offsets.iter_mut() {
             *o = offset;
             let key_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
             offset += 2 + key_len + 4;

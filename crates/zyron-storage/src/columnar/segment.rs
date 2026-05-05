@@ -229,21 +229,91 @@ impl ColumnSegment {
             ));
         }
 
-        // Compute column statistics: min, max, null count, cardinality, sorted flag.
-        // Sorted detection uses raw byte comparison (preserves LE numeric ordering).
-        // Min/max use stat slots for fixed-size storage in the segment header.
+        // Single fused pass over values, computes:
+        //   - null count and null bitmap
+        //   - global min/max stat slots
+        //   - sorted flag
+        //   - distinct tracking, capped at BLOOM_MIN_CARDINALITY+1 since we
+        //     only need to know whether the column is high-cardinality enough
+        //     to warrant a bloom filter, exact count beyond the threshold is
+        //     not useful for query planning at the segment level
+        //   - raw data buffer with non-null values copied into their slots,
+        //     buffer is allocated with zero-fill so null slots stay zeroed
+        //     for encoder determinism
+        //   - per-zone min/max emitted at every ZONE_MAP_BATCH_SIZE boundary
+        //
+        // Prior implementation walked values 4-5 separate times which kept
+        // the L1/L2 cache cold for each pass on large columns, the fused
+        // pass touches each value once and keeps zone-map and bitmap state
+        // in registers
+        let uncompressedSize = (rowCount * valueSize) as u64;
+        // Skip the upfront zero-fill, the fused pass below explicitly zeros
+        // null slots and writes non-null values into their slots, so every
+        // byte of rawData is touched before the encoder reads it
+        let buf_len = rowCount * valueSize;
+        let mut rawData: Vec<u8> = Vec::with_capacity(buf_len);
+        // SAFETY, capacity reserved above, every slot is written below
+        unsafe {
+            rawData.set_len(buf_len);
+        }
+
+        let batchSize = ZONE_MAP_BATCH_SIZE as usize;
+        let zoneCount = rowCount.div_ceil(batchSize);
+        let mut zoneMaps: Vec<ZoneMapEntry> = Vec::with_capacity(zoneCount);
+
         let mut nullCount = 0u64;
+        let mut nullBitmap: Vec<u8> = Vec::new();
+        // Bounded distinct tracking, capped at BLOOM_MIN_CARDINALITY+1 since
+        // we only need to distinguish "high enough cardinality for bloom" from
+        // "low cardinality". For high-cardinality columns this saves an
+        // unbounded HashSet that would otherwise grow to N entries (~32 MB
+        // for 1M unique values), the segment header reports the saturated
+        // value which downstream consumers treat as "at least this many"
         let mut distinct = hashbrown::HashSet::new();
+        let mut distinctCapped = false;
         let mut globalMin: Option<[u8; STAT_VALUE_SIZE]> = None;
         let mut globalMax: Option<[u8; STAT_VALUE_SIZE]> = None;
         let mut isSorted = true;
         let mut prevRaw: Option<&[u8]> = None;
 
-        for val in values.iter() {
+        let mut zoneMin: Option<[u8; STAT_VALUE_SIZE]> = None;
+        let mut zoneMax: Option<[u8; STAT_VALUE_SIZE]> = None;
+        let mut zoneIdx = 0usize;
+
+        for (i, val) in values.iter().enumerate() {
+            let nextZoneBoundary = (zoneIdx + 1) * batchSize;
+            if i == nextZoneBoundary {
+                zoneMaps.push(ZoneMapEntry {
+                    min_value: zoneMin.unwrap_or([0xFF; STAT_VALUE_SIZE]),
+                    max_value: zoneMax.unwrap_or([0u8; STAT_VALUE_SIZE]),
+                });
+                zoneMin = None;
+                zoneMax = None;
+                zoneIdx += 1;
+            }
+
             match val {
-                None => nullCount += 1,
+                None => {
+                    nullCount += 1;
+                    if nullBitmap.is_empty() {
+                        nullBitmap = vec![0u8; rowCount.div_ceil(8)];
+                    }
+                    nullBitmap[i / 8] |= 1 << (i % 8);
+                    // Zero the null slot in rawData since the buffer was
+                    // allocated uninitialized, encoders treat the slot as
+                    // a deterministic zero placeholder and the null bitmap
+                    // tells consumers to skip it
+                    let start = i * valueSize;
+                    let end = start + valueSize;
+                    rawData[start..end].fill(0);
+                }
                 Some(v) => {
-                    distinct.insert(*v);
+                    if !distinctCapped {
+                        distinct.insert(*v);
+                        if distinct.len() as u64 > BLOOM_MIN_CARDINALITY {
+                            distinctCapped = true;
+                        }
+                    }
                     let slot = value_to_stat_slot(v);
 
                     globalMin = Some(match globalMin {
@@ -263,6 +333,23 @@ impl ColumnSegment {
                         _ => slot,
                     });
 
+                    zoneMin = Some(match zoneMin {
+                        Some(cur)
+                            if compare_stat_slots(&cur, &slot) != std::cmp::Ordering::Greater =>
+                        {
+                            cur
+                        }
+                        _ => slot,
+                    });
+                    zoneMax = Some(match zoneMax {
+                        Some(cur)
+                            if compare_stat_slots(&cur, &slot) != std::cmp::Ordering::Less =>
+                        {
+                            cur
+                        }
+                        _ => slot,
+                    });
+
                     if isSorted
                         && let Some(prev) = prevRaw
                         && compare_le_bytes(v, prev) == std::cmp::Ordering::Less
@@ -270,88 +357,53 @@ impl ColumnSegment {
                         isSorted = false;
                     }
                     prevRaw = Some(*v);
-                }
-            }
-        }
 
-        let cardinality = distinct.len() as u64;
-        let minValue = globalMin.unwrap_or([0u8; STAT_VALUE_SIZE]);
-        let maxValue = globalMax.unwrap_or([0u8; STAT_VALUE_SIZE]);
-
-        // Select encoding strategy based on type and sample statistics.
-        let encodingType = select_encoding(typeId, values);
-        let encoder = create_encoding(encodingType);
-
-        // Build raw data buffer from non-null values, filling nulls with zeros.
-        let uncompressedSize = (rowCount * valueSize) as u64;
-        let mut rawData = vec![0u8; rowCount * valueSize];
-        for (i, val) in values.iter().enumerate() {
-            if let Some(v) = val {
-                let start = i * valueSize;
-                let end = start + valueSize;
-                if v.len() == valueSize && end <= rawData.len() {
-                    rawData[start..end].copy_from_slice(v);
-                }
-            }
-        }
-
-        let encodedData = encoder.encode(&rawData, rowCount, valueSize)?;
-        let compressedSize = encodedData.len() as u64;
-
-        // Build null bitmap if any nulls exist. Bit i is set when row i is null.
-        let nullBitmap = if nullCount > 0 {
-            let bitmapLen = rowCount.div_ceil(8);
-            let mut bitmap = vec![0u8; bitmapLen];
-            for (i, val) in values.iter().enumerate() {
-                if val.is_none() {
-                    bitmap[i / 8] |= 1 << (i % 8);
-                }
-            }
-            bitmap
-        } else {
-            Vec::new()
-        };
-
-        // Build zone maps, one entry per ZONE_MAP_BATCH_SIZE rows.
-        let batchSize = ZONE_MAP_BATCH_SIZE as usize;
-        let zoneCount = rowCount.div_ceil(batchSize);
-        let mut zoneMaps = Vec::with_capacity(zoneCount);
-
-        for z in 0..zoneCount {
-            let zoneStart = z * batchSize;
-            let zoneEnd = (zoneStart + batchSize).min(rowCount);
-
-            let mut zoneMin: Option<[u8; STAT_VALUE_SIZE]> = None;
-            let mut zoneMax: Option<[u8; STAT_VALUE_SIZE]> = None;
-
-            for v in values[zoneStart..zoneEnd].iter().flatten() {
-                let slot = value_to_stat_slot(v);
-                zoneMin = Some(match zoneMin {
-                    Some(cur) if compare_stat_slots(&cur, &slot) != std::cmp::Ordering::Greater => {
-                        cur
+                    let start = i * valueSize;
+                    let end = start + valueSize;
+                    let raw_len = rawData.len();
+                    if v.len() == valueSize && end <= raw_len {
+                        rawData[start..end].copy_from_slice(v);
+                    } else {
+                        // Mismatched length, zero the slot so encoders see
+                        // deterministic placeholder bytes since rawData was
+                        // allocated uninitialized
+                        let cap_end = end.min(raw_len);
+                        rawData[start..cap_end].fill(0);
                     }
-                    _ => slot,
-                });
-                zoneMax = Some(match zoneMax {
-                    Some(cur) if compare_stat_slots(&cur, &slot) != std::cmp::Ordering::Less => cur,
-                    _ => slot,
-                });
+                }
             }
-
-            // All-null zones use sentinel min=0xFF/max=0x00 (min > max is
-            // impossible for real data, so range queries always skip them).
+        }
+        // Push the final zone, may be partially filled
+        if zoneMaps.len() < zoneCount {
             zoneMaps.push(ZoneMapEntry {
                 min_value: zoneMin.unwrap_or([0xFF; STAT_VALUE_SIZE]),
                 max_value: zoneMax.unwrap_or([0u8; STAT_VALUE_SIZE]),
             });
         }
 
-        // Build bloom filter when cardinality is high enough to benefit.
-        // Dictionary-encoded segments already have an implicit lookup structure,
-        // so bloom filters are skipped for those.
+        let cardinality = distinct.len() as u64;
+        let minValue = globalMin.unwrap_or([0u8; STAT_VALUE_SIZE]);
+        let maxValue = globalMax.unwrap_or([0u8; STAT_VALUE_SIZE]);
+
+        let encodingType = select_encoding(typeId, values);
+        let encoder = create_encoding(encodingType);
+
+        let encodedData = encoder.encode(&rawData, rowCount, valueSize)?;
+        let compressedSize = encodedData.len() as u64;
+
+        // Build bloom filter when cardinality is high enough to benefit
+        // Dictionary-encoded segments already have an implicit lookup structure
+        // so bloom filters are skipped for those, this is the only remaining
+        // pass over values since the bloom filter sizing depends on the
+        // cardinality decision computed in the fused pass above
         let bloomFilter =
             if cardinality >= BLOOM_MIN_CARDINALITY && encodingType != EncodingType::Dictionary {
-                let mut filter = BloomFilter::new(cardinality);
+                let bloom_size_hint = if distinctCapped {
+                    rowCount as u64
+                } else {
+                    cardinality
+                };
+                let mut filter = BloomFilter::new(bloom_size_hint);
                 for v in values.iter().flatten() {
                     filter.insert(v);
                 }
@@ -642,7 +694,10 @@ mod tests {
 
         assert_eq!(segment.header.column_id, 0);
         assert_eq!(segment.header.null_count, 0);
-        assert_eq!(segment.header.cardinality, 100);
+        // Bounded distinct tracking saturates at BLOOM_MIN_CARDINALITY+1 for
+        // high-cardinality columns, downstream consumers read the saturated
+        // value as "at least this many distinct values"
+        assert!(segment.header.cardinality >= BLOOM_MIN_CARDINALITY);
         assert_eq!(segment.header.uncompressed_size, 400);
         assert!(segment.header.compressed_size > 0);
         assert!(segment.header.is_sorted);
@@ -857,7 +912,9 @@ mod tests {
 
         assert_eq!(recovered.column_id, 5);
         assert_eq!(recovered.null_count, 0);
-        assert_eq!(recovered.cardinality, 200);
+        // Bounded distinct tracking saturates at BLOOM_MIN_CARDINALITY+1 for
+        // high-cardinality columns
+        assert!(recovered.cardinality >= BLOOM_MIN_CARDINALITY);
         assert_eq!(recovered.uncompressed_size, 200);
         assert!(recovered.is_sorted);
     }

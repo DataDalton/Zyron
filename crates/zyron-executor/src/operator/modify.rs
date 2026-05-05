@@ -17,28 +17,42 @@ use crate::context::ExecutionContext;
 use crate::expr::evaluate;
 use crate::operator::{ExecutionBatch, Operator, OperatorResult};
 
-/// Encodes a row's value at the given column position into bytes suitable
-/// for B+Tree key comparison. Big-endian for integers (matches the literal
-/// path in extract_scan_bounds), Utf8 as raw bytes
-fn encode_btree_key(
+/// Encodes a row's value at the given column position into a caller-provided
+/// buffer suitable for B+Tree key comparison. Big-endian for integers (matches
+/// the literal path in extract_scan_bounds), Utf8 as raw bytes
+///
+/// Returns true when the row contributed a key, false when the column is
+/// missing or null. Caller is expected to hoist buf out of any row loop and
+/// clear it inside this function so a single Vec amortizes across the batch
+fn encode_btree_key_into(
     batch: &DataBatch,
     row_idx: usize,
     col_pos: usize,
     type_id: TypeId,
-) -> Option<Vec<u8>> {
-    let col = batch.columns.get(col_pos)?;
+    buf: &mut Vec<u8>,
+) -> bool {
+    let Some(col) = batch.columns.get(col_pos) else {
+        return false;
+    };
     if col.is_null(row_idx) {
-        return None;
+        return false;
     }
+    buf.clear();
     match (&col.data, type_id) {
-        (ColumnData::Int8(v), _) => Some((v[row_idx] as i64 as u64).to_be_bytes().to_vec()),
-        (ColumnData::Int16(v), _) => Some((v[row_idx] as i64 as u64).to_be_bytes().to_vec()),
-        (ColumnData::Int32(v), _) => Some((v[row_idx] as i64 as u64).to_be_bytes().to_vec()),
-        (ColumnData::Int64(v), _) => Some((v[row_idx] as u64).to_be_bytes().to_vec()),
-        (ColumnData::UInt8(v), _) => Some((v[row_idx] as u64).to_be_bytes().to_vec()),
-        (ColumnData::UInt16(v), _) => Some((v[row_idx] as u64).to_be_bytes().to_vec()),
-        (ColumnData::UInt32(v), _) => Some((v[row_idx] as u64).to_be_bytes().to_vec()),
-        (ColumnData::UInt64(v), _) => Some(v[row_idx].to_be_bytes().to_vec()),
+        (ColumnData::Int8(v), _) => {
+            buf.extend_from_slice(&(v[row_idx] as i64 as u64).to_be_bytes())
+        }
+        (ColumnData::Int16(v), _) => {
+            buf.extend_from_slice(&(v[row_idx] as i64 as u64).to_be_bytes())
+        }
+        (ColumnData::Int32(v), _) => {
+            buf.extend_from_slice(&(v[row_idx] as i64 as u64).to_be_bytes())
+        }
+        (ColumnData::Int64(v), _) => buf.extend_from_slice(&(v[row_idx] as u64).to_be_bytes()),
+        (ColumnData::UInt8(v), _) => buf.extend_from_slice(&(v[row_idx] as u64).to_be_bytes()),
+        (ColumnData::UInt16(v), _) => buf.extend_from_slice(&(v[row_idx] as u64).to_be_bytes()),
+        (ColumnData::UInt32(v), _) => buf.extend_from_slice(&(v[row_idx] as u64).to_be_bytes()),
+        (ColumnData::UInt64(v), _) => buf.extend_from_slice(&v[row_idx].to_be_bytes()),
         (ColumnData::Float64(v), _) => {
             let bits = v[row_idx].to_bits();
             let sortable = if bits >> 63 == 1 {
@@ -46,7 +60,7 @@ fn encode_btree_key(
             } else {
                 bits ^ (1u64 << 63)
             };
-            Some(sortable.to_be_bytes().to_vec())
+            buf.extend_from_slice(&sortable.to_be_bytes());
         }
         (ColumnData::Float32(v), _) => {
             let bits = (v[row_idx] as f64).to_bits();
@@ -55,12 +69,13 @@ fn encode_btree_key(
             } else {
                 bits ^ (1u64 << 63)
             };
-            Some(sortable.to_be_bytes().to_vec())
+            buf.extend_from_slice(&sortable.to_be_bytes());
         }
-        (ColumnData::Utf8(v), _) => Some(v[row_idx].as_bytes().to_vec()),
-        (ColumnData::Binary(v), _) => Some(v[row_idx].clone()),
-        _ => None,
+        (ColumnData::Utf8(v), _) => buf.extend_from_slice(v[row_idx].as_bytes()),
+        (ColumnData::Binary(v), _) => buf.extend_from_slice(&v[row_idx]),
+        _ => return false,
     }
+    true
 }
 
 /// Extracts text content from a DataBatch row for FTS indexing into a reusable buffer.
@@ -337,11 +352,13 @@ impl Operator for InsertOperator {
                     }
                 }
 
-                // Batch WAL log: one CAS + commit for all inserts in this batch.
+                // Batch WAL log: one CAS + commit for all inserts in this batch
+                // Use the last-LSN-only variant so the WAL writer skips its
+                // per-record Vec<Lsn> allocation, callers further down the
+                // pipeline only need the last LSN to chain to the Commit record
                 let batch_records: Vec<(u32, &[u8])> =
                     tuples.iter().map(|t| (txn_id, t.data())).collect();
-                let lsns = self.ctx.wal.log_insert_batch(&batch_records)?;
-                let last_lsn = lsns.last().copied().unwrap_or(zyron_wal::Lsn::INVALID);
+                let last_lsn = self.ctx.wal.log_insert_batch_last_lsn(&batch_records)?;
 
                 let tuple_ids = heap_file.insert_batch(&tuples).await?;
 
@@ -456,7 +473,11 @@ impl Operator for InsertOperator {
                 }
 
                 // Maintain B+Tree indexes
+                // Hoist a single key buffer outside the row loop so encode_btree_key_into
+                // can amortize one Vec allocation across the entire batch instead of
+                // allocating a fresh Vec per row per index
                 let btree_indexes = self.ctx.btree_indexes_for_table(self.table_id.0);
+                let mut key_buf: Vec<u8> = Vec::with_capacity(16);
                 for (idx_id, col_id) in &btree_indexes {
                     let Some(btree) = self.ctx.get_index(zyron_catalog::IndexId(*idx_id)) else {
                         continue;
@@ -465,14 +486,18 @@ impl Operator for InsertOperator {
                     let Some(col_pos) = col_pos else { continue };
                     let col_entry = &table_entry.columns[col_pos];
                     for (row_idx, tid) in tuple_ids.iter().enumerate() {
-                        if let Some(key) =
-                            encode_btree_key(&exec_batch.batch, row_idx, col_pos, col_entry.type_id)
-                        {
+                        if encode_btree_key_into(
+                            &exec_batch.batch,
+                            row_idx,
+                            col_pos,
+                            col_entry.type_id,
+                            &mut key_buf,
+                        ) {
                             let normalized = TupleId::new(
                                 zyron_common::page::PageId::new(0, tid.page_id.page_num),
                                 tid.slot_id,
                             );
-                            let _ = btree.insert_sync(&key, normalized);
+                            let _ = btree.insert_sync(&key_buf, normalized);
                         }
                     }
                 }

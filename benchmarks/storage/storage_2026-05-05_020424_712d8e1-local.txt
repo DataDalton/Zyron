@@ -1,0 +1,52 @@
+
+=== B+ Tree Arena Performance Test ===
+Keys per run: 1000000
+Lookup sample: 10000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Delete [PASS]: 46,326,323 ops/sec (2.1586ms, 100000 keys, target: 8,000,000)
+  All 100000 deleted keys verified not found
+  Delete throughput (ops/sec) [PASS]: 46,326,323 >= 8,000,000 (target)
+  Insert: 39,226,300 ops/sec (25.4931ms), height=2
+    Breakdown: hash_table=0.0ms, flush=26.0ms, flushes=8
+  Lookup: 11.90 ns/op (119µs)
+  Range: 5,005,000,000 ops/sec (200ns)
+
+--- Run 2/5 ---
+  Insert: 39,204,924 ops/sec (25.507ms), height=2
+    Breakdown: hash_table=0.0ms, flush=26.5ms, flushes=8
+  Lookup: 15.34 ns/op (153.4µs)
+  Range: 5,005,000,000 ops/sec (200ns)
+
+--- Run 3/5 ---
+  Insert: 39,823,502 ops/sec (25.1108ms), height=2
+    Breakdown: hash_table=0.0ms, flush=26.3ms, flushes=8
+  Lookup: 13.79 ns/op (137.9µs)
+  Range: 5,005,000,000 ops/sec (200ns)
+
+--- Run 4/5 ---
+  Insert: 38,480,779 ops/sec (25.987ms), height=2
+    Breakdown: hash_table=0.0ms, flush=26.8ms, flushes=8
+  Lookup: 15.30 ns/op (153µs)
+  Range: 5,005,000,000 ops/sec (200ns)
+
+--- Run 5/5 ---
+  Insert: 39,443,997 ops/sec (25.3524ms), height=2
+    Breakdown: hash_table=0.0ms, flush=26.5ms, flushes=8
+  Lookup: 14.32 ns/op (143.2µs)
+  Range: 5,005,000,000 ops/sec (200ns)
+
+=== B+ Tree Validation Results ===
+  Insert throughput (ops/sec) [PASS/OK]:
+    Runs: [39,226,300, 39,204,924, 39,823,502, 38,480,779, 39,443,997]
+    Average: 39,235,901 >= 10,000,000 (target)
+    Min/Max: 38,480,779 / 39,823,502, StdDev: 438,142
+  Lookup latency (ns/op) [PASS/OK]:
+    Runs: [12, 15, 14, 15, 14]
+    Average: 14 <= 40 (target)
+    Min/Max: 12 / 15, StdDev: 1
+  Range throughput (ops/sec) [PASS/OK]:
+    Runs: [5,005,000,000, 5,005,000,000, 5,005,000,000, 5,005,000,000, 5,005,000,000]
+    Average: 5,005,000,000 >= 40,000,000 (target)
+    Min/Max: 5,005,000,000 / 5,005,000,000, StdDev: 0

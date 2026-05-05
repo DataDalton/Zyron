@@ -343,6 +343,17 @@ impl WalWriter {
             // the next flush iteration after rotation installs a new segment
             let mut leftover: Vec<u8> = Vec::new();
 
+            // Idle backoff state, the park_timeout grows exponentially when
+            // no work arrives so a quiet WAL costs near-zero CPU. The hot
+            // base interval is 50us so sub-4KB writes still flush within an
+            // ms of the writer's commit, an unpark from the writer (via
+            // wake_flush_thread) immediately returns from park_timeout
+            // regardless of the timeout so latency on first write is
+            // unaffected by the backoff
+            const PARK_BASE_US: u64 = 50;
+            const PARK_MAX_US: u64 = 10_000;
+            let mut park_us: u64 = PARK_BASE_US;
+
             loop {
                 // Check for work before parking. This prevents missed wakeups:
                 // if unpark() fires between our last drain_into() and park(),
@@ -351,9 +362,13 @@ impl WalWriter {
                 let has_rotation = rotation.is_rotating();
 
                 if !has_data && !has_rotation && !shutdown.load(Ordering::Acquire) {
-                    // Short park with timeout so records below the 4KB wakeup threshold
-                    // still get flushed promptly.
-                    std::thread::park_timeout(std::time::Duration::from_micros(50));
+                    // Idle backoff, double the park interval each idle round
+                    // up to PARK_MAX_US. Reset to PARK_BASE_US on the first
+                    // round that observes work below
+                    std::thread::park_timeout(std::time::Duration::from_micros(park_us));
+                    park_us = (park_us * 2).min(PARK_MAX_US);
+                } else {
+                    park_us = PARK_BASE_US;
                 }
 
                 if shutdown.load(Ordering::Acquire) {
@@ -918,18 +933,46 @@ impl WalWriter {
         self.append(txn_id, prev_lsn, LogRecordType::Insert, 0, payload)
     }
 
-    /// Logs a batch of insert operations with amortized atomic overhead.
+    /// Logs a batch of insert operations with amortized atomic overhead
     ///
     /// Reserves space for all records in one CAS, serializes them contiguously,
-    /// and commits once. Reduces atomic operations from 3N to 3 per batch.
-    /// Falls back to per-record append at segment boundaries.
+    /// and commits once. Reduces atomic operations from 3N to 3 per batch
+    /// Falls back to per-record append at segment boundaries
     #[inline]
     pub fn log_insert_batch(&self, inserts: &[(u32, &[u8])]) -> Result<Vec<Lsn>> {
         if inserts.is_empty() {
             return Ok(Vec::new());
         }
-
         let mut lsns = Vec::with_capacity(inserts.len());
+        self.log_insert_batch_inner(inserts, |lsn| lsns.push(lsn))?;
+        Ok(lsns)
+    }
+
+    /// Logs a batch of insert operations and returns only the last LSN
+    ///
+    /// Same batching machinery as log_insert_batch but skips the per-record
+    /// Vec<Lsn> allocation, callers like the executor's INSERT operator only
+    /// need the last LSN to chain to the Commit record so the per-row LSNs
+    /// are pure overhead, this variant runs zero allocations on the success
+    /// path
+    #[inline]
+    pub fn log_insert_batch_last_lsn(&self, inserts: &[(u32, &[u8])]) -> Result<Lsn> {
+        if inserts.is_empty() {
+            return Ok(Lsn::INVALID);
+        }
+        let mut last = Lsn::INVALID;
+        self.log_insert_batch_inner(inserts, |lsn| last = lsn)?;
+        Ok(last)
+    }
+
+    /// Shared inner loop, invokes the callback once per record with the
+    /// assigned LSN. The callback either pushes into a Vec or remembers the
+    /// last value, both compile down to a tight inline loop
+    fn log_insert_batch_inner(
+        &self,
+        inserts: &[(u32, &[u8])],
+        mut on_lsn: impl FnMut(Lsn),
+    ) -> Result<()> {
         let mut idx = 0;
 
         while idx < inserts.len() {
@@ -952,7 +995,7 @@ impl WalWriter {
             if needs_rotation {
                 let (txn_id, payload) = inserts[idx];
                 let lsn = self.append(txn_id, Lsn::INVALID, LogRecordType::Insert, 0, payload)?;
-                lsns.push(lsn);
+                on_lsn(lsn);
                 idx += 1;
                 continue;
             }
@@ -960,6 +1003,7 @@ impl WalWriter {
             let buf_start = unsafe { self.ring_buffer.write_record(batch_size as usize) };
 
             let mut buf_offset: u32 = 0;
+            let mut last_record_lsn = base_lsn;
             for &(txn_id, payload) in &inserts[batch_start..batch_end] {
                 let rsize = record_size_for_payload(payload.len()) as u32;
                 let record_lsn = Lsn::new(base_lsn.segment_id(), base_lsn.offset() + buf_offset);
@@ -977,18 +1021,19 @@ impl WalWriter {
                     );
                 }
 
-                lsns.push(record_lsn);
+                on_lsn(record_lsn);
+                last_record_lsn = record_lsn;
                 buf_offset += rsize;
             }
 
             self.ring_buffer
-                .commit_write(batch_size as usize, *lsns.last().unwrap());
+                .commit_write(batch_size as usize, last_record_lsn);
             self.maybe_wake_flush_thread(batch_size as usize);
 
             idx = batch_end;
         }
 
-        Ok(lsns)
+        Ok(())
     }
 
     /// Logs an update operation.

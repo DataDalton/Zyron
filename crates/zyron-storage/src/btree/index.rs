@@ -470,7 +470,10 @@ impl BTreeIndex {
         // Allocate new page
         let new_page_num = pages.allocate();
         let new_page_id = PageId::new(self.file_id, new_page_num as u64);
-        let (split_key, mut right_leaf) = leaf.split(new_page_id);
+        // Pass the inserting key so the split path can right-bias when the
+        // key is the new rightmost, monotonic workloads (auto-increment,
+        // UUID v7, time-ordered) avoid the 50% page-utilization penalty
+        let (split_key, mut right_leaf) = leaf.split_for_key(Some(key.as_ref()), new_page_id);
 
         // Insert into appropriate leaf
         if key.as_ref() < split_key.as_ref() {
@@ -658,7 +661,10 @@ impl BTreeIndex {
         // Allocate new page for right sibling
         let new_page_num = pages.allocate();
         let new_page_id = PageId::new(self.file_id, new_page_num as u64);
-        let (split_key, mut right_leaf) = leaf.split(new_page_id);
+        // Pass the inserting key so the split path can right-bias when the
+        // key is the new rightmost, monotonic workloads avoid the 50%
+        // page-utilization penalty of midpoint splits
+        let (split_key, mut right_leaf) = leaf.split_for_key(Some(key.as_ref()), new_page_id);
 
         // Insert the new key into appropriate leaf
         if key.as_ref() < split_key.as_ref() {

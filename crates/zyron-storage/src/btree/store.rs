@@ -40,7 +40,9 @@ impl PageSlot {
 impl Drop for PageSlot {
     fn drop(&mut self) {
         if self.owned {
-            unsafe { drop(Box::from_raw(*self.data.get_mut())); }
+            unsafe {
+                drop(Box::from_raw(*self.data.get_mut()));
+            }
         }
         // Arena-allocated pages: memory is freed by InMemoryPageStore::drop.
     }
@@ -58,7 +60,9 @@ unsafe impl Sync for PageArena {}
 
 impl Drop for PageArena {
     fn drop(&mut self) {
-        unsafe { std::alloc::dealloc(self.ptr, self.layout); }
+        unsafe {
+            std::alloc::dealloc(self.ptr, self.layout);
+        }
     }
 }
 
@@ -73,23 +77,74 @@ impl Drop for PageArena {
 /// methods remain for callers holding an external RwLock during structural modifications
 /// (node splits, merges).
 pub struct InMemoryPageStore {
-    /// Pages stored by page number (index = page_num).
+    /// Pages stored by page number (index = page_num)
     pages: Vec<PageSlot>,
-    /// Bulk memory arenas for checkpoint-loaded pages.
+    /// Bulk memory arenas for checkpoint-loaded pages and split pre-warm
     arenas: Vec<PageArena>,
+    /// Pre-warmed page numbers ready for allocate(), populated in arena
+    /// chunks so the per-split Box::new + zero-fill cost (5-10us for an
+    /// 8 KB allocation on Windows) amortizes at 1/ALLOC_CHUNK the rate,
+    /// bulk_allocate is independent and does not touch this stack
+    prewarm_pool: Vec<u32>,
 }
 
 impl InMemoryPageStore {
+    /// Pages reserved per arena refill, sized to balance the up-front
+    /// allocation cost (one 128 KB arena) against pool exhaustion frequency
+    const ALLOC_CHUNK: usize = 16;
+
     /// Creates a new empty page store.
     pub fn new() -> Self {
-        Self { pages: Vec::new(), arenas: Vec::new() }
+        Self {
+            pages: Vec::new(),
+            arenas: Vec::new(),
+            prewarm_pool: Vec::new(),
+        }
     }
     /// Allocates a new page and returns its page number.
     #[inline]
     pub fn allocate(&mut self) -> u32 {
-        let page_num = self.pages.len() as u32;
-        self.pages.push(PageSlot::new());
-        page_num
+        if let Some(page_num) = self.prewarm_pool.pop() {
+            return page_num;
+        }
+        self.refill_prewarm();
+        // refill_prewarm guarantees the pool has at least one entry, except
+        // in the impossible case of an alloc failure which would have
+        // panicked, so the unwrap is unreachable
+        self.prewarm_pool
+            .pop()
+            .expect("refill_prewarm produced no pages")
+    }
+
+    /// Reserves an arena-backed pool of ALLOC_CHUNK pages, avoids the
+    /// per-split Box::new heap allocation at the cost of holding up to
+    /// ALLOC_CHUNK-1 pre-warmed pages in reserve at any time
+    fn refill_prewarm(&mut self) {
+        let count = Self::ALLOC_CHUNK;
+        let total_bytes = count * PAGE_SIZE;
+        let layout = std::alloc::Layout::from_size_align(total_bytes, 16).unwrap();
+        let base = unsafe { std::alloc::alloc_zeroed(layout) };
+        if base.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        self.arenas.push(PageArena { ptr: base, layout });
+        self.pages.reserve(count);
+        let start = self.pages.len();
+        for i in 0..count {
+            let page_ptr = unsafe { base.add(i * PAGE_SIZE) as *mut [u8; PAGE_SIZE] };
+            self.pages.push(PageSlot {
+                version: AtomicU64::new(0),
+                data: UnsafeCell::new(page_ptr),
+                owned: false,
+            });
+        }
+        // Push in reverse so pop returns the lowest page_num first which
+        // mirrors the original Vec::push allocation order callers may
+        // implicitly rely on for monotonic page_num assignment
+        self.prewarm_pool.reserve(count);
+        for i in (0..count).rev() {
+            self.prewarm_pool.push((start + i) as u32);
+        }
     }
 
     /// Gets a page by page number (read-only).
@@ -114,7 +169,9 @@ impl InMemoryPageStore {
     #[inline]
     pub fn write(&mut self, page_num: u32, data: &[u8; PAGE_SIZE]) {
         if let Some(slot) = self.pages.get_mut(page_num as usize) {
-            unsafe { (**slot.data.get_mut()).copy_from_slice(data); }
+            unsafe {
+                (**slot.data.get_mut()).copy_from_slice(data);
+            }
             let v = slot.version.load(Ordering::Relaxed);
             slot.version.store(v + 2, Ordering::Release);
         }
@@ -191,8 +248,7 @@ impl InMemoryPageStore {
             (**slot.data.get()).copy_from_slice(data);
         }
 
-        slot.version
-            .store(expected_version + 2, Ordering::Release);
+        slot.version.store(expected_version + 2, Ordering::Release);
         true
     }
 
@@ -202,7 +258,9 @@ impl InMemoryPageStore {
     /// Memory is zeroed to pre-fault OS virtual memory pages.
     pub fn bulk_allocate(&mut self, count: usize) -> u32 {
         let start = self.pages.len() as u32;
-        if count == 0 { return start; }
+        if count == 0 {
+            return start;
+        }
 
         let total_bytes = count * PAGE_SIZE;
         let layout = std::alloc::Layout::from_size_align(total_bytes, 16).unwrap();
@@ -226,5 +284,4 @@ impl InMemoryPageStore {
         }
         start
     }
-
 }

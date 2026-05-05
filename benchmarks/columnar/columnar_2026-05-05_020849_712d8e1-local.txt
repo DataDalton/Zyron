@@ -1,0 +1,17 @@
+
+=== Parallel Column Encoding ===
+Rows: 100000, Columns: 8
+  Sequential: 100000 rows, 8 cols, 1720500 bytes
+  Parallel: 100000 rows, 8 cols, 1720500 bytes
+  Parallel correctness (all columns decodable): PASS
+  Avg sequential: 0.069s, avg parallel: 0.026s
+  Parallel speedup (x) [FAIL/OK]:
+    Runs: [3, 3, 3, 3, 3]
+    Average: 3 >= 3 (target)
+    Min/Max: 3 / 3, StdDev: 0
+  Sequential compaction (rows/sec) [PASS/OK]:
+    Runs: [1,368,068, 1,402,202, 1,454,746, 1,546,568, 1,459,479]
+    Average: 1,446,213 >= 1,000,000 (target)
+    Min/Max: 1,368,068 / 1,546,568, StdDev: 60,603
+
+  Parallel column encoding: ALL PASS
