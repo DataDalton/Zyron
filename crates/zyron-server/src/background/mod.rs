@@ -12,6 +12,7 @@ pub mod dlq_ttl;
 pub mod host_health;
 pub mod mv_refresh;
 pub mod publication_retention;
+pub mod quota_gossip;
 pub mod stats;
 pub mod stream_monitor;
 pub mod vacuum;
@@ -35,10 +36,15 @@ use zyron_buffer::BackgroundWriter;
 use self::cdc_writer::{CdcWriter, CdcWriterConfig};
 use self::checkpoint::{CheckpointWorker, CheckpointWorkerConfig};
 use self::mv_refresh::{MvRefreshConfig, MvRefreshWorker};
+use self::quota_gossip::{
+    NoopTransport, QuotaGossipConfig, QuotaGossipTransport, QuotaGossipWorker,
+};
 use self::stats::{StatsCollector, StatsCollectorConfig};
 use self::stream_monitor::{StreamMonitor, StreamMonitorConfig};
 use self::vacuum::{VacuumWorker, VacuumWorkerConfig};
 use self::wal_archiver::{WalArchiver, WalArchiverConfig};
+
+use zyron_types::scheduling::QuotaRegistry;
 
 /// Coordinates all background maintenance workers.
 pub struct BackgroundWorkers {
@@ -49,6 +55,7 @@ pub struct BackgroundWorkers {
     cdc_writer: CdcWriter,
     mv_refresh: MvRefreshWorker,
     stream_monitor: StreamMonitor,
+    quota_gossip: Option<QuotaGossipWorker>,
 }
 
 impl BackgroundWorkers {
@@ -132,7 +139,34 @@ impl BackgroundWorkers {
             cdc_writer,
             mv_refresh,
             stream_monitor,
+            quota_gossip: None,
         }
+    }
+
+    /// Attaches a QuotaGossip worker to the running set. Call after `start`
+    /// when the server has assembled its QuotaRegistry and (optional) peer
+    /// transport. Pass NoopTransport to enable the worker as a no-op while
+    /// reserving the gossip schedule, or a real transport once peers are wired
+    pub fn attach_quota_gossip(
+        &mut self,
+        registry: Arc<QuotaRegistry>,
+        transport: Arc<dyn QuotaGossipTransport>,
+        config: QuotaGossipConfig,
+    ) {
+        if self.quota_gossip.is_none() {
+            self.quota_gossip = Some(QuotaGossipWorker::start(registry, transport, config));
+            info!("QuotaGossip worker attached");
+        }
+    }
+
+    /// Convenience: attach with the default no-op transport. Useful when the
+    /// server is single-node or peer transport is not yet configured
+    pub fn attach_quota_gossip_default(&mut self, registry: Arc<QuotaRegistry>) {
+        self.attach_quota_gossip(
+            registry,
+            Arc::new(NoopTransport),
+            QuotaGossipConfig::default(),
+        );
     }
 
     /// Returns a reference to the checkpoint worker (for stats access).
@@ -164,6 +198,9 @@ impl BackgroundWorkers {
         }
 
         // Stop workers in reverse dependency order
+        if let Some(ref mut gossip) = self.quota_gossip {
+            gossip.shutdown();
+        }
         self.stream_monitor.shutdown();
         self.mv_refresh.shutdown();
         self.cdc_writer.shutdown();

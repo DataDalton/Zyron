@@ -12,15 +12,21 @@ pub use registry::{
     is_types_window_function,
 };
 
+pub mod arena;
+pub mod barcode;
 pub mod bitfield;
 pub mod business_time;
+pub mod checksum;
 pub mod color;
 pub mod cron;
 pub mod crypto;
 pub mod data_quality;
 pub mod diff;
+pub mod diff_patch;
+pub mod document;
 pub mod encoding;
 pub mod entity_resolution;
+pub mod file_detect;
 pub mod financial;
 pub mod fingerprint;
 pub mod formatting;
@@ -32,6 +38,7 @@ pub mod identifier;
 pub mod json_schema;
 pub mod matrix;
 pub mod money;
+pub mod natural_sort;
 pub mod network;
 pub mod probabilistic;
 pub mod quantity;
@@ -39,6 +46,8 @@ pub mod range;
 pub mod rate_limit;
 pub mod rating;
 pub mod regex_type;
+pub mod resilience;
+pub mod scheduling;
 pub mod semver;
 pub mod similarity;
 pub mod spatial_index;

@@ -1,0 +1,756 @@
+
+=== Type Serialization (All Types) Test ===
+
+=== QUIC Channel Bridge Throughput Test ===
+
+=== Message Codec Roundtrip Test ===
+  Encoded 23 backend message types (339 bytes total)
+
+
+=== Session Management Test ===
+  Startup message decoded: user=testuser, database=testdb
+
+  Query message decoded: SELECT 1
+
+  Default variables verified (server_version, encoding)
+
+  Startup parameters: 9 entries
+
+
+=== COPY Protocol Test ===
+  Transaction state transitions: Idle -> InTransaction -> Failed -> Idle
+
+  COPY IN (text): 2 rows parsed correctly
+
+  Custom variable set/get verified
+
+  19 TypeId -> PG OID mappings verified
+
+  Parse message decoded: stmt1, SELECT $1
+
+
+=== Extended Query Protocol Messages Test ===
+
+=== Authentication Protocols Test ===
+  TrustAuthenticator: immediate authentication verified
+
+  Parse: stmt1 with 1 param
+
+  Describe: statement stmt1
+
+  CleartextAuthenticator: correct password accepted
+
+  Bind: portal1 <- stmt1 with param=42
+
+  CleartextAuthenticator: wrong password rejected
+
+  9 scalar_to_text conversions verified
+
+
+=== Error SQLSTATE Mapping Test ===
+--- Run 1/5 ---
+
+  COPY IN (CSV): 2 rows parsed correctly
+
+  Bind message decoded
+
+  Describe: portal portal1
+
+  Search path parsing verified: ["public", "myschema"]
+
+  Null -> None verified
+
+  5 scalar_to_binary conversions verified
+
+  Md5Authenticator: correct MD5 hash accepted
+
+  All 4 authentication protocol tests passed
+
+  Execute message decoded
+
+  Describe message decoded
+
+  Sync message decoded
+
+  14 SQLSTATE mappings verified
+
+  Execute: portal1 (unlimited rows)
+
+  Sync
+
+  COPY IN (CSV quoted): quoted field with comma parsed correctly
+
+  Terminate message decoded
+
+  All 23 backend + 8 frontend message types verified
+
+  COPY OUT (text): 2 rows formatted correctly
+
+  COPY OUT (CSV): field with comma properly quoted
+
+  All COPY protocol tests passed
+
+  5 text_to_scalar conversions verified
+
+  7 response messages encoded (82 bytes)
+
+  3 binary_to_scalar conversions verified
+
+  pg_type_size verified for 10 types
+
+  Full extended query protocol cycle verified
+
+  Write: 21827 MB/s (67,108,864 bytes in 2.93ms), Read: 11051 MB/s (67,108,864 bytes in 5.79ms)
+
+--- Run 2/5 ---
+
+  Write: 22127 MB/s (67,108,864 bytes in 2.89ms), Read: 9705 MB/s (67,108,864 bytes in 6.59ms)
+
+--- Run 3/5 ---
+
+  Write: 18943 MB/s (67,108,864 bytes in 3.38ms), Read: 9467 MB/s (67,108,864 bytes in 6.76ms)
+
+--- Run 4/5 ---
+
+  Write: 19530 MB/s (67,108,864 bytes in 3.28ms), Read: 11971 MB/s (67,108,864 bytes in 5.35ms)
+
+--- Run 5/5 ---
+
+  Write: 19039 MB/s (67,108,864 bytes in 3.36ms), Read: 9495 MB/s (67,108,864 bytes in 6.74ms)
+
+  QUIC channel write throughput (MB/s) [PASS/OK]:
+    Runs: [21,827, 22,127, 18,943, 19,530, 19,039]
+    Average: 20,293 >= 500 (target)
+    Min/Max: 18,943 / 22,127, StdDev: 1,393
+  QUIC channel read throughput (MB/s) [PASS/OK]:
+    Runs: [11,051, 9,705, 9,467, 11,971, 9,495]
+    Average: 10,338 >= 500 (target)
+    Min/Max: 9,467 / 11,971, StdDev: 1,005
+
+=== QUIC Transport Properties Test ===
+  QUIC transport: encrypted=true, name=QUIC
+
+  TCP transport: encrypted=false, name=TCP
+
+--- Run 1/5 ---
+
+  100,000 round-trips in 22.39ms, avg 224 ns/op (4,466,000 ops/sec), 100,000 writes confirmed
+
+--- Run 2/5 ---
+
+  100,000 round-trips in 23.15ms, avg 232 ns/op (4,318,759 ops/sec), 100,000 writes confirmed
+
+--- Run 3/5 ---
+
+  100,000 round-trips in 22.89ms, avg 229 ns/op (4,368,415 ops/sec), 100,000 writes confirmed
+
+--- Run 4/5 ---
+
+  100,000 round-trips in 23.17ms, avg 232 ns/op (4,316,727 ops/sec), 100,000 writes confirmed
+
+--- Run 5/5 ---
+
+  100,000 round-trips in 23.46ms, avg 235 ns/op (4,262,793 ops/sec), 100,000 writes confirmed
+
+  QUIC channel round-trip throughput (ops/sec) [PASS/OK]:
+    Runs: [4,466,000, 4,318,759, 4,368,415, 4,316,727, 4,262,793]
+    Average: 4,346,539 >= 500,000 (target)
+    Min/Max: 4,262,793 / 4,466,000, StdDev: 68,445
+
+=== QUIC PG Handshake Latency Test ===
+--- Run 1/5 ---
+
+  500 QUIC PG handshakes (500 success) in 2.20ms, avg 4.4 us/handshake
+
+--- Run 2/5 ---
+
+  500 QUIC PG handshakes (500 success) in 2.14ms, avg 4.3 us/handshake
+
+--- Run 3/5 ---
+
+  500 QUIC PG handshakes (500 success) in 2.16ms, avg 4.3 us/handshake
+
+--- Run 4/5 ---
+
+  500 QUIC PG handshakes (500 success) in 2.15ms, avg 4.3 us/handshake
+
+--- Run 5/5 ---
+
+  500 QUIC PG handshakes (500 success) in 2.15ms, avg 4.3 us/handshake
+
+  QUIC PG handshake latency (us) [PASS/OK]:
+    Runs: [4, 4, 4, 4, 4]
+    Average: 4 <= 500 (target)
+    Min/Max: 4 / 4, StdDev: 0
+
+=== API Key Auth Throughput Test ===
+--- Run 1/5 ---
+
+  1,000,000 verifications in 35.03ms, 28,548,834 ops/sec
+
+--- Run 2/5 ---
+
+  1,000,000 verifications in 35.41ms, 28,239,493 ops/sec
+
+--- Run 3/5 ---
+
+  1,000,000 verifications in 36.33ms, 27,524,325 ops/sec
+
+--- Run 4/5 ---
+
+  1,000,000 verifications in 34.95ms, 28,610,830 ops/sec
+
+--- Run 5/5 ---
+
+  1,000,000 verifications in 34.79ms, 28,746,701 ops/sec
+
+  API key verify throughput (ops/sec) [PASS/OK]:
+    Runs: [28,548,834, 28,239,493, 27,524,325, 28,610,830, 28,746,701]
+    Average: 28,334,037 >= 500,000 (target)
+    Min/Max: 27,524,325 / 28,746,701, StdDev: 437,634
+
+=== QUIC Handshake Latency Test ===
+  QUIC server listening on 127.0.0.1:62789
+
+--- Run 1/5 ---
+
+  20 QUIC handshakes (20 success) in 61.09ms, avg 3054.5 us/handshake
+
+--- Run 2/5 ---
+
+  20 QUIC handshakes (20 success) in 59.30ms, avg 2965.1 us/handshake
+
+--- Run 3/5 ---
+
+  20 QUIC handshakes (20 success) in 58.50ms, avg 2925.1 us/handshake
+
+--- Run 4/5 ---
+
+  20 QUIC handshakes (20 success) in 59.46ms, avg 2972.8 us/handshake
+
+--- Run 5/5 ---
+
+  20 QUIC handshakes (20 success) in 59.28ms, avg 2964.0 us/handshake
+
+  QUIC handshake latency (us) [PASS/OK]:
+    Runs: [3,054, 2,965, 2,925, 2,973, 2,964]
+    Average: 2,976 <= 10,000 (target)
+    Min/Max: 2,925 / 3,054, StdDev: 42
+  QUIC handshake benchmark completed (passed: true)
+
+
+=== Bind Message Latency Test ===
+--- Run 1/5 ---
+
+  500,000 bind decodes in 47.82ms, avg 0.096 us/op
+
+--- Run 2/5 ---
+
+  500,000 bind decodes in 47.13ms, avg 0.094 us/op
+
+--- Run 3/5 ---
+
+  500,000 bind decodes in 48.43ms, avg 0.097 us/op
+
+--- Run 4/5 ---
+
+  500,000 bind decodes in 46.02ms, avg 0.092 us/op
+
+--- Run 5/5 ---
+
+  500,000 bind decodes in 45.85ms, avg 0.092 us/op
+
+  Bind message decode latency (us) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 4 (target)
+    Min/Max: 0 / 0, StdDev: 0
+
+=== Concurrent Connections Test ===
+  Server listening on 127.0.0.1:59521
+
+--- Run 1/5 ---
+
+  200 concurrent connections (200 success) in 521.00ms, 384 conns/sec
+
+--- Run 2/5 ---
+
+  200 concurrent connections (200 success) in 515.71ms, 388 conns/sec
+
+--- Run 3/5 ---
+
+  200 concurrent connections (200 success) in 515.88ms, 388 conns/sec
+
+--- Run 4/5 ---
+
+  200 concurrent connections (200 success) in 518.27ms, 386 conns/sec
+
+--- Run 5/5 ---
+
+  200 concurrent connections (200 success) in 511.01ms, 391 conns/sec
+
+  Connection establishment rate (conns/sec) [FAIL/REGR!]:
+    Runs: [384, 388, 388, 386, 391]
+    Average: 387 >= 1,000 (target)
+    Min/Max: 384 / 391, StdDev: 2
+=== Notification Channels Test ===
+
+  Subscribed to 'test_channel'
+
+  Sent notification, 1 receiver(s) notified
+
+  Received: channel='test_channel', payload='hello from test', pid=42
+
+  Notify on empty channel returned 0 receivers
+
+  Broadcast to 2 listeners verified
+
+  Unlisten on dropped receivers cleaned up channel
+
+  All notification channel tests passed
+
+
+=== COPY FROM Throughput Test ===
+--- Run 1/5 ---
+
+  500,000 rows (14,055,560 bytes) in 30.57ms, 16,358,098 rows/sec
+
+--- Run 2/5 ---
+
+  500,000 rows (14,055,560 bytes) in 18.04ms, 27,712,346 rows/sec
+
+--- Run 3/5 ---
+
+  500,000 rows (14,055,560 bytes) in 17.92ms, 27,894,470 rows/sec
+
+--- Run 4/5 ---
+
+  500,000 rows (14,055,560 bytes) in 17.73ms, 28,196,337 rows/sec
+
+--- Run 5/5 ---
+
+  500,000 rows (14,055,560 bytes) in 18.54ms, 26,969,589 rows/sec
+
+  COPY FROM (CSV) throughput (rows/sec) [PASS/OK]:
+    Runs: [16,358,098, 27,712,346, 27,894,470, 28,196,337, 26,969,589]
+    Average: 25,426,168 >= 3,000,000 (target)
+    Min/Max: 16,358,098 / 28,196,337, StdDev: 4,552,032
+
+=== COPY TO Throughput Test ===
+--- Run 1/5 ---
+
+  512,000 rows in 24.46ms, 20,930,594 rows/sec
+
+--- Run 2/5 ---
+
+  512,000 rows in 21.67ms, 23,632,042 rows/sec
+
+--- Run 3/5 ---
+
+  512,000 rows in 21.25ms, 24,099,108 rows/sec
+
+--- Run 4/5 ---
+
+  512,000 rows in 21.46ms, 23,855,117 rows/sec
+
+--- Run 5/5 ---
+
+  512,000 rows in 21.27ms, 24,067,162 rows/sec
+
+  COPY TO (text) throughput (rows/sec) [PASS/OK]:
+    Runs: [20,930,594, 23,632,042, 24,099,108, 23,855,117, 24,067,162]
+    Average: 23,316,805 >= 5,000,000 (target)
+    Min/Max: 20,930,594 / 24,099,108, StdDev: 1,204,840
+
+=== DataRow Encode Throughput Test ===
+--- Run 1/5 ---
+
+  2,000,000 rows (92,831,949 bytes) in 175.57ms, 11,391,267 rows/sec
+
+--- Run 2/5 ---
+
+  2,000,000 rows (92,831,949 bytes) in 174.70ms, 11,448,184 rows/sec
+
+--- Run 3/5 ---
+
+  2,000,000 rows (92,831,949 bytes) in 173.00ms, 11,560,567 rows/sec
+
+--- Run 4/5 ---
+
+  2,000,000 rows (92,831,949 bytes) in 174.22ms, 11,479,837 rows/sec
+
+--- Run 5/5 ---
+
+  2,000,000 rows (92,831,949 bytes) in 168.94ms, 11,838,761 rows/sec
+
+  DataRow encode throughput (rows/sec) [PASS/OK]:
+    Runs: [11,391,267, 11,448,184, 11,560,567, 11,479,837, 11,838,761]
+    Average: 11,543,723 >= 8,000,000 (target)
+    Min/Max: 11,391,267 / 11,838,761, StdDev: 157,342
+
+=== DDL Dispatch Statement Coverage ===
+  62 statement types parsed and dispatched correctly
+
+
+=== DDL Dispatch Throughput Test ===
+--- Run 1/5 ---
+
+  1,000,000 parses in 232.15ms, 4,307,497 ops/sec
+
+--- Run 2/5 ---
+
+  1,000,000 parses in 230.17ms, 4,344,626 ops/sec
+
+--- Run 3/5 ---
+
+  1,000,000 parses in 226.22ms, 4,420,386 ops/sec
+
+--- Run 4/5 ---
+
+  1,000,000 parses in 229.87ms, 4,350,361 ops/sec
+
+--- Run 5/5 ---
+
+  1,000,000 parses in 235.04ms, 4,254,508 ops/sec
+
+  DDL parse throughput (ops/sec) [PASS/OK]:
+    Runs: [4,307,497, 4,344,626, 4,420,386, 4,350,361, 4,254,508]
+    Average: 4,335,475 >= 500,000 (target)
+    Min/Max: 4,254,508 / 4,420,386, StdDev: 54,504
+
+=== JWT Auth Throughput Test ===
+--- Run 1/5 ---
+
+  1,000,000 decodes in 8.27s, 120,941 ops/sec
+
+--- Run 2/5 ---
+
+  1,000,000 decodes in 8.29s, 120,615 ops/sec
+
+--- Run 3/5 ---
+
+  1,000,000 decodes in 8.09s, 123,595 ops/sec
+
+--- Run 4/5 ---
+
+  1,000,000 decodes in 8.33s, 120,041 ops/sec
+
+--- Run 5/5 ---
+
+  1,000,000 decodes in 1.51s, 662,734 ops/sec
+
+  JWT decode throughput (ops/sec) [PASS/OK]:
+    Runs: [120,941, 120,615, 123,595, 120,041, 662,734]
+    Average: 229,585 >= 200,000 (target)
+    Min/Max: 120,041 / 662,734, StdDev: 216,578
+
+=== QUIC PG Simple Query Throughput Test ===
+--- Run 1/5 ---
+
+  5,000 queries in 48.76ms, avg 9.8 us/query (102,549 qps)
+
+--- Run 2/5 ---
+
+  5,000 queries in 68.24ms, avg 13.6 us/query (73,268 qps)
+
+--- Run 3/5 ---
+
+  5,000 queries in 47.96ms, avg 9.6 us/query (104,257 qps)
+
+--- Run 4/5 ---
+
+  5,000 queries in 50.11ms, avg 10.0 us/query (99,775 qps)
+
+--- Run 5/5 ---
+
+  5,000 queries in 72.35ms, avg 14.5 us/query (69,108 qps)
+
+  QUIC PG simple query throughput (qps) [PASS/OK]:
+    Runs: [102,549, 73,268, 104,257, 99,775, 69,108]
+    Average: 89,791 >= 10,000 (target)
+    Min/Max: 69,108 / 104,257, StdDev: 15,314
+
+=== Parse Message Latency Test ===
+--- Run 1/5 ---
+
+  500,000 parse decodes in 78.51ms, avg 0.157 us/op
+
+--- Run 2/5 ---
+
+  500,000 parse decodes in 87.29ms, avg 0.175 us/op
+
+--- Run 3/5 ---
+
+  500,000 parse decodes in 62.66ms, avg 0.125 us/op
+
+--- Run 4/5 ---
+
+  500,000 parse decodes in 55.29ms, avg 0.111 us/op
+
+--- Run 5/5 ---
+
+  500,000 parse decodes in 68.53ms, avg 0.137 us/op
+
+  Parse message decode latency (us) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 8 (target)
+    Min/Max: 0 / 0, StdDev: 0
+
+=== Execute Message Latency Test ===
+--- Run 1/5 ---
+
+  500,000 execute decodes in 38.79ms, avg 0.078 us/op
+
+--- Run 2/5 ---
+
+  500,000 execute decodes in 41.00ms, avg 0.082 us/op
+
+--- Run 3/5 ---
+
+  500,000 execute decodes in 40.70ms, avg 0.081 us/op
+
+--- Run 4/5 ---
+
+  500,000 execute decodes in 42.11ms, avg 0.084 us/op
+
+--- Run 5/5 ---
+
+  500,000 execute decodes in 37.48ms, avg 0.075 us/op
+
+  Execute message decode latency (us) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 20 (target)
+    Min/Max: 0 / 0, StdDev: 0
+
+=== Row Serialization Throughput Test ===
+--- Run 1/5 ---
+
+  1,000,000 rows (26,037,038 bytes) in 57.77ms, 17,311,041 rows/sec
+
+--- Run 2/5 ---
+
+  1,000,000 rows (26,037,038 bytes) in 56.64ms, 17,655,149 rows/sec
+
+--- Run 3/5 ---
+
+  1,000,000 rows (26,037,038 bytes) in 54.76ms, 18,260,904 rows/sec
+
+--- Run 4/5 ---
+
+  1,000,000 rows (26,037,038 bytes) in 55.95ms, 17,874,155 rows/sec
+
+--- Run 5/5 ---
+
+  1,000,000 rows (26,037,038 bytes) in 58.19ms, 17,184,729 rows/sec
+
+  Row serialization throughput (rows/sec) [PASS/OK]:
+    Runs: [17,311,041, 17,655,149, 18,260,904, 17,874,155, 17,184,729]
+    Average: 17,657,196 >= 8,000,000 (target)
+    Min/Max: 17,184,729 / 18,260,904, StdDev: 388,481
+
+=== Simple Query Message Throughput Test ===
+--- Run 1/5 ---
+
+  1,000,000 query roundtrips in 54.42ms, avg 0.054 us/op (18,374,213 qps)
+
+--- Run 2/5 ---
+
+  1,000,000 query roundtrips in 53.91ms, avg 0.054 us/op (18,548,505 qps)
+
+--- Run 3/5 ---
+
+  1,000,000 query roundtrips in 52.30ms, avg 0.052 us/op (19,121,812 qps)
+
+--- Run 4/5 ---
+
+  1,000,000 query roundtrips in 53.41ms, avg 0.053 us/op (18,721,543 qps)
+
+--- Run 5/5 ---
+
+  1,000,000 query roundtrips in 52.60ms, avg 0.053 us/op (19,010,395 qps)
+
+  Simple query message latency (us) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 20 (target)
+    Min/Max: 0 / 0, StdDev: 0
+=== COPY Binary Format Test ===
+
+  Header: format=1 (binary), 2 column format entries
+
+  format_batch() returned 1 message(s)
+
+  PGCOPY signature verified (75 bytes total)
+
+  Flags: 0 (no OIDs)
+
+  Header extension length: 0
+
+  First row field count: 2
+
+  Trailer sentinel: -1
+
+  CopyDone message verified
+
+  All COPY binary format tests passed
+
+
+=== TOTP Auth Throughput Test ===
+--- Run 1/5 ---
+
+  1,000,000 verifications in 68.96ms, 14,500,887 ops/sec
+
+--- Run 2/5 ---
+
+  1,000,000 verifications in 73.43ms, 13,617,930 ops/sec
+
+--- Run 3/5 ---
+
+  1,000,000 verifications in 71.72ms, 13,943,229 ops/sec
+
+--- Run 4/5 ---
+
+  1,000,000 verifications in 69.03ms, 14,485,553 ops/sec
+
+--- Run 5/5 ---
+
+  1,000,000 verifications in 68.55ms, 14,586,977 ops/sec
+
+  TOTP verify throughput (ops/sec) [PASS/OK]:
+    Runs: [14,500,887, 13,617,930, 13,943,229, 14,485,553, 14,586,977]
+    Average: 14,226,915 >= 500,000 (target)
+    Min/Max: 13,617,930 / 14,586,977, StdDev: 380,247
+
+=== Message Decode Throughput Test ===
+--- Run 1/5 ---
+
+  1,000,000 decodes in 39.65ms, 25,223,798 ops/sec
+
+--- Run 2/5 ---
+
+  1,000,000 decodes in 39.02ms, 25,624,731 ops/sec
+
+--- Run 3/5 ---
+
+  1,000,000 decodes in 39.05ms, 25,605,310 ops/sec
+
+--- Run 4/5 ---
+
+  1,000,000 decodes in 38.47ms, 25,994,281 ops/sec
+
+--- Run 5/5 ---
+
+  1,000,000 decodes in 39.10ms, 25,575,840 ops/sec
+
+  FrontendMessage decode throughput (ops/sec) [PASS/OK]:
+    Runs: [25,223,798, 25,624,731, 25,605,310, 25,994,281, 25,575,840]
+    Average: 25,604,792 >= 2,000,000 (target)
+    Min/Max: 25,223,798 / 25,994,281, StdDev: 244,170
+
+=== Message Encode Throughput Test ===
+--- Run 1/5 ---
+
+  1,000,000 encodes in 35.20ms, 28,409,091 ops/sec
+
+--- Run 2/5 ---
+
+  1,000,000 encodes in 37.11ms, 26,946,915 ops/sec
+
+--- Run 3/5 ---
+
+  1,000,000 encodes in 33.81ms, 29,579,060 ops/sec
+
+--- Run 4/5 ---
+
+  1,000,000 encodes in 34.03ms, 29,382,814 ops/sec
+
+--- Run 5/5 ---
+
+  1,000,000 encodes in 33.56ms, 29,801,640 ops/sec
+
+  BackendMessage encode throughput (ops/sec) [PASS/OK]:
+    Runs: [28,409,091, 26,946,915, 29,579,060, 29,382,814, 29,801,640]
+    Average: 28,823,904 >= 2,000,000 (target)
+    Min/Max: 26,946,915 / 29,801,640, StdDev: 1,052,024
+
+=== Connection Handshake Latency Test ===
+  Server listening on 127.0.0.1:53283
+
+--- Run 1/5 ---
+
+  500 handshakes (500 success) in 63.91ms, avg 127.8 us/handshake
+
+--- Run 2/5 ---
+
+  500 handshakes (500 success) in 91.13ms, avg 182.3 us/handshake
+
+--- Run 3/5 ---
+
+  500 handshakes (500 success) in 66.62ms, avg 133.2 us/handshake
+
+--- Run 4/5 ---
+
+  500 handshakes (500 success) in 202.57ms, avg 405.1 us/handshake
+
+--- Run 5/5 ---
+
+  500 handshakes (500 success) in 164.03ms, avg 328.1 us/handshake
+
+  Handshake latency (us) [FAIL/REGR!]:
+    Runs: [128, 182, 133, 405, 328]
+    Average: 235 <= 50 (target)
+    Min/Max: 128 / 405, StdDev: 112
+
+=== Notification Channel Throughput Test ===
+--- Run 1/5 ---
+
+  1,000,000 notifies in 38.59ms, 25,915,329 ops/sec
+
+--- Run 2/5 ---
+
+  1,000,000 notifies in 38.95ms, 25,672,095 ops/sec
+
+--- Run 3/5 ---
+
+  1,000,000 notifies in 39.63ms, 25,235,701 ops/sec
+
+--- Run 4/5 ---
+
+  1,000,000 notifies in 39.02ms, 25,625,256 ops/sec
+
+--- Run 5/5 ---
+
+  1,000,000 notifies in 38.72ms, 25,825,846 ops/sec
+
+  notify() throughput (ops/sec) [PASS/OK]:
+    Runs: [25,915,329, 25,672,095, 25,235,701, 25,625,256, 25,825,846]
+    Average: 25,654,846 >= 1,000,000 (target)
+    Min/Max: 25,235,701 / 25,915,329, StdDev: 234,072
+
+=== Type Serialization Throughput Test ===
+--- Run 1/5 ---
+
+  Text: 103,772,763 ops/sec, Binary: 180,472,187 ops/sec
+
+--- Run 2/5 ---
+
+  Text: 102,995,310 ops/sec, Binary: 180,126,305 ops/sec
+
+--- Run 3/5 ---
+
+  Text: 100,871,734 ops/sec, Binary: 171,076,447 ops/sec
+
+--- Run 4/5 ---
+
+  Text: 97,706,248 ops/sec, Binary: 179,857,409 ops/sec
+
+--- Run 5/5 ---
+
+  Text: 102,318,747 ops/sec, Binary: 180,448,740 ops/sec
+
+  scalar_to_text throughput (ops/sec) [PASS/OK]:
+    Runs: [103,772,763, 102,995,310, 100,871,734, 97,706,248, 102,318,747]
+    Average: 101,532,960 >= 8,000,000 (target)
+    Min/Max: 97,706,248 / 103,772,763, StdDev: 2,137,924
+  scalar_to_binary throughput (ops/sec) [PASS/OK]:
+    Runs: [180,472,187, 180,126,305, 171,076,447, 179,857,409, 180,448,740]
+    Average: 178,396,218 >= 8,000,000 (target)
+    Min/Max: 171,076,447 / 180,472,187, StdDev: 3,666,874

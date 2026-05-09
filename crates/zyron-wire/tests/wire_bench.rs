@@ -164,6 +164,7 @@ async fn create_test_server(db_name: &str) -> (Arc<ServerState>, tempfile::TempD
         subscription_runtimes: Arc::new(scc::HashMap::new()),
         heap_files: Arc::new(scc::HashMap::new()),
         btree_indexes: Arc::new(scc::HashMap::new()),
+        vacuum_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
 
     (state, tmp)

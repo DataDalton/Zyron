@@ -18,6 +18,7 @@ tokio.workspace = true
 hashbrown.workspace = true
 parking_lot.workspace = true
 scc.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 rand = "0.10"

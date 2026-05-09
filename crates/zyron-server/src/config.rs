@@ -158,9 +158,9 @@ impl ZyronConfig {
                         self.server.tls_enabled = v;
                     }
                 }
-                "health_port" => {
+                "dual_stack" => {
                     if let Ok(v) = value.parse() {
-                        self.server.health_port = v;
+                        self.server.dual_stack = v;
                     }
                 }
                 _ => {}
@@ -573,6 +573,7 @@ impl ZyronConfig {
             quic_port: self.server.quic_port,
             quic_zero_rtt: self.server.quic_zero_rtt,
             quic_idle_timeout_secs: self.server.quic_idle_timeout_secs,
+            dual_stack: self.server.dual_stack,
         }
     }
 
@@ -625,7 +626,9 @@ impl ZyronConfig {
             "server.statement_timeout_secs" => Some(self.server.statement_timeout_secs.to_string()),
             "server.worker_threads" => Some(self.server.worker_threads.to_string()),
             "server.tls_enabled" => Some(self.server.tls_enabled.to_string()),
-            "server.health_port" => Some(self.server.health_port.to_string()),
+            "server.dual_stack" => Some(self.server.dual_stack.to_string()),
+            "metrics.host" => Some(self.metrics.host.clone()),
+            "metrics.dual_stack" => Some(self.metrics.dual_stack.to_string()),
             // Storage
             "storage.data_dir" => Some(self.storage.data_dir.display().to_string()),
             "storage.page_size" => Some(self.storage.page_size.to_string()),
@@ -730,9 +733,9 @@ impl ZyronConfig {
                 "TLS enabled".into(),
             ),
             (
-                "server.health_port".into(),
-                self.server.health_port.to_string(),
-                "Health/metrics HTTP port".into(),
+                "server.dual_stack".into(),
+                self.server.dual_stack.to_string(),
+                "Accept IPv4 connections on IPv6 wildcard binds (V6ONLY off)".into(),
             ),
             (
                 "storage.data_dir".into(),
@@ -902,6 +905,11 @@ impl ZyronConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ServerSection {
+    /// Bind address for the main wire protocol listener. Accepts any string
+    /// `TcpListener::bind` understands. Examples: `"127.0.0.1"` (IPv4 loopback),
+    /// `"0.0.0.0"` (IPv4 wildcard, IPv4 only), `"::1"` (IPv6 loopback),
+    /// `"[::]"` (IPv6 wildcard, also accepts IPv4 on dual-stack OSes when
+    /// `dual_stack = true`)
     pub host: String,
     pub port: u16,
     pub max_connections: u32,
@@ -915,14 +923,20 @@ pub struct ServerSection {
     pub quic_port: Option<u16>,
     pub quic_zero_rtt: bool,
     pub quic_idle_timeout_secs: u32,
-    /// Port for the health/metrics HTTP server.
-    pub health_port: u16,
+    /// When the bind address is an IPv6 wildcard (`::` or `[::]`), accept
+    /// IPv4 connections too via IPv4-mapped IPv6 addresses. Linux kernel
+    /// defaults V6ONLY to false; Windows defaults to true. Setting this true
+    /// applies V6ONLY=false explicitly via socket2 so behaviour is identical
+    /// across platforms. Set false to bind IPv6-only when needed
+    pub dual_stack: bool,
 }
 
 impl Default for ServerSection {
     fn default() -> Self {
         Self {
-            host: "127.0.0.1".into(),
+            // Dual-stack default so IPv6 clients work out of the box.
+            // Operators wanting IPv4-only can set host = "0.0.0.0"
+            host: "[::]".into(),
             port: 5432,
             max_connections: 1000,
             connection_timeout_secs: 30,
@@ -937,7 +951,7 @@ impl Default for ServerSection {
             quic_port: None,
             quic_zero_rtt: false,
             quic_idle_timeout_secs: 300,
-            health_port: 9090,
+            dual_stack: true,
         }
     }
 }
@@ -1121,18 +1135,31 @@ impl Default for BufferSection {
 #[serde(default)]
 pub struct MetricsSection {
     pub enabled: bool,
+    /// Bind address for the health/metrics HTTP server. Accepts any string
+    /// `TcpListener::bind` understands. Examples: `"127.0.0.1"` (IPv4 loopback),
+    /// `"0.0.0.0"` (IPv4 wildcard), `"::1"` (IPv6 loopback), `"[::]"` (IPv6
+    /// wildcard, also accepts IPv4 on dual-stack OSes when `dual_stack=true`)
+    pub host: String,
     /// Port for health and metrics HTTP server.
     pub port: u16,
     /// Metrics endpoint path.
     pub path: String,
+    /// When `host` is an IPv6 wildcard, accept IPv4 connections too via
+    /// IPv4-mapped IPv6 addresses. Linux defaults V6ONLY to false (so this
+    /// matches the kernel default), Windows defaults to true (so this flag
+    /// explicitly overrides via socket2 to give consistent dual-stack behaviour)
+    pub dual_stack: bool,
 }
 
 impl Default for MetricsSection {
     fn default() -> Self {
         Self {
             enabled: true,
+            // Dual-stack default so IPv6 clients work out of the box
+            host: "[::]".into(),
             port: 9090,
             path: "/metrics".into(),
+            dual_stack: true,
         }
     }
 }
@@ -1477,7 +1504,9 @@ wal_bytes_threshold = 33554432
     fn test_to_server_config() {
         let config = ZyronConfig::default();
         let server_cfg = config.to_server_config();
-        assert_eq!(server_cfg.host, "127.0.0.1");
+        // Default is dual-stack IPv6 wildcard
+        assert_eq!(server_cfg.host, "[::]");
+        assert!(server_cfg.dual_stack);
         assert_eq!(server_cfg.port, 5432);
         assert_eq!(server_cfg.max_connections, 1000);
     }

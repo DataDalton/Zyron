@@ -1,0 +1,81 @@
+{
+  "id": "2026-05-08_024118_a5b812a-local",
+  "date": "2026-05-08 02:41:22Z",
+  "ts": 1778208082,
+  "commit": "a5b812a-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Planner Performance": {
+      "util_before": { "cpu_pct": 6.0, "ram_used_gb": 9.91 },
+      "util_after": { "cpu_pct": 14.0, "ram_used_gb": 9.93 },
+      "Binding latency (us)": {
+        "average": 1.662080,
+        "runs": [1.89, 1.62, 1.62, 1.57, 1.62],
+        "target": 2.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Logical plan latency (us)": {
+        "average": 0.419620,
+        "runs": [0.31, 0.40, 0.54, 0.42, 0.44],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Optimization latency (us)": {
+        "average": 22.960220,
+        "runs": [21.96, 21.84, 22.06, 26.61, 22.33],
+        "target": 25.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Physical plan latency (us)": {
+        "average": 0.403620,
+        "runs": [0.96, 0.33, 0.71, 0.01, 0.01],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Join reorder latency (us, 5 tables)": {
+        "average": 26.545800,
+        "runs": [35.19, 23.64, 25.75, 24.45, 23.70],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Index selection latency (us)": {
+        "average": 0.010000,
+        "runs": [0.01, 0.01, 0.01, 0.01, 0.01],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Full pipeline latency (us)": {
+        "average": 44.263960,
+        "runs": [44.09, 44.06, 43.92, 44.34, 44.91],
+        "target": 50.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Plan cache hit rate": {
+        "average": 0.999000,
+        "runs": [1.00],
+        "target": 0.980000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "Cardinality estimation error factor": {
+        "average": 1.000000,
+        "runs": [1.00],
+        "target": 2.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    }
+  }
+}

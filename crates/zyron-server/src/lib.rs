@@ -578,6 +578,12 @@ impl Server {
             Some(Arc::clone(&stream_mgr_arc)),
         );
 
+        // Attach the QuotaGossip worker with the default no-op transport.
+        // Operators that need cross-node quota convergence call
+        // BackgroundWorkers::attach_quota_gossip with their peer transport
+        let server_quota_registry = Arc::new(zyron_types::scheduling::QuotaRegistry::new());
+        background.attach_quota_gossip_default(Arc::clone(&server_quota_registry));
+
         // Extract background worker stats for ServerState
         let ckpt_stats = background.checkpoint_stats();
         let vac_stats = background.vacuum_stats();
@@ -791,6 +797,7 @@ impl Server {
             subscription_runtimes: Arc::new(scc::HashMap::new()),
             heap_files: Arc::new(scc::HashMap::new()),
             btree_indexes: Arc::new(scc::HashMap::new()),
+            vacuum_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
 
         // -------------------------------------------------------------------
@@ -925,11 +932,20 @@ impl Server {
         }
 
         // 11. Start health/metrics HTTP server
+        let health_host = self.config.metrics.host.clone();
         let health_port = self.config.metrics.port;
+        let health_dual_stack = self.config.metrics.dual_stack;
         let health_shutdown = Arc::clone(&self.shutdown);
         let health_state = Arc::clone(&self.health_state);
         tokio::spawn(async move {
-            health::start_health_server(health_port, health_state, health_shutdown).await;
+            health::start_health_server(
+                &health_host,
+                health_port,
+                health_dual_stack,
+                health_state,
+                health_shutdown,
+            )
+            .await;
         });
 
         // Mark startup complete

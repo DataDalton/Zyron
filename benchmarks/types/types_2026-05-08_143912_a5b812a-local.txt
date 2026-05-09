@@ -1,0 +1,284 @@
+
+=== Color ===
+  color_from_hex('#FF5733') -> rgb=(0xFF,0x57,0x33) PASS
+  color_blend(red, blue, 0.5) -> (128,0,128) PASS
+  wcag_contrast_ratio(black, white) = 21.0000 (expected 21.0)
+  wcag_compliant(dark_gray, white, 'AA') = true PASS
+
+=== Entity Resolution (FUZZY_JOIN) ===
+  matches: [(1, 3, 0.9777777777777777), (2, 0, 0.9733333333333334)]
+  NOTE: Jane <-> Janet matched at 0.978
+  John-Jon matched PASS
+
+=== Formatting ===
+  format_number(1234567.89, 'en_US') = '1,234,567.89' PASS
+  format_currency(1234.56, 'USD', 'en_US') = '$1,234.56' PASS
+  format_bytes(1536) = '1.54 KB' (reference spec '1.5 KB')
+  format_duration(3661) = '1h 1m 1s' PASS
+
+=== Gap Fill ===
+  LOCF: hour 3 = 20 (expected 20) PASS
+  INTERPOLATE: hour 3 = 30 (expected 30) PASS
+
+=== Geospatial Distance ===
+  ST_Distance(NYC, LA) = 3935.8 km (expected ~3944)
+  ST_Distance(same, same) = 0 PASS
+  ST_DWithin NYC-nearby (10km) = true PASS
+  ST_DWithin NYC-LA (10km) = false PASS
+
+=== Hierarchy (closure table) ===
+  ancestors(B) = [1, 2, 3]
+  descendants(root) = [1, 2, 4, 3]
+  depth(B) = 2
+
+=== Data Profile ===
+  total=10000 null=100 distinct=9900 mean=Some(5000.0) p95=Some(9499.099999999999)
+  DATA_PROFILE numeric column correctness PASS
+  Text column: top value = "item-42" count = 200
+  DATA_PROFILE text column correctness PASS
+
+=== ID Generation ===
+  100000 UUID v7 values unique + time-ordered PASS
+  100000 Snowflake IDs unique + monotonically increasing PASS
+
+=== Jaro-Winkler ===
+  JW('MARTHA','MARHTA') = 0.9611 (expected ~0.961)
+  Correctness PASS
+
+=== Levenshtein ===
+  similarity('kitten','sitting') = 0.5714 (expected ~0.571)
+  Correctness PASS
+
+=== LTTB Downsampling ===
+  Run 1: 11.00 us
+  Run 2: 11.00 us
+  Run 3: 11.00 us
+  Run 4: 11.00 us
+  Run 5: 11.00 us
+  Exactly 100 points returned, peak/valley preserved PASS
+  LTTB 10K -> 100 (us) [PASS/OK]:
+    Runs: [11, 11, 11, 11, 11]
+    Average: 11 <= 500 (target)
+    Min/Max: 11 / 11, StdDev: 0
+
+=== Financial ===
+  NPV(0.10, [-1000,300,300,300,300]) = -49.040 (expected ~-49)
+  IRR([-1000,300,300,300,300]) = 0.0771 (expected ~0.077)
+  PMT(0.05/12, 360, 200000) = -1073.64
+  DEPRECIATION_SL(10000,1000,5) = 1800
+  NPV 360 cashflows (us) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 2 (target)
+    Min/Max: 0 / 0, StdDev: 0
+  IRR convergence (us) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 30 (target)
+    Min/Max: 0 / 0, StdDev: 0
+
+=== Matrix ===
+  matrix_multiply(A, B) = [19, 22, 43, 50] PASS
+  matrix_inverse(A) * A = identity PASS
+  matrix_determinant(I3) = 1 PASS
+  SVD diagonal (sorted desc): [4.0, 3.0, 2.0]
+  SVD singular values recovered PASS
+  MATRIX_MULTIPLY 4x4 (ns) [PASS/OK]:
+    Runs: [24, 23, 23, 23, 23]
+    Average: 23 <= 30 (target)
+    Min/Max: 23 / 24, StdDev: 0
+  SVD 100x100 (ms) [PASS/OK]:
+    Runs: [1, 1, 1, 1, 1]
+    Average: 1 <= 3 (target)
+    Min/Max: 1 / 1, StdDev: 0
+
+=== Performance Sweep ===
+
+--- TIME_BUCKET 10M rows ---
+  Run 1: 552,486,188 rows/sec
+  Run 2: 559,177,785 rows/sec
+  Run 3: 578,235,226 rows/sec
+  Run 4: 582,736,999 rows/sec
+  Run 5: 563,923,555 rows/sec
+  TIME_BUCKET throughput (rows/sec) [PASS/OK]:
+    Runs: [552,486,188, 559,177,785, 578,235,226, 582,736,999, 563,923,555]
+    Average: 567,311,951 >= 150,000,000 (target)
+    Min/Max: 552,486,188 / 582,736,999, StdDev: 11,442,895
+
+--- Gap fill LOCF (10M values, 5% gaps) ---
+  Run 1: 629,469,232 rows/sec
+  Run 2: 622,203,971 rows/sec
+  Run 3: 640,885,961 rows/sec
+  Run 4: 632,763,214 rows/sec
+  Run 5: 576,854,298 rows/sec
+  LOCF throughput (rows/sec) [PASS/OK]:
+    Runs: [629,469,232, 622,203,971, 640,885,961, 632,763,214, 576,854,298]
+    Average: 620,435,335 >= 80,000,000 (target)
+    Min/Max: 576,854,298 / 640,885,961, StdDev: 22,601,995
+
+--- ST_Distance 1M pairs ---
+  Run 1: 14.0 ns/call
+  Run 2: 14.0 ns/call
+  Run 3: 14.0 ns/call
+  Run 4: 14.0 ns/call
+  Run 5: 13.9 ns/call
+  ST_Distance (ns) [PASS/OK]:
+    Runs: [14, 14, 14, 14, 14]
+    Average: 14 <= 120 (target)
+    Min/Max: 14 / 14, StdDev: 0
+
+--- NPV 100K sets (360 cashflows each) ---
+  Run 1: 0.025 s total
+  Run 2: 0.025 s total
+  Run 3: 0.025 s total
+  Run 4: 0.025 s total
+  Run 5: 0.024 s total
+  Avg NPV per call: 0.245 us
+
+--- MATRIX_MULTIPLY 4x4 x 1000 ---
+  Run 1: 33.00 us total
+  Run 2: 30.00 us total
+  Run 3: 30.00 us total
+  Run 4: 30.00 us total
+  Run 5: 30.00 us total
+
+--- Levenshtein 1M pairs (10-char strings) ---
+  Run 1: 270.6 ns/call
+  Run 2: 273.7 ns/call
+  Run 3: 272.2 ns/call
+  Run 4: 268.1 ns/call
+  Run 5: 468.0 ns/call
+  Levenshtein 10-char (ns) [FAIL/OK]:
+    Runs: [271, 274, 272, 268, 468]
+    Average: 311 <= 300 (target)
+    Min/Max: 268 / 468, StdDev: 79
+
+--- Jaro-Winkler 1M pairs ---
+  Run 1: 75.5 ns/call
+  Run 2: 73.3 ns/call
+  Run 3: 79.1 ns/call
+  Run 4: 75.2 ns/call
+  Run 5: 74.7 ns/call
+  Jaro-Winkler 10-char (ns) [PASS/OK]:
+    Runs: [75, 73, 79, 75, 75]
+    Average: 76 <= 150 (target)
+    Min/Max: 73 / 79, StdDev: 2
+
+--- Soundex 1M calls ---
+  Run 1: 111.4 ns/call
+  Run 2: 116.4 ns/call
+  Run 3: 112.1 ns/call
+  Run 4: 106.9 ns/call
+  Run 5: 105.9 ns/call
+  Soundex (ns) [FAIL/OK]:
+    Runs: [111, 116, 112, 107, 106]
+    Average: 111 <= 80 (target)
+    Min/Max: 106 / 116, StdDev: 4
+
+--- Entity resolve 100K records (FirstLetter blocking) ---
+  Run 1: 202.52 s
+  Run 2: 207.80 s
+  Run 3: 190.71 s
+  Run 4: 191.55 s
+  Run 5: 161.84 s
+  Entity resolve 100K (s) [FAIL/REGR!]:
+    Runs: [203, 208, 191, 192, 162]
+    Average: 191 <= 12 (target)
+    Min/Max: 162 / 208, StdDev: 16
+
+--- UUID v7 10M IDs ---
+  Run 1: 556,517,093 IDs/sec
+  Run 2: 557,472,642 IDs/sec
+  Run 3: 558,213,271 IDs/sec
+  Run 4: 554,591,183 IDs/sec
+  Run 5: 560,600,964 IDs/sec
+  UUID v7 throughput (IDs/sec) [PASS/OK]:
+    Runs: [556,517,093, 557,472,642, 558,213,271, 554,591,183, 560,600,964]
+    Average: 557,479,031 >= 80,000,000 (target)
+    Min/Max: 554,591,183 / 560,600,964, StdDev: 1,977,403
+
+--- SLUG 100-char input ---
+  Run 1: 103.4 ns/call
+  Run 2: 102.0 ns/call
+  Run 3: 100.1 ns/call
+  Run 4: 100.4 ns/call
+  Run 5: 101.3 ns/call
+  SLUG 100-char (ns) [PASS/OK]:
+    Runs: [103, 102, 100, 100, 101]
+    Average: 101 <= 500 (target)
+    Min/Max: 100 / 103, StdDev: 1
+
+--- FORMAT_NUMBER ---
+  Run 1: 73.6 ns/call
+  Run 2: 73.8 ns/call
+  Run 3: 73.7 ns/call
+  Run 4: 73.8 ns/call
+  Run 5: 72.9 ns/call
+  format_number (ns) [PASS/OK]:
+    Runs: [74, 74, 74, 74, 73]
+    Average: 74 <= 200 (target)
+    Min/Max: 73 / 74, StdDev: 0
+
+--- DATA_PROFILE 1M rows ---
+  Run 1: 0.187 s
+  Run 2: 0.187 s
+  Run 3: 0.191 s
+  Run 4: 0.205 s
+  Run 5: 0.186 s
+  DATA_PROFILE 1M rows (s) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 5 (target)
+    Min/Max: 0 / 0, StdDev: 0
+
+--- Fuzzy join 10K x 10K (blocked by first letter) ---
+  Run 1: 4.88 s
+  Run 2: 4.89 s
+  Run 3: 4.90 s
+  Run 4: 6.44 s
+  Run 5: 7.88 s
+  Fuzzy join 20K records (s) [PASS/OK]:
+    Runs: [5, 5, 5, 6, 8]
+    Average: 6 <= 20 (target)
+    Min/Max: 5 / 8, StdDev: 1
+
+=== Performance sweep complete ===
+
+=== Phonetic ===
+  SOUNDEX('Robert') = 'R163'
+  SOUNDEX('Rupert') = 'R163'
+  Robert == Rupert soundex match PASS
+  double_metaphone('Smith') = ('SMT', 'SM0')
+  Double metaphone returned non-empty codes PASS
+
+=== Point In Polygon ===
+  Point in Manhattan: true PASS
+  Point in Brooklyn: false PASS
+
+=== Spatial KNN (100K points) ===
+  NOTE: this bench uses a brute-force scan rather than a spatial index.
+  Run 1: 6.535 ms
+  Run 2: 6.104 ms
+  Run 3: 9.735 ms
+  Run 4: 6.079 ms
+  Run 5: 6.618 ms
+  KNN top-10 of 100K (ms) [FAIL/REGR!]:
+    Runs: [7, 6, 10, 6, 7]
+    Average: 7 <= 2 (target)
+    Min/Max: 6 / 10, StdDev: 1
+  EXPLAIN-index check: not applicable (no spatial index implemented)
+
+=== String Ops ===
+  camel_case('hello world') = 'helloWorld' PASS
+  snake_case('helloWorld') = 'hello_world' PASS
+  slug(...) = 'hello-world-this-is-a-test' PASS
+  strip_html(...) = 'Hello world' PASS
+
+=== Validation ===
+  validate_email good/bad PASS
+  validate_uuid PASS
+  validate_credit_card (Luhn) PASS
+
+=== TIME_BUCKET ===
+  TIME_BUCKET('5 min', '2024-01-01 10:07:30') -> '2024-01-01 10:05:00' PASS
+  TIME_BUCKET('1 hour', '2024-01-01 14:33:00') -> '2024-01-01 14:00:00' PASS
+  TIME_BUCKET('1 day', '2024-01-15 18:00:00') -> '2024-01-15 00:00:00' PASS
+  GROUP BY TIME_BUCKET aggregation: 6 buckets x 10 rows PASS
+  TIME_BUCKET_CALENDAR('1 month', 'Feb 15') -> 'Feb 1' PASS

@@ -1,0 +1,25 @@
+{
+  "id": "2026-05-08_145041_a5b812a-local",
+  "date": "2026-05-08 14:50:45Z",
+  "ts": 1778251845,
+  "commit": "a5b812a-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Hash Build": {
+      "util_before": { "cpu_pct": 6.0, "ram_used_gb": 24.55 },
+      "util_after": { "cpu_pct": 5.0, "ram_used_gb": 24.55 },
+      "Hash build throughput (rows/sec)": {
+        "average": 119169523.896004,
+        "runs": [116710627.67, 115366866.64, 117122076.34, 124320897.10, 122327151.73],
+        "target": 50000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}

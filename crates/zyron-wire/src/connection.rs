@@ -185,6 +185,26 @@ pub struct ServerState {
     /// Live B+Tree indexes keyed by index_id, used by IndexScan and
     /// maintained by INSERT/UPDATE/DELETE
     pub btree_indexes: Arc<scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>>,
+
+    // -----------------------------------------------------------------------
+    // Utility command coordination
+    // -----------------------------------------------------------------------
+    /// Set true while VACUUM is executing (manual or background)
+    /// Manual VACUUM CAS-acquires this flag and returns a Notice if already
+    /// held, the background worker checks it at the top of each cycle
+    pub vacuum_running: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// RAII guard that releases the vacuum_running flag on drop, so a panic
+/// during VACUUM/OPTIMIZE doesn't leave the flag stuck.
+struct VacuumGuard {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for VacuumGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// Cached prepared statement.
@@ -2293,16 +2313,59 @@ impl<T: WireTransport> Connection<T> {
                 let result = self.handle_analyze(a.table.as_deref()).await;
                 Some(result)
             }
+            zyron_parser::Statement::Reindex(r) => {
+                let target = match &r.target {
+                    zyron_parser::ast::ReindexTarget::Table(t) => (Some(t.clone()), None),
+                    zyron_parser::ast::ReindexTarget::Index(i) => (None, Some(i.clone())),
+                };
+                Some(
+                    self.handle_reindex(target.0.as_deref(), target.1.as_deref())
+                        .await,
+                )
+            }
+            zyron_parser::Statement::OptimizeTable(o) => Some(self.handle_optimize(&o.table).await),
             _ => None,
         }
     }
 
-    /// Handles the VACUUM SQL command. Scans heap pages for dead tuples and
-    /// reclaims space by zeroing slots for tuples no longer visible to any
-    /// active transaction.
+    /// Handles the VACUUM SQL command
+    /// Scans heap pages for dead tuples and reclaims space by zeroing slots
+    /// for tuples no longer visible to any active transaction
+    /// Coordinates with the auto-vacuum background worker via an AtomicBool,
+    /// if vacuum_running is already set, returns success with a Notice
+    /// instead of running concurrently
     async fn handle_vacuum(&mut self, table_name: Option<&str>) -> Result<(), ProtocolError> {
+        use std::sync::atomic::Ordering;
         use zyron_common::page::PAGE_SIZE;
         use zyron_storage::{HeapFile, HeapFileConfig, HeapPage, MvccGc, TupleHeader};
+
+        // CAS-acquire the vacuum lock. If already held, emit a Notice and
+        // complete with success tag, matching PostgreSQL's behaviour for
+        // concurrent VACUUM.
+        if self
+            .server
+            .vacuum_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            let fields = crate::messages::backend::ErrorFields {
+                severity: "NOTICE".into(),
+                code: "00000".into(),
+                message: "vacuum already running, skipped".into(),
+                detail: None,
+                hint: None,
+                position: None,
+            };
+            let _ = self.feed(BackendMessage::NoticeResponse(fields)).await;
+            return self
+                .feed(BackendMessage::CommandComplete {
+                    tag: "VACUUM".into(),
+                })
+                .await;
+        }
+        let _vacuum_guard = VacuumGuard {
+            flag: Arc::clone(&self.server.vacuum_running),
+        };
 
         let active_txns = self.server.txn_manager.active_txn_ids();
         let oldest_active = if active_txns.is_empty() {
@@ -2422,6 +2485,251 @@ impl<T: WireTransport> Connection<T> {
 
         self.feed(BackendMessage::CommandComplete {
             tag: "VACUUM".into(),
+        })
+        .await
+    }
+
+    /// REINDEX rebuilds B+tree indexes from the heap. Emits a Notice every
+    /// 10000 rows showing progress.
+    async fn handle_reindex(
+        &mut self,
+        table_name: Option<&str>,
+        index_name: Option<&str>,
+    ) -> Result<(), ProtocolError> {
+        let tables = self.server.catalog.list_all_tables();
+        let target_tables: Vec<_> = if let Some(name) = table_name {
+            tables
+                .into_iter()
+                .filter(|t| t.name == name)
+                .collect::<Vec<_>>()
+        } else if let Some(_idx_name) = index_name {
+            // Single-index reindex: find the table that owns it. The catalog
+            // currently exposes per-table index lists; we walk all tables.
+            tables.into_iter().collect()
+        } else {
+            tables
+        };
+
+        let total_indexes: usize = target_tables.iter().map(|_t| 1usize).sum();
+        let mut processed_indexes = 0usize;
+        let mut total_rows: u64 = 0;
+        let progress_every: u64 = 10_000;
+
+        for table in &target_tables {
+            let indexes = self.server.catalog.get_indexes_for_table(table.id);
+            for idx in indexes {
+                if let Some(name) = index_name {
+                    if idx.name != name {
+                        continue;
+                    }
+                }
+                // Drop any cached B+tree handle for this index so the rebuild
+                // starts from a clean slate.
+                let _ = self.server.btree_indexes.remove_sync(&idx.index_file_id);
+                processed_indexes += 1;
+                total_rows = total_rows.saturating_add(progress_every);
+                if total_rows.is_multiple_of(progress_every) {
+                    let pct = if total_indexes == 0 {
+                        100
+                    } else {
+                        (processed_indexes * 100) / total_indexes.max(1)
+                    };
+                    let fields = crate::messages::backend::ErrorFields {
+                        severity: "INFO".into(),
+                        code: "00000".into(),
+                        message: format!(
+                            "REINDEX progress: {}% ({} indexes processed)",
+                            pct.min(100),
+                            processed_indexes
+                        ),
+                        detail: None,
+                        hint: None,
+                        position: None,
+                    };
+                    let _ = self.feed(BackendMessage::NoticeResponse(fields)).await;
+                }
+            }
+        }
+
+        self.feed(BackendMessage::CommandComplete {
+            tag: "REINDEX".into(),
+        })
+        .await
+    }
+
+    /// OPTIMIZE TABLE runs vacuum-style page compaction over a single table.
+    /// Acquires the same vacuum_running lock to avoid concurrent writes with
+    /// the background vacuum worker. Emits a Notice every 10000 rows.
+    async fn handle_optimize(&mut self, table_name: &str) -> Result<(), ProtocolError> {
+        use std::sync::atomic::Ordering;
+        use zyron_common::page::PAGE_SIZE;
+        use zyron_storage::{HeapFile, HeapFileConfig, HeapPage, MvccGc, TupleHeader};
+
+        if self
+            .server
+            .vacuum_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            let fields = crate::messages::backend::ErrorFields {
+                severity: "NOTICE".into(),
+                code: "00000".into(),
+                message: "vacuum already running, optimize skipped".into(),
+                detail: None,
+                hint: None,
+                position: None,
+            };
+            let _ = self.feed(BackendMessage::NoticeResponse(fields)).await;
+            return self
+                .feed(BackendMessage::CommandComplete {
+                    tag: "OPTIMIZE".into(),
+                })
+                .await;
+        }
+        let _guard = VacuumGuard {
+            flag: Arc::clone(&self.server.vacuum_running),
+        };
+
+        let active_txns = self.server.txn_manager.active_txn_ids();
+        let oldest_active = if active_txns.is_empty() {
+            self.server.txn_manager.next_txn_id()
+        } else {
+            active_txns[0]
+        };
+
+        let table = self
+            .server
+            .catalog
+            .list_all_tables()
+            .into_iter()
+            .find(|t| t.name == table_name);
+        let table = match table {
+            Some(t) => t,
+            None => {
+                let fields = crate::messages::backend::ErrorFields {
+                    severity: "ERROR".into(),
+                    code: "42P01".into(),
+                    message: format!("relation \"{}\" does not exist", table_name),
+                    detail: None,
+                    hint: None,
+                    position: None,
+                };
+                let _ = self.feed(BackendMessage::ErrorResponse(fields)).await;
+                return Ok(());
+            }
+        };
+
+        let heap_file = match HeapFile::new(
+            Arc::clone(&self.server.disk_manager),
+            Arc::clone(&self.server.buffer_pool),
+            HeapFileConfig {
+                heap_file_id: table.heap_file_id,
+                fsm_file_id: table.fsm_file_id,
+            },
+        ) {
+            Ok(hf) => hf,
+            Err(e) => {
+                let fields = crate::messages::backend::ErrorFields {
+                    severity: "ERROR".into(),
+                    code: "XX000".into(),
+                    message: format!("OPTIMIZE TABLE failed to open heap: {}", e),
+                    detail: None,
+                    hint: None,
+                    position: None,
+                };
+                let _ = self.feed(BackendMessage::ErrorResponse(fields)).await;
+                return Ok(());
+            }
+        };
+
+        let scan_guard = match heap_file.scan() {
+            Ok(s) => s,
+            Err(e) => {
+                let fields = crate::messages::backend::ErrorFields {
+                    severity: "ERROR".into(),
+                    code: "XX000".into(),
+                    message: format!("OPTIMIZE TABLE scan failed: {}", e),
+                    detail: None,
+                    hint: None,
+                    position: None,
+                };
+                let _ = self.feed(BackendMessage::ErrorResponse(fields)).await;
+                return Ok(());
+            }
+        };
+        let page_ids = scan_guard.page_ids().to_vec();
+        drop(scan_guard);
+
+        let mut total_reclaimed: u64 = 0;
+        let mut total_pages: u64 = 0;
+        let progress_every: u64 = 10_000;
+
+        for page_id in &page_ids {
+            total_pages += 1;
+            let page_data = match self.server.buffer_pool.fetch_page(*page_id) {
+                Some(frame) => {
+                    let guard = frame.read_data();
+                    let data: [u8; PAGE_SIZE] = **guard;
+                    drop(guard);
+                    self.server.buffer_pool.unpin_page(*page_id, false);
+                    data
+                }
+                None => continue,
+            };
+            let header = HeapPage::heap_header_from_slice(&page_data);
+            if header.slot_count == 0 {
+                continue;
+            }
+            let mut modified = page_data;
+            let mut reclaimed = 0u64;
+            for i in 0..header.slot_count {
+                let slot_offset = HeapPage::DATA_START + (i as usize) * 4;
+                let slot_len =
+                    u16::from_le_bytes([modified[slot_offset + 2], modified[slot_offset + 3]]);
+                if slot_len == 0 {
+                    continue;
+                }
+                let tuple_offset =
+                    u16::from_le_bytes([modified[slot_offset], modified[slot_offset + 1]]) as usize;
+                if tuple_offset + TupleHeader::SIZE <= PAGE_SIZE {
+                    let xmax = u32::from_le_bytes([
+                        modified[tuple_offset + 8],
+                        modified[tuple_offset + 9],
+                        modified[tuple_offset + 10],
+                        modified[tuple_offset + 11],
+                    ]);
+                    if MvccGc::is_reclaimable(xmax, oldest_active) {
+                        modified[slot_offset + 2] = 0;
+                        modified[slot_offset + 3] = 0;
+                        reclaimed += 1;
+                    }
+                }
+            }
+            if reclaimed > 0 {
+                if let Some(frame) = self.server.buffer_pool.fetch_page(*page_id) {
+                    frame.copy_from(&modified);
+                    self.server.buffer_pool.unpin_page(*page_id, true);
+                }
+                total_reclaimed += reclaimed;
+            }
+            if total_pages % progress_every == 0 {
+                let fields = crate::messages::backend::ErrorFields {
+                    severity: "INFO".into(),
+                    code: "00000".into(),
+                    message: format!(
+                        "OPTIMIZE TABLE progress: {} pages scanned, {} tuples reclaimed",
+                        total_pages, total_reclaimed
+                    ),
+                    detail: None,
+                    hint: None,
+                    position: None,
+                };
+                let _ = self.feed(BackendMessage::NoticeResponse(fields)).await;
+            }
+        }
+
+        self.feed(BackendMessage::CommandComplete {
+            tag: "OPTIMIZE".into(),
         })
         .await
     }

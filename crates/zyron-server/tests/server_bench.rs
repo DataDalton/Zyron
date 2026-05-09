@@ -191,6 +191,7 @@ async fn create_test_state(
         subscription_runtimes: Arc::new(scc::HashMap::new()),
         heap_files: Arc::new(scc::HashMap::new()),
         btree_indexes: Arc::new(scc::HashMap::new()),
+        vacuum_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
 
     (state, wal, pool, disk, bg_writer, catalog)
@@ -1227,7 +1228,7 @@ fn test_11_health_checks() {
         drop(listener); // Release so health server can bind
 
         let server_handle = tokio::spawn(async move {
-            start_health_server(port, health_clone, shutdown_clone).await;
+            start_health_server("127.0.0.1", port, false, health_clone, shutdown_clone).await;
         });
 
         // Give the server time to bind

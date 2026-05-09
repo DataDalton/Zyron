@@ -185,6 +185,7 @@ fn build_from_item(item: &BoundFromItem) -> Result<LogicalPlan> {
             table_idx,
             table_id,
             entry,
+            as_of,
         } => {
             let columns: Vec<LogicalColumn> = entry
                 .columns
@@ -197,13 +198,25 @@ fn build_from_item(item: &BoundFromItem) -> Result<LogicalPlan> {
                     nullable: c.nullable,
                 })
                 .collect();
+            let as_of_target = match as_of {
+                None => None,
+                Some(crate::binder::BoundAsOfTarget::Timestamp(ts)) => {
+                    Some(crate::logical::AsOfTarget::Timestamp(*ts))
+                }
+                Some(crate::binder::BoundAsOfTarget::Version(v)) => {
+                    Some(crate::logical::AsOfTarget::Version(*v))
+                }
+                Some(crate::binder::BoundAsOfTarget::Branch(name)) => {
+                    Some(crate::logical::AsOfTarget::Branch(name.clone()))
+                }
+            };
             Ok(LogicalPlan::Scan {
                 table_id: *table_id,
                 table_idx: *table_idx,
                 columns,
                 alias: entry.name.clone(),
                 encoding_hints: None,
-                as_of: None,
+                as_of: as_of_target,
             })
         }
         BoundFromItem::Join {

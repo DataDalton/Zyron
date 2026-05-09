@@ -331,6 +331,33 @@ fn parse_json_string(s: &str) -> Result<(String, &str)> {
     let rest = s
         .strip_prefix('"')
         .ok_or_else(|| ZyronError::ExecutionError("Expected '\"'".into()))?;
+    // Fast path: scan bytes for the closing quote without seeing any backslash.
+    // The vast majority of real JSON strings (object keys, simple values) have
+    // no escapes, so we can skip the char-by-char copy and slice directly
+    let bytes = rest.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' {
+            // Safe because we only advanced over verified UTF-8 boundary at
+            // ASCII bytes (any < 0x80 byte is a complete codepoint)
+            let value = unsafe { std::str::from_utf8_unchecked(&bytes[..i]) }.to_string();
+            return Ok((value, &rest[i + 1..]));
+        }
+        if b == b'\\' {
+            // Escape encountered, fall back to general decoder
+            return parse_json_string_with_escapes(rest);
+        }
+        // Skip ASCII bytes one at a time; for multi-byte UTF-8 (b >= 0x80), we
+        // also advance one byte at a time which is fine for the scan since we
+        // only check for ASCII '"' and '\\' bytes (UTF-8 continuation bytes
+        // are >= 0x80, never colliding with '"' = 0x22 or '\\' = 0x5C)
+        i += 1;
+    }
+    Err(ZyronError::ExecutionError("Unterminated string".into()))
+}
+
+fn parse_json_string_with_escapes(rest: &str) -> Result<(String, &str)> {
     let mut result = String::new();
     let mut chars = rest.char_indices();
     while let Some((i, c)) = chars.next() {
@@ -527,33 +554,61 @@ fn compute_json_diff(old: &JsonValue, new: &JsonValue, path: &str, ops: &mut Vec
 
     match (old, new) {
         (JsonValue::Object(o_items), JsonValue::Object(n_items)) => {
+            // Build a small lookup over new_items keys so the "find removed"
+            // and "find added/changed" passes are O(n) instead of O(n^2)
+            // For typical objects (<= 64 keys) the overhead of a hashmap is
+            // larger than linear scan, so we use a Vec<&str> sorted for binary
+            // search only when the set is large
+            let n_lookup: Option<std::collections::HashMap<&str, &JsonValue>> =
+                if n_items.len() > 16 {
+                    let mut m = std::collections::HashMap::with_capacity(n_items.len());
+                    for (k, v) in n_items {
+                        m.insert(k.as_str(), v);
+                    }
+                    Some(m)
+                } else {
+                    None
+                };
+            let o_lookup: Option<std::collections::HashMap<&str, &JsonValue>> =
+                if o_items.len() > 16 {
+                    let mut m = std::collections::HashMap::with_capacity(o_items.len());
+                    for (k, v) in o_items {
+                        m.insert(k.as_str(), v);
+                    }
+                    Some(m)
+                } else {
+                    None
+                };
+
             // Find removed keys
             for (k, _) in o_items {
-                if !n_items.iter().any(|(k2, _)| k2 == k) {
-                    let mut op = Vec::new();
+                let in_new = match &n_lookup {
+                    Some(m) => m.contains_key(k.as_str()),
+                    None => n_items.iter().any(|(k2, _)| k2 == k),
+                };
+                if !in_new {
+                    let mut op = Vec::with_capacity(2);
                     op.push(("op".to_string(), JsonValue::String("remove".into())));
-                    op.push((
-                        "path".to_string(),
-                        JsonValue::String(format!("{}/{}", path, escape_json_pointer(k))),
-                    ));
+                    op.push(("path".to_string(), JsonValue::String(join_pointer(path, k))));
                     ops.push(JsonValue::Object(op));
                 }
             }
             // Find added or changed keys
             for (k, v) in n_items {
-                match o_items.iter().find(|(k2, _)| k2 == k) {
+                let old_v = match &o_lookup {
+                    Some(m) => m.get(k.as_str()).copied(),
+                    None => o_items.iter().find(|(k2, _)| k2 == k).map(|(_, v)| v),
+                };
+                match old_v {
                     None => {
-                        let mut op = Vec::new();
+                        let mut op = Vec::with_capacity(3);
                         op.push(("op".to_string(), JsonValue::String("add".into())));
-                        op.push((
-                            "path".to_string(),
-                            JsonValue::String(format!("{}/{}", path, escape_json_pointer(k))),
-                        ));
+                        op.push(("path".to_string(), JsonValue::String(join_pointer(path, k))));
                         op.push(("value".to_string(), v.clone()));
                         ops.push(JsonValue::Object(op));
                     }
-                    Some((_, old_v)) if old_v != v => {
-                        let new_path = format!("{}/{}", path, escape_json_pointer(k));
+                    Some(old_v) if old_v != v => {
+                        let new_path = join_pointer(path, k);
                         compute_json_diff(old_v, v, &new_path, ops);
                     }
                     _ => {}
@@ -580,6 +635,29 @@ fn compute_json_diff(old: &JsonValue, new: &JsonValue, path: &str, ops: &mut Vec
 
 fn escape_json_pointer(s: &str) -> String {
     s.replace('~', "~0").replace('/', "~1")
+}
+
+/// Joins a JSON Pointer path with a child key. Avoids the format! +
+/// double-replace allocations of escape_json_pointer when the key has no
+/// special characters (the common case in 99%+ of real-world JSON)
+#[inline]
+fn join_pointer(path: &str, key: &str) -> String {
+    let needs_escape = key.bytes().any(|b| b == b'~' || b == b'/');
+    let mut out = String::with_capacity(path.len() + 1 + key.len());
+    out.push_str(path);
+    out.push('/');
+    if needs_escape {
+        for c in key.chars() {
+            match c {
+                '~' => out.push_str("~0"),
+                '/' => out.push_str("~1"),
+                c => out.push(c),
+            }
+        }
+    } else {
+        out.push_str(key);
+    }
+    out
 }
 
 fn unescape_json_pointer(s: &str) -> String {

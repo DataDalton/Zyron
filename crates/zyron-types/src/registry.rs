@@ -327,6 +327,55 @@ pub fn infer_types_scalar_return_type(name: &str, arg_types: &[TypeId]) -> Optio
         "url_query_params" => Some(TypeId::Array),
         "url_is_absolute" => Some(TypeId::Boolean),
 
+        // ---------- Phase 15: checksum (additions to existing CRC/xxHash/Murmur) ----------
+        "xxhash32" | "adler32" => Some(TypeId::Int32),
+        "xxhash128" => Some(TypeId::Int128),
+        "city_hash" | "cityhash64" | "fnvhash" | "fnv1a_64" | "siphash" => Some(TypeId::Int64),
+
+        // ---------- Phase 15: scheduling, rate limit, quotas ----------
+        "cron_list" => Some(TypeId::Array),
+        "rate_limit_check" => Some(TypeId::Boolean),
+        "rate_limit_decision" => Some(TypeId::Composite),
+        "quota_check" => Some(TypeId::Composite),
+        "quota_increment" => Some(TypeId::Int64),
+        "quota_release" => Some(TypeId::Boolean),
+
+        // ---------- Phase 15: diff/patch additions ----------
+        "row_diff" | "row_diff_ordinal" | "change_log" | "json_diff_table" => Some(TypeId::Array),
+        "json_equals" => Some(TypeId::Boolean),
+
+        // ---------- Phase 15: natural sort ----------
+        "natural_sort_key" => Some(TypeId::Bytea),
+        "natural_compare" | "version_compare" | "ip_compare" | "path_compare"
+        | "custom_order_rank" => Some(TypeId::Int32),
+        "ip_sort_key" => Some(TypeId::Bytea),
+
+        // ---------- Phase 15: barcode/QR ----------
+        "barcode_encode" | "qr_encode" | "data_matrix_encode" => Some(TypeId::Bytea),
+        "barcode_decode" | "qr_decode" | "data_matrix_decode" => Some(TypeId::Varchar),
+
+        // ---------- Phase 15: document processing ----------
+        "markdown_to_html" | "html_to_text" | "html_to_markdown" | "sanitize_html" => {
+            Some(TypeId::Text)
+        }
+        "markdown_extract_headers" | "markdown_extract_links" | "markdown_extract_code_blocks" => {
+            Some(TypeId::Array)
+        }
+
+        // ---------- Phase 15: file detection ----------
+        "detect_mime_type" | "detect_encoding" | "file_extension" => Some(TypeId::Varchar),
+        "is_binary" => Some(TypeId::Boolean),
+
+        // ---------- Phase 15: resilience / circuit breaker ----------
+        "circuit_breaker_status" => Some(TypeId::Composite),
+        "circuit_breaker_acquire"
+        | "circuit_breaker_record_success"
+        | "circuit_breaker_record_failure"
+        | "circuit_breaker_reset" => Some(TypeId::Boolean),
+        "circuit_breaker_set_threshold" | "circuit_breaker_set_reset_timeout" => {
+            Some(TypeId::Boolean)
+        }
+
         _ => None,
     }
     .or_else(|| {

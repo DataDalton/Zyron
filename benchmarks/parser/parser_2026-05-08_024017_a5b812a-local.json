@@ -1,0 +1,78 @@
+{
+  "id": "2026-05-08_024017_a5b812a-local",
+  "date": "2026-05-08 02:40:33Z",
+  "ts": 1778208033,
+  "commit": "a5b812a-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Error Recovery": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 9.85 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 9.88 },
+      "Latency (us/error)": {
+        "average": 0.280579,
+        "runs": [0.28, 0.28, 0.28, 0.28, 0.28],
+        "target": 2.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Lexer Throughput": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 9.88 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 9.88 },
+      "Throughput (MB/sec)": {
+        "average": 226.981994,
+        "runs": [222.18, 225.54, 225.08, 230.57, 231.54],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Parser Batch": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 9.87 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 9.87 },
+      "Throughput (stmts/sec)": {
+        "average": 2149331.753059,
+        "runs": [2135258.37, 2119983.43, 2126145.94, 2184398.15, 2180872.87],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Parser Complex": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 9.87 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 9.87 },
+      "Latency (us/parse)": {
+        "average": 7.805948,
+        "runs": [7.75, 7.78, 7.75, 7.76, 7.99],
+        "target": 20.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Parser Simple": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 9.87 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 9.85 },
+      "Latency (ns/parse)": {
+        "average": 816.617400,
+        "runs": [821.41, 836.13, 805.91, 819.24, 800.40],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Memory": {
+      "Estimated per-parse (bytes)": {
+        "average": 832.000000,
+        "runs": [832.00],
+        "target": 1024.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    }
+  }
+}

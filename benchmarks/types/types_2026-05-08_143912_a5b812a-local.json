@@ -1,0 +1,142 @@
+{
+  "id": "2026-05-08_143912_a5b812a-local",
+  "date": "2026-05-08 14:55:42Z",
+  "ts": 1778252142,
+  "commit": "a5b812a-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Performance": {
+      "LTTB 10K -> 100 (us)": {
+        "average": 11.000000,
+        "runs": [11.00, 11.00, 11.00, 11.00, 11.00],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "NPV 360 cashflows (us)": {
+        "average": 0.000020,
+        "runs": [0.00, 0.00, 0.00, 0.00, 0.00],
+        "target": 2.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "IRR convergence (us)": {
+        "average": 0.023080,
+        "runs": [0.02, 0.02, 0.02, 0.02, 0.02],
+        "target": 30.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "MATRIX_MULTIPLY 4x4 (ns)": {
+        "average": 23.076400,
+        "runs": [23.73, 22.98, 22.91, 22.90, 22.86],
+        "target": 30.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "SVD 100x100 (ms)": {
+        "average": 0.965820,
+        "runs": [0.99, 0.96, 0.96, 0.96, 0.97],
+        "target": 3.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "TIME_BUCKET throughput (rows/sec)": {
+        "average": 567311950.516147,
+        "runs": [552486187.85, 559177784.98, 578235226.09, 582736999.14, 563923554.52],
+        "target": 150000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "LOCF throughput (rows/sec)": {
+        "average": 620435335.004207,
+        "runs": [629469231.54, 622203970.91, 640885960.75, 632763213.68, 576854298.14],
+        "target": 80000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "ST_Distance (ns)": {
+        "average": 13.983220,
+        "runs": [13.99, 13.95, 14.05, 14.00, 13.92],
+        "target": 120.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Levenshtein 10-char (ns)": {
+        "average": 310.506820,
+        "runs": [270.56, 273.66, 272.18, 268.14, 467.99],
+        "target": 300.000000,
+        "passed": false,
+        "higher_is_better": false
+      },
+      "Jaro-Winkler 10-char (ns)": {
+        "average": 75.554360,
+        "runs": [75.48, 73.25, 79.07, 75.25, 74.72],
+        "target": 150.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Soundex (ns)": {
+        "average": 110.535700,
+        "runs": [111.43, 116.36, 112.12, 106.85, 105.91],
+        "target": 80.000000,
+        "passed": false,
+        "higher_is_better": false
+      },
+      "Entity resolve 100K (s)": {
+        "average": 190.882689,
+        "runs": [202.52, 207.80, 190.71, 191.55, 161.84],
+        "target": 12.000000,
+        "passed": false,
+        "higher_is_better": false
+      },
+      "UUID v7 throughput (IDs/sec)": {
+        "average": 557479030.751590,
+        "runs": [556517093.42, 557472642.03, 558213270.96, 554591183.11, 560600964.23],
+        "target": 80000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "SLUG 100-char (ns)": {
+        "average": 101.461000,
+        "runs": [103.39, 102.05, 100.11, 100.45, 101.32],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "format_number (ns)": {
+        "average": 73.547580,
+        "runs": [73.55, 73.82, 73.66, 73.81, 72.89],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "DATA_PROFILE 1M rows (s)": {
+        "average": 0.191182,
+        "runs": [0.19, 0.19, 0.19, 0.21, 0.19],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Fuzzy join 20K records (s)": {
+        "average": 5.797469,
+        "runs": [4.88, 4.89, 4.90, 6.44, 7.88],
+        "target": 20.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "KNN top-10 of 100K (ms)": {
+        "average": 7.014100,
+        "runs": [6.53, 6.10, 9.73, 6.08, 6.62],
+        "target": 2.000000,
+        "passed": false,
+        "higher_is_better": false
+      }
+    }
+  }
+}

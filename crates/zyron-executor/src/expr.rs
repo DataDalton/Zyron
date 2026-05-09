@@ -106,6 +106,13 @@ pub fn evaluate(
             "window functions not supported yet".to_string(),
         )),
         BoundExpr::Parameter { index, .. } => evaluate_parameter(*index, params, batch.num_rows),
+        BoundExpr::TemporalRef { inner, .. } => {
+            // Pure-evaluator path returns the inner column at the current
+            // snapshot. Time-travel-aware operators (ROW_DIFF) inspect the
+            // temporal qualifier through a parallel dispatch path before
+            // reaching this generic evaluator
+            evaluate(inner, batch, schema, params)
+        }
     }
 }
 

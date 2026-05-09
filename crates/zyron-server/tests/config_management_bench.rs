@@ -1151,7 +1151,8 @@ fn test_config_introspection_comprehensive() {
 
     // Test every documented config key
     let expected: Vec<(&str, &str)> = vec![
-        ("server.host", "127.0.0.1"),
+        // server.host defaults to [::] for dual-stack IPv6 wildcard
+        ("server.host", "[::]"),
         ("server.port", "5432"),
         ("server.max_connections", "1000"),
         ("buffer.pool_size", "134217728"),

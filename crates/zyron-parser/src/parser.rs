@@ -2567,6 +2567,51 @@ impl<'a> Parser<'a> {
             return Ok((lhs, false));
         }
 
+        // Expression-position time travel: <expr> AS OF [TIMESTAMP] X
+        //                                  <expr> VERSION AS OF N
+        //                                  <expr> IN BRANCH 'name'
+        // Wraps lhs in an Expr::TemporalRef. Used by ROW_DIFF and friends to
+        // refer to the same row at different versions/timestamps/branches
+        if self.at_keyword(Keyword::As) && self.peek.token == Token::Keyword(Keyword::Of) {
+            self.advance()?; // AS
+            self.advance()?; // OF
+            let _ = self.consume_keyword(Keyword::Timestamp)?;
+            let _ = self.consume_keyword(Keyword::Timestamptz)?;
+            let when = self.parse_expr_bp(10)?;
+            return Ok((
+                Expr::TemporalRef {
+                    inner: Box::new(lhs),
+                    temporal: Box::new(AsOf::Timestamp(when)),
+                },
+                true,
+            ));
+        }
+        if self.at_keyword(Keyword::Version) && self.peek.token == Token::Keyword(Keyword::As) {
+            self.advance()?; // VERSION
+            self.advance()?; // AS
+            self.expect_keyword(Keyword::Of)?;
+            let v = self.parse_expr_bp(10)?;
+            return Ok((
+                Expr::TemporalRef {
+                    inner: Box::new(lhs),
+                    temporal: Box::new(AsOf::Version(v)),
+                },
+                true,
+            ));
+        }
+        if self.at_keyword(Keyword::In) && self.peek.token == Token::Keyword(Keyword::Branch) {
+            self.advance()?; // IN
+            self.advance()?; // BRANCH
+            let name = self.parse_expr_bp(10)?;
+            return Ok((
+                Expr::TemporalRef {
+                    inner: Box::new(lhs),
+                    temporal: Box::new(AsOf::Branch(name)),
+                },
+                true,
+            ));
+        }
+
         // IS [NOT] NULL
         if self.at_keyword(Keyword::Is) {
             self.advance()?;
@@ -12909,6 +12954,79 @@ mod tests {
                 other => panic!("Expected Temporal join, got {:?}", other),
             },
             _ => panic!("Expected CreateStreamingJob"),
+        }
+    }
+
+    fn extract_first_select_expr(stmt: &Statement) -> &Expr {
+        match stmt {
+            Statement::Select(s) => match &s.projections[0] {
+                SelectItem::Expr(expr, _) => expr,
+                _ => panic!("expected expression projection"),
+            },
+            _ => panic!("expected SELECT"),
+        }
+    }
+
+    #[test]
+    fn test_temporal_ref_as_of_timestamp_in_call_arg() {
+        let stmt =
+            parse_one("SELECT ROW_DIFF(c.id AS OF TIMESTAMP '2024-01-01', c.id) FROM customers c");
+        let expr = extract_first_select_expr(&stmt);
+        match expr {
+            Expr::Function { name, args, .. } => {
+                assert_eq!(name, "ROW_DIFF");
+                match &args[0] {
+                    FunctionArg::Unnamed(Expr::TemporalRef { temporal, .. }) => {
+                        assert!(matches!(temporal.as_ref(), AsOf::Timestamp(_)));
+                    }
+                    other => panic!("expected TemporalRef Timestamp, got {:?}", other),
+                }
+            }
+            other => panic!("expected Function call, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_temporal_ref_version_as_of_in_call_arg() {
+        let stmt = parse_one(
+            "SELECT ROW_DIFF(c.id VERSION AS OF 100, c.id VERSION AS OF 200) FROM customers c",
+        );
+        let expr = extract_first_select_expr(&stmt);
+        match expr {
+            Expr::Function { name, args, .. } => {
+                assert_eq!(name, "ROW_DIFF");
+                for arg in args {
+                    match arg {
+                        FunctionArg::Unnamed(Expr::TemporalRef { temporal, .. }) => {
+                            assert!(matches!(temporal.as_ref(), AsOf::Version(_)));
+                        }
+                        _ => panic!("expected TemporalRef Version"),
+                    }
+                }
+            }
+            _ => panic!("expected Function"),
+        }
+    }
+
+    #[test]
+    fn test_temporal_ref_in_branch_in_call_arg() {
+        let stmt = parse_one(
+            "SELECT ROW_DIFF(c.id IN BRANCH 'main', c.id IN BRANCH 'dev') FROM customers c",
+        );
+        let expr = extract_first_select_expr(&stmt);
+        match expr {
+            Expr::Function { name, args, .. } => {
+                assert_eq!(name, "ROW_DIFF");
+                for arg in args {
+                    match arg {
+                        FunctionArg::Unnamed(Expr::TemporalRef { temporal, .. }) => {
+                            assert!(matches!(temporal.as_ref(), AsOf::Branch(_)));
+                        }
+                        _ => panic!("expected TemporalRef Branch"),
+                    }
+                }
+            }
+            _ => panic!("expected Function"),
         }
     }
 }

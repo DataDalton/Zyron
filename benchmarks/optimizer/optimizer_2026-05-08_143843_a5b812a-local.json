@@ -1,0 +1,23 @@
+{
+  "id": "2026-05-08_143843_a5b812a-local",
+  "date": "2026-05-08 14:38:44Z",
+  "ts": 1778251124,
+  "commit": "a5b812a-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "optimizer": {
+      "selectivity_estimate_ns": {
+        "average": 118.609140,
+        "runs": [118.97, 118.38, 118.27, 118.80, 118.63],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    }
+  }
+}

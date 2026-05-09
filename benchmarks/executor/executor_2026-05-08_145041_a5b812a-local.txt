@@ -1,0 +1,25 @@
+
+=== Hash Build Performance Test ===
+Rows: 1000000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Hash Build: 116,710,628 rows/sec (8.5682ms), 1000 groups
+
+--- Run 2/5 ---
+  Hash Build: 115,366,867 rows/sec (8.668ms), 1000 groups
+
+--- Run 3/5 ---
+  Hash Build: 117,122,076 rows/sec (8.5381ms), 1000 groups
+
+--- Run 4/5 ---
+  Hash Build: 124,320,897 rows/sec (8.0437ms), 1000 groups
+
+--- Run 5/5 ---
+  Hash Build: 122,327,152 rows/sec (8.1748ms), 1000 groups
+
+=== Hash Build Validation Results ===
+  Hash build throughput (rows/sec) [PASS/OK]:
+    Runs: [116,710,628, 115,366,867, 117,122,076, 124,320,897, 122,327,152]
+    Average: 119,169,524 >= 50,000,000 (target)
+    Min/Max: 115,366,867 / 124,320,897, StdDev: 3,498,733

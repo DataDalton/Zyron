@@ -1,0 +1,72 @@
+{
+  "id": "2026-05-08_143904_a5b812a-local",
+  "date": "2026-05-08 14:39:12Z",
+  "ts": 1778251152,
+  "commit": "a5b812a-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Performance": {
+      "bulk_load 100K points/sec": {
+        "average": 5664326.993387,
+        "runs": [5548188.79, 5601111.26, 5784426.01, 5576996.01, 5810912.89],
+        "target": 1500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "bulk_load 1M points/sec (parallel STR)": {
+        "average": 4277776.628799,
+        "runs": [4075951.28, 4338097.43, 4340159.10, 4252673.44, 4382001.89],
+        "target": 2000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "range 100K 1% area (us)": {
+        "average": 6.201380,
+        "runs": [6.22, 6.22, 6.25, 6.24, 6.07],
+        "target": 1500.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "dwithin 100K r=500 (us)": {
+        "average": 7.878548,
+        "runs": [5.50, 6.29, 9.12, 9.25, 9.22],
+        "target": 1500.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "delete_by_data/sec": {
+        "average": 437049.421610,
+        "runs": [418762.22, 437519.96, 451257.43, 445428.35, 432279.15],
+        "target": 500000.000000,
+        "passed": false,
+        "higher_is_better": true
+      },
+      "KNN 100K k=10 (us)": {
+        "average": 6.993446,
+        "runs": [7.06, 7.05, 6.91, 6.75, 7.19],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "snapshot roundtrip 100K (ms)": {
+        "average": 28.809960,
+        "runs": [34.12, 28.16, 27.96, 27.44, 26.38],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "insert points/sec": {
+        "average": 102401.154522,
+        "runs": [106177.02, 105198.07, 98770.23, 99913.55, 101946.90],
+        "target": 300000.000000,
+        "passed": false,
+        "higher_is_better": true
+      }
+    }
+  }
+}

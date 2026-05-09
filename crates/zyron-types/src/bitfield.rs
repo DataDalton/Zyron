@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn test_to_positions() {
-        assert_eq!(bitfield_to_positions(0), vec![]);
+        assert_eq!(bitfield_to_positions(0), Vec::<u8>::new());
         assert_eq!(bitfield_to_positions(0b1010), vec![1, 3]);
         assert_eq!(bitfield_to_positions(0b1000_0001), vec![0, 7]);
         assert_eq!(bitfield_to_positions(1u64 << 63), vec![63]);

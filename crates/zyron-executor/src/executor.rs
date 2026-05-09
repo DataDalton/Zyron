@@ -73,18 +73,52 @@ fn build_operator_tree(
                 as_of,
                 ..
             } => {
+                // Resolve the AS OF qualifier into a concrete scan parameter
+                let mut effective_predicate = predicate;
                 let as_of_version = match &as_of {
                     Some(AsOfTarget::Version(v)) => Some(*v),
-                    _ => None,
+                    Some(AsOfTarget::Timestamp(ts)) => {
+                        // Translate AS OF TIMESTAMP into a sys_start/sys_end
+                        // predicate on a system-versioned table. Without this
+                        // the scan would silently return current data
+                        let entry = ctx.catalog.get_table_by_id(table_id)?;
+                        if !entry.system_versioned {
+                            return Err(zyron_common::ZyronError::ExecutionError(format!(
+                                "AS OF TIMESTAMP requires a system-versioned table, table {} is not system-versioned. \
+                                 Enable with ALTER TABLE ... SET (system_versioning = on) or use AS OF VERSION instead",
+                                entry.name
+                            )));
+                        }
+                        let predicate_for_ts = build_system_time_predicate(&entry, *ts)?;
+                        effective_predicate = Some(match effective_predicate {
+                            Some(existing) => combine_with_and(existing, predicate_for_ts),
+                            None => predicate_for_ts,
+                        });
+                        None
+                    }
+                    Some(AsOfTarget::Branch(name)) => {
+                        return Err(zyron_common::ZyronError::ExecutionError(format!(
+                            "IN BRANCH '{}' is parsed and bound but executor branch lookup is not yet wired",
+                            name
+                        )));
+                    }
+                    None => None,
                 };
 
                 // ParallelSeqScan does not support as_of, fall back to serial in that case
                 let num_pages = ctx.get_heap_file(table_id).await?.num_pages_cached() as u64;
 
-                if as_of_version.is_none() && should_use_parallel_scan(num_pages, false) {
-                    let op =
-                        ParallelSeqScanOperator::new(ctx.clone(), table_id, columns, predicate)
-                            .await?;
+                if as_of_version.is_none()
+                    && as_of.is_none()
+                    && should_use_parallel_scan(num_pages, false)
+                {
+                    let op = ParallelSeqScanOperator::new(
+                        ctx.clone(),
+                        table_id,
+                        columns,
+                        effective_predicate,
+                    )
+                    .await?;
                     let br = BuildResult::new(Box::new(op));
                     Ok(br.with_metrics("ParallelSeqScan", analyze, vec![]))
                 } else {
@@ -92,7 +126,7 @@ fn build_operator_tree(
                         ctx.clone(),
                         table_id,
                         columns,
-                        predicate,
+                        effective_predicate,
                         false,
                         as_of_version,
                     )
@@ -684,15 +718,37 @@ fn build_scan_with_tuple_ids(
                 as_of,
                 ..
             } => {
+                let mut effective_predicate = predicate;
                 let as_of_version = match &as_of {
                     Some(AsOfTarget::Version(v)) => Some(*v),
-                    _ => None,
+                    Some(AsOfTarget::Timestamp(ts)) => {
+                        let entry = ctx.catalog.get_table_by_id(table_id)?;
+                        if !entry.system_versioned {
+                            return Err(zyron_common::ZyronError::ExecutionError(format!(
+                                "AS OF TIMESTAMP requires a system-versioned table, table {} is not system-versioned",
+                                entry.name
+                            )));
+                        }
+                        let predicate_for_ts = build_system_time_predicate(&entry, *ts)?;
+                        effective_predicate = Some(match effective_predicate {
+                            Some(existing) => combine_with_and(existing, predicate_for_ts),
+                            None => predicate_for_ts,
+                        });
+                        None
+                    }
+                    Some(AsOfTarget::Branch(name)) => {
+                        return Err(zyron_common::ZyronError::ExecutionError(format!(
+                            "IN BRANCH '{}' is parsed and bound but executor branch lookup is not yet wired",
+                            name
+                        )));
+                    }
+                    None => None,
                 };
                 let op = SeqScanOperator::new(
                     ctx.clone(),
                     table_id,
                     columns,
-                    predicate,
+                    effective_predicate,
                     true,
                     as_of_version,
                 )
@@ -776,6 +832,109 @@ pub async fn execute(plan: PhysicalPlan, ctx: &Arc<ExecutionContext>) -> Result<
     }
 
     Ok(results)
+}
+
+/// Builds the visibility predicate for AS OF TIMESTAMP <ts> on a system-versioned
+/// table. Filters tuples whose system-time period [sys_start, sys_end) contains ts
+/// `sys_end IS NULL` is treated as "still current" so currently-live rows match
+fn build_system_time_predicate(
+    entry: &zyron_catalog::TableEntry,
+    ts_micros: i64,
+) -> Result<zyron_planner::binder::BoundExpr> {
+    use zyron_planner::binder::{BoundExpr, ColumnRef};
+    use zyron_parser::ast::{BinaryOperator, LiteralValue};
+    use zyron_common::TypeId;
+
+    let sys_start = entry
+        .columns
+        .iter()
+        .find(|c| c.name == "sys_start")
+        .ok_or_else(|| {
+            zyron_common::ZyronError::ExecutionError(format!(
+                "system-versioned table {} is missing the sys_start column",
+                entry.name
+            ))
+        })?;
+    let sys_end = entry
+        .columns
+        .iter()
+        .find(|c| c.name == "sys_end")
+        .ok_or_else(|| {
+            zyron_common::ZyronError::ExecutionError(format!(
+                "system-versioned table {} is missing the sys_end column",
+                entry.name
+            ))
+        })?;
+
+    let table_idx = 0usize;
+    let ts_lit = BoundExpr::Literal {
+        value: LiteralValue::Integer(ts_micros),
+        type_id: TypeId::Timestamp,
+    };
+    let sys_start_ref = BoundExpr::ColumnRef(ColumnRef {
+        table_idx,
+        column_id: sys_start.id,
+        type_id: sys_start.type_id,
+        nullable: sys_start.nullable,
+    });
+    let sys_end_ref = BoundExpr::ColumnRef(ColumnRef {
+        table_idx,
+        column_id: sys_end.id,
+        type_id: sys_end.type_id,
+        nullable: sys_end.nullable,
+    });
+
+    // sys_start <= ts
+    let start_le = BoundExpr::BinaryOp {
+        left: Box::new(sys_start_ref),
+        op: BinaryOperator::LtEq,
+        right: Box::new(ts_lit.clone()),
+        type_id: TypeId::Boolean,
+    };
+    // sys_end > ts
+    let end_gt = BoundExpr::BinaryOp {
+        left: Box::new(sys_end_ref.clone()),
+        op: BinaryOperator::Gt,
+        right: Box::new(ts_lit),
+        type_id: TypeId::Boolean,
+    };
+    // sys_end IS NULL (currently-live rows have sys_end = MAX_TIMESTAMP per
+    // SystemVersionedTable::on_insert_defaults, but defensive-IS-NULL keeps
+    // schemas that store NULL for the live row also working)
+    let end_is_null = BoundExpr::IsNull {
+        expr: Box::new(sys_end_ref),
+        negated: false,
+    };
+    // (sys_end > ts OR sys_end IS NULL)
+    let end_visible = BoundExpr::BinaryOp {
+        left: Box::new(end_gt),
+        op: BinaryOperator::Or,
+        right: Box::new(end_is_null),
+        type_id: TypeId::Boolean,
+    };
+    // sys_start <= ts AND (sys_end > ts OR sys_end IS NULL)
+    Ok(BoundExpr::BinaryOp {
+        left: Box::new(start_le),
+        op: BinaryOperator::And,
+        right: Box::new(end_visible),
+        type_id: TypeId::Boolean,
+    })
+}
+
+/// Combines two BoundExpr predicates with logical AND
+fn combine_with_and(
+    left: zyron_planner::binder::BoundExpr,
+    right: zyron_planner::binder::BoundExpr,
+) -> zyron_planner::binder::BoundExpr {
+    use zyron_planner::binder::BoundExpr;
+    use zyron_parser::ast::BinaryOperator;
+    use zyron_common::TypeId;
+    BoundExpr::BinaryOp {
+        left: Box::new(left),
+        op: BinaryOperator::And,
+        right: Box::new(right),
+        type_id: TypeId::Boolean,
+    }
 }
 
 /// Executes a PhysicalPlan with EXPLAIN ANALYZE, returning both the result

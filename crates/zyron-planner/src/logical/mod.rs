@@ -47,6 +47,9 @@ pub enum AsOfTarget {
     Version(u64),
     /// Query table at a specific timestamp (microseconds since epoch).
     Timestamp(i64),
+    /// Query table on a named branch. The executor resolves the name to
+    /// the branch's pinned VersionId via BranchManager at scan time
+    Branch(String),
 }
 
 // ---------------------------------------------------------------------------

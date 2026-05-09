@@ -116,17 +116,29 @@ impl HealthState {
     }
 }
 
-/// Starts the health/metrics HTTP server on the given port.
+/// Starts the health/metrics HTTP server on the given bind host and port.
 /// Uses a shutdown flag to terminate the accept loop without polling.
-pub async fn start_health_server(port: u16, state: Arc<HealthState>, shutdown: Arc<AtomicBool>) {
-    let addr = format!("0.0.0.0:{}", port);
-    let listener = match TcpListener::bind(&addr).await {
+/// When `host` resolves to an IPv6 wildcard and `dual_stack` is true, V6ONLY
+/// is disabled so the listener also accepts IPv4 connections via mapped
+/// addresses (matches Linux kernel default, overrides Windows default)
+pub async fn start_health_server(
+    host: &str,
+    port: u16,
+    dual_stack: bool,
+    state: Arc<HealthState>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let listener = match bind_dual_stack_listener(host, port, dual_stack) {
         Ok(l) => l,
         Err(e) => {
-            error!("Failed to bind health server on {}: {}", addr, e);
+            error!("Failed to bind health server on {}:{}: {}", host, port, e);
             return;
         }
     };
+    let addr = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| format!("{}:{}", host, port));
 
     info!("Health/metrics server listening on {}", addr);
 
@@ -583,6 +595,65 @@ fn extract_path(request: &str) -> &str {
     let first_line = request.lines().next().unwrap_or("");
     let parts: Vec<&str> = first_line.split_whitespace().collect();
     if parts.len() >= 2 { parts[1] } else { "/" }
+}
+
+/// Builds a tokio TcpListener at `host:port`. When the resolved address is an
+/// IPv6 wildcard and `dual_stack` is true, IPV6_V6ONLY is disabled so the
+/// listener also accepts IPv4 connections via IPv4-mapped IPv6 addresses.
+/// Linux defaults V6ONLY to false, Windows defaults it to true; this routine
+/// makes the behaviour identical across platforms when dual-stack is requested
+pub(crate) fn bind_dual_stack_listener(
+    host: &str,
+    port: u16,
+    dual_stack: bool,
+) -> std::io::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+
+    // Strip a leading [ and trailing ] so callers can pass either bare IPv6
+    // (`::`) or bracketed (`[::]`) forms uniformly
+    let trimmed = host.trim();
+    let host_clean =
+        if let Some(stripped) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            stripped
+        } else {
+            trimmed
+        };
+
+    let addr_str = format!("{}:{}", host_clean, port);
+    let addr: SocketAddr = if let Ok(parsed) = addr_str.parse() {
+        parsed
+    } else if host_clean.parse::<IpAddr>().is_ok() {
+        format!("{}:{}", host_clean, port)
+            .parse()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
+    } else {
+        // hostname form, resolve via DNS
+        addr_str.to_socket_addrs()?.next().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                format!("no addresses for {}", host_clean),
+            )
+        })?
+    };
+
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    sock.set_reuse_address(true)?;
+    if addr.is_ipv6() {
+        // Honour the dual_stack flag, defaulting V6ONLY off matches Linux
+        // and gives a single listener that handles both protocols
+        sock.set_only_v6(!dual_stack)?;
+    }
+    sock.bind(&addr.into())?;
+    sock.listen(1024)?;
+    sock.set_nonblocking(true)?;
+    let std_listener: std::net::TcpListener = sock.into();
+    TcpListener::from_std(std_listener)
 }
 
 #[cfg(test)]

@@ -1,0 +1,113 @@
+{
+  "id": "2026-05-09_220129_a5b812a-local",
+  "date": "2026-05-09 22:01:41Z",
+  "ts": 1778364101,
+  "commit": "a5b812a-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Subscription Control": {
+      "Y+W+A+j encode throughput (ops/sec)": {
+        "average": 246527324.957517,
+        "runs": [241653879.15, 232533804.60, 250056262.66, 261280798.47, 247111879.90],
+        "target": 5000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Subscription X Encode": {
+      "ChangeBatch encode (100 rows, ops/sec)": {
+        "average": 2398943.737906,
+        "runs": [2407313.61, 2330047.50, 2391312.46, 2454288.87, 2411756.25],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Subscription X Decode": {
+      "ChangeBatch decode (100 rows, ops/sec)": {
+        "average": 349513.587614,
+        "runs": [341674.87, 346376.39, 351231.95, 357074.09, 351210.63],
+        "target": 200000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Pool Acquire Primitive": {
+      "Semaphore(4) acquire+release (ops/sec)": {
+        "average": 26227920.476434,
+        "runs": [27305990.93, 25411023.30, 26326874.47, 25832450.72, 26263262.95],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "INSERT VALUES encode": {
+      "rows/sec at batch=1000": {
+        "average": 26788912.470977,
+        "runs": [26690296.48, 26244859.29, 26603244.53, 26410171.09, 27995990.97],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "COPY BINARY encode": {
+      "rows/sec at batch=1000": {
+        "average": 304353890.056017,
+        "runs": [291103865.86, 328407224.96, 290166265.27, 251965329.57, 360126764.62],
+        "target": 3000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "URI Parse": {
+      "parse_zyron_uri throughput (ops/sec)": {
+        "average": 5074178.633739,
+        "runs": [5249082.07, 5179710.04, 4827135.45, 5070088.91, 5044876.70],
+        "target": 5000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Credential Seal": {
+      "seal_credentials throughput (ops/sec)": {
+        "average": 2533165.996807,
+        "runs": [2664080.73, 2646188.69, 2494636.53, 2676602.21, 2184321.81],
+        "target": 1500.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Credential Open": {
+      "open_credentials throughput (ops/sec)": {
+        "average": 3095697.488114,
+        "runs": [3102506.83, 3079215.91, 3101833.18, 3068915.57, 3126015.96],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Snapshot Chunk Distribution": {
+      "compute_chunks ops/sec": {
+        "average": 117973615.455175,
+        "runs": [117850871.51, 118756383.16, 117785630.15, 118358602.90, 117116589.56],
+        "target": 5000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Publication Retention Sweep": {
+      "decisions/sec": {
+        "average": 364374515.016685,
+        "runs": [356689352.11, 366644179.16, 369308949.09, 364878276.61, 364351818.12],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}

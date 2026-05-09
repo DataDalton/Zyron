@@ -25,6 +25,13 @@ pub struct Session {
     pub search_path: Vec<String>,
     /// Security context for privilege checks. None if auth system is not initialized.
     pub security_context: Option<zyron_auth::SecurityContext>,
+    /// Per-session circuit breaker registry. Holds named breakers for use with
+    /// CIRCUIT_BREAKER_STATUS('name') and ALTER CIRCUIT BREAKER 'name'.
+    pub circuit_breakers: std::sync::Arc<zyron_types::resilience::CircuitBreakerRegistry>,
+    /// Per-session rate limiter registry, keyed by user-supplied bucket name.
+    pub rate_limiters: std::sync::Arc<zyron_types::scheduling::RateLimiterRegistry>,
+    /// Per-session quota registry.
+    pub quotas: std::sync::Arc<zyron_types::scheduling::QuotaRegistry>,
 }
 
 impl Session {
@@ -68,6 +75,11 @@ impl Session {
             database_id,
             search_path: Vec::new(),
             security_context,
+            circuit_breakers: std::sync::Arc::new(
+                zyron_types::resilience::CircuitBreakerRegistry::new(),
+            ),
+            rate_limiters: std::sync::Arc::new(zyron_types::scheduling::RateLimiterRegistry::new()),
+            quotas: std::sync::Arc::new(zyron_types::scheduling::QuotaRegistry::new()),
         }
     }
 

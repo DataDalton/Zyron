@@ -1360,6 +1360,16 @@ fn rewrite_window_refs(
         ))),
         // Subqueries don't participate in window rewriting at this level.
         BE::Subquery { .. } | BE::Exists { .. } | BE::InSubquery { .. } => expr.clone(),
+        BE::TemporalRef { inner, temporal } => BE::TemporalRef {
+            inner: Box::new(rewrite_window_refs(
+                inner,
+                collected,
+                names,
+                input_schema_len,
+                None,
+            )),
+            temporal: temporal.clone(),
+        },
     }
 }
 

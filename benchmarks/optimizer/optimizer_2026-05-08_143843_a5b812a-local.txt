@@ -1,0 +1,5 @@
+=== PERF: Selectivity Estimate Latency ===
+  selectivity_estimate_ns [PASS/OK]:
+    Runs: [119, 118, 118, 119, 119]
+    Average: 119 <= 200 (target)
+    Min/Max: 118 / 119, StdDev: 0

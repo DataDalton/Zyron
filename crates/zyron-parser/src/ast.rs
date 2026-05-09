@@ -1774,6 +1774,8 @@ pub enum AsOf {
         start: Expr,
         end: Expr,
     },
+    /// `IN BRANCH 'name'` (expression-position only at parse time)
+    Branch(Expr),
 }
 
 // ---------------------------------------------------------------------------
@@ -1957,6 +1959,14 @@ pub enum Expr {
         columns: Vec<String>,
         query: Box<Expr>,
         mode: Option<String>,
+    },
+    /// Temporal expression reference: `<expr> AS OF TIMESTAMP X`,
+    /// `<expr> VERSION AS OF N`, or `<expr> IN BRANCH 'name'`. Used in
+    /// expression position so functions like ROW_DIFF can compare snapshots
+    /// of the same row at different points in time without nested subqueries
+    TemporalRef {
+        inner: Box<Expr>,
+        temporal: Box<AsOf>,
     },
 }
 

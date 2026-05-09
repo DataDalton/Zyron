@@ -142,37 +142,69 @@ fn now_secs() -> u64 {
 }
 
 /// Parses an IPv4 dotted-quad string into a 32-bit integer.
-fn parse_ipv4(s: &str) -> Option<u32> {
-    let parts: Vec<&str> = s.split('.').collect();
-    if parts.len() != 4 {
-        return None;
-    }
-    let a = parts[0].parse::<u8>().ok()? as u32;
-    let b = parts[1].parse::<u8>().ok()? as u32;
-    let c = parts[2].parse::<u8>().ok()? as u32;
-    let d = parts[3].parse::<u8>().ok()? as u32;
-    Some((a << 24) | (b << 16) | (c << 8) | d)
-}
-
-/// Checks if an IP address matches a CIDR range or exact address.
+/// Checks if an IP address matches a CIDR range or exact address. Supports
+/// IPv4 and IPv6 in either argument
+///
+/// Match rules
+///   - exact-address form (no `/`): canonicalizes both via IpAddr so equivalent
+///     representations (e.g. `::1` vs `0:0:0:0:0:0:0:1`) compare equal
+///   - CIDR form: parses both `cidr` and `ip` to IpAddr, masks to the prefix
+///     width. Cross-family pairs (v4 cidr vs v6 ip or reverse) never match
+///     so operators must register both rules to cover dual-stack clients
 fn matches_cidr(cidr: &str, ip: &str) -> bool {
-    let ip_addr = match parse_ipv4(ip) {
-        Some(a) => a,
-        None => return false,
-    };
+    use std::net::IpAddr;
+    use std::str::FromStr;
     if let Some(slash) = cidr.find('/') {
-        let net = match parse_ipv4(&cidr[..slash]) {
-            Some(a) => a,
-            None => return false,
+        let net_str = &cidr[..slash];
+        let mask_str = &cidr[slash + 1..];
+        let net_addr = match IpAddr::from_str(net_str) {
+            Ok(a) => a,
+            Err(_) => return false,
         };
-        let bits: u32 = match cidr[slash + 1..].parse() {
-            Ok(b) if b <= 32 => b,
-            _ => return false,
+        let ip_addr = match IpAddr::from_str(ip) {
+            Ok(a) => a,
+            Err(_) => return false,
         };
-        let mask = if bits == 0 { 0 } else { !0u32 << (32 - bits) };
-        (ip_addr & mask) == (net & mask)
+        let bits: u32 = match mask_str.parse() {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        match (net_addr, ip_addr) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                if bits > 32 {
+                    return false;
+                }
+                if bits == 0 {
+                    return true;
+                }
+                let mask = if bits == 32 {
+                    u32::MAX
+                } else {
+                    u32::MAX << (32 - bits)
+                };
+                (u32::from(net) & mask) == (u32::from(ip) & mask)
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                if bits > 128 {
+                    return false;
+                }
+                if bits == 0 {
+                    return true;
+                }
+                let mask = if bits == 128 {
+                    u128::MAX
+                } else {
+                    u128::MAX << (128 - bits)
+                };
+                (u128::from(net) & mask) == (u128::from(ip) & mask)
+            }
+            _ => false,
+        }
     } else {
-        parse_ipv4(cidr) == Some(ip_addr)
+        match (IpAddr::from_str(cidr), IpAddr::from_str(ip)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => cidr == ip,
+        }
     }
 }
 
@@ -485,6 +517,42 @@ mod tests {
         assert!(mgr.is_blocked("10.0.0.50").is_some());
         assert!(mgr.is_blocked("10.0.0.200").is_some());
         assert!(mgr.is_blocked("10.0.1.1").is_none());
+    }
+
+    #[test]
+    fn test_matches_cidr_ipv6() {
+        // Exact IPv6 match (canonicalized via IpAddr so equivalent forms match)
+        assert!(matches_cidr("2001:db8::1", "2001:db8::1"));
+        assert!(matches_cidr("::1", "0:0:0:0:0:0:0:1"));
+        // CIDR range
+        assert!(matches_cidr("2001:db8::/32", "2001:db8:1234::1"));
+        assert!(!matches_cidr("2001:db8::/32", "2001:db9::1"));
+        // /128 host-only
+        assert!(matches_cidr("2001:db8::1/128", "2001:db8::1"));
+        assert!(!matches_cidr("2001:db8::1/128", "2001:db8::2"));
+        // /0 matches everything in v6
+        assert!(matches_cidr("::/0", "fe80::1"));
+        // Cross-family does not match
+        assert!(!matches_cidr("10.0.0.0/8", "::1"));
+        assert!(!matches_cidr("::/0", "10.0.0.1"));
+        // Invalid mask width is rejected
+        assert!(!matches_cidr("2001:db8::/129", "2001:db8::1"));
+    }
+
+    #[test]
+    fn test_block_ipv6_range() {
+        let mgr = IpManager::new();
+        mgr.block_ip(
+            "2001:db8::/32".to_string(),
+            0,
+            "v6 range block".to_string(),
+            IpBlockSource::Admin(UserId(1)),
+        );
+        assert!(mgr.is_blocked("2001:db8::1").is_some());
+        assert!(mgr.is_blocked("2001:db8:abcd::ff").is_some());
+        assert!(mgr.is_blocked("2001:db9::1").is_none());
+        // IPv4 client doesn't match v6 rule
+        assert!(mgr.is_blocked("10.0.0.1").is_none());
     }
 
     #[test]

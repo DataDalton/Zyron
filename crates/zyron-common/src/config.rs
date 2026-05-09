@@ -7,7 +7,9 @@ use std::path::PathBuf;
 /// Server configuration for the ZyronDB instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
-    /// Host address to bind to.
+    /// Host address to bind to. Accepts IPv4 (`127.0.0.1`, `0.0.0.0`),
+    /// IPv6 (`::1`, `::`, `[::]`), and hostnames. The `[]` brackets around an
+    /// IPv6 literal are optional and stripped automatically
     pub host: String,
     /// Port number to listen on.
     pub port: u16,
@@ -34,12 +36,25 @@ pub struct ServerConfig {
     pub quic_zero_rtt: bool,
     /// QUIC idle timeout in seconds before closing inactive connections.
     pub quic_idle_timeout_secs: u32,
+    /// When `host` resolves to an IPv6 wildcard (`::`), accept IPv4
+    /// connections too via IPv4-mapped IPv6 addresses. Linux kernel defaults
+    /// V6ONLY to false (matches this default); Windows defaults to true so
+    /// the listener applies V6ONLY=false explicitly via socket2 to give
+    /// consistent behaviour across platforms. Set false to bind IPv6-only
+    #[serde(default = "default_dual_stack")]
+    pub dual_stack: bool,
+}
+
+fn default_dual_stack() -> bool {
+    true
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            host: "127.0.0.1".to_string(),
+            // Dual-stack default so IPv6 clients work out of the box. Operators
+            // wanting IPv4-only can set host = "0.0.0.0"
+            host: "[::]".to_string(),
             port: 5432,
             max_connections: 100,
             connection_timeout_secs: 30,
@@ -52,6 +67,7 @@ impl Default for ServerConfig {
             quic_port: None,
             quic_zero_rtt: false,
             quic_idle_timeout_secs: 300,
+            dual_stack: true,
         }
     }
 }
@@ -120,7 +136,11 @@ mod tests {
     #[test]
     fn test_server_config_defaults() {
         let config = ServerConfig::default();
-        assert_eq!(config.host, "127.0.0.1");
+        // Dual-stack IPv6 wildcard accepts both IPv4 and IPv6 clients out of
+        // the box on Linux (V6ONLY=false default) and on Windows via the
+        // explicit V6ONLY=false applied by socket2 in the wire crate
+        assert_eq!(config.host, "[::]");
+        assert!(config.dual_stack);
         assert_eq!(config.port, 5432);
         assert_eq!(config.max_connections, 100);
         assert_eq!(config.connection_timeout_secs, 30);
@@ -152,6 +172,7 @@ mod tests {
             quic_port: Some(5444),
             quic_zero_rtt: true,
             quic_idle_timeout_secs: 120,
+            dual_stack: false,
         };
 
         assert_eq!(config.host, "0.0.0.0");

@@ -49,7 +49,15 @@ pub use crate::zyron_sink::{ZyronSinkClient, build_sink_client_from_entry};
 /// Creates a TCP listener with SO_REUSEADDR for fast server restarts
 /// (no waiting for TIME_WAIT sockets to expire) and SO_REUSEPORT on Linux
 /// for kernel-level load balancing across accept loops.
-fn create_tcp_listener(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
+///
+/// When `addr` is IPv6 and `dual_stack` is true, IPV6_V6ONLY is disabled so
+/// the listener also accepts IPv4 connections via IPv4-mapped IPv6 addresses.
+/// Linux defaults V6ONLY off (matches dual_stack=true), Windows defaults it
+/// on (so this option overrides explicitly via socket2)
+fn create_tcp_listener(
+    addr: SocketAddr,
+    dual_stack: bool,
+) -> std::io::Result<std::net::TcpListener> {
     let socket = socket2::Socket::new(
         socket2::Domain::for_address(addr),
         socket2::Type::STREAM,
@@ -58,10 +66,24 @@ fn create_tcp_listener(addr: SocketAddr) -> std::io::Result<std::net::TcpListene
     socket.set_reuse_address(true)?;
     #[cfg(target_os = "linux")]
     socket.set_reuse_port(true)?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(!dual_stack)?;
+    }
     socket.bind(&addr.into())?;
     socket.listen(1024)?;
     socket.set_nonblocking(true)?;
     Ok(std::net::TcpListener::from(socket))
+}
+
+/// Strips optional brackets from an IPv6 host literal, so callers can pass
+/// either `[::]` or `::` interchangeably. Hostnames and IPv4 addresses pass
+/// through unchanged
+fn strip_ipv6_brackets(host: &str) -> &str {
+    let trimmed = host.trim();
+    trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(trimmed)
 }
 
 /// Message sent from the accept loop to a worker thread.
@@ -135,8 +157,10 @@ pub async fn start_server(
     config: &ServerConfig,
     server_state: Arc<ServerState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
-    let std_listener = create_tcp_listener(addr)?;
+    // Strip IPv6 brackets so `[::]` and `::` are equivalent in the config
+    let host_clean = strip_ipv6_brackets(&config.host);
+    let addr: SocketAddr = format!("{}:{}", host_clean, config.port).parse()?;
+    let std_listener = create_tcp_listener(addr, config.dual_stack)?;
     let listener = TcpListener::from_std(std_listener)?;
     let semaphore = Arc::new(Semaphore::new(config.max_connections as usize));
 

@@ -35,7 +35,7 @@ tracing-subscriber = "0.3.23"
 
 # Checksums
 crc32fast = "1.5.0"
-xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+xxhash-rust = { version = "0.8.15", features = ["xxh3", "xxh32"] }
 
 # System info
 sysinfo = "0.38.4"

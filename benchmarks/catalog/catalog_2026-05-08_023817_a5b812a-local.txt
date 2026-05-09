@@ -1,0 +1,111 @@
+
+=== Benchmark: ANALYZE Throughput ===
+  ANALYZE throughput (rows/sec) [PASS/OK]:
+    Runs: [11,441,517, 11,965,014, 12,391,267, 12,599,854, 12,238,853]
+    Average: 12,127,301 >= 8,000,000 (target)
+    Min/Max: 11,441,517 / 12,599,854, StdDev: 400,516
+
+=== Benchmark: Cache Hit Rate ===
+  Cache hit rate [PASS]: 1 >= 1 (target)
+
+=== Benchmark: DDL Create Latency ===
+  Create table latency (us/op) [PASS/OK]:
+    Runs: [2, 1, 3, 1, 3]
+    Average: 2 <= 200 (target)
+    Min/Max: 1 / 3, StdDev: 1
+
+=== Benchmark: DDL Drop Latency ===
+  Drop table latency (us/op) [PASS/OK]:
+    Runs: [30, 39, 65, 28, 27]
+    Average: 38 <= 80 (target)
+    Min/Max: 27 / 65, StdDev: 14
+
+=== Benchmark: Histogram Build Latency ===
+  Histogram build latency (ms/col) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 10 (target)
+    Min/Max: 0 / 0, StdDev: 0
+
+=== Benchmark: Schema Resolve Latency ===
+  Resolve latency (ns/op) [FAIL/OK]:
+    Runs: [110, 158, 149, 121, 115]
+    Average: 130 <= 100 (target)
+    Min/Max: 110 / 158, StdDev: 19
+
+=== Column Type Roundtrip ===
+  All 29 column types roundtripped: PASS
+  Default expression preserved: PASS
+
+=== Benchmark: Table Lookup Latency ===
+  Lookup latency (ns/op) [PASS/OK]:
+    Runs: [44, 46, 46, 53, 52]
+    Average: 48 <= 50 (target)
+    Min/Max: 44 / 53, StdDev: 4
+
+============================================
+  Catalog - All Tests Complete
+============================================
+  DDL Persistence:    1 test (create + reload)
+  Name Resolution:    1 test (6 cases)
+  Column Types:       1 test (29 types)
+  Constraints:        1 test (5 constraint types)
+  DDL Create/Drop:    1 test (8 operations)
+  Statistics:         1 test (100K rows)
+  Crash Recovery:     1 test (3 object types)
+  Benchmarks:         8 performance tests
+============================================
+
+=== Benchmark: Recovery Time ===
+  Recovery time (ms) [PASS/REGR!]:
+    Runs: [4, 0, 0, 0, 0]
+    Average: 1 <= 1 (target)
+    Min/Max: 0 / 4, StdDev: 2
+
+=== Constraint Storage ===
+  PRIMARY KEY (column-level): PASS
+  PRIMARY KEY (table-level, composite): PASS
+  UNIQUE constraint: PASS
+  NOT NULL constraint: PASS
+  DEFAULT value: PASS
+  All constraint tables listed: PASS (5 tables)
+
+=== DDL Create/Drop Cycle ===
+  Create table: PASS
+  Create index: PASS
+  Drop index: PASS
+  Drop table: PASS
+  Create/drop schema: PASS
+  Create/drop database: PASS
+  Duplicate database detection: PASS
+
+=== DDL Persistence ===
+  Created: database=DatabaseId(10000), schema=SchemaId(10001), table=TableId(10002), idx1=IndexId(10003), idx2=IndexId(10004)
+  Database reload: PASS
+  Schema reload: PASS
+  Table reload: PASS (10 columns)
+  Column metadata: PASS
+  Index reload: PASS (2 indexes, 1 unique, 1 composite)
+
+=== Name Resolution ===
+  Resolve 'users' -> app.users: PASS
+  Resolve 'orders' -> app.orders: PASS
+  Resolve 'public.users' -> public.users: PASS
+  Resolve 'nonexistent' -> error: PASS
+  Resolve column 'user_id': PASS
+  Resolve nonexistent column -> error: PASS
+
+=== Statistics Collection ===
+  Inserting 100000 rows...
+  Row count: 100000 (expected 100000): PASS
+  Page count: 150: PASS
+  Avg row size: 8 bytes: PASS
+  Distinct count: 100000: PASS
+  Histogram: 100 buckets, total=100000: PASS
+  MCV: 10 entries: PASS
+  Stats store/retrieve: PASS
+  ANALYZE: 10348 us for 100000 rows (9663703 rows/sec)
+
+=== Crash Recovery ===
+  Database survived crash: PASS
+  Schema survived crash: PASS
+  Table survived crash: PASS (2 columns)

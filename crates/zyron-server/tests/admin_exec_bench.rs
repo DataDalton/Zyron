@@ -406,7 +406,7 @@ async fn start_admin_server(
     let shutdown_clone = Arc::clone(&shutdown);
     let state_clone = Arc::clone(&health_state);
     tokio::spawn(async move {
-        start_health_server(port, state_clone, shutdown_clone).await;
+        start_health_server("127.0.0.1", port, false, state_clone, shutdown_clone).await;
     });
     // Wait briefly for the server to bind.
     for _ in 0..20 {
