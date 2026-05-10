@@ -9,6 +9,7 @@ zyron-common = { path = "../zyron-common" }
 zyron-parser = { path = "../zyron-parser" }
 zyron-catalog = { path = "../zyron-catalog" }
 zyron-types = { path = "../zyron-types" }
+zyron-analytics = { path = "../zyron-analytics" }
 tokio.workspace = true
 sha2.workspace = true
 

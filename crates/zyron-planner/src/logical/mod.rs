@@ -156,6 +156,16 @@ pub enum LogicalPlan {
         params: Vec<(String, BoundExpr)>,
         output_columns: Vec<LogicalColumn>,
     },
+
+    /// Analytics table-returning function. Resolved by the binder against
+    /// the analytics function registry. The executor dispatches by name
+    /// to the corresponding zyron-analytics implementation.
+    AnalyticsTableFunction {
+        function_name: String,
+        named_args: Vec<(String, BoundExpr)>,
+        positional_args: Vec<BoundExpr>,
+        output_columns: Vec<LogicalColumn>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -256,6 +266,7 @@ impl LogicalPlan {
             LogicalPlan::Update { .. } => Vec::new(),
             LogicalPlan::Delete { .. } => Vec::new(),
             LogicalPlan::GraphAlgorithm { output_columns, .. } => output_columns.clone(),
+            LogicalPlan::AnalyticsTableFunction { output_columns, .. } => output_columns.clone(),
         }
     }
 
@@ -264,7 +275,8 @@ impl LogicalPlan {
         match self {
             LogicalPlan::Scan { .. }
             | LogicalPlan::Values { .. }
-            | LogicalPlan::GraphAlgorithm { .. } => vec![],
+            | LogicalPlan::GraphAlgorithm { .. }
+            | LogicalPlan::AnalyticsTableFunction { .. } => vec![],
             LogicalPlan::Filter { child, .. }
             | LogicalPlan::Project { child, .. }
             | LogicalPlan::Aggregate { child, .. }
@@ -285,7 +297,8 @@ impl LogicalPlan {
         match self {
             LogicalPlan::Scan { .. }
             | LogicalPlan::Values { .. }
-            | LogicalPlan::GraphAlgorithm { .. } => vec![],
+            | LogicalPlan::GraphAlgorithm { .. }
+            | LogicalPlan::AnalyticsTableFunction { .. } => vec![],
             LogicalPlan::Filter { child, .. }
             | LogicalPlan::Project { child, .. }
             | LogicalPlan::Aggregate { child, .. }

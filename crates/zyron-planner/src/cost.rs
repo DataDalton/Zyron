@@ -579,6 +579,24 @@ impl CostModel {
                     row_count,
                 }
             }
+            LogicalPlan::AnalyticsTableFunction {
+                function_name,
+                output_columns,
+                positional_args,
+                ..
+            } => {
+                let nominal_rows: f64 = 10_000.0;
+                let row_count = match function_name.as_str() {
+                    "DATA_PROFILE" | "COLUMN_PROFILE" => output_columns.len() as f64,
+                    "CORRELATION_MATRIX" => positional_args.len().pow(2) as f64,
+                    _ => nominal_rows,
+                };
+                PlanCost {
+                    io_cost: nominal_rows,
+                    cpu_cost: nominal_rows * 4.0,
+                    row_count,
+                }
+            }
         }
     }
 }

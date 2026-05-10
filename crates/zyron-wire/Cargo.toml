@@ -19,6 +19,7 @@ zyron-pipeline = { path = "../zyron-pipeline" }
 zyron-streaming = { path = "../zyron-streaming" }
 zyron-versioning = { path = "../zyron-versioning" }
 zyron-search = { path = "../zyron-search" }
+zyron-analytics = { path = "../zyron-analytics" }
 zyron-types = { path = "../zyron-types" }
 tokio.workspace = true
 bytes.workspace = true

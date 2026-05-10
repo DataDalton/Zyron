@@ -324,6 +324,34 @@ impl<'a> PhysicalPlanner<'a> {
                     cost,
                 })
             }
+            LogicalPlan::AnalyticsTableFunction {
+                function_name,
+                named_args,
+                positional_args,
+                output_columns,
+            } => {
+                // Cost: a single scan over the input source plus per-row work
+                // proportional to the function. Without source size info we
+                // use a nominal 10k-row estimate so the optimizer has a value
+                // to compare against.
+                let nominal_rows: f64 = 10_000.0;
+                let cost = PlanCost {
+                    io_cost: nominal_rows,
+                    cpu_cost: nominal_rows * 4.0,
+                    row_count: match function_name.as_str() {
+                        "DATA_PROFILE" | "COLUMN_PROFILE" => output_columns.len() as f64,
+                        "CORRELATION_MATRIX" => positional_args.len().pow(2) as f64,
+                        _ => nominal_rows,
+                    },
+                };
+                Ok(PhysicalPlan::AnalyticsTableFunction {
+                    function_name,
+                    named_args,
+                    positional_args,
+                    output_columns,
+                    cost,
+                })
+            }
         }
     }
 

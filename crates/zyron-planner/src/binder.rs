@@ -1073,6 +1073,24 @@ fn literal_to_string(e: &Expr) -> Result<String> {
     }
 }
 
+// Maps an analytics function output schema type label (e.g. "INT64",
+// "FLOAT64", "TEXT") to the corresponding TypeId
+fn type_label_to_id(label: &str) -> TypeId {
+    match label.to_ascii_uppercase().as_str() {
+        "BOOL" | "BOOLEAN" => TypeId::Boolean,
+        "INT8" => TypeId::Int8,
+        "INT16" => TypeId::Int16,
+        "INT32" => TypeId::Int32,
+        "INT64" => TypeId::Int64,
+        "FLOAT32" => TypeId::Float32,
+        "FLOAT64" => TypeId::Float64,
+        "TEXT" | "VARCHAR" | "STRING" => TypeId::Varchar,
+        "DATE" => TypeId::Date,
+        "TIMESTAMP" => TypeId::Timestamp,
+        _ => TypeId::Varchar,
+    }
+}
+
 /// ISO-8601 / RFC 3339 timestamp parser. Returns microseconds since
 /// 1970-01-01 00:00:00 UTC, or None when the input is not a valid date or
 /// timestamp. Accepted forms:
@@ -1325,6 +1343,13 @@ pub enum BoundFromItem {
         schema_name: String,
         algorithm: String,
         params: Vec<(String, BoundExpr)>,
+        output_columns: Vec<LogicalColumn>,
+    },
+    AnalyticsFunction {
+        table_idx: usize,
+        function_name: String,
+        params: Vec<(String, BoundExpr)>,
+        positional: Vec<BoundExpr>,
         output_columns: Vec<LogicalColumn>,
     },
 }
@@ -2242,10 +2267,96 @@ impl<'a> Binder<'a> {
                         "betweenness_centrality",
                     ];
                     if !graph_algos.contains(&algo.as_str()) {
-                        return Err(ZyronError::PlanError(format!(
-                            "table function '{}' is not supported",
-                            name
-                        )));
+                        // Try the analytics registry next. Table-returning
+                        // analytics functions (COHORT_RETENTION, FUNNEL_ANALYSIS,
+                        // DATA_PROFILE, COLUMN_PROFILE, CORRELATION_MATRIX) are
+                        // resolved here and produce a BoundFromItem::AnalyticsFunction
+                        let registry = zyron_analytics::default_registry();
+                        let func = registry.lookup(name).ok_or_else(|| {
+                            ZyronError::PlanError(format!(
+                                "table function '{}' is not supported",
+                                name
+                            ))
+                        })?;
+                        if !matches!(
+                            func.kind,
+                            zyron_analytics::AnalyticsFunctionKind::TableReturning
+                        ) {
+                            return Err(ZyronError::PlanError(format!(
+                                "function '{}' is not a table-returning function",
+                                name
+                            )));
+                        }
+
+                        let mut named_params: Vec<(String, BoundExpr)> = Vec::new();
+                        let mut positional: Vec<BoundExpr> = Vec::new();
+                        for arg in args.iter() {
+                            match arg {
+                                FunctionArg::Named { name: pn, value } => {
+                                    let bound = self.bind_expr(ctx, value).await?;
+                                    named_params.push((pn.clone(), bound));
+                                }
+                                FunctionArg::Unnamed(value) => {
+                                    let bound = self.bind_expr(ctx, value).await?;
+                                    positional.push(bound);
+                                }
+                                FunctionArg::Wildcard => {
+                                    return Err(ZyronError::PlanError(format!(
+                                        "table function `{}()` does not accept `*`",
+                                        name
+                                    )));
+                                }
+                            }
+                        }
+                        if positional.len() + named_params.len() < func.min_args {
+                            return Err(ZyronError::PlanError(format!(
+                                "function '{}' requires at least {} arguments",
+                                name, func.min_args
+                            )));
+                        }
+
+                        let output_columns: Vec<LogicalColumn> = func
+                            .output_schema
+                            .iter()
+                            .enumerate()
+                            .map(|(i, (cname, ctype))| LogicalColumn {
+                                table_idx: None,
+                                column_id: ColumnId(i as u16),
+                                name: (*cname).to_string(),
+                                type_id: type_label_to_id(ctype),
+                                nullable: true,
+                            })
+                            .collect();
+
+                        let idx = self.alloc_table_idx();
+                        let tbl_alias = alias.clone().unwrap_or_else(|| name.clone());
+                        let bound_cols: Vec<BoundColumnDef> = output_columns
+                            .iter()
+                            .enumerate()
+                            .map(|(i, lc)| BoundColumnDef {
+                                column_id: lc.column_id,
+                                name: lc.name.clone(),
+                                type_id: lc.type_id,
+                                nullable: lc.nullable,
+                                ordinal: i as u16,
+                            })
+                            .collect();
+                        let bound_table = BoundTableRef {
+                            table_idx: idx,
+                            table_id: None,
+                            alias: tbl_alias,
+                            columns: bound_cols,
+                            entry: None,
+                        };
+                        ctx.tables.push(bound_table);
+
+                        return Ok(BoundFromItem::AnalyticsFunction {
+                            table_idx: idx,
+                            function_name: name.to_ascii_uppercase(),
+                            params: named_params,
+                            positional,
+                            output_columns,
+                        });
                     }
 
                     // First positional arg is the graph schema name.

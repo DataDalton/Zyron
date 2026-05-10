@@ -250,6 +250,17 @@ pub enum PhysicalPlan {
         cost: PlanCost,
     },
 
+    /// Analytics table-returning function (COHORT_RETENTION,
+    /// FUNNEL_ANALYSIS, DATA_PROFILE, COLUMN_PROFILE, CORRELATION_MATRIX).
+    /// Resolved by the binder against the analytics function registry.
+    AnalyticsTableFunction {
+        function_name: String,
+        named_args: Vec<(String, BoundExpr)>,
+        positional_args: Vec<BoundExpr>,
+        output_columns: Vec<LogicalColumn>,
+        cost: PlanCost,
+    },
+
     /// Window function evaluation over partitioned and ordered input.
     /// Drains the child, sorts by (partition_by, order_by), applies each
     /// window function per-partition, and appends result columns.
@@ -329,6 +340,7 @@ impl PhysicalPlan {
             | PhysicalPlan::VectorScan { cost, .. }
             | PhysicalPlan::SpatialScan { cost, .. }
             | PhysicalPlan::GraphAlgorithm { cost, .. }
+            | PhysicalPlan::AnalyticsTableFunction { cost, .. }
             | PhysicalPlan::Window { cost, .. } => cost,
         }
     }
@@ -416,6 +428,7 @@ impl PhysicalPlan {
             | PhysicalPlan::VectorScan { columns, .. }
             | PhysicalPlan::SpatialScan { columns, .. } => columns.clone(),
             PhysicalPlan::GraphAlgorithm { output_columns, .. } => output_columns.clone(),
+            PhysicalPlan::AnalyticsTableFunction { output_columns, .. } => output_columns.clone(),
             PhysicalPlan::Window {
                 window_exprs,
                 window_names,
@@ -452,7 +465,8 @@ impl PhysicalPlan {
             | PhysicalPlan::FulltextScan { .. }
             | PhysicalPlan::VectorScan { .. }
             | PhysicalPlan::SpatialScan { .. }
-            | PhysicalPlan::GraphAlgorithm { .. } => PlanCost::zero(),
+            | PhysicalPlan::GraphAlgorithm { .. }
+            | PhysicalPlan::AnalyticsTableFunction { .. } => PlanCost::zero(),
             PhysicalPlan::Filter { child, .. }
             | PhysicalPlan::Project { child, .. }
             | PhysicalPlan::HashAggregate { child, .. }

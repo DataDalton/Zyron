@@ -193,6 +193,15 @@ pub struct ServerState {
     /// Manual VACUUM CAS-acquires this flag and returns a Notice if already
     /// held, the background worker checks it at the top of each cycle
     pub vacuum_running: Arc<std::sync::atomic::AtomicBool>,
+
+    // -----------------------------------------------------------------------
+    // Analytics
+    // -----------------------------------------------------------------------
+    /// Analytics function catalog. Populated at startup with the default
+    /// table-returning analytical functions (COHORT_RETENTION, FUNNEL_ANALYSIS,
+    /// DATA_PROFILE, COLUMN_PROFILE, CORRELATION_MATRIX) and the period and
+    /// statistical window/scalar functions (YOY, MOM, ZSCORE, CORR, ...).
+    pub analytics_registry: Arc<zyron_analytics::AnalyticsRegistry>,
 }
 
 /// RAII guard that releases the vacuum_running flag on drop, so a panic

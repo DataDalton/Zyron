@@ -253,6 +253,18 @@ fn build_from_item(item: &BoundFromItem) -> Result<LogicalPlan> {
             params: params.clone(),
             output_columns: output_columns.clone(),
         }),
+        BoundFromItem::AnalyticsFunction {
+            function_name,
+            params,
+            positional,
+            output_columns,
+            ..
+        } => Ok(LogicalPlan::AnalyticsTableFunction {
+            function_name: function_name.clone(),
+            named_args: params.clone(),
+            positional_args: positional.clone(),
+            output_columns: output_columns.clone(),
+        }),
     }
 }
 

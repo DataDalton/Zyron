@@ -334,6 +334,25 @@ fn build_operator_tree(
                 Ok(br.with_metrics("GraphAlgorithm", analyze, vec![]))
             }
 
+            PhysicalPlan::AnalyticsTableFunction {
+                function_name,
+                named_args,
+                positional_args,
+                output_columns,
+                ..
+            } => {
+                use crate::operator::analytics_table_fn::AnalyticsTableFunctionOperator;
+                let op = AnalyticsTableFunctionOperator::new(
+                    Arc::clone(&ctx),
+                    function_name,
+                    named_args,
+                    positional_args,
+                    output_columns,
+                );
+                let br = BuildResult::new(Box::new(op));
+                Ok(br.with_metrics("AnalyticsTableFunction", analyze, vec![]))
+            }
+
             PhysicalPlan::Filter {
                 predicate, child, ..
             } => {
@@ -841,9 +860,9 @@ fn build_system_time_predicate(
     entry: &zyron_catalog::TableEntry,
     ts_micros: i64,
 ) -> Result<zyron_planner::binder::BoundExpr> {
-    use zyron_planner::binder::{BoundExpr, ColumnRef};
-    use zyron_parser::ast::{BinaryOperator, LiteralValue};
     use zyron_common::TypeId;
+    use zyron_parser::ast::{BinaryOperator, LiteralValue};
+    use zyron_planner::binder::{BoundExpr, ColumnRef};
 
     let sys_start = entry
         .columns
@@ -926,9 +945,9 @@ fn combine_with_and(
     left: zyron_planner::binder::BoundExpr,
     right: zyron_planner::binder::BoundExpr,
 ) -> zyron_planner::binder::BoundExpr {
-    use zyron_planner::binder::BoundExpr;
-    use zyron_parser::ast::BinaryOperator;
     use zyron_common::TypeId;
+    use zyron_parser::ast::BinaryOperator;
+    use zyron_planner::binder::BoundExpr;
     BoundExpr::BinaryOp {
         left: Box::new(left),
         op: BinaryOperator::And,

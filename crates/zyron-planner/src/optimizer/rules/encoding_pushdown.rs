@@ -330,7 +330,8 @@ impl EncodingPushdown {
             // Leaf nodes: no transformation
             LogicalPlan::Scan { .. }
             | LogicalPlan::Values { .. }
-            | LogicalPlan::GraphAlgorithm { .. } => None,
+            | LogicalPlan::GraphAlgorithm { .. }
+            | LogicalPlan::AnalyticsTableFunction { .. } => None,
         }
     }
 }

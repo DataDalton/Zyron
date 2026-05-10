@@ -66,7 +66,8 @@ impl IndexAdvisor {
             }
             LogicalPlan::Scan { .. }
             | LogicalPlan::Values { .. }
-            | LogicalPlan::GraphAlgorithm { .. } => {}
+            | LogicalPlan::GraphAlgorithm { .. }
+            | LogicalPlan::AnalyticsTableFunction { .. } => {}
             LogicalPlan::Project { child, .. }
             | LogicalPlan::Sort { child, .. }
             | LogicalPlan::Limit { child, .. }

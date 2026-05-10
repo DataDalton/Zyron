@@ -11,7 +11,8 @@ pub mod types;
 pub mod zerocopy;
 
 pub use checksum::{
-    ALGORITHM_VERSION, Hasher, ZyBuildHasher, ZyBuildHasherSeeded, hash32, hash32_seeded, hash64,
+    ALGORITHM_VERSION, FX_K, Hasher, IdentityBuildHasher, IdentityHasher, PreHashMap,
+    ZyBuildHasher, ZyBuildHasherSeeded, fx_finalize, fx_mix, hash32, hash32_seeded, hash64,
     hash64_seeded, hash128, hash128_seeded,
 };
 pub use config::{ServerConfig, StorageConfig};

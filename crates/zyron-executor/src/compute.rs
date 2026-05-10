@@ -6,40 +6,15 @@
 //! ScalarValue intermediaries.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
 
 use zyron_common::{Result, TypeId, ZyronError};
 
+// Re-export the canonical IdentityHasher / PreHashMap from zyron-common so
+// existing call sites (aggregate, distinct, setop) stay unchanged. The one
+// definition lives in zyron-common alongside the FxHash mixing primitives.
+pub use zyron_common::{IdentityHasher, PreHashMap};
+
 use crate::column::{Column, ColumnData, NullBitmap, ScalarValue};
-
-// ---------------------------------------------------------------------------
-// Identity hasher for pre-computed u64 hashes
-// ---------------------------------------------------------------------------
-
-/// Hasher that uses a pre-computed u64 hash value directly, avoiding
-/// double-hashing when the HashMap key is already a well-distributed hash.
-#[derive(Default)]
-pub struct IdentityHasher(u64);
-
-impl Hasher for IdentityHasher {
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, _bytes: &[u8]) {
-        // u64 keys call write_u64 directly.
-    }
-
-    #[inline]
-    fn write_u64(&mut self, i: u64) {
-        self.0 = i;
-    }
-}
-
-/// HashMap type using pre-computed hash keys without re-hashing.
-pub type PreHashMap<K, V> = HashMap<K, V, BuildHasherDefault<IdentityHasher>>;
 
 // ---------------------------------------------------------------------------
 // Comparison kernels

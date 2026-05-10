@@ -5,6 +5,7 @@
 //! its children on demand.
 
 pub mod aggregate;
+pub mod analytics_table_fn;
 pub mod distinct;
 pub mod filter;
 pub mod fts_scan;

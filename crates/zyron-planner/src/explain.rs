@@ -484,6 +484,26 @@ impl ExplainNode {
                 actual_metrics: None,
                 children: Vec::new(),
             },
+            PhysicalPlan::AnalyticsTableFunction {
+                function_name,
+                named_args,
+                positional_args,
+                cost,
+                ..
+            } => Self {
+                operator_name: "AnalyticsTableFunction".to_string(),
+                details: vec![
+                    ("function".to_string(), function_name.clone()),
+                    ("named_args".to_string(), format!("{}", named_args.len())),
+                    (
+                        "positional_args".to_string(),
+                        format!("{}", positional_args.len()),
+                    ),
+                ],
+                estimated_cost: Some(*cost),
+                actual_metrics: None,
+                children: Vec::new(),
+            },
             PhysicalPlan::Window {
                 window_exprs,
                 child,

@@ -798,6 +798,7 @@ impl Server {
             heap_files: Arc::new(scc::HashMap::new()),
             btree_indexes: Arc::new(scc::HashMap::new()),
             vacuum_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            analytics_registry: zyron_analytics::default_registry(),
         });
 
         // -------------------------------------------------------------------

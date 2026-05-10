@@ -1,0 +1,164 @@
+
+=== Test 1: ROLLUP Correctness ===
+  Grouping sets expanded: 4
+  Grand total = 2747500.00 (expected 2747500.00)
+  Region subtotal rows: 5, sum 2747500.00
+  Hierarchical subtotals verified: PASS
+  GROUPING() flag values verified: PASS
+
+=== Test 2: CUBE Correctness ===
+  Grouping sets expanded: 4
+  GROUPING_ID(grand_total) = 0b11
+  CUBE all combinations present: PASS
+  GROUPING_ID bitmasks verified: PASS
+
+=== Test 3: GROUPING SETS Correctness ===
+  3 distinct grouping types observed: PASS
+  Grand total matches input sum: PASS
+
+=== Test 4: Period-over-Period Comparisons ===
+  YOY value alignment verified for 24 months: PASS
+  YOY_GROWTH percentage verified: PASS
+  MOM previous-month value verified: PASS
+  YTD_SUM resets at year boundary: PASS
+  QTD_SUM bucket boundaries verified: PASS
+  PERIOD_COMPARE generic invocation verified: PASS
+
+=== Test 5: Cohort Retention Correctness ===
+  Generated 2660 events for 1000 users
+  Cohorts: 10, periods per cohort: 12
+  Each user assigned to exactly one cohort: PASS
+  month_0 values are 100% of each cohort's size: PASS
+  Non-monotonic cohort steps: 3
+  Retention decreases over time: PASS
+
+=== Test 6: Funnel Analysis Correctness ===
+  Generated 2978 events across 1000 users
+  page_view      users= 1000 conv=1.000 drop=0.000
+  add_to_cart    users=  961 conv=0.961 drop=0.039
+  checkout       users=  642 conv=0.668 drop=0.332
+  purchase       users=  325 conv=0.506 drop=0.494
+  Step counts are monotonically non-increasing: PASS
+  Drop-off + conversion sums to 1.0 per step: PASS
+  step2=642 step3=325 drop=317 late_events=50
+  Window constraint excludes late events: PASS
+
+=== Test 7: Data Profiling Correctness ===
+  revenue null_count: profile=5000 actual=5000
+  revenue distinct: estimate=4811 actual=4750 err=0.0128
+  revenue p50: estimate=2524.00 actual=2526.00 err=0.0008
+  MCV count: 64
+  All column-level statistics verified: PASS
+
+=== Test 8: Outlier Detection Correctness ===
+  ZSCORE: 10/10 injected outliers exceed |z|>3
+  ZSCORE false positives on normal data: 0
+  IQR_OUTLIER: 10 injected detected, 0 false positives in normal data
+  MAD_OUTLIER: 10 injected detected
+  All outlier detectors verified: PASS
+
+=== Test 9: Correlation Correctness ===
+  CORR perfect=1.000000 anti=-1.000000 indep=-0.010949
+  Matrix [0,1]=1.0000 [0,2]=-1.0000 [1,2]=-1.0000
+  CORRELATION_MATRIX symmetry + diagonal verified: PASS
+
+=== Test 10: ROLLUP Performance (1M rows, 3 cols) ===
+  Run 1: 59.59ms
+  Run 2: 46.48ms
+  Run 3: 40.66ms
+  Run 4: 41.03ms
+  Run 5: 41.16ms
+  Latency (ms) [PASS/OK]:
+    Runs: [60, 46, 41, 41, 41]
+    Average: 46 <= 200 (target)
+    Min/Max: 41 / 60, StdDev: 7
+
+=== Test 11: CUBE Performance (1M rows, 3 cols) ===
+  Run 1: 89.78ms
+  Run 2: 91.52ms
+  Run 3: 91.96ms
+  Run 4: 91.10ms
+  Run 5: 90.99ms
+  Latency (ms) [PASS/OK]:
+    Runs: [90, 92, 92, 91, 91]
+    Average: 91 <= 500 (target)
+    Min/Max: 90 / 92, StdDev: 1
+
+=== Test 12: YOY Performance (10M rows) ===
+  Run 1: 92.05ms
+  Run 2: 94.87ms
+  Run 3: 95.25ms
+  Run 4: 94.49ms
+  Run 5: 93.22ms
+  Latency (ms) [PASS/OK]:
+    Runs: [92, 95, 95, 94, 93]
+    Average: 94 <= 2,000 (target)
+    Min/Max: 92 / 95, StdDev: 1
+
+=== Test 13: Cohort Retention Performance (10M events) ===
+  Generated 2693764 events
+  Run 1: 677.58ms
+  Run 2: 706.63ms
+  Run 3: 651.77ms
+  Run 4: 671.30ms
+  Run 5: 661.17ms
+  Latency (ms) [PASS/OK]:
+    Runs: [678, 707, 652, 671, 661]
+    Average: 674 <= 10,000 (target)
+    Min/Max: 652 / 707, StdDev: 19
+
+=== Test 14: Funnel Performance (10M events, 5 steps) ===
+  Total events: 11799916
+  Run 1: 744.05ms
+  Run 2: 726.96ms
+  Run 3: 746.12ms
+  Run 4: 739.59ms
+  Run 5: 742.80ms
+  Latency (ms) [PASS/OK]:
+    Runs: [744, 727, 746, 740, 743]
+    Average: 740 <= 5,000 (target)
+    Min/Max: 727 / 746, StdDev: 7
+
+=== Test 15: DATA_PROFILE Performance (10M rows, 20 cols) ===
+  Run 1: 1865.57ms
+  Run 2: 1848.71ms
+  Run 3: 1840.02ms
+  Run 4: 1845.18ms
+  Run 5: 1842.84ms
+  Latency (ms) [PASS/OK]:
+    Runs: [1,866, 1,849, 1,840, 1,845, 1,843]
+    Average: 1,848 <= 30,000 (target)
+    Min/Max: 1,840 / 1,866, StdDev: 9
+
+=== Test 16: ZSCORE Performance (10M rows) ===
+  Run 1: 25.99ms
+  Run 2: 25.10ms
+  Run 3: 25.17ms
+  Run 4: 25.55ms
+  Run 5: 25.65ms
+  Latency (ms) [PASS/OK]:
+    Runs: [26, 25, 25, 26, 26]
+    Average: 25 <= 500 (target)
+    Min/Max: 25 / 26, StdDev: 0
+
+=== Test 17: CORR Performance (10M rows) ===
+  Run 1: 33.29ms
+  Run 2: 34.78ms
+  Run 3: 37.82ms
+  Run 4: 36.21ms
+  Run 5: 36.18ms
+  Latency (ms) [PASS/OK]:
+    Runs: [33, 35, 38, 36, 36]
+    Average: 36 <= 300 (target)
+    Min/Max: 33 / 38, StdDev: 2
+
+=== Test 18: CORRELATION_MATRIX Performance (20 cols) ===
+  Run 1: 34.97ms
+  Run 2: 35.35ms
+  Run 3: 34.53ms
+  Run 4: 34.77ms
+  Run 5: 35.00ms
+  Latency (ms) [PASS/OK]:
+    Runs: [35, 35, 35, 35, 35]
+    Average: 35 <= 5,000 (target)
+    Min/Max: 35 / 35, StdDev: 0

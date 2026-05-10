@@ -269,6 +269,7 @@ fn logical_op_name(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::Update { .. } => "Update",
         LogicalPlan::Delete { .. } => "Delete",
         LogicalPlan::GraphAlgorithm { .. } => "GraphAlgorithm",
+        LogicalPlan::AnalyticsTableFunction { .. } => "AnalyticsTableFunction",
     }
 }
 

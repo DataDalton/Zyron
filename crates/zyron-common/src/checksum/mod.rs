@@ -410,6 +410,90 @@ impl std::hash::BuildHasher for ZyBuildHasher {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Hot-path hash primitives
+// ---------------------------------------------------------------------------
+//
+// The Hasher above is sized for KB-and-up inputs (file checksums, large
+// records). For tight per-record loops (hash joins, HashAggregate, distinct,
+// set ops, name-keyed lookups, analytics grouping) the project's canonical
+// pattern is:
+//
+//   1. Compute a u64 hash inline with a rotate-xor-multiply mix
+//      (constants kept identical to the catalog cache and executor compute
+//      kernels for cross-component consistency).
+//   2. Store it in a HashMap whose hasher is `IdentityHasher`, which passes
+//      the u64 through unchanged so the table never re-hashes.
+
+/// Mixing constant used by fx_mix and fx_finalize. Matches the constant
+/// the catalog cache and executor compute kernels use so cross-component
+/// hashes agree.
+pub const FX_K: u64 = 0x517cc1b727220a95;
+
+/// Single-step mix: rotate the running hash, xor in the byte/word, multiply
+/// by the mixing constant. Use this in tight loops over records or bytes
+/// to build a u64 hash without allocation.
+#[inline(always)]
+pub fn fx_mix(h: u64, b: u64) -> u64 {
+    (h.rotate_left(5) ^ b).wrapping_mul(FX_K)
+}
+
+/// Avalanche finalizer for an fx_mix-built u64. Spreads bits so the result
+/// is well-distributed across the lower bits used by HashMap bucket
+/// selection.
+#[inline(always)]
+pub fn fx_finalize(mut h: u64) -> u64 {
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51afd7ed558ccd);
+    h ^= h >> 33;
+    h
+}
+
+/// Hasher that returns a pre-computed u64 unchanged. Use with HashMap when
+/// the key is itself a well-distributed hash (fx_mix output, name_key,
+/// analytics grouping hash) so the table avoids re-hashing it.
+#[derive(Default)]
+pub struct IdentityHasher(u64);
+
+impl std::hash::Hasher for IdentityHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    /// Fallback for callers that did not pre-hash. Folds bytes via fx_mix
+    /// so HashMap behavior is correct even when callers use the stdlib
+    /// Hash derive on non-u64 keys.
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0;
+        for &b in bytes {
+            h = fx_mix(h, b as u64);
+        }
+        self.0 = h;
+    }
+    #[inline]
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n;
+    }
+}
+
+/// `BuildHasher` adapter that constructs `IdentityHasher` instances.
+#[derive(Clone, Copy, Default)]
+pub struct IdentityBuildHasher;
+
+impl std::hash::BuildHasher for IdentityBuildHasher {
+    type Hasher = IdentityHasher;
+    #[inline]
+    fn build_hasher(&self) -> IdentityHasher {
+        IdentityHasher(0)
+    }
+}
+
+/// HashMap parameterised on the identity hasher. Use when the key is a
+/// pre-hashed u64; the table performs no additional hashing on lookup or
+/// insert.
+pub type PreHashMap<K, V> =
+    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<IdentityHasher>>;
+
 /// Seeded `BuildHasher` for callers that want randomized hash-map hashing.
 #[derive(Clone, Copy)]
 pub struct ZyBuildHasherSeeded {

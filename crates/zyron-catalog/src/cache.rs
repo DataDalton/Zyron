@@ -11,61 +11,21 @@ use crate::ids::*;
 use crate::schema::*;
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-// ---------------------------------------------------------------------------
-// Fast hash + identity hasher for zero-allocation, zero-double-hash lookups
-// ---------------------------------------------------------------------------
+use zyron_common::{FX_K, IdentityBuildHasher, fx_finalize, fx_mix};
 
 /// FxHash-style rotate-xor-multiply hash for (u32 id, name) pairs.
 /// Produces well-distributed u64 keys for catalog name lookups without
-/// allocation. Not cryptographic, but collision-safe because all reads
-/// verify the actual entry name before returning.
+/// allocation. Reads verify the actual entry name so collisions are safe.
 #[inline]
 fn name_key(id: u32, name: &str) -> u64 {
-    const K: u64 = 0x517cc1b727220a95;
-    let mut h = (id as u64).wrapping_mul(K);
+    let mut h = (id as u64).wrapping_mul(FX_K);
     for &b in name.as_bytes() {
-        h = (h.rotate_left(5) ^ b as u64).wrapping_mul(K);
+        h = fx_mix(h, b as u64);
     }
-    // Avalanche mix for good bit distribution across scc shards
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xff51afd7ed558ccd);
-    h ^= h >> 33;
-    h
-}
-
-/// Passes pre-hashed u64 keys through without re-hashing.
-/// Safe because name_key() already produces well-distributed output.
-#[derive(Default)]
-struct IdentityHasher(u64);
-
-impl Hasher for IdentityHasher {
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, _bytes: &[u8]) {}
-
-    #[inline]
-    fn write_u64(&mut self, n: u64) {
-        self.0 = n;
-    }
-}
-
-#[derive(Clone, Default)]
-struct IdentityBuildHasher;
-
-impl BuildHasher for IdentityBuildHasher {
-    type Hasher = IdentityHasher;
-
-    #[inline]
-    fn build_hasher(&self) -> IdentityHasher {
-        IdentityHasher(0)
-    }
+    fx_finalize(h)
 }
 
 type NameMap<V> = scc::HashMap<u64, V, IdentityBuildHasher>;
@@ -585,16 +545,10 @@ impl CatalogCache {
             by_pub.get(&publication_id).cloned().unwrap_or_default()
         };
         let store = self.publication_tables.read();
-        ids.iter()
-            .filter_map(|id| store.get(id).cloned())
-            .collect()
+        ids.iter().filter_map(|id| store.get(id).cloned()).collect()
     }
 
-    pub fn invalidate_publication_table(
-        &self,
-        publication_id: PublicationId,
-        table_id: TableId,
-    ) {
+    pub fn invalidate_publication_table(&self, publication_id: PublicationId, table_id: TableId) {
         let mut drop_id: Option<u32> = None;
         {
             let store = self.publication_tables.read();
@@ -663,9 +617,7 @@ impl CatalogCache {
             by_pub.get(&pub_id).cloned().unwrap_or_default()
         };
         let store = self.subscriptions.read();
-        ids.iter()
-            .filter_map(|id| store.get(id).cloned())
-            .collect()
+        ids.iter().filter_map(|id| store.get(id).cloned()).collect()
     }
 
     pub fn invalidate_subscription(&self, id: SubscriptionId) {
