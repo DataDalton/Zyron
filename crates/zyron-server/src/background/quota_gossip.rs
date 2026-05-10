@@ -138,7 +138,10 @@ impl HttpQuotaGossipTransport {
     pub fn start(config: HttpTransportConfig) -> Result<Self, std::io::Error> {
         use std::net::TcpListener;
         let listener = TcpListener::bind(&config.bind_addr)?;
-        listener.set_nonblocking(true)?;
+        // Blocking accept, the thread sleeps in the kernel until a peer
+        // connects rather than busy-polling at a fixed cadence. Shutdown
+        // is signalled by connecting to the bound address from shutdown(),
+        // which unblocks the accept and lets the loop observe the flag
         let bound_addr = listener.local_addr()?;
 
         let inbound = Arc::new(HttpInboundQueue::new());
@@ -172,24 +175,22 @@ impl HttpQuotaGossipTransport {
         timeout: Duration,
     ) {
         loop {
+            // accept() blocks in the kernel, no CPU polling. shutdown()
+            // wakes us by opening a connection to the bound address
+            let (mut stream, _peer) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
             if shutdown.load(Ordering::Acquire) {
                 return;
             }
-            match listener.accept() {
-                Ok((mut stream, _peer)) => {
-                    let _ = stream.set_read_timeout(Some(timeout));
-                    let _ = stream.set_write_timeout(Some(timeout));
-                    if let Some(frame) = read_http_post_json::<QuotaGossipFrameWire>(&mut stream) {
-                        inbound.push(frame.into());
-                        let _ = write_http_response(&mut stream, 200, "OK", b"");
-                    } else {
-                        let _ = write_http_response(&mut stream, 400, "Bad Request", b"");
-                    }
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(_) => return,
+            let _ = stream.set_read_timeout(Some(timeout));
+            let _ = stream.set_write_timeout(Some(timeout));
+            if let Some(frame) = read_http_post_json::<QuotaGossipFrameWire>(&mut stream) {
+                inbound.push(frame.into());
+                let _ = write_http_response(&mut stream, 200, "OK", b"");
+            } else {
+                let _ = write_http_response(&mut stream, 400, "Bad Request", b"");
             }
         }
     }
@@ -202,8 +203,15 @@ impl HttpQuotaGossipTransport {
     /// Stops the listener thread and waits for it to exit
     pub fn shutdown(&self) {
         self.listener_shutdown.store(true, Ordering::Release);
+        // Wake the listener thread out of accept() by opening a dummy
+        // connection to the bound address. The loop checks the shutdown
+        // flag immediately after accept returns and exits cleanly
+        if let Ok(stream) =
+            std::net::TcpStream::connect_timeout(&self.bound_addr, Duration::from_millis(500))
+        {
+            drop(stream);
+        }
         if let Some(handle) = self.listener.lock().take() {
-            // The accept loop polls shutdown every ~50ms; join with bounded patience
             let _ = handle.join();
         }
     }

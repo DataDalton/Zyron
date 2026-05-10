@@ -113,7 +113,7 @@ async fn setup_catalog(
         .await
         .unwrap();
     let public_schema_id = catalog
-        .create_schema(SYSTEM_DATABASE_ID, "public", "system")
+        .create_schema(SYSTEM_DATABASE_ID, "planner_test", "system")
         .await
         .unwrap();
     (disk, pool, wal, catalog, public_schema_id)
@@ -205,15 +205,20 @@ fn parse_sql(sql: &str) -> zyron_parser::Statement {
 /// Runs the full planner pipeline: parse -> bind -> logical -> optimize -> physical.
 async fn plan_sql(catalog: &Catalog, sql: &str) -> PhysicalPlan {
     let stmt = parse_sql(sql);
-    zyron_planner::plan(catalog, DatabaseId(1), vec!["public".to_string()], stmt)
-        .await
-        .unwrap()
+    zyron_planner::plan(
+        catalog,
+        DatabaseId(1),
+        vec!["planner_test".to_string()],
+        stmt,
+    )
+    .await
+    .unwrap()
 }
 
 /// Binds a parsed statement without further planning.
 async fn bind_sql(catalog: &Catalog, sql: &str) -> BoundStatement {
     let stmt = parse_sql(sql);
-    let resolver = catalog.resolver(DatabaseId(1), vec!["public".to_string()]);
+    let resolver = catalog.resolver(DatabaseId(1), vec!["planner_test".to_string()]);
     let mut binder = Binder::new(resolver, catalog);
     binder.bind(stmt).await.unwrap()
 }
@@ -490,7 +495,7 @@ async fn test_binding() {
     // Bind: SELECT nonexistent FROM users -> error
     tprintln!("  Binding: SELECT nonexistent FROM users (expect error)");
     let stmt = parse_sql("SELECT nonexistent FROM users");
-    let resolver = catalog.resolver(DatabaseId(1), vec!["public".to_string()]);
+    let resolver = catalog.resolver(DatabaseId(1), vec!["planner_test".to_string()]);
     let mut binder = Binder::new(resolver, &catalog);
     let result = binder.bind(stmt).await;
     assert!(result.is_err(), "should fail for nonexistent column");
@@ -499,7 +504,7 @@ async fn test_binding() {
     // Bind: SELECT id FROM nonexistent -> error
     tprintln!("  Binding: SELECT id FROM nonexistent (expect error)");
     let stmt = parse_sql("SELECT id FROM nonexistent");
-    let resolver = catalog.resolver(DatabaseId(1), vec!["public".to_string()]);
+    let resolver = catalog.resolver(DatabaseId(1), vec!["planner_test".to_string()]);
     let mut binder = Binder::new(resolver, &catalog);
     let result = binder.bind(stmt).await;
     assert!(result.is_err(), "should fail for nonexistent table");
@@ -1291,7 +1296,7 @@ async fn test_bench_planner_performance() {
         let start = Instant::now();
         for _ in 0..iterations {
             let stmt = parse_sql(bind_sql_str);
-            let resolver = catalog.resolver(DatabaseId(1), vec!["public".to_string()]);
+            let resolver = catalog.resolver(DatabaseId(1), vec!["planner_test".to_string()]);
             let mut binder = Binder::new(resolver, &catalog);
             let _ = binder.bind(stmt).await.unwrap();
         }

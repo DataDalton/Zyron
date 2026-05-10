@@ -282,18 +282,16 @@ pub fn infer_types_scalar_return_type(name: &str, arg_types: &[TypeId]) -> Optio
         "outlier_detect_zscore" | "outlier_detect_iqr" => Some(TypeId::Array),
 
         // ---------- window functions (routed through BoundExpr::WindowFunction) ----------
-        // These can also appear as bare function calls; return types are declared here
-        // so the binder can resolve them when nested inside a WindowFunction wrapper.
+        // These can also appear as bare function calls, return types are declared
+        // here so the binder can resolve them when nested inside a WindowFunction
+        // wrapper. moving_average and exponential_smoothing are intentionally
+        // omitted, the scalar/aggregate form returns Array (declared in the
+        // statistics group above), the Float64 per-window form is registered in
+        // infer_types_window_return_type
         "row_number" | "rank" | "dense_rank" | "ntile" => Some(TypeId::Int64),
-        "percent_rank"
-        | "cume_dist"
-        | "ema"
-        | "rate"
-        | "delta"
-        | "derivative"
-        | "moving_average"
-        | "moving_avg"
-        | "exponential_smoothing" => Some(TypeId::Float64),
+        "percent_rank" | "cume_dist" | "ema" | "rate" | "delta" | "derivative" | "moving_avg" => {
+            Some(TypeId::Float64)
+        }
         "lag" | "lead" | "first_value" | "last_value" | "nth_value" => {
             arg_types.first().copied().or(Some(TypeId::Null))
         }

@@ -791,10 +791,9 @@ pub unsafe fn serialize_raw_deferred(
 /// Each record's checksum is computed from its header + payload bytes using
 /// `wal_checksum`, then written into the 4-byte placeholder at the end of
 /// each record.
-pub fn backfill_checksums(buf: &mut [u8]) -> usize {
+pub fn backfill_checksums(buf: &mut [u8]) {
     let len = buf.len();
     let mut offset = 0;
-    let mut count = 0usize;
 
     while offset + HEADER_SIZE + CHECKSUM_SIZE <= len {
         // Read payload_len from header
@@ -817,9 +816,7 @@ pub fn backfill_checksums(buf: &mut [u8]) -> usize {
         buf[checksum_offset..checksum_offset + 4].copy_from_slice(&checksum.to_le_bytes());
 
         offset += record_size;
-        count += 1;
     }
-    count
 }
 
 #[cfg(test)]

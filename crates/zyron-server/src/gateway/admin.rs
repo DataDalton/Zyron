@@ -1339,7 +1339,7 @@ mod tests {
     use zyron_catalog::schema::{ExternalFormat, TableEntry as CatTable};
     use zyron_catalog::{
         CatalogCache, CatalogClassification, ExternalSinkEntry, ExternalSinkId, HeapCatalogStorage,
-        SchemaId,
+        SYSTEM_DATABASE_ID, SchemaId,
     };
     use zyron_parser::ast::{ColumnDef, DataType};
     use zyron_storage::{DiskManager, DiskManagerConfig, Tuple};
@@ -1350,6 +1350,7 @@ mod tests {
         Arc<Catalog>,
         Arc<DiskManager>,
         Arc<BufferPool>,
+        SchemaId,
     ) {
         let tmp = tempfile::TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -1379,7 +1380,13 @@ mod tests {
             Arc::new(HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap());
         let cache = Arc::new(CatalogCache::new(64, 32));
         let catalog = Arc::new(Catalog::new(storage, cache, wal).await.unwrap());
-        (tmp, catalog, disk, pool)
+        // SchemaId(1) is the reserved zyron_sys schema and rejects user
+        // table creation, so the DLQ fixtures need their own scratch schema
+        let test_schema_id = catalog
+            .create_schema(SYSTEM_DATABASE_ID, "dlq_test", "zyron")
+            .await
+            .unwrap();
+        (tmp, catalog, disk, pool, test_schema_id)
     }
 
     fn dlq_column_defs() -> Vec<ColumnDef> {
@@ -1467,6 +1474,7 @@ mod tests {
     }
 
     fn make_sink_entry(
+        schema_id: SchemaId,
         name: &str,
         backend: ExternalBackend,
         dlq_table: Option<&str>,
@@ -1477,7 +1485,7 @@ mod tests {
         }
         ExternalSinkEntry {
             id: ExternalSinkId(0),
-            schema_id: SchemaId(1),
+            schema_id,
             name: name.to_string(),
             backend,
             uri: "zyron://user@127.0.0.1:1/db".to_string(),
@@ -1495,7 +1503,7 @@ mod tests {
 
     #[tokio::test]
     async fn replay_dlq_missing_sink_returns_404() {
-        let (_tmp, catalog, _disk, _pool) = build_test_harness().await;
+        let (_tmp, catalog, _disk, _pool, _schema_id) = build_test_harness().await;
         let exec = AdminExecutor::new(catalog, None, None, None);
         let resp = exec.replay_dlq("nonexistent_sink", 1000, 0).await;
         assert_eq!(resp.status, 404);
@@ -1503,8 +1511,8 @@ mod tests {
 
     #[tokio::test]
     async fn replay_dlq_non_zyron_sink_returns_400() {
-        let (_tmp, catalog, _disk, _pool) = build_test_harness().await;
-        let entry = make_sink_entry("file_sink", ExternalBackend::File, None);
+        let (_tmp, catalog, _disk, _pool, _schema_id) = build_test_harness().await;
+        let entry = make_sink_entry(_schema_id, "file_sink", ExternalBackend::File, None);
         catalog.create_external_sink(entry).await.unwrap();
         let exec = AdminExecutor::new(catalog, None, None, None);
         let resp = exec.replay_dlq("file_sink", 1000, 0).await;
@@ -1517,8 +1525,8 @@ mod tests {
 
     #[tokio::test]
     async fn replay_dlq_empty_table_returns_zero() {
-        let (_tmp, catalog, disk, pool) = build_test_harness().await;
-        let entry = make_sink_entry("s1", ExternalBackend::Zyron, Some("s1_dlq"));
+        let (_tmp, catalog, disk, pool, schema_id) = build_test_harness().await;
+        let entry = make_sink_entry(schema_id, "s1", ExternalBackend::Zyron, Some("s1_dlq"));
         catalog.create_external_sink(entry).await.unwrap();
 
         let recorded = StdArc::new(PlMutex::new(Vec::new()));
@@ -1542,12 +1550,12 @@ mod tests {
 
     #[tokio::test]
     async fn replay_dlq_writes_to_sink_client_and_deletes() {
-        let (_tmp, catalog, disk, pool) = build_test_harness().await;
+        let (_tmp, catalog, disk, pool, schema_id) = build_test_harness().await;
 
         // Create a DLQ table with the known layout.
         let cols = dlq_column_defs();
         let table_id = catalog
-            .create_table(SchemaId(1), "s2_dlq", &cols, &[])
+            .create_table(schema_id, "s2_dlq", &cols, &[])
             .await
             .unwrap();
         let dlq_table: Arc<CatTable> = catalog.get_table_by_id(table_id).unwrap();
@@ -1584,7 +1592,7 @@ mod tests {
         heap.insert_batch(&rows).await.unwrap();
 
         // Register the sink entry.
-        let entry = make_sink_entry("s2", ExternalBackend::Zyron, Some("s2_dlq"));
+        let entry = make_sink_entry(schema_id, "s2", ExternalBackend::Zyron, Some("s2_dlq"));
         catalog.create_external_sink(entry).await.unwrap();
 
         // Wire the recording factory.
@@ -1636,12 +1644,13 @@ mod tests {
         catalog: &Arc<Catalog>,
         disk: &Arc<DiskManager>,
         pool: &Arc<BufferPool>,
+        schema_id: SchemaId,
         table_name: &str,
         n: usize,
     ) -> Arc<CatTable> {
         let cols = dlq_column_defs();
         let table_id = catalog
-            .create_table(SchemaId(1), table_name, &cols, &[])
+            .create_table(schema_id, table_name, &cols, &[])
             .await
             .unwrap();
         let dlq_table: Arc<CatTable> = catalog.get_table_by_id(table_id).unwrap();
@@ -1677,9 +1686,14 @@ mod tests {
 
     #[tokio::test]
     async fn replay_dlq_respects_limit() {
-        let (_tmp, catalog, disk, pool) = build_test_harness().await;
-        let _dlq = seed_dlq_rows(&catalog, &disk, &pool, "limit_sink_dlq", 100).await;
-        let entry = make_sink_entry("limit_sink", ExternalBackend::Zyron, Some("limit_sink_dlq"));
+        let (_tmp, catalog, disk, pool, schema_id) = build_test_harness().await;
+        let _dlq = seed_dlq_rows(&catalog, &disk, &pool, schema_id, "limit_sink_dlq", 100).await;
+        let entry = make_sink_entry(
+            schema_id,
+            "limit_sink",
+            ExternalBackend::Zyron,
+            Some("limit_sink_dlq"),
+        );
         catalog.create_external_sink(entry).await.unwrap();
 
         let recorded = StdArc::new(PlMutex::new(Vec::new()));
@@ -1710,9 +1724,14 @@ mod tests {
 
     #[tokio::test]
     async fn replay_dlq_returns_next_offset() {
-        let (_tmp, catalog, disk, pool) = build_test_harness().await;
-        let _dlq = seed_dlq_rows(&catalog, &disk, &pool, "page_sink_dlq", 50).await;
-        let entry = make_sink_entry("page_sink", ExternalBackend::Zyron, Some("page_sink_dlq"));
+        let (_tmp, catalog, disk, pool, schema_id) = build_test_harness().await;
+        let _dlq = seed_dlq_rows(&catalog, &disk, &pool, schema_id, "page_sink_dlq", 50).await;
+        let entry = make_sink_entry(
+            schema_id,
+            "page_sink",
+            ExternalBackend::Zyron,
+            Some("page_sink_dlq"),
+        );
         catalog.create_external_sink(entry).await.unwrap();
 
         let recorded = StdArc::new(PlMutex::new(Vec::new()));

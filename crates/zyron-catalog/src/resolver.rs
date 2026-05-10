@@ -7,6 +7,7 @@ use crate::cache::CatalogCache;
 use crate::ids::*;
 use crate::schema::*;
 use crate::storage::CatalogStorage;
+use parking_lot::RwLock;
 use std::sync::Arc;
 use zyron_common::{Result, ZyronError};
 
@@ -16,6 +17,11 @@ pub struct NameResolver {
     search_path: Vec<String>,
     cache: Arc<CatalogCache>,
     storage: Arc<dyn CatalogStorage>,
+    /// Cached SchemaId per search_path entry, populated lazily on first
+    /// resolve. None entries either have not been looked up yet or refer to
+    /// a schema that does not exist. Skips one cache lookup + name hash
+    /// per search path entry on the resolve hot path
+    search_path_ids: RwLock<Vec<Option<SchemaId>>>,
 }
 
 impl NameResolver {
@@ -26,11 +32,13 @@ impl NameResolver {
         cache: Arc<CatalogCache>,
         storage: Arc<dyn CatalogStorage>,
     ) -> Self {
+        let len = search_path.len();
         Self {
             database_id,
             search_path,
             cache,
             storage,
+            search_path_ids: RwLock::new(vec![None; len]),
         }
     }
 
@@ -72,12 +80,28 @@ impl NameResolver {
             )));
         }
 
-        for path_schema in &self.search_path {
-            if let Some(schema_entry) = self.cache.get_schema_by_name(self.database_id, path_schema)
-            {
-                if let Some(table) = self.cache.get_table_by_name(schema_entry.id, table_name) {
-                    return Ok(table);
+        // Hot path uses the cached SchemaId for each search-path entry,
+        // skipping the schema name hash + scc shard lookup that would
+        // otherwise dominate the per-call cost
+        for (idx, path_schema) in self.search_path.iter().enumerate() {
+            let cached_id = self.search_path_ids.read().get(idx).copied().flatten();
+            let schema_id = match cached_id {
+                Some(sid) => sid,
+                None => {
+                    let Some(entry) = self.cache.get_schema_by_name(self.database_id, path_schema)
+                    else {
+                        continue;
+                    };
+                    let sid = entry.id;
+                    let mut w = self.search_path_ids.write();
+                    if idx < w.len() {
+                        w[idx] = Some(sid);
+                    }
+                    sid
                 }
+            };
+            if let Some(table) = self.cache.get_table_by_name(schema_id, table_name) {
+                return Ok(table);
             }
         }
 
@@ -127,7 +151,9 @@ impl NameResolver {
 
     /// Sets the search path.
     pub fn set_search_path(&mut self, path: Vec<String>) {
+        let len = path.len();
         self.search_path = path;
+        *self.search_path_ids.get_mut() = vec![None; len];
     }
 
     /// Returns the current search path.

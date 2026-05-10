@@ -3182,10 +3182,26 @@ fn dm_assemble_full_grid(data_grid: &[bool], sym: &DmSymbol) -> Vec<bool> {
     let region_outer_c = inner_c + 2;
     let nrow = sym.nrow as usize;
     let ncol = sym.ncol as usize;
-    debug_assert_eq!(region_outer_r * regions_v, nrow);
-    debug_assert_eq!(region_outer_c * regions_h, ncol);
+    // Region geometry must tile the symbol exactly. Hard-asserting in
+    // release as well as debug because a regression in the symbol table
+    // would otherwise scribble past the grid in the inner write loops
+    assert_eq!(
+        region_outer_r * regions_v,
+        nrow,
+        "DataMatrix symbol nrow does not match region_outer_r * regions_v",
+    );
+    assert_eq!(
+        region_outer_c * regions_h,
+        ncol,
+        "DataMatrix symbol ncol does not match region_outer_c * regions_h",
+    );
 
     let data_per_row = inner_c * regions_h;
+    assert_eq!(
+        data_grid.len(),
+        inner_r * regions_v * data_per_row,
+        "DataMatrix data_grid size does not match symbol inner area",
+    );
     let mut grid = vec![false; nrow * ncol];
 
     for ry in 0..regions_v {

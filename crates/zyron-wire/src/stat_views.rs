@@ -410,7 +410,7 @@ fn build_stat_wal(server: &ServerState) -> (Vec<FieldDescription>, Vec<Vec<Optio
         make_field("last_checkpoint_lsn", PG_INT8_OID, 8),
     ];
 
-    let wal_records = server.wal.wal_records_written.load(Ordering::Relaxed);
+    let wal_records = server.wal.wal_records_written();
     let wal_bytes = server.wal.wal_bytes_written();
     let wal_syncs = server.wal.wal_syncs.load(Ordering::Relaxed);
     let flushed_lsn = server.wal.flushed_lsn().0;

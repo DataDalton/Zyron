@@ -5652,7 +5652,7 @@ mod tests {
 
         let db_id = catalog.create_database("streamdb", "tester").await.unwrap();
         let schema_id = catalog
-            .create_schema(db_id, "public", "tester")
+            .create_schema(db_id, "binder_test", "tester")
             .await
             .unwrap();
 
@@ -5722,7 +5722,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        let resolver = catalog.resolver(db_id, vec!["public".to_string()]);
+        let resolver = catalog.resolver(db_id, vec!["binder_test".to_string()]);
         let mut binder = Binder::new(resolver, &catalog);
         let bound = binder.bind(stmt).await.unwrap();
         match bound {
@@ -5748,7 +5748,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        let resolver = catalog.resolver(db_id, vec!["public".to_string()]);
+        let resolver = catalog.resolver(db_id, vec!["binder_test".to_string()]);
         let mut binder = Binder::new(resolver, &catalog);
         let err = binder.bind(stmt).await.expect_err("bind should fail");
         let msg = format!("{}", err);
@@ -5789,7 +5789,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        let resolver = catalog.resolver(db_id, vec!["public".to_string()]);
+        let resolver = catalog.resolver(db_id, vec!["binder_test".to_string()]);
         let mut binder = Binder::new(resolver, &catalog);
         let bound = binder.bind(stmt).await.expect("bind should succeed");
         match bound {
@@ -5813,7 +5813,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        let resolver = catalog.resolver(db_id, vec!["public".to_string()]);
+        let resolver = catalog.resolver(db_id, vec!["binder_test".to_string()]);
         let mut binder = Binder::new(resolver, &catalog);
         let err = binder.bind(stmt).await.expect_err("bind should fail");
         let msg = format!("{}", err);
@@ -5899,7 +5899,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        let resolver = catalog.resolver(db_id, vec!["public".to_string()]);
+        let resolver = catalog.resolver(db_id, vec!["binder_test".to_string()]);
         let mut binder = Binder::new(resolver, &catalog);
         let bound = binder.bind(stmt).await.unwrap();
         match bound {
@@ -5928,7 +5928,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        let resolver = catalog.resolver(db_id, vec!["public".to_string()]);
+        let resolver = catalog.resolver(db_id, vec!["binder_test".to_string()]);
         let mut binder = Binder::new(resolver, &catalog);
         let bound = binder.bind(stmt).await.unwrap();
         match bound {
@@ -5970,7 +5970,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        let resolver = catalog.resolver(db_id, vec!["public".to_string()]);
+        let resolver = catalog.resolver(db_id, vec!["binder_test".to_string()]);
         let mut binder = Binder::new(resolver, &catalog);
         let err = binder
             .bind(stmt)
@@ -6000,7 +6000,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        let resolver = catalog.resolver(db_id, vec!["public".to_string()]);
+        let resolver = catalog.resolver(db_id, vec!["binder_test".to_string()]);
         let mut binder = Binder::new(resolver, &catalog);
         let err = binder
             .bind(stmt)
@@ -6023,7 +6023,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        let resolver = catalog.resolver(db_id, vec!["public".to_string()]);
+        let resolver = catalog.resolver(db_id, vec!["binder_test".to_string()]);
         let mut binder = Binder::new(resolver, &catalog);
         let bound = binder.bind(stmt).await.unwrap();
         match bound {
@@ -6053,7 +6053,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        let resolver = catalog.resolver(db_id, vec!["public".to_string()]);
+        let resolver = catalog.resolver(db_id, vec!["binder_test".to_string()]);
         let mut binder = Binder::new(resolver, catalog);
         binder.bind(stmt).await.unwrap()
     }
@@ -6068,7 +6068,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        let resolver = catalog.resolver(db_id, vec!["public".to_string()]);
+        let resolver = catalog.resolver(db_id, vec!["binder_test".to_string()]);
         let mut binder = Binder::new(resolver, catalog);
         binder.bind(stmt).await.unwrap_err()
     }
@@ -6316,7 +6316,7 @@ mod tests {
             Err(_) => {}
             Ok(stmts) => {
                 let stmt = stmts.into_iter().next().unwrap();
-                let resolver = catalog.resolver(db_id, vec!["public".to_string()]);
+                let resolver = catalog.resolver(db_id, vec!["binder_test".to_string()]);
                 let mut binder = Binder::new(resolver, &catalog);
                 let err = binder.bind(stmt).await.unwrap_err();
                 assert!(
@@ -6614,7 +6614,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        let resolver = catalog.resolver(db_id, vec!["public".to_string()]);
+        let resolver = catalog.resolver(db_id, vec!["binder_test".to_string()]);
         let mut binder = Binder::new(resolver, &catalog);
         let bound = binder.bind(stmt).await.unwrap();
         let bound_select = match bound {
@@ -6643,7 +6643,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        let resolver = catalog.resolver(db_id, vec!["public".to_string()]);
+        let resolver = catalog.resolver(db_id, vec!["binder_test".to_string()]);
         let mut binder = Binder::new(resolver, &catalog);
         let bound = binder.bind(stmt).await.unwrap();
         let bound_select = match bound {

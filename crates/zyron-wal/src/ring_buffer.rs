@@ -45,6 +45,12 @@ pub struct RingBuffer {
     /// Logically on the same cache line via the commit pairing; keeping it
     /// on its own CachePadded field prevents packing with write_cursor.
     max_lsn: CachePadded<AtomicU64>,
+    /// Total record count committed to the buffer. Updated synchronously in
+    /// commit_write so that observers (zyron_stat_wal, tests) see record
+    /// counts immediately without waiting on the flush thread to drain.
+    /// Co-located with committed_cursor on its own padded line so commit_write
+    /// dirties one cache line per commit, not three
+    committed_records: CachePadded<AtomicU64>,
     /// Read cursor: bytes already drained. Owned by the flush thread;
     /// writers only read it in the slow path (wait_for_space_slow).
     read_cursor: CachePadded<AtomicU64>,
@@ -86,6 +92,7 @@ impl RingBuffer {
             committed_cursor: CachePadded(AtomicU64::new(0)),
             read_cursor: CachePadded(AtomicU64::new(0)),
             max_lsn: CachePadded(AtomicU64::new(0)),
+            committed_records: CachePadded(AtomicU64::new(0)),
             // Initial limit: writers can fill the entire buffer before needing to check.
             safe_write_limit: CachePadded(AtomicU64::new(capacity_bytes as u64)),
         }
@@ -187,11 +194,21 @@ impl RingBuffer {
     /// wait_for_flush retries until the target LSN is reached.
     #[inline]
     pub fn commit_write(&self, size: usize, lsn: Lsn) {
+        self.commit_write_n(size, lsn, 1);
+    }
+
+    /// Same as commit_write but advances the record counter by `records`,
+    /// used by the batch append paths that pack multiple records into a
+    /// single contiguous write
+    #[inline]
+    pub fn commit_write_n(&self, size: usize, lsn: Lsn, records: u32) {
         // committed_cursor Release pairs with drain_into's Acquire load,
         // guaranteeing the max_lsn Relaxed store below is visible to the reader.
         self.committed_cursor
             .fetch_add(size as u64, Ordering::Release);
         self.max_lsn.store(lsn.0, Ordering::Relaxed);
+        self.committed_records
+            .fetch_add(records as u64, Ordering::Relaxed);
     }
 
     /// Drains all committed bytes into `output`.
@@ -259,6 +276,13 @@ impl RingBuffer {
     #[inline]
     pub fn total_committed_bytes(&self) -> u64 {
         self.committed_cursor.load(Ordering::Relaxed)
+    }
+
+    /// Total records committed to the buffer across its lifetime, updated
+    /// synchronously in commit_write so observers see the count immediately
+    #[inline]
+    pub fn total_committed_records(&self) -> u64 {
+        self.committed_records.load(Ordering::Relaxed)
     }
 
     /// Returns true if no data has been committed since the last drain.

@@ -208,11 +208,6 @@ pub struct WalWriter {
     /// Set to true by the flush thread when an I/O error occurs during flush.
     /// Checked by append() to fail fast instead of buffering into a broken WAL.
     flush_io_error: Arc<AtomicBool>,
-    /// Total records written (for zyron_stat_wal). Maintained by the flush
-    /// thread in one atomic-add per drained batch (amortized across all
-    /// records in that batch) instead of per-record in the append() hot path.
-    /// Arc-shared with the flush thread.
-    pub wal_records_written: Arc<AtomicU64>,
     /// Total fsync calls (for zyron_stat_wal). Arc-shared with the flush thread.
     pub wal_syncs: Arc<AtomicU64>,
     /// Retention hook that returns the minimum LSN that must be retained.
@@ -243,7 +238,6 @@ impl WalWriter {
         let rotation = Arc::new(AtomicRotationState::new());
         let flush_io_error = Arc::new(AtomicBool::new(false));
         let wal_syncs = Arc::new(AtomicU64::new(0));
-        let wal_records_written = Arc::new(AtomicU64::new(0));
         let flush_thread = Self::spawn_flush_thread(
             ring_buffer.clone(),
             segment.clone(),
@@ -258,7 +252,6 @@ impl WalWriter {
             config.segment_size,
             flush_io_error.clone(),
             wal_syncs.clone(),
-            wal_records_written.clone(),
         );
 
         Ok(Self {
@@ -274,7 +267,6 @@ impl WalWriter {
             config,
             rotation,
             flush_io_error,
-            wal_records_written,
             wal_syncs,
             retention_hook: parking_lot::RwLock::new(None),
         })
@@ -330,7 +322,6 @@ impl WalWriter {
         segment_size: u32,
         flush_io_error: Arc<AtomicBool>,
         wal_syncs_counter: Arc<AtomicU64>,
-        wal_records_counter: Arc<AtomicU64>,
     ) -> JoinHandle<()> {
         std::thread::spawn(move || {
             // Register this thread for unpark wakeup. The waker is stored in
@@ -400,7 +391,6 @@ impl WalWriter {
                         fsync_enabled,
                         &flush_io_error,
                         &wal_syncs_counter,
-                        &wal_records_counter,
                     );
                     break;
                 }
@@ -417,7 +407,6 @@ impl WalWriter {
                     fsync_enabled,
                     &flush_io_error,
                     &wal_syncs_counter,
-                    &wal_records_counter,
                 );
 
                 // Handle segment rotation only when requested by append().
@@ -537,7 +526,6 @@ impl WalWriter {
         fsync_enabled: bool,
         flush_io_error: &AtomicBool,
         wal_syncs_counter: &AtomicU64,
-        wal_records_counter: &AtomicU64,
     ) {
         batch_buffer.clear();
         // Stage previous-iteration overflow bytes ahead of any new drain
@@ -563,8 +551,7 @@ impl WalWriter {
 
         // Compute checksums for all records in the batch before writing to disk.
         // Deferred from append() hot path to amortize checksum cost in the flush thread
-        let records_in_batch = backfill_checksums(batch_buffer);
-        wal_records_counter.fetch_add(records_in_batch as u64, Ordering::Relaxed);
+        backfill_checksums(batch_buffer);
 
         let mut current_seg_id: u32 = 0;
         let mut overflow = false;
@@ -779,6 +766,13 @@ impl WalWriter {
     #[inline]
     pub fn wal_bytes_written(&self) -> u64 {
         self.ring_buffer.total_committed_bytes()
+    }
+
+    /// Total records written across the writer's lifetime. Updated
+    /// synchronously in commit_write so observers see the count immediately
+    #[inline]
+    pub fn wal_records_written(&self) -> u64 {
+        self.ring_buffer.total_committed_records()
     }
 
     /// Allocates a new transaction ID.
@@ -1026,8 +1020,11 @@ impl WalWriter {
                 buf_offset += rsize;
             }
 
-            self.ring_buffer
-                .commit_write(batch_size as usize, last_record_lsn);
+            self.ring_buffer.commit_write_n(
+                batch_size as usize,
+                last_record_lsn,
+                (batch_end - batch_start) as u32,
+            );
             self.maybe_wake_flush_thread(batch_size as usize);
 
             idx = batch_end;
@@ -1111,8 +1108,11 @@ impl WalWriter {
                 buf_offset += rsize;
             }
 
-            self.ring_buffer
-                .commit_write(batch_size as usize, *lsns.last().unwrap());
+            self.ring_buffer.commit_write_n(
+                batch_size as usize,
+                *lsns.last().unwrap(),
+                (batch_end - batch_start) as u32,
+            );
             self.maybe_wake_flush_thread(batch_size as usize);
 
             idx = batch_end;

@@ -1008,11 +1008,7 @@ async fn test_wal_stats_counters() {
     let wal = Arc::new(zyron_wal::WalWriter::new(config).expect("WAL writer creation failed"));
 
     // Verify initial counters are zero
-    assert_eq!(
-        wal.wal_records_written
-            .load(std::sync::atomic::Ordering::Relaxed),
-        0
-    );
+    assert_eq!(wal.wal_records_written(), 0);
     assert_eq!(wal.wal_bytes_written(), 0);
     tprintln!("  Initial counters at zero: PASS");
 
@@ -1024,9 +1020,7 @@ async fn test_wal_stats_counters() {
             .expect("WAL insert failed");
     }
 
-    let records_written = wal
-        .wal_records_written
-        .load(std::sync::atomic::Ordering::Relaxed);
+    let records_written = wal.wal_records_written();
     let bytes_written = wal.wal_bytes_written();
 
     tprintln!("  After {} inserts:", num_records);
