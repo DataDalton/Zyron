@@ -44,11 +44,18 @@ use zyron_analytics::correlation::{
     CorrelationMatrix, KendallAggregator, PearsonAggregator, SpearmanAggregator,
     correlation_matrix, kendall_tau, mutual_information, pearson_corr,
 };
+use zyron_analytics::featureLineage::{LineageEntry, extractTablesAndColumns};
+use zyron_analytics::featureStore::{FeatureDefinition, FeatureGroup, FeatureStore, FeatureValue};
 use zyron_analytics::funnel::FunnelEvent;
 use zyron_analytics::grouping::{
     Aggregator, GroupingSetExpander, GroupingSetType, GroupingSetsRunner, RowKey, SumAgg,
     expand_grouping_sets, grouping_bit, grouping_id_bits,
 };
+use zyron_analytics::ml::{
+    Hyperparameters, ModelConfig, ModelData, ModelType, TrainingData, decisionTree, kmeans,
+    linearRegression, logisticRegression, randomForest,
+};
+use zyron_analytics::mlInference::{predictBatch, predictOne};
 use zyron_analytics::outlier::{
     IsolationForest, OutlierDecision, ZScoreEvaluator, iqr_outlier, mad_outlier, zscore,
 };
@@ -60,9 +67,12 @@ use zyron_analytics::profiling::{ColumnProfile, TableProfile, column_profile, pr
 use zyron_analytics::registry::{AnalyticsFunctionKind, default_registry};
 use zyron_analytics::value::{AnalyticsRow, AnalyticsValue, MS_PER_DAY, MS_PER_HOUR};
 use zyron_analytics::{
-    CohortAnalysis, CohortDefinition, CohortMetric, CohortPeriod, CohortType, FunnelConfig,
-    FunnelStep, funnel_analysis, retention_analysis,
+    AnomalyMethod, CohortAnalysis, CohortDefinition, CohortMetric, CohortPeriod, CohortType,
+    FeatureLineageRegistry, ForecastMethod, FunnelConfig, FunnelStep, anomalyDetect, arima, ate,
+    diffInDiff, forecast, funnel_analysis, propensityScore, retention_analysis, seasonalDecompose,
+    trend,
 };
+use zyron_common::Xoshiro256pp;
 
 // =============================================================================
 // Performance target constants
@@ -77,6 +87,17 @@ const DATA_PROFILE_TARGET_MS: f64 = 30_000.0;
 const ZSCORE_TARGET_MS: f64 = 500.0;
 const CORR_TARGET_MS: f64 = 300.0;
 const CORRELATION_MATRIX_TARGET_MS: f64 = 5_000.0;
+
+// Feature store and ML targets, 5-run average
+const FEATURE_RETRIEVAL_TARGET_MS: f64 = 200.0;
+const PIT_JOIN_TARGET_MS: f64 = 5_000.0;
+const LINEAR_TRAIN_TARGET_MS: f64 = 500.0;
+const LOGISTIC_TRAIN_TARGET_MS: f64 = 1_000.0;
+const TREE_TRAIN_TARGET_MS: f64 = 2_000.0;
+const BATCH_PREDICT_TARGET_MS: f64 = 2_000.0;
+const SINGLE_PREDICT_TARGET_US: f64 = 100.0;
+const ATE_TARGET_MS: f64 = 5_000.0;
+const FORECAST_TARGET_MS: f64 = 10_000.0;
 
 static BENCHMARK_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1502,4 +1523,972 @@ fn test_18_correlation_matrix_performance() {
         !result.regression_detected,
         "Correlation matrix regression detected"
     );
+}
+
+// =============================================================================
+// Feature store and ML helpers
+// =============================================================================
+
+fn buildOrdersFeatureGroup() -> FeatureGroup {
+    let mut g = FeatureGroup::new("user_features".into(), "user_id".into());
+    g.refreshSeconds = 3600;
+    g.sourceQuery =
+        "SELECT user_id, SUM(amount) AS total_purchases FROM orders GROUP BY user_id".into();
+    g.addFeature(FeatureDefinition::new(
+        "total_purchases".into(),
+        "FLOAT64".into(),
+        "SELECT SUM(amount) FROM orders WHERE user_id = entity.user_id".into(),
+    ));
+    g.addFeature(FeatureDefinition::new(
+        "avg_order_value".into(),
+        "FLOAT64".into(),
+        "SELECT AVG(amount) FROM orders WHERE user_id = entity.user_id".into(),
+    ));
+    g.addFeature(FeatureDefinition::new(
+        "days_since_last_order".into(),
+        "FLOAT64".into(),
+        "SELECT CURRENT_DATE - MAX(order_date) FROM orders WHERE user_id = entity.user_id".into(),
+    ));
+    g.addFeature(FeatureDefinition::new(
+        "order_count".into(),
+        "INT64".into(),
+        "SELECT COUNT(*) FROM orders WHERE user_id = entity.user_id".into(),
+    ));
+    g.addFeature(FeatureDefinition::new(
+        "max_order_value".into(),
+        "FLOAT64".into(),
+        "SELECT MAX(amount) FROM orders WHERE user_id = entity.user_id".into(),
+    ));
+    g
+}
+
+fn fv(ts: i64, v: f64) -> FeatureValue {
+    FeatureValue {
+        computationTimestampMs: ts,
+        validFromMs: ts,
+        validToMs: i64::MAX,
+        value: AnalyticsValue::Float(v),
+        featureVersion: 1,
+    }
+}
+
+fn buildLinearTrainingData(n: usize, seed: u64) -> (Vec<f64>, Vec<f64>) {
+    let mut rng = Xoshiro256pp::fromSeed(seed);
+    let mut xs = Vec::with_capacity(n);
+    let mut ys = Vec::with_capacity(n);
+    for i in 0..n {
+        let x = i as f64 * 0.01;
+        xs.push(x);
+        ys.push(2.0 * x + 3.0 + 0.05 * rng.nextNormal());
+    }
+    (xs, ys)
+}
+
+fn buildClassificationData(n: usize, dims: usize, seed: u64) -> (Vec<f64>, Vec<f64>) {
+    let mut rng = Xoshiro256pp::fromSeed(seed);
+    let mut xs = Vec::with_capacity(n * dims);
+    let mut ys = Vec::with_capacity(n);
+    for _ in 0..n {
+        let cls = rng.nextRange(2) as f64;
+        let mu = if cls == 1.0 { 1.5 } else { -1.5 };
+        for _ in 0..dims {
+            xs.push(mu + 0.7 * rng.nextNormal());
+        }
+        ys.push(cls);
+    }
+    (xs, ys)
+}
+
+fn buildIrisLikeData() -> (Vec<f64>, Vec<f64>, usize) {
+    let mut rng = Xoshiro256pp::fromSeed(303);
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    for cls in 0..3u64 {
+        for _ in 0..200 {
+            let mu = cls as f64 * 4.0;
+            xs.push(mu + 0.5 * rng.nextNormal());
+            xs.push(mu + 0.5 * rng.nextNormal());
+            xs.push(mu + 0.5 * rng.nextNormal());
+            xs.push(mu + 0.5 * rng.nextNormal());
+            ys.push(cls as f64);
+        }
+    }
+    (xs, ys, 600)
+}
+
+fn buildCausalData(n: usize, trueEffect: f64, seed: u64) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let mut rng = Xoshiro256pp::fromSeed(seed);
+    let mut cov = Vec::with_capacity(n * 2);
+    let mut treat = Vec::with_capacity(n);
+    let mut outcome = Vec::with_capacity(n);
+    for _ in 0..n {
+        let x1 = rng.nextNormal();
+        let x2 = rng.nextNormal();
+        cov.push(x1);
+        cov.push(x2);
+        let z = 0.5 * x1 - 0.3 * x2;
+        let p = 1.0 / (1.0 + (-z).exp());
+        let t = if rng.nextF64() < p { 1.0 } else { 0.0 };
+        treat.push(t);
+        outcome.push(trueEffect * t + 0.4 * x1 + 0.2 * x2 + 0.3 * rng.nextNormal());
+    }
+    (outcome, treat, cov)
+}
+
+fn buildSinusoidalTrend(n: usize) -> Vec<f64> {
+    let mut v = Vec::with_capacity(n);
+    for i in 0..n {
+        let trendPart = 0.1 * i as f64;
+        let seasonal = (2.0 * std::f64::consts::PI * (i % 7) as f64 / 7.0).sin();
+        v.push(trendPart + seasonal);
+    }
+    v
+}
+
+// =============================================================================
+// Correctness tests
+// =============================================================================
+
+#[test]
+fn test_19_feature_group_correctness() {
+    zyron_bench_harness::init("analytics");
+    let _guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Test 19: Feature Group Correctness ===");
+
+    let store = FeatureStore::new();
+    store
+        .registerFeatureGroup(buildOrdersFeatureGroup())
+        .unwrap();
+    for i in 0..100u32 {
+        let entity = format!("u{:03}", i);
+        store
+            .writeFeatureValue(
+                "user_features",
+                &entity,
+                "total_purchases",
+                fv(1000, (i as f64) * 10.0),
+            )
+            .unwrap();
+        store
+            .writeFeatureValue("user_features", &entity, "order_count", fv(1000, i as f64))
+            .unwrap();
+        store
+            .writeFeatureValue(
+                "user_features",
+                &entity,
+                "avg_order_value",
+                fv(1000, (i as f64) + 5.0),
+            )
+            .unwrap();
+        store
+            .writeFeatureValue(
+                "user_features",
+                &entity,
+                "max_order_value",
+                fv(1000, (i as f64) * 2.0),
+            )
+            .unwrap();
+        store
+            .writeFeatureValue(
+                "user_features",
+                &entity,
+                "days_since_last_order",
+                fv(1000, (i as f64) % 30.0),
+            )
+            .unwrap();
+    }
+    let entities: Vec<String> = (0..100u32).map(|i| format!("u{:03}", i)).collect();
+    let names = vec![
+        "total_purchases".to_string(),
+        "order_count".to_string(),
+        "avg_order_value".to_string(),
+        "max_order_value".to_string(),
+        "days_since_last_order".to_string(),
+    ];
+    let frame = store
+        .getFeatures("user_features", &entities, &names, 2000)
+        .unwrap();
+    assert_eq!(frame.rows.len(), 100);
+    for (i, row) in frame.rows.iter().enumerate() {
+        if let AnalyticsValue::Float(f) = &row.values[0] {
+            assert!((f - (i as f64 * 10.0)).abs() < 1e-9);
+        } else {
+            panic!("expected float at row {}", i);
+        }
+        if let AnalyticsValue::Float(f) = &row.values[1] {
+            assert!((f - (i as f64)).abs() < 1e-9);
+        }
+    }
+    tprintln!("  100 entities x 5 features verified: PASS");
+}
+
+#[test]
+fn test_20_point_in_time_join_correctness() {
+    zyron_bench_harness::init("analytics");
+    let _guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Test 20: Point-in-Time Join Correctness ===");
+
+    let store = FeatureStore::new();
+    store
+        .registerFeatureGroup(buildOrdersFeatureGroup())
+        .unwrap();
+    let janFifteenMs = 1_705_276_800_000i64;
+    let janThirtyOneMs = 1_706_659_200_000i64;
+    for day in 1..=31i64 {
+        let ts = janFifteenMs + (day - 15) * 24 * 60 * 60 * 1000;
+        store
+            .writeFeatureValue(
+                "user_features",
+                "u1",
+                "total_purchases",
+                fv(ts, day as f64 * 100.0),
+            )
+            .unwrap();
+    }
+    let f15 = store
+        .getFeatures(
+            "user_features",
+            &["u1".to_string()],
+            &["total_purchases".to_string()],
+            janFifteenMs,
+        )
+        .unwrap();
+    let f31 = store
+        .getFeatures(
+            "user_features",
+            &["u1".to_string()],
+            &["total_purchases".to_string()],
+            janThirtyOneMs,
+        )
+        .unwrap();
+    let v15 = if let AnalyticsValue::Float(f) = &f15.rows[0].values[0] {
+        *f
+    } else {
+        panic!()
+    };
+    let v31 = if let AnalyticsValue::Float(f) = &f31.rows[0].values[0] {
+        *f
+    } else {
+        panic!()
+    };
+    assert!((v15 - 1500.0).abs() < 1.0, "AS OF Jan 15 = {}", v15);
+    assert!((v31 - 3100.0).abs() < 1.0, "AS OF Jan 31 = {}", v31);
+    assert!(v31 > v15);
+    tprintln!(
+        "  AS OF Jan 15 = {:.0}, AS OF Jan 31 = {:.0}, no leakage: PASS",
+        v15,
+        v31
+    );
+}
+
+#[test]
+fn test_21_feature_versioning_correctness() {
+    zyron_bench_harness::init("analytics");
+    let _guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Test 21: Feature Versioning Correctness ===");
+
+    let store = FeatureStore::new();
+    store
+        .registerFeatureGroup(buildOrdersFeatureGroup())
+        .unwrap();
+    let mut v1 = fv(1000, 50.0);
+    v1.featureVersion = 1;
+    let mut v2 = fv(1000, 88.0);
+    v2.featureVersion = 2;
+    store
+        .writeFeatureValue("user_features", "u1", "total_purchases", v1)
+        .unwrap();
+    store
+        .writeFeatureValue("user_features", "u1", "total_purchases", v2)
+        .unwrap();
+    let f1 = store
+        .getFeaturesVersioned(
+            "user_features",
+            &["u1".to_string()],
+            &["total_purchases".to_string()],
+            1,
+            2000,
+        )
+        .unwrap();
+    let f2 = store
+        .getFeaturesVersioned(
+            "user_features",
+            &["u1".to_string()],
+            &["total_purchases".to_string()],
+            2,
+            2000,
+        )
+        .unwrap();
+    if let (AnalyticsValue::Float(a), AnalyticsValue::Float(b)) =
+        (&f1.rows[0].values[0], &f2.rows[0].values[0])
+    {
+        assert!((a - 50.0).abs() < 1e-12);
+        assert!((b - 88.0).abs() < 1e-12);
+        tprintln!("  Version 1 = {}, Version 2 = {}: PASS", a, b);
+    } else {
+        panic!("expected float values for both versions");
+    }
+
+    let mut reg = FeatureLineageRegistry::new();
+    let (tables, cols) = extractTablesAndColumns(
+        "SELECT user_id, SUM(amount) FROM orders WHERE order_date > '2024-01-01'",
+    );
+    let mut entry = LineageEntry::new("user_features.total_purchases".into());
+    entry.sourceTables = tables;
+    entry.sourceColumns = cols;
+    entry.lastComputedMs = 1000;
+    reg.register("user_features.total_purchases".into(), entry);
+    assert!(!reg.isStale("user_features.total_purchases"));
+    reg.touchTable("orders", 2000);
+    assert!(reg.isStale("user_features.total_purchases"));
+    tprintln!("  Lineage staleness: PASS");
+}
+
+#[test]
+fn test_22_linear_regression_correctness() {
+    zyron_bench_harness::init("analytics");
+    let _guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Test 22: Linear Regression Correctness ===");
+
+    let (xs, ys) = buildLinearTrainingData(2000, 101);
+    let mut config = ModelConfig::new(ModelType::LinearRegression, vec!["x".into()]);
+    config.targetColumn = Some("y".into());
+    let data = TrainingData::new(&xs, &ys, xs.len(), 1);
+    let model = linearRegression::train(&config, &data).unwrap();
+    let r2 = model.metrics.get("r_squared").copied().unwrap();
+    assert!(r2 > 0.95, "R^2 = {}", r2);
+    let yh0 = linearRegression::predict(&model, &[0.0]);
+    let yh10 = linearRegression::predict(&model, &[10.0]);
+    let slope = (yh10 - yh0) / 10.0;
+    let intercept = yh0;
+    tprintln!(
+        "  Recovered slope = {:.3}, intercept = {:.3}, R^2 = {:.4}",
+        slope,
+        intercept,
+        r2
+    );
+    assert!((slope - 2.0).abs() < 0.2);
+    assert!((intercept - 3.0).abs() < 0.5);
+}
+
+#[test]
+fn test_23_logistic_regression_correctness() {
+    zyron_bench_harness::init("analytics");
+    let _guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Test 23: Logistic Regression Correctness ===");
+
+    let (xs, ys) = buildClassificationData(2000, 2, 202);
+    let mut config = ModelConfig::new(
+        ModelType::LogisticRegression,
+        vec!["x1".into(), "x2".into()],
+    );
+    config.targetColumn = Some("y".into());
+    let data = TrainingData::new(&xs, &ys, ys.len(), 2);
+    let model = logisticRegression::train(&config, &data).unwrap();
+    let acc = model.metrics.get("accuracy").copied().unwrap();
+    assert!(acc > 0.85, "accuracy = {}", acc);
+    for i in 0..50 {
+        let row = &xs[i * 2..i * 2 + 2];
+        let p = logisticRegression::predictProbability(&model, row);
+        assert!((0.0..=1.0).contains(&p), "probability out of range: {}", p);
+    }
+    tprintln!("  Accuracy = {:.4}: PASS", acc);
+}
+
+#[test]
+fn test_24_decision_tree_correctness() {
+    zyron_bench_harness::init("analytics");
+    let _guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Test 24: Decision Tree Correctness ===");
+
+    let (xs, ys, n) = buildIrisLikeData();
+    let data = TrainingData::new(&xs, &ys, n, 4);
+    let mut config = ModelConfig::new(
+        ModelType::DecisionTreeClassification,
+        vec!["a".into(), "b".into(), "c".into(), "d".into()],
+    );
+    config.hyperparameters.setF64("max_depth", 8.0);
+    let model = decisionTree::train(&config, &data).unwrap();
+    let acc = model.metrics.get("accuracy").copied().unwrap();
+    assert!(acc > 0.9, "accuracy = {}", acc);
+    if let ModelData::Tree { nodes } = &model.data {
+        assert!(nodes.len() < 200, "tree size = {}", nodes.len());
+        tprintln!("  Accuracy = {:.4}, nodes = {}: PASS", acc, nodes.len());
+    } else {
+        panic!("expected tree model");
+    }
+}
+
+#[test]
+fn test_25_batch_prediction_correctness() {
+    zyron_bench_harness::init("analytics");
+    let _guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Test 25: Batch Prediction Correctness ===");
+
+    let mut rng = Xoshiro256pp::fromSeed(404);
+    let n = 10_000;
+    let mut xs = Vec::with_capacity(n);
+    let mut ys = Vec::with_capacity(n);
+    for _ in 0..n {
+        let x = rng.nextNormal();
+        xs.push(x);
+        ys.push(2.0 * x + 0.1 * rng.nextNormal());
+    }
+    let mut config = ModelConfig::new(ModelType::LinearRegression, vec!["x".into()]);
+    config.targetColumn = Some("y".into());
+    let data = TrainingData::new(&xs, &ys, n, 1);
+    let model = linearRegression::train(&config, &data).unwrap();
+
+    let mPredict = 100_000usize;
+    let mut testXs = Vec::with_capacity(mPredict);
+    for _ in 0..mPredict {
+        testXs.push(rng.nextNormal());
+    }
+    let mut out = vec![0.0f64; mPredict];
+    predictBatch(&model, &testXs, mPredict, 1, &mut out);
+
+    let mut finite = 0usize;
+    for v in &out {
+        if v.is_finite() {
+            finite += 1;
+        }
+    }
+    assert_eq!(finite, mPredict);
+    tprintln!("  100K predictions, all finite: PASS");
+}
+
+#[test]
+fn test_26_causal_inference_correctness() {
+    zyron_bench_harness::init("analytics");
+    let _guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Test 26: Causal Inference Correctness ===");
+
+    let (outcome, treatment, cov) = buildCausalData(2000, 0.10, 505);
+    let est = ate(&outcome, &treatment, &cov, 2).unwrap();
+    let probs = propensityScore(&treatment, &cov, 2).unwrap();
+    for p in &probs {
+        assert!(*p > 0.0 && *p < 1.0, "propensity out of range: {}", p);
+    }
+    assert!((est - 0.10).abs() < 0.4, "ATE = {} vs 0.10", est);
+
+    // ATT and DID
+    let attEst = zyron_analytics::att(&outcome, &treatment, &cov, 2).unwrap();
+    assert!((attEst - 0.10).abs() < 0.4, "ATT = {}", attEst);
+    let post: Vec<f64> = treatment
+        .iter()
+        .enumerate()
+        .map(|(i, _)| if i % 2 == 0 { 1.0 } else { 0.0 })
+        .collect();
+    let _ = diffInDiff(&outcome, &treatment, &post).unwrap();
+    tprintln!("  ATE = {:.4}, ATT = {:.4}: PASS", est, attEst);
+}
+
+#[test]
+fn test_27_forecasting_correctness() {
+    zyron_bench_harness::init("analytics");
+    let _guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Test 27: Forecasting Correctness ===");
+
+    let v = buildSinusoidalTrend(200);
+    let mut extra = std::collections::HashMap::new();
+    extra.insert("season".to_string(), 7.0);
+    let f = forecast(&v, 30, ForecastMethod::SeasonalDecompose, &extra).unwrap();
+    assert_eq!(f.len(), 30);
+    let mut increases = 0;
+    for i in 1..f.len() {
+        if f[i] > f[i - 1] {
+            increases += 1;
+        }
+    }
+    assert!(
+        increases >= 15,
+        "forecast trend not increasing enough: {}",
+        increases
+    );
+
+    let comp = seasonalDecompose(&v, 7);
+    assert_eq!(comp.seasonalIndices.len(), 7);
+    let arimaForecast = arima(&v, 10, 1, 1, 1).unwrap();
+    assert_eq!(arimaForecast.len(), 10);
+
+    let mut anomalyV = vec![1.0; 100];
+    anomalyV[50] = 100.0;
+    let detected = anomalyDetect(&anomalyV, AnomalyMethod::ZScore, 3.0);
+    assert!(detected[50].1, "anomaly should flag index 50");
+
+    let (slope, _) = trend(&v);
+    assert!(slope > 0.0);
+    tprintln!(
+        "  Trend slope = {:.4}, anomaly + ARIMA + decompose: PASS",
+        slope
+    );
+}
+
+// =============================================================================
+// Performance tests
+// =============================================================================
+
+#[test]
+fn test_28_feature_retrieval_performance() {
+    zyron_bench_harness::init("analytics");
+    let _guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Test 28: Feature Retrieval Performance (1K entities, 10 features) ===");
+    let util_before = take_util_snapshot();
+
+    let store = FeatureStore::new();
+    let mut group = FeatureGroup::new("perf_features".into(), "id".into());
+    for f in 0..10 {
+        group.addFeature(FeatureDefinition::new(
+            format!("f{}", f),
+            "FLOAT64".into(),
+            String::new(),
+        ));
+    }
+    store.registerFeatureGroup(group).unwrap();
+
+    for i in 0..1000u32 {
+        let entity = format!("e{:04}", i);
+        for f in 0..10 {
+            let name = format!("f{}", f);
+            store
+                .writeFeatureValue(
+                    "perf_features",
+                    &entity,
+                    &name,
+                    fv(1000, (i as f64) * 0.5 + f as f64),
+                )
+                .unwrap();
+        }
+    }
+    let entities: Vec<String> = (0..1000u32).map(|i| format!("e{:04}", i)).collect();
+    let names: Vec<String> = (0..10).map(|f| format!("f{}", f)).collect();
+
+    let mut latencies = Vec::with_capacity(VALIDATION_RUNS);
+    for run in 0..VALIDATION_RUNS {
+        let start = Instant::now();
+        let frame = store
+            .getFeatures("perf_features", &entities, &names, 2000)
+            .unwrap();
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+        assert_eq!(frame.rows.len(), 1000);
+        latencies.push(elapsed_ms);
+        tprintln!("  Run {}: {:.2}ms", run + 1, elapsed_ms);
+    }
+    let result = validate_metric(
+        "FEATURE_RETRIEVAL_1K_x_10",
+        "Latency (ms)",
+        latencies,
+        FEATURE_RETRIEVAL_TARGET_MS,
+        false,
+    );
+    record_test_util("FeatureRetrieval", util_before, take_util_snapshot());
+    assert!(
+        result.passed,
+        "Feature retrieval avg {:.2}ms > target {:.0}ms",
+        result.average, FEATURE_RETRIEVAL_TARGET_MS
+    );
+    assert!(!result.regression_detected, "Feature retrieval regression");
+}
+
+#[test]
+fn test_29_pit_join_performance() {
+    zyron_bench_harness::init("analytics");
+    let _guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Test 29: PIT Join Performance (1M feature points) ===");
+    let util_before = take_util_snapshot();
+
+    let store = FeatureStore::new();
+    let mut group = FeatureGroup::new("pit_features".into(), "id".into());
+    group.addFeature(FeatureDefinition::new(
+        "v".into(),
+        "FLOAT64".into(),
+        String::new(),
+    ));
+    store.registerFeatureGroup(group).unwrap();
+    // 10K entities x 100 timestamps each = 1M points
+    let entities_count: usize = 10_000;
+    let history: usize = 100;
+    for i in 0..entities_count {
+        let entity = format!("e{:05}", i);
+        for t in 0..history {
+            let ts = 1_000_000 + (t as i64) * 1000;
+            store
+                .writeFeatureValue("pit_features", &entity, "v", fv(ts, (i + t) as f64))
+                .unwrap();
+        }
+    }
+    let entities: Vec<String> = (0..entities_count).map(|i| format!("e{:05}", i)).collect();
+    let names = vec!["v".to_string()];
+
+    let mut latencies = Vec::with_capacity(VALIDATION_RUNS);
+    for run in 0..VALIDATION_RUNS {
+        let asOf = 1_000_000 + (history as i64) * 1000 / 2;
+        let start = Instant::now();
+        let frame = store
+            .getFeatures("pit_features", &entities, &names, asOf)
+            .unwrap();
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+        assert_eq!(frame.rows.len(), entities_count);
+        latencies.push(elapsed_ms);
+        tprintln!("  Run {}: {:.2}ms", run + 1, elapsed_ms);
+    }
+    let result = validate_metric(
+        "PIT_JOIN_1M",
+        "Latency (ms)",
+        latencies,
+        PIT_JOIN_TARGET_MS,
+        false,
+    );
+    record_test_util("PitJoin", util_before, take_util_snapshot());
+    assert!(
+        result.passed,
+        "PIT join avg {:.2}ms > target {:.0}ms",
+        result.average, PIT_JOIN_TARGET_MS
+    );
+    assert!(!result.regression_detected, "PIT join regression");
+}
+
+#[test]
+fn test_30_linear_regression_train_performance() {
+    zyron_bench_harness::init("analytics");
+    let _guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Test 30: Linear Regression Train (100K rows, 10 features) ===");
+    let util_before = take_util_snapshot();
+
+    let n = 100_000usize;
+    let p = 10usize;
+    let mut rng = Xoshiro256pp::fromSeed(1001);
+    let mut xs = Vec::with_capacity(n * p);
+    let mut ys = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut sum = 0.0;
+        for j in 0..p {
+            let v = rng.nextNormal();
+            xs.push(v);
+            sum += (j as f64 + 1.0) * 0.1 * v;
+        }
+        ys.push(sum + 0.05 * rng.nextNormal());
+    }
+
+    let mut latencies = Vec::with_capacity(VALIDATION_RUNS);
+    for run in 0..VALIDATION_RUNS {
+        let mut config = ModelConfig::new(
+            ModelType::LinearRegression,
+            (0..p).map(|i| format!("x{}", i)).collect(),
+        );
+        config.targetColumn = Some("y".into());
+        let data = TrainingData::new(&xs, &ys, n, p);
+        let start = Instant::now();
+        let model = linearRegression::train(&config, &data).unwrap();
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+        let r2 = model.metrics.get("r_squared").copied().unwrap();
+        assert!(r2 > 0.9, "linear train r2 = {}", r2);
+        latencies.push(elapsed_ms);
+        tprintln!("  Run {}: {:.2}ms (R^2 = {:.4})", run + 1, elapsed_ms, r2);
+    }
+    let result = validate_metric(
+        "LINEAR_TRAIN_100K_10",
+        "Latency (ms)",
+        latencies,
+        LINEAR_TRAIN_TARGET_MS,
+        false,
+    );
+    record_test_util("LinearTrain", util_before, take_util_snapshot());
+    assert!(
+        result.passed,
+        "Linear train avg {:.2}ms > target {:.0}ms",
+        result.average, LINEAR_TRAIN_TARGET_MS
+    );
+    assert!(!result.regression_detected, "Linear train regression");
+}
+
+#[test]
+fn test_31_logistic_regression_train_performance() {
+    zyron_bench_harness::init("analytics");
+    let _guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Test 31: Logistic Regression Train (100K rows, 10 features) ===");
+    let util_before = take_util_snapshot();
+
+    let n = 100_000usize;
+    let p = 10usize;
+    let mut rng = Xoshiro256pp::fromSeed(1002);
+    let mut xs = Vec::with_capacity(n * p);
+    let mut ys = Vec::with_capacity(n);
+    for _ in 0..n {
+        let cls = rng.nextRange(2) as f64;
+        let mu = if cls == 1.0 { 0.8 } else { -0.8 };
+        for _ in 0..p {
+            xs.push(mu + rng.nextNormal());
+        }
+        ys.push(cls);
+    }
+
+    let mut latencies = Vec::with_capacity(VALIDATION_RUNS);
+    for run in 0..VALIDATION_RUNS {
+        let mut config = ModelConfig::new(
+            ModelType::LogisticRegression,
+            (0..p).map(|i| format!("x{}", i)).collect(),
+        );
+        config.hyperparameters.setF64("max_epochs", 30.0);
+        config.targetColumn = Some("y".into());
+        let data = TrainingData::new(&xs, &ys, n, p);
+        let start = Instant::now();
+        let model = logisticRegression::train(&config, &data).unwrap();
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+        let acc = model.metrics.get("accuracy").copied().unwrap();
+        assert!(acc > 0.8, "logistic train accuracy = {}", acc);
+        latencies.push(elapsed_ms);
+        tprintln!("  Run {}: {:.2}ms (acc = {:.4})", run + 1, elapsed_ms, acc);
+    }
+    let result = validate_metric(
+        "LOGISTIC_TRAIN_100K_10",
+        "Latency (ms)",
+        latencies,
+        LOGISTIC_TRAIN_TARGET_MS,
+        false,
+    );
+    record_test_util("LogisticTrain", util_before, take_util_snapshot());
+    assert!(
+        result.passed,
+        "Logistic train avg {:.2}ms > target {:.0}ms",
+        result.average, LOGISTIC_TRAIN_TARGET_MS
+    );
+    assert!(!result.regression_detected, "Logistic train regression");
+}
+
+#[test]
+fn test_32_decision_tree_train_performance() {
+    zyron_bench_harness::init("analytics");
+    let _guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Test 32: Decision Tree Train (100K rows) ===");
+    let util_before = take_util_snapshot();
+
+    let n = 100_000usize;
+    let p = 10usize;
+    let mut rng = Xoshiro256pp::fromSeed(1003);
+    let mut xs = Vec::with_capacity(n * p);
+    let mut ys = Vec::with_capacity(n);
+    for _ in 0..n {
+        let cls = rng.nextRange(3) as f64;
+        let mu = cls * 2.0;
+        for _ in 0..p {
+            xs.push(mu + 0.5 * rng.nextNormal());
+        }
+        ys.push(cls);
+    }
+
+    let mut latencies = Vec::with_capacity(VALIDATION_RUNS);
+    for run in 0..VALIDATION_RUNS {
+        let mut config = ModelConfig::new(
+            ModelType::DecisionTreeClassification,
+            (0..p).map(|i| format!("x{}", i)).collect(),
+        );
+        config.hyperparameters.setF64("max_depth", 8.0);
+        let data = TrainingData::new(&xs, &ys, n, p);
+        let start = Instant::now();
+        let model = decisionTree::train(&config, &data).unwrap();
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+        let acc = model.metrics.get("accuracy").copied().unwrap();
+        assert!(acc > 0.8, "tree train accuracy = {}", acc);
+        latencies.push(elapsed_ms);
+        tprintln!("  Run {}: {:.2}ms (acc = {:.4})", run + 1, elapsed_ms, acc);
+    }
+    let result = validate_metric(
+        "TREE_TRAIN_100K",
+        "Latency (ms)",
+        latencies,
+        TREE_TRAIN_TARGET_MS,
+        false,
+    );
+    record_test_util("TreeTrain", util_before, take_util_snapshot());
+    assert!(
+        result.passed,
+        "Tree train avg {:.2}ms > target {:.0}ms",
+        result.average, TREE_TRAIN_TARGET_MS
+    );
+    assert!(!result.regression_detected, "Tree train regression");
+}
+
+#[test]
+fn test_33_batch_predict_performance() {
+    zyron_bench_harness::init("analytics");
+    let _guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Test 33: Batch Predict (1M rows) ===");
+    let util_before = take_util_snapshot();
+
+    let p = 10usize;
+    let trainN = 10_000usize;
+    let mut rng = Xoshiro256pp::fromSeed(1004);
+    let mut xs = Vec::with_capacity(trainN * p);
+    let mut ys = Vec::with_capacity(trainN);
+    for _ in 0..trainN {
+        let mut sum = 0.0;
+        for j in 0..p {
+            let v = rng.nextNormal();
+            xs.push(v);
+            sum += (j as f64 + 1.0) * 0.1 * v;
+        }
+        ys.push(sum);
+    }
+    let mut config = ModelConfig::new(
+        ModelType::LinearRegression,
+        (0..p).map(|i| format!("x{}", i)).collect(),
+    );
+    config.targetColumn = Some("y".into());
+    let data = TrainingData::new(&xs, &ys, trainN, p);
+    let model = linearRegression::train(&config, &data).unwrap();
+
+    let predictN = 1_000_000usize;
+    let mut testXs = Vec::with_capacity(predictN * p);
+    for _ in 0..(predictN * p) {
+        testXs.push(rng.nextNormal());
+    }
+
+    let mut latencies = Vec::with_capacity(VALIDATION_RUNS);
+    for run in 0..VALIDATION_RUNS {
+        let mut out = vec![0.0f64; predictN];
+        let start = Instant::now();
+        predictBatch(&model, &testXs, predictN, p, &mut out);
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+        latencies.push(elapsed_ms);
+        tprintln!("  Run {}: {:.2}ms", run + 1, elapsed_ms);
+    }
+    let result = validate_metric(
+        "BATCH_PREDICT_1M",
+        "Latency (ms)",
+        latencies,
+        BATCH_PREDICT_TARGET_MS,
+        false,
+    );
+    record_test_util("BatchPredict", util_before, take_util_snapshot());
+    assert!(
+        result.passed,
+        "Batch predict avg {:.2}ms > target {:.0}ms",
+        result.average, BATCH_PREDICT_TARGET_MS
+    );
+    assert!(!result.regression_detected, "Batch predict regression");
+}
+
+#[test]
+fn test_34_single_predict_performance() {
+    zyron_bench_harness::init("analytics");
+    let _guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Test 34: Single Predict Latency ===");
+    let util_before = take_util_snapshot();
+
+    let p = 10usize;
+    let n = 5_000usize;
+    let mut rng = Xoshiro256pp::fromSeed(1005);
+    let mut xs = Vec::with_capacity(n * p);
+    let mut ys = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut sum = 0.0;
+        for j in 0..p {
+            let v = rng.nextNormal();
+            xs.push(v);
+            sum += (j as f64 + 1.0) * 0.1 * v;
+        }
+        ys.push(sum);
+    }
+    let mut config = ModelConfig::new(
+        ModelType::LinearRegression,
+        (0..p).map(|i| format!("x{}", i)).collect(),
+    );
+    config.targetColumn = Some("y".into());
+    let data = TrainingData::new(&xs, &ys, n, p);
+    let model = linearRegression::train(&config, &data).unwrap();
+
+    let row: Vec<f64> = (0..p).map(|_| rng.nextNormal()).collect();
+    let iters = 10_000usize;
+    let mut latencies = Vec::with_capacity(VALIDATION_RUNS);
+    for run in 0..VALIDATION_RUNS {
+        let start = Instant::now();
+        let mut sink = 0.0f64;
+        for _ in 0..iters {
+            sink += predictOne(&model, &row);
+        }
+        std::hint::black_box(sink);
+        let elapsed = start.elapsed();
+        let per_us = elapsed.as_nanos() as f64 / (iters as f64 * 1_000.0);
+        latencies.push(per_us);
+        tprintln!("  Run {}: {:.3}us per predict", run + 1, per_us);
+    }
+    let result = validate_metric(
+        "SINGLE_PREDICT",
+        "Latency (us)",
+        latencies,
+        SINGLE_PREDICT_TARGET_US,
+        false,
+    );
+    record_test_util("SinglePredict", util_before, take_util_snapshot());
+    assert!(
+        result.passed,
+        "Single predict avg {:.3}us > target {:.1}us",
+        result.average, SINGLE_PREDICT_TARGET_US
+    );
+    assert!(!result.regression_detected, "Single predict regression");
+}
+
+#[test]
+fn test_35_ate_estimation_performance() {
+    zyron_bench_harness::init("analytics");
+    let _guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Test 35: ATE Estimation (100K observations) ===");
+    let util_before = take_util_snapshot();
+
+    let (outcome, treatment, cov) = buildCausalData(100_000, 0.10, 1006);
+
+    let mut latencies = Vec::with_capacity(VALIDATION_RUNS);
+    for run in 0..VALIDATION_RUNS {
+        let start = Instant::now();
+        let est = ate(&outcome, &treatment, &cov, 2).unwrap();
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+        assert!(est.is_finite(), "ATE non-finite: {}", est);
+        latencies.push(elapsed_ms);
+        tprintln!("  Run {}: {:.2}ms (est = {:.4})", run + 1, elapsed_ms, est);
+    }
+    let result = validate_metric("ATE_100K", "Latency (ms)", latencies, ATE_TARGET_MS, false);
+    record_test_util("ATE", util_before, take_util_snapshot());
+    assert!(
+        result.passed,
+        "ATE avg {:.2}ms > target {:.0}ms",
+        result.average, ATE_TARGET_MS
+    );
+    assert!(!result.regression_detected, "ATE regression");
+}
+
+#[test]
+fn test_36_forecast_performance() {
+    zyron_bench_harness::init("analytics");
+    let _guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tprintln!("\n=== Test 36: Forecast (10K history) ===");
+    let util_before = take_util_snapshot();
+
+    let v = buildSinusoidalTrend(10_000);
+    let mut extra = std::collections::HashMap::new();
+    extra.insert("season".to_string(), 7.0);
+
+    let mut latencies = Vec::with_capacity(VALIDATION_RUNS);
+    for run in 0..VALIDATION_RUNS {
+        let start = Instant::now();
+        let f = forecast(&v, 1000, ForecastMethod::SeasonalDecompose, &extra).unwrap();
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+        assert_eq!(f.len(), 1000);
+        latencies.push(elapsed_ms);
+        tprintln!("  Run {}: {:.2}ms", run + 1, elapsed_ms);
+    }
+    let result = validate_metric(
+        "FORECAST_10K",
+        "Latency (ms)",
+        latencies,
+        FORECAST_TARGET_MS,
+        false,
+    );
+    record_test_util("Forecast", util_before, take_util_snapshot());
+    assert!(
+        result.passed,
+        "Forecast avg {:.2}ms > target {:.0}ms",
+        result.average, FORECAST_TARGET_MS
+    );
+    assert!(!result.regression_detected, "Forecast regression");
 }

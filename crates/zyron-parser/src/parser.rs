@@ -1054,6 +1054,8 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::User) => self.parse_create_user(),
             Token::Keyword(Keyword::Role) => self.parse_create_role(),
             Token::Keyword(Keyword::Pipeline) => self.parse_create_pipeline(),
+            Token::Keyword(Keyword::Feature) => self.parse_create_feature_group(),
+            Token::Keyword(Keyword::Model) => self.parse_create_model(),
             Token::Keyword(Keyword::Graph) => self.parse_create_graph_schema(),
             Token::Keyword(Keyword::Fulltext) => self.parse_create_fulltext_index(),
             Token::Keyword(Keyword::Vector) => self.parse_create_vector_index(),
@@ -1175,6 +1177,8 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::User) => self.parse_drop_user(),
             Token::Keyword(Keyword::Role) => self.parse_drop_role(),
             Token::Keyword(Keyword::Pipeline) => self.parse_drop_pipeline(),
+            Token::Keyword(Keyword::Feature) => self.parse_drop_feature_group(),
+            Token::Keyword(Keyword::Model) => self.parse_drop_model(),
             Token::Keyword(Keyword::Graph) => self.parse_drop_graph_schema(),
             Token::Keyword(Keyword::Branch) => self.parse_drop_branch(),
             Token::Keyword(Keyword::Replication) => self.parse_drop_replication_slot(),
@@ -4360,6 +4364,228 @@ impl<'a> Parser<'a> {
         Ok(Statement::CreatePipeline(Box::new(
             CreatePipelineStatement { name, stages },
         )))
+    }
+
+    /// CREATE FEATURE GROUP [IF NOT EXISTS] name (
+    ///   ENTITY KEY col,
+    ///   FEATURES (
+    ///     fname [type] AS (expr),
+    ///     ...
+    ///   ),
+    ///   [SOURCE AS (select_query),]
+    ///   [REFRESH EVERY 'interval',]
+    ///   [WITH (key = value, ...)]
+    /// )
+    fn parse_create_feature_group(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Feature)?;
+        self.expect_keyword(Keyword::Group)?;
+        let if_not_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Not)?;
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_ident()?;
+        self.expect_token(&Token::LParen)?;
+
+        let mut entity_key: Option<String> = None;
+        let mut features: Vec<FeatureDefinitionAst> = Vec::new();
+        let mut source_query: Option<Box<SelectStatement>> = None;
+        let mut refresh_interval: Option<String> = None;
+        let mut options: Vec<TableOption> = Vec::new();
+        let mut got_any = false;
+
+        loop {
+            if self.at_token(&Token::RParen) {
+                self.advance()?;
+                break;
+            }
+            if got_any {
+                if self.at_token(&Token::Comma) {
+                    self.advance()?;
+                }
+            }
+            got_any = true;
+
+            if self.consume_keyword(Keyword::Entity)? {
+                self.expect_keyword(Keyword::Key)?;
+                entity_key = Some(self.parse_ident()?);
+            } else if self.consume_keyword(Keyword::Features)? {
+                self.expect_token(&Token::LParen)?;
+                features = self.parse_comma_separated(|p| p.parse_feature_definition_ast())?;
+                self.expect_token(&Token::RParen)?;
+            } else if self.consume_keyword(Keyword::Source)? {
+                self.expect_keyword(Keyword::As)?;
+                self.expect_token(&Token::LParen)?;
+                let q = self.parse_select_body(None)?;
+                source_query = Some(Box::new(q));
+                self.expect_token(&Token::RParen)?;
+            } else if self.consume_keyword(Keyword::Refresh)? {
+                self.expect_keyword(Keyword::Every)?;
+                if let Token::String(s) = &self.current.token {
+                    refresh_interval = Some(s.clone());
+                    self.advance()?;
+                } else {
+                    return Err(self.error("Expected interval string literal after REFRESH EVERY"));
+                }
+            } else if self.consume_keyword(Keyword::With)? {
+                self.expect_token(&Token::LParen)?;
+                options = self.parse_comma_separated(|p| p.parse_table_option())?;
+                self.expect_token(&Token::RParen)?;
+            } else {
+                return Err(self.error(
+                    "Expected ENTITY KEY, FEATURES, SOURCE AS, REFRESH EVERY, or WITH in CREATE FEATURE GROUP",
+                ));
+            }
+        }
+
+        let entity_key = entity_key.ok_or_else(|| self.error("ENTITY KEY is required"))?;
+        if features.is_empty() {
+            return Err(self.error("FEATURES list cannot be empty"));
+        }
+        Ok(Statement::CreateFeatureGroup(Box::new(
+            CreateFeatureGroupStatement {
+                name,
+                if_not_exists,
+                entity_key,
+                features,
+                source_query,
+                refresh_interval,
+                options,
+            },
+        )))
+    }
+
+    /// Parses a single feature definition: name [TYPE] AS (transform_expr)
+    fn parse_feature_definition_ast(&mut self) -> Result<FeatureDefinitionAst> {
+        let name = self.parse_ident()?;
+        let data_type = if self.at_keyword_data_type() {
+            Some(self.parse_data_type()?)
+        } else {
+            None
+        };
+        self.expect_keyword(Keyword::As)?;
+        self.expect_token(&Token::LParen)?;
+        let transform_expr = self.parse_expr()?;
+        self.expect_token(&Token::RParen)?;
+        Ok(FeatureDefinitionAst {
+            name,
+            data_type,
+            transform_expr,
+        })
+    }
+
+    fn at_keyword_data_type(&self) -> bool {
+        match &self.current.token {
+            Token::Keyword(k) => matches!(
+                k,
+                Keyword::Int
+                    | Keyword::Bigint
+                    | Keyword::Smallint
+                    | Keyword::Tinyint
+                    | Keyword::Float
+                    | Keyword::Real
+                    | Keyword::Double
+                    | Keyword::Decimal
+                    | Keyword::Numeric
+                    | Keyword::Boolean
+                    | Keyword::Char
+                    | Keyword::Varchar
+                    | Keyword::Text
+                    | Keyword::Date
+                    | Keyword::Timestamp
+                    | Keyword::Time
+                    | Keyword::Uuid
+                    | Keyword::Json
+                    | Keyword::Jsonb
+            ),
+            _ => false,
+        }
+    }
+
+    fn parse_drop_feature_group(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Feature)?;
+        self.expect_keyword(Keyword::Group)?;
+        let if_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_ident()?;
+        Ok(Statement::DropFeatureGroup(Box::new(
+            DropFeatureGroupStatement { name, if_exists },
+        )))
+    }
+
+    /// CREATE MODEL [IF NOT EXISTS] name
+    ///   TYPE algorithm
+    ///   FEATURES (col1, col2, ...)
+    ///   [TARGET col]
+    ///   USING (select_query)
+    ///   [WITH (key = value, ...)]
+    fn parse_create_model(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Model)?;
+        let if_not_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Not)?;
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_ident()?;
+        self.expect_keyword(Keyword::Type)?;
+        let model_type = self.parse_ident()?;
+        self.expect_keyword(Keyword::Features)?;
+        self.expect_token(&Token::LParen)?;
+        let features = self.parse_comma_separated(|p| p.parse_ident())?;
+        self.expect_token(&Token::RParen)?;
+        let target = if self.consume_keyword(Keyword::Target)? {
+            Some(self.parse_ident()?)
+        } else {
+            None
+        };
+        let training_query = if self.consume_keyword(Keyword::Using)? {
+            self.expect_token(&Token::LParen)?;
+            let q = self.parse_select_body(None)?;
+            self.expect_token(&Token::RParen)?;
+            Some(Box::new(q))
+        } else {
+            None
+        };
+        let options = if self.consume_keyword(Keyword::With)? {
+            self.expect_token(&Token::LParen)?;
+            let opts = self.parse_comma_separated(|p| p.parse_table_option())?;
+            self.expect_token(&Token::RParen)?;
+            opts
+        } else {
+            Vec::new()
+        };
+        Ok(Statement::CreateModel(Box::new(CreateModelStatement {
+            name,
+            if_not_exists,
+            model_type,
+            features,
+            target,
+            training_query,
+            options,
+        })))
+    }
+
+    fn parse_drop_model(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Model)?;
+        let if_exists = if self.consume_keyword(Keyword::If)? {
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_ident()?;
+        Ok(Statement::DropModel(Box::new(DropModelStatement {
+            name,
+            if_exists,
+        })))
     }
 
     fn parse_pipeline_stage(&mut self) -> Result<PipelineStage> {

@@ -166,6 +166,14 @@ pub async fn try_handle_ddl_utility(
         Statement::RunPipeline(_) => Some(Ok(DdlResult::Tag("RUN PIPELINE".to_string()))),
         Statement::DropPipeline(_) => Some(Ok(DdlResult::Tag("DROP PIPELINE".to_string()))),
 
+        // -- Feature store and ML --
+        Statement::CreateFeatureGroup(s) => Some(handle_create_feature_group(s, server).await),
+        Statement::DropFeatureGroup(s) => Some(handle_drop_feature_group(s, server).await),
+        Statement::CreateModel(s) => {
+            Some(handle_create_model(s, server, session, txn, raw_sql).await)
+        }
+        Statement::DropModel(s) => Some(handle_drop_model(s, server).await),
+
         // -- Scheduling --
         Statement::CreateSchedule(_) => {
             Some(Ok(DdlResult::Tag("CREATE SCHEDULE".to_string())))
@@ -4458,4 +4466,554 @@ async fn handle_drop_security_map(
         actor_role = actor_role_id(session),
     );
     Ok(DdlResult::Tag("DROP SECURITY MAP".to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Feature store and ML model handlers
+//
+// Materialization executor implementation lives in
+// `crate::feature_materialization_executor` and is registered with the
+// server's background worker via `install_materialization_executor`.
+// The DDL handlers below are sync entry points called from the wire path
+// ---------------------------------------------------------------------------
+
+/// Render an expression AST back to a SQL string for storage and lineage
+fn renderExpr(expr: &zyron_parser::ast::Expr) -> String {
+    format!("{:?}", expr)
+}
+
+/// Convert an AST DataType to a canonical type label
+fn renderDataType(dt: &Option<zyron_parser::ast::DataType>) -> String {
+    match dt {
+        Some(t) => format!("{:?}", t).to_uppercase(),
+        None => "FLOAT64".to_string(),
+    }
+}
+
+/// Parses a human-readable interval like "1 hour", "30 minutes", "10s"
+fn parseIntervalSeconds(spec: &str) -> Option<u64> {
+    let s = spec.trim().to_ascii_lowercase();
+    let mut split = s.split_whitespace();
+    let n: f64 = split.next()?.parse().ok().or_else(|| {
+        // Maybe "1h" / "30m" combined form
+        let mut digits = String::new();
+        let mut rest = String::new();
+        let mut seen_unit = false;
+        for c in s.chars() {
+            if !seen_unit && (c.is_ascii_digit() || c == '.') {
+                digits.push(c);
+            } else {
+                seen_unit = true;
+                rest.push(c);
+            }
+        }
+        let v: f64 = digits.parse().ok()?;
+        let mult = unitToSeconds(rest.trim())?;
+        Some(v * mult as f64)
+    })?;
+    let unit = split.next().unwrap_or("seconds");
+    let mult = unitToSeconds(unit)?;
+    Some((n * mult as f64) as u64)
+}
+
+fn unitToSeconds(unit: &str) -> Option<u64> {
+    match unit.trim_end_matches('s') {
+        "second" | "sec" | "s" | "" => Some(1),
+        "minute" | "min" | "m" => Some(60),
+        "hour" | "hr" | "h" => Some(3600),
+        "day" | "d" => Some(86_400),
+        "week" | "w" => Some(604_800),
+        _ => None,
+    }
+}
+
+async fn handle_create_feature_group(
+    stmt: &zyron_parser::ast::CreateFeatureGroupStatement,
+    server: &Arc<ServerState>,
+) -> Result<DdlResult, ProtocolError> {
+    use zyron_analytics::featureLineage::{LineageEntry, extractTablesAndColumns};
+    use zyron_analytics::featureStore::{FeatureDefinition, FeatureGroup};
+
+    let nowMs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    if stmt.if_not_exists && server.feature_store.group(&stmt.name).is_some() {
+        return Ok(DdlResult::Tag("CREATE FEATURE GROUP".to_string()));
+    }
+
+    let mut group = FeatureGroup::new(stmt.name.clone(), stmt.entity_key.clone());
+    if let Some(ref iv) = stmt.refresh_interval {
+        if let Some(secs) = parseIntervalSeconds(iv) {
+            group.refreshSeconds = secs;
+        } else {
+            return Err(ProtocolError::Database(ZyronError::ParseError(format!(
+                "invalid REFRESH EVERY interval '{}'",
+                iv
+            ))));
+        }
+    }
+    for opt in &stmt.options {
+        match opt.key.as_str() {
+            "max_staleness_seconds" => {
+                if let Some(v) = optionAsU64(&opt.value) {
+                    group.maxStalenessSeconds = v;
+                }
+            }
+            "retention_days" => {
+                if let Some(v) = optionAsU64(&opt.value) {
+                    group.retentionDays = v;
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(ref sq) = stmt.source_query {
+        group.sourceQuery = format!("{:?}", sq);
+    }
+    let backingTableName = format!("_feature_{}", stmt.name);
+    group.backingTable = Some(backingTableName.clone());
+
+    let mut lineageGuard = server.feature_lineage.write();
+    for fdef in &stmt.features {
+        let transformText = renderExpr(&fdef.transform_expr);
+        let mut def = FeatureDefinition::new(
+            fdef.name.clone(),
+            renderDataType(&fdef.data_type),
+            transformText.clone(),
+        );
+        def.createdAtMs = nowMs;
+        group.addFeature(def);
+
+        let (tables, cols) = extractTablesAndColumns(&transformText);
+        let qualifiedName = format!("{}.{}", stmt.name, fdef.name);
+        let mut entry = LineageEntry::new(qualifiedName.clone());
+        entry.sourceTables = tables;
+        entry.sourceColumns = cols;
+        entry.transformChain = vec![transformText];
+        entry.lastComputedMs = 0;
+        lineageGuard.register(qualifiedName, entry);
+    }
+    drop(lineageGuard);
+
+    server
+        .feature_store
+        .registerFeatureGroup(group)
+        .map_err(ProtocolError::Database)?;
+
+    snapshotFeatureStore(server).map_err(ProtocolError::Database)?;
+
+    tracing::info!(
+        target: "zyron::audit",
+        event = "FeatureGroupCreated",
+        name = %stmt.name,
+        entity_key = %stmt.entity_key,
+        feature_count = stmt.features.len(),
+    );
+    Ok(DdlResult::Tag("CREATE FEATURE GROUP".to_string()))
+}
+
+async fn handle_drop_feature_group(
+    stmt: &zyron_parser::ast::DropFeatureGroupStatement,
+    server: &Arc<ServerState>,
+) -> Result<DdlResult, ProtocolError> {
+    let existed = server.feature_store.group(&stmt.name).is_some();
+    if !existed && !stmt.if_exists {
+        return Err(ProtocolError::Database(ZyronError::ExecutionError(
+            format!("feature group '{}' not found", stmt.name),
+        )));
+    }
+    if existed {
+        server
+            .feature_store
+            .dropFeatureGroup(&stmt.name)
+            .map_err(ProtocolError::Database)?;
+        snapshotFeatureStore(server).map_err(ProtocolError::Database)?;
+    }
+    Ok(DdlResult::Tag("DROP FEATURE GROUP".to_string()))
+}
+
+async fn handle_create_model(
+    stmt: &zyron_parser::ast::CreateModelStatement,
+    server: &Arc<ServerState>,
+    _session: &mut Option<Session>,
+    _txn: &mut Option<zyron_storage::txn::Transaction>,
+    raw_sql: &str,
+) -> Result<DdlResult, ProtocolError> {
+    use zyron_analytics::ml::{
+        Hyperparameters, ModelConfig, ModelType, TrainingData, decisionTree, gradientBoosting,
+        kmeans, knn, linearRegression, logisticRegression, randomForest,
+    };
+
+    let nowMs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    if stmt.if_not_exists && server.model_cache.get(&stmt.name).is_some() {
+        return Ok(DdlResult::Tag("CREATE MODEL".to_string()));
+    }
+
+    let modelType = ModelType::fromStr(&stmt.model_type).ok_or_else(|| {
+        ProtocolError::Database(ZyronError::ParseError(format!(
+            "unknown model type '{}'",
+            stmt.model_type
+        )))
+    })?;
+
+    let mut hyperparameters = Hyperparameters::new();
+    for opt in &stmt.options {
+        match &opt.value {
+            zyron_parser::ast::TableOptionValue::String(s) => {
+                hyperparameters.setStr(&opt.key, s);
+            }
+            zyron_parser::ast::TableOptionValue::Integer(n) => {
+                hyperparameters.setF64(&opt.key, *n as f64);
+            }
+            zyron_parser::ast::TableOptionValue::Boolean(b) => {
+                hyperparameters.setF64(&opt.key, if *b { 1.0 } else { 0.0 });
+            }
+            zyron_parser::ast::TableOptionValue::Identifier(s) => {
+                hyperparameters.setStr(&opt.key, s);
+            }
+            zyron_parser::ast::TableOptionValue::StringList(_) => {}
+        }
+    }
+
+    let trainingQuery = stmt.training_query.as_ref().ok_or_else(|| {
+        ProtocolError::Database(ZyronError::ParseError(
+            "CREATE MODEL requires USING (query) clause".to_string(),
+        ))
+    })?;
+
+    // Materialize the training query via the executor
+    let (xs, ys, rowCount) = collectTrainingRowsFromQuery(
+        server,
+        trainingQuery,
+        &stmt.features,
+        stmt.target.as_deref(),
+        raw_sql,
+    )
+    .await
+    .map_err(ProtocolError::Database)?;
+
+    if rowCount == 0 {
+        return Err(ProtocolError::Database(ZyronError::ExecutionError(
+            "training query returned no rows".to_string(),
+        )));
+    }
+    let p = stmt.features.len();
+    let data = TrainingData::new(&xs, &ys, rowCount, p);
+
+    let mut config = ModelConfig::new(modelType, stmt.features.clone());
+    config.targetColumn = stmt.target.clone();
+    config.hyperparameters = hyperparameters;
+
+    let mut trained = match modelType {
+        ModelType::LinearRegression => linearRegression::train(&config, &data),
+        ModelType::LogisticRegression => logisticRegression::train(&config, &data),
+        ModelType::DecisionTreeRegression | ModelType::DecisionTreeClassification => {
+            decisionTree::train(&config, &data)
+        }
+        ModelType::RandomForestRegression | ModelType::RandomForestClassification => {
+            randomForest::train(&config, &data)
+        }
+        ModelType::GradientBoostingRegression | ModelType::GradientBoostingClassification => {
+            gradientBoosting::train(&config, &data)
+        }
+        ModelType::KMeans => kmeans::train(&config, &data),
+        ModelType::KnnRegression | ModelType::KnnClassification => knn::train(&config, &data),
+    }
+    .map_err(ProtocolError::Database)?;
+
+    trained.modelId = stmt.name.clone();
+    trained.createdAtMs = nowMs;
+
+    persistModel(server, &stmt.name, &trained).map_err(ProtocolError::Database)?;
+    server.model_cache.install(stmt.name.clone(), trained);
+
+    tracing::info!(
+        target: "zyron::audit",
+        event = "ModelCreated",
+        name = %stmt.name,
+        model_type = %stmt.model_type,
+        training_rows = rowCount,
+    );
+
+    Ok(DdlResult::Tag("CREATE MODEL".to_string()))
+}
+
+async fn handle_drop_model(
+    stmt: &zyron_parser::ast::DropModelStatement,
+    server: &Arc<ServerState>,
+) -> Result<DdlResult, ProtocolError> {
+    if server.model_cache.get(&stmt.name).is_none() && !stmt.if_exists {
+        return Err(ProtocolError::Database(ZyronError::ExecutionError(
+            format!("model '{}' not found", stmt.name),
+        )));
+    }
+    server.model_cache.invalidate(&stmt.name);
+    let _ = removeModelFile(server, &stmt.name);
+    Ok(DdlResult::Tag("DROP MODEL".to_string()))
+}
+
+fn optionAsU64(v: &zyron_parser::ast::TableOptionValue) -> Option<u64> {
+    match v {
+        zyron_parser::ast::TableOptionValue::Integer(n) => Some(*n as u64),
+        zyron_parser::ast::TableOptionValue::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+/// Runs the training SELECT and materializes feature columns and target
+async fn collectTrainingRowsFromQuery(
+    server: &Arc<ServerState>,
+    query: &zyron_parser::ast::SelectStatement,
+    featureColumns: &[String],
+    targetColumn: Option<&str>,
+    _raw_sql: &str,
+) -> Result<(Vec<f64>, Vec<f64>, usize), ZyronError> {
+    use zyron_executor::column::ScalarValue;
+    use zyron_executor::context::ExecutionContext;
+
+    let stmt = zyron_parser::Statement::Select(Box::new(query.clone()));
+    let database_id = zyron_catalog::DatabaseId(1);
+    let search_path: Vec<String> = vec!["public".to_string()];
+    let plan = zyron_planner::plan(&server.catalog, database_id, search_path, stmt).await?;
+
+    let schema = plan.output_schema();
+    let mut featureIndices: Vec<usize> = Vec::with_capacity(featureColumns.len());
+    for f in featureColumns {
+        let idx = schema
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(f))
+            .ok_or_else(|| ZyronError::ColumnNotFound(f.clone()))?;
+        featureIndices.push(idx);
+    }
+    let targetIdx = match targetColumn {
+        Some(t) => Some(
+            schema
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(t))
+                .ok_or_else(|| ZyronError::ColumnNotFound(t.to_string()))?,
+        ),
+        None => None,
+    };
+
+    let mut read_txn = server
+        .txn_manager
+        .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)?;
+    let snapshot = read_txn.snapshot.clone();
+    let txn_id_u32 = u32::try_from(read_txn.txn_id)
+        .map_err(|_| ZyronError::ExecutionError("txn_id overflow".into()))?;
+    let ctx = Arc::new(ExecutionContext::new(
+        server.catalog.clone(),
+        server.wal.clone(),
+        server.buffer_pool.clone(),
+        server.disk_manager.clone(),
+        txn_id_u32,
+        snapshot,
+    ));
+    let result = zyron_executor::execute(plan, &ctx).await;
+    let _ = server.txn_manager.abort(&mut read_txn);
+    let batches = result?;
+
+    let mut xs: Vec<f64> = Vec::new();
+    let mut ys: Vec<f64> = Vec::new();
+    let mut n: usize = 0;
+    for batch in &batches {
+        let rows = batch.num_rows;
+        for r in 0..rows {
+            for &fi in &featureIndices {
+                xs.push(scalarToF64(&batch.column(fi).get_scalar(r)));
+            }
+            if let Some(ti) = targetIdx {
+                ys.push(scalarToF64(&batch.column(ti).get_scalar(r)));
+            } else {
+                ys.push(0.0);
+            }
+            n += 1;
+        }
+    }
+
+    fn scalarToF64(v: &ScalarValue) -> f64 {
+        match v {
+            ScalarValue::Null => f64::NAN,
+            ScalarValue::Boolean(b) => {
+                if *b {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            ScalarValue::Int8(x) => *x as f64,
+            ScalarValue::Int16(x) => *x as f64,
+            ScalarValue::Int32(x) => *x as f64,
+            ScalarValue::Int64(x) => *x as f64,
+            ScalarValue::Int128(x) => *x as f64,
+            ScalarValue::UInt8(x) => *x as f64,
+            ScalarValue::UInt16(x) => *x as f64,
+            ScalarValue::UInt32(x) => *x as f64,
+            ScalarValue::UInt64(x) => *x as f64,
+            ScalarValue::Float32(f) => *f as f64,
+            ScalarValue::Float64(f) => *f,
+            ScalarValue::Utf8(_) | ScalarValue::Binary(_) | ScalarValue::FixedBinary16(_) => 0.0,
+            ScalarValue::Interval(_) => 0.0,
+        }
+    }
+
+    Ok((xs, ys, n))
+}
+
+fn featureStoreSnapshotPath(server: &Arc<ServerState>) -> std::path::PathBuf {
+    server.data_dir.join("feature_store.json")
+}
+
+fn modelsDir(server: &Arc<ServerState>) -> std::path::PathBuf {
+    server.data_dir.join("models")
+}
+
+/// Debounced async snapshot writer. DDL handlers mark the store dirty
+/// and the worker flushes after a quiet period, coalescing bursts of
+/// CREATE/DROP into one write to disk. The worker holds only a Weak
+/// reference to ServerState so the server can drop cleanly; the worker
+/// thread itself self-terminates when its sentinel `shutdown` flag is
+/// set, joining synchronously through the public shutdown method
+pub struct SnapshotFlusher {
+    dirty: std::sync::atomic::AtomicBool,
+    shutdown: std::sync::atomic::AtomicBool,
+    waker: std::sync::OnceLock<std::thread::Thread>,
+    path: std::path::PathBuf,
+    server: std::sync::Weak<ServerState>,
+    handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl SnapshotFlusher {
+    /// Signal the worker to exit and join it. Idempotent; multiple calls
+    /// return immediately after the first
+    pub fn shutdown(&self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(t) = self.waker.get() {
+            t.unpark();
+        }
+        if let Ok(mut guard) = self.handle.lock() {
+            if let Some(h) = guard.take() {
+                let _ = h.join();
+            }
+        }
+    }
+}
+
+impl Drop for SnapshotFlusher {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+static SNAPSHOT_FLUSHER: std::sync::OnceLock<Arc<SnapshotFlusher>> = std::sync::OnceLock::new();
+
+fn ensureSnapshotFlusher(server: &Arc<ServerState>) -> Arc<SnapshotFlusher> {
+    SNAPSHOT_FLUSHER
+        .get_or_init(|| {
+            let f = Arc::new(SnapshotFlusher {
+                dirty: std::sync::atomic::AtomicBool::new(false),
+                shutdown: std::sync::atomic::AtomicBool::new(false),
+                waker: std::sync::OnceLock::new(),
+                path: server.data_dir.join("feature_store.json"),
+                server: Arc::downgrade(server),
+                handle: std::sync::Mutex::new(None),
+            });
+            let worker = Arc::clone(&f);
+            let handle = std::thread::Builder::new()
+                .name("zyron-feature-snapshot".into())
+                .spawn(move || {
+                    let _ = worker.waker.set(std::thread::current());
+                    loop {
+                        std::thread::park();
+                        if worker.shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                            return;
+                        }
+                        // 200ms debounce window. Re-check shutdown at the
+                        // end so a shutdown signal during sleep also exits
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                        if worker.shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                            return;
+                        }
+                        if worker
+                            .dirty
+                            .swap(false, std::sync::atomic::Ordering::AcqRel)
+                        {
+                            if let Some(srv) = worker.server.upgrade() {
+                                let _ = writeFeatureSnapshotSync(&worker.path, &srv);
+                            }
+                        }
+                    }
+                })
+                .expect("failed to spawn snapshot flusher thread");
+            if let Ok(mut guard) = f.handle.lock() {
+                *guard = Some(handle);
+            }
+            f
+        })
+        .clone()
+}
+
+/// Public accessor so server shutdown can join the worker cleanly
+pub fn snapshotFlusher() -> Option<Arc<SnapshotFlusher>> {
+    SNAPSHOT_FLUSHER.get().cloned()
+}
+
+fn writeFeatureSnapshotSync(
+    path: &std::path::Path,
+    server: &Arc<ServerState>,
+) -> std::result::Result<(), ZyronError> {
+    let groups = server.feature_store.groups();
+    let groupsVec: Vec<zyron_analytics::FeatureGroup> =
+        groups.iter().map(|g| (**g).clone()).collect();
+    let text = serde_json::to_string_pretty(&groupsVec)
+        .map_err(|e| ZyronError::ExecutionError(format!("feature store snapshot encode: {}", e)))?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(path, text)
+        .map_err(|e| ZyronError::ExecutionError(format!("feature store snapshot write: {}", e)))?;
+    Ok(())
+}
+
+fn snapshotFeatureStore(server: &Arc<ServerState>) -> Result<(), ZyronError> {
+    let flusher = ensureSnapshotFlusher(server);
+    flusher
+        .dirty
+        .store(true, std::sync::atomic::Ordering::Release);
+    if let Some(t) = flusher.waker.get() {
+        t.unpark();
+    }
+    Ok(())
+}
+
+fn persistModel(
+    server: &Arc<ServerState>,
+    name: &str,
+    model: &zyron_analytics::TrainedModel,
+) -> Result<(), ZyronError> {
+    let dir = modelsDir(server);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| ZyronError::ExecutionError(format!("models dir: {}", e)))?;
+    let path = dir.join(format!("{}.json", name));
+    let text = serde_json::to_string(model)
+        .map_err(|e| ZyronError::ExecutionError(format!("model serialize: {}", e)))?;
+    std::fs::write(&path, text)
+        .map_err(|e| ZyronError::ExecutionError(format!("model write: {}", e)))?;
+    Ok(())
+}
+
+fn removeModelFile(server: &Arc<ServerState>, name: &str) -> Result<(), ZyronError> {
+    let path = modelsDir(server).join(format!("{}.json", name));
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .map_err(|e| ZyronError::ExecutionError(format!("model remove: {}", e)))?;
+    }
+    Ok(())
 }

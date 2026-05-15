@@ -245,6 +245,216 @@ fn build_default_registry() -> Arc<AnalyticsRegistry> {
         ],
     });
 
+    // Feature store and lineage
+    entries.push(AnalyticsFunction {
+        name: "GET_FEATURES",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 3,
+        max_args: Some(4),
+        description: "Point-in-time correct retrieval of feature values",
+        output_schema: &[("entity_key", "TEXT"), ("feature_name", "TEXT"), ("value", "TEXT")],
+    });
+    entries.push(AnalyticsFunction {
+        name: "FEATURE_LINEAGE",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 1,
+        max_args: Some(1),
+        description: "Source tables, columns, and dependencies for a qualified feature",
+        output_schema: &[
+            ("source_table", "TEXT"),
+            ("source_column", "TEXT"),
+            ("transform", "TEXT"),
+            ("dependency", "TEXT"),
+            ("last_computed_ms", "INT64"),
+        ],
+    });
+    entries.push(AnalyticsFunction {
+        name: "FEATURE_PARITY_CHECK",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 2,
+        max_args: Some(2),
+        description: "Compares offline and online feature retrievals for divergence",
+        output_schema: &[
+            ("entity_key", "TEXT"),
+            ("feature_name", "TEXT"),
+            ("offline", "TEXT"),
+            ("online", "TEXT"),
+        ],
+    });
+
+    // ML inference
+    entries.push(AnalyticsFunction {
+        name: "PREDICT",
+        kind: AnalyticsFunctionKind::Scalar,
+        min_args: 2,
+        max_args: None,
+        description: "Apply a trained model to a row, returns prediction",
+        output_schema: &[],
+    });
+    entries.push(AnalyticsFunction {
+        name: "PREDICT_BATCH",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 2,
+        max_args: None,
+        description: "Apply a trained model to a query result, returns predictions",
+        output_schema: &[("row_idx", "INT64"), ("prediction", "FLOAT64")],
+    });
+    entries.push(AnalyticsFunction {
+        name: "EXPLAIN_PREDICTION",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 2,
+        max_args: None,
+        description: "Per-feature contribution explanation for a single prediction",
+        output_schema: &[("feature", "TEXT"), ("contribution", "FLOAT64")],
+    });
+    entries.push(AnalyticsFunction {
+        name: "MODEL_LINEAGE",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 1,
+        max_args: Some(1),
+        description: "Training metadata and feature dependencies for a model",
+        output_schema: &[
+            ("attribute", "TEXT"),
+            ("value", "TEXT"),
+        ],
+    });
+
+    // Causal inference
+    entries.push(AnalyticsFunction {
+        name: "PROPENSITY_SCORE",
+        kind: AnalyticsFunctionKind::Scalar,
+        min_args: 2,
+        max_args: None,
+        description: "Logistic-regression propensity score for treatment given covariates",
+        output_schema: &[],
+    });
+    entries.push(AnalyticsFunction {
+        name: "ATE",
+        kind: AnalyticsFunctionKind::Scalar,
+        min_args: 3,
+        max_args: None,
+        description: "Average Treatment Effect via inverse-propensity weighting",
+        output_schema: &[],
+    });
+    entries.push(AnalyticsFunction {
+        name: "ATT",
+        kind: AnalyticsFunctionKind::Scalar,
+        min_args: 3,
+        max_args: None,
+        description: "Average Treatment Effect on the Treated",
+        output_schema: &[],
+    });
+    entries.push(AnalyticsFunction {
+        name: "DIFF_IN_DIFF",
+        kind: AnalyticsFunctionKind::Scalar,
+        min_args: 4,
+        max_args: Some(4),
+        description: "Difference-in-differences estimator on (outcome, treatment, time, post)",
+        output_schema: &[],
+    });
+
+    // Predictive analytics
+    entries.push(AnalyticsFunction {
+        name: "FORECAST",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 2,
+        max_args: None,
+        description: "Time series forecast (ES, ARIMA, Holt-Winters, linear trend, decomposition)",
+        output_schema: &[("step", "INT64"), ("value", "FLOAT64")],
+    });
+    entries.push(AnalyticsFunction {
+        name: "ANOMALY_DETECT",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 1,
+        max_args: Some(3),
+        description: "Anomaly detection on a series, returns per-row score and flag",
+        output_schema: &[("idx", "INT64"), ("is_anomaly", "BOOL"), ("score", "FLOAT64")],
+    });
+    entries.push(AnalyticsFunction {
+        name: "TREND",
+        kind: AnalyticsFunctionKind::Scalar,
+        min_args: 1,
+        max_args: Some(2),
+        description: "Linear trend slope and intercept over a series",
+        output_schema: &[],
+    });
+    entries.push(AnalyticsFunction {
+        name: "SEASONALITY_DETECT",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 1,
+        max_args: Some(2),
+        description: "Detects periodic patterns in a series via autocorrelation peaks",
+        output_schema: &[("period", "INT64"), ("strength", "FLOAT64")],
+    });
+    entries.push(AnalyticsFunction {
+        name: "ACF",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 1,
+        max_args: Some(2),
+        description: "Auto-correlation function up to a maximum lag",
+        output_schema: &[("lag", "INT64"), ("value", "FLOAT64")],
+    });
+    entries.push(AnalyticsFunction {
+        name: "PACF",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 1,
+        max_args: Some(2),
+        description: "Partial auto-correlation up to a maximum lag",
+        output_schema: &[("lag", "INT64"), ("value", "FLOAT64")],
+    });
+    entries.push(AnalyticsFunction {
+        name: "CHANGE_POINTS",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 1,
+        max_args: Some(2),
+        description: "CUSUM change point indices",
+        output_schema: &[("idx", "INT64")],
+    });
+
+    // Drift and quality
+    entries.push(AnalyticsFunction {
+        name: "PSI",
+        kind: AnalyticsFunctionKind::Scalar,
+        min_args: 2,
+        max_args: Some(2),
+        description: "Population Stability Index between two histograms",
+        output_schema: &[],
+    });
+    entries.push(AnalyticsFunction {
+        name: "KS_TEST",
+        kind: AnalyticsFunctionKind::Scalar,
+        min_args: 2,
+        max_args: Some(2),
+        description: "Kolmogorov-Smirnov D statistic between two samples",
+        output_schema: &[],
+    });
+    entries.push(AnalyticsFunction {
+        name: "DATE_FEATURES",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 1,
+        max_args: Some(1),
+        description: "Decomposes a timestamp into year, month, day, dow, hour, weekend, doy, woy, quarter",
+        output_schema: &[
+            ("year", "INT32"),
+            ("month", "INT32"),
+            ("day", "INT32"),
+            ("dow", "INT32"),
+            ("hour", "INT32"),
+            ("is_weekend", "BOOL"),
+            ("doy", "INT32"),
+            ("woy", "INT32"),
+            ("quarter", "INT32"),
+        ],
+    });
+    entries.push(AnalyticsFunction {
+        name: "POLYNOMIAL_FEATURES",
+        kind: AnalyticsFunctionKind::TableReturning,
+        min_args: 2,
+        max_args: None,
+        description: "Polynomial expansion of features up to a given degree",
+        output_schema: &[("term", "TEXT"), ("value", "FLOAT64")],
+    });
+
     // Scalar / window functions
     for (name, kind, args, desc) in [
         (

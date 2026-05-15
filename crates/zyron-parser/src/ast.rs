@@ -106,6 +106,14 @@ pub enum Statement {
     DisableFeature(Box<DisableFeatureStatement>),
     /// CREATE FULLTEXT INDEX name ON table(columns) [WITH (options)]
     CreateFulltextIndex(Box<CreateFulltextIndexStatement>),
+    /// CREATE FEATURE GROUP name (ENTITY KEY col, FEATURES (...), REFRESH EVERY 'N units', WITH (options))
+    CreateFeatureGroup(Box<CreateFeatureGroupStatement>),
+    /// DROP FEATURE GROUP [IF EXISTS] name
+    DropFeatureGroup(Box<DropFeatureGroupStatement>),
+    /// CREATE MODEL name TYPE algorithm FEATURES (...) [TARGET col] USING (query) [WITH (options)]
+    CreateModel(Box<CreateModelStatement>),
+    /// DROP MODEL [IF EXISTS] name
+    DropModel(Box<DropModelStatement>),
     /// CREATE VECTOR INDEX name ON table(column) [WITH (options)]
     CreateVectorIndex(Box<CreateVectorIndexStatement>),
     CreateSpatialIndex(Box<CreateSpatialIndexStatement>),
@@ -1688,6 +1696,47 @@ pub struct CreateFulltextIndexStatement {
     pub table: String,
     pub columns: Vec<String>,
     pub options: Vec<TableOption>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FeatureDefinitionAst {
+    pub name: String,
+    pub data_type: Option<DataType>,
+    pub transform_expr: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateFeatureGroupStatement {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub entity_key: String,
+    pub features: Vec<FeatureDefinitionAst>,
+    pub source_query: Option<Box<SelectStatement>>,
+    pub refresh_interval: Option<String>,
+    pub options: Vec<TableOption>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropFeatureGroupStatement {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateModelStatement {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub model_type: String,
+    pub features: Vec<String>,
+    pub target: Option<String>,
+    pub training_query: Option<Box<SelectStatement>>,
+    pub options: Vec<TableOption>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropModelStatement {
+    pub name: String,
+    pub if_exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

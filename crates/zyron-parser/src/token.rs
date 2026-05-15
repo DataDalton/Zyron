@@ -392,6 +392,14 @@ pub enum Keyword {
     Quarantine,
     Run,
 
+    // Feature store and ML
+    Feature,
+    Model,
+    Algorithm,
+    Entity,
+    Hyperparameters,
+    Features,
+
     // Archive / Restore
     Restore,
 
@@ -1032,6 +1040,14 @@ pub fn lookup_keyword(word: &str) -> Option<Keyword> {
         "FAIL" => Some(Keyword::Fail),
         "QUARANTINE" => Some(Keyword::Quarantine),
         "RUN" => Some(Keyword::Run),
+
+        // Feature store and ML
+        "FEATURE" => Some(Keyword::Feature),
+        "FEATURES" => Some(Keyword::Features),
+        "MODEL" => Some(Keyword::Model),
+        "ALGORITHM" => Some(Keyword::Algorithm),
+        "ENTITY" => Some(Keyword::Entity),
+        "HYPERPARAMETERS" => Some(Keyword::Hyperparameters),
 
         // Archive / Restore
         "RESTORE" => Some(Keyword::Restore),

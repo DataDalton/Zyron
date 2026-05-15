@@ -357,6 +357,11 @@ impl<K, V> SmallChain<K, V> {
             .chain(self.tail.iter().map(|(_, k, v)| (k, v)))
     }
 
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&K, &mut V)> {
+        let (head_k, head_v) = (&self.head.1, &mut self.head.2);
+        std::iter::once((head_k, head_v)).chain(self.tail.iter_mut().map(|(_, k, v)| (&*k, v)))
+    }
+
     pub fn into_iter(self) -> impl Iterator<Item = (K, V)> {
         std::iter::once((self.head.1, self.head.2))
             .chain(self.tail.into_iter().map(|(_, k, v)| (k, v)))
@@ -436,8 +441,24 @@ impl<K, V> VerifiedKeyMap<K, V> {
             .map(|(_, _, v)| v)
     }
 
+    pub fn get_mut(&mut self, hash_low: u64, hash_high: u64) -> Option<&mut V> {
+        let chain = self.inner.get_mut(&hash_low)?;
+        if chain.head.0 == hash_high {
+            return Some(&mut chain.head.2);
+        }
+        chain
+            .tail
+            .iter_mut()
+            .find(|(h, _, _)| *h == hash_high)
+            .map(|(_, _, v)| v)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
         self.inner.values().flat_map(|chain| chain.iter())
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&K, &mut V)> {
+        self.inner.values_mut().flat_map(|chain| chain.iter_mut())
     }
 
     pub fn into_iter(self) -> impl Iterator<Item = (K, V)> {

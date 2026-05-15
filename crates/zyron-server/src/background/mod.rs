@@ -9,6 +9,8 @@ pub mod checkpoint;
 pub mod credential_refresh;
 pub mod dead_subscriber_reaper;
 pub mod dlq_ttl;
+pub mod feature_materialization;
+pub mod feature_materialization_impl;
 pub mod host_health;
 pub mod mv_refresh;
 pub mod publication_retention;
@@ -35,6 +37,9 @@ use zyron_buffer::BackgroundWriter;
 
 use self::cdc_writer::{CdcWriter, CdcWriterConfig};
 use self::checkpoint::{CheckpointWorker, CheckpointWorkerConfig};
+use self::feature_materialization::{
+    FeatureMaterializationConfig, FeatureMaterializationWorker,
+};
 use self::mv_refresh::{MvRefreshConfig, MvRefreshWorker};
 use self::quota_gossip::{
     NoopTransport, QuotaGossipConfig, QuotaGossipTransport, QuotaGossipWorker,
@@ -54,6 +59,7 @@ pub struct BackgroundWorkers {
     wal_archiver: Option<WalArchiver>,
     cdc_writer: CdcWriter,
     mv_refresh: MvRefreshWorker,
+    feature_materialization: FeatureMaterializationWorker,
     stream_monitor: StreamMonitor,
     quota_gossip: Option<QuotaGossipWorker>,
 }
@@ -124,6 +130,8 @@ impl BackgroundWorkers {
             CdcWriter::start_with_registry(CdcWriterConfig::default(), cdc_registry.clone());
         let mv_refresh =
             MvRefreshWorker::start_with_catalog(MvRefreshConfig::default(), Some(catalog_for_mv));
+        let feature_materialization =
+            FeatureMaterializationWorker::start(FeatureMaterializationConfig::default());
         let stream_monitor = StreamMonitor::start_with_manager(
             StreamMonitorConfig::default(),
             stream_job_manager.clone(),
@@ -138,9 +146,17 @@ impl BackgroundWorkers {
             wal_archiver,
             cdc_writer,
             mv_refresh,
+            feature_materialization,
             stream_monitor,
             quota_gossip: None,
         }
+    }
+
+    /// Returns the feature materialization worker stats Arc
+    pub fn feature_materialization_stats(
+        &self,
+    ) -> Arc<feature_materialization::FeatureMaterializationStats> {
+        self.feature_materialization.stats()
     }
 
     /// Attaches a QuotaGossip worker to the running set. Call after `start`
@@ -202,6 +218,7 @@ impl BackgroundWorkers {
             gossip.shutdown();
         }
         self.stream_monitor.shutdown();
+        self.feature_materialization.shutdown();
         self.mv_refresh.shutdown();
         self.cdc_writer.shutdown();
         if let Some(ref mut archiver) = self.wal_archiver {

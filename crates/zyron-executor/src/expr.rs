@@ -604,7 +604,345 @@ fn evaluate_function(
             let b = evaluate(&args[1], batch, schema, params)?;
             eval_nullif(&a, &b)
         }
+        n if name_matches_ml(n) => eval_ml_scalar(n, args, batch, schema, params),
         _ => crate::types_bridge::evaluate_types_function(name, args, batch, schema, params),
+    }
+}
+
+fn name_matches_ml(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "PREDICT"
+            | "ATE"
+            | "ATT"
+            | "PROPENSITY_SCORE"
+            | "DIFF_IN_DIFF"
+            | "TREND"
+            | "PSI"
+            | "KS_TEST"
+    )
+}
+
+fn eval_ml_scalar(
+    name: &str,
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    let upper = name.to_ascii_uppercase();
+    match upper.as_str() {
+        "PREDICT" => eval_predict(args, batch, schema, params),
+        "ATE" => eval_ate(args, batch, schema, params),
+        "ATT" => eval_att(args, batch, schema, params),
+        "PROPENSITY_SCORE" => eval_propensity(args, batch, schema, params),
+        "DIFF_IN_DIFF" => eval_did(args, batch, schema, params),
+        "TREND" => eval_trend(args, batch, schema, params),
+        "PSI" => eval_psi(args, batch, schema, params),
+        "KS_TEST" => eval_ks(args, batch, schema, params),
+        _ => Err(ZyronError::ExecutionError(format!(
+            "ML scalar '{}' not implemented",
+            name
+        ))),
+    }
+}
+
+/// PREDICT('model_name', col1, col2, ...) returns prediction per row
+fn eval_predict(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    if args.is_empty() {
+        return Err(ZyronError::ExecutionError(
+            "PREDICT requires model name and feature args".to_string(),
+        ));
+    }
+    let model_name = literal_string(&args[0]).ok_or_else(|| {
+        ZyronError::ExecutionError("PREDICT first argument must be model name literal".to_string())
+    })?;
+    let handle = zyron_analytics::InferenceHandle::resolve(&model_name).ok_or_else(|| {
+        ZyronError::ExecutionError(format!("model '{}' not found in cache", model_name))
+    })?;
+    let feature_cols: Vec<Column> = args[1..]
+        .iter()
+        .map(|a| evaluate(a, batch, schema, params))
+        .collect::<Result<Vec<_>>>()?;
+    let p = handle.model.featureColumns.len();
+    if feature_cols.len() != p {
+        return Err(ZyronError::ExecutionError(format!(
+            "PREDICT got {} feature columns, model expects {}",
+            feature_cols.len(),
+            p
+        )));
+    }
+    let n = batch.num_rows;
+    let mut data = ColumnData::with_capacity(TypeId::Float64, n);
+    let mut nulls = NullBitmap::empty();
+    let mut row = vec![0.0f64; p];
+    for i in 0..n {
+        let mut any_null = false;
+        for (j, col) in feature_cols.iter().enumerate() {
+            if col.is_null(i) {
+                any_null = true;
+                break;
+            }
+            row[j] = scalar_to_f64(&col.data.get_scalar(i));
+        }
+        if any_null {
+            nulls.push(true);
+            data.push_default();
+        } else {
+            let v = handle.predictOne(&row);
+            nulls.push(false);
+            data.push_scalar(&ScalarValue::Float64(v));
+        }
+    }
+    Ok(Column::with_nulls(data, nulls, TypeId::Float64))
+}
+
+fn eval_ate(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    let (outcome, treatment, covariates, p) = collect_causal_inputs(args, batch, schema, params)?;
+    let est = zyron_analytics::ate(&outcome, &treatment, &covariates, p)?;
+    broadcast_f64(est, batch.num_rows)
+}
+
+fn eval_att(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    let (outcome, treatment, covariates, p) = collect_causal_inputs(args, batch, schema, params)?;
+    let est = zyron_analytics::att(&outcome, &treatment, &covariates, p)?;
+    broadcast_f64(est, batch.num_rows)
+}
+
+fn eval_propensity(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    if args.len() < 2 {
+        return Err(ZyronError::ExecutionError(
+            "PROPENSITY_SCORE requires (treatment, covariate1, ...)".to_string(),
+        ));
+    }
+    let treatment_col = evaluate(&args[0], batch, schema, params)?;
+    let p = args.len() - 1;
+    let n = batch.num_rows;
+    let mut treatment = Vec::with_capacity(n);
+    for i in 0..n {
+        treatment.push(scalar_to_f64(&treatment_col.data.get_scalar(i)));
+    }
+    let mut covariates: Vec<f64> = Vec::with_capacity(n * p);
+    let cov_cols: Vec<Column> = args[1..]
+        .iter()
+        .map(|a| evaluate(a, batch, schema, params))
+        .collect::<Result<Vec<_>>>()?;
+    for i in 0..n {
+        for c in &cov_cols {
+            covariates.push(scalar_to_f64(&c.data.get_scalar(i)));
+        }
+    }
+    let scores = zyron_analytics::propensityScore(&treatment, &covariates, p)?;
+    let mut data = ColumnData::with_capacity(TypeId::Float64, scores.len());
+    let mut nulls = NullBitmap::empty();
+    for s in scores {
+        nulls.push(false);
+        data.push_scalar(&ScalarValue::Float64(s));
+    }
+    Ok(Column::with_nulls(data, nulls, TypeId::Float64))
+}
+
+fn eval_did(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    if args.len() < 3 {
+        return Err(ZyronError::ExecutionError(
+            "DIFF_IN_DIFF requires (outcome, treatment, post[, time])".to_string(),
+        ));
+    }
+    let outcome = collect_column_f64(&args[0], batch, schema, params)?;
+    let treatment = collect_column_f64(&args[1], batch, schema, params)?;
+    let post = if args.len() >= 4 {
+        collect_column_f64(&args[3], batch, schema, params)?
+    } else {
+        collect_column_f64(&args[2], batch, schema, params)?
+    };
+    let est = zyron_analytics::diffInDiff(&outcome, &treatment, &post)?;
+    broadcast_f64(est, batch.num_rows)
+}
+
+fn eval_trend(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    if args.is_empty() {
+        return Err(ZyronError::ExecutionError(
+            "TREND requires a value column".to_string(),
+        ));
+    }
+    let values = collect_column_f64(&args[0], batch, schema, params)?;
+    let (slope, _intercept) = zyron_analytics::trend(&values);
+    broadcast_f64(slope, batch.num_rows)
+}
+
+fn eval_psi(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    if args.len() != 2 {
+        return Err(ZyronError::ExecutionError(
+            "PSI requires (actual_histogram_col, expected_histogram_col)".to_string(),
+        ));
+    }
+    let a = collect_column_u64(&args[0], batch, schema, params)?;
+    let b = collect_column_u64(&args[1], batch, schema, params)?;
+    let psi = zyron_analytics::ml::transforms::psi(&a, &b);
+    broadcast_f64(psi, batch.num_rows)
+}
+
+fn eval_ks(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    if args.len() != 2 {
+        return Err(ZyronError::ExecutionError(
+            "KS_TEST requires (sample_a, sample_b)".to_string(),
+        ));
+    }
+    let a = collect_column_f64(&args[0], batch, schema, params)?;
+    let b = collect_column_f64(&args[1], batch, schema, params)?;
+    let d = zyron_analytics::ml::transforms::ksStatistic(&a, &b);
+    broadcast_f64(d, batch.num_rows)
+}
+
+fn collect_causal_inputs(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, usize)> {
+    if args.len() < 3 {
+        return Err(ZyronError::ExecutionError(
+            "causal estimator requires (outcome, treatment, covariate1, ...)".to_string(),
+        ));
+    }
+    let outcome = collect_column_f64(&args[0], batch, schema, params)?;
+    let treatment = collect_column_f64(&args[1], batch, schema, params)?;
+    let p = args.len() - 2;
+    let n = outcome.len();
+    let mut covariates = Vec::with_capacity(n * p);
+    let cov_cols: Vec<Column> = args[2..]
+        .iter()
+        .map(|a| evaluate(a, batch, schema, params))
+        .collect::<Result<Vec<_>>>()?;
+    for i in 0..n {
+        for c in &cov_cols {
+            covariates.push(scalar_to_f64(&c.data.get_scalar(i)));
+        }
+    }
+    Ok((outcome, treatment, covariates, p))
+}
+
+fn collect_column_f64(
+    expr: &BoundExpr,
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Vec<f64>> {
+    let col = evaluate(expr, batch, schema, params)?;
+    let n = batch.num_rows;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        if col.is_null(i) {
+            out.push(f64::NAN);
+        } else {
+            out.push(scalar_to_f64(&col.data.get_scalar(i)));
+        }
+    }
+    Ok(out)
+}
+
+fn collect_column_u64(
+    expr: &BoundExpr,
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Vec<u64>> {
+    let col = evaluate(expr, batch, schema, params)?;
+    let n = batch.num_rows;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        if col.is_null(i) {
+            out.push(0);
+        } else {
+            out.push(scalar_to_f64(&col.data.get_scalar(i)).max(0.0) as u64);
+        }
+    }
+    Ok(out)
+}
+
+fn broadcast_f64(value: f64, n: usize) -> Result<Column> {
+    let mut data = ColumnData::with_capacity(TypeId::Float64, n);
+    let mut nulls = NullBitmap::empty();
+    for _ in 0..n {
+        nulls.push(false);
+        data.push_scalar(&ScalarValue::Float64(value));
+    }
+    Ok(Column::with_nulls(data, nulls, TypeId::Float64))
+}
+
+fn scalar_to_f64(v: &ScalarValue) -> f64 {
+    match v {
+        ScalarValue::Null => f64::NAN,
+        ScalarValue::Boolean(b) => {
+            if *b {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        ScalarValue::Int8(x) => *x as f64,
+        ScalarValue::Int16(x) => *x as f64,
+        ScalarValue::Int32(x) => *x as f64,
+        ScalarValue::Int64(x) => *x as f64,
+        ScalarValue::Int128(x) => *x as f64,
+        ScalarValue::UInt8(x) => *x as f64,
+        ScalarValue::UInt16(x) => *x as f64,
+        ScalarValue::UInt32(x) => *x as f64,
+        ScalarValue::UInt64(x) => *x as f64,
+        ScalarValue::Float32(f) => *f as f64,
+        ScalarValue::Float64(f) => *f,
+        _ => 0.0,
+    }
+}
+
+fn literal_string(expr: &BoundExpr) -> Option<String> {
+    use zyron_parser::ast::LiteralValue;
+    match expr {
+        BoundExpr::Literal {
+            value: LiteralValue::String(s),
+            ..
+        } => Some(s.clone()),
+        _ => None,
     }
 }
 

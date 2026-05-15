@@ -7,6 +7,7 @@
 pub mod background;
 pub mod backup;
 pub mod config;
+pub mod feature_persistence;
 pub mod gateway;
 pub mod health;
 pub mod hooks;
@@ -799,7 +800,29 @@ impl Server {
             btree_indexes: Arc::new(scc::HashMap::new()),
             vacuum_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             analytics_registry: zyron_analytics::default_registry(),
+            feature_store: zyron_analytics::featureStore(),
+            feature_lineage: zyron_analytics::featureLineageRegistry(),
+            model_cache: zyron_analytics::modelCache(),
         });
+
+        // Restore feature groups and trained models from on-disk snapshots
+        if let Err(e) = crate::feature_persistence::restore_feature_state(&server_state) {
+            tracing::warn!(target: "zyron::server", "feature/model restore: {}", e);
+        }
+
+        // Install the planner-backed materialization executor so the
+        // background feature_materialization worker runs each group's
+        // source query on its schedule
+        let mat_exec = std::sync::Arc::new(
+            crate::background::feature_materialization_impl::PlannerMaterializationExecutor::new(
+                Arc::clone(&server_state.catalog),
+                Arc::clone(&server_state.wal),
+                Arc::clone(&server_state.buffer_pool),
+                Arc::clone(&server_state.disk_manager),
+                Arc::clone(&server_state.txn_manager),
+            ),
+        );
+        crate::background::feature_materialization::install_materialization_executor(mat_exec);
 
         // -------------------------------------------------------------------
         // Install the admin executor on the shared HealthState so /admin/*

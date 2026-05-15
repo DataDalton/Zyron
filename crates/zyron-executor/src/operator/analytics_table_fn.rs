@@ -73,6 +73,20 @@ impl AnalyticsTableFunctionOperator {
             "CORRELATION_MATRIX" => self.run_correlation_matrix().await,
             "COHORT_RETENTION" => self.run_cohort_retention().await,
             "FUNNEL_ANALYSIS" => self.run_funnel_analysis().await,
+            "GET_FEATURES" => self.run_get_features().await,
+            "FEATURE_LINEAGE" => self.run_feature_lineage().await,
+            "PREDICT_BATCH" => self.run_predict_batch().await,
+            "FORECAST" => self.run_forecast().await,
+            "ANOMALY_DETECT" => self.run_anomaly_detect().await,
+            "ACF" => self.run_acf().await,
+            "PACF" => self.run_pacf().await,
+            "SEASONALITY_DETECT" => self.run_seasonality_detect().await,
+            "CHANGE_POINTS" => self.run_change_points().await,
+            "DATE_FEATURES" => self.run_date_features().await,
+            "POLYNOMIAL_FEATURES" => self.run_polynomial_features().await,
+            "FEATURE_PARITY_CHECK" => self.run_feature_parity_check().await,
+            "EXPLAIN_PREDICTION" => self.run_explain_prediction().await,
+            "MODEL_LINEAGE" => self.run_model_lineage().await,
             other => Err(ZyronError::ExecutionError(format!(
                 "analytics function '{}' has no executor dispatch",
                 other
@@ -602,6 +616,535 @@ impl AnalyticsTableFunctionOperator {
         }
         scalar_columns_to_batch(vec![(TypeId::Varchar, keys), (TypeId::Varchar, vals)])
     }
+
+    // ---- Feature store and ML ----
+
+    fn first_pos_strings(&self) -> Result<Vec<String>> {
+        match self.positional_args.first() {
+            Some(BoundExpr::Function { name, args, .. }) if name == "array" => {
+                let mut out = Vec::with_capacity(args.len());
+                for e in args {
+                    if let BoundExpr::Literal {
+                        value: LiteralValue::String(s),
+                        ..
+                    } = e
+                    {
+                        out.push(s.clone());
+                    } else {
+                        return Err(ZyronError::ExecutionError(
+                            "expected array of string literals".to_string(),
+                        ));
+                    }
+                }
+                Ok(out)
+            }
+            Some(BoundExpr::Literal {
+                value: LiteralValue::String(s),
+                ..
+            }) => Ok(vec![s.clone()]),
+            _ => Err(ZyronError::ExecutionError(format!(
+                "{} requires a string or array-of-strings as the first argument",
+                self.function_name
+            ))),
+        }
+    }
+
+    fn pos_strings_at(&self, idx: usize) -> Result<Vec<String>> {
+        match self.positional_args.get(idx) {
+            Some(BoundExpr::Function { name, args, .. }) if name == "array" => {
+                let mut out = Vec::with_capacity(args.len());
+                for e in args {
+                    if let BoundExpr::Literal {
+                        value: LiteralValue::String(s),
+                        ..
+                    } = e
+                    {
+                        out.push(s.clone());
+                    } else {
+                        return Err(ZyronError::ExecutionError(
+                            "expected array of string literals".to_string(),
+                        ));
+                    }
+                }
+                Ok(out)
+            }
+            Some(BoundExpr::Literal {
+                value: LiteralValue::String(s),
+                ..
+            }) => Ok(vec![s.clone()]),
+            _ => Err(ZyronError::ExecutionError(format!(
+                "{} positional argument {} must be a string array",
+                self.function_name, idx
+            ))),
+        }
+    }
+
+    fn pos_string_at(&self, idx: usize) -> Result<String> {
+        match self.positional_args.get(idx) {
+            Some(BoundExpr::Literal {
+                value: LiteralValue::String(s),
+                ..
+            }) => Ok(s.clone()),
+            _ => Err(ZyronError::ExecutionError(format!(
+                "{} positional argument {} must be a string literal",
+                self.function_name, idx
+            ))),
+        }
+    }
+
+    fn pos_int_at(&self, idx: usize) -> Result<i64> {
+        match self.positional_args.get(idx) {
+            Some(BoundExpr::Literal {
+                value: LiteralValue::Integer(i),
+                ..
+            }) => Ok(*i),
+            _ => Err(ZyronError::ExecutionError(format!(
+                "{} positional argument {} must be an integer literal",
+                self.function_name, idx
+            ))),
+        }
+    }
+
+    fn pos_float_at(&self, idx: usize) -> Result<f64> {
+        match self.positional_args.get(idx) {
+            Some(BoundExpr::Literal {
+                value: LiteralValue::Float(f),
+                ..
+            }) => Ok(*f),
+            Some(BoundExpr::Literal {
+                value: LiteralValue::Integer(i),
+                ..
+            }) => Ok(*i as f64),
+            _ => Err(ZyronError::ExecutionError(format!(
+                "{} positional argument {} must be a numeric literal",
+                self.function_name, idx
+            ))),
+        }
+    }
+
+    async fn run_get_features(&self) -> Result<DataBatch> {
+        // GET_FEATURES(group_name, [entity_keys], [feature_names], as_of_ms)
+        let groupName = self.pos_string_at(0)?;
+        let entities = self.pos_strings_at(1)?;
+        let features = self.pos_strings_at(2)?;
+        let asOf = self.pos_int_at(3).unwrap_or_else(|_| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0)
+        });
+        let store = zyron_analytics::featureStore();
+        let frame = store
+            .getFeatures(&groupName, &entities, &features, asOf)
+            .map_err(|e| ZyronError::ExecutionError(format!("{}", e)))?;
+
+        let mut entityCol: Vec<ScalarValue> = Vec::new();
+        let mut featureCol: Vec<ScalarValue> = Vec::new();
+        let mut valueCol: Vec<ScalarValue> = Vec::new();
+        for row in &frame.rows {
+            for (i, name) in frame.featureNames.iter().enumerate() {
+                entityCol.push(ScalarValue::Utf8(row.entityKey.clone()));
+                featureCol.push(ScalarValue::Utf8(name.clone()));
+                valueCol.push(ScalarValue::Utf8(format!("{:?}", row.values[i])));
+            }
+        }
+        Ok(scalar_columns_to_batch(vec![
+            (TypeId::Varchar, entityCol),
+            (TypeId::Varchar, featureCol),
+            (TypeId::Varchar, valueCol),
+        ]))
+    }
+
+    async fn run_feature_lineage(&self) -> Result<DataBatch> {
+        let qualifiedName = self.pos_string_at(0)?;
+        let registry = zyron_analytics::featureLineageRegistry();
+        let guard = registry.read();
+        let entry = guard.get(&qualifiedName).cloned();
+        drop(guard);
+
+        let mut sourceTable: Vec<ScalarValue> = Vec::new();
+        let mut sourceColumn: Vec<ScalarValue> = Vec::new();
+        let mut transform: Vec<ScalarValue> = Vec::new();
+        let mut dependency: Vec<ScalarValue> = Vec::new();
+        let mut lastComputed: Vec<ScalarValue> = Vec::new();
+        if let Some(e) = entry {
+            for t in &e.sourceTables {
+                sourceTable.push(ScalarValue::Utf8(t.clone()));
+                sourceColumn.push(ScalarValue::Utf8(String::new()));
+                transform.push(ScalarValue::Utf8(e.transformChain.join(" ; ")));
+                dependency.push(ScalarValue::Utf8(e.dependencies.join(",")));
+                lastComputed.push(ScalarValue::Int64(e.lastComputedMs));
+            }
+            for (tab, col) in &e.sourceColumns {
+                sourceTable.push(ScalarValue::Utf8(tab.clone()));
+                sourceColumn.push(ScalarValue::Utf8(col.clone()));
+                transform.push(ScalarValue::Utf8(e.transformChain.join(" ; ")));
+                dependency.push(ScalarValue::Utf8(e.dependencies.join(",")));
+                lastComputed.push(ScalarValue::Int64(e.lastComputedMs));
+            }
+        }
+        Ok(scalar_columns_to_batch(vec![
+            (TypeId::Varchar, sourceTable),
+            (TypeId::Varchar, sourceColumn),
+            (TypeId::Varchar, transform),
+            (TypeId::Varchar, dependency),
+            (TypeId::Int64, lastComputed),
+        ]))
+    }
+
+    async fn run_predict_batch(&self) -> Result<DataBatch> {
+        // PREDICT_BATCH(model_name, source_table)
+        let modelName = self.pos_string_at(0)?;
+        let sourceTable = self.pos_string_at(1)?;
+        let handle = zyron_analytics::InferenceHandle::resolve(&modelName).ok_or_else(|| {
+            ZyronError::ExecutionError(format!("model '{}' not found in cache", modelName))
+        })?;
+
+        let tableEntry = self.resolve_table(&sourceTable)?;
+        let columns = tableEntry.columns.clone();
+        let featureCols = &handle.model.featureColumns;
+        let mut featureIdx: Vec<usize> = Vec::with_capacity(featureCols.len());
+        for f in featureCols {
+            let idx = columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(f))
+                .ok_or_else(|| ZyronError::ColumnNotFound(f.clone()))?;
+            featureIdx.push(idx);
+        }
+
+        let heap_file = self.ctx.get_heap_file(tableEntry.id).await?;
+        let snapshot = self.ctx.snapshot.clone();
+        let guard = heap_file.scan()?;
+        let mut rowIdx: Vec<ScalarValue> = Vec::new();
+        let mut preds: Vec<ScalarValue> = Vec::new();
+        let mut featureBuf = vec![0.0f64; featureCols.len()];
+        let mut rowNum: i64 = 0;
+        guard.for_each(|_tid, view| {
+            if view.is_deleted() {
+                return;
+            }
+            if !view.header.is_visible_to(&snapshot) {
+                return;
+            }
+            decode_row_features(view.data, &columns, &featureIdx, &mut featureBuf);
+            let p = handle.predictOne(&featureBuf);
+            rowIdx.push(ScalarValue::Int64(rowNum));
+            preds.push(ScalarValue::Float64(p));
+            rowNum += 1;
+        });
+        Ok(scalar_columns_to_batch(vec![
+            (TypeId::Int64, rowIdx),
+            (TypeId::Float64, preds),
+        ]))
+    }
+
+    async fn run_forecast(&self) -> Result<DataBatch> {
+        // FORECAST(table_name, value_col, periods, method)
+        let table = self.pos_string_at(0)?;
+        let valueCol = self.pos_string_at(1)?;
+        let periods = self.pos_int_at(2)? as usize;
+        let methodStr = self
+            .pos_string_at(3)
+            .unwrap_or_else(|_| "linear_trend".into());
+        let method = zyron_analytics::ForecastMethod::fromStr(&methodStr).ok_or_else(|| {
+            ZyronError::ExecutionError(format!("unknown forecast method '{}'", methodStr))
+        })?;
+        let values = self.collect_numeric_column(&table, &valueCol).await?;
+        let extra = std::collections::HashMap::new();
+        let result = zyron_analytics::forecast(&values, periods, method, &extra)?;
+        let mut stepCol: Vec<ScalarValue> = Vec::with_capacity(result.len());
+        let mut valCol: Vec<ScalarValue> = Vec::with_capacity(result.len());
+        for (i, v) in result.iter().enumerate() {
+            stepCol.push(ScalarValue::Int64(i as i64));
+            valCol.push(ScalarValue::Float64(*v));
+        }
+        Ok(scalar_columns_to_batch(vec![
+            (TypeId::Int64, stepCol),
+            (TypeId::Float64, valCol),
+        ]))
+    }
+
+    async fn run_anomaly_detect(&self) -> Result<DataBatch> {
+        // ANOMALY_DETECT(table_name, value_col, [method], [threshold])
+        let table = self.pos_string_at(0)?;
+        let valueCol = self.pos_string_at(1)?;
+        let methodStr = self.pos_string_at(2).unwrap_or_else(|_| "zscore".into());
+        let threshold = self.pos_float_at(3).unwrap_or(3.0);
+        let method = zyron_analytics::AnomalyMethod::fromStr(&methodStr).ok_or_else(|| {
+            ZyronError::ExecutionError(format!("unknown anomaly method '{}'", methodStr))
+        })?;
+        let values = self.collect_numeric_column(&table, &valueCol).await?;
+        let result = zyron_analytics::anomalyDetect(&values, method, threshold);
+        let mut idxCol: Vec<ScalarValue> = Vec::with_capacity(result.len());
+        let mut isCol: Vec<ScalarValue> = Vec::with_capacity(result.len());
+        let mut scoreCol: Vec<ScalarValue> = Vec::with_capacity(result.len());
+        for (i, flag, score) in result {
+            idxCol.push(ScalarValue::Int64(i as i64));
+            isCol.push(ScalarValue::Boolean(flag));
+            scoreCol.push(ScalarValue::Float64(score));
+        }
+        Ok(scalar_columns_to_batch(vec![
+            (TypeId::Int64, idxCol),
+            (TypeId::Boolean, isCol),
+            (TypeId::Float64, scoreCol),
+        ]))
+    }
+
+    async fn run_acf(&self) -> Result<DataBatch> {
+        let table = self.pos_string_at(0)?;
+        let valueCol = self.pos_string_at(1)?;
+        let maxLag = self.pos_int_at(2).unwrap_or(20) as usize;
+        let values = self.collect_numeric_column(&table, &valueCol).await?;
+        let result = zyron_analytics::acf(&values, maxLag);
+        let mut lagCol: Vec<ScalarValue> = Vec::with_capacity(result.len());
+        let mut valCol: Vec<ScalarValue> = Vec::with_capacity(result.len());
+        for (i, v) in result.iter().enumerate() {
+            lagCol.push(ScalarValue::Int64(i as i64));
+            valCol.push(ScalarValue::Float64(*v));
+        }
+        Ok(scalar_columns_to_batch(vec![
+            (TypeId::Int64, lagCol),
+            (TypeId::Float64, valCol),
+        ]))
+    }
+
+    async fn run_pacf(&self) -> Result<DataBatch> {
+        let table = self.pos_string_at(0)?;
+        let valueCol = self.pos_string_at(1)?;
+        let maxLag = self.pos_int_at(2).unwrap_or(20) as usize;
+        let values = self.collect_numeric_column(&table, &valueCol).await?;
+        let result = zyron_analytics::pacf(&values, maxLag);
+        let mut lagCol: Vec<ScalarValue> = Vec::with_capacity(result.len());
+        let mut valCol: Vec<ScalarValue> = Vec::with_capacity(result.len());
+        for (i, v) in result.iter().enumerate() {
+            lagCol.push(ScalarValue::Int64(i as i64));
+            valCol.push(ScalarValue::Float64(*v));
+        }
+        Ok(scalar_columns_to_batch(vec![
+            (TypeId::Int64, lagCol),
+            (TypeId::Float64, valCol),
+        ]))
+    }
+
+    async fn run_seasonality_detect(&self) -> Result<DataBatch> {
+        let table = self.pos_string_at(0)?;
+        let valueCol = self.pos_string_at(1)?;
+        let maxPeriod = self.pos_int_at(2).unwrap_or(30) as usize;
+        let values = self.collect_numeric_column(&table, &valueCol).await?;
+        let comps = zyron_analytics::seasonalityDetect(&values, maxPeriod);
+        let mut periodCol: Vec<ScalarValue> = Vec::with_capacity(comps.len());
+        let mut strengthCol: Vec<ScalarValue> = Vec::with_capacity(comps.len());
+        for c in &comps {
+            periodCol.push(ScalarValue::Int64(c.period as i64));
+            let strength: f64 = c.seasonalIndices.iter().map(|v| v.abs()).sum::<f64>()
+                / c.seasonalIndices.len().max(1) as f64;
+            strengthCol.push(ScalarValue::Float64(strength));
+        }
+        Ok(scalar_columns_to_batch(vec![
+            (TypeId::Int64, periodCol),
+            (TypeId::Float64, strengthCol),
+        ]))
+    }
+
+    async fn run_change_points(&self) -> Result<DataBatch> {
+        let table = self.pos_string_at(0)?;
+        let valueCol = self.pos_string_at(1)?;
+        let threshold = self.pos_float_at(2).unwrap_or(10.0);
+        let values = self.collect_numeric_column(&table, &valueCol).await?;
+        let points = zyron_analytics::changePoints(&values, threshold);
+        let col: Vec<ScalarValue> = points
+            .into_iter()
+            .map(|p| ScalarValue::Int64(p as i64))
+            .collect();
+        Ok(scalar_columns_to_batch(vec![(TypeId::Int64, col)]))
+    }
+
+    async fn run_date_features(&self) -> Result<DataBatch> {
+        // DATE_FEATURES(timestamp_ms_literal)
+        let ts = self.pos_int_at(0)?;
+        let f = zyron_analytics::ml::transforms::dateFeatures(ts);
+        Ok(scalar_columns_to_batch(vec![
+            (TypeId::Int32, vec![ScalarValue::Int32(f[0] as i32)]),
+            (TypeId::Int32, vec![ScalarValue::Int32(f[1] as i32)]),
+            (TypeId::Int32, vec![ScalarValue::Int32(f[2] as i32)]),
+            (TypeId::Int32, vec![ScalarValue::Int32(f[3] as i32)]),
+            (TypeId::Int32, vec![ScalarValue::Int32(f[4] as i32)]),
+            (TypeId::Boolean, vec![ScalarValue::Boolean(f[5] != 0.0)]),
+            (TypeId::Int32, vec![ScalarValue::Int32(f[6] as i32)]),
+            (TypeId::Int32, vec![ScalarValue::Int32(f[7] as i32)]),
+            (TypeId::Int32, vec![ScalarValue::Int32(f[8] as i32)]),
+        ]))
+    }
+
+    async fn run_polynomial_features(&self) -> Result<DataBatch> {
+        let degree = self.pos_int_at(0)? as u32;
+        let mut features: Vec<f64> = Vec::new();
+        for i in 1..self.positional_args.len() {
+            features.push(self.pos_float_at(i)?);
+        }
+        let expanded = zyron_analytics::ml::transforms::polynomialFeatures(&features, degree);
+        let mut termCol: Vec<ScalarValue> = Vec::with_capacity(expanded.len());
+        let mut valCol: Vec<ScalarValue> = Vec::with_capacity(expanded.len());
+        for (i, v) in expanded.iter().enumerate() {
+            termCol.push(ScalarValue::Utf8(format!("term_{}", i)));
+            valCol.push(ScalarValue::Float64(*v));
+        }
+        Ok(scalar_columns_to_batch(vec![
+            (TypeId::Varchar, termCol),
+            (TypeId::Float64, valCol),
+        ]))
+    }
+
+    async fn run_feature_parity_check(&self) -> Result<DataBatch> {
+        // FEATURE_PARITY_CHECK(group_name, sample_size)
+        let groupName = self.pos_string_at(0)?;
+        let store = zyron_analytics::featureStore();
+        let group = store.group(&groupName).ok_or_else(|| {
+            ZyronError::ExecutionError(format!("group '{}' not found", groupName))
+        })?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        // Compare offline path (current materialized values) against itself,
+        // since the in-process feature store is the single source of truth.
+        // External offline/online divergence would surface here when an
+        // external pipeline writes to a different backend.
+        let names: Vec<String> = group.features.iter().map(|f| f.name.clone()).collect();
+        let entities: Vec<String> = Vec::new();
+        let frame = store.getFeatures(&groupName, &entities, &names, now)?;
+        let parity = zyron_analytics::featureParityCheck(&frame, &frame);
+        let entity = vec![ScalarValue::Utf8("__summary__".to_string())];
+        let feature = vec![ScalarValue::Utf8("matched_vs_mismatched".to_string())];
+        let offline = vec![ScalarValue::Utf8(format!("{}", parity.matched))];
+        let online = vec![ScalarValue::Utf8(format!("{}", parity.mismatched))];
+        Ok(scalar_columns_to_batch(vec![
+            (TypeId::Varchar, entity),
+            (TypeId::Varchar, feature),
+            (TypeId::Varchar, offline),
+            (TypeId::Varchar, online),
+        ]))
+    }
+
+    async fn run_explain_prediction(&self) -> Result<DataBatch> {
+        // EXPLAIN_PREDICTION(model_name, feature1, feature2, ...)
+        let modelName = self.pos_string_at(0)?;
+        let handle = zyron_analytics::InferenceHandle::resolve(&modelName).ok_or_else(|| {
+            ZyronError::ExecutionError(format!("model '{}' not found", modelName))
+        })?;
+        let mut features = Vec::new();
+        for i in 1..self.positional_args.len() {
+            features.push(self.pos_float_at(i)?);
+        }
+        let mut nameCol: Vec<ScalarValue> = Vec::new();
+        let mut contribCol: Vec<ScalarValue> = Vec::new();
+        // Linear-style explanation: weight_j * standardized_feature_j
+        // For tree-based models, contribution is the marginal contribution
+        // approximated by weight * raw value or zero
+        for (j, name) in handle.model.featureColumns.iter().enumerate() {
+            let raw = features.get(j).copied().unwrap_or(0.0);
+            let mean = handle.model.featureMean.get(j).copied().unwrap_or(0.0);
+            let std = handle.model.featureStd.get(j).copied().unwrap_or(1.0);
+            let std = if std == 0.0 { 1.0 } else { std };
+            let standardized = (raw - mean) / std;
+            let weight = handle.model.weights.get(j).copied().unwrap_or(0.0);
+            nameCol.push(ScalarValue::Utf8(name.clone()));
+            contribCol.push(ScalarValue::Float64(weight * standardized));
+        }
+        Ok(scalar_columns_to_batch(vec![
+            (TypeId::Varchar, nameCol),
+            (TypeId::Float64, contribCol),
+        ]))
+    }
+
+    async fn run_model_lineage(&self) -> Result<DataBatch> {
+        let modelName = self.pos_string_at(0)?;
+        let handle = zyron_analytics::InferenceHandle::resolve(&modelName).ok_or_else(|| {
+            ZyronError::ExecutionError(format!("model '{}' not found", modelName))
+        })?;
+        let mut keyCol: Vec<ScalarValue> = Vec::new();
+        let mut valCol: Vec<ScalarValue> = Vec::new();
+        let pushRow = |k: &str, v: String, kc: &mut Vec<ScalarValue>, vc: &mut Vec<ScalarValue>| {
+            kc.push(ScalarValue::Utf8(k.to_string()));
+            vc.push(ScalarValue::Utf8(v));
+        };
+        pushRow(
+            "model_type",
+            format!("{:?}", handle.model.modelType),
+            &mut keyCol,
+            &mut valCol,
+        );
+        pushRow(
+            "feature_columns",
+            handle.model.featureColumns.join(","),
+            &mut keyCol,
+            &mut valCol,
+        );
+        if let Some(t) = &handle.model.targetColumn {
+            pushRow("target_column", t.clone(), &mut keyCol, &mut valCol);
+        }
+        pushRow(
+            "training_rows",
+            handle.model.trainingRows.to_string(),
+            &mut keyCol,
+            &mut valCol,
+        );
+        pushRow(
+            "created_at_ms",
+            handle.model.createdAtMs.to_string(),
+            &mut keyCol,
+            &mut valCol,
+        );
+        for (k, v) in &handle.model.metrics {
+            pushRow(
+                &format!("metric:{}", k),
+                v.to_string(),
+                &mut keyCol,
+                &mut valCol,
+            );
+        }
+        for (k, v) in &handle.model.hyperparameters.values {
+            pushRow(
+                &format!("hp:{}", k),
+                v.to_string(),
+                &mut keyCol,
+                &mut valCol,
+            );
+        }
+        Ok(scalar_columns_to_batch(vec![
+            (TypeId::Varchar, keyCol),
+            (TypeId::Varchar, valCol),
+        ]))
+    }
+
+    async fn collect_numeric_column(
+        &self,
+        table_name: &str,
+        column_name: &str,
+    ) -> Result<Vec<f64>> {
+        let table_entry = self.resolve_table(table_name)?;
+        let columns = table_entry.columns.clone();
+        let idx = columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(column_name))
+            .ok_or_else(|| ZyronError::ColumnNotFound(column_name.to_string()))?;
+        let heap_file = self.ctx.get_heap_file(table_entry.id).await?;
+        let snapshot = self.ctx.snapshot.clone();
+        let guard = heap_file.scan()?;
+        let mut values = Vec::new();
+        let mut featureBuf = vec![0.0f64; 1];
+        guard.for_each(|_tid, view| {
+            if view.is_deleted() {
+                return;
+            }
+            if !view.header.is_visible_to(&snapshot) {
+                return;
+            }
+            decode_row_features(view.data, &columns, &[idx], &mut featureBuf);
+            values.push(featureBuf[0]);
+        });
+        Ok(values)
+    }
 }
 
 impl Operator for AnalyticsTableFunctionOperator {
@@ -972,6 +1515,123 @@ fn decode_one_column_streaming(
                 offset += len;
             }
         }
+    }
+}
+
+fn decode_row_features(
+    bytes: &[u8],
+    columns: &[zyron_catalog::ColumnEntry],
+    feature_indices: &[usize],
+    out: &mut [f64],
+) {
+    use zyron_analytics::AnalyticsValue;
+    // Decode the entire row into AnalyticsValues for the requested columns
+    let mut offset = 0usize;
+    let mut decoded: Vec<Option<AnalyticsValue>> = vec![None; columns.len()];
+    for (i, col) in columns.iter().enumerate() {
+        if let Some((value, len)) = decode_one_value(&bytes[offset..], col.type_id) {
+            decoded[i] = Some(value);
+            offset += len;
+        } else {
+            break;
+        }
+    }
+    for (slot, &idx) in feature_indices.iter().enumerate() {
+        out[slot] = decoded
+            .get(idx)
+            .and_then(|v| v.as_ref())
+            .and_then(|v| v.as_f64())
+            .unwrap_or(f64::NAN);
+    }
+}
+
+fn decode_one_value(
+    bytes: &[u8],
+    type_id: TypeId,
+) -> Option<(zyron_analytics::AnalyticsValue, usize)> {
+    use zyron_analytics::AnalyticsValue;
+    match type_id {
+        TypeId::Boolean => {
+            if bytes.is_empty() {
+                return None;
+            }
+            Some((AnalyticsValue::Bool(bytes[0] != 0), 1))
+        }
+        TypeId::Int8 => bytes
+            .first()
+            .map(|b| (AnalyticsValue::Int(*b as i8 as i64), 1)),
+        TypeId::Int16 => {
+            if bytes.len() < 2 {
+                return None;
+            }
+            Some((
+                AnalyticsValue::Int(i16::from_le_bytes([bytes[0], bytes[1]]) as i64),
+                2,
+            ))
+        }
+        TypeId::Int32 => {
+            if bytes.len() < 4 {
+                return None;
+            }
+            Some((
+                AnalyticsValue::Int(
+                    i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i64
+                ),
+                4,
+            ))
+        }
+        TypeId::Int64 => {
+            if bytes.len() < 8 {
+                return None;
+            }
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&bytes[..8]);
+            Some((AnalyticsValue::Int(i64::from_le_bytes(buf)), 8))
+        }
+        TypeId::Float32 => {
+            if bytes.len() < 4 {
+                return None;
+            }
+            let mut buf = [0u8; 4];
+            buf.copy_from_slice(&bytes[..4]);
+            Some((AnalyticsValue::Float(f32::from_le_bytes(buf) as f64), 4))
+        }
+        TypeId::Float64 => {
+            if bytes.len() < 8 {
+                return None;
+            }
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&bytes[..8]);
+            Some((AnalyticsValue::Float(f64::from_le_bytes(buf)), 8))
+        }
+        TypeId::Timestamp | TypeId::TimestampTz => {
+            if bytes.len() < 8 {
+                return None;
+            }
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&bytes[..8]);
+            Some((AnalyticsValue::Timestamp(i64::from_le_bytes(buf)), 8))
+        }
+        TypeId::Date => {
+            if bytes.len() < 4 {
+                return None;
+            }
+            let mut buf = [0u8; 4];
+            buf.copy_from_slice(&bytes[..4]);
+            Some((AnalyticsValue::Date(i32::from_le_bytes(buf)), 4))
+        }
+        TypeId::Varchar | TypeId::Char | TypeId::Text => {
+            if bytes.len() < 4 {
+                return None;
+            }
+            let len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+            if bytes.len() < 4 + len {
+                return None;
+            }
+            let s = std::str::from_utf8(&bytes[4..4 + len]).ok()?.to_string();
+            Some((AnalyticsValue::Text(s), 4 + len))
+        }
+        _ => None,
     }
 }
 

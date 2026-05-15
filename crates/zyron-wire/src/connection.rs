@@ -202,6 +202,17 @@ pub struct ServerState {
     /// DATA_PROFILE, COLUMN_PROFILE, CORRELATION_MATRIX) and the period and
     /// statistical window/scalar functions (YOY, MOM, ZSCORE, CORR, ...).
     pub analytics_registry: Arc<zyron_analytics::AnalyticsRegistry>,
+
+    // -----------------------------------------------------------------------
+    // Feature store and ML
+    // -----------------------------------------------------------------------
+    /// Feature store registry, holds feature groups, definitions, and
+    /// materialized point-in-time values
+    pub feature_store: Arc<zyron_analytics::FeatureStore>,
+    /// Feature lineage tracker, indexed by qualified feature name
+    pub feature_lineage: Arc<parking_lot::RwLock<zyron_analytics::FeatureLineageRegistry>>,
+    /// Server-wide trained-model inference cache
+    pub model_cache: Arc<zyron_analytics::ModelCache>,
 }
 
 /// RAII guard that releases the vacuum_running flag on drop, so a panic
