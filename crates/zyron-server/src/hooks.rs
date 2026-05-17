@@ -227,3 +227,8 @@ impl DmlHook for DmlHookBridge {
         Ok(true)
     }
 }
+
+// Legal-hold / WORM enforcement hooks live in zyron-wire so the
+// per-connection executor and lifecycle DDL dispatch share one
+// implementation. Re-exported here for the server's hook wiring.
+pub use zyron_wire::dml_enforce::{CompositeDmlHook, LegalHoldDmlHook};

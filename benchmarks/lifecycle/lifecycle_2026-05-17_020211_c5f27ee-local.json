@@ -1,0 +1,50 @@
+{
+  "id": "2026-05-17_020211_c5f27ee-local",
+  "date": "2026-05-17 02:02:13Z",
+  "ts": 1778983333,
+  "commit": "c5f27ee-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "legal_hold_check_no_holds": {
+      "latency (ns/op)": {
+        "average": 6.042124,
+        "runs": [6.16, 6.34, 5.89, 5.91, 5.90],
+        "target": 50.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "pii_detection": {
+      "latency (s)": {
+        "average": 0.001537,
+        "runs": [0.00, 0.00, 0.00, 0.00, 0.00],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "ttl_row_delete": {
+      "throughput (rows/sec)": {
+        "average": 15200742.843719,
+        "runs": [13763204.07, 15728340.11, 15138555.63, 15753861.67, 15619752.74],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "archive_to_object_store": {
+      "throughput (rows/sec)": {
+        "average": 83820033.138327,
+        "runs": [79123313.68, 80625655.08, 85528566.54, 89309636.51, 84512993.87],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}

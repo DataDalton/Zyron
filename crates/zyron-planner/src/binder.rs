@@ -1830,10 +1830,44 @@ fn compute_publication_fingerprint(
 
 /// Converts parsed AST into bound plan with resolved OIDs and type information.
 #[allow(dead_code)]
+/// Parses a bare boolean predicate (RLS/ABAC/ownership policy text) into an
+/// AST expression by wrapping it in a throwaway SELECT and extracting the
+/// WHERE. Parse failure is an error so a malformed policy fails closed.
+fn parse_predicate_sql(sql: &str) -> Result<zyron_parser::ast::Expr> {
+    let wrapped = format!("SELECT * FROM __rls_policy WHERE {sql}");
+    let stmts = zyron_parser::parse(&wrapped).map_err(|e| {
+        ZyronError::PlanError(format!("invalid row-security predicate '{sql}': {e}"))
+    })?;
+    match stmts.into_iter().next() {
+        Some(zyron_parser::ast::Statement::Select(s)) => match s.where_clause {
+            Some(w) => Ok(*w),
+            None => Err(ZyronError::PlanError(format!(
+                "row-security predicate '{sql}' produced no filter"
+            ))),
+        },
+        _ => Err(ZyronError::PlanError(format!(
+            "row-security predicate '{sql}' did not parse as a filter"
+        ))),
+    }
+}
+
+fn bin(
+    l: zyron_parser::ast::Expr,
+    op: zyron_parser::ast::BinaryOperator,
+    r: zyron_parser::ast::Expr,
+) -> zyron_parser::ast::Expr {
+    zyron_parser::ast::Expr::BinaryOp {
+        left: Box::new(l),
+        op,
+        right: Box::new(r),
+    }
+}
+
 pub struct Binder<'a> {
     resolver: NameResolver,
     catalog: &'a Catalog,
     next_table_idx: usize,
+    row_security: Option<std::sync::Arc<dyn crate::RowSecurityProvider>>,
 }
 
 impl<'a> Binder<'a> {
@@ -1842,7 +1876,54 @@ impl<'a> Binder<'a> {
             resolver,
             catalog,
             next_table_idx: 0,
+            row_security: None,
         }
+    }
+
+    /// Installs the row-security provider so SELECT/UPDATE/DELETE on a single
+    /// base table get RLS/ABAC/row-ownership predicates injected.
+    pub fn set_row_security(&mut self, provider: std::sync::Arc<dyn crate::RowSecurityProvider>) {
+        self.row_security = Some(provider);
+    }
+
+    /// Builds the combined row-security AST predicate for a table, or an
+    /// error if the table has row security but the caller cannot inject it
+    /// (fail closed, never fail open). Returns Ok(None) when no policy.
+    fn row_security_predicate(&self, table_id: u32) -> Result<Option<zyron_parser::ast::Expr>> {
+        let provider = match &self.row_security {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        let preds = provider.row_predicates(table_id);
+        if preds.is_empty() {
+            return Ok(None);
+        }
+        let mut permissive: Vec<zyron_parser::ast::Expr> = Vec::new();
+        let mut restrictive: Vec<zyron_parser::ast::Expr> = Vec::new();
+        for p in preds {
+            let expr = parse_predicate_sql(&p.sql)?;
+            if p.permissive {
+                permissive.push(expr);
+            } else {
+                restrictive.push(expr);
+            }
+        }
+        let mut combined: Option<zyron_parser::ast::Expr> = None;
+        if !permissive.is_empty() {
+            let mut it = permissive.into_iter();
+            let mut acc = it.next().unwrap();
+            for e in it {
+                acc = bin(acc, zyron_parser::ast::BinaryOperator::Or, e);
+            }
+            combined = Some(acc);
+        }
+        for r in restrictive {
+            combined = Some(match combined {
+                Some(c) => bin(c, zyron_parser::ast::BinaryOperator::And, r),
+                None => r,
+            });
+        }
+        Ok(combined)
     }
 
     fn alloc_table_idx(&mut self) -> usize {
@@ -1867,10 +1948,7 @@ impl<'a> Binder<'a> {
                 let bound = self.bind_update(&s).await?;
                 Ok(BoundStatement::Update(bound))
             }
-            Statement::Delete(s) => {
-                let bound = self.bind_delete(&s).await?;
-                Ok(BoundStatement::Delete(bound))
-            }
+            Statement::Delete(s) => self.bind_delete_dispatch(&s).await,
             Statement::CreateStreamingJob(s) => {
                 let bound = self.bind_create_streaming_job(&s).await?;
                 Ok(BoundStatement::CreateStreamingJob(bound))
@@ -2042,8 +2120,64 @@ impl<'a> Binder<'a> {
             // Bind FROM clause
             let from = self.bind_from(ctx, &stmt.from).await?;
 
-            // Bind WHERE
-            let where_clause = if let Some(expr) = &stmt.where_clause {
+            // Soft-delete visibility injection. When exactly one base table
+            // has soft-delete enabled, inject the is_deleted predicate
+            // according to the trailing modifier (default excludes deleted).
+            let injected_soft_delete: Option<Expr> = {
+                let sd_entries: Vec<&Arc<TableEntry>> = ctx
+                    .tables
+                    .iter()
+                    .filter_map(|t| t.entry.as_ref())
+                    .filter(|e| e.lifecycle.soft_delete_enabled)
+                    .collect();
+                if sd_entries.len() == 1 {
+                    let cfg = zyron_lifecycle::soft_delete::soft_delete_config(sd_entries[0]);
+                    match (cfg, stmt.soft_delete_mode) {
+                        (Some(c), SoftDeleteSelectMode::Default) => {
+                            Some(zyron_lifecycle::soft_delete::build_is_deleted_false_predicate(&c))
+                        }
+                        (Some(c), SoftDeleteSelectMode::OnlyDeleted) => {
+                            Some(zyron_lifecycle::soft_delete::build_is_deleted_true_predicate(&c))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            };
+
+            // Row-security (RLS/ABAC/row-ownership) injection. Enforced for a
+            // single base table. For multi-table queries, if any referenced
+            // table has row security we fail closed rather than leak.
+            let base_entries: Vec<&Arc<TableEntry>> =
+                ctx.tables.iter().filter_map(|t| t.entry.as_ref()).collect();
+            let injected_security: Option<Expr> = if base_entries.len() == 1 {
+                self.row_security_predicate(base_entries[0].id.0)?
+            } else {
+                if let Some(provider) = &self.row_security {
+                    for e in &base_entries {
+                        if provider.has_row_security(e.id.0) {
+                            return Err(ZyronError::PlanError(format!(
+                                "row security on '{}' cannot be enforced in a \
+                                 multi-table query; rewrite as a single-table \
+                                 query or a view",
+                                e.name
+                            )));
+                        }
+                    }
+                }
+                None
+            };
+
+            // Bind WHERE (combined with injected soft-delete + row security).
+            let effective_where = zyron_lifecycle::soft_delete::and_combine(
+                zyron_lifecycle::soft_delete::and_combine(
+                    stmt.where_clause.as_ref().map(|b| (**b).clone()),
+                    injected_soft_delete,
+                ),
+                injected_security,
+            );
+            let where_clause = if let Some(expr) = &effective_where {
                 Some(self.bind_expr(ctx, expr).await?)
             } else {
                 None
@@ -3244,7 +3378,12 @@ impl<'a> Binder<'a> {
             });
         }
 
-        let where_clause = if let Some(expr) = &stmt.where_clause {
+        let injected_security = self.row_security_predicate(entry.id.0)?;
+        let effective_where = zyron_lifecycle::soft_delete::and_combine(
+            stmt.where_clause.as_ref().map(|b| (**b).clone()),
+            injected_security,
+        );
+        let where_clause = if let Some(expr) = &effective_where {
             Some(self.bind_expr(&ctx, expr).await?)
         } else {
             None
@@ -3268,6 +3407,43 @@ impl<'a> Binder<'a> {
     // -----------------------------------------------------------------------
     // DELETE binding
     // -----------------------------------------------------------------------
+
+    /// Dispatches DELETE: when the table has soft-delete enabled and the
+    /// statement is not `HARD`, the delete is rewritten to an UPDATE that sets
+    /// `is_deleted = true, deleted_at = now()` (filtered to not re-tombstone
+    /// already-deleted rows). Otherwise it binds a normal physical delete.
+    async fn bind_delete_dispatch(&mut self, stmt: &DeleteStatement) -> Result<BoundStatement> {
+        let (schema_name, table_name) = if let Some(dot_pos) = stmt.table.find('.') {
+            (Some(&stmt.table[..dot_pos]), &stmt.table[dot_pos + 1..])
+        } else {
+            (None, stmt.table.as_str())
+        };
+        let entry = self.resolver.resolve_table(schema_name, table_name).await?;
+
+        if !stmt.hard {
+            if let Some(cfg) = zyron_lifecycle::soft_delete::soft_delete_config(&entry) {
+                let user_where = stmt.where_clause.as_ref().map(|b| (**b).clone());
+                let not_deleted =
+                    zyron_lifecycle::soft_delete::build_is_deleted_false_predicate(&cfg);
+                let where_expr =
+                    zyron_lifecycle::soft_delete::and_combine(user_where, Some(not_deleted));
+                let assignments = zyron_lifecycle::soft_delete::build_soft_delete_assignments(&cfg)
+                    .into_iter()
+                    .collect();
+                let upd = UpdateStatement {
+                    table: stmt.table.clone(),
+                    assignments,
+                    where_clause: where_expr.map(Box::new),
+                    returning: stmt.returning.clone(),
+                };
+                let bound = self.bind_update(&upd).await?;
+                return Ok(BoundStatement::Update(bound));
+            }
+        }
+
+        let bound = self.bind_delete(stmt).await?;
+        Ok(BoundStatement::Delete(bound))
+    }
 
     async fn bind_delete(&mut self, stmt: &DeleteStatement) -> Result<BoundDelete> {
         let (schema_name, table_name) = if let Some(dot_pos) = stmt.table.find('.') {
@@ -3300,7 +3476,12 @@ impl<'a> Binder<'a> {
             entry: Some(Arc::clone(&entry)),
         });
 
-        let where_clause = if let Some(expr) = &stmt.where_clause {
+        let injected_security = self.row_security_predicate(entry.id.0)?;
+        let effective_where = zyron_lifecycle::soft_delete::and_combine(
+            stmt.where_clause.as_ref().map(|b| (**b).clone()),
+            injected_security,
+        );
+        let where_clause = if let Some(expr) = &effective_where {
             Some(self.bind_expr(&ctx, expr).await?)
         } else {
             None

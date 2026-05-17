@@ -40,6 +40,14 @@ const ENDPOINTS_HEAP_FILE_ID: u32 = 144;
 const ENDPOINTS_FSM_FILE_ID: u32 = 145;
 const SECURITY_MAPS_HEAP_FILE_ID: u32 = 146;
 const SECURITY_MAPS_FSM_FILE_ID: u32 = 147;
+const LEGAL_HOLDS_HEAP_FILE_ID: u32 = 148;
+const LEGAL_HOLDS_FSM_FILE_ID: u32 = 149;
+const RETENTION_POLICIES_HEAP_FILE_ID: u32 = 150;
+const RETENTION_POLICIES_FSM_FILE_ID: u32 = 151;
+const RETENTION_JOBS_HEAP_FILE_ID: u32 = 152;
+const RETENTION_JOBS_FSM_FILE_ID: u32 = 153;
+const COMPLIANCE_LOG_HEAP_FILE_ID: u32 = 154;
+const COMPLIANCE_LOG_FSM_FILE_ID: u32 = 155;
 
 /// Starting file ID for user-created heap files (heap=200, fsm=201, ...).
 const USER_HEAP_FILE_START: u32 = 200;
@@ -127,6 +135,27 @@ pub trait CatalogStorage: Send + Sync {
     async fn update_security_map(&self, entry: &SecurityMapEntry) -> Result<bool>;
     async fn delete_security_map(&self, id: SecurityMapId) -> Result<bool>;
 
+    // Data lifecycle operations (Phase 17)
+    async fn load_legal_holds(&self) -> Result<Vec<LegalHoldEntry>>;
+    async fn store_legal_hold(&self, entry: &LegalHoldEntry) -> Result<TupleId>;
+    async fn update_legal_hold(&self, entry: &LegalHoldEntry) -> Result<bool>;
+    async fn delete_legal_hold(&self, id: u32) -> Result<bool>;
+
+    async fn load_retention_policies(&self) -> Result<Vec<RetentionPolicyEntry>>;
+    async fn store_retention_policy(&self, entry: &RetentionPolicyEntry) -> Result<TupleId>;
+    /// Replaces all policy rows for a table with the given set (delete + insert).
+    async fn replace_retention_policies(
+        &self,
+        table_id: u32,
+        entries: &[RetentionPolicyEntry],
+    ) -> Result<()>;
+
+    async fn load_retention_jobs(&self) -> Result<Vec<RetentionJobEntry>>;
+    async fn store_retention_job(&self, entry: &RetentionJobEntry) -> Result<TupleId>;
+
+    async fn load_compliance_log(&self) -> Result<Vec<ComplianceLogEntry>>;
+    async fn store_compliance_log(&self, entry: &ComplianceLogEntry) -> Result<TupleId>;
+
     // Bootstrap and recovery
     async fn is_bootstrapped(&self) -> Result<bool>;
     async fn bootstrap(&self) -> Result<()>;
@@ -152,6 +181,10 @@ pub struct HeapCatalogStorage {
     subscriptions_heap: HeapFile,
     endpoints_heap: HeapFile,
     security_maps_heap: HeapFile,
+    legal_holds_heap: HeapFile,
+    retention_policies_heap: HeapFile,
+    retention_jobs_heap: HeapFile,
+    compliance_log_heap: HeapFile,
     next_heap_file: AtomicU32,
     next_index_file: AtomicU32,
 }
@@ -263,6 +296,38 @@ impl HeapCatalogStorage {
                 fsm_file_id: SECURITY_MAPS_FSM_FILE_ID,
             },
         )?;
+        let legal_holds_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: LEGAL_HOLDS_HEAP_FILE_ID,
+                fsm_file_id: LEGAL_HOLDS_FSM_FILE_ID,
+            },
+        )?;
+        let retention_policies_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: RETENTION_POLICIES_HEAP_FILE_ID,
+                fsm_file_id: RETENTION_POLICIES_FSM_FILE_ID,
+            },
+        )?;
+        let retention_jobs_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: RETENTION_JOBS_HEAP_FILE_ID,
+                fsm_file_id: RETENTION_JOBS_FSM_FILE_ID,
+            },
+        )?;
+        let compliance_log_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: COMPLIANCE_LOG_HEAP_FILE_ID,
+                fsm_file_id: COMPLIANCE_LOG_FSM_FILE_ID,
+            },
+        )?;
 
         Ok(Self {
             databases_heap,
@@ -278,6 +343,10 @@ impl HeapCatalogStorage {
             subscriptions_heap,
             endpoints_heap,
             security_maps_heap,
+            legal_holds_heap,
+            retention_policies_heap,
+            retention_jobs_heap,
+            compliance_log_heap,
             next_heap_file: AtomicU32::new(USER_HEAP_FILE_START),
             next_index_file: AtomicU32::new(USER_INDEX_FILE_START),
         })
@@ -300,6 +369,10 @@ impl HeapCatalogStorage {
             self.subscriptions_heap.init_cache(),
             self.endpoints_heap.init_cache(),
             self.security_maps_heap.init_cache(),
+            self.legal_holds_heap.init_cache(),
+            self.retention_policies_heap.init_cache(),
+            self.retention_jobs_heap.init_cache(),
+            self.compliance_log_heap.init_cache(),
         )?;
         Ok(())
     }
@@ -972,6 +1045,140 @@ impl CatalogStorage for HeapCatalogStorage {
             Some(tid) => self.security_maps_heap.delete(tid).await,
             None => Ok(false),
         }
+    }
+
+    // ----- Data lifecycle (Phase 17) -----
+
+    async fn load_legal_holds(&self) -> Result<Vec<LegalHoldEntry>> {
+        let mut entries = Vec::new();
+        let guard = self.legal_holds_heap.scan()?;
+        guard.for_each(|_tid, view| {
+            if let Ok(e) = LegalHoldEntry::from_bytes(view.data) {
+                entries.push(e);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_legal_hold(&self, entry: &LegalHoldEntry) -> Result<TupleId> {
+        let tuple = Tuple::new(entry.to_bytes(), 0);
+        let ids = self.legal_holds_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
+    }
+
+    async fn update_legal_hold(&self, entry: &LegalHoldEntry) -> Result<bool> {
+        let mut target = None;
+        let guard = self.legal_holds_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(existing) = LegalHoldEntry::from_bytes(view.data) {
+                if existing.id == entry.id {
+                    target = Some(tid);
+                }
+            }
+        });
+        drop(guard);
+        match target {
+            Some(tid) => {
+                self.legal_holds_heap.delete(tid).await?;
+                let tuple = Tuple::new(entry.to_bytes(), 0);
+                self.legal_holds_heap.insert_batch(&[tuple]).await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn delete_legal_hold(&self, id: u32) -> Result<bool> {
+        let mut target = None;
+        let guard = self.legal_holds_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(e) = LegalHoldEntry::from_bytes(view.data) {
+                if e.id == id {
+                    target = Some(tid);
+                }
+            }
+        });
+        match target {
+            Some(tid) => self.legal_holds_heap.delete(tid).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn load_retention_policies(&self) -> Result<Vec<RetentionPolicyEntry>> {
+        let mut entries = Vec::new();
+        let guard = self.retention_policies_heap.scan()?;
+        guard.for_each(|_tid, view| {
+            if let Ok(e) = RetentionPolicyEntry::from_bytes(view.data) {
+                entries.push(e);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_retention_policy(&self, entry: &RetentionPolicyEntry) -> Result<TupleId> {
+        let tuple = Tuple::new(entry.to_bytes(), 0);
+        let ids = self.retention_policies_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
+    }
+
+    async fn replace_retention_policies(
+        &self,
+        table_id: u32,
+        entries: &[RetentionPolicyEntry],
+    ) -> Result<()> {
+        let mut stale = Vec::new();
+        let guard = self.retention_policies_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(e) = RetentionPolicyEntry::from_bytes(view.data) {
+                if e.table_id == table_id {
+                    stale.push(tid);
+                }
+            }
+        });
+        drop(guard);
+        for tid in stale {
+            self.retention_policies_heap.delete(tid).await?;
+        }
+        for e in entries {
+            let tuple = Tuple::new(e.to_bytes(), 0);
+            self.retention_policies_heap.insert_batch(&[tuple]).await?;
+        }
+        Ok(())
+    }
+
+    async fn load_retention_jobs(&self) -> Result<Vec<RetentionJobEntry>> {
+        let mut entries = Vec::new();
+        let guard = self.retention_jobs_heap.scan()?;
+        guard.for_each(|_tid, view| {
+            if let Ok(e) = RetentionJobEntry::from_bytes(view.data) {
+                entries.push(e);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_retention_job(&self, entry: &RetentionJobEntry) -> Result<TupleId> {
+        let tuple = Tuple::new(entry.to_bytes(), 0);
+        let ids = self.retention_jobs_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
+    }
+
+    async fn load_compliance_log(&self) -> Result<Vec<ComplianceLogEntry>> {
+        let mut entries = Vec::new();
+        let guard = self.compliance_log_heap.scan()?;
+        guard.for_each(|_tid, view| {
+            if let Ok(e) = ComplianceLogEntry::from_bytes(view.data) {
+                entries.push(e);
+            }
+        });
+        entries.sort_by_key(|e| e.event_id);
+        Ok(entries)
+    }
+
+    async fn store_compliance_log(&self, entry: &ComplianceLogEntry) -> Result<TupleId> {
+        let tuple = Tuple::new(entry.to_bytes(), 0);
+        let ids = self.compliance_log_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
     }
 
     async fn is_bootstrapped(&self) -> Result<bool> {

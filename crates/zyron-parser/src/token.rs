@@ -287,6 +287,23 @@ pub enum Keyword {
     Retain,
     Expire,
 
+    // Phase 17 data lifecycle
+    Legal,
+    Forget,
+    Tier,
+    Classification,
+    Deleted,
+    Hard,
+    Including,
+    Purge,
+    Move,
+    Action,
+    Anonymize,
+    Export,
+    Undrop,
+    Dry,
+    Reason,
+
     // Scheduling
     Schedule,
     Every,
@@ -976,6 +993,23 @@ pub fn lookup_keyword(word: &str) -> Option<Keyword> {
         "ARCHIVE" => Some(Keyword::Archive),
         "RETAIN" => Some(Keyword::Retain),
         "EXPIRE" => Some(Keyword::Expire),
+
+        // Phase 17 data lifecycle
+        "LEGAL" => Some(Keyword::Legal),
+        "FORGET" => Some(Keyword::Forget),
+        "TIER" => Some(Keyword::Tier),
+        "CLASSIFICATION" => Some(Keyword::Classification),
+        "DELETED" => Some(Keyword::Deleted),
+        "HARD" => Some(Keyword::Hard),
+        "INCLUDING" => Some(Keyword::Including),
+        "PURGE" => Some(Keyword::Purge),
+        "MOVE" => Some(Keyword::Move),
+        "ACTION" => Some(Keyword::Action),
+        "ANONYMIZE" => Some(Keyword::Anonymize),
+        "EXPORT" => Some(Keyword::Export),
+        "UNDROP" => Some(Keyword::Undrop),
+        "DRY" => Some(Keyword::Dry),
+        "REASON" => Some(Keyword::Reason),
 
         // Scheduling
         "SCHEDULE" => Some(Keyword::Schedule),

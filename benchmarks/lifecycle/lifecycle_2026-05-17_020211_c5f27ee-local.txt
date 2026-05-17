@@ -1,0 +1,47 @@
+
+=== Archive + Restore ===
+  Archive write + delete + restore round-trip: PASS
+
+=== Compliance Report ===
+  SOX retention validation + PII detection: PASS
+
+=== FORGET USER (cross-table) ===
+  FORGET USER cross-table erasure + PII detect: PASS
+
+=== Legal Hold ===
+  Legal hold blocks DELETE/UPDATE/TTL, release restores: PASS
+
+=== Partition-Scoped TTL ===
+  Partition-scoped TTL (predicate drop): PASS
+
+=== Performance (5-run average) ===
+  latency (ns/op) [PASS/OK]:
+    Runs: [6, 6, 6, 6, 6]
+    Average: 6 <= 50 (target)
+    Min/Max: 6 / 6, StdDev: 0
+  latency (s) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 5 (target)
+    Min/Max: 0 / 0, StdDev: 0
+  throughput (rows/sec) [PASS/OK]:
+    Runs: [13,763,204, 15,728,340, 15,138,556, 15,753,862, 15,619,753]
+    Average: 15,200,743 >= 500,000 (target)
+    Min/Max: 13,763,204 / 15,753,862, StdDev: 752,363
+  throughput (rows/sec) [PASS/OK]:
+    Runs: [79,123,314, 80,625,655, 85,528,567, 89,309,637, 84,512,994]
+    Average: 83,820,033 >= 500,000 (target)
+    Min/Max: 79,123,314 / 89,309,637, StdDev: 3,627,623
+
+  Performance suite complete.
+
+=== Row-Level TTL ===
+  Row-level TTL delete + retention boundary: PASS
+
+=== Soft Delete ===
+  Soft delete + visibility modifiers + HARD: PASS
+
+=== Soft-Delete Purge ===
+  Soft-delete purge after grace window: PASS
+
+=== Tiered Storage ===
+  Tiered storage transparent query + cost model: PASS

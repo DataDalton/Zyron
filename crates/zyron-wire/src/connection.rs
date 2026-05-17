@@ -49,6 +49,9 @@ pub struct ServerState {
     pub disk_manager: Arc<DiskManager>,
     pub txn_manager: Arc<TransactionManager>,
     pub security_manager: Option<Arc<zyron_auth::SecurityManager>>,
+    /// Lock-free legal-hold registry. Reloaded from the catalog at startup and
+    /// after each LEGAL HOLD CREATE/DROP/RELEASE so the DML hook enforces holds.
+    pub legal_holds: Arc<zyron_lifecycle::legal_hold::LegalHoldRegistry>,
     /// Key store for sealing and opening external-source/sink credentials.
     /// Populated by the server binary from a data-dir-derived master key.
     pub key_store: Arc<dyn zyron_auth::KeyStore>,
@@ -1594,10 +1597,23 @@ impl<T: WireTransport> Connection<T> {
         // Start implicit transaction if needed
         let (txn_id, snapshot) = self.ensure_transaction()?;
 
-        // Plan
-        let plan = zyron_planner::plan(&self.server.catalog, db_id, search_path, stmt)
-            .await
-            .map_err(ProtocolError::Database)?;
+        // Plan, injecting RLS/ABAC/row-ownership for the session's roles.
+        let row_security: Option<std::sync::Arc<dyn zyron_planner::RowSecurityProvider>> =
+            match (&self.server.security_manager, &sec_ctx) {
+                (Some(sm), Some(sc)) => Some(std::sync::Arc::new(
+                    crate::row_security::SmRowSecurityProvider::new(std::sync::Arc::clone(sm), sc),
+                )),
+                _ => None,
+            };
+        let plan = zyron_planner::plan_with_security(
+            &self.server.catalog,
+            db_id,
+            search_path,
+            stmt,
+            row_security,
+        )
+        .await
+        .map_err(ProtocolError::Database)?;
 
         let output_schema = plan.output_schema();
         let is_select = !output_schema.is_empty() && is_query_plan(&plan);

@@ -617,9 +617,16 @@ impl Server {
         // admin executor share the same instance.
         let security_manager_arc = Arc::new(security_manager);
 
+        // Legal-hold registry: load active holds so the DML hook enforces them.
+        let legal_hold_registry = Arc::new(zyron_lifecycle::legal_hold::LegalHoldRegistry::new());
+        if let Ok(holds) = catalog.load_legal_holds().await {
+            legal_hold_registry.reload(&holds);
+        }
+
         // Build ServerState for zyron-wire
         let server_state = Arc::new(ServerState {
             catalog: Arc::clone(&catalog),
+            legal_holds: Arc::clone(&legal_hold_registry),
             wal: Arc::clone(&wal),
             buffer_pool: Arc::clone(&buffer_pool),
             disk_manager: Arc::clone(&disk_manager),
@@ -785,10 +792,14 @@ impl Server {
                 Arc::clone(&cdc_registry_arc),
                 Arc::clone(&trigger_mgr_arc),
             )) as Arc<dyn zyron_executor::context::CdcHook>),
-            dml_hook: Some(
+            dml_hook: Some(Arc::new(hooks::CompositeDmlHook::new(vec![
+                Arc::new(hooks::LegalHoldDmlHook::new(
+                    Arc::clone(&legal_hold_registry),
+                    Arc::clone(&catalog),
+                )) as Arc<dyn zyron_executor::context::DmlHook>,
                 Arc::new(hooks::DmlHookBridge::new(Arc::clone(&trigger_mgr_arc)))
                     as Arc<dyn zyron_executor::context::DmlHook>,
-            ),
+            ])) as Arc<dyn zyron_executor::context::DmlHook>),
             // Notification channels
             notification_channels: Some(notif_arc),
             // TLS upgrade support (disabled by default; enable via config).

@@ -96,6 +96,22 @@ pub enum Statement {
     RestoreTable(Box<RestoreTableStatement>),
     /// ALTER TABLE name SET (key = value, ...)
     AlterTableOptions(Box<AlterTableOptionsStatement>),
+    /// CREATE/DROP/RELEASE LEGAL HOLD
+    LegalHold(Box<LegalHoldStatement>),
+    /// FORGET USER 'id' [CASCADE] [DRY RUN]
+    ForgetUser(Box<ForgetUserStatement>),
+    /// EXPORT USER 'id' [TO 'uri'] [CASCADE]
+    ExportUser(Box<ExportUserStatement>),
+    /// ALTER TABLE t MOVE ... TO TIER 'tier'
+    AlterTableMove(Box<AlterTableMoveStatement>),
+    /// ALTER TABLE t ALTER COLUMN c SET CLASSIFICATION 'level'
+    AlterColumnClassification(Box<AlterColumnClassificationStatement>),
+    /// RESTORE FROM t WHERE expr  (undo soft delete)
+    RestoreSoftDelete(Box<RestoreSoftDeleteStatement>),
+    /// RUN RETENTION JOB [ON t] [DRY RUN]
+    RunRetentionJob(Box<RunRetentionJobStatement>),
+    /// UNDROP TABLE t
+    UndropTable(Box<UndropTableStatement>),
     /// ALTER TABLE name ADD EXPECTATION name EXPECT expr ON VIOLATION action
     AddExpectation(Box<AddExpectationStatement>),
     /// ALTER TABLE name DROP EXPECTATION name
@@ -238,6 +254,20 @@ pub struct SelectStatement {
     pub offset: Option<Box<Expr>>,
     pub fetch: Option<FetchFirst>,
     pub for_clause: Option<ForClause>,
+    /// Soft-delete visibility modifier: trailing INCLUDING DELETED / ONLY DELETED.
+    pub soft_delete_mode: SoftDeleteSelectMode,
+}
+
+/// Trailing soft-delete visibility modifier on a SELECT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SoftDeleteSelectMode {
+    /// Default: exclude soft-deleted rows.
+    #[default]
+    Default,
+    /// INCLUDING DELETED: all rows.
+    IncludingDeleted,
+    /// ONLY DELETED: only soft-deleted rows.
+    OnlyDeleted,
 }
 
 /// WITH [RECURSIVE] cte_name [(columns)] AS (select), ...
@@ -302,6 +332,8 @@ pub struct DeleteStatement {
     pub table: String,
     pub where_clause: Option<Box<Expr>>,
     pub returning: Option<Vec<SelectItem>>,
+    /// Trailing HARD: bypass soft-delete, force physical delete.
+    pub hard: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +347,8 @@ pub struct CreateTableStatement {
     pub columns: Vec<ColumnDef>,
     pub constraints: Vec<TableConstraint>,
     pub options: Vec<TableOption>,
+    /// Optional inline `TTL <duration> ON <column> [ACTION ...]` clause.
+    pub ttl: Option<TtlClause>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -976,6 +1010,101 @@ pub enum TtlUnit {
 pub enum TtlAction {
     Delete,
     Archive,
+    Anonymize,
+}
+
+/// TTL clause usable inside CREATE TABLE and ALTER TABLE.
+/// `TTL <duration> ON <column> [ACTION DELETE|ARCHIVE|ANONYMIZE]`
+#[derive(Debug, Clone, PartialEq)]
+pub struct TtlClause {
+    pub duration: TtlDuration,
+    pub column: String,
+    pub action: TtlAction,
+}
+
+// ---------------------------------------------------------------------------
+// Phase 17 data lifecycle statements
+// ---------------------------------------------------------------------------
+
+/// CREATE/DROP/RELEASE LEGAL HOLD
+#[derive(Debug, Clone, PartialEq)]
+pub struct LegalHoldStatement {
+    pub operation: LegalHoldOperation,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LegalHoldOperation {
+    /// LEGAL HOLD CREATE name ON table [WHERE expr] [REASON 'text']
+    Create {
+        name: String,
+        table: String,
+        where_clause: Option<Box<Expr>>,
+        reason: Option<String>,
+    },
+    /// LEGAL HOLD DROP [IF EXISTS] name
+    Drop { name: String, if_exists: bool },
+    /// LEGAL HOLD RELEASE name
+    Release { name: String },
+}
+
+/// FORGET USER 'id' [CASCADE] [DRY RUN]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForgetUserStatement {
+    pub user_id: String,
+    pub cascade: bool,
+    pub dry_run: bool,
+}
+
+/// EXPORT USER 'id' [TO 'uri'] [CASCADE]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExportUserStatement {
+    pub user_id: String,
+    pub destination: Option<String>,
+    pub cascade: bool,
+}
+
+/// ALTER TABLE t MOVE {WHERE expr | PARTITION 'k=v'} TO TIER 'tier' [DRY RUN]
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterTableMoveStatement {
+    pub table: String,
+    pub target: MoveTarget,
+    pub tier: String,
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MoveTarget {
+    Where(Box<Expr>),
+    /// `PARTITION 'col=value'` desugared by the executor to `col = value`.
+    Partition(String),
+}
+
+/// ALTER TABLE t ALTER COLUMN c SET CLASSIFICATION 'level'
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterColumnClassificationStatement {
+    pub table: String,
+    pub column: String,
+    pub level: String,
+}
+
+/// RESTORE FROM t WHERE expr  (undo soft delete)
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoreSoftDeleteStatement {
+    pub table: String,
+    pub where_clause: Option<Box<Expr>>,
+}
+
+/// RUN RETENTION JOB [ON t] [DRY RUN]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunRetentionJobStatement {
+    pub table: Option<String>,
+    pub dry_run: bool,
+}
+
+/// UNDROP TABLE t  (recycle-bin restore within the window)
+#[derive(Debug, Clone, PartialEq)]
+pub struct UndropTableStatement {
+    pub table: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1128,6 +1257,8 @@ pub struct ArchiveTableStatement {
     pub table: String,
     pub where_clause: Option<Box<Expr>>,
     pub destination: String,
+    /// Trailing DRY RUN: preview only, no mutation.
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2770,6 +2901,7 @@ mod tests {
             offset: None,
             fetch: None,
             for_clause: None,
+            soft_delete_mode: SoftDeleteSelectMode::Default,
         }));
         assert!(matches!(select, Statement::Select(_)));
 

@@ -309,6 +309,29 @@ pub(crate) fn build_operator_and_key_for_sink(
     build_operator_and_key(backend, uri, options, credentials)
 }
 
+/// Infers the backend from a URI scheme and builds an OpenDAL operator plus
+/// the object key prefix. Used by the data-lifecycle layer for archive,
+/// tiering, and DSAR export so opendal wiring stays centralized here.
+pub fn build_object_operator(
+    uri: &str,
+    options: &[(String, String)],
+    credentials: &HashMap<String, String>,
+) -> Result<(Operator, String)> {
+    let backend = if uri.starts_with("s3://") {
+        ExternalBackend::S3
+    } else if uri.starts_with("gs://") || uri.starts_with("gcs://") {
+        ExternalBackend::Gcs
+    } else if uri.starts_with("azblob://") || uri.starts_with("az://") {
+        ExternalBackend::Azure
+    } else if uri.starts_with("http://") || uri.starts_with("https://") {
+        ExternalBackend::Http
+    } else {
+        ExternalBackend::File
+    };
+    let (op, prefix, _glob) = build_operator_and_key(backend, uri, options, credentials)?;
+    Ok((op, prefix))
+}
+
 /// Parses the URI and builds an OpenDAL operator plus the prefix and
 /// optional glob matcher. For s3/gcs/azblob URIs the bucket or container is
 /// extracted from the URI and the remainder is used as the object prefix.

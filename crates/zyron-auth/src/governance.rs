@@ -291,6 +291,11 @@ pub enum TwoPersonOperation {
     GrantSuperuser,
     BreakGlassActivate,
     DropAllPrivileges,
+    // Phase 17 irreversible data-lifecycle operations.
+    ReleaseLegalHold,
+    ForgetUser,
+    RetentionLock,
+    CryptoShred,
 }
 
 /// A pending two-person approval request.

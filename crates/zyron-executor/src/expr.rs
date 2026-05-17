@@ -205,6 +205,32 @@ fn evaluate_literal(value: &LiteralValue, type_id: TypeId, num_rows: usize) -> R
 // Binary operators
 // ---------------------------------------------------------------------------
 
+/// Returns the common type two numeric operands should be cast to before a
+/// comparison or arithmetic op, or None when either side is not numeric.
+fn common_numeric_type(a: TypeId, b: TypeId) -> Option<TypeId> {
+    fn rank(t: TypeId) -> Option<u8> {
+        match t {
+            TypeId::Int8 | TypeId::UInt8 => Some(1),
+            TypeId::Int16 | TypeId::UInt16 => Some(2),
+            TypeId::Int32 | TypeId::UInt32 => Some(3),
+            TypeId::Int64 | TypeId::UInt64 => Some(4),
+            TypeId::Int128 | TypeId::UInt128 => Some(5),
+            TypeId::Float32 => Some(6),
+            TypeId::Float64 | TypeId::Decimal | TypeId::Money => Some(7),
+            _ => None,
+        }
+    }
+    let ra = rank(a)?;
+    let rb = rank(b)?;
+    let hi = ra.max(rb);
+    Some(match hi {
+        6 => TypeId::Float32,
+        7 => TypeId::Float64,
+        5 => TypeId::Int128,
+        _ => TypeId::Int64,
+    })
+}
+
 fn evaluate_binary_op(
     left: &BoundExpr,
     op: BinaryOperator,
@@ -213,8 +239,41 @@ fn evaluate_binary_op(
     schema: &[LogicalColumn],
     params: &[ScalarValue],
 ) -> Result<Column> {
-    let left_col = evaluate(left, batch, schema, params)?;
-    let right_col = evaluate(right, batch, schema, params)?;
+    let mut left_col = evaluate(left, batch, schema, params)?;
+    let mut right_col = evaluate(right, batch, schema, params)?;
+
+    // Numeric coercion: comparisons and arithmetic between different numeric
+    // widths (e.g. an INT32 column vs an INT64 integer literal) must align to
+    // a common type. Without this the ScalarValue fallback compares distinct
+    // enum variants and never matches, so every column-vs-literal predicate
+    // would be all-false.
+    if matches!(
+        op,
+        BinaryOperator::Plus
+            | BinaryOperator::Minus
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide
+            | BinaryOperator::Modulo
+            | BinaryOperator::Eq
+            | BinaryOperator::Neq
+            | BinaryOperator::Lt
+            | BinaryOperator::Gt
+            | BinaryOperator::LtEq
+            | BinaryOperator::GtEq
+    ) {
+        let lt = left_col.type_id;
+        let rt = right_col.type_id;
+        if lt != rt {
+            if let Some(common) = common_numeric_type(lt, rt) {
+                if lt != common {
+                    left_col = compute::cast_column(&left_col, common)?;
+                }
+                if rt != common {
+                    right_col = compute::cast_column(&right_col, common)?;
+                }
+            }
+        }
+    }
 
     // Intercept interval arithmetic before falling into the generic numeric path.
     if matches!(
@@ -582,6 +641,20 @@ fn evaluate_function(
     params: &[ScalarValue],
 ) -> Result<Column> {
     match name {
+        // Current transaction wall-clock time. Timestamps are stored as i64
+        // microseconds since the Unix epoch (ColumnData::Int64). Broadcast one
+        // value per row so it composes like a literal in assignments/filters.
+        "now" | "current_timestamp" | "transaction_timestamp" | "statement_timestamp" => {
+            let micros = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as i64)
+                .unwrap_or(0);
+            let n = batch.num_rows.max(1);
+            Ok(Column::new(
+                ColumnData::Int64(vec![micros; n]),
+                TypeId::TimestampTz,
+            ))
+        }
         "abs" => {
             let col = evaluate(&args[0], batch, schema, params)?;
             eval_abs(&col)

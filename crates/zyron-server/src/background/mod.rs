@@ -15,6 +15,7 @@ pub mod host_health;
 pub mod mv_refresh;
 pub mod publication_retention;
 pub mod quota_gossip;
+pub mod retention;
 pub mod stats;
 pub mod stream_monitor;
 pub mod vacuum;
@@ -37,13 +38,12 @@ use zyron_buffer::BackgroundWriter;
 
 use self::cdc_writer::{CdcWriter, CdcWriterConfig};
 use self::checkpoint::{CheckpointWorker, CheckpointWorkerConfig};
-use self::feature_materialization::{
-    FeatureMaterializationConfig, FeatureMaterializationWorker,
-};
+use self::feature_materialization::{FeatureMaterializationConfig, FeatureMaterializationWorker};
 use self::mv_refresh::{MvRefreshConfig, MvRefreshWorker};
 use self::quota_gossip::{
     NoopTransport, QuotaGossipConfig, QuotaGossipTransport, QuotaGossipWorker,
 };
+use self::retention::{RetentionWorker, RetentionWorkerConfig};
 use self::stats::{StatsCollector, StatsCollectorConfig};
 use self::stream_monitor::{StreamMonitor, StreamMonitorConfig};
 use self::vacuum::{VacuumWorker, VacuumWorkerConfig};
@@ -56,6 +56,7 @@ pub struct BackgroundWorkers {
     checkpoint: CheckpointWorker,
     stats: StatsCollector,
     vacuum: VacuumWorker,
+    retention: RetentionWorker,
     wal_archiver: Option<WalArchiver>,
     cdc_writer: CdcWriter,
     mv_refresh: MvRefreshWorker,
@@ -108,6 +109,14 @@ impl BackgroundWorkers {
         );
 
         let catalog_for_mv = catalog.clone();
+        let retention = RetentionWorker::start(
+            catalog.clone(),
+            txn_manager.clone(),
+            wal.clone(),
+            buffer_pool.clone(),
+            disk_manager.clone(),
+            RetentionWorkerConfig::default(),
+        );
         let vacuum = VacuumWorker::start(
             catalog,
             txn_manager,
@@ -143,6 +152,7 @@ impl BackgroundWorkers {
             checkpoint,
             stats,
             vacuum,
+            retention,
             wal_archiver,
             cdc_writer,
             mv_refresh,
@@ -224,6 +234,7 @@ impl BackgroundWorkers {
         if let Some(ref mut archiver) = self.wal_archiver {
             archiver.shutdown();
         }
+        self.retention.shutdown();
         self.vacuum.shutdown();
         self.stats.shutdown();
         self.checkpoint.shutdown();

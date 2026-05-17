@@ -18,20 +18,57 @@ pub use logical::LogicalPlan;
 pub use optimizer::Optimizer;
 pub use physical::PhysicalPlan;
 
+use std::sync::Arc;
+
 use zyron_catalog::{Catalog, DatabaseId};
 use zyron_common::Result;
 use zyron_parser::Statement;
 
+/// One row-security predicate for a table. `permissive` predicates within a
+/// table are OR'd together then AND'd with the user filter; non-permissive
+/// (restrictive) predicates are AND'd.
+#[derive(Debug, Clone)]
+pub struct RowPredicate {
+    pub sql: String,
+    pub permissive: bool,
+}
+
+/// Supplies RLS / ABAC / row-ownership predicates for a table given the
+/// session's role context. Implemented by the connection layer over the
+/// SecurityManager so zyron-planner does not depend on zyron-auth.
+pub trait RowSecurityProvider: Send + Sync {
+    /// Predicates to enforce for `table_id`. Empty means no row security.
+    fn row_predicates(&self, table_id: u32) -> Vec<RowPredicate>;
+    /// True when `table_id` has any row-security policy. Used to fail closed
+    /// for query shapes where per-table injection is not performed.
+    fn has_row_security(&self, table_id: u32) -> bool;
+}
+
 /// Plans a parsed SQL statement into an optimized physical execution plan.
-/// This is the main entry point for query planning.
+/// Internal/admin path: no row security is injected.
 pub async fn plan(
     catalog: &Catalog,
     database_id: DatabaseId,
     search_path: Vec<String>,
     stmt: Statement,
 ) -> Result<PhysicalPlan> {
+    plan_with_security(catalog, database_id, search_path, stmt, None).await
+}
+
+/// Plans a statement, injecting RLS/ABAC/row-ownership predicates from the
+/// provider (user-facing query path).
+pub async fn plan_with_security(
+    catalog: &Catalog,
+    database_id: DatabaseId,
+    search_path: Vec<String>,
+    stmt: Statement,
+    security: Option<Arc<dyn RowSecurityProvider>>,
+) -> Result<PhysicalPlan> {
     let resolver = catalog.resolver(database_id, search_path);
     let mut binder = Binder::new(resolver, catalog);
+    if let Some(sec) = security {
+        binder.set_row_security(sec);
+    }
     let bound = binder.bind(stmt).await?;
     let logical = logical::builder::build_logical_plan(&bound)?;
     let optimized = Optimizer::new(catalog).optimize(logical)?;

@@ -247,6 +247,102 @@ pub struct TableEntry {
     pub cdf_enabled: bool,
     /// CDF retention in days (0 = unlimited).
     pub cdf_retention_days: u32,
+    /// Phase 17 data lifecycle configuration (tail-appended, backward
+    /// compatible; defaults to all-off for tables created before Phase 17).
+    pub lifecycle: LifecycleConfig,
+}
+
+/// Per-table data lifecycle configuration. All fields default to off so a
+/// table with no lifecycle policy behaves exactly as before Phase 17.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleConfig {
+    /// Soft delete enabled on this table.
+    pub soft_delete_enabled: bool,
+    /// Column id of the boolean is_deleted marker (0 = unset).
+    pub soft_delete_is_deleted_col_id: u32,
+    /// Column id of the deleted_at timestamp (0 = unset).
+    pub soft_delete_deleted_at_col_id: u32,
+    /// Column id used for TTL expiry comparison (0 = unset).
+    pub ttl_column_id: u32,
+    /// TTL interval in seconds (0 = no TTL).
+    pub ttl_seconds: i64,
+    /// TTL action: 0 Delete, 1 Archive, 2 Anonymize.
+    pub ttl_action: u8,
+    /// Per-row retention column id (0 = unset). When set, expiry is
+    /// `retention_column < now()` instead of `ttl_column + ttl_seconds`.
+    pub retention_column_id: u32,
+    /// Current storage tier: 0 Hot, 1 Warm, 2 Cold, 3 Archive.
+    pub storage_tier: u8,
+    /// Move to cold tier after this many seconds (0 = never).
+    pub cold_after_seconds: i64,
+    /// Archive after this many seconds (0 = never).
+    pub archive_after_seconds: i64,
+    /// Archive destination URI (empty = unset).
+    pub archive_destination: String,
+    /// Archive rows before hard-purge.
+    pub archive_on_purge: bool,
+    /// Grace seconds after soft delete before physical purge (0 = immediate).
+    pub purge_grace_seconds: i64,
+    /// Retention lock expiry (epoch micros, 0 = none). Even admins cannot
+    /// delete or modify rows before this time.
+    pub retention_lock_until: i64,
+    /// Recycle-bin window in seconds for DELETE/DROP/TRUNCATE (0 = none).
+    pub recycle_window_seconds: i64,
+    /// Crypto-shred data key id (0 = none).
+    pub data_key_id: u64,
+    /// Required data-residency region (empty = unset).
+    pub residency_region: String,
+    /// Immutable (WORM) table: no UPDATE/DELETE permitted.
+    pub immutable: bool,
+}
+
+impl LifecycleConfig {
+    fn write_into(&self, buf: &mut Vec<u8>) {
+        buf.push(if self.soft_delete_enabled { 1 } else { 0 });
+        write_u32(buf, self.soft_delete_is_deleted_col_id);
+        write_u32(buf, self.soft_delete_deleted_at_col_id);
+        write_u32(buf, self.ttl_column_id);
+        write_u64(buf, self.ttl_seconds as u64);
+        buf.push(self.ttl_action);
+        write_u32(buf, self.retention_column_id);
+        buf.push(self.storage_tier);
+        write_u64(buf, self.cold_after_seconds as u64);
+        write_u64(buf, self.archive_after_seconds as u64);
+        write_string(buf, &self.archive_destination);
+        buf.push(if self.archive_on_purge { 1 } else { 0 });
+        write_u64(buf, self.purge_grace_seconds as u64);
+        write_u64(buf, self.retention_lock_until as u64);
+        write_u64(buf, self.recycle_window_seconds as u64);
+        write_u64(buf, self.data_key_id);
+        write_string(buf, &self.residency_region);
+        buf.push(if self.immutable { 1 } else { 0 });
+    }
+
+    fn read_from(data: &[u8], off: &mut usize) -> Result<Self> {
+        let mut c = LifecycleConfig::default();
+        if *off >= data.len() {
+            return Ok(c);
+        }
+        c.soft_delete_enabled = read_u8(data, off)? != 0;
+        c.soft_delete_is_deleted_col_id = read_u32(data, off)?;
+        c.soft_delete_deleted_at_col_id = read_u32(data, off)?;
+        c.ttl_column_id = read_u32(data, off)?;
+        c.ttl_seconds = read_u64(data, off)? as i64;
+        c.ttl_action = read_u8(data, off)?;
+        c.retention_column_id = read_u32(data, off)?;
+        c.storage_tier = read_u8(data, off)?;
+        c.cold_after_seconds = read_u64(data, off)? as i64;
+        c.archive_after_seconds = read_u64(data, off)? as i64;
+        c.archive_destination = read_string(data, off)?;
+        c.archive_on_purge = read_u8(data, off)? != 0;
+        c.purge_grace_seconds = read_u64(data, off)? as i64;
+        c.retention_lock_until = read_u64(data, off)? as i64;
+        c.recycle_window_seconds = read_u64(data, off)? as i64;
+        c.data_key_id = read_u64(data, off)?;
+        c.residency_region = read_string(data, off)?;
+        c.immutable = read_u8(data, off)? != 0;
+        Ok(c)
+    }
 }
 
 impl TableEntry {
@@ -282,6 +378,9 @@ impl TableEntry {
         write_u32(&mut buf, self.history_table_id.unwrap_or(0));
         buf.push(if self.cdf_enabled { 1 } else { 0 });
         write_u32(&mut buf, self.cdf_retention_days);
+
+        // Phase 17 lifecycle config (tail-appended)
+        self.lifecycle.write_into(&mut buf);
 
         buf
     }
@@ -357,6 +456,9 @@ impl TableEntry {
             0
         };
 
+        // Phase 17 lifecycle config (tail-appended, defaults when absent).
+        let lifecycle = LifecycleConfig::read_from(data, &mut off)?;
+
         Ok(Self {
             id,
             schema_id,
@@ -372,6 +474,7 @@ impl TableEntry {
             history_table_id,
             cdf_enabled,
             cdf_retention_days,
+            lifecycle,
         })
     }
 }
@@ -1913,6 +2016,200 @@ impl SecurityMapEntry {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 17 data lifecycle catalog entries
+// ---------------------------------------------------------------------------
+
+/// A legal hold protecting rows of a table from deletion/modification.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LegalHoldEntry {
+    pub id: u32,
+    pub name: String,
+    pub table_id: u32,
+    /// SQL predicate text; empty means the whole table is held.
+    pub predicate_sql: String,
+    pub reason: String,
+    pub created_at: i64,
+    /// 0 = active, otherwise the epoch-micros release time.
+    pub released_at: i64,
+}
+
+impl LegalHoldEntry {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(64);
+        write_u32(&mut buf, self.id);
+        write_string(&mut buf, &self.name);
+        write_u32(&mut buf, self.table_id);
+        write_string(&mut buf, &self.predicate_sql);
+        write_string(&mut buf, &self.reason);
+        write_u64(&mut buf, self.created_at as u64);
+        write_u64(&mut buf, self.released_at as u64);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut off = 0;
+        Ok(Self {
+            id: read_u32(data, &mut off)?,
+            name: read_string(data, &mut off)?,
+            table_id: read_u32(data, &mut off)?,
+            predicate_sql: read_string(data, &mut off)?,
+            reason: read_string(data, &mut off)?,
+            created_at: read_u64(data, &mut off)? as i64,
+            released_at: read_u64(data, &mut off)? as i64,
+        })
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.released_at == 0
+    }
+}
+
+/// A derived retention policy index entry keyed by table. `TableEntry` is the
+/// source of truth; this lets workers enumerate policy tables without scanning
+/// every table row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetentionPolicyEntry {
+    pub table_id: u32,
+    /// 0 = TTL, 1 = Cold tiering, 2 = Archive.
+    pub kind: u8,
+    pub interval_seconds: i64,
+    /// 0 Delete, 1 Archive, 2 Anonymize (TTL only).
+    pub action: u8,
+    pub destination: String,
+}
+
+impl RetentionPolicyEntry {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32);
+        write_u32(&mut buf, self.table_id);
+        write_u8(&mut buf, self.kind);
+        write_u64(&mut buf, self.interval_seconds as u64);
+        write_u8(&mut buf, self.action);
+        write_string(&mut buf, &self.destination);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut off = 0;
+        Ok(Self {
+            table_id: read_u32(data, &mut off)?,
+            kind: read_u8(data, &mut off)?,
+            interval_seconds: read_u64(data, &mut off)? as i64,
+            action: read_u8(data, &mut off)?,
+            destination: read_string(data, &mut off)?,
+        })
+    }
+}
+
+/// History of executed retention/tiering/archive jobs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetentionJobEntry {
+    pub job_id: u64,
+    pub table_id: u32,
+    /// 0 ttl_delete, 1 tier_migrate, 2 archive, 3 purge, 4 anonymize.
+    pub kind: u8,
+    pub scheduled_at: i64,
+    pub started_at: i64,
+    pub finished_at: i64,
+    pub rows_affected: u64,
+    /// 0 pending, 1 running, 2 done, 3 failed, 4 skipped (dry run).
+    pub status: u8,
+    pub detail: String,
+}
+
+impl RetentionJobEntry {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(64);
+        write_u64(&mut buf, self.job_id);
+        write_u32(&mut buf, self.table_id);
+        write_u8(&mut buf, self.kind);
+        write_u64(&mut buf, self.scheduled_at as u64);
+        write_u64(&mut buf, self.started_at as u64);
+        write_u64(&mut buf, self.finished_at as u64);
+        write_u64(&mut buf, self.rows_affected);
+        write_u8(&mut buf, self.status);
+        write_string(&mut buf, &self.detail);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut off = 0;
+        Ok(Self {
+            job_id: read_u64(data, &mut off)?,
+            table_id: read_u32(data, &mut off)?,
+            kind: read_u8(data, &mut off)?,
+            scheduled_at: read_u64(data, &mut off)? as i64,
+            started_at: read_u64(data, &mut off)? as i64,
+            finished_at: read_u64(data, &mut off)? as i64,
+            rows_affected: read_u64(data, &mut off)?,
+            status: read_u8(data, &mut off)?,
+            detail: read_string(data, &mut off)?,
+        })
+    }
+}
+
+/// Tamper-evident compliance audit log entry. `entry_hash` chains over
+/// `prev_hash` so the log is verifiable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComplianceLogEntry {
+    pub event_id: u64,
+    /// 0 ttl, 1 archive, 2 restore, 3 legal_hold, 4 forget_user,
+    /// 5 export_user, 6 classification, 7 tier_move, 8 retention_lock,
+    /// 9 crypto_shred, 10 purge, 11 undrop.
+    pub event_type: u8,
+    pub subject: String,
+    pub table_id: u32,
+    pub ts: i64,
+    pub detail: String,
+    pub prev_hash: u32,
+    pub entry_hash: u32,
+}
+
+impl ComplianceLogEntry {
+    /// Computes the chained hash over the previous hash plus this entry's
+    /// content fields. Uses CRC32C (hardware-accelerated, present in
+    /// zyron-common).
+    pub fn compute_hash(&self) -> u32 {
+        let mut payload = Vec::with_capacity(64);
+        payload.extend_from_slice(&self.prev_hash.to_le_bytes());
+        payload.extend_from_slice(&self.event_id.to_le_bytes());
+        payload.push(self.event_type);
+        payload.extend_from_slice(self.subject.as_bytes());
+        payload.extend_from_slice(&self.table_id.to_le_bytes());
+        payload.extend_from_slice(&self.ts.to_le_bytes());
+        payload.extend_from_slice(self.detail.as_bytes());
+        zyron_common::hash32(&payload)
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(64);
+        write_u64(&mut buf, self.event_id);
+        write_u8(&mut buf, self.event_type);
+        write_string(&mut buf, &self.subject);
+        write_u32(&mut buf, self.table_id);
+        write_u64(&mut buf, self.ts as u64);
+        write_string(&mut buf, &self.detail);
+        write_u32(&mut buf, self.prev_hash);
+        write_u32(&mut buf, self.entry_hash);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut off = 0;
+        Ok(Self {
+            event_id: read_u64(data, &mut off)?,
+            event_type: read_u8(data, &mut off)?,
+            subject: read_string(data, &mut off)?,
+            table_id: read_u32(data, &mut off)?,
+            ts: read_u64(data, &mut off)? as i64,
+            detail: read_string(data, &mut off)?,
+            prev_hash: read_u32(data, &mut off)?,
+            entry_hash: read_u32(data, &mut off)?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2034,6 +2331,7 @@ mod tests {
             history_table_id: None,
             cdf_enabled: false,
             cdf_retention_days: 0,
+            lifecycle: Default::default(),
         };
         let bytes = entry.to_bytes();
         let decoded = TableEntry::from_bytes(&bytes).unwrap();
@@ -2179,6 +2477,7 @@ mod tests {
             history_table_id: None,
             cdf_enabled: false,
             cdf_retention_days: 0,
+            lifecycle: Default::default(),
         };
         let bytes = entry.to_bytes();
         let decoded = TableEntry::from_bytes(&bytes).unwrap();

@@ -84,8 +84,36 @@ pub async fn try_handle_ddl_utility(
         Statement::CreateView(_) => Some(Ok(DdlResult::Tag("CREATE VIEW".to_string()))),
         Statement::DropView(_) => Some(Ok(DdlResult::Tag("DROP VIEW".to_string()))),
         Statement::AlterView(_) => Some(Ok(DdlResult::Tag("ALTER VIEW".to_string()))),
-        Statement::AlterTableTtl(_) => Some(Ok(DdlResult::Tag("ALTER TABLE".to_string()))),
-        Statement::AlterTableOptions(_) => Some(Ok(DdlResult::Tag("ALTER TABLE".to_string()))),
+        Statement::AlterTableTtl(s) => {
+            Some(crate::lifecycle_dispatch::handle_alter_table_ttl(s, server, session).await)
+        }
+        Statement::AlterTableOptions(s) => {
+            Some(crate::lifecycle_dispatch::handle_alter_table_options(s, server, session).await)
+        }
+        Statement::LegalHold(s) => {
+            Some(crate::lifecycle_dispatch::handle_legal_hold(s, server, session).await)
+        }
+        Statement::ForgetUser(s) => {
+            Some(crate::lifecycle_dispatch::handle_forget_user(s, server, session).await)
+        }
+        Statement::ExportUser(s) => {
+            Some(crate::lifecycle_dispatch::handle_export_user(s, server, session).await)
+        }
+        Statement::AlterTableMove(s) => {
+            Some(crate::lifecycle_dispatch::handle_alter_table_move(s, server, session).await)
+        }
+        Statement::AlterColumnClassification(s) => Some(
+            crate::lifecycle_dispatch::handle_alter_column_classification(s, server, session).await,
+        ),
+        Statement::RestoreSoftDelete(s) => {
+            Some(crate::lifecycle_dispatch::handle_restore_soft_delete(s, server, session).await)
+        }
+        Statement::RunRetentionJob(s) => {
+            Some(crate::lifecycle_dispatch::handle_run_retention_job(s, server, session).await)
+        }
+        Statement::UndropTable(s) => {
+            Some(crate::lifecycle_dispatch::handle_undrop_table(s, server, session).await)
+        }
         Statement::OptimizeTable(_) => Some(Ok(DdlResult::Tag("OPTIMIZE".to_string()))),
         Statement::Reindex(_) => Some(Ok(DdlResult::Tag("REINDEX".to_string()))),
         Statement::CommentOn(_) => Some(Ok(DdlResult::Tag("COMMENT".to_string()))),
@@ -115,7 +143,7 @@ pub async fn try_handle_ddl_utility(
         // -- Auth/Roles --
         Statement::CreateUser(s) => Some(handle_create_user(s, server).await),
         Statement::AlterUser(_) => Some(Ok(DdlResult::Tag("ALTER USER".to_string()))),
-        Statement::DropUser(s) => Some(handle_drop_user(s, server).await),
+        Statement::DropUser(s) => Some(handle_drop_user(s, server, session).await),
         Statement::CreateRole(s) => Some(handle_create_role(s, server).await),
         Statement::AlterRole(_) => Some(Ok(DdlResult::Tag("ALTER ROLE".to_string()))),
         Statement::DropRole(s) => Some(handle_drop_role(s, server).await),
@@ -299,7 +327,7 @@ pub async fn try_handle_ddl_utility(
 /// Checks whether the session has the required privilege for a DDL operation.
 /// If no security manager is configured, the check is skipped (open access).
 /// The object_id is the catalog ID of the target object (schema ID, table ID, etc.).
-fn check_ddl_privilege(
+pub(crate) fn check_ddl_privilege(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
     privilege: zyron_auth::PrivilegeType,
@@ -682,8 +710,16 @@ async fn handle_create_user(
 async fn handle_drop_user(
     stmt: &zyron_parser::ast::DropUserStatement,
     server: &Arc<ServerState>,
+    session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
     let sm = require_security_manager(server)?;
+    check_ddl_privilege(
+        server,
+        session,
+        zyron_auth::PrivilegeType::ManageRoles,
+        zyron_auth::ObjectType::System,
+        0,
+    )?;
 
     match sm.lookup_role(&stmt.name) {
         Some(r) => {
@@ -777,6 +813,15 @@ async fn handle_grant(
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
     let sm = require_security_manager(server)?;
+    // Only roles holding ManagePrivileges may grant privileges. Without this
+    // any authenticated role could self-grant superuser.
+    check_ddl_privilege(
+        server,
+        session,
+        zyron_auth::PrivilegeType::ManagePrivileges,
+        zyron_auth::ObjectType::System,
+        0,
+    )?;
 
     // Resolve the grantee role by name
     let grantee = sm
@@ -825,6 +870,13 @@ async fn handle_revoke(
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
     let sm = require_security_manager(server)?;
+    check_ddl_privilege(
+        server,
+        session,
+        zyron_auth::PrivilegeType::ManagePrivileges,
+        zyron_auth::ObjectType::System,
+        0,
+    )?;
 
     // Resolve the grantee role by name
     let grantee = sm
@@ -957,7 +1009,7 @@ fn eval_literal_expr(expr: &zyron_parser::ast::Expr) -> String {
 /// Zyron has no default user schema, so this returns an error when the
 /// session's search_path is empty. Callers must either qualify DDL
 /// identifiers or have the client set a search_path first.
-fn get_session_schema(
+pub(crate) fn get_session_schema(
     session: &Option<Session>,
     server: &Arc<ServerState>,
     _override_schema: Option<&str>,

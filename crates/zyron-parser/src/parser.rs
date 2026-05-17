@@ -68,9 +68,18 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Optimize) => self.parse_optimize_table(),
             Token::Keyword(Keyword::Pause) => self.parse_pause_schedule(),
             Token::Keyword(Keyword::Resume) => self.parse_resume_schedule(),
+            Token::Keyword(Keyword::Run)
+                if self.peek.token == Token::Keyword(Keyword::Retention) =>
+            {
+                self.parse_run_retention_job()
+            }
             Token::Keyword(Keyword::Run) => self.parse_run_pipeline(),
             Token::Keyword(Keyword::Archive) => self.parse_archive_table(),
-            Token::Keyword(Keyword::Restore) => self.parse_restore_table(),
+            Token::Keyword(Keyword::Restore) => self.parse_restore_statement(),
+            Token::Keyword(Keyword::Legal) => self.parse_legal_hold(),
+            Token::Keyword(Keyword::Forget) => self.parse_forget_user(),
+            Token::Keyword(Keyword::Export) => self.parse_export_user(),
+            Token::Keyword(Keyword::Undrop) => self.parse_undrop_table(),
             Token::Keyword(Keyword::Analyze) => self.parse_analyze(),
             Token::Keyword(Keyword::Use) => self.parse_use_branch(),
             Token::Keyword(Keyword::Call) => self.parse_call(),
@@ -522,6 +531,22 @@ impl<'a> Parser<'a> {
             None
         };
 
+        let soft_delete_mode = if self.at_keyword(Keyword::Including)
+            && self.peek.token == Token::Keyword(Keyword::Deleted)
+        {
+            self.advance()?;
+            self.advance()?;
+            SoftDeleteSelectMode::IncludingDeleted
+        } else if self.at_keyword(Keyword::Only)
+            && self.peek.token == Token::Keyword(Keyword::Deleted)
+        {
+            self.advance()?;
+            self.advance()?;
+            SoftDeleteSelectMode::OnlyDeleted
+        } else {
+            SoftDeleteSelectMode::Default
+        };
+
         Ok(SelectStatement {
             with,
             distinct,
@@ -539,6 +564,7 @@ impl<'a> Parser<'a> {
             offset: None,
             fetch: None,
             for_clause: None,
+            soft_delete_mode,
         })
     }
 
@@ -1008,10 +1034,13 @@ impl<'a> Parser<'a> {
 
         let returning = self.parse_returning()?;
 
+        let hard = self.consume_keyword(Keyword::Hard)?;
+
         Ok(Statement::Delete(Box::new(DeleteStatement {
             table,
             where_clause,
             returning,
+            hard,
         })))
     }
 
@@ -1125,6 +1154,12 @@ impl<'a> Parser<'a> {
 
         self.expect_token(&Token::RParen)?;
 
+        // Optional inline TTL clause before WITH options
+        let mut ttl = None;
+        if self.consume_keyword(Keyword::Ttl)? {
+            ttl = Some(self.parse_ttl_clause_body()?);
+        }
+
         // Parse WITH (options) if present
         let mut options = vec![];
         if self.consume_keyword(Keyword::With)? {
@@ -1133,12 +1168,18 @@ impl<'a> Parser<'a> {
             self.expect_token(&Token::RParen)?;
         }
 
+        // Allow the TTL clause to also appear after WITH
+        if ttl.is_none() && self.consume_keyword(Keyword::Ttl)? {
+            ttl = Some(self.parse_ttl_clause_body()?);
+        }
+
         Ok(Statement::CreateTable(Box::new(CreateTableStatement {
             name,
             if_not_exists,
             columns,
             constraints,
             options,
+            ttl,
         })))
     }
 
@@ -1277,24 +1318,57 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::Table)?;
         let name = self.parse_ident()?;
 
+        // ALTER TABLE t MOVE {WHERE expr | PARTITION 'k=v'} TO TIER 'tier' [DRY RUN]
+        if self.consume_keyword(Keyword::Move)? {
+            let target = if self.consume_keyword(Keyword::Where)? {
+                MoveTarget::Where(Box::new(self.parse_expr()?))
+            } else if self.consume_keyword(Keyword::Partition)? {
+                if let Token::String(s) = &self.current.token {
+                    let s = s.clone();
+                    self.advance()?;
+                    MoveTarget::Partition(s)
+                } else {
+                    return Err(self.error("Expected 'col=value' string after PARTITION"));
+                }
+            } else {
+                return Err(self.error("Expected WHERE or PARTITION after MOVE"));
+            };
+            self.expect_keyword(Keyword::To)?;
+            self.expect_keyword(Keyword::Tier)?;
+            let tier = if let Token::String(s) = &self.current.token {
+                let s = s.clone();
+                self.advance()?;
+                s
+            } else {
+                self.parse_ident()?
+            };
+            let dry_run = self.parse_dry_run()?;
+            return Ok(Statement::AlterTableMove(Box::new(
+                AlterTableMoveStatement {
+                    table: name,
+                    target,
+                    tier,
+                    dry_run,
+                },
+            )));
+        }
+
         // Handle SET TTL and DROP TTL before the standard ALTER TABLE operations
         if self.at_keyword(Keyword::Set) && self.peek.token == Token::Keyword(Keyword::Ttl) {
             self.advance()?; // SET
             self.advance()?; // TTL
-            let action = if self.consume_keyword(Keyword::Archive)? {
-                TtlAction::Archive
-            } else {
-                TtlAction::Delete
-            };
-            let duration = self.parse_ttl_duration()?;
-            self.expect_keyword(Keyword::On)?;
-            let column = self.parse_ident()?;
+            // Legacy form: SET TTL ARCHIVE <duration> ON <col>
+            let legacy_archive = self.consume_keyword(Keyword::Archive)?;
+            let mut clause = self.parse_ttl_clause_body()?;
+            if legacy_archive {
+                clause.action = TtlAction::Archive;
+            }
             return Ok(Statement::AlterTableTtl(Box::new(AlterTableTtlStatement {
                 table: name,
                 operation: TtlOperation::Set {
-                    duration,
-                    column,
-                    action,
+                    duration: clause.duration,
+                    column: clause.column,
+                    action: clause.action,
                 },
             })));
         }
@@ -1411,6 +1485,22 @@ impl<'a> Parser<'a> {
                 let column = self.parse_ident()?;
 
                 if self.consume_keyword(Keyword::Set)? {
+                    if self.consume_keyword(Keyword::Classification)? {
+                        let level = if let Token::String(s) = &self.current.token {
+                            let s = s.clone();
+                            self.advance()?;
+                            s
+                        } else {
+                            self.parse_ident()?
+                        };
+                        return Ok(Statement::AlterColumnClassification(Box::new(
+                            AlterColumnClassificationStatement {
+                                table: name,
+                                column,
+                                level,
+                            },
+                        )));
+                    }
                     if self.consume_keyword(Keyword::Not)? {
                         self.expect_keyword(Keyword::Null)?;
                         AlterTableOperation::AlterColumnSetNotNull { column }
@@ -4053,6 +4143,33 @@ impl<'a> Parser<'a> {
         Ok(TtlDuration { value, unit })
     }
 
+    /// `TTL <duration> ON <column> [ACTION DELETE|ARCHIVE|ANONYMIZE]`
+    /// Shared by CREATE TABLE and ALTER TABLE. The TTL keyword is already
+    /// consumed by the caller.
+    fn parse_ttl_clause_body(&mut self) -> Result<TtlClause> {
+        let duration = self.parse_ttl_duration()?;
+        self.expect_keyword(Keyword::On)?;
+        let column = self.parse_ident()?;
+        let action = if self.consume_keyword(Keyword::Action)? {
+            if self.consume_keyword(Keyword::Anonymize)? {
+                TtlAction::Anonymize
+            } else if self.consume_keyword(Keyword::Archive)? {
+                TtlAction::Archive
+            } else if self.consume_keyword(Keyword::Delete)? {
+                TtlAction::Delete
+            } else {
+                return Err(self.error("Expected DELETE, ARCHIVE, or ANONYMIZE after ACTION"));
+            }
+        } else {
+            TtlAction::Delete
+        };
+        Ok(TtlClause {
+            duration,
+            column,
+            action,
+        })
+    }
+
     fn parse_create_schedule(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Schedule)?;
         let name = self.parse_ident()?;
@@ -4700,18 +4817,58 @@ impl<'a> Parser<'a> {
         } else {
             return Err(self.error("Expected destination path string after TO"));
         };
+        let dry_run = self.parse_dry_run()?;
         Ok(Statement::ArchiveTable(Box::new(ArchiveTableStatement {
             table,
             where_clause,
             destination,
+            dry_run,
         })))
     }
 
-    fn parse_restore_table(&mut self) -> Result<Statement> {
+    /// Dispatches the RESTORE forms:
+    ///   RESTORE TABLE name FROM 'uri' [INTO t] [TO VERSION|TIMESTAMP AS OF e]
+    ///   RESTORE TABLE name                         (undrop within window)
+    ///   RESTORE FROM 'uri' [INTO t] [...]          (archive restore)
+    ///   RESTORE FROM t WHERE expr                  (undo soft delete)
+    fn parse_restore_statement(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Restore)?;
-        self.expect_keyword(Keyword::Table)?;
-        let table = self.parse_ident()?;
+
+        if self.consume_keyword(Keyword::Table)? {
+            let table = self.parse_ident()?;
+            if !self.consume_keyword(Keyword::From)? {
+                // RESTORE TABLE name  -> undrop
+                return Ok(Statement::UndropTable(Box::new(UndropTableStatement {
+                    table,
+                })));
+            }
+            return self.parse_restore_archive_tail(Some(table));
+        }
+
         self.expect_keyword(Keyword::From)?;
+        if let Token::String(_) = &self.current.token {
+            // RESTORE FROM 'uri' ...  -> archive restore (no explicit table)
+            return self.parse_restore_archive_tail(None);
+        }
+
+        // RESTORE FROM t WHERE expr  -> undo soft delete
+        let table = self.parse_ident()?;
+        let where_clause = if self.consume_keyword(Keyword::Where)? {
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        Ok(Statement::RestoreSoftDelete(Box::new(
+            RestoreSoftDeleteStatement {
+                table,
+                where_clause,
+            },
+        )))
+    }
+
+    /// Parses the archive-restore tail starting at the source string. The
+    /// RESTORE [TABLE name] FROM prefix is already consumed.
+    fn parse_restore_archive_tail(&mut self, table: Option<String>) -> Result<Statement> {
         let source = if let Token::String(s) = &self.current.token {
             let s = s.clone();
             self.advance()?;
@@ -4725,7 +4882,6 @@ impl<'a> Parser<'a> {
             None
         };
 
-        // Optional: TO VERSION AS OF expr or TO TIMESTAMP AS OF expr
         let mut at_version = None;
         let mut at_timestamp = None;
         if self.consume_keyword(Keyword::To)? {
@@ -4743,12 +4899,150 @@ impl<'a> Parser<'a> {
         }
 
         Ok(Statement::RestoreTable(Box::new(RestoreTableStatement {
-            table,
+            table: table.unwrap_or_default(),
             source,
             into_table,
             at_version,
             at_timestamp,
         })))
+    }
+
+    /// Optional trailing `DRY RUN`.
+    fn parse_dry_run(&mut self) -> Result<bool> {
+        if self.consume_keyword(Keyword::Dry)? {
+            self.expect_keyword(Keyword::Run)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// LEGAL HOLD CREATE name ON table [WHERE expr] [REASON 'text']
+    /// LEGAL HOLD DROP [IF EXISTS] name
+    /// LEGAL HOLD RELEASE name
+    fn parse_legal_hold(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Legal)?;
+        self.expect_keyword(Keyword::Hold)?;
+        let operation = if self.consume_keyword(Keyword::Create)? {
+            let name = self.parse_ident()?;
+            self.expect_keyword(Keyword::On)?;
+            let table = self.parse_ident()?;
+            let where_clause = if self.consume_keyword(Keyword::Where)? {
+                Some(Box::new(self.parse_expr()?))
+            } else {
+                None
+            };
+            let reason = if self.consume_keyword(Keyword::Reason)? {
+                if let Token::String(s) = &self.current.token {
+                    let s = s.clone();
+                    self.advance()?;
+                    Some(s)
+                } else {
+                    return Err(self.error("Expected reason string after REASON"));
+                }
+            } else {
+                None
+            };
+            LegalHoldOperation::Create {
+                name,
+                table,
+                where_clause,
+                reason,
+            }
+        } else if self.consume_keyword(Keyword::Drop)? {
+            let if_exists = if self.consume_keyword(Keyword::If)? {
+                self.expect_keyword(Keyword::Exists)?;
+                true
+            } else {
+                false
+            };
+            let name = self.parse_ident()?;
+            LegalHoldOperation::Drop { name, if_exists }
+        } else if self.consume_keyword(Keyword::Release)? {
+            let name = self.parse_ident()?;
+            LegalHoldOperation::Release { name }
+        } else {
+            return Err(self.error("Expected CREATE, DROP, or RELEASE after LEGAL HOLD"));
+        };
+        Ok(Statement::LegalHold(Box::new(LegalHoldStatement {
+            operation,
+        })))
+    }
+
+    /// FORGET USER 'id' [CASCADE] [DRY RUN]
+    fn parse_forget_user(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Forget)?;
+        self.expect_keyword(Keyword::User)?;
+        let user_id = if let Token::String(s) = &self.current.token {
+            let s = s.clone();
+            self.advance()?;
+            s
+        } else {
+            self.parse_ident()?
+        };
+        let cascade = self.consume_keyword(Keyword::Cascade)?;
+        let dry_run = self.parse_dry_run()?;
+        Ok(Statement::ForgetUser(Box::new(ForgetUserStatement {
+            user_id,
+            cascade,
+            dry_run,
+        })))
+    }
+
+    /// EXPORT USER 'id' [TO 'uri'] [CASCADE]
+    fn parse_export_user(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Export)?;
+        self.expect_keyword(Keyword::User)?;
+        let user_id = if let Token::String(s) = &self.current.token {
+            let s = s.clone();
+            self.advance()?;
+            s
+        } else {
+            self.parse_ident()?
+        };
+        let destination = if self.consume_keyword(Keyword::To)? {
+            if let Token::String(s) = &self.current.token {
+                let s = s.clone();
+                self.advance()?;
+                Some(s)
+            } else {
+                return Err(self.error("Expected destination string after TO"));
+            }
+        } else {
+            None
+        };
+        let cascade = self.consume_keyword(Keyword::Cascade)?;
+        Ok(Statement::ExportUser(Box::new(ExportUserStatement {
+            user_id,
+            destination,
+            cascade,
+        })))
+    }
+
+    /// UNDROP TABLE t
+    fn parse_undrop_table(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Undrop)?;
+        self.expect_keyword(Keyword::Table)?;
+        let table = self.parse_ident()?;
+        Ok(Statement::UndropTable(Box::new(UndropTableStatement {
+            table,
+        })))
+    }
+
+    /// RUN RETENTION JOB [ON t] [DRY RUN]
+    fn parse_run_retention_job(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Run)?;
+        self.expect_keyword(Keyword::Retention)?;
+        self.expect_keyword(Keyword::Job)?;
+        let table = if self.consume_keyword(Keyword::On)? {
+            Some(self.parse_ident()?)
+        } else {
+            None
+        };
+        let dry_run = self.parse_dry_run()?;
+        Ok(Statement::RunRetentionJob(Box::new(
+            RunRetentionJobStatement { table, dry_run },
+        )))
     }
 
     // -----------------------------------------------------------------------
@@ -7365,6 +7659,21 @@ fn keyword_to_ident_str(kw: Keyword) -> Option<&'static str> {
         Keyword::Archive => Some("archive"),
         Keyword::Retain => Some("retain"),
         Keyword::Expire => Some("expire"),
+        // Phase 17 data lifecycle (mid-statement, stay identifier-usable).
+        // Legal and Forget are intentionally omitted so they lead statements.
+        Keyword::Tier => Some("tier"),
+        Keyword::Classification => Some("classification"),
+        Keyword::Deleted => Some("deleted"),
+        Keyword::Hard => Some("hard"),
+        Keyword::Including => Some("including"),
+        Keyword::Purge => Some("purge"),
+        Keyword::Move => Some("move"),
+        Keyword::Action => Some("action"),
+        Keyword::Anonymize => Some("anonymize"),
+        Keyword::Export => Some("export"),
+        Keyword::Undrop => Some("undrop"),
+        Keyword::Dry => Some("dry"),
+        Keyword::Reason => Some("reason"),
         // Scheduling
         Keyword::Schedule => Some("schedule"),
         Keyword::Every => Some("every"),

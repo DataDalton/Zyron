@@ -266,12 +266,29 @@ impl Operator for ValuesOperator {
             let mut col_nulls: Vec<NullBitmap> =
                 (0..num_cols).map(|_| NullBitmap::empty()).collect();
 
-            // Create a dummy empty batch for evaluating literal expressions.
-            let dummy = DataBatch::empty();
+            // Single-row evaluation context for the per-row VALUES
+            // expressions. It must report num_rows == 1 so literal columns are
+            // length 1 (an empty batch would size every literal to 0 rows and
+            // collapse all inserted values to NULL).
+            let row_eval_ctx = DataBatch::new(vec![Column::new(
+                ColumnData::Boolean(vec![false]),
+                TypeId::Boolean,
+            )]);
 
             for row_exprs in &self.rows {
                 for (c, expr) in row_exprs.iter().enumerate() {
-                    let col = evaluate(expr, &dummy, &self.schema, &self.params)?;
+                    let col = evaluate(expr, &row_eval_ctx, &self.schema, &self.params)?;
+                    // Coerce the evaluated value to the target column's type.
+                    // Integer/decimal literals bind wider than narrow columns
+                    // (e.g. an Int64 literal into an Int32 column); without
+                    // this cast push_scalar would store 0 for the mismatched
+                    // variant. NULL and same-type values pass through.
+                    let target = self.schema[c].type_id;
+                    let col = if col.len() > 0 && col.type_id != target && !col.is_null(0) {
+                        crate::compute::cast_column(&col, target)?
+                    } else {
+                        col
+                    };
                     let scalar = if col.len() > 0 {
                         col.get_scalar(0)
                     } else {

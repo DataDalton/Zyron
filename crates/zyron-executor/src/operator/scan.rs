@@ -20,9 +20,10 @@ use zyron_planner::logical::LogicalColumn;
 use zyron_storage::{BTreeIndex, DiskManager, HeapPage, TupleId};
 
 use crate::batch::{
-    BATCH_SIZE, DataBatch, build_column_to_builder_map, create_builders,
+    BATCH_SIZE, ColumnBuilder, DataBatch, build_column_to_builder_map, create_builders,
     decode_tuple_into_builders, finalize_builders,
 };
+use crate::column::ScalarValue;
 use crate::compute::column_to_mask;
 use crate::context::ExecutionContext;
 use crate::expr::evaluate;
@@ -105,8 +106,7 @@ impl SeqScanOperator {
         let num_pages = ctx.get_heap_file(table_id).await?.num_pages_cached() as u64;
         let output_ids: Vec<zyron_catalog::ColumnId> =
             columns.iter().map(|c| c.column_id).collect();
-        let column_to_builder =
-            build_column_to_builder_map(&table_entry.columns, &output_ids);
+        let column_to_builder = build_column_to_builder_map(&table_entry.columns, &output_ids);
 
         Ok(Self {
             ctx,
@@ -121,6 +121,78 @@ impl SeqScanOperator {
             track_tuple_ids,
             as_of_version,
         })
+    }
+
+    /// Enforces column-level security on a result batch: classification
+    /// clearance and masking policies. Columns the session role lacks
+    /// clearance for are masked (if a masking policy exists) or NULLed
+    /// (deny). Internal queries (no security context) are unaffected.
+    fn apply_column_security(&self, batch: DataBatch) -> DataBatch {
+        let sc = match &self.ctx.security_context {
+            Some(s) => s,
+            None => return batch,
+        };
+        let sm = match &self.ctx.security_manager {
+            Some(s) => s,
+            None => return batch,
+        };
+        let table_id = self.table_entry.id.0;
+        let n = batch.num_rows;
+        let mut cols = Vec::with_capacity(batch.columns.len());
+        for (i, col) in batch.columns.iter().enumerate() {
+            // Only base-table columns carry a classification/mask label.
+            if i >= self.output_columns.len() {
+                cols.push(col.clone());
+                continue;
+            }
+            let col_id = self.output_columns[i].column_id.0;
+            let cleared = sm
+                .classification_store
+                .check_clearance(sc.clearance, table_id, col_id);
+            // Probe whether a masking policy applies to this (role, column).
+            let mut probe = String::new();
+            let has_mask = sm.masking_policy_store.apply_masking(
+                table_id,
+                col_id,
+                "",
+                &sc.effective_roles,
+                &mut probe,
+            );
+            if cleared && !has_mask {
+                cols.push(col.clone());
+                continue;
+            }
+            let mut b = ColumnBuilder::new(col.type_id, n);
+            for r in 0..n {
+                let v = col.get_scalar(r);
+                let masked_text = if let ScalarValue::Utf8(s) = &v {
+                    let mut buf = String::new();
+                    if sm.masking_policy_store.apply_masking(
+                        table_id,
+                        col_id,
+                        s,
+                        &sc.effective_roles,
+                        &mut buf,
+                    ) {
+                        Some(buf)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(m) = masked_text {
+                    b.push(&ScalarValue::Utf8(m));
+                } else if cleared {
+                    b.push(&v);
+                } else {
+                    // No clearance and no applicable mask: deny by NULLing.
+                    b.push(&ScalarValue::Null);
+                }
+            }
+            cols.push(b.finish());
+        }
+        DataBatch::new(cols)
     }
 }
 
@@ -144,12 +216,9 @@ impl Operator for SeqScanOperator {
             while row_count < batch_size && self.page_cursor < self.num_pages {
                 let page_id = PageId::new(self.table_entry.heap_file_id, self.page_cursor);
 
-                let page_data: [u8; PAGE_SIZE] = read_page_through_pool(
-                    &self.ctx.buffer_pool,
-                    &self.ctx.disk_manager,
-                    page_id,
-                )
-                .await?;
+                let page_data: [u8; PAGE_SIZE] =
+                    read_page_through_pool(&self.ctx.buffer_pool, &self.ctx.disk_manager, page_id)
+                        .await?;
 
                 // Empty page fast path, avoid HeapPage box allocation when
                 // the page has zero slots (freshly allocated, never written)
@@ -233,13 +302,15 @@ impl Operator for SeqScanOperator {
 
             let batch = finalize_builders(builders);
 
-            // Apply predicate filter if present.
+            // Apply predicate filter if present. The predicate runs on the
+            // real (unmasked) values; column-level security is applied to the
+            // surviving rows afterward so masking never changes filtering.
             if let Some(ref predicate) = self.predicate {
-                let mask_col =
-                    evaluate(predicate, &batch, &self.output_columns, &self.ctx.params)?;
+                let mask_col = evaluate(predicate, &batch, &self.output_columns, &self.ctx.params)?;
                 let mask = column_to_mask(&mask_col);
 
                 let filtered = batch.filter(&mask);
+                let secured = self.apply_column_security(filtered);
 
                 if self.track_tuple_ids {
                     let filtered_ids: Vec<TupleId> = mask
@@ -247,16 +318,17 @@ impl Operator for SeqScanOperator {
                         .enumerate()
                         .filter_map(|(i, &keep)| if keep { Some(tuple_ids[i]) } else { None })
                         .collect();
-                    return Ok(Some(ExecutionBatch::with_tuple_ids(filtered, filtered_ids)));
+                    return Ok(Some(ExecutionBatch::with_tuple_ids(secured, filtered_ids)));
                 }
 
-                return Ok(Some(ExecutionBatch::new(filtered)));
+                return Ok(Some(ExecutionBatch::new(secured)));
             }
 
+            let secured = self.apply_column_security(batch);
             if self.track_tuple_ids {
-                Ok(Some(ExecutionBatch::with_tuple_ids(batch, tuple_ids)))
+                Ok(Some(ExecutionBatch::with_tuple_ids(secured, tuple_ids)))
             } else {
-                Ok(Some(ExecutionBatch::new(batch)))
+                Ok(Some(ExecutionBatch::new(secured)))
             }
         })
     }
@@ -831,8 +903,7 @@ impl IndexScanOperator {
 
             let output_ids: Vec<zyron_catalog::ColumnId> =
                 columns.iter().map(|c| c.column_id).collect();
-            let column_to_builder =
-                build_column_to_builder_map(&table_entry.columns, &output_ids);
+            let column_to_builder = build_column_to_builder_map(&table_entry.columns, &output_ids);
 
             return Ok(Self {
                 index_state: Some(IndexScanState {
@@ -914,15 +985,16 @@ impl Operator for IndexScanOperator {
                 let tid = state.tuple_ids[state.cursor];
                 state.cursor += 1;
 
-                let frame_present =
-                    state.ctx.buffer_pool.fetch_page(tid.page_id).is_some();
+                let frame_present = state.ctx.buffer_pool.fetch_page(tid.page_id).is_some();
                 if !frame_present {
-                    let disk_data =
-                        state.ctx.disk_manager.read_page(tid.page_id).await?;
-                    let (_, evicted) =
-                        state.ctx.buffer_pool.load_page(tid.page_id, &disk_data)?;
+                    let disk_data = state.ctx.disk_manager.read_page(tid.page_id).await?;
+                    let (_, evicted) = state.ctx.buffer_pool.load_page(tid.page_id, &disk_data)?;
                     if let Some(ev) = evicted {
-                        state.ctx.disk_manager.write_page(ev.page_id, &ev.data).await?;
+                        state
+                            .ctx
+                            .disk_manager
+                            .write_page(ev.page_id, &ev.data)
+                            .await?;
                     }
                     // load_page pinned, frame_present path's fetch_page also
                     // pinned, in both cases we have one extra pin to balance
@@ -941,8 +1013,7 @@ impl Operator for IndexScanOperator {
                     match HeapPage::get_tuple_view_from_slice(&**guard, slot_id) {
                         None => false,
                         Some(view) => {
-                            if view.is_deleted()
-                                || !view.header.is_visible_to(&state.ctx.snapshot)
+                            if view.is_deleted() || !view.header.is_visible_to(&state.ctx.snapshot)
                             {
                                 false
                             } else {
@@ -976,8 +1047,7 @@ impl Operator for IndexScanOperator {
 
             // Apply remaining predicate as a post-filter.
             if let Some(ref pred) = state.remaining_predicate {
-                let mask_col =
-                    evaluate(pred, &batch, &state.output_columns, &state.ctx.params)?;
+                let mask_col = evaluate(pred, &batch, &state.output_columns, &state.ctx.params)?;
                 let mask = column_to_mask(&mask_col);
                 let filtered = batch.filter(&mask);
 

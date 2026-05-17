@@ -794,21 +794,82 @@ pub fn cast_scalar(value: &ScalarValue, target: TypeId) -> Result<ScalarValue> {
                 "cannot cast {value} to Boolean"
             ))),
         },
-        TypeId::Int32 | TypeId::Date => match value {
-            ScalarValue::Int8(v) => Ok(ScalarValue::Int32(*v as i32)),
-            ScalarValue::Int16(v) => Ok(ScalarValue::Int32(*v as i32)),
-            ScalarValue::Int32(v) => Ok(ScalarValue::Int32(*v)),
-            ScalarValue::Int64(v) => Ok(ScalarValue::Int32(*v as i32)),
-            ScalarValue::Float64(v) => Ok(ScalarValue::Int32(*v as i32)),
-            ScalarValue::Utf8(s) => s
-                .parse::<i32>()
-                .map(ScalarValue::Int32)
-                .map_err(|_| ZyronError::ExecutionError(format!("cannot cast '{s}' to Int32"))),
-            _ => Err(ZyronError::ExecutionError(format!(
-                "cannot cast {value} to Int32"
-            ))),
-        },
+        TypeId::Int32 | TypeId::Date => Ok(ScalarValue::Int32(
+            i32::try_from(checked_int(value, "INTEGER")?).map_err(|_| {
+                ZyronError::ExecutionError(format!("value {value} out of range for INTEGER"))
+            })?,
+        )),
+        TypeId::Int16 => Ok(ScalarValue::Int16(
+            i16::try_from(checked_int(value, "SMALLINT")?).map_err(|_| {
+                ZyronError::ExecutionError(format!("value {value} out of range for SMALLINT"))
+            })?,
+        )),
+        TypeId::Int8 => Ok(ScalarValue::Int8(
+            i8::try_from(checked_int(value, "TINYINT")?).map_err(|_| {
+                ZyronError::ExecutionError(format!("value {value} out of range for TINYINT"))
+            })?,
+        )),
+        TypeId::UInt64 | TypeId::UInt32 | TypeId::UInt16 | TypeId::UInt8 => {
+            let raw = checked_int(value, "unsigned integer")?;
+            let max: i128 = match target {
+                TypeId::UInt8 => u8::MAX as i128,
+                TypeId::UInt16 => u16::MAX as i128,
+                TypeId::UInt32 => u32::MAX as i128,
+                _ => u64::MAX as i128,
+            };
+            if raw < 0 || raw > max {
+                return Err(ZyronError::ExecutionError(format!(
+                    "value {value} out of range for {target:?}"
+                )));
+            }
+            Ok(match target {
+                TypeId::UInt8 => ScalarValue::UInt8(raw as u8),
+                TypeId::UInt16 => ScalarValue::UInt16(raw as u16),
+                TypeId::UInt32 => ScalarValue::UInt32(raw as u32),
+                _ => ScalarValue::UInt64(raw as u64),
+            })
+        }
         _ => Ok(value.clone()),
+    }
+}
+
+/// Coerces an integer-like scalar to an i128 for range-checked narrowing.
+/// Rejects out-of-range narrowing (e.g. a BIGINT value that does not fit an
+/// INTEGER column) with an error instead of silently wrapping. Floats must be
+/// finite and integral within the target range.
+fn checked_int(value: &ScalarValue, target_name: &str) -> Result<i128> {
+    let out_of_range =
+        || ZyronError::ExecutionError(format!("value {value} out of range for {target_name}"));
+    match value {
+        ScalarValue::Int8(v) => Ok(*v as i128),
+        ScalarValue::Int16(v) => Ok(*v as i128),
+        ScalarValue::Int32(v) => Ok(*v as i128),
+        ScalarValue::Int64(v) => Ok(*v as i128),
+        ScalarValue::Int128(v) => Ok(*v),
+        ScalarValue::UInt8(v) => Ok(*v as i128),
+        ScalarValue::UInt16(v) => Ok(*v as i128),
+        ScalarValue::UInt32(v) => Ok(*v as i128),
+        ScalarValue::UInt64(v) => Ok(*v as i128),
+        ScalarValue::Boolean(b) => Ok(if *b { 1 } else { 0 }),
+        ScalarValue::Float32(f) => {
+            let f = *f as f64;
+            if !f.is_finite() || f.fract() != 0.0 {
+                return Err(out_of_range());
+            }
+            Ok(f as i128)
+        }
+        ScalarValue::Float64(f) => {
+            if !f.is_finite() || f.fract() != 0.0 {
+                return Err(out_of_range());
+            }
+            Ok(*f as i128)
+        }
+        ScalarValue::Utf8(s) => s
+            .parse::<i128>()
+            .map_err(|_| ZyronError::ExecutionError(format!("cannot cast '{s}' to {target_name}"))),
+        _ => Err(ZyronError::ExecutionError(format!(
+            "cannot cast {value} to {target_name}"
+        ))),
     }
 }
 

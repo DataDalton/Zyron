@@ -342,6 +342,13 @@ pub enum ZyronError {
     #[error("Schedule already exists: {0}")]
     ScheduleAlreadyExists(String),
 
+    // Data lifecycle errors
+    #[error("Legal hold violation: {0}")]
+    LegalHoldViolation(String),
+
+    #[error("Retention violation: {0}")]
+    RetentionViolation(String),
+
     // Stored procedure errors
     #[error("Procedure not found: {0}")]
     ProcedureNotFound(String),

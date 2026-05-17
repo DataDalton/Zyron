@@ -459,6 +459,7 @@ impl Catalog {
             history_table_id: None,
             cdf_enabled: false,
             cdf_retention_days: 0,
+            lifecycle: Default::default(),
         };
 
         self.log_ddl(DDL_CREATE_TABLE, &entry.to_bytes())?;
@@ -1216,6 +1217,99 @@ impl Catalog {
         let insert_lsn = self.wal.log_insert(txn_id, begin_lsn, &payload)?;
         let commit_lsn = self.wal.log_commit(txn_id, insert_lsn)?;
         Ok(commit_lsn)
+    }
+
+    /// Persists a mutated table entry (used by ALTER TABLE lifecycle ops).
+    /// Re-logs the entry, replaces the stored tuple, and refreshes the cache.
+    /// Columns and indexes are unaffected (separate system tables).
+    pub async fn update_table(&self, entry: TableEntry) -> Result<()> {
+        self.log_ddl(DDL_CREATE_TABLE, &entry.to_bytes())?;
+        self.storage.delete_table(entry.id).await?;
+        self.storage.store_table(&entry).await?;
+        self.cache.put_table(entry);
+        Ok(())
+    }
+
+    // ----- Phase 17 data lifecycle accessors -----
+
+    pub async fn load_legal_holds(&self) -> Result<Vec<crate::schema::LegalHoldEntry>> {
+        self.storage.load_legal_holds().await
+    }
+
+    pub async fn store_legal_hold(&self, e: &crate::schema::LegalHoldEntry) -> Result<()> {
+        self.storage.store_legal_hold(e).await?;
+        Ok(())
+    }
+
+    pub async fn update_legal_hold(&self, e: &crate::schema::LegalHoldEntry) -> Result<bool> {
+        self.storage.update_legal_hold(e).await
+    }
+
+    pub async fn delete_legal_hold(&self, id: u32) -> Result<bool> {
+        self.storage.delete_legal_hold(id).await
+    }
+
+    pub async fn load_retention_policies(
+        &self,
+    ) -> Result<Vec<crate::schema::RetentionPolicyEntry>> {
+        self.storage.load_retention_policies().await
+    }
+
+    pub async fn replace_retention_policies(
+        &self,
+        table_id: u32,
+        entries: &[crate::schema::RetentionPolicyEntry],
+    ) -> Result<()> {
+        self.storage
+            .replace_retention_policies(table_id, entries)
+            .await
+    }
+
+    pub async fn load_retention_jobs(&self) -> Result<Vec<crate::schema::RetentionJobEntry>> {
+        self.storage.load_retention_jobs().await
+    }
+
+    pub async fn store_retention_job(&self, e: &crate::schema::RetentionJobEntry) -> Result<()> {
+        self.storage.store_retention_job(e).await?;
+        Ok(())
+    }
+
+    pub async fn load_compliance_log(&self) -> Result<Vec<crate::schema::ComplianceLogEntry>> {
+        self.storage.load_compliance_log().await
+    }
+
+    /// Appends a compliance log entry, chaining its hash over the latest
+    /// entry's hash so the audit log is tamper-evident.
+    pub async fn append_compliance_log(
+        &self,
+        mut entry: crate::schema::ComplianceLogEntry,
+    ) -> Result<()> {
+        let existing = self.storage.load_compliance_log().await?;
+        let prev_hash = existing.last().map(|e| e.entry_hash).unwrap_or(0);
+        let next_id = existing.last().map(|e| e.event_id + 1).unwrap_or(1);
+        entry.event_id = next_id;
+        entry.prev_hash = prev_hash;
+        entry.entry_hash = entry.compute_hash();
+        self.storage.store_compliance_log(&entry).await?;
+        Ok(())
+    }
+
+    /// Verifies the compliance log hash chain. Returns the count of verified
+    /// entries and whether the whole chain is intact.
+    pub async fn verify_compliance_chain(&self) -> Result<(usize, bool)> {
+        let log = self.storage.load_compliance_log().await?;
+        let mut prev = 0u32;
+        let mut verified = 0usize;
+        let mut intact = true;
+        for e in &log {
+            if e.prev_hash != prev || e.entry_hash != e.compute_hash() {
+                intact = false;
+                break;
+            }
+            prev = e.entry_hash;
+            verified += 1;
+        }
+        Ok((verified, intact))
     }
 }
 

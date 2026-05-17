@@ -74,6 +74,12 @@ pub enum PrivilegeType {
     ManagePublicationCredentials = 47,
     InvokeEndpoint = 48,
     AdminAccess = 49,
+    // Phase 17 data lifecycle privileges.
+    ManageLegalHold = 50,
+    ManageDataLifecycle = 51,
+    ManageRetention = 52,
+    ManageErasure = 53,
+    ManageCryptoShred = 54,
     All = 255,
 }
 
@@ -131,6 +137,11 @@ impl PrivilegeType {
             47 => Ok(Self::ManagePublicationCredentials),
             48 => Ok(Self::InvokeEndpoint),
             49 => Ok(Self::AdminAccess),
+            50 => Ok(Self::ManageLegalHold),
+            51 => Ok(Self::ManageDataLifecycle),
+            52 => Ok(Self::ManageRetention),
+            53 => Ok(Self::ManageErasure),
+            54 => Ok(Self::ManageCryptoShred),
             255 => Ok(Self::All),
             _ => Err(ZyronError::CatalogCorrupted(format!(
                 "invalid PrivilegeType value {}",
@@ -192,6 +203,11 @@ impl PrivilegeType {
             PrivilegeType::ManagePublicationCredentials,
             PrivilegeType::InvokeEndpoint,
             PrivilegeType::AdminAccess,
+            PrivilegeType::ManageLegalHold,
+            PrivilegeType::ManageDataLifecycle,
+            PrivilegeType::ManageRetention,
+            PrivilegeType::ManageErasure,
+            PrivilegeType::ManageCryptoShred,
         ]
     }
 

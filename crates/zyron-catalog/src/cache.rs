@@ -275,7 +275,18 @@ impl CatalogCache {
         let key = name_key(entry.schema_id.0, &entry.name);
         let arc = Arc::new(entry);
         self.tables.write().insert(id, Arc::clone(&arc));
-        let _ = self.table_by_name.insert_sync(key, arc);
+        // Atomic upsert: scc insert does not overwrite an existing key, so an
+        // update_table on an already-cached table would otherwise leave the
+        // by-name index pointing at the stale entry. entry_sync locks the
+        // bucket once, replacing in place with no remove/insert race window.
+        match self.table_by_name.entry_sync(key) {
+            scc::hash_map::Entry::Occupied(mut o) => {
+                *o.get_mut() = arc;
+            }
+            scc::hash_map::Entry::Vacant(v) => {
+                v.insert_entry(arc);
+            }
+        }
     }
 
     pub fn invalidate_table(&self, id: TableId) {
@@ -807,6 +818,7 @@ mod tests {
             history_table_id: None,
             cdf_enabled: false,
             cdf_retention_days: 0,
+            lifecycle: Default::default(),
         }
     }
 

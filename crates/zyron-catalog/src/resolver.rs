@@ -347,6 +347,54 @@ mod tests {
         async fn delete_security_map(&self, _: SecurityMapId) -> Result<bool> {
             unimplemented!()
         }
+        async fn load_legal_holds(&self) -> Result<Vec<crate::schema::LegalHoldEntry>> {
+            Ok(vec![])
+        }
+        async fn store_legal_hold(&self, _: &crate::schema::LegalHoldEntry) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn update_legal_hold(&self, _: &crate::schema::LegalHoldEntry) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn delete_legal_hold(&self, _: u32) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn load_retention_policies(
+            &self,
+        ) -> Result<Vec<crate::schema::RetentionPolicyEntry>> {
+            Ok(vec![])
+        }
+        async fn store_retention_policy(
+            &self,
+            _: &crate::schema::RetentionPolicyEntry,
+        ) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn replace_retention_policies(
+            &self,
+            _: u32,
+            _: &[crate::schema::RetentionPolicyEntry],
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn load_retention_jobs(&self) -> Result<Vec<crate::schema::RetentionJobEntry>> {
+            Ok(vec![])
+        }
+        async fn store_retention_job(
+            &self,
+            _: &crate::schema::RetentionJobEntry,
+        ) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn load_compliance_log(&self) -> Result<Vec<crate::schema::ComplianceLogEntry>> {
+            Ok(vec![])
+        }
+        async fn store_compliance_log(
+            &self,
+            _: &crate::schema::ComplianceLogEntry,
+        ) -> Result<TupleId> {
+            unimplemented!()
+        }
         async fn is_bootstrapped(&self) -> Result<bool> {
             Ok(true)
         }
@@ -415,6 +463,7 @@ mod tests {
                     history_table_id: None,
                     cdf_enabled: false,
                     cdf_retention_days: 0,
+                    lifecycle: Default::default(),
                 },
                 TableEntry {
                     id: TableId(20),
@@ -431,6 +480,7 @@ mod tests {
                     history_table_id: None,
                     cdf_enabled: false,
                     cdf_retention_days: 0,
+                    lifecycle: Default::default(),
                 },
             ],
         });
