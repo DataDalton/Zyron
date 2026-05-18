@@ -1,0 +1,71 @@
+{
+  "id": "2026-05-18_225946_f404438-local",
+  "date": "2026-05-18 22:59:48Z",
+  "ts": 1779145188,
+  "commit": "f404438-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "ps_decode_throughput": {
+      "us decode rows/sec": {
+        "average": 699742077.837661,
+        "runs": [682128240.11, 694444444.44, 707714083.51, 693962526.02, 720461095.10],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "ps decode rows/sec": {
+        "average": 468210045.088274,
+        "runs": [534330750.73, 526731630.23, 485672656.63, 426803243.70, 367511944.14],
+        "target": 233247359.279220,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "irregular_overhead": {
+      "us irregular ratio (raw:encoded)": {
+        "average": 3.047549,
+        "runs": [3.05, 3.05, 3.05, 3.05, 3.05],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "ps irregular ratio (raw:encoded)": {
+        "average": 3.047549,
+        "runs": [3.05, 3.05, 3.05, 3.05, 3.05],
+        "target": 1.219020,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "sentinel_density": {
+      "sentinel ps ratio (raw:encoded)": {
+        "average": 15.744932,
+        "runs": [15.74, 15.74, 15.74, 15.74, 15.74],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "regular_density": {
+      "us regular ratio (raw:encoded)": {
+        "average": 80000.000000,
+        "runs": [80000.00, 80000.00, 80000.00, 80000.00, 80000.00],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "ps regular ratio (raw:encoded)": {
+        "average": 80000.000000,
+        "runs": [80000.00, 80000.00, 80000.00, 80000.00, 80000.00],
+        "target": 40000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}

@@ -1132,6 +1132,48 @@ impl WalWriter {
     pub fn log_checkpoint_end(&self, payload: &[u8]) -> Result<Lsn> {
         self.append(0, Lsn::INVALID, LogRecordType::CheckpointEnd, 0, payload)
     }
+
+    /// Logs a columnar compaction begin marker.
+    #[inline]
+    pub fn log_compaction_begin(&self, payload: &[u8]) -> Result<Lsn> {
+        self.append(0, Lsn::INVALID, LogRecordType::CompactionBegin, 0, payload)
+    }
+
+    /// Logs a columnar compaction end marker. This is the fold commit point.
+    #[inline]
+    pub fn log_compaction_end(&self, payload: &[u8]) -> Result<Lsn> {
+        self.append(0, Lsn::INVALID, LogRecordType::CompactionEnd, 0, payload)
+    }
+
+    /// Logs a columnar merge begin marker.
+    #[inline]
+    pub fn log_merge_begin(&self, payload: &[u8]) -> Result<Lsn> {
+        self.append(0, Lsn::INVALID, LogRecordType::MergeBegin, 0, payload)
+    }
+
+    /// Logs a columnar merge end marker. This is the merge commit point.
+    #[inline]
+    pub fn log_merge_end(&self, payload: &[u8]) -> Result<Lsn> {
+        self.append(0, Lsn::INVALID, LogRecordType::MergeEnd, 0, payload)
+    }
+
+    /// Logs an epoch-tagged columnar value patch.
+    #[inline]
+    pub fn log_columnar_patch(&self, payload: &[u8]) -> Result<Lsn> {
+        self.append(0, Lsn::INVALID, LogRecordType::ColumnarPatch, 0, payload)
+    }
+
+    /// Logs a columnar supersede (delete of a columnar-resident row).
+    #[inline]
+    pub fn log_columnar_supersede(&self, payload: &[u8]) -> Result<Lsn> {
+        self.append(
+            0,
+            Lsn::INVALID,
+            LogRecordType::ColumnarSupersede,
+            0,
+            payload,
+        )
+    }
 }
 
 impl Drop for WalWriter {

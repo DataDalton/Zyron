@@ -5,9 +5,6 @@
 //! Runs on a dedicated std::thread with parking_lot::Condvar for wake/sleep.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::JoinHandle;
 use zyron_common::Result;
 use zyron_common::types::TypeId;
 
@@ -46,113 +43,6 @@ impl Default for CompactionConfig {
             oltp_p99_threshold_us: 1000,
             check_interval_ms: 5000,
         }
-    }
-}
-
-/// Background compaction thread lifecycle manager.
-/// Uses std::thread (no tokio dependency) with Condvar for wakeup.
-pub struct CompactionThread {
-    config: CompactionConfig,
-    thread_handle: Option<JoinHandle<()>>,
-    stop_flag: Arc<AtomicBool>,
-    trigger: Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>,
-}
-
-impl CompactionThread {
-    /// Creates and starts the compaction thread.
-    pub fn start(config: CompactionConfig) -> Self {
-        let stopFlag = Arc::new(AtomicBool::new(false));
-        let trigger = Arc::new((parking_lot::Mutex::new(false), parking_lot::Condvar::new()));
-
-        let stopClone = Arc::clone(&stopFlag);
-        let triggerClone = Arc::clone(&trigger);
-        let cfg = config.clone();
-
-        let handle = std::thread::Builder::new()
-            .name("zyron-compaction".into())
-            .spawn(move || {
-                compaction_loop(cfg, stopClone, triggerClone);
-            })
-            .expect("failed to spawn compaction thread");
-
-        Self {
-            config,
-            thread_handle: Some(handle),
-            stop_flag: stopFlag,
-            trigger,
-        }
-    }
-
-    /// Triggers an immediate compaction cycle.
-    pub fn trigger(&self) {
-        let (lock, cvar) = &*self.trigger;
-        let mut triggered = lock.lock();
-        *triggered = true;
-        cvar.notify_one();
-    }
-
-    /// Stops the compaction thread and waits for it to finish.
-    pub fn stop(&mut self) {
-        self.stop_flag.store(true, Ordering::Release);
-
-        // Wake the thread if it is parked
-        let (lock, cvar) = &*self.trigger;
-        let mut triggered = lock.lock();
-        *triggered = true;
-        cvar.notify_one();
-        drop(triggered);
-
-        if let Some(handle) = self.thread_handle.take() {
-            let _ = handle.join();
-        }
-    }
-
-    /// Returns the compaction configuration.
-    pub fn config(&self) -> &CompactionConfig {
-        &self.config
-    }
-}
-
-impl Drop for CompactionThread {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-/// Main compaction loop. Wakes on trigger or check_interval timeout.
-fn compaction_loop(
-    config: CompactionConfig,
-    stop: Arc<AtomicBool>,
-    trigger: Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>,
-) {
-    let checkInterval = std::time::Duration::from_millis(config.check_interval_ms);
-
-    while !stop.load(Ordering::Acquire) {
-        // Wait for trigger or timeout
-        {
-            let (lock, cvar) = &*trigger;
-            let mut triggered = lock.lock();
-            if !*triggered {
-                cvar.wait_for(&mut triggered, checkInterval);
-            }
-            *triggered = false;
-        }
-
-        if stop.load(Ordering::Acquire) {
-            break;
-        }
-
-        // Compaction cycle placeholder.
-        // Full implementation will:
-        // 1. Check if enough heap rows have accumulated (>= min_rows)
-        // 2. Rate-limit: check OLTP p99, pause 100ms if above threshold
-        // 3. Materialize committed heap rows into per-column vectors
-        // 4. Sort by primary key
-        // 5. Parallel column encoding via std::thread::scope
-        // 6. Build bloom filters for high-cardinality columns
-        // 7. Compute zone maps
-        // 8. Write .zyr file via ZyrFileWriter
-        // 9. Log compaction to WAL (CompactionBegin/CompactionEnd)
     }
 }
 
@@ -280,54 +170,114 @@ pub fn run_compaction_cycle(
         (0..rowCount).collect()
     };
 
-    // Per-column work: apply the sort permutation in-place, then encode the
-    // segment, both steps run inside one worker so each column's permutation
-    // happens concurrently with the others, prior implementation ran
-    // permutation serially across all 8 columns before spawning encode
-    // threads, that left ~27% of total work on the serial path which capped
-    // Amdahl-bound speedup, the combined-pass keeps each thread busy for the
-    // full duration of its column
+    // The fold path assigns sys_rowid monotonically and sorts by it, so the
+    // permutation is the identity. Detecting that lets every column skip the
+    // O(rows) permutation clone and shuffle, and turns the materialized data
+    // straight into encoder views with no reordering.
+    let identityPerm = sortedIndices.iter().enumerate().all(|(i, &x)| i == x);
     let mut reorderedColumns = input.column_data;
-    let threadCount = encoding_thread_count(input.columns.len(), config.max_encoding_threads);
-    let columns = &input.columns;
-    let needs_perm = pkIndex.is_some();
+    let columns = input.columns;
+    let needs_perm = pkIndex.is_some() && !identityPerm;
+
+    if needs_perm {
+        // Permute owned data once per column before borrowing views.
+        if encoding_thread_count(columns.len(), config.max_encoding_threads) <= 1
+            || columns.len() <= 1
+        {
+            for colData in reorderedColumns.iter_mut() {
+                let mut perm = sortedIndices.clone();
+                apply_permutation_in_place(colData, &mut perm);
+            }
+        } else {
+            std::thread::scope(|s| {
+                let perm_template = &sortedIndices;
+                let handles: Vec<_> = reorderedColumns
+                    .iter_mut()
+                    .map(|colData| {
+                        s.spawn(move || {
+                            let mut perm = perm_template.clone();
+                            apply_permutation_in_place(colData, &mut perm);
+                        })
+                    })
+                    .collect();
+                for h in handles {
+                    let _ = h.join();
+                }
+            });
+        }
+    }
+
+    let rowCount = if reorderedColumns.is_empty() {
+        0
+    } else {
+        reorderedColumns[0].len()
+    };
+
+    encode_and_write(
+        config,
+        &columns,
+        rowCount,
+        |i| reorderedColumns[i].iter().map(|v| v.as_deref()).collect(),
+        pkIndex,
+        input.table_id,
+        input.xmin_lo,
+        input.xmin_hi,
+    )
+}
+
+/// Encodes already-ordered columns in parallel and writes the .zyr file.
+/// The caller guarantees rows are in final (primary-key) order; this does
+/// no sorting. `column_view(i)` yields column `i`'s borrowed value view and
+/// is invoked inside that column's own encode worker, so view
+/// materialization is parallelized across columns alongside the encode (the
+/// serial collect of every column's view before encoding was a regression).
+/// `pk_index`, when set, marks the file header sorted Asc on that column.
+/// Used by both the legacy owned-data path and the fold's arena-backed
+/// zero-per-cell path.
+pub fn encode_and_write<'a, V>(
+    config: &CompactionConfig,
+    columns: &[ColumnDescriptor],
+    row_count: usize,
+    column_view: V,
+    pk_index: Option<usize>,
+    table_id: u64,
+    xmin_lo: u64,
+    xmin_hi: u64,
+) -> Result<CompactionResult>
+where
+    V: Fn(usize) -> Vec<Option<&'a [u8]>> + Sync,
+{
+    if columns.is_empty() || row_count == 0 {
+        return Err(zyron_common::ZyronError::CompactionFailed(
+            "no data to compact".to_string(),
+        ));
+    }
+    let rowCount = row_count;
+
+    let threadCount = encoding_thread_count(columns.len(), config.max_encoding_threads);
 
     let segments: Vec<Result<ColumnSegment>> = if threadCount <= 1 || columns.len() <= 1 {
-        // Single-threaded path: permute then encode each column in turn
         columns
             .iter()
             .enumerate()
-            .map(|(colIdx, col)| {
-                let colData = &mut reorderedColumns[colIdx];
-                if needs_perm {
-                    let mut perm = sortedIndices.clone();
-                    apply_permutation_in_place(colData, &mut perm);
-                }
-                let values: Vec<Option<&[u8]>> = colData.iter().map(|v| v.as_deref()).collect();
+            .map(|(i, col)| {
+                let values = column_view(i);
                 ColumnSegment::build(col.column_id, col.type_id, col.value_size, &values)
             })
             .collect()
     } else {
-        // Multi-threaded path: spawn one worker per column, each worker owns
-        // its column for both the permutation and the encode steps
         std::thread::scope(|s| {
-            let perm_template = &sortedIndices;
-            let handles: Vec<_> = reorderedColumns
-                .iter_mut()
-                .zip(columns.iter())
-                .map(|(colData, col)| {
+            let column_view = &column_view;
+            let handles: Vec<_> = columns
+                .iter()
+                .enumerate()
+                .map(|(i, col)| {
                     s.spawn(move || {
-                        if needs_perm {
-                            let mut perm = perm_template.clone();
-                            apply_permutation_in_place(colData, &mut perm);
-                        }
-                        let values: Vec<Option<&[u8]>> =
-                            colData.iter().map(|v| v.as_deref()).collect();
+                        let values = column_view(i);
                         ColumnSegment::build(col.column_id, col.type_id, col.value_size, &values)
                     })
                 })
                 .collect();
-
             handles
                 .into_iter()
                 .map(|h| {
@@ -341,27 +291,22 @@ pub fn run_compaction_cycle(
         })
     };
 
-    // Collect segments, propagating any encoding errors
     let builtSegments: Vec<ColumnSegment> = segments.into_iter().collect::<Result<Vec<_>>>()?;
 
-    // Determine sort order for the file header
-    let sortOrder = if pkIndex.is_some() {
+    let sortOrder = if pk_index.is_some() {
         SortOrder::Asc
     } else {
         SortOrder::None
     };
+    let pkColumnId = pk_index.map(|i| columns[i].column_id).unwrap_or(0);
 
-    let pkColumnId = pkIndex.map(|i| input.columns[i].column_id).unwrap_or(0);
-
-    // Generate output file path
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let fileName = format!("table_{}_{}_{}.zyr", input.table_id, rowCount, timestamp);
+    let fileName = format!("table_{}_{}_{}.zyr", table_id, rowCount, timestamp);
     let outputPath = config.columnar_dir.join(&fileName);
 
-    // Create output directory if needed
     if let Some(parent) = outputPath.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             zyron_common::ZyronError::CompactionFailed(format!(
@@ -371,28 +316,26 @@ pub fn run_compaction_cycle(
         })?;
     }
 
-    // Build file header
     let header = ZyrFileHeader {
         format_version: crate::columnar::constants::ZYR_FORMAT_VERSION,
-        column_count: input.columns.len() as u32,
+        column_count: columns.len() as u32,
         row_count: rowCount as u64,
-        table_id: input.table_id,
-        xmin_range_lo: input.xmin_lo,
-        xmin_range_hi: input.xmin_hi,
+        table_id,
+        xmin_range_lo: xmin_lo,
+        xmin_range_hi: xmin_hi,
         xmax_range_lo: 0,
         xmax_range_hi: 0,
         primary_key_column_id: pkColumnId,
         sort_order: sortOrder,
     };
 
-    // Write .zyr file
     let fileSize = write_zyr_file(&outputPath, header, &builtSegments, config.fsync_enabled)?;
 
     Ok(CompactionResult {
         file_path: outputPath,
         file_size: fileSize,
         row_count: rowCount as u64,
-        column_count: input.columns.len() as u32,
+        column_count: columns.len() as u32,
     })
 }
 
@@ -425,6 +368,7 @@ fn write_zyr_file(
             &headerBytes,
             bloomSlice,
             &zoneMapBytes,
+            &segment.null_bitmap,
             &segment.encoded_data,
         )?;
     }
@@ -455,36 +399,5 @@ mod tests {
         assert!(encoding_thread_count(100, 4) <= 4);
         // With 1 column
         assert_eq!(encoding_thread_count(1, 4), 1);
-    }
-
-    #[test]
-    fn test_compaction_thread_start_stop() {
-        let config = CompactionConfig {
-            check_interval_ms: 50, // Short interval for test
-            ..Default::default()
-        };
-
-        let mut thread = CompactionThread::start(config);
-
-        // Let it run briefly
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
-        // Trigger a cycle
-        thread.trigger();
-
-        // Stop
-        thread.stop();
-        assert!(thread.thread_handle.is_none());
-    }
-
-    #[test]
-    fn test_compaction_thread_drop_stops() {
-        let config = CompactionConfig {
-            check_interval_ms: 50,
-            ..Default::default()
-        };
-
-        // Drop should call stop() via Drop impl
-        let _thread = CompactionThread::start(config);
     }
 }

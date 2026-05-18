@@ -252,10 +252,15 @@ impl Encoding for AlpEncoding {
         // Single-pass decode: unpack, reverse delta in-place, convert to float,
         // and write output directly. Eliminates intermediate Vec<i64> allocation.
         let outLen = row_count * value_size;
-        let mut out: Vec<u8> = Vec::with_capacity(outLen);
-        unsafe {
-            out.set_len(outLen);
-        }
+        // SAFETY: every byte of `out` is written by the decode below before
+        // any read; zeroing first would memset the whole buffer only to
+        // overwrite it, regressing decode throughput on the scan path.
+        #[allow(clippy::uninit_vec)]
+        let mut out: Vec<u8> = {
+            let mut v = Vec::with_capacity(outLen);
+            unsafe { v.set_len(outLen) };
+            v
+        };
         let outPtr = out.as_mut_ptr();
         let packedPtr = packed.as_ptr();
         let packedLen = packed.len();

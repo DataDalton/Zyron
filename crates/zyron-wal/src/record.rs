@@ -112,8 +112,16 @@ pub enum LogRecordType {
     Clr = 40,
     /// Compaction begin marker. Payload: table_id(8) + output file path.
     CompactionBegin = 50,
-    /// Compaction end marker. Payload: table_id(8) + file_size(8) + row_count(8) + output file path.
+    /// Compaction end marker. Payload: table_id(8) + file_size(8) + row_count(8) + sys_rowid range + sys_xmin range + next_rowid + output file path.
     CompactionEnd = 51,
+    /// Columnar merge begin marker. Payload: table_id(8) + output file path.
+    MergeBegin = 52,
+    /// Columnar merge end marker. Payload: table_id(8) + new file path + replaced file id list.
+    MergeEnd = 53,
+    /// Columnar value patch. Payload: table_id(8) + file_id(8) + sys_rowid(8) + column_id(4) + patch_xmin(8) + value_len(4) + value bytes.
+    ColumnarPatch = 54,
+    /// Columnar supersede (delete of a columnar-resident row). Payload: table_id(8) + file_id(8) + sys_rowid(8) + supersede_xid(8).
+    ColumnarSupersede = 55,
     /// Version log append. Payload: table_id(4) + version_id(8) + commit_timestamp(8) + operation_type(1) + row_count_delta(4) = 25 bytes.
     VersionAppend = 60,
     /// Branch creation. Payload: branch_id(8) + parent_branch_id(8) + base_version_id(8) + name_len(2) + name bytes.
@@ -140,6 +148,10 @@ impl TryFrom<u8> for LogRecordType {
             40 => Ok(LogRecordType::Clr),
             50 => Ok(LogRecordType::CompactionBegin),
             51 => Ok(LogRecordType::CompactionEnd),
+            52 => Ok(LogRecordType::MergeBegin),
+            53 => Ok(LogRecordType::MergeEnd),
+            54 => Ok(LogRecordType::ColumnarPatch),
+            55 => Ok(LogRecordType::ColumnarSupersede),
             60 => Ok(LogRecordType::VersionAppend),
             61 => Ok(LogRecordType::BranchCreate),
             62 => Ok(LogRecordType::BranchMerge),

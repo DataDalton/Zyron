@@ -267,14 +267,18 @@ impl ZyrFileWriter {
     }
 
     /// Writes a column segment. The segment consists of a 128-byte header,
-    /// optional bloom filter bytes, zone map bytes, and encoded column data.
-    /// The combined output is padded to the next PAGE_SIZE boundary.
+    /// optional bloom filter bytes, zone map bytes, the null bitmap, and
+    /// encoded column data, in that order. The combined output is padded to
+    /// the next PAGE_SIZE boundary. The null bitmap is empty when the column
+    /// has no nulls; readers derive its length from the header null_count and
+    /// the file row_count.
     pub fn write_segment(
         &mut self,
         columnId: u32,
         headerBytes: &[u8; SEGMENT_HEADER_SIZE],
         bloomBytes: Option<&[u8]>,
         zoneMapBytes: &[u8],
+        nullBitmap: &[u8],
         encodedData: &[u8],
     ) -> Result<()> {
         let segmentStart = self.currentOffset;
@@ -299,12 +303,21 @@ impl ZyrFileWriter {
             .write_all(zoneMapBytes)
             .map_err(|e| ZyronError::IoError(format!("failed to write zone map: {}", e)))?;
 
+        // Write the null bitmap (empty when the column has no nulls).
+        self.writer
+            .write_all(nullBitmap)
+            .map_err(|e| ZyronError::IoError(format!("failed to write null bitmap: {}", e)))?;
+
         // Write encoded column data.
         self.writer
             .write_all(encodedData)
             .map_err(|e| ZyronError::IoError(format!("failed to write encoded data: {}", e)))?;
 
-        let rawLen = SEGMENT_HEADER_SIZE + bloomLen + zoneMapBytes.len() + encodedData.len();
+        let rawLen = SEGMENT_HEADER_SIZE
+            + bloomLen
+            + zoneMapBytes.len()
+            + nullBitmap.len()
+            + encodedData.len();
         let paddedLen = round_up_to_page(rawLen);
         let padBytes = paddedLen - rawLen;
 
@@ -331,12 +344,18 @@ impl ZyrFileWriter {
     pub fn finalize(mut self, fsync: bool) -> Result<u64> {
         let segmentIndexOffset = self.currentOffset;
 
-        // Write segment index entries.
+        // Write segment index entries, CRCing them as they go. The footer
+        // checksum covers only this index region (offsets/sizes), not the
+        // bulk payload: per-segment data is protected by SegmentHeader
+        // data_checksum, the file header by its own header_checksum, so a
+        // read never needs a whole-file pass to be integrity-safe.
+        let mut indexHasher = zyron_common::Hasher::new();
         for entry in &self.segmentIndex {
             let mut entryBuf = [0u8; SEGMENT_INDEX_ENTRY_SIZE];
             entryBuf[0..4].copy_from_slice(&entry.columnId.to_le_bytes());
             entryBuf[4..12].copy_from_slice(&entry.offset.to_le_bytes());
             entryBuf[12..20].copy_from_slice(&entry.size.to_le_bytes());
+            indexHasher.update(&entryBuf);
             self.writer.write_all(&entryBuf).map_err(|e| {
                 ZyronError::IoError(format!("failed to write segment index entry: {}", e))
             })?;
@@ -354,17 +373,12 @@ impl ZyrFileWriter {
             .write_all(&ZYR_MAGIC)
             .map_err(|e| ZyronError::IoError(format!("failed to write footer magic: {}", e)))?;
 
-        // Compute file checksum over all bytes written so far.
-        // Flush the buffer first, then re-read the file for checksumming.
+        // Footer checksum = CRC of the segment-index region only (computed
+        // in memory above, no file re-read).
+        let indexChecksum = indexHasher.finish32();
         self.writer
-            .flush()
-            .map_err(|e| ZyronError::IoError(format!("failed to flush before checksum: {}", e)))?;
-
-        let fileChecksum = compute_file_checksum(&self.tmpPath)?;
-
-        self.writer
-            .write_all(&fileChecksum.to_le_bytes())
-            .map_err(|e| ZyronError::IoError(format!("failed to write file checksum: {}", e)))?;
+            .write_all(&indexChecksum.to_le_bytes())
+            .map_err(|e| ZyronError::IoError(format!("failed to write index checksum: {}", e)))?;
 
         self.writer
             .flush()
@@ -410,37 +424,6 @@ impl ZyrFileWriter {
     }
 }
 
-/// Streams the file contents through the central hasher in 64 KB chunks,
-/// avoiding a full-file `Vec<u8>` allocation that measured -10% on compaction
-/// throughput for multi-MB segments.
-fn compute_file_checksum(path: &Path) -> Result<u32> {
-    use std::fs::File;
-    use std::io::Read;
-    let mut f = File::open(path).map_err(|e| {
-        ZyronError::IoError(format!(
-            "failed to open file for checksum {}: {}",
-            path.display(),
-            e
-        ))
-    })?;
-    let mut hasher = zyron_common::Hasher::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = f.read(&mut buf).map_err(|e| {
-            ZyronError::IoError(format!(
-                "failed to read file for checksum {}: {}",
-                path.display(),
-                e
-            ))
-        })?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hasher.finish32())
-}
-
 /// Rounds `size` up to the next PAGE_SIZE multiple.
 #[inline]
 fn round_up_to_page(size: usize) -> usize {
@@ -461,7 +444,15 @@ pub struct ZyrFileReader {
 }
 
 impl ZyrFileReader {
-    /// Opens a .zyr file at `path`. Reads and validates the header and footer.
+    /// Opens a .zyr file with granular integrity validation and no
+    /// whole-file pass: the file header is checked by its own
+    /// header_checksum, the footer magic and the segment-index region by the
+    /// footer checksum, and each SegmentHeader self-verifies its header_crc
+    /// when parsed. A segment's encoded payload is verified by the reader
+    /// against SegmentHeader.data_checksum over exactly the bytes it reads to
+    /// decode (zero extra IO), so a metadata aggregate that never reads a
+    /// payload never pays for it, while corruption is still detected on any
+    /// byte actually consumed.
     pub fn open(path: &Path) -> Result<Self> {
         let filePath = path.to_path_buf();
         let mut file = BufReader::new(File::open(path).map_err(|e| {
@@ -527,37 +518,10 @@ impl ZyrFileReader {
             trailerBuf[19],
         ]);
 
-        // Validate file checksum. The checksum covers all bytes before the
-        // checksum field itself (file_size - 4).
-        let checksumLen = fileSize - 4;
-        file.seek(SeekFrom::Start(0)).map_err(|e| {
-            ZyronError::IoError(format!("failed to seek for checksum validation: {}", e))
-        })?;
-        // Stream through the hasher in 64 KB chunks instead of buffering the
-        // entire file. Saves a multi-MB allocation on segment load/compaction.
-        let mut hasher = zyron_common::Hasher::new();
-        let mut remaining = checksumLen as usize;
-        let mut chunk = vec![0u8; 64 * 1024];
-        while remaining > 0 {
-            let take = remaining.min(chunk.len());
-            file.read_exact(&mut chunk[..take]).map_err(|e| {
-                ZyronError::IoError(format!(
-                    "failed to read file for checksum validation: {}",
-                    e
-                ))
-            })?;
-            hasher.update(&chunk[..take]);
-            remaining -= take;
-        }
-        let computedFileChecksum = hasher.finish32();
-        if storedFileChecksum != computedFileChecksum {
-            return Err(ZyronError::InvalidZyrFile(format!(
-                "file checksum mismatch: stored 0x{:08x}, computed 0x{:08x}",
-                storedFileChecksum, computedFileChecksum
-            )));
-        }
-
-        // Read segment index entries.
+        // Read the segment-index region once, verify the footer checksum
+        // over exactly that region (offsets/sizes only — small, bounded by
+        // metadata not data, no whole-file pass), then parse entries from
+        // the in-memory buffer.
         let indexRegionSize = (trailerStart - segmentIndexOffset) as usize;
         if !indexRegionSize.is_multiple_of(SEGMENT_INDEX_ENTRY_SIZE) {
             return Err(ZyronError::InvalidZyrFile(format!(
@@ -569,13 +533,25 @@ impl ZyrFileReader {
 
         file.seek(SeekFrom::Start(segmentIndexOffset))
             .map_err(|e| ZyronError::IoError(format!("failed to seek to segment index: {}", e)))?;
+        let mut indexBytes = vec![0u8; indexRegionSize];
+        file.read_exact(&mut indexBytes)
+            .map_err(|e| ZyronError::IoError(format!("failed to read segment index: {}", e)))?;
+        let computedIndexChecksum = zyron_common::hash32(&indexBytes);
+        if storedFileChecksum != computedIndexChecksum {
+            return Err(ZyronError::InvalidZyrFile(format!(
+                "segment index checksum mismatch: stored 0x{:08x}, computed 0x{:08x}",
+                storedFileChecksum, computedIndexChecksum
+            )));
+        }
 
         let mut segmentIndex = Vec::with_capacity(entryCount);
-        for _ in 0..entryCount {
-            let mut entryBuf = [0u8; SEGMENT_INDEX_ENTRY_SIZE];
-            file.read_exact(&mut entryBuf).map_err(|e| {
-                ZyronError::IoError(format!("failed to read segment index entry: {}", e))
-            })?;
+        for k in 0..entryCount {
+            let entryBuf: [u8; SEGMENT_INDEX_ENTRY_SIZE] = indexBytes
+                [k * SEGMENT_INDEX_ENTRY_SIZE..(k + 1) * SEGMENT_INDEX_ENTRY_SIZE]
+                .try_into()
+                .map_err(|_| {
+                    ZyronError::InvalidZyrFile("failed to slice segment index entry".into())
+                })?;
             let columnId = u32::from_le_bytes([entryBuf[0], entryBuf[1], entryBuf[2], entryBuf[3]]);
             let offset = u64::from_le_bytes(entryBuf[4..12].try_into().map_err(|_| {
                 ZyronError::InvalidZyrFile("failed to parse segment offset".into())
@@ -646,6 +622,85 @@ impl ZyrFileReader {
 
         Ok(buf)
     }
+
+    /// Reads only the SEGMENT_HEADER_SIZE-byte header for a column, without
+    /// pulling the encoded data. This is the metadata-only path used by
+    /// aggregate pushdown (MIN/MAX/COUNT answered from the header), so a
+    /// `SELECT MAX(c)` over a clean segment costs one small header read
+    /// instead of decoding every row.
+    pub fn read_segment_header_bytes(&self, columnId: u32) -> Result<[u8; SEGMENT_HEADER_SIZE]> {
+        let entry = self
+            .segmentIndex
+            .iter()
+            .find(|e| e.columnId == columnId)
+            .ok_or_else(|| {
+                ZyronError::InvalidZyrFile(format!("no segment found for column_id {}", columnId))
+            })?;
+        let mut file = File::open(&self.path).map_err(|e| {
+            ZyronError::IoError(format!(
+                "failed to reopen .zyr file {}: {}",
+                self.path.display(),
+                e
+            ))
+        })?;
+        file.seek(SeekFrom::Start(entry.offset))
+            .map_err(|e| ZyronError::IoError(format!("failed to seek to segment header: {}", e)))?;
+        let mut buf = [0u8; SEGMENT_HEADER_SIZE];
+        file.read_exact(&mut buf)
+            .map_err(|e| ZyronError::IoError(format!("failed to read segment header: {}", e)))?;
+        Ok(buf)
+    }
+
+    /// Reads several column segments with a single file open, invoking `f`
+    /// with the raw bytes for each requested column as soon as it is read.
+    /// The raw buffer is reused across columns, so peak raw memory is one
+    /// segment instead of the sum of every requested segment. The callback
+    /// decodes the bytes before the next column overwrites the buffer. `f`
+    /// receives the request-order index and `None` when the column is absent.
+    pub fn read_segments_each<F>(&self, column_ids: &[u32], mut f: F) -> Result<()>
+    where
+        F: FnMut(usize, Option<&[u8]>) -> Result<()>,
+    {
+        let mut file = BufReader::new(File::open(&self.path).map_err(|e| {
+            ZyronError::IoError(format!(
+                "failed to reopen .zyr file {}: {}",
+                self.path.display(),
+                e
+            ))
+        })?);
+        let mut buf: Vec<u8> = Vec::new();
+        for (idx, &cid) in column_ids.iter().enumerate() {
+            match self.segmentIndex.iter().find(|e| e.columnId == cid) {
+                Some(entry) => {
+                    file.seek(SeekFrom::Start(entry.offset)).map_err(|e| {
+                        ZyronError::IoError(format!("failed to seek to segment: {}", e))
+                    })?;
+                    let need = entry.size as usize;
+                    buf.clear();
+                    buf.reserve(need);
+                    // SAFETY: read_exact writes exactly `need` bytes into the
+                    // slice or returns an error, so no element is observed
+                    // before initialization. Avoids the resize zero-fill on
+                    // the scan hot path.
+                    #[allow(clippy::uninit_vec)]
+                    unsafe {
+                        buf.set_len(need);
+                    }
+                    file.read_exact(&mut buf).map_err(|e| {
+                        ZyronError::IoError(format!("failed to read segment: {}", e))
+                    })?;
+                    f(idx, Some(&buf))?;
+                }
+                None => f(idx, None)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the file-level row count from the header.
+    pub fn row_count(&self) -> u64 {
+        self.header.row_count
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -693,7 +748,7 @@ mod tests {
             let zoneMap0 = vec![0xAAu8; 256];
             let data0 = vec![0x11u8; 4096];
             writer
-                .write_segment(0, &segHdr0, None, &zoneMap0, &data0)
+                .write_segment(0, &segHdr0, None, &zoneMap0, &[], &data0)
                 .expect("write segment 0");
 
             // Segment 1: 128-byte header + 64 bytes bloom + 128 bytes zone map + 2048 bytes data.
@@ -702,7 +757,7 @@ mod tests {
             let zoneMap1 = vec![0xCCu8; 128];
             let data1 = vec![0x22u8; 2048];
             writer
-                .write_segment(1, &segHdr1, Some(&bloom1), &zoneMap1, &data1)
+                .write_segment(1, &segHdr1, Some(&bloom1), &zoneMap1, &[], &data1)
                 .expect("write segment 1");
 
             let fileSize = writer.finalize(false).expect("finalize");
@@ -823,7 +878,13 @@ mod tests {
     }
 
     #[test]
-    fn test_file_checksum_detects_corruption() {
+    fn test_segment_index_corruption_detected_at_open() {
+        // Granular integrity model: open() validates the file header (its
+        // own header_checksum) and the segment-index region (footer
+        // checksum). Corruption inside the index region must be caught at
+        // open. Segment-payload corruption is caught when the segment is
+        // read (SegmentHeader.data_checksum), not at open, so it is not part
+        // of this test.
         let dir = tempdir().expect("failed to create temp dir");
         let filePath = dir.path().join("corrupt.zyr");
 
@@ -845,26 +906,29 @@ mod tests {
         let zoneMap = vec![0xFFu8; 64];
         let data = vec![0xEEu8; 512];
         writer
-            .write_segment(0, &segHdr, None, &zoneMap, &data)
+            .write_segment(0, &segHdr, None, &zoneMap, &[], &data)
             .expect("write segment");
         writer.finalize(false).expect("finalize");
 
-        // Corrupt a byte in the middle of the segment data region.
-        let mut fileData = std::fs::read(&filePath).expect("read file");
-        let corruptOffset = PAGE_SIZE + SEGMENT_HEADER_SIZE + 100;
-        if corruptOffset < fileData.len() {
-            fileData[corruptOffset] ^= 0xFF;
-            std::fs::write(&filePath, &fileData).expect("write corrupted file");
+        // A clean file opens.
+        ZyrFileReader::open(&filePath).expect("clean file opens");
 
-            let result = ZyrFileReader::open(&filePath);
-            assert!(result.is_err());
-            let errMsg = format!("{}", result.err().expect("expected error"));
-            assert!(
-                errMsg.contains("checksum mismatch"),
-                "error should mention checksum mismatch, got: {}",
-                errMsg
-            );
-        }
+        // Corrupt a byte in the segment-index region (the
+        // SEGMENT_INDEX_ENTRY_SIZE bytes immediately before the 20-byte
+        // trailer). open() must reject it.
+        let mut fileData = std::fs::read(&filePath).expect("read file");
+        let idxByte = fileData.len() - FOOTER_SIZE - 1;
+        fileData[idxByte] ^= 0xFF;
+        std::fs::write(&filePath, &fileData).expect("write corrupted file");
+
+        let result = ZyrFileReader::open(&filePath);
+        assert!(result.is_err(), "index corruption must be detected");
+        let errMsg = format!("{}", result.err().expect("expected error"));
+        assert!(
+            errMsg.contains("index checksum mismatch"),
+            "error should mention index checksum mismatch, got: {}",
+            errMsg
+        );
     }
 
     #[test]
@@ -940,7 +1004,7 @@ mod tests {
         let mut writer = ZyrFileWriter::create(&filePath, header).expect("create writer");
         let segHdr = make_segment_header(0);
         writer
-            .write_segment(0, &segHdr, None, &[], &[0u8; 128])
+            .write_segment(0, &segHdr, None, &[], &[], &[0u8; 128])
             .expect("write segment");
         writer.finalize(false).expect("finalize");
 

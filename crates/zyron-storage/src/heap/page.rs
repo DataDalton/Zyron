@@ -285,11 +285,14 @@ impl HeapPage {
             }
         }
 
-        // Sort by offset ascending so the lowest-offset (closest to page end) tuple
-        // is moved first. Since we pack tuples from the page end downward, moving
-        // lowest-offset tuples first prevents source data from being overwritten
-        // by earlier copy_within calls.
-        active.sort_unstable_by_key(|&(_, offset, _)| offset);
+        // Pack tuples from the page end downward, processing highest original
+        // offset first. The first-processed tuple (closest to the end) keeps
+        // or moves toward the end; every later tuple has a lower original
+        // offset and a lower destination, so an already-written destination
+        // (higher address) can never clobber a not-yet-moved source (lower
+        // address). Ascending order is unsafe in-place: writing the end-most
+        // destination first overwrites the next tuple's source bytes.
+        active.sort_unstable_by_key(|&(_, offset, _)| std::cmp::Reverse(offset));
 
         // Rewrite tuple data from the end of the page.
         let mut new_free_space_end = PAGE_SIZE as u16;
@@ -974,42 +977,10 @@ impl HeapPage {
     /// Compacts the page by moving all active tuples together.
     /// Eliminates holes from deleted tuples and maximizes contiguous free space.
     pub fn compact(&mut self) {
-        let header = self.heap_header();
-
-        // Collect active tuples: (slot_id, tuple_data)
-        let mut active_tuples: Vec<(SlotId, Vec<u8>)> = Vec::new();
-        for i in 0..header.slot_count {
-            let slot_id = SlotId(i);
-            if let Some(slot) = self.get_slot(slot_id)
-                && !slot.is_empty()
-            {
-                let start = slot.offset as usize;
-                let end = start + slot.length as usize;
-                let data = self.data[start..end].to_vec();
-                active_tuples.push((slot_id, data));
-            }
-        }
-
-        // Rewrite tuple data from the end of the page
-        let mut new_free_space_end = PAGE_SIZE as u16;
-
-        for (slot_id, tuple_data) in &active_tuples {
-            let tuple_len = tuple_data.len() as u16;
-            new_free_space_end -= tuple_len;
-
-            // Copy tuple data to new location
-            let new_offset = new_free_space_end as usize;
-            self.data[new_offset..new_offset + tuple_data.len()].copy_from_slice(tuple_data);
-
-            // Update slot with new offset
-            let new_slot = TupleSlot::new(new_free_space_end, tuple_len);
-            self.set_slot(*slot_id, new_slot);
-        }
-
-        // Update header with new free_space_end
-        let mut new_header = header;
-        new_header.free_space_end = new_free_space_end;
-        self.set_heap_header(new_header);
+        // In-place: offset-sorted `copy_within` packing, zero per-tuple
+        // allocation. Shares the exact algorithm used by the inline append
+        // path (`compact_in_slice`) so there is one compaction implementation.
+        Self::compact_in_slice(&mut self.data[..]);
     }
 
     /// Returns total usable space including reclaimable space from deleted tuples.

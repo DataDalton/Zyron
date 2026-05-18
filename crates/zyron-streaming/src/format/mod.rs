@@ -51,6 +51,35 @@ pub enum FormatKind {
 pub struct ColumnSpec {
     pub name: String,
     pub type_id: TypeId,
+    /// Fractional-second precision for TIMESTAMP(p)/TIMESTAMPTZ(p). p>6 means
+    /// the column is i128 picoseconds and Arrow export downcasts ps->ns (the
+    /// one sanctioned lossy narrowing). None / p<=6 is the i64 microsecond
+    /// path and is byte-identical to before this field existed.
+    pub ts_precision: Option<u8>,
+}
+
+impl ColumnSpec {
+    /// Non-temporal / default-precision column spec (ts_precision = None).
+    pub fn new(name: impl Into<String>, type_id: TypeId) -> Self {
+        Self {
+            name: name.into(),
+            type_id,
+            ts_precision: None,
+        }
+    }
+
+    /// Column spec carrying a TIMESTAMP(p)/TIMESTAMPTZ(p) precision.
+    pub fn with_precision(
+        name: impl Into<String>,
+        type_id: TypeId,
+        ts_precision: Option<u8>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            type_id,
+            ts_precision,
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -123,22 +152,10 @@ pub fn writer_for(kind: FormatKind) -> Box<dyn FormatWriter> {
 #[cfg(test)]
 pub(crate) fn sample_schema() -> Vec<ColumnSpec> {
     vec![
-        ColumnSpec {
-            name: "id".to_string(),
-            type_id: TypeId::Int64,
-        },
-        ColumnSpec {
-            name: "name".to_string(),
-            type_id: TypeId::Varchar,
-        },
-        ColumnSpec {
-            name: "active".to_string(),
-            type_id: TypeId::Boolean,
-        },
-        ColumnSpec {
-            name: "score".to_string(),
-            type_id: TypeId::Float64,
-        },
+        ColumnSpec::new("id".to_string(), TypeId::Int64),
+        ColumnSpec::new("name".to_string(), TypeId::Varchar),
+        ColumnSpec::new("active".to_string(), TypeId::Boolean),
+        ColumnSpec::new("score".to_string(), TypeId::Float64),
     ]
 }
 

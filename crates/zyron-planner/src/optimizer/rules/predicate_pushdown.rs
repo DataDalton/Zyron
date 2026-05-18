@@ -41,13 +41,15 @@ fn has_filter(plan: &LogicalPlan) -> bool {
 fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
     match plan {
         // Filter above Join: try to push predicates into join sides
-        LogicalPlan::Filter {
-            predicate,
-            child,
-        } => {
+        LogicalPlan::Filter { predicate, child } => {
             let (child_plan, child_changed) = push_predicates(child);
             match &child_plan {
-                LogicalPlan::Join { left, right, join_type, condition } => {
+                LogicalPlan::Join {
+                    left,
+                    right,
+                    join_type,
+                    condition,
+                } => {
                     let conjuncts = split_conjuncts(predicate);
                     let left_tables = collect_table_indices(left);
                     let right_tables = collect_table_indices(right);
@@ -59,7 +61,8 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
                     for conj in conjuncts {
                         let refs = collect_column_refs(&conj);
                         let touches_left = refs.iter().any(|r| left_tables.contains(&r.table_idx));
-                        let touches_right = refs.iter().any(|r| right_tables.contains(&r.table_idx));
+                        let touches_right =
+                            refs.iter().any(|r| right_tables.contains(&r.table_idx));
 
                         if touches_left && !touches_right {
                             left_preds.push(conj);
@@ -106,30 +109,43 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
                     if remaining.is_empty() {
                         (join, true)
                     } else {
-                        (LogicalPlan::Filter {
-                            predicate: combine_conjuncts(remaining),
-                            child: Box::new(join),
-                        }, true)
+                        (
+                            LogicalPlan::Filter {
+                                predicate: combine_conjuncts(remaining),
+                                child: Box::new(join),
+                            },
+                            true,
+                        )
                     }
                 }
                 // Filter above Project: keep filter above for now
-                LogicalPlan::Project { expressions, aliases, child: proj_child } => {
+                LogicalPlan::Project {
+                    expressions,
+                    aliases,
+                    child: proj_child,
+                } => {
                     let (pushed_proj_child, _) = push_predicates(proj_child);
-                    (LogicalPlan::Filter {
-                        predicate: predicate.clone(),
-                        child: Box::new(LogicalPlan::Project {
-                            expressions: expressions.clone(),
-                            aliases: aliases.clone(),
-                            child: Box::new(pushed_proj_child),
-                        }),
-                    }, child_changed)
+                    (
+                        LogicalPlan::Filter {
+                            predicate: predicate.clone(),
+                            child: Box::new(LogicalPlan::Project {
+                                expressions: expressions.clone(),
+                                aliases: aliases.clone(),
+                                child: Box::new(pushed_proj_child),
+                            }),
+                        },
+                        child_changed,
+                    )
                 }
                 _ => {
                     if child_changed {
-                        (LogicalPlan::Filter {
-                            predicate: predicate.clone(),
-                            child: Box::new(child_plan),
-                        }, true)
+                        (
+                            LogicalPlan::Filter {
+                                predicate: predicate.clone(),
+                                child: Box::new(child_plan),
+                            },
+                            true,
+                        )
                     } else {
                         (plan.clone(), false)
                     }
@@ -137,40 +153,62 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
             }
         }
         // Recursively apply to all other node types
-        LogicalPlan::Project { expressions, aliases, child } => {
+        LogicalPlan::Project {
+            expressions,
+            aliases,
+            child,
+        } => {
             let (fc, changed) = push_predicates(child);
             if changed {
-                (LogicalPlan::Project {
-                    expressions: expressions.clone(),
-                    aliases: aliases.clone(),
-                    child: Box::new(fc),
-                }, true)
+                (
+                    LogicalPlan::Project {
+                        expressions: expressions.clone(),
+                        aliases: aliases.clone(),
+                        child: Box::new(fc),
+                    },
+                    true,
+                )
             } else {
                 (plan.clone(), false)
             }
         }
-        LogicalPlan::Join { left, right, join_type, condition } => {
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            condition,
+        } => {
             let (fl, lc) = push_predicates(left);
             let (fr, rc) = push_predicates(right);
             if lc || rc {
-                (LogicalPlan::Join {
-                    left: Box::new(fl),
-                    right: Box::new(fr),
-                    join_type: *join_type,
-                    condition: condition.clone(),
-                }, true)
+                (
+                    LogicalPlan::Join {
+                        left: Box::new(fl),
+                        right: Box::new(fr),
+                        join_type: *join_type,
+                        condition: condition.clone(),
+                    },
+                    true,
+                )
             } else {
                 (plan.clone(), false)
             }
         }
-        LogicalPlan::Aggregate { group_by, aggregates, child } => {
+        LogicalPlan::Aggregate {
+            group_by,
+            aggregates,
+            child,
+        } => {
             let (fc, changed) = push_predicates(child);
             if changed {
-                (LogicalPlan::Aggregate {
-                    group_by: group_by.clone(),
-                    aggregates: aggregates.clone(),
-                    child: Box::new(fc),
-                }, true)
+                (
+                    LogicalPlan::Aggregate {
+                        group_by: group_by.clone(),
+                        aggregates: aggregates.clone(),
+                        child: Box::new(fc),
+                    },
+                    true,
+                )
             } else {
                 (plan.clone(), false)
             }
@@ -178,18 +216,32 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
         LogicalPlan::Sort { order_by, child } => {
             let (fc, changed) = push_predicates(child);
             if changed {
-                (LogicalPlan::Sort {
-                    order_by: order_by.clone(),
-                    child: Box::new(fc),
-                }, true)
+                (
+                    LogicalPlan::Sort {
+                        order_by: order_by.clone(),
+                        child: Box::new(fc),
+                    },
+                    true,
+                )
             } else {
                 (plan.clone(), false)
             }
         }
-        LogicalPlan::Limit { limit, offset, child } => {
+        LogicalPlan::Limit {
+            limit,
+            offset,
+            child,
+        } => {
             let (fc, changed) = push_predicates(child);
             if changed {
-                (LogicalPlan::Limit { limit: *limit, offset: *offset, child: Box::new(fc) }, true)
+                (
+                    LogicalPlan::Limit {
+                        limit: *limit,
+                        offset: *offset,
+                        child: Box::new(fc),
+                    },
+                    true,
+                )
             } else {
                 (plan.clone(), false)
             }
@@ -197,32 +249,72 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
         LogicalPlan::Distinct { child } => {
             let (fc, changed) = push_predicates(child);
             if changed {
-                (LogicalPlan::Distinct { child: Box::new(fc) }, true)
+                (
+                    LogicalPlan::Distinct {
+                        child: Box::new(fc),
+                    },
+                    true,
+                )
             } else {
                 (plan.clone(), false)
             }
         }
-        LogicalPlan::SetOp { op, all, left, right } => {
+        LogicalPlan::SetOp {
+            op,
+            all,
+            left,
+            right,
+        } => {
             let (fl, lc) = push_predicates(left);
             let (fr, rc) = push_predicates(right);
             if lc || rc {
-                (LogicalPlan::SetOp { op: *op, all: *all, left: Box::new(fl), right: Box::new(fr) }, true)
+                (
+                    LogicalPlan::SetOp {
+                        op: *op,
+                        all: *all,
+                        left: Box::new(fl),
+                        right: Box::new(fr),
+                    },
+                    true,
+                )
             } else {
                 (plan.clone(), false)
             }
         }
-        LogicalPlan::Insert { table_id, target_columns, source } => {
+        LogicalPlan::Insert {
+            table_id,
+            target_columns,
+            source,
+        } => {
             let (fs, changed) = push_predicates(source);
             if changed {
-                (LogicalPlan::Insert { table_id: *table_id, target_columns: target_columns.clone(), source: Box::new(fs) }, true)
+                (
+                    LogicalPlan::Insert {
+                        table_id: *table_id,
+                        target_columns: target_columns.clone(),
+                        source: Box::new(fs),
+                    },
+                    true,
+                )
             } else {
                 (plan.clone(), false)
             }
         }
-        LogicalPlan::Update { table_id, assignments, child } => {
+        LogicalPlan::Update {
+            table_id,
+            assignments,
+            child,
+        } => {
             let (fc, changed) = push_predicates(child);
             if changed {
-                (LogicalPlan::Update { table_id: *table_id, assignments: assignments.clone(), child: Box::new(fc) }, true)
+                (
+                    LogicalPlan::Update {
+                        table_id: *table_id,
+                        assignments: assignments.clone(),
+                        child: Box::new(fc),
+                    },
+                    true,
+                )
             } else {
                 (plan.clone(), false)
             }
@@ -230,7 +322,13 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
         LogicalPlan::Delete { table_id, child } => {
             let (fc, changed) = push_predicates(child);
             if changed {
-                (LogicalPlan::Delete { table_id: *table_id, child: Box::new(fc) }, true)
+                (
+                    LogicalPlan::Delete {
+                        table_id: *table_id,
+                        child: Box::new(fc),
+                    },
+                    true,
+                )
             } else {
                 (plan.clone(), false)
             }
@@ -242,7 +340,12 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
 /// Splits an AND expression into its conjuncts.
 fn split_conjuncts(expr: &BoundExpr) -> Vec<BoundExpr> {
     match expr {
-        BoundExpr::BinaryOp { left, op: BinaryOperator::And, right, .. } => {
+        BoundExpr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+            ..
+        } => {
             let mut result = split_conjuncts(left);
             result.extend(split_conjuncts(right));
             result
@@ -308,7 +411,9 @@ fn collect_column_refs_recursive(expr: &BoundExpr, out: &mut Vec<ColumnRef>) {
                 collect_column_refs_recursive(item, out);
             }
         }
-        BoundExpr::Between { expr, low, high, .. } => {
+        BoundExpr::Between {
+            expr, low, high, ..
+        } => {
             collect_column_refs_recursive(expr, out);
             collect_column_refs_recursive(low, out);
             collect_column_refs_recursive(high, out);
@@ -329,7 +434,12 @@ fn collect_column_refs_recursive(expr: &BoundExpr, out: &mut Vec<ColumnRef>) {
         }
         BoundExpr::Cast { expr, .. } => collect_column_refs_recursive(expr, out),
         BoundExpr::Nested(inner) => collect_column_refs_recursive(inner, out),
-        BoundExpr::Case { operand, conditions, else_result, .. } => {
+        BoundExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
             if let Some(op) = operand {
                 collect_column_refs_recursive(op, out);
             }
@@ -359,6 +469,7 @@ mod tests {
             column_id: ColumnId(col),
             type_id: TypeId::Int64,
             nullable: false,
+            ts_precision: None,
         })
     }
 
@@ -386,7 +497,13 @@ mod tests {
         let a = make_col_ref(0, 0);
         let b = make_col_ref(1, 0);
         let combined = combine_conjuncts(vec![a, b]);
-        assert!(matches!(combined, BoundExpr::BinaryOp { op: BinaryOperator::And, .. }));
+        assert!(matches!(
+            combined,
+            BoundExpr::BinaryOp {
+                op: BinaryOperator::And,
+                ..
+            }
+        ));
     }
 
     #[test]

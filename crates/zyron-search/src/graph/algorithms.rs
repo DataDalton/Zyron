@@ -1022,9 +1022,9 @@ mod tests {
     #[test]
     fn test_simd_fill() {
         let mut data = vec![0.0f64; 100];
-        simdFill(&mut data, 3.14);
+        simdFill(&mut data, 3.5);
         for val in &data {
-            assert!((val - 3.14).abs() < 1e-15);
+            assert!((val - 3.5).abs() < 1e-15);
         }
     }
 

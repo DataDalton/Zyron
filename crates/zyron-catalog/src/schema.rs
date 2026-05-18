@@ -99,9 +99,23 @@ pub struct ColumnEntry {
     pub nullable: bool,
     pub default_expr: Option<String>,
     pub max_length: Option<usize>,
+    /// TIMESTAMP(p) fractional-second precision 0..=12. None means the default
+    /// 6 (microseconds). p>6 routes the column to the i128 picosecond path.
+    pub ts_precision: Option<u8>,
+    /// Original timezone offset in seconds for a single-zone TIMESTAMPTZ
+    /// column, reattached on display/export. None == unknown (display UTC).
+    pub tz_offset_secs: Option<i32>,
 }
 
 impl ColumnEntry {
+    /// Physical storage TypeId. A TIMESTAMP(p)/TIMESTAMPTZ(p) column with
+    /// p>6 stores i128 picoseconds; everything else is its logical type.
+    /// This is the single key the executor/storage layer uses for byte
+    /// layout, so encode and decode stay consistent.
+    pub fn physical_type_id(&self) -> TypeId {
+        TypeId::timestamp_physical_type_id(self.type_id, self.ts_precision)
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(64);
         write_u16(&mut buf, self.id.0);
@@ -112,6 +126,15 @@ impl ColumnEntry {
         write_bool(&mut buf, self.nullable);
         write_option_string(&mut buf, &self.default_expr);
         write_option_usize(&mut buf, &self.max_length);
+        // 0 = None, 1..=13 = Some(0..=12).
+        write_u8(&mut buf, self.ts_precision.map(|p| p + 1).unwrap_or(0));
+        match self.tz_offset_secs {
+            Some(secs) => {
+                write_u8(&mut buf, 1);
+                write_u32(&mut buf, secs as u32);
+            }
+            None => write_u8(&mut buf, 0),
+        }
         buf
     }
 
@@ -125,6 +148,24 @@ impl ColumnEntry {
         let nullable = read_bool(data, &mut off)?;
         let default_expr = read_option_string(data, &mut off)?;
         let max_length = read_option_usize(data, &mut off)?;
+        let ts_precision = match read_u8(data, &mut off)? {
+            0 => None,
+            n if n <= 13 => Some(n - 1),
+            n => {
+                return Err(zyron_common::ZyronError::CatalogCorrupted(format!(
+                    "invalid ts_precision byte {n} (expected 0..=13)"
+                )));
+            }
+        };
+        let tz_offset_secs = match read_u8(data, &mut off)? {
+            0 => None,
+            1 => Some(read_u32(data, &mut off)? as i32),
+            n => {
+                return Err(zyron_common::ZyronError::CatalogCorrupted(format!(
+                    "invalid tz_offset presence byte {n}"
+                )));
+            }
+        };
         Ok(Self {
             id,
             table_id,
@@ -134,6 +175,8 @@ impl ColumnEntry {
             nullable,
             default_expr,
             max_length,
+            ts_precision,
+            tz_offset_secs,
         })
     }
 }
@@ -250,6 +293,10 @@ pub struct TableEntry {
     /// Phase 17 data lifecycle configuration (tail-appended, backward
     /// compatible; defaults to all-off for tables created before Phase 17).
     pub lifecycle: LifecycleConfig,
+    /// Columnar tier registry (tail-appended). Empty until the compaction
+    /// thread folds rows into .zyr segments.
+    #[serde(default)]
+    pub columnar: ColumnarRegistry,
 }
 
 /// Per-table data lifecycle configuration. All fields default to off so a
@@ -345,6 +392,84 @@ impl LifecycleConfig {
     }
 }
 
+/// One immutable .zyr segment file folded from the heap. The sys_rowid and
+/// sys_xmin ranges drive file-level pruning and the MVCC zone guard.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnarSegmentEntry {
+    /// Per-table monotonic file id. Stable identity for patch-log routing.
+    pub file_id: u64,
+    /// Path to the .zyr file on disk.
+    pub path: String,
+    /// Logical rows in the file.
+    pub row_count: u64,
+    /// Lowest sys_rowid in the file.
+    pub sys_rowid_lo: u64,
+    /// Highest sys_rowid in the file.
+    pub sys_rowid_hi: u64,
+    /// Lowest sys_xmin in the file.
+    pub sys_xmin_lo: u64,
+    /// Highest sys_xmin in the file.
+    pub sys_xmin_hi: u64,
+}
+
+/// Per-table columnar tier registry. Durable so it survives WAL truncation.
+/// Mutated only by the single-owner compaction thread, applied atomically
+/// with the CompactionEnd/MergeEnd commit point.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnarRegistry {
+    /// Registered immutable segment files for this table.
+    pub segments: Vec<ColumnarSegmentEntry>,
+    /// Next sys_rowid to assign at fold time. Monotonic, never reused.
+    pub next_rowid: u64,
+    /// Next file_id to assign. Monotonic, never reused.
+    pub next_file_id: u64,
+    /// Merge low-water: a supersede below this is unobservable by any
+    /// snapshot, so the row can be physically dropped at merge.
+    pub low_water: u64,
+}
+
+impl ColumnarRegistry {
+    fn write_into(&self, buf: &mut Vec<u8>) {
+        write_u32(buf, self.segments.len() as u32);
+        for seg in &self.segments {
+            write_u64(buf, seg.file_id);
+            write_string(buf, &seg.path);
+            write_u64(buf, seg.row_count);
+            write_u64(buf, seg.sys_rowid_lo);
+            write_u64(buf, seg.sys_rowid_hi);
+            write_u64(buf, seg.sys_xmin_lo);
+            write_u64(buf, seg.sys_xmin_hi);
+        }
+        write_u64(buf, self.next_rowid);
+        write_u64(buf, self.next_file_id);
+        write_u64(buf, self.low_water);
+    }
+
+    fn read_from(data: &[u8], off: &mut usize) -> Result<Self> {
+        let mut r = ColumnarRegistry::default();
+        if *off >= data.len() {
+            return Ok(r);
+        }
+        let n = read_u32(data, off)? as usize;
+        r.segments.reserve(n);
+        for _ in 0..n {
+            let mut seg = ColumnarSegmentEntry::default();
+            seg.file_id = read_u64(data, off)?;
+            seg.path = read_string(data, off)?;
+            seg.row_count = read_u64(data, off)?;
+            seg.sys_rowid_lo = read_u64(data, off)?;
+            seg.sys_rowid_hi = read_u64(data, off)?;
+            seg.sys_xmin_lo = read_u64(data, off)?;
+            seg.sys_xmin_hi = read_u64(data, off)?;
+            r.segments.push(seg);
+        }
+        r.next_rowid = read_u64(data, off)?;
+        r.next_file_id = read_u64(data, off)?;
+        r.low_water = read_u64(data, off)?;
+        Ok(r)
+    }
+}
+
 impl TableEntry {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(256);
@@ -381,6 +506,9 @@ impl TableEntry {
 
         // Phase 17 lifecycle config (tail-appended)
         self.lifecycle.write_into(&mut buf);
+
+        // Columnar registry (tail-appended)
+        self.columnar.write_into(&mut buf);
 
         buf
     }
@@ -459,6 +587,9 @@ impl TableEntry {
         // Phase 17 lifecycle config (tail-appended, defaults when absent).
         let lifecycle = LifecycleConfig::read_from(data, &mut off)?;
 
+        // Columnar registry (tail-appended, defaults when absent).
+        let columnar = ColumnarRegistry::read_from(data, &mut off)?;
+
         Ok(Self {
             id,
             schema_id,
@@ -475,6 +606,7 @@ impl TableEntry {
             cdf_enabled,
             cdf_retention_days,
             lifecycle,
+            columnar,
         })
     }
 }
@@ -2257,6 +2389,8 @@ mod tests {
             nullable: false,
             default_expr: None,
             max_length: None,
+            ts_precision: None,
+            tz_offset_secs: None,
         };
         let bytes = entry.to_bytes();
         let decoded = ColumnEntry::from_bytes(&bytes).unwrap();
@@ -2278,12 +2412,41 @@ mod tests {
             nullable: true,
             default_expr: Some("'unknown'".to_string()),
             max_length: Some(255),
+            ts_precision: None,
+            tz_offset_secs: None,
         };
         let bytes = entry.to_bytes();
         let decoded = ColumnEntry::from_bytes(&bytes).unwrap();
         assert_eq!(decoded.default_expr, Some("'unknown'".to_string()));
         assert_eq!(decoded.max_length, Some(255));
         assert_eq!(decoded.nullable, true);
+    }
+
+    #[test]
+    fn test_column_entry_ts_precision_roundtrip() {
+        for (p, off) in [
+            (None, None),
+            (Some(0u8), None),
+            (Some(6u8), Some(-18000i32)),
+            (Some(9u8), Some(0i32)),
+            (Some(12u8), Some(3600i32)),
+        ] {
+            let entry = ColumnEntry {
+                id: ColumnId(2),
+                table_id: TableId(10),
+                name: "ts".to_string(),
+                type_id: TypeId::TimestampTz,
+                ordinal: 2,
+                nullable: true,
+                default_expr: None,
+                max_length: None,
+                ts_precision: p,
+                tz_offset_secs: off,
+            };
+            let decoded = ColumnEntry::from_bytes(&entry.to_bytes()).unwrap();
+            assert_eq!(decoded.ts_precision, p, "precision {p:?}");
+            assert_eq!(decoded.tz_offset_secs, off, "offset {off:?}");
+        }
     }
 
     #[test]
@@ -2304,6 +2467,8 @@ mod tests {
                     nullable: false,
                     default_expr: None,
                     max_length: None,
+                    ts_precision: None,
+                    tz_offset_secs: None,
                 },
                 ColumnEntry {
                     id: ColumnId(1),
@@ -2314,6 +2479,8 @@ mod tests {
                     nullable: true,
                     default_expr: None,
                     max_length: Some(100),
+                    ts_precision: None,
+                    tz_offset_secs: None,
                 },
             ],
             constraints: vec![ConstraintEntry {
@@ -2332,6 +2499,7 @@ mod tests {
             cdf_enabled: false,
             cdf_retention_days: 0,
             lifecycle: Default::default(),
+            columnar: Default::default(),
         };
         let bytes = entry.to_bytes();
         let decoded = TableEntry::from_bytes(&bytes).unwrap();
@@ -2478,6 +2646,7 @@ mod tests {
             cdf_enabled: false,
             cdf_retention_days: 0,
             lifecycle: Default::default(),
+            columnar: Default::default(),
         };
         let bytes = entry.to_bytes();
         let decoded = TableEntry::from_bytes(&bytes).unwrap();

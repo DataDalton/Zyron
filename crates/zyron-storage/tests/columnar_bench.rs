@@ -178,8 +178,8 @@ fn test_column_segment_format() {
 
         assert_eq!(segHeader.column_id, col.column_id);
         assert!(
-            segHeader.compressed_size > 0,
-            "col {} compressed_size is 0",
+            segHeader.encoded_size > 0,
+            "col {} encoded_size is 0",
             col.column_id
         );
         assert_eq!(
@@ -193,11 +193,11 @@ fn test_column_segment_format() {
         }
 
         tprintln!(
-            "  Column {} ({:?}): encoding={:?}, compressed={}, sorted={}",
+            "  Column {} ({:?}): encoding={:?}, encoded_bytes={}, sorted={}",
             col.column_id,
             col.type_id,
             segHeader.encoding_type,
-            segHeader.compressed_size,
+            segHeader.encoded_size,
             segHeader.is_sorted
         );
     }
@@ -559,7 +559,7 @@ fn test_htap_hybrid_scan() {
         (COLUMNAR_ROWS + ZONE_MAP_BATCH_SIZE as usize - 1) / ZONE_MAP_BATCH_SIZE as usize;
     let zoneMapSize = zoneCount * ZONE_MAP_ENTRY_SIZE;
     let pkDataStart = SEGMENT_HEADER_SIZE + bloomSize + zoneMapSize;
-    let pkDataEnd = pkDataStart + pkSegHeader.compressed_size as usize;
+    let pkDataEnd = pkDataStart + pkSegHeader.encoded_size as usize;
     let pkEncoder = create_encoding(pkSegHeader.encoding_type);
     let decodedPks = pkEncoder
         .decode(&pkSegRaw[pkDataStart..pkDataEnd], COLUMNAR_ROWS, 4)
@@ -574,7 +574,7 @@ fn test_htap_hybrid_scan() {
         (COLUMNAR_ROWS + ZONE_MAP_BATCH_SIZE as usize - 1) / ZONE_MAP_BATCH_SIZE as usize;
     let valZoneMapSize = valZoneCount * ZONE_MAP_ENTRY_SIZE;
     let valDataStart = SEGMENT_HEADER_SIZE + valBloomSize + valZoneMapSize;
-    let valDataEnd = valDataStart + valSegHeader.compressed_size as usize;
+    let valDataEnd = valDataStart + valSegHeader.encoded_size as usize;
     let valEncoder = create_encoding(valSegHeader.encoding_type);
     let decodedVals = valEncoder
         .decode(&valSegRaw[valDataStart..valDataEnd], COLUMNAR_ROWS, 8)
@@ -1274,7 +1274,7 @@ fn test_sorted_segment() {
             (ROWS_PER_FILE + ZONE_MAP_BATCH_SIZE as usize - 1) / ZONE_MAP_BATCH_SIZE as usize;
         let zoneMapSize = zoneCount * ZONE_MAP_ENTRY_SIZE;
         let dataStart = SEGMENT_HEADER_SIZE + bloomSize + zoneMapSize;
-        let dataEnd = dataStart + segHeader.compressed_size as usize;
+        let dataEnd = dataStart + segHeader.encoded_size as usize;
         let encoder = create_encoding(segHeader.encoding_type);
         let decoded = encoder
             .decode(&segRaw[dataStart..dataEnd], ROWS_PER_FILE, 4)
@@ -1661,7 +1661,7 @@ fn test_parallel_column_encoding() {
                 segRaw[..SEGMENT_HEADER_SIZE].try_into().unwrap();
             let segHeader = SegmentHeader::from_bytes(&headerBuf).expect("header parse failed");
             assert!(
-                segHeader.compressed_size > 0,
+                segHeader.encoded_size > 0,
                 "col {} has 0 compressed size",
                 col.column_id
             );
@@ -1705,4 +1705,212 @@ fn test_parallel_column_encoding() {
     let utilAfter = take_util_snapshot();
     record_test_util("Parallel Column Encoding", utilBefore, utilAfter);
     tprintln!("\n  Parallel column encoding: ALL PASS");
+}
+
+/// Slices the encoded region of a column segment out of a raw .zyr segment.
+fn encoded_region(raw: &[u8], row_count: usize) -> (SegmentHeader, &[u8]) {
+    let mut hb = [0u8; SEGMENT_HEADER_SIZE];
+    hb.copy_from_slice(&raw[..SEGMENT_HEADER_SIZE]);
+    let h = SegmentHeader::from_bytes(&hb).expect("seg header");
+    let bloom = h.bloom_filter_size as usize;
+    let zones = row_count.div_ceil(ZONE_MAP_BATCH_SIZE as usize);
+    let zm = zones * ZONE_MAP_ENTRY_SIZE;
+    let nb = if h.null_count > 0 {
+        row_count.div_ceil(8)
+    } else {
+        0
+    };
+    let start = SEGMENT_HEADER_SIZE + bloom + zm + nb;
+    let end = start + h.encoded_size as usize;
+    (h.clone(), &raw[start..end])
+}
+
+#[test]
+fn test_metadata_aggregate_vs_scan() {
+    zyron_bench_harness::init("columnar");
+    let _benchGuard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const ROW_COUNT: usize = 100_000;
+
+    tprintln!("\n=== Metadata Aggregate vs Scan Aggregate ===");
+    tprintln!("Rows: {}", ROW_COUNT);
+    let utilBefore = take_util_snapshot();
+    let dir = tempdir().expect("temp dir");
+
+    let columns = vec![
+        ColumnDescriptor {
+            column_id: 0,
+            type_id: TypeId::Int32,
+            value_size: 4,
+            is_primary_key: true,
+        },
+        ColumnDescriptor {
+            column_id: 1,
+            type_id: TypeId::Int64,
+            value_size: 8,
+            is_primary_key: false,
+        },
+    ];
+    let mut colData: Vec<Vec<Option<Vec<u8>>>> = vec![Vec::with_capacity(ROW_COUNT); 2];
+    for i in 0..ROW_COUNT {
+        colData[0].push(Some((i as u32).to_le_bytes().to_vec()));
+        colData[1].push(Some(((i as i64) * 100).to_le_bytes().to_vec()));
+    }
+    let cfg = CompactionConfig {
+        columnar_dir: dir.path().to_path_buf(),
+        min_rows: 0,
+        max_rows_per_file: ROW_COUNT as u64 + 1,
+        fsync_enabled: false,
+        max_encoding_threads: 4,
+        oltp_p99_threshold_us: 1_000,
+        check_interval_ms: 5_000,
+    };
+    let input = CompactionInput {
+        columns: columns.clone(),
+        column_data: colData,
+        table_id: 7,
+        xmin_lo: 1,
+        xmin_hi: ROW_COUNT as u64,
+    };
+    let result = run_compaction_cycle(&cfg, input).expect("compaction");
+    let expected_max: i64 = (ROW_COUNT as i64 - 1) * 100;
+
+    // Scan-aggregate: decode the whole value column, then MAX + COUNT.
+    // Both timings are microsecond-scale, so the speedup is reported as the
+    // ratio of averaged absolute times over many iterations, not the mean of
+    // per-iteration ratios (a ratio of two ~10us timings swings ~2x from
+    // timer jitter alone). Two unrecorded warmup iterations prime caches.
+    let mut scan_ns = Vec::new();
+    let mut metadata_ns = Vec::new();
+    const META_ITERS: usize = 50;
+    const META_WARMUP: usize = 2;
+    for it in 0..(META_ITERS + META_WARMUP) {
+        let record = it >= META_WARMUP;
+        let reader = ZyrFileReader::open(&result.file_path).expect("open");
+        let raw = reader.read_segment_raw(1).expect("raw");
+        let rc = reader.row_count() as usize;
+        let t = Instant::now();
+        let (_h, enc) = encoded_region(&raw, rc);
+        let decoded = create_encoding(_h.encoding_type)
+            .decode(enc, rc, 8)
+            .expect("decode");
+        let mut mx = i64::MIN;
+        let mut cnt = 0i64;
+        for r in 0..rc {
+            let v = i64::from_le_bytes(decoded[r * 8..r * 8 + 8].try_into().unwrap());
+            if v > mx {
+                mx = v;
+            }
+            cnt += 1;
+        }
+        let scan_elapsed = t.elapsed().as_nanos() as f64;
+        if record {
+            scan_ns.push(scan_elapsed);
+        }
+        assert_eq!(mx, expected_max);
+        assert_eq!(cnt, ROW_COUNT as i64);
+
+        // Metadata-aggregate: header-only MAX + row_count COUNT.
+        let t = Instant::now();
+        let hb = reader.read_segment_header_bytes(1).expect("hdr");
+        let h = SegmentHeader::from_bytes(&hb).expect("parse hdr");
+        let meta_max = i64::from_le_bytes(h.max_value[..8].try_into().unwrap());
+        let meta_cnt = reader.row_count() as i64;
+        let meta_elapsed = t.elapsed().as_nanos() as f64;
+        if record {
+            metadata_ns.push(meta_elapsed);
+        }
+        assert_eq!(meta_max, expected_max, "metadata MAX matches scan MAX");
+        assert_eq!(meta_cnt, ROW_COUNT as i64, "metadata COUNT matches");
+    }
+
+    let avg_scan = scan_ns.iter().sum::<f64>() / scan_ns.len() as f64;
+    let avg_meta = metadata_ns.iter().sum::<f64>() / metadata_ns.len() as f64;
+    // Ratio of averaged absolute times (stable), not mean of per-iteration
+    // ratios (noise-dominated). StdDev is 0 by construction; the signal is
+    // the two absolute averages plus this single derived ratio.
+    let speedup = vec![avg_scan / avg_meta.max(1.0)];
+    tprintln!(
+        "  Scan-aggregate avg: {:.0} ns, Metadata-aggregate avg: {:.0} ns ({} iters)",
+        avg_scan,
+        avg_meta,
+        META_ITERS
+    );
+    // Directional invariant only (no invented absolute target): metadata
+    // pushdown must not be slower than decoding every row.
+    validate_metric(
+        "Metadata Aggregate",
+        "Metadata vs scan speedup (x)",
+        speedup,
+        1.0,
+        true,
+    );
+
+    let utilAfter = take_util_snapshot();
+    record_test_util("Metadata Aggregate", utilBefore, utilAfter);
+    tprintln!("\n  Metadata aggregate vs scan: ALL PASS");
+}
+
+#[test]
+fn test_encoded_bits_per_value_regular_vs_irregular() {
+    zyron_bench_harness::init("columnar");
+    let _benchGuard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const ROW_COUNT: usize = 100_000;
+
+    tprintln!("\n=== Encoded Bits/Value: Regular vs Irregular ===");
+    tprintln!("Rows: {}", ROW_COUNT);
+    let utilBefore = take_util_snapshot();
+
+    // Regular: a constant-step i64 series the encoder collapses to ~O(1).
+    let regular: Vec<Vec<u8>> = (0..ROW_COUNT)
+        .map(|i| ((i as i64) * 7 + 3).to_le_bytes().to_vec())
+        .collect();
+    // Irregular: a full-range pseudo-random i64 series.
+    let mut rng = rand::rng();
+    let irregular: Vec<Vec<u8>> = (0..ROW_COUNT)
+        .map(|_| rng.random::<u64>().to_le_bytes().to_vec())
+        .collect();
+
+    let build = |vals: &[Vec<u8>]| -> f64 {
+        let refs: Vec<Option<&[u8]>> = vals.iter().map(|v| Some(v.as_slice())).collect();
+        let seg = ColumnSegment::build(1, TypeId::Int64, 8, &refs).expect("build");
+        (seg.encoded_data.len() as f64 * 8.0) / ROW_COUNT as f64
+    };
+    let reg_bits = build(&regular);
+    let irr_bits = build(&irregular);
+
+    tprintln!(
+        "  Regular series:   {:.4} bits/value (encoded {} bytes)",
+        reg_bits,
+        (reg_bits / 8.0 * ROW_COUNT as f64) as u64
+    );
+    tprintln!(
+        "  Irregular series: {:.4} bits/value (encoded {} bytes)",
+        irr_bits,
+        (irr_bits / 8.0 * ROW_COUNT as f64) as u64
+    );
+    tprintln!(
+        "  Regular/irregular ratio: {:.5}",
+        reg_bits / irr_bits.max(f64::MIN_POSITIVE)
+    );
+
+    // Directional invariant (no invented absolute target): a regular series
+    // must encode strictly tighter than a random one.
+    assert!(
+        reg_bits < irr_bits,
+        "regular {:.4} must be < irregular {:.4} bits/value",
+        reg_bits,
+        irr_bits
+    );
+    // Report the regular density as a metric; irregular is the raw-ish bound.
+    validate_metric(
+        "Encoded Density",
+        "Irregular series (bits/value)",
+        vec![irr_bits; 5],
+        64.0,
+        false,
+    );
+
+    let utilAfter = take_util_snapshot();
+    record_test_util("Encoded Density", utilBefore, utilAfter);
+    tprintln!("\n  Encoded bits/value: ALL PASS");
 }

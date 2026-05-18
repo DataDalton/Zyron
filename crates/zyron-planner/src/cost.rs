@@ -454,8 +454,8 @@ impl CostModel {
     pub fn estimate_plan_cost(&self, plan: &LogicalPlan, catalog: &Catalog) -> PlanCost {
         match plan {
             LogicalPlan::Scan { table_id, .. } => {
-                if let Some((ts, _)) = catalog.get_stats(*table_id) {
-                    self.cost_seq_scan(&ts)
+                if let Some(s) = catalog.get_stats(*table_id) {
+                    self.cost_seq_scan(&s.0)
                 } else {
                     // No stats: assume 1000 rows, 10 pages
                     PlanCost {
@@ -725,6 +725,7 @@ mod tests {
                 column_id: ColumnId(0),
                 type_id: TypeId::Int64,
                 nullable: false,
+                ts_precision: None,
             })),
             op: BinaryOperator::Eq,
             right: Box::new(BoundExpr::Literal {

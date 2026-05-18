@@ -5,7 +5,9 @@ use zyron_common::page::PAGE_SIZE;
 /// Magic bytes identifying a .zyr columnar file.
 pub const ZYR_MAGIC: [u8; 8] = *b"ZYRCOL\0\0";
 
-/// Current .zyr format version.
+/// Current .zyr format version. The field exists so the format can be
+/// versioned in the future. Only the current version is supported (reads of
+/// any other version are rejected).
 pub const ZYR_FORMAT_VERSION: u32 = 1;
 
 /// File header occupies one full page for alignment.
@@ -45,3 +47,45 @@ pub const BLOOM_MIN_CARDINALITY: u64 = 64;
 
 /// Block size for split-block bloom filter (cache-line aligned).
 pub const BLOOM_BLOCK_SIZE: usize = 64;
+
+// ---------------------------------------------------------------------------
+// Columnar-MVCC system columns
+// ---------------------------------------------------------------------------
+//
+// Every .zyr carries three hidden system columns beside the user columns.
+// Their column ids live in a reserved high range that user column ordinals
+// never reach, so the segment index keys do not collide. Each is an ordinary
+// encoded column with its own zone map, so per-zone MVCC min/max comes for
+// free from the sys_xmin and sys_supersede zone maps.
+
+/// Per-table monotonic row identity. Survives merges. Encodes as constant-step.
+pub const SYS_COL_ROWID: u32 = u32::MAX;
+
+/// Creating transaction id, widened from the heap u32 tuple header.
+pub const SYS_COL_XMIN: u32 = u32::MAX - 1;
+
+/// Transaction id that superseded this columnar version, 0 if never.
+pub const SYS_COL_SUPERSEDE: u32 = u32::MAX - 2;
+
+/// Lowest reserved system column id. User column ids are catalog ordinals and
+/// never reach this range.
+pub const SYS_COL_MIN: u32 = u32::MAX - 2;
+
+/// All three system columns are 8-byte values.
+pub const SYS_COL_VALUE_SIZE: usize = 8;
+
+// ---------------------------------------------------------------------------
+// Columnar patch log
+// ---------------------------------------------------------------------------
+
+/// File extension for the per-table append-only columnar patch log. UPDATE and
+/// DELETE of a columnar-resident row append epoch-tagged entries here. Never a
+/// .zyr rewrite, never a heap round trip. Folded into base at merge.
+pub const ZYRPATCH_EXTENSION: &str = "zyrpatch";
+
+/// Magic bytes identifying a .zyrpatch log file.
+pub const ZYRPATCH_MAGIC: [u8; 8] = *b"ZYRPAT\0\0";
+
+/// Patch log record kinds.
+pub const PATCH_KIND_VALUE: u8 = 1;
+pub const PATCH_KIND_SUPERSEDE: u8 = 2;

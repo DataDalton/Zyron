@@ -83,10 +83,7 @@ fn parse_columns_encoding(raw: &str) -> Result<Vec<ColumnSpec>> {
             ))
         })?;
         let type_id = type_id_from_u8(type_id_num)?;
-        out.push(ColumnSpec {
-            name: name.to_string(),
-            type_id,
-        });
+        out.push(ColumnSpec::new(name.to_string(), type_id));
     }
     if out.is_empty() {
         return Err(ZyronError::PlanError(
@@ -290,10 +287,7 @@ fn endpoint_from_source_entry(entry: &ExternalSourceEntry) -> CopyEndpoint {
         columns: entry
             .columns
             .iter()
-            .map(|(name, t)| ColumnSpec {
-                name: name.clone(),
-                type_id: *t,
-            })
+            .map(|(name, t)| ColumnSpec::new(name.clone(), *t))
             .collect(),
     }
 }
@@ -308,10 +302,7 @@ fn endpoint_from_sink_entry(entry: &ExternalSinkEntry) -> CopyEndpoint {
         columns: entry
             .columns
             .iter()
-            .map(|(name, t)| ColumnSpec {
-                name: name.clone(),
-                type_id: *t,
-            })
+            .map(|(name, t)| ColumnSpec::new(name.clone(), *t))
             .collect(),
     }
 }
@@ -423,14 +414,8 @@ mod tests {
         use zyron_streaming::row_codec::StreamValue;
 
         let columns = vec![
-            ColumnSpec {
-                name: "id".to_string(),
-                type_id: TypeId::Int64,
-            },
-            ColumnSpec {
-                name: "label".to_string(),
-                type_id: TypeId::Varchar,
-            },
+            ColumnSpec::new("id".to_string(), TypeId::Int64),
+            ColumnSpec::new("label".to_string(), TypeId::Varchar),
         ];
         let rows = vec![
             vec![StreamValue::I64(1), StreamValue::Utf8("alpha".to_string())],

@@ -166,6 +166,10 @@ async fn create_test_server(db_name: &str) -> (Arc<ServerState>, tempfile::TempD
         btree_indexes: Arc::new(scc::HashMap::new()),
         vacuum_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         analytics_registry: zyron_analytics::default_registry(),
+        legal_holds: Arc::new(zyron_lifecycle::legal_hold::LegalHoldRegistry::new()),
+        feature_store: zyron_analytics::featureStore(),
+        feature_lineage: zyron_analytics::featureLineageRegistry(),
+        model_cache: zyron_analytics::modelCache(),
     });
 
     (state, tmp)
@@ -506,6 +510,7 @@ fn make_column(type_id: TypeId, values: Vec<ScalarValue>) -> Column {
         data,
         nulls,
         type_id,
+        ts_precision: None,
     }
 }
 
@@ -518,6 +523,7 @@ fn make_test_columns() -> Vec<LogicalColumn> {
             name: "id".to_string(),
             type_id: TypeId::Int32,
             nullable: false,
+            ts_precision: None,
         },
         LogicalColumn {
             table_idx: None,
@@ -525,6 +531,7 @@ fn make_test_columns() -> Vec<LogicalColumn> {
             name: "name".to_string(),
             type_id: TypeId::Text,
             nullable: false,
+            ts_precision: None,
         },
     ]
 }
@@ -787,7 +794,7 @@ fn test_wire_type_serialization_all_types() {
         (ScalarValue::Int32(-1), "-1"),
         (ScalarValue::Int32(0), "0"),
         (ScalarValue::Int64(9999999999i64), "9999999999"),
-        (ScalarValue::Float64(3.14), "3.14"),
+        (ScalarValue::Float64(3.5), "3.5"),
         (ScalarValue::Utf8("hello world".into()), "hello world"),
         (ScalarValue::Utf8("".into()), ""),
     ];
@@ -821,7 +828,7 @@ fn test_wire_type_serialization_all_types() {
         (ScalarValue::Boolean(false), vec![0]),
         (ScalarValue::Int32(42), 42i32.to_be_bytes().to_vec()),
         (ScalarValue::Int64(12345), 12345i64.to_be_bytes().to_vec()),
-        (ScalarValue::Float64(2.718), 2.718f64.to_be_bytes().to_vec()),
+        (ScalarValue::Float64(2.75), 2.75f64.to_be_bytes().to_vec()),
     ];
 
     for (scalar, expected) in &binary_cases {
@@ -1017,6 +1024,7 @@ fn test_wire_copy_protocol() {
             name: "id".into(),
             type_id: TypeId::Int32,
             nullable: false,
+            ts_precision: None,
         },
         LogicalColumn {
             table_idx: None,
@@ -1024,6 +1032,7 @@ fn test_wire_copy_protocol() {
             name: "name".into(),
             type_id: TypeId::Text,
             nullable: false,
+            ts_precision: None,
         },
     ];
 
@@ -1546,6 +1555,7 @@ fn test_wire_copy_from_throughput() {
             name: "id".into(),
             type_id: TypeId::Int32,
             nullable: false,
+            ts_precision: None,
         },
         LogicalColumn {
             table_idx: None,
@@ -1553,6 +1563,7 @@ fn test_wire_copy_from_throughput() {
             name: "name".into(),
             type_id: TypeId::Text,
             nullable: false,
+            ts_precision: None,
         },
         LogicalColumn {
             table_idx: None,
@@ -1560,6 +1571,7 @@ fn test_wire_copy_from_throughput() {
             name: "value".into(),
             type_id: TypeId::Float64,
             nullable: true,
+            ts_precision: None,
         },
     ];
 
@@ -1636,6 +1648,7 @@ fn test_wire_copy_to_throughput() {
             name: "id".into(),
             type_id: TypeId::Int32,
             nullable: false,
+            ts_precision: None,
         },
         LogicalColumn {
             table_idx: None,
@@ -1643,6 +1656,7 @@ fn test_wire_copy_to_throughput() {
             name: "name".into(),
             type_id: TypeId::Text,
             nullable: false,
+            ts_precision: None,
         },
     ];
 
@@ -3210,7 +3224,7 @@ fn test_wire_ddl_dispatch_statement_coverage() {
         match zyron_parser::parse(sql) {
             Ok(stmts) if !stmts.is_empty() => {
                 let variant_name = statement_variant_name(&stmts[0]);
-                if variant_name != *expected_variant {
+                if variant_name.as_str() != *expected_variant {
                     failed.push(format!(
                         "{}: expected {}, got {}",
                         sql, expected_variant, variant_name
@@ -3238,131 +3252,18 @@ fn test_wire_ddl_dispatch_statement_coverage() {
     );
 }
 
-/// Returns a string identifying the Statement variant for comparison.
-fn statement_variant_name(stmt: &zyron_parser::Statement) -> &'static str {
-    use zyron_parser::Statement;
-    match stmt {
-        Statement::Select(_) => "Select",
-        Statement::Insert(_) => "Insert",
-        Statement::Update(_) => "Update",
-        Statement::Delete(_) => "Delete",
-        Statement::Merge(_) => "Merge",
-        Statement::CreateTable(_) => "CreateTable",
-        Statement::DropTable(_) => "DropTable",
-        Statement::AlterTable(_) => "AlterTable",
-        Statement::CreateIndex(_) => "CreateIndex",
-        Statement::DropIndex(_) => "DropIndex",
-        Statement::AlterIndex(_) => "AlterIndex",
-        Statement::CreateSchema(_) => "CreateSchema",
-        Statement::DropSchema(_) => "DropSchema",
-        Statement::CreateSequence(_) => "CreateSequence",
-        Statement::DropSequence(_) => "DropSequence",
-        Statement::AlterSequence(_) => "AlterSequence",
-        Statement::Truncate(_) => "Truncate",
-        Statement::CreateView(_) => "CreateView",
-        Statement::DropView(_) => "DropView",
-        Statement::AlterView(_) => "AlterView",
-        Statement::CreateMaterializedView(_) => "CreateMaterializedView",
-        Statement::DropMaterializedView(_) => "DropMaterializedView",
-        Statement::RefreshMaterializedView(_) => "RefreshMaterializedView",
-        Statement::CreateUser(_) => "CreateUser",
-        Statement::AlterUser(_) => "AlterUser",
-        Statement::DropUser(_) => "DropUser",
-        Statement::CreateRole(_) => "CreateRole",
-        Statement::AlterRole(_) => "AlterRole",
-        Statement::DropRole(_) => "DropRole",
-        Statement::Grant(_) => "Grant",
-        Statement::Revoke(_) => "Revoke",
-        Statement::Begin(_) => "Begin",
-        Statement::Commit(_) => "Commit",
-        Statement::Rollback(_) => "Rollback",
-        Statement::Savepoint(_) => "Savepoint",
-        Statement::ReleaseSavepoint(_) => "ReleaseSavepoint",
-        Statement::Prepare(_) => "Prepare",
-        Statement::Execute(_) => "Execute",
-        Statement::Deallocate(_) => "Deallocate",
-        Statement::SetVariable(_) => "SetVariable",
-        Statement::Show(_) => "Show",
-        Statement::Listen(_) => "Listen",
-        Statement::Notify(_) => "Notify",
-        Statement::DeclareCursor(_) => "DeclareCursor",
-        Statement::FetchCursor(_) => "FetchCursor",
-        Statement::CloseCursor(_) => "CloseCursor",
-        Statement::Copy(_) => "Copy",
-        Statement::Vacuum(_) => "Vacuum",
-        Statement::Analyze(_) => "Analyze",
-        Statement::Reindex(_) => "Reindex",
-        Statement::CommentOn(_) => "CommentOn",
-        Statement::Checkpoint(_) => "Checkpoint",
-        Statement::Explain(_) => "Explain",
-        Statement::DoBlock(_) => "DoBlock",
-        Statement::ValuesQuery(_) => "ValuesQuery",
-        Statement::CreatePipeline(_) => "CreatePipeline",
-        Statement::RunPipeline(_) => "RunPipeline",
-        Statement::DropPipeline(_) => "DropPipeline",
-        Statement::CreateSchedule(_) => "CreateSchedule",
-        Statement::DropSchedule(_) => "DropSchedule",
-        Statement::PauseSchedule(_) => "PauseSchedule",
-        Statement::ResumeSchedule(_) => "ResumeSchedule",
-        Statement::CreateFulltextIndex(_) => "CreateFulltextIndex",
-        Statement::CreateVectorIndex(_) => "CreateVectorIndex",
-        Statement::AlterTableTtl(_) => "AlterTableTtl",
-        Statement::AlterTableOptions(_) => "AlterTableOptions",
-        Statement::OptimizeTable(_) => "OptimizeTable",
-        Statement::CreateReplicationSlot(_) => "CreateReplicationSlot",
-        Statement::DropReplicationSlot(_) => "DropReplicationSlot",
-        Statement::CreatePublication(_) => "CreatePublication",
-        Statement::AlterPublication(_) => "AlterPublication",
-        Statement::DropPublication(_) => "DropPublication",
-        Statement::CreateBranch(_) => "CreateBranch",
-        Statement::MergeBranch(_) => "MergeBranch",
-        Statement::DropBranch(_) => "DropBranch",
-        Statement::UseBranch(_) => "UseBranch",
-        Statement::CreateVersion(_) => "CreateVersion",
-        Statement::CreateFunction(_) => "CreateFunction",
-        Statement::DropFunction(_) => "DropFunction",
-        Statement::CreateAggregate(_) => "CreateAggregate",
-        Statement::DropAggregate(_) => "DropAggregate",
-        Statement::CreateProcedure(_) => "CreateProcedure",
-        Statement::DropProcedure(_) => "DropProcedure",
-        Statement::Call(_) => "Call",
-        Statement::CreateTrigger(_) => "CreateTrigger",
-        Statement::DropTrigger(_) => "DropTrigger",
-        Statement::CreateEventHandler(_) => "CreateEventHandler",
-        Statement::DropEventHandler(_) => "DropEventHandler",
-        Statement::AddExpectation(_) => "AddExpectation",
-        Statement::DropExpectation(_) => "DropExpectation",
-        Statement::EnableFeature(_) => "EnableFeature",
-        Statement::DisableFeature(_) => "DisableFeature",
-        Statement::ArchiveTable(_) => "ArchiveTable",
-        Statement::RestoreTable(_) => "RestoreTable",
-        Statement::AlterSystemSet(_) => "AlterSystemSet",
-        Statement::CreateCdcStream(_) => "CreateCdcStream",
-        Statement::DropCdcStream(_) => "DropCdcStream",
-        Statement::CreateCdcIngest(_) => "CreateCdcIngest",
-        Statement::DropCdcIngest(_) => "DropCdcIngest",
-        Statement::CreateStreamingJob(_) => "CreateStreamingJob",
-        Statement::DropStreamingJob(_) => "DropStreamingJob",
-        Statement::AlterStreamingJob(_) => "AlterStreamingJob",
-        Statement::CreateSpatialIndex(_) => "CreateSpatialIndex",
-        Statement::CreateGraphSchema(_) => "CreateGraphSchema",
-        Statement::DropGraphSchema(_) => "DropGraphSchema",
-        Statement::CreateExternalSource(_) => "CreateExternalSource",
-        Statement::CreateExternalSink(_) => "CreateExternalSink",
-        Statement::DropExternalSource(_) => "DropExternalSource",
-        Statement::DropExternalSink(_) => "DropExternalSink",
-        Statement::AlterExternalSource(_) => "AlterExternalSource",
-        Statement::AlterExternalSink(_) => "AlterExternalSink",
-        Statement::CreateEndpoint(_) => "CreateEndpoint",
-        Statement::CreateStreamingEndpoint(_) => "CreateStreamingEndpoint",
-        Statement::AlterEndpoint(_) => "AlterEndpoint",
-        Statement::DropEndpoint(_) => "DropEndpoint",
-        Statement::AlterSecurityMap(_) => "AlterSecurityMap",
-        Statement::DropSecurityMap(_) => "DropSecurityMap",
-        Statement::TagPublication(_) => "TagPublication",
-        Statement::UntagPublication(_) => "UntagPublication",
-        Statement::CreateAbacPolicy(_) => "CreateAbacPolicy",
-    }
+/// The Statement variant's name, derived from its `Debug` form. A
+/// hand-written match over every variant is what silently rotted and broke
+/// this round-trip suite the moment the grammar grew a new statement; deriving
+/// the name from the enum itself is exhaustive by construction and never
+/// drifts. `Debug` for an enum prints `Variant(..)` / `Variant { .. }`, so the
+/// identifier before the first delimiter is exactly the variant name.
+fn statement_variant_name(stmt: &zyron_parser::Statement) -> String {
+    let dbg = format!("{:?}", stmt);
+    let end = dbg
+        .find(|c: char| c == '(' || c == '{' || c == ' ')
+        .unwrap_or(dbg.len());
+    dbg[..end].to_string()
 }
 
 // ---------------------------------------------------------------------------

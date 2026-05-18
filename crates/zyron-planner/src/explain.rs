@@ -115,6 +115,56 @@ impl ExplainNode {
                     children: Vec::new(),
                 }
             }
+            PhysicalPlan::HybridScan {
+                table_id,
+                columns,
+                predicate,
+                cost,
+            } => {
+                let mut details = vec![
+                    ("table_id".to_string(), format!("{}", table_id.0)),
+                    ("columns".to_string(), format!("{}", columns.len())),
+                    ("stores".to_string(), "columnar+heap".to_string()),
+                ];
+                if predicate.is_some() {
+                    details.push(("filter".to_string(), "yes".to_string()));
+                }
+                Self {
+                    operator_name: "HybridScan".to_string(),
+                    details,
+                    estimated_cost: Some(*cost),
+                    actual_metrics: None,
+                    children: Vec::new(),
+                }
+            }
+            PhysicalPlan::ColumnarMetadataAggregate {
+                table_id,
+                specs,
+                cost,
+                ..
+            } => {
+                let aggs = specs
+                    .iter()
+                    .map(|s| match s.kind {
+                        crate::physical::MetaAggKind::CountStar => "count(*)".to_string(),
+                        crate::physical::MetaAggKind::CountCol => "count(col)".to_string(),
+                        crate::physical::MetaAggKind::Min => "min(col)".to_string(),
+                        crate::physical::MetaAggKind::Max => "max(col)".to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                Self {
+                    operator_name: "ColumnarMetadataAggregate".to_string(),
+                    details: vec![
+                        ("table_id".to_string(), format!("{}", table_id.0)),
+                        ("aggs".to_string(), aggs),
+                        ("source".to_string(), "segment-headers+heap".to_string()),
+                    ],
+                    estimated_cost: Some(*cost),
+                    actual_metrics: None,
+                    children: Vec::new(),
+                }
+            }
             PhysicalPlan::IndexScan {
                 table_id,
                 index_id,
@@ -226,6 +276,21 @@ impl ExplainNode {
                 details: vec![
                     ("groups".to_string(), format!("{}", group_by.len())),
                     ("aggregates".to_string(), format!("{}", aggregates.len())),
+                ],
+                estimated_cost: Some(*cost),
+                actual_metrics: None,
+                children: vec![Self::from_physical_plan(child)],
+            },
+            PhysicalPlan::GapFill {
+                bucket_col,
+                width,
+                child,
+                cost,
+            } => Self {
+                operator_name: "GapFill".to_string(),
+                details: vec![
+                    ("bucket_col".to_string(), format!("{bucket_col}")),
+                    ("width".to_string(), format!("{width}")),
                 ],
                 estimated_cost: Some(*cost),
                 actual_metrics: None,

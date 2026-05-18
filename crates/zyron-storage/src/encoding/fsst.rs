@@ -7,7 +7,9 @@
 //!
 //! Based on FSST (VLDB 2020), adapted for Zyron's columnar format.
 
-use crate::encoding::{Encoding, EncodingType, Predicate, eval_predicate_on_raw};
+use crate::encoding::{
+    Encoding, EncodingType, Predicate, eval_predicate_on_raw, slice_rows, varlen_pack,
+};
 use zyron_common::{Result, ZyronError};
 
 pub struct FsstEncoding;
@@ -130,6 +132,12 @@ impl Encoding for FsstEncoding {
             ));
         }
 
+        // Variable-length: each row decompresses to its full original bytes
+        // (no fixed cap); emit the canonical variable-length buffer.
+        if value_size == 0 {
+            return decode_fsst_varlen(encoded, row_count);
+        }
+
         let storedRowCount =
             u32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]) as usize;
         let storedValueSize =
@@ -200,10 +208,15 @@ impl Encoding for FsstEncoding {
         // Pre-allocate output buffer. Decompress directly into it without
         // per-string Vec allocation.
         let outSize = row_count * value_size;
-        let mut out: Vec<u8> = Vec::with_capacity(outSize);
-        unsafe {
-            out.set_len(outSize);
-        }
+        // SAFETY: the symbol-expansion loop below writes every byte of `out`
+        // before any read; zeroing first would memset the whole buffer only
+        // to overwrite it, regressing scan decode throughput.
+        #[allow(clippy::uninit_vec)]
+        let mut out: Vec<u8> = {
+            let mut v = Vec::with_capacity(outSize);
+            unsafe { v.set_len(outSize) };
+            v
+        };
         let outPtr = out.as_mut_ptr();
         let compPtr = compressed.as_ptr();
         let compLen = compressed.len();
@@ -388,25 +401,105 @@ impl Encoding for FsstEncoding {
     }
 }
 
-/// Extracts individual string values from contiguous fixed-size data.
+/// Extracts the per-row byte slices. `value_size > 0` is the fixed-width
+/// layout; `value_size == 0` is the canonical variable-length buffer. FSST's
+/// symbol compression operates on arbitrary-length slices either way.
 fn extract_strings(data: &[u8], row_count: usize, value_size: usize) -> Result<Vec<&[u8]>> {
-    if value_size == 0 {
-        return Err(ZyronError::EncodingFailed(
-            "FSST requires non-zero value_size".to_string(),
+    slice_rows(data, row_count, value_size)
+}
+
+/// Decodes an FSST segment whose rows are variable length. Each row is
+/// decompressed to its full original bytes and the result is returned as the
+/// canonical variable-length buffer so the columnar read path is uniform.
+fn decode_fsst_varlen(encoded: &[u8], row_count: usize) -> Result<Vec<u8>> {
+    let symbol_count =
+        u32::from_le_bytes([encoded[8], encoded[9], encoded[10], encoded[11]]) as usize;
+    let offset_bits = encoded[12];
+    let mut pos = 14usize;
+    let mut symbols: Vec<&[u8]> = Vec::with_capacity(symbol_count);
+    for _ in 0..symbol_count {
+        if pos >= encoded.len() {
+            return Err(ZyronError::DecodingFailed(
+                "FSST varlen symbol table truncated".to_string(),
+            ));
+        }
+        let len = encoded[pos] as usize;
+        pos += 1;
+        if pos + len > encoded.len() {
+            return Err(ZyronError::DecodingFailed(
+                "FSST varlen symbol data truncated".to_string(),
+            ));
+        }
+        symbols.push(&encoded[pos..pos + len]);
+        pos += len;
+    }
+    let total_bits = row_count as u64 * offset_bits as u64;
+    let packed_bytes = (total_bits as usize).div_ceil(8);
+    let offsets_start = pos;
+    let offsets_end = offsets_start + packed_bytes;
+    if offsets_end > encoded.len() {
+        return Err(ZyronError::DecodingFailed(
+            "FSST varlen offsets truncated".to_string(),
         ));
     }
+    let packed = &encoded[offsets_start..offsets_end];
+    let compressed = &encoded[offsets_end..];
+    let mask: u64 = if offset_bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << offset_bits) - 1
+    };
 
-    if data.len() < row_count * value_size {
-        return Err(ZyronError::EncodingFailed(
-            "data shorter than expected for FSST encoding".to_string(),
-        ));
-    }
-
-    let mut strings = Vec::with_capacity(row_count);
+    let mut rows: Vec<Vec<u8>> = Vec::with_capacity(row_count);
+    let mut cursor = 0usize;
     for i in 0..row_count {
-        strings.push(&data[i * value_size..(i + 1) * value_size]);
+        let bit_off = i as u64 * offset_bits as u64;
+        let byte_idx = (bit_off >> 3) as usize;
+        let bit_idx = (bit_off & 7) as u32;
+        let row_len = if byte_idx + 8 <= packed.len() {
+            let raw = u64::from_le_bytes(packed[byte_idx..byte_idx + 8].try_into().unwrap());
+            ((raw >> bit_idx) & mask) as usize
+        } else {
+            let mut b = [0u8; 8];
+            let avail = packed.len().saturating_sub(byte_idx).min(8);
+            b[..avail].copy_from_slice(&packed[byte_idx..byte_idx + avail]);
+            ((u64::from_le_bytes(b) >> bit_idx) & mask) as usize
+        };
+        let end = cursor + row_len;
+        if end > compressed.len() {
+            return Err(ZyronError::DecodingFailed(
+                "FSST varlen compressed data out of bounds".to_string(),
+            ));
+        }
+        let mut out = Vec::with_capacity(row_len);
+        let mut j = cursor;
+        while j < end {
+            let byte = compressed[j];
+            j += 1;
+            if byte == ESCAPE_BYTE {
+                if j >= end {
+                    return Err(ZyronError::DecodingFailed(
+                        "FSST varlen escape at row end".to_string(),
+                    ));
+                }
+                out.push(compressed[j]);
+                j += 1;
+            } else {
+                let code = byte as usize;
+                if code >= symbol_count {
+                    return Err(ZyronError::DecodingFailed(format!(
+                        "FSST varlen symbol code {} out of range",
+                        code
+                    )));
+                }
+                out.extend_from_slice(symbols[code]);
+            }
+        }
+        rows.push(out);
+        cursor = end;
     }
-    Ok(strings)
+    let refs: Vec<Option<&[u8]>> = rows.iter().map(|r| Some(r.as_slice())).collect();
+    Ok(varlen_pack(&refs))
 }
 
 /// Builds a symbol table using iterative refinement.
@@ -705,6 +798,28 @@ fn unpack_bits(packed: &[u8], bit_offset: u64, bit_width: u8) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_roundtrip_varlen_canonical_buffer() {
+        // Variable-length rows of differing lengths, including an empty one.
+        let vals: Vec<Option<&[u8]>> = vec![
+            Some(b"the quick brown fox".as_slice()),
+            Some(b"the quick brown dog".as_slice()),
+            Some(b"".as_slice()),
+            Some(b"jumps over the lazy fox".as_slice()),
+            Some(b"the quick brown fox".as_slice()),
+        ];
+        let raw = crate::encoding::varlen_pack(&vals);
+        let enc = FsstEncoding;
+        let encoded = enc.encode(&raw, vals.len(), 0).expect("encode varlen");
+        let decoded = enc.decode(&encoded, vals.len(), 0).expect("decode varlen");
+        let rows = crate::encoding::varlen_slice_rows(&decoded, vals.len()).expect("slice");
+        assert_eq!(rows[0], b"the quick brown fox");
+        assert_eq!(rows[1], b"the quick brown dog");
+        assert_eq!(rows[2], b"");
+        assert_eq!(rows[3], b"jumps over the lazy fox");
+        assert_eq!(rows[4], b"the quick brown fox");
+    }
 
     #[test]
     fn test_roundtrip_fixed_strings() {

@@ -15,7 +15,8 @@ pub use page_version_map::{PageVersionMap, PageVersionRange};
 pub use scd::{ScdActions, ScdConfig, ScdHandler, ScdType, SurrogateKeyGenerator};
 pub use snapshot::{SnapshotReader, TableSnapshot};
 pub use temporal::{
-    ApplicationTimeTable, BiTemporalTable, MAX_TIMESTAMP, SystemVersionedTable, TemporalConfig,
-    TemporalQuery, TemporalType,
+    ApplicationTimeTable, BiTemporalTable, MAX_TIMESTAMP, MAX_TIMESTAMP_PS, SystemVersionedTable,
+    SystemVersionedUpdateActionsP, TemporalConfig, TemporalQuery, TemporalType,
+    max_timestamp_sentinel,
 };
 pub use version::{OperationType, VersionEntry, VersionId, VersionLog};

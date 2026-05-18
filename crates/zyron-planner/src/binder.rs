@@ -33,6 +33,10 @@ pub struct ColumnRef {
     pub column_id: ColumnId,
     pub type_id: TypeId,
     pub nullable: bool,
+    /// Fractional-second precision when this references a TIMESTAMP(p) column
+    /// (None otherwise). Propagates so cross-precision compare and the
+    /// physical i128 picosecond routing stay correct through projections.
+    pub ts_precision: Option<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -57,6 +61,9 @@ pub struct BoundColumnDef {
     pub type_id: TypeId,
     pub nullable: bool,
     pub ordinal: u16,
+    /// Fractional-second precision for a TIMESTAMP(p) column (None otherwise),
+    /// carried from the catalog so it propagates into ColumnRef.
+    pub ts_precision: Option<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -420,6 +427,20 @@ impl BoundExpr {
             BoundExpr::WindowFunction { type_id, .. } => *type_id,
             BoundExpr::Parameter { type_id, .. } => *type_id,
             BoundExpr::TemporalRef { inner, .. } => inner.type_id(),
+        }
+    }
+
+    /// Fractional-second precision this expression carries, if it is (or
+    /// passes through) a timestamp column. None means the default 6
+    /// (microseconds) or a non-timestamp expression.
+    pub fn ts_precision(&self) -> Option<u8> {
+        match self {
+            BoundExpr::ColumnRef(cr) => cr.ts_precision,
+            BoundExpr::Nested(inner) => inner.ts_precision(),
+            BoundExpr::TemporalRef { inner, .. } => inner.ts_precision(),
+            // CAST AS TIMESTAMP(p) precision is carried in B5 (cross-precision
+            // cast); until then a cast result reports the default precision.
+            _ => None,
         }
     }
 
@@ -1868,6 +1889,11 @@ pub struct Binder<'a> {
     catalog: &'a Catalog,
     next_table_idx: usize,
     row_security: Option<std::sync::Arc<dyn crate::RowSecurityProvider>>,
+    // Per-bind memo: one statement resolves the same table 8+ times
+    // (RLS, constraints, publications, target+source). Each resolver call
+    // is a cache lookup or, on a miss, a heap scan. The lock is taken only
+    // for the get/insert, never across the resolver await.
+    table_memo: std::sync::Mutex<HashMap<(Option<String>, String), Arc<TableEntry>>>,
 }
 
 impl<'a> Binder<'a> {
@@ -1877,7 +1903,29 @@ impl<'a> Binder<'a> {
             catalog,
             next_table_idx: 0,
             row_security: None,
+            table_memo: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Resolves a table through a per-bind memo so a statement that
+    /// references the same table many times pays the resolver (cache lookup
+    /// or, on miss, a heap scan) once. Mirrors `NameResolver::resolve_table`.
+    async fn rt_memo(&self, schema: Option<&str>, name: &str) -> Result<Arc<TableEntry>> {
+        let key = (schema.map(|s| s.to_string()), name.to_string());
+        if let Some(e) = self
+            .table_memo
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            return Ok(Arc::clone(e));
+        }
+        let entry = self.resolver.resolve_table(schema, name).await?;
+        self.table_memo
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, Arc::clone(&entry));
+        Ok(entry)
     }
 
     /// Installs the row-security provider so SELECT/UPDATE/DELETE on a single
@@ -2300,7 +2348,7 @@ impl<'a> Binder<'a> {
                         (None, name.as_str())
                     };
 
-                    let entry = self.resolver.resolve_table(schema_name, table_name).await?;
+                    let entry = self.rt_memo(schema_name, table_name).await?;
                     let idx = self.alloc_table_idx();
 
                     let columns: Vec<BoundColumnDef> = entry
@@ -2312,6 +2360,7 @@ impl<'a> Binder<'a> {
                             type_id: c.type_id,
                             nullable: c.nullable,
                             ordinal: c.ordinal,
+                            ts_precision: c.ts_precision,
                         })
                         .collect();
 
@@ -2459,6 +2508,7 @@ impl<'a> Binder<'a> {
                                 name: (*cname).to_string(),
                                 type_id: type_label_to_id(ctype),
                                 nullable: true,
+                                ts_precision: None,
                             })
                             .collect();
 
@@ -2473,6 +2523,7 @@ impl<'a> Binder<'a> {
                                 type_id: lc.type_id,
                                 nullable: lc.nullable,
                                 ordinal: i as u16,
+                                ts_precision: lc.ts_precision,
                             })
                             .collect();
                         let bound_table = BoundTableRef {
@@ -2540,6 +2591,7 @@ impl<'a> Binder<'a> {
                                 name: "node_id".to_string(),
                                 type_id: TypeId::Int64,
                                 nullable: false,
+                                ts_precision: None,
                             },
                             LogicalColumn {
                                 table_idx: None,
@@ -2547,6 +2599,7 @@ impl<'a> Binder<'a> {
                                 name: "score".to_string(),
                                 type_id: TypeId::Float64,
                                 nullable: false,
+                                ts_precision: None,
                             },
                         ],
                         "shortest_path" => vec![
@@ -2556,6 +2609,7 @@ impl<'a> Binder<'a> {
                                 name: "step".to_string(),
                                 type_id: TypeId::Int32,
                                 nullable: false,
+                                ts_precision: None,
                             },
                             LogicalColumn {
                                 table_idx: None,
@@ -2563,6 +2617,7 @@ impl<'a> Binder<'a> {
                                 name: "node_id".to_string(),
                                 type_id: TypeId::Int64,
                                 nullable: false,
+                                ts_precision: None,
                             },
                         ],
                         "bfs" => vec![
@@ -2572,6 +2627,7 @@ impl<'a> Binder<'a> {
                                 name: "node_id".to_string(),
                                 type_id: TypeId::Int64,
                                 nullable: false,
+                                ts_precision: None,
                             },
                             LogicalColumn {
                                 table_idx: None,
@@ -2579,6 +2635,7 @@ impl<'a> Binder<'a> {
                                 name: "depth".to_string(),
                                 type_id: TypeId::Int32,
                                 nullable: false,
+                                ts_precision: None,
                             },
                         ],
                         "betweenness_centrality" => vec![
@@ -2588,6 +2645,7 @@ impl<'a> Binder<'a> {
                                 name: "node_id".to_string(),
                                 type_id: TypeId::Int64,
                                 nullable: false,
+                                ts_precision: None,
                             },
                             LogicalColumn {
                                 table_idx: None,
@@ -2595,6 +2653,7 @@ impl<'a> Binder<'a> {
                                 name: "centrality".to_string(),
                                 type_id: TypeId::Float64,
                                 nullable: false,
+                                ts_precision: None,
                             },
                         ],
                         // connected_components and community_detection share
@@ -2606,6 +2665,7 @@ impl<'a> Binder<'a> {
                                 name: "node_id".to_string(),
                                 type_id: TypeId::Int64,
                                 nullable: false,
+                                ts_precision: None,
                             },
                             LogicalColumn {
                                 table_idx: None,
@@ -2613,6 +2673,7 @@ impl<'a> Binder<'a> {
                                 name: "component".to_string(),
                                 type_id: TypeId::Int64,
                                 nullable: false,
+                                ts_precision: None,
                             },
                         ],
                     };
@@ -2628,6 +2689,7 @@ impl<'a> Binder<'a> {
                             type_id: lc.type_id,
                             nullable: lc.nullable,
                             ordinal: i as u16,
+                            ts_precision: lc.ts_precision,
                         })
                         .collect();
                     let bound_table = BoundTableRef {
@@ -3100,6 +3162,7 @@ impl<'a> Binder<'a> {
                         column_id: col.column_id,
                         type_id: col.type_id,
                         nullable: col.nullable,
+                        ts_precision: col.ts_precision,
                     });
                 }
             }
@@ -3131,6 +3194,7 @@ impl<'a> Binder<'a> {
                             column_id: col.column_id,
                             type_id: col.type_id,
                             nullable: col.nullable,
+                            ts_precision: col.ts_precision,
                         });
                     }
                 }
@@ -3213,6 +3277,7 @@ impl<'a> Binder<'a> {
                         type_id: expr.type_id(),
                         nullable: expr.nullable(),
                         ordinal: ordinal as u16,
+                        ts_precision: expr.ts_precision(),
                     });
                 }
                 BoundSelectItem::Wildcard => {
@@ -3262,7 +3327,7 @@ impl<'a> Binder<'a> {
             (None, stmt.table.as_str())
         };
 
-        let entry = self.resolver.resolve_table(schema_name, table_name).await?;
+        let entry = self.rt_memo(schema_name, table_name).await?;
 
         // Resolve target columns
         let target_columns = if stmt.columns.is_empty() {
@@ -3289,6 +3354,7 @@ impl<'a> Binder<'a> {
                 type_id: c.type_id,
                 nullable: c.nullable,
                 ordinal: c.ordinal,
+                ts_precision: c.ts_precision,
             })
             .collect();
         ctx.tables.push(BoundTableRef {
@@ -3344,7 +3410,7 @@ impl<'a> Binder<'a> {
             (None, stmt.table.as_str())
         };
 
-        let entry = self.resolver.resolve_table(schema_name, table_name).await?;
+        let entry = self.rt_memo(schema_name, table_name).await?;
 
         // Register table in context
         let mut ctx = BindContext::new();
@@ -3358,6 +3424,7 @@ impl<'a> Binder<'a> {
                 type_id: c.type_id,
                 nullable: c.nullable,
                 ordinal: c.ordinal,
+                ts_precision: c.ts_precision,
             })
             .collect();
         ctx.tables.push(BoundTableRef {
@@ -3418,7 +3485,7 @@ impl<'a> Binder<'a> {
         } else {
             (None, stmt.table.as_str())
         };
-        let entry = self.resolver.resolve_table(schema_name, table_name).await?;
+        let entry = self.rt_memo(schema_name, table_name).await?;
 
         if !stmt.hard {
             if let Some(cfg) = zyron_lifecycle::soft_delete::soft_delete_config(&entry) {
@@ -3452,7 +3519,7 @@ impl<'a> Binder<'a> {
             (None, stmt.table.as_str())
         };
 
-        let entry = self.resolver.resolve_table(schema_name, table_name).await?;
+        let entry = self.rt_memo(schema_name, table_name).await?;
 
         // Register table in context
         let mut ctx = BindContext::new();
@@ -3466,6 +3533,7 @@ impl<'a> Binder<'a> {
                 type_id: c.type_id,
                 nullable: c.nullable,
                 ordinal: c.ordinal,
+                ts_precision: c.ts_precision,
             })
             .collect();
         ctx.tables.push(BoundTableRef {
@@ -3551,7 +3619,7 @@ impl<'a> Binder<'a> {
         let mut bound_tables = Vec::with_capacity(stmt.tables.len());
         let mut first_entry: Option<Arc<TableEntry>> = None;
         for tref in &stmt.tables {
-            let entry = self.resolver.resolve_table(None, &tref.table_name).await?;
+            let entry = self.rt_memo(None, &tref.table_name).await?;
             let mut column_ids = Vec::with_capacity(tref.columns.len());
             for cname in &tref.columns {
                 let col = entry
@@ -3674,7 +3742,7 @@ impl<'a> Binder<'a> {
 
         let action = match &stmt.action {
             AlterPublicationAction::AddTable(tref) => {
-                let entry = self.resolver.resolve_table(None, &tref.table_name).await?;
+                let entry = self.rt_memo(None, &tref.table_name).await?;
                 let mut column_ids = Vec::with_capacity(tref.columns.len());
                 for cname in &tref.columns {
                     let col = entry
@@ -3704,7 +3772,7 @@ impl<'a> Binder<'a> {
                 })
             }
             AlterPublicationAction::DropTable(name) => {
-                let entry = self.resolver.resolve_table(None, name).await?;
+                let entry = self.rt_memo(None, name).await?;
                 BoundAlterPublicationAction::DropTable(entry.id)
             }
             AlterPublicationAction::SetOptions(opts) => {
@@ -3835,6 +3903,8 @@ impl<'a> Binder<'a> {
                     nullable: c.nullable,
                     default_expr: None,
                     max_length: None,
+                    ts_precision: None,
+                    tz_offset_secs: None,
                 })
                 .collect(),
             _ => Vec::new(),
@@ -4028,6 +4098,7 @@ impl<'a> Binder<'a> {
                 type_id: c.type_id,
                 nullable: c.nullable,
                 ordinal: c.ordinal,
+                ts_precision: c.ts_precision,
             })
             .collect();
         ctx.tables.push(BoundTableRef {
@@ -4262,7 +4333,7 @@ impl<'a> Binder<'a> {
             zyron_parser::StreamingSinkRef::Named(name) => {
                 let (tgt_schema_opt, tgt_tbl) = split_qualified(name);
                 // Named form: try Zyron table first, then external sink.
-                let zyron_tbl = self.resolver.resolve_table(tgt_schema_opt, tgt_tbl).await;
+                let zyron_tbl = self.rt_memo(tgt_schema_opt, tgt_tbl).await;
                 match zyron_tbl {
                     Ok(entry) => (
                         BoundStreamingSinkKind::Zyron {
@@ -4317,7 +4388,7 @@ impl<'a> Binder<'a> {
         // external source lookup in the session's schema.
         let (src_schema_opt, src_tbl) = split_qualified(&source_name);
         let source_resolved: SourceResolution = {
-            let zyron_tbl = self.resolver.resolve_table(src_schema_opt, src_tbl).await;
+            let zyron_tbl = self.rt_memo(src_schema_opt, src_tbl).await;
             match zyron_tbl {
                 Ok(entry) => SourceResolution::Zyron(entry),
                 Err(_) => {
@@ -4388,6 +4459,8 @@ impl<'a> Binder<'a> {
                         nullable: true,
                         default_expr: None,
                         max_length: None,
+                        ts_precision: None,
+                        tz_offset_secs: None,
                     })
                     .collect();
                 if matches!(&target_kind, BoundStreamingSinkKind::ExternalInline { .. })
@@ -4428,6 +4501,7 @@ impl<'a> Binder<'a> {
                 type_id: c.type_id,
                 nullable: c.nullable,
                 ordinal: c.ordinal,
+                ts_precision: c.ts_precision,
             })
             .collect();
         let source_table_id_for_scope = match &source_kind {
@@ -4482,6 +4556,7 @@ impl<'a> Binder<'a> {
                     type_id: c.type_id,
                     nullable: c.nullable,
                     ordinal: c.ordinal,
+                    ts_precision: c.ts_precision,
                 })
                 .collect();
             let r_idx = self.alloc_table_idx();
@@ -4517,6 +4592,7 @@ impl<'a> Binder<'a> {
                                 column_id: col.id,
                                 type_id: col.type_id,
                                 nullable: col.nullable,
+                                ts_precision: col.ts_precision,
                             }));
                         }
                     }
@@ -4527,6 +4603,7 @@ impl<'a> Binder<'a> {
                                 column_id: col.id,
                                 type_id: col.type_id,
                                 nullable: col.nullable,
+                                ts_precision: col.ts_precision,
                             }));
                         }
                     }
@@ -5671,6 +5748,14 @@ fn infer_function_type(name: &str, arg_types: &[TypeId]) -> TypeId {
             TypeId::Varchar
         }
         "now" | "current_timestamp" => TypeId::TimestampTz,
+        "hlc_now" => TypeId::Hlc,
+        // time_bucket(width, ts) / time_bucket_gapfill(width, ts) return the
+        // timestamp argument's type.
+        "time_bucket" | "time_bucket_gapfill" => {
+            arg_types.get(1).copied().unwrap_or(TypeId::TimestampTz)
+        }
+        // locf/interpolate return the value column's type.
+        "locf" | "interpolate" => arg_types.first().copied().unwrap_or(TypeId::Null),
         "current_date" => TypeId::Date,
         "current_time" => TypeId::Time,
         "coalesce" => arg_types.first().copied().unwrap_or(TypeId::Null),
@@ -5792,7 +5877,7 @@ mod tests {
     #[test]
     fn test_literal_type_inference() {
         assert_eq!(literal_type(&LiteralValue::Integer(42)), TypeId::Int64);
-        assert_eq!(literal_type(&LiteralValue::Float(3.14)), TypeId::Float64);
+        assert_eq!(literal_type(&LiteralValue::Float(2.5)), TypeId::Float64);
         assert_eq!(
             literal_type(&LiteralValue::String("hello".to_string())),
             TypeId::Varchar

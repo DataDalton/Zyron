@@ -10,6 +10,9 @@ use zyron_planner::physical::PhysicalPlan;
 use crate::batch::DataBatch;
 use crate::context::ExecutionContext;
 use crate::operator::aggregate::{HashAggregateOperator, SortAggregateOperator};
+use crate::operator::column_scan::{
+    ColumnScanOperator, ColumnarMetadataAggregateOperator, HybridScanOperator,
+};
 use crate::operator::distinct::HashDistinctOperator;
 use crate::operator::filter::FilterOperator;
 use crate::operator::join::{HashJoinOperator, MergeJoinOperator, NestedLoopJoinOperator};
@@ -134,6 +137,41 @@ fn build_operator_tree(
                     let br = BuildResult::new(Box::new(op));
                     Ok(br.with_metrics("SeqScan", analyze, vec![]))
                 }
+            }
+
+            PhysicalPlan::HybridScan {
+                table_id,
+                columns,
+                predicate,
+                ..
+            } => {
+                // Columnar segments union the heap residual. Folded rows were
+                // physically deleted from the heap, so the two sets are
+                // disjoint under one snapshot: no double count.
+                let columnar = ColumnScanOperator::new(
+                    ctx.clone(),
+                    table_id,
+                    columns.clone(),
+                    predicate.clone(),
+                )?;
+                let heap =
+                    SeqScanOperator::new(ctx.clone(), table_id, columns, predicate, false, None)
+                        .await?;
+                let op = HybridScanOperator::new(columnar, heap);
+                let br = BuildResult::new(Box::new(op));
+                Ok(br.with_metrics("HybridScan", analyze, vec![]))
+            }
+
+            PhysicalPlan::ColumnarMetadataAggregate {
+                table_id,
+                specs,
+                schema,
+                ..
+            } => {
+                let op =
+                    ColumnarMetadataAggregateOperator::new(ctx.clone(), table_id, specs, schema);
+                let br = BuildResult::new(Box::new(op) as Box<dyn Operator>);
+                Ok(br.with_metrics("ColumnarMetadataAggregate", analyze, vec![]))
             }
 
             PhysicalPlan::IndexScan {
@@ -480,6 +518,20 @@ fn build_operator_tree(
                 Ok(br.with_metrics("HashAggregate", analyze, child_m))
             }
 
+            PhysicalPlan::GapFill {
+                bucket_col,
+                width,
+                child,
+                ..
+            } => {
+                let child_br = build_operator_tree(*child, ctx).await?;
+                let child_m = collect_metrics(&[&child_br.metrics]);
+                let br = BuildResult::new(Box::new(
+                    crate::operator::gapfill::GapFillOperator::new(child_br.op, bucket_col, width),
+                ));
+                Ok(br.with_metrics("GapFill", analyze, child_m))
+            }
+
             PhysicalPlan::SortAggregate {
                 group_by,
                 aggregates,
@@ -706,6 +758,7 @@ fn build_aggregate_schema(
             name: format!("group{}", i),
             type_id: expr.type_id(),
             nullable: expr.nullable(),
+            ts_precision: expr.ts_precision(),
         });
     }
     for (i, agg) in aggregates.iter().enumerate() {
@@ -716,6 +769,8 @@ fn build_aggregate_schema(
             name: agg.function_name.clone(),
             type_id: agg.return_type,
             nullable: true,
+            // Aggregate-result precision finalized in B5.
+            ts_precision: None,
         });
     }
     schema
@@ -829,6 +884,30 @@ fn build_scan_with_tuple_ids(
                 Ok(br.with_metrics("Limit", analyze, child_m))
             }
 
+            PhysicalPlan::HybridScan {
+                table_id,
+                columns,
+                predicate,
+                ..
+            } => {
+                // DML over a folded table. The columnar scan emits
+                // (file_id, sys_rowid) locators so UPDATE/DELETE route those
+                // rows to the patch log; the heap scan tracks tuple ids for
+                // the not-yet-folded residual. Disjoint by construction.
+                let columnar = ColumnScanOperator::new_for_dml(
+                    ctx.clone(),
+                    table_id,
+                    columns.clone(),
+                    predicate.clone(),
+                )?;
+                let heap =
+                    SeqScanOperator::new(ctx.clone(), table_id, columns, predicate, true, None)
+                        .await?;
+                let op = HybridScanOperator::new(columnar, heap);
+                let br = BuildResult::new(Box::new(op) as Box<dyn Operator>);
+                Ok(br.with_metrics("HybridScan", analyze, vec![]))
+            }
+
             other => build_operator_tree(other, ctx).await,
         };
         result
@@ -895,12 +974,14 @@ fn build_system_time_predicate(
         column_id: sys_start.id,
         type_id: sys_start.type_id,
         nullable: sys_start.nullable,
+        ts_precision: sys_start.ts_precision,
     });
     let sys_end_ref = BoundExpr::ColumnRef(ColumnRef {
         table_idx,
         column_id: sys_end.id,
         type_id: sys_end.type_id,
         nullable: sys_end.nullable,
+        ts_precision: sys_end.ts_precision,
     });
 
     // sys_start <= ts

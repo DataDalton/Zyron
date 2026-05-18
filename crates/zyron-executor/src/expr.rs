@@ -151,10 +151,9 @@ fn evaluate_parameter(index: usize, params: &[ScalarValue], num_rows: usize) -> 
         return Ok(Column::null_column(TypeId::Null, num_rows));
     }
     let type_id = scalar.type_id();
-    let mut data = ColumnData::with_capacity(type_id, num_rows);
-    for _ in 0..num_rows {
-        data.push_scalar(scalar);
-    }
+    // Vectorized broadcast (single vec![v; n] fill) instead of num_rows
+    // push_scalar calls, each a 30+-variant match. Null is handled above.
+    let data = ColumnData::from_scalar(scalar, num_rows);
     Ok(Column::new(data, type_id))
 }
 
@@ -231,6 +230,74 @@ fn common_numeric_type(a: TypeId, b: TypeId) -> Option<TypeId> {
     })
 }
 
+/// Hybrid Logical Clock state: high 48 bits = physical milliseconds since the
+/// Unix epoch, low 16 bits = logical counter. Process-wide and lock-free.
+static HLC_STATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Standard HLC send rule, generated lock-free via a single CAS loop. The
+/// returned value is monotonic and causally ordered under plain integer
+/// comparison (it is stored in the i128 HLC column, high bits zero).
+fn next_hlc() -> u64 {
+    use std::sync::atomic::Ordering;
+    let phys_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+        & 0xFFFF_FFFF_FFFF; // 48 bits
+    loop {
+        let prev = HLC_STATE.load(Ordering::Acquire);
+        let prev_ms = prev >> 16;
+        let prev_logical = prev & 0xFFFF;
+        let (new_ms, new_logical) = if phys_ms > prev_ms {
+            (phys_ms, 0)
+        } else if prev_logical == 0xFFFF {
+            // Logical counter exhausted within this millisecond: advance the
+            // physical part to preserve strict monotonicity.
+            (prev_ms + 1, 0)
+        } else {
+            (prev_ms, prev_logical + 1)
+        };
+        let next = (new_ms << 16) | new_logical;
+        if HLC_STATE
+            .compare_exchange_weak(prev, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return next;
+        }
+    }
+}
+
+#[inline]
+fn is_ts_col(col: &Column) -> bool {
+    matches!(col.type_id, TypeId::Timestamp | TypeId::TimestampTz)
+}
+
+#[inline]
+fn ts_col_is_ps(col: &Column) -> bool {
+    is_ts_col(col) && col.ts_precision.unwrap_or(6) > 6
+}
+
+/// When exactly one operand is a picosecond (p>6) timestamp and the other a
+/// microsecond (p<=6) timestamp, scale the microsecond side up to picoseconds
+/// so both express the same instant in the same unit. Equal units or
+/// non-timestamp operands are left untouched.
+fn normalize_ts_pair(left: &mut Column, right: &mut Column) -> Result<()> {
+    if !(is_ts_col(left) && is_ts_col(right)) {
+        return Ok(());
+    }
+    let lps = ts_col_is_ps(left);
+    let rps = ts_col_is_ps(right);
+    if lps == rps {
+        return Ok(());
+    }
+    if lps {
+        *right = crate::compute::scale_us_to_ps(right, left.ts_precision)?;
+    } else {
+        *left = crate::compute::scale_us_to_ps(left, right.ts_precision)?;
+    }
+    Ok(())
+}
+
 fn evaluate_binary_op(
     left: &BoundExpr,
     op: BinaryOperator,
@@ -241,6 +308,25 @@ fn evaluate_binary_op(
 ) -> Result<Column> {
     let mut left_col = evaluate(left, batch, schema, params)?;
     let mut right_col = evaluate(right, batch, schema, params)?;
+
+    // Cross-precision timestamp normalization (B5): when the two operands are
+    // timestamps stored in different units (one i64 microseconds for p<=6, the
+    // other i128 picoseconds for p>6), scale the microsecond side up to
+    // picoseconds (exact x1_000_000) so the same instant compares equal.
+    // Never the reverse - downcasting ps->us would lose information.
+    if matches!(
+        op,
+        BinaryOperator::Plus
+            | BinaryOperator::Minus
+            | BinaryOperator::Eq
+            | BinaryOperator::Neq
+            | BinaryOperator::Lt
+            | BinaryOperator::Gt
+            | BinaryOperator::LtEq
+            | BinaryOperator::GtEq
+    ) {
+        normalize_ts_pair(&mut left_col, &mut right_col)?;
+    }
 
     // Numeric coercion: comparisons and arithmetic between different numeric
     // widths (e.g. an INT32 column vs an INT64 integer literal) must align to
@@ -528,11 +614,17 @@ fn evaluate_in_list(
     }
 
     let first = evaluate(&list[0], batch, schema, params)?;
-    let mut combined = compare(&expr_col, &first, CmpOp::Eq)?;
+    let mut e0 = expr_col.clone();
+    let mut f0 = first;
+    normalize_ts_pair(&mut e0, &mut f0)?;
+    let mut combined = compare(&e0, &f0, CmpOp::Eq)?;
 
     for item in &list[1..] {
         let item_col = evaluate(item, batch, schema, params)?;
-        let cmp_result = compare(&expr_col, &item_col, CmpOp::Eq)?;
+        let mut e = expr_col.clone();
+        let mut it = item_col;
+        normalize_ts_pair(&mut e, &mut it)?;
+        let cmp_result = compare(&e, &it, CmpOp::Eq)?;
         combined = bool_or(&combined, &cmp_result)?;
     }
 
@@ -560,8 +652,15 @@ fn evaluate_between(
     let low_col = evaluate(low, batch, schema, params)?;
     let high_col = evaluate(high, batch, schema, params)?;
 
-    let gte_low = compare(&expr_col, &low_col, CmpOp::GtEq)?;
-    let lte_high = compare(&expr_col, &high_col, CmpOp::LtEq)?;
+    // Cross-precision timestamp normalization (B5) per comparison.
+    let mut e_lo = expr_col.clone();
+    let mut lo = low_col.clone();
+    normalize_ts_pair(&mut e_lo, &mut lo)?;
+    let gte_low = compare(&e_lo, &lo, CmpOp::GtEq)?;
+    let mut e_hi = expr_col.clone();
+    let mut hi = high_col.clone();
+    normalize_ts_pair(&mut e_hi, &mut hi)?;
+    let lte_high = compare(&e_hi, &hi, CmpOp::LtEq)?;
     let result = bool_and(&gte_low, &lte_high)?;
 
     if negated {
@@ -654,6 +753,215 @@ fn evaluate_function(
                 ColumnData::Int64(vec![micros; n]),
                 TypeId::TimestampTz,
             ))
+        }
+        // Hybrid Logical Clock: a monotonic, causally-ordered timestamp.
+        // Packed 48-bit physical milliseconds + 16-bit logical counter into a
+        // single value, stored on the i128 HLC physical path so plain integer
+        // comparison yields causal order. Generation is lock-free (one
+        // AtomicU64 CAS) per the standard HLC send rule.
+        "hlc_now" => {
+            let h = next_hlc() as i128;
+            let n = batch.num_rows.max(1);
+            Ok(Column::new_ts(
+                ColumnData::Int128(vec![h; n]),
+                TypeId::Hlc,
+                None,
+            ))
+        }
+        // time_bucket(width, ts): floor each timestamp down to a multiple of
+        // `width`, the foundational downsampling primitive for
+        // `GROUP BY time_bucket(...)`. width is an integer count in the
+        // column's storage unit (microseconds for p<=6, picoseconds for p>6)
+        // or an INTERVAL. Floor is toward negative infinity so pre-epoch
+        // timestamps bucket correctly. Result keeps the timestamp's type and
+        // precision.
+        // time_bucket_gapfill computes the same bucket as time_bucket (so
+        // grouping is identical); the planner inserts a GapFill node above the
+        // aggregate to densify absent buckets.
+        "time_bucket" | "time_bucket_gapfill" => {
+            if args.len() != 2 {
+                return Err(ZyronError::ExecutionError(
+                    "time_bucket(width, ts) takes exactly 2 arguments".to_string(),
+                ));
+            }
+            let width_col = evaluate(&args[0], batch, schema, params)?;
+            let ts = evaluate(&args[1], batch, schema, params)?;
+            let is_ps = ts_col_is_ps(&ts);
+            // Resolve the bucket width into the timestamp's storage unit.
+            let width: i128 = match width_col.data.get_scalar(0) {
+                ScalarValue::Int8(v) => v as i128,
+                ScalarValue::Int16(v) => v as i128,
+                ScalarValue::Int32(v) => v as i128,
+                ScalarValue::Int64(v) => v as i128,
+                ScalarValue::Int128(v) => v,
+                ScalarValue::Interval(iv) => {
+                    // Interval is i64 nanoseconds. Convert to the column unit.
+                    let ns = iv.nanoseconds as i128;
+                    if is_ps {
+                        ns * 1000
+                    } else if ns % 1000 == 0 {
+                        ns / 1000
+                    } else {
+                        return Err(ZyronError::ExecutionError(
+                            "time_bucket interval width is not a whole microsecond \
+                             for a microsecond-precision column"
+                                .to_string(),
+                        ));
+                    }
+                }
+                other => {
+                    return Err(ZyronError::ExecutionError(format!(
+                        "time_bucket width must be an integer or interval, got {other:?}"
+                    )));
+                }
+            };
+            if width <= 0 {
+                return Err(ZyronError::ExecutionError(
+                    "time_bucket width must be positive".to_string(),
+                ));
+            }
+            let bucket = |v: i128| -> i128 { v.div_euclid(width) * width };
+            let data = match &ts.data {
+                ColumnData::Int64(v) => ColumnData::Int64(
+                    v.iter().map(|&x| bucket(x as i128) as i64).collect(),
+                ),
+                ColumnData::Int128(v) => {
+                    ColumnData::Int128(v.iter().map(|&x| bucket(x)).collect())
+                }
+                _ => {
+                    return Err(ZyronError::ExecutionError(
+                        "time_bucket second argument must be a timestamp column"
+                            .to_string(),
+                    ));
+                }
+            };
+            Ok(Column::with_nulls_ts(
+                data,
+                ts.nulls.clone(),
+                ts.type_id,
+                ts.ts_precision,
+            ))
+        }
+        // locf(col): last-observation-carried-forward. Replaces each NULL with
+        // the most recent preceding non-NULL value in the batch (rows are
+        // expected to arrive in the desired order, e.g. after ORDER BY). A
+        // leading run of NULLs stays NULL.
+        "locf" => {
+            if args.len() != 1 {
+                return Err(ZyronError::ExecutionError(
+                    "locf(col) takes exactly 1 argument".to_string(),
+                ));
+            }
+            let col = evaluate(&args[0], batch, schema, params)?;
+            let n = col.len();
+            let mut data = ColumnData::with_capacity(col.type_id, n);
+            let mut nulls = NullBitmap::none(n);
+            let mut last: Option<ScalarValue> = None;
+            for i in 0..n {
+                if col.is_null(i) {
+                    match &last {
+                        Some(v) => data.push_scalar(v),
+                        None => {
+                            data.push_scalar(&ScalarValue::Null);
+                            nulls.set_null(i);
+                        }
+                    }
+                } else {
+                    let v = col.data.get_scalar(i);
+                    data.push_scalar(&v);
+                    last = Some(v);
+                }
+            }
+            Ok(Column::with_nulls_ts(data, nulls, col.type_id, col.ts_precision))
+        }
+        // interpolate(col): linear interpolation. Each NULL between two
+        // non-NULL values is filled on the straight line between the nearest
+        // preceding and following non-NULL (by row index). Leading or trailing
+        // NULL runs (no bracketing pair) stay NULL. Numeric columns only.
+        "interpolate" => {
+            if args.len() != 1 {
+                return Err(ZyronError::ExecutionError(
+                    "interpolate(col) takes exactly 1 argument".to_string(),
+                ));
+            }
+            let col = evaluate(&args[0], batch, schema, params)?;
+            let n = col.len();
+            // Pull values as f64 with null mask.
+            let as_f64 = |i: usize| -> Option<f64> {
+                if col.is_null(i) {
+                    return None;
+                }
+                match col.data.get_scalar(i) {
+                    ScalarValue::Int8(v) => Some(v as f64),
+                    ScalarValue::Int16(v) => Some(v as f64),
+                    ScalarValue::Int32(v) => Some(v as f64),
+                    ScalarValue::Int64(v) => Some(v as f64),
+                    ScalarValue::Int128(v) => Some(v as f64),
+                    ScalarValue::Float32(v) => Some(v as f64),
+                    ScalarValue::Float64(v) => Some(v),
+                    _ => None,
+                }
+            };
+            let known: Vec<(usize, f64)> =
+                (0..n).filter_map(|i| as_f64(i).map(|v| (i, v))).collect();
+            let mut data = ColumnData::with_capacity(col.type_id, n);
+            let mut nulls = NullBitmap::none(n);
+            let int_like = matches!(
+                col.type_id,
+                TypeId::Int8
+                    | TypeId::Int16
+                    | TypeId::Int32
+                    | TypeId::Int64
+                    | TypeId::Int128
+                    | TypeId::Timestamp
+                    | TypeId::TimestampTz
+            );
+            for i in 0..n {
+                if !col.is_null(i) {
+                    data.push_scalar(&col.data.get_scalar(i));
+                    continue;
+                }
+                // Find bracketing known points.
+                let before = known.iter().rev().find(|(k, _)| *k < i).copied();
+                let after = known.iter().find(|(k, _)| *k > i).copied();
+                match (before, after) {
+                    (Some((i0, v0)), Some((i1, v1))) => {
+                        let t = (i - i0) as f64 / (i1 - i0) as f64;
+                        let v = v0 + (v1 - v0) * t;
+                        let sv = if int_like {
+                            ScalarValue::Int64(v.round() as i64)
+                        } else {
+                            ScalarValue::Float64(v)
+                        };
+                        // Coerce to the column's variant via push_scalar's
+                        // typed path by casting through a single-row column.
+                        let tmp = crate::compute::cast_column(
+                            &Column::new(
+                                if int_like {
+                                    ColumnData::Int64(vec![match sv {
+                                        ScalarValue::Int64(x) => x,
+                                        _ => 0,
+                                    }])
+                                } else {
+                                    ColumnData::Float64(vec![v])
+                                },
+                                if int_like {
+                                    TypeId::Int64
+                                } else {
+                                    TypeId::Float64
+                                },
+                            ),
+                            col.type_id,
+                        )?;
+                        data.push_scalar(&tmp.data.get_scalar(0));
+                    }
+                    _ => {
+                        data.push_scalar(&ScalarValue::Null);
+                        nulls.set_null(i);
+                    }
+                }
+            }
+            Ok(Column::with_nulls_ts(data, nulls, col.type_id, col.ts_precision))
         }
         "abs" => {
             let col = evaluate(&args[0], batch, schema, params)?;

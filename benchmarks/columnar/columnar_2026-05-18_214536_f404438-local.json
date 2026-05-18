@@ -1,0 +1,25 @@
+{
+  "id": "2026-05-18_214536_f404438-local",
+  "date": "2026-05-18 21:45:40Z",
+  "ts": 1779140740,
+  "commit": "f404438-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Fold Path": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 15.69 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 16.03 },
+      "Fold-path throughput (rows/sec)": {
+        "average": 4564649.293312,
+        "runs": [4330654.10, 4646775.37, 4758732.27, 4186973.49, 4900111.23],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}

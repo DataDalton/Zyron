@@ -8,7 +8,7 @@
 // contain more than one batch.
 
 use super::{ColumnSpec, FormatReader, FormatWriter};
-use super::schema::{arrow_to_type_id, type_id_to_arrow};
+use super::schema::{arrow_to_type_id, timestamp_arrow_type};
 use crate::row_codec::StreamValue;
 use arrow::array::RecordBatch;
 use arrow::datatypes::{Field, Schema};
@@ -51,7 +51,13 @@ impl FormatWriter for ArrowIpcWriter {
     ) -> Result<Vec<u8>> {
         let fields: Vec<Field> = schema
             .iter()
-            .map(|c| Field::new(&c.name, type_id_to_arrow(c.type_id), true))
+            .map(|c| {
+                Field::new(
+                    &c.name,
+                    timestamp_arrow_type(c.type_id, c.ts_precision),
+                    true,
+                )
+            })
             .collect();
         let arrow_schema = Arc::new(Schema::new(fields));
         let batch: RecordBatch =
@@ -87,7 +93,7 @@ pub fn infer_arrow_ipc_schema(bytes: &[u8]) -> Result<Vec<ColumnSpec>> {
     let mut cols = Vec::with_capacity(schema.fields().len());
     for field in schema.fields() {
         let type_id = arrow_to_type_id(field.data_type())?;
-        cols.push(ColumnSpec { name: field.name().to_string(), type_id });
+        cols.push(ColumnSpec::new(field.name().to_string(), type_id));
     }
     Ok(cols)
 }
@@ -107,6 +113,48 @@ mod tests {
         let mut reader = ArrowIpcReader;
         let decoded = reader.read_rows(&bytes, &schema).unwrap();
         assert_rows_equal(&decoded, &rows);
+    }
+
+    #[test]
+    fn arrow_ipc_ps_timestamp_exports_as_nanosecond_lossy() {
+        use crate::format::ColumnSpec;
+        use crate::row_codec::StreamValue;
+        use arrow::array::{Array, TimestampNanosecondArray};
+        use arrow::datatypes::{DataType as AT, TimeUnit};
+        use arrow::ipc::reader::StreamReader;
+
+        // A TIMESTAMP(9) column: i128 picoseconds. Arrow has no ps unit, so it
+        // must export as Timestamp(Nanosecond) with values truncated ps/1000.
+        let schema = vec![ColumnSpec::with_precision(
+            "t9",
+            TypeId::Timestamp,
+            Some(9),
+        )];
+        // 1_700_000_000_123_456_789_000 ps -> 1_700_000_000_123_456_789 ns.
+        // 1_999 ps -> 1 ns (truncating, not rounding). A null passes through.
+        let rows = vec![
+            vec![StreamValue::I128(1_700_000_000_123_456_789_000)],
+            vec![StreamValue::I128(1_999)],
+            vec![StreamValue::Null],
+        ];
+        let mut writer = ArrowIpcWriter;
+        let bytes = writer.write_rows(&rows, &schema).unwrap();
+
+        let mut rdr = StreamReader::try_new(std::io::Cursor::new(bytes), None).unwrap();
+        let batch = rdr.next().unwrap().unwrap();
+        assert_eq!(
+            batch.schema().field(0).data_type(),
+            &AT::Timestamp(TimeUnit::Nanosecond, None),
+            "ps column must export as a Nanosecond timestamp"
+        );
+        let a = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("nanosecond timestamp array");
+        assert_eq!(a.value(0), 1_700_000_000_123_456_789);
+        assert_eq!(a.value(1), 1, "ps->ns truncates the low 3 digits");
+        assert!(a.is_null(2), "null passes through");
     }
 
     #[test]

@@ -140,7 +140,8 @@ impl IndexAdvisor {
             let column_id = ColumnId(col_raw);
 
             // Check table size
-            if let Some((ts, cs)) = catalog.get_stats(table_id) {
+            if let Some(s) = catalog.get_stats(table_id) {
+                let (ts, cs) = (&s.0, &s.1);
                 if ts.row_count < self.min_table_rows {
                     continue;
                 }
@@ -249,6 +250,7 @@ mod tests {
                 column_id: ColumnId(5),
                 type_id: zyron_common::TypeId::Int64,
                 nullable: false,
+                ts_precision: None,
             }),
             child: Box::new(scan),
         };

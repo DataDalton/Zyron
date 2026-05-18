@@ -301,10 +301,7 @@ impl EndpointExecutor {
         // -----------------------------------------------------------------------------
         let schema: Vec<ColumnSpec> = output_schema
             .iter()
-            .map(|c| ColumnSpec {
-                name: c.name.clone(),
-                type_id: c.type_id,
-            })
+            .map(|c| ColumnSpec::with_precision(c.name.clone(), c.type_id, c.ts_precision))
             .collect();
         let rows = collect_rows(&batches, schema.len());
 

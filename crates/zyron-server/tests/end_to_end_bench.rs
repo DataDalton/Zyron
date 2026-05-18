@@ -217,6 +217,10 @@ async fn boot_server(db_name: &str) -> (E2EServer, Duration) {
         btree_indexes: Arc::new(scc::HashMap::new()),
         vacuum_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         analytics_registry: zyron_analytics::default_registry(),
+        legal_holds: Arc::new(zyron_lifecycle::legal_hold::LegalHoldRegistry::new()),
+        feature_store: zyron_analytics::featureStore(),
+        feature_lineage: zyron_analytics::featureLineageRegistry(),
+        model_cache: zyron_analytics::modelCache(),
     });
 
     let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.expect("bind"));

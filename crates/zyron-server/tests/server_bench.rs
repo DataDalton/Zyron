@@ -193,6 +193,10 @@ async fn create_test_state(
         btree_indexes: Arc::new(scc::HashMap::new()),
         vacuum_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         analytics_registry: zyron_analytics::default_registry(),
+        legal_holds: Arc::new(zyron_lifecycle::legal_hold::LegalHoldRegistry::new()),
+        feature_store: zyron_analytics::featureStore(),
+        feature_lineage: zyron_analytics::featureLineageRegistry(),
+        model_cache: zyron_analytics::modelCache(),
     });
 
     (state, wal, pool, disk, bg_writer, catalog)

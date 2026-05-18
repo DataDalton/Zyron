@@ -32,8 +32,14 @@ pub struct LogicalColumn {
     pub table_idx: Option<usize>,
     pub column_id: ColumnId,
     pub name: String,
+    /// Logical type. For a TIMESTAMP(p)/TIMESTAMPTZ(p) column this stays the
+    /// logical timestamp type; ts_precision records p so the executor can
+    /// pick the i128 picosecond physical buffer for p>6 while keeping the
+    /// logical identity for compare/cast/presentation.
     pub type_id: TypeId,
     pub nullable: bool,
+    /// Fractional-second precision for timestamp columns (None otherwise).
+    pub ts_precision: Option<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +228,7 @@ impl LogicalPlan {
                         name,
                         type_id: expr.type_id(),
                         nullable: expr.nullable(),
+                        ts_precision: expr.ts_precision(),
                     }
                 })
                 .collect(),
@@ -243,6 +250,7 @@ impl LogicalPlan {
                         name: format!("group{}", i),
                         type_id: expr.type_id(),
                         nullable: expr.nullable(),
+                        ts_precision: expr.ts_precision(),
                     });
                 }
                 for (i, agg) in aggregates.iter().enumerate() {
@@ -253,6 +261,8 @@ impl LogicalPlan {
                         name: agg.function_name.clone(),
                         type_id: agg.return_type,
                         nullable: true,
+                        // Aggregate-result precision finalized in B5.
+                        ts_precision: None,
                     });
                 }
                 schema
@@ -332,6 +342,7 @@ mod tests {
                     name: "id".to_string(),
                     type_id: TypeId::Int64,
                     nullable: false,
+                    ts_precision: None,
                 },
                 LogicalColumn {
                     table_idx: Some(0),
@@ -339,6 +350,7 @@ mod tests {
                     name: "name".to_string(),
                     type_id: TypeId::Varchar,
                     nullable: true,
+                    ts_precision: None,
                 },
             ],
             alias: "users".to_string(),
@@ -362,6 +374,7 @@ mod tests {
                 name: "id".to_string(),
                 type_id: TypeId::Int64,
                 nullable: false,
+                ts_precision: None,
             }],
             alias: "t".to_string(),
             encoding_hints: None,
@@ -390,6 +403,7 @@ mod tests {
                 name: "a".to_string(),
                 type_id: TypeId::Int64,
                 nullable: false,
+                ts_precision: None,
             }],
             alias: "l".to_string(),
             encoding_hints: None,
@@ -404,6 +418,7 @@ mod tests {
                 name: "b".to_string(),
                 type_id: TypeId::Int64,
                 nullable: false,
+                ts_precision: None,
             }],
             alias: "r".to_string(),
             encoding_hints: None,

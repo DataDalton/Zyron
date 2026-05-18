@@ -148,9 +148,9 @@ fn test_lexer_numbers() {
     let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n=== Lexer - Numbers ===");
 
-    let tokens = lex_all("42 3.14 1e10 2.5E-3");
+    let tokens = lex_all("42 3.5 1e10 2.5E-3");
     assert_eq!(tokens[0].token, Token::Integer(42));
-    assert!(matches!(tokens[1].token, Token::Float(f) if (f - 3.14).abs() < 1e-10));
+    assert!(matches!(tokens[1].token, Token::Float(f) if (f - 3.5).abs() < 1e-10));
     // 1e10 is integer "1" then ident "e10"
     assert_eq!(tokens[2].token, Token::Integer(1));
     assert!(matches!(tokens[4].token, Token::Float(f) if (f - 2.5e-3).abs() < 1e-10));
@@ -590,7 +590,7 @@ fn test_create_table() {
 
             // created_at TIMESTAMP DEFAULT now()
             assert_eq!(s.columns[2].name, "created_at");
-            assert_eq!(s.columns[2].data_type, DataType::Timestamp);
+            assert_eq!(s.columns[2].data_type, DataType::Timestamp(None));
             assert!(
                 s.columns[2]
                     .constraints
@@ -877,6 +877,9 @@ fn datatype_to_sql(dt: &DataType) -> String {
         DataType::Int => "INT".into(),
         DataType::BigInt => "BIGINT".into(),
         DataType::Int128 => "INT128".into(),
+        // HLC is the canonical keyword the lexer maps to Keyword::Hlc and
+        // the parser to DataType::Hlc, so this round-trips.
+        DataType::Hlc => "HLC".into(),
         DataType::UInt8 => "UINT8".into(),
         DataType::UInt16 => "UINT16".into(),
         DataType::UInt32 => "UINT32".into(),
@@ -906,8 +909,10 @@ fn datatype_to_sql(dt: &DataType) -> String {
         DataType::Bytea => "BYTEA".into(),
         DataType::Date => "DATE".into(),
         DataType::Time => "TIME".into(),
-        DataType::Timestamp => "TIMESTAMP".into(),
-        DataType::TimestampTz => "TIMESTAMPTZ".into(),
+        DataType::Timestamp(Some(p)) => format!("TIMESTAMP({})", p),
+        DataType::Timestamp(None) => "TIMESTAMP".into(),
+        DataType::TimestampTz(Some(p)) => format!("TIMESTAMPTZ({})", p),
+        DataType::TimestampTz(None) => "TIMESTAMPTZ".into(),
         DataType::Interval => "INTERVAL".into(),
         DataType::Uuid => "UUID".into(),
         DataType::Json => "JSON".into(),

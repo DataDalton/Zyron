@@ -19,7 +19,8 @@ pub use checksum::{
 pub use config::{ServerConfig, StorageConfig};
 pub use error::{Result, ZyronError};
 pub use interval::{
-    Interval, days_from_ymd, days_in_month, is_leap, parse_interval_string, ymd_from_days,
+    Interval, days_from_ymd, days_in_month, is_leap, parse_date_days, parse_interval_string,
+    parse_timestamp_micros, ymd_from_days,
 };
 pub use page::{PAGE_SIZE, PageHeader, PageId};
 pub use prng::{ReservoirL, Xoshiro256pp, splitMix64};

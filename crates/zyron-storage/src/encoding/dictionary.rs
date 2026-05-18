@@ -5,16 +5,30 @@
 //! Predicate evaluation resolves the search term to a code via binary search
 //! on the dictionary, then scans the code array without decoding.
 
-use crate::encoding::{Encoding, EncodingType, Predicate};
+use crate::encoding::{Encoding, EncodingType, Predicate, slice_rows, varlen_pack};
+use std::collections::{HashMap, HashSet};
 use zyron_common::{Result, ZyronError};
 
 pub struct DictionaryEncoding;
 
-/// Encoded format:
+/// Fixed-width encoded format (`value_size > 0`):
 ///   [0..4]     value_size: u32
 ///   [4..8]     dict_count: u32
 ///   [8..8+dict_count*value_size]  dictionary entries (sorted)
 ///   [8+dict_count*value_size..]   bit-packed code array (ceil(log2(dict_count)) bits per row)
+///
+/// Variable-length encoded format (`value_size == 0`, signalled by the stored
+/// value_size being 0):
+///   [0..4]     value_size: u32 = 0
+///   [4..8]     dict_count: u32
+///   [8..12]    dict_blob_len: u32
+///   [12 .. 12+4*(dict_count+1)]   dict offsets: u32 LE, dict_off[0]=0,
+///                                 dict_off[dict_count]=dict_blob_len
+///   [.. + dict_blob_len]          dict blob: sorted distinct values concatenated
+///   [.. ]                         bit-packed code array (row_count codes)
+/// Decode reproduces the canonical variable-length buffer. A null row is a
+/// zero-length value here; the segment null bitmap stays authoritative so an
+/// empty string and a null remain distinct.
 impl Encoding for DictionaryEncoding {
     fn encoding_type(&self) -> EncodingType {
         EncodingType::Dictionary
@@ -27,20 +41,26 @@ impl Encoding for DictionaryEncoding {
             return Ok(out);
         }
 
+        if value_size == 0 {
+            return encode_varlen(data, row_count);
+        }
+
         if data.len() < row_count * value_size {
             return Err(ZyronError::EncodingFailed(
                 "data shorter than expected for dictionary encoding".to_string(),
             ));
         }
 
-        // Collect distinct values in sorted order via binary search insertion
-        let mut distinct: Vec<&[u8]> = Vec::new();
+        // Dedup in O(n) via a hash set, then sort the distinct set once
+        // (O(k log k)). The prior binary-search + Vec::insert was O(k^2) in
+        // shifts on high-cardinality columns. The dictionary stays sorted, so
+        // the on-disk format and decode/predicate path are unchanged.
+        let mut seen: HashSet<&[u8]> = HashSet::with_capacity(row_count.min(4096));
         for i in 0..row_count {
-            let val = &data[i * value_size..(i + 1) * value_size];
-            if let Err(pos) = distinct.binary_search_by(|probe| (*probe).cmp(val)) {
-                distinct.insert(pos, val);
-            }
+            seen.insert(&data[i * value_size..(i + 1) * value_size]);
         }
+        let mut distinct: Vec<&[u8]> = seen.into_iter().collect();
+        distinct.sort_unstable();
 
         if distinct.len() > u32::MAX as usize {
             return Err(ZyronError::EncodingFailed(
@@ -70,17 +90,22 @@ impl Encoding for DictionaryEncoding {
             out.extend_from_slice(entry);
         }
 
+        // O(1) per-row code lookup instead of O(log k) binary search per row.
+        let code_of: HashMap<&[u8], u32> = distinct
+            .iter()
+            .enumerate()
+            .map(|(idx, v)| (*v, idx as u32))
+            .collect();
+
         // Bit-pack the code array
         let mut packed = vec![0u8; packedCodeBytes];
         for i in 0..row_count {
             let val = &data[i * value_size..(i + 1) * value_size];
-            let code = distinct
-                .binary_search_by(|probe| (*probe).cmp(val))
-                .map_err(|_| {
-                    ZyronError::EncodingFailed(
-                        "value not found in dictionary during encoding".to_string(),
-                    )
-                })? as u32;
+            let code = *code_of.get(val).ok_or_else(|| {
+                ZyronError::EncodingFailed(
+                    "value not found in dictionary during encoding".to_string(),
+                )
+            })?;
             pack_bits(
                 &mut packed,
                 i as u64 * codeBitWidth as u64,
@@ -102,6 +127,10 @@ impl Encoding for DictionaryEncoding {
             return Err(ZyronError::DecodingFailed(
                 "dictionary header too short".to_string(),
             ));
+        }
+
+        if value_size == 0 {
+            return decode_varlen(encoded, row_count);
         }
 
         let storedValueSize =
@@ -169,6 +198,12 @@ impl Encoding for DictionaryEncoding {
             return Err(ZyronError::DecodingFailed(
                 "dictionary header too short for predicate evaluation".to_string(),
             ));
+        }
+
+        let headerValueSize =
+            u32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]) as usize;
+        if headerValueSize == 0 {
+            return eval_predicate_varlen(encoded, row_count, predicate);
         }
 
         let storedValueSize =
@@ -273,6 +308,214 @@ fn dict_binary_search(
     None
 }
 
+/// Code bit width for a dictionary of `dict_count` entries.
+#[inline]
+fn code_bit_width(dict_count: usize) -> u8 {
+    if dict_count <= 1 {
+        1u8
+    } else {
+        (32 - (dict_count as u32 - 1).leading_zeros()) as u8
+    }
+}
+
+/// Encodes the canonical variable-length buffer as a variable-length
+/// dictionary. Distinct values are stored once, sorted, behind their own
+/// u32 offset array; each row becomes a bit-packed code.
+fn encode_varlen(data: &[u8], row_count: usize) -> Result<Vec<u8>> {
+    let rows = slice_rows(data, row_count, 0)?;
+
+    let mut seen: HashSet<&[u8]> = HashSet::with_capacity(row_count.min(4096));
+    for r in &rows {
+        seen.insert(*r);
+    }
+    let mut distinct: Vec<&[u8]> = seen.into_iter().collect();
+    distinct.sort_unstable();
+
+    if distinct.len() > u32::MAX as usize {
+        return Err(ZyronError::EncodingFailed(
+            "dictionary cardinality exceeds u32 range".to_string(),
+        ));
+    }
+    let dict_count = distinct.len();
+    let code_of: HashMap<&[u8], u32> = distinct
+        .iter()
+        .enumerate()
+        .map(|(idx, v)| (*v, idx as u32))
+        .collect();
+
+    let dict_blob_len: usize = distinct.iter().map(|v| v.len()).sum();
+    if dict_blob_len > u32::MAX as usize {
+        return Err(ZyronError::EncodingFailed(
+            "dictionary blob exceeds u32 range".to_string(),
+        ));
+    }
+    let code_bits = code_bit_width(dict_count);
+    let packed_bytes = (row_count as u64 * code_bits as u64).div_ceil(8) as usize;
+    let offsets_bytes = 4 * (dict_count + 1);
+
+    let mut out = Vec::with_capacity(12 + offsets_bytes + dict_blob_len + packed_bytes);
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&(dict_count as u32).to_le_bytes());
+    out.extend_from_slice(&(dict_blob_len as u32).to_le_bytes());
+
+    let mut cursor = 0u32;
+    out.extend_from_slice(&cursor.to_le_bytes());
+    for v in &distinct {
+        cursor += v.len() as u32;
+        out.extend_from_slice(&cursor.to_le_bytes());
+    }
+    for v in &distinct {
+        out.extend_from_slice(v);
+    }
+
+    let mut packed = vec![0u8; packed_bytes];
+    for (i, r) in rows.iter().enumerate() {
+        let code = *code_of.get(*r).ok_or_else(|| {
+            ZyronError::EncodingFailed("value not found in dictionary during encoding".to_string())
+        })?;
+        pack_bits(
+            &mut packed,
+            i as u64 * code_bits as u64,
+            code as u64,
+            code_bits,
+        );
+    }
+    out.extend_from_slice(&packed);
+    Ok(out)
+}
+
+/// Reads the variable-length dictionary container header. Returns
+/// (dict_count, dict offsets, blob slice, packed code slice).
+fn read_varlen_container(encoded: &[u8]) -> Result<(usize, Vec<u32>, &[u8], &[u8])> {
+    if encoded.len() < 12 {
+        return Err(ZyronError::DecodingFailed(
+            "varlen dictionary header too short".to_string(),
+        ));
+    }
+    let dict_count = u32::from_le_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]) as usize;
+    let dict_blob_len =
+        u32::from_le_bytes([encoded[8], encoded[9], encoded[10], encoded[11]]) as usize;
+    let offsets_start = 12;
+    let offsets_end = offsets_start + 4 * (dict_count + 1);
+    let blob_end = offsets_end + dict_blob_len;
+    if encoded.len() < blob_end {
+        return Err(ZyronError::DecodingFailed(
+            "varlen dictionary blob truncated".to_string(),
+        ));
+    }
+    let mut offsets = Vec::with_capacity(dict_count + 1);
+    for i in 0..=dict_count {
+        let p = offsets_start + 4 * i;
+        offsets.push(u32::from_le_bytes([
+            encoded[p],
+            encoded[p + 1],
+            encoded[p + 2],
+            encoded[p + 3],
+        ]));
+    }
+    if offsets[dict_count] as usize != dict_blob_len {
+        return Err(ZyronError::DecodingFailed(
+            "varlen dictionary offset array inconsistent with blob length".to_string(),
+        ));
+    }
+    let blob = &encoded[offsets_end..blob_end];
+    let packed = &encoded[blob_end..];
+    Ok((dict_count, offsets, blob, packed))
+}
+
+/// Returns dictionary entry `i` as a byte slice.
+#[inline]
+fn varlen_dict_entry<'a>(blob: &'a [u8], offsets: &[u32], i: usize) -> &'a [u8] {
+    &blob[offsets[i] as usize..offsets[i + 1] as usize]
+}
+
+/// Decodes a variable-length dictionary back to the canonical buffer.
+fn decode_varlen(encoded: &[u8], row_count: usize) -> Result<Vec<u8>> {
+    let (dict_count, offsets, blob, packed) = read_varlen_container(encoded)?;
+    let code_bits = code_bit_width(dict_count);
+    let mut rows: Vec<&[u8]> = Vec::with_capacity(row_count);
+    for i in 0..row_count {
+        let code = unpack_bits(packed, i as u64 * code_bits as u64, code_bits) as usize;
+        if code >= dict_count {
+            return Err(ZyronError::DecodingFailed(format!(
+                "varlen dictionary code {} out of range (dict_count={})",
+                code, dict_count
+            )));
+        }
+        rows.push(varlen_dict_entry(blob, &offsets, code));
+    }
+    let refs: Vec<Option<&[u8]>> = rows.iter().map(|r| Some(*r)).collect();
+    Ok(varlen_pack(&refs))
+}
+
+/// Evaluates a predicate on a variable-length dictionary. Comparisons are
+/// lexicographic over the distinct entries (correct for string and binary
+/// columns), then the bit-packed codes are scanned once.
+fn eval_predicate_varlen(
+    encoded: &[u8],
+    row_count: usize,
+    predicate: &Predicate,
+) -> Result<Vec<u8>> {
+    let (dict_count, offsets, blob, packed) = read_varlen_container(encoded)?;
+    let code_bits = code_bit_width(dict_count);
+    let bitmask_len = row_count.div_ceil(8);
+    let mut bitmask = vec![0u8; bitmask_len];
+
+    // The distinct entries are stored sorted, so equality/IN resolve by
+    // binary search and a range scans the contiguous matching prefix.
+    let find = |target: &[u8]| -> Option<u32> {
+        let mut lo = 0usize;
+        let mut hi = dict_count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match varlen_dict_entry(blob, &offsets, mid).cmp(target) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Equal => return Some(mid as u32),
+                std::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+        None
+    };
+
+    let mut matching: Vec<u32> = Vec::new();
+    match predicate {
+        Predicate::Equality(target) => {
+            if let Some(c) = find(target) {
+                matching.push(c);
+            }
+        }
+        Predicate::Range { low, high } => {
+            for c in 0..dict_count {
+                let entry = varlen_dict_entry(blob, &offsets, c);
+                let above = low.map_or(true, |lo| entry >= lo);
+                let below = high.map_or(true, |hi| entry <= hi);
+                if above && below {
+                    matching.push(c as u32);
+                }
+            }
+        }
+        Predicate::In(values) => {
+            for t in *values {
+                if let Some(c) = find(t) {
+                    matching.push(c);
+                }
+            }
+        }
+    }
+
+    if matching.is_empty() {
+        return Ok(bitmask);
+    }
+    matching.sort_unstable();
+    for i in 0..row_count {
+        let code = unpack_bits(packed, i as u64 * code_bits as u64, code_bits) as u32;
+        if matching.binary_search(&code).is_ok() {
+            bitmask[i / 8] |= 1 << (i % 8);
+        }
+    }
+    Ok(bitmask)
+}
+
 /// Packs a u64 value at the given bit offset.
 #[inline]
 fn pack_bits(packed: &mut [u8], bit_offset: u64, value: u64, bit_width: u8) {
@@ -326,6 +569,86 @@ fn unpack_bits(packed: &[u8], bit_offset: u64, bit_width: u8) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::{eval_predicate_on_raw, varlen_slice_rows};
+
+    #[test]
+    fn test_varlen_roundtrip_and_density() {
+        let enc = DictionaryEncoding;
+        // Low-cardinality category column: 3 distinct values over 3000 rows,
+        // plus a null (zero-length) row mixed in.
+        let cats: [&[u8]; 3] = [b"pending", b"shipped", b"delivered"];
+        let mut vals: Vec<Option<&[u8]>> = Vec::with_capacity(3001);
+        for i in 0..3000 {
+            vals.push(Some(cats[i % 3]));
+        }
+        vals.push(None);
+        let raw = varlen_pack(&vals);
+
+        let encoded = enc.encode(&raw, vals.len(), 0).unwrap();
+        // 3 codes + a null entry -> tiny dict + 2-bit codes, far under raw.
+        assert!(
+            encoded.len() < raw.len() / 4,
+            "varlen dictionary must be dense: {} vs {}",
+            encoded.len(),
+            raw.len()
+        );
+
+        let decoded = enc.decode(&encoded, vals.len(), 0).unwrap();
+        let rows = varlen_slice_rows(&decoded, vals.len()).unwrap();
+        for i in 0..3000 {
+            assert_eq!(rows[i], cats[i % 3]);
+        }
+        assert_eq!(rows[3000], b"");
+    }
+
+    #[test]
+    fn test_varlen_predicate_matches_full_scan() {
+        let enc = DictionaryEncoding;
+        let cats: [&[u8]; 4] = [b"a", b"bb", b"ccc", b"dddd"];
+        let vals: Vec<Option<&[u8]>> = (0..500).map(|i| Some(cats[i % 4])).collect();
+        let raw = varlen_pack(&vals);
+        let encoded = enc.encode(&raw, vals.len(), 0).unwrap();
+
+        let eq = enc
+            .eval_predicate(&encoded, vals.len(), 0, &Predicate::Equality(b"ccc"))
+            .unwrap();
+        let truth =
+            eval_predicate_on_raw(&raw, vals.len(), 0, &Predicate::Equality(b"ccc")).unwrap();
+        assert_eq!(eq, truth);
+
+        let lo: &[u8] = b"bb";
+        let hi: &[u8] = b"ccc";
+        let rng = enc
+            .eval_predicate(
+                &encoded,
+                vals.len(),
+                0,
+                &Predicate::Range {
+                    low: Some(lo),
+                    high: Some(hi),
+                },
+            )
+            .unwrap();
+        let rng_truth = eval_predicate_on_raw(
+            &raw,
+            vals.len(),
+            0,
+            &Predicate::Range {
+                low: Some(lo),
+                high: Some(hi),
+            },
+        )
+        .unwrap();
+        assert_eq!(rng, rng_truth);
+
+        let in_set: [&[u8]; 2] = [b"a", b"dddd"];
+        let isin = enc
+            .eval_predicate(&encoded, vals.len(), 0, &Predicate::In(&in_set))
+            .unwrap();
+        let isin_truth =
+            eval_predicate_on_raw(&raw, vals.len(), 0, &Predicate::In(&in_set)).unwrap();
+        assert_eq!(isin, isin_truth);
+    }
 
     #[test]
     fn test_roundtrip_i32() {

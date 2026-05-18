@@ -9,6 +9,21 @@ use zyron_common::error::{Result, ZyronError};
 /// Maximum timestamp sentinel (9999-12-31 23:59:59 UTC in microseconds).
 pub const MAX_TIMESTAMP: i64 = 253_402_300_799_000_000;
 
+/// Same wall-clock instant as MAX_TIMESTAMP expressed in picoseconds, used by
+/// system-versioned period columns declared with precision p>6.
+pub const MAX_TIMESTAMP_PS: i128 = (MAX_TIMESTAMP as i128) * 1_000_000;
+
+/// sys_end sentinel for a period column at the given fractional-second
+/// precision. p<=6 -> microsecond value, p>6 -> picosecond value.
+#[inline]
+pub fn max_timestamp_sentinel(precision: Option<u8>) -> i128 {
+    if precision.unwrap_or(6) > 6 {
+        MAX_TIMESTAMP_PS
+    } else {
+        MAX_TIMESTAMP as i128
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Temporal table types
 // ---------------------------------------------------------------------------
@@ -127,6 +142,62 @@ impl SystemVersionedTable {
     pub fn on_delete(now_micros: i64) -> i64 {
         now_micros
     }
+
+    /// Scales an engine `now` microsecond reading to the period column's
+    /// precision. p<=6 keeps microseconds, p>6 widens to picoseconds (exact,
+    /// us->ps is *1_000_000). Returned as i128 so a precision-6 and a
+    /// precision-9 period column share one code path.
+    #[inline]
+    pub fn now_at_precision(now_micros: i64, precision: Option<u8>) -> i128 {
+        if precision.unwrap_or(6) > 6 {
+            now_micros as i128 * 1_000_000
+        } else {
+            now_micros as i128
+        }
+    }
+
+    /// Precision-aware INSERT defaults: (sys_start, sys_end) at the period
+    /// column's resolution. sys_end is the precision-correct max sentinel
+    /// (`MAX_TIMESTAMP` micros for p<=6, `MAX_TIMESTAMP_PS` for p>6) so a
+    /// live row's open interval stays open under `sys_end > point`.
+    #[inline]
+    pub fn on_insert_defaults_p(now_micros: i64, precision: Option<u8>) -> (i128, i128) {
+        (
+            Self::now_at_precision(now_micros, precision),
+            max_timestamp_sentinel(precision),
+        )
+    }
+
+    /// Precision-aware UPDATE actions at the period column's resolution.
+    #[inline]
+    pub fn on_update_p(now_micros: i64, precision: Option<u8>) -> SystemVersionedUpdateActionsP {
+        let now = Self::now_at_precision(now_micros, precision);
+        SystemVersionedUpdateActionsP {
+            old_sys_end: now,
+            new_sys_start: now,
+            new_sys_end: max_timestamp_sentinel(precision),
+        }
+    }
+
+    /// Precision-aware DELETE sys_end (the soft-delete instant) at the period
+    /// column's resolution.
+    #[inline]
+    pub fn on_delete_p(now_micros: i64, precision: Option<u8>) -> i128 {
+        Self::now_at_precision(now_micros, precision)
+    }
+}
+
+/// Precision-aware variant of [`SystemVersionedUpdateActions`]. Values are
+/// i128 so a microsecond (p<=6) and a picosecond (p>6) period column share
+/// one type without a lossy narrowing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemVersionedUpdateActionsP {
+    /// Set sys_end on the old row.
+    pub old_sys_end: i128,
+    /// Set sys_start on the new row.
+    pub new_sys_start: i128,
+    /// Set sys_end on the new row.
+    pub new_sys_end: i128,
 }
 
 // ---------------------------------------------------------------------------
@@ -339,6 +410,39 @@ mod tests {
     #[test]
     fn test_system_versioned_delete() {
         assert_eq!(SystemVersionedTable::on_delete(9000), 9000);
+    }
+
+    #[test]
+    fn test_max_timestamp_ps_is_exact_us_scale() {
+        assert_eq!(MAX_TIMESTAMP_PS, MAX_TIMESTAMP as i128 * 1_000_000);
+        assert_eq!(max_timestamp_sentinel(None), MAX_TIMESTAMP as i128);
+        assert_eq!(max_timestamp_sentinel(Some(6)), MAX_TIMESTAMP as i128);
+        assert_eq!(max_timestamp_sentinel(Some(9)), MAX_TIMESTAMP_PS);
+        assert_eq!(max_timestamp_sentinel(Some(12)), MAX_TIMESTAMP_PS);
+    }
+
+    #[test]
+    fn test_precision_aware_defaults() {
+        // p<=6: microseconds, sentinel == MAX_TIMESTAMP.
+        let (s6, e6) = SystemVersionedTable::on_insert_defaults_p(1_000, Some(6));
+        assert_eq!(s6, 1_000);
+        assert_eq!(e6, MAX_TIMESTAMP as i128);
+
+        // p>6: now widened to picoseconds, sentinel == MAX_TIMESTAMP_PS.
+        let (s9, e9) = SystemVersionedTable::on_insert_defaults_p(1_000, Some(9));
+        assert_eq!(s9, 1_000i128 * 1_000_000);
+        assert_eq!(e9, MAX_TIMESTAMP_PS);
+
+        let u9 = SystemVersionedTable::on_update_p(5_000, Some(12));
+        assert_eq!(u9.old_sys_end, 5_000i128 * 1_000_000);
+        assert_eq!(u9.new_sys_start, 5_000i128 * 1_000_000);
+        assert_eq!(u9.new_sys_end, MAX_TIMESTAMP_PS);
+
+        assert_eq!(
+            SystemVersionedTable::on_delete_p(9_000, Some(9)),
+            9_000i128 * 1_000_000
+        );
+        assert_eq!(SystemVersionedTable::on_delete_p(9_000, Some(6)), 9_000i128);
     }
 
     #[test]

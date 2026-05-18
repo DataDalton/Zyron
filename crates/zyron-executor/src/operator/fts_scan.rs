@@ -89,8 +89,7 @@ impl Operator for FulltextScanOperator {
             let mut builders = create_builders(&self.output_columns, batch_size);
             let output_ids: Vec<zyron_catalog::ColumnId> =
                 self.output_columns.iter().map(|c| c.column_id).collect();
-            let column_to_builder =
-                build_column_to_builder_map(&table_entry.columns, &output_ids);
+            let column_to_builder = build_column_to_builder_map(&table_entry.columns, &output_ids);
             let mut scores: Vec<f64> = Vec::with_capacity(batch_size);
             let mut row_count = 0usize;
 
@@ -137,11 +136,10 @@ impl Operator for FulltextScanOperator {
 
             let mut batch = finalize_builders(builders);
             // Append relevance score as an additional Float64 column.
-            batch.columns.push(crate::column::Column {
-                data: crate::column::ColumnData::Float64(scores),
-                nulls: crate::column::NullBitmap::none(row_count),
-                type_id: zyron_common::TypeId::Float64,
-            });
+            batch.columns.push(crate::column::Column::new(
+                crate::column::ColumnData::Float64(scores),
+                zyron_common::TypeId::Float64,
+            ));
             Ok(Some(ExecutionBatch::new(batch)))
         })
     }

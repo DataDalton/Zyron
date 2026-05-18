@@ -6,7 +6,9 @@
 
 use crate::columnar::bloom::BloomFilter;
 use crate::columnar::constants::*;
-use crate::encoding::{EncodingType, create_encoding, select_encoding};
+use crate::encoding::{
+    EncodingType, create_encoding, select_encoding, select_encoding_varlen, varlen_pack,
+};
 use zyron_common::types::TypeId;
 use zyron_common::{Result, ZyronError};
 
@@ -20,9 +22,9 @@ pub struct SegmentHeader {
     /// Encoding strategy applied to this segment's data.
     pub encoding_type: EncodingType,
     /// Byte size of column data before encoding.
-    pub uncompressed_size: u64,
+    pub raw_size: u64,
     /// Byte size of encoded column data.
-    pub compressed_size: u64,
+    pub encoded_size: u64,
     /// Number of null values in this segment.
     pub null_count: u64,
     /// Number of distinct non-null values.
@@ -31,8 +33,15 @@ pub struct SegmentHeader {
     pub min_value: [u8; STAT_VALUE_SIZE],
     /// Maximum value in the segment (left-padded with zeros).
     pub max_value: [u8; STAT_VALUE_SIZE],
-    /// Byte offset from start of file to encoded data.
-    pub data_offset: u64,
+    /// CRC of this segment's encoded payload. The scan verifies it over the
+    /// bytes it reads to decode anyway, so corruption is detected with zero
+    /// extra IO. A metadata aggregate never reads the payload, so it never
+    /// pays this.
+    pub data_checksum: u32,
+    /// CRC of the segment header itself (bytes [0..108]). Lets a metadata
+    /// aggregate trust min/max/null_count/encoded_size from a header-only
+    /// read without a whole-file checksum pass.
+    pub header_crc: u32,
     /// Byte offset from start of file to bloom filter (0 if absent).
     pub bloom_filter_offset: u64,
     /// Size of bloom filter in bytes.
@@ -49,17 +58,21 @@ impl SegmentHeader {
         buf[0..4].copy_from_slice(&self.column_id.to_le_bytes());
         buf[4] = self.encoding_type as u8;
         // [5..8] reserved
-        buf[8..16].copy_from_slice(&self.uncompressed_size.to_le_bytes());
-        buf[16..24].copy_from_slice(&self.compressed_size.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.raw_size.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.encoded_size.to_le_bytes());
         buf[24..32].copy_from_slice(&self.null_count.to_le_bytes());
         buf[32..40].copy_from_slice(&self.cardinality.to_le_bytes());
         buf[40..72].copy_from_slice(&self.min_value);
         buf[72..104].copy_from_slice(&self.max_value);
-        buf[104..112].copy_from_slice(&self.data_offset.to_le_bytes());
+        buf[104..108].copy_from_slice(&self.data_checksum.to_le_bytes());
+        // [108..112] = header_crc, filled last over [0..108].
         buf[112..120].copy_from_slice(&self.bloom_filter_offset.to_le_bytes());
         buf[120..124].copy_from_slice(&self.bloom_filter_size.to_le_bytes());
         buf[124] = if self.is_sorted { 1 } else { 0 };
         // [125..128] reserved
+
+        let hc = zyron_common::hash32(&buf[0..108]);
+        buf[108..112].copy_from_slice(&hc.to_le_bytes());
 
         buf
     }
@@ -68,10 +81,10 @@ impl SegmentHeader {
     pub fn from_bytes(buf: &[u8; SEGMENT_HEADER_SIZE]) -> Result<Self> {
         let columnId = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         let encodingType = EncodingType::from_u8(buf[4])?;
-        let uncompressedSize = u64::from_le_bytes([
+        let rawSize = u64::from_le_bytes([
             buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
         ]);
-        let compressedSize = u64::from_le_bytes([
+        let encodedSize = u64::from_le_bytes([
             buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
         ]);
         let nullCount = u64::from_le_bytes([
@@ -86,9 +99,17 @@ impl SegmentHeader {
         let mut maxValue = [0u8; STAT_VALUE_SIZE];
         maxValue.copy_from_slice(&buf[72..104]);
 
-        let dataOffset = u64::from_le_bytes([
-            buf[104], buf[105], buf[106], buf[107], buf[108], buf[109], buf[110], buf[111],
-        ]);
+        let dataChecksum = u32::from_le_bytes([buf[104], buf[105], buf[106], buf[107]]);
+        let headerCrc = u32::from_le_bytes([buf[108], buf[109], buf[110], buf[111]]);
+        // Self-verify the header so a metadata aggregate can trust it from a
+        // header-only read (no whole-file checksum pass).
+        let computed = zyron_common::hash32(&buf[0..108]);
+        if headerCrc != computed {
+            return Err(ZyronError::InvalidZyrFile(format!(
+                "segment header checksum mismatch: stored 0x{:08x}, computed 0x{:08x}",
+                headerCrc, computed
+            )));
+        }
         let bloomFilterOffset = u64::from_le_bytes([
             buf[112], buf[113], buf[114], buf[115], buf[116], buf[117], buf[118], buf[119],
         ]);
@@ -98,13 +119,14 @@ impl SegmentHeader {
         Ok(Self {
             column_id: columnId,
             encoding_type: encodingType,
-            uncompressed_size: uncompressedSize,
-            compressed_size: compressedSize,
+            raw_size: rawSize,
+            encoded_size: encodedSize,
             null_count: nullCount,
             cardinality,
             min_value: minValue,
             max_value: maxValue,
-            data_offset: dataOffset,
+            data_checksum: dataChecksum,
+            header_crc: headerCrc,
             bloom_filter_offset: bloomFilterOffset,
             bloom_filter_size: bloomFilterSize,
             is_sorted: isSorted,
@@ -174,6 +196,59 @@ pub fn value_to_stat_slot(value: &[u8]) -> [u8; STAT_VALUE_SIZE] {
     slot
 }
 
+/// True when this column's fixed-width value is a signed integer in two's
+/// complement (so a negative value's high byte has bit 7 set and an unsigned
+/// byte comparison would rank it above every non-negative value). Temporal
+/// and HLC columns are integer-backed (Date i32, Time/Timestamp/TimestampTz/
+/// Interval i64, ps Timestamp/HLC i128) and are stamped from a signed instant,
+/// so a pre-1970 / negative picosecond must sort below 1970. Unsigned integer
+/// types keep the plain unsigned ordering.
+pub fn stat_slot_is_signed(type_id: TypeId) -> bool {
+    matches!(
+        type_id,
+        TypeId::Int8
+            | TypeId::Int16
+            | TypeId::Int32
+            | TypeId::Int64
+            | TypeId::Int128
+            | TypeId::Decimal
+            | TypeId::Date
+            | TypeId::Time
+            | TypeId::Timestamp
+            | TypeId::TimestampTz
+            | TypeId::Interval
+            | TypeId::Hlc
+    )
+}
+
+/// Compares two stat slots holding `width`-byte little-endian values.
+/// `signed` selects two's complement ordering: when the operands have
+/// different sign bits the negative one is the smaller, otherwise (same sign,
+/// including two negatives) the unsigned little-endian comparison of the value
+/// bytes is already the correct order. The slot stays raw value bytes so the
+/// metadata-aggregate decode reads the true signed extremum back unchanged.
+pub fn compare_stat_slots_typed(
+    a: &[u8; STAT_VALUE_SIZE],
+    b: &[u8; STAT_VALUE_SIZE],
+    width: usize,
+    signed: bool,
+) -> std::cmp::Ordering {
+    if signed && width > 0 {
+        let sign_byte = width - 1;
+        let a_neg = a[sign_byte] & 0x80 != 0;
+        let b_neg = b[sign_byte] & 0x80 != 0;
+        if a_neg != b_neg {
+            // The negative operand is the smaller one.
+            return if a_neg {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            };
+        }
+    }
+    compare_stat_slots(a, b)
+}
+
 /// Compares two stat slots as unsigned little-endian integers.
 /// Returns Ordering::Less, Equal, or Greater.
 /// For LE values, comparison starts from the most significant byte (highest index
@@ -229,6 +304,10 @@ impl ColumnSegment {
             ));
         }
 
+        if valueSize == 0 {
+            return Self::build_varlen(columnId, typeId, values);
+        }
+
         // Single fused pass over values, computes:
         //   - null count and null bitmap
         //   - global min/max stat slots
@@ -246,16 +325,25 @@ impl ColumnSegment {
         // the L1/L2 cache cold for each pass on large columns, the fused
         // pass touches each value once and keeps zone-map and bitmap state
         // in registers
-        let uncompressedSize = (rowCount * valueSize) as u64;
-        // Skip the upfront zero-fill, the fused pass below explicitly zeros
-        // null slots and writes non-null values into their slots, so every
-        // byte of rawData is touched before the encoder reads it
+        let rawSize = (rowCount * valueSize) as u64;
+        // SAFETY: the fused pass below writes every one of `buf_len` slots
+        // (null slots explicitly zeroed, non-null slots copied) before the
+        // encoder reads rawData; no path reads it before the fill. Zeroing
+        // up front would memset the whole column buffer only to overwrite
+        // it, regressing encode/compaction throughput on large columns.
         let buf_len = rowCount * valueSize;
-        let mut rawData: Vec<u8> = Vec::with_capacity(buf_len);
-        // SAFETY, capacity reserved above, every slot is written below
-        unsafe {
-            rawData.set_len(buf_len);
-        }
+        #[allow(clippy::uninit_vec)]
+        let mut rawData: Vec<u8> = {
+            let mut v = Vec::with_capacity(buf_len);
+            unsafe { v.set_len(buf_len) };
+            v
+        };
+
+        // Two's complement ordering for signed columns so a negative value
+        // (incl. a pre-1970 picosecond timestamp) sorts below zero in the
+        // segment min/max instead of above every positive under an unsigned
+        // byte compare.
+        let statSigned = stat_slot_is_signed(typeId);
 
         let batchSize = ZONE_MAP_BATCH_SIZE as usize;
         let zoneCount = rowCount.div_ceil(batchSize);
@@ -318,7 +406,8 @@ impl ColumnSegment {
 
                     globalMin = Some(match globalMin {
                         Some(cur)
-                            if compare_stat_slots(&cur, &slot) != std::cmp::Ordering::Greater =>
+                            if compare_stat_slots_typed(&cur, &slot, valueSize, statSigned)
+                                != std::cmp::Ordering::Greater =>
                         {
                             cur
                         }
@@ -326,7 +415,8 @@ impl ColumnSegment {
                     });
                     globalMax = Some(match globalMax {
                         Some(cur)
-                            if compare_stat_slots(&cur, &slot) != std::cmp::Ordering::Less =>
+                            if compare_stat_slots_typed(&cur, &slot, valueSize, statSigned)
+                                != std::cmp::Ordering::Less =>
                         {
                             cur
                         }
@@ -335,7 +425,8 @@ impl ColumnSegment {
 
                     zoneMin = Some(match zoneMin {
                         Some(cur)
-                            if compare_stat_slots(&cur, &slot) != std::cmp::Ordering::Greater =>
+                            if compare_stat_slots_typed(&cur, &slot, valueSize, statSigned)
+                                != std::cmp::Ordering::Greater =>
                         {
                             cur
                         }
@@ -343,7 +434,8 @@ impl ColumnSegment {
                     });
                     zoneMax = Some(match zoneMax {
                         Some(cur)
-                            if compare_stat_slots(&cur, &slot) != std::cmp::Ordering::Less =>
+                            if compare_stat_slots_typed(&cur, &slot, valueSize, statSigned)
+                                != std::cmp::Ordering::Less =>
                         {
                             cur
                         }
@@ -389,7 +481,7 @@ impl ColumnSegment {
         let encoder = create_encoding(encodingType);
 
         let encodedData = encoder.encode(&rawData, rowCount, valueSize)?;
-        let compressedSize = encodedData.len() as u64;
+        let encodedSize = encodedData.len() as u64;
 
         // Build bloom filter when cardinality is high enough to benefit
         // Dictionary-encoded segments already have an implicit lookup structure
@@ -419,13 +511,161 @@ impl ColumnSegment {
         let header = SegmentHeader {
             column_id: columnId,
             encoding_type: encodingType,
-            uncompressed_size: uncompressedSize,
-            compressed_size: compressedSize,
+            raw_size: rawSize,
+            encoded_size: encodedSize,
             null_count: nullCount,
             cardinality,
             min_value: minValue,
             max_value: maxValue,
-            data_offset: 0,
+            data_checksum: zyron_common::hash32(&encodedData),
+            header_crc: 0,
+            bloom_filter_offset: 0,
+            bloom_filter_size: bloomFilterSize,
+            is_sorted: isSorted,
+        };
+
+        Ok(Self {
+            header,
+            bloom_filter: bloomFilter,
+            zone_maps: zoneMaps,
+            encoded_data: encodedData,
+            null_bitmap: nullBitmap,
+        })
+    }
+
+    /// Builds a variable-length column segment. Values are stored in the
+    /// canonical variable-length buffer (a u32 offset array plus a values
+    /// blob). Zone-map and segment min/max use a left-aligned, zero-padded
+    /// byte prefix into STAT_VALUE_SIZE compared lexicographically. The same
+    /// prefix transform is applied to predicate literals at prune time, so a
+    /// shared prefix only ever widens a zone (a conservative non-skip), never
+    /// a false skip. The null bitmap is authoritative, so an empty string and
+    /// a null stay distinct.
+    fn build_varlen(columnId: u32, typeId: TypeId, values: &[Option<&[u8]>]) -> Result<Self> {
+        let rowCount = values.len();
+        let batchSize = ZONE_MAP_BATCH_SIZE as usize;
+        let zoneCount = rowCount.div_ceil(batchSize);
+        let mut zoneMaps: Vec<ZoneMapEntry> = Vec::with_capacity(zoneCount);
+
+        let mut nullCount = 0u64;
+        let mut nullBitmap: Vec<u8> = Vec::new();
+        let mut distinct = hashbrown::HashSet::new();
+        let mut distinctCapped = false;
+        let mut globalMin: Option<[u8; STAT_VALUE_SIZE]> = None;
+        let mut globalMax: Option<[u8; STAT_VALUE_SIZE]> = None;
+        let mut isSorted = true;
+        let mut prevRaw: Option<&[u8]> = None;
+
+        let mut zoneMin: Option<[u8; STAT_VALUE_SIZE]> = None;
+        let mut zoneMax: Option<[u8; STAT_VALUE_SIZE]> = None;
+        let mut zoneIdx = 0usize;
+
+        for (i, val) in values.iter().enumerate() {
+            let nextZoneBoundary = (zoneIdx + 1) * batchSize;
+            if i == nextZoneBoundary {
+                zoneMaps.push(ZoneMapEntry {
+                    min_value: zoneMin.unwrap_or([0xFF; STAT_VALUE_SIZE]),
+                    max_value: zoneMax.unwrap_or([0u8; STAT_VALUE_SIZE]),
+                });
+                zoneMin = None;
+                zoneMax = None;
+                zoneIdx += 1;
+            }
+
+            match val {
+                None => {
+                    nullCount += 1;
+                    if nullBitmap.is_empty() {
+                        nullBitmap = vec![0u8; rowCount.div_ceil(8)];
+                    }
+                    nullBitmap[i / 8] |= 1 << (i % 8);
+                }
+                Some(v) => {
+                    if !distinctCapped {
+                        distinct.insert(*v);
+                        if distinct.len() as u64 > BLOOM_MIN_CARDINALITY {
+                            distinctCapped = true;
+                        }
+                    }
+                    let slot = value_to_stat_slot(v);
+
+                    globalMin = Some(match globalMin {
+                        Some(cur) if cur <= slot => cur,
+                        _ => slot,
+                    });
+                    globalMax = Some(match globalMax {
+                        Some(cur) if cur >= slot => cur,
+                        _ => slot,
+                    });
+                    zoneMin = Some(match zoneMin {
+                        Some(cur) if cur <= slot => cur,
+                        _ => slot,
+                    });
+                    zoneMax = Some(match zoneMax {
+                        Some(cur) if cur >= slot => cur,
+                        _ => slot,
+                    });
+
+                    if isSorted
+                        && let Some(prev) = prevRaw
+                        && (*v).cmp(prev) == std::cmp::Ordering::Less
+                    {
+                        isSorted = false;
+                    }
+                    prevRaw = Some(*v);
+                }
+            }
+        }
+        if zoneMaps.len() < zoneCount {
+            zoneMaps.push(ZoneMapEntry {
+                min_value: zoneMin.unwrap_or([0xFF; STAT_VALUE_SIZE]),
+                max_value: zoneMax.unwrap_or([0u8; STAT_VALUE_SIZE]),
+            });
+        }
+
+        let cardinality = distinct.len() as u64;
+        let minValue = globalMin.unwrap_or([0u8; STAT_VALUE_SIZE]);
+        let maxValue = globalMax.unwrap_or([0u8; STAT_VALUE_SIZE]);
+
+        let rawData = varlen_pack(values);
+        let rawSize = rawData.len() as u64;
+
+        let encodingType = select_encoding_varlen(typeId, values);
+        let encoder = create_encoding(encodingType);
+        let encodedData = encoder.encode(&rawData, rowCount, 0)?;
+        let encodedSize = encodedData.len() as u64;
+
+        let bloomFilter =
+            if cardinality >= BLOOM_MIN_CARDINALITY && encodingType != EncodingType::Dictionary {
+                let bloom_size_hint = if distinctCapped {
+                    rowCount as u64
+                } else {
+                    cardinality
+                };
+                let mut filter = BloomFilter::new(bloom_size_hint);
+                for v in values.iter().flatten() {
+                    filter.insert(v);
+                }
+                Some(filter)
+            } else {
+                None
+            };
+
+        let bloomFilterSize = bloomFilter
+            .as_ref()
+            .map_or(0, |bf| bf.on_disk_size() as u32);
+
+        let header = SegmentHeader {
+            column_id: columnId,
+            encoding_type: encodingType,
+            raw_size: rawSize,
+            encoded_size: encodedSize,
+            null_count: nullCount,
+            cardinality,
+            min_value: minValue,
+            max_value: maxValue,
+            data_checksum: zyron_common::hash32(&encodedData),
+            header_crc: 0,
             bloom_filter_offset: 0,
             bloom_filter_size: bloomFilterSize,
             is_sorted: isSorted,
@@ -444,6 +684,128 @@ impl ColumnSegment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::{Predicate, eval_predicate_on_raw, varlen_slice_rows};
+
+    // -- Variable-length segment tests --
+
+    #[test]
+    fn test_varlen_segment_unencoded_roundtrip() {
+        // Distinct strings of varying length plus a null and an empty string.
+        let raw: Vec<Option<&[u8]>> = vec![
+            Some(b"alpha".as_slice()),
+            Some(b"".as_slice()),
+            None,
+            Some(b"a-much-longer-string-value-here".as_slice()),
+            Some(b"beta".as_slice()),
+        ];
+        let seg = ColumnSegment::build(7, TypeId::Text, 0, &raw).expect("build varlen");
+        assert_eq!(seg.header.null_count, 1);
+        // Bit 2 is the null row; empty string at row 1 is not null.
+        assert_eq!(seg.null_bitmap[0] & 0b100, 0b100);
+        assert_eq!(seg.null_bitmap[0] & 0b010, 0);
+
+        let decoder = create_encoding(seg.header.encoding_type);
+        let decoded = decoder
+            .decode(&seg.encoded_data, raw.len(), 0)
+            .expect("decode varlen");
+        let rows = varlen_slice_rows(&decoded, raw.len()).expect("slice rows");
+        assert_eq!(rows[0], b"alpha");
+        assert_eq!(rows[1], b"");
+        assert_eq!(rows[3], b"a-much-longer-string-value-here");
+        assert_eq!(rows[4], b"beta");
+
+        // Predicate pushdown on the canonical buffer.
+        let mask = eval_predicate_on_raw(&decoded, raw.len(), 0, &Predicate::Equality(b"beta"))
+            .expect("eval");
+        assert_eq!(mask[0] & (1 << 4), 1 << 4);
+        assert_eq!(mask[0] & 1, 0);
+    }
+
+    #[test]
+    fn test_varlen_segment_constant_roundtrip() {
+        let raw: Vec<Option<&[u8]>> = vec![Some(b"same".as_slice()); 2048];
+        let seg = ColumnSegment::build(3, TypeId::Varchar, 0, &raw).expect("build varlen const");
+        assert_eq!(seg.header.encoding_type, EncodingType::Constant);
+        let decoder = create_encoding(seg.header.encoding_type);
+        let decoded = decoder
+            .decode(&seg.encoded_data, raw.len(), 0)
+            .expect("decode const varlen");
+        let rows = varlen_slice_rows(&decoded, raw.len()).expect("slice rows");
+        assert_eq!(rows.len(), 2048);
+        assert!(rows.iter().all(|r| *r == b"same"));
+    }
+
+    #[test]
+    fn test_signed_segment_minmax_handles_negatives() {
+        // i64 column with values straddling zero. The segment header min/max
+        // must be the true signed extrema so a metadata MIN()/MAX() answered
+        // from the header (decode_fixed_scalar reads them back signed) is
+        // correct. An unsigned byte compare would rank -100 above +100.
+        let vals: Vec<[u8; 8]> = [-100i64, -50, 0, 25, 100, -1, 99]
+            .iter()
+            .map(|v| v.to_le_bytes())
+            .collect();
+        let values: Vec<Option<&[u8]>> = vals.iter().map(|v| Some(v.as_slice())).collect();
+        let seg = ColumnSegment::build(0, TypeId::Int64, 8, &values).expect("build");
+        let min = i64::from_le_bytes(seg.header.min_value[..8].try_into().unwrap());
+        let max = i64::from_le_bytes(seg.header.max_value[..8].try_into().unwrap());
+        assert_eq!(min, -100, "signed min");
+        assert_eq!(max, 100, "signed max");
+
+        // i128 picosecond timestamp with a pre-1970 negative value: the
+        // segment min must be the negative, not the largest positive.
+        let ps: Vec<[u8; 16]> = [
+            -123_456_789_012_345i128,
+            1_700_000_000_000_000_000_000i128,
+            1_775_000_000_000_000_000_000i128,
+            -1i128,
+        ]
+        .iter()
+        .map(|v| v.to_le_bytes())
+        .collect();
+        let pv: Vec<Option<&[u8]>> = ps.iter().map(|v| Some(v.as_slice())).collect();
+        // Logical type id is Timestamp (physical i128 ps), exactly what the
+        // fold path passes to build.
+        let pseg = ColumnSegment::build(1, TypeId::Timestamp, 16, &pv).expect("build ps");
+        let pmin = i128::from_le_bytes(pseg.header.min_value[..16].try_into().unwrap());
+        let pmax = i128::from_le_bytes(pseg.header.max_value[..16].try_into().unwrap());
+        assert_eq!(pmin, -123_456_789_012_345i128, "ps signed min (pre-1970)");
+        assert_eq!(pmax, 1_775_000_000_000_000_000_000i128, "ps signed max");
+
+        // Unsigned columns keep unsigned ordering: a high-bit-set u64 is the
+        // max, not a small positive.
+        let uvals: Vec<[u8; 8]> = [1u64, 5, u64::MAX, 9, 0]
+            .iter()
+            .map(|v| v.to_le_bytes())
+            .collect();
+        let uv: Vec<Option<&[u8]>> = uvals.iter().map(|v| Some(v.as_slice())).collect();
+        let useg = ColumnSegment::build(2, TypeId::UInt64, 8, &uv).expect("build u64");
+        let umin = u64::from_le_bytes(useg.header.min_value[..8].try_into().unwrap());
+        let umax = u64::from_le_bytes(useg.header.max_value[..8].try_into().unwrap());
+        assert_eq!(umin, 0, "unsigned min");
+        assert_eq!(umax, u64::MAX, "unsigned max stays unsigned");
+    }
+
+    #[test]
+    fn test_varlen_segment_low_cardinality_picks_dictionary() {
+        // Enum-like text column: a handful of distinct values over many rows
+        // must select the variable-length dictionary, not FSST or Unencoded.
+        let cats: [&[u8]; 3] = [b"active", b"inactive", b"suspended"];
+        let raw: Vec<Option<&[u8]>> = (0..4096).map(|i| Some(cats[i % 3])).collect();
+        let seg = ColumnSegment::build(9, TypeId::Text, 0, &raw).expect("build varlen dict");
+        assert_eq!(seg.header.encoding_type, EncodingType::Dictionary);
+        // Dictionary has an implicit lookup structure, so no bloom is built.
+        assert!(seg.bloom_filter.is_none());
+
+        let decoder = create_encoding(seg.header.encoding_type);
+        let decoded = decoder
+            .decode(&seg.encoded_data, raw.len(), 0)
+            .expect("decode varlen dict");
+        let rows = varlen_slice_rows(&decoded, raw.len()).expect("slice rows");
+        for i in 0..raw.len() {
+            assert_eq!(rows[i], cats[i % 3]);
+        }
+    }
 
     // -- SegmentHeader serialization tests --
 
@@ -452,13 +814,14 @@ mod tests {
         let header = SegmentHeader {
             column_id: 0,
             encoding_type: EncodingType::Unencoded,
-            uncompressed_size: 0,
-            compressed_size: 0,
+            raw_size: 0,
+            encoded_size: 0,
             null_count: 0,
             cardinality: 0,
             min_value: [0u8; STAT_VALUE_SIZE],
             max_value: [0u8; STAT_VALUE_SIZE],
-            data_offset: 0,
+            data_checksum: 0,
+            header_crc: 0,
             bloom_filter_offset: 0,
             bloom_filter_size: 0,
             is_sorted: false,
@@ -481,13 +844,14 @@ mod tests {
         let header = SegmentHeader {
             column_id: 42,
             encoding_type: EncodingType::FastLanes,
-            uncompressed_size: 81920,
-            compressed_size: 40960,
+            raw_size: 81920,
+            encoded_size: 40960,
             null_count: 7,
             cardinality: 500,
             min_value: minVal,
             max_value: maxVal,
-            data_offset: 8192,
+            data_checksum: 8192,
+            header_crc: 0,
             bloom_filter_offset: 49152,
             bloom_filter_size: 1024,
             is_sorted: true,
@@ -498,13 +862,13 @@ mod tests {
 
         assert_eq!(recovered.column_id, 42);
         assert_eq!(recovered.encoding_type, EncodingType::FastLanes);
-        assert_eq!(recovered.uncompressed_size, 81920);
-        assert_eq!(recovered.compressed_size, 40960);
+        assert_eq!(recovered.raw_size, 81920);
+        assert_eq!(recovered.encoded_size, 40960);
         assert_eq!(recovered.null_count, 7);
         assert_eq!(recovered.cardinality, 500);
         assert_eq!(recovered.min_value, minVal);
         assert_eq!(recovered.max_value, maxVal);
-        assert_eq!(recovered.data_offset, 8192);
+        assert_eq!(recovered.data_checksum, 8192);
         assert_eq!(recovered.bloom_filter_offset, 49152);
         assert_eq!(recovered.bloom_filter_size, 1024);
         assert_eq!(recovered.is_sorted, true);
@@ -517,13 +881,14 @@ mod tests {
             let header = SegmentHeader {
                 column_id: encoding as u32,
                 encoding_type: encodingType,
-                uncompressed_size: 0,
-                compressed_size: 0,
+                raw_size: 0,
+                encoded_size: 0,
                 null_count: 0,
                 cardinality: 0,
                 min_value: [0u8; STAT_VALUE_SIZE],
                 max_value: [0u8; STAT_VALUE_SIZE],
-                data_offset: 0,
+                data_checksum: 0,
+                header_crc: 0,
                 bloom_filter_offset: 0,
                 bloom_filter_size: 0,
                 is_sorted: false,
@@ -548,13 +913,14 @@ mod tests {
         let header = SegmentHeader {
             column_id: 1,
             encoding_type: EncodingType::Rle,
-            uncompressed_size: 100,
-            compressed_size: 50,
+            raw_size: 100,
+            encoded_size: 50,
             null_count: 0,
             cardinality: 10,
             min_value: [0u8; STAT_VALUE_SIZE],
             max_value: [0u8; STAT_VALUE_SIZE],
-            data_offset: 200,
+            data_checksum: 200,
+            header_crc: 0,
             bloom_filter_offset: 0,
             bloom_filter_size: 0,
             is_sorted: false,
@@ -575,13 +941,14 @@ mod tests {
         let header = SegmentHeader {
             column_id: u32::MAX,
             encoding_type: EncodingType::Unencoded,
-            uncompressed_size: u64::MAX,
-            compressed_size: u64::MAX,
+            raw_size: u64::MAX,
+            encoded_size: u64::MAX,
             null_count: u64::MAX,
             cardinality: u64::MAX,
             min_value: [0xFF; STAT_VALUE_SIZE],
             max_value: [0xFF; STAT_VALUE_SIZE],
-            data_offset: u64::MAX,
+            data_checksum: u32::MAX,
+            header_crc: 0,
             bloom_filter_offset: u64::MAX,
             bloom_filter_size: u32::MAX,
             is_sorted: true,
@@ -590,13 +957,13 @@ mod tests {
         let recovered = SegmentHeader::from_bytes(&bytes).expect("from_bytes failed");
 
         assert_eq!(recovered.column_id, u32::MAX);
-        assert_eq!(recovered.uncompressed_size, u64::MAX);
-        assert_eq!(recovered.compressed_size, u64::MAX);
+        assert_eq!(recovered.raw_size, u64::MAX);
+        assert_eq!(recovered.encoded_size, u64::MAX);
         assert_eq!(recovered.null_count, u64::MAX);
         assert_eq!(recovered.cardinality, u64::MAX);
         assert_eq!(recovered.min_value, [0xFF; STAT_VALUE_SIZE]);
         assert_eq!(recovered.max_value, [0xFF; STAT_VALUE_SIZE]);
-        assert_eq!(recovered.data_offset, u64::MAX);
+        assert_eq!(recovered.data_checksum, u32::MAX);
         assert_eq!(recovered.bloom_filter_offset, u64::MAX);
         assert_eq!(recovered.bloom_filter_size, u32::MAX);
         assert_eq!(recovered.is_sorted, true);
@@ -698,8 +1065,8 @@ mod tests {
         // high-cardinality columns, downstream consumers read the saturated
         // value as "at least this many distinct values"
         assert!(segment.header.cardinality >= BLOOM_MIN_CARDINALITY);
-        assert_eq!(segment.header.uncompressed_size, 400);
-        assert!(segment.header.compressed_size > 0);
+        assert_eq!(segment.header.raw_size, 400);
+        assert!(segment.header.encoded_size > 0);
         assert!(segment.header.is_sorted);
         assert!(segment.null_bitmap.is_empty());
         // Bloom filter is auto-built when cardinality >= BLOOM_MIN_CARDINALITY (64).
@@ -915,7 +1282,7 @@ mod tests {
         // Bounded distinct tracking saturates at BLOOM_MIN_CARDINALITY+1 for
         // high-cardinality columns
         assert!(recovered.cardinality >= BLOOM_MIN_CARDINALITY);
-        assert_eq!(recovered.uncompressed_size, 200);
+        assert_eq!(recovered.raw_size, 200);
         assert!(recovered.is_sorted);
     }
 
@@ -940,8 +1307,12 @@ mod tests {
         let values: Vec<Option<&[u8]>> = vec![Some(&val); 100];
         let segment = ColumnSegment::build(0, TypeId::Int32, 4, &values).expect("build failed");
 
-        // data_offset and bloom_filter_offset are set by the file writer, not build().
-        assert_eq!(segment.header.data_offset, 0);
+        // build() stamps the payload checksum; bloom_filter_offset is set by
+        // the file writer, not build().
+        assert_eq!(
+            segment.header.data_checksum,
+            zyron_common::hash32(&segment.encoded_data)
+        );
         assert_eq!(segment.header.bloom_filter_offset, 0);
         assert_eq!(segment.header.bloom_filter_size, 0);
     }

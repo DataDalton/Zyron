@@ -39,7 +39,7 @@ pub fn type_id_to_pg_oid(type_id: TypeId) -> i32 {
         TypeId::Int16 => PG_INT2_OID,
         TypeId::Int32 | TypeId::UInt16 => PG_INT4_OID,
         TypeId::Int64 | TypeId::UInt32 => PG_INT8_OID,
-        TypeId::Int128 | TypeId::UInt64 | TypeId::UInt128 => PG_NUMERIC_OID,
+        TypeId::Int128 | TypeId::UInt64 | TypeId::UInt128 | TypeId::Hlc => PG_NUMERIC_OID,
         TypeId::Float32 => PG_FLOAT4_OID,
         TypeId::Float64 => PG_FLOAT8_OID,
         TypeId::Decimal => PG_NUMERIC_OID,
@@ -784,10 +784,10 @@ mod tests {
 
     #[test]
     fn test_scalar_to_text_float() {
-        let result = scalar_to_text(&ScalarValue::Float64(3.14));
+        let result = scalar_to_text(&ScalarValue::Float64(3.5));
         assert!(result.is_some());
         let s = String::from_utf8(result.unwrap()).unwrap();
-        assert!(s.starts_with("3.14"));
+        assert!(s.starts_with("3.5"));
     }
 
     #[test]
@@ -934,8 +934,8 @@ mod tests {
 
     #[test]
     fn test_format_float_decimal() {
-        let s = format_float(3.14);
-        assert!(s.contains("3.14"));
+        let s = format_float(3.5);
+        assert!(s.contains("3.5"));
     }
 
     #[test]

@@ -6,6 +6,8 @@
 
 pub mod background;
 pub mod backup;
+pub mod columnar_recovery;
+pub mod columnar_wal_pin;
 pub mod config;
 pub mod feature_persistence;
 pub mod gateway;
@@ -211,7 +213,7 @@ impl Server {
             config.server.connection_timeout_secs,
         ));
         let metrics = Arc::new(MetricsRegistry::new(session_mgr.clone()));
-        let health_state = Arc::new(HealthState::new(metrics));
+        let health_state = Arc::new(HealthState::new(Arc::clone(&metrics)));
         let shutdown = Arc::new(AtomicBool::new(false));
 
         Ok(Self {
@@ -275,6 +277,16 @@ impl Server {
             fsync_enabled: self.config.wal.sync_mode == "fsync",
             ring_buffer_capacity: 256 * 1024, // 256 KB ring buffer
         })?);
+
+        // Pin WAL retention so a checkpoint cannot reclaim a CompactionEnd
+        // record whose fold registry entry is still cache-only. Without this
+        // a crash after such a checkpoint loses the segment and regresses the
+        // file-id counter, which the next fold would overwrite.
+        wal.set_retention_hook(std::sync::Arc::new(|| {
+            crate::columnar_wal_pin::ColumnarWalPin::global()
+                .min_retained()
+                .map(zyron_wal::Lsn)
+        }));
 
         // 5. WAL recovery
         let recovery_result = if self.config.storage.data_dir.exists() {
@@ -552,6 +564,21 @@ impl Server {
             Arc::new(mgr)
         };
 
+        // Columnar crash-recovery reconcile. Runs after WAL recovery and the
+        // catalog is loaded, before any worker or query touches a folded
+        // table. Discards uncommitted .zyr, idempotently redoes committed
+        // folds, and replays patch records.
+        if let Err(e) = crate::columnar_recovery::reconcile_columnar(
+            &wal_dir,
+            &catalog,
+            &disk_manager,
+            &data_dir.join("columnar"),
+        )
+        .await
+        {
+            tracing::error!("columnar recovery reconcile failed: {}", e);
+        }
+
         // 11. Start background workers
         let ckpt_config = CheckpointWorkerConfig {
             wal_bytes_threshold: self.config.checkpoint.wal_bytes_threshold,
@@ -561,6 +588,35 @@ impl Server {
         let vacuum_config = VacuumWorkerConfig {
             interval_secs: self.config.vacuum.interval_secs,
             ..VacuumWorkerConfig::default()
+        };
+        let compaction_config = crate::background::compaction::CompactionWorkerConfig {
+            interval_secs: self.config.compaction.interval_secs,
+            min_rows: self.config.compaction.threshold_rows,
+            max_rows_per_file: self.config.compaction.max_rows_per_file,
+            oltp_p99_threshold_us: self.config.compaction.oltp_p99_threshold_us,
+            columnar_dir: data_dir.join("columnar"),
+            // The .zyr must be durable before CompactionBegin, so the fold
+            // hand-off always fsyncs regardless of other IO settings.
+            fsync_enabled: true,
+            max_encoding_threads: self.config.compaction.max_concurrent.max(1),
+            merge_min_churn_ratio: 0.10,
+            registry_persist_every: 16,
+        };
+        let compaction_metrics = if self.config.compaction.enabled {
+            Some(Arc::clone(&self.health_state.metrics))
+        } else {
+            // Disabled: pass an interval so large the worker effectively
+            // never folds, and no metrics handle. The worker still exists so
+            // shutdown ordering and recovery wiring stay uniform.
+            None
+        };
+        let compaction_config = if self.config.compaction.enabled {
+            compaction_config
+        } else {
+            crate::background::compaction::CompactionWorkerConfig {
+                interval_secs: u32::MAX as u64,
+                ..compaction_config
+            }
         };
         let mut background = BackgroundWorkers::start(
             Arc::clone(&catalog),
@@ -573,6 +629,8 @@ impl Server {
             ckpt_config,
             StatsCollectorConfig::default(),
             vacuum_config,
+            compaction_config,
+            compaction_metrics,
             wal_dir,
             None, // WAL archiving disabled unless configured
             Some(Arc::clone(&cdc_registry_arc)),

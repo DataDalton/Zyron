@@ -11,8 +11,23 @@ use zyron_planner::binder::{BoundAssignment, BoundExpr};
 use zyron_planner::logical::LogicalColumn;
 use zyron_storage::TupleId;
 
-use crate::batch::{DataBatch, batch_to_tuples};
+use crate::batch::{DataBatch, batch_to_tuples, encode_scalar_value};
 use crate::column::{Column, ColumnData, NullBitmap, ScalarValue};
+use zyron_storage::columnar::{ColumnarPatchManager, PatchStore};
+
+/// Returns the per-table columnar patch store. Used by UPDATE and DELETE to
+/// route mutations of columnar-resident rows to the append-only patch log
+/// instead of the heap, with no .zyr rewrite and no heap round trip.
+fn columnar_patch_store(te: &zyron_catalog::TableEntry) -> zyron_common::Result<Arc<PatchStore>> {
+    let seg = te.columnar.segments.first().ok_or_else(|| {
+        ZyronError::Internal("columnar locators present but no registered segments".into())
+    })?;
+    let dir = std::path::Path::new(&seg.path)
+        .parent()
+        .map(|d| d.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    ColumnarPatchManager::global(&dir).store(te.id.0 as u64)
+}
 use crate::context::ExecutionContext;
 use crate::expr::evaluate;
 use crate::operator::{ExecutionBatch, Operator, OperatorResult};
@@ -49,6 +64,14 @@ fn encode_btree_key_into(
             buf.extend_from_slice(&(v[row_idx] as i64 as u64).to_be_bytes())
         }
         (ColumnData::Int64(v), _) => buf.extend_from_slice(&(v[row_idx] as u64).to_be_bytes()),
+        // 16-byte order-preserving key for Int128 (incl. i128 picosecond
+        // timestamps). The explicit sign-bit flip keeps negative values
+        // (pre-1970 timestamps) ordered before positive ones, unlike the
+        // legacy bare i64 cast above which is only correct for non-negatives.
+        (ColumnData::Int128(v), _) => {
+            let key = (v[row_idx] as u128) ^ (1u128 << 127);
+            buf.extend_from_slice(&key.to_be_bytes());
+        }
         (ColumnData::UInt8(v), _) => buf.extend_from_slice(&(v[row_idx] as u64).to_be_bytes()),
         (ColumnData::UInt16(v), _) => buf.extend_from_slice(&(v[row_idx] as u64).to_be_bytes()),
         (ColumnData::UInt32(v), _) => buf.extend_from_slice(&(v[row_idx] as u64).to_be_bytes()),
@@ -261,7 +284,15 @@ impl Operator for ValuesOperator {
             let mut col_data: Vec<ColumnData> = self
                 .schema
                 .iter()
-                .map(|c| ColumnData::with_capacity(c.type_id, num_rows))
+                .map(|c| {
+                    ColumnData::with_capacity(
+                        zyron_common::types::TypeId::timestamp_physical_type_id(
+                            c.type_id,
+                            c.ts_precision,
+                        ),
+                        num_rows,
+                    )
+                })
                 .collect();
             let mut col_nulls: Vec<NullBitmap> =
                 (0..num_cols).map(|_| NullBitmap::empty()).collect();
@@ -283,7 +314,8 @@ impl Operator for ValuesOperator {
                     // (e.g. an Int64 literal into an Int32 column); without
                     // this cast push_scalar would store 0 for the mismatched
                     // variant. NULL and same-type values pass through.
-                    let target = self.schema[c].type_id;
+                    let entry = &self.schema[c];
+                    let target = entry.type_id;
                     let col = if col.len() > 0 && col.type_id != target && !col.is_null(0) {
                         crate::compute::cast_column(&col, target)?
                     } else {
@@ -294,6 +326,20 @@ impl Operator for ValuesOperator {
                     } else {
                         ScalarValue::Null
                     };
+                    // A TIMESTAMP(p>6) column stores i128 picoseconds. A
+                    // timestamp literal evaluates to i64 microseconds, so scale
+                    // it up exactly (x1_000_000) into the i128 buffer.
+                    let scalar = if entry.ts_precision.unwrap_or(6) > 6
+                        && matches!(target, TypeId::Timestamp | TypeId::TimestampTz)
+                    {
+                        match scalar {
+                            ScalarValue::Int64(us) => ScalarValue::Int128(us as i128 * 1_000_000),
+                            ScalarValue::Int128(ps) => ScalarValue::Int128(ps),
+                            other => other,
+                        }
+                    } else {
+                        scalar
+                    };
                     col_nulls[c].push(scalar.is_null());
                     col_data[c].push_scalar(&scalar);
                 }
@@ -303,7 +349,9 @@ impl Operator for ValuesOperator {
                 .into_iter()
                 .zip(col_nulls)
                 .zip(self.schema.iter())
-                .map(|((data, nulls), lc)| Column::with_nulls(data, nulls, lc.type_id))
+                .map(|((data, nulls), lc)| {
+                    Column::with_nulls_ts(data, nulls, lc.type_id, lc.ts_precision)
+                })
                 .collect();
 
             Ok(Some(ExecutionBatch::new(DataBatch::new(columns))))
@@ -586,6 +634,25 @@ impl Operator for DeleteOperator {
                     break;
                 };
 
+                // Columnar-resident rows: append a supersede to the patch
+                // log. No heap delete, no .zyr rewrite. WAL-logged first so
+                // the delete and the supersede commit together.
+                if let Some(locs) = exec_batch.columnar_locators.clone() {
+                    let te = self.ctx.get_table_entry(self.table_id)?;
+                    let store = columnar_patch_store(&te)?;
+                    for &(file_id, rowid) in &locs {
+                        let mut pl = Vec::with_capacity(32);
+                        pl.extend_from_slice(&(self.table_id.0 as u64).to_le_bytes());
+                        pl.extend_from_slice(&file_id.to_le_bytes());
+                        pl.extend_from_slice(&rowid.to_le_bytes());
+                        pl.extend_from_slice(&(txn_id as u64).to_le_bytes());
+                        let lsn = self.ctx.wal.log_columnar_supersede(&pl)?;
+                        store.append_supersede(file_id, rowid, txn_id as u64, lsn.0)?;
+                    }
+                    total_deleted += locs.len() as i64;
+                    continue;
+                }
+
                 let tuple_ids = exec_batch.tuple_ids.ok_or_else(|| {
                     ZyronError::Internal("DeleteOperator requires tuple IDs from scan".into())
                 })?;
@@ -763,6 +830,59 @@ impl Operator for UpdateOperator {
                 let Some(exec_batch) = input else {
                     break;
                 };
+
+                // Columnar-resident rows: write one epoch-tagged value patch
+                // per assigned column to the patch log. The old columnar
+                // value remains the version for snapshots that predate this
+                // transaction; this patch is the version for later ones. No
+                // heap round trip, no .zyr rewrite.
+                if let Some(locs) = exec_batch.columnar_locators.clone() {
+                    let store = columnar_patch_store(&table_entry)?;
+                    for assignment in &self.assignments {
+                        let new_col = evaluate(
+                            &assignment.value,
+                            &exec_batch.batch,
+                            &self.input_schema,
+                            &self.ctx.params,
+                        )?;
+                        let ce = table_entry
+                            .columns
+                            .iter()
+                            .find(|c| c.id == assignment.column_id)
+                            .ok_or_else(|| {
+                                ZyronError::Internal(format!(
+                                    "assignment column {:?} not in table",
+                                    assignment.column_id
+                                ))
+                            })?;
+                        let col_id = ce.id.0 as u32;
+                        let phys = ce.physical_type_id();
+                        let vsize = phys.fixed_size().unwrap_or(0);
+                        for (r, &(file_id, rowid)) in locs.iter().enumerate() {
+                            let sv = new_col.data.get_scalar(r);
+                            let bytes = encode_scalar_value(phys, &sv, vsize);
+                            let mut pl = Vec::with_capacity(40 + bytes.len());
+                            pl.extend_from_slice(&(self.table_id.0 as u64).to_le_bytes());
+                            pl.extend_from_slice(&file_id.to_le_bytes());
+                            pl.extend_from_slice(&rowid.to_le_bytes());
+                            pl.extend_from_slice(&col_id.to_le_bytes());
+                            pl.extend_from_slice(&(txn_id as u64).to_le_bytes());
+                            pl.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                            pl.extend_from_slice(&bytes);
+                            let lsn = self.ctx.wal.log_columnar_patch(&pl)?;
+                            store.append_value_patch(
+                                file_id,
+                                rowid,
+                                col_id,
+                                txn_id as u64,
+                                lsn.0,
+                                &bytes,
+                            )?;
+                        }
+                    }
+                    total_updated += locs.len() as i64;
+                    continue;
+                }
 
                 let tuple_ids = exec_batch.tuple_ids.ok_or_else(|| {
                     ZyronError::Internal("UpdateOperator requires tuple IDs from scan".into())
@@ -963,5 +1083,55 @@ impl Operator for UpdateOperator {
 
             Ok(Some(ExecutionBatch::new(count_batch(total_updated))))
         })
+    }
+}
+
+#[cfg(test)]
+mod b6_key_tests {
+    use super::*;
+    use crate::column::{Column, ColumnData};
+    use zyron_common::TypeId;
+
+    #[test]
+    fn test_i128_index_key_order_preserving_with_negatives() {
+        // i128 values incl. pre-1970 (negative) picosecond timestamps must
+        // produce big-endian keys that sort in numeric order.
+        let vals: Vec<i128> = vec![
+            i128::MIN / 2,
+            -1_000_000_000_000,
+            -1,
+            0,
+            1,
+            1_700_000_000_000_000_000_000,
+            i128::MAX / 2,
+        ];
+        let col = Column::new_ts(
+            ColumnData::Int128(vals.clone()),
+            TypeId::TimestampTz,
+            Some(9),
+        );
+        let batch = DataBatch::new(vec![col]);
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        for r in 0..vals.len() {
+            let mut buf = Vec::new();
+            assert!(encode_btree_key_into(
+                &batch,
+                r,
+                0,
+                TypeId::TimestampTz,
+                &mut buf
+            ));
+            assert_eq!(buf.len(), 16);
+            keys.push(buf);
+        }
+        // Byte-lexicographic order of keys must match numeric order of values.
+        for i in 1..keys.len() {
+            assert!(
+                keys[i - 1] < keys[i],
+                "key order broken at {i}: {:?} vs {:?}",
+                vals[i - 1],
+                vals[i]
+            );
+        }
     }
 }

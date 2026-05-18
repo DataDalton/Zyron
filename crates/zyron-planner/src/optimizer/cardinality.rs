@@ -422,6 +422,7 @@ mod tests {
             column_id: ColumnId(col_id),
             type_id: TypeId::Int64,
             nullable: false,
+            ts_precision: None,
         })
     }
 

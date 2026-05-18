@@ -161,7 +161,7 @@ fn make_10_column_defs() -> Vec<ColumnDef> {
         },
         ColumnDef {
             name: "created_at".to_string(),
-            data_type: DataType::Timestamp,
+            data_type: DataType::Timestamp(None),
             nullable: Some(false),
             default: None,
             constraints: vec![],
@@ -349,14 +349,14 @@ fn make_all_types_column_defs() -> Vec<ColumnDef> {
         },
         ColumnDef {
             name: "c_timestamp".into(),
-            data_type: DataType::Timestamp,
+            data_type: DataType::Timestamp(None),
             nullable: Some(true),
             default: None,
             constraints: vec![],
         },
         ColumnDef {
             name: "c_timestamptz".into(),
-            data_type: DataType::TimestampTz,
+            data_type: DataType::TimestampTz(None),
             nullable: Some(true),
             default: None,
             constraints: vec![],
@@ -1146,8 +1146,8 @@ async fn test_statistics() {
     catalog.put_stats(table_id, table_stats.clone(), col_stats.clone());
     let retrieved = catalog.get_stats(table_id);
     assert!(retrieved.is_some());
-    let (ts, _cs_list) = retrieved.unwrap();
-    assert_eq!(ts.row_count, row_count);
+    let s = retrieved.unwrap();
+    assert_eq!(s.0.row_count, row_count);
     tprintln!("  Stats store/retrieve: PASS");
 
     // Benchmark analyze throughput

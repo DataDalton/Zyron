@@ -323,6 +323,155 @@ fn add_days_to_date(year: i32, month: u32, day: u32, delta: i64) -> (i32, u32, u
 }
 
 // ---------------------------------------------------------------------------
+// Timestamp / date string parsing (ISO-8601 / SQL)
+// ---------------------------------------------------------------------------
+
+fn ts_err(s: &str) -> ZyronError {
+    ZyronError::ExecutionError(format!("invalid timestamp literal '{s}'"))
+}
+
+/// Parses `YYYY-MM-DD` into days since the Unix epoch (validating).
+pub fn parse_date_days(s: &str) -> Result<i32> {
+    let t = s.trim();
+    let mut it = t.split('-');
+    let y: i32 = it
+        .next()
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| ts_err(s))?;
+    let mo: u32 = it
+        .next()
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| ts_err(s))?;
+    let d: u32 = it
+        .next()
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| ts_err(s))?;
+    if it.next().is_some() || !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) {
+        return Err(ts_err(s));
+    }
+    Ok(days_from_ymd(y, mo, d))
+}
+
+/// Parses an ISO-8601 / SQL timestamp string into Unix-epoch microseconds.
+///
+/// Accepts `YYYY-MM-DD`, `YYYY-MM-DD HH:MM:SS`, `YYYY-MM-DDTHH:MM:SS`, an
+/// optional `.ffffff` fractional second (1..=6 digits), and an optional
+/// `Z` / `+HH:MM` / `-HH:MM` UTC offset. More than 6 fractional digits is a
+/// hard error: the literal/value path is microsecond resolution, so silently
+/// dropping sub-microsecond digits is not allowed (matches the interval rule
+/// and the temporal-precision honesty boundary).
+pub fn parse_timestamp_micros(s: &str) -> Result<i64> {
+    let t = s.trim();
+    // Split date and time on the first 'T' or ' '.
+    let (date_part, time_part) = match t.find(['T', ' ']) {
+        Some(i) => (&t[..i], Some(t[i + 1..].trim())),
+        None => (t, None),
+    };
+    let mut dit = date_part.split('-');
+    let y: i32 = dit
+        .next()
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| ts_err(s))?;
+    let mo: u32 = dit
+        .next()
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| ts_err(s))?;
+    let d: u32 = dit
+        .next()
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| ts_err(s))?;
+    if dit.next().is_some() || !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) {
+        return Err(ts_err(s));
+    }
+    let days = days_from_ymd(y, mo, d) as i64;
+
+    let mut tod_micros: i64 = 0;
+    let mut offset_micros: i64 = 0;
+    if let Some(tp) = time_part.filter(|p| !p.is_empty()) {
+        // Peel a trailing UTC offset: 'Z' or a sign that follows the time.
+        let (core, off): (&str, Option<&str>) = if let Some(stripped) = tp.strip_suffix('Z') {
+            (stripped, Some("Z"))
+        } else {
+            match tp.rfind(['+', '-']) {
+                // A sign at position 0 is not an offset (time has no sign).
+                Some(p) if p > 0 => (&tp[..p], Some(&tp[p..])),
+                _ => (tp, None),
+            }
+        };
+        let mut cit = core.split(':');
+        let h: i64 = cit
+            .next()
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| ts_err(s))?;
+        let mi: i64 = cit
+            .next()
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| ts_err(s))?;
+        let (sec, frac_micros): (i64, i64) = match cit.next() {
+            Some(secpart) => {
+                let mut sp = secpart.split('.');
+                let sec: i64 = sp
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| ts_err(s))?;
+                let fm = match sp.next() {
+                    Some(f) => {
+                        if f.is_empty() || f.len() > 6 || !f.bytes().all(|b| b.is_ascii_digit()) {
+                            // >6 digits = sub-microsecond, not representable here.
+                            return Err(ts_err(s));
+                        }
+                        let mut digits = f.to_string();
+                        while digits.len() < 6 {
+                            digits.push('0');
+                        }
+                        digits.parse::<i64>().map_err(|_| ts_err(s))?
+                    }
+                    None => 0,
+                };
+                if sp.next().is_some() {
+                    return Err(ts_err(s));
+                }
+                (sec, fm)
+            }
+            None => (0, 0),
+        };
+        if cit.next().is_some()
+            || !(0..24).contains(&h)
+            || !(0..60).contains(&mi)
+            || !(0..60).contains(&sec)
+        {
+            return Err(ts_err(s));
+        }
+        tod_micros = (h * 3600 + mi * 60 + sec) * 1_000_000 + frac_micros;
+
+        if let Some(o) = off
+            && o != "Z"
+        {
+            let sign = if o.starts_with('-') { -1 } else { 1 };
+            let ov = &o[1..];
+            let mut oit = ov.split(':');
+            let oh: i64 = oit
+                .next()
+                .and_then(|v| v.parse().ok())
+                .ok_or_else(|| ts_err(s))?;
+            let om: i64 = match oit.next() {
+                Some(v) => v.parse().map_err(|_| ts_err(s))?,
+                None => 0,
+            };
+            if oit.next().is_some() || !(0..=23).contains(&oh) || !(0..60).contains(&om) {
+                return Err(ts_err(s));
+            }
+            offset_micros = sign * (oh * 3600 + om * 60) * 1_000_000;
+        }
+    }
+
+    Ok(days
+        .saturating_mul(86_400_000_000)
+        .saturating_add(tod_micros)
+        .saturating_sub(offset_micros))
+}
+
+// ---------------------------------------------------------------------------
 // String parser
 // ---------------------------------------------------------------------------
 
@@ -493,8 +642,24 @@ fn interval_from_unit(count: f64, unit: &str) -> Result<Interval> {
     match normalized {
         // Sub-second
         "picosecond" | "ps" => {
-            let nanos = (count / 1000.0).trunc() as i64;
-            Ok(Interval::from_nanoseconds(nanos))
+            // Intervals are stored as i64 nanoseconds. A picosecond value with
+            // sub-nanosecond resolution cannot be represented without loss, so
+            // reject it rather than silently truncate. Whole-nanosecond ps
+            // (a multiple of 1000) converts exactly.
+            if !count.is_finite() || count.fract() != 0.0 {
+                return Err(ZyronError::ExecutionError(format!(
+                    "interval picosecond value {count} is not a whole nanosecond \
+                     (sub-nanosecond interval precision is not supported)"
+                )));
+            }
+            let ps = count as i128;
+            if ps % 1000 != 0 {
+                return Err(ZyronError::ExecutionError(format!(
+                    "interval picosecond value {count} is not a whole nanosecond \
+                     (sub-nanosecond interval precision is not supported)"
+                )));
+            }
+            Ok(Interval::from_nanoseconds((ps / 1000) as i64))
         }
         "nanosecond" | "nano" | "ns" => Ok(Interval::from_nanoseconds(count as i64)),
         "microsecond" | "micro" | "us" | "μs" => {
@@ -730,10 +895,106 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_picoseconds() {
-        // 2000 picoseconds = 2 nanoseconds
-        let i = parse_interval_string("2000 ps").unwrap();
-        assert_eq!(i, Interval::from_nanoseconds(2));
+    fn test_parse_timestamp_micros_valid() {
+        let day = 86_400_000_000i64;
+        assert_eq!(parse_timestamp_micros("1970-01-01").unwrap(), 0);
+        assert_eq!(parse_timestamp_micros("1970-01-01 00:00:00").unwrap(), 0);
+        assert_eq!(parse_timestamp_micros("1970-01-01T00:00:00").unwrap(), 0);
+        assert_eq!(parse_timestamp_micros("1970-01-02").unwrap(), day);
+        assert_eq!(
+            parse_timestamp_micros("1970-01-01 00:00:01").unwrap(),
+            1_000_000
+        );
+        assert_eq!(
+            parse_timestamp_micros("1970-01-01 00:00:00.5").unwrap(),
+            500_000
+        );
+        assert_eq!(
+            parse_timestamp_micros("1970-01-01 00:00:00.123456").unwrap(),
+            123_456
+        );
+        assert_eq!(
+            parse_timestamp_micros("1970-01-01 01:02:03").unwrap(),
+            (3600 + 2 * 60 + 3) * 1_000_000
+        );
+        // UTC offsets normalize to UTC.
+        assert_eq!(parse_timestamp_micros("1970-01-01 00:00:00Z").unwrap(), 0);
+        assert_eq!(
+            parse_timestamp_micros("1970-01-01T01:00:00+01:00").unwrap(),
+            0
+        );
+        assert_eq!(
+            parse_timestamp_micros("1970-01-01T00:00:00-01:00").unwrap(),
+            3600 * 1_000_000
+        );
+        // A concrete instant round-trips through the civil helpers.
+        let want = days_from_ymd(2026, 5, 17) as i64 * day
+            + (12 * 3600 + 34 * 60 + 56) * 1_000_000
+            + 123_456;
+        assert_eq!(
+            parse_timestamp_micros("2026-05-17 12:34:56.123456").unwrap(),
+            want
+        );
+    }
+
+    #[test]
+    fn test_parse_timestamp_micros_rejects_invalid() {
+        for bad in [
+            "garbage",
+            "1970-13-01",
+            "1970-00-01",
+            "1970-01-32",
+            "1970-01-01 24:00:00",
+            "1970-01-01 00:60:00",
+            "1970-01-01 00:00:60",
+            "1970-01-01 00:00:00.1234567", // sub-microsecond, not representable
+            "1970-01-01 00:00:00.",
+            "",
+        ] {
+            assert!(
+                parse_timestamp_micros(bad).is_err(),
+                "{bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_date_days() {
+        assert_eq!(parse_date_days("1970-01-01").unwrap(), 0);
+        assert_eq!(parse_date_days("1970-01-02").unwrap(), 1);
+        assert_eq!(
+            parse_date_days("2026-05-17").unwrap(),
+            days_from_ymd(2026, 5, 17)
+        );
+        assert!(parse_date_days("1970-13-01").is_err());
+        assert!(parse_date_days("nope").is_err());
+    }
+
+    #[test]
+    fn test_parse_picoseconds_whole_nanosecond_ok() {
+        // Whole-nanosecond picosecond values convert exactly.
+        assert_eq!(
+            parse_interval_string("2000 ps").unwrap(),
+            Interval::from_nanoseconds(2)
+        );
+        assert_eq!(
+            parse_interval_string("1000 ps").unwrap(),
+            Interval::from_nanoseconds(1)
+        );
+        assert_eq!(
+            parse_interval_string("0 ps").unwrap(),
+            Interval::from_nanoseconds(0)
+        );
+    }
+
+    #[test]
+    fn test_parse_picoseconds_sub_nanosecond_rejected() {
+        // Sub-nanosecond resolution must be a hard error, never silently
+        // truncated to a smaller nanosecond value.
+        assert!(parse_interval_string("2500 ps").is_err());
+        assert!(parse_interval_string("1 ps").is_err());
+        assert!(parse_interval_string("999 ps").is_err());
+        assert!(parse_interval_string("1500 ps").is_err());
     }
 
     #[test]

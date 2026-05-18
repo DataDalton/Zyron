@@ -115,10 +115,16 @@ impl Encoding for BitPackEncoding {
         ]);
 
         let packed = &encoded[13..];
-        let mut out = Vec::with_capacity(row_count * value_size);
-        unsafe {
-            out.set_len(row_count * value_size);
-        }
+        // SAFETY: the loop below writes all `row_count * value_size` bytes
+        // (one value_size-wide value per row) before any read; zeroing first
+        // would memset the buffer only to overwrite it.
+        #[allow(clippy::uninit_vec)]
+        let mut out: Vec<u8> = {
+            let n = row_count * value_size;
+            let mut v = Vec::with_capacity(n);
+            unsafe { v.set_len(n) };
+            v
+        };
         let mut bitOffset: u64 = 0;
 
         for i in 0..row_count {

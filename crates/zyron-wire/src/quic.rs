@@ -604,7 +604,7 @@ mod tests {
         let (mut stream, _read_tx, _write_rx) = test_stream_pair();
 
         // Write less than threshold
-        stream.write(b"small").await.unwrap();
+        stream.write_all(b"small").await.unwrap();
         assert!(stream.pending_write_bytes > 0);
 
         stream.flush().await.unwrap();
@@ -706,12 +706,12 @@ mod tests {
         let (mut stream, _read_tx, _write_rx) = test_stream_pair();
 
         // Small writes below threshold should not trigger notify
-        stream.write(b"a").await.unwrap();
+        stream.write_all(b"a").await.unwrap();
         assert_eq!(stream.pending_write_bytes, 1);
 
         // Write enough to exceed threshold
         let big = vec![0u8; WRITE_NOTIFY_THRESHOLD];
-        stream.write(&big).await.unwrap();
+        stream.write_all(&big).await.unwrap();
         // After exceeding threshold, pending should reset
         assert_eq!(stream.pending_write_bytes, 0);
     }

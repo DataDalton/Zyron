@@ -1903,19 +1903,25 @@ impl<'a> Parser<'a> {
             }
             Token::Keyword(Keyword::Timestamp) => {
                 self.advance()?;
-                // TIMESTAMP WITH TIME ZONE -> TimestampTz
+                // SQL standard: TIMESTAMP(p) [WITH TIME ZONE]
+                let precision = self.parse_optional_timestamp_precision()?;
                 if self.at_keyword(Keyword::With) {
                     self.advance()?;
                     self.expect_keyword(Keyword::Time)?;
                     self.expect_keyword(Keyword::Zone)?;
-                    Ok(DataType::TimestampTz)
+                    Ok(DataType::TimestampTz(precision))
                 } else {
-                    Ok(DataType::Timestamp)
+                    Ok(DataType::Timestamp(precision))
                 }
             }
             Token::Keyword(Keyword::Timestamptz) => {
                 self.advance()?;
-                Ok(DataType::TimestampTz)
+                let precision = self.parse_optional_timestamp_precision()?;
+                Ok(DataType::TimestampTz(precision))
+            }
+            Token::Keyword(Keyword::Hlc) => {
+                self.advance()?;
+                Ok(DataType::Hlc)
             }
             Token::Keyword(Keyword::Interval) => {
                 self.advance()?;
@@ -2046,6 +2052,24 @@ impl<'a> Parser<'a> {
             let val = self.parse_integer_value()? as u32;
             self.expect_token(&Token::RParen)?;
             Ok(Some(val))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Optional `(p)` fractional-second precision for timestamp types.
+    /// Rejects anything outside 0..=12.
+    fn parse_optional_timestamp_precision(&mut self) -> Result<Option<u8>> {
+        if self.at_token(&Token::LParen) {
+            self.advance()?;
+            let p = self.parse_integer_value()?;
+            self.expect_token(&Token::RParen)?;
+            if !(0..=12).contains(&p) {
+                return Err(ZyronError::ParseError(format!(
+                    "timestamp precision must be 0..=12, got {p}"
+                )));
+            }
+            Ok(Some(p as u8))
         } else {
             Ok(None)
         }
@@ -8277,9 +8301,50 @@ mod tests {
         let stmt = parse_one("CREATE TABLE t (created_at TIMESTAMP WITH TIME ZONE)");
         match stmt {
             Statement::CreateTable(ct) => {
-                assert_eq!(ct.columns[0].data_type, DataType::TimestampTz);
+                assert_eq!(ct.columns[0].data_type, DataType::TimestampTz(None));
             }
             _ => panic!("Expected CREATE TABLE"),
+        }
+    }
+
+    #[test]
+    fn test_hlc_type_grammar() {
+        let stmt = parse_one("CREATE TABLE t (h HLC)");
+        match stmt {
+            Statement::CreateTable(ct) => {
+                assert_eq!(ct.columns[0].data_type, DataType::Hlc);
+            }
+            _ => panic!("Expected CREATE TABLE"),
+        }
+    }
+
+    #[test]
+    fn test_timestamp_precision_grammar() {
+        let cases: &[(&str, DataType)] = &[
+            ("TIMESTAMP", DataType::Timestamp(None)),
+            ("TIMESTAMP(0)", DataType::Timestamp(Some(0))),
+            ("TIMESTAMP(6)", DataType::Timestamp(Some(6))),
+            ("TIMESTAMP(9)", DataType::Timestamp(Some(9))),
+            ("TIMESTAMP(12)", DataType::Timestamp(Some(12))),
+            ("TIMESTAMPTZ(9)", DataType::TimestampTz(Some(9))),
+            (
+                "TIMESTAMP(9) WITH TIME ZONE",
+                DataType::TimestampTz(Some(9)),
+            ),
+        ];
+        for (sql, want) in cases {
+            let stmt = parse_one(&format!("CREATE TABLE t (c {sql})"));
+            match stmt {
+                Statement::CreateTable(ct) => {
+                    assert_eq!(&ct.columns[0].data_type, want, "sql: {sql}")
+                }
+                _ => panic!("Expected CREATE TABLE for {sql}"),
+            }
+        }
+
+        for bad in ["TIMESTAMP(13)", "TIMESTAMP(99)", "TIMESTAMPTZ(13)"] {
+            let p = crate::parse(&format!("CREATE TABLE t (c {bad})"));
+            assert!(p.is_err(), "{bad} must be rejected");
         }
     }
 

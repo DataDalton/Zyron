@@ -181,14 +181,8 @@ mod tests {
 
     fn sample_columns() -> Vec<ColumnSpec> {
         vec![
-            ColumnSpec {
-                name: "id".to_string(),
-                type_id: TypeId::Int64,
-            },
-            ColumnSpec {
-                name: "label".to_string(),
-                type_id: TypeId::Varchar,
-            },
+            ColumnSpec::new("id".to_string(), TypeId::Int64),
+            ColumnSpec::new("label".to_string(), TypeId::Varchar),
         ]
     }
 
@@ -206,11 +200,7 @@ mod tests {
         let columns = sample_columns();
         let bytes = writer_for(format).write_rows(rows, &columns).unwrap();
         let dir = std::env::temp_dir();
-        let name = format!(
-            "zyron_copy_src_{}_{}.bin",
-            std::process::id(),
-            uuid_like(),
-        );
+        let name = format!("zyron_copy_src_{}_{}.bin", std::process::id(), uuid_like(),);
         let path = dir.join(name);
         std::fs::write(&path, &bytes).unwrap();
         path.to_string_lossy().into_owned()
@@ -315,7 +305,9 @@ mod tests {
             credentials: HashMap::new(),
             columns: skewed,
         };
-        let err = run_external_to_external(source, sink, 1024).await.unwrap_err();
+        let err = run_external_to_external(source, sink, 1024)
+            .await
+            .unwrap_err();
         match err {
             ZyronError::Internal(msg) => assert!(msg.contains("column count mismatch")),
             other => panic!("unexpected error: {other:?}"),

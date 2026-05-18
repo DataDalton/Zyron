@@ -6,9 +6,11 @@
 
 pub mod aggregate;
 pub mod analytics_table_fn;
+pub mod column_scan;
 pub mod distinct;
 pub mod filter;
 pub mod fts_scan;
+pub mod gapfill;
 pub mod graph_scan;
 pub mod join;
 pub mod limit;
@@ -30,7 +32,84 @@ use std::time::Instant;
 use zyron_common::Result;
 use zyron_storage::TupleId;
 
-use crate::batch::DataBatch;
+use crate::batch::{ColumnBuilder, DataBatch};
+use crate::column::ScalarValue;
+use crate::context::ExecutionContext;
+use zyron_planner::logical::LogicalColumn;
+
+/// Enforces column-level security on a result batch: classification clearance
+/// and masking. Columns the session role lacks clearance for are masked when
+/// a masking policy exists, otherwise NULLed (deny). Internal queries (no
+/// security context) are returned unchanged. Single source of truth shared by
+/// every scan operator so heap and columnar reads enforce identical policy.
+pub(crate) fn apply_column_security(
+    ctx: &ExecutionContext,
+    table_id: u32,
+    output_columns: &[LogicalColumn],
+    batch: DataBatch,
+) -> DataBatch {
+    let sc = match &ctx.security_context {
+        Some(s) => s,
+        None => return batch,
+    };
+    let sm = match &ctx.security_manager {
+        Some(s) => s,
+        None => return batch,
+    };
+    let n = batch.num_rows;
+    let mut cols = Vec::with_capacity(batch.columns.len());
+    for (i, col) in batch.columns.iter().enumerate() {
+        if i >= output_columns.len() {
+            cols.push(col.clone());
+            continue;
+        }
+        let col_id = output_columns[i].column_id.0;
+        let cleared = sm
+            .classification_store
+            .check_clearance(sc.clearance, table_id, col_id);
+        let mut probe = String::new();
+        let has_mask = sm.masking_policy_store.apply_masking(
+            table_id,
+            col_id,
+            "",
+            &sc.effective_roles,
+            &mut probe,
+        );
+        if cleared && !has_mask {
+            cols.push(col.clone());
+            continue;
+        }
+        let mut b = ColumnBuilder::new(col.type_id, n);
+        for r in 0..n {
+            let v = col.get_scalar(r);
+            let masked_text = if let ScalarValue::Utf8(s) = &v {
+                let mut buf = String::new();
+                if sm.masking_policy_store.apply_masking(
+                    table_id,
+                    col_id,
+                    s,
+                    &sc.effective_roles,
+                    &mut buf,
+                ) {
+                    Some(buf)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(m) = masked_text {
+                b.push(&ScalarValue::Utf8(m));
+            } else if cleared {
+                b.push(&v);
+            } else {
+                b.push(&ScalarValue::Null);
+            }
+        }
+        cols.push(b.finish());
+    }
+    DataBatch::new(cols)
+}
 
 /// Boxed future returned by Operator::next().
 pub type OperatorResult<'a> =
@@ -44,6 +123,10 @@ pub struct ExecutionBatch {
     /// Optional tuple IDs for each row, used by UPDATE and DELETE operators
     /// to locate the source tuples in heap pages.
     pub tuple_ids: Option<Vec<TupleId>>,
+    /// Optional (columnar_file_id, sys_rowid) per row for rows served from a
+    /// .zyr segment. UPDATE and DELETE route these to the columnar patch log
+    /// instead of the heap. Aligned 1:1 with batch rows when present.
+    pub columnar_locators: Option<Vec<(u64, u64)>>,
 }
 
 impl ExecutionBatch {
@@ -52,6 +135,7 @@ impl ExecutionBatch {
         Self {
             batch,
             tuple_ids: None,
+            columnar_locators: None,
         }
     }
 
@@ -60,6 +144,17 @@ impl ExecutionBatch {
         Self {
             batch,
             tuple_ids: Some(tuple_ids),
+            columnar_locators: None,
+        }
+    }
+
+    /// Creates a batch whose rows are columnar-resident, each carrying its
+    /// (file_id, sys_rowid) locator for the DML patch path.
+    pub fn with_columnar_locators(batch: DataBatch, locators: Vec<(u64, u64)>) -> Self {
+        Self {
+            batch,
+            tuple_ids: None,
+            columnar_locators: Some(locators),
         }
     }
 

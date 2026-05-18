@@ -1054,6 +1054,62 @@ impl<'a> ScanGuard<'a> {
         }
     }
 
+    /// Like `for_each` but stops as soon as `f` returns `false`. Lets a
+    /// targeted lookup (e.g. resolve one table by name) abandon the scan on
+    /// the first match instead of materializing and deserializing every
+    /// remaining tuple.
+    pub fn try_for_each<F>(&self, mut f: F)
+    where
+        F: FnMut(TupleId, TupleView<'_>) -> bool,
+    {
+        let max_slots = (PAGE_SIZE - DATA_START) / TUPLE_SLOT_SIZE;
+        for &page_id in &self.page_ids {
+            if let Some(p) = unsafe { self.pool.frame_data_ptr(page_id) } {
+                let data = unsafe { &*p };
+                let raw_slot_count =
+                    u16::from_le_bytes([data[HEAP_HEADER_OFFSET], data[HEAP_HEADER_OFFSET + 1]])
+                        as usize;
+                let slot_count = raw_slot_count.min(max_slots);
+
+                for i in 0..slot_count {
+                    let slot_base = DATA_START + i * TUPLE_SLOT_SIZE;
+                    let tuple_length = unsafe {
+                        u16::from_le_bytes([
+                            *data.get_unchecked(slot_base + 2),
+                            *data.get_unchecked(slot_base + 3),
+                        ])
+                    } as usize;
+
+                    if tuple_length == 0 {
+                        continue;
+                    }
+
+                    let tuple_offset = unsafe {
+                        u16::from_le_bytes([
+                            *data.get_unchecked(slot_base),
+                            *data.get_unchecked(slot_base + 1),
+                        ])
+                    } as usize;
+
+                    let header = unsafe {
+                        TupleHeader::from_bytes_unchecked(
+                            &data[tuple_offset..tuple_offset + TUPLE_HEADER_SIZE],
+                        )
+                    };
+                    let data_start = tuple_offset + TUPLE_HEADER_SIZE;
+                    let data_end = data_start + header.data_len as usize;
+
+                    if !f(
+                        TupleId::new(page_id, i as u16),
+                        TupleView::new(header, &data[data_start..data_end]),
+                    ) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     /// Fast tuple count without constructing TupleView for each tuple.
     #[inline]
     pub fn count(&self) -> usize {

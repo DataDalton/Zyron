@@ -1,0 +1,12 @@
+
+=== Fold-path throughput (CompactionWorker::run_cycle) ===
+Rows per run: 100000, runs: 5
+  run 1: 4,330,654 rows/sec
+  run 2: 4,646,775 rows/sec
+  run 3: 4,758,732 rows/sec
+  run 4: 4,186,973 rows/sec
+  run 5: 4,900,111 rows/sec
+  Fold-path throughput (rows/sec) [PASS/OK]:
+    Runs: [4,330,654, 4,646,775, 4,758,732, 4,186,973, 4,900,111]
+    Average: 4,564,649 >= 1,000,000 (target)
+    Min/Max: 4,186,973 / 4,900,111, StdDev: 266,211

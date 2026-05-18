@@ -127,8 +127,21 @@ impl<K: std::hash::Hash + Eq + Copy, V> LruMap<K, V> {
     }
 
     fn evict_one(&mut self) {
-        if let Some((&evict_key, _)) = self.entries.iter().min_by_key(|(_, (_, ts))| *ts) {
-            self.entries.remove(&evict_key);
+        // Sampled (approximate) LRU: evict the oldest of a bounded sample
+        // instead of scanning every entry for the global minimum. This is
+        // O(SAMPLE) not O(capacity); a slightly suboptimal eviction only
+        // affects cache hit rate, never correctness (the HashMap stays the
+        // source of truth). HashMap iteration order is unspecified, which
+        // makes the sample effectively random across the map.
+        const SAMPLE: usize = 16;
+        let victim = self
+            .entries
+            .iter()
+            .take(SAMPLE)
+            .min_by_key(|(_, (_, ts))| *ts)
+            .map(|(k, _)| *k);
+        if let Some(k) = victim {
+            self.entries.remove(&k);
         }
     }
 }
@@ -809,6 +822,8 @@ mod tests {
                 nullable: false,
                 default_expr: None,
                 max_length: None,
+                ts_precision: None,
+                tz_offset_secs: None,
             }],
             constraints: vec![],
             created_at: 0,
@@ -819,6 +834,7 @@ mod tests {
             cdf_enabled: false,
             cdf_retention_days: 0,
             lifecycle: Default::default(),
+            columnar: Default::default(),
         }
     }
 

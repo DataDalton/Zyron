@@ -12,18 +12,21 @@ pub mod cache;
 pub mod compaction;
 pub mod constants;
 pub mod file;
+pub mod patch;
 pub mod segment;
 pub mod sorted;
 
 pub use bloom::BloomFilter;
 pub use cache::{SegmentCache, SegmentCacheKey, SegmentCacheStats};
 pub use compaction::{
-    ColumnDescriptor, CompactionConfig, CompactionInput, CompactionResult, CompactionThread,
+    ColumnDescriptor, CompactionConfig, CompactionInput, CompactionResult, encode_and_write,
+    run_compaction_cycle,
 };
 pub use constants::*;
 pub use file::{SortOrder, ZyrFileHeader, ZyrFileReader, ZyrFileWriter};
+pub use patch::{ColumnarPatchManager, PatchStore, RowOverlay, ValuePatch};
 pub use segment::{
     ColumnSegment, SegmentHeader, ZoneMapEntry, compare_le_bytes, compare_stat_slots,
-    value_to_stat_slot,
+    compare_stat_slots_typed, stat_slot_is_signed, value_to_stat_slot,
 };
 pub use sorted::{SortedSegmentEntry, SortedSegmentIndex};

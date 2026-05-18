@@ -192,14 +192,8 @@ mod tests {
 
     fn schema() -> Vec<ColumnSpec> {
         vec![
-            ColumnSpec {
-                name: "id".into(),
-                type_id: TypeId::Int64,
-            },
-            ColumnSpec {
-                name: "name".into(),
-                type_id: TypeId::Varchar,
-            },
+            ColumnSpec::new("id", TypeId::Int64),
+            ColumnSpec::new("name", TypeId::Varchar),
         ]
     }
 

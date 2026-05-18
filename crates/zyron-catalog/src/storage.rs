@@ -70,6 +70,21 @@ pub trait CatalogStorage: Send + Sync {
 
     // Table operations
     async fn load_tables(&self) -> Result<Vec<TableEntry>>;
+    /// Resolves a single table by (schema_id, name). The default filters
+    /// `load_tables` for trait impls that have no targeted path; the heap
+    /// implementation overrides this with an early-return scan so a cache
+    /// miss does not deserialize and allocate every table in the catalog.
+    async fn load_table_by_name(
+        &self,
+        schema_id: SchemaId,
+        name: &str,
+    ) -> Result<Option<TableEntry>> {
+        Ok(self
+            .load_tables()
+            .await?
+            .into_iter()
+            .find(|t| t.schema_id == schema_id && t.name == name))
+    }
     async fn store_table(&self, entry: &TableEntry) -> Result<TupleId>;
     async fn delete_table(&self, id: TableId) -> Result<bool>;
 
@@ -487,6 +502,25 @@ impl CatalogStorage for HeapCatalogStorage {
             }
         });
         Ok(entries)
+    }
+
+    async fn load_table_by_name(
+        &self,
+        schema_id: SchemaId,
+        name: &str,
+    ) -> Result<Option<TableEntry>> {
+        let guard = self.tables_heap.scan()?;
+        let mut found = None;
+        guard.try_for_each(|_tid, view| {
+            if let Ok(entry) = TableEntry::from_bytes(view.data) {
+                if entry.schema_id == schema_id && entry.name == name {
+                    found = Some(entry);
+                    return false; // stop scanning at the first match
+                }
+            }
+            true
+        });
+        Ok(found)
     }
 
     async fn store_table(&self, entry: &TableEntry) -> Result<TupleId> {

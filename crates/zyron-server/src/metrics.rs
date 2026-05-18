@@ -59,6 +59,29 @@ impl LatencyHistogram {
         self.buckets[idx].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Estimates the 99th percentile latency in microseconds from the
+    /// cumulative bucket counts. Returns the upper bound of the bucket that
+    /// contains the p99 observation (standard histogram-quantile bucket
+    /// estimate). Returns 0 when no observations have been recorded so the
+    /// caller treats an idle system as no backpressure.
+    pub fn p99_estimate_us(&self) -> u64 {
+        let total = self.count.load(Ordering::Relaxed);
+        if total == 0 {
+            return 0;
+        }
+        let target = ((total as f64) * 0.99).ceil() as u64;
+        let mut cumulative: u64 = 0;
+        for (i, &boundary) in self.boundaries.iter().enumerate() {
+            cumulative += self.buckets[i].load(Ordering::Relaxed);
+            if cumulative >= target {
+                return boundary;
+            }
+        }
+        // p99 falls in the +Inf bucket: return the largest boundary as the
+        // best finite estimate.
+        self.boundaries.last().copied().unwrap_or(u64::MAX)
+    }
+
     /// Renders histogram lines in Prometheus text format.
     fn render_prometheus(&self, name: &str, help: &str, out: &mut String) {
         out.push_str(&format!("# HELP {} {}\n", name, help));

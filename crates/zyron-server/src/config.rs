@@ -1173,6 +1173,12 @@ pub struct CompactionSection {
     pub max_concurrent: usize,
     /// Rate limit for compaction IO in megabytes per second.
     pub rate_limit_mbps: u64,
+    /// Seconds between compaction cycles.
+    pub interval_secs: u64,
+    /// Skip a cycle when measured query p99 exceeds this many microseconds.
+    pub oltp_p99_threshold_us: u64,
+    /// Maximum rows written into one .zyr segment file.
+    pub max_rows_per_file: u64,
 }
 
 impl Default for CompactionSection {
@@ -1182,6 +1188,9 @@ impl Default for CompactionSection {
             threshold_rows: 100_000,
             max_concurrent: 2,
             rate_limit_mbps: 100,
+            interval_secs: 30,
+            oltp_p99_threshold_us: 1_000,
+            max_rows_per_file: 1_000_000,
         }
     }
 }

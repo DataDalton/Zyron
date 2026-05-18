@@ -2339,9 +2339,12 @@ fn columns_to_specs(
     cols: &[zyron_catalog::ColumnEntry],
 ) -> Vec<zyron_streaming::format::ColumnSpec> {
     cols.iter()
-        .map(|c| zyron_streaming::format::ColumnSpec {
-            name: c.name.clone(),
-            type_id: c.type_id,
+        .map(|c| {
+            zyron_streaming::format::ColumnSpec::with_precision(
+                c.name.clone(),
+                c.type_id,
+                c.ts_precision,
+            )
         })
         .collect()
 }

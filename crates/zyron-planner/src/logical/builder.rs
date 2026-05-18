@@ -68,6 +68,7 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
                 name: "".to_string(),
                 type_id: TypeId::Null,
                 nullable: true,
+                ts_precision: None,
             }],
         }
     } else {
@@ -196,6 +197,7 @@ fn build_from_item(item: &BoundFromItem) -> Result<LogicalPlan> {
                     name: c.name.clone(),
                     type_id: c.type_id,
                     nullable: c.nullable,
+                    ts_precision: c.ts_precision,
                 })
                 .collect();
             let as_of_target = match as_of {
@@ -310,6 +312,7 @@ fn rewrite_post_aggregate(
             column_id: ColumnId(i as u16),
             type_id: g.type_id(),
             nullable: g.nullable(),
+            ts_precision: g.ts_precision(),
         });
         return;
     }
@@ -341,6 +344,9 @@ fn rewrite_post_aggregate(
                 column_id: ColumnId(column_idx as u16),
                 type_id: *return_type,
                 nullable: true,
+                // Aggregate-result precision (e.g. MIN/MAX over TIMESTAMP(p))
+                // is finalized in B5; default precision until then.
+                ts_precision: None,
             });
         }
         BoundExpr::BinaryOp { left, right, .. } => {
@@ -484,6 +490,7 @@ fn build_insert_plan(insert: &BoundInsert) -> Result<LogicalPlan> {
                     name: c.name.clone(),
                     type_id: c.type_id,
                     nullable: c.nullable,
+                    ts_precision: c.ts_precision,
                 })
                 .collect();
             LogicalPlan::Values {
@@ -516,6 +523,7 @@ fn build_update_plan(update: &BoundUpdate) -> Result<LogicalPlan> {
             name: c.name.clone(),
             type_id: c.type_id,
             nullable: c.nullable,
+            ts_precision: c.ts_precision,
         })
         .collect();
 
@@ -556,6 +564,7 @@ fn build_delete_plan(delete: &BoundDelete) -> Result<LogicalPlan> {
             name: c.name.clone(),
             type_id: c.type_id,
             nullable: c.nullable,
+            ts_precision: c.ts_precision,
         })
         .collect();
 

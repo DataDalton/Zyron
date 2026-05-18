@@ -660,7 +660,7 @@ mod tests {
     #[test]
     fn test_scalar_value_to_f64() {
         assert_eq!(ScalarValue::Int64(42).to_f64(), Some(42.0));
-        assert_eq!(ScalarValue::Float64(3.14).to_f64(), Some(3.14));
+        assert_eq!(ScalarValue::Float64(3.5).to_f64(), Some(3.5));
         assert_eq!(ScalarValue::Utf8("hello".into()).to_f64(), None);
         assert_eq!(ScalarValue::Null.to_f64(), None);
     }

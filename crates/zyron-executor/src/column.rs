@@ -431,7 +431,9 @@ impl ColumnData {
             TypeId::Int64 | TypeId::Time | TypeId::Timestamp | TypeId::TimestampTz => {
                 ColumnData::Int64(Vec::with_capacity(cap))
             }
-            TypeId::Int128 | TypeId::Decimal => ColumnData::Int128(Vec::with_capacity(cap)),
+            TypeId::Int128 | TypeId::Decimal | TypeId::Hlc => {
+                ColumnData::Int128(Vec::with_capacity(cap))
+            }
             TypeId::UInt8 => ColumnData::UInt8(Vec::with_capacity(cap)),
             TypeId::UInt16 => ColumnData::UInt16(Vec::with_capacity(cap)),
             TypeId::UInt32 | TypeId::Color => ColumnData::UInt32(Vec::with_capacity(cap)),
@@ -730,7 +732,9 @@ impl ColumnData {
             TypeId::Int64 | TypeId::Time | TypeId::Timestamp | TypeId::TimestampTz => {
                 ColumnData::Int64(vec![0; len])
             }
-            TypeId::Int128 | TypeId::Decimal | TypeId::UInt128 => ColumnData::Int128(vec![0; len]),
+            TypeId::Int128 | TypeId::Decimal | TypeId::UInt128 | TypeId::Hlc => {
+                ColumnData::Int128(vec![0; len])
+            }
             TypeId::UInt8 => ColumnData::UInt8(vec![0; len]),
             TypeId::UInt16 => ColumnData::UInt16(vec![0; len]),
             TypeId::UInt32 | TypeId::Color => ColumnData::UInt32(vec![0; len]),
@@ -821,6 +825,12 @@ pub struct Column {
     pub data: ColumnData,
     pub nulls: NullBitmap,
     pub type_id: TypeId,
+    /// Fractional-second precision when type_id is a logical timestamp and the
+    /// physical data is i128 picoseconds (p>6). None for every other column,
+    /// including p<=6 timestamps (i64 microseconds). Carried with the value so
+    /// cross-precision compare, casts, and presentation know a physical i128
+    /// is logically a ps timestamp, not a plain Int128.
+    pub ts_precision: Option<u8>,
 }
 
 impl Column {
@@ -831,6 +841,18 @@ impl Column {
             data,
             nulls: NullBitmap::none(len),
             type_id,
+            ts_precision: None,
+        }
+    }
+
+    /// Creates a timestamp column carrying its fractional-second precision.
+    pub fn new_ts(data: ColumnData, type_id: TypeId, ts_precision: Option<u8>) -> Self {
+        let len = data.len();
+        Self {
+            data,
+            nulls: NullBitmap::none(len),
+            type_id,
+            ts_precision,
         }
     }
 
@@ -841,6 +863,23 @@ impl Column {
             data,
             nulls,
             type_id,
+            ts_precision: None,
+        }
+    }
+
+    /// Like with_nulls but carries timestamp precision.
+    pub fn with_nulls_ts(
+        data: ColumnData,
+        nulls: NullBitmap,
+        type_id: TypeId,
+        ts_precision: Option<u8>,
+    ) -> Self {
+        debug_assert_eq!(data.len(), nulls.len());
+        Self {
+            data,
+            nulls,
+            type_id,
+            ts_precision,
         }
     }
 
@@ -850,6 +889,7 @@ impl Column {
             data: ColumnData::null_fill(type_id, len),
             nulls: NullBitmap::all_null(len),
             type_id,
+            ts_precision: None,
         }
     }
 
@@ -887,6 +927,7 @@ impl Column {
             data: self.data.filter(mask),
             nulls: self.nulls.filter(mask),
             type_id: self.type_id,
+            ts_precision: self.ts_precision,
         }
     }
 
@@ -896,6 +937,7 @@ impl Column {
             data: self.data.take(indices),
             nulls: self.nulls.take(indices),
             type_id: self.type_id,
+            ts_precision: self.ts_precision,
         }
     }
 
@@ -905,6 +947,7 @@ impl Column {
             data: self.data.slice(offset, len),
             nulls: self.nulls.slice(offset, len),
             type_id: self.type_id,
+            ts_precision: self.ts_precision,
         }
     }
 

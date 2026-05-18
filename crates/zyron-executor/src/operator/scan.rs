@@ -123,76 +123,16 @@ impl SeqScanOperator {
         })
     }
 
-    /// Enforces column-level security on a result batch: classification
-    /// clearance and masking policies. Columns the session role lacks
-    /// clearance for are masked (if a masking policy exists) or NULLed
-    /// (deny). Internal queries (no security context) are unaffected.
+    /// Enforces column-level security on a result batch. Delegates to the
+    /// shared operator-level policy so heap and columnar scans behave
+    /// identically.
     fn apply_column_security(&self, batch: DataBatch) -> DataBatch {
-        let sc = match &self.ctx.security_context {
-            Some(s) => s,
-            None => return batch,
-        };
-        let sm = match &self.ctx.security_manager {
-            Some(s) => s,
-            None => return batch,
-        };
-        let table_id = self.table_entry.id.0;
-        let n = batch.num_rows;
-        let mut cols = Vec::with_capacity(batch.columns.len());
-        for (i, col) in batch.columns.iter().enumerate() {
-            // Only base-table columns carry a classification/mask label.
-            if i >= self.output_columns.len() {
-                cols.push(col.clone());
-                continue;
-            }
-            let col_id = self.output_columns[i].column_id.0;
-            let cleared = sm
-                .classification_store
-                .check_clearance(sc.clearance, table_id, col_id);
-            // Probe whether a masking policy applies to this (role, column).
-            let mut probe = String::new();
-            let has_mask = sm.masking_policy_store.apply_masking(
-                table_id,
-                col_id,
-                "",
-                &sc.effective_roles,
-                &mut probe,
-            );
-            if cleared && !has_mask {
-                cols.push(col.clone());
-                continue;
-            }
-            let mut b = ColumnBuilder::new(col.type_id, n);
-            for r in 0..n {
-                let v = col.get_scalar(r);
-                let masked_text = if let ScalarValue::Utf8(s) = &v {
-                    let mut buf = String::new();
-                    if sm.masking_policy_store.apply_masking(
-                        table_id,
-                        col_id,
-                        s,
-                        &sc.effective_roles,
-                        &mut buf,
-                    ) {
-                        Some(buf)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                if let Some(m) = masked_text {
-                    b.push(&ScalarValue::Utf8(m));
-                } else if cleared {
-                    b.push(&v);
-                } else {
-                    // No clearance and no applicable mask: deny by NULLing.
-                    b.push(&ScalarValue::Null);
-                }
-            }
-            cols.push(b.finish());
-        }
-        DataBatch::new(cols)
+        crate::operator::apply_column_security(
+            &self.ctx,
+            self.table_entry.id.0,
+            &self.output_columns,
+            batch,
+        )
     }
 }
 

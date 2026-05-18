@@ -52,6 +52,9 @@ pub enum TypeId {
     Timestamp = 72,
     TimestampTz = 73,
     Interval = 74,
+    /// Hybrid Logical Clock: 64-bit physical us + 64-bit logical counter
+    /// packed into an i128 (16 bytes), compared as a plain i128.
+    Hlc = 75,
 
     // UUID
     Uuid = 80,
@@ -121,6 +124,7 @@ impl TypeId {
             TypeId::Date => Some(4),
             TypeId::Time => Some(8),
             TypeId::Timestamp | TypeId::TimestampTz => Some(8),
+            TypeId::Hlc => Some(16),
             TypeId::Interval => Some(16),
 
             TypeId::Uuid => Some(16),
@@ -157,6 +161,17 @@ impl TypeId {
     /// Returns true if this type has a fixed byte size.
     pub fn is_fixed_size(&self) -> bool {
         self.fixed_size().is_some()
+    }
+
+    /// Physical storage type for a (logical timestamp type, precision) pair.
+    /// p<=6 keeps the i64 microsecond representation. p>6 uses i128
+    /// picoseconds so it rides the 128-bit columnar path. Non-timestamp
+    /// types and None/<=6 precision return the logical type unchanged.
+    pub fn timestamp_physical_type_id(logical: TypeId, precision: Option<u8>) -> TypeId {
+        match logical {
+            TypeId::Timestamp | TypeId::TimestampTz if precision.unwrap_or(6) > 6 => TypeId::Int128,
+            other => other,
+        }
     }
 
     /// Returns true if this type is a numeric type.
@@ -209,6 +224,7 @@ impl TypeId {
             72 => TypeId::Timestamp,
             73 => TypeId::TimestampTz,
             74 => TypeId::Interval,
+            75 => TypeId::Hlc,
             80 => TypeId::Uuid,
             90 => TypeId::Json,
             91 => TypeId::Jsonb,
@@ -343,6 +359,7 @@ impl std::fmt::Display for TypeId {
             TypeId::Time => "TIME",
             TypeId::Timestamp => "TIMESTAMP",
             TypeId::TimestampTz => "TIMESTAMPTZ",
+            TypeId::Hlc => "HLC",
             TypeId::Interval => "INTERVAL",
             TypeId::Uuid => "UUID",
             TypeId::Json => "JSON",

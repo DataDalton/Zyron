@@ -13,6 +13,31 @@ use std::sync::Arc;
 use zyron_catalog::{ColumnId, IndexEntry, IndexId, TableId};
 use zyron_parser::ast::{JoinType, SetOpType};
 
+/// One aggregate answered from columnar segment metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetaAggKind {
+    /// COUNT(*): sum of segment row counts plus heap residual.
+    CountStar,
+    /// COUNT(col): row count minus that column's null count.
+    CountCol,
+    /// MIN(col) from per-segment header min (fixed-width columns only).
+    Min,
+    /// MAX(col) from per-segment header max (fixed-width columns only).
+    Max,
+}
+
+/// Specification of one metadata-pushdown aggregate output column.
+#[derive(Debug, Clone)]
+pub struct MetaAggSpec {
+    pub kind: MetaAggKind,
+    /// Target column id for CountCol/Min/Max; ignored for CountStar.
+    pub column_id: Option<ColumnId>,
+    /// Result type id.
+    pub return_type: zyron_common::types::TypeId,
+    /// Output column name.
+    pub name: String,
+}
+
 /// Physical execution plan. Each variant maps to a concrete operator
 /// and carries cost estimates.
 #[derive(Debug, Clone)]
@@ -25,6 +50,29 @@ pub enum PhysicalPlan {
         cost: PlanCost,
         /// Time travel target for versioned table scans.
         as_of: Option<super::logical::AsOfTarget>,
+    },
+
+    /// Hybrid scan: the union of the table's registered .zyr columnar
+    /// segments and the heap residual, reconciled by snapshot visibility.
+    /// A folded row exists in exactly one store, so the union never double
+    /// counts. Chosen when the table has registered columnar segments.
+    HybridScan {
+        table_id: TableId,
+        columns: Vec<LogicalColumn>,
+        predicate: Option<BoundExpr>,
+        cost: PlanCost,
+    },
+
+    /// MIN/MAX/COUNT answered from columnar segment headers plus the heap
+    /// residual, with no decode of the folded rows. Emitted only when the
+    /// table has registered segments, there is no GROUP BY, no predicate, no
+    /// DISTINCT, and the patch overlay is consulted at execution so the
+    /// metadata is MVCC-safe (a non-clean segment falls back to a scan).
+    ColumnarMetadataAggregate {
+        table_id: TableId,
+        specs: Vec<MetaAggSpec>,
+        schema: Vec<LogicalColumn>,
+        cost: PlanCost,
     },
 
     /// Index-based scan for selective predicates.
@@ -98,6 +146,18 @@ pub enum PhysicalPlan {
     SortAggregate {
         group_by: Vec<BoundExpr>,
         aggregates: Vec<AggregateExpr>,
+        child: Box<PhysicalPlan>,
+        cost: PlanCost,
+    },
+
+    /// Time-bucket gap fill. Densifies a time-bucketed aggregate by emitting a
+    /// row for every bucket in the observed [min, max] range stepping by
+    /// `width`. Absent buckets get the bucket value and NULL for all other
+    /// columns. `bucket_col` is the index of the time_bucket_gapfill grouping
+    /// column in the child output.
+    GapFill {
+        bucket_col: usize,
+        width: i128,
         child: Box<PhysicalPlan>,
         cost: PlanCost,
     },
@@ -315,6 +375,8 @@ impl PhysicalPlan {
     pub fn cost(&self) -> &PlanCost {
         match self {
             PhysicalPlan::SeqScan { cost, .. }
+            | PhysicalPlan::HybridScan { cost, .. }
+            | PhysicalPlan::ColumnarMetadataAggregate { cost, .. }
             | PhysicalPlan::IndexScan { cost, .. }
             | PhysicalPlan::Filter { cost, .. }
             | PhysicalPlan::Project { cost, .. }
@@ -341,6 +403,7 @@ impl PhysicalPlan {
             | PhysicalPlan::SpatialScan { cost, .. }
             | PhysicalPlan::GraphAlgorithm { cost, .. }
             | PhysicalPlan::AnalyticsTableFunction { cost, .. }
+            | PhysicalPlan::GapFill { cost, .. }
             | PhysicalPlan::Window { cost, .. } => cost,
         }
     }
@@ -349,8 +412,10 @@ impl PhysicalPlan {
     pub fn output_schema(&self) -> Vec<LogicalColumn> {
         match self {
             PhysicalPlan::SeqScan { columns, .. }
+            | PhysicalPlan::HybridScan { columns, .. }
             | PhysicalPlan::IndexScan { columns, .. }
             | PhysicalPlan::ParallelSeqScan { columns, .. } => columns.clone(),
+            PhysicalPlan::ColumnarMetadataAggregate { schema, .. } => schema.clone(),
             PhysicalPlan::Filter { child, .. } => child.output_schema(),
             PhysicalPlan::Project {
                 expressions,
@@ -370,6 +435,7 @@ impl PhysicalPlan {
                         name,
                         type_id: expr.type_id(),
                         nullable: expr.nullable(),
+                        ts_precision: None,
                     }
                 })
                 .collect(),
@@ -399,6 +465,7 @@ impl PhysicalPlan {
                         name: format!("group{}", i),
                         type_id: expr.type_id(),
                         nullable: expr.nullable(),
+                        ts_precision: None,
                     });
                 }
                 for (i, agg) in aggregates.iter().enumerate() {
@@ -409,6 +476,7 @@ impl PhysicalPlan {
                         name: agg.function_name.clone(),
                         type_id: agg.return_type,
                         nullable: true,
+                        ts_precision: None,
                     });
                 }
                 schema
@@ -418,6 +486,7 @@ impl PhysicalPlan {
             | PhysicalPlan::HashDistinct { child, .. }
             | PhysicalPlan::Gather { child, .. }
             | PhysicalPlan::Repartition { child, .. }
+            | PhysicalPlan::GapFill { child, .. }
             | PhysicalPlan::Broadcast { child, .. } => child.output_schema(),
             PhysicalPlan::SetOp { left, .. } => left.output_schema(),
             PhysicalPlan::Insert { .. }
@@ -447,6 +516,7 @@ impl PhysicalPlan {
                         name,
                         type_id: expr.type_id(),
                         nullable: true,
+                        ts_precision: None,
                     });
                 }
                 schema
@@ -459,6 +529,8 @@ impl PhysicalPlan {
         let own = *self.cost();
         let children_cost = match self {
             PhysicalPlan::SeqScan { .. }
+            | PhysicalPlan::HybridScan { .. }
+            | PhysicalPlan::ColumnarMetadataAggregate { .. }
             | PhysicalPlan::IndexScan { .. }
             | PhysicalPlan::Values { .. }
             | PhysicalPlan::ParallelSeqScan { .. }
@@ -480,6 +552,7 @@ impl PhysicalPlan {
             | PhysicalPlan::Gather { child, .. }
             | PhysicalPlan::Repartition { child, .. }
             | PhysicalPlan::Broadcast { child, .. }
+            | PhysicalPlan::GapFill { child, .. }
             | PhysicalPlan::Window { child, .. } => child.total_cost(),
             PhysicalPlan::NestedLoopJoin { left, right, .. }
             | PhysicalPlan::HashJoin { left, right, .. }

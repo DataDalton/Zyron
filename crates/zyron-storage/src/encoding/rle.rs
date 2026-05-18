@@ -95,10 +95,15 @@ impl Encoding for RleEncoding {
             u32::from_le_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]) as usize;
 
         let totalBytes = row_count * value_size;
-        let mut out: Vec<u8> = Vec::with_capacity(totalBytes);
-        unsafe {
-            out.set_len(totalBytes);
-        }
+        // SAFETY: the run-expansion loop below writes every byte of `out`
+        // before any read; zeroing first would memset the whole buffer only
+        // to overwrite it, regressing scan decode throughput.
+        #[allow(clippy::uninit_vec)]
+        let mut out: Vec<u8> = {
+            let mut v = Vec::with_capacity(totalBytes);
+            unsafe { v.set_len(totalBytes) };
+            v
+        };
         let outPtr = out.as_mut_ptr();
         let mut writePos = 0usize;
         let mut pos = 8;

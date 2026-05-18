@@ -107,6 +107,96 @@ pub trait Encoding: Send + Sync {
     }
 }
 
+/// Canonical variable-length column buffer, used when `value_size == 0`:
+///   [0..4]                      row_count: u32 (LE)
+///   [4 .. 4 + 4*(row_count+1)]  offsets: u32 LE array. offsets[0] == 0,
+///                               offsets[i+1] == end of row i in the blob.
+///   [offsets_end ..]            values blob
+/// Row i bytes are `blob[offsets[i]..offsets[i+1]]`. A null row is stored as
+/// a zero-length slice. The null bitmap held by `ColumnSegment` is the
+/// authoritative null marker, so an empty string and a null stay distinct.
+pub const VARLEN_VALUE_SIZE: usize = 0;
+
+/// Packs row values into the canonical variable-length buffer. A `None`
+/// value is encoded as a zero-length row.
+pub fn varlen_pack(values: &[Option<&[u8]>]) -> Vec<u8> {
+    let row_count = values.len();
+    let blob_len: usize = values.iter().map(|v| v.map_or(0, |b| b.len())).sum();
+    let offsets_bytes = 4 * (row_count + 1);
+    let mut out = Vec::with_capacity(4 + offsets_bytes + blob_len);
+    out.extend_from_slice(&(row_count as u32).to_le_bytes());
+    let mut cursor = 0u32;
+    out.extend_from_slice(&cursor.to_le_bytes());
+    for v in values {
+        cursor += v.map_or(0, |b| b.len()) as u32;
+        out.extend_from_slice(&cursor.to_le_bytes());
+    }
+    for v in values {
+        if let Some(b) = v {
+            out.extend_from_slice(b);
+        }
+    }
+    out
+}
+
+/// Reads the row count from a canonical variable-length buffer header.
+pub fn varlen_row_count(data: &[u8]) -> Result<usize> {
+    if data.len() < 4 {
+        return Err(ZyronError::DecodingFailed(
+            "varlen buffer shorter than header".to_string(),
+        ));
+    }
+    Ok(u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize)
+}
+
+/// Borrows each row as a slice from a canonical variable-length buffer.
+pub fn varlen_slice_rows(data: &[u8], row_count: usize) -> Result<Vec<&[u8]>> {
+    let offsets_start = 4;
+    let blob_start = offsets_start + 4 * (row_count + 1);
+    if data.len() < blob_start {
+        return Err(ZyronError::DecodingFailed(
+            "varlen buffer offset array truncated".to_string(),
+        ));
+    }
+    let read_off = |i: usize| -> u32 {
+        let p = offsets_start + 4 * i;
+        u32::from_le_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]])
+    };
+    let blob = &data[blob_start..];
+    let mut rows = Vec::with_capacity(row_count);
+    for i in 0..row_count {
+        let lo = read_off(i) as usize;
+        let hi = read_off(i + 1) as usize;
+        if lo > hi || hi > blob.len() {
+            return Err(ZyronError::DecodingFailed(
+                "varlen buffer offset out of range".to_string(),
+            ));
+        }
+        rows.push(&blob[lo..hi]);
+    }
+    Ok(rows)
+}
+
+/// Borrows each row as a slice. `value_size > 0` is the fixed-width layout
+/// (`row_count` contiguous `value_size`-byte slots). `value_size == 0` is the
+/// canonical variable-length layout. Every encoder uses this so the
+/// fixed/variable split lives in exactly one place.
+pub fn slice_rows(data: &[u8], row_count: usize, value_size: usize) -> Result<Vec<&[u8]>> {
+    if value_size == 0 {
+        return varlen_slice_rows(data, row_count);
+    }
+    if data.len() < row_count * value_size {
+        return Err(ZyronError::DecodingFailed(
+            "data shorter than expected row count".to_string(),
+        ));
+    }
+    let mut rows = Vec::with_capacity(row_count);
+    for i in 0..row_count {
+        rows.push(&data[i * value_size..(i + 1) * value_size]);
+    }
+    Ok(rows)
+}
+
 /// Evaluates a predicate on raw (decoded) column data, producing a packed bitmask.
 pub fn eval_predicate_on_raw(
     data: &[u8],
@@ -114,6 +204,27 @@ pub fn eval_predicate_on_raw(
     value_size: usize,
     predicate: &Predicate,
 ) -> Result<Vec<u8>> {
+    if value_size == 0 {
+        // Variable-length: lexicographic comparison over the canonical buffer.
+        let rows = varlen_slice_rows(data, row_count)?;
+        let bitmask_len = row_count.div_ceil(8);
+        let mut bitmask = vec![0u8; bitmask_len];
+        for (i, value) in rows.iter().enumerate() {
+            let matches = match predicate {
+                Predicate::Equality(target) => value == target,
+                Predicate::Range { low, high } => {
+                    let above_low = low.map_or(true, |lo| *value >= lo);
+                    let below_high = high.map_or(true, |hi| *value <= hi);
+                    above_low && below_high
+                }
+                Predicate::In(values) => values.iter().any(|t| value == t),
+            };
+            if matches {
+                bitmask[i / 8] |= 1 << (i % 8);
+            }
+        }
+        return Ok(bitmask);
+    }
     let bitmask_len = row_count.div_ceil(8);
     let mut bitmask = vec![0u8; bitmask_len];
 
@@ -272,8 +383,16 @@ pub fn select_encoding(type_id: TypeId, sample: &[Option<&[u8]>]) -> EncodingTyp
         return EncodingType::Rle;
     }
 
-    // Type-specific candidate and Unencoded fallback for trial-encode
-    let typeCandidate = if type_id.is_integer() {
+    // Type-specific candidate and Unencoded fallback for trial-encode.
+    // Temporal and HLC types are integer-backed fixed-width values (Date i32,
+    // Time/Timestamp/TimestampTz/Interval i64, ps Timestamp/HLC i128), so they
+    // ride the FastLanes FoR+delta/delta-of-delta/const-step path exactly like
+    // the integer types. ColumnSegment::build is handed the logical type id,
+    // which for a ps column is Timestamp (not Int128), so keying only on
+    // is_integer() here would fold every timestamp column Unencoded and the
+    // "ps at us-class density" property would never hold. Trial-encode still
+    // falls back to Unencoded when FastLanes is not actually smaller.
+    let typeCandidate = if type_id.is_integer() || type_id.is_temporal() || type_id == TypeId::Hlc {
         EncodingType::FastLanes
     } else if type_id.is_floating_point() {
         EncodingType::Alp
@@ -312,6 +431,56 @@ pub fn select_encoding(type_id: TypeId, sample: &[Option<&[u8]>]) -> EncodingTyp
     }
 
     EncodingType::Unencoded
+}
+
+/// Selects the encoding for a variable-length column (`value_size == 0`,
+/// canonical buffer). Fixed-width selection in `select_encoding` keys off
+/// value width and bit-packing which do not apply to variable-length data.
+/// Constant collapses an all-identical column to a single stored value.
+/// Unencoded stores the canonical buffer verbatim and round-trips exactly,
+/// with predicate pushdown handled by `eval_predicate_on_raw`'s
+/// variable-length path. FSST symbol compression of the values blob is the
+/// next optimization layered on this selection, not a correctness
+/// prerequisite: every variable-length column folds and reads correctly
+/// under this policy.
+pub fn select_encoding_varlen(_type_id: TypeId, sample: &[Option<&[u8]>]) -> EncodingType {
+    if sample.is_empty() {
+        return EncodingType::Unencoded;
+    }
+    let stats = compute_sample_stats(sample);
+    if stats.all_identical {
+        return EncodingType::Constant;
+    }
+
+    // Trial-encode every applicable candidate against the canonical buffer
+    // and keep the densest. Dictionary is only a candidate for low-cardinality
+    // columns (the enum/category/status string pattern); FSST symbol
+    // compression and the verbatim Unencoded buffer are always candidates.
+    // Unencoded is the floor and is always correct, so a candidate is only
+    // chosen when it is strictly smaller.
+    let raw = varlen_pack(sample);
+    let row_count = sample.len();
+    let mut best = EncodingType::Unencoded;
+    let mut best_size = raw.len();
+
+    if stats.cardinality < 65536 && stats.cardinality < row_count / 2 {
+        let dict = create_encoding(EncodingType::Dictionary);
+        if let Ok(enc) = dict.encode(&raw, row_count, 0)
+            && enc.len() < best_size
+        {
+            best = EncodingType::Dictionary;
+            best_size = enc.len();
+        }
+    }
+
+    let fsst = create_encoding(EncodingType::Fsst);
+    if let Ok(enc) = fsst.encode(&raw, row_count, 0)
+        && enc.len() < best_size
+    {
+        best = EncodingType::Fsst;
+    }
+
+    best
 }
 
 /// Creates an Encoding trait object for the given encoding type.
@@ -408,6 +577,49 @@ mod tests {
     #[test]
     fn test_select_empty_sample() {
         assert_eq!(select_encoding(TypeId::Int32, &[]), EncodingType::Unencoded);
+    }
+
+    #[test]
+    fn test_sentinel_i128_column_compacts_and_roundtrips() {
+        // System-versioning sys_end pattern: ~every live row holds the same
+        // i128 MAX_TIMESTAMP sentinel, a few rows have real end timestamps.
+        // The existing Constant/Dictionary/RLE selection already collapses this
+        // without a bespoke sub-encoding.
+        let sentinel: u128 = 253_402_300_799_000_000u128 * 1_000_000;
+        let ended: [u128; 3] = [1_700_000_000_000_000, 1_700_000_005_000_000, 42];
+        let mut raw = Vec::new();
+        let mut sample: Vec<[u8; 16]> = Vec::with_capacity(2000);
+        for i in 0..2000usize {
+            let v = if i % 700 == 13 {
+                ended[i % 3]
+            } else {
+                sentinel
+            };
+            sample.push(v.to_le_bytes());
+        }
+        let sample_refs: Vec<Option<&[u8]>> = sample.iter().map(|b| Some(b.as_slice())).collect();
+        let et = select_encoding(TypeId::Int128, &sample_refs);
+        assert!(
+            matches!(
+                et,
+                EncodingType::Constant | EncodingType::Dictionary | EncodingType::Rle
+            ),
+            "sentinel column should compact, got {:?}",
+            et
+        );
+        for b in &sample {
+            raw.extend_from_slice(b);
+        }
+        let enc = create_encoding(et);
+        let encoded = enc.encode(&raw, sample.len(), 16).unwrap();
+        assert!(
+            encoded.len() < raw.len() / 4,
+            "sentinel column must compress hard: {} vs {}",
+            encoded.len(),
+            raw.len()
+        );
+        let decoded = enc.decode(&encoded, sample.len(), 16).unwrap();
+        assert_eq!(decoded, raw);
     }
 
     #[test]

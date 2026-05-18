@@ -2387,8 +2387,14 @@ pub enum DataType {
     Bytea,
     Date,
     Time,
-    Timestamp,
-    TimestampTz,
+    /// TIMESTAMP(p): p is fractional-second precision 0..=12. None = default 6
+    /// (microseconds). p<=6 stores i64 us, p>6 stores i128 picoseconds.
+    Timestamp(Option<u8>),
+    /// TIMESTAMPTZ(p): same precision rules as Timestamp.
+    TimestampTz(Option<u8>),
+    /// Hybrid Logical Clock: high 64 bits physical microseconds since epoch,
+    /// low 64 bits logical counter, packed into the i128 physical path.
+    Hlc,
     Interval,
     Uuid,
     Json,
@@ -2430,6 +2436,15 @@ pub enum DataType {
 }
 
 impl DataType {
+    /// Fractional-second precision for timestamp types. None for non-timestamp
+    /// types or when no `(p)` was given (caller treats None as the default 6).
+    pub fn timestamp_precision(&self) -> Option<u8> {
+        match self {
+            DataType::Timestamp(p) | DataType::TimestampTz(p) => *p,
+            _ => None,
+        }
+    }
+
     /// Converts this SQL data type to the corresponding internal TypeId.
     pub fn to_type_id(&self) -> TypeId {
         match self {
@@ -2463,8 +2478,9 @@ impl DataType {
             DataType::Bytea => TypeId::Bytea,
             DataType::Date => TypeId::Date,
             DataType::Time => TypeId::Time,
-            DataType::Timestamp => TypeId::Timestamp,
-            DataType::TimestampTz => TypeId::TimestampTz,
+            DataType::Timestamp(_) => TypeId::Timestamp,
+            DataType::TimestampTz(_) => TypeId::TimestampTz,
+            DataType::Hlc => TypeId::Hlc,
             DataType::Interval => TypeId::Interval,
             DataType::Uuid => TypeId::Uuid,
             DataType::Json => TypeId::Json,
@@ -2863,8 +2879,12 @@ mod tests {
         assert_eq!(DataType::Text.to_type_id(), TypeId::Text);
         assert_eq!(DataType::Date.to_type_id(), TypeId::Date);
         assert_eq!(DataType::Time.to_type_id(), TypeId::Time);
-        assert_eq!(DataType::Timestamp.to_type_id(), TypeId::Timestamp);
-        assert_eq!(DataType::TimestampTz.to_type_id(), TypeId::TimestampTz);
+        assert_eq!(DataType::Timestamp(None).to_type_id(), TypeId::Timestamp);
+        assert_eq!(
+            DataType::TimestampTz(Some(9)).to_type_id(),
+            TypeId::TimestampTz
+        );
+        assert_eq!(DataType::Hlc.to_type_id(), TypeId::Hlc);
         assert_eq!(DataType::Interval.to_type_id(), TypeId::Interval);
         assert_eq!(DataType::Uuid.to_type_id(), TypeId::Uuid);
         assert_eq!(DataType::Json.to_type_id(), TypeId::Json);

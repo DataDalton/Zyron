@@ -370,6 +370,39 @@ impl<'a> PhysicalPlanner<'a> {
         // Get table stats
         let table_stats = self.catalog.get_stats(table_id);
 
+        // Columnar correctness gate. When the table has registered .zyr
+        // segments, folded rows were physically deleted from the heap, so a
+        // heap-only SeqScan or IndexScan would silently miss them. Only the
+        // hybrid scan reads both stores. Time travel (AS OF) stays on the
+        // heap/version path and is not folded, so it keeps the heap scan.
+        if as_of.is_none()
+            && let Ok(te) = self.catalog.get_table_by_id(table_id)
+            && !te.columnar.segments.is_empty()
+        {
+            let mut cost = match &table_stats {
+                Some(s) => self.cost_model.cost_seq_scan(&s.0),
+                None => PlanCost::zero(),
+            };
+            // Wire the zone-map / bloom skip-rate hint to the real columnar
+            // path: a higher provable skip rate lowers the scanned cost.
+            if let Some(hints) = &encoding_hints
+                && hints.any_applicable()
+            {
+                let keep = 1.0 - hints.estimated_skip_rate();
+                cost = PlanCost {
+                    io_cost: cost.io_cost * keep,
+                    cpu_cost: cost.cpu_cost * keep,
+                    row_count: cost.row_count,
+                };
+            }
+            return Ok(PhysicalPlan::HybridScan {
+                table_id,
+                columns,
+                predicate,
+                cost,
+            });
+        }
+
         // Get available indexes
         let indexes = self.catalog.get_indexes_for_table(table_id);
 
@@ -469,7 +502,8 @@ impl<'a> PhysicalPlanner<'a> {
         if let Some(pred) = &predicate {
             for index in &indexes {
                 if let Some((index_pred, remaining)) = match_index(pred, index) {
-                    let (selectivity, cost) = if let Some((ts, cs)) = &table_stats {
+                    let (selectivity, cost) = if let Some(s) = &table_stats {
+                        let (ts, cs) = (&s.0, &s.1);
                         let sel =
                             self.cost_model
                                 .estimate_selectivity(&index_pred, Some(ts), Some(cs));
@@ -503,13 +537,14 @@ impl<'a> PhysicalPlanner<'a> {
         }
 
         // Compute sequential scan cost
-        let seq_cost = if let Some((ts, _)) = &table_stats {
+        let seq_cost = if let Some(s) = &table_stats {
+            let ts = &s.0;
             let mut scan_cost = self.cost_model.cost_seq_scan(ts);
             if let Some(pred) = &predicate {
                 let selectivity = self.cost_model.estimate_selectivity(
                     pred,
-                    table_stats.as_ref().map(|(ts, _)| ts),
-                    table_stats.as_ref().map(|(_, cs)| cs.as_slice()),
+                    table_stats.as_ref().map(|s| &s.0),
+                    table_stats.as_ref().map(|s| s.1.as_slice()),
                 );
                 scan_cost.row_count = (scan_cost.row_count * selectivity).max(1.0);
             }
@@ -525,7 +560,8 @@ impl<'a> PhysicalPlanner<'a> {
         // Consider parallel scan for large tables.
         // Use the predicate-adjusted row count from seq_cost to decide threshold,
         // since filtering reduces the effective work.
-        if let Some((ts, _)) = &table_stats {
+        if let Some(s) = &table_stats {
+            let ts = &s.0;
             if parallel_plan::should_parallelize(ts.row_count as f64) {
                 let num_workers = parallel_plan::compute_worker_count(ts.page_count);
                 if num_workers > 1 {
@@ -565,7 +601,8 @@ impl<'a> PhysicalPlanner<'a> {
         // Consider encoding-aware scan cost if hints are present
         if let Some(hints) = &encoding_hints {
             if hints.any_applicable() {
-                if let Some((ts, _)) = &table_stats {
+                if let Some(s) = &table_stats {
+                    let ts = &s.0;
                     let skip_rate = hints.estimated_skip_rate();
                     let params = EncodingCostParameters {
                         skip_rate,
@@ -751,6 +788,58 @@ impl<'a> PhysicalPlanner<'a> {
     // Aggregate planning: Hash vs Sort
     // -----------------------------------------------------------------------
 
+    /// Maps a set of ungrouped aggregates to metadata-pushdown specs, or
+    /// None if any aggregate is not metadata-answerable. MIN/MAX require a
+    /// fixed-width column (a variable-length header stores only a truncated
+    /// byte prefix, which is not an exact extremum). DISTINCT disqualifies.
+    fn try_meta_agg_specs(
+        &self,
+        table_id: zyron_catalog::TableId,
+        aggregates: &[crate::logical::AggregateExpr],
+    ) -> Option<Vec<crate::physical::MetaAggSpec>> {
+        if aggregates.is_empty() {
+            return None;
+        }
+        let te = self.catalog.get_table_by_id(table_id).ok()?;
+        let mut specs = Vec::with_capacity(aggregates.len());
+        for a in aggregates {
+            if a.distinct {
+                return None;
+            }
+            let fname = a.function_name.to_lowercase();
+            let (kind, col) = match fname.as_str() {
+                "count" => {
+                    let col = a.args.first().and_then(extract_column_id_from_expr);
+                    match col {
+                        Some(c) => (crate::physical::MetaAggKind::CountCol, Some(c)),
+                        None => (crate::physical::MetaAggKind::CountStar, None),
+                    }
+                }
+                "min" | "max" => {
+                    let c = a.args.first().and_then(extract_column_id_from_expr)?;
+                    let ce = te.columns.iter().find(|x| x.id == c)?;
+                    // Fixed-width only: a var-len header min/max is a
+                    // truncated prefix, not the exact value.
+                    ce.physical_type_id().fixed_size()?;
+                    let k = if fname == "min" {
+                        crate::physical::MetaAggKind::Min
+                    } else {
+                        crate::physical::MetaAggKind::Max
+                    };
+                    (k, Some(c))
+                }
+                _ => return None,
+            };
+            specs.push(crate::physical::MetaAggSpec {
+                kind,
+                column_id: col,
+                return_type: a.return_type,
+                name: a.function_name.clone(),
+            });
+        }
+        Some(specs)
+    }
+
     fn plan_aggregate(
         &self,
         group_by: Vec<BoundExpr>,
@@ -759,6 +848,44 @@ impl<'a> PhysicalPlanner<'a> {
     ) -> Result<PhysicalPlan> {
         let child_plan = self.plan(child)?;
         let child_cost = *child_plan.cost();
+
+        // Metadata aggregate pushdown: ungrouped MIN/MAX/COUNT over a table
+        // with columnar segments and no predicate can be answered from
+        // segment headers (with an MVCC patch guard at execution) instead of
+        // decoding the folded rows.
+        if group_by.is_empty()
+            && let PhysicalPlan::HybridScan {
+                table_id,
+                predicate: None,
+                ..
+            } = &child_plan
+        {
+            let tid = *table_id;
+            if let Some(specs) = self.try_meta_agg_specs(tid, &aggregates) {
+                let schema: Vec<crate::logical::LogicalColumn> = specs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| crate::logical::LogicalColumn {
+                        table_idx: Some(crate::logical::AGGREGATE_TABLE_IDX),
+                        column_id: zyron_catalog::ColumnId(i as u16),
+                        name: s.name.clone(),
+                        type_id: s.return_type,
+                        nullable: true,
+                        ts_precision: None,
+                    })
+                    .collect();
+                return Ok(PhysicalPlan::ColumnarMetadataAggregate {
+                    table_id: tid,
+                    specs,
+                    schema,
+                    cost: PlanCost {
+                        io_cost: 1.0,
+                        cpu_cost: 1.0,
+                        row_count: 1.0,
+                    },
+                });
+            }
+        }
 
         let group_count = if group_by.is_empty() {
             1.0
@@ -770,8 +897,14 @@ impl<'a> PhysicalPlanner<'a> {
             .cost_model
             .cost_hash_aggregate(&child_cost, group_count);
 
+        // Detect a time_bucket_gapfill(width, ts) grouping key: it groups
+        // exactly like time_bucket, then a GapFill node densifies the result.
+        let gapfill = group_by.iter().enumerate().find_map(|(i, g)| {
+            gapfill_width(g).map(|w| (i, w))
+        });
+
         // Use HashAggregate by default (better for random group distributions)
-        Ok(PhysicalPlan::HashAggregate {
+        let agg = PhysicalPlan::HashAggregate {
             group_by,
             aggregates,
             child: Box::new(child_plan),
@@ -780,7 +913,54 @@ impl<'a> PhysicalPlanner<'a> {
                 cpu_cost: cost.cpu_cost - child_cost.cpu_cost,
                 row_count: group_count,
             },
-        })
+        };
+
+        match gapfill {
+            Some((bucket_col, width)) => {
+                let agg_cost = *agg.cost();
+                Ok(PhysicalPlan::GapFill {
+                    bucket_col,
+                    width,
+                    child: Box::new(agg),
+                    cost: PlanCost {
+                        io_cost: 0.0,
+                        cpu_cost: agg_cost.cpu_cost,
+                        // Dense output row count is data-derived at execution;
+                        // estimate at least the grouped row count.
+                        row_count: agg_cost.row_count,
+                    },
+                })
+            }
+            None => Ok(agg),
+        }
+    }
+}
+
+/// A constant integer value of a bound expression (unwrapping Nested), or None.
+fn const_int(e: &BoundExpr) -> Option<i128> {
+    match e {
+        BoundExpr::Literal {
+            value: zyron_parser::ast::LiteralValue::Integer(v),
+            ..
+        } => Some(*v as i128),
+        BoundExpr::Nested(inner) => const_int(inner),
+        _ => None,
+    }
+}
+
+/// If `e` is `time_bucket_gapfill(width, ts)` with a constant integer width,
+/// returns that width (in the timestamp column's storage unit). The grouping
+/// itself is computed by the time_bucket_gapfill scalar (identical to
+/// time_bucket); a GapFill node then densifies the grouped result.
+fn gapfill_width(e: &BoundExpr) -> Option<i128> {
+    match e {
+        BoundExpr::Function { name, args, .. }
+            if name.eq_ignore_ascii_case("time_bucket_gapfill") && !args.is_empty() =>
+        {
+            const_int(&args[0])
+        }
+        BoundExpr::Nested(inner) => gapfill_width(inner),
+        _ => None,
     }
 }
 
@@ -1150,6 +1330,8 @@ fn rewrite_window_refs(
                 column_id: ColumnId((input_schema_len + idx) as u16),
                 type_id: *type_id,
                 nullable: true,
+                // Window-output precision finalized in B5.
+                ts_precision: None,
             })
         }
         BE::ColumnRef(_) | BE::Literal { .. } | BE::Parameter { .. } => expr.clone(),
@@ -1414,12 +1596,14 @@ mod tests {
             column_id: ColumnId(0),
             type_id: TypeId::Int64,
             nullable: false,
+            ts_precision: None,
         });
         let right_col = BoundExpr::ColumnRef(ColumnRef {
             table_idx: 1,
             column_id: ColumnId(0),
             type_id: TypeId::Int64,
             nullable: false,
+            ts_precision: None,
         });
         let eq = BoundExpr::BinaryOp {
             left: Box::new(left_col.clone()),
@@ -1443,12 +1627,14 @@ mod tests {
             column_id: ColumnId(0),
             type_id: TypeId::Int64,
             nullable: false,
+            ts_precision: None,
         });
         let right_col = BoundExpr::ColumnRef(ColumnRef {
             table_idx: 1,
             column_id: ColumnId(0),
             type_id: TypeId::Int64,
             nullable: false,
+            ts_precision: None,
         });
         let eq = BoundExpr::BinaryOp {
             left: Box::new(left_col.clone()),
@@ -1488,6 +1674,7 @@ mod tests {
                 column_id: ColumnId(0),
                 type_id: TypeId::Int64,
                 nullable: false,
+                ts_precision: None,
             })),
             op: BinaryOperator::Gt,
             right: Box::new(BoundExpr::Literal {

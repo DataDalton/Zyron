@@ -88,8 +88,7 @@ impl Operator for VectorScanOperator {
             let mut builders = create_builders(&self.output_columns, batch_size);
             let output_ids: Vec<zyron_catalog::ColumnId> =
                 self.output_columns.iter().map(|c| c.column_id).collect();
-            let column_to_builder =
-                build_column_to_builder_map(&table_entry.columns, &output_ids);
+            let column_to_builder = build_column_to_builder_map(&table_entry.columns, &output_ids);
             let mut distances: Vec<f32> = Vec::with_capacity(batch_size);
             let mut row_count = 0usize;
 
@@ -137,11 +136,10 @@ impl Operator for VectorScanOperator {
             let mut batch = finalize_builders(builders);
             // Append distance as an additional Float32 column stored as Float64
             let float_distances: Vec<f64> = distances.iter().map(|&d| d as f64).collect();
-            batch.columns.push(crate::column::Column {
-                data: crate::column::ColumnData::Float64(float_distances),
-                nulls: crate::column::NullBitmap::none(row_count),
-                type_id: zyron_common::TypeId::Float64,
-            });
+            batch.columns.push(crate::column::Column::new(
+                crate::column::ColumnData::Float64(float_distances),
+                zyron_common::TypeId::Float64,
+            ));
             Ok(Some(ExecutionBatch::new(batch)))
         })
     }

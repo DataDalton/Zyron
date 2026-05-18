@@ -13,8 +13,8 @@ use arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder, Decimal128Array,
     Decimal128Builder, Float32Array, Float32Builder, Float64Array, Float64Builder, Int8Array,
     Int8Builder, Int16Array, Int16Builder, Int32Array, Int32Builder, Int64Array, Int64Builder,
-    RecordBatch, StringArray, StringBuilder, UInt8Array, UInt8Builder, UInt16Array, UInt16Builder,
-    UInt32Array, UInt32Builder, UInt64Array, UInt64Builder,
+    RecordBatch, StringArray, StringBuilder, TimestampNanosecondArray, UInt8Array, UInt8Builder,
+    UInt16Array, UInt16Builder, UInt32Array, UInt32Builder, UInt64Array, UInt64Builder,
 };
 use arrow::datatypes::Schema;
 use std::sync::Arc;
@@ -31,14 +31,47 @@ pub fn rows_to_batch(
 ) -> Result<RecordBatch> {
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(schema.len());
     for (ci, col) in schema.iter().enumerate() {
-        arrays.push(build_column(ci, col.type_id, rows)?);
+        arrays.push(build_column(ci, col.type_id, col.ts_precision, rows)?);
     }
     RecordBatch::try_new(arrow_schema, arrays)
         .map_err(|e| ZyronError::StreamingError(format!("record_batch: build error: {e}")))
 }
 
-fn build_column(ci: usize, t: TypeId, rows: &[Vec<StreamValue>]) -> Result<ArrayRef> {
+fn build_column(
+    ci: usize,
+    t: TypeId,
+    ts_precision: Option<u8>,
+    rows: &[Vec<StreamValue>],
+) -> Result<ArrayRef> {
     let n = rows.len();
+    // Picosecond TIMESTAMP(p>6)/TIMESTAMPTZ(p>6): the column is i128 ps. Arrow
+    // has no picosecond unit, so it exports as an Int64 Nanosecond timestamp
+    // array via ps_to_arrow_ns. LOSSY: ps -> ns truncates the low 3 digits.
+    // This is the only sanctioned silent narrowing for the picosecond feature
+    // and is documented in the format spec. p<=6/None keeps the i64
+    // microsecond path below, byte-identical to before.
+    if matches!(t, TypeId::Timestamp | TypeId::TimestampTz)
+        && ts_precision.unwrap_or(6) > 6
+    {
+        let mut ns: Vec<Option<i64>> = Vec::with_capacity(n);
+        for row in rows {
+            match &row[ci] {
+                StreamValue::Null => ns.push(None),
+                StreamValue::I128(v) => ns.push(Some(super::schema::ps_to_arrow_ns(*v))),
+                StreamValue::I64(v) => ns.push(Some(*v)),
+                other => return Err(col_type_err(ci, t, other)),
+            }
+        }
+        let arr = TimestampNanosecondArray::from(ns);
+        // TIMESTAMPTZ carries a UTC zone so it matches the schema field that
+        // timestamp_arrow_type emits for p>6 (Some("UTC")).
+        let arr = if t == TypeId::TimestampTz {
+            arr.with_timezone("UTC")
+        } else {
+            arr
+        };
+        return Ok(Arc::new(arr) as ArrayRef);
+    }
     match t {
         TypeId::Boolean => {
             let mut b = BooleanBuilder::with_capacity(n);
@@ -85,7 +118,7 @@ fn build_column(ci: usize, t: TypeId, rows: &[Vec<StreamValue>]) -> Result<Array
             }
             Ok(Arc::new(b.finish()) as ArrayRef)
         }
-        TypeId::Int128 | TypeId::Decimal | TypeId::UInt128 => {
+        TypeId::Int128 | TypeId::Decimal | TypeId::UInt128 | TypeId::Hlc => {
             let mut b = Decimal128Builder::with_capacity(n)
                 .with_precision_and_scale(38, 0)
                 .map_err(|e| {
@@ -298,7 +331,7 @@ fn extract_scalar(t: TypeId, arr: &dyn Array, i: usize) -> Result<StreamValue> {
                 .ok_or_else(|| dc_err("Float64"))?
                 .value(i),
         )),
-        TypeId::Int128 | TypeId::Decimal | TypeId::UInt128 => Ok(StreamValue::I128(
+        TypeId::Int128 | TypeId::Decimal | TypeId::UInt128 | TypeId::Hlc => Ok(StreamValue::I128(
             arr.as_any()
                 .downcast_ref::<Decimal128Array>()
                 .ok_or_else(|| dc_err("Decimal128"))?

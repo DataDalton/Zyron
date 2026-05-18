@@ -56,7 +56,12 @@ pub struct Catalog {
     cache: Arc<CatalogCache>,
     wal: Arc<WalWriter>,
     oid_allocator: OidAllocator,
-    stats: RwLock<HashMap<TableId, (TableStats, Vec<ColumnStats>)>>,
+    // Read-mostly: written only by the background stats refresh, read on
+    // every cardinality estimate. The value is an Arc so a read is a single
+    // refcount bump, not a deep clone of TableStats + Vec<ColumnStats>; the
+    // RwLock read section is then just a map get and is uncontended in
+    // practice (writes are seconds apart, readers do not block readers).
+    stats: RwLock<HashMap<TableId, Arc<(TableStats, Vec<ColumnStats>)>>>,
 }
 
 impl Catalog {
@@ -460,6 +465,7 @@ impl Catalog {
             cdf_enabled: false,
             cdf_retention_days: 0,
             lifecycle: Default::default(),
+            columnar: Default::default(),
         };
 
         self.log_ddl(DDL_CREATE_TABLE, &entry.to_bytes())?;
@@ -1191,11 +1197,12 @@ impl Catalog {
     ) {
         self.stats
             .write()
-            .insert(table_id, (table_stats, column_stats));
+            .insert(table_id, Arc::new((table_stats, column_stats)));
     }
 
-    /// Retrieves statistics for a table.
-    pub fn get_stats(&self, table_id: TableId) -> Option<(TableStats, Vec<ColumnStats>)> {
+    /// Retrieves statistics for a table. Returns an `Arc`: cloning it is a
+    /// refcount bump, never a copy of the stats payload.
+    pub fn get_stats(&self, table_id: TableId) -> Option<Arc<(TableStats, Vec<ColumnStats>)>> {
         self.stats.read().get(&table_id).cloned()
     }
 
@@ -1228,6 +1235,18 @@ impl Catalog {
         self.storage.store_table(&entry).await?;
         self.cache.put_table(entry);
         Ok(())
+    }
+
+    /// Replaces the cached table entry without WAL logging or a storage
+    /// rewrite. The compaction worker uses this for the common per-fold
+    /// columnar-registry update so a fold is O(1) instead of re-serializing
+    /// and re-persisting every prior segment (which is O(segments) per fold,
+    /// O(n^2) over a table's life). Durable persistence is amortized via a
+    /// periodic `update_table`; a crash before the next durable persist is
+    /// reconciled at startup from the WAL `CompactionEnd` records, which is
+    /// already the columnar registry's recovery path.
+    pub fn cache_put_table(&self, entry: TableEntry) {
+        self.cache.put_table(entry);
     }
 
     // ----- Phase 17 data lifecycle accessors -----
@@ -1336,6 +1355,8 @@ fn convert_column_defs(table_id: TableId, defs: &[ColumnDef]) -> Result<Vec<Colu
             nullable,
             default_expr,
             max_length,
+            ts_precision: def.data_type.timestamp_precision(),
+            tz_offset_secs: None,
         });
     }
     Ok(entries)
@@ -1480,6 +1501,8 @@ mod tests {
                 nullable: false,
                 default_expr: None,
                 max_length: None,
+                ts_precision: None,
+                tz_offset_secs: None,
             },
             ColumnEntry {
                 id: ColumnId(1),
@@ -1490,6 +1513,8 @@ mod tests {
                 nullable: false,
                 default_expr: None,
                 max_length: None,
+                ts_precision: None,
+                tz_offset_secs: None,
             },
         ];
         let tcs = vec![

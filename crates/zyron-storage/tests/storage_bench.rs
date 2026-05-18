@@ -2607,10 +2607,7 @@ async fn test_checkpoint_io_profile_v2() {
             let mut f = std::fs::File::open(&path).unwrap();
             let meta = f.metadata().unwrap();
             let len = meta.len() as usize;
-            let mut buf = Vec::with_capacity(len);
-            unsafe {
-                buf.set_len(len);
-            }
+            let mut buf = vec![0u8; len];
             f.read_exact(&mut buf).unwrap();
             let r = t.elapsed().as_secs_f64() * 1000.0;
             if r < best_r2 {

@@ -352,7 +352,7 @@ mod tests {
 
     #[test]
     fn vectorValueSerializationRoundTrip() {
-        let original = VectorValue::new(vec![1.5, -2.25, 0.0, 3.14]).expect("valid vector");
+        let original = VectorValue::new(vec![1.5, -2.25, 0.0, 3.5]).expect("valid vector");
         let bytes = original.toBytes();
         assert_eq!(bytes.len(), 2 + 4 * 4);
 

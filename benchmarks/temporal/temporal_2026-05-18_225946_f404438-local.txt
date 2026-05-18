@@ -1,0 +1,36 @@
+
+=== Decode throughput: ps vs us full materialization ===
+  us decode rows/sec [PASS/OK]:
+    Runs: [682,128,240, 694,444,444, 707,714,084, 693,962,526, 720,461,095]
+    Average: 699,742,078 >= 1 (target)
+    Min/Max: 682,128,240 / 720,461,095, StdDev: 13,149,494
+  ps decode rows/sec [PASS/OK]:
+    Runs: [534,330,751, 526,731,630, 485,672,657, 426,803,244, 367,511,944]
+    Average: 468,210,045 >= 233,247,359 (target)
+    Min/Max: 367,511,944 / 534,330,751, StdDev: 63,176,415
+
+=== Irregular ps vs irregular us (matched shape) ===
+  us irregular ratio (raw:encoded) [PASS/OK]:
+    Runs: [3, 3, 3, 3, 3]
+    Average: 3 >= 1 (target)
+    Min/Max: 3 / 3, StdDev: 0
+  ps irregular ratio (raw:encoded) [PASS/OK]:
+    Runs: [3, 3, 3, 3, 3]
+    Average: 3 >= 1 (target)
+    Min/Max: 3 / 3, StdDev: 0
+
+=== sys_end ps sentinel column density ===
+  sentinel ps ratio (raw:encoded) [PASS/OK]:
+    Runs: [16, 16, 16, 16, 16]
+    Average: 16 >= 10 (target)
+    Min/Max: 16 / 16, StdDev: 0
+
+=== Regular series: ps vs us encoding ratio ===
+  us regular ratio (raw:encoded) [PASS/OK]:
+    Runs: [80,000, 80,000, 80,000, 80,000, 80,000]
+    Average: 80,000 >= 100 (target)
+    Min/Max: 80,000 / 80,000, StdDev: 0
+  ps regular ratio (raw:encoded) [PASS/OK]:
+    Runs: [80,000, 80,000, 80,000, 80,000, 80,000]
+    Average: 80,000 >= 40,000 (target)
+    Min/Max: 80,000 / 80,000, StdDev: 0

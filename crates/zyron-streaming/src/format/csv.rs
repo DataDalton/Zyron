@@ -19,11 +19,7 @@ use zyron_common::{Result, TypeId, ZyronError};
 pub struct CsvReader;
 
 impl FormatReader for CsvReader {
-    fn read_rows(
-        &mut self,
-        bytes: &[u8],
-        schema: &[ColumnSpec],
-    ) -> Result<Vec<Vec<StreamValue>>> {
+    fn read_rows(&mut self, bytes: &[u8], schema: &[ColumnSpec]) -> Result<Vec<Vec<StreamValue>>> {
         let mut rdr = ::csv::ReaderBuilder::new()
             .has_headers(true)
             .from_reader(bytes);
@@ -62,16 +58,11 @@ impl FormatReader for CsvReader {
 pub struct CsvWriter;
 
 impl FormatWriter for CsvWriter {
-    fn write_rows(
-        &mut self,
-        rows: &[Vec<StreamValue>],
-        schema: &[ColumnSpec],
-    ) -> Result<Vec<u8>> {
+    fn write_rows(&mut self, rows: &[Vec<StreamValue>], schema: &[ColumnSpec]) -> Result<Vec<u8>> {
         let mut wtr = ::csv::WriterBuilder::new().from_writer(Vec::new());
         let header: Vec<&str> = schema.iter().map(|c| c.name.as_str()).collect();
-        wtr.write_record(&header).map_err(|e| {
-            ZyronError::StreamingError(format!("csv: header write error: {e}"))
-        })?;
+        wtr.write_record(&header)
+            .map_err(|e| ZyronError::StreamingError(format!("csv: header write error: {e}")))?;
         for row in rows {
             if row.len() != schema.len() {
                 return Err(ZyronError::StreamingError(format!(
@@ -84,9 +75,8 @@ impl FormatWriter for CsvWriter {
             for (col, v) in schema.iter().zip(row.iter()) {
                 fields.push(value_to_text(v, col.type_id)?);
             }
-            wtr.write_record(&fields).map_err(|e| {
-                ZyronError::StreamingError(format!("csv: row write error: {e}"))
-            })?;
+            wtr.write_record(&fields)
+                .map_err(|e| ZyronError::StreamingError(format!("csv: row write error: {e}")))?;
         }
         wtr.flush()
             .map_err(|e| ZyronError::StreamingError(format!("csv: flush error: {e}")))?;
@@ -126,7 +116,7 @@ fn text_to_value(text: &str, t: TypeId) -> Result<StreamValue> {
             .parse::<i64>()
             .map(StreamValue::I64)
             .map_err(|_| ZyronError::StreamingError(format!("csv: bad integer '{text}'"))),
-        TypeId::Int128 | TypeId::Decimal | TypeId::UInt128 => text
+        TypeId::Int128 | TypeId::Decimal | TypeId::UInt128 | TypeId::Hlc => text
             .parse::<i128>()
             .map(StreamValue::I128)
             .map_err(|_| ZyronError::StreamingError(format!("csv: bad i128 '{text}'"))),
@@ -169,7 +159,11 @@ fn text_to_value(text: &str, t: TypeId) -> Result<StreamValue> {
 fn value_to_text(v: &StreamValue, t: TypeId) -> Result<String> {
     match v {
         StreamValue::Null => Ok(String::new()),
-        StreamValue::Bool(b) => Ok(if *b { "true".to_string() } else { "false".to_string() }),
+        StreamValue::Bool(b) => Ok(if *b {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        }),
         StreamValue::I64(n) => Ok(n.to_string()),
         StreamValue::I128(n) => Ok(n.to_string()),
         StreamValue::F64(n) => Ok(n.to_string()),

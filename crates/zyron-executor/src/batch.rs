@@ -90,7 +90,12 @@ impl DataBatch {
 pub struct ColumnBuilder {
     data: ColumnData,
     nulls: NullBitmap,
+    /// Logical type reported on the finished Column (e.g. TimestampTz even
+    /// when the physical buffer is Int128 picoseconds).
     type_id: TypeId,
+    /// Fractional-second precision carried onto the finished Column so a
+    /// physical i128 is known to be a logical ps timestamp.
+    ts_precision: Option<u8>,
 }
 
 impl ColumnBuilder {
@@ -99,6 +104,24 @@ impl ColumnBuilder {
             data: ColumnData::with_capacity(type_id, capacity),
             nulls: NullBitmap::empty(),
             type_id,
+            ts_precision: None,
+        }
+    }
+
+    /// Builder for a timestamp column: the physical buffer is sized for
+    /// `physical_type` (Int128 when p>6) while the finished Column reports the
+    /// `logical_type` and carries `ts_precision`.
+    pub fn new_ts(
+        logical_type: TypeId,
+        physical_type: TypeId,
+        ts_precision: Option<u8>,
+        capacity: usize,
+    ) -> Self {
+        Self {
+            data: ColumnData::with_capacity(physical_type, capacity),
+            nulls: NullBitmap::empty(),
+            type_id: logical_type,
+            ts_precision,
         }
     }
 
@@ -114,15 +137,24 @@ impl ColumnBuilder {
     }
 
     pub fn finish(self) -> Column {
-        Column::with_nulls(self.data, self.nulls, self.type_id)
+        Column::with_nulls_ts(self.data, self.nulls, self.type_id, self.ts_precision)
     }
 }
 
-/// Creates a vector of column builders for the given logical columns.
+/// Creates a vector of column builders for the given logical columns. A
+/// TIMESTAMP(p) column with p>6 gets an i128 physical buffer while the
+/// finished Column keeps its logical timestamp type and precision.
 pub fn create_builders(columns: &[LogicalColumn], capacity: usize) -> Vec<ColumnBuilder> {
     columns
         .iter()
-        .map(|col| ColumnBuilder::new(col.type_id, capacity))
+        .map(|col| {
+            let phys = TypeId::timestamp_physical_type_id(col.type_id, col.ts_precision);
+            if phys != col.type_id {
+                ColumnBuilder::new_ts(col.type_id, phys, col.ts_precision, capacity)
+            } else {
+                ColumnBuilder::new(col.type_id, capacity)
+            }
+        })
         .collect()
 }
 
@@ -183,8 +215,12 @@ pub fn decode_tuple_into_builders(
     for (i, col) in columns.iter().enumerate() {
         let is_null = (null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
         let builder_idx = column_to_builder[i].map(|b| b as usize);
+        // Physical type drives byte layout: a TIMESTAMP(p>6) column is stored
+        // as 16-byte i128 picoseconds even though its logical type is a
+        // timestamp.
+        let phys_type = col.physical_type_id();
 
-        if let Some(fixed_size) = col.type_id.fixed_size() {
+        if let Some(fixed_size) = phys_type.fixed_size() {
             if is_null {
                 if let Some(b) = builder_idx {
                     builders[b].push_null();
@@ -193,7 +229,7 @@ pub fn decode_tuple_into_builders(
             } else {
                 let value_bytes = &data[offset..offset + fixed_size];
                 if let Some(b) = builder_idx {
-                    let scalar = decode_fixed_scalar(col.type_id, value_bytes);
+                    let scalar = decode_fixed_scalar(phys_type, value_bytes);
                     builders[b].push(&scalar);
                 }
                 offset += fixed_size;
@@ -226,7 +262,7 @@ pub fn decode_tuple_into_builders(
 }
 
 /// Decodes a fixed-size value from raw bytes into a ScalarValue.
-fn decode_fixed_scalar(type_id: TypeId, bytes: &[u8]) -> ScalarValue {
+pub(crate) fn decode_fixed_scalar(type_id: TypeId, bytes: &[u8]) -> ScalarValue {
     match type_id {
         TypeId::Null => ScalarValue::Null,
         TypeId::Boolean => ScalarValue::Boolean(bytes[0] != 0),
@@ -238,7 +274,7 @@ fn decode_fixed_scalar(type_id: TypeId, bytes: &[u8]) -> ScalarValue {
         TypeId::Int64 | TypeId::Time | TypeId::Timestamp | TypeId::TimestampTz => {
             ScalarValue::Int64(i64::from_le_bytes(bytes[..8].try_into().unwrap()))
         }
-        TypeId::Int128 | TypeId::Decimal => {
+        TypeId::Int128 | TypeId::Decimal | TypeId::Hlc => {
             ScalarValue::Int128(i128::from_le_bytes(bytes[..16].try_into().unwrap()))
         }
         TypeId::UInt8 => ScalarValue::UInt8(bytes[0]),
@@ -260,7 +296,7 @@ fn decode_fixed_scalar(type_id: TypeId, bytes: &[u8]) -> ScalarValue {
 }
 
 /// Decodes a variable-length value from raw bytes into a ScalarValue.
-fn decode_varlen_scalar(type_id: TypeId, bytes: &[u8]) -> ScalarValue {
+pub(crate) fn decode_varlen_scalar(type_id: TypeId, bytes: &[u8]) -> ScalarValue {
     match type_id {
         TypeId::Char | TypeId::Varchar | TypeId::Text | TypeId::Json | TypeId::Jsonb => {
             ScalarValue::Utf8(String::from_utf8_lossy(bytes).into_owned())
@@ -294,11 +330,13 @@ pub fn encode_row(batch: &DataBatch, row_idx: usize, columns: &[ColumnEntry]) ->
             buf[i / 8] |= 1 << (i % 8);
         }
 
-        if let Some(fixed_size) = col.type_id.fixed_size() {
+        // Physical type drives byte layout (TIMESTAMP(p>6) = 16-byte i128 ps).
+        let phys_type = col.physical_type_id();
+        if let Some(fixed_size) = phys_type.fixed_size() {
             if is_null {
                 buf.extend(std::iter::repeat(0u8).take(fixed_size));
             } else {
-                encode_fixed_scalar(&mut buf, col.type_id, &column.data.get_scalar(row_idx));
+                encode_fixed_scalar(&mut buf, phys_type, &column.data.get_scalar(row_idx));
             }
         } else if is_null {
             buf.extend_from_slice(&0u32.to_le_bytes());
@@ -307,6 +345,32 @@ pub fn encode_row(batch: &DataBatch, row_idx: usize, columns: &[ColumnEntry]) ->
         }
     }
 
+    buf
+}
+
+/// Encodes one scalar into the raw columnar value form: a fixed-width LE
+/// value when `value_size > 0`, or the bare variable-length bytes (no length
+/// prefix) when `value_size == 0`. This is the exact inverse of
+/// `decode_fixed_scalar` / `decode_varlen_scalar`, so a value written here by
+/// the columnar patch path round-trips through the columnar read path.
+pub(crate) fn encode_scalar_value(
+    type_id: TypeId,
+    scalar: &ScalarValue,
+    value_size: usize,
+) -> Vec<u8> {
+    if value_size == 0 {
+        return match scalar {
+            ScalarValue::Utf8(s) => s.as_bytes().to_vec(),
+            ScalarValue::Binary(b) => b.clone(),
+            ScalarValue::Null => Vec::new(),
+            _ => Vec::new(),
+        };
+    }
+    let mut buf = Vec::with_capacity(value_size);
+    encode_fixed_scalar(&mut buf, type_id, scalar);
+    if buf.len() < value_size {
+        buf.resize(value_size, 0);
+    }
     buf
 }
 
@@ -324,9 +388,10 @@ fn encode_fixed_scalar(buf: &mut Vec<u8>, type_id: TypeId, scalar: &ScalarValue)
             TypeId::Int64 | TypeId::Time | TypeId::Timestamp | TypeId::TimestampTz,
             ScalarValue::Int64(v),
         ) => buf.extend_from_slice(&v.to_le_bytes()),
-        (TypeId::Int128 | TypeId::Decimal | TypeId::UInt128, ScalarValue::Int128(v)) => {
-            buf.extend_from_slice(&v.to_le_bytes())
-        }
+        (
+            TypeId::Int128 | TypeId::Decimal | TypeId::UInt128 | TypeId::Hlc,
+            ScalarValue::Int128(v),
+        ) => buf.extend_from_slice(&v.to_le_bytes()),
         (TypeId::UInt8, ScalarValue::UInt8(v)) => buf.extend_from_slice(&v.to_le_bytes()),
         (TypeId::UInt16, ScalarValue::UInt16(v)) => buf.extend_from_slice(&v.to_le_bytes()),
         (TypeId::UInt32, ScalarValue::UInt32(v)) => buf.extend_from_slice(&v.to_le_bytes()),

@@ -177,13 +177,15 @@ impl NameResolver {
             return Ok(entry);
         }
 
-        // Fall back to storage
-        let tables = self.storage.load_tables().await?;
-        for table in tables {
-            if table.schema_id == schema_id && table.name == table_name {
-                self.cache.put_table(table.clone());
-                return Ok(Arc::new(table));
-            }
+        // Fall back to storage with a targeted early-return lookup instead
+        // of deserializing and allocating every table in the catalog.
+        if let Some(table) = self
+            .storage
+            .load_table_by_name(schema_id, table_name)
+            .await?
+        {
+            self.cache.put_table(table.clone());
+            return Ok(Arc::new(table));
         }
 
         Err(ZyronError::TableNotFound(table_name.to_string()))
@@ -443,6 +445,8 @@ mod tests {
                             nullable: false,
                             default_expr: None,
                             max_length: None,
+                            ts_precision: None,
+                            tz_offset_secs: None,
                         },
                         ColumnEntry {
                             id: ColumnId(1),
@@ -453,6 +457,8 @@ mod tests {
                             nullable: true,
                             default_expr: None,
                             max_length: Some(255),
+                            ts_precision: None,
+                            tz_offset_secs: None,
                         },
                     ],
                     constraints: vec![],
@@ -464,6 +470,7 @@ mod tests {
                     cdf_enabled: false,
                     cdf_retention_days: 0,
                     lifecycle: Default::default(),
+                    columnar: Default::default(),
                 },
                 TableEntry {
                     id: TableId(20),
@@ -481,6 +488,7 @@ mod tests {
                     cdf_enabled: false,
                     cdf_retention_days: 0,
                     lifecycle: Default::default(),
+                    columnar: Default::default(),
                 },
             ],
         });

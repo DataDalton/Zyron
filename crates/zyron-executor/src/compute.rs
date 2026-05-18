@@ -719,6 +719,34 @@ fn sql_like_dp(text: &[char], pattern: &[char]) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Casts a column to a target type.
+/// Scales a microsecond (i64) timestamp column up to picoseconds (i128),
+/// exact x1_000_000. An already-i128 (ps) column passes through. Nulls and the
+/// logical type are preserved; the result carries `ps_precision`. Used to
+/// normalize a p<=6 operand to a p>6 operand before compare/arith so the two
+/// instants are expressed in the same unit (never the reverse, which would
+/// lose information).
+pub fn scale_us_to_ps(col: &Column, ps_precision: Option<u8>) -> Result<Column> {
+    let len = col.len();
+    let data = match &col.data {
+        ColumnData::Int64(v) => {
+            ColumnData::Int128(v.iter().map(|&x| x as i128 * 1_000_000).collect())
+        }
+        ColumnData::Int128(v) => ColumnData::Int128(v.clone()),
+        _ => {
+            return Err(ZyronError::ExecutionError(
+                "scale_us_to_ps expects an integer timestamp column".to_string(),
+            ));
+        }
+    };
+    debug_assert_eq!(data.len(), len);
+    Ok(Column::with_nulls_ts(
+        data,
+        col.nulls.clone(),
+        col.type_id,
+        ps_precision,
+    ))
+}
+
 pub fn cast_column(col: &Column, target: TypeId) -> Result<Column> {
     let len = col.len();
     let mut data = ColumnData::with_capacity(target, len);
@@ -794,7 +822,32 @@ pub fn cast_scalar(value: &ScalarValue, target: TypeId) -> Result<ScalarValue> {
                 "cannot cast {value} to Boolean"
             ))),
         },
-        TypeId::Int32 | TypeId::Date => Ok(ScalarValue::Int32(
+        // Timestamps are stored as i64 microseconds since the Unix epoch.
+        // Strings are parsed via the validating ISO-8601/SQL parser; integers
+        // are taken as already-microsecond values. (A p>6 column's i64->i128
+        // picosecond scaling is layered by the INSERT path.)
+        TypeId::Timestamp | TypeId::TimestampTz => match value {
+            ScalarValue::Utf8(s) => {
+                Ok(ScalarValue::Int64(zyron_common::parse_timestamp_micros(s)?))
+            }
+            ScalarValue::Int8(v) => Ok(ScalarValue::Int64(*v as i64)),
+            ScalarValue::Int16(v) => Ok(ScalarValue::Int64(*v as i64)),
+            ScalarValue::Int32(v) => Ok(ScalarValue::Int64(*v as i64)),
+            ScalarValue::Int64(v) => Ok(ScalarValue::Int64(*v)),
+            ScalarValue::Int128(v) => Ok(ScalarValue::Int64(*v as i64)),
+            _ => Err(ZyronError::ExecutionError(format!(
+                "cannot cast {value} to TIMESTAMP"
+            ))),
+        },
+        TypeId::Date => match value {
+            ScalarValue::Utf8(s) => Ok(ScalarValue::Int32(zyron_common::parse_date_days(s)?)),
+            _ => Ok(ScalarValue::Int32(
+                i32::try_from(checked_int(value, "DATE")?).map_err(|_| {
+                    ZyronError::ExecutionError(format!("value {value} out of range for DATE"))
+                })?,
+            )),
+        },
+        TypeId::Int32 => Ok(ScalarValue::Int32(
             i32::try_from(checked_int(value, "INTEGER")?).map_err(|_| {
                 ZyronError::ExecutionError(format!("value {value} out of range for INTEGER"))
             })?,
@@ -2020,4 +2073,54 @@ pub fn column_to_mask(col: &Column) -> Vec<bool> {
         mask.push(!col.is_null(i) && bools[i]);
     }
     mask
+}
+
+#[cfg(test)]
+mod ps_tests {
+    use super::*;
+    use crate::column::Column;
+    use zyron_common::TypeId;
+
+    #[test]
+    fn test_scale_us_to_ps_exact_and_order_preserving() {
+        // Microsecond timestamps -> picoseconds, exact x1_000_000.
+        let us: Vec<i64> = vec![-5, 0, 1, 1_700_000_000_000_000, 999];
+        let col = Column::new(ColumnData::Int64(us.clone()), TypeId::TimestampTz);
+        let ps = scale_us_to_ps(&col, Some(9)).unwrap();
+        match &ps.data {
+            ColumnData::Int128(v) => {
+                for (i, &u) in us.iter().enumerate() {
+                    assert_eq!(v[i], u as i128 * 1_000_000);
+                }
+            }
+            _ => panic!("expected Int128"),
+        }
+        assert_eq!(ps.type_id, TypeId::TimestampTz);
+        assert_eq!(ps.ts_precision, Some(9));
+        // Already-ps passes through unchanged.
+        let again = scale_us_to_ps(&ps, Some(9)).unwrap();
+        match (&ps.data, &again.data) {
+            (ColumnData::Int128(a), ColumnData::Int128(b)) => assert_eq!(a, b),
+            _ => panic!("expected Int128"),
+        }
+    }
+
+    #[test]
+    fn test_cross_precision_same_instant_compares_equal() {
+        // Same wall-clock instant: 1_700_000_000 s. p6 stores us, p9 stores ps.
+        let us_instant: i64 = 1_700_000_000_000_000; // microseconds
+        let left = Column::new(ColumnData::Int64(vec![us_instant]), TypeId::TimestampTz);
+        let right = Column::new_ts(
+            ColumnData::Int128(vec![us_instant as i128 * 1_000_000]),
+            TypeId::TimestampTz,
+            Some(9),
+        );
+        // Normalize the us side up to ps, then they must be equal.
+        let scaled = scale_us_to_ps(&left, Some(9)).unwrap();
+        let eq = compare(&scaled, &right, CmpOp::Eq).unwrap();
+        match &eq.data {
+            ColumnData::Boolean(b) => assert!(b[0], "same instant must compare equal"),
+            _ => panic!("expected Boolean"),
+        }
+    }
 }

@@ -1489,7 +1489,7 @@ mod tests {
     #[test]
     fn test_serialize_deserialize_sum() {
         let mut acc = SumAccumulator::new();
-        acc.update_scalar(&ScalarValue::Float64(3.14));
+        acc.update_scalar(&ScalarValue::Float64(3.5));
         let bytes = acc.serialize();
         let restored = SumAccumulator::from_bytes(&bytes);
         assert!(restored.is_some());

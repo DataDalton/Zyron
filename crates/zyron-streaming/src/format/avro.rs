@@ -98,6 +98,7 @@ fn avro_type_json(t: TypeId) -> &'static str {
         TypeId::Int128
         | TypeId::Decimal
         | TypeId::UInt128
+        | TypeId::Hlc
         | TypeId::Binary
         | TypeId::Varbinary
         | TypeId::Bytea
@@ -158,7 +159,8 @@ fn stream_value_to_avro(v: &StreamValue, t: TypeId) -> Result<AvroValue> {
         | (TypeId::Jsonb, StreamValue::Utf8(s)) => AvroValue::String(s.clone()),
         (TypeId::Int128, StreamValue::I128(n))
         | (TypeId::Decimal, StreamValue::I128(n))
-        | (TypeId::UInt128, StreamValue::I128(n)) => AvroValue::Bytes(n.to_le_bytes().to_vec()),
+        | (TypeId::UInt128, StreamValue::I128(n))
+        | (TypeId::Hlc, StreamValue::I128(n)) => AvroValue::Bytes(n.to_le_bytes().to_vec()),
         (TypeId::Binary, StreamValue::Binary(b))
         | (TypeId::Varbinary, StreamValue::Binary(b))
         | (TypeId::Bytea, StreamValue::Binary(b))
@@ -258,10 +260,7 @@ pub fn infer_avro_schema(bytes: &[u8]) -> Result<Vec<ColumnSpec>> {
     let mut cols = Vec::with_capacity(record_fields.len());
     for field in record_fields {
         let type_id = avro_to_type_id(&field.schema)?;
-        cols.push(ColumnSpec {
-            name: field.name.clone(),
-            type_id,
-        });
+        cols.push(ColumnSpec::new(field.name.clone(), type_id));
     }
     Ok(cols)
 }

@@ -1,7 +1,8 @@
 //! Round-trip codec tests for Phase 17 catalog entries.
 
 use zyron_catalog::schema::{
-    ComplianceLogEntry, LegalHoldEntry, LifecycleConfig, RetentionJobEntry, RetentionPolicyEntry,
+    ColumnarRegistry, ColumnarSegmentEntry, ComplianceLogEntry, LegalHoldEntry, LifecycleConfig,
+    RetentionJobEntry, RetentionPolicyEntry,
 };
 use zyron_catalog::{SchemaId, TableEntry, TableId};
 
@@ -43,6 +44,7 @@ fn table_entry_lifecycle_roundtrip() {
         cdf_enabled: false,
         cdf_retention_days: 0,
         lifecycle: lc.clone(),
+        columnar: Default::default(),
     };
     let bytes = entry.to_bytes();
     let decoded = TableEntry::from_bytes(&bytes).expect("decode");
@@ -71,9 +73,69 @@ fn table_entry_backward_compatible_without_lifecycle() {
         cdf_enabled: false,
         cdf_retention_days: 0,
         lifecycle: LifecycleConfig::default(),
+        columnar: Default::default(),
     };
     let decoded = TableEntry::from_bytes(&entry.to_bytes()).expect("decode");
     assert_eq!(decoded.lifecycle, LifecycleConfig::default());
+}
+
+#[test]
+fn table_entry_columnar_registry_roundtrip() {
+    let columnar = ColumnarRegistry {
+        segments: vec![
+            ColumnarSegmentEntry {
+                file_id: 1,
+                path: "data/columnar/t7_f1.zyr".into(),
+                row_count: 1_048_576,
+                sys_rowid_lo: 0,
+                sys_rowid_hi: 1_048_575,
+                sys_xmin_lo: 100,
+                sys_xmin_hi: 9_500,
+            },
+            ColumnarSegmentEntry {
+                file_id: 2,
+                path: "data/columnar/t7_f2.zyr".into(),
+                row_count: 500_000,
+                sys_rowid_lo: 1_048_576,
+                sys_rowid_hi: 1_548_575,
+                sys_xmin_lo: 9_600,
+                sys_xmin_hi: 12_000,
+            },
+        ],
+        next_rowid: 1_548_576,
+        next_file_id: 3,
+        low_water: 11_800,
+    };
+    let entry = TableEntry {
+        id: TableId(7),
+        schema_id: SchemaId(1),
+        name: "metrics".into(),
+        heap_file_id: 200,
+        fsm_file_id: 201,
+        columns: vec![],
+        constraints: vec![],
+        created_at: 1,
+        versioning_enabled: false,
+        scd_type: None,
+        system_versioned: false,
+        history_table_id: None,
+        cdf_enabled: false,
+        cdf_retention_days: 0,
+        lifecycle: LifecycleConfig::default(),
+        columnar: columnar.clone(),
+    };
+    let decoded = TableEntry::from_bytes(&entry.to_bytes()).expect("decode");
+    assert_eq!(decoded.columnar, columnar);
+    // A buffer without the columnar tail decodes to an empty registry.
+    assert_eq!(
+        ColumnarRegistry::default(),
+        ColumnarRegistry {
+            segments: vec![],
+            next_rowid: 0,
+            next_file_id: 0,
+            low_water: 0,
+        }
+    );
 }
 
 #[test]

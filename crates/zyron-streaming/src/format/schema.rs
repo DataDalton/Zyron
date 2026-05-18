@@ -26,7 +26,9 @@ pub fn type_id_to_arrow(t: TypeId) -> ArrowDataType {
         TypeId::Int16 => ArrowDataType::Int16,
         TypeId::Int32 => ArrowDataType::Int32,
         TypeId::Int64 => ArrowDataType::Int64,
-        TypeId::Int128 | TypeId::Decimal | TypeId::UInt128 => ArrowDataType::Decimal128(38, 0),
+        TypeId::Int128 | TypeId::Decimal | TypeId::UInt128 | TypeId::Hlc => {
+            ArrowDataType::Decimal128(38, 0)
+        }
         TypeId::UInt8 => ArrowDataType::UInt8,
         TypeId::UInt16 => ArrowDataType::UInt16,
         TypeId::UInt32 => ArrowDataType::UInt32,
@@ -39,6 +41,9 @@ pub fn type_id_to_arrow(t: TypeId) -> ArrowDataType {
         TypeId::Binary | TypeId::Varbinary | TypeId::Bytea => ArrowDataType::Binary,
         TypeId::Date => ArrowDataType::Date32,
         TypeId::Time => ArrowDataType::Time64(TimeUnit::Microsecond),
+        // Precision-agnostic mapping (default p<=6 microseconds). For a
+        // TIMESTAMP(p) column with p>6 use timestamp_arrow_type, which maps to
+        // nanoseconds (Arrow has no picosecond unit) with a documented loss.
         TypeId::Timestamp => ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
         TypeId::TimestampTz => ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
         TypeId::Uuid => ArrowDataType::FixedSizeBinary(16),
@@ -59,6 +64,32 @@ pub fn type_id_to_arrow(t: TypeId) -> ArrowDataType {
         }
         TypeId::Inet | TypeId::Cidr | TypeId::MacAddr => ArrowDataType::Binary,
     }
+}
+
+/// Precision-aware Arrow type for a timestamp column. p<=6 (or None) keeps the
+/// microsecond mapping byte-for-byte. p>6 maps to Arrow nanoseconds because
+/// Arrow has no picosecond unit - this is the one sanctioned lossy export
+/// (ps -> ns truncates the low 3 digits; see ps_to_arrow_ns and the format
+/// spec). Non-timestamp types defer to type_id_to_arrow.
+pub fn timestamp_arrow_type(t: TypeId, ts_precision: Option<u8>) -> ArrowDataType {
+    match t {
+        TypeId::Timestamp if ts_precision.unwrap_or(6) > 6 => {
+            ArrowDataType::Timestamp(TimeUnit::Nanosecond, None)
+        }
+        TypeId::TimestampTz if ts_precision.unwrap_or(6) > 6 => {
+            ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
+        }
+        _ => type_id_to_arrow(t),
+    }
+}
+
+/// Converts an i128 picosecond timestamp to an i64 Arrow nanosecond value.
+/// LOSSY: Arrow has no picosecond unit, so this truncates the low 3 decimal
+/// digits (ps -> ns). This is the only sanctioned silent narrowing for the
+/// picosecond feature and is documented in the format spec.
+#[inline]
+pub fn ps_to_arrow_ns(ps: i128) -> i64 {
+    (ps / 1000) as i64
 }
 
 // -----------------------------------------------------------------------------
@@ -265,7 +296,7 @@ pub fn json_to_stream_value(v: &serde_json::Value, t: TypeId) -> Result<StreamVa
                 .map_err(|_| type_err("integer string", v)),
             _ => Err(type_err("integer", v)),
         },
-        TypeId::Int128 | TypeId::Decimal | TypeId::UInt128 => match v {
+        TypeId::Int128 | TypeId::Decimal | TypeId::UInt128 | TypeId::Hlc => match v {
             serde_json::Value::String(s) => s
                 .parse::<i128>()
                 .map(StreamValue::I128)
@@ -553,5 +584,43 @@ mod tests {
             let dec = base64_decode(&enc).unwrap();
             assert_eq!(&dec[..], *c, "roundtrip failed for {:?}", c);
         }
+    }
+
+    #[test]
+    fn test_timestamp_arrow_type_precision_aware() {
+        // p<=6 / None keeps microseconds byte-for-byte.
+        assert_eq!(
+            timestamp_arrow_type(TypeId::Timestamp, None),
+            ArrowDataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        assert_eq!(
+            timestamp_arrow_type(TypeId::Timestamp, Some(6)),
+            ArrowDataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        // p>6 maps to nanoseconds (documented lossy), tz preserved.
+        assert_eq!(
+            timestamp_arrow_type(TypeId::Timestamp, Some(9)),
+            ArrowDataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
+        assert_eq!(
+            timestamp_arrow_type(TypeId::TimestampTz, Some(12)),
+            ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
+        );
+        // Non-timestamp defers to the base mapping.
+        assert_eq!(
+            timestamp_arrow_type(TypeId::Int64, Some(9)),
+            ArrowDataType::Int64
+        );
+    }
+
+    #[test]
+    fn test_ps_to_arrow_ns_truncates() {
+        // ps -> ns truncates the low 3 digits (documented loss).
+        assert_eq!(
+            ps_to_arrow_ns(1_700_000_000_123_456_789_000),
+            1_700_000_000_123_456_789
+        );
+        assert_eq!(ps_to_arrow_ns(1_999), 1);
+        assert_eq!(ps_to_arrow_ns(-2_001), -2);
     }
 }

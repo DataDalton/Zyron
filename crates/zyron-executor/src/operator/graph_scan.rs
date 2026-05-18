@@ -159,16 +159,8 @@ fn build_node_score_batches(
     }
 
     let batch = DataBatch::new(vec![
-        Column {
-            data: ColumnData::Int64(node_ids),
-            nulls: NullBitmap::none(row_count),
-            type_id: zyron_common::TypeId::Int64,
-        },
-        Column {
-            data: ColumnData::Float64(scores),
-            nulls: NullBitmap::none(row_count),
-            type_id: zyron_common::TypeId::Float64,
-        },
+        Column::new(ColumnData::Int64(node_ids), zyron_common::TypeId::Int64),
+        Column::new(ColumnData::Float64(scores), zyron_common::TypeId::Float64),
     ]);
     vec![batch]
 }
@@ -190,16 +182,8 @@ fn build_path_batches(path: &[u64], _output_columns: &[LogicalColumn]) -> Vec<Da
     }
 
     let batch = DataBatch::new(vec![
-        Column {
-            data: ColumnData::Int32(steps),
-            nulls: NullBitmap::none(row_count),
-            type_id: zyron_common::TypeId::Int32,
-        },
-        Column {
-            data: ColumnData::Int64(node_ids),
-            nulls: NullBitmap::none(row_count),
-            type_id: zyron_common::TypeId::Int64,
-        },
+        Column::new(ColumnData::Int32(steps), zyron_common::TypeId::Int32),
+        Column::new(ColumnData::Int64(node_ids), zyron_common::TypeId::Int64),
     ]);
     vec![batch]
 }
@@ -224,16 +208,8 @@ fn build_node_depth_batches(
     }
 
     let batch = DataBatch::new(vec![
-        Column {
-            data: ColumnData::Int64(node_ids),
-            nulls: NullBitmap::none(row_count),
-            type_id: zyron_common::TypeId::Int64,
-        },
-        Column {
-            data: ColumnData::Int32(depths),
-            nulls: NullBitmap::none(row_count),
-            type_id: zyron_common::TypeId::Int32,
-        },
+        Column::new(ColumnData::Int64(node_ids), zyron_common::TypeId::Int64),
+        Column::new(ColumnData::Int32(depths), zyron_common::TypeId::Int32),
     ]);
     vec![batch]
 }
@@ -260,16 +236,11 @@ fn build_component_batches(
     }
 
     let batch = DataBatch::new(vec![
-        Column {
-            data: ColumnData::Int64(node_ids),
-            nulls: NullBitmap::none(total_rows),
-            type_id: zyron_common::TypeId::Int64,
-        },
-        Column {
-            data: ColumnData::Int64(component_ids),
-            nulls: NullBitmap::none(total_rows),
-            type_id: zyron_common::TypeId::Int64,
-        },
+        Column::new(ColumnData::Int64(node_ids), zyron_common::TypeId::Int64),
+        Column::new(
+            ColumnData::Int64(component_ids),
+            zyron_common::TypeId::Int64,
+        ),
     ]);
     vec![batch]
 }

@@ -6,6 +6,7 @@
 
 pub mod cdc_writer;
 pub mod checkpoint;
+pub mod compaction;
 pub mod credential_refresh;
 pub mod dead_subscriber_reaper;
 pub mod dlq_ttl;
@@ -38,6 +39,7 @@ use zyron_buffer::BackgroundWriter;
 
 use self::cdc_writer::{CdcWriter, CdcWriterConfig};
 use self::checkpoint::{CheckpointWorker, CheckpointWorkerConfig};
+use self::compaction::{CompactionWorker, CompactionWorkerConfig};
 use self::feature_materialization::{FeatureMaterializationConfig, FeatureMaterializationWorker};
 use self::mv_refresh::{MvRefreshConfig, MvRefreshWorker};
 use self::quota_gossip::{
@@ -48,6 +50,7 @@ use self::stats::{StatsCollector, StatsCollectorConfig};
 use self::stream_monitor::{StreamMonitor, StreamMonitorConfig};
 use self::vacuum::{VacuumWorker, VacuumWorkerConfig};
 use self::wal_archiver::{WalArchiver, WalArchiverConfig};
+use crate::metrics::MetricsRegistry;
 
 use zyron_types::scheduling::QuotaRegistry;
 
@@ -56,6 +59,7 @@ pub struct BackgroundWorkers {
     checkpoint: CheckpointWorker,
     stats: StatsCollector,
     vacuum: VacuumWorker,
+    compaction: CompactionWorker,
     retention: RetentionWorker,
     wal_archiver: Option<WalArchiver>,
     cdc_writer: CdcWriter,
@@ -78,6 +82,8 @@ impl BackgroundWorkers {
         ckpt_config: CheckpointWorkerConfig,
         stats_config: StatsCollectorConfig,
         vacuum_config: VacuumWorkerConfig,
+        compaction_config: CompactionWorkerConfig,
+        metrics: Option<Arc<MetricsRegistry>>,
         wal_dir: PathBuf,
         archive_dir: Option<PathBuf>,
         cdc_registry: Option<Arc<zyron_cdc::CdfRegistry>>,
@@ -117,6 +123,15 @@ impl BackgroundWorkers {
             disk_manager.clone(),
             RetentionWorkerConfig::default(),
         );
+        let compaction = CompactionWorker::start(
+            catalog.clone(),
+            txn_manager.clone(),
+            disk_manager.clone(),
+            buffer_pool.clone(),
+            wal.clone(),
+            metrics,
+            compaction_config,
+        );
         let vacuum = VacuumWorker::start(
             catalog,
             txn_manager,
@@ -152,6 +167,7 @@ impl BackgroundWorkers {
             checkpoint,
             stats,
             vacuum,
+            compaction,
             retention,
             wal_archiver,
             cdc_writer,
@@ -210,10 +226,19 @@ impl BackgroundWorkers {
         Arc::clone(self.vacuum.stats())
     }
 
+    /// Returns the compaction worker stats Arc.
+    pub fn compaction_stats(&self) -> Arc<compaction::CompactionStats> {
+        Arc::clone(self.compaction.stats())
+    }
+
     /// Gracefully shuts down all workers.
     /// Runs a final checkpoint before stopping the checkpoint worker.
     pub fn shutdown(&mut self) {
         info!("Shutting down background workers");
+
+        // Stop compaction before the final checkpoint so no fold transition
+        // is in flight while the checkpoint runs.
+        self.compaction.shutdown();
 
         // Run final checkpoint for zero-replay restart
         if let Err(e) = self.checkpoint.final_checkpoint() {

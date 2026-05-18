@@ -3,14 +3,16 @@
 //! Predicate evaluation compares against the single stored value,
 //! producing an all-ones or all-zeros bitmask in O(1).
 
-use crate::encoding::{Encoding, EncodingType, Predicate};
+use crate::encoding::{Encoding, EncodingType, Predicate, slice_rows, varlen_pack};
 use zyron_common::{Result, ZyronError};
 
 pub struct ConstantEncoding;
 
 /// Encoded format:
-///   [0..4]  value_size: u32 (little-endian)
-///   [4..]   value: [u8; value_size]
+///   [0..4]  stored_len: u32 (little-endian, the constant value's byte length;
+///           equals value_size for the fixed-width path, the value length for
+///           the variable-length path where value_size == 0)
+///   [4..]   value: [u8; stored_len]
 impl Encoding for ConstantEncoding {
     fn encoding_type(&self) -> EncodingType {
         EncodingType::Constant
@@ -23,27 +25,20 @@ impl Encoding for ConstantEncoding {
             return Ok(out);
         }
 
-        let expected_len = row_count * value_size;
-        if data.len() < expected_len {
-            return Err(ZyronError::EncodingFailed(
-                "data shorter than expected for constant encoding".to_string(),
-            ));
-        }
-
-        let first_value = &data[..value_size];
+        let rows = slice_rows(data, row_count, value_size)?;
+        let first_value = rows[0];
 
         // Verify all rows have the same value
-        for i in 1..row_count {
-            let offset = i * value_size;
-            if &data[offset..offset + value_size] != first_value {
+        for r in &rows[1..] {
+            if *r != first_value {
                 return Err(ZyronError::EncodingFailed(
                     "not all values are identical for constant encoding".to_string(),
                 ));
             }
         }
 
-        let mut out = Vec::with_capacity(4 + value_size);
-        out.extend_from_slice(&(value_size as u32).to_le_bytes());
+        let mut out = Vec::with_capacity(4 + first_value.len());
+        out.extend_from_slice(&(first_value.len() as u32).to_le_bytes());
         out.extend_from_slice(first_value);
         Ok(out)
     }
@@ -61,20 +56,25 @@ impl Encoding for ConstantEncoding {
 
         let stored_size =
             u32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]) as usize;
-        if stored_size != value_size {
+        if value_size != 0 && stored_size != value_size {
             return Err(ZyronError::DecodingFailed(format!(
                 "constant value_size mismatch: stored {}, expected {}",
                 stored_size, value_size
             )));
         }
 
-        if encoded.len() < 4 + value_size {
+        if encoded.len() < 4 + stored_size {
             return Err(ZyronError::DecodingFailed(
                 "constant encoded data truncated".to_string(),
             ));
         }
 
-        let value = &encoded[4..4 + value_size];
+        let value = &encoded[4..4 + stored_size];
+        if value_size == 0 {
+            // Variable-length: reconstruct the canonical buffer.
+            let rows: Vec<Option<&[u8]>> = vec![Some(value); row_count];
+            return Ok(varlen_pack(&rows));
+        }
         let mut out = Vec::with_capacity(row_count * value_size);
         for _ in 0..row_count {
             out.extend_from_slice(value);
@@ -86,20 +86,27 @@ impl Encoding for ConstantEncoding {
         &self,
         encoded: &[u8],
         row_count: usize,
-        value_size: usize,
+        _value_size: usize,
         predicate: &Predicate,
     ) -> Result<Vec<u8>> {
         if row_count == 0 {
             return Ok(Vec::new());
         }
 
-        if encoded.len() < 4 + value_size {
+        if encoded.len() < 4 {
+            return Err(ZyronError::DecodingFailed(
+                "constant encoded data too short for predicate evaluation".to_string(),
+            ));
+        }
+        let stored_size =
+            u32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]) as usize;
+        if encoded.len() < 4 + stored_size {
             return Err(ZyronError::DecodingFailed(
                 "constant encoded data too short for predicate evaluation".to_string(),
             ));
         }
 
-        let value = &encoded[4..4 + value_size];
+        let value = &encoded[4..4 + stored_size];
         let bitmask_len = row_count.div_ceil(8);
 
         let matches = match predicate {
