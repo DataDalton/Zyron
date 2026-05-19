@@ -452,20 +452,29 @@ pub fn select_encoding_varlen(_type_id: TypeId, sample: &[Option<&[u8]>]) -> Enc
         return EncodingType::Constant;
     }
 
-    // Trial-encode every applicable candidate against the canonical buffer
-    // and keep the densest. Dictionary is only a candidate for low-cardinality
-    // columns (the enum/category/status string pattern); FSST symbol
-    // compression and the verbatim Unencoded buffer are always candidates.
-    // Unencoded is the floor and is always correct, so a candidate is only
-    // chosen when it is strictly smaller.
-    let raw = varlen_pack(sample);
+    // Pick the encoding from a bounded prefix probe instead of fully encoding
+    // the whole column twice (Dictionary and FSST) just to choose. The
+    // cardinality/run decision uses the full-sample stats above (cheap: a
+    // HashSet pass, no encoding); only the expensive trial compression runs
+    // on a bounded prefix. The chosen encoder still encodes the full column
+    // in build_varlen, so this changes the selection cost, not the encoded
+    // output. Unencoded is the always-correct floor, so a candidate is only
+    // chosen when it is strictly smaller on the probe. RLE is intentionally
+    // not a candidate here: it is a fixed-width encoder and cannot round-trip
+    // the canonical variable-length buffer; run-heavy / low-cardinality
+    // variable-length columns are already captured densely by the Dictionary
+    // candidate (whole-value dedup + bit-packed codes).
+    const PROBE_ROWS: usize = 8192;
     let row_count = sample.len();
+    let probe = &sample[..row_count.min(PROBE_ROWS)];
+    let raw = varlen_pack(probe);
+    let probe_rows = probe.len();
     let mut best = EncodingType::Unencoded;
     let mut best_size = raw.len();
 
     if stats.cardinality < 65536 && stats.cardinality < row_count / 2 {
         let dict = create_encoding(EncodingType::Dictionary);
-        if let Ok(enc) = dict.encode(&raw, row_count, 0)
+        if let Ok(enc) = dict.encode(&raw, probe_rows, 0)
             && enc.len() < best_size
         {
             best = EncodingType::Dictionary;
@@ -474,7 +483,7 @@ pub fn select_encoding_varlen(_type_id: TypeId, sample: &[Option<&[u8]>]) -> Enc
     }
 
     let fsst = create_encoding(EncodingType::Fsst);
-    if let Ok(enc) = fsst.encode(&raw, row_count, 0)
+    if let Ok(enc) = fsst.encode(&raw, probe_rows, 0)
         && enc.len() < best_size
     {
         best = EncodingType::Fsst;

@@ -53,8 +53,21 @@ impl GapFillOperator {
     }
 
     async fn materialize(&mut self) -> Result<()> {
-        // Drain the child into one combined batch.
+        if self.width <= 0 {
+            return Err(ZyronError::ExecutionError(
+                "time_bucket_gapfill width must be positive".to_string(),
+            ));
+        }
+        // Drain the child (an aggregate, so one row per present bucket) while
+        // folding the bucket index and [min,max] in the same pass. The dense
+        // span is checked as it grows so a pathological range errors before
+        // the full result is materialized, instead of after a second O(n)
+        // pass. The good path is also one pass instead of two.
         let mut cols: Vec<Column> = Vec::new();
+        let mut by_bucket: HashMap<i128, usize> = HashMap::new();
+        let mut min_b: Option<i128> = None;
+        let mut max_b: Option<i128> = None;
+        let mut base_row: usize = 0;
         loop {
             match self.child.next().await? {
                 Some(eb) => {
@@ -62,6 +75,31 @@ impl GapFillOperator {
                     if b.num_rows == 0 {
                         continue;
                     }
+                    if self.bucket_col < b.columns.len() {
+                        let bc = &b.columns[self.bucket_col];
+                        let n = bc.len();
+                        for r in 0..n {
+                            if let Some(bk) = Self::bucket_at(bc, r) {
+                                by_bucket.entry(bk).or_insert(base_row + r);
+                                min_b = Some(min_b.map_or(bk, |m| m.min(bk)));
+                                max_b = Some(max_b.map_or(bk, |m| m.max(bk)));
+                            }
+                        }
+                        if let (Some(a), Some(z)) = (min_b, max_b) {
+                            // Early bound: reject before holding the full
+                            // result if the observed span already exceeds the
+                            // synthesizable cap.
+                            let dense = (z - a) / self.width + 1;
+                            if dense > MAX_GAPFILL_BUCKETS {
+                                return Err(ZyronError::ExecutionError(format!(
+                                    "time_bucket_gapfill would synthesize {dense} buckets \
+                                     (cap {MAX_GAPFILL_BUCKETS}); narrow the range or \
+                                     widen the bucket"
+                                )));
+                            }
+                        }
+                    }
+                    base_row += b.num_rows;
                     if cols.is_empty() {
                         cols = b.columns;
                     } else {
@@ -85,17 +123,6 @@ impl GapFillOperator {
             return Ok(());
         }
 
-        // Map each present bucket value to its source row. Determine [min,max].
-        let mut by_bucket: HashMap<i128, usize> = HashMap::with_capacity(nrows);
-        let mut min_b: Option<i128> = None;
-        let mut max_b: Option<i128> = None;
-        for r in 0..nrows {
-            if let Some(b) = Self::bucket_at(&cols[self.bucket_col], r) {
-                by_bucket.entry(b).or_insert(r);
-                min_b = Some(min_b.map_or(b, |m| m.min(b)));
-                max_b = Some(max_b.map_or(b, |m| m.max(b)));
-            }
-        }
         let (min_b, max_b) = match (min_b, max_b) {
             (Some(a), Some(b)) => (a, b),
             // No non-null bucket: nothing to densify.
@@ -104,13 +131,7 @@ impl GapFillOperator {
                 return Ok(());
             }
         };
-        if self.width <= 0 {
-            return Err(ZyronError::ExecutionError(
-                "time_bucket_gapfill width must be positive".to_string(),
-            ));
-        }
-        // Align min/max to the bucket grid (the scalar already floors them, but
-        // be defensive) and bound the dense count.
+        // Final dense count (the per-batch early check already bounded this).
         let span = max_b - min_b;
         let dense = span / self.width + 1;
         if dense > MAX_GAPFILL_BUCKETS {

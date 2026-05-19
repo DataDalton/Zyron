@@ -13,7 +13,7 @@ use arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder, Decimal128Array,
     Decimal128Builder, Float32Array, Float32Builder, Float64Array, Float64Builder, Int8Array,
     Int8Builder, Int16Array, Int16Builder, Int32Array, Int32Builder, Int64Array, Int64Builder,
-    RecordBatch, StringArray, StringBuilder, TimestampNanosecondArray, UInt8Array, UInt8Builder,
+    RecordBatch, StringArray, StringBuilder, TimestampNanosecondBuilder, UInt8Array, UInt8Builder,
     UInt16Array, UInt16Builder, UInt32Array, UInt32Builder, UInt64Array, UInt64Builder,
 };
 use arrow::datatypes::Schema;
@@ -50,19 +50,17 @@ fn build_column(
     // This is the only sanctioned silent narrowing for the picosecond feature
     // and is documented in the format spec. p<=6/None keeps the i64
     // microsecond path below, byte-identical to before.
-    if matches!(t, TypeId::Timestamp | TypeId::TimestampTz)
-        && ts_precision.unwrap_or(6) > 6
-    {
-        let mut ns: Vec<Option<i64>> = Vec::with_capacity(n);
+    if matches!(t, TypeId::Timestamp | TypeId::TimestampTz) && ts_precision.unwrap_or(6) > 6 {
+        let mut b = TimestampNanosecondBuilder::with_capacity(n);
         for row in rows {
             match &row[ci] {
-                StreamValue::Null => ns.push(None),
-                StreamValue::I128(v) => ns.push(Some(super::schema::ps_to_arrow_ns(*v))),
-                StreamValue::I64(v) => ns.push(Some(*v)),
+                StreamValue::Null => b.append_null(),
+                StreamValue::I128(v) => b.append_value(super::schema::ps_to_arrow_ns(*v)),
+                StreamValue::I64(v) => b.append_value(*v),
                 other => return Err(col_type_err(ci, t, other)),
             }
         }
-        let arr = TimestampNanosecondArray::from(ns);
+        let arr = b.finish();
         // TIMESTAMPTZ carries a UTC zone so it matches the schema field that
         // timestamp_arrow_type emits for p>6 (Some("UTC")).
         let arr = if t == TypeId::TimestampTz {

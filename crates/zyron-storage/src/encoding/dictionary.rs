@@ -429,12 +429,16 @@ fn varlen_dict_entry<'a>(blob: &'a [u8], offsets: &[u32], i: usize) -> &'a [u8] 
     &blob[offsets[i] as usize..offsets[i + 1] as usize]
 }
 
-/// Decodes a variable-length dictionary back to the canonical buffer.
+/// Decodes a variable-length dictionary directly into the canonical buffer in
+/// a single allocation. The prior path built Vec<&[u8]> then Vec<Option<..>>
+/// then varlen_pack (three allocations + an extra pass) for a 1M-row column;
+/// here the codes are unpacked once to size the output, then again to fill it,
+/// writing the header, offset array, and blob in place.
 fn decode_varlen(encoded: &[u8], row_count: usize) -> Result<Vec<u8>> {
     let (dict_count, offsets, blob, packed) = read_varlen_container(encoded)?;
     let code_bits = code_bit_width(dict_count);
-    let mut rows: Vec<&[u8]> = Vec::with_capacity(row_count);
-    for i in 0..row_count {
+
+    let code_at = |i: usize| -> Result<usize> {
         let code = unpack_bits(packed, i as u64 * code_bits as u64, code_bits) as usize;
         if code >= dict_count {
             return Err(ZyronError::DecodingFailed(format!(
@@ -442,10 +446,34 @@ fn decode_varlen(encoded: &[u8], row_count: usize) -> Result<Vec<u8>> {
                 code, dict_count
             )));
         }
-        rows.push(varlen_dict_entry(blob, &offsets, code));
+        Ok(code)
+    };
+
+    // Pass 1: total decoded blob length (validates every code too).
+    let mut blob_total: usize = 0;
+    for i in 0..row_count {
+        let code = code_at(i)?;
+        blob_total += varlen_dict_entry(blob, &offsets, code).len();
     }
-    let refs: Vec<Option<&[u8]>> = rows.iter().map(|r| Some(*r)).collect();
-    Ok(varlen_pack(&refs))
+
+    let header = 4 + 4 * (row_count + 1);
+    let mut out = Vec::with_capacity(header + blob_total);
+    out.extend_from_slice(&(row_count as u32).to_le_bytes());
+
+    // Pass 2a: cumulative offset array.
+    let mut cursor: u32 = 0;
+    out.extend_from_slice(&cursor.to_le_bytes());
+    for i in 0..row_count {
+        let code = code_at(i)?;
+        cursor += varlen_dict_entry(blob, &offsets, code).len() as u32;
+        out.extend_from_slice(&cursor.to_le_bytes());
+    }
+    // Pass 2b: values blob.
+    for i in 0..row_count {
+        let code = code_at(i)?;
+        out.extend_from_slice(varlen_dict_entry(blob, &offsets, code));
+    }
+    Ok(out)
 }
 
 /// Evaluates a predicate on a variable-length dictionary. Comparisons are

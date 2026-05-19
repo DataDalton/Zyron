@@ -834,7 +834,16 @@ pub fn cast_scalar(value: &ScalarValue, target: TypeId) -> Result<ScalarValue> {
             ScalarValue::Int16(v) => Ok(ScalarValue::Int64(*v as i64)),
             ScalarValue::Int32(v) => Ok(ScalarValue::Int64(*v as i64)),
             ScalarValue::Int64(v) => Ok(ScalarValue::Int64(*v)),
-            ScalarValue::Int128(v) => Ok(ScalarValue::Int64(*v as i64)),
+            // Never silently wrap a 128-bit value into the i64 microsecond
+            // slot: a real picosecond instant is ~1e21 and would overflow i64
+            // and corrupt the timestamp. An out-of-range value is a hard
+            // error (matching the Date arm), an in-range one casts exactly.
+            ScalarValue::Int128(v) => i64::try_from(*v).map(ScalarValue::Int64).map_err(|_| {
+                ZyronError::ExecutionError(format!(
+                    "value {v} is out of range for an i64-microsecond TIMESTAMP \
+                     (cast a picosecond value to TIMESTAMP(p>6), not TIMESTAMP)"
+                ))
+            }),
             _ => Err(ZyronError::ExecutionError(format!(
                 "cannot cast {value} to TIMESTAMP"
             ))),

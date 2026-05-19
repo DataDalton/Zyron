@@ -249,6 +249,44 @@ pub fn compare_stat_slots_typed(
     compare_stat_slots(a, b)
 }
 
+/// Orders a raw fixed-width value against an existing stat slot without
+/// materializing a 32-byte slot for the value. A stat slot is the value bytes
+/// left-aligned and zero-padded, so for `width <= STAT_VALUE_SIZE` comparing
+/// the value's `width` bytes (zero-extended) against the slot's `width` bytes
+/// is identical to comparing two slots. This lets `ColumnSegment::build`
+/// compare every row's value to the running min/max and only build the
+/// 32-byte slot on the rare row that actually moves a bound.
+pub fn compare_value_to_slot(
+    v: &[u8],
+    slot: &[u8; STAT_VALUE_SIZE],
+    width: usize,
+    signed: bool,
+) -> std::cmp::Ordering {
+    let vb = |i: usize| -> u8 { v.get(i).copied().unwrap_or(0) };
+    if signed && width > 0 {
+        let sign_byte = width - 1;
+        let a_neg = vb(sign_byte) & 0x80 != 0;
+        let b_neg = slot[sign_byte] & 0x80 != 0;
+        if a_neg != b_neg {
+            return if a_neg {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            };
+        }
+    }
+    // Unsigned little-endian compare, most significant byte first. Bytes at or
+    // above `width` are zero in both operands (slots are zero-padded), so only
+    // the value bytes need to be compared.
+    for i in (0..width.min(STAT_VALUE_SIZE)).rev() {
+        match vb(i).cmp(&slot[i]) {
+            std::cmp::Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
 /// Compares two stat slots as unsigned little-endian integers.
 /// Returns Ordering::Less, Equal, or Greater.
 /// For LE values, comparison starts from the most significant byte (highest index
@@ -402,45 +440,37 @@ impl ColumnSegment {
                             distinctCapped = true;
                         }
                     }
-                    let slot = value_to_stat_slot(v);
-
-                    globalMin = Some(match globalMin {
-                        Some(cur)
-                            if compare_stat_slots_typed(&cur, &slot, valueSize, statSigned)
-                                != std::cmp::Ordering::Greater =>
-                        {
-                            cur
-                        }
-                        _ => slot,
+                    // Compare the raw value against each running bound and
+                    // build the 32-byte slot only on a row that actually moves
+                    // a bound, instead of materializing a slot for every row.
+                    use std::cmp::Ordering::{Greater, Less};
+                    let new_gmin = globalMin.is_none_or(|cur| {
+                        compare_value_to_slot(v, &cur, valueSize, statSigned) == Less
                     });
-                    globalMax = Some(match globalMax {
-                        Some(cur)
-                            if compare_stat_slots_typed(&cur, &slot, valueSize, statSigned)
-                                != std::cmp::Ordering::Less =>
-                        {
-                            cur
-                        }
-                        _ => slot,
+                    let new_gmax = globalMax.is_none_or(|cur| {
+                        compare_value_to_slot(v, &cur, valueSize, statSigned) == Greater
                     });
-
-                    zoneMin = Some(match zoneMin {
-                        Some(cur)
-                            if compare_stat_slots_typed(&cur, &slot, valueSize, statSigned)
-                                != std::cmp::Ordering::Greater =>
-                        {
-                            cur
-                        }
-                        _ => slot,
+                    let new_zmin = zoneMin.is_none_or(|cur| {
+                        compare_value_to_slot(v, &cur, valueSize, statSigned) == Less
                     });
-                    zoneMax = Some(match zoneMax {
-                        Some(cur)
-                            if compare_stat_slots_typed(&cur, &slot, valueSize, statSigned)
-                                != std::cmp::Ordering::Less =>
-                        {
-                            cur
-                        }
-                        _ => slot,
+                    let new_zmax = zoneMax.is_none_or(|cur| {
+                        compare_value_to_slot(v, &cur, valueSize, statSigned) == Greater
                     });
+                    if new_gmin || new_gmax || new_zmin || new_zmax {
+                        let slot = value_to_stat_slot(v);
+                        if new_gmin {
+                            globalMin = Some(slot);
+                        }
+                        if new_gmax {
+                            globalMax = Some(slot);
+                        }
+                        if new_zmin {
+                            zoneMin = Some(slot);
+                        }
+                        if new_zmax {
+                            zoneMax = Some(slot);
+                        }
+                    }
 
                     if isSorted
                         && let Some(prev) = prevRaw
@@ -587,24 +617,40 @@ impl ColumnSegment {
                             distinctCapped = true;
                         }
                     }
-                    let slot = value_to_stat_slot(v);
-
-                    globalMin = Some(match globalMin {
-                        Some(cur) if cur <= slot => cur,
-                        _ => slot,
-                    });
-                    globalMax = Some(match globalMax {
-                        Some(cur) if cur >= slot => cur,
-                        _ => slot,
-                    });
-                    zoneMin = Some(match zoneMin {
-                        Some(cur) if cur <= slot => cur,
-                        _ => slot,
-                    });
-                    zoneMax = Some(match zoneMax {
-                        Some(cur) if cur >= slot => cur,
-                        _ => slot,
-                    });
+                    // Variable-length min/max order the stat slots
+                    // lexicographically (prefix bound, correct for string and
+                    // binary). Compare the value's padded-prefix order against
+                    // each running bound and only build the 32-byte slot on a
+                    // row that actually moves a bound.
+                    use std::cmp::Ordering::{Greater, Less};
+                    let lex = |v: &[u8], cur: &[u8; STAT_VALUE_SIZE]| -> std::cmp::Ordering {
+                        for i in 0..STAT_VALUE_SIZE {
+                            match v.get(i).copied().unwrap_or(0).cmp(&cur[i]) {
+                                std::cmp::Ordering::Equal => continue,
+                                other => return other,
+                            }
+                        }
+                        std::cmp::Ordering::Equal
+                    };
+                    let new_gmin = globalMin.is_none_or(|cur| lex(v, &cur) == Less);
+                    let new_gmax = globalMax.is_none_or(|cur| lex(v, &cur) == Greater);
+                    let new_zmin = zoneMin.is_none_or(|cur| lex(v, &cur) == Less);
+                    let new_zmax = zoneMax.is_none_or(|cur| lex(v, &cur) == Greater);
+                    if new_gmin || new_gmax || new_zmin || new_zmax {
+                        let slot = value_to_stat_slot(v);
+                        if new_gmin {
+                            globalMin = Some(slot);
+                        }
+                        if new_gmax {
+                            globalMax = Some(slot);
+                        }
+                        if new_zmin {
+                            zoneMin = Some(slot);
+                        }
+                        if new_zmax {
+                            zoneMax = Some(slot);
+                        }
+                    }
 
                     if isSorted
                         && let Some(prev) = prevRaw
@@ -626,6 +672,29 @@ impl ColumnSegment {
         let cardinality = distinct.len() as u64;
         let minValue = globalMin.unwrap_or([0u8; STAT_VALUE_SIZE]);
         let maxValue = globalMax.unwrap_or([0u8; STAT_VALUE_SIZE]);
+
+        // The canonical variable-length buffer addresses the values blob with
+        // a u32 cumulative offset array. A blob (or row count) past u32 would
+        // wrap an offset and silently return wrong slices on decode, so the
+        // fold is rejected here and must split the column into smaller
+        // segments instead of corrupting. Segments are already row-bounded by
+        // the compaction max-rows policy, so this is a guard, not a normal
+        // path.
+        let blobLen: usize = values.iter().map(|v| v.map_or(0, |b| b.len())).sum();
+        if blobLen > u32::MAX as usize {
+            return Err(ZyronError::EncodingFailed(format!(
+                "variable-length segment blob {} bytes exceeds the {}-byte u32 \
+                 offset limit, the fold must split this column into smaller segments",
+                blobLen,
+                u32::MAX
+            )));
+        }
+        if rowCount > u32::MAX as usize {
+            return Err(ZyronError::EncodingFailed(format!(
+                "variable-length segment row count {} exceeds the u32 limit",
+                rowCount
+            )));
+        }
 
         let rawData = varlen_pack(values);
         let rawSize = rawData.len() as u64;

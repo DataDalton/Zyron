@@ -147,6 +147,22 @@ fn unlink_logged(path: &std::path::Path, context: &str) {
     }
 }
 
+/// Length-prefix a path into a WAL recovery payload. A `len as u32` truncation
+/// would make recovery parse every following field at the wrong offset, so an
+/// impossibly long path is rejected before the record is written rather than
+/// silently corrupting the record. Real filesystem paths are far under this.
+fn push_len_prefixed_path(buf: &mut Vec<u8>, path: &str) -> std::result::Result<(), String> {
+    if path.len() > u32::MAX as usize {
+        return Err(format!(
+            "compaction WAL path length {} exceeds the u32 length-prefix limit",
+            path.len()
+        ));
+    }
+    buf.extend_from_slice(&(path.len() as u32).to_le_bytes());
+    buf.extend_from_slice(path.as_bytes());
+    Ok(())
+}
+
 /// One column's materialized values for a fold: a single contiguous blob
 /// plus a per-row (offset, len) index. Building a column appends cell bytes
 /// into the amortized-growth blob and pushes one index entry per row, so a
@@ -411,28 +427,26 @@ impl CompactionWorker {
         columns.sort_by_key(|c| c.ordinal);
 
         for seg in te.columnar.segments.clone() {
-            let touched: Vec<(u64, u64)> = store
-                .rows_with_overlay()
-                .into_iter()
-                .filter(|(f, _)| *f == seg.file_id)
-                .collect();
-            if touched.is_empty() {
+            // One overlay snapshot per segment under a single read-lock,
+            // reused for the settled check and the survivor resolution below,
+            // instead of scanning the whole store (rows_with_overlay) and then
+            // re-locking per row.
+            let seg_overlay = store.file_overlay(seg.file_id);
+            if seg_overlay.is_empty() {
                 continue;
             }
             // Settled check: every overlay xid for this file < oldest_active.
             let mut settled = true;
-            for &(_, rid) in &touched {
-                if let Some(ov) = store.row_overlay(seg.file_id, rid) {
-                    if ov.supersedes.iter().any(|x| *x >= oldest_active)
-                        || ov
-                            .patches
-                            .values()
-                            .flatten()
-                            .any(|p| p.patch_xid >= oldest_active)
-                    {
-                        settled = false;
-                        break;
-                    }
+            for ov in seg_overlay.values() {
+                if ov.supersedes.iter().any(|x| *x >= oldest_active)
+                    || ov
+                        .patches
+                        .values()
+                        .flatten()
+                        .any(|p| p.patch_xid >= oldest_active)
+                {
+                    settled = false;
+                    break;
                 }
             }
             if !settled {
@@ -482,11 +496,13 @@ impl CompactionWorker {
             let mut col_vals: Vec<Vec<Option<Vec<u8>>>> = vec![Vec::new(); columns.len()];
             let mut dropped = 0usize;
             let mut patched = 0usize;
+            // Reuse the single per-segment overlay snapshot taken above; per
+            // row this is a plain local map lookup, no lock, no whole-store
+            // scan.
             for r in 0..row_count {
                 let rid = read_u64(&rowid_b, r);
-                let ov = store.row_overlay(seg.file_id, rid);
+                let ov = seg_overlay.get(&rid);
                 let dead = ov
-                    .as_ref()
                     .map(|o| o.supersedes.iter().any(|x| *x < oldest_active))
                     .unwrap_or(false);
                 if dead {
@@ -495,9 +511,14 @@ impl CompactionWorker {
                 }
                 keep_rowid.push(rid);
                 keep_xmin.push(read_u64(&xmin_b, r));
+                // Churn is counted once per patched row, not once per patched
+                // cell: a row with N changed columns is one mutation for the
+                // rewrite trigger, not N, so multi-column updates do not
+                // prematurely force a full-segment rewrite.
+                let mut row_has_patch = false;
                 for (ci, c) in columns.iter().enumerate() {
                     let (bytes, nb, vs, isv) = &user_dec[ci];
-                    let patched_val = ov.as_ref().and_then(|o| {
+                    let patched_val = ov.and_then(|o| {
                         o.patches.get(&(c.id.0 as u32)).and_then(|chain| {
                             chain
                                 .iter()
@@ -507,7 +528,7 @@ impl CompactionWorker {
                         })
                     });
                     if let Some(v) = patched_val {
-                        patched += 1;
+                        row_has_patch = true;
                         col_vals[ci].push(Some(v));
                         continue;
                     }
@@ -519,6 +540,9 @@ impl CompactionWorker {
                     } else {
                         col_vals[ci].push(Some(bytes[r * vs..(r + 1) * vs].to_vec()));
                     }
+                }
+                if row_has_patch {
+                    patched += 1;
                 }
             }
             if dropped == 0 && patched == 0 {
@@ -646,8 +670,7 @@ impl CompactionWorker {
             ep.extend_from_slice(&(table_id.0 as u64).to_le_bytes());
             ep.extend_from_slice(&new_file_id.to_le_bytes());
             ep.extend_from_slice(&seg.file_id.to_le_bytes());
-            ep.extend_from_slice(&(new_path.len() as u32).to_le_bytes());
-            ep.extend_from_slice(new_path.as_bytes());
+            push_len_prefixed_path(&mut ep, &new_path)?;
             wal.log_merge_end(&ep).map_err(|e| e.to_string())?;
             wal.flush().map_err(|e| e.to_string())?;
 
@@ -1064,21 +1087,26 @@ impl CompactionWorker {
         end_payload.extend_from_slice(&next_rowid.to_le_bytes());
         end_payload.extend_from_slice(&xmin_lo.to_le_bytes());
         end_payload.extend_from_slice(&xmin_hi.to_le_bytes());
-        end_payload.extend_from_slice(&(path_str.len() as u32).to_le_bytes());
-        end_payload.extend_from_slice(path_str.as_bytes());
-        end_payload.extend_from_slice(&(rid_path_str.len() as u32).to_le_bytes());
-        end_payload.extend_from_slice(rid_path_str.as_bytes());
+        push_len_prefixed_path(&mut end_payload, &path_str)?;
+        push_len_prefixed_path(&mut end_payload, &rid_path_str)?;
         let end_lsn = wal
             .log_compaction_end(&end_payload)
             .map_err(|e| format!("CompactionEnd log failed: {}", e))?;
         wal.flush()
             .map_err(|e| format!("WAL flush failed: {}", e))?;
 
-        // Step 6: apply (only after the commit point is durable). Register
-        // the segment, then zero the folded heap slots and write those pages
-        // durably to disk so the post-commit state survives a crash without
-        // needing the sidecar. Recovery redoes this idempotently from the
-        // sidecar if a crash lands mid-apply.
+        // Step 6: apply (only after the commit point is durable). Zero the
+        // folded heap slots BEFORE the segment becomes visible to scans. The
+        // CompactionEnd WAL record above is the durable commit point and the
+        // rid sidecar lets recovery redo this idempotently after a crash, so
+        // the order here is purely about in-process visibility: if the segment
+        // were registered first, a concurrent scan in the gap before the heap
+        // delete would see every folded row in both the heap and the new
+        // columnar segment (a transient double count). Deleting first closes
+        // that window with no durability change.
+        Self::delete_folded_rows(rt, buffer_pool, disk_manager, &folded_rids)?;
+
+        // Register the segment now that its rows no longer exist in the heap.
         entry.columnar.segments.push(ColumnarSegmentEntry {
             file_id,
             path: path_str.clone(),
@@ -1114,8 +1142,6 @@ impl CompactionWorker {
             // recovery needs to rebuild this segment.
             crate::columnar_wal_pin::ColumnarWalPin::global().note(table.id.0, end_lsn.0);
         }
-
-        Self::delete_folded_rows(rt, buffer_pool, disk_manager, &folded_rids)?;
 
         // Heap and registry are now durable; the sidecar is no longer needed.
         unlink_logged(&rid_path, "applied fold sidecar");
