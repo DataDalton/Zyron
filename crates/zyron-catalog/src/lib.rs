@@ -7,6 +7,7 @@
 
 pub mod cache;
 pub mod catalog;
+pub mod checkpoint;
 pub mod encoding;
 pub mod ids;
 pub mod resolver;

@@ -188,18 +188,42 @@ impl K8sTokenReviewer {
 
         let result = parse_token_review(&text)?;
         if !result.authenticated {
+            tracing::info!(
+                target: "zyron::audit",
+                event = "K8sTokenRejected",
+                principal = %result.username,
+                object = %audience.unwrap_or(""),
+                decision = "denied",
+                reason = "tokenreview-not-authenticated",
+            );
             return Err(ZyronError::AuthenticationFailed(
                 "TokenReview rejected token".to_string(),
             ));
         }
         if let Some(expected) = audience {
             if !result.audiences.iter().any(|a| a == expected) {
+                tracing::info!(
+                    target: "zyron::audit",
+                    event = "K8sTokenRejected",
+                    principal = %result.username,
+                    object = %expected,
+                    decision = "denied",
+                    reason = "audience-mismatch",
+                );
                 return Err(ZyronError::AuthenticationFailed(format!(
                     "TokenReview missing required audience {}",
                     expected
                 )));
             }
         }
+        tracing::info!(
+            target: "zyron::audit",
+            event = "K8sTokenValidated",
+            principal = %result.username,
+            object = %audience.unwrap_or(""),
+            decision = "granted",
+            reason = "tokenreview-authenticated",
+        );
         Ok(result)
     }
 }

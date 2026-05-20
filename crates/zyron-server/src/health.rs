@@ -371,11 +371,16 @@ pub async fn handle_dynamic_endpoint(raw: &[u8], state: &HealthState) -> Vec<u8>
     let started = std::time::Instant::now();
     let origin = req.header("origin").unwrap_or("").to_string();
 
+    let sm_arc = state
+        .endpoint_executor()
+        .and_then(|ex| ex.security_manager.clone());
+    let security_map = sm_arc.as_deref().map(|sm| &sm.security_map);
     let pipeline_out = run_pipeline(
         Arc::clone(&route),
         path_params,
         &req,
         state.rate_limiter.as_ref(),
+        security_map,
     );
 
     let resp: HttpResponse = match pipeline_out {
@@ -404,6 +409,14 @@ pub async fn handle_dynamic_endpoint(raw: &[u8], state: &HealthState) -> Vec<u8>
                     return build_response_bytes(&resp).unwrap_or_default();
                 }
             };
+            tracing::info!(
+                target: "zyron::audit",
+                event = "EndpointInvoked",
+                principal = auth.user_hint.as_deref().unwrap_or("anonymous"),
+                object = %req.path,
+                decision = "granted",
+                reason = auth.via,
+            );
             let query_pairs = req.query_pairs();
             let content_type = req
                 .header("content-type")
@@ -663,7 +676,8 @@ mod tests {
 
     fn test_state() -> Arc<HealthState> {
         let session_mgr = Arc::new(SessionManager::new(100, 0));
-        let metrics = Arc::new(MetricsRegistry::new(session_mgr));
+        let labeled = Arc::new(zyron_common::LabeledMetrics::new());
+        let metrics = Arc::new(MetricsRegistry::new(session_mgr, labeled));
         Arc::new(HealthState::new(metrics))
     }
 

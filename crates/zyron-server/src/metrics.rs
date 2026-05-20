@@ -131,13 +131,19 @@ pub struct MetricsRegistry {
     // Histograms
     pub query_duration: LatencyHistogram,
 
+    // Labeled metric series shared with emit sites in lower crates
+    pub labeled: Arc<zyron_common::LabeledMetrics>,
+
     // References for gauge sampling
     session_mgr: Arc<SessionManager>,
 }
 
 impl MetricsRegistry {
     /// Creates a new metrics registry with all counters at zero.
-    pub fn new(session_mgr: Arc<SessionManager>) -> Self {
+    pub fn new(
+        session_mgr: Arc<SessionManager>,
+        labeled: Arc<zyron_common::LabeledMetrics>,
+    ) -> Self {
         Self {
             connections_total: AtomicU64::new(0),
             queries_total: AtomicU64::new(0),
@@ -147,6 +153,7 @@ impl MetricsRegistry {
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
             query_duration: LatencyHistogram::new(),
+            labeled,
             session_mgr,
         }
     }
@@ -220,6 +227,9 @@ impl MetricsRegistry {
             &mut out,
         );
 
+        // Labeled publication/subscription/credential/TLS series
+        self.labeled.render_prometheus(&mut out);
+
         out
     }
 }
@@ -277,7 +287,8 @@ mod tests {
     #[test]
     fn test_metrics_registry_render() {
         let session_mgr = Arc::new(SessionManager::new(100, 0));
-        let registry = MetricsRegistry::new(session_mgr);
+        let labeled = Arc::new(zyron_common::LabeledMetrics::new());
+        let registry = MetricsRegistry::new(session_mgr, labeled);
 
         registry.connections_total.fetch_add(10, Ordering::Relaxed);
         registry.queries_total.fetch_add(50, Ordering::Relaxed);
@@ -289,5 +300,51 @@ mod tests {
         assert!(output.contains("zyrondb_errors_total 2"));
         assert!(output.contains("zyrondb_active_connections 0"));
         assert!(output.contains("zyrondb_max_connections 100"));
+    }
+
+    #[test]
+    fn test_labeled_families_render_and_accumulate() {
+        use zyron_common::TlsDirection;
+        let session_mgr = Arc::new(SessionManager::new(100, 0));
+        let labeled = Arc::new(zyron_common::LabeledMetrics::new());
+        let registry = MetricsRegistry::new(session_mgr, labeled.clone());
+
+        labeled.pubSubscribersInc("pub1");
+        labeled.pubBytesSent("pub1", 4096);
+        labeled.pubRetentionLagSet("pub1", 12);
+        labeled.subLagLsnSet("sub1", 7);
+        labeled.subLastPollSet("sub1", 1_700_000_000);
+        labeled.subReconnectInc("sub1");
+        labeled.credCacheHit("aws_sts");
+        labeled.credCacheMiss("aws_sts");
+        labeled.credRefresh("aws_sts");
+        labeled.tlsHandshake(TlsDirection::Inbound, true);
+        labeled.tlsHandshake(TlsDirection::Outbound, false);
+        labeled.tlsSessionResumed();
+
+        let out = registry.render_prometheus();
+        assert!(out.contains("zyron_publication_active_subscribers{publication=\"pub1\"} 1"));
+        assert!(out.contains("zyron_publication_bytes_sent_total{publication=\"pub1\"} 4096"));
+        assert!(out.contains("zyron_publication_retention_lag_seconds{publication=\"pub1\"} 12"));
+        assert!(out.contains("zyron_subscription_lag_lsn{subscription=\"sub1\"} 7"));
+        assert!(
+            out.contains(
+                "zyron_subscription_last_poll_timestamp{subscription=\"sub1\"} 1700000000"
+            )
+        );
+        assert!(out.contains("zyron_subscription_reconnects_total{subscription=\"sub1\"} 1"));
+        assert!(out.contains("zyron_credential_cache_hits_total{provider=\"aws_sts\"} 1"));
+        assert!(out.contains("zyron_credential_cache_misses_total{provider=\"aws_sts\"} 1"));
+        assert!(out.contains("zyron_credential_refreshes_total{provider=\"aws_sts\"} 1"));
+        assert!(out.contains("zyron_tls_handshakes_total{direction=\"inbound\",result=\"ok\"} 1"));
+        assert!(
+            out.contains("zyron_tls_handshakes_total{direction=\"outbound\",result=\"fail\"} 1")
+        );
+        assert!(out.contains("zyron_tls_session_resumptions_total 1"));
+
+        // Counter accumulates rather than overwrites.
+        labeled.pubBytesSent("pub1", 1000);
+        let out2 = registry.render_prometheus();
+        assert!(out2.contains("zyron_publication_bytes_sent_total{publication=\"pub1\"} 5096"));
     }
 }

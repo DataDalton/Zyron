@@ -6,8 +6,8 @@
 //! a refresh-before threshold.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -64,6 +64,7 @@ pub struct CredentialCache {
     misses: AtomicU64,
     refreshes: AtomicU64,
     invalidations: AtomicU64,
+    metrics: OnceLock<Arc<zyron_common::LabeledMetrics>>,
 }
 
 impl CredentialCache {
@@ -75,7 +76,14 @@ impl CredentialCache {
             misses: AtomicU64::new(0),
             refreshes: AtomicU64::new(0),
             invalidations: AtomicU64::new(0),
+            metrics: OnceLock::new(),
         }
+    }
+
+    /// Attaches the shared labeled-metrics handle. Set once at server start
+    /// so per-provider cache counters surface on the metrics endpoint.
+    pub fn attachMetrics(&self, metrics: Arc<zyron_common::LabeledMetrics>) {
+        let _ = self.metrics.set(metrics);
     }
 
     /// Returns cached credentials if still fresh, otherwise fetches through the
@@ -89,20 +97,41 @@ impl CredentialCache {
         refresh_before: Duration,
     ) -> Result<HashMap<String, String>> {
         let now = Instant::now();
+        let kind = provider.provider_kind();
+        let metrics = self.metrics.get();
         let existing = self.entries.read_async(key, |_, v| v.clone()).await;
+        let mut was_refresh = false;
         if let Some(entry) = existing {
             if entry.expires_at > now {
                 let remaining = entry.expires_at.duration_since(now);
                 if remaining > refresh_before {
                     self.hits.fetch_add(1, Ordering::Relaxed);
+                    if let Some(m) = metrics {
+                        m.credCacheHit(kind);
+                    }
+                    tracing::info!(
+                        target: "zyron::audit",
+                        event = "CredentialRead",
+                        principal = %key,
+                        object = kind,
+                        decision = "granted",
+                        reason = "cache-hit",
+                    );
                     return Ok(entry.credentials);
                 }
                 self.refreshes.fetch_add(1, Ordering::Relaxed);
+                was_refresh = true;
             } else {
                 self.misses.fetch_add(1, Ordering::Relaxed);
+                if let Some(m) = metrics {
+                    m.credCacheMiss(kind);
+                }
             }
         } else {
             self.misses.fetch_add(1, Ordering::Relaxed);
+            if let Some(m) = metrics {
+                m.credCacheMiss(kind);
+            }
         }
 
         let (creds, ttl) = provider.fetch().await?;
@@ -127,6 +156,27 @@ impl CredentialCache {
             .map_err(|_| {
                 ZyronError::InvalidCredential("credential cache insert race".to_string())
             })?;
+        if was_refresh {
+            if let Some(m) = metrics {
+                m.credRefresh(kind);
+            }
+            tracing::info!(
+                target: "zyron::audit",
+                event = "CredentialRefreshed",
+                principal = %key,
+                object = kind,
+                decision = "granted",
+                reason = "proactive-ttl-refresh",
+            );
+        }
+        tracing::info!(
+            target: "zyron::audit",
+            event = "CredentialRead",
+            principal = %key,
+            object = kind,
+            decision = "granted",
+            reason = "provider-fetch",
+        );
         Ok(creds)
     }
 
@@ -321,5 +371,88 @@ mod tests {
             .get_or_fetch("k", &provider, Duration::from_secs(1))
             .await;
         assert!(r.is_err());
+    }
+
+    #[derive(Clone)]
+    struct SharedBuf(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+        type Writer = SharedBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_read_audit_fires_on_fetch_and_hit() {
+        let buf = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(SharedBuf(buf.clone()))
+            .with_max_level(tracing::Level::INFO)
+            .without_time()
+            .with_ansi(false)
+            .finish();
+
+        let captured = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let cache = CredentialCache::new();
+            let provider = StaticCredentialProvider::new(mkcreds(), Duration::from_secs(60));
+            // First call: provider-fetch path.
+            cache
+                .get_or_fetch("k", &provider, Duration::from_secs(5))
+                .await
+                .expect("fetch");
+            // Second call: cache-hit path.
+            cache
+                .get_or_fetch("k", &provider, Duration::from_secs(5))
+                .await
+                .expect("hit");
+            String::from_utf8(buf.lock().clone()).unwrap()
+        };
+
+        assert!(captured.contains("CredentialRead"));
+        assert!(captured.contains("provider-fetch"));
+        assert!(captured.contains("cache-hit"));
+        assert!(captured.contains("static"));
+    }
+
+    #[tokio::test]
+    async fn credential_refreshed_audit_fires_on_proactive_refresh() {
+        let buf = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(SharedBuf(buf.clone()))
+            .with_max_level(tracing::Level::INFO)
+            .without_time()
+            .with_ansi(false)
+            .finish();
+
+        let captured = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let cache = CredentialCache::new();
+            // Short TTL so the second call lands in the proactive-refresh
+            // window (remaining <= refresh_before) instead of a plain hit.
+            let provider = StaticCredentialProvider::new(mkcreds(), Duration::from_millis(40));
+            cache
+                .get_or_fetch("k", &provider, Duration::from_millis(5))
+                .await
+                .expect("fetch");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            cache
+                .get_or_fetch("k", &provider, Duration::from_millis(30))
+                .await
+                .expect("refresh");
+            String::from_utf8(buf.lock().clone()).unwrap()
+        };
+
+        assert!(captured.contains("CredentialRefreshed"));
+        assert!(captured.contains("proactive-ttl-refresh"));
     }
 }

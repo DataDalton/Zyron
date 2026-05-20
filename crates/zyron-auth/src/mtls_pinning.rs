@@ -64,6 +64,77 @@ pub fn format_pin(fp: &Sha256Fingerprint) -> String {
 }
 
 // -----------------------------------------------------------------------------
+// Pinned-peer authorization
+// -----------------------------------------------------------------------------
+
+/// Reason a pinned-peer check failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MtlsPinError {
+    /// The peer presented no certificate fingerprint.
+    NoFingerprint,
+    /// The fingerprint is not present in the configured pin set.
+    NotPinned,
+}
+
+impl std::fmt::Display for MtlsPinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MtlsPinError::NoFingerprint => write!(f, "no peer certificate fingerprint"),
+            MtlsPinError::NotPinned => write!(f, "fingerprint not in pin set"),
+        }
+    }
+}
+
+/// Compares an observed peer certificate fingerprint against the configured
+/// fingerprint-to-role pin set and returns the mapped role on a match. Emits
+/// the MTLSFingerprintMatched or MTLSFingerprintMismatch audit event
+/// co-located with the comparison so the audit cannot drift from enforcement.
+pub fn verify_pinned_peer(
+    observed: Option<&Sha256Fingerprint>,
+    maps: &crate::security_map::SecurityMapStore,
+) -> std::result::Result<crate::role::RoleId, MtlsPinError> {
+    let fp = match observed {
+        Some(fp) => fp,
+        None => {
+            tracing::info!(
+                target: "zyron::audit",
+                event = "MTLSFingerprintMismatch",
+                principal = "mtls-peer",
+                object = "",
+                decision = "denied",
+                reason = "no peer certificate fingerprint",
+            );
+            return Err(MtlsPinError::NoFingerprint);
+        }
+    };
+    let object = format_pin(fp);
+    match maps.resolve_mtls_fingerprint(fp) {
+        Some(role) => {
+            tracing::info!(
+                target: "zyron::audit",
+                event = "MTLSFingerprintMatched",
+                principal = role.0,
+                object = %object,
+                decision = "granted",
+                reason = "fingerprint pinned to role",
+            );
+            Ok(role)
+        }
+        None => {
+            tracing::info!(
+                target: "zyron::audit",
+                event = "MTLSFingerprintMismatch",
+                principal = "mtls-peer",
+                object = %object,
+                decision = "denied",
+                reason = "fingerprint not in pin set",
+            );
+            Err(MtlsPinError::NotPinned)
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Fingerprint store
 // -----------------------------------------------------------------------------
 
@@ -487,5 +558,89 @@ mod tests {
         outer.push(tbs.len() as u8);
         outer.extend_from_slice(&tbs);
         outer
+    }
+
+    // -------------------------------------------------------------------------
+    // verify_pinned_peer enforcement plus co-located audit
+    // -------------------------------------------------------------------------
+
+    use crate::role::RoleId;
+    use crate::security_map::SecurityMapStore;
+    use parking_lot::Mutex as PlMutex;
+    use std::sync::Arc;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone)]
+    struct SharedBuf(Arc<PlMutex<Vec<u8>>>);
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> MakeWriter<'a> for SharedBuf {
+        type Writer = SharedBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capture_audit<F: FnOnce()>(f: F) -> String {
+        let buf = Arc::new(PlMutex::new(Vec::<u8>::new()));
+        let writer = SharedBuf(buf.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_max_level(tracing::Level::INFO)
+            .without_time()
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(buf.lock().clone()).unwrap()
+    }
+
+    #[test]
+    fn pinned_peer_resolves_to_mapped_role_and_audits_match() {
+        let maps = SecurityMapStore::new();
+        let fp = fingerprint_of(b"peer-cert-der");
+        maps.map_mtls_fingerprint(fp, RoleId(77));
+
+        let mut result = None;
+        let captured = capture_audit(|| {
+            result = Some(verify_pinned_peer(Some(&fp), &maps));
+        });
+        assert_eq!(result.unwrap(), Ok(RoleId(77)));
+        assert!(captured.contains("MTLSFingerprintMatched"));
+        assert!(captured.contains("decision") && captured.contains("granted"));
+        assert!(captured.contains("77"));
+    }
+
+    #[test]
+    fn unpinned_peer_is_refused_and_audits_mismatch() {
+        let maps = SecurityMapStore::new();
+        let fp = fingerprint_of(b"unknown-cert");
+
+        let mut result = None;
+        let captured = capture_audit(|| {
+            result = Some(verify_pinned_peer(Some(&fp), &maps));
+        });
+        assert_eq!(result.unwrap(), Err(MtlsPinError::NotPinned));
+        assert!(captured.contains("MTLSFingerprintMismatch"));
+        assert!(captured.contains("denied"));
+        assert!(captured.contains("fingerprint not in pin set"));
+    }
+
+    #[test]
+    fn missing_fingerprint_is_refused_and_audits_mismatch() {
+        let maps = SecurityMapStore::new();
+        let mut result = None;
+        let captured = capture_audit(|| {
+            result = Some(verify_pinned_peer(None, &maps));
+        });
+        assert_eq!(result.unwrap(), Err(MtlsPinError::NoFingerprint));
+        assert!(captured.contains("MTLSFingerprintMismatch"));
+        assert!(captured.contains("no peer certificate fingerprint"));
     }
 }

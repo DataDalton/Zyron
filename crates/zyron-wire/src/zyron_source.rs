@@ -496,22 +496,19 @@ impl ZyronSourceClient {
     where
         F: Fn(Vec<RowDelta>) -> Result<()> + Send + Sync,
     {
-        let mut conn = self
+        let conn = self
             .pool
             .acquire_role(HostRole::Unknown)
             .await
             .map_err(|e| ZyronError::StreamingError(format!("pool acquire: {e}")))?;
-        // Consume the connection: the push protocol needs the raw stream.
-        let pg_client = conn.client_mut();
-        // The SubscriptionHandle uses a generic AsyncRead+AsyncWrite. The
-        // shared PgClient does not expose its transport, so the push-mode
-        // path requires a dedicated raw stream acquired through the pool.
-        // For this runtime we adapt by running the consumer loop over a
-        // newly-opened duplex owned by this task.
+        // The push-mode consumer runs over a task-local duplex, not the
+        // pooled PG transport. Genuinely close the pooled connection here
+        // (PG Terminate plus socket shutdown) instead of returning it to the
+        // idle pool, so the server-side connection is released immediately.
+        conn.discard().await;
+
         let (client_side, server_side) = tokio::io::duplex(1 << 16);
         drop(server_side);
-        drop(pg_client);
-        drop(conn);
 
         let cfg = ConsumerConfig {
             initial_credit: credit_bytes.max(1),

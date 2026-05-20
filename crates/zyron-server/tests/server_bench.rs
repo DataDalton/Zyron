@@ -189,6 +189,8 @@ async fn create_test_state(
         tls_acceptor: None,
         endpoint_registrar: None,
         subscription_runtimes: Arc::new(scc::HashMap::new()),
+        pub_sub_state: Arc::new(zyron_wire::subscription::PubSubServerState::new()),
+        subscription_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         heap_files: Arc::new(scc::HashMap::new()),
         btree_indexes: Arc::new(scc::HashMap::new()),
         vacuum_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1096,7 +1098,10 @@ fn test_10_metrics() {
     tprintln!("\n=== Metrics Test ===");
 
     let session_mgr = Arc::new(SessionManager::new(1000, 0));
-    let registry = Arc::new(MetricsRegistry::new(session_mgr.clone()));
+    let registry = Arc::new(MetricsRegistry::new(
+        session_mgr.clone(),
+        Arc::new(zyron_common::LabeledMetrics::new()),
+    ));
 
     // Increment counters
     registry
@@ -1194,7 +1199,10 @@ fn test_11_health_checks() {
     tprintln!("\n=== Health Check Test ===");
 
     let session_mgr = Arc::new(SessionManager::new(100, 0));
-    let metrics = Arc::new(MetricsRegistry::new(session_mgr));
+    let metrics = Arc::new(MetricsRegistry::new(
+        session_mgr,
+        Arc::new(zyron_common::LabeledMetrics::new()),
+    ));
     let health = Arc::new(HealthState::new(metrics));
 
     // Before startup: startup endpoint returns 503

@@ -584,4 +584,144 @@ mod tests {
         let r = p.acquire().await;
         assert!(matches!(r, Err(PoolError::Shutdown)));
     }
+
+    // -------------------------------------------------------------------------
+    // PooledConnection::discard closes the server-side socket.
+    //
+    // This validates the exact primitive the source-runtime push path now
+    // relies on after the A3 fix: discard() must perform a real network close
+    // (PG Terminate plus socket shutdown) so the server observes the
+    // connection drop, rather than the connection being recycled into the
+    // idle pool. The test asserts directly on PooledConnection::discard
+    // against a counting fake PG server because run_cdf_tail_push is private
+    // and its post-discard consumer needs a live producer over the duplex,
+    // which has no real fixture. The negative control shows plain Drop keeps
+    // the connection open, which is why the fix uses discard().
+    // -------------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn spawn_fake_pg_server(live: Arc<AtomicUsize>) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                let live = Arc::clone(&live);
+                tokio::spawn(async move {
+                    live.fetch_add(1, AtomicOrdering::SeqCst);
+                    // Read the StartupMessage: i32 total length including the
+                    // 4 length bytes, then total-4 payload bytes.
+                    let mut len_buf = [0u8; 4];
+                    if sock.read_exact(&mut len_buf).await.is_ok() {
+                        let total = i32::from_be_bytes(len_buf) as usize;
+                        if total >= 4 {
+                            let mut body = vec![0u8; total - 4];
+                            let _ = sock.read_exact(&mut body).await;
+                        }
+                        // AuthenticationOk: 'R', len 8, i32 0.
+                        let mut auth_ok = Vec::new();
+                        auth_ok.push(b'R');
+                        auth_ok.extend_from_slice(&8i32.to_be_bytes());
+                        auth_ok.extend_from_slice(&0i32.to_be_bytes());
+                        // ReadyForQuery: 'Z', len 5, 'I'.
+                        let mut rfq = Vec::new();
+                        rfq.push(b'Z');
+                        rfq.extend_from_slice(&5i32.to_be_bytes());
+                        rfq.push(b'I');
+                        if sock.write_all(&auth_ok).await.is_ok()
+                            && sock.write_all(&rfq).await.is_ok()
+                        {
+                            let _ = sock.flush().await;
+                            // Drain until the peer half-closes, then record
+                            // the close.
+                            let mut scratch = [0u8; 256];
+                            loop {
+                                match sock.read(&mut scratch).await {
+                                    Ok(0) => break,
+                                    Ok(_) => continue,
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+                    }
+                    live.fetch_sub(1, AtomicOrdering::SeqCst);
+                });
+            }
+        });
+        addr
+    }
+
+    async fn wait_for_count(live: &AtomicUsize, target: usize) -> bool {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if live.load(AtomicOrdering::SeqCst) == target {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    #[tokio::test]
+    async fn discard_closes_server_side_connection() {
+        let live = Arc::new(AtomicUsize::new(0));
+        let addr = spawn_fake_pg_server(Arc::clone(&live)).await;
+
+        let cfg = PoolConfig::simple(&addr.ip().to_string(), addr.port(), "u", None, "db");
+        let pool = ConnectionPool::new(cfg);
+
+        let conn = pool
+            .acquire_role(HostRole::Unknown)
+            .await
+            .expect("fake server completes the PG startup handshake");
+        assert!(
+            wait_for_count(&live, 1).await,
+            "server should observe one live connection after acquire"
+        );
+
+        conn.discard().await;
+        assert!(
+            wait_for_count(&live, 0).await,
+            "server-side connection count must drop to zero after discard"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_keeps_connection_open_negative_control() {
+        let live = Arc::new(AtomicUsize::new(0));
+        let addr = spawn_fake_pg_server(Arc::clone(&live)).await;
+
+        let cfg = PoolConfig::simple(&addr.ip().to_string(), addr.port(), "u", None, "db");
+        let pool = ConnectionPool::new(cfg);
+
+        let conn = pool.acquire_role(HostRole::Unknown).await.unwrap();
+        assert!(wait_for_count(&live, 1).await);
+
+        // Plain Drop returns the live client to the idle pool, so the socket
+        // stays open and the server still sees one connection. This is why
+        // the A3 fix uses discard() rather than dropping the guard.
+        drop(conn);
+        let dropped_to_zero = tokio::time::timeout(Duration::from_millis(300), async {
+            loop {
+                if live.load(AtomicOrdering::SeqCst) == 0 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            !dropped_to_zero,
+            "Drop must not close the socket, connection is recycled into the idle pool"
+        );
+    }
 }

@@ -23,6 +23,7 @@ pub async fn publication_retention_loop(
     cdc_registry: Option<Arc<zyron_cdc::CdfRegistry>>,
     shutdown: Arc<AtomicBool>,
     interval_secs: u64,
+    metrics: Option<Arc<zyron_common::LabeledMetrics>>,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(60)));
     loop {
@@ -30,7 +31,7 @@ pub async fn publication_retention_loop(
         if shutdown.load(Ordering::Acquire) {
             break;
         }
-        run_retention_sweep(&catalog, cdc_registry.as_deref()).await;
+        run_retention_sweep(&catalog, cdc_registry.as_deref(), metrics.as_deref()).await;
     }
 }
 
@@ -44,11 +45,20 @@ pub async fn publication_retention_loop(
 pub async fn run_retention_sweep(
     catalog: &Catalog,
     cdc_registry: Option<&zyron_cdc::CdfRegistry>,
+    metrics: Option<&zyron_common::LabeledMetrics>,
 ) -> u64 {
     let mut grand_total: u64 = 0;
     let publications = catalog.list_publications();
     for pub_entry in publications {
         let retention_point = compute_retention_point(catalog, &pub_entry);
+        if let Some(m) = metrics {
+            // Lag is how far behind wall-clock now the truncation horizon
+            // sits. compute_retention_point returns an epoch-seconds cutoff
+            // (capped by the slowest active subscriber when subscriber-lag
+            // holding is enabled).
+            let lag = current_secs().saturating_sub(retention_point);
+            m.pubRetentionLagSet(&pub_entry.id.0.to_string(), lag);
+        }
         let mut total_removed: u64 = 0;
         if let Some(reg) = cdc_registry {
             let tables = catalog.get_publication_tables(pub_entry.id);
@@ -238,7 +248,7 @@ mod tests {
             .await
             .unwrap();
 
-        let removed = run_retention_sweep(&catalog, Some(&cdf_registry)).await;
+        let removed = run_retention_sweep(&catalog, Some(&cdf_registry), None).await;
         assert_eq!(removed, 10);
         assert_eq!(feed.record_count(), 0);
     }
@@ -268,9 +278,9 @@ mod tests {
             .await
             .unwrap();
 
-        let first = run_retention_sweep(&catalog, Some(&cdf_registry)).await;
+        let first = run_retention_sweep(&catalog, Some(&cdf_registry), None).await;
         assert_eq!(first, 5);
-        let second = run_retention_sweep(&catalog, Some(&cdf_registry)).await;
+        let second = run_retention_sweep(&catalog, Some(&cdf_registry), None).await;
         assert_eq!(second, 0);
         assert_eq!(feed.record_count(), 0);
     }

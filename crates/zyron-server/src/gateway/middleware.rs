@@ -40,6 +40,7 @@ pub fn run_pipeline(
     path_params: HashMap<String, String>,
     req: &HttpRequest,
     rate_limiter: &RateLimiter,
+    security_map: Option<&zyron_auth::SecurityMapStore>,
 ) -> MiddlewareOutcome {
     if !route.enabled {
         return MiddlewareOutcome::Response(service_unavailable("endpoint disabled"));
@@ -59,14 +60,30 @@ pub fn run_pipeline(
         return MiddlewareOutcome::Response(super::response::payload_too_large());
     }
     // Auth.
-    let auth = match auth_mw::authenticate(&route, req) {
+    let auth = match auth_mw::authenticate(&route, req, security_map) {
         Ok(out) => out,
         Err(e) => {
+            tracing::info!(
+                target: "zyron::audit",
+                event = "EndpointAuthFailed",
+                principal = "unknown",
+                object = %req.path,
+                decision = "denied",
+                reason = e.detail(),
+            );
             return MiddlewareOutcome::Response(map_auth_error(e));
         }
     };
     // Scope.
     if !auth_mw::scope_check(&auth, &route.required_scopes) {
+        tracing::info!(
+            target: "zyron::audit",
+            event = "EndpointAuthFailed",
+            principal = auth.user_hint.as_deref().unwrap_or("unknown"),
+            object = %req.path,
+            decision = "denied",
+            reason = "missing-required-scope",
+        );
         return MiddlewareOutcome::Response(forbidden("missing required scope"));
     }
     // Rate limit.
@@ -185,7 +202,7 @@ mod tests {
         let route = basic_route(EndpointAuthMode::None, vec![HttpMethod::Get]);
         let rl = RateLimiter::new();
         let req = req(HttpMethod::Options, &[("origin", "https://a.test")], b"");
-        let out = run_pipeline(route, HashMap::new(), &req, &rl);
+        let out = run_pipeline(route, HashMap::new(), &req, &rl, None);
         match out {
             MiddlewareOutcome::Response(r) => {
                 assert_eq!(r.status, 204);
@@ -202,7 +219,7 @@ mod tests {
         let route = basic_route(EndpointAuthMode::None, vec![HttpMethod::Get]);
         let rl = RateLimiter::new();
         let r = req(HttpMethod::Post, &[], b"");
-        let out = run_pipeline(route, HashMap::new(), &r, &rl);
+        let out = run_pipeline(route, HashMap::new(), &r, &rl, None);
         if let MiddlewareOutcome::Response(resp) = out {
             assert_eq!(resp.status, 405);
         } else {
@@ -216,7 +233,7 @@ mod tests {
         let rl = RateLimiter::new();
         let big = vec![0u8; 2048];
         let r = req(HttpMethod::Post, &[], &big);
-        let out = run_pipeline(route, HashMap::new(), &r, &rl);
+        let out = run_pipeline(route, HashMap::new(), &r, &rl, None);
         if let MiddlewareOutcome::Response(resp) = out {
             assert_eq!(resp.status, 413);
         } else {
@@ -229,7 +246,7 @@ mod tests {
         let route = basic_route(EndpointAuthMode::Jwt, vec![HttpMethod::Get]);
         let rl = RateLimiter::new();
         let r = req(HttpMethod::Get, &[], b"");
-        let out = run_pipeline(route, HashMap::new(), &r, &rl);
+        let out = run_pipeline(route, HashMap::new(), &r, &rl, None);
         if let MiddlewareOutcome::Response(resp) = out {
             assert_eq!(resp.status, 401);
         } else {
@@ -242,7 +259,49 @@ mod tests {
         let route = basic_route(EndpointAuthMode::None, vec![HttpMethod::Get]);
         let rl = RateLimiter::new();
         let r = req(HttpMethod::Get, &[], b"");
-        let out = run_pipeline(route, HashMap::new(), &r, &rl);
+        let out = run_pipeline(route, HashMap::new(), &r, &rl, None);
         assert!(matches!(out, MiddlewareOutcome::Execute { .. }));
+    }
+
+    #[derive(Clone)]
+    struct SharedBuf(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+        type Writer = SharedBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn missing_jwt_emits_endpoint_auth_failed_audit() {
+        let buf = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(SharedBuf(buf.clone()))
+            .with_max_level(tracing::Level::INFO)
+            .without_time()
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let route = basic_route(EndpointAuthMode::Jwt, vec![HttpMethod::Get]);
+            let rl = RateLimiter::new();
+            let r = req(HttpMethod::Get, &[], b"");
+            let out = run_pipeline(route, HashMap::new(), &r, &rl, None);
+            assert!(matches!(out, MiddlewareOutcome::Response(_)));
+        });
+
+        let captured = String::from_utf8(buf.lock().clone()).unwrap();
+        assert!(captured.contains("EndpointAuthFailed"));
+        assert!(captured.contains("denied"));
+        assert!(captured.contains("missing credential"));
     }
 }

@@ -101,6 +101,7 @@ pub fn install_default_crypto_provider() {
 #[derive(Clone)]
 pub struct ServerTlsAcceptor {
     acceptor: tokio_rustls::TlsAcceptor,
+    metrics: Option<Arc<zyron_common::LabeledMetrics>>,
 }
 
 impl ServerTlsAcceptor {
@@ -149,7 +150,14 @@ impl ServerTlsAcceptor {
 
         Ok(Self {
             acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(server_config)),
+            metrics: None,
         })
+    }
+
+    /// Attaches the shared labeled-metrics handle so inbound handshake
+    /// outcomes and session resumptions are counted.
+    pub fn attachMetrics(&mut self, metrics: Arc<zyron_common::LabeledMetrics>) {
+        self.metrics = Some(metrics);
     }
 
     /// Wraps a plain stream in a TLS session by performing the handshake.
@@ -157,10 +165,23 @@ impl ServerTlsAcceptor {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        self.acceptor
-            .accept(stream)
-            .await
-            .map_err(|e| TlsError::Handshake(e.to_string()))
+        match self.acceptor.accept(stream).await {
+            Ok(tls) => {
+                if let Some(m) = &self.metrics {
+                    m.tlsHandshake(zyron_common::TlsDirection::Inbound, true);
+                    if tls.get_ref().1.handshake_kind() == Some(rustls::HandshakeKind::Resumed) {
+                        m.tlsSessionResumed();
+                    }
+                }
+                Ok(tls)
+            }
+            Err(e) => {
+                if let Some(m) = &self.metrics {
+                    m.tlsHandshake(zyron_common::TlsDirection::Inbound, false);
+                }
+                Err(TlsError::Handshake(e.to_string()))
+            }
+        }
     }
 }
 
@@ -174,6 +195,7 @@ impl ServerTlsAcceptor {
 pub struct ClientTlsConnector {
     connector: tokio_rustls::TlsConnector,
     server_name: ServerName<'static>,
+    metrics: Option<Arc<zyron_common::LabeledMetrics>>,
 }
 
 impl ClientTlsConnector {
@@ -255,7 +277,14 @@ impl ClientTlsConnector {
         Ok(Self {
             connector: tokio_rustls::TlsConnector::from(Arc::new(client_config)),
             server_name,
+            metrics: None,
         })
+    }
+
+    /// Attaches the shared labeled-metrics handle so outbound handshake
+    /// outcomes and session resumptions are counted.
+    pub fn attachMetrics(&mut self, metrics: Arc<zyron_common::LabeledMetrics>) {
+        self.metrics = Some(metrics);
     }
 
     /// Performs the client handshake over the given stream.
@@ -263,10 +292,27 @@ impl ClientTlsConnector {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        self.connector
+        match self
+            .connector
             .connect(self.server_name.clone(), stream)
             .await
-            .map_err(|e| TlsError::Handshake(e.to_string()))
+        {
+            Ok(tls) => {
+                if let Some(m) = &self.metrics {
+                    m.tlsHandshake(zyron_common::TlsDirection::Outbound, true);
+                    if tls.get_ref().1.handshake_kind() == Some(rustls::HandshakeKind::Resumed) {
+                        m.tlsSessionResumed();
+                    }
+                }
+                Ok(tls)
+            }
+            Err(e) => {
+                if let Some(m) = &self.metrics {
+                    m.tlsHandshake(zyron_common::TlsDirection::Outbound, false);
+                }
+                Err(TlsError::Handshake(e.to_string()))
+            }
+        }
     }
 
     /// Returns the server name used for SNI and hostname verification.

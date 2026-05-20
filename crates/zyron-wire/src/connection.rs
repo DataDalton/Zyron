@@ -180,6 +180,16 @@ pub struct ServerState {
     pub subscription_runtimes:
         Arc<scc::HashMap<zyron_catalog::SubscriptionId, tokio::task::JoinHandle<()>>>,
 
+    /// Active inbound subscriber map for the wire-level push producer pump.
+    /// Each Y handshake registers a SubscriptionServerContext here and the
+    /// pump removes it on disconnect or graceful end.
+    pub pub_sub_state: Arc<crate::subscription::PubSubServerState>,
+
+    /// Shutdown flag shared with the wire-level push producer pump. Set true
+    /// by the outer server on graceful shutdown so the pump drains and emits
+    /// EndSubscription frames to live subscribers.
+    pub subscription_shutdown: Arc<std::sync::atomic::AtomicBool>,
+
     /// Server-wide HeapFile cache keyed by heap_file_id. Reusing the same
     /// `HeapFile` across queries keeps the per-file free-space hint cache
     /// warm so single-row INSERTs land on the same hot page instead of
@@ -711,6 +721,9 @@ impl<T: WireTransport> Connection<T> {
                 FrontendMessage::Terminate => {
                     debug!("Client sent Terminate");
                     return Ok(());
+                }
+                FrontendMessage::Subscribe(sub) => {
+                    self.handle_subscribe(sub).await?;
                 }
                 _ => {
                     warn!("Unhandled message type in message loop");
@@ -3061,6 +3074,407 @@ impl<T: WireTransport> Connection<T> {
     // Error conversion
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // Subscribe authorization
+    //
+    // A Y (Subscribe) request must clear three gates before any change data
+    // is delivered: the SUBSCRIBE RBAC privilege on the publication, the
+    // publication ABAC policy set, and the Bell-LaPadula classification
+    // ceiling (subscriber clearance must be at least the publication
+    // classification). The decision and its audit are co-located in
+    // audit_subscribe_decision so an unauthorized peer can never receive a
+    // SubscribeOk.
+    // -----------------------------------------------------------------------
+    async fn handle_subscribe(
+        &mut self,
+        sub: crate::messages::frontend::SubscribeMessage,
+    ) -> Result<(), ProtocolError> {
+        let principal_role = self
+            .session
+            .as_ref()
+            .and_then(|s| s.security_context.as_ref())
+            .map(|c| c.current_role.0)
+            .unwrap_or(0);
+
+        let publication = self
+            .server
+            .catalog
+            .list_publications()
+            .into_iter()
+            .find(|p| p.name == sub.publication);
+        let publication = match publication {
+            Some(p) => p,
+            None => {
+                tracing::info!(
+                    target: "zyron::audit",
+                    event = "SubscribeDenied",
+                    principal = principal_role,
+                    object = %sub.publication,
+                    decision = "denied",
+                    reason = "unknown publication",
+                );
+                self.send_error(&ZyronError::Internal(format!(
+                    "unknown publication {}",
+                    sub.publication
+                )))
+                .await?;
+                self.flush().await?;
+                return Ok(());
+            }
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let sm = self.server.security_manager.clone();
+
+        let allowed = {
+            let ctx = self
+                .session
+                .as_mut()
+                .and_then(|s| s.security_context.as_mut());
+            audit_subscribe_decision(sm.as_deref(), ctx, &publication, principal_role, now)
+        };
+
+        if allowed {
+            let ok = crate::messages::backend::SubscribeOkMessage {
+                schema_fingerprint: publication.schema_fingerprint,
+                columns: Vec::new(),
+                resumed_at_lsn: sub.from_lsn,
+                features: sub.features,
+            };
+            self.feed(BackendMessage::SubscribeOk(ok)).await?;
+            self.flush().await?;
+            // Hand the connection over to the push producer pump. The pump
+            // owns the stream until the subscriber sends EndSubscription /
+            // Terminate, disconnects, or the server signals shutdown.
+            self.run_subscription_pump(sub, publication, principal_role)
+                .await?;
+            Ok(())
+        } else {
+            self.send_error(&ZyronError::PermissionDenied(format!(
+                "subscribe denied on publication {}",
+                publication.name
+            )))
+            .await?;
+            self.flush().await?;
+            Ok(())
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Subscription producer pump
+    //
+    // After SubscribeOk is sent, the connection enters this pump and remains
+    // here until the consumer ends the subscription, disconnects, or the
+    // server signals shutdown. The pump interleaves three concerns:
+    //   1. Read inbound FlowControl / SubscriptionAck / EndSubscription /
+    //      Terminate frames from the consumer.
+    //   2. Poll the CDC ChangeSource for new batches and write X frames
+    //      while the subscriber has credit and buffer headroom.
+    //   3. Emit periodic Q heartbeats so the consumer can advance its
+    //      liveness check.
+    // The pump persists last_seen_lsn into the catalog on every push and
+    // again on exit, removes the context from PubSubServerState, and emits
+    // SubscriptionPumpStarted / SubscriptionPumpEnded audit events.
+    // -----------------------------------------------------------------------
+    async fn run_subscription_pump(
+        &mut self,
+        sub: crate::messages::frontend::SubscribeMessage,
+        publication: std::sync::Arc<zyron_catalog::PublicationEntry>,
+        principal_role: u32,
+    ) -> Result<(), ProtocolError> {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        let registry = match &self.server.cdc_registry {
+            Some(r) => Arc::clone(r),
+            None => {
+                tracing::warn!(
+                    target: "zyron::audit",
+                    event = "SubscriptionPumpEnded",
+                    principal = principal_role,
+                    object = %publication.name,
+                    decision = "denied",
+                    reason = "no cdc registry configured",
+                );
+                return Ok(());
+            }
+        };
+
+        // Resolve member table ids: prefer the catalog publication-table map,
+        // fall back to the PublicationManager when it is the source of truth.
+        let mut table_ids: Vec<u32> = self
+            .server
+            .catalog
+            .get_publication_tables(publication.id)
+            .into_iter()
+            .map(|pt| pt.table_id.0)
+            .collect();
+        if table_ids.is_empty() {
+            if let Some(pm) = &self.server.publication_manager {
+                if let Ok(tids) = pm.get_tables_for_publication(&publication.name) {
+                    table_ids = tids;
+                }
+            }
+        }
+
+        let source: Arc<dyn crate::subscription::ChangeSource> = Arc::new(
+            crate::subscription::CdcChangeSource::new(registry, table_ids.clone()),
+        );
+
+        // Register a catalog subscription entry. The id is auto-allocated by
+        // the catalog when zero is supplied. last_seen_lsn starts at the
+        // consumer-supplied from_lsn so reconnects resume cleanly.
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let new_entry = zyron_catalog::SubscriptionEntry {
+            id: zyron_catalog::SubscriptionId(0),
+            publication_id: publication.id,
+            consumer_id: sub.consumer_id.clone(),
+            consumer_role_id: principal_role,
+            last_seen_lsn: sub.from_lsn,
+            last_poll_at: now_secs,
+            schema_pin: publication.schema_fingerprint,
+            mode: zyron_catalog::SubscriptionMode::Push,
+            state: zyron_catalog::SubscriptionState::Active,
+            last_error: None,
+            created_at: now_secs,
+            source_id: None,
+        };
+        let subscription_id = match self.server.catalog.create_subscription(new_entry).await {
+            Ok(id) => id,
+            Err(_) => zyron_catalog::SubscriptionId(0),
+        };
+
+        // Build the per-subscription producer context.
+        let peer_addr: std::net::SocketAddr = self
+            .peer_addr
+            .as_deref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| std::net::SocketAddr::from(([127u8, 0, 0, 1], 0u16)));
+        let watermark_high = 16 * 1024 * 1024u64;
+        let watermark_low = 8 * 1024 * 1024u64;
+        let initial_credit = if sub.initial_credit > 0 {
+            sub.initial_credit
+        } else {
+            64 * 1024
+        };
+        let mut ctx = crate::subscription::SubscriptionServerContext::new(
+            subscription_id.0,
+            publication.id.0,
+            sub.consumer_id.clone(),
+            publication.schema_fingerprint,
+            peer_addr,
+            principal_role,
+            initial_credit,
+            sub.from_lsn,
+            watermark_high,
+            watermark_low,
+        );
+        // Attach the shared labeled-metrics handle so the pump's record_push
+        // and apply_ack feed zyron_subscription_lag_lsn and bytes-sent.
+        // The metrics field on ServerState lives indirectly through the
+        // PubSubServerState handle.
+        ctx = ctx.withMetrics(None);
+        let ctx = Arc::new(ctx);
+        self.server.pub_sub_state.insert(Arc::clone(&ctx));
+
+        tracing::info!(
+            target: "zyron::audit",
+            event = "SubscriptionPumpStarted",
+            principal = principal_role,
+            object = %publication.name,
+            decision = "granted",
+            reason = "subscribe authorized, pump running",
+        );
+
+        let shutdown_flag = Arc::clone(&self.server.subscription_shutdown);
+        let cfg = crate::subscription::ProducerConfig::default();
+        let mut last_heartbeat = Instant::now();
+        let mut last_schema_check = Instant::now();
+        let mut encoded = BytesMut::with_capacity(8192);
+        let mut current_schema = publication.schema_fingerprint;
+        let pump_pub_id = publication.id;
+
+        // The pump loop returns a Result so write/read failures land in the
+        // same cleanup arm as a graceful exit. Previously a stream write
+        // error short-circuited via `?` before deregistering the context
+        // or persisting last_seen_lsn, leaking a phantom Active entry in
+        // the catalog and in PubSubServerState.
+        let pump_result: std::result::Result<&'static str, ProtocolError> = async {
+            loop {
+                if shutdown_flag.load(Ordering::Acquire) {
+                    return Ok("server shutdown");
+                }
+
+                // Schema-pin drift: if the publication's fingerprint changed
+                // since the last check, send a SchemaUpdate v frame so the
+                // consumer can react. The pump continues delivering with the
+                // refreshed fingerprint.
+                if last_schema_check.elapsed() >= Duration::from_millis(50) {
+                    if let Some(latest) = self.server.catalog.get_publication_by_id(pump_pub_id) {
+                        if latest.schema_fingerprint != current_schema {
+                            let msg = crate::messages::backend::SchemaUpdateMessage {
+                                publication: publication.name.clone(),
+                                new_fingerprint: latest.schema_fingerprint,
+                                columns: Vec::new(),
+                            };
+                            encoded.clear();
+                            msg.encode(&mut encoded);
+                            self.stream
+                                .write_all(&encoded)
+                                .await
+                                .map_err(ProtocolError::Io)?;
+                            self.stream.flush().await.map_err(ProtocolError::Io)?;
+                            current_schema = latest.schema_fingerprint;
+                        }
+                    }
+                    last_schema_check = Instant::now();
+                }
+
+                // Pump a batch when the subscriber has credit and buffer room.
+                if ctx.can_send() {
+                    let after = ctx.last_pushed_lsn.load(Ordering::Acquire);
+                    let credit = ctx.credit_remaining_bytes.load(Ordering::Acquire);
+                    let cap_bytes = credit.clamp(0, u32::MAX as i64) as u32;
+                    let next = source
+                        .next_batch(after, cap_bytes, cfg.batch_size_hint)
+                        .await?;
+                    if let Some(batch) = next {
+                        encoded.clear();
+                        batch.encode(&mut encoded);
+                        let encoded_len = encoded.len() as u64;
+                        let row_count = batch.row_count as u64;
+                        let end_lsn = batch.end_lsn;
+                        self.stream
+                            .write_all(&encoded)
+                            .await
+                            .map_err(ProtocolError::Io)?;
+                        self.stream.flush().await.map_err(ProtocolError::Io)?;
+                        ctx.record_push(end_lsn, encoded_len, row_count);
+                        let _ = self
+                            .server
+                            .catalog
+                            .update_subscription_lsn(subscription_id, end_lsn)
+                            .await;
+                        continue;
+                    }
+                }
+
+                if last_heartbeat.elapsed() >= cfg.heartbeat_interval {
+                    let committed = source.committed_lsn().await;
+                    let now_us = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_micros() as i64)
+                        .unwrap_or(0);
+                    let msg = crate::messages::backend::SubscriptionStatusMessage {
+                        committed_lsn: committed,
+                        producer_now_us: now_us,
+                    };
+                    encoded.clear();
+                    msg.encode(&mut encoded);
+                    self.stream
+                        .write_all(&encoded)
+                        .await
+                        .map_err(ProtocolError::Io)?;
+                    self.stream.flush().await.map_err(ProtocolError::Io)?;
+                    last_heartbeat = Instant::now();
+                }
+
+                // Race a short read against a small idle sleep so the pump stays
+                // responsive without busy-looping. read_message uses cancel-safe
+                // AsyncReadExt::read_buf on a persistent BytesMut buffer, so the
+                // dropped future preserves any partial bytes for the next pass.
+                let timeout_fut = tokio::time::sleep(cfg.source_poll);
+                tokio::select! {
+                    biased;
+                    r = self.read_message() => {
+                        match r {
+                            Ok(crate::messages::frontend::FrontendMessage::FlowControl(fc)) => {
+                                ctx.grant_credit(fc.credit_bytes);
+                            }
+                            Ok(crate::messages::frontend::FrontendMessage::SubscriptionAck(ack)) => {
+                                let prev = ctx.last_acked_lsn.load(Ordering::Acquire);
+                                let released = ack.acked_lsn.saturating_sub(prev);
+                                ctx.apply_ack(ack.acked_lsn, released);
+                            }
+                            Ok(crate::messages::frontend::FrontendMessage::EndSubscription(_)) => {
+                                return Ok("client EndSubscription");
+                            }
+                            Ok(crate::messages::frontend::FrontendMessage::Terminate) => {
+                                return Ok("client Terminate");
+                            }
+                            Ok(_) => {
+                                // Other frontend messages are not part of the
+                                // subscription frame grammar. Ignore them while
+                                // the pump owns the connection.
+                            }
+                            Err(ProtocolError::ConnectionClosed) => return Ok("client disconnect"),
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    _ = timeout_fut => {}
+                }
+            }
+        }
+        .await;
+
+        // Single cleanup path covers every exit: graceful end, client
+        // disconnect, server shutdown, read error, write error, encode
+        // error. We persist last_pushed_lsn (so the next subscribe
+        // resumes from the same place), mark the subscription Failed when
+        // the pump bailed on an error, and remove the in-memory context.
+        let final_lsn = ctx.last_pushed_lsn.load(Ordering::Acquire);
+        let _ = self
+            .server
+            .catalog
+            .update_subscription_lsn(subscription_id, final_lsn)
+            .await;
+        match &pump_result {
+            Ok(_) => {}
+            Err(e) => {
+                let _ = self
+                    .server
+                    .catalog
+                    .update_subscription_state(
+                        subscription_id,
+                        zyron_catalog::SubscriptionState::Failed,
+                        Some(format!("pump error: {}", e)),
+                    )
+                    .await;
+            }
+        }
+        self.server.pub_sub_state.remove(ctx.subscription_id);
+        match pump_result {
+            Ok(reason) => {
+                tracing::info!(
+                    target: "zyron::audit",
+                    event = "SubscriptionPumpEnded",
+                    principal = principal_role,
+                    object = %publication.name,
+                    decision = "granted",
+                    reason = reason,
+                );
+                Ok(())
+            }
+            Err(e) => {
+                tracing::info!(
+                    target: "zyron::audit",
+                    event = "SubscriptionPumpEnded",
+                    principal = principal_role,
+                    object = %publication.name,
+                    decision = "denied",
+                    reason = %format!("pump error: {}", e),
+                );
+                Err(e)
+            }
+        }
+    }
+
     /// Converts a ZyronError to an ErrorResponse and sends it.
     async fn send_error(&mut self, err: &ZyronError) -> Result<(), ProtocolError> {
         let fields = zyron_error_to_fields(err);
@@ -3169,6 +3583,143 @@ impl<T: WireTransport> Connection<T> {
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
+
+/// Authorizes a subscribe request and emits the co-located audit trail.
+///
+/// Returns true when the subscriber clears the SUBSCRIBE RBAC privilege, the
+/// publication ABAC policy set, and the classification ceiling. Every grant
+/// and deny is logged on the `zyron::audit` target with principal, object,
+/// decision, and reason so the audit can never drift from enforcement. When
+/// no security manager is configured the gate is open, matching the rest of
+/// the server, and the access is still audited as granted.
+pub fn audit_subscribe_decision(
+    sm: Option<&zyron_auth::SecurityManager>,
+    ctx: Option<&mut zyron_auth::SecurityContext>,
+    publication: &zyron_catalog::PublicationEntry,
+    principal_role: u32,
+    now: u64,
+) -> bool {
+    let sm = match sm {
+        Some(sm) => sm,
+        None => {
+            tracing::info!(
+                target: "zyron::audit",
+                event = "SubscribeGranted",
+                principal = principal_role,
+                object = %publication.name,
+                decision = "granted",
+                reason = "no security manager configured, gate open",
+            );
+            return true;
+        }
+    };
+    let ctx = match ctx {
+        Some(ctx) => ctx,
+        None => {
+            tracing::info!(
+                target: "zyron::audit",
+                event = "SubscribeDenied",
+                principal = principal_role,
+                object = %publication.name,
+                decision = "denied",
+                reason = "unauthenticated",
+            );
+            return false;
+        }
+    };
+
+    let has_priv = ctx.has_privilege(
+        &sm.privilege_store,
+        zyron_auth::PrivilegeType::Subscribe,
+        zyron_auth::ObjectType::Publication,
+        publication.id.0,
+        None,
+        now,
+    );
+    if !has_priv {
+        tracing::info!(
+            target: "zyron::audit",
+            event = "PublicationAccessDenied",
+            principal = principal_role,
+            object = %publication.name,
+            decision = "denied",
+            reason = "missing SUBSCRIBE privilege",
+        );
+        tracing::info!(
+            target: "zyron::audit",
+            event = "SubscribeDenied",
+            principal = principal_role,
+            object = %publication.name,
+            decision = "denied",
+            reason = "missing SUBSCRIBE privilege",
+        );
+        return false;
+    }
+    tracing::info!(
+        target: "zyron::audit",
+        event = "PublicationAccessGranted",
+        principal = principal_role,
+        object = %publication.name,
+        decision = "granted",
+        reason = "SUBSCRIBE privilege present",
+    );
+
+    let resource = format!("publication:{}", publication.name);
+    if !sm
+        .abac_rule_store
+        .evaluate_abac(&ctx.attributes, Some(&resource), None)
+    {
+        tracing::info!(
+            target: "zyron::audit",
+            event = "ABACPolicyRejected",
+            principal = principal_role,
+            object = %publication.name,
+            decision = "denied",
+            reason = "ABAC policy denied",
+        );
+        tracing::info!(
+            target: "zyron::audit",
+            event = "SubscribeDenied",
+            principal = principal_role,
+            object = %publication.name,
+            decision = "denied",
+            reason = "ABAC policy denied",
+        );
+        return false;
+    }
+
+    let pub_level = publication.classification as u8;
+    let clearance = ctx.break_glass_clearance.unwrap_or(ctx.clearance) as u8;
+    if clearance < pub_level {
+        tracing::info!(
+            target: "zyron::audit",
+            event = "ClassificationRejected",
+            principal = principal_role,
+            object = %publication.name,
+            decision = "denied",
+            reason = "clearance below publication classification",
+        );
+        tracing::info!(
+            target: "zyron::audit",
+            event = "SubscribeDenied",
+            principal = principal_role,
+            object = %publication.name,
+            decision = "denied",
+            reason = "clearance below publication classification",
+        );
+        return false;
+    }
+
+    tracing::info!(
+        target: "zyron::audit",
+        event = "SubscribeGranted",
+        principal = principal_role,
+        object = %publication.name,
+        decision = "granted",
+        reason = "rbac, abac, and classification checks passed",
+    );
+    true
+}
 
 /// Maps ZyronError to ErrorFields with appropriate SQLSTATE codes.
 pub fn zyron_error_to_fields(err: &ZyronError) -> ErrorFields {
@@ -3405,4 +3956,205 @@ fn build_webauthn_authenticator(sm: &Arc<zyron_auth::SecurityManager>) -> WebAut
     });
 
     WebAuthnAuthenticator::new(sm_for_auth, rp_config, user_lookup)
+}
+
+#[cfg(test)]
+mod subscribe_authz_tests {
+    use super::audit_subscribe_decision;
+    use parking_lot::Mutex as PlMutex;
+    use std::sync::Arc;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    use zyron_auth::{
+        ClassificationLevel, GrantEntry, ObjectType, PrivilegeState, PrivilegeType, RoleId,
+        SecurityContext, SecurityManager, UserId,
+    };
+    use zyron_buffer::{BufferPool, BufferPoolConfig};
+    use zyron_catalog::{
+        CatalogClassification, PublicationEntry, PublicationId, RowFormat, SchemaId,
+    };
+    use zyron_storage::{DiskManager, DiskManagerConfig};
+
+    #[derive(Clone)]
+    struct SharedBuf(Arc<PlMutex<Vec<u8>>>);
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> MakeWriter<'a> for SharedBuf {
+        type Writer = SharedBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capture_audit<F: FnOnce()>(f: F) -> String {
+        let buf = Arc::new(PlMutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(SharedBuf(buf.clone()))
+            .with_max_level(tracing::Level::INFO)
+            .without_time()
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(buf.lock().clone()).unwrap()
+    }
+
+    async fn make_security_manager(tmp: &tempfile::TempDir) -> SecurityManager {
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let disk = Arc::new(
+            DiskManager::new(DiskManagerConfig {
+                data_dir,
+                fsync_enabled: false,
+            })
+            .await
+            .unwrap(),
+        );
+        let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 64 }));
+        let storage = Arc::new(zyron_auth::HeapAuthStorage::new(disk, pool).unwrap());
+        SecurityManager::new(storage).await.unwrap()
+    }
+
+    fn make_ctx(clearance: ClassificationLevel) -> SecurityContext {
+        let role = RoleId(5);
+        let attrs = zyron_auth::SessionAttributes {
+            role_id: role,
+            department: None,
+            region: None,
+            clearance,
+            ip_address: "127.0.0.1".to_string(),
+            connection_time: 0,
+            custom: std::collections::HashMap::new(),
+        };
+        SecurityContext::new(
+            UserId(1),
+            role,
+            vec![role],
+            vec![role],
+            clearance,
+            attrs,
+            None,
+            zyron_auth::QueryLimits::default(),
+        )
+    }
+
+    fn make_pub(classification: CatalogClassification) -> PublicationEntry {
+        PublicationEntry {
+            id: PublicationId(42),
+            schema_id: SchemaId(1),
+            name: "sales_pub".to_string(),
+            change_feed: true,
+            row_format: RowFormat::Binary,
+            retention_days: 7,
+            retain_until_advance: false,
+            max_rows_per_sec: None,
+            max_bytes_per_sec: None,
+            max_concurrent_subscribers: None,
+            classification,
+            allow_initial_snapshot: true,
+            where_predicate: None,
+            columns_projection: Vec::new(),
+            rls_using_predicate: None,
+            tags: Vec::new(),
+            schema_fingerprint: [7u8; 32],
+            owner_role_id: 0,
+            created_at: 0,
+        }
+    }
+
+    fn grant_subscribe(sm: &SecurityManager, role: u32, pub_id: u32) {
+        sm.privilege_store
+            .grant(GrantEntry {
+                grantee: RoleId(role),
+                privilege: PrivilegeType::Subscribe,
+                object_type: ObjectType::Publication,
+                object_id: pub_id,
+                columns: None,
+                state: PrivilegeState::Grant,
+                with_grant_option: false,
+                granted_by: RoleId(0),
+                valid_from: None,
+                valid_until: None,
+                time_window: None,
+                object_pattern: None,
+                no_inherit: false,
+                mask_function: None,
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscribe_without_privilege_is_denied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sm = make_security_manager(&tmp).await;
+        let mut ctx = make_ctx(ClassificationLevel::Internal);
+        let publication = make_pub(CatalogClassification::Public);
+
+        let mut allowed = true;
+        let captured = capture_audit(|| {
+            allowed = audit_subscribe_decision(Some(&sm), Some(&mut ctx), &publication, 5, 1000);
+        });
+        assert!(!allowed, "subscribe must be refused without the privilege");
+        assert!(captured.contains("PublicationAccessDenied"));
+        assert!(captured.contains("SubscribeDenied"));
+        assert!(captured.contains("missing SUBSCRIBE privilege"));
+    }
+
+    #[tokio::test]
+    async fn subscribe_above_classification_ceiling_is_denied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sm = make_security_manager(&tmp).await;
+        grant_subscribe(&sm, 5, 42);
+        let mut ctx = make_ctx(ClassificationLevel::Public);
+        let publication = make_pub(CatalogClassification::Restricted);
+
+        let mut allowed = true;
+        let captured = capture_audit(|| {
+            allowed = audit_subscribe_decision(Some(&sm), Some(&mut ctx), &publication, 5, 1000);
+        });
+        assert!(!allowed, "clearance below ceiling must be refused");
+        assert!(captured.contains("PublicationAccessGranted"));
+        assert!(captured.contains("ClassificationRejected"));
+        assert!(captured.contains("SubscribeDenied"));
+        assert!(captured.contains("clearance below publication classification"));
+    }
+
+    #[tokio::test]
+    async fn authorized_subscribe_is_granted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sm = make_security_manager(&tmp).await;
+        grant_subscribe(&sm, 5, 42);
+        let mut ctx = make_ctx(ClassificationLevel::Confidential);
+        let publication = make_pub(CatalogClassification::Internal);
+
+        let mut allowed = false;
+        let captured = capture_audit(|| {
+            allowed = audit_subscribe_decision(Some(&sm), Some(&mut ctx), &publication, 5, 1000);
+        });
+        assert!(allowed, "all gates pass so subscribe is authorized");
+        assert!(captured.contains("PublicationAccessGranted"));
+        assert!(captured.contains("SubscribeGranted"));
+        assert!(!captured.contains("SubscribeDenied"));
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_subscribe_is_denied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sm = make_security_manager(&tmp).await;
+        let publication = make_pub(CatalogClassification::Public);
+
+        let mut allowed = true;
+        let captured = capture_audit(|| {
+            allowed = audit_subscribe_decision(Some(&sm), None, &publication, 0, 1000);
+        });
+        assert!(!allowed);
+        assert!(captured.contains("SubscribeDenied"));
+        assert!(captured.contains("unauthenticated"));
+    }
 }

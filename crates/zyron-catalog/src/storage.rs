@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use zyron_buffer::BufferPool;
-use zyron_common::Result;
+use zyron_common::{PAGE_SIZE, Result, ZyronError};
 use zyron_storage::{DiskManager, HeapFile, HeapFileConfig, Tuple, TupleId};
 
 // System table file ID assignments (reserved range 100-119).
@@ -175,6 +175,24 @@ pub trait CatalogStorage: Send + Sync {
     async fn is_bootstrapped(&self) -> Result<bool>;
     async fn bootstrap(&self) -> Result<()>;
 
+    /// Initializes any cached counters or in-memory structures the storage
+    /// implementation needs after open. Called unconditionally by
+    /// Catalog::new, including on already-bootstrapped storage, so reopens
+    /// after a crash reseed heap page counts from disk.
+    async fn init(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Flushes every dirty page held by the storage backend to durable disk
+    /// storage. This is the data-side half of the catalog checkpoint
+    /// barrier: after this returns, every committed catalog write whose
+    /// WAL LSN is at or below the corresponding wal.flushed_lsn() is
+    /// guaranteed reflected on disk, so reopen recovery can be skipped for
+    /// those records.
+    async fn flush_all_dirty(&self) -> Result<()> {
+        Ok(())
+    }
+
     // File ID allocation for user tables and indexes
     fn next_heap_file_id(&self) -> (u32, u32);
     fn next_index_file_id(&self) -> u32;
@@ -202,6 +220,12 @@ pub struct HeapCatalogStorage {
     compliance_log_heap: HeapFile,
     next_heap_file: AtomicU32,
     next_index_file: AtomicU32,
+    init_done: std::sync::atomic::AtomicBool,
+    /// Shared disk manager. Kept here so flush_all_dirty can take a single
+    /// pass over the buffer pool and write directly to the on-disk files
+    /// without going through each HeapFile's own filtered flush.
+    disk: Arc<DiskManager>,
+    pool: Arc<BufferPool>,
 }
 
 impl HeapCatalogStorage {
@@ -364,12 +388,26 @@ impl HeapCatalogStorage {
             compliance_log_heap,
             next_heap_file: AtomicU32::new(USER_HEAP_FILE_START),
             next_index_file: AtomicU32::new(USER_INDEX_FILE_START),
+            init_done: std::sync::atomic::AtomicBool::new(false),
+            disk,
+            pool,
         })
     }
 
     /// Initializes page count caches for all system table heap files.
-    /// Runs all 5 init calls concurrently to minimize cold-start latency.
+    /// Runs all init calls concurrently to minimize cold-start latency.
+    /// Idempotent: the init_done flag is CAS-set the first time through,
+    /// so callers that drive both this method and the catalog's own
+    /// init() do not pay the cost twice.
     pub async fn init_cache(&self) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        if self
+            .init_done
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
         tokio::try_join!(
             self.databases_heap.init_cache(),
             self.schemas_heap.init_cache(),
@@ -425,6 +463,82 @@ impl HeapCatalogStorage {
 
 #[async_trait]
 impl CatalogStorage for HeapCatalogStorage {
+    async fn init(&self) -> Result<()> {
+        // Seed cached heap page counts from on-disk file sizes. Without
+        // this, a reopened storage observes cached_heap_pages = 0 even when
+        // the file holds many pages, and scans return zero tuples until the
+        // next insert path bumps the counter.
+        self.init_cache().await
+    }
+
+    async fn flush_all_dirty(&self) -> Result<()> {
+        // Single pass over the buffer pool. The naive variant (one
+        // HeapFile::flush() per heap) walked BufferPool::page_table 17
+        // times and stamped every dirty page that did not match the
+        // current heap's file ids. That is O(heaps * pool_size). One
+        // dispatch table over every catalog file id lets us walk the pool
+        // exactly once and write directly to the matching file.
+        let data_dir = self.disk.data_dir().to_path_buf();
+        let allowed: std::collections::HashSet<u32> = [
+            DATABASES_HEAP_FILE_ID,
+            DATABASES_FSM_FILE_ID,
+            SCHEMAS_HEAP_FILE_ID,
+            SCHEMAS_FSM_FILE_ID,
+            TABLES_HEAP_FILE_ID,
+            TABLES_FSM_FILE_ID,
+            COLUMNS_HEAP_FILE_ID,
+            COLUMNS_FSM_FILE_ID,
+            INDEXES_HEAP_FILE_ID,
+            INDEXES_FSM_FILE_ID,
+            STREAMING_JOBS_HEAP_FILE_ID,
+            STREAMING_JOBS_FSM_FILE_ID,
+            EXTERNAL_SOURCES_HEAP_FILE_ID,
+            EXTERNAL_SOURCES_FSM_FILE_ID,
+            EXTERNAL_SINKS_HEAP_FILE_ID,
+            EXTERNAL_SINKS_FSM_FILE_ID,
+            PUBLICATIONS_HEAP_FILE_ID,
+            PUBLICATIONS_FSM_FILE_ID,
+            PUBLICATION_TABLES_HEAP_FILE_ID,
+            PUBLICATION_TABLES_FSM_FILE_ID,
+            SUBSCRIPTIONS_HEAP_FILE_ID,
+            SUBSCRIPTIONS_FSM_FILE_ID,
+            ENDPOINTS_HEAP_FILE_ID,
+            ENDPOINTS_FSM_FILE_ID,
+            SECURITY_MAPS_HEAP_FILE_ID,
+            SECURITY_MAPS_FSM_FILE_ID,
+            LEGAL_HOLDS_HEAP_FILE_ID,
+            LEGAL_HOLDS_FSM_FILE_ID,
+            RETENTION_POLICIES_HEAP_FILE_ID,
+            RETENTION_POLICIES_FSM_FILE_ID,
+            RETENTION_JOBS_HEAP_FILE_ID,
+            RETENTION_JOBS_FSM_FILE_ID,
+            COMPLIANCE_LOG_HEAP_FILE_ID,
+            COMPLIANCE_LOG_FSM_FILE_ID,
+        ]
+        .into_iter()
+        .collect();
+
+        self.pool.flush_all(|page_id, data| {
+            if !allowed.contains(&page_id.file_id) {
+                return Ok(());
+            }
+            let path = data_dir.join(format!("{:08}.dat", page_id.file_id));
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .map_err(|e| {
+                    ZyronError::IoError(format!("flush open {}: {}", path.display(), e))
+                })?;
+            let offset = page_id.page_num * (PAGE_SIZE as u64);
+            std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset))
+                .map_err(|e| ZyronError::IoError(format!("flush seek: {}", e)))?;
+            std::io::Write::write_all(&mut file, data)
+                .map_err(|e| ZyronError::IoError(format!("flush write: {}", e)))?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     async fn load_databases(&self) -> Result<Vec<DatabaseEntry>> {
         let mut entries = Vec::new();
         let guard = self.databases_heap.scan()?;

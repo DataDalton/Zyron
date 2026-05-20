@@ -88,6 +88,7 @@ pub struct SubscriptionServerContext {
     pub started_at: Instant,
     pub rows_delivered: AtomicU64,
     pub bytes_delivered: AtomicU64,
+    metrics: Option<Arc<zyron_common::LabeledMetrics>>,
 }
 
 impl SubscriptionServerContext {
@@ -122,6 +123,30 @@ impl SubscriptionServerContext {
             started_at: Instant::now(),
             rows_delivered: AtomicU64::new(0),
             bytes_delivered: AtomicU64::new(0),
+            metrics: None,
+        }
+    }
+
+    /// Attaches the shared labeled-metrics handle before the context is
+    /// wrapped in an Arc and registered with PubSubServerState.
+    pub fn withMetrics(mut self, metrics: Option<Arc<zyron_common::LabeledMetrics>>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    fn publicationLabel(&self) -> String {
+        self.publication_id.to_string()
+    }
+
+    fn subscriptionLabel(&self) -> String {
+        self.subscription_id.to_string()
+    }
+
+    fn recordLag(&self) {
+        if let Some(m) = &self.metrics {
+            let pushed = self.last_pushed_lsn.load(Ordering::Acquire);
+            let acked = self.last_acked_lsn.load(Ordering::Acquire);
+            m.subLagLsnSet(&self.subscriptionLabel(), pushed.saturating_sub(acked));
         }
     }
 
@@ -153,6 +178,7 @@ impl SubscriptionServerContext {
             let new = cur.saturating_sub(bytes_released);
             self.buffered_bytes.store(new, Ordering::Release);
         }
+        self.recordLag();
     }
 
     /// Records an emitted batch. Decrements credit and tracks buffered bytes.
@@ -164,6 +190,10 @@ impl SubscriptionServerContext {
         self.rows_delivered.fetch_add(row_count, Ordering::Relaxed);
         self.bytes_delivered
             .fetch_add(encoded_len, Ordering::Relaxed);
+        if let Some(m) = &self.metrics {
+            m.pubBytesSent(&self.publicationLabel(), encoded_len);
+        }
+        self.recordLag();
     }
 }
 
@@ -172,19 +202,38 @@ impl SubscriptionServerContext {
 pub struct PubSubServerState {
     subscriptions:
         parking_lot::RwLock<std::collections::HashMap<u32, Arc<SubscriptionServerContext>>>,
+    metrics: Option<Arc<zyron_common::LabeledMetrics>>,
 }
 
 impl PubSubServerState {
     pub fn new() -> Self {
         Self {
             subscriptions: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            metrics: None,
         }
     }
 
-    /// Registers a new subscription context.
+    /// Builds the state with the shared labeled-metrics handle attached.
+    pub fn with_metrics(metrics: Option<Arc<zyron_common::LabeledMetrics>>) -> Self {
+        Self {
+            subscriptions: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            metrics,
+        }
+    }
+
+    /// Registers a new subscription context. Increments the per-publication
+    /// active-subscriber gauge, and counts a reconnect when a context for the
+    /// same subscription id was already present.
     pub fn insert(&self, ctx: Arc<SubscriptionServerContext>) {
         let id = ctx.subscription_id;
-        self.subscriptions.write().insert(id, ctx);
+        let publication = ctx.publication_id.to_string();
+        let prior = self.subscriptions.write().insert(id, ctx);
+        if let Some(m) = &self.metrics {
+            m.pubSubscribersInc(&publication);
+            if prior.is_some() {
+                m.subReconnectInc(&id.to_string());
+            }
+        }
     }
 
     /// Fetches a subscription context by id.
@@ -195,7 +244,11 @@ impl PubSubServerState {
     /// Removes a subscription context. Returns the removed entry if it was
     /// present.
     pub fn remove(&self, id: u32) -> Option<Arc<SubscriptionServerContext>> {
-        self.subscriptions.write().remove(&id)
+        let removed = self.subscriptions.write().remove(&id);
+        if let (Some(m), Some(ctx)) = (&self.metrics, &removed) {
+            m.pubSubscribersDec(&ctx.publication_id.to_string());
+        }
+        removed
     }
 
     /// Returns the current active subscription count.
@@ -717,6 +770,128 @@ pub async fn send_schema_update<S: AsyncWrite + Unpin>(
     let mut buf = BytesMut::with_capacity(256);
     msg.encode(&mut buf);
     write_all(stream, &buf).await
+}
+
+// ----------------------------------------------------------------------------
+// CDC-backed ChangeSource: bridges CdfRegistry per-table feeds into a
+// publication-scoped batch source consumed by drive_subscription.
+// ----------------------------------------------------------------------------
+
+/// Reads change records from one or more CDF feeds and packages them as
+/// ChangeBatchMessage frames. Each call returns the next batch of records
+/// with commit_version > after_lsn across all subscribed tables, capped by
+/// the caller's byte and row budgets.
+pub struct CdcChangeSource {
+    registry: Arc<zyron_cdc::CdfRegistry>,
+    table_ids: Vec<u32>,
+    high_lsn: AtomicU64,
+}
+
+impl CdcChangeSource {
+    pub fn new(registry: Arc<zyron_cdc::CdfRegistry>, table_ids: Vec<u32>) -> Self {
+        Self {
+            registry,
+            table_ids,
+            high_lsn: AtomicU64::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ChangeSource for CdcChangeSource {
+    async fn next_batch(
+        &self,
+        after_lsn: u64,
+        max_bytes: u32,
+        max_rows: u32,
+    ) -> Result<Option<ChangeBatchMessage>, ProtocolError> {
+        let mut collected: Vec<crate::messages::backend::RowDelta> = Vec::new();
+        let mut commit_ts: i64 = 0;
+        let mut total_bytes: u32 = 0;
+        let start = after_lsn.saturating_add(1);
+
+        for &tid in &self.table_ids {
+            let feed = match self.registry.get_feed(tid) {
+                Some(f) => f,
+                None => continue,
+            };
+            let recs = feed
+                .query_changes(start, u64::MAX)
+                .map_err(|e| ProtocolError::Malformed(format!("cdf query_changes: {}", e)))?;
+            for r in recs {
+                if (collected.len() as u32) >= max_rows {
+                    break;
+                }
+                let frame_bytes = 1
+                    + 4
+                    + 8
+                    + 4
+                    + (r.row_data.len() as u32)
+                    + 4
+                    + (r.primary_key_data.len() as u32);
+                if !collected.is_empty() && total_bytes.saturating_add(frame_bytes) > max_bytes {
+                    break;
+                }
+                let change_type = match r.change_type {
+                    zyron_cdc::ChangeType::Insert => 0u8,
+                    zyron_cdc::ChangeType::UpdatePreimage => 2,
+                    zyron_cdc::ChangeType::UpdatePostimage => 3,
+                    zyron_cdc::ChangeType::Delete => 1,
+                    zyron_cdc::ChangeType::SchemaChange | zyron_cdc::ChangeType::Truncate => {
+                        continue;
+                    }
+                };
+                commit_ts = r.commit_timestamp;
+                total_bytes = total_bytes.saturating_add(frame_bytes);
+                collected.push(crate::messages::backend::RowDelta {
+                    change_type,
+                    table_id: r.table_id,
+                    lsn: r.commit_version,
+                    row_bytes: r.row_data,
+                    primary_key_bytes: r.primary_key_data,
+                });
+            }
+        }
+        if collected.is_empty() {
+            return Ok(None);
+        }
+        collected.sort_by_key(|r| r.lsn);
+        let start_lsn = collected.first().map(|r| r.lsn).unwrap_or(0);
+        let end_lsn = collected.last().map(|r| r.lsn).unwrap_or(0);
+        let row_count = collected.len() as u32;
+        // Bump the heartbeat high-water mark using fetch_max so concurrent
+        // batches across feeds advance the published LSN monotonically.
+        let mut hi = self.high_lsn.load(std::sync::atomic::Ordering::Relaxed);
+        while end_lsn > hi {
+            match self.high_lsn.compare_exchange_weak(
+                hi,
+                end_lsn,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => hi = observed,
+            }
+        }
+        Ok(Some(ChangeBatchMessage {
+            start_lsn,
+            end_lsn,
+            row_count,
+            rows: collected,
+            commit_timestamp_us: commit_ts,
+        }))
+    }
+
+    async fn committed_lsn(&self) -> u64 {
+        // Heartbeat-only signal. The previous implementation called
+        // feed.query_changes(0, u64::MAX) per heartbeat which is a full
+        // scan of every feed. With realistic CDF sizes this is a
+        // multi-millisecond stall every 10 seconds for the lifetime of
+        // every subscription. Track the high-water-mark locally as
+        // batches flow through next_batch and report it; this is exactly
+        // the value the consumer needs for liveness without any I/O.
+        self.high_lsn.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 // ----------------------------------------------------------------------------

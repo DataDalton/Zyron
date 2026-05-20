@@ -50,6 +50,7 @@ memchr = "2"
 
 [dev-dependencies]
 tempfile = "3"
+tracing-subscriber = "0.3"
 md-5 = { workspace = true }
 tokio-util.workspace = true
 futures.workspace = true

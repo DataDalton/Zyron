@@ -15,7 +15,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use zyron_common::{Result, ZyronError};
 use zyron_parser::ast::{ColumnConstraint, ColumnDef, DataType, TableConstraint};
-use zyron_wal::record::Lsn;
+use zyron_wal::RecoveryManager;
+use zyron_wal::record::{LogRecordType, Lsn};
 use zyron_wal::writer::WalWriter;
 
 /// DDL operation type prefixes for WAL payloads.
@@ -83,8 +84,641 @@ impl Catalog {
             catalog.storage.bootstrap().await?;
         }
 
+        // Seed storage-internal counters (heap page caches, FSM pages) from
+        // on-disk file sizes. This is required even on already-bootstrapped
+        // storage so reopens after a crash see the real page counts and
+        // scans iterate every persisted tuple.
+        catalog.storage.init().await?;
+
+        // Replay committed DDL records from the WAL that the storage pages
+        // have not yet absorbed. Cheap-skip path: when the catalog's
+        // checkpoint marker file says every WAL byte already written is
+        // reflected in storage, skip the WAL scan entirely. This is the
+        // common clean-shutdown reopen and runs in O(1).
+        let wal_dir = catalog.wal.wal_dir();
+        let marker = crate::checkpoint::read(wal_dir).unwrap_or(None);
+        let wal_frontier = catalog.wal.flushed_lsn().0;
+        let skip_recover = match marker {
+            Some(m) => m.last_applied_lsn >= wal_frontier,
+            None => false,
+        };
+        if !skip_recover {
+            catalog.recover_unflushed_ddl().await?;
+        }
+
         catalog.load().await?;
         Ok(catalog)
+    }
+
+    /// Drives the catalog checkpoint barrier.
+    ///
+    /// Captures the current WAL flushed LSN, flushes every catalog heap's
+    /// dirty pages to disk so the on-disk storage view catches up to that
+    /// LSN, then writes a WAL CheckpointEnd record marking the boundary.
+    /// The CheckpointEnd write is itself waited for durability so a
+    /// subsequent crash cannot lose the checkpoint marker.
+    ///
+    /// After this returns, every committed DDL whose LSN is at or below
+    /// the checkpoint LSN is guaranteed reflected in storage pages on
+    /// disk. The next Catalog::new sees the CheckpointEnd record during
+    /// WAL recovery and clears its redo buffer, so reopen does O(1) work
+    /// when no DDL was issued after the checkpoint.
+    pub async fn checkpoint(&self) -> Result<()> {
+        // 1. Capture the WAL frontier we are committing to disk. Any
+        //    catalog DDL whose commit LSN is at or below this value will
+        //    be durable after step 2 because log_ddl is synchronous
+        //    against wait_for_flush.
+        let chkpt_lsn = self.wal.flushed_lsn();
+
+        // 2. Push every dirty catalog page to disk. After this point the
+        //    on-disk pages reflect every DDL whose commit LSN <= chkpt_lsn.
+        //    Ordering matters: storage must land before the CheckpointEnd
+        //    record so a crash between the two steps over-replays
+        //    (harmless) rather than under-replays (would lose DDL).
+        self.storage.flush_all_dirty().await?;
+
+        // 3. Record the checkpoint in the WAL. payload encodes the LSN
+        //    value the storage view is known to have reached, matching
+        //    the format zyron_wal::RecoveryManager expects (first 8 bytes
+        //    little-endian u64). Wait for the record's durability so the
+        //    next crash cannot lose it.
+        let lsn_payload = chkpt_lsn.0.to_le_bytes();
+        let end_lsn = self.wal.log_checkpoint_end(&lsn_payload)?;
+        self.wal.wait_for_flush(end_lsn)?;
+
+        // 4. Persist the checkpoint marker file. Once this lands the next
+        //    Catalog::new can compare the marker against the WAL frontier
+        //    and skip the recovery scan when the marker covers it. The
+        //    marker is written atomically (write-temp + fsync + rename)
+        //    so a crash mid-write either leaves the previous marker intact
+        //    or none at all; in either case recovery is still correct.
+        let wal_dir = self.wal.wal_dir().to_path_buf();
+        let marker = crate::checkpoint::CatalogCheckpoint {
+            last_applied_lsn: end_lsn.0,
+        };
+        crate::checkpoint::write_atomic(&wal_dir, &marker)?;
+        Ok(())
+    }
+
+    /// Replays DDL records from the WAL into storage to recover writes that
+    /// committed before a crash but had not been flushed by the buffer pool.
+    /// Each record is applied in LSN order. Stores are idempotent against
+    /// existing rows; deletes are no-ops when the row is already absent.
+    async fn recover_unflushed_ddl(&self) -> Result<()> {
+        let wal_dir = self.wal.wal_dir().to_path_buf();
+        let rm = match RecoveryManager::new(&wal_dir) {
+            Ok(rm) => rm,
+            Err(_) => return Ok(()),
+        };
+        let result = match rm.recover() {
+            Ok(r) => r,
+            Err(_) => return Ok(()),
+        };
+        if result.redo_records.is_empty() {
+            return Ok(());
+        }
+
+        // Snapshot what storage currently holds so we can skip rows that are
+        // already durably present. This snapshot does not need to be
+        // consistent with concurrent writers because Catalog::new runs
+        // before the server accepts any external traffic.
+        let mut have_databases: HashSet<u32> = self
+            .storage
+            .load_databases()
+            .await?
+            .into_iter()
+            .map(|e| e.id.0)
+            .collect();
+        let mut have_schemas: HashSet<u32> = self
+            .storage
+            .load_schemas()
+            .await?
+            .into_iter()
+            .map(|e| e.id.0)
+            .collect();
+        let mut have_tables: HashSet<u32> = self
+            .storage
+            .load_tables()
+            .await?
+            .into_iter()
+            .map(|e| e.id.0)
+            .collect();
+        let mut have_indexes: HashSet<u32> = self
+            .storage
+            .load_indexes()
+            .await?
+            .into_iter()
+            .map(|e| e.id.0)
+            .collect();
+        let mut have_publications: HashSet<u32> = self
+            .storage
+            .load_publications()
+            .await?
+            .into_iter()
+            .map(|e| e.id.0)
+            .collect();
+        let mut have_pub_tables: HashSet<(u32, u32)> = self
+            .storage
+            .load_publication_tables()
+            .await?
+            .into_iter()
+            .map(|e| (e.publication_id.0, e.table_id.0))
+            .collect();
+        let mut have_subscriptions: HashSet<u32> = self
+            .storage
+            .load_subscriptions()
+            .await?
+            .into_iter()
+            .map(|e| e.id.0)
+            .collect();
+        let mut have_endpoints: HashSet<u32> = self
+            .storage
+            .load_endpoints()
+            .await?
+            .into_iter()
+            .map(|e| e.id.0)
+            .collect();
+        let mut have_security_maps: HashSet<u32> = self
+            .storage
+            .load_security_maps()
+            .await?
+            .into_iter()
+            .map(|e| e.id.0)
+            .collect();
+        let mut have_external_sources: HashSet<u32> = self
+            .storage
+            .load_external_sources()
+            .await?
+            .into_iter()
+            .map(|e| e.id.0)
+            .collect();
+        let mut have_external_sinks: HashSet<u32> = self
+            .storage
+            .load_external_sinks()
+            .await?
+            .into_iter()
+            .map(|e| e.id.0)
+            .collect();
+        let mut have_streaming_jobs: HashSet<u32> = self
+            .storage
+            .load_streaming_jobs()
+            .await?
+            .into_iter()
+            .map(|e| e.id.0)
+            .collect();
+
+        // Pre-dedupe redo records in LSN order, keeping only the latest
+        // record per (entity-kind, id) tuple. Subsequent records for the
+        // same object always supersede prior ones, so applying every
+        // intermediate write is wasted work that dominates recovery time
+        // at scale. After this pass the dispatch below does at most one
+        // storage operation per logical object.
+        //
+        // The dedup key uses the entity kind (CREATE and UPDATE for the
+        // same kind share a key, DROP shares the same key so a later DROP
+        // wins over earlier CREATE/UPDATE) plus the affected id. For the
+        // pub-table junction the key is the (publication_id, table_id)
+        // pair.
+        let mut redo = result.redo_records;
+        redo.sort_by_key(|r| r.lsn.0);
+
+        fn entity_key(ddl_type: u8, entry_bytes: &[u8]) -> Option<(u8, u64)> {
+            fn read_u32(b: &[u8], off: usize) -> Option<u32> {
+                if b.len() < off + 4 {
+                    return None;
+                }
+                Some(u32::from_le_bytes([
+                    b[off],
+                    b[off + 1],
+                    b[off + 2],
+                    b[off + 3],
+                ]))
+            }
+            let id_u32 = |b: &[u8]| read_u32(b, 0);
+            match ddl_type {
+                DDL_CREATE_DATABASE | DDL_DROP_DATABASE => {
+                    let id: u32 = if ddl_type == DDL_CREATE_DATABASE {
+                        DatabaseEntry::from_bytes(entry_bytes)
+                            .ok()
+                            .map(|e| e.id.0)?
+                    } else {
+                        id_u32(entry_bytes)?
+                    };
+                    Some((1, id as u64))
+                }
+                DDL_CREATE_SCHEMA | DDL_DROP_SCHEMA => {
+                    let id: u32 = if ddl_type == DDL_CREATE_SCHEMA {
+                        SchemaEntry::from_bytes(entry_bytes).ok().map(|e| e.id.0)?
+                    } else {
+                        id_u32(entry_bytes)?
+                    };
+                    Some((2, id as u64))
+                }
+                DDL_CREATE_TABLE | DDL_DROP_TABLE => {
+                    let id: u32 = if ddl_type == DDL_CREATE_TABLE {
+                        TableEntry::from_bytes(entry_bytes).ok().map(|e| e.id.0)?
+                    } else {
+                        id_u32(entry_bytes)?
+                    };
+                    Some((3, id as u64))
+                }
+                DDL_CREATE_INDEX | DDL_DROP_INDEX => {
+                    let id: u32 = if ddl_type == DDL_CREATE_INDEX {
+                        IndexEntry::from_bytes(entry_bytes).ok().map(|e| e.id.0)?
+                    } else {
+                        id_u32(entry_bytes)?
+                    };
+                    Some((4, id as u64))
+                }
+                DDL_CREATE_STREAMING_JOB | DDL_ALTER_STREAMING_JOB | DDL_DROP_STREAMING_JOB => {
+                    let id: u32 = if ddl_type == DDL_DROP_STREAMING_JOB {
+                        id_u32(entry_bytes)?
+                    } else {
+                        StreamingJobEntry::from_bytes(entry_bytes)
+                            .ok()
+                            .map(|e| e.id.0)?
+                    };
+                    Some((5, id as u64))
+                }
+                DDL_CREATE_EXTERNAL_SOURCE
+                | DDL_ALTER_EXTERNAL_SOURCE
+                | DDL_DROP_EXTERNAL_SOURCE => {
+                    let id: u32 = if ddl_type == DDL_DROP_EXTERNAL_SOURCE {
+                        id_u32(entry_bytes)?
+                    } else {
+                        ExternalSourceEntry::from_bytes(entry_bytes)
+                            .ok()
+                            .map(|e| e.id.0)?
+                    };
+                    Some((6, id as u64))
+                }
+                DDL_CREATE_EXTERNAL_SINK | DDL_ALTER_EXTERNAL_SINK | DDL_DROP_EXTERNAL_SINK => {
+                    let id: u32 = if ddl_type == DDL_DROP_EXTERNAL_SINK {
+                        id_u32(entry_bytes)?
+                    } else {
+                        ExternalSinkEntry::from_bytes(entry_bytes)
+                            .ok()
+                            .map(|e| e.id.0)?
+                    };
+                    Some((7, id as u64))
+                }
+                DDL_CREATE_PUBLICATION | DDL_ALTER_PUBLICATION | DDL_DROP_PUBLICATION => {
+                    let id: u32 = if ddl_type == DDL_DROP_PUBLICATION {
+                        id_u32(entry_bytes)?
+                    } else {
+                        PublicationEntry::from_bytes(entry_bytes)
+                            .ok()
+                            .map(|e| e.id.0)?
+                    };
+                    Some((8, id as u64))
+                }
+                DDL_ADD_PUBLICATION_TABLE | DDL_REMOVE_PUBLICATION_TABLE => {
+                    let (pid, tid): (u32, u32) = if ddl_type == DDL_ADD_PUBLICATION_TABLE {
+                        let e = PublicationTableEntry::from_bytes(entry_bytes).ok()?;
+                        (e.publication_id.0, e.table_id.0)
+                    } else {
+                        (read_u32(entry_bytes, 0)?, read_u32(entry_bytes, 4)?)
+                    };
+                    Some((9, ((pid as u64) << 32) | (tid as u64)))
+                }
+                DDL_CREATE_SUBSCRIPTION | DDL_UPDATE_SUBSCRIPTION | DDL_DROP_SUBSCRIPTION => {
+                    let id: u32 = if ddl_type == DDL_DROP_SUBSCRIPTION {
+                        id_u32(entry_bytes)?
+                    } else {
+                        SubscriptionEntry::from_bytes(entry_bytes)
+                            .ok()
+                            .map(|e| e.id.0)?
+                    };
+                    Some((10, id as u64))
+                }
+                DDL_CREATE_ENDPOINT | DDL_ALTER_ENDPOINT | DDL_DROP_ENDPOINT => {
+                    let id: u32 = if ddl_type == DDL_DROP_ENDPOINT {
+                        id_u32(entry_bytes)?
+                    } else {
+                        EndpointEntry::from_bytes(entry_bytes)
+                            .ok()
+                            .map(|e| e.id.0)?
+                    };
+                    Some((11, id as u64))
+                }
+                DDL_CREATE_SECURITY_MAP | DDL_DROP_SECURITY_MAP => {
+                    let id: u32 = if ddl_type == DDL_CREATE_SECURITY_MAP {
+                        SecurityMapEntry::from_bytes(entry_bytes)
+                            .ok()
+                            .map(|e| e.id.0)?
+                    } else {
+                        id_u32(entry_bytes)?
+                    };
+                    Some((12, id as u64))
+                }
+                _ => None,
+            }
+        }
+
+        let mut latest: HashMap<(u8, u64), zyron_wal::record::LogRecord> = HashMap::new();
+        for record in redo
+            .into_iter()
+            .filter(|r| r.record_type == LogRecordType::Insert && !r.payload.is_empty())
+        {
+            let ddl_type = record.payload[0];
+            let entry_bytes = &record.payload[1..];
+            if let Some(key) = entity_key(ddl_type, entry_bytes) {
+                latest.insert(key, record);
+            }
+        }
+        let mut deduped: Vec<zyron_wal::record::LogRecord> = latest.into_values().collect();
+        deduped.sort_by_key(|r| r.lsn.0);
+
+        for record in deduped {
+            let ddl_type = record.payload[0];
+            let entry_bytes = &record.payload[1..];
+            match ddl_type {
+                DDL_CREATE_DATABASE => {
+                    if let Ok(entry) = DatabaseEntry::from_bytes(entry_bytes) {
+                        if !have_databases.contains(&entry.id.0) {
+                            let _ = self.storage.store_database(&entry).await;
+                            have_databases.insert(entry.id.0);
+                        }
+                    }
+                }
+                DDL_DROP_DATABASE => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_databases.remove(&id) {
+                            let _ = self.storage.delete_database(DatabaseId(id)).await;
+                        }
+                    }
+                }
+                DDL_CREATE_SCHEMA => {
+                    if let Ok(entry) = SchemaEntry::from_bytes(entry_bytes) {
+                        if !have_schemas.contains(&entry.id.0) {
+                            let _ = self.storage.store_schema(&entry).await;
+                            have_schemas.insert(entry.id.0);
+                        }
+                    }
+                }
+                DDL_DROP_SCHEMA => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_schemas.remove(&id) {
+                            let _ = self.storage.delete_schema(SchemaId(id)).await;
+                        }
+                    }
+                }
+                DDL_CREATE_TABLE => {
+                    if let Ok(entry) = TableEntry::from_bytes(entry_bytes) {
+                        // CREATE TABLE log records are re-emitted by every
+                        // ALTER. When the id is already present we treat
+                        // the record as an update so column metadata stays
+                        // in sync with the latest committed shape.
+                        if have_tables.contains(&entry.id.0) {
+                            let _ = self.storage.delete_table(entry.id).await;
+                        }
+                        let _ = self.storage.store_table(&entry).await;
+                        have_tables.insert(entry.id.0);
+                    }
+                }
+                DDL_DROP_TABLE => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_tables.remove(&id) {
+                            let _ = self.storage.delete_table(TableId(id)).await;
+                        }
+                    }
+                }
+                DDL_CREATE_INDEX => {
+                    if let Ok(entry) = IndexEntry::from_bytes(entry_bytes) {
+                        if !have_indexes.contains(&entry.id.0) {
+                            let _ = self.storage.store_index(&entry).await;
+                            have_indexes.insert(entry.id.0);
+                        }
+                    }
+                }
+                DDL_DROP_INDEX => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_indexes.remove(&id) {
+                            let _ = self.storage.delete_index(IndexId(id)).await;
+                        }
+                    }
+                }
+                DDL_CREATE_STREAMING_JOB | DDL_ALTER_STREAMING_JOB => {
+                    if let Ok(entry) = StreamingJobEntry::from_bytes(entry_bytes) {
+                        if have_streaming_jobs.contains(&entry.id.0) {
+                            let _ = self.storage.delete_streaming_job(entry.id).await;
+                        }
+                        let _ = self.storage.store_streaming_job(&entry).await;
+                        have_streaming_jobs.insert(entry.id.0);
+                    }
+                }
+                DDL_DROP_STREAMING_JOB => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_streaming_jobs.remove(&id) {
+                            let _ = self.storage.delete_streaming_job(StreamingJobId(id)).await;
+                        }
+                    }
+                }
+                DDL_CREATE_EXTERNAL_SOURCE | DDL_ALTER_EXTERNAL_SOURCE => {
+                    if let Ok(entry) = ExternalSourceEntry::from_bytes(entry_bytes) {
+                        if have_external_sources.contains(&entry.id.0) {
+                            let _ = self.storage.delete_external_source(entry.id).await;
+                        }
+                        let _ = self.storage.store_external_source(&entry).await;
+                        have_external_sources.insert(entry.id.0);
+                    }
+                }
+                DDL_DROP_EXTERNAL_SOURCE => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_external_sources.remove(&id) {
+                            let _ = self
+                                .storage
+                                .delete_external_source(ExternalSourceId(id))
+                                .await;
+                        }
+                    }
+                }
+                DDL_CREATE_EXTERNAL_SINK | DDL_ALTER_EXTERNAL_SINK => {
+                    if let Ok(entry) = ExternalSinkEntry::from_bytes(entry_bytes) {
+                        if have_external_sinks.contains(&entry.id.0) {
+                            let _ = self.storage.delete_external_sink(entry.id).await;
+                        }
+                        let _ = self.storage.store_external_sink(&entry).await;
+                        have_external_sinks.insert(entry.id.0);
+                    }
+                }
+                DDL_DROP_EXTERNAL_SINK => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_external_sinks.remove(&id) {
+                            let _ = self.storage.delete_external_sink(ExternalSinkId(id)).await;
+                        }
+                    }
+                }
+                DDL_CREATE_PUBLICATION | DDL_ALTER_PUBLICATION => {
+                    if let Ok(entry) = PublicationEntry::from_bytes(entry_bytes) {
+                        if have_publications.contains(&entry.id.0) {
+                            let _ = self.storage.update_publication(&entry).await;
+                        } else {
+                            let _ = self.storage.store_publication(&entry).await;
+                            have_publications.insert(entry.id.0);
+                        }
+                    }
+                }
+                DDL_DROP_PUBLICATION => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_publications.remove(&id) {
+                            let _ = self.storage.delete_publication(PublicationId(id)).await;
+                        }
+                    }
+                }
+                DDL_ADD_PUBLICATION_TABLE => {
+                    if let Ok(entry) = PublicationTableEntry::from_bytes(entry_bytes) {
+                        let k = (entry.publication_id.0, entry.table_id.0);
+                        if !have_pub_tables.contains(&k) {
+                            let _ = self.storage.store_publication_table(&entry).await;
+                            have_pub_tables.insert(k);
+                        }
+                    }
+                }
+                DDL_REMOVE_PUBLICATION_TABLE => {
+                    if entry_bytes.len() >= 8 {
+                        let pid = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        let tid = u32::from_le_bytes([
+                            entry_bytes[4],
+                            entry_bytes[5],
+                            entry_bytes[6],
+                            entry_bytes[7],
+                        ]);
+                        if have_pub_tables.remove(&(pid, tid)) {
+                            let _ = self
+                                .storage
+                                .delete_publication_table(PublicationId(pid), TableId(tid))
+                                .await;
+                        }
+                    }
+                }
+                DDL_CREATE_SUBSCRIPTION | DDL_UPDATE_SUBSCRIPTION => {
+                    if let Ok(entry) = SubscriptionEntry::from_bytes(entry_bytes) {
+                        if have_subscriptions.contains(&entry.id.0) {
+                            let _ = self.storage.update_subscription(&entry).await;
+                        } else {
+                            let _ = self.storage.store_subscription(&entry).await;
+                            have_subscriptions.insert(entry.id.0);
+                        }
+                    }
+                }
+                DDL_DROP_SUBSCRIPTION => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_subscriptions.remove(&id) {
+                            let _ = self.storage.delete_subscription(SubscriptionId(id)).await;
+                        }
+                    }
+                }
+                DDL_CREATE_ENDPOINT | DDL_ALTER_ENDPOINT => {
+                    if let Ok(entry) = EndpointEntry::from_bytes(entry_bytes) {
+                        if have_endpoints.contains(&entry.id.0) {
+                            let _ = self.storage.update_endpoint(&entry).await;
+                        } else {
+                            let _ = self.storage.store_endpoint(&entry).await;
+                            have_endpoints.insert(entry.id.0);
+                        }
+                    }
+                }
+                DDL_DROP_ENDPOINT => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_endpoints.remove(&id) {
+                            let _ = self.storage.delete_endpoint(EndpointId(id)).await;
+                        }
+                    }
+                }
+                DDL_CREATE_SECURITY_MAP => {
+                    if let Ok(entry) = SecurityMapEntry::from_bytes(entry_bytes) {
+                        if !have_security_maps.contains(&entry.id.0) {
+                            let _ = self.storage.store_security_map(&entry).await;
+                            have_security_maps.insert(entry.id.0);
+                        }
+                    }
+                }
+                DDL_DROP_SECURITY_MAP => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_security_maps.remove(&id) {
+                            let _ = self.storage.delete_security_map(SecurityMapId(id)).await;
+                        }
+                    }
+                }
+                _ => {
+                    // Unknown DDL type byte. Skip rather than panic so the
+                    // catalog tolerates forward-compatible WAL records.
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Loads all catalog data from storage into cache and recovers OID counter.
@@ -1210,8 +1844,13 @@ impl Catalog {
     // WAL integration
     // -----------------------------------------------------------------------
 
-    /// Logs a DDL operation to the WAL as a transactional insert.
-    /// Returns the commit LSN.
+    /// Logs a DDL operation to the WAL as a transactional insert and waits
+    /// for the commit record to reach durable storage. DDL is a low-volume,
+    /// high-importance write path: a crash between log_commit and the next
+    /// flush would otherwise lose the schema change even though storage
+    /// pages are lazy. Blocking on wait_for_flush here makes catalog DDL
+    /// crash-safe end-to-end and lets recover_unflushed_ddl on the next
+    /// boot put storage back in sync.
     fn log_ddl(&self, ddl_type: u8, entry_bytes: &[u8]) -> Result<Lsn> {
         let txn_id = self.wal.allocate_txn_id();
         let begin_lsn = self.wal.log_begin(txn_id)?;
@@ -1223,6 +1862,7 @@ impl Catalog {
 
         let insert_lsn = self.wal.log_insert(txn_id, begin_lsn, &payload)?;
         let commit_lsn = self.wal.log_commit(txn_id, insert_lsn)?;
+        self.wal.wait_for_flush(commit_lsn)?;
         Ok(commit_lsn)
     }
 

@@ -100,8 +100,8 @@ pub use credential_provider::{
 };
 pub use k8s_auth::{K8sTokenProvider, K8sTokenReviewer, TokenReviewResult};
 pub use mtls_pinning::{
-    CertFingerprintStore, CrlOcspChecker, CrlStatus, RevocationStatus, Sha256Fingerprint,
-    fingerprint_of, format_pin, parse_pin,
+    CertFingerprintStore, CrlOcspChecker, CrlStatus, MtlsPinError, RevocationStatus,
+    Sha256Fingerprint, fingerprint_of, format_pin, parse_pin, verify_pinned_peer,
 };
 pub use oauth2_client::OAuth2ClientCredentialsProvider;
 pub use secret_providers::{

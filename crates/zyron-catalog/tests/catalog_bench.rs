@@ -1783,6 +1783,11 @@ async fn test_bench_recovery() {
                 .unwrap();
         }
 
+        // Mirror Server::shutdown: drive the catalog checkpoint so the
+        // WAL gets a CheckpointEnd record after dirty pages flush. The
+        // next reopen's WAL recovery sees the marker and skips replay of
+        // every record at or below the checkpoint LSN.
+        catalog.checkpoint().await.unwrap();
         wal.flush().unwrap();
         wal.close().unwrap();
     }

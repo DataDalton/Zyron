@@ -64,9 +64,31 @@ impl CredentialProvider for AwsStsAssumeRoleProvider {
         if let Some(ref eid) = self.external_id {
             builder = builder.external_id(eid.clone());
         }
-        let out = builder.send().await.map_err(|e| {
-            ZyronError::AuthenticationFailed(format!("STS AssumeRole failed: {}", e))
-        })?;
+        let out = match builder.send().await {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::info!(
+                    target: "zyron::audit",
+                    event = "AwsStsAssumed",
+                    principal = %self.session_name,
+                    object = %self.role_arn,
+                    decision = "denied",
+                    reason = %format!("assume-role failed: {}", e),
+                );
+                return Err(ZyronError::AuthenticationFailed(format!(
+                    "STS AssumeRole failed: {}",
+                    e
+                )));
+            }
+        };
+        tracing::info!(
+            target: "zyron::audit",
+            event = "AwsStsAssumed",
+            principal = %self.session_name,
+            object = %self.role_arn,
+            decision = "granted",
+            reason = "assume-role",
+        );
         convert_sts_credentials(out.credentials(), self.duration)
     }
 
@@ -128,7 +150,7 @@ impl CredentialProvider for AwsStsWebIdentityProvider {
             .load()
             .await;
         let client = aws_sdk_sts::Client::new(&cfg);
-        let out = client
+        let out = match client
             .assume_role_with_web_identity()
             .role_arn(self.role_arn.clone())
             .role_session_name(self.session_name.clone())
@@ -136,12 +158,31 @@ impl CredentialProvider for AwsStsWebIdentityProvider {
             .duration_seconds(self.duration.as_secs().min(43200) as i32)
             .send()
             .await
-            .map_err(|e| {
-                ZyronError::AuthenticationFailed(format!(
+        {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::info!(
+                    target: "zyron::audit",
+                    event = "AwsStsAssumed",
+                    principal = %self.session_name,
+                    object = %self.role_arn,
+                    decision = "denied",
+                    reason = %format!("assume-role-web-identity failed: {}", e),
+                );
+                return Err(ZyronError::AuthenticationFailed(format!(
                     "STS AssumeRoleWithWebIdentity failed: {}",
                     e
-                ))
-            })?;
+                )));
+            }
+        };
+        tracing::info!(
+            target: "zyron::audit",
+            event = "AwsStsAssumed",
+            principal = %self.session_name,
+            object = %self.role_arn,
+            decision = "granted",
+            reason = "assume-role-web-identity",
+        );
         convert_sts_credentials(out.credentials(), self.duration)
     }
 

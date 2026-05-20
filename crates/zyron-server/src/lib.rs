@@ -212,7 +212,8 @@ impl Server {
             config.server.max_connections,
             config.server.connection_timeout_secs,
         ));
-        let metrics = Arc::new(MetricsRegistry::new(session_mgr.clone()));
+        let labeled_metrics = Arc::new(zyron_common::LabeledMetrics::new());
+        let metrics = Arc::new(MetricsRegistry::new(session_mgr.clone(), labeled_metrics));
         let health_state = Arc::new(HealthState::new(Arc::clone(&metrics)));
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -332,6 +333,9 @@ impl Server {
             zyron_auth::HeapAuthStorage::new(Arc::clone(&disk_manager), Arc::clone(&buffer_pool))?,
         );
         let mut security_manager = zyron_auth::SecurityManager::new(auth_storage).await?;
+        security_manager
+            .credential_cache
+            .attachMetrics(Arc::clone(&self.health_state.metrics.labeled));
 
         // Apply auth config from the config file
         {
@@ -865,6 +869,8 @@ impl Server {
             tls_acceptor: None,
             endpoint_registrar: Some(Arc::clone(&endpoint_registrar)),
             subscription_runtimes: Arc::new(scc::HashMap::new()),
+            pub_sub_state: Arc::new(zyron_wire::subscription::PubSubServerState::new()),
+            subscription_shutdown: Arc::clone(&self.shutdown),
             heap_files: Arc::new(scc::HashMap::new()),
             btree_indexes: Arc::new(scc::HashMap::new()),
             vacuum_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -964,27 +970,32 @@ impl Server {
         // -------------------------------------------------------------------
         {
             use std::time::Duration;
+            let labeled = Arc::clone(&self.health_state.metrics.labeled);
             let catalog_ret = Arc::clone(&catalog);
             let cdc_reg_ret = Some(Arc::clone(&cdc_registry_arc));
             let sh_ret = Arc::clone(&self.shutdown);
+            let labeled_ret = Arc::clone(&labeled);
             tokio::spawn(async move {
                 background::publication_retention::publication_retention_loop(
                     catalog_ret,
                     cdc_reg_ret,
                     sh_ret,
                     background::publication_retention::DEFAULT_INTERVAL_SECS,
+                    Some(labeled_ret),
                 )
                 .await;
             });
 
             let catalog_reap = Arc::clone(&catalog);
             let sh_reap = Arc::clone(&self.shutdown);
+            let labeled_reap = Arc::clone(&labeled);
             tokio::spawn(async move {
                 background::dead_subscriber_reaper::dead_subscriber_reaper_loop(
                     catalog_reap,
                     sh_reap,
                     background::dead_subscriber_reaper::DEFAULT_INTERVAL_SECS,
                     Duration::from_secs(3600),
+                    Some(labeled_reap),
                 )
                 .await;
             });
@@ -1176,6 +1187,19 @@ impl Server {
                     count
                 );
             }
+        }
+
+        // Catalog checkpoint: persist every dirty catalog page and emit a
+        // WAL CheckpointEnd so the next boot's recover_unflushed_ddl path
+        // sees zero post-checkpoint records and reopen is O(1). Failures
+        // here are logged but do not abort shutdown; the WAL still holds
+        // every committed DDL so the next start will replay them.
+        if let Err(e) = state_for_shutdown.catalog.checkpoint().await {
+            warn!(
+                target: "zyron::shutdown",
+                "catalog checkpoint failed during shutdown: {}",
+                e
+            );
         }
 
         // Stop background workers (runs final checkpoint)

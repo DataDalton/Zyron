@@ -358,7 +358,13 @@ fn test_gateway_middleware_pipeline() {
         let start = Instant::now();
         let mut exec_count = 0usize;
         for _ in 0..iterations {
-            let out = run_pipeline(Arc::clone(&route), HashMap::new(), &req, &rate_limiter);
+            let out = run_pipeline(
+                Arc::clone(&route),
+                HashMap::new(),
+                &req,
+                &rate_limiter,
+                None,
+            );
             if matches!(out, MiddlewareOutcome::Execute { .. }) {
                 exec_count += 1;
             }

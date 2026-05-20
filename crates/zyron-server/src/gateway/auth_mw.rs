@@ -40,7 +40,15 @@ impl AuthError {
 }
 
 /// Applies the route's configured auth mode. Returns an AuthOutcome on success.
-pub fn authenticate(route: &CompiledRoute, req: &HttpRequest) -> Result<AuthOutcome, AuthError> {
+/// `security_map` carries the fingerprint-to-role pin set used by the mTLS
+/// path. When it is absent (no security manager configured) the mTLS path
+/// falls back to presence-only, consistent with the rest of the gateway
+/// opening the gate when no security manager is wired.
+pub fn authenticate(
+    route: &CompiledRoute,
+    req: &HttpRequest,
+    security_map: Option<&zyron_auth::SecurityMapStore>,
+) -> Result<AuthOutcome, AuthError> {
     match route.auth {
         EndpointAuthMode::None => Ok(AuthOutcome {
             role_hint: None,
@@ -116,14 +124,30 @@ pub fn authenticate(route: &CompiledRoute, req: &HttpRequest) -> Result<AuthOutc
         }
         EndpointAuthMode::Mtls => {
             let info = req.tls_info.as_ref().ok_or(AuthError::MissingCredential)?;
-            info.peer_cert_fingerprint
+            let fp = info
+                .peer_cert_fingerprint
                 .ok_or(AuthError::MissingCredential)?;
-            Ok(AuthOutcome {
-                role_hint: None,
-                user_hint: Some("mtls-peer".to_string()),
-                scopes: Vec::new(),
-                via: "mtls",
-            })
+            match security_map {
+                Some(maps) => {
+                    // Real pinning: the observed fingerprint must resolve to a
+                    // mapped role. verify_pinned_peer emits the
+                    // MTLSFingerprintMatched/Mismatch audit at the comparison.
+                    let role = zyron_auth::verify_pinned_peer(Some(&fp), maps)
+                        .map_err(|_| AuthError::Rejected)?;
+                    Ok(AuthOutcome {
+                        role_hint: Some(role.0.to_string()),
+                        user_hint: Some("mtls-peer".to_string()),
+                        scopes: Vec::new(),
+                        via: "mtls",
+                    })
+                }
+                None => Ok(AuthOutcome {
+                    role_hint: None,
+                    user_hint: Some("mtls-peer".to_string()),
+                    scopes: Vec::new(),
+                    via: "mtls",
+                }),
+            }
         }
     }
 }
@@ -312,7 +336,7 @@ mod tests {
     fn none_always_succeeds() {
         let r = route(EndpointAuthMode::None);
         let q = req_with_headers(&[]);
-        let out = authenticate(&r, &q).unwrap();
+        let out = authenticate(&r, &q, None).unwrap();
         assert_eq!(out.via, "none");
     }
 
@@ -321,7 +345,7 @@ mod tests {
         let r = route(EndpointAuthMode::Jwt);
         let q = req_with_headers(&[]);
         assert!(matches!(
-            authenticate(&r, &q),
+            authenticate(&r, &q, None),
             Err(AuthError::MissingCredential)
         ));
     }
@@ -334,7 +358,7 @@ mod tests {
         let b64 = b64_encode(payload.as_bytes());
         let token = format!("h.{}.s", b64);
         let q = req_with_headers(&[("authorization", &format!("Bearer {}", token))]);
-        let out = authenticate(&r, &q).unwrap();
+        let out = authenticate(&r, &q, None).unwrap();
         assert_eq!(out.user_hint.as_deref(), Some("alice"));
         assert_eq!(out.scopes, vec!["read".to_string(), "write".to_string()]);
     }
@@ -343,7 +367,7 @@ mod tests {
     fn apikey_from_header() {
         let r = route(EndpointAuthMode::ApiKey);
         let q = req_with_headers(&[("x-api-key", "secret")]);
-        assert!(authenticate(&r, &q).is_ok());
+        assert!(authenticate(&r, &q, None).is_ok());
     }
 
     #[test]
@@ -351,7 +375,7 @@ mod tests {
         let r = route(EndpointAuthMode::Basic);
         let creds = b64_encode(b"alice:pw");
         let q = req_with_headers(&[("authorization", &format!("Basic {}", creds))]);
-        let out = authenticate(&r, &q).unwrap();
+        let out = authenticate(&r, &q, None).unwrap();
         assert_eq!(out.user_hint.as_deref(), Some("alice"));
     }
 
@@ -359,7 +383,7 @@ mod tests {
     fn mtls_requires_fingerprint() {
         let r = route(EndpointAuthMode::Mtls);
         let q = req_with_headers(&[]);
-        assert!(authenticate(&r, &q).is_err());
+        assert!(authenticate(&r, &q, None).is_err());
     }
 
     #[test]

@@ -213,6 +213,8 @@ async fn boot_server(db_name: &str) -> (E2EServer, Duration) {
         tls_acceptor: None,
         endpoint_registrar: None,
         subscription_runtimes: Arc::new(scc::HashMap::new()),
+        pub_sub_state: Arc::new(zyron_wire::subscription::PubSubServerState::new()),
+        subscription_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         heap_files: Arc::new(scc::HashMap::new()),
         btree_indexes: Arc::new(scc::HashMap::new()),
         vacuum_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -743,7 +745,7 @@ fn run_gateway() -> f64 {
     let mut hits = 0u64;
     for _ in 0..GATEWAY_ITERATIONS {
         if let Some((route, params)) = router.lookup(HttpMethod::Get, &req.path) {
-            let outcome = run_pipeline(route, params, &req, &rate);
+            let outcome = run_pipeline(route, params, &req, &rate, None);
             if matches!(outcome, MiddlewareOutcome::Execute { .. }) {
                 hits += 1;
             }
