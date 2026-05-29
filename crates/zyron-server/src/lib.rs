@@ -264,10 +264,14 @@ impl Server {
 
         let dm_for_bg = Arc::clone(&disk_manager);
         let write_fn: WriteFn =
-            Arc::new(move |page_id, data| dm_for_bg.write_page_sync(page_id, data));
+            Arc::new(move |page_id, data| dm_for_bg.write_page_sync_no_fsync(page_id, data));
+        let dm_for_fsync = Arc::clone(&disk_manager);
+        let fsync_fn: zyron_buffer::FsyncFn =
+            Arc::new(move |file_id| dm_for_fsync.fsync_file(file_id));
         let background_writer = Arc::new(BackgroundWriter::new(
             Arc::clone(&buffer_pool),
             write_fn,
+            fsync_fn,
             BackgroundWriterConfig::default(),
         ));
 
@@ -873,6 +877,7 @@ impl Server {
             subscription_shutdown: Arc::clone(&self.shutdown),
             heap_files: Arc::new(scc::HashMap::new()),
             btree_indexes: Arc::new(scc::HashMap::new()),
+            plan_cache: Arc::new(zyron_wire::plan_cache::ServerPlanCache::new()),
             vacuum_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             analytics_registry: zyron_analytics::default_registry(),
             feature_store: zyron_analytics::featureStore(),

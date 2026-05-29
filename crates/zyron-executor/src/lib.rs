@@ -7,6 +7,7 @@ pub mod expr;
 pub mod operator;
 pub mod types_bridge;
 
+pub use batch::evaluate_row_filter;
 pub use context::ExecutionContext;
 pub use executor::{execute, execute_analyze};
 pub use operator::OperatorMetrics;

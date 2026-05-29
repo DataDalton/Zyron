@@ -1742,6 +1742,11 @@ pub struct CreateAbacPolicyStatement {
     pub target: AbacPolicyTarget,
     pub target_name: String,
     pub predicate: Expr,
+    /// Source text of the predicate expression, captured verbatim during
+    /// parsing. The policy is enforced by re-injecting this SQL as a row
+    /// filter, so the original text is preserved rather than rendered back
+    /// from the AST.
+    pub predicate_sql: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

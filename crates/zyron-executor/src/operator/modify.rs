@@ -29,7 +29,7 @@ fn columnar_patch_store(te: &zyron_catalog::TableEntry) -> zyron_common::Result<
     ColumnarPatchManager::global(&dir).store(te.id.0 as u64)
 }
 use crate::context::ExecutionContext;
-use crate::expr::evaluate;
+use crate::expr::{evaluate, literal_to_scalar};
 use crate::operator::{ExecutionBatch, Operator, OperatorResult};
 
 /// Encodes a row's value at the given column position into a caller-provided
@@ -308,27 +308,45 @@ impl Operator for ValuesOperator {
 
             for row_exprs in &self.rows {
                 for (c, expr) in row_exprs.iter().enumerate() {
-                    let col = evaluate(expr, &row_eval_ctx, &self.schema, &self.params)?;
-                    // Coerce the evaluated value to the target column's type.
-                    // Integer/decimal literals bind wider than narrow columns
-                    // (e.g. an Int64 literal into an Int32 column); without
-                    // this cast push_scalar would store 0 for the mismatched
-                    // variant. NULL and same-type values pass through.
                     let entry = &self.schema[c];
                     let target = entry.type_id;
-                    let col = if col.len() > 0 && col.type_id != target && !col.is_null(0) {
-                        crate::compute::cast_column(&col, target)?
-                    } else {
-                        col
+
+                    // Fast paths produce a ScalarValue directly, skipping the
+                    // per-cell Column alloc + cast_column dispatch the generic
+                    // evaluator pays. Literal cells come from inline VALUES,
+                    // Parameter cells come from a cached/parameterized plan
+                    // (auto-param or extended protocol). Both fall back to the
+                    // full evaluator for type combinations not covered by the
+                    // fast coercions (Decimal, Interval, FixedBinary, etc.).
+                    let fast = match expr {
+                        BoundExpr::Literal { value, .. } => literal_to_scalar(value, target),
+                        BoundExpr::Parameter { index, .. } => {
+                            // 1-based parameter index into the bound values.
+                            self.params
+                                .get(index.wrapping_sub(1))
+                                .and_then(|sv| crate::expr::coerce_scalar_to(sv, target))
+                        }
+                        _ => None,
                     };
-                    let scalar = if col.len() > 0 {
-                        col.get_scalar(0)
+                    let scalar = if let Some(s) = fast {
+                        s
                     } else {
-                        ScalarValue::Null
+                        let col = evaluate(expr, &row_eval_ctx, &self.schema, &self.params)?;
+                        let col = if col.len() > 0 && col.type_id != target && !col.is_null(0) {
+                            crate::compute::cast_column(&col, target)?
+                        } else {
+                            col
+                        };
+                        if col.len() > 0 {
+                            col.get_scalar(0)
+                        } else {
+                            ScalarValue::Null
+                        }
                     };
-                    // A TIMESTAMP(p>6) column stores i128 picoseconds. A
-                    // timestamp literal evaluates to i64 microseconds, so scale
-                    // it up exactly (x1_000_000) into the i128 buffer.
+
+                    // TIMESTAMP(p>6) columns store i128 picoseconds. A
+                    // timestamp literal evaluates to i64 microseconds, scale
+                    // it up exactly into the i128 buffer.
                     let scalar = if entry.ts_precision.unwrap_or(6) > 6
                         && matches!(target, TypeId::Timestamp | TypeId::TimestampTz)
                     {
@@ -400,6 +418,34 @@ impl Operator for InsertOperator {
             let mut total_inserted: i64 = 0;
             let txn_id = self.ctx.txn_id;
 
+            // Resolve the index snapshot ONCE per statement instead of per
+            // batch. Pre-bind the per-index handles so the inner row loop
+            // only does work proportional to actual indexes, not catalog
+            // lookups.
+            let index_snap = self.ctx.index_snapshot_for_table(self.table_id.0);
+            let fts_resolved: Vec<(zyron_catalog::IndexId, Arc<zyron_search::InvertedIndex>)> =
+                if index_snap.fts.is_empty() {
+                    Vec::new()
+                } else if let Some(mgr) = self.ctx.fts_manager.as_ref() {
+                    index_snap
+                        .fts
+                        .iter()
+                        .filter_map(|id| mgr.get_index(id.0).map(|idx| (*id, idx)))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+            let vec_resolved: Vec<(u32, Arc<zyron_search::vector::VectorIndex>)> =
+                if index_snap.vector.is_empty() {
+                    Vec::new()
+                } else {
+                    index_snap
+                        .vector
+                        .iter()
+                        .filter_map(|id| self.ctx.get_vector_index(id.0).map(|idx| (id.0, idx)))
+                        .collect()
+                };
+
             loop {
                 self.ctx.check_cancelled()?;
                 let input = self.source.next().await?;
@@ -409,9 +455,21 @@ impl Operator for InsertOperator {
 
                 let tuples = batch_to_tuples(&exec_batch.batch, &table_entry.columns, txn_id);
 
+                // Reused scratch lives outside the inner alloc paths so the
+                // common-case OLTP single-row insert does not heap-allocate
+                // a fresh Vec for the trigger payload, the WAL record list,
+                // or the dirty-page set on every call.
+                let mut batch_records: Vec<(u32, &[u8])> = Vec::with_capacity(tuples.len());
+                for t in &tuples {
+                    batch_records.push((txn_id, t.data()));
+                }
+
                 // Fire BEFORE INSERT triggers if present.
                 if let Some(ref hook) = self.ctx.dml_hook {
-                    let tuple_refs: Vec<&[u8]> = tuples.iter().map(|t| t.data()).collect();
+                    let mut tuple_refs: Vec<&[u8]> = Vec::with_capacity(tuples.len());
+                    for t in &tuples {
+                        tuple_refs.push(t.data());
+                    }
                     if !hook.before_insert(self.table_id.0, &tuple_refs, txn_id)? {
                         continue; // Trigger cancelled the insert
                     }
@@ -421,25 +479,35 @@ impl Operator for InsertOperator {
                 // Use the last-LSN-only variant so the WAL writer skips its
                 // per-record Vec<Lsn> allocation, callers further down the
                 // pipeline only need the last LSN to chain to the Commit record
-                let batch_records: Vec<(u32, &[u8])> =
-                    tuples.iter().map(|t| (txn_id, t.data())).collect();
                 let last_lsn = self.ctx.wal.log_insert_batch_last_lsn(&batch_records)?;
 
                 let tuple_ids = heap_file.insert_batch(&tuples).await?;
 
                 // Stamp dirty pages with WAL LSN for checkpoint ordering.
-                // Duplicate page_ids are harmless: set_dirty_lsn uses CAS from 0,
-                // so only the first call per page succeeds.
-                for tid in &tuple_ids {
+                // Walk tuple_ids in order and emit one mark_dirty per distinct
+                // page, since insert_batch writes to consecutive heap pages
+                // and the buffer-pool dirty stamp is a per-page atomic. This
+                // turns an O(rows) hash lookup into O(unique pages).
+                if let Some(first) = tuple_ids.first() {
+                    let mut prev_page = first.page_id;
                     self.ctx
                         .buffer_pool
-                        .mark_dirty_with_lsn(tid.page_id, last_lsn.0);
+                        .mark_dirty_with_lsn(prev_page, last_lsn.0);
+                    for tid in tuple_ids.iter().skip(1) {
+                        if tid.page_id != prev_page {
+                            self.ctx
+                                .buffer_pool
+                                .mark_dirty_with_lsn(tid.page_id, last_lsn.0);
+                            prev_page = tid.page_id;
+                        }
+                    }
                 }
 
                 total_inserted += tuples.len() as i64;
 
                 // Maintain FTS indexes: add each inserted document.
-                let fts_indexes = self.ctx.fts_indexes_for_table(self.table_id.0);
+                let fts_indexes: &[(zyron_catalog::IndexId, Arc<zyron_search::InvertedIndex>)] =
+                    fts_resolved.as_slice();
                 if !fts_indexes.is_empty() {
                     let analyzer = zyron_search::SimpleAnalyzer;
                     let mut fts_buf = zyron_search::AnalysisBuffer::new();
@@ -454,7 +522,7 @@ impl Operator for InsertOperator {
                             &table_entry.columns,
                             &mut text_buf,
                         );
-                        for (idx_id, fts_idx) in &fts_indexes {
+                        for (idx_id, fts_idx) in fts_indexes.iter() {
                             if let Err(e) = fts_idx.add_document_with_buf(
                                 doc_id,
                                 &text_buf,
@@ -469,15 +537,11 @@ impl Operator for InsertOperator {
 
                 // Maintain vector indexes: insert each new vector into every
                 // vector index on the table, sourced from that index's column.
-                let vec_index_ids = self.ctx.vector_indexes_for_table(self.table_id.0);
-                if !vec_index_ids.is_empty() {
+                if !vec_resolved.is_empty() {
                     for (row_idx, tid) in tuple_ids.iter().enumerate() {
                         let vec_id =
                             zyron_search::encode_doc_id(tid.page_id.page_num, tid.slot_id)?;
-                        for &idx_id in &vec_index_ids {
-                            let Some(vec_idx) = self.ctx.get_vector_index(idx_id) else {
-                                continue;
-                            };
+                        for (idx_id, vec_idx) in &vec_resolved {
                             let col_id = vec_idx.column_id();
                             if let Some(vec_bytes) = extract_vector_bytes(
                                 &exec_batch.batch,
@@ -501,14 +565,13 @@ impl Operator for InsertOperator {
                 // Maintain spatial (R-tree) indexes: for each indexed
                 // geometry column, decode WKB to a Geometry, take its MBR,
                 // and insert (mbr, rowid) into the live R-tree.
-                let spatial_indexes = self.ctx.spatial_indexes_for_table(self.table_id.0);
-                if !spatial_indexes.is_empty() {
+                if !index_snap.spatial.is_empty() {
                     if let Some(ref spatial_mgr) = self.ctx.spatial_manager {
                         for (row_idx, tid) in tuple_ids.iter().enumerate() {
                             let rowid =
                                 zyron_search::encode_doc_id(tid.page_id.page_num, tid.slot_id)?;
-                            for (idx_id, col_id) in &spatial_indexes {
-                                let Some(tree) = spatial_mgr.get(*idx_id) else {
+                            for (idx_id, col_id) in &index_snap.spatial {
+                                let Some(tree) = spatial_mgr.get(idx_id.0) else {
                                     continue;
                                 };
                                 let Some(geom_bytes) = extract_column_bytes(
@@ -537,32 +600,53 @@ impl Operator for InsertOperator {
                     }
                 }
 
-                // Maintain B+Tree indexes
-                // Hoist a single key buffer outside the row loop so encode_btree_key_into
-                // can amortize one Vec allocation across the entire batch instead of
-                // allocating a fresh Vec per row per index
-                let btree_indexes = self.ctx.btree_indexes_for_table(self.table_id.0);
-                let mut key_buf: Vec<u8> = Vec::with_capacity(16);
-                for (idx_id, col_id) in &btree_indexes {
-                    let Some(btree) = self.ctx.get_index(zyron_catalog::IndexId(*idx_id)) else {
-                        continue;
-                    };
-                    let col_pos = table_entry.columns.iter().position(|c| c.id == *col_id);
-                    let Some(col_pos) = col_pos else { continue };
-                    let col_entry = &table_entry.columns[col_pos];
-                    for (row_idx, tid) in tuple_ids.iter().enumerate() {
-                        if encode_btree_key_into(
-                            &exec_batch.batch,
-                            row_idx,
-                            col_pos,
-                            col_entry.type_id,
-                            &mut key_buf,
-                        ) {
-                            let normalized = TupleId::new(
-                                zyron_common::page::PageId::new(0, tid.page_id.page_num),
-                                tid.slot_id,
-                            );
-                            let _ = btree.insert_sync(&key_buf, normalized);
+                // Maintain B+Tree indexes via the batched insert path. The
+                // snapshot is resolved outside the batch loop so this section
+                // runs purely O(rows * btree indexes) plus one sort per
+                // index, instead of paying a full tree traversal per row.
+                if !index_snap.btree.is_empty() {
+                    // All keys for one index are packed into a single buffer and
+                    // handed to insert_many as borrowed slices, instead of one
+                    // heap-allocated Vec per row. insert_many copies the bytes
+                    // into the tree, so it does not need owned keys. key_spans
+                    // records (offset, len) into key_bytes per kept row.
+                    let mut key_bytes: Vec<u8> = Vec::with_capacity(tuple_ids.len() * 16);
+                    let mut key_spans: Vec<(usize, usize, TupleId)> =
+                        Vec::with_capacity(tuple_ids.len());
+                    let mut scratch: Vec<u8> = Vec::with_capacity(16);
+                    for (idx_id, col_id) in &index_snap.btree {
+                        let Some(btree) = self.ctx.get_index(*idx_id) else {
+                            continue;
+                        };
+                        let col_pos = table_entry.columns.iter().position(|c| c.id == *col_id);
+                        let Some(col_pos) = col_pos else { continue };
+                        let col_entry = &table_entry.columns[col_pos];
+                        key_bytes.clear();
+                        key_spans.clear();
+                        for (row_idx, tid) in tuple_ids.iter().enumerate() {
+                            scratch.clear();
+                            if encode_btree_key_into(
+                                &exec_batch.batch,
+                                row_idx,
+                                col_pos,
+                                col_entry.type_id,
+                                &mut scratch,
+                            ) {
+                                let off = key_bytes.len();
+                                key_bytes.extend_from_slice(&scratch);
+                                let normalized = TupleId::new(
+                                    zyron_common::page::PageId::new(0, tid.page_id.page_num),
+                                    tid.slot_id,
+                                );
+                                key_spans.push((off, scratch.len(), normalized));
+                            }
+                        }
+                        if !key_spans.is_empty() {
+                            let mut items: Vec<(&[u8], TupleId)> = key_spans
+                                .iter()
+                                .map(|&(off, len, tid)| (&key_bytes[off..off + len], tid))
+                                .collect();
+                            let _ = btree.insert_many(&mut items);
                         }
                     }
                 }

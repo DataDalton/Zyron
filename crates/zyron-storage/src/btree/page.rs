@@ -799,6 +799,62 @@ impl BTreeInternalPage {
         }
     }
 
+    /// Like `find_child_in_slice` but also returns this node's exclusive
+    /// upper-bound separator for the chosen child: the first key strictly
+    /// greater than `key`, meaning the chosen subtree holds only keys less
+    /// than it. `None` when `key` routes to the rightmost child (no bound at
+    /// this level). Used by batched insert to route a sorted run of keys to
+    /// one leaf without re-descending per key.
+    pub fn find_child_with_upper(data: &[u8], key: &[u8]) -> (u32, Option<Vec<u8>>) {
+        let header_offset = InternalPageHeader::OFFSET;
+        let num_keys = u16::from_le_bytes([data[header_offset], data[header_offset + 1]]) as usize;
+
+        let leftmost_offset = Self::DATA_START;
+        let leftmost = PageId::from_u64(u64::from_le_bytes([
+            data[leftmost_offset],
+            data[leftmost_offset + 1],
+            data[leftmost_offset + 2],
+            data[leftmost_offset + 3],
+            data[leftmost_offset + 4],
+            data[leftmost_offset + 5],
+            data[leftmost_offset + 6],
+            data[leftmost_offset + 7],
+        ]))
+        .page_num as u32;
+
+        if num_keys == 0 {
+            return (leftmost, None);
+        }
+
+        let mut offset = Self::DATA_START + Self::LEFTMOST_PTR_SIZE;
+        let mut last_child = leftmost;
+
+        for _ in 0..num_keys {
+            let key_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+            let entry_key = &data[offset + 2..offset + 2 + key_len];
+
+            // First separator strictly greater than `key`: the chosen child
+            // is everything to its left, and this separator is the exclusive
+            // upper bound of that subtree.
+            if compare_keys(key, entry_key).is_lt() {
+                return (last_child, Some(entry_key.to_vec()));
+            }
+
+            let child_offset = offset + 2 + key_len;
+            last_child = u32::from_le_bytes([
+                data[child_offset],
+                data[child_offset + 1],
+                data[child_offset + 2],
+                data[child_offset + 3],
+            ]);
+
+            offset += 2 + key_len + 4;
+        }
+
+        // key >= every separator: rightmost child, no upper bound here.
+        (last_child, None)
+    }
+
     /// Inserts a key and right child pointer.
     /// Uses in-place insertion for efficiency.
     #[inline]

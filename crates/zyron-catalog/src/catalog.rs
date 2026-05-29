@@ -63,6 +63,10 @@ pub struct Catalog {
     // RwLock read section is then just a map get and is uncontended in
     // practice (writes are seconds apart, readers do not block readers).
     stats: RwLock<HashMap<TableId, Arc<(TableStats, Vec<ColumnStats>)>>>,
+    /// Monotonically advancing version stamp bumped on every DDL. Wire-layer
+    /// plan caches read this with a single atomic load to validate that a
+    /// cached PhysicalPlan is still consistent with the live catalog.
+    schema_version: std::sync::atomic::AtomicU64,
 }
 
 impl Catalog {
@@ -78,6 +82,7 @@ impl Catalog {
             wal,
             oid_allocator: OidAllocator::new(USER_OID_START),
             stats: RwLock::new(HashMap::new()),
+            schema_version: std::sync::atomic::AtomicU64::new(1),
         };
 
         if !catalog.storage.is_bootstrapped().await? {
@@ -1141,6 +1146,12 @@ impl Catalog {
             .ok_or_else(|| ZyronError::TableNotFound(format!("id={}", id.0)))
     }
 
+    pub fn get_schema_by_id(&self, id: SchemaId) -> Result<Arc<SchemaEntry>> {
+        self.cache
+            .get_schema(id)
+            .ok_or_else(|| ZyronError::SchemaNotFound(format!("id={}", id.0)))
+    }
+
     pub fn list_tables(&self, schema_id: SchemaId) -> Vec<Arc<TableEntry>> {
         self.cache.list_tables(schema_id)
     }
@@ -1283,6 +1294,13 @@ impl Catalog {
 
     pub fn get_indexes_for_table(&self, table_id: TableId) -> Vec<Arc<IndexEntry>> {
         self.cache.get_indexes_for_table(table_id)
+    }
+
+    /// Returns the lock-free, pre-partitioned index snapshot for a table.
+    /// DML operators consult this once per statement instead of hitting four
+    /// separate catalog `RwLock` reads + allocations per batch.
+    pub fn index_snapshot(&self, table_id: TableId) -> Arc<crate::cache::TableIndexSnapshot> {
+        self.cache.index_snapshot(table_id)
     }
 
     // -----------------------------------------------------------------------
@@ -1863,7 +1881,19 @@ impl Catalog {
         let insert_lsn = self.wal.log_insert(txn_id, begin_lsn, &payload)?;
         let commit_lsn = self.wal.log_commit(txn_id, insert_lsn)?;
         self.wal.wait_for_flush(commit_lsn)?;
+        // Bump the schema version so any cached PhysicalPlans become stale
+        // and the wire layer re-plans on the next reference. AcqRel pairs
+        // with the Acquire load in plan-cache lookup.
+        self.schema_version
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok(commit_lsn)
+    }
+
+    /// Returns the current schema version. Bumped on every DDL.
+    #[inline]
+    pub fn schema_version(&self) -> u64 {
+        self.schema_version
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Persists a mutated table entry (used by ALTER TABLE lifecycle ops).

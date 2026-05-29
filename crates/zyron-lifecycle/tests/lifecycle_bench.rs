@@ -133,7 +133,7 @@ async fn run(e: &Engine, sql: &str, dml: bool) -> zyron_common::Result<u64> {
     match res {
         Ok(b) => {
             if dml {
-                e.txn.commit(&mut txn)?;
+                e.txn.commit_blocking(&mut txn)?;
             } else {
                 let _ = e.txn.abort(&mut txn);
             }

@@ -6,6 +6,7 @@
 pub mod ast;
 pub mod lexer;
 pub mod parser;
+pub mod simd_scan;
 pub mod token;
 
 pub use ast::*;

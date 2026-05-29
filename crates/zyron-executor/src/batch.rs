@@ -6,7 +6,8 @@
 //! for query processing.
 
 use zyron_catalog::{ColumnEntry, ColumnId};
-use zyron_common::TypeId;
+use zyron_common::{Result, TypeId};
+use zyron_planner::binder::BoundExpr;
 use zyron_planner::logical::LogicalColumn;
 use zyron_storage::Tuple;
 
@@ -40,6 +41,16 @@ impl DataBatch {
         Self {
             columns: Vec::new(),
             num_rows: 0,
+        }
+    }
+
+    /// Creates a batch carrying a row count but no column data, for the
+    /// `COUNT(*)`-style scan fast path where the consumer needs only the
+    /// number of visible rows.
+    pub fn with_row_count(num_rows: usize) -> Self {
+        Self {
+            columns: Vec::new(),
+            num_rows,
         }
     }
 
@@ -261,6 +272,92 @@ pub fn decode_tuple_into_builders(
     }
 }
 
+/// Evaluates a bound predicate against a set of encoded tuple rows and returns
+/// a keep mask (true means the row satisfies the predicate). The rows are
+/// decoded once into a columnar batch and the predicate is evaluated
+/// vectorized, so the per-row cost is amortized across the whole set rather
+/// than paid as a scalar evaluation per row.
+///
+/// `output_columns` is the logical schema the predicate was bound against (its
+/// ColumnRefs resolve by position in this slice). `table_columns` is the full
+/// table schema used to decode the NSM tuple bytes; only the columns present
+/// in `output_columns` are materialized.
+pub fn evaluate_row_filter(
+    output_columns: &[LogicalColumn],
+    table_columns: &[ColumnEntry],
+    predicate: &BoundExpr,
+    rows: &[&[u8]],
+) -> Result<Vec<bool>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let output_ids: Vec<ColumnId> = output_columns.iter().map(|c| c.column_id).collect();
+    let column_to_builder = build_column_to_builder_map(table_columns, &output_ids);
+
+    // Fail closed on a row whose bytes do not span the full schema: a truncated
+    // or malformed change record is dropped (mask = false) rather than panicking
+    // the decoder or evaluating a garbage predicate result. Only well-formed
+    // rows are decoded into the batch; their predicate results are scattered
+    // back to their original positions.
+    let mut keep = vec![false; rows.len()];
+    let mut decodable: Vec<usize> = Vec::with_capacity(rows.len());
+    let mut builders = create_builders(output_columns, rows.len());
+    for (i, row) in rows.iter().enumerate() {
+        if tuple_decodes_within_bounds(row, table_columns) {
+            decode_tuple_into_builders(row, table_columns, &column_to_builder, &mut builders);
+            decodable.push(i);
+        }
+    }
+    let batch = finalize_builders(builders);
+    if batch.num_rows == 0 {
+        return Ok(keep);
+    }
+    let mask_col = crate::expr::evaluate(predicate, &batch, output_columns, &[])?;
+    let sub = crate::compute::column_to_mask(&mask_col);
+    for (j, &i) in decodable.iter().enumerate() {
+        keep[i] = sub.get(j).copied().unwrap_or(false);
+    }
+    Ok(keep)
+}
+
+/// Returns whether `data` holds a complete NSM tuple for `columns` without
+/// reading past its end. MUST mirror the offset advancement in
+/// `decode_tuple_into_builders` (null bitmap, fixed sizes by physical type,
+/// 4-byte length prefix for variable-length columns) so a row that passes here
+/// decodes without an out-of-bounds index.
+fn tuple_decodes_within_bounds(data: &[u8], columns: &[ColumnEntry]) -> bool {
+    let num_cols = columns.len();
+    let null_bitmap_len = num_cols.div_ceil(8);
+    if data.len() < null_bitmap_len {
+        return false;
+    }
+    let mut offset = null_bitmap_len;
+    for col in columns {
+        let phys_type = col.physical_type_id();
+        if let Some(fixed_size) = phys_type.fixed_size() {
+            offset += fixed_size;
+            if offset > data.len() {
+                return false;
+            }
+        } else {
+            if offset + 4 > data.len() {
+                return false;
+            }
+            let len = u32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]) as usize;
+            offset += 4 + len;
+            if offset > data.len() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Decodes a fixed-size value from raw bytes into a ScalarValue.
 pub(crate) fn decode_fixed_scalar(type_id: TypeId, bytes: &[u8]) -> ScalarValue {
     match type_id {
@@ -445,4 +542,133 @@ pub fn batch_to_tuples(batch: &DataBatch, columns: &[ColumnEntry], xmin: u32) ->
         tuples.push(Tuple::new(data, xmin));
     }
     tuples
+}
+
+#[cfg(test)]
+mod row_filter_tests {
+    use super::*;
+    use zyron_catalog::TableId;
+    use zyron_parser::ast::{BinaryOperator, LiteralValue};
+    use zyron_planner::binder::{BoundExpr, ColumnRef};
+
+    fn col(id: u16, name: &str, type_id: TypeId, ordinal: u16) -> ColumnEntry {
+        ColumnEntry {
+            id: ColumnId(id),
+            table_id: TableId(1),
+            name: name.to_string(),
+            type_id,
+            ordinal,
+            nullable: false,
+            default_expr: None,
+            max_length: None,
+            ts_precision: None,
+            tz_offset_secs: None,
+        }
+    }
+
+    fn lcol(id: u16, name: &str, type_id: TypeId) -> LogicalColumn {
+        LogicalColumn {
+            table_idx: Some(0),
+            column_id: ColumnId(id),
+            name: name.to_string(),
+            type_id,
+            nullable: false,
+            ts_precision: None,
+        }
+    }
+
+    // evaluate_row_filter must decode encoded rows and return a keep mask that
+    // matches the predicate, so the publication stream drops rows the policy
+    // hides.
+    #[test]
+    fn row_filter_masks_by_predicate() {
+        let table_columns = vec![
+            col(0, "id", TypeId::Int64, 0),
+            col(1, "region", TypeId::Text, 1),
+        ];
+
+        // Three rows: us, eu, us.
+        let batch = DataBatch::new(vec![
+            Column::new(ColumnData::Int64(vec![1, 2, 3]), TypeId::Int64),
+            Column::new(
+                ColumnData::Utf8(vec!["us".into(), "eu".into(), "us".into()]),
+                TypeId::Text,
+            ),
+        ]);
+        let encoded: Vec<Vec<u8>> = (0..batch.num_rows)
+            .map(|i| encode_row(&batch, i, &table_columns))
+            .collect();
+        let rows: Vec<&[u8]> = encoded.iter().map(|v| v.as_slice()).collect();
+
+        let output_columns = vec![
+            lcol(0, "id", TypeId::Int64),
+            lcol(1, "region", TypeId::Text),
+        ];
+
+        // region = 'us'
+        let predicate = BoundExpr::BinaryOp {
+            left: Box::new(BoundExpr::ColumnRef(ColumnRef {
+                table_idx: 0,
+                column_id: ColumnId(1),
+                type_id: TypeId::Text,
+                nullable: false,
+                ts_precision: None,
+            })),
+            op: BinaryOperator::Eq,
+            right: Box::new(BoundExpr::Literal {
+                value: LiteralValue::String("us".into()),
+                type_id: TypeId::Text,
+            }),
+            type_id: TypeId::Boolean,
+        };
+
+        let mask = evaluate_row_filter(&output_columns, &table_columns, &predicate, &rows).unwrap();
+        assert_eq!(mask, vec![true, false, true]);
+
+        // Empty input is a no-op.
+        let empty = evaluate_row_filter(&output_columns, &table_columns, &predicate, &[]).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    // A truncated / malformed row image must be dropped (fail closed), never
+    // panic the decoder, and must not affect the verdict on well-formed rows.
+    #[test]
+    fn row_filter_drops_truncated_rows() {
+        let table_columns = vec![
+            col(0, "id", TypeId::Int64, 0),
+            col(1, "region", TypeId::Text, 1),
+        ];
+        let batch = DataBatch::new(vec![
+            Column::new(ColumnData::Int64(vec![1]), TypeId::Int64),
+            Column::new(ColumnData::Utf8(vec!["us".into()]), TypeId::Text),
+        ]);
+        let good = encode_row(&batch, 0, &table_columns);
+        let truncated: Vec<u8> = vec![0u8]; // far too short for the schema
+        let empty: Vec<u8> = Vec::new();
+        let rows: Vec<&[u8]> = vec![good.as_slice(), truncated.as_slice(), empty.as_slice()];
+
+        let output_columns = vec![
+            lcol(0, "id", TypeId::Int64),
+            lcol(1, "region", TypeId::Text),
+        ];
+        let predicate = BoundExpr::BinaryOp {
+            left: Box::new(BoundExpr::ColumnRef(ColumnRef {
+                table_idx: 0,
+                column_id: ColumnId(1),
+                type_id: TypeId::Text,
+                nullable: false,
+                ts_precision: None,
+            })),
+            op: BinaryOperator::Eq,
+            right: Box::new(BoundExpr::Literal {
+                value: LiteralValue::String("us".into()),
+                type_id: TypeId::Text,
+            }),
+            type_id: TypeId::Boolean,
+        };
+
+        let mask = evaluate_row_filter(&output_columns, &table_columns, &predicate, &rows).unwrap();
+        // Good row passes; the two malformed rows are dropped.
+        assert_eq!(mask, vec![true, false, false]);
+    }
 }

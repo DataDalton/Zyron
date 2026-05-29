@@ -7,18 +7,22 @@
 
 mod btree_latch;
 mod deadlock;
+mod durability;
 mod gc;
 mod intent_lock;
 mod isolation;
 mod lock_table;
+mod proc_array;
 mod snapshot;
 
 pub use btree_latch::NodeLatch;
 pub use deadlock::WaitForGraph;
+use durability::DurabilityQueue;
 pub use gc::{GcStats, MvccGc};
 pub use intent_lock::IntentLockTable;
 pub use isolation::IsolationLevel;
 pub use lock_table::LockTable;
+pub use proc_array::ProcArray;
 pub use snapshot::Snapshot;
 
 use std::sync::Arc;
@@ -63,6 +67,9 @@ pub struct Transaction {
     last_lsn: Lsn,
     /// Stack of savepoints for partial rollback.
     savepoints: Vec<Savepoint>,
+    /// Index of the proc-array slot this transaction occupies, returned to
+    /// the pool on commit or abort.
+    slot_idx: usize,
 }
 
 impl Transaction {
@@ -147,15 +154,15 @@ impl Transaction {
 
 /// Manages transaction lifecycle: begin, commit, abort.
 ///
-/// Holds the active-transaction set in a `parking_lot::Mutex<BTreeSet<u64>>`.
-/// `begin` snapshots the set in sorted order with a single short-held lock
-/// so concurrent connections do not pay the cost of walking and re-sorting
-/// a hash map on every transaction start.
+/// The active-transaction set lives in a lock-free `ProcArray` of
+/// cache-line-padded atomic slots. begin claims a slot via CAS, commit and
+/// abort release it with an atomic store. Snapshots iterate the slot table
+/// with Acquire loads, no shared lock is taken on the hot path.
 pub struct TransactionManager {
     /// Monotonically increasing transaction ID counter.
     next_txn_id: AtomicU64,
-    /// Sorted set of currently-active transaction IDs.
-    active_txns: parking_lot::Mutex<std::collections::BTreeSet<u64>>,
+    /// Lock-free table of active transaction slots.
+    proc_array: ProcArray,
     /// WAL writer for durability.
     wal: Arc<WalWriter>,
     /// Row-level lock table for write-write conflict detection.
@@ -164,56 +171,91 @@ pub struct TransactionManager {
     intent_locks: IntentLockTable,
     /// Wait-for graph for deadlock detection.
     wait_for_graph: WaitForGraph,
+    /// Targeted commit-durability wakeups. A committing transaction registers
+    /// its commit LSN and is woken only when a flush satisfies that LSN, instead
+    /// of waking on every flush. Driven by the WAL flush thread via the
+    /// registered flush waker.
+    durability: Arc<DurabilityQueue>,
 }
 
 impl TransactionManager {
     /// Creates a new transaction manager.
     pub fn new(wal: Arc<WalWriter>) -> Self {
+        let durability = Self::register_durability(&wal);
         Self {
             next_txn_id: AtomicU64::new(1),
-            active_txns: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
+            proc_array: ProcArray::new(),
             wal,
             lock_table: LockTable::new(),
             intent_locks: IntentLockTable::new(),
             wait_for_graph: WaitForGraph::new(),
+            durability,
         }
     }
 
     /// Creates a transaction manager with a starting txn_id.
     /// Used for recovery to resume from the last known txn_id.
     pub fn with_start_txn_id(wal: Arc<WalWriter>, start_txn_id: u64) -> Self {
+        let durability = Self::register_durability(&wal);
         Self {
             next_txn_id: AtomicU64::new(start_txn_id),
-            active_txns: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
+            proc_array: ProcArray::new(),
             wal,
             lock_table: LockTable::new(),
             intent_locks: IntentLockTable::new(),
             wait_for_graph: WaitForGraph::new(),
+            durability,
         }
+    }
+
+    /// Builds the durability queue and registers a flush waker that drains it.
+    /// After each flush the WAL calls the waker, which wakes only the committers
+    /// whose target LSN the flush satisfied. The closure holds an Arc to the
+    /// queue, keeping it alive for the WAL's lifetime; the manager holds another.
+    fn register_durability(wal: &Arc<WalWriter>) -> Arc<DurabilityQueue> {
+        let queue = DurabilityQueue::new(Arc::clone(wal));
+        let queue_for_waker = Arc::clone(&queue);
+        wal.register_flush_waker(Arc::new(move || {
+            queue_for_waker.wake_satisfied();
+        }));
+        queue
     }
 
     /// Begins a new transaction with the given isolation level.
     ///
-    /// Captures the active-transaction snapshot under a single short-held
-    /// mutex acquisition, then registers this txn before writing the WAL
-    /// Begin record.
+    /// Allocates a fresh txn_id, claims a proc-array slot lock-free, takes a
+    /// snapshot of the other live transactions, then writes the WAL Begin
+    /// record. If the WAL append fails the slot is released so the table
+    /// does not leak.
     pub fn begin(&self, isolation: IsolationLevel) -> Result<Transaction> {
         let txn_id = self.next_txn_id.fetch_add(1, Ordering::Relaxed);
 
-        let active_ids = {
-            let mut guard = self.active_txns.lock();
-            // BTreeSet::iter is in sorted order, so the resulting Vec is
-            // already sorted and `Snapshot::new` skips its sort.
-            let ids: Vec<u64> = guard.iter().copied().collect();
-            guard.insert(txn_id);
-            ids
-        };
+        let slot_idx = self.proc_array.claim(txn_id)?;
+
+        // Empty until snapshot_into pushes live txn ids. At low concurrency the
+        // active set is usually empty, so starting empty skips a heap allocation
+        // on the common begin; snapshot_into grows it only when peers are live.
+        let mut active_ids: Vec<u64> = Vec::new();
+        self.proc_array.snapshot_into(txn_id, &mut active_ids);
         let snapshot = Snapshot::new(txn_id, active_ids);
 
-        // Write Begin record to WAL
-        let txn_id_u32 = u32::try_from(txn_id)
-            .map_err(|_| ZyronError::Internal(format!("txn_id {} exceeds u32::MAX", txn_id)))?;
-        let lsn = self.wal.log_begin(txn_id_u32)?;
+        let txn_id_u32 = match u32::try_from(txn_id) {
+            Ok(v) => v,
+            Err(_) => {
+                self.proc_array.release(slot_idx);
+                return Err(ZyronError::Internal(format!(
+                    "txn_id {} exceeds u32::MAX",
+                    txn_id
+                )));
+            }
+        };
+        let lsn = match self.wal.log_begin(txn_id_u32) {
+            Ok(lsn) => lsn,
+            Err(e) => {
+                self.proc_array.release(slot_idx);
+                return Err(e);
+            }
+        };
 
         Ok(Transaction {
             txn_id,
@@ -222,14 +264,20 @@ impl TransactionManager {
             status: TransactionStatus::Active,
             last_lsn: lsn,
             savepoints: Vec::new(),
+            slot_idx,
         })
     }
 
     /// Commits a transaction.
     ///
-    /// Writes a Commit record to the WAL, releases all locks,
-    /// and removes from the active transaction set.
-    pub fn commit(&self, txn: &mut Transaction) -> Result<()> {
+    /// Writes a Commit record to the WAL, releases all locks, and frees the
+    /// proc-array slot.
+    /// Writes the commit record, releases the transaction's locks and proc-array
+    /// slot, and marks it committed. Returns the commit LSN. The caller must
+    /// then await durability (via `commit` or `commit_blocking`) before
+    /// acknowledging the commit; this method alone does not guarantee the record
+    /// is on stable storage.
+    fn commit_inner(&self, txn: &mut Transaction) -> Result<Lsn> {
         if txn.status != TransactionStatus::Active {
             return Err(ZyronError::TransactionAborted(format!(
                 "transaction {} is not active (status: {:?})",
@@ -242,23 +290,62 @@ impl TransactionManager {
         txn.last_lsn = lsn;
         txn.status = TransactionStatus::Committed;
 
-        // Release all locks held by this transaction
         self.lock_table.unlock_all(txn.txn_id);
         self.intent_locks.unlock_all(txn.txn_id);
-
-        // Clean up wait-for graph edges
         self.wait_for_graph.remove_transaction(txn.txn_id);
 
-        // Remove from active set
-        self.active_txns.lock().remove(&txn.txn_id);
+        self.proc_array.release(txn.slot_idx);
 
+        Ok(lsn)
+    }
+
+    /// Commits a transaction durably for async callers (the server hot path):
+    /// writes the commit record, then awaits until it is fsync'd before
+    /// returning, yielding the runtime worker instead of blocking it. Durability
+    /// is unconditional, so a returned Ok means the commit survives a crash.
+    /// Concurrent commits share one fsync via the flush thread (group commit),
+    /// so the cost is one flush of latency, not one fsync per transaction.
+    pub async fn commit(&self, txn: &mut Transaction) -> Result<()> {
+        let lsn = self.commit_inner(txn)?;
+        self.wait_durable(lsn).await;
         Ok(())
+    }
+
+    /// Commits a transaction durably for synchronous callers (background worker
+    /// threads, tests). Blocks the calling thread until the commit record is
+    /// fsync'd. Identical durability guarantee to `commit`; it differs only in
+    /// waiting by blocking the thread rather than yielding an async task, which
+    /// suits non-async call sites.
+    pub fn commit_blocking(&self, txn: &mut Transaction) -> Result<()> {
+        let lsn = self.commit_inner(txn)?;
+        // The dedicated WAL flush thread is the sole flusher and group-commit
+        // leader; wait_for_flush nudges it and parks until the commit record is
+        // durable. Concurrent committers are batched into one device write.
+        self.wal.wait_for_flush(lsn)?;
+        Ok(())
+    }
+
+    /// Awaits until the WAL has durably flushed at least up to `target`,
+    /// yielding the runtime worker instead of blocking it. Nudges the flush
+    /// thread once, then registers on the DurabilityQueue for a targeted wakeup
+    /// the flush thread issues after the flush that satisfies `target`. Group
+    /// commit means many awaiting committers wake from one device write.
+    async fn wait_durable(&self, target: Lsn) {
+        // Fast path: already durable. Under group commit a peer's flush often
+        // advanced flushed_lsn past our LSN before we even check.
+        if self.wal.flushed_lsn() >= target {
+            return;
+        }
+        // Nudge the sole flush thread so it drains and writes our record, then
+        // await the targeted wakeup it fires once flushed_lsn covers target.
+        self.wal.request_flush();
+        self.durability.wait(target).await;
     }
 
     /// Aborts a transaction.
     ///
-    /// Writes an Abort record to the WAL, releases all locks,
-    /// and removes from the active transaction set.
+    /// Writes an Abort record to the WAL, releases all locks, and frees the
+    /// proc-array slot.
     pub fn abort(&self, txn: &mut Transaction) -> Result<()> {
         if txn.status != TransactionStatus::Active {
             return Err(ZyronError::TransactionAborted(format!(
@@ -272,28 +359,25 @@ impl TransactionManager {
         txn.last_lsn = lsn;
         txn.status = TransactionStatus::Aborted;
 
-        // Release all locks held by this transaction
         self.lock_table.unlock_all(txn.txn_id);
         self.intent_locks.unlock_all(txn.txn_id);
-
-        // Clean up wait-for graph edges
         self.wait_for_graph.remove_transaction(txn.txn_id);
 
-        // Remove from active set
-        self.active_txns.lock().remove(&txn.txn_id);
+        self.proc_array.release(txn.slot_idx);
 
         Ok(())
     }
 
     /// Returns a sorted snapshot of currently active transaction IDs.
     pub fn active_txn_ids(&self) -> Vec<u64> {
-        self.active_txns.lock().iter().copied().collect()
+        self.proc_array.active_txn_ids()
     }
 
     /// Refreshes the snapshot for a ReadCommitted transaction.
     /// Returns a new snapshot reflecting the current active transaction set.
     pub fn refresh_snapshot(&self, txn: &Transaction) -> Snapshot {
-        let active_ids = self.active_txn_ids();
+        let mut active_ids: Vec<u64> = Vec::with_capacity(16);
+        self.proc_array.snapshot_into(txn.txn_id, &mut active_ids);
         Snapshot::new(txn.txn_id, active_ids)
     }
 
@@ -314,7 +398,7 @@ impl TransactionManager {
 
     /// Returns the number of currently active transactions.
     pub fn active_count(&self) -> usize {
-        self.active_txns.lock().len()
+        self.proc_array.active_count()
     }
 
     /// Returns the next txn_id that will be assigned.
@@ -374,8 +458,59 @@ mod tests {
         let mut txn = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
         assert_eq!(mgr.active_count(), 1);
 
-        mgr.commit(&mut txn).unwrap();
+        mgr.commit_blocking(&mut txn).unwrap();
         assert_eq!(txn.status, TransactionStatus::Committed);
+        assert_eq!(mgr.active_count(), 0);
+    }
+
+    // Exercises the async durable commit path end to end.
+    #[tokio::test]
+    async fn test_commit_transaction_async_durable() {
+        let (mgr, _dir) = create_test_manager();
+        let mut txn = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
+        mgr.commit(&mut txn).await.unwrap();
+        assert_eq!(txn.status, TransactionStatus::Committed);
+        assert_eq!(mgr.active_count(), 0);
+    }
+
+    // Hammers the async durable commit path under concurrency with fsync on,
+    // the exact path the targeted-wakeup durability queue serves. A lost wakeup
+    // would hang one of the tasks; the outer timeout turns that into a failure
+    // instead of a stuck test. All commits must complete and each commit LSN
+    // must be durably flushed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_durable_commits_all_wake() {
+        let dir = tempdir().unwrap();
+        let config = WalWriterConfig {
+            wal_dir: dir.path().to_path_buf(),
+            segment_size: LogSegment::DEFAULT_SIZE,
+            fsync_enabled: true,
+            ring_buffer_capacity: 1024 * 1024,
+        };
+        let mgr = Arc::new(TransactionManager::new(Arc::new(
+            WalWriter::new(config).unwrap(),
+        )));
+
+        let run = async {
+            let mut handles = Vec::new();
+            for _ in 0..256 {
+                let mgr = Arc::clone(&mgr);
+                handles.push(tokio::spawn(async move {
+                    let mut txn = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
+                    let target = txn.last_lsn();
+                    mgr.commit(&mut txn).await.unwrap();
+                    assert_eq!(txn.status, TransactionStatus::Committed);
+                    assert!(mgr.wal.flushed_lsn() >= target);
+                }));
+            }
+            for h in handles {
+                h.await.unwrap();
+            }
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(20), run)
+            .await
+            .expect("concurrent durable commits did not all complete: lost wakeup");
         assert_eq!(mgr.active_count(), 0);
     }
 
@@ -396,9 +531,9 @@ mod tests {
         let (mgr, _dir) = create_test_manager();
 
         let mut txn = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
-        mgr.commit(&mut txn).unwrap();
+        mgr.commit_blocking(&mut txn).unwrap();
 
-        let result = mgr.commit(&mut txn);
+        let result = mgr.commit_blocking(&mut txn);
         assert!(result.is_err());
     }
 
@@ -441,7 +576,7 @@ mod tests {
         assert!(refreshed.is_txn_active(txn2.txn_id));
 
         // Commit txn2
-        mgr.commit(&mut txn2).unwrap();
+        mgr.commit_blocking(&mut txn2).unwrap();
 
         // Refresh again, txn2 is no longer active
         let refreshed2 = mgr.refresh_snapshot(&txn1);
@@ -520,7 +655,7 @@ mod tests {
         assert_eq!(mgr.wait_for_graph().edge_count(), 1);
 
         // Committing txn2 should clean up its edges
-        mgr.commit(&mut txn2).unwrap();
+        mgr.commit_blocking(&mut txn2).unwrap();
         assert_eq!(mgr.wait_for_graph().edge_count(), 0);
     }
 }

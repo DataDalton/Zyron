@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use zyron_buffer::BufferPool;
-use zyron_catalog::{Catalog, IndexId, TableEntry, TableId};
+use zyron_catalog::{Catalog, IndexId, TableEntry, TableId, TableIndexSnapshot};
 use zyron_common::{Result, ZyronError};
 use zyron_storage::{BTreeIndex, DiskManager, HeapFile, HeapFileConfig, Snapshot};
 use zyron_wal::WalWriter;
@@ -343,20 +343,33 @@ impl ExecutionContext {
         }
     }
 
+    /// Returns the lock-free, pre-partitioned index snapshot for a table.
+    /// DML hot paths consult this once per statement instead of paying the
+    /// per-batch cost of four separate catalog `RwLock` reads and Vec
+    /// allocations. Tables with no indexes share a single static empty
+    /// snapshot.
+    #[inline]
+    pub fn index_snapshot_for_table(&self, table_id: u32) -> Arc<TableIndexSnapshot> {
+        self.catalog.index_snapshot(TableId(table_id))
+    }
+
     /// Returns all live FTS indexes for the given table. Used by DML operators
     /// to maintain FTS indexes on INSERT/UPDATE/DELETE.
     pub fn fts_indexes_for_table(
         &self,
         table_id: u32,
     ) -> Vec<(IndexId, Arc<zyron_search::InvertedIndex>)> {
-        match &self.fts_manager {
-            Some(mgr) => mgr
-                .indexes_for_table(table_id)
-                .into_iter()
-                .filter_map(|id| mgr.get_index(id).map(|idx| (IndexId(id), idx)))
-                .collect(),
-            None => Vec::new(),
+        let Some(mgr) = self.fts_manager.as_ref() else {
+            return Vec::new();
+        };
+        let snap = self.index_snapshot_for_table(table_id);
+        if snap.fts.is_empty() {
+            return Vec::new();
         }
+        snap.fts
+            .iter()
+            .filter_map(|id| mgr.get_index(id.0).map(|idx| (*id, idx)))
+            .collect()
     }
 
     /// Sets the vector index manager for DML maintenance and query-time lookups.
@@ -377,10 +390,11 @@ impl ExecutionContext {
     /// Returns all vector index IDs for the given table. Used by DML operators
     /// to maintain vector indexes on INSERT/UPDATE/DELETE.
     pub fn vector_indexes_for_table(&self, table_id: u32) -> Vec<u32> {
-        match &self.vector_manager {
-            Some(mgr) => mgr.indexes_for_table(table_id),
-            None => Vec::new(),
+        if self.vector_manager.is_none() {
+            return Vec::new();
         }
+        let snap = self.index_snapshot_for_table(table_id);
+        snap.vector.iter().map(|id| id.0).collect()
     }
 
     /// Sets the graph manager for algorithm execution.
@@ -397,28 +411,16 @@ impl ExecutionContext {
     }
 
     /// Returns all (index_id, indexed column_id) pairs for spatial indexes
-    /// on the given table. Used by DML operators to maintain spatial indexes
-    /// on INSERT/UPDATE/DELETE. Reads catalog directly because the spatial
-    /// manager only stores trees keyed by index_id and doesn't carry the
-    /// column mapping.
+    /// on the given table. Lock-free read from the catalog index snapshot.
     pub fn spatial_indexes_for_table(&self, table_id: u32) -> Vec<(u32, zyron_catalog::ColumnId)> {
-        let table_id = zyron_catalog::TableId(table_id);
-        self.catalog
-            .get_indexes_for_table(table_id)
-            .iter()
-            .filter(|idx| idx.index_type == zyron_catalog::IndexType::Spatial)
-            .filter_map(|idx| idx.columns.first().map(|c| (idx.id.0, c.column_id)))
-            .collect()
+        let snap = self.index_snapshot_for_table(table_id);
+        snap.spatial.iter().map(|(id, col)| (id.0, *col)).collect()
     }
 
-    /// Returns (index_id, indexed column_id) for B+Tree indexes on the table
+    /// Returns (index_id, indexed column_id) for B+Tree indexes on the
+    /// table. Lock-free read from the catalog index snapshot.
     pub fn btree_indexes_for_table(&self, table_id: u32) -> Vec<(u32, zyron_catalog::ColumnId)> {
-        let table_id = zyron_catalog::TableId(table_id);
-        self.catalog
-            .get_indexes_for_table(table_id)
-            .iter()
-            .filter(|idx| idx.index_type == zyron_catalog::IndexType::BTree)
-            .filter_map(|idx| idx.columns.first().map(|c| (idx.id.0, c.column_id)))
-            .collect()
+        let snap = self.index_snapshot_for_table(table_id);
+        snap.btree.iter().map(|(id, col)| (id.0, *col)).collect()
     }
 }

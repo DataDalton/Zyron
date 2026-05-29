@@ -9,6 +9,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub mod auth;
+pub mod auto_param;
 pub mod codec;
 pub mod connection;
 pub mod copy;
@@ -21,11 +22,14 @@ pub mod messages;
 pub mod notifications;
 pub mod pem;
 pub mod pg_client;
+pub mod plan_cache;
 pub mod pool;
+pub mod publication_filter;
 pub mod quic;
 pub mod row_security;
 pub mod session;
 pub mod stat_views;
+pub mod statement_cache;
 pub mod subscription;
 pub mod tls;
 pub mod transport;

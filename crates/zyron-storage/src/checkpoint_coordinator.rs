@@ -243,13 +243,7 @@ impl CheckpointScheduler {
             .spawn(move || {
                 let _ = thread_waker.set(thread::current());
 
-                Self::scheduler_loop(
-                    &coordinator,
-                    &wal,
-                    &config,
-                    &thread_shutdown,
-                    &thread_stats,
-                );
+                Self::scheduler_loop(&coordinator, &wal, &config, &thread_shutdown, &thread_stats);
             })
             .expect("failed to spawn checkpoint scheduler thread");
 
@@ -404,9 +398,11 @@ mod tests {
         ));
 
         let write_fn: zyron_buffer::WriteFn = Arc::new(|_pid, _data| Ok(()));
+        let fsync_fn: zyron_buffer::FsyncFn = Arc::new(|_fid| Ok(()));
         let bg_writer = Arc::new(zyron_buffer::BackgroundWriter::new(
             Arc::clone(&pool),
             write_fn,
+            fsync_fn,
             zyron_buffer::BackgroundWriterConfig::default(),
         ));
 
@@ -433,7 +429,10 @@ mod tests {
         // Should start and shut down without panic
         scheduler.shutdown();
         assert_eq!(
-            scheduler.stats().checkpoints_completed.load(Ordering::Relaxed),
+            scheduler
+                .stats()
+                .checkpoints_completed
+                .load(Ordering::Relaxed),
             0
         );
     }
@@ -458,9 +457,11 @@ mod tests {
         ));
 
         let write_fn: zyron_buffer::WriteFn = Arc::new(|_pid, _data| Ok(()));
+        let fsync_fn: zyron_buffer::FsyncFn = Arc::new(|_fid| Ok(()));
         let bg_writer = Arc::new(zyron_buffer::BackgroundWriter::new(
             Arc::clone(&pool),
             write_fn,
+            fsync_fn,
             zyron_buffer::BackgroundWriterConfig::default(),
         ));
 
@@ -488,7 +489,10 @@ mod tests {
         // Wait for the time trigger to fire
         std::thread::sleep(Duration::from_secs(3));
 
-        let completed = scheduler.stats().checkpoints_completed.load(Ordering::Relaxed);
+        let completed = scheduler
+            .stats()
+            .checkpoints_completed
+            .load(Ordering::Relaxed);
         assert!(
             completed >= 1,
             "expected at least 1 checkpoint from time trigger, got {}",

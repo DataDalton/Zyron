@@ -9,7 +9,10 @@ use zyron_planner::physical::PhysicalPlan;
 
 use crate::batch::DataBatch;
 use crate::context::ExecutionContext;
-use crate::operator::aggregate::{HashAggregateOperator, SortAggregateOperator};
+use crate::operator::aggregate::{
+    HashAggregateOperator, ParallelHashAggregateOperator, SortAggregateOperator,
+    aggregate_supports_parallel,
+};
 use crate::operator::column_scan::{
     ColumnScanOperator, ColumnarMetadataAggregateOperator, HybridScanOperator,
 };
@@ -506,16 +509,74 @@ fn build_operator_tree(
             } => {
                 let input_schema = child.output_schema();
                 let output_schema = build_aggregate_schema(&group_by, &aggregates);
-                let child_br = build_operator_tree(*child, ctx).await?;
-                let child_m = collect_metrics(&[&child_br.metrics]);
-                let br = BuildResult::new(Box::new(HashAggregateOperator::new(
-                    child_br.op,
-                    group_by,
-                    aggregates,
-                    input_schema,
-                    output_schema,
-                )));
-                Ok(br.with_metrics("HashAggregate", analyze, child_m))
+
+                // Fuse with a parallel heap scan when the child is a plain scan
+                // large enough for parallelism and every aggregate combines
+                // associatively across partitions. Each worker aggregates a
+                // disjoint page range, then partials merge, so grouped analytic
+                // queries scale across cores instead of one aggregation thread.
+                // DISTINCT aggregates are excluded: their partial states are not
+                // associative across partitions (a value seen in two ranges
+                // would be counted twice), so they must take the serial path.
+                let parallel_table = if !group_by.is_empty()
+                    && aggregates
+                        .iter()
+                        .all(|a| !a.distinct && aggregate_supports_parallel(&a.function_name))
+                {
+                    match child.as_ref() {
+                        PhysicalPlan::SeqScan {
+                            table_id,
+                            as_of: None,
+                            ..
+                        } => {
+                            let np = ctx.get_heap_file(*table_id).await?.num_pages_cached() as u64;
+                            if should_use_parallel_scan(np, false) {
+                                Some(*table_id)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                if parallel_table.is_some() {
+                    if let PhysicalPlan::SeqScan {
+                        table_id,
+                        columns,
+                        predicate,
+                        ..
+                    } = *child
+                    {
+                        let op = ParallelHashAggregateOperator::new(
+                            ctx.clone(),
+                            table_id,
+                            columns,
+                            predicate,
+                            group_by,
+                            aggregates,
+                            input_schema,
+                            output_schema,
+                        );
+                        let br = BuildResult::new(Box::new(op));
+                        Ok(br.with_metrics("ParallelHashAggregate", analyze, vec![]))
+                    } else {
+                        unreachable!("parallel_table is set only for a SeqScan child")
+                    }
+                } else {
+                    let child_br = build_operator_tree(*child, ctx).await?;
+                    let child_m = collect_metrics(&[&child_br.metrics]);
+                    let br = BuildResult::new(Box::new(HashAggregateOperator::new(
+                        child_br.op,
+                        group_by,
+                        aggregates,
+                        input_schema,
+                        output_schema,
+                    )));
+                    Ok(br.with_metrics("HashAggregate", analyze, child_m))
+                }
             }
 
             PhysicalPlan::GapFill {

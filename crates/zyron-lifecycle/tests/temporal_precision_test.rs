@@ -124,7 +124,7 @@ async fn query(
     match zyron_executor::execute(plan, &ctx).await {
         Ok(b) => {
             if dml {
-                e.txn.commit(&mut txn)?;
+                e.txn.commit_blocking(&mut txn)?;
             } else {
                 let _ = e.txn.abort(&mut txn);
             }

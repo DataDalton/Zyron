@@ -1,7 +1,5 @@
 //! Disk manager for async page-level file I/O.
 
-use std::collections::HashMap;
-use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -38,9 +36,15 @@ pub struct DiskManager {
     /// scc::HashMap allows concurrent access to different file_ids.
     /// Per-file Mutex serializes operations on the same file.
     files: scc::HashMap<u32, Mutex<FileHandle>>,
-    /// Synchronous file handles for the background writer thread.
-    /// Separate from async handles to avoid tokio runtime dependency.
-    sync_files: parking_lot::Mutex<HashMap<u32, std::fs::File>>,
+    /// Synchronous file handles for the background writer thread and
+    /// buffer-pool eviction. Lock-free reads via `scc::HashMap::read_sync`,
+    /// and writes use positional I/O (`pwrite` / `seek_write`) so multiple
+    /// threads can write to the same file at different offsets concurrently
+    /// without any lock. Previously a single global `Mutex<HashMap<File>>`
+    /// serialized ALL page writes across every file in the engine, holding
+    /// the lock through every fsync (~5ms on Windows), which capped the
+    /// engine at roughly 200 page writes per second.
+    sync_files: scc::HashMap<u32, std::sync::Arc<std::fs::File>>,
 }
 
 /// Handle for an open data file.
@@ -59,8 +63,39 @@ impl DiskManager {
         Ok(Self {
             config,
             files: scc::HashMap::new(),
-            sync_files: parking_lot::Mutex::new(HashMap::new()),
+            sync_files: scc::HashMap::new(),
         })
+    }
+
+    /// Returns a shared `std::fs::File` handle for the given file_id,
+    /// lazily opening the file the first time it is referenced. Reads are
+    /// lock-free, opens settle by letting the first writer's `insert_sync`
+    /// win and subsequent racers fall through to the established entry.
+    fn sync_file(&self, file_id: u32) -> Result<std::sync::Arc<std::fs::File>> {
+        if let Some(arc) = self
+            .sync_files
+            .read_sync(&file_id, |_, f| std::sync::Arc::clone(f))
+        {
+            return Ok(arc);
+        }
+        let path = self.file_path(file_id);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| ZyronError::IoError(format!("open {}: {}", path.display(), e)))?;
+        let arc = std::sync::Arc::new(file);
+        let _ = self
+            .sync_files
+            .insert_sync(file_id, std::sync::Arc::clone(&arc));
+        // If a concurrent caller's insert won, our `arc` is dropped harmlessly
+        // and the next read_sync returns theirs; otherwise we keep our own.
+        Ok(self
+            .sync_files
+            .read_sync(&file_id, |_, f| std::sync::Arc::clone(f))
+            .unwrap_or(arc))
     }
 
     /// Returns the data directory path.
@@ -235,27 +270,48 @@ impl DiskManager {
     /// Uses std::fs::File handles separate from the async path.
     /// The background writer is a dedicated OS thread that can block on I/O.
     pub fn write_page_sync(&self, page_id: PageId, data: &[u8; PAGE_SIZE]) -> Result<()> {
-        let mut sync_files = self.sync_files.lock();
-        let file = sync_files.entry(page_id.file_id).or_insert_with(|| {
-            let path = self.file_path(page_id.file_id);
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&path)
-                .expect("failed to open sync file handle")
-        });
-
+        let file = self.sync_file(page_id.file_id)?;
         let offset = page_id.page_num * (PAGE_SIZE as u64);
-        file.seek(std::io::SeekFrom::Start(offset))?;
-        file.write_all(data)?;
-
+        positional_write_all(&file, data, offset).map_err(|e| {
+            ZyronError::IoError(format!(
+                "write page {}@{} for file {}: {}",
+                page_id.page_num, offset, page_id.file_id, e
+            ))
+        })?;
         if self.config.fsync_enabled {
-            file.sync_all()?;
+            file.sync_all().map_err(|e| {
+                ZyronError::IoError(format!("fsync file {}: {}", page_id.file_id, e))
+            })?;
         }
-
         Ok(())
+    }
+
+    /// Writes a page synchronously WITHOUT issuing fsync. Used by the
+    /// background writer to issue many writes in a batch followed by a
+    /// single `fsync_file` per touched file, which is dramatically faster
+    /// than one fsync per page on platforms where fsync dominates write
+    /// cost (notably Windows).
+    pub fn write_page_sync_no_fsync(&self, page_id: PageId, data: &[u8; PAGE_SIZE]) -> Result<()> {
+        let file = self.sync_file(page_id.file_id)?;
+        let offset = page_id.page_num * (PAGE_SIZE as u64);
+        positional_write_all(&file, data, offset).map_err(|e| {
+            ZyronError::IoError(format!(
+                "write page {}@{} for file {}: {}",
+                page_id.page_num, offset, page_id.file_id, e
+            ))
+        })?;
+        Ok(())
+    }
+
+    /// Issues fsync against the file backing `file_id`, with no effect when
+    /// the manager is configured fsync-disabled.
+    pub fn fsync_file(&self, file_id: u32) -> Result<()> {
+        if !self.config.fsync_enabled {
+            return Ok(());
+        }
+        let file = self.sync_file(file_id)?;
+        file.sync_all()
+            .map_err(|e| ZyronError::IoError(format!("fsync file {}: {}", file_id, e)))
     }
 
     /// Flushes all pending writes to disk.
@@ -343,6 +399,53 @@ impl DiskManager {
         }
         Ok(())
     }
+}
+
+/// Positional `write_all` against a shared `std::fs::File`. Does not move
+/// the file's seek cursor, so concurrent callers writing to different
+/// offsets of the same file run in parallel without any lock. On Unix
+/// this uses `pwrite` via `FileExt::write_at`, on Windows `WriteFile`
+/// with an `OVERLAPPED` offset via `FileExt::seek_write`.
+#[cfg(unix)]
+fn positional_write_all(
+    file: &std::fs::File,
+    mut data: &[u8],
+    mut offset: u64,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    while !data.is_empty() {
+        match file.write_at(data, offset) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                data = &data[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn positional_write_all(
+    file: &std::fs::File,
+    mut data: &[u8],
+    mut offset: u64,
+) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !data.is_empty() {
+        match file.seek_write(data, offset) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                data = &data[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

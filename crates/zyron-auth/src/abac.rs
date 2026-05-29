@@ -40,13 +40,25 @@ impl SessionAttributes {
     }
 }
 
-/// An ABAC policy attached to a table. The predicate string is appended as a
-/// WHERE clause filter when the policy is active.
+/// What an ABAC policy is attached to. Table policies are enforced as a row
+/// filter at query bind time; publication policies are enforced as a row
+/// filter on the change stream sent to subscribers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AbacTarget {
+    Table,
+    Publication,
+}
+
+/// An ABAC policy attached to a table or publication. The predicate string is
+/// applied as a WHERE-clause row filter when the policy is active.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AbacPolicy {
     pub id: u32,
     pub name: String,
+    /// Object the policy is attached to: a table id when `target` is Table, a
+    /// publication id when `target` is Publication.
     pub table_id: u32,
+    pub target: AbacTarget,
     /// SQL predicate expression injected into queries.
     pub predicate: String,
     pub enabled: bool,
@@ -68,6 +80,7 @@ impl AbacPolicy {
             + 4
             + 1
             + 1
+            + 1
             + 4
             + (self.roles.len() * 4)
             + 4
@@ -80,6 +93,10 @@ impl AbacPolicy {
         buf.extend_from_slice(&self.table_id.to_le_bytes());
         buf.push(if self.enabled { 1 } else { 0 });
         buf.push(if self.permissive { 1 } else { 0 });
+        buf.push(match self.target {
+            AbacTarget::Table => 0,
+            AbacTarget::Publication => 1,
+        });
 
         buf.extend_from_slice(&(self.roles.len() as u32).to_le_bytes());
         for role in &self.roles {
@@ -97,7 +114,7 @@ impl AbacPolicy {
 
     /// Deserializes a policy from bytes.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 18 {
+        if data.len() < 19 {
             return Err(ZyronError::DecodingFailed(
                 "AbacPolicy data too short".to_string(),
             ));
@@ -111,6 +128,12 @@ impl AbacPolicy {
         let enabled = data[pos] != 0;
         pos += 1;
         let permissive = data[pos] != 0;
+        pos += 1;
+        let target = if data[pos] == 1 {
+            AbacTarget::Publication
+        } else {
+            AbacTarget::Table
+        };
         pos += 1;
 
         let roles_count =
@@ -169,6 +192,7 @@ impl AbacPolicy {
             id,
             name,
             table_id,
+            target,
             predicate,
             enabled,
             permissive,
@@ -177,46 +201,70 @@ impl AbacPolicy {
     }
 }
 
-/// Stores ABAC policies indexed by table_id.
+/// Stores ABAC policies. Table-target policies are indexed by table id and
+/// enforced at query bind time; publication-target policies are indexed by
+/// publication id and enforced on the subscriber change stream.
 pub struct AbacStore {
-    policies: RcuMap<u32, Vec<AbacPolicy>>,
+    table_policies: RcuMap<u32, Vec<AbacPolicy>>,
+    publication_policies: RcuMap<u32, Vec<AbacPolicy>>,
 }
 
 impl AbacStore {
     pub fn new() -> Self {
         Self {
-            policies: RcuMap::empty_map(),
+            table_policies: RcuMap::empty_map(),
+            publication_policies: RcuMap::empty_map(),
         }
     }
 
-    /// Returns all policies for the given table.
+    /// Returns all policies attached to the given table.
     pub fn policies_for_table(&self, table_id: u32) -> Vec<AbacPolicy> {
-        let snap = self.policies.load();
+        let snap = self.table_policies.load();
         snap.get(&table_id).cloned().unwrap_or_default()
     }
 
-    /// Adds a policy to the store, grouped by table_id.
+    /// Returns all policies attached to the given publication.
+    pub fn policies_for_publication(&self, publication_id: u32) -> Vec<AbacPolicy> {
+        let snap = self.publication_policies.load();
+        snap.get(&publication_id).cloned().unwrap_or_default()
+    }
+
+    /// Adds a policy, routing it to the table or publication index by its
+    /// target. The object id is `policy.table_id` for both (it holds the
+    /// publication id for publication-target policies).
     pub fn add_policy(&self, policy: AbacPolicy) -> Result<()> {
-        let table_id = policy.table_id;
+        let map = match policy.target {
+            AbacTarget::Table => &self.table_policies,
+            AbacTarget::Publication => &self.publication_policies,
+        };
+        let object_id = policy.table_id;
         let name = policy.name.clone();
-        // Check for duplicates before mutating.
-        let snap = self.policies.load();
-        if let Some(v) = snap.get(&table_id) {
+        let snap = map.load();
+        if let Some(v) = snap.get(&object_id) {
             if v.iter().any(|p| p.name == name) {
                 return Err(ZyronError::PolicyAlreadyExists(name));
             }
         }
-        self.policies.update(|m| {
-            m.entry(table_id).or_insert_with(Vec::new).push(policy);
+        map.update(|m| {
+            m.entry(object_id).or_insert_with(Vec::new).push(policy);
         });
         Ok(())
     }
 
-    /// Removes a policy by table_id and name. Returns true if removed.
+    /// Removes a table-target policy by table id and name. Returns true if removed.
     pub fn remove_policy(&self, table_id: u32, name: &str) -> bool {
+        Self::remove_from(&self.table_policies, table_id, name)
+    }
+
+    /// Removes a publication-target policy by publication id and name.
+    pub fn remove_publication_policy(&self, publication_id: u32, name: &str) -> bool {
+        Self::remove_from(&self.publication_policies, publication_id, name)
+    }
+
+    fn remove_from(map: &RcuMap<u32, Vec<AbacPolicy>>, object_id: u32, name: &str) -> bool {
         let mut removed = false;
-        self.policies.update(|m| {
-            if let Some(v) = m.get_mut(&table_id) {
+        map.update(|m| {
+            if let Some(v) = m.get_mut(&object_id) {
                 let before = v.len();
                 v.retain(|p| p.name != name);
                 removed = v.len() < before;
@@ -225,11 +273,33 @@ impl AbacStore {
         removed
     }
 
-    /// Bulk-loads policies, grouping by table_id.
+    /// Bulk-loads policies, routing each by its target.
     pub fn load(&self, policies: Vec<AbacPolicy>) {
         for policy in policies {
             let _ = self.add_policy(policy);
         }
+    }
+
+    /// Highest policy id across both indexes, for recovering the id counter at
+    /// startup. Zero when there are no policies.
+    pub fn max_id(&self) -> u32 {
+        let table_max = self
+            .table_policies
+            .load()
+            .values()
+            .flat_map(|v| v.iter())
+            .map(|p| p.id)
+            .max()
+            .unwrap_or(0);
+        let pub_max = self
+            .publication_policies
+            .load()
+            .values()
+            .flat_map(|v| v.iter())
+            .map(|p| p.id)
+            .max()
+            .unwrap_or(0);
+        table_max.max(pub_max)
     }
 }
 
@@ -752,6 +822,7 @@ mod tests {
             id,
             name: name.to_string(),
             table_id,
+            target: AbacTarget::Table,
             predicate: "department = current_department()".to_string(),
             enabled: true,
             permissive: true,
@@ -1164,6 +1235,7 @@ mod tests {
             id: 1,
             name: "partner_region_lock".to_string(),
             table_id: 501,
+            target: AbacTarget::Table,
             predicate: "region = 'us-east-1'".to_string(),
             enabled: true,
             permissive: true,
@@ -1173,5 +1245,32 @@ mod tests {
         let got = store.policies_for_table(501);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name, "partner_region_lock");
+    }
+
+    #[test]
+    fn test_publication_policy_routing() {
+        let store = AbacStore::new();
+        let policy = AbacPolicy {
+            id: 2,
+            name: "pub_region".to_string(),
+            table_id: 900,
+            target: AbacTarget::Publication,
+            predicate: "region = 'us-east-1'".to_string(),
+            enabled: true,
+            permissive: true,
+            roles: vec![],
+        };
+        store.add_policy(policy).expect("attach");
+        // Publication policy must not appear under the table index, and vice versa.
+        assert!(store.policies_for_table(900).is_empty());
+        let got = store.policies_for_publication(900);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "pub_region");
+
+        // Round-trips through serialization with its target preserved.
+        let bytes = got[0].to_bytes();
+        let back = AbacPolicy::from_bytes(&bytes).expect("decode");
+        assert_eq!(back.target, AbacTarget::Publication);
+        assert_eq!(back.predicate, "region = 'us-east-1'");
     }
 }

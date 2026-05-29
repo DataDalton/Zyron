@@ -13,7 +13,7 @@ use crate::record::{
 use crate::ring_buffer::RingBuffer;
 use crate::segment::{LogSegment, SegmentHeader, SegmentId};
 use crate::sequencer::LsnSequencer;
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -189,8 +189,10 @@ pub struct WalWriter {
     /// Flush thread handle for unpark-based wakeup. Set by the flush thread on
     /// startup via OnceLock so get() is a single atomic Acquire load.
     flush_thread_waker: Arc<OnceLock<std::thread::Thread>>,
-    /// Signal from flush thread to waiters when a flush cycle completes.
-    flush_done: Arc<(Mutex<bool>, Condvar)>,
+    /// Flush buffers owned by the sole flusher (the background flush thread).
+    /// Behind a Mutex only so the thread can own them across the loop; no
+    /// committer ever locks it (committers nudge the flush thread and wait).
+    flush_state: Arc<Mutex<FlushState>>,
     /// Shutdown flag.
     shutdown: Arc<AtomicBool>,
     /// Flush thread join handle. Wrapped in Mutex so close() can join via &self.
@@ -213,6 +215,33 @@ pub struct WalWriter {
     /// Retention hook that returns the minimum LSN that must be retained.
     /// Used by replication slots to prevent WAL segment deletion.
     retention_hook: parking_lot::RwLock<Option<Arc<dyn Fn() -> Option<Lsn> + Send + Sync>>>,
+    /// Called by the flush thread after each flush so an async durability
+    /// waiter can be woken without this crate depending on an async runtime.
+    /// Set once via register_flush_waker.
+    durable_waker: Arc<OnceLock<FlushWaker>>,
+}
+
+/// Callback invoked by the flush thread after every flush cycle, used to wake
+/// transaction-commit durability waiters. Kept as a plain closure so the WAL
+/// crate stays free of any async-runtime dependency.
+pub type FlushWaker = Arc<dyn Fn() + Send + Sync>;
+
+/// A batch append at or above this many bytes wakes the flush thread eagerly,
+/// to bound ring-buffer occupancy. Smaller batches are left for the commit's
+/// leader flush so a batch costs one device write instead of two.
+const EAGER_FLUSH_BYTES: u32 = 256 * 1024;
+
+/// Buffers a flush owns across calls. Shared behind a mutex so a committing
+/// thread can drive a flush inline (leader-driven group commit) under the same
+/// serialization as the background flush thread. Whoever holds the lock is the
+/// flush leader; the lock guarantees one flusher at a time and one consistent
+/// `leftover` carry-over across segment boundaries.
+struct FlushState {
+    /// Scratch reused across flushes to stage drained records before the write.
+    batch_buffer: Vec<u8>,
+    /// Bytes that did not fit in the current segment, carried to the next flush
+    /// after rotation installs a new segment.
+    leftover: Vec<u8>,
 }
 
 impl WalWriter {
@@ -231,18 +260,23 @@ impl WalWriter {
         ));
         let ring_buffer = Arc::new(RingBuffer::new(config.ring_buffer_capacity));
         let flush_thread_waker = Arc::new(OnceLock::new());
-        let flush_done = Arc::new((Mutex::new(false), Condvar::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let segment = Arc::new(Mutex::new(Some(segment)));
+        let next_segment = Arc::new(Mutex::new(None));
         let flushed_lsn = Arc::new(AtomicU64::new(initial_lsn.0.saturating_sub(1)));
         let rotation = Arc::new(AtomicRotationState::new());
         let flush_io_error = Arc::new(AtomicBool::new(false));
         let wal_syncs = Arc::new(AtomicU64::new(0));
+        let durable_waker: Arc<OnceLock<FlushWaker>> = Arc::new(OnceLock::new());
+        let flush_state = Arc::new(Mutex::new(FlushState {
+            batch_buffer: Vec::with_capacity(64 * 1024),
+            leftover: Vec::new(),
+        }));
         let flush_thread = Self::spawn_flush_thread(
             ring_buffer.clone(),
             segment.clone(),
+            next_segment.clone(),
             flush_thread_waker.clone(),
-            flush_done.clone(),
             shutdown.clone(),
             flushed_lsn.clone(),
             config.fsync_enabled,
@@ -252,13 +286,14 @@ impl WalWriter {
             config.segment_size,
             flush_io_error.clone(),
             wal_syncs.clone(),
+            durable_waker.clone(),
+            flush_state.clone(),
         );
 
         Ok(Self {
             sequencer,
             ring_buffer,
             flush_thread_waker,
-            flush_done,
             shutdown,
             flush_thread: Mutex::new(Some(flush_thread)),
             segment,
@@ -269,7 +304,30 @@ impl WalWriter {
             flush_io_error,
             wal_syncs,
             retention_hook: parking_lot::RwLock::new(None),
+            durable_waker,
+            flush_state,
         })
+    }
+
+    /// Address used as the parking key for sync durability waiters. Stable for
+    /// the writer's lifetime (the flushed-LSN atomic lives on the heap behind an
+    /// Arc), and identical to the address flush_records_sync wakes by.
+    #[inline]
+    fn flushed_lsn_key(&self) -> usize {
+        Arc::as_ptr(&self.flushed_lsn) as usize
+    }
+
+    /// Registers a callback the flush thread invokes after each flush cycle,
+    /// used to wake transaction-commit durability waiters. Set once.
+    pub fn register_flush_waker(&self, waker: FlushWaker) {
+        let _ = self.durable_waker.set(waker);
+    }
+
+    /// Wakes the flush thread so a pending commit record is fsync'd promptly,
+    /// rather than waiting for the idle park timeout. Called by a committer
+    /// awaiting durability.
+    pub fn request_flush(&self) {
+        self.wake_flush_thread();
     }
 
     /// Recovers from existing segments or creates a new one.
@@ -311,8 +369,8 @@ impl WalWriter {
     fn spawn_flush_thread(
         ring_buffer: Arc<RingBuffer>,
         segment: Arc<Mutex<Option<LogSegment>>>,
+        next_segment: Arc<Mutex<Option<LogSegment>>>,
         flush_thread_waker: Arc<OnceLock<std::thread::Thread>>,
-        flush_done: Arc<(Mutex<bool>, Condvar)>,
         shutdown: Arc<AtomicBool>,
         flushed_lsn: Arc<AtomicU64>,
         fsync_enabled: bool,
@@ -322,17 +380,14 @@ impl WalWriter {
         segment_size: u32,
         flush_io_error: Arc<AtomicBool>,
         wal_syncs_counter: Arc<AtomicU64>,
+        durable_waker: Arc<OnceLock<FlushWaker>>,
+        flush_state: Arc<Mutex<FlushState>>,
     ) -> JoinHandle<()> {
         std::thread::spawn(move || {
             // Register this thread for unpark wakeup. The waker is stored in
             // an OnceLock so the append() hot path reads it with a single
             // atomic Acquire load and calls std::thread::unpark directly.
             flush_thread_waker.set(std::thread::current()).ok();
-
-            let mut batch_buffer = Vec::with_capacity(64 * 1024);
-            // Bytes that did not fit in the current segment, carried over to
-            // the next flush iteration after rotation installs a new segment
-            let mut leftover: Vec<u8> = Vec::new();
 
             // Idle backoff state, the park_timeout grows exponentially when
             // no work arrives so a quiet WAL costs near-zero CPU. The hot
@@ -343,24 +398,58 @@ impl WalWriter {
             // unaffected by the backoff
             const PARK_BASE_US: u64 = 50;
             const PARK_MAX_US: u64 = 10_000;
+            // Bounded busy-poll before parking. A committer awaiting durability
+            // appends its record then nudges this thread; if the thread is
+            // already on-core spinning, it serves that record without paying an
+            // unpark plus scheduler dispatch (~10us on Windows), which is the
+            // dominant non-fsync commit latency under active load. Sized to a
+            // few microseconds so a truly idle WAL still falls through to the
+            // park backoff and costs near-zero CPU.
+            const SPIN_LIMIT: u32 = 512;
             let mut park_us: u64 = PARK_BASE_US;
 
             loop {
-                // Check for work before parking. This prevents missed wakeups:
-                // if unpark() fires between our last drain_into() and park(),
-                // the token is consumed and park() returns immediately.
-                let has_data = !ring_buffer.is_empty() || !leftover.is_empty();
-                let has_rotation = rotation.is_rotating();
-
-                if !has_data && !has_rotation && !shutdown.load(Ordering::Acquire) {
-                    // Idle backoff, double the park interval each idle round
-                    // up to PARK_MAX_US. Reset to PARK_BASE_US on the first
-                    // round that observes work below
-                    std::thread::park_timeout(std::time::Duration::from_micros(park_us));
-                    park_us = (park_us * 2).min(PARK_MAX_US);
-                } else {
-                    park_us = PARK_BASE_US;
+                // Wait for work before flushing. Spin-poll first so a just
+                // committed record is picked up without an unpark dispatch;
+                // only park (with exponential backoff) once the spin window
+                // expires with no work. Checking for work before parking also
+                // prevents missed wakeups: an unpark arriving between the last
+                // drain and the park is held as a token and returns immediately.
+                let mut spun: u32 = 0;
+                loop {
+                    // An overflow always also requests rotation, so a non-empty
+                    // leftover implies is_rotating(); checking rotation covers it
+                    // without locking flush_state on every spin iteration. The
+                    // flush thread is the sole flusher: any committed ring data
+                    // is its work to drain. While a device write is in flight,
+                    // concurrent committers pile into the ring, so the next drain
+                    // batches the whole group in one write (group commit with no
+                    // artificial window).
+                    let idle = ring_buffer.is_empty()
+                        && !rotation.is_rotating()
+                        && !shutdown.load(Ordering::Acquire);
+                    if !idle {
+                        // Work or shutdown observed: reset the park backoff and
+                        // run the flush body below.
+                        park_us = PARK_BASE_US;
+                        break;
+                    }
+                    if spun >= SPIN_LIMIT {
+                        std::thread::park_timeout(std::time::Duration::from_micros(park_us));
+                        park_us = (park_us * 2).min(PARK_MAX_US);
+                        break;
+                    }
+                    spun += 1;
+                    std::hint::spin_loop();
                 }
+
+                // Capture the rotation state before flushing. An overflow inside
+                // flush_records_sync may request a fresh rotation and stage the
+                // tail in leftover; that tail must be written to the old segment
+                // on a later iteration before the new segment is installed, so
+                // rotation is handled the iteration after it is observed here,
+                // never in the same flush that staged the overflow.
+                let has_rotation = rotation.is_rotating();
 
                 if shutdown.load(Ordering::Acquire) {
                     // Complete any in-flight rotation before final drain.
@@ -373,6 +462,7 @@ impl WalWriter {
                             &rotation,
                             &ring_buffer,
                             &segment,
+                            &next_segment,
                             &sequencer,
                             &wal_dir,
                             segment_size,
@@ -380,51 +470,150 @@ impl WalWriter {
                         );
                     }
                     // Final drain of any remaining records
+                    {
+                        let mut state = flush_state.lock();
+                        let state = &mut *state;
+                        Self::flush_records_sync(
+                            &ring_buffer,
+                            &segment,
+                            &mut state.batch_buffer,
+                            &mut state.leftover,
+                            &rotation,
+                            &flushed_lsn,
+                            fsync_enabled,
+                            &flush_io_error,
+                            &wal_syncs_counter,
+                        );
+                    }
+                    // Wake any commit awaiting durability before the thread exits.
+                    if let Some(waker) = durable_waker.get() {
+                        waker();
+                    }
+                    break;
+                }
+
+                // Drain and write all committed records in one batch. The
+                // device-write latency is itself the group-commit window:
+                // committers that arrive during the previous write are swept
+                // into this one. No artificial timer, no committer-led flushing.
+                {
+                    let mut state = flush_state.lock();
+                    let state = &mut *state;
                     Self::flush_records_sync(
                         &ring_buffer,
                         &segment,
-                        &mut batch_buffer,
-                        &mut leftover,
+                        &mut state.batch_buffer,
+                        &mut state.leftover,
                         &rotation,
                         &flushed_lsn,
-                        &flush_done,
                         fsync_enabled,
                         &flush_io_error,
                         &wal_syncs_counter,
                     );
-                    break;
                 }
 
-                // Flush any pending records
-                Self::flush_records_sync(
-                    &ring_buffer,
+                // Wake commit durability waiters now that flushed_lsn has
+                // advanced (and been fsync'd when durability is enabled). A
+                // spurious wake when nothing flushed is harmless: waiters
+                // re-check flushed_lsn and resume waiting.
+                if let Some(waker) = durable_waker.get() {
+                    waker();
+                }
+
+                // Pre-allocate the next segment when the live segment is
+                // 75% full so the eventual rotation does not pay file
+                // create + fsync inside the append-path stall. Cheap to
+                // check, only fires once per ~12MB of WAL traffic with
+                // the default 16MB segment.
+                Self::maybe_prealloc_next_segment(
                     &segment,
-                    &mut batch_buffer,
-                    &mut leftover,
-                    &rotation,
-                    &flushed_lsn,
-                    &flush_done,
-                    fsync_enabled,
-                    &flush_io_error,
-                    &wal_syncs_counter,
+                    &next_segment,
+                    &sequencer,
+                    &wal_dir,
+                    segment_size,
                 );
 
-                // Handle segment rotation only when requested by append().
-                // Skipping the call when no rotation is pending avoids an
-                // Acquire load + phase check on every flush iteration.
+                // Handle segment rotation only when it was already pending at
+                // the start of this iteration. Using the pre-flush snapshot
+                // defers a rotation that this flush's overflow just requested to
+                // the next iteration, after the staged leftover is written.
                 if has_rotation {
                     Self::handle_rotation_sync(
                         &rotation,
                         &ring_buffer,
                         &segment,
+                        &next_segment,
                         &sequencer,
                         &wal_dir,
                         segment_size,
                         fsync_enabled,
                     );
                 }
+
+                // Re-evaluate any flush()/wait_for_flush waiters once per
+                // iteration. flush_records_sync already unparks after a
+                // non-empty drain; this also covers the empty-drain and
+                // post-rotation cases (a flush() caller waiting for the ring to
+                // drain or a rotation to settle), so no waiter is stranded when
+                // state changed without records being written. No-op when no
+                // thread is parked on the key.
+                // SAFETY: key is the address of the flushed_lsn atomic, the same
+                // key flush_records_sync and the waiters use.
+                unsafe {
+                    parking_lot_core::unpark_all(
+                        Arc::as_ptr(&flushed_lsn) as usize,
+                        parking_lot_core::DEFAULT_UNPARK_TOKEN,
+                    );
+                }
             }
         })
+    }
+
+    /// If the live segment has crossed PREALLOC_THRESHOLD and we do not
+    /// already hold a pre-built next segment, create one on the flush
+    /// thread so the eventual rotation skips file create + fsync.
+    fn maybe_prealloc_next_segment(
+        segment: &Mutex<Option<LogSegment>>,
+        next_segment: &Mutex<Option<LogSegment>>,
+        sequencer: &Arc<LsnSequencer>,
+        wal_dir: &Path,
+        segment_size: u32,
+    ) {
+        const PREALLOC_NUMER: u32 = 3;
+        const PREALLOC_DENOM: u32 = 4;
+
+        if next_segment.lock().is_some() {
+            return;
+        }
+
+        let (current_segment_id, current_write_offset) = {
+            let guard = segment.lock();
+            match guard.as_ref() {
+                Some(s) => (s.segment_id().0, s.write_offset()),
+                None => return,
+            }
+        };
+
+        let threshold = (segment_size / PREALLOC_DENOM) * PREALLOC_NUMER;
+        if current_write_offset < threshold {
+            return;
+        }
+        // Skip if the sequencer has already advanced past this segment, the
+        // rotation finished before pre-allocation got scheduled.
+        if sequencer.current_segment_id() != current_segment_id {
+            return;
+        }
+
+        let new_segment_id = current_segment_id + 1;
+        let first_lsn = Lsn::new(new_segment_id, SegmentHeader::SIZE as u32);
+        match LogSegment::create(wal_dir, SegmentId(new_segment_id), first_lsn, segment_size) {
+            Ok(seg) => {
+                *next_segment.lock() = Some(seg);
+            }
+            Err(e) => {
+                eprintln!("WAL pre-allocate segment failed: {:?}", e);
+            }
+        }
     }
 
     /// Creates a new segment and advances the sequencer to complete rotation.
@@ -437,6 +626,7 @@ impl WalWriter {
         rotation: &Arc<AtomicRotationState>,
         ring_buffer: &RingBuffer,
         segment: &Mutex<Option<LogSegment>>,
+        next_segment: &Mutex<Option<LogSegment>>,
         sequencer: &Arc<LsnSequencer>,
         wal_dir: &Path,
         segment_size: u32,
@@ -472,7 +662,6 @@ impl WalWriter {
         }
 
         let new_segment_id = old_segment_id + 1;
-        let first_lsn = Lsn::new(new_segment_id, SegmentHeader::SIZE as u32);
 
         // Sync old segment before switching
         {
@@ -484,15 +673,31 @@ impl WalWriter {
             }
         }
 
-        // Create the new segment file
-        match LogSegment::create(wal_dir, SegmentId(new_segment_id), first_lsn, segment_size) {
+        // Prefer the pre-allocated next segment if it matches the rotation
+        // target. Falling back to LogSegment::create here covers the rare
+        // case where rotation fires before pre-allocation got scheduled.
+        let new_seg_result = {
+            let mut next_guard = next_segment.lock();
+            match next_guard.take() {
+                Some(seg) if seg.segment_id().0 == new_segment_id => Ok(seg),
+                Some(_stale) => {
+                    // Stale pre-allocated segment, create on demand.
+                    let first_lsn = Lsn::new(new_segment_id, SegmentHeader::SIZE as u32);
+                    LogSegment::create(wal_dir, SegmentId(new_segment_id), first_lsn, segment_size)
+                }
+                None => {
+                    let first_lsn = Lsn::new(new_segment_id, SegmentHeader::SIZE as u32);
+                    LogSegment::create(wal_dir, SegmentId(new_segment_id), first_lsn, segment_size)
+                }
+            }
+        };
+
+        match new_seg_result {
             Ok(new_seg) => {
-                // Install new segment
                 {
                     let mut seg_guard = segment.lock();
                     *seg_guard = Some(new_seg);
                 }
-                // Advance sequencer so append() callers can reserve space
                 sequencer.advance_segment(new_segment_id);
             }
             Err(e) => {
@@ -522,7 +727,6 @@ impl WalWriter {
         leftover: &mut Vec<u8>,
         rotation: &Arc<AtomicRotationState>,
         flushed_lsn: &AtomicU64,
-        flush_done: &Arc<(Mutex<bool>, Condvar)>,
         fsync_enabled: bool,
         flush_io_error: &AtomicBool,
         wal_syncs_counter: &AtomicU64,
@@ -541,11 +745,6 @@ impl WalWriter {
         };
 
         if batch_buffer.is_empty() {
-            // Signal waiters even when empty so flush() callers don't hang
-            let (lock, condvar) = flush_done.as_ref();
-            let mut done = lock.lock();
-            *done = true;
-            condvar.notify_all();
             return;
         }
 
@@ -572,10 +771,6 @@ impl WalWriter {
                             e,
                         );
                         flush_io_error.store(true, Ordering::Release);
-                        let (lock, condvar) = flush_done.as_ref();
-                        let mut done = lock.lock();
-                        *done = true;
-                        condvar.notify_all();
                         return;
                     }
                 }
@@ -590,10 +785,6 @@ impl WalWriter {
                     if let Err(e) = seg.sync() {
                         eprintln!("WAL sync error: {:?}", e);
                         flush_io_error.store(true, Ordering::Release);
-                        let (lock, condvar) = flush_done.as_ref();
-                        let mut done = lock.lock();
-                        *done = true;
-                        condvar.notify_all();
                         return;
                     }
                     wal_syncs_counter.fetch_add(1, Ordering::Relaxed);
@@ -607,11 +798,20 @@ impl WalWriter {
 
         flushed_lsn.store(max_lsn.0, Ordering::Release);
 
-        // Signal flush waiters
-        let (lock, condvar) = flush_done.as_ref();
-        let mut done = lock.lock();
-        *done = true;
-        condvar.notify_all();
+        // Wake threads parked on the flushed-LSN address (futex / WaitOnAddress
+        // via parking_lot_core). The store above is Release and unpark_all takes
+        // the parking bucket lock, while a parked waiter re-reads flushed_lsn in
+        // its park-validate closure under that same bucket lock, so the advance
+        // is never lost to a wake that fires before the waiter parks. No-op cost
+        // when no thread is parked on this key.
+        // SAFETY: the key is the address of this same flushed_lsn atomic, which
+        // is exactly the key sync waiters park on.
+        unsafe {
+            parking_lot_core::unpark_all(
+                flushed_lsn as *const AtomicU64 as usize,
+                parking_lot_core::DEFAULT_UNPARK_TOKEN,
+            );
+        }
     }
 
     /// Cold error path for payload size validation. Separated from append()
@@ -740,17 +940,48 @@ impl WalWriter {
         }
     }
 
-    /// Waits until the given LSN has been flushed to disk.
+    /// Blocks until the given LSN has been flushed (and fsync'd) to disk.
+    ///
+    /// Blocks until the WAL has durably flushed at least up to `target_lsn`.
+    ///
+    /// The dedicated flush thread is the sole flusher and group-commit leader.
+    /// This caller nudges it once (the record is already in the ring) and parks
+    /// on the flushed-LSN address until the thread's next flush advances it.
+    /// The flush thread stores flushed_lsn (Release) then unpark_all on this
+    /// same address; park's validate closure re-reads flushed_lsn under the
+    /// parking bucket lock, so a flush completing between the check and the park
+    /// is observed, not lost. No mutex on the wait path, no per-waiter
+    /// allocation, no polling timer.
     pub fn wait_for_flush(&self, target_lsn: Lsn) -> Result<()> {
+        let key = self.flushed_lsn_key();
+        // Ensure the flush thread runs even if it had parked on an idle ring.
+        self.wake_flush_thread();
         loop {
             if self.flushed_lsn() >= target_lsn {
                 return Ok(());
             }
-            self.wake_flush_thread();
-            let (lock, condvar) = self.flush_done.as_ref();
-            let mut done = lock.lock();
-            // Short timeout to recheck flushed_lsn
-            condvar.wait_for(&mut done, std::time::Duration::from_micros(100));
+            // A failed flush never advances flushed_lsn; surface the error
+            // instead of waiting forever.
+            if self.flush_io_error.load(Ordering::Acquire) {
+                return Err(ZyronError::WalWriteFailed(
+                    "flush thread encountered an I/O error".into(),
+                ));
+            }
+            // SAFETY: key is the address of self.flushed_lsn, the same address
+            // flush_records_sync wakes by.
+            unsafe {
+                parking_lot_core::park(
+                    key,
+                    || {
+                        self.flushed_lsn().0 < target_lsn.0
+                            && !self.flush_io_error.load(Ordering::Acquire)
+                    },
+                    || self.wake_flush_thread(),
+                    |_, _| {},
+                    parking_lot_core::DEFAULT_PARK_TOKEN,
+                    None,
+                );
+            }
         }
     }
 
@@ -856,17 +1087,34 @@ impl WalWriter {
 
     /// Forces a flush and waits for completion.
     /// Waits until the ring buffer is empty and no segment rotation is in progress.
+    /// The dedicated flush thread is the sole flusher; this nudges it and parks
+    /// on the flushed-LSN address (advanced on every drain) until drained.
     pub fn flush(&self) -> Result<Lsn> {
+        let key = self.flushed_lsn_key();
+        let drained = |s: &Self| {
+            s.ring_buffer.is_empty() && !s.rotation.is_rotating() && !s.rotation.is_done()
+        };
+        self.wake_flush_thread();
         loop {
-            let buffer_empty = self.ring_buffer.is_empty();
-            let rotation_idle = !self.rotation.is_rotating() && !self.rotation.is_done();
-            if buffer_empty && rotation_idle {
+            if drained(self) {
                 return Ok(self.flushed_lsn());
             }
-            self.wake_flush_thread();
-            let (lock, condvar) = self.flush_done.as_ref();
-            let mut done = lock.lock();
-            condvar.wait_for(&mut done, std::time::Duration::from_micros(100));
+            if self.flush_io_error.load(Ordering::Acquire) {
+                return Err(ZyronError::WalWriteFailed(
+                    "flush thread encountered an I/O error".into(),
+                ));
+            }
+            // SAFETY: key is the address of self.flushed_lsn.
+            unsafe {
+                parking_lot_core::park(
+                    key,
+                    || !drained(self) && !self.flush_io_error.load(Ordering::Acquire),
+                    || self.wake_flush_thread(),
+                    |_, _| {},
+                    parking_lot_core::DEFAULT_PARK_TOKEN,
+                    None,
+                );
+            }
         }
     }
 
@@ -1025,7 +1273,14 @@ impl WalWriter {
                 last_record_lsn,
                 (batch_end - batch_start) as u32,
             );
-            self.maybe_wake_flush_thread(batch_size as usize);
+            // Do not eagerly flush a normal-sized insert batch. These records
+            // are not durability-required until commit, and the commit's leader
+            // flush sweeps them into a single device write; eagerly flushing
+            // them here would cost a second write-through per batch. Only wake
+            // for very large batches, to bound ring-buffer occupancy.
+            if batch_size >= EAGER_FLUSH_BYTES {
+                self.wake_flush_thread();
+            }
 
             idx = batch_end;
         }
@@ -1113,7 +1368,12 @@ impl WalWriter {
                 *lsns.last().unwrap(),
                 (batch_end - batch_start) as u32,
             );
-            self.maybe_wake_flush_thread(batch_size as usize);
+            // See log_insert_batch_last_lsn: defer to the commit's leader flush
+            // so a batch is one device write, not two. Only very large batches
+            // wake the flush thread eagerly to bound ring-buffer occupancy.
+            if batch_size >= EAGER_FLUSH_BYTES {
+                self.wake_flush_thread();
+            }
 
             idx = batch_end;
         }
@@ -1283,6 +1543,28 @@ mod tests {
         let (writer, _dir) = create_test_writer();
         assert!(writer.next_lsn().is_valid());
         assert_eq!(writer.current_segment_id().unwrap(), SegmentId::FIRST);
+    }
+
+    // Reproduces the commit_blocking hot loop: a single thread logs a record
+    // then waits for its durability, repeatedly. Guards against a regression
+    // that would hang or catastrophically slow wait_for_flush; expected runtime
+    // is well under the assertion bound on fsync-disabled in-memory flushes.
+    #[test]
+    fn many_sequential_wait_for_flush() {
+        let (writer, _dir) = create_test_writer();
+        let mut prev = Lsn::INVALID;
+        let start = std::time::Instant::now();
+        for _ in 0..20_000 {
+            let lsn = writer.log_insert(1, prev, b"x").unwrap();
+            writer.wait_for_flush(lsn).unwrap();
+            prev = lsn;
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "20K sequential wait_for_flush took {:?}, regression suspected",
+            elapsed
+        );
     }
 
     #[test]

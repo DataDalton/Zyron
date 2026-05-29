@@ -15,7 +15,7 @@ pub mod schema;
 pub mod stats;
 pub mod storage;
 
-pub use cache::CatalogCache;
+pub use cache::{CatalogCache, TableIndexSnapshot};
 pub use catalog::Catalog;
 pub use ids::{
     ColumnId, DatabaseId, EndpointId, ExternalSinkId, ExternalSourceId, IndexId, Oid, OidAllocator,

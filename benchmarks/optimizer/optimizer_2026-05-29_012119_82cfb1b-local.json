@@ -1,0 +1,79 @@
+{
+  "id": "2026-05-29_012119_82cfb1b-local",
+  "date": "2026-05-29 01:21:23Z",
+  "ts": 1780017683,
+  "commit": "82cfb1b-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "optimizer": {
+      "analyze_1m_ms": {
+        "average": 44.918180,
+        "runs": [44.36, 43.29, 44.91, 46.96, 45.06],
+        "target": 400.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "auto_analyze_trigger_ms": {
+        "average": 3.353960,
+        "runs": [4.21, 3.18, 3.08, 3.12, 3.17],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "cardinality_accuracy_ratio": {
+        "average": 1.000000,
+        "runs": [1.00, 1.00, 1.00, 1.00, 1.00],
+        "target": 2.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "encoding_pushdown_speedup_x": {
+        "average": 30.578262,
+        "runs": [30.58, 30.58, 30.58, 30.58, 30.58],
+        "target": 3.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "explain_analyze_overhead_pct": {
+        "average": 28.386312,
+        "runs": [26.59, 28.15, 27.13, 28.75, 31.31],
+        "target": 3.000000,
+        "passed": false,
+        "higher_is_better": false
+      },
+      "explain_latency_us": {
+        "average": 1.045446,
+        "runs": [1.04, 1.07, 1.04, 1.04, 1.04],
+        "target": 20.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "histogram_build_1m_ms": {
+        "average": 0.440620,
+        "runs": [0.44, 0.44, 0.41, 0.48, 0.44],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "parallel_plan_selection_us": {
+        "average": 0.215429,
+        "runs": [0.21, 0.22, 0.21, 0.22, 0.22],
+        "target": 50.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "selectivity_estimate_ns": {
+        "average": 118.473240,
+        "runs": [118.31, 118.00, 118.68, 117.22, 120.15],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    }
+  }
+}

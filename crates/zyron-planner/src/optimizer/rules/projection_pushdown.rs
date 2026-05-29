@@ -58,8 +58,11 @@ fn push_projections(
                     })
                     .cloned()
                     .collect();
-                // Only prune if we actually removed columns
-                if pruned.len() < columns.len() && !pruned.is_empty() {
+                // Prune whenever we removed columns, including down to zero:
+                // a scan that needs no data columns (bare COUNT(*)) becomes a
+                // count-only scan that walks visibility without decoding any
+                // tuple bytes.
+                if pruned.len() < columns.len() {
                     return LogicalPlan::Scan {
                         table_id: *table_id,
                         table_idx: *table_idx,

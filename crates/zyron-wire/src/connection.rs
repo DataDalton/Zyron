@@ -199,6 +199,12 @@ pub struct ServerState {
     /// maintained by INSERT/UPDATE/DELETE
     pub btree_indexes: Arc<scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>>,
 
+    /// Server-wide L2 plan cache, shared across connections. A query shape
+    /// planned by one connection is reused by every other connection with
+    /// the same identity, search path, and schema version, behind each
+    /// connection's lock-free per-session L1 cache.
+    pub plan_cache: Arc<crate::plan_cache::ServerPlanCache>,
+
     // -----------------------------------------------------------------------
     // Utility command coordination
     // -----------------------------------------------------------------------
@@ -295,6 +301,10 @@ pub struct Connection<T: WireTransport> {
     /// Notification channel receivers for LISTEN/NOTIFY.
     notification_receivers:
         HashMap<String, tokio::sync::broadcast::Receiver<crate::notifications::Notification>>,
+    /// Per-connection cache of parsed and planned SQL statements keyed by
+    /// SQL text hash. Eliminates parse + plan cost on repeated identical
+    /// queries through the unnamed extended-protocol path.
+    statement_cache: crate::statement_cache::StatementCache,
 }
 
 /// Per-connection cursor state for DECLARE/FETCH/CLOSE support.
@@ -334,6 +344,7 @@ impl<T: WireTransport> Connection<T> {
             active_branch: None,
             cursors: HashMap::new(),
             notification_receivers: HashMap::new(),
+            statement_cache: crate::statement_cache::StatementCache::new(),
         }
     }
 
@@ -743,6 +754,28 @@ impl<T: WireTransport> Connection<T> {
             self.feed(BackendMessage::EmptyQueryResponse).await?;
             self.send_ready_for_query().await?;
             return Ok(());
+        }
+
+        // Auto-prepared plan cache fast path. A single-statement DML shape
+        // with only literal values is rewritten to a `$N` template, looked
+        // up in the per-connection plan cache, and executed directly. On a
+        // cache miss the template is parsed/planned once and cached. Any
+        // shape the scanner does not positively recognize returns false and
+        // falls through to the full parse path below.
+        match self.try_templated_execute(&sql).await {
+            Ok(true) => {
+                self.auto_commit_if_needed().await;
+                self.send_ready_for_query().await?;
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(e) => {
+                self.send_protocol_error(&e).await?;
+                self.mark_failed_if_in_transaction();
+                self.auto_commit_if_needed().await;
+                self.send_ready_for_query().await?;
+                return Ok(());
+            }
         }
 
         // Parse SQL into statements
@@ -1684,6 +1717,192 @@ impl<T: WireTransport> Connection<T> {
     }
 
     // -----------------------------------------------------------------------
+    // Auto-prepared plan cache (simple query fast path)
+    // -----------------------------------------------------------------------
+
+    /// Attempts to satisfy `sql` from the per-connection plan cache by
+    /// auto-parameterizing its literals. Returns `Ok(true)` when the query
+    /// was executed (cache hit, or miss-then-planned-and-cached), `Ok(false)`
+    /// when the shape is not cacheable and the caller must use the normal
+    /// parse path. Planning or execution errors that should surface to the
+    /// client return `Err`.
+    async fn try_templated_execute(&mut self, sql: &str) -> Result<bool, ProtocolError> {
+        // Never take the fast path inside a failed transaction; only ROLLBACK
+        // is permitted there and that is not a cacheable shape anyway.
+        if self.session_ref().transaction_state() == TransactionState::Failed {
+            return Ok(false);
+        }
+
+        let templated = match crate::auto_param::templatize(sql) {
+            Some(t) => t,
+            None => return Ok(false),
+        };
+
+        let (cache_key, current_version) = {
+            let session = self
+                .session
+                .as_ref()
+                .ok_or(ProtocolError::Malformed("No session established".into()))?;
+            let key = crate::statement_cache::CacheKey {
+                template_hash: zyron_common::hash64(templated.template.as_bytes()),
+                search_path_hash: crate::statement_cache::StatementCache::hash_search_path(
+                    &session.search_path,
+                ),
+                role_id: session.identity_hash(),
+                rls_policy_hash: 0,
+                type_kinds_hash: templated.type_kinds_hash,
+            };
+            (key, self.server.catalog.schema_version())
+        };
+
+        // L1 hit (per-session): reuse the planned shape directly.
+        if let Some(cached) = self.statement_cache.lookup(&cache_key, current_version) {
+            if cached.param_count != templated.literals.len() {
+                // Shape mismatch should be impossible (the template hash
+                // encodes the placeholder count), but never bind the wrong
+                // number of params: fall through to the safe path.
+                return Ok(false);
+            }
+            self.execute_cached_plan(cached, templated.literals).await?;
+            return Ok(true);
+        }
+
+        // L2 hit (server-wide): another connection already planned this
+        // shape. Promote it into this connection's L1 so subsequent runs
+        // hit the lock-free path, then execute.
+        if let Some(cached) = self.server.plan_cache.lookup(&cache_key, current_version) {
+            if cached.param_count == templated.literals.len() {
+                self.statement_cache.insert(cached.clone());
+                self.execute_cached_plan(cached, templated.literals).await?;
+                return Ok(true);
+            }
+        }
+
+        // Cache miss: parse the templated SQL (which already carries the
+        // `$N` placeholders) so the planner emits Parameter slots, plan it
+        // under the session's row security, and cache the result. On any
+        // parse/plan failure, fall back to the normal path so the original
+        // SQL produces the user-facing error.
+        let stmts = match zyron_parser::parse(&templated.template) {
+            Ok(s) => s,
+            Err(_) => return Ok(false),
+        };
+        if stmts.len() != 1 {
+            return Ok(false);
+        }
+        let stmt = stmts.into_iter().next().unwrap();
+
+        let (db_id, search_path, row_security) = {
+            let sm = self.server.security_manager.as_ref();
+            let session = self
+                .session
+                .as_ref()
+                .ok_or(ProtocolError::Malformed("No session established".into()))?;
+            let rs: Option<std::sync::Arc<dyn zyron_planner::RowSecurityProvider>> =
+                match (sm, &session.security_context) {
+                    (Some(sm), Some(sc)) => Some(std::sync::Arc::new(
+                        crate::row_security::SmRowSecurityProvider::new(
+                            std::sync::Arc::clone(sm),
+                            sc,
+                        ),
+                    )),
+                    _ => None,
+                };
+            (session.database_id, session.search_path.clone(), rs)
+        };
+
+        let plan = match zyron_planner::plan_with_security(
+            &self.server.catalog,
+            db_id,
+            search_path,
+            stmt,
+            row_security,
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(_) => return Ok(false),
+        };
+
+        let output_schema = plan.output_schema();
+        let plan_arc = Arc::new(plan);
+        let entry = crate::statement_cache::CachedPlan {
+            key: cache_key,
+            schema_version: current_version,
+            plan: Arc::clone(&plan_arc),
+            output_schema: output_schema.clone(),
+            param_count: templated.literals.len(),
+        };
+        self.statement_cache.insert(entry.clone());
+        self.server.plan_cache.insert(entry.clone());
+        self.execute_cached_plan(entry, templated.literals).await?;
+        Ok(true)
+    }
+
+    /// Executes a cached plan with the supplied parameter values and streams
+    /// the result. Mirrors the tail of `plan_and_execute_statement`.
+    async fn execute_cached_plan(
+        &mut self,
+        cached: crate::statement_cache::CachedPlan,
+        params: Vec<ScalarValue>,
+    ) -> Result<(), ProtocolError> {
+        let sec_ctx = self
+            .session
+            .as_mut()
+            .and_then(|s| s.security_context.take());
+
+        let (txn_id, snapshot) = self.ensure_transaction()?;
+
+        let mut ctx = ExecutionContext::new(
+            self.server.catalog.clone(),
+            self.server.wal.clone(),
+            self.server.buffer_pool.clone(),
+            self.server.disk_manager.clone(),
+            txn_id as u32,
+            snapshot,
+        );
+        ctx.params = params;
+        ctx.security_context = sec_ctx;
+        ctx.heap_files = Some(Arc::clone(&self.server.heap_files));
+        ctx.btree_indexes = Some(Arc::clone(&self.server.btree_indexes));
+        if let Some(ref hook) = self.server.cdc_hook {
+            ctx.cdc_hook = Some(Arc::clone(hook));
+        }
+        if let Some(ref hook) = self.server.dml_hook {
+            ctx.dml_hook = Some(Arc::clone(hook));
+        }
+        let ctx = Arc::new(ctx);
+
+        let plan = (*cached.plan).clone();
+        let output_schema = cached.output_schema;
+        let is_select = !output_schema.is_empty() && is_query_plan(&plan);
+
+        let batches = execute(plan, &ctx).await.map_err(ProtocolError::Database)?;
+
+        if let Ok(mut unwrapped) = Arc::try_unwrap(ctx) {
+            if let Some(session) = self.session.as_mut() {
+                session.security_context = unwrapped.security_context.take();
+            }
+        }
+
+        if is_select {
+            let row_desc = self.build_row_description(&output_schema, &[]);
+            self.feed(row_desc).await?;
+            let row_count = self.send_data_rows(&batches, &output_schema, &[]).await?;
+            self.feed(BackendMessage::CommandComplete {
+                tag: format!("SELECT {}", row_count),
+            })
+            .await?;
+        } else {
+            let affected = count_affected_rows(&batches);
+            let tag = make_dml_tag(&output_schema, affected);
+            self.feed(BackendMessage::CommandComplete { tag }).await?;
+        }
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // EXPLAIN handling
     // -----------------------------------------------------------------------
 
@@ -1796,6 +2015,63 @@ impl<T: WireTransport> Connection<T> {
     ) -> Result<(), ProtocolError> {
         debug!("Parse: name={}, query={}", name, query);
 
+        // Statement cache lookup: build the composite key and skip the
+        // parse + plan round trip when the same text was bound under the
+        // same search path, identity, and schema version. The extended
+        // protocol already carries `$N` placeholders, so the template is
+        // the query verbatim and there are no extracted literals.
+        let session = self
+            .session
+            .as_ref()
+            .ok_or(ProtocolError::Malformed("No session established".into()))?;
+        let cache_key = crate::statement_cache::CacheKey {
+            template_hash: zyron_common::hash64(query.as_bytes()),
+            search_path_hash: crate::statement_cache::StatementCache::hash_search_path(
+                &session.search_path,
+            ),
+            role_id: session.identity_hash(),
+            rls_policy_hash: 0,
+            type_kinds_hash: 0,
+        };
+        let current_version = self.server.catalog.schema_version();
+
+        // L1 (per-session), then L2 (server-wide) before parsing. An L2 hit
+        // is promoted into L1 so the next Parse on this connection is
+        // lock-free.
+        let cache_hit = self
+            .statement_cache
+            .lookup(&cache_key, current_version)
+            .or_else(|| {
+                self.server
+                    .plan_cache
+                    .lookup(&cache_key, current_version)
+                    .inspect(|c| self.statement_cache.insert(c.clone()))
+            });
+        if let Some(cached) = cache_hit {
+            // Evict a named statement if over capacity.
+            if !name.is_empty() && self.statements.len() >= MAX_PREPARED_STATEMENTS {
+                let victim = self
+                    .statements
+                    .keys()
+                    .find(|k| !k.is_empty() && *k != &name)
+                    .cloned();
+                if let Some(key) = victim {
+                    self.statements.remove(&key);
+                }
+            }
+            self.statements.insert(
+                name,
+                PreparedStatement {
+                    query,
+                    param_types,
+                    plan: Some(cached.plan),
+                    output_schema: cached.output_schema,
+                },
+            );
+            self.feed(BackendMessage::ParseComplete).await?;
+            return Ok(());
+        }
+
         let stmts = match zyron_parser::parse(&query) {
             Ok(stmts) => stmts,
             Err(e) => {
@@ -1804,7 +2080,7 @@ impl<T: WireTransport> Connection<T> {
             }
         };
 
-        let (plan, schema) = if stmts.len() == 1 && param_types.is_empty() {
+        let (plan, schema) = if stmts.len() == 1 {
             let stmt = stmts.into_iter().next().unwrap();
 
             // DDL/utility statements bypass the planner. They get None plan
@@ -1826,8 +2102,18 @@ impl<T: WireTransport> Connection<T> {
                 .await
                 {
                     Ok(p) => {
-                        let schema = p.output_schema();
-                        (Some(Arc::new(p)), schema)
+                        let plan_arc = Arc::new(p);
+                        let schema = plan_arc.output_schema();
+                        let entry = crate::statement_cache::CachedPlan {
+                            key: cache_key,
+                            schema_version: current_version,
+                            plan: Arc::clone(&plan_arc),
+                            output_schema: schema.clone(),
+                            param_count: 0,
+                        };
+                        self.statement_cache.insert(entry.clone());
+                        self.server.plan_cache.insert(entry);
+                        (Some(plan_arc), schema)
                     }
                     Err(e) => {
                         self.send_error(&e).await?;
@@ -2163,7 +2449,7 @@ impl<T: WireTransport> Connection<T> {
             }
             zyron_parser::Statement::Commit(_) => {
                 if let Some(mut txn) = self.transaction.take() {
-                    match self.server.txn_manager.commit(&mut txn) {
+                    match self.server.txn_manager.commit(&mut txn).await {
                         Ok(()) => {
                             if let Some(session) = self.session.as_mut() {
                                 session.set_transaction_state(TransactionState::Idle);
@@ -2873,7 +3159,7 @@ impl<T: WireTransport> Connection<T> {
                 if self.session_ref().transaction_state() == TransactionState::Failed {
                     let _ = self.server.txn_manager.abort(&mut txn);
                 } else {
-                    let _ = self.server.txn_manager.commit(&mut txn);
+                    let _ = self.server.txn_manager.commit(&mut txn).await;
                 }
             }
         }
@@ -3220,9 +3506,38 @@ impl<T: WireTransport> Connection<T> {
             }
         }
 
-        let source: Arc<dyn crate::subscription::ChangeSource> = Arc::new(
-            crate::subscription::CdcChangeSource::new(registry, table_ids.clone()),
-        );
+        // Compile the publication's ABAC policies that apply to this subscriber
+        // into a row filter. None when no policy applies, so the stream pays
+        // nothing. A predicate that cannot bind against a member table fails the
+        // subscription closed rather than streaming unfiltered rows.
+        let abac_filter = match self.server.security_manager.as_ref() {
+            Some(sm) => {
+                match crate::publication_filter::PublicationRowFilter::build(
+                    &self.server.catalog,
+                    sm,
+                    &publication,
+                    &table_ids,
+                    principal_role,
+                )
+                .await
+                {
+                    Ok(opt) => opt.map(Arc::new),
+                    Err(e) => {
+                        self.send_error(&e).await?;
+                        self.flush().await?;
+                        return Ok(());
+                    }
+                }
+            }
+            None => None,
+        };
+
+        let source: Arc<dyn crate::subscription::ChangeSource> =
+            Arc::new(crate::subscription::CdcChangeSource::with_filter(
+                registry,
+                table_ids.clone(),
+                abac_filter,
+            ));
 
         // Register a catalog subscription entry. The id is auto-allocated by
         // the catalog when zero is supplied. last_seen_lsn starts at the

@@ -204,11 +204,10 @@ impl<'a> Lexer<'a> {
         let start = self.pos;
         let start_col = self.column;
 
-        // Consume digits
-        while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
-            self.pos += 1;
-            self.column += 1;
-        }
+        // Consume the integer-part digit run. Digits cannot contain newlines.
+        let end = crate::simd_scan::digits_end(self.bytes, self.pos);
+        self.column += end - self.pos;
+        self.pos = end;
 
         // Check for decimal point followed by digit
         let is_float = self.pos < self.bytes.len()
@@ -219,10 +218,9 @@ impl<'a> Lexer<'a> {
         if is_float {
             self.pos += 1; // consume '.'
             self.column += 1;
-            while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
-                self.pos += 1;
-                self.column += 1;
-            }
+            let end = crate::simd_scan::digits_end(self.bytes, self.pos);
+            self.column += end - self.pos;
+            self.pos = end;
 
             // Scientific notation: e/E followed by optional +/- and digits
             if self.pos < self.bytes.len()
@@ -236,10 +234,9 @@ impl<'a> Lexer<'a> {
                     self.pos += 1;
                     self.column += 1;
                 }
-                while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
-                    self.pos += 1;
-                    self.column += 1;
-                }
+                let end = crate::simd_scan::digits_end(self.bytes, self.pos);
+                self.column += end - self.pos;
+                self.pos = end;
             }
 
             let text = &self.input[start..self.pos];
@@ -272,20 +269,22 @@ impl<'a> Lexer<'a> {
         self.pos += 1; // consume opening quote
         self.column += 1;
 
-        // Scan forward to find closing quote for zero-copy fast path.
+        // SIMD-scan to the closing quote. A doubled quote ('') is an escape,
+        // so on hitting one we note it and resume the search past both.
         let content_start = self.pos;
         let mut has_escape = false;
         let mut scan = self.pos;
-        while scan < self.bytes.len() {
-            if self.bytes[scan] == b'\'' {
-                if scan + 1 < self.bytes.len() && self.bytes[scan + 1] == b'\'' {
-                    has_escape = true;
-                    scan += 2;
-                    continue;
-                }
+        loop {
+            scan = crate::simd_scan::find_byte(self.bytes, scan, b'\'');
+            if scan >= self.bytes.len() {
                 break;
             }
-            scan += 1;
+            if scan + 1 < self.bytes.len() && self.bytes[scan + 1] == b'\'' {
+                has_escape = true;
+                scan += 2;
+                continue;
+            }
+            break;
         }
         if scan >= self.bytes.len() {
             return Err(ZyronError::ParseError(format!(
@@ -420,12 +419,11 @@ impl<'a> Lexer<'a> {
     fn scan_word(&mut self) -> Result<SpannedToken> {
         let start = self.pos;
 
-        while self.pos < self.bytes.len()
-            && (self.bytes[self.pos].is_ascii_alphanumeric() || self.bytes[self.pos] == b'_')
-        {
-            self.pos += 1;
-            self.column += 1;
-        }
+        // SIMD-scan the identifier run. Identifiers cannot contain newlines,
+        // so the column advances by exactly the run length.
+        let end = crate::simd_scan::identifier_end(self.bytes, self.pos);
+        self.column += end - self.pos;
+        self.pos = end;
 
         let word = &self.input[start..self.pos];
         let span = Span::new(start, self.pos - start);

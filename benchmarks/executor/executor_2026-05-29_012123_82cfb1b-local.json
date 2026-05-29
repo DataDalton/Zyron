@@ -1,0 +1,91 @@
+{
+  "id": "2026-05-29_012123_82cfb1b-local",
+  "date": "2026-05-29 01:21:48Z",
+  "ts": 1780017708,
+  "commit": "82cfb1b-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Aggregate": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 14.97 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 14.97 },
+      "Aggregate throughput (rows/sec)": {
+        "average": 1292849091.505274,
+        "runs": [1067805659.37, 1157943492.36, 1350986219.94, 1449695563.93, 1437814521.93],
+        "target": 150000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Filter Throughput": {
+      "util_before": { "cpu_pct": 4.0, "ram_used_gb": 15.07 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 15.04 },
+      "Filter throughput (rows/sec)": {
+        "average": 260390220.521962,
+        "runs": [257731958.76, 257951350.38, 256917503.79, 263887056.34, 265463233.34],
+        "target": 60000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Hash Build": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 15.02 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 15.02 },
+      "Hash build throughput (rows/sec)": {
+        "average": 123447561.140955,
+        "runs": [124283814.52, 126090684.42, 120894133.01, 120682580.68, 125286593.08],
+        "target": 50000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Hash Join": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 15.01 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 15.01 },
+      "Join throughput (rows/sec)": {
+        "average": 111381695.603425,
+        "runs": [109435313.78, 118542147.12, 118539592.22, 101058356.61, 109333068.28],
+        "target": 100000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Limit": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 15.03 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 16.04 },
+      "Limit throughput (rows/sec)": {
+        "average": 763318627174.299683,
+        "runs": [704970038773.35, 815328169588.26, 788643533123.03, 811030008110.30, 696621386276.56],
+        "target": 200000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Scan Throughput": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 15.08 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 15.11 },
+      "Scan throughput (rows/sec)": {
+        "average": 2791836282.719735,
+        "runs": [2434274586.17, 2753303964.76, 3117206982.54, 3281916639.32, 2372479240.81],
+        "target": 75000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Sort": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 15.11 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 15.10 },
+      "Sort throughput (rows/sec)": {
+        "average": 123835631.997360,
+        "runs": [113183629.12, 123493380.75, 127346356.62, 127369064.60, 127785728.89],
+        "target": 100000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}

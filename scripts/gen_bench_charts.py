@@ -42,15 +42,83 @@ LATENCY = [
     ("versioning", "branch_page_resolution", "ns_per_resolve", "Branch resolve"),
     ("transaction", "Phase 1.5 Microbenchmarks", "lock_row() latency (ns/op)", "Row lock"),
     ("lifecycle", "legal_hold_check_no_holds", "latency (ns/op)", "Legal-hold check"),
+    ("columnar", "Bloom Filter", "Bloom probe latency (ns)", "Bloom probe"),
     ("optimizer", "optimizer", "selectivity_estimate_ns", "Selectivity est"),
 ]
 
 # Supplementary table, rendered below the charts.
 # (suite, group, metric key, subsystem, metric label, divisor, decimals, suffix)
 EXTRA = [
-    ("transaction", "Phase 1.5 Microbenchmarks", "GC sweep throughput (tuples/sec)", "MVCC", "GC sweep", 1e9, 1, "B tuples/sec"),
-    ("columnar", "Parallel Column Encoding", "Sequential compaction (rows/sec)", "Columnar", "Sequential compaction", 1e6, 1, "M rows/sec"),
-    ("versioning", "time_travel_scan_overhead", "overhead_percent", "Versioning", "Time-travel scan overhead", 1, 0, "%"),
+    (
+        "transaction",
+        "Phase 1.5 Microbenchmarks",
+        "GC sweep throughput (tuples/sec)",
+        "MVCC",
+        "GC sweep",
+        1e9,
+        1,
+        "B tuples/sec",
+    ),
+    (
+        "columnar",
+        "Column Segment Format",
+        ".zyr scan throughput (GB/sec)",
+        "Columnar",
+        ".zyr scan throughput",
+        1,
+        1,
+        " GB/sec",
+    ),
+    (
+        "columnar",
+        "Compaction Pipeline",
+        "Compaction throughput (rows/sec)",
+        "Columnar",
+        "Compaction pipeline",
+        1e6,
+        1,
+        "M rows/sec",
+    ),
+    (
+        "columnar",
+        "HTAP Hybrid Scan",
+        "Hybrid scan overhead (%)",
+        "Columnar",
+        "HybridScan overhead vs heap-only",
+        1,
+        1,
+        "%",
+    ),
+    (
+        "columnar",
+        "Metadata Aggregate",
+        "Metadata vs scan speedup (x)",
+        "Columnar",
+        "Metadata-aggregate pruning speedup",
+        1,
+        1,
+        "x",
+    ),
+    (
+        "temporal",
+        "ps_decode_throughput",
+        "ps decode rows/sec",
+        "Temporal",
+        "Picosecond timestamp decode",
+        1e6,
+        0,
+        "M rows/sec",
+    ),
+    (
+        "versioning",
+        "time_travel_scan_overhead",
+        "overhead_percent",
+        "Versioning",
+        "Time-travel scan overhead",
+        1,
+        0,
+        "%",
+    ),
     ("wire", "QUIC PG Handshake", "QUIC PG handshake latency (us)", "Wire", "QUIC PostgreSQL handshake", 1, 0, " us"),
 ]
 
@@ -125,10 +193,19 @@ def main():
     seed = metric(e2e, "Bootstrap", "seed insert (rows/sec)")
     teardown = metric(e2e, "Shutdown", "teardown (ms)")
     analytics_us = metric(e2e, "Analytics", "median query us")
-    conns = [("c1", "1 client"), ("c4", "4 clients"), ("c16", "16 clients")]
-    tps = {c: metric(e2e, "OLTP", f"{c} tps") for c, _ in conns}
-    p99 = {c: metric(e2e, "OLTP", f"{c} p99 us") for c, _ in conns}
+    # Discover OLTP concurrency levels from the JSON itself so the bench can
+    # change its OLTP_CONCURRENCY_LEVELS without the script needing edits.
+    oltp = e2e["tests"].get("OLTP", {})
+    levels = sorted(
+        (int(m.group(1)) for k in oltp if (m := re.fullmatch(r"c(\d+) tps", k))),
+        key=int,
+    )
+    tps = {n: metric(e2e, "OLTP", f"c{n} tps") for n in levels}
+    p99 = {n: metric(e2e, "OLTP", f"c{n} p99 us") for n in levels}
 
+    oltp_rows = "".join(
+        f"| OLTP, {n} client{'s' if n != 1 else ''} | {tps[n]/1000:.1f}K tps, p99 {p99[n]:.0f} us |\n" for n in levels
+    )
     e2e_table = (
         "| Lifecycle / workload | Result |\n"
         "|----------------------|--------|\n"
@@ -136,14 +213,12 @@ def main():
         f"| First `ReadyForQuery` | {first_q:.2f} ms |\n"
         f"| Schema DDL bootstrap | {ddl:.1f} ms |\n"
         f"| Seed insert | {seed/1000:.0f}K rows/sec |\n"
-        f"| OLTP, 1 client | {tps['c1']/1000:.1f}K tps, p99 {p99['c1']:.0f} us |\n"
-        f"| OLTP, 4 clients | {tps['c4']/1000:.1f}K tps, p99 {p99['c4']:.0f} us |\n"
-        f"| OLTP, 16 clients | {tps['c16']/1000:.1f}K tps, p99 {p99['c16']:.0f} us |\n"
+        f"{oltp_rows}"
         f"| Analytical query (median) | {analytics_us/1000:.2f} ms |\n"
         f"| Graceful shutdown | {teardown:.0f} ms |\n"
     )
-    tps_labels = [lbl for _, lbl in conns]
-    tps_vals = [tps[c] / 1000 for c, _ in conns]
+    tps_labels = [f"{n} client{'s' if n != 1 else ''}" for n in levels]
+    tps_vals = [tps[n] / 1000 for n in levels]
     tps_top = int(max(tps_vals) * 1.15)
 
     any_doc = next(iter(cache.values()))
@@ -159,7 +234,15 @@ def main():
     out.append("### End-to-end\n")
     out.append("What a client sees from a running server over the wire protocol, from cold start to shutdown:\n")
     out.append(e2e_table)
-    out.append(bar_block("OLTP throughput vs. concurrent clients (thousand tps, higher is better)", "K tps", tps_labels, tps_vals, tps_top))
+    out.append(
+        bar_block(
+            "OLTP throughput vs. concurrent clients (thousand tps, higher is better)",
+            "K tps",
+            tps_labels,
+            tps_vals,
+            tps_top,
+        )
+    )
     out.append("### Engine internals\n")
     out.append("Raw subsystem throughput and hot-path latency under microbenchmark:\n")
     out.append(bar_block("Throughput (million ops/sec, higher is better)", "M ops/sec", tp_labels, tp_vals, tp_top))
@@ -179,8 +262,9 @@ def main():
     suite_count = sum(1 for p in BENCH.iterdir() if p.is_dir())
     out.append(
         f"{suite_count} benchmark suites cover storage, executor, optimizer, encoding, wire, "
-        "search, analytics, CDC, versioning, transactions, types, lifecycle, and end-to-end. "
-        "Each run writes a timestamped JSON/TXT pair under `benchmarks/<suite>/`.\n"
+        "search, analytics, CDC, versioning, transactions, temporal, columnar, types, "
+        "lifecycle, gateway, Zyron-to-Zyron, and end-to-end. Each run writes a timestamped "
+        "JSON/TXT pair under `benchmarks/<suite>/`.\n"
     )
 
     block = "<!-- BENCH:START -->\n" + "\n".join(out) + "<!-- BENCH:END -->"

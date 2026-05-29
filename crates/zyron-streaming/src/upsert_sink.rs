@@ -253,7 +253,7 @@ impl ZyronUpsertSink {
 
         match result {
             Ok(()) => {
-                self.txn_manager.commit(&mut txn)?;
+                self.txn_manager.commit_blocking(&mut txn)?;
                 Ok(())
             }
             Err(e) => {

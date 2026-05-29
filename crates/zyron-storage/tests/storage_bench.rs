@@ -1424,19 +1424,7 @@ async fn test_checkpoint_round_trip_1m() {
         let checkpoint_dir = dir.path().join("ckpt");
         std::fs::create_dir_all(&checkpoint_dir).unwrap();
 
-        let disk = Arc::new(
-            DiskManager::new(DiskManagerConfig {
-                data_dir: dir.path().to_path_buf(),
-                fsync_enabled: false,
-            })
-            .await
-            .unwrap(),
-        );
-        let pool = Arc::new(BufferPool::auto_sized());
-
         let mut btree = BTreeIndex::create_with_config(
-            disk.clone(),
-            pool.clone(),
             0,
             checkpoint_dir.clone(),
             CheckpointConfig {
@@ -1469,9 +1457,7 @@ async fn test_checkpoint_round_trip_1m() {
 
         // Load checkpoint into a new index
         let load_start = Instant::now();
-        let loaded = BTreeIndex::open(disk.clone(), pool.clone(), 0, &checkpoint_dir)
-            .await
-            .unwrap();
+        let loaded = BTreeIndex::open(0, &checkpoint_dir).await.unwrap();
         let load_duration = load_start.elapsed();
 
         assert_eq!(loaded.checkpoint_lsn(), checkpoint_lsn);
@@ -1572,20 +1558,8 @@ async fn test_checkpoint_corrupt_fallback() {
     let checkpoint_dir = dir.path().join("ckpt");
     std::fs::create_dir_all(&checkpoint_dir).unwrap();
 
-    let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir: dir.path().to_path_buf(),
-            fsync_enabled: false,
-        })
-        .await
-        .unwrap(),
-    );
-    let pool = Arc::new(BufferPool::auto_sized());
-
     // Create index, insert keys, checkpoint
     let mut btree = BTreeIndex::create_with_config(
-        disk.clone(),
-        pool.clone(),
         0,
         checkpoint_dir.clone(),
         CheckpointConfig {
@@ -1612,9 +1586,7 @@ async fn test_checkpoint_corrupt_fallback() {
     std::fs::write(&ckpt_path, &data).unwrap();
 
     // Loading should fail CRC validation and fall back to empty tree
-    let loaded = BTreeIndex::open(disk.clone(), pool.clone(), 0, &checkpoint_dir)
-        .await
-        .unwrap();
+    let loaded = BTreeIndex::open(0, &checkpoint_dir).await.unwrap();
 
     // The loaded tree should be empty (fallback to fresh store)
     assert_eq!(
@@ -1670,22 +1642,10 @@ async fn test_recovery_with_checkpoint() {
         std::fs::create_dir_all(&checkpoint_dir).unwrap();
         std::fs::create_dir_all(&wal_dir).unwrap();
 
-        let disk = Arc::new(
-            DiskManager::new(DiskManagerConfig {
-                data_dir: dir.path().to_path_buf(),
-                fsync_enabled: false,
-            })
-            .await
-            .unwrap(),
-        );
-        let pool = Arc::new(BufferPool::auto_sized());
-
         // Phase 1: Insert 500K keys and checkpoint
         let checkpoint_lsn;
         {
             let mut btree = BTreeIndex::create_with_config(
-                disk.clone(),
-                pool.clone(),
                 0,
                 checkpoint_dir.clone(),
                 CheckpointConfig {
@@ -1746,9 +1706,7 @@ async fn test_recovery_with_checkpoint() {
         let recovery_start = Instant::now();
 
         // Load checkpoint
-        let mut recovered = BTreeIndex::open(disk.clone(), pool.clone(), 0, &checkpoint_dir)
-            .await
-            .unwrap();
+        let mut recovered = BTreeIndex::open(0, &checkpoint_dir).await.unwrap();
 
         assert_eq!(
             recovered.checkpoint_lsn(),
@@ -1848,16 +1806,6 @@ async fn test_recovery_without_checkpoint() {
     std::fs::create_dir_all(&checkpoint_dir).unwrap();
     std::fs::create_dir_all(&wal_dir).unwrap();
 
-    let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir: dir.path().to_path_buf(),
-            fsync_enabled: false,
-        })
-        .await
-        .unwrap(),
-    );
-    let pool = Arc::new(BufferPool::auto_sized());
-
     // Phase 1: Insert keys with WAL logging, no checkpoint
     {
         let wal_config = WalWriterConfig {
@@ -1883,9 +1831,7 @@ async fn test_recovery_without_checkpoint() {
     }
 
     // Phase 2: Recovery from WAL only (no checkpoint)
-    let mut recovered = BTreeIndex::open(disk.clone(), pool.clone(), 0, &checkpoint_dir)
-        .await
-        .unwrap();
+    let mut recovered = BTreeIndex::open(0, &checkpoint_dir).await.unwrap();
 
     assert_eq!(recovered.checkpoint_lsn(), 0, "No checkpoint should exist");
 
@@ -2193,23 +2139,11 @@ async fn test_graceful_shutdown_checkpoint() {
         let checkpoint_dir = dir.path().join("ckpt");
         std::fs::create_dir_all(&checkpoint_dir).unwrap();
 
-        let disk = Arc::new(
-            DiskManager::new(DiskManagerConfig {
-                data_dir: dir.path().to_path_buf(),
-                fsync_enabled: false,
-            })
-            .await
-            .unwrap(),
-        );
-        let pool = Arc::new(BufferPool::auto_sized());
-
         let shutdown_lsn = 99999u64;
 
         // Insert keys and shutdown
         {
             let mut btree = BTreeIndex::create_with_config(
-                disk.clone(),
-                pool.clone(),
                 0,
                 checkpoint_dir.clone(),
                 CheckpointConfig {
@@ -2238,9 +2172,7 @@ async fn test_graceful_shutdown_checkpoint() {
 
         // Startup: load from checkpoint (zero WAL replay needed)
         let startup_start = Instant::now();
-        let loaded = BTreeIndex::open(disk.clone(), pool.clone(), 0, &checkpoint_dir)
-            .await
-            .unwrap();
+        let loaded = BTreeIndex::open(0, &checkpoint_dir).await.unwrap();
         let startup_duration = startup_start.elapsed();
         let startup_ms = startup_duration.as_secs_f64() * 1000.0;
 
@@ -2330,21 +2262,9 @@ async fn test_checkpoint_scale_10m() {
         std::fs::create_dir_all(&checkpoint_dir).unwrap();
         std::fs::create_dir_all(&wal_dir).unwrap();
 
-        let disk = Arc::new(
-            DiskManager::new(DiskManagerConfig {
-                data_dir: dir.path().to_path_buf(),
-                fsync_enabled: false,
-            })
-            .await
-            .unwrap(),
-        );
-        let pool = Arc::new(BufferPool::auto_sized());
-
         // Build 10M key B+Tree
         let build_start = Instant::now();
         let mut btree = BTreeIndex::create_with_config(
-            disk.clone(),
-            pool.clone(),
             0,
             checkpoint_dir.clone(),
             CheckpointConfig {
@@ -2388,9 +2308,7 @@ async fn test_checkpoint_scale_10m() {
 
         // Load checkpoint (standalone timing)
         let load_start = Instant::now();
-        let _loaded = BTreeIndex::open(disk.clone(), pool.clone(), 0, &checkpoint_dir)
-            .await
-            .unwrap();
+        let _loaded = BTreeIndex::open(0, &checkpoint_dir).await.unwrap();
         let load_duration = load_start.elapsed();
         let load_ms = load_duration.as_secs_f64() * 1000.0;
 
@@ -2430,9 +2348,7 @@ async fn test_checkpoint_scale_10m() {
 
         // Full recovery: checkpoint load + WAL replay
         let recovery_start = Instant::now();
-        let mut recovered = BTreeIndex::open(disk.clone(), pool.clone(), 0, &checkpoint_dir)
-            .await
-            .unwrap();
+        let mut recovered = BTreeIndex::open(0, &checkpoint_dir).await.unwrap();
 
         // Replay post-checkpoint WAL
         let recovery = RecoveryManager::new(&wal_dir).unwrap();
@@ -2682,10 +2598,14 @@ async fn test_checkpoint_integration() {
     // Set up background writer with real disk writes
     let disk_for_writer = Arc::clone(&disk);
     let write_fn: WriteFn =
-        Arc::new(move |page_id, data| disk_for_writer.write_page_sync(page_id, data));
+        Arc::new(move |page_id, data| disk_for_writer.write_page_sync_no_fsync(page_id, data));
+    let disk_for_fsync = Arc::clone(&disk);
+    let fsync_fn: zyron_buffer::FsyncFn =
+        Arc::new(move |file_id| disk_for_fsync.fsync_file(file_id));
     let bg_writer = Arc::new(BackgroundWriter::new(
         Arc::clone(&pool),
         write_fn,
+        fsync_fn,
         BackgroundWriterConfig::default(),
     ));
 
@@ -2937,10 +2857,14 @@ async fn test_checkpoint_integration() {
     );
     let disk2_for_writer = Arc::clone(&disk2);
     let write_fn2: WriteFn =
-        Arc::new(move |page_id, data| disk2_for_writer.write_page_sync(page_id, data));
+        Arc::new(move |page_id, data| disk2_for_writer.write_page_sync_no_fsync(page_id, data));
+    let disk2_for_fsync = Arc::clone(&disk2);
+    let fsync_fn2: zyron_buffer::FsyncFn =
+        Arc::new(move |file_id| disk2_for_fsync.fsync_file(file_id));
     let bg_writer2 = Arc::new(BackgroundWriter::new(
         Arc::clone(&pool2),
         write_fn2,
+        fsync_fn2,
         BackgroundWriterConfig::default(),
     ));
     let tracker2 = Arc::new(CheckpointTracker::new());
@@ -3154,10 +3078,15 @@ async fn test_checkpoint_scheduler_integration() {
     let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 4096 }));
 
     let disk_for_write = Arc::clone(&disk);
-    let write_fn: WriteFn = Arc::new(move |pid, data| disk_for_write.write_page_sync(pid, data));
+    let write_fn: WriteFn =
+        Arc::new(move |pid, data| disk_for_write.write_page_sync_no_fsync(pid, data));
+    let disk_for_fsync = Arc::clone(&disk);
+    let fsync_fn: zyron_buffer::FsyncFn =
+        Arc::new(move |file_id| disk_for_fsync.fsync_file(file_id));
     let bg_writer = Arc::new(BackgroundWriter::new(
         Arc::clone(&pool),
         write_fn,
+        fsync_fn,
         BackgroundWriterConfig::default(),
     ));
 

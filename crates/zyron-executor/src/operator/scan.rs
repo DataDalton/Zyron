@@ -13,6 +13,7 @@ use std::sync::Arc;
 use zyron_buffer::BufferPool;
 use zyron_catalog::{IndexEntry, TableEntry};
 use zyron_common::Result;
+use zyron_common::TypeId;
 use zyron_common::page::{PAGE_SIZE, PageId};
 use zyron_parser::ast::{BinaryOperator, LiteralValue};
 use zyron_planner::binder::BoundExpr;
@@ -103,7 +104,8 @@ impl SeqScanOperator {
         let table_entry = ctx.get_table_entry(table_id)?;
         // cached atomic load instead of disk_manager.num_pages which would
         // queue on the per-file tokio Mutex under concurrency
-        let num_pages = ctx.get_heap_file(table_id).await?.num_pages_cached() as u64;
+        let hf = ctx.get_heap_file(table_id).await?;
+        let num_pages = hf.num_pages_cached() as u64;
         let output_ids: Vec<zyron_catalog::ColumnId> =
             columns.iter().map(|c| c.column_id).collect();
         let column_to_builder = build_column_to_builder_map(&table_entry.columns, &output_ids);
@@ -145,6 +147,8 @@ impl Operator for SeqScanOperator {
             self.ctx.check_cancelled()?;
 
             let batch_size = self.ctx.batch_size;
+            let count_only =
+                self.output_columns.is_empty() && self.predicate.is_none() && !self.track_tuple_ids;
             let mut builders = create_builders(&self.output_columns, batch_size);
             let mut tuple_ids: Vec<TupleId> = if self.track_tuple_ids {
                 Vec::with_capacity(batch_size)
@@ -208,15 +212,17 @@ impl Operator for SeqScanOperator {
                         continue;
                     }
 
-                    decode_tuple_into_builders(
-                        tuple.data,
-                        &self.table_entry.columns,
-                        &self.column_to_builder,
-                        &mut builders,
-                    );
+                    if !count_only {
+                        decode_tuple_into_builders(
+                            tuple.data,
+                            &self.table_entry.columns,
+                            &self.column_to_builder,
+                            &mut builders,
+                        );
 
-                    if self.track_tuple_ids {
-                        tuple_ids.push(TupleId::new(page_id, slot_id.0));
+                        if self.track_tuple_ids {
+                            tuple_ids.push(TupleId::new(page_id, slot_id.0));
+                        }
                     }
 
                     row_count += 1;
@@ -238,6 +244,13 @@ impl Operator for SeqScanOperator {
             if row_count == 0 {
                 self.finished = true;
                 return Ok(None);
+            }
+
+            // Count-only path emits the visible-row count with no column data.
+            if count_only {
+                return Ok(Some(ExecutionBatch::new(DataBatch::with_row_count(
+                    row_count,
+                ))));
             }
 
             let batch = finalize_builders(builders);
@@ -288,6 +301,11 @@ impl Operator for SeqScanOperator {
 pub struct ParallelSeqScanOperator {
     receiver: tokio::sync::mpsc::Receiver<Result<DataBatch>>,
     finished: bool,
+    /// Worker join handles, retained so a worker that panics (rather than
+    /// returning Err through the channel) is detected as an error instead of
+    /// being mistaken for clean end-of-stream, which would silently truncate
+    /// the result set.
+    workers: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl ParallelSeqScanOperator {
@@ -314,6 +332,7 @@ impl ParallelSeqScanOperator {
         // without unbounded buffering.
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<DataBatch>>(num_workers * 2);
 
+        let mut workers = Vec::with_capacity(num_workers);
         for worker_id in 0..num_workers {
             let start_page = worker_id as u64 * pages_per_worker;
             let end_page = ((worker_id as u64 + 1) * pages_per_worker).min(num_pages);
@@ -328,7 +347,7 @@ impl ParallelSeqScanOperator {
             let columns = columns.clone();
             let predicate = predicate.clone();
 
-            tokio::spawn(async move {
+            workers.push(tokio::spawn(async move {
                 let result = scan_page_range(
                     &ctx,
                     &table_entry,
@@ -344,12 +363,13 @@ impl ParallelSeqScanOperator {
                 if let Err(e) = result {
                     let _ = tx.send(Err(e)).await;
                 }
-            });
+            }));
         }
 
         Ok(Self {
             receiver: rx,
             finished: false,
+            workers,
         })
     }
 }
@@ -365,101 +385,161 @@ async fn scan_page_range(
     end_page: u64,
     tx: &tokio::sync::mpsc::Sender<Result<DataBatch>>,
 ) -> Result<()> {
-    let batch_size = BATCH_SIZE;
-    let mut page_cursor = start_page;
-    // Resume position within the current page when a batch fills mid-page.
-    // Without this, slots after the break would be skipped because page_cursor
-    // already advanced
-    let mut slot_cursor: u16 = 0;
-
-    let output_ids: Vec<zyron_catalog::ColumnId> =
-        output_columns.iter().map(|c| c.column_id).collect();
-    let column_to_builder = build_column_to_builder_map(&table_entry.columns, &output_ids);
-
-    while page_cursor < end_page {
-        ctx.check_cancelled()?;
-
-        let mut builders = create_builders(output_columns, batch_size);
-        let mut row_count = 0usize;
-
-        while row_count < batch_size && page_cursor < end_page {
-            let page_id = PageId::new(table_entry.heap_file_id, page_cursor);
-
-            let page_data: [u8; PAGE_SIZE] =
-                read_page_through_pool(&ctx.buffer_pool, &ctx.disk_manager, page_id).await?;
-
-            let header = HeapPage::heap_header_from_slice(&page_data);
-            if header.slot_count == 0 {
-                page_cursor += 1;
-                slot_cursor = 0;
-                continue;
-            }
-
-            let page = HeapPage::from_bytes(page_data);
-            let slot_count = header.slot_count;
-            let mut slot_idx = slot_cursor;
-            let mut filled_batch = false;
-
-            while slot_idx < slot_count {
-                let slot_id = zyron_storage::SlotId(slot_idx);
-                slot_idx += 1;
-                let Some(tuple) = page.get_tuple_view(slot_id) else {
-                    continue;
-                };
-                if tuple.is_deleted() {
-                    continue;
-                }
-                let hdr = tuple.header;
-                if !hdr.is_visible_to(&ctx.snapshot) {
-                    continue;
-                }
-
-                decode_tuple_into_builders(
-                    tuple.data,
-                    &table_entry.columns,
-                    &column_to_builder,
-                    &mut builders,
-                );
-
-                row_count += 1;
-                if row_count >= batch_size {
-                    filled_batch = true;
-                    break;
-                }
-            }
-
-            if filled_batch && slot_idx < slot_count {
-                slot_cursor = slot_idx;
-            } else {
-                page_cursor += 1;
-                slot_cursor = 0;
-            }
-        }
-
-        if row_count == 0 {
-            break;
-        }
-
-        let batch = finalize_builders(builders);
-
-        let output = if let Some(pred) = predicate {
-            let mask_col = evaluate(pred, &batch, output_columns, &ctx.params)?;
-            let mask = column_to_mask(&mask_col);
-            let filtered = batch.filter(&mask);
-            if filtered.num_rows == 0 {
-                continue;
-            }
-            filtered
-        } else {
-            batch
-        };
-
-        if tx.send(Ok(output)).await.is_err() {
+    let mut scanner = PageRangeScanner::new(
+        ctx,
+        table_entry,
+        output_columns,
+        predicate,
+        start_page,
+        end_page,
+    );
+    while let Some(batch) = scanner.next_batch().await? {
+        if tx.send(Ok(batch)).await.is_err() {
             break;
         }
     }
-
     Ok(())
+}
+
+/// Pull-based scanner over a contiguous page range. The single
+/// decode/visibility/count-only path shared by the parallel scan and the
+/// parallel aggregate, so both consume rows identically.
+///
+/// Count-only mirrors SeqScanOperator. When no columns are projected and no
+/// predicate filters rows, COUNT(*) needs only the visible-row count, so the
+/// batch carries num_rows with no column data. Without this the empty builders
+/// finalize to a zero-column batch whose num_rows is 0, dropping every row.
+pub(crate) struct PageRangeScanner<'a> {
+    ctx: &'a ExecutionContext,
+    table_entry: &'a TableEntry,
+    output_columns: &'a [LogicalColumn],
+    predicate: Option<&'a BoundExpr>,
+    column_to_builder: Vec<Option<u16>>,
+    count_only: bool,
+    page_cursor: u64,
+    end_page: u64,
+    // Resume position within the current page when a batch fills mid-page.
+    // Without this, slots after the break would be skipped because page_cursor
+    // already advanced.
+    slot_cursor: u16,
+}
+
+impl<'a> PageRangeScanner<'a> {
+    pub(crate) fn new(
+        ctx: &'a ExecutionContext,
+        table_entry: &'a TableEntry,
+        output_columns: &'a [LogicalColumn],
+        predicate: Option<&'a BoundExpr>,
+        start_page: u64,
+        end_page: u64,
+    ) -> Self {
+        let output_ids: Vec<zyron_catalog::ColumnId> =
+            output_columns.iter().map(|c| c.column_id).collect();
+        let column_to_builder = build_column_to_builder_map(&table_entry.columns, &output_ids);
+        let count_only = output_columns.is_empty() && predicate.is_none();
+        Self {
+            ctx,
+            table_entry,
+            output_columns,
+            predicate,
+            column_to_builder,
+            count_only,
+            page_cursor: start_page,
+            end_page,
+            slot_cursor: 0,
+        }
+    }
+
+    /// Produces the next result batch, or None when the range is exhausted.
+    pub(crate) async fn next_batch(&mut self) -> Result<Option<DataBatch>> {
+        let batch_size = self.ctx.batch_size;
+
+        while self.page_cursor < self.end_page {
+            self.ctx.check_cancelled()?;
+
+            let mut builders = create_builders(self.output_columns, batch_size);
+            let mut row_count = 0usize;
+
+            while row_count < batch_size && self.page_cursor < self.end_page {
+                let page_id = PageId::new(self.table_entry.heap_file_id, self.page_cursor);
+
+                let page_data: [u8; PAGE_SIZE] =
+                    read_page_through_pool(&self.ctx.buffer_pool, &self.ctx.disk_manager, page_id)
+                        .await?;
+
+                let header = HeapPage::heap_header_from_slice(&page_data);
+                if header.slot_count == 0 {
+                    self.page_cursor += 1;
+                    self.slot_cursor = 0;
+                    continue;
+                }
+
+                let page = HeapPage::from_bytes(page_data);
+                let slot_count = header.slot_count;
+                let mut slot_idx = self.slot_cursor;
+                let mut filled_batch = false;
+
+                while slot_idx < slot_count {
+                    let slot_id = zyron_storage::SlotId(slot_idx);
+                    slot_idx += 1;
+                    let Some(tuple) = page.get_tuple_view(slot_id) else {
+                        continue;
+                    };
+                    if tuple.is_deleted() {
+                        continue;
+                    }
+                    let hdr = tuple.header;
+                    if !hdr.is_visible_to(&self.ctx.snapshot) {
+                        continue;
+                    }
+
+                    if !self.count_only {
+                        decode_tuple_into_builders(
+                            tuple.data,
+                            &self.table_entry.columns,
+                            &self.column_to_builder,
+                            &mut builders,
+                        );
+                    }
+
+                    row_count += 1;
+                    if row_count >= batch_size {
+                        filled_batch = true;
+                        break;
+                    }
+                }
+
+                if filled_batch && slot_idx < slot_count {
+                    self.slot_cursor = slot_idx;
+                } else {
+                    self.page_cursor += 1;
+                    self.slot_cursor = 0;
+                }
+            }
+
+            if row_count == 0 {
+                break;
+            }
+
+            if self.count_only {
+                return Ok(Some(DataBatch::with_row_count(row_count)));
+            }
+
+            let batch = finalize_builders(builders);
+            if let Some(pred) = self.predicate {
+                let mask_col = evaluate(pred, &batch, self.output_columns, &self.ctx.params)?;
+                let mask = column_to_mask(&mask_col);
+                let filtered = batch.filter(&mask);
+                if filtered.num_rows == 0 {
+                    continue;
+                }
+                return Ok(Some(filtered));
+            }
+            return Ok(Some(batch));
+        }
+
+        Ok(None)
+    }
 }
 
 impl Operator for ParallelSeqScanOperator {
@@ -477,6 +557,18 @@ impl Operator for ParallelSeqScanOperator {
                 }
                 None => {
                     self.finished = true;
+                    // The channel closed because every worker's sender dropped.
+                    // Distinguish clean completion from a worker that panicked
+                    // (which would otherwise look like an early end-of-stream
+                    // and silently truncate results). Join the handles and
+                    // surface a panic as an execution error.
+                    for handle in self.workers.drain(..) {
+                        if handle.await.is_err() {
+                            return Err(zyron_common::ZyronError::ExecutionError(
+                                "parallel scan worker panicked".to_string(),
+                            ));
+                        }
+                    }
                     Ok(None)
                 }
             }
@@ -530,7 +622,11 @@ fn literal_to_key_bytes(value: &LiteralValue) -> Option<Vec<u8>> {
 /// Predicates that cannot be decomposed into range bounds (complex AND
 /// trees, OR, functions) return an unbounded scan, letting the remaining
 /// predicate handle correctness via post-filtering.
-fn extract_scan_bounds(predicate: &BoundExpr, index: &IndexEntry) -> ScanBounds {
+fn extract_scan_bounds(
+    predicate: &BoundExpr,
+    index: &IndexEntry,
+    params: &[ScalarValue],
+) -> ScanBounds {
     if index.columns.is_empty() {
         return ScanBounds {
             start_key: None,
@@ -547,7 +643,7 @@ fn extract_scan_bounds(predicate: &BoundExpr, index: &IndexEntry) -> ScanBounds 
             right,
             ..
         } => {
-            if let Some(bytes) = match_column_literal(left, right, index_col_id) {
+            if let Some(bytes) = match_column_literal(left, right, index_col_id, params) {
                 return ScanBounds {
                     start_key: Some(bytes.clone()),
                     end_key: Some(bytes),
@@ -561,7 +657,7 @@ fn extract_scan_bounds(predicate: &BoundExpr, index: &IndexEntry) -> ScanBounds 
             right,
             ..
         } => {
-            if let Some(bytes) = match_column_op_literal(left, right, index_col_id) {
+            if let Some(bytes) = match_column_op_literal(left, right, index_col_id, params) {
                 // Start just after this key. For integer keys, increment by 1.
                 let start = increment_key(&bytes);
                 return ScanBounds {
@@ -570,7 +666,7 @@ fn extract_scan_bounds(predicate: &BoundExpr, index: &IndexEntry) -> ScanBounds 
                 };
             }
             // literal > col means col < literal
-            if let Some(bytes) = match_literal_op_column(left, right, index_col_id) {
+            if let Some(bytes) = match_literal_op_column(left, right, index_col_id, params) {
                 let end = decrement_key(&bytes);
                 return ScanBounds {
                     start_key: None,
@@ -585,13 +681,13 @@ fn extract_scan_bounds(predicate: &BoundExpr, index: &IndexEntry) -> ScanBounds 
             right,
             ..
         } => {
-            if let Some(bytes) = match_column_op_literal(left, right, index_col_id) {
+            if let Some(bytes) = match_column_op_literal(left, right, index_col_id, params) {
                 return ScanBounds {
                     start_key: Some(bytes),
                     end_key: None,
                 };
             }
-            if let Some(bytes) = match_literal_op_column(left, right, index_col_id) {
+            if let Some(bytes) = match_literal_op_column(left, right, index_col_id, params) {
                 return ScanBounds {
                     start_key: None,
                     end_key: Some(bytes),
@@ -605,14 +701,14 @@ fn extract_scan_bounds(predicate: &BoundExpr, index: &IndexEntry) -> ScanBounds 
             right,
             ..
         } => {
-            if let Some(bytes) = match_column_op_literal(left, right, index_col_id) {
+            if let Some(bytes) = match_column_op_literal(left, right, index_col_id, params) {
                 let end = decrement_key(&bytes);
                 return ScanBounds {
                     start_key: None,
                     end_key: Some(end),
                 };
             }
-            if let Some(bytes) = match_literal_op_column(left, right, index_col_id) {
+            if let Some(bytes) = match_literal_op_column(left, right, index_col_id, params) {
                 let start = increment_key(&bytes);
                 return ScanBounds {
                     start_key: Some(start),
@@ -627,13 +723,13 @@ fn extract_scan_bounds(predicate: &BoundExpr, index: &IndexEntry) -> ScanBounds 
             right,
             ..
         } => {
-            if let Some(bytes) = match_column_op_literal(left, right, index_col_id) {
+            if let Some(bytes) = match_column_op_literal(left, right, index_col_id, params) {
                 return ScanBounds {
                     start_key: None,
                     end_key: Some(bytes),
                 };
             }
-            if let Some(bytes) = match_literal_op_column(left, right, index_col_id) {
+            if let Some(bytes) = match_literal_op_column(left, right, index_col_id, params) {
                 return ScanBounds {
                     start_key: Some(bytes),
                     end_key: None,
@@ -648,8 +744,9 @@ fn extract_scan_bounds(predicate: &BoundExpr, index: &IndexEntry) -> ScanBounds 
             negated: false,
         } => {
             if matches_index_column(expr, index_col_id) {
-                let start = extract_literal_bytes(low);
-                let end = extract_literal_bytes(high);
+                let col_ty = column_type_id(expr);
+                let start = extract_constant_bytes(low, params, col_ty);
+                let end = extract_constant_bytes(high, params, col_ty);
                 if start.is_some() || end.is_some() {
                     return ScanBounds {
                         start_key: start,
@@ -665,8 +762,8 @@ fn extract_scan_bounds(predicate: &BoundExpr, index: &IndexEntry) -> ScanBounds 
             right,
             ..
         } => {
-            let left_bounds = extract_scan_bounds(left, index);
-            let right_bounds = extract_scan_bounds(right, index);
+            let left_bounds = extract_scan_bounds(left, index, params);
+            let right_bounds = extract_scan_bounds(right, index, params);
             return ScanBounds {
                 start_key: pick_later_key(left_bounds.start_key, right_bounds.start_key),
                 end_key: pick_earlier_key(left_bounds.end_key, right_bounds.end_key),
@@ -686,43 +783,167 @@ fn matches_index_column(expr: &BoundExpr, col_id: zyron_catalog::ColumnId) -> bo
     matches!(expr, BoundExpr::ColumnRef(cr) if cr.column_id == col_id)
 }
 
-/// Checks if left is a ColumnRef matching col_id and right is a literal.
-/// Returns the literal serialized as key bytes.
+/// Returns the TypeId carried by a ColumnRef expression when one is
+/// present, otherwise None. Used so index bound encoding can coerce a
+/// parameter scalar to the same byte layout the indexer used at INSERT
+/// time even when the wire layer decoded the parameter as Utf8 (which
+/// happens whenever the client sent Parse with zero param type hints).
+fn column_type_id(expr: &BoundExpr) -> Option<TypeId> {
+    if let BoundExpr::ColumnRef(cr) = expr {
+        Some(cr.type_id)
+    } else {
+        None
+    }
+}
+
+/// Checks if left is a ColumnRef matching col_id and right is a constant.
+/// Returns the constant serialized as key bytes.
 fn match_column_op_literal(
     left: &BoundExpr,
     right: &BoundExpr,
     col_id: zyron_catalog::ColumnId,
+    params: &[ScalarValue],
 ) -> Option<Vec<u8>> {
     if matches_index_column(left, col_id) {
-        return extract_literal_bytes(right);
+        return extract_constant_bytes(right, params, column_type_id(left));
     }
     None
 }
 
-/// Checks if left is a literal and right is a ColumnRef matching col_id.
-/// Returns the literal serialized as key bytes.
+/// Checks if left is a constant and right is a ColumnRef matching col_id.
+/// Returns the constant serialized as key bytes.
 fn match_literal_op_column(
     left: &BoundExpr,
     right: &BoundExpr,
     col_id: zyron_catalog::ColumnId,
+    params: &[ScalarValue],
 ) -> Option<Vec<u8>> {
     if matches_index_column(right, col_id) {
-        return extract_literal_bytes(left);
+        return extract_constant_bytes(left, params, column_type_id(right));
     }
     None
 }
 
-/// Matches col = literal or literal = col patterns.
+/// Matches col = constant or constant = col patterns.
 fn match_column_literal(
     left: &BoundExpr,
     right: &BoundExpr,
     col_id: zyron_catalog::ColumnId,
+    params: &[ScalarValue],
 ) -> Option<Vec<u8>> {
-    match_column_op_literal(left, right, col_id)
-        .or_else(|| match_literal_op_column(left, right, col_id))
+    match_column_op_literal(left, right, col_id, params)
+        .or_else(|| match_literal_op_column(left, right, col_id, params))
 }
 
-/// Extracts literal bytes from a BoundExpr::Literal.
+/// Extracts constant bytes from a `BoundExpr::Literal` or a
+/// `BoundExpr::Parameter` resolved against the executor's bind parameters.
+/// `column_ty` is the TypeId of the indexed column being compared, used to
+/// coerce a Utf8-decoded parameter back to the column's wire encoding.
+fn extract_constant_bytes(
+    expr: &BoundExpr,
+    params: &[ScalarValue],
+    column_ty: Option<TypeId>,
+) -> Option<Vec<u8>> {
+    match expr {
+        BoundExpr::Literal { value, .. } => literal_to_key_bytes(value),
+        // PG parameter indexes are 1-based ($1, $2, ...) while the params
+        // slice is 0-based. The mismatch silently produced empty bounds and
+        // an open range scan for every prepared point lookup.
+        BoundExpr::Parameter { index, .. } if *index >= 1 => params
+            .get(*index - 1)
+            .and_then(|v| scalar_to_key_bytes(v, column_ty)),
+        _ => None,
+    }
+}
+
+/// Encodes a bound parameter into the same big-endian, order-preserving
+/// byte layout that `encode_btree_key_into` uses when an indexed row is
+/// indexed. `column_ty` is the indexed column's TypeId, used to coerce
+/// from the parameter's wire-decoded scalar shape (often Utf8 when the
+/// client did not send param type hints during Parse) to the layout the
+/// indexer wrote.
+fn scalar_to_key_bytes(value: &ScalarValue, column_ty: Option<TypeId>) -> Option<Vec<u8>> {
+    if let (ScalarValue::Utf8(s), Some(ty)) = (value, column_ty) {
+        if let Some(bytes) = coerce_text_to_key_bytes(s, ty) {
+            return Some(bytes);
+        }
+    }
+    match value {
+        ScalarValue::Null => None,
+        ScalarValue::Boolean(b) => Some(vec![*b as u8]),
+        ScalarValue::Int8(v) => Some((*v as i64 as u64).to_be_bytes().to_vec()),
+        ScalarValue::Int16(v) => Some((*v as i64 as u64).to_be_bytes().to_vec()),
+        ScalarValue::Int32(v) => Some((*v as i64 as u64).to_be_bytes().to_vec()),
+        ScalarValue::Int64(v) => Some((*v as u64).to_be_bytes().to_vec()),
+        ScalarValue::Int128(v) => {
+            let key = (*v as u128) ^ (1u128 << 127);
+            Some(key.to_be_bytes().to_vec())
+        }
+        ScalarValue::UInt8(v) => Some((*v as u64).to_be_bytes().to_vec()),
+        ScalarValue::UInt16(v) => Some((*v as u64).to_be_bytes().to_vec()),
+        ScalarValue::UInt32(v) => Some((*v as u64).to_be_bytes().to_vec()),
+        ScalarValue::UInt64(v) => Some(v.to_be_bytes().to_vec()),
+        ScalarValue::Float32(v) => {
+            let bits = (*v as f64).to_bits();
+            let sortable = if bits >> 63 == 1 {
+                !bits
+            } else {
+                bits ^ (1u64 << 63)
+            };
+            Some(sortable.to_be_bytes().to_vec())
+        }
+        ScalarValue::Float64(v) => {
+            let bits = v.to_bits();
+            let sortable = if bits >> 63 == 1 {
+                !bits
+            } else {
+                bits ^ (1u64 << 63)
+            };
+            Some(sortable.to_be_bytes().to_vec())
+        }
+        ScalarValue::Utf8(s) => Some(s.as_bytes().to_vec()),
+        ScalarValue::Binary(b) => Some(b.clone()),
+        ScalarValue::FixedBinary16(b) => Some(b.to_vec()),
+        ScalarValue::Interval(i) => Some(i.to_le_bytes().to_vec()),
+    }
+}
+
+/// Coerces a text-encoded parameter to the byte layout the indexer wrote
+/// for a column of the given TypeId. Returns None when the text cannot be
+/// parsed to that type, which causes the caller to fall back to the raw
+/// Utf8 byte path and the index scan to come up empty.
+fn coerce_text_to_key_bytes(text: &str, ty: TypeId) -> Option<Vec<u8>> {
+    match ty {
+        TypeId::Int8 | TypeId::Int16 | TypeId::Int32 | TypeId::Int64 => text
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .map(|v| (v as u64).to_be_bytes().to_vec()),
+        TypeId::UInt8 | TypeId::UInt16 | TypeId::UInt32 | TypeId::UInt64 => text
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(|v| v.to_be_bytes().to_vec()),
+        TypeId::Float32 | TypeId::Float64 => text.trim().parse::<f64>().ok().map(|v| {
+            let bits = v.to_bits();
+            let sortable = if bits >> 63 == 1 {
+                !bits
+            } else {
+                bits ^ (1u64 << 63)
+            };
+            sortable.to_be_bytes().to_vec()
+        }),
+        TypeId::Boolean => match text.trim() {
+            "t" | "T" | "true" | "TRUE" | "1" | "yes" | "on" => Some(vec![1]),
+            "f" | "F" | "false" | "FALSE" | "0" | "no" | "off" => Some(vec![0]),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Extracts literal bytes from a `BoundExpr::Literal`. Kept for callers
+/// that already have a literal in hand and do not need parameter lookup.
 fn extract_literal_bytes(expr: &BoundExpr) -> Option<Vec<u8>> {
     if let BoundExpr::Literal { value, .. } = expr {
         literal_to_key_bytes(value)
@@ -824,7 +1045,29 @@ impl IndexScanOperator {
     ) -> Result<Self> {
         // Try B+ tree path when both index metadata and a live tree are available.
         if let (Some(index_entry), Some(btree_index)) = (&index, &btree) {
-            let bounds = extract_scan_bounds(&predicate, index_entry);
+            let bounds = extract_scan_bounds(&predicate, index_entry, &ctx.params);
+
+            // If bounds extraction could not narrow the scan to a single
+            // key range, the predicate still has to filter the result so
+            // we do not return rows that do not match. Push it into the
+            // remaining_predicate so the post-filter catches them. This
+            // keeps correctness intact for any predicate shape that the
+            // bounds extractor does not yet decompose (function calls,
+            // OR, unsupported scalar shapes) without silently degrading
+            // an indexed lookup into an open scan.
+            let effective_remaining = if bounds.start_key.is_none() && bounds.end_key.is_none() {
+                match remaining_predicate {
+                    Some(rest) => Some(BoundExpr::BinaryOp {
+                        left: Box::new(predicate.clone()),
+                        op: BinaryOperator::And,
+                        right: Box::new(rest),
+                        type_id: zyron_common::TypeId::Boolean,
+                    }),
+                    None => Some(predicate.clone()),
+                }
+            } else {
+                remaining_predicate
+            };
 
             let table_entry = ctx.get_table_entry(table_id)?;
             let heap_file_id = table_entry.heap_file_id;
@@ -851,7 +1094,7 @@ impl IndexScanOperator {
                     table_entry,
                     output_columns: columns,
                     column_to_builder,
-                    remaining_predicate,
+                    remaining_predicate: effective_remaining,
                     track_tuple_ids,
                     tuple_ids,
                     cursor: 0,

@@ -33,9 +33,17 @@ impl Default for BackgroundWriterConfig {
     }
 }
 
-/// Write function type for flushing pages to disk.
-/// Decoupled from DiskManager so the buffer crate has no storage dependency.
+/// Write function type for flushing pages to disk. Expected to write the
+/// page WITHOUT issuing fsync, the writer batches fsync across a whole
+/// cycle through `FsyncFn`. Decoupled from DiskManager so the buffer
+/// crate has no storage dependency.
 pub type WriteFn = Arc<dyn Fn(PageId, &[u8; PAGE_SIZE]) -> Result<()> + Send + Sync>;
+
+/// File-level fsync function. Invoked once per touched file_id at the end
+/// of each flush cycle, replacing per-page fsync calls. On platforms where
+/// fsync dominates page-write cost (notably Windows ~5ms per fsync), this
+/// turns 64 fsyncs into 1-3 per cycle and unblocks the buffer pool.
+pub type FsyncFn = Arc<dyn Fn(u32) -> Result<()> + Send + Sync>;
 
 /// Background writer that continuously flushes dirty pages to disk.
 ///
@@ -58,8 +66,16 @@ pub struct BackgroundWriter {
 }
 
 impl BackgroundWriter {
-    /// Creates and starts the background writer thread.
-    pub fn new(pool: Arc<BufferPool>, write_fn: WriteFn, config: BackgroundWriterConfig) -> Self {
+    /// Creates and starts the background writer thread. `write_fn` is
+    /// expected to write a page WITHOUT fsync, then `fsync_fn` is called
+    /// once per touched file at the end of each cycle. Pass a no-op
+    /// `fsync_fn` for in-memory tests.
+    pub fn new(
+        pool: Arc<BufferPool>,
+        write_fn: WriteFn,
+        fsync_fn: FsyncFn,
+        config: BackgroundWriterConfig,
+    ) -> Self {
         let target_lsn = Arc::new(AtomicU64::new(0));
         let min_dirty_lsn = Arc::new(AtomicU64::new(u64::MAX));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -83,6 +99,7 @@ impl BackgroundWriter {
                 Self::writer_loop(
                     &thread_pool,
                     &write_fn,
+                    &fsync_fn,
                     &thread_target,
                     &thread_min_dirty,
                     &thread_shutdown,
@@ -106,6 +123,7 @@ impl BackgroundWriter {
     fn writer_loop(
         pool: &BufferPool,
         write_fn: &WriteFn,
+        fsync_fn: &FsyncFn,
         target_lsn: &AtomicU64,
         min_dirty_lsn: &AtomicU64,
         shutdown: &AtomicBool,
@@ -118,6 +136,7 @@ impl BackgroundWriter {
                 Self::flush_cycle(
                     pool,
                     write_fn,
+                    fsync_fn,
                     u64::MAX,
                     min_dirty_lsn,
                     pages_flushed,
@@ -133,6 +152,7 @@ impl BackgroundWriter {
             let flushed = Self::flush_cycle(
                 pool,
                 write_fn,
+                fsync_fn,
                 threshold,
                 min_dirty_lsn,
                 pages_flushed,
@@ -153,6 +173,7 @@ impl BackgroundWriter {
     fn flush_cycle(
         pool: &BufferPool,
         write_fn: &WriteFn,
+        fsync_fn: &FsyncFn,
         threshold: u64,
         min_dirty_lsn: &AtomicU64,
         pages_flushed: &AtomicU64,
@@ -170,10 +191,20 @@ impl BackgroundWriter {
 
         let mut flushed = 0;
         let mut new_min = u64::MAX;
+        // Track touched file_ids so fsync runs once per file at the end,
+        // not once per page. Most batches touch a handful of files so the
+        // pre-reserved Vec stays small. Linear `contains` over <=8 entries
+        // is faster than a HashSet hash for these sizes.
+        let mut touched: Vec<u32> = Vec::with_capacity(8);
 
         for &(page_id, frame_id, dlsn) in &dirty_pages {
             match pool.flush_dirty_frame(page_id, frame_id, dlsn, |pid, data| write_fn(pid, data)) {
-                Ok(true) => flushed += 1,
+                Ok(true) => {
+                    flushed += 1;
+                    if !touched.contains(&page_id.file_id) {
+                        touched.push(page_id.file_id);
+                    }
+                }
                 Ok(false) => {
                     // Page was evicted or already clean, track its LSN as still pending
                     if dlsn < new_min {
@@ -187,6 +218,11 @@ impl BackgroundWriter {
                     }
                 }
             }
+        }
+
+        // One fsync per touched file replaces 64 fsyncs per cycle.
+        for &file_id in &touched {
+            let _ = fsync_fn(file_id);
         }
 
         pages_flushed.fetch_add(flushed as u64, Ordering::Relaxed);
@@ -278,9 +314,11 @@ mod tests {
             pool.mark_dirty_with_lsn(page_id, (i + 1) * 100);
         }
 
+        let fsync_fn: FsyncFn = Arc::new(|_fid| Ok(()));
         let mut writer = BackgroundWriter::new(
             Arc::clone(&pool),
             write_fn,
+            fsync_fn,
             BackgroundWriterConfig {
                 pages_per_cycle: 64,
                 idle_sleep_us: 100,
@@ -322,9 +360,11 @@ mod tests {
             pool.mark_dirty_with_lsn(page_id, 1000 + (i - 5) * 100);
         }
 
+        let fsync_fn: FsyncFn = Arc::new(|_fid| Ok(()));
         let mut writer = BackgroundWriter::new(
             Arc::clone(&pool),
             write_fn,
+            fsync_fn,
             BackgroundWriterConfig {
                 pages_per_cycle: 64,
                 idle_sleep_us: 100,
@@ -357,9 +397,11 @@ mod tests {
         pool.unpin_page(page_id, true);
         pool.mark_dirty_with_lsn(page_id, 500);
 
+        let fsync_fn: FsyncFn = Arc::new(|_fid| Ok(()));
         let mut writer = BackgroundWriter::new(
             Arc::clone(&pool),
             write_fn,
+            fsync_fn,
             BackgroundWriterConfig {
                 pages_per_cycle: 64,
                 idle_sleep_us: 100,
@@ -398,9 +440,11 @@ mod tests {
         }
 
         // Shut down immediately (no sleep). The shutdown final flush should get them.
+        let fsync_fn: FsyncFn = Arc::new(|_fid| Ok(()));
         let mut writer = BackgroundWriter::new(
             Arc::clone(&pool),
             write_fn,
+            fsync_fn,
             BackgroundWriterConfig {
                 pages_per_cycle: 64,
                 idle_sleep_us: 500_000, // Very long idle so it doesn't flush before shutdown

@@ -394,7 +394,7 @@ impl ZyronRowSink {
         let insert_result = rt.block_on(async { self.heap.insert_batch(&tuples).await });
         match insert_result {
             Ok(_) => {
-                self.txn_manager.commit(&mut txn)?;
+                self.txn_manager.commit_blocking(&mut txn)?;
                 Ok(())
             }
             Err(e) => {

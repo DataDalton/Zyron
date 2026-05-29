@@ -45,8 +45,8 @@ pub mod webauthn_store;
 pub mod webhook;
 
 pub use abac::{
-    AbacEffect, AbacOperator, AbacPolicy, AbacRule, AbacRuleStore, AbacStore, AttributeCondition,
-    SessionAttributes,
+    AbacEffect, AbacOperator, AbacPolicy, AbacRule, AbacRuleStore, AbacStore, AbacTarget,
+    AttributeCondition, SessionAttributes,
 };
 pub use auth_rules::{AuthMethod, AuthResolver, AuthRule, ConnectionType};
 pub use balloon::BalloonParams;
@@ -158,6 +158,9 @@ pub struct SecurityManager {
     /// Monotonic counter for generating unique role IDs. Initialized from
     /// the max existing role ID at startup to survive restarts.
     next_role_id: std::sync::atomic::AtomicU32,
+    /// Monotonic counter for ABAC policy IDs, recovered from the max existing
+    /// policy id at startup.
+    next_abac_policy_id: std::sync::atomic::AtomicU32,
     /// TTL-aware cache shared across dynamic credential providers.
     pub credential_cache: Arc<CredentialCache>,
     /// mTLS certificate fingerprint pinning, subject-id keyed.
@@ -226,6 +229,7 @@ impl SecurityManager {
             webauthn_rp_config,
             auth_storage,
             next_role_id: std::sync::atomic::AtomicU32::new(1),
+            next_abac_policy_id: std::sync::atomic::AtomicU32::new(1),
             credential_cache: Arc::new(CredentialCache::new()),
             mtls_pinning: CertFingerprintStore::new(),
             crl_ocsp: CrlOcspChecker::new(None)?,
@@ -246,7 +250,41 @@ impl SecurityManager {
             .next_role_id
             .store(max_id + 1, std::sync::atomic::Ordering::Relaxed);
 
+        // Recover the ABAC policy id counter from the loaded policies.
+        manager.next_abac_policy_id.store(
+            manager.abac_store.max_id() + 1,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
         Ok(manager)
+    }
+
+    /// Creates an ABAC policy: allocates an id (when zero), adds it to the
+    /// in-memory store, then persists it. On a persistence failure the
+    /// in-memory addition is rolled back so the store matches durable state.
+    pub async fn create_abac_policy(&self, mut policy: abac::AbacPolicy) -> Result<()> {
+        if policy.id == 0 {
+            policy.id = self
+                .next_abac_policy_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let target = policy.target;
+        let object_id = policy.table_id;
+        let name = policy.name.clone();
+
+        self.abac_store.add_policy(policy.clone())?;
+        if let Err(e) = self.auth_storage.store_abac_policy(&policy).await {
+            match target {
+                abac::AbacTarget::Table => {
+                    self.abac_store.remove_policy(object_id, &name);
+                }
+                abac::AbacTarget::Publication => {
+                    self.abac_store.remove_publication_policy(object_id, &name);
+                }
+            }
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Loads all auth data from persistent storage into in-memory stores.
@@ -561,13 +599,6 @@ impl SecurityManager {
             .store_row_ownership_config(&config)
             .await?;
         self.row_ownership_store.enable(table_id, config);
-        Ok(())
-    }
-
-    /// Creates an ABAC policy.
-    pub async fn create_abac_policy(&self, policy: AbacPolicy) -> Result<()> {
-        self.auth_storage.store_abac_policy(&policy).await?;
-        self.abac_store.add_policy(policy)?;
         Ok(())
     }
 

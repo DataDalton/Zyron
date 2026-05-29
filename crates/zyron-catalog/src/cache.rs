@@ -11,10 +11,42 @@ use crate::ids::*;
 use crate::schema::*;
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use zyron_common::{FX_K, IdentityBuildHasher, fx_finalize, fx_mix};
+
+/// Pre-partitioned view of a table's indexes for fast DML hot-path lookup.
+/// One snapshot per table, rebuilt only on index DDL and atomically swapped
+/// in via `Arc` so readers take no locks.
+#[derive(Debug, Clone, Default)]
+pub struct TableIndexSnapshot {
+    /// (index_id, indexed leading column_id) pairs for B+Tree indexes.
+    pub btree: Vec<(IndexId, ColumnId)>,
+    /// (index_id, indexed leading column_id) pairs for spatial R-tree indexes.
+    pub spatial: Vec<(IndexId, ColumnId)>,
+    /// Index ids for full-text indexes.
+    pub fts: Vec<IndexId>,
+    /// Index ids for vector indexes.
+    pub vector: Vec<IndexId>,
+}
+
+impl TableIndexSnapshot {
+    /// Returns true if every kind of index list is empty. The DML hot path
+    /// uses this to skip the inner per-row loops with a single check.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.btree.is_empty()
+            && self.spatial.is_empty()
+            && self.fts.is_empty()
+            && self.vector.is_empty()
+    }
+}
+
+fn empty_index_snapshot() -> Arc<TableIndexSnapshot> {
+    static EMPTY: OnceLock<Arc<TableIndexSnapshot>> = OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::new(TableIndexSnapshot::default())))
+}
 
 /// FxHash-style rotate-xor-multiply hash for (u32 id, name) pairs.
 /// Produces well-distributed u64 keys for catalog name lookups without
@@ -47,10 +79,19 @@ pub struct CatalogCache {
     // Table entries with LRU (ID-based) + lock-free name lookup
     tables: RwLock<LruMap<TableId, Arc<TableEntry>>>,
     table_by_name: NameMap<Arc<TableEntry>>,
+    // Lock-free id-keyed mirror serving the DML hot path. get_table is hit on
+    // every insert/update/delete; reading it from the RwLock<LruMap> above made
+    // that lock the most contended cache line under concurrent writes. This scc
+    // map serves get_table with no lock. The LruMap still bounds memory and
+    // backs list/range ops. Both are written on put_table / invalidate_table.
+    tables_by_id: scc::HashMap<TableId, Arc<TableEntry>>,
 
     // Index entries (keyed by IndexId, with table_id reverse index)
     indexes: RwLock<HashMap<IndexId, Arc<IndexEntry>>>,
     table_indexes: RwLock<HashMap<TableId, Vec<IndexId>>>,
+    /// Per-table partitioned index snapshot, served lock-free from the DML
+    /// hot path. Rebuilt on `put_index` / `invalidate_index`.
+    table_index_snapshots: scc::HashMap<TableId, Arc<TableIndexSnapshot>>,
 
     // Streaming job entries. The name-index keys on the job's source_schema_id
     // since streaming jobs do not have a dedicated owning schema yet.
@@ -106,12 +147,18 @@ impl<K: std::hash::Hash + Eq + Copy, V> LruMap<K, V> {
         })
     }
 
-    fn insert(&mut self, key: K, value: V) {
+    /// Inserts an entry, returning the evicted (key, value) when inserting a
+    /// new key over capacity. Callers mirror the eviction into their lock-free
+    /// by-id / by-name maps so those stay memory-bounded with this map.
+    fn insert(&mut self, key: K, value: V) -> Option<(K, V)> {
         let ts = self.clock.fetch_add(1, Ordering::Relaxed);
-        if self.entries.len() >= self.capacity && !self.entries.contains_key(&key) {
-            self.evict_one();
-        }
+        let evicted = if self.entries.len() >= self.capacity && !self.entries.contains_key(&key) {
+            self.evict_one()
+        } else {
+            None
+        };
         self.entries.insert(key, (value, ts));
+        evicted
     }
 
     fn remove(&mut self, key: &K) -> Option<V> {
@@ -126,7 +173,7 @@ impl<K: std::hash::Hash + Eq + Copy, V> LruMap<K, V> {
         self.entries.values().map(|(v, _)| v)
     }
 
-    fn evict_one(&mut self) {
+    fn evict_one(&mut self) -> Option<(K, V)> {
         // Sampled (approximate) LRU: evict the oldest of a bounded sample
         // instead of scanning every entry for the global minimum. This is
         // O(SAMPLE) not O(capacity); a slightly suboptimal eviction only
@@ -140,9 +187,7 @@ impl<K: std::hash::Hash + Eq + Copy, V> LruMap<K, V> {
             .take(SAMPLE)
             .min_by_key(|(_, (_, ts))| *ts)
             .map(|(k, _)| *k);
-        if let Some(k) = victim {
-            self.entries.remove(&k);
-        }
+        victim.and_then(|k| self.entries.remove(&k).map(|(v, _)| (k, v)))
     }
 }
 
@@ -160,8 +205,10 @@ impl CatalogCache {
             schema_by_name: new_name_map(),
             tables: RwLock::new(LruMap::new(max_tables)),
             table_by_name: new_name_map(),
+            tables_by_id: scc::HashMap::new(),
             indexes: RwLock::new(HashMap::new()),
             table_indexes: RwLock::new(HashMap::new()),
+            table_index_snapshots: scc::HashMap::new(),
             streaming_jobs: RwLock::new(HashMap::new()),
             streaming_jobs_by_name: RwLock::new(HashMap::new()),
             external_sources: RwLock::new(HashMap::new()),
@@ -245,7 +292,12 @@ impl CatalogCache {
         let id = entry.id;
         let key = name_key(entry.database_id.0, &entry.name);
         let arc = Arc::new(entry);
-        self.schemas.write().insert(id, Arc::clone(&arc));
+        if let Some((evicted_id, evicted_entry)) = self.schemas.write().insert(id, Arc::clone(&arc))
+        {
+            let ekey = name_key(evicted_entry.database_id.0, &evicted_entry.name);
+            self.schema_by_name
+                .remove_if_sync(&ekey, |v| v.id == evicted_id);
+        }
         let _ = self.schema_by_name.insert_sync(key, arc);
     }
 
@@ -262,7 +314,8 @@ impl CatalogCache {
     // -----------------------------------------------------------------------
 
     pub fn get_table(&self, id: TableId) -> Option<Arc<TableEntry>> {
-        self.tables.read().get(&id).cloned()
+        self.tables_by_id
+            .read_sync(&id, |_, entry| Arc::clone(entry))
     }
 
     pub fn get_table_mut(&self, id: TableId) -> Option<Arc<TableEntry>> {
@@ -287,7 +340,26 @@ impl CatalogCache {
         let id = entry.id;
         let key = name_key(entry.schema_id.0, &entry.name);
         let arc = Arc::new(entry);
-        self.tables.write().insert(id, Arc::clone(&arc));
+        // Insert into the LRU map and propagate any eviction into the lock-free
+        // mirrors so they stay bounded with the LRU map rather than growing for
+        // the process lifetime.
+        if let Some((evicted_id, evicted_entry)) = self.tables.write().insert(id, Arc::clone(&arc))
+        {
+            self.tables_by_id.remove_sync(&evicted_id);
+            let ekey = name_key(evicted_entry.schema_id.0, &evicted_entry.name);
+            self.table_by_name
+                .remove_if_sync(&ekey, |v| v.id == evicted_id);
+        }
+        // Atomic upsert into the id-mirror so the lock-free hot path sees the
+        // new entry. Replace in place when present to avoid a stale handle.
+        match self.tables_by_id.entry_sync(id) {
+            scc::hash_map::Entry::Occupied(mut o) => {
+                *o.get_mut() = Arc::clone(&arc);
+            }
+            scc::hash_map::Entry::Vacant(v) => {
+                v.insert_entry(Arc::clone(&arc));
+            }
+        }
         // Atomic upsert: scc insert does not overwrite an existing key, so an
         // update_table on an already-cached table would otherwise leave the
         // by-name index pointing at the stale entry. entry_sync locks the
@@ -303,6 +375,7 @@ impl CatalogCache {
     }
 
     pub fn invalidate_table(&self, id: TableId) {
+        self.tables_by_id.remove_sync(&id);
         if let Some(entry) = self.tables.write().remove(&id) {
             let key = name_key(entry.schema_id.0, &entry.name);
             self.table_by_name
@@ -345,6 +418,54 @@ impl CatalogCache {
         }
     }
 
+    /// Returns the partitioned per-table index snapshot. DML hot path reads
+    /// this without acquiring any lock: `read_sync` is lock-free on scc and
+    /// the value is an `Arc` clone. Tables with no indexes share a single
+    /// static empty snapshot so the cost is one atomic increment.
+    pub fn index_snapshot(&self, table_id: TableId) -> Arc<TableIndexSnapshot> {
+        if let Some(snap) = self
+            .table_index_snapshots
+            .read_sync(&table_id, |_, v| Arc::clone(v))
+        {
+            return snap;
+        }
+        empty_index_snapshot()
+    }
+
+    fn rebuild_index_snapshot(&self, table_id: TableId) {
+        let idx_map = self.table_indexes.read();
+        let idx_store = self.indexes.read();
+        let snap = match idx_map.get(&table_id) {
+            Some(ids) => {
+                let mut s = TableIndexSnapshot::default();
+                for id in ids {
+                    let Some(entry) = idx_store.get(id) else {
+                        continue;
+                    };
+                    match entry.index_type {
+                        IndexType::BTree => {
+                            if let Some(col) = entry.columns.first() {
+                                s.btree.push((entry.id, col.column_id));
+                            }
+                        }
+                        IndexType::Spatial => {
+                            if let Some(col) = entry.columns.first() {
+                                s.spatial.push((entry.id, col.column_id));
+                            }
+                        }
+                        IndexType::Fulltext => s.fts.push(entry.id),
+                        IndexType::Vector => s.vector.push(entry.id),
+                    }
+                }
+                Arc::new(s)
+            }
+            None => empty_index_snapshot(),
+        };
+        drop(idx_store);
+        drop(idx_map);
+        self.table_index_snapshots.upsert_sync(table_id, snap);
+    }
+
     pub fn put_index(&self, entry: IndexEntry) {
         let id = entry.id;
         let table_id = entry.table_id;
@@ -355,14 +476,22 @@ impl CatalogCache {
             .entry(table_id)
             .or_default()
             .push(id);
+        self.rebuild_index_snapshot(table_id);
     }
 
     pub fn invalidate_index(&self, id: IndexId) {
-        if let Some(entry) = self.indexes.write().remove(&id) {
-            let mut ti = self.table_indexes.write();
-            if let Some(ids) = ti.get_mut(&entry.table_id) {
-                ids.retain(|i| *i != id);
+        let removed_table = {
+            let mut store = self.indexes.write();
+            store.remove(&id).map(|entry| entry.table_id)
+        };
+        if let Some(table_id) = removed_table {
+            {
+                let mut ti = self.table_indexes.write();
+                if let Some(ids) = ti.get_mut(&table_id) {
+                    ids.retain(|i| *i != id);
+                }
             }
+            self.rebuild_index_snapshot(table_id);
         }
     }
 
@@ -761,6 +890,7 @@ impl CatalogCache {
         self.schema_by_name.retain_sync(|_, _| false);
         self.tables.write().clear();
         self.table_by_name.retain_sync(|_, _| false);
+        self.tables_by_id.retain_sync(|_, _| false);
         self.indexes.write().clear();
         self.table_indexes.write().clear();
         self.streaming_jobs.write().clear();

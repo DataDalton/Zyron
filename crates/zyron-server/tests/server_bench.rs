@@ -107,10 +107,14 @@ async fn create_test_state(
     let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 4096 }));
 
     let dm_for_bg = Arc::clone(&disk);
-    let write_fn: WriteFn = Arc::new(move |pid, data| dm_for_bg.write_page_sync(pid, data));
+    let write_fn: WriteFn =
+        Arc::new(move |pid, data| dm_for_bg.write_page_sync_no_fsync(pid, data));
+    let dm_for_fsync = Arc::clone(&disk);
+    let fsync_fn: zyron_buffer::FsyncFn = Arc::new(move |file_id| dm_for_fsync.fsync_file(file_id));
     let bg_writer = Arc::new(BackgroundWriter::new(
         Arc::clone(&pool),
         write_fn,
+        fsync_fn,
         BackgroundWriterConfig::default(),
     ));
 
@@ -193,6 +197,7 @@ async fn create_test_state(
         subscription_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         heap_files: Arc::new(scc::HashMap::new()),
         btree_indexes: Arc::new(scc::HashMap::new()),
+        plan_cache: Arc::new(zyron_wire::plan_cache::ServerPlanCache::new()),
         vacuum_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         analytics_registry: zyron_analytics::default_registry(),
         legal_holds: Arc::new(zyron_lifecycle::legal_hold::LegalHoldRegistry::new()),
@@ -672,7 +677,7 @@ fn test_05_transaction_isolation() {
 
     // After txn1 commits, a new txn3 should NOT see txn1 as active
     let mut txn1 = txn1;
-    txn_mgr.commit(&mut txn1).unwrap();
+    txn_mgr.commit_blocking(&mut txn1).unwrap();
     let txn3 = txn_mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
     assert!(!txn3.snapshot.is_txn_active(txn1.txn_id));
     tprintln!("  New snapshot after commit: txn1 no longer active: PASS");

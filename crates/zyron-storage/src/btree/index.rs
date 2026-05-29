@@ -5,150 +5,99 @@ use super::constants::MAX_KEY_SIZE;
 use super::page::{BTreeInternalPage, BTreeLeafPage};
 use super::store::InMemoryPageStore;
 use super::types::{DeleteResult, LeafPageHeader, compare_keys};
-use crate::disk::DiskManager;
 use crate::tuple::TupleId;
 use bytes::Bytes;
-use parking_lot::RwLock;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use zyron_buffer::BufferPool;
 use zyron_common::page::PageId;
 use zyron_common::{Result, ZyronError};
 
 pub struct BTreeIndex {
-    /// In-memory page storage (all nodes stored here).
-    pages: RwLock<InMemoryPageStore>,
-    /// Root page number (index into pages).
+    /// Lock-free in-memory page storage. See store.rs for the version
+    /// protocol and lock_for_write semantics used by the methods below.
+    pages: InMemoryPageStore,
+    /// Root page number.
     root_page_num: AtomicU32,
-    /// Tree height (1 = just root as leaf).
+    /// Tree height, 1 means root is also the only leaf.
     height: AtomicU32,
-    /// File ID for this index (used for PageId construction).
+    /// File ID for this index, used for PageId construction.
     file_id: u32,
-    /// Disk manager for checkpoint I/O (not used in hot path).
-    #[allow(dead_code)]
-    disk: Arc<DiskManager>,
-    /// Buffer pool reference (kept for compatibility, not used in hot path).
-    #[allow(dead_code)]
-    pool: Arc<BufferPool>,
-    /// LSN of the most recent checkpoint. 0 means no checkpoint exists.
+    /// LSN of the most recent checkpoint, 0 means no checkpoint exists.
     checkpoint_lsn: AtomicU64,
     /// Directory for checkpoint files.
     checkpoint_dir: PathBuf,
-    /// WAL bytes accumulated since last checkpoint. Lock-free counter
-    /// so record_wal_bytes() on every WAL append has zero contention.
+    /// WAL bytes accumulated since last checkpoint.
     wal_bytes_since_checkpoint: AtomicU64,
-    /// WAL bytes threshold cached from CheckpointConfig. Allows
-    /// maybe_checkpoint() to skip the Mutex when below threshold.
+    /// WAL bytes threshold cached from CheckpointConfig.
     wal_bytes_threshold: u64,
-    /// Checkpoint config + last checkpoint time. Only locked when
-    /// wal_bytes exceeds threshold (rare) and for reset after checkpoint.
+    /// Checkpoint config + last checkpoint time, locked only when
+    /// wal_bytes exceeds threshold and for reset after checkpoint.
     checkpoint_trigger: parking_lot::Mutex<CheckpointTrigger>,
+    /// Serializes root-replacement during split propagation. Held only
+    /// when the root itself splits, which is rare.
+    root_change_lock: parking_lot::Mutex<()>,
 }
 
 impl BTreeIndex {
     /// Maximum B+Tree height (supports billions of keys).
     const MAX_HEIGHT: usize = 16;
 
-    /// Creates a new B+ tree index with fully in-memory storage.
-    ///
-    /// All pages are stored in RAM. Disk/BufferPool are kept for compatibility
-    /// but not used in the hot path.
-    pub async fn create(
-        disk: Arc<DiskManager>,
-        pool: Arc<BufferPool>,
-        file_id: u32,
-        checkpoint_dir: PathBuf,
-    ) -> Result<Self> {
-        Self::create_with_config(
-            disk,
-            pool,
-            file_id,
-            checkpoint_dir,
-            CheckpointConfig::default(),
-        )
-        .await
+    /// Creates a new B+ tree index. All pages live in RAM.
+    pub async fn create(file_id: u32, checkpoint_dir: PathBuf) -> Result<Self> {
+        Self::create_with_config(file_id, checkpoint_dir, CheckpointConfig::default()).await
     }
 
     /// Creates a new B+ tree index with a custom checkpoint configuration.
     pub async fn create_with_config(
-        disk: Arc<DiskManager>,
-        pool: Arc<BufferPool>,
         file_id: u32,
         checkpoint_dir: PathBuf,
         checkpoint_config: CheckpointConfig,
     ) -> Result<Self> {
-        // Create in-memory page store
         let mut store = InMemoryPageStore::new();
-
-        // Allocate root leaf page (page 0)
         let root_page_num = store.allocate();
         let root_page_id = PageId::new(file_id, root_page_num as u64);
-
-        // Initialize root as empty leaf
         let root_page = BTreeLeafPage::new(root_page_id);
         store.write(root_page_num, root_page.as_bytes());
 
         Ok(Self {
-            pages: RwLock::new(store),
+            pages: store,
             root_page_num: AtomicU32::new(root_page_num),
             height: AtomicU32::new(1),
             file_id,
-            disk,
-            pool,
             checkpoint_lsn: AtomicU64::new(0),
             checkpoint_dir,
             wal_bytes_since_checkpoint: AtomicU64::new(0),
             wal_bytes_threshold: checkpoint_config.wal_bytes_threshold,
             checkpoint_trigger: parking_lot::Mutex::new(CheckpointTrigger::new(checkpoint_config)),
+            root_change_lock: parking_lot::Mutex::new(()),
         })
     }
 
     /// Opens an existing B+ tree index, loading from checkpoint if available.
-    ///
-    /// If a .zyridx checkpoint file exists in checkpoint_dir, loads pages from it.
-    /// On checkpoint load failure (corrupt file, bad CRC), falls back to creating
-    /// an empty store. The caller is responsible for replaying WAL records after
-    /// checkpoint_lsn to bring the index up to date.
-    pub async fn open(
-        disk: Arc<DiskManager>,
-        pool: Arc<BufferPool>,
-        file_id: u32,
-        checkpoint_dir: &Path,
-    ) -> Result<Self> {
-        Self::open_with_config(
-            disk,
-            pool,
-            file_id,
-            checkpoint_dir,
-            CheckpointConfig::default(),
-        )
-        .await
+    /// On checkpoint load failure (corrupt file, bad checksum), falls back to
+    /// an empty store. The caller is responsible for replaying WAL records
+    /// after checkpoint_lsn to bring the index up to date.
+    pub async fn open(file_id: u32, checkpoint_dir: &Path) -> Result<Self> {
+        Self::open_with_config(file_id, checkpoint_dir, CheckpointConfig::default()).await
     }
 
     /// Opens an existing B+ tree index with a custom checkpoint configuration.
     pub async fn open_with_config(
-        disk: Arc<DiskManager>,
-        pool: Arc<BufferPool>,
         file_id: u32,
         checkpoint_dir: &Path,
         checkpoint_config: CheckpointConfig,
     ) -> Result<Self> {
         let checkpoint_path = checkpoint_dir.join(format!("index_{}.zyridx", file_id));
 
-        // Try loading from checkpoint file directly into the page store.
-        // V2 format: decompresses + bulk-builds the B+Tree. Returns height directly.
         if checkpoint_path.exists() {
             let mut store = InMemoryPageStore::new();
             match checkpoint::load_checkpoint_into_store(&checkpoint_path, &mut store, file_id) {
                 Ok((lsn, root_page_num, _entry_count, height)) => {
                     return Ok(Self {
-                        pages: RwLock::new(store),
+                        pages: store,
                         root_page_num: AtomicU32::new(root_page_num),
                         height: AtomicU32::new(height),
                         file_id,
-                        disk,
-                        pool,
                         checkpoint_lsn: AtomicU64::new(lsn),
                         checkpoint_dir: checkpoint_dir.to_path_buf(),
                         wal_bytes_since_checkpoint: AtomicU64::new(0),
@@ -156,16 +105,15 @@ impl BTreeIndex {
                         checkpoint_trigger: parking_lot::Mutex::new(CheckpointTrigger::new(
                             checkpoint_config,
                         )),
+                        root_change_lock: parking_lot::Mutex::new(()),
                     });
                 }
                 Err(_) => {
-                    // Corrupt checkpoint. Fall through to create empty store.
-                    // Caller will do full WAL replay.
+                    // Corrupt checkpoint, caller will do full WAL replay
                 }
             }
         }
 
-        // No checkpoint or corrupt checkpoint. Create empty store.
         let mut store = InMemoryPageStore::new();
         let root_page_num = store.allocate();
         let root_page_id = PageId::new(file_id, root_page_num as u64);
@@ -173,17 +121,16 @@ impl BTreeIndex {
         store.write(root_page_num, root_page.as_bytes());
 
         Ok(Self {
-            pages: RwLock::new(store),
+            pages: store,
             root_page_num: AtomicU32::new(root_page_num),
             height: AtomicU32::new(1),
             file_id,
-            disk,
-            pool,
             checkpoint_lsn: AtomicU64::new(0),
             checkpoint_dir: checkpoint_dir.to_path_buf(),
             wal_bytes_since_checkpoint: AtomicU64::new(0),
             wal_bytes_threshold: checkpoint_config.wal_bytes_threshold,
             checkpoint_trigger: parking_lot::Mutex::new(CheckpointTrigger::new(checkpoint_config)),
+            root_change_lock: parking_lot::Mutex::new(()),
         })
     }
 
@@ -202,10 +149,10 @@ impl BTreeIndex {
         self.file_id
     }
 
-    /// Returns a read lock on the page store (for debugging/testing).
+    /// Returns a reference to the page store (for debugging/testing).
     #[cfg(test)]
-    pub fn pages_ref(&self) -> parking_lot::RwLockReadGuard<'_, InMemoryPageStore> {
-        self.pages.read()
+    pub fn pages_ref(&self) -> &InMemoryPageStore {
+        &self.pages
     }
 
     /// Returns the tree height.
@@ -218,66 +165,69 @@ impl BTreeIndex {
     // Core In-Memory Operations (Synchronous)
     // =========================================================================
 
-    /// Finds the leaf page number for a given key using existing pages reference.
+    /// Finds the leaf page number for a given key using lock-free
+    /// version-stamped reads. Spins on torn reads.
     #[inline]
     fn find_leaf_in_pages(&self, pages: &InMemoryPageStore, key: &[u8]) -> u32 {
-        let height = self.height.load(Ordering::Relaxed);
-        let mut current = self.root_page_num.load(Ordering::Relaxed);
+        loop {
+            let height = self.height.load(Ordering::Acquire);
+            let mut current = self.root_page_num.load(Ordering::Acquire);
 
-        // Height 1 means root is the leaf
-        if height == 1 {
+            if height == 1 {
+                return current;
+            }
+
+            let mut torn = false;
+            for _ in 0..(height - 1) {
+                match pages.try_read(current) {
+                    Some(Ok(data)) => {
+                        let child_page_id = BTreeInternalPage::find_child_in_slice(&data, key);
+                        current = child_page_id.page_num as u32;
+                    }
+                    Some(Err(())) => {
+                        torn = true;
+                        break;
+                    }
+                    None => return current,
+                }
+            }
+            if torn {
+                std::hint::spin_loop();
+                continue;
+            }
             return current;
         }
-
-        // Traverse internal nodes
-        for _ in 0..(height - 1) {
-            if let Some(data) = pages.get(current) {
-                let child_page_id = BTreeInternalPage::find_child_in_slice(data, key);
-                current = child_page_id.page_num as u32;
-            } else {
-                break;
-            }
-        }
-
-        current
     }
 
-    /// Finds the leaf page number for a given key (takes read lock).
+    /// Finds the leaf page number for a given key using lock-free reads.
     #[inline]
     fn find_leaf_page_num(&self, key: &[u8]) -> u32 {
-        let pages = self.pages.read();
-        self.find_leaf_in_pages(&pages, key)
+        self.find_leaf_in_pages(&self.pages, key)
     }
 
     /// Searches for a key synchronously. All data is in RAM.
     ///
-    /// Uses optimistic lock-free reads via version stamps. Retries if a concurrent
-    /// write is detected. Falls back to RwLock read on repeated contention.
+    /// Pure lock-free path: traverses via version-stamped reads, retrying
+    /// on torn reads. No global lock acquisition.
     #[inline]
     pub fn search_sync(&self, key: &[u8]) -> Option<TupleId> {
-        let pages = self.pages.read();
-
-        // Optimistic path: traverse using try_read with version stamp validation.
-        for _ in 0..4 {
-            match self.search_optimistic(&pages, key) {
+        loop {
+            match self.search_optimistic(&self.pages, key) {
                 Ok(result) => return result,
-                Err(()) => {
-                    // Version conflict, retry.
-                    std::hint::spin_loop();
-                }
+                Err(()) => std::hint::spin_loop(),
             }
-        }
-
-        // Fallback: version-validated read after repeated contention (very rare).
-        let leaf_page_num = self.find_leaf_in_pages(&pages, key);
-        match pages.try_read(leaf_page_num) {
-            Some(Ok(data)) => BTreeLeafPage::get_in_slice(&data, key),
-            _ => None,
         }
     }
 
-    /// Optimistic search using version stamps. Returns Err(()) if a version
-    /// conflict is detected at any point during traversal.
+    /// Optimistic search using version stamps. Returns Err(()) if a torn
+    /// read is observed at any page in the traversal.
+    ///
+    /// After locating the candidate leaf, follows the right-link chain as
+    /// long as the target exceeds the current leaf's last key. This is the
+    /// Lehman-Yao protocol that handles the window between parent update
+    /// and old-leaf shrink during a concurrent split: a reader that arrives
+    /// at the pre-split leaf may find that its key was relocated to the
+    /// right sibling, and follows the link to find it there.
     #[inline]
     fn search_optimistic(
         &self,
@@ -287,7 +237,6 @@ impl BTreeIndex {
         let height = self.height.load(Ordering::Acquire);
         let mut current = self.root_page_num.load(Ordering::Acquire);
 
-        // Traverse internal nodes
         if height > 1 {
             for _ in 0..(height - 1) {
                 let data = pages.try_read(current).ok_or(())??;
@@ -296,16 +245,51 @@ impl BTreeIndex {
             }
         }
 
-        // Read leaf page
-        let leaf_data = pages.try_read(current).ok_or(())??;
-        Ok(BTreeLeafPage::get_in_slice(&leaf_data, key))
+        let ho = LeafPageHeader::OFFSET;
+        let sa = BTreeLeafPage::SLOT_ARRAY_START;
+        let ss = BTreeLeafPage::SLOT_SIZE;
+        // Cap right-link walks so a misbehaving leaf chain cannot stall
+        // the reader. In practice we follow at most one link, the cap
+        // covers transient mid-split states.
+        for _ in 0..Self::MAX_HEIGHT * 4 {
+            let leaf_data = pages.try_read(current).ok_or(())??;
+            if let Some(tid) = BTreeLeafPage::get_in_slice(&leaf_data, key) {
+                return Ok(Some(tid));
+            }
+            let ns = u16::from_le_bytes([leaf_data[ho], leaf_data[ho + 1]]) as usize;
+            if ns == 0 {
+                return Ok(None);
+            }
+            let last_so = sa + (ns - 1) * ss;
+            let last_eo = u16::from_le_bytes([leaf_data[last_so], leaf_data[last_so + 1]]) as usize;
+            let last_kl = u16::from_le_bytes([leaf_data[last_eo], leaf_data[last_eo + 1]]) as usize;
+            let last_key = &leaf_data[last_eo + 2..last_eo + 2 + last_kl];
+            if compare_keys(key, last_key).is_le() {
+                return Ok(None);
+            }
+            let next_packed = u64::from_le_bytes([
+                leaf_data[ho + 4],
+                leaf_data[ho + 5],
+                leaf_data[ho + 6],
+                leaf_data[ho + 7],
+                leaf_data[ho + 8],
+                leaf_data[ho + 9],
+                leaf_data[ho + 10],
+                leaf_data[ho + 11],
+            ]);
+            if next_packed == u64::MAX {
+                return Ok(None);
+            }
+            current = next_packed as u32;
+        }
+        Ok(None)
     }
 
     /// Inserts a key-value pair synchronously. All data is in RAM.
     ///
-    /// Uses optimistic lock-free path for non-split inserts: reads the leaf via
-    /// version stamp, inserts into a local copy, CAS-writes back. Falls back to
-    /// RwLock write on version conflict or when a split is needed.
+    /// Pure lock-free hot path: reads the leaf via version stamp, inserts
+    /// into a local copy, CAS-writes back. Retries on version conflict.
+    /// Acquires a per-leaf split latch only when an actual split is needed.
     #[inline]
     pub fn insert_sync(&self, key: &[u8], tuple_id: TupleId) -> Result<()> {
         if key.len() > MAX_KEY_SIZE {
@@ -315,12 +299,14 @@ impl BTreeIndex {
             });
         }
 
-        // Optimistic fast path: try lock-free insert (no split case).
-        let pages = self.pages.read();
-        for _ in 0..4 {
-            match self.insert_optimistic(&pages, key, tuple_id) {
+        // Pure lock-free CAS loop. NodeFull breaks out to the split path,
+        // VersionConflict spins. Under contention this still completes in
+        // a few iterations because the CAS protocol guarantees forward
+        // progress, one of the contending writers always wins per round.
+        loop {
+            match self.insert_optimistic(&self.pages, key, tuple_id) {
                 Ok(()) => return Ok(()),
-                Err(ZyronError::NodeFull) => break, // Need split, fall through
+                Err(ZyronError::NodeFull) => break,
                 Err(ZyronError::VersionConflict) => {
                     std::hint::spin_loop();
                     continue;
@@ -328,26 +314,129 @@ impl BTreeIndex {
                 Err(e) => return Err(e),
             }
         }
-        drop(pages);
 
-        // Locked path: handles version conflicts after retries and split case.
-        {
-            let mut pages = self.pages.write();
-            let leaf_page_num = self.find_leaf_in_pages(&pages, key);
+        // Split path holds the per-leaf split latch, allocates a new page
+        // via the lock-free counter, writes both halves via the version
+        // protocol, and CAS-updates the parent to install the split key.
+        self.insert_with_split_sync(Bytes::copy_from_slice(key), tuple_id)
+    }
 
-            if let Some(data) = pages.get_mut(leaf_page_num) {
-                match BTreeLeafPage::insert_in_slice(data, key, tuple_id) {
-                    Ok(()) => return Ok(()),
+    /// Batched key insertion. Sorts the input by key, then locks each
+    /// destination leaf once and inserts every key in the batch that
+    /// belongs to that leaf, instead of doing 1 traversal + 1 lock per
+    /// key as a loop of `insert_sync` calls would.
+    ///
+    /// For the seed workload (a 100-row INSERT VALUES batch) this collapses
+    /// ~100 leaf round trips into ~1-2, which dominates the heap+WAL work.
+    /// Items are passed `&mut` so the in-place sort is allocation-free.
+    pub fn insert_many<K: AsRef<[u8]>>(&self, items: &mut [(K, TupleId)]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        for (key, _) in items.iter() {
+            if key.as_ref().len() > MAX_KEY_SIZE {
+                return Err(ZyronError::KeyTooLarge {
+                    size: key.as_ref().len(),
+                    max: MAX_KEY_SIZE,
+                });
+            }
+        }
+        items.sort_by(|a, b| compare_keys(a.0.as_ref(), b.0.as_ref()));
+
+        let mut i = 0;
+        while i < items.len() {
+            // One lock-free descent per leaf group, returning the leaf and
+            // its exclusive upper-bound key. The inner loop then routes the
+            // sorted run with a cheap key comparison against the bound,
+            // never re-descending (and never re-copying internal pages)
+            // per key.
+            let (leaf_pn, bound) = self.find_leaf_and_bound(items[i].0.as_ref());
+            let guard = self.pages.lock_for_write(leaf_pn);
+            let mut leaf = BTreeLeafPage::from_bytes(guard.read());
+
+            let mut applied = 0usize;
+            let mut full = false;
+            while i + applied < items.len() {
+                // A key at or beyond the leaf's upper bound belongs in a
+                // sibling: stop and re-descend for it. Sorted order means
+                // every later key is also beyond the bound.
+                if let Some(ref b) = bound {
+                    if compare_keys(items[i + applied].0.as_ref(), b).is_ge() {
+                        break;
+                    }
+                }
+                let tid = items[i + applied].1;
+                let key = Bytes::copy_from_slice(items[i + applied].0.as_ref());
+                match leaf.insert(key, tid) {
+                    Ok(()) => applied += 1,
                     Err(ZyronError::NodeFull) => {
-                        // Need split, fall through
+                        full = true;
+                        break;
                     }
                     Err(e) => return Err(e),
                 }
             }
-        }
 
-        // Slow path: need to split
-        self.insert_with_split_sync(Bytes::copy_from_slice(key), tuple_id)
+            if applied > 0 {
+                guard.write(leaf.as_bytes());
+            }
+            drop(guard);
+
+            i += applied;
+            if full {
+                // The current leaf cannot hold items[i], fall through to the
+                // single-key split path which allocates a sibling, propagates
+                // the split key into the parent, and shrinks the left half.
+                let key = Bytes::copy_from_slice(items[i].0.as_ref());
+                let tid = items[i].1;
+                self.insert_with_split_sync(key, tid)?;
+                i += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Finds the leaf for `key` plus that leaf's exclusive upper-bound key
+    /// (the smallest separator strictly greater than every key the leaf can
+    /// hold), via a single lock-free version-stamped descent. `None` bound
+    /// means the leaf is the rightmost on its path and has no upper bound.
+    fn find_leaf_and_bound(&self, key: &[u8]) -> (u32, Option<Vec<u8>>) {
+        loop {
+            let height = self.height.load(Ordering::Acquire);
+            let mut current = self.root_page_num.load(Ordering::Acquire);
+            if height == 1 {
+                return (current, None);
+            }
+
+            let mut bound: Option<Vec<u8>> = None;
+            let mut torn = false;
+            for _ in 0..(height - 1) {
+                match self.pages.try_read(current) {
+                    Some(Ok(data)) => {
+                        let (child, stop) = BTreeInternalPage::find_child_with_upper(&data, key);
+                        current = child;
+                        // The leaf's bound is the tightest (smallest)
+                        // separator we stopped before across the path.
+                        if let Some(s) = stop {
+                            bound = Some(match bound {
+                                Some(b) if compare_keys(&b, &s).is_le() => b,
+                                _ => s,
+                            });
+                        }
+                    }
+                    Some(Err(())) => {
+                        torn = true;
+                        break;
+                    }
+                    None => return (current, bound),
+                }
+            }
+            if torn {
+                std::hint::spin_loop();
+                continue;
+            }
+            return (current, bound);
+        }
     }
 
     /// Optimistic lock-free insert. Reads the leaf page via version stamp,
@@ -405,7 +494,7 @@ impl BTreeIndex {
             });
         }
 
-        let pages = self.pages.get_mut();
+        let pages = &mut self.pages;
         let height = *self.height.get_mut();
         let root = *self.root_page_num.get_mut();
 
@@ -459,7 +548,7 @@ impl BTreeIndex {
         let leaf_page_num = path[path.len() - 1];
 
         // Get direct access to pages
-        let pages = self.pages.get_mut();
+        let pages = &mut self.pages;
 
         // Read and split the leaf
         let leaf_data = *pages
@@ -508,7 +597,7 @@ impl BTreeIndex {
 
         loop {
             let parent_page_num = path[parent_idx];
-            let pages = self.pages.get_mut();
+            let pages = &mut self.pages;
 
             let parent_data = *pages
                 .get(parent_page_num)
@@ -552,7 +641,7 @@ impl BTreeIndex {
 
     /// Create new root with exclusive access.
     fn create_new_root_exclusive(&mut self, key: Bytes, right_child: u32) -> Result<()> {
-        let pages = self.pages.get_mut();
+        let pages = &mut self.pages;
         let old_root = *self.root_page_num.get_mut();
         let height = *self.height.get_mut();
 
@@ -576,7 +665,7 @@ impl BTreeIndex {
     /// Searches with exclusive access (no locking).
     #[inline]
     pub fn search_exclusive(&mut self, key: &[u8]) -> Option<TupleId> {
-        let pages = self.pages.get_mut();
+        let pages = &mut self.pages;
         let height = *self.height.get_mut();
         let root = *self.root_page_num.get_mut();
 
@@ -610,38 +699,60 @@ impl BTreeIndex {
         current
     }
 
-    /// Finds the path from root to leaf (returns page numbers).
+    /// Finds the path from root to leaf using lock-free version-stamped
+    /// reads. Spins on torn reads of any page along the descent.
     fn find_path_sync(&self, key: &[u8]) -> ([u32; Self::MAX_HEIGHT], usize) {
-        let pages = self.pages.read();
-        let height = self.height.load(Ordering::Acquire);
-        let root = self.root_page_num.load(Ordering::Acquire);
+        loop {
+            let height = self.height.load(Ordering::Acquire);
+            let root = self.root_page_num.load(Ordering::Acquire);
 
-        let mut path = [0u32; Self::MAX_HEIGHT];
-        let mut path_len = 0;
-        let mut current = root;
+            let mut path = [0u32; Self::MAX_HEIGHT];
+            let mut path_len = 0;
+            let mut current = root;
 
-        path[path_len] = current;
-        path_len += 1;
+            path[path_len] = current;
+            path_len += 1;
 
-        if height == 1 {
+            if height == 1 {
+                return (path, path_len);
+            }
+
+            let mut torn = false;
+            for _ in 0..(height - 1) {
+                match self.pages.try_read(current) {
+                    Some(Ok(data)) => {
+                        let child_page_id = BTreeInternalPage::find_child_in_slice(&data, key);
+                        current = child_page_id.page_num as u32;
+                        path[path_len] = current;
+                        path_len += 1;
+                    }
+                    Some(Err(())) => {
+                        torn = true;
+                        break;
+                    }
+                    None => return (path, path_len),
+                }
+            }
+            if torn {
+                std::hint::spin_loop();
+                continue;
+            }
             return (path, path_len);
         }
-
-        for _ in 0..(height - 1) {
-            if let Some(data) = pages.get(current) {
-                let child_page_id = BTreeInternalPage::find_child_in_slice(data, key);
-                current = child_page_id.page_num as u32;
-                path[path_len] = current;
-                path_len += 1;
-            } else {
-                break;
-            }
-        }
-
-        (path, path_len)
     }
 
-    /// Insert with split handling (synchronous).
+    /// Insert with split handling. Acquires lock_for_write on the leaf
+    /// for the entire structural mutation so optimistic CAS writers and
+    /// readers retry against the in-progress version. Unrelated leaves
+    /// proceed in parallel because the lock is per-page.
+    ///
+    /// Ordering inside the lock:
+    ///   1. Write the freshly allocated right-leaf page (not reachable
+    ///      from the parent yet, so no reader observes it).
+    ///   2. Install the split key in the parent, making the right-leaf
+    ///      visible. Concurrent readers may now route to either half.
+    ///   3. Write the shrunk left-leaf into the guard, which becomes
+    ///      visible when the guard drops at the end of the function.
     fn insert_with_split_sync(&self, key: Bytes, tuple_id: TupleId) -> Result<()> {
         let (path, path_len) = self.find_path_sync(&key);
         if path_len == 0 {
@@ -649,43 +760,54 @@ impl BTreeIndex {
         }
 
         let leaf_page_num = path[path_len - 1];
+        let leaf_guard = self.pages.lock_for_write(leaf_page_num);
+        let leaf_bytes = leaf_guard.read();
+        let mut leaf = BTreeLeafPage::from_bytes(leaf_bytes);
 
-        let mut pages = self.pages.write();
-
-        // Read the leaf page
-        let leaf_data = pages
-            .get(leaf_page_num)
-            .ok_or_else(|| ZyronError::BTreeCorrupted("leaf not found".to_string()))?;
-        let mut leaf = BTreeLeafPage::from_bytes(*leaf_data);
-
-        // Allocate new page for right sibling
-        let new_page_num = pages.allocate();
-        let new_page_id = PageId::new(self.file_id, new_page_num as u64);
-        // Pass the inserting key so the split path can right-bias when the
-        // key is the new rightmost, monotonic workloads avoid the 50%
-        // page-utilization penalty of midpoint splits
-        let (split_key, mut right_leaf) = leaf.split_for_key(Some(key.as_ref()), new_page_id);
-
-        // Insert the new key into appropriate leaf
-        if key.as_ref() < split_key.as_ref() {
-            leaf.insert(key, tuple_id)?;
-        } else {
-            right_leaf.insert(key, tuple_id)?;
+        // The leaf may have shrunk between find_path_sync and the lock,
+        // either a concurrent split moved the high half elsewhere or
+        // a delete freed space. Re-attempt the in-slice insert before
+        // committing to a structural split.
+        match leaf.insert(key.clone(), tuple_id) {
+            Ok(()) => {
+                leaf_guard.write(leaf.as_bytes());
+                return Ok(());
+            }
+            Err(ZyronError::NodeFull) => {}
+            Err(e) => return Err(e),
         }
 
-        // Write both leaves
-        pages.write(leaf_page_num, leaf.as_bytes());
-        pages.write(new_page_num, right_leaf.as_bytes());
+        let new_page_num = self.pages.allocate();
+        let new_page_id = PageId::new(self.file_id, new_page_num as u64);
+        // Right-bias when the inserting key is the new rightmost so
+        // monotonic workloads avoid the 50% page-utilization penalty
+        // of midpoint splits
+        let (split_key, mut right_leaf) = leaf.split_for_key(Some(key.as_ref()), new_page_id);
 
-        // Propagate split up the tree
-        drop(pages); // Release lock before recursive call
-        self.propagate_split_sync(split_key, new_page_num, &path[..path_len])
+        if key.as_ref() < split_key.as_ref() {
+            leaf.insert(key.clone(), tuple_id)?;
+        } else {
+            right_leaf.insert(key.clone(), tuple_id)?;
+        }
+
+        // Step 1: publish right-leaf (unreachable from parent until step 2).
+        self.pages.force_write(new_page_num, right_leaf.as_bytes());
+
+        // Step 2: install split key in parent.
+        self.propagate_split_sync(split_key, new_page_num, &path[..path_len])?;
+
+        // Step 3: shrink left-leaf, becomes visible when guard drops.
+        leaf_guard.write(leaf.as_bytes());
+        Ok(())
     }
 
-    /// Propagate split up the tree.
+    /// Propagate a split up the tree. Each parent is locked individually
+    /// via lock_for_write so unrelated splits at sibling subtrees proceed
+    /// in parallel. The lock is held across the parent read+mutate so
+    /// concurrent CAS writers on the parent (none today, but the protocol
+    /// is symmetric) would retry against the in-progress version.
     fn propagate_split_sync(&self, key: Bytes, new_child: u32, path: &[u32]) -> Result<()> {
         if path.len() < 2 {
-            // Root was a leaf, create new root
             return self.create_new_root_sync(key, new_child);
         }
 
@@ -695,44 +817,43 @@ impl BTreeIndex {
 
         loop {
             let parent_page_num = path[parent_idx];
+            let parent_guard = self.pages.lock_for_write(parent_page_num);
 
-            let mut pages = self.pages.write();
-
-            let parent_data = pages
-                .get(parent_page_num)
-                .ok_or_else(|| ZyronError::BTreeCorrupted("parent not found".to_string()))?;
-            let mut parent = BTreeInternalPage::from_bytes(*parent_data);
+            let parent_bytes = parent_guard.read();
+            let mut parent = BTreeInternalPage::from_bytes(parent_bytes);
 
             let new_child_page_id = PageId::new(self.file_id, current_child as u64);
 
             match parent.insert(current_key.clone(), new_child_page_id) {
                 Ok(()) => {
-                    pages.write(parent_page_num, parent.as_bytes());
+                    parent_guard.write(parent.as_bytes());
                     return Ok(());
                 }
                 Err(ZyronError::NodeFull) => {
-                    // Split the internal node
-                    let new_page_num = pages.allocate();
+                    // Internal-node split. Build the right half on a fresh
+                    // page and publish it before mutating the left half so
+                    // readers see a consistent routing graph throughout.
+                    let new_page_num = self.pages.allocate();
                     let new_page_id = PageId::new(self.file_id, new_page_num as u64);
                     let (promoted_key, mut right_internal) = parent.split(new_page_id);
 
-                    // Insert into appropriate side
                     if current_key.as_ref() < promoted_key.as_ref() {
                         parent.insert(current_key, new_child_page_id)?;
                     } else {
                         right_internal.insert(current_key, new_child_page_id)?;
                     }
 
-                    // Write both pages
-                    pages.write(parent_page_num, parent.as_bytes());
-                    pages.write(new_page_num, right_internal.as_bytes());
+                    self.pages
+                        .force_write(new_page_num, right_internal.as_bytes());
 
-                    drop(pages);
-
-                    // Continue propagating up
                     if parent_idx == 0 {
-                        return self.create_new_root_sync(promoted_key, new_page_num);
+                        self.create_new_root_sync(promoted_key.clone(), new_page_num)?;
+                        parent_guard.write(parent.as_bytes());
+                        return Ok(());
                     }
+
+                    parent_guard.write(parent.as_bytes());
+                    drop(parent_guard);
 
                     current_key = promoted_key;
                     current_child = new_page_num;
@@ -743,13 +864,16 @@ impl BTreeIndex {
         }
     }
 
-    /// Creates a new root when the current root splits.
+    /// Creates a new root when the current root splits. The root_change_lock
+    /// guarantees that concurrent root splits are linearized, which is
+    /// trivially cheap because the root only splits once per tree-height
+    /// increase.
     fn create_new_root_sync(&self, key: Bytes, right_child: u32) -> Result<()> {
-        let mut pages = self.pages.write();
+        let _g = self.root_change_lock.lock();
         let old_root = self.root_page_num.load(Ordering::Acquire);
         let height = self.height.load(Ordering::Acquire);
 
-        let new_root_num = pages.allocate();
+        let new_root_num = self.pages.allocate();
         let new_root_id = PageId::new(self.file_id, new_root_num as u64);
         let old_root_id = PageId::new(self.file_id, old_root as u64);
         let right_child_id = PageId::new(self.file_id, right_child as u64);
@@ -758,7 +882,7 @@ impl BTreeIndex {
         new_root.set_leftmost_child(old_root_id);
         new_root.insert(key, right_child_id)?;
 
-        pages.write(new_root_num, new_root.as_bytes());
+        self.pages.force_write(new_root_num, new_root.as_bytes());
 
         self.root_page_num.store(new_root_num, Ordering::Release);
         self.height.store(height + 1, Ordering::Release);
@@ -766,39 +890,36 @@ impl BTreeIndex {
         Ok(())
     }
 
-    /// Deletes a key synchronously.
+    /// Deletes a key synchronously. The leaf is locked for the rewrite
+    /// so concurrent inserters and other deleters retry against the
+    /// in-progress version, and readers see the deletion atomically when
+    /// the guard drops.
     pub fn delete_sync(&self, key: &[u8]) -> bool {
         let leaf_page_num = self.find_leaf_page_num(key);
-
-        let mut pages = self.pages.write();
-        if let Some(data) = pages.get(leaf_page_num) {
-            let mut leaf = BTreeLeafPage::from_bytes(*data);
-            match leaf.delete(key) {
-                DeleteResult::Ok | DeleteResult::Underfull => {
-                    pages.write(leaf_page_num, leaf.as_bytes());
-                    true
-                }
-                DeleteResult::NotFound => false,
+        let guard = self.pages.lock_for_write(leaf_page_num);
+        let mut leaf = BTreeLeafPage::from_bytes(guard.read());
+        match leaf.delete(key) {
+            DeleteResult::Ok | DeleteResult::Underfull => {
+                guard.write(leaf.as_bytes());
+                true
             }
-        } else {
-            false
+            DeleteResult::NotFound => false,
         }
     }
 
-    /// Range scan synchronously. Works directly on borrowed page data
-    /// without copying 16KB pages. Uses binary search to find the
-    /// start position in the first leaf page.
+    /// Range scan synchronously. Each leaf page is read via the stable
+    /// version protocol, producing a per-page 8KB copy on the stack. This
+    /// removes the global read lock the previous implementation required
+    /// to hold across the entire scan.
     pub fn range_scan_sync(
         &self,
         start_key: Option<&[u8]>,
         end_key: Option<&[u8]>,
     ) -> Vec<(Bytes, TupleId)> {
-        let pages = self.pages.read();
         let mut results = Vec::with_capacity(1024);
-
         let start_leaf_num = match start_key {
-            Some(key) => self.find_leaf_page_num(key),
-            None => self.find_leftmost_leaf_num(&pages),
+            Some(key) => self.find_leaf_in_pages(&self.pages, key),
+            None => self.find_leftmost_leaf_num(&self.pages),
         };
 
         let ho = LeafPageHeader::OFFSET;
@@ -808,7 +929,10 @@ impl BTreeIndex {
         let mut first_page = true;
 
         while let Some(pn) = current_page_num {
-            let Some(data) = pages.get(pn) else { break };
+            let Some(data) = self.pages.read_stable(pn) else {
+                break;
+            };
+            let data = &data;
             let ns = u16::from_le_bytes([data[ho], data[ho + 1]]) as usize;
 
             // Binary search for start position on first page
@@ -878,17 +1002,16 @@ impl BTreeIndex {
         results
     }
 
-    /// Zero-copy range scan that calls a callback for each matching entry.
-    /// The key is borrowed from the page buffer. Returns false from f to stop early.
+    /// Range scan that calls a callback for each matching entry. Each leaf
+    /// page is materialized once via read_stable, so the callback sees a
+    /// consistent snapshot of that leaf even with concurrent splits.
     pub fn range_scan_for_each<F>(&self, start_key: Option<&[u8]>, end_key: Option<&[u8]>, mut f: F)
     where
         F: FnMut(&[u8], TupleId) -> bool,
     {
-        let pages = self.pages.read();
-
         let start_leaf_num = match start_key {
-            Some(key) => self.find_leaf_page_num(key),
-            None => self.find_leftmost_leaf_num(&pages),
+            Some(key) => self.find_leaf_in_pages(&self.pages, key),
+            None => self.find_leftmost_leaf_num(&self.pages),
         };
 
         let ho = LeafPageHeader::OFFSET;
@@ -898,7 +1021,10 @@ impl BTreeIndex {
         let mut first_page = true;
 
         while let Some(pn) = current_page_num {
-            let Some(data) = pages.get(pn) else { break };
+            let Some(data) = self.pages.read_stable(pn) else {
+                break;
+            };
+            let data = &data;
             let ns = u16::from_le_bytes([data[ho], data[ho + 1]]) as usize;
 
             let start_slot = if first_page {
@@ -964,25 +1090,36 @@ impl BTreeIndex {
         }
     }
 
-    /// Find leftmost leaf page number.
+    /// Find leftmost leaf page number using lock-free reads.
     fn find_leftmost_leaf_num(&self, pages: &InMemoryPageStore) -> u32 {
-        let height = self.height.load(Ordering::Acquire);
-        let mut current = self.root_page_num.load(Ordering::Acquire);
+        loop {
+            let height = self.height.load(Ordering::Acquire);
+            let mut current = self.root_page_num.load(Ordering::Acquire);
 
-        if height == 1 {
+            if height == 1 {
+                return current;
+            }
+
+            let mut torn = false;
+            for _ in 0..(height - 1) {
+                match pages.try_read(current) {
+                    Some(Ok(data)) => {
+                        let internal = BTreeInternalPage::from_bytes(data);
+                        current = internal.leftmost_child().page_num as u32;
+                    }
+                    Some(Err(())) => {
+                        torn = true;
+                        break;
+                    }
+                    None => return current,
+                }
+            }
+            if torn {
+                std::hint::spin_loop();
+                continue;
+            }
             return current;
         }
-
-        for _ in 0..(height - 1) {
-            if let Some(data) = pages.get(current) {
-                let internal = BTreeInternalPage::from_bytes(*data);
-                current = internal.leftmost_child().page_num as u32;
-            } else {
-                break;
-            }
-        }
-
-        current
     }
 
     // =========================================================================
@@ -1023,7 +1160,11 @@ impl BTreeIndex {
     /// Extracts all leaf entries, LZ4-compresses them, writes to a single file.
     /// Uses atomic rename (write to .tmp, rename to final) for crash safety.
     pub fn force_checkpoint(&self, current_lsn: u64) -> Result<()> {
-        let pages = self.pages.read();
+        // Hold root_change_lock so the tree height and root_page_num
+        // do not shift mid-checkpoint. Leaf-level splits below the root
+        // still proceed, the checkpoint LSN ensures any post-snapshot
+        // structural changes get replayed on next recovery.
+        let _g = self.root_change_lock.lock();
         let root = self.root_page_num.load(Ordering::Acquire);
         let height = self.height.load(Ordering::Acquire);
         let fsync = self.checkpoint_trigger.lock().config().fsync;
@@ -1038,7 +1179,7 @@ impl BTreeIndex {
         std::fs::create_dir_all(&self.checkpoint_dir)?;
         checkpoint::write_checkpoint_from_store(
             &tmp_path,
-            &pages,
+            &self.pages,
             current_lsn,
             root,
             height,
@@ -1133,16 +1274,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let ckpt_dir = dir.path().join("ckpt");
         std::fs::create_dir_all(&ckpt_dir).unwrap();
-        let disk = Arc::new(
-            crate::DiskManager::new(crate::DiskManagerConfig {
-                data_dir: dir.path().to_path_buf(),
-                fsync_enabled: false,
-            })
-            .await
-            .unwrap(),
-        );
-        let pool = Arc::new(BufferPool::auto_sized());
-        let mut btree = BTreeIndex::create(disk, pool, 0, ckpt_dir).await.unwrap();
+        let mut btree = BTreeIndex::create(0, ckpt_dir).await.unwrap();
         for i in 0..10_000u64 {
             let key = i.to_be_bytes();
             let tid = TupleId::new(PageId::new(0, 0), 0);
@@ -1156,16 +1288,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let ckpt_dir = dir.path().join("ckpt");
         std::fs::create_dir_all(&ckpt_dir).unwrap();
-        let disk = Arc::new(
-            crate::DiskManager::new(crate::DiskManagerConfig {
-                data_dir: dir.path().to_path_buf(),
-                fsync_enabled: false,
-            })
-            .await
-            .unwrap(),
-        );
-        let pool = Arc::new(BufferPool::auto_sized());
-        let mut btree = BTreeIndex::create(disk, pool, 0, ckpt_dir).await.unwrap();
+        let mut btree = BTreeIndex::create(0, ckpt_dir).await.unwrap();
         let n = 1_000_000u64;
         for i in 0..n {
             let key = i.to_be_bytes();

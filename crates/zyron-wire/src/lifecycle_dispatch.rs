@@ -326,6 +326,7 @@ async fn run_sql(
                 server
                     .txn_manager
                     .commit(&mut txn)
+                    .await
                     .map_err(ProtocolError::Database)?;
             } else {
                 let _ = server.txn_manager.abort(&mut txn);

@@ -3,6 +3,8 @@
 //! Evaluates BoundExpr trees from the planner, producing Column results
 //! using the custom compute kernels.
 
+use std::borrow::Cow;
+
 use zyron_catalog::ColumnId;
 use zyron_common::{Result, TypeId, ZyronError};
 use zyron_parser::ast::{BinaryOperator, LiteralValue, UnaryOperator};
@@ -19,6 +21,24 @@ use crate::compute::{
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/// Evaluates a ColumnRef without cloning, returning a borrow into the batch.
+/// Falls back to `evaluate` for non-ColumnRef expressions, which still produces
+/// an owned Column. Operators that only read the result (hash aggregate, sort
+/// keys, filter predicates with chained refs) should prefer this entry so a
+/// ColumnRef does not pay the full Vec<T> clone cost on every batch.
+pub fn evaluate_borrowed<'a>(
+    expr: &BoundExpr,
+    batch: &'a DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Cow<'a, Column>> {
+    if let BoundExpr::ColumnRef(col_ref) = expr {
+        let idx = resolve_column_index(col_ref.table_idx, col_ref.column_id, schema)?;
+        return Ok(Cow::Borrowed(batch.column(idx)));
+    }
+    Ok(Cow::Owned(evaluate(expr, batch, schema, params)?))
+}
 
 /// Evaluates a bound expression against a DataBatch, returning the result as a Column.
 /// The `params` slice provides values for query parameters ($1, $2, ...).
@@ -173,6 +193,91 @@ fn evaluate_column_ref(
 // ---------------------------------------------------------------------------
 // Literals
 // ---------------------------------------------------------------------------
+
+/// Converts a parsed literal directly to a ScalarValue coerced to the
+/// target column type. Returns None when the combination is not one of
+/// the common cases, the caller falls back to the full evaluator path
+/// for those (e.g. Decimal, FixedBinary, Interval, casts from non-integer
+/// to integer, etc.).
+///
+/// Hot-path entry for ValuesOperator. Skipping the 1-row Column alloc
+/// + cast_column dispatch per cell drops the per-batch ValuesOp cost by
+/// ~10x for the literal-only INSERT VALUES workload.
+pub fn literal_to_scalar(value: &LiteralValue, target: TypeId) -> Option<ScalarValue> {
+    match (value, target) {
+        (LiteralValue::Null, _) => Some(ScalarValue::Null),
+        (LiteralValue::Integer(v), TypeId::Int8) => Some(ScalarValue::Int8(*v as i8)),
+        (LiteralValue::Integer(v), TypeId::Int16) => Some(ScalarValue::Int16(*v as i16)),
+        (LiteralValue::Integer(v), TypeId::Int32) => Some(ScalarValue::Int32(*v as i32)),
+        (LiteralValue::Integer(v), TypeId::Int64) => Some(ScalarValue::Int64(*v)),
+        (LiteralValue::Integer(v), TypeId::Int128) => Some(ScalarValue::Int128(*v as i128)),
+        (LiteralValue::Integer(v), TypeId::UInt8) => Some(ScalarValue::UInt8(*v as u8)),
+        (LiteralValue::Integer(v), TypeId::UInt16) => Some(ScalarValue::UInt16(*v as u16)),
+        (LiteralValue::Integer(v), TypeId::UInt32) => Some(ScalarValue::UInt32(*v as u32)),
+        (LiteralValue::Integer(v), TypeId::UInt64) => Some(ScalarValue::UInt64(*v as u64)),
+        (LiteralValue::Integer(v), TypeId::Float32) => Some(ScalarValue::Float32(*v as f32)),
+        (LiteralValue::Integer(v), TypeId::Float64) => Some(ScalarValue::Float64(*v as f64)),
+        (LiteralValue::Float(v), TypeId::Float32) => Some(ScalarValue::Float32(*v as f32)),
+        (LiteralValue::Float(v), TypeId::Float64) => Some(ScalarValue::Float64(*v)),
+        (LiteralValue::Boolean(b), TypeId::Boolean) => Some(ScalarValue::Boolean(*b)),
+        (LiteralValue::String(s), TypeId::Text | TypeId::Char | TypeId::Varchar) => {
+            Some(ScalarValue::Utf8(s.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// Coerces an already-extracted scalar (e.g. a bound `$N` parameter) to the
+/// target column type without allocating a Column. Returns None for type
+/// combinations not covered here, the caller then falls back to the full
+/// `cast_column` path. Mirrors the common widenings the literal fast path
+/// handles.
+pub fn coerce_scalar_to(scalar: &ScalarValue, target: TypeId) -> Option<ScalarValue> {
+    match scalar {
+        ScalarValue::Null => Some(ScalarValue::Null),
+        ScalarValue::Int64(v) => match target {
+            TypeId::Int64 => Some(ScalarValue::Int64(*v)),
+            TypeId::Int8 => Some(ScalarValue::Int8(*v as i8)),
+            TypeId::Int16 => Some(ScalarValue::Int16(*v as i16)),
+            TypeId::Int32 => Some(ScalarValue::Int32(*v as i32)),
+            TypeId::Int128 => Some(ScalarValue::Int128(*v as i128)),
+            TypeId::UInt8 => Some(ScalarValue::UInt8(*v as u8)),
+            TypeId::UInt16 => Some(ScalarValue::UInt16(*v as u16)),
+            TypeId::UInt32 => Some(ScalarValue::UInt32(*v as u32)),
+            TypeId::UInt64 => Some(ScalarValue::UInt64(*v as u64)),
+            TypeId::Float32 => Some(ScalarValue::Float32(*v as f32)),
+            TypeId::Float64 => Some(ScalarValue::Float64(*v as f64)),
+            _ => None,
+        },
+        ScalarValue::Float64(v) => match target {
+            TypeId::Float64 => Some(ScalarValue::Float64(*v)),
+            TypeId::Float32 => Some(ScalarValue::Float32(*v as f32)),
+            _ => None,
+        },
+        ScalarValue::Float32(v) => match target {
+            TypeId::Float32 => Some(ScalarValue::Float32(*v)),
+            TypeId::Float64 => Some(ScalarValue::Float64(*v as f64)),
+            _ => None,
+        },
+        ScalarValue::Boolean(b) => match target {
+            TypeId::Boolean => Some(ScalarValue::Boolean(*b)),
+            _ => None,
+        },
+        ScalarValue::Utf8(s) => match target {
+            TypeId::Text | TypeId::Char | TypeId::Varchar => Some(ScalarValue::Utf8(s.clone())),
+            _ => None,
+        },
+        // Already-correct integer/binary variants pass through when they
+        // match the target exactly.
+        other => {
+            if other.type_id() == target {
+                Some(other.clone())
+            } else {
+                None
+            }
+        }
+    }
+}
 
 fn evaluate_literal(value: &LiteralValue, type_id: TypeId, num_rows: usize) -> Result<Column> {
     match value {
@@ -822,16 +927,13 @@ fn evaluate_function(
             }
             let bucket = |v: i128| -> i128 { v.div_euclid(width) * width };
             let data = match &ts.data {
-                ColumnData::Int64(v) => ColumnData::Int64(
-                    v.iter().map(|&x| bucket(x as i128) as i64).collect(),
-                ),
-                ColumnData::Int128(v) => {
-                    ColumnData::Int128(v.iter().map(|&x| bucket(x)).collect())
+                ColumnData::Int64(v) => {
+                    ColumnData::Int64(v.iter().map(|&x| bucket(x as i128) as i64).collect())
                 }
+                ColumnData::Int128(v) => ColumnData::Int128(v.iter().map(|&x| bucket(x)).collect()),
                 _ => {
                     return Err(ZyronError::ExecutionError(
-                        "time_bucket second argument must be a timestamp column"
-                            .to_string(),
+                        "time_bucket second argument must be a timestamp column".to_string(),
                     ));
                 }
             };
@@ -872,7 +974,12 @@ fn evaluate_function(
                     last = Some(v);
                 }
             }
-            Ok(Column::with_nulls_ts(data, nulls, col.type_id, col.ts_precision))
+            Ok(Column::with_nulls_ts(
+                data,
+                nulls,
+                col.type_id,
+                col.ts_precision,
+            ))
         }
         // interpolate(col): linear interpolation. Each NULL between two
         // non-NULL values is filled on the straight line between the nearest
@@ -961,7 +1068,12 @@ fn evaluate_function(
                     }
                 }
             }
-            Ok(Column::with_nulls_ts(data, nulls, col.type_id, col.ts_precision))
+            Ok(Column::with_nulls_ts(
+                data,
+                nulls,
+                col.type_id,
+                col.ts_precision,
+            ))
         }
         "abs" => {
             let col = evaluate(&args[0], batch, schema, params)?;

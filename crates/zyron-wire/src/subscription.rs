@@ -785,6 +785,10 @@ pub struct CdcChangeSource {
     registry: Arc<zyron_cdc::CdfRegistry>,
     table_ids: Vec<u32>,
     high_lsn: AtomicU64,
+    /// Compiled ABAC publication policies, applied as a per-row filter on the
+    /// change stream. None means no policy covers this subscriber, so rows pass
+    /// through unfiltered (zero added cost).
+    filter: Option<Arc<crate::publication_filter::PublicationRowFilter>>,
 }
 
 impl CdcChangeSource {
@@ -793,6 +797,21 @@ impl CdcChangeSource {
             registry,
             table_ids,
             high_lsn: AtomicU64::new(0),
+            filter: None,
+        }
+    }
+
+    /// Builds a source with an ABAC row filter applied to the change stream.
+    pub fn with_filter(
+        registry: Arc<zyron_cdc::CdfRegistry>,
+        table_ids: Vec<u32>,
+        filter: Option<Arc<crate::publication_filter::PublicationRowFilter>>,
+    ) -> Self {
+        Self {
+            registry,
+            table_ids,
+            high_lsn: AtomicU64::new(0),
+            filter,
         }
     }
 }
@@ -818,20 +837,12 @@ impl ChangeSource for CdcChangeSource {
             let recs = feed
                 .query_changes(start, u64::MAX)
                 .map_err(|e| ProtocolError::Malformed(format!("cdf query_changes: {}", e)))?;
+
+            // Map raw change records to candidate deltas, skipping schema and
+            // truncate markers which carry no row image.
+            let mut candidates: Vec<(crate::messages::backend::RowDelta, i64)> =
+                Vec::with_capacity(recs.len());
             for r in recs {
-                if (collected.len() as u32) >= max_rows {
-                    break;
-                }
-                let frame_bytes = 1
-                    + 4
-                    + 8
-                    + 4
-                    + (r.row_data.len() as u32)
-                    + 4
-                    + (r.primary_key_data.len() as u32);
-                if !collected.is_empty() && total_bytes.saturating_add(frame_bytes) > max_bytes {
-                    break;
-                }
                 let change_type = match r.change_type {
                     zyron_cdc::ChangeType::Insert => 0u8,
                     zyron_cdc::ChangeType::UpdatePreimage => 2,
@@ -841,15 +852,55 @@ impl ChangeSource for CdcChangeSource {
                         continue;
                     }
                 };
-                commit_ts = r.commit_timestamp;
+                candidates.push((
+                    crate::messages::backend::RowDelta {
+                        change_type,
+                        table_id: r.table_id,
+                        lsn: r.commit_version,
+                        row_bytes: r.row_data,
+                        primary_key_bytes: r.primary_key_data,
+                    },
+                    r.commit_timestamp,
+                ));
+            }
+
+            // Enforce the publication's ABAC predicate: a subscriber only sees
+            // rows that satisfy it. Decoded and evaluated once for the whole
+            // table batch (vectorized). Rows filtered out never count against
+            // the subscriber's row/byte budget below.
+            if let Some(filter) = self.filter.as_ref() {
+                if filter.covers(tid) {
+                    let rows: Vec<&[u8]> = candidates
+                        .iter()
+                        .map(|(d, _)| d.row_bytes.as_slice())
+                        .collect();
+                    if let Some(mask) = filter
+                        .mask_for(tid, &rows)
+                        .map_err(|e| ProtocolError::Malformed(format!("abac filter: {e}")))?
+                    {
+                        let mut keep = mask.into_iter();
+                        candidates.retain(|_| keep.next().unwrap_or(false));
+                    }
+                }
+            }
+
+            for (delta, ts) in candidates {
+                if (collected.len() as u32) >= max_rows {
+                    break;
+                }
+                let frame_bytes = 1
+                    + 4
+                    + 8
+                    + 4
+                    + (delta.row_bytes.len() as u32)
+                    + 4
+                    + (delta.primary_key_bytes.len() as u32);
+                if !collected.is_empty() && total_bytes.saturating_add(frame_bytes) > max_bytes {
+                    break;
+                }
+                commit_ts = ts;
                 total_bytes = total_bytes.saturating_add(frame_bytes);
-                collected.push(crate::messages::backend::RowDelta {
-                    change_type,
-                    table_id: r.table_id,
-                    lsn: r.commit_version,
-                    row_bytes: r.row_data,
-                    primary_key_bytes: r.primary_key_data,
-                });
+                collected.push(delta);
             }
         }
         if collected.is_empty() {

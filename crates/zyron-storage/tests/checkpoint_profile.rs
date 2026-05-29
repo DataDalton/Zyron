@@ -1,13 +1,11 @@
 //! Checkpoint performance profiling test.
 //! Measures each stage of the write/load path separately.
 
-use std::sync::Arc;
 use std::time::Instant;
 use tempfile::tempdir;
 
-use zyron_buffer::BufferPool;
 use zyron_common::page::PageId;
-use zyron_storage::{BTreeIndex, DiskManager, DiskManagerConfig, TupleId};
+use zyron_storage::{BTreeIndex, TupleId};
 
 #[tokio::test]
 async fn profile_checkpoint_stages() {
@@ -17,19 +15,7 @@ async fn profile_checkpoint_stages() {
     let checkpoint_dir = dir.path().join("ckpt");
     std::fs::create_dir_all(&checkpoint_dir).unwrap();
 
-    let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir: dir.path().to_path_buf(),
-            fsync_enabled: false,
-        })
-        .await
-        .unwrap(),
-    );
-    let pool = Arc::new(BufferPool::auto_sized());
-
-    let mut btree = BTreeIndex::create(disk.clone(), pool.clone(), 0, checkpoint_dir.clone())
-        .await
-        .unwrap();
+    let mut btree = BTreeIndex::create(0, checkpoint_dir.clone()).await.unwrap();
 
     for i in 0..KEY_COUNT as u64 {
         let key = i.to_be_bytes();
@@ -114,9 +100,7 @@ async fn profile_checkpoint_stages() {
 
     // Stage 7: Full load from checkpoint
     let t6 = Instant::now();
-    let loaded = BTreeIndex::open(disk.clone(), pool.clone(), 0, &checkpoint_dir)
-        .await
-        .unwrap();
+    let loaded = BTreeIndex::open(0, &checkpoint_dir).await.unwrap();
     let full_load_time = t6.elapsed();
     println!(
         "  Full load: {:.2} ms ({:.0} MB/sec)",

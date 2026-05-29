@@ -79,7 +79,7 @@ const SHUTDOWN_TARGET_MS: f64 = 250.0;
 
 const SCHEMA_TABLES: usize = 6;
 const SEED_ROWS: usize = 10_000;
-const OLTP_CONCURRENCY_LEVELS: &[usize] = &[1, 4, 16];
+const OLTP_CONCURRENCY_LEVELS: &[usize] = &[1, 4, 16, 64, 256];
 const OLTP_DURATION: Duration = Duration::from_secs(5);
 const ANALYTIC_ITERATIONS: usize = 200;
 const GATEWAY_ITERATIONS: usize = 50_000;
@@ -144,10 +144,14 @@ async fn boot_server(db_name: &str) -> (E2EServer, Duration) {
     // pages flush async instead of solely on eviction
     // Held alive in E2EServer so its drop runs at shutdown like in production
     let dm_for_bg = Arc::clone(&disk);
-    let write_fn: WriteFn = Arc::new(move |page_id, data| dm_for_bg.write_page_sync(page_id, data));
+    let write_fn: WriteFn =
+        Arc::new(move |page_id, data| dm_for_bg.write_page_sync_no_fsync(page_id, data));
+    let dm_for_fsync = Arc::clone(&disk);
+    let fsync_fn: zyron_buffer::FsyncFn = Arc::new(move |file_id| dm_for_fsync.fsync_file(file_id));
     let background_writer = Arc::new(BackgroundWriter::new(
         Arc::clone(&pool),
         write_fn,
+        fsync_fn,
         BackgroundWriterConfig::default(),
     ));
 
@@ -217,6 +221,7 @@ async fn boot_server(db_name: &str) -> (E2EServer, Duration) {
         subscription_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         heap_files: Arc::new(scc::HashMap::new()),
         btree_indexes: Arc::new(scc::HashMap::new()),
+        plan_cache: Arc::new(zyron_wire::plan_cache::ServerPlanCache::new()),
         vacuum_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         analytics_registry: zyron_analytics::default_registry(),
         legal_holds: Arc::new(zyron_lifecycle::legal_hold::LegalHoldRegistry::new()),

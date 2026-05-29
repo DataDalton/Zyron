@@ -12,7 +12,7 @@ mod page_table;
 mod pool;
 mod replacer;
 
-pub use background_writer::{BackgroundWriter, BackgroundWriterConfig, WriteFn};
+pub use background_writer::{BackgroundWriter, BackgroundWriterConfig, FsyncFn, WriteFn};
 pub use frame::{BufferFrame, FrameId};
 pub use pool::{BufferPool, BufferPoolConfig, EvictedPage};
 pub use replacer::{ClockReplacer, Replacer};

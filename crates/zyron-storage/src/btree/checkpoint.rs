@@ -713,21 +713,10 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let disk = std::sync::Arc::new(
-                crate::DiskManager::new(crate::DiskManagerConfig {
-                    data_dir: dir.path().to_path_buf(),
-                    fsync_enabled: false,
-                })
-                .await
-                .unwrap(),
-            );
-            let pool = std::sync::Arc::new(zyron_buffer::BufferPool::auto_sized());
             let ckpt_dir = dir.path().join("ckpt");
             std::fs::create_dir_all(&ckpt_dir).unwrap();
 
             let mut btree = crate::btree::index::BTreeIndex::create_with_config(
-                disk.clone(),
-                pool.clone(),
                 0,
                 ckpt_dir.clone(),
                 CheckpointConfig {
@@ -747,10 +736,9 @@ mod tests {
 
             btree.force_checkpoint(42).unwrap();
 
-            let loaded =
-                crate::btree::index::BTreeIndex::open(disk.clone(), pool.clone(), 0, &ckpt_dir)
-                    .await
-                    .unwrap();
+            let loaded = crate::btree::index::BTreeIndex::open(0, &ckpt_dir)
+                .await
+                .unwrap();
 
             // Verify all keys survived checkpoint round-trip
             let mut first_missing = None;

@@ -11,6 +11,9 @@ pub struct Parser<'a> {
     lexer: Lexer<'a>,
     current: SpannedToken,
     peek: SpannedToken,
+    /// Original SQL source, retained so handlers can capture the verbatim text
+    /// of a sub-expression (e.g. an ABAC policy predicate) via token spans.
+    input: &'a str,
 }
 
 impl<'a> Parser<'a> {
@@ -23,6 +26,7 @@ impl<'a> Parser<'a> {
             lexer,
             current,
             peek,
+            input,
         })
     }
 
@@ -7475,13 +7479,20 @@ impl<'a> Parser<'a> {
         };
         let target_name = self.parse_ident()?;
         self.expect_keyword(Keyword::Where)?;
+        // Capture the predicate's verbatim source text between the start of the
+        // expression and the token that follows it. The policy is enforced by
+        // re-injecting this SQL, so the original text is preserved.
+        let pred_start = self.current.span.offset;
         let predicate = self.parse_expr()?;
+        let pred_end = self.current.span.offset.max(pred_start);
+        let predicate_sql = self.input[pred_start..pred_end].trim().to_string();
         Ok(Statement::CreateAbacPolicy(Box::new(
             CreateAbacPolicyStatement {
                 name,
                 target,
                 target_name,
                 predicate,
+                predicate_sql,
             },
         )))
     }

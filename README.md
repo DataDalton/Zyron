@@ -38,8 +38,9 @@ Fresh writes land in an MVCC row heap tuned for OLTP. A background thread compac
 
 - **One engine, both workloads.** Row heap for transactional writes, `.zyr` columnar format for analytical scans, with automatic background compaction between them.
 - **Lock-free hot paths.** LSN assignment, the WAL ring buffer, MVCC visibility checks, the buffer pool, and the B+ tree avoid mutexes on the query and write path entirely. Locks exist only on single-owner background threads.
+- **Full durability, no per-page fsync tax.** Every commit fsyncs the WAL through group commit before acknowledging the client. Dirty heap and index pages are written by a background writer and then fsynced at explicit durability barriers, so an acknowledged transaction survives a power loss without paying a per-page fsync on the OLTP hot path.
 - **Query-on-encoded.** Dictionary, RLE, bit-pack, and FastLanes columns are filtered without being decoded; only rows that survive predicates are materialized.
-- **Time as a first-class dimension.** `AS OF TIMESTAMP` and `VERSION AS OF` queries, copy-on-write branches, slowly changing dimensions, and bitemporal tables are part of the engine, not an add-on.
+- **Time as a first-class dimension.** `AS OF TIMESTAMP` and `VERSION AS OF` queries, copy-on-write branches, slowly changing dimensions, and bitemporal tables are part of the engine, with picosecond-resolution timestamps and hybrid logical clocks underneath.
 - **Security built into the planner.** Three-state privileges, row-level security, column masking, ABAC, and mandatory access control are evaluated inside query planning, not in an application tier.
 - **Drop-in client compatibility.** Implements the PostgreSQL wire protocol v3 over both TCP and QUIC, so existing drivers and tooling connect unchanged.
 
@@ -104,10 +105,14 @@ flowchart TB
 
 - MVCC, snapshot isolation, savepoints
 - Lock-free WAL, group commit, crash recovery
+- Unconditional durability: WAL fsync on every commit, background page writes with explicit fsync barriers
 - `.zyr` columnar format, query-on-encoded
+- HybridScan over row heap + `.zyr` segments in one operator
+- Bloom filters and zone maps on segment metadata
 - Cost-based optimizer: DP join reorder, predicate/projection pushdown, subquery decorrelation
 - Vectorized, morsel-parallel execution
 - CTEs, window functions, `MERGE`, `QUALIFY`, `ROLLUP`/`CUBE`/`GROUPING SETS`
+- Time-series `GAP FILL` operator
 - Prepared statements, cursors, `COPY`
 - Wire protocol over TCP and QUIC
 
@@ -116,6 +121,8 @@ flowchart TB
 - `AS OF TIMESTAMP` / `VERSION AS OF`
 - Copy-on-write branches with merge conflict resolution
 - SCD types, system/application/bitemporal time
+- Picosecond-resolution timestamps with hybrid logical clocks
+- Arrow `ps`->`ns` export for downstream tooling
 - Diff and patch between versions
 - CDC: change feeds, replication slots, Debezium / Avro / Wal2Json / native decoders, publications, snapshots
 
@@ -181,23 +188,25 @@ What a client sees from a running server over the wire protocol, from cold start
 
 | Lifecycle / workload | Result |
 |----------------------|--------|
-| Cold boot to accepting queries | 23 ms |
-| First `ReadyForQuery` | 0.41 ms |
-| Schema DDL bootstrap | 2.4 ms |
-| Seed insert | 764K rows/sec |
-| OLTP, 1 client | 34.1K tps, p99 60 us |
-| OLTP, 4 clients | 79.4K tps, p99 84 us |
-| OLTP, 16 clients | 89.6K tps, p99 281 us |
-| Analytical query (median) | 1.63 ms |
-| Graceful shutdown | 51 ms |
+| Cold boot to accepting queries | 26 ms |
+| First `ReadyForQuery` | 0.34 ms |
+| Schema DDL bootstrap | 33.5 ms |
+| Seed insert | 409K rows/sec |
+| OLTP, 1 client | 9.5K tps, p99 210 us |
+| OLTP, 4 clients | 26.2K tps, p99 239 us |
+| OLTP, 16 clients | 58.6K tps, p99 437 us |
+| OLTP, 64 clients | 78.0K tps, p99 2455 us |
+| OLTP, 256 clients | 76.3K tps, p99 6885 us |
+| Analytical query (median) | 1.95 ms |
+| Graceful shutdown | 56 ms |
 
 ```mermaid
-%%{init: {'theme':'base','themeVariables':{'xyChart':{'backgroundColor':'transparent','titleColor':'#e6edf3','xAxisLabelColor':'#e6edf3','xAxisTitleColor':'#e6edf3','xAxisTickColor':'#1f6feb','xAxisLineColor':'#1f6feb','yAxisLabelColor':'#e6edf3','yAxisTitleColor':'#e6edf3','yAxisTickColor':'#1f6feb','yAxisLineColor':'#1f6feb','plotColorPalette':'#1f6feb'}},'xyChart':{'width':720,'height':360}}}%%
+%%{init: {'theme':'base','themeVariables':{'xyChart':{'backgroundColor':'transparent','titleColor':'#e6edf3','xAxisLabelColor':'#e6edf3','xAxisTitleColor':'#e6edf3','xAxisTickColor':'#1f6feb','xAxisLineColor':'#1f6feb','yAxisLabelColor':'#e6edf3','yAxisTitleColor':'#e6edf3','yAxisTickColor':'#1f6feb','yAxisLineColor':'#1f6feb','plotColorPalette':'#1f6feb'}},'xyChart':{'width':750,'height':360}}}%%
 xychart-beta
     title "OLTP throughput vs. concurrent clients (thousand tps, higher is better)"
-    x-axis ["1 client", "4 clients", "16 clients"]
-    y-axis "K tps" 0 --> 103
-    bar [34.1, 79.4, 89.6]
+    x-axis ["1 client", "4 clients", "16 clients", "64 clients", "256 clients"]
+    y-axis "K tps" 0 --> 89
+    bar [9.5, 26.2, 58.6, 78.0, 76.3]
 ```
 
 ### Engine internals
@@ -209,17 +218,17 @@ Raw subsystem throughput and hot-path latency under microbenchmark:
 xychart-beta
     title "Throughput (million ops/sec, higher is better)"
     x-axis ["B+tree insert", "B+tree delete", "Hash join build", "SCD-2 merge", "COPY FROM", "Row serialize", "SQL parse", "TTL purge", "Archive"]
-    y-axis "M ops/sec" 0 --> 137
-    bar [39.2, 46.3, 119.2, 45.8, 24.1, 17.1, 2.1, 15.2, 83.8]
+    y-axis "M ops/sec" 0 --> 141
+    bar [39.2, 46.3, 123.4, 45.8, 23.2, 18.2, 2.2, 15.2, 83.8]
 ```
 
 ```mermaid
-%%{init: {'theme':'base','themeVariables':{'xyChart':{'backgroundColor':'transparent','titleColor':'#e6edf3','xAxisLabelColor':'#e6edf3','xAxisTitleColor':'#e6edf3','xAxisTickColor':'#1f6feb','xAxisLineColor':'#1f6feb','yAxisLabelColor':'#e6edf3','yAxisTitleColor':'#e6edf3','yAxisTickColor':'#1f6feb','yAxisLineColor':'#1f6feb','plotColorPalette':'#1f6feb'}},'xyChart':{'width':1050,'height':360}}}%%
+%%{init: {'theme':'base','themeVariables':{'xyChart':{'backgroundColor':'transparent','titleColor':'#e6edf3','xAxisLabelColor':'#e6edf3','xAxisTitleColor':'#e6edf3','xAxisTickColor':'#1f6feb','xAxisLineColor':'#1f6feb','yAxisLabelColor':'#e6edf3','yAxisTitleColor':'#e6edf3','yAxisTickColor':'#1f6feb','yAxisLineColor':'#1f6feb','plotColorPalette':'#1f6feb'}},'xyChart':{'width':1200,'height':360}}}%%
 xychart-beta
     title "Hot-path latency (nanoseconds, lower is better)"
-    x-axis ["MVCC visible", "Version lookup", "B+tree lookup", "Branch resolve", "Row lock", "Legal-hold check", "Selectivity est"]
+    x-axis ["MVCC visible", "Version lookup", "B+tree lookup", "Branch resolve", "Row lock", "Legal-hold check", "Bloom probe", "Selectivity est"]
     y-axis "ns/op" 0 --> 136
-    bar [1.4, 10.8, 14.1, 39.0, 75.2, 6.0, 118.6]
+    bar [1.4, 10.8, 14.1, 39.0, 73.1, 6.0, 5.9, 118.5]
 ```
 
 A few more numbers not shown in the charts above:
@@ -227,11 +236,15 @@ A few more numbers not shown in the charts above:
 | Subsystem | Metric | Result |
 |-----------|--------|--------|
 | MVCC | GC sweep | ~1.9B tuples/sec |
-| Columnar | Sequential compaction | ~1.4M rows/sec |
+| Columnar | .zyr scan throughput | ~3.0 GB/sec |
+| Columnar | Compaction pipeline | ~4.0M rows/sec |
+| Columnar | HybridScan overhead vs heap-only | ~-4.7% |
+| Columnar | Metadata-aggregate pruning speedup | ~14.2x |
+| Temporal | Picosecond timestamp decode | ~528M rows/sec |
 | Versioning | Time-travel scan overhead | ~17% |
 | Wire | QUIC PostgreSQL handshake | ~4 us |
 
-28 benchmark suites cover storage, executor, optimizer, encoding, wire, search, analytics, CDC, versioning, transactions, types, lifecycle, and end-to-end. Each run writes a timestamped JSON/TXT pair under `benchmarks/<suite>/`.
+29 benchmark suites cover storage, executor, optimizer, encoding, wire, search, analytics, CDC, versioning, transactions, temporal, columnar, types, lifecycle, gateway, Zyron-to-Zyron, and end-to-end. Each run writes a timestamped JSON/TXT pair under `benchmarks/<suite>/`.
 <!-- BENCH:END -->
 
 ## Getting Started

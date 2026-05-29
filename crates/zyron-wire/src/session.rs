@@ -83,6 +83,38 @@ impl Session {
         }
     }
 
+    /// Stable hash of the session's effective identity for plan-cache
+    /// keying. RLS, ABAC, and column-security predicates are a function of
+    /// the role, so a plan bound under one identity must never be served to
+    /// another. Folds the user name, whether a security context is active, and
+    /// the active role set so a secured session never collides with an
+    /// unsecured one of the same name nor with the same login under a
+    /// different role.
+    ///
+    /// Row-security policies are loaded at startup and have no live
+    /// CREATE/ALTER/DROP path today, so the policy set is fixed for the
+    /// process lifetime and need not be in the key. If runtime policy DDL is
+    /// added, it must either bump catalog schema_version or fold a policy
+    /// epoch into the cache key, otherwise stale plans would survive the change.
+    pub fn identity_hash(&self) -> u64 {
+        let mut h = zyron_common::hash64(self.user.as_bytes());
+        // Row-security predicates are baked into the cached plan per effective
+        // role, so the key must change when the active role set changes
+        // (SET ROLE, or two sessions of the same login user under different
+        // roles). Fold current_role and the effective-role set into the hash.
+        if let Some(sc) = self.security_context.as_ref() {
+            h ^= 0x9e37_79b9_7f4a_7c15;
+            h = h
+                .rotate_left(7)
+                .wrapping_add(sc.current_role.0 as u64)
+                .wrapping_mul(0x0100_0000_01b3);
+            for role in &sc.effective_roles {
+                h = h.rotate_left(5).wrapping_add(role.0 as u64);
+            }
+        }
+        h
+    }
+
     /// Returns the current transaction state.
     pub fn transaction_state(&self) -> TransactionState {
         self.txn_state

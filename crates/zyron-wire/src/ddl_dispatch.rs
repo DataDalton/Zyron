@@ -314,10 +314,89 @@ pub async fn try_handle_ddl_utility(
         }
         Statement::DropPublication(s) => Some(handle_drop_publication(s, server, session).await),
         Statement::DropEndpoint(s) => Some(handle_drop_endpoint(s, server, session).await),
-        Statement::CreateAbacPolicy(_) => Some(Ok(DdlResult::Tag(
-            "CREATE ABAC POLICY not yet wired".to_string(),
-        ))),
+        Statement::CreateAbacPolicy(s) => {
+            Some(handle_create_abac_policy(s, server, session).await)
+        }
     }
+}
+
+/// Creates an ABAC policy on a table or publication. Resolves the target to its
+/// catalog id, checks ManagePolicy privilege, then stores the policy (the
+/// verbatim predicate text is the row filter). Table policies are enforced at
+/// query bind time via the row-security provider; publication policies are
+/// enforced on the subscriber change stream.
+async fn handle_create_abac_policy(
+    stmt: &zyron_parser::ast::CreateAbacPolicyStatement,
+    server: &Arc<ServerState>,
+    session: &mut Option<Session>,
+) -> Result<DdlResult, ProtocolError> {
+    use zyron_parser::ast::AbacPolicyTarget;
+
+    let (_db_id, schema_id) = get_session_schema(session, server, None)?;
+
+    let (object_id, target, object_type) = match stmt.target {
+        AbacPolicyTarget::Table => {
+            let table = server
+                .catalog
+                .get_table(schema_id, &stmt.target_name)
+                .map_err(ProtocolError::Database)?;
+            (
+                table.id.0,
+                zyron_auth::AbacTarget::Table,
+                zyron_auth::ObjectType::Table,
+            )
+        }
+        AbacPolicyTarget::Publication => {
+            let publication = server
+                .catalog
+                .get_publication(schema_id, &stmt.target_name)
+                .ok_or_else(|| {
+                    ProtocolError::Database(ZyronError::Internal(format!(
+                        "publication '{}' does not exist",
+                        stmt.target_name
+                    )))
+                })?;
+            (
+                publication.id.0,
+                zyron_auth::AbacTarget::Publication,
+                zyron_auth::ObjectType::Publication,
+            )
+        }
+    };
+
+    check_ddl_privilege(
+        server,
+        session,
+        zyron_auth::PrivilegeType::ManagePolicy,
+        object_type,
+        object_id,
+    )?;
+
+    // A policy can only be stored and enforced when a security manager exists.
+    // Fail closed rather than report success on a no-op, so the statement never
+    // implies an access control that is not actually applied.
+    let sm = server.security_manager.as_ref().ok_or_else(|| {
+        ProtocolError::Database(ZyronError::Internal(
+            "security is not enabled; cannot create ABAC policy".to_string(),
+        ))
+    })?;
+
+    let policy = zyron_auth::AbacPolicy {
+        id: 0,
+        name: stmt.name.clone(),
+        table_id: object_id,
+        target,
+        predicate: stmt.predicate_sql.clone(),
+        enabled: true,
+        permissive: true,
+        roles: Vec::new(),
+    };
+
+    sm.create_abac_policy(policy)
+        .await
+        .map_err(ProtocolError::Database)?;
+
+    Ok(DdlResult::Tag("CREATE ABAC POLICY".to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -534,14 +613,9 @@ async fn handle_create_index(
                         index_id.0
                     )))
                 })?;
-            let btree = zyron_storage::BTreeIndex::create(
-                Arc::clone(&server.disk_manager),
-                Arc::clone(&server.buffer_pool),
-                entry.index_file_id,
-                checkpoint_dir,
-            )
-            .await
-            .map_err(ProtocolError::Database)?;
+            let btree = zyron_storage::BTreeIndex::create(entry.index_file_id, checkpoint_dir)
+                .await
+                .map_err(ProtocolError::Database)?;
             let _ = server
                 .btree_indexes
                 .insert_async(index_id.0, Arc::new(btree))

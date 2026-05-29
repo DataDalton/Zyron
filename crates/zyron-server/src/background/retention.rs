@@ -362,6 +362,7 @@ impl RetentionWorker {
             Ok(batches) => {
                 wc.txn_manager
                     .commit(&mut txn)
+                    .await
                     .map_err(|e| format!("commit: {e}"))?;
                 let affected: u64 = batches.iter().map(|b| b.num_rows as u64).sum();
                 Ok(affected)
