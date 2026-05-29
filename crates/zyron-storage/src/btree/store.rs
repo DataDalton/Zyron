@@ -2,22 +2,71 @@
 //!
 //! Pages are organized into fixed-size chunks installed lazily. Each
 //! page number maps directly to a (chunk_idx, slot_idx) pair so reads,
-//! in-slice writes, and allocations proceed without any global lock.
+//! writes, and allocations proceed without any global lock.
 //!
-//! Concurrency primitives per page:
-//!  - version: even = stable readable, odd = exclusive writer in progress.
-//!    Readers snapshot version before+after data copy, mismatch or odd =
-//!    retry. CAS writers CAS even to odd, copy data, store version+2.
-//!  - lock_for_write returns a WriteGuard that keeps the page version
-//!    odd for the duration of a multi-step structural operation (node
-//!    split). While the guard is held, all CAS writers and readers on
-//!    the locked page retry, so the structural mutation is observed
-//!    atomically by everyone else.
+//! Concurrency model (RCU / copy-on-write pointer swap):
+//!  - Each slot holds an atomic pointer to an immutable page buffer. A
+//!    published buffer is never mutated in place, so readers load the
+//!    pointer once and read the buffer they got with no version check and
+//!    no retry. Reads are wait-free.
+//!  - Writers build a new buffer, apply their change, and swap the slot
+//!    pointer to it. The old buffer is retired through epoch-based
+//!    reclamation so a reader that still holds it is never freed under.
+//!  - The per-slot version counter (even = stable, odd = a writer is
+//!    publishing) serializes writers against each other only. Readers
+//!    ignore it. A CAS writer publishes by claiming the version even->odd,
+//!    swapping the pointer, then storing version+2. A second writer that
+//!    sees a changed version retries; readers are never affected.
+//!  - lock_for_write claims the version for a multi-step structural
+//!    operation (node split) and publishes the result via pointer swap
+//!    when the guard drops. Other writers retry while it is held, readers
+//!    keep reading the pre-split buffer.
 
+use crossbeam::epoch::{self, Atomic, Owned};
+use crossbeam::queue::ArrayQueue;
 use parking_lot::Mutex;
-use std::cell::UnsafeCell;
+use std::cell::Cell;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use zyron_common::page::PAGE_SIZE;
+
+// Recycled page-buffer pool. A publish allocates a fresh 8KB buffer and the
+// old buffer is retired; rather than round-tripping the allocator on every
+// write, retired buffers are pushed back here (after the epoch grace period,
+// so no reader still holds them) and reused. All buffers are PAGE_SIZE, so the
+// pool is shared process-wide across every index. Capacity bounds the recycled
+// memory; a push that overflows frees the buffer instead.
+const BUFFER_POOL_CAP: usize = 8192; // 8192 * 8KB = 64MB ceiling
+
+// Raw page-buffer pointer made Send so it can cross into the epoch-deferred
+// recycle closure. The buffer is unreachable (already swapped out) and the
+// epoch grace period guarantees no reader holds it when the closure runs.
+struct SendPtr(*mut [u8; PAGE_SIZE]);
+unsafe impl Send for SendPtr {}
+
+fn buffer_pool() -> &'static ArrayQueue<SendPtr> {
+    static POOL: OnceLock<ArrayQueue<SendPtr>> = OnceLock::new();
+    POOL.get_or_init(|| ArrayQueue::new(BUFFER_POOL_CAP))
+}
+
+/// Takes a page buffer from the pool, or allocates one if the pool is empty.
+/// Contents are undefined, the caller fully overwrites before publishing.
+#[inline]
+fn take_buffer() -> *mut [u8; PAGE_SIZE] {
+    match buffer_pool().pop() {
+        Some(SendPtr(raw)) => raw,
+        None => Box::into_raw(Box::new([0u8; PAGE_SIZE])),
+    }
+}
+
+/// Returns a retired page buffer to the pool, or frees it if the pool is full.
+#[inline]
+fn return_buffer(raw: *mut [u8; PAGE_SIZE]) {
+    if buffer_pool().push(SendPtr(raw)).is_err() {
+        // SAFETY: raw came from Box::into_raw and is no longer referenced.
+        unsafe { drop(Box::from_raw(raw)) };
+    }
+}
 
 // 1024 slots per chunk, 8KB per slot, 8MB per chunk
 const SLOTS_PER_CHUNK: usize = 1024;
@@ -29,14 +78,11 @@ const CHUNK_INDEX_SHIFT: usize = 10;
 const MAX_CHUNKS: usize = 16384;
 
 struct PageSlot {
+    // even = stable, odd = a writer is publishing. Serializes writers only.
     version: AtomicU64,
-    data: UnsafeCell<[u8; PAGE_SIZE]>,
+    // Pointer to the current immutable page buffer, null until first write.
+    page: Atomic<[u8; PAGE_SIZE]>,
 }
-
-// All concurrent access goes through the version protocol or the split
-// latch, UnsafeCell access is gated by these atomic operations
-unsafe impl Send for PageSlot {}
-unsafe impl Sync for PageSlot {}
 
 #[repr(C)]
 struct Chunk {
@@ -45,9 +91,9 @@ struct Chunk {
 
 impl Chunk {
     fn new_zeroed() -> *mut Chunk {
-        // The all-zero bit pattern is a valid PageSlot, AtomicU64::new(0)
-        // is 0, AtomicU32::new(0) is 0, [0u8; PAGE_SIZE] is the zero page
-        // We alloc_zeroed directly to avoid 1024 individual PageSlot inits
+        // The all-zero bit pattern is a valid Chunk: AtomicU64::new(0) is 0
+        // and Atomic::null() is the null pointer (zero bits). We alloc_zeroed
+        // directly to avoid 1024 individual PageSlot inits.
         let layout = std::alloc::Layout::new::<Chunk>();
         let raw = unsafe { std::alloc::alloc_zeroed(layout) as *mut Chunk };
         if raw.is_null() {
@@ -134,7 +180,8 @@ impl InMemoryPageStore {
     #[inline]
     pub fn allocate(&self) -> u32 {
         let p = self.next_page.fetch_add(1, Ordering::Relaxed);
-        // Touch the chunk so future accesses do not race the install
+        // Touch the chunk so future accesses do not race the install. The
+        // slot's page pointer stays null until the first write.
         let _ = self.slot(p);
         p
     }
@@ -155,26 +202,31 @@ impl InMemoryPageStore {
         start
     }
 
-    /// Optimistic lock-free read. Returns None if the page has never been
-    /// touched (chunk not installed). Returns Err(()) if the read tore due
-    /// to a concurrent writer, caller should retry.
+    /// Wait-free read. Loads the current immutable page buffer and copies it
+    /// out. Returns None if the page has never been written (null pointer).
+    /// Never tears and never asks the caller to retry, because the buffer it
+    /// returns is immutable: a concurrent writer publishes a new buffer
+    /// rather than mutating this one. The Result is kept for call-site
+    /// compatibility; it is always Ok.
     #[inline]
     pub fn try_read(&self, page_num: u32) -> Option<Result<[u8; PAGE_SIZE], ()>> {
         let slot = self.slot_if_installed(page_num)?;
-        let v1 = slot.version.load(Ordering::Acquire);
-        if v1 & 1 != 0 {
-            return Some(Err(()));
+        let guard = epoch::pin();
+        let shared = slot.page.load(Ordering::Acquire, &guard);
+        if shared.is_null() {
+            return None;
         }
-        let data = unsafe { *slot.data.get() };
-        let v2 = slot.version.load(Ordering::Acquire);
-        if v1 != v2 {
-            return Some(Err(()));
-        }
+        // SAFETY: the buffer is alive while the guard is pinned, and it is
+        // immutable once published, so this copy cannot tear.
+        let data = unsafe { *shared.deref() };
         Some(Ok(data))
     }
 
-    /// Same as try_read but also returns the validated version for use
-    /// with try_versioned_write.
+    /// Read for the writer CAS protocol: returns the buffer plus the version
+    /// token to pass to try_versioned_write. Validates the version around the
+    /// copy so the (data, version) pair is consistent for a read-modify-write.
+    /// Returns Err(()) if a writer is mid-publish so the calling writer
+    /// retries. Readers should use try_read, which never retries.
     #[inline]
     pub fn try_read_versioned(&self, page_num: u32) -> Option<Result<([u8; PAGE_SIZE], u64), ()>> {
         let slot = self.slot_if_installed(page_num)?;
@@ -182,7 +234,12 @@ impl InMemoryPageStore {
         if v1 & 1 != 0 {
             return Some(Err(()));
         }
-        let data = unsafe { *slot.data.get() };
+        let guard = epoch::pin();
+        let shared = slot.page.load(Ordering::Acquire, &guard);
+        if shared.is_null() {
+            return None;
+        }
+        let data = unsafe { *shared.deref() };
         let v2 = slot.version.load(Ordering::Acquire);
         if v1 != v2 {
             return Some(Err(()));
@@ -190,28 +247,22 @@ impl InMemoryPageStore {
         Some(Ok((data, v1)))
     }
 
-    /// Reads a page until it is stable, blocking via short spins on torn reads.
-    /// Returns None only if the chunk has not been installed.
+    /// Reads the current immutable page buffer. Returns None only if the page
+    /// has never been written. Wait-free, never tears.
     #[inline]
     pub fn read_stable(&self, page_num: u32) -> Option<[u8; PAGE_SIZE]> {
         let slot = self.slot_if_installed(page_num)?;
-        loop {
-            let v1 = slot.version.load(Ordering::Acquire);
-            if v1 & 1 != 0 {
-                std::hint::spin_loop();
-                continue;
-            }
-            let data = unsafe { *slot.data.get() };
-            let v2 = slot.version.load(Ordering::Acquire);
-            if v1 == v2 {
-                return Some(data);
-            }
-            std::hint::spin_loop();
+        let guard = epoch::pin();
+        let shared = slot.page.load(Ordering::Acquire, &guard);
+        if shared.is_null() {
+            return None;
         }
+        Some(unsafe { *shared.deref() })
     }
 
-    /// CAS-write. Succeeds only if the page version equals expected_version,
-    /// meaning no concurrent writer has modified the page since the read.
+    /// CAS-publish. Succeeds only if the page version still equals
+    /// expected_version, meaning no concurrent writer has published since the
+    /// read. Builds a new immutable buffer and swaps it in, retiring the old.
     #[inline]
     pub fn try_versioned_write(
         &self,
@@ -222,25 +273,28 @@ impl InMemoryPageStore {
         let Some(slot) = self.slot_if_installed(page_num) else {
             return false;
         };
-        let odd = expected_version | 1;
+        // Claim the version even->odd. Other writers retry while odd.
         if slot
             .version
-            .compare_exchange(expected_version, odd, Ordering::AcqRel, Ordering::Relaxed)
+            .compare_exchange(
+                expected_version,
+                expected_version | 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
             .is_err()
         {
             return false;
         }
-        unsafe {
-            (*slot.data.get()).copy_from_slice(data);
-        }
+        self.publish(slot, data);
         slot.version.store(expected_version + 2, Ordering::Release);
         true
     }
 
-    /// Force-write that ignores the current version. Caller must hold the
-    /// split_latch on this page so no concurrent split races. CAS writers
-    /// and readers using the version protocol still proceed safely because
-    /// this method bumps the version even-odd-even like any other writer.
+    /// Unconditional publish. Caller is the only writer of this page for the
+    /// duration (freshly allocated split sibling, recovery), but readers may
+    /// be reading the old buffer, so the swap still goes through epoch
+    /// reclamation. Spins only against other writers via the version claim.
     pub fn force_write(&self, page_num: u32, data: &[u8; PAGE_SIZE]) {
         let slot = self.slot(page_num);
         loop {
@@ -254,19 +308,93 @@ impl InMemoryPageStore {
                 .compare_exchange(v, v | 1, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                unsafe {
-                    (*slot.data.get()).copy_from_slice(data);
-                }
+                self.publish(slot, data);
                 slot.version.store(v + 2, Ordering::Release);
                 return;
             }
+            std::hint::spin_loop();
         }
     }
 
-    /// Acquires exclusive write access to a page by CAS-ing the version
-    /// from even to odd, spinning until acquired. The returned guard holds
-    /// version odd until dropped, so all readers and CAS writers retry
-    /// while the multi-step structural operation runs.
+    /// Swaps in a new immutable buffer holding `data` and retires the old one
+    /// through epoch reclamation. The caller must hold the version claim
+    /// (odd) so two writers cannot swap concurrently.
+    #[inline]
+    fn publish(&self, slot: &PageSlot, data: &[u8; PAGE_SIZE]) {
+        let raw = take_buffer();
+        // SAFETY: take_buffer returns an owned buffer we fully initialize.
+        unsafe { *raw = *data };
+        self.publish_raw(slot, raw);
+    }
+
+    /// Swaps in `raw` (an owned, fully-initialized page buffer) as the new
+    /// immutable page and retires the old one to the pool after the epoch
+    /// grace period. The caller must hold the version claim.
+    #[inline]
+    fn publish_raw(&self, slot: &PageSlot, raw: *mut [u8; PAGE_SIZE]) {
+        let new = unsafe { Owned::from_raw(raw) };
+        let guard = epoch::pin();
+        let old = slot.page.swap(new, Ordering::AcqRel, &guard);
+        if !old.is_null() {
+            let old_raw = old.as_raw() as *mut [u8; PAGE_SIZE];
+            // SAFETY: the old buffer is immutable and no longer reachable from
+            // the slot. The deferred recycle runs only after every reader that
+            // could hold it has unpinned, so reuse cannot race a reader. The
+            // closure touches only the 'static pool and the unreachable
+            // buffer, so deferring it unchecked is sound.
+            unsafe { guard.defer_unchecked(move || return_buffer(old_raw)) };
+        }
+    }
+
+    /// Loads the current page content into a fresh working buffer from the
+    /// pool, or a zeroed buffer if the page has never been written. The caller
+    /// owns the returned raw buffer and must publish or return it.
+    #[inline]
+    fn load_working(slot: &PageSlot) -> *mut [u8; PAGE_SIZE] {
+        let raw = take_buffer();
+        let guard = epoch::pin();
+        let shared = slot.page.load(Ordering::Acquire, &guard);
+        // SAFETY: raw is owned by this caller; fully initialize it.
+        unsafe {
+            if shared.is_null() {
+                *raw = [0u8; PAGE_SIZE];
+            } else {
+                *raw = *shared.deref();
+            }
+        }
+        raw
+    }
+
+    /// Attempts to acquire the write claim only if the current (even) version
+    /// equals `expected`. Returns the guard on success, None without touching
+    /// the page on mismatch or while another writer holds it. Used by
+    /// prepare-then-publish split: the split halves are built off-claim
+    /// against a versioned snapshot and committed only when the leaf has not
+    /// changed since, so the publish is a single pointer swap on guard drop.
+    #[inline]
+    pub fn try_lock_for_write_at(&self, page_num: u32, expected: u64) -> Option<WriteGuard<'_>> {
+        let slot = self.slot(page_num);
+        if slot
+            .version
+            .compare_exchange(expected, expected | 1, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            Some(WriteGuard {
+                store: self,
+                slot,
+                base_version: expected,
+                working: Self::load_working(slot),
+                dirty: Cell::new(false),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Claims the write version for a multi-step structural operation,
+    /// spinning until acquired. Other writers retry while the claim is held;
+    /// readers keep reading the current buffer. The guard publishes the
+    /// mutated buffer via pointer swap when it drops.
     #[inline]
     pub fn lock_for_write(&self, page_num: u32) -> WriteGuard<'_> {
         let slot = self.slot(page_num);
@@ -282,8 +410,11 @@ impl InMemoryPageStore {
                 .is_ok()
             {
                 return WriteGuard {
+                    store: self,
                     slot,
                     base_version: v,
+                    working: Self::load_working(slot),
+                    dirty: Cell::new(false),
                 };
             }
             std::hint::spin_loop();
@@ -294,28 +425,48 @@ impl InMemoryPageStore {
 
     /// Returns a reference to the raw page bytes. Caller must guarantee no
     /// concurrent writers, typically during single-threaded initialization
-    /// or recovery. Returns None if the chunk has not been installed.
+    /// or recovery. Returns None if the page has never been written.
     pub fn get(&self, page_num: u32) -> Option<&[u8; PAGE_SIZE]> {
         let slot = self.slot_if_installed(page_num)?;
-        Some(unsafe { &*slot.data.get() })
+        let guard = epoch::pin();
+        let shared = slot.page.load(Ordering::Acquire, &guard);
+        if shared.is_null() {
+            return None;
+        }
+        // SAFETY: exclusive-access contract, the buffer outlives this borrow
+        // because no concurrent writer swaps it.
+        Some(unsafe { &*shared.as_raw() })
     }
 
-    /// Returns a mutable reference to the page bytes. Caller must hold
-    /// &mut self, used only by checkpoint loading paths.
+    /// Returns a mutable reference to the page bytes, installing a zeroed
+    /// buffer if the page has never been written. Caller must hold &mut self,
+    /// used only by checkpoint loading paths.
     pub fn get_mut(&mut self, page_num: u32) -> Option<&mut [u8; PAGE_SIZE]> {
-        let slot = self.slot_if_installed(page_num)?;
-        // SAFETY: &mut self guarantees no other thread holds a reference
-        // to any part of this store
-        Some(unsafe { &mut *slot.data.get() })
+        let slot = self.slot(page_num);
+        let guard = epoch::pin();
+        let shared = slot.page.load(Ordering::Acquire, &guard);
+        let raw = if shared.is_null() {
+            let owned = Owned::new([0u8; PAGE_SIZE]);
+            let installed = owned.into_shared(&guard);
+            slot.page.store(installed, Ordering::Release);
+            installed.as_raw() as *mut [u8; PAGE_SIZE]
+        } else {
+            shared.as_raw() as *mut [u8; PAGE_SIZE]
+        };
+        // SAFETY: &mut self guarantees no other thread accesses this store.
+        Some(unsafe { &mut *raw })
     }
 
     /// Single-threaded write helper used by initialization and checkpoint
-    /// loading. Bumps version to an even value so any future concurrent
-    /// reader sees the new data.
+    /// loading. Publishes a new buffer and bumps the version even.
     pub fn write(&mut self, page_num: u32, data: &[u8; PAGE_SIZE]) {
         let slot = self.slot(page_num);
-        unsafe {
-            (*slot.data.get()).copy_from_slice(data);
+        // &mut self: no concurrent readers, free the old buffer immediately.
+        let guard = epoch::pin();
+        let new = Owned::new(*data);
+        let old = slot.page.swap(new, Ordering::AcqRel, &guard);
+        if !old.is_null() {
+            unsafe { drop(old.into_owned()) };
         }
         let v = slot.version.load(Ordering::Relaxed);
         let next = (v & !1) + 2;
@@ -331,41 +482,72 @@ impl Default for InMemoryPageStore {
 
 impl Drop for InMemoryPageStore {
     fn drop(&mut self) {
-        for slot in self.chunks.iter() {
-            let p = slot.load(Ordering::Relaxed);
-            if !p.is_null() {
-                unsafe { Chunk::dealloc(p) };
+        // No concurrent access during Drop: free each page buffer, then the
+        // chunk arrays.
+        let guard = epoch::pin();
+        for chunk_slot in self.chunks.iter() {
+            let p = chunk_slot.load(Ordering::Relaxed);
+            if p.is_null() {
+                continue;
             }
+            for si in 0..SLOTS_PER_CHUNK {
+                let page = unsafe { &(*p).slots[si].page };
+                let shared = page.load(Ordering::Relaxed, &guard);
+                if !shared.is_null() {
+                    unsafe { drop(shared.into_owned()) };
+                }
+            }
+            unsafe { Chunk::dealloc(p) };
         }
     }
 }
 
+/// Exclusive write claim over a single page for a multi-step structural
+/// operation. Mutations accumulate in a private working buffer and are
+/// published as one immutable buffer when the guard drops, so readers never
+/// observe an intermediate state and never retry.
 pub struct WriteGuard<'a> {
+    store: &'a InMemoryPageStore,
     slot: &'a PageSlot,
     base_version: u64,
+    // Pooled working buffer, owned by this guard. Mutations accumulate here
+    // and publish as one immutable page when the guard drops.
+    working: *mut [u8; PAGE_SIZE],
+    dirty: Cell<bool>,
 }
 
 impl<'a> WriteGuard<'a> {
-    /// Reads the current page bytes while the guard is held. Safe because
-    /// the guard's odd-version state excludes other writers.
+    /// Reads the current working bytes.
     #[inline]
     pub fn read(&self) -> [u8; PAGE_SIZE] {
-        unsafe { *self.slot.data.get() }
+        // SAFETY: the guard exclusively owns the working buffer for its
+        // lifetime, so there is no aliasing access.
+        unsafe { *self.working }
     }
 
-    /// Writes new bytes into the page while the guard is held. The data
-    /// becomes visible to readers only when the guard drops and the
-    /// version transitions back to even.
+    /// Writes new bytes into the working buffer. The data becomes visible to
+    /// readers only when the guard drops and publishes the buffer.
     #[inline]
     pub fn write(&self, data: &[u8; PAGE_SIZE]) {
+        // SAFETY: exclusive ownership for the guard's lifetime.
         unsafe {
-            (*self.slot.data.get()).copy_from_slice(data);
+            (*self.working).copy_from_slice(data);
         }
+        self.dirty.set(true);
     }
 }
 
 impl<'a> Drop for WriteGuard<'a> {
     fn drop(&mut self) {
+        if self.dirty.get() {
+            // Publish the working buffer directly as the new immutable page,
+            // retiring the old one to the pool.
+            self.store.publish_raw(self.slot, self.working);
+        } else {
+            // Unchanged: return the working buffer to the pool unused.
+            return_buffer(self.working);
+        }
+        // Release the write claim back to even. Readers never observed odd.
         self.slot
             .version
             .store(self.base_version + 2, Ordering::Release);
@@ -437,27 +619,44 @@ mod tests {
     }
 
     #[test]
+    fn lock_for_write_publishes_on_drop() {
+        let s = InMemoryPageStore::new();
+        let p = s.allocate();
+        {
+            let g = s.lock_for_write(p);
+            let mut data = g.read();
+            data[7] = 0x5A;
+            g.write(&data);
+        }
+        let read = s.try_read(p).unwrap().unwrap();
+        assert_eq!(read[7], 0x5A);
+    }
+
+    #[test]
     fn lock_for_write_is_exclusive() {
         use std::sync::Arc;
-        use std::sync::atomic::AtomicU32;
         let s = Arc::new(InMemoryPageStore::new());
         let p = s.allocate();
-        let counter = Arc::new(AtomicU32::new(0));
+        s.force_write(p, &[0u8; PAGE_SIZE]);
         let mut handles = Vec::new();
         for _ in 0..4 {
             let s = Arc::clone(&s);
-            let counter = Arc::clone(&counter);
             handles.push(std::thread::spawn(move || {
                 for _ in 0..1000 {
-                    let _g = s.lock_for_write(p);
-                    let v = counter.load(Ordering::Relaxed);
-                    counter.store(v + 1, Ordering::Relaxed);
+                    let g = s.lock_for_write(p);
+                    let mut data = g.read();
+                    let v = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                    data[0..4].copy_from_slice(&(v + 1).to_le_bytes());
+                    g.write(&data);
                 }
             }));
         }
         for h in handles {
             h.join().unwrap();
         }
-        assert_eq!(counter.load(Ordering::Relaxed), 4000);
+        let final_data = s.try_read(p).unwrap().unwrap();
+        let count =
+            u32::from_le_bytes([final_data[0], final_data[1], final_data[2], final_data[3]]);
+        assert_eq!(count, 4000);
     }
 }

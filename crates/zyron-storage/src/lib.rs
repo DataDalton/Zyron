@@ -47,6 +47,6 @@ pub use tuple::{
     VersionedTupleHeader, VersionedTupleView,
 };
 pub use txn::{
-    GcStats, IntentLockTable, IsolationLevel, LockTable, MvccGc, NodeLatch, Savepoint, Snapshot,
-    Transaction, TransactionManager, TransactionStatus, WaitForGraph,
+    GcStats, IntentLockTable, IsolationLevel, LockTable, MvccGc, Savepoint, Snapshot, Transaction,
+    TransactionManager, TransactionStatus, WaitForGraph,
 };

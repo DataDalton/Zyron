@@ -188,25 +188,25 @@ What a client sees from a running server over the wire protocol, from cold start
 
 | Lifecycle / workload | Result |
 |----------------------|--------|
-| Cold boot to accepting queries | 26 ms |
-| First `ReadyForQuery` | 0.34 ms |
-| Schema DDL bootstrap | 33.5 ms |
-| Seed insert | 409K rows/sec |
-| OLTP, 1 client | 9.5K tps, p99 210 us |
-| OLTP, 4 clients | 26.2K tps, p99 239 us |
-| OLTP, 16 clients | 58.6K tps, p99 437 us |
-| OLTP, 64 clients | 78.0K tps, p99 2455 us |
-| OLTP, 256 clients | 76.3K tps, p99 6885 us |
-| Analytical query (median) | 1.95 ms |
-| Graceful shutdown | 56 ms |
+| Cold boot to accepting queries | 31 ms |
+| First `ReadyForQuery` | 0.46 ms |
+| Schema DDL bootstrap | 4.3 ms |
+| Seed insert | 497K rows/sec |
+| OLTP, 1 client | 9.2K tps, p99 251 us |
+| OLTP, 4 clients | 25.8K tps, p99 250 us |
+| OLTP, 16 clients | 59.5K tps, p99 417 us |
+| OLTP, 64 clients | 79.8K tps, p99 1381 us |
+| OLTP, 256 clients | 76.9K tps, p99 6189 us |
+| Analytical query (median) | 2.06 ms |
+| Graceful shutdown | 58 ms |
 
 ```mermaid
 %%{init: {'theme':'base','themeVariables':{'xyChart':{'backgroundColor':'transparent','titleColor':'#e6edf3','xAxisLabelColor':'#e6edf3','xAxisTitleColor':'#e6edf3','xAxisTickColor':'#1f6feb','xAxisLineColor':'#1f6feb','yAxisLabelColor':'#e6edf3','yAxisTitleColor':'#e6edf3','yAxisTickColor':'#1f6feb','yAxisLineColor':'#1f6feb','plotColorPalette':'#1f6feb'}},'xyChart':{'width':750,'height':360}}}%%
 xychart-beta
     title "OLTP throughput vs. concurrent clients (thousand tps, higher is better)"
     x-axis ["1 client", "4 clients", "16 clients", "64 clients", "256 clients"]
-    y-axis "K tps" 0 --> 89
-    bar [9.5, 26.2, 58.6, 78.0, 76.3]
+    y-axis "K tps" 0 --> 91
+    bar [9.2, 25.8, 59.5, 79.8, 76.9]
 ```
 
 ### Engine internals
@@ -218,8 +218,8 @@ Raw subsystem throughput and hot-path latency under microbenchmark:
 xychart-beta
     title "Throughput (million ops/sec, higher is better)"
     x-axis ["B+tree insert", "B+tree delete", "Hash join build", "SCD-2 merge", "COPY FROM", "Row serialize", "SQL parse", "TTL purge", "Archive"]
-    y-axis "M ops/sec" 0 --> 141
-    bar [39.2, 46.3, 123.4, 45.8, 23.2, 18.2, 2.2, 15.2, 83.8]
+    y-axis "M ops/sec" 0 --> 133
+    bar [39.2, 46.3, 116.3, 45.8, 23.2, 18.2, 2.2, 15.2, 83.8]
 ```
 
 ```mermaid
@@ -228,7 +228,7 @@ xychart-beta
     title "Hot-path latency (nanoseconds, lower is better)"
     x-axis ["MVCC visible", "Version lookup", "B+tree lookup", "Branch resolve", "Row lock", "Legal-hold check", "Bloom probe", "Selectivity est"]
     y-axis "ns/op" 0 --> 136
-    bar [1.4, 10.8, 14.1, 39.0, 73.1, 6.0, 5.9, 118.5]
+    bar [1.4, 10.8, 14.1, 39.0, 75.4, 6.0, 5.9, 118.5]
 ```
 
 A few more numbers not shown in the charts above:

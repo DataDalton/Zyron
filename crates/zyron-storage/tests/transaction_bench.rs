@@ -1,4 +1,4 @@
-#![allow(non_snake_case, unused_assignments)]
+﻿#![allow(non_snake_case, unused_assignments)]
 
 //! Transaction Benchmark Suite
 //!
@@ -24,8 +24,8 @@ use zyron_buffer::{BufferPool, BufferPoolConfig};
 use zyron_common::page::PageId;
 use zyron_storage::{
     BTreeIndex, BufferedBTreeIndex, DiskManager, DiskManagerConfig, HeapFile, IsolationLevel,
-    LockTable, MvccGc, NodeLatch, Snapshot, Transaction, TransactionManager, TransactionStatus,
-    Tuple, TupleHeader, TupleId,
+    LockTable, MvccGc, Snapshot, Transaction, TransactionManager, TransactionStatus, Tuple,
+    TupleHeader, TupleId,
 };
 use zyron_wal::{LogRecordType, WalReader, WalWriter, WalWriterConfig};
 
@@ -748,157 +748,167 @@ fn test_concurrent_btree_latch_coupling() {
 // Test 9: Optimistic Read Under Contention
 // =============================================================================
 
-/// Validates optimistic read behavior under sustained write contention using NodeLatch.
-/// 1 writer thread continuously acquires/releases the latch, 15 readers perform
-/// optimistic reads. Measures max read latency (version check + potential retry).
+/// Real B+Tree read-under-contention: 1 writer thread continuously overwrites
+/// keys (exercising the page seqlock's CAS publish on hot leaves) while 15
+/// reader threads run search_sync against the same key range. Measures reader
+/// latency under live writer contention. This drives the actual store seqlock
+/// (try_read / try_versioned_write / lock_for_write) that the engine uses, not
+/// a standalone latch primitive.
 #[test]
 fn test_optimistic_read_under_contention() {
     zyron_bench_harness::init("transaction");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    tprintln!("\n=== Transaction: Optimistic Read Under Contention Test ===");
+    tprintln!("\n=== Transaction: B+Tree Read Under Write Contention ===");
 
-    const WRITER_OPS: usize = 100_000;
+    const KEYS: u64 = 20_000;
     const READER_THREADS: usize = 15;
     const READS_PER_READER: usize = 50_000;
 
-    let latch_util_before = take_util_snapshot();
+    let util_before = take_util_snapshot();
 
-    let latch = Arc::new(NodeLatch::new());
-    // Simulated data protected by the latch
-    let shared_data = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Build a real B+Tree and pre-populate the key range.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let index = rt.block_on(async {
+        BTreeIndex::create(1, dir.path().to_path_buf())
+            .await
+            .unwrap()
+    });
+    // Pre-populate EVEN keys (2*k). Readers always search these, so a search
+    // returning None is a torn-read correctness failure. The writer inserts
+    // unique ODD keys interleaved between them, landing on the same leaves the
+    // readers scan (real reader/writer leaf contention) without ever inserting
+    // a duplicate (the B+Tree rejects duplicate keys with DuplicateKey).
+    {
+        let mut items: Vec<([u8; 8], TupleId)> = (0..KEYS)
+            .map(|k| ((2 * k).to_be_bytes(), TupleId::new(PageId::new(1, k), 0)))
+            .collect();
+        index.insert_many(&mut items).unwrap();
+    }
+    let index = Arc::new(index);
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Writer thread: continuously acquire/release latch (simulates B+Tree mutations)
-    let latch_w = Arc::clone(&latch);
-    let data_w = Arc::clone(&shared_data);
+    // Writer thread: continuously insert fresh unique odd keys (2*n+1) so it
+    // CAS-publishes on the leaves the readers are scanning, without duplicates.
+    let idx_w = Arc::clone(&index);
     let stop_w = Arc::clone(&stop_flag);
     let writer = std::thread::spawn(move || {
-        let mut written = 0u64;
-        while !stop_w.load(std::sync::atomic::Ordering::Relaxed) && written < WRITER_OPS as u64 {
-            loop {
-                match latch_w.acquire_write() {
-                    Ok(v) => {
-                        data_w.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        latch_w.release_write(v);
-                        written += 1;
-                        break;
-                    }
-                    Err(_) => std::hint::spin_loop(),
-                }
-            }
+        let mut n = 0u64;
+        let mut writes = 0u64;
+        while !stop_w.load(std::sync::atomic::Ordering::Relaxed) {
+            let mut batch: Vec<([u8; 8], TupleId)> = (0..64)
+                .map(|_| {
+                    let key = 2 * n + 1;
+                    n += 1;
+                    (key.to_be_bytes(), TupleId::new(PageId::new(1, key), 0))
+                })
+                .collect();
+            idx_w.insert_many(&mut batch).unwrap();
+            writes += 64;
         }
-        written
+        writes
     });
 
-    // Reader threads: optimistic read protocol with latency tracking
+    // Reader threads: drive single read attempts (search_attempt) in their own
+    // retry loop so the BENCHMARK counts retries directly. A torn read (Err)
+    // is a retry; the count measures reader contention against the writer. The
+    // counting lives entirely here, not in the production search_sync path.
     let reader_handles: Vec<_> = (0..READER_THREADS)
-        .map(|_| {
-            let latch = Arc::clone(&latch);
-            let data = Arc::clone(&shared_data);
+        .map(|t| {
+            let idx = Arc::clone(&index);
             std::thread::spawn(move || {
                 let mut max_latency_ns = 0u128;
-                let mut total_reads = 0usize;
-                let mut retries = 0usize;
-
+                let mut hits = 0usize;
+                let mut retries = 0u64;
+                let mut k = (t as u64) * 7919 % KEYS;
                 for _ in 0..READS_PER_READER {
                     let read_start = Instant::now();
-                    loop {
-                        match latch.read_version() {
-                            Ok(v) => {
-                                // Read the shared data
-                                let _ = std::hint::black_box(
-                                    data.load(std::sync::atomic::Ordering::Relaxed),
-                                );
-                                if latch.validate_version(v) {
-                                    break;
-                                } else {
-                                    retries += 1;
-                                }
-                            }
-                            Err(_) => {
+                    let found = loop {
+                        match idx.search_attempt(&(2 * k).to_be_bytes()) {
+                            Ok(r) => break r,
+                            Err(()) => {
                                 retries += 1;
                                 std::hint::spin_loop();
                             }
                         }
+                    };
+                    if found.is_some() {
+                        hits += 1;
                     }
                     let latency = read_start.elapsed().as_nanos();
                     if latency > max_latency_ns {
                         max_latency_ns = latency;
                     }
-                    total_reads += 1;
+                    k = (k + 1) % KEYS;
                 }
-
-                (max_latency_ns, total_reads, retries)
+                (max_latency_ns, hits, retries)
             })
         })
         .collect();
 
-    // Wait for readers to complete
     let mut global_max_latency_ns = 0u128;
-    let mut total_reads = 0usize;
-    let mut total_retries = 0usize;
-
+    let mut total_hits = 0usize;
+    let mut total_retries = 0u64;
     for h in reader_handles {
-        let (max_lat, reads, retries) = h.join().unwrap();
+        let (max_lat, hits, retries) = h.join().unwrap();
         if max_lat > global_max_latency_ns {
             global_max_latency_ns = max_lat;
         }
-        total_reads += reads;
+        total_hits += hits;
         total_retries += retries;
     }
 
-    // Stop writer
     stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-    let keys_written = writer.join().unwrap();
+    let writes_done = writer.join().unwrap();
 
     let max_latency_us = global_max_latency_ns as f64 / 1000.0;
-    let retry_rate = total_retries as f64 / (total_reads as f64 + total_retries as f64) * 100.0;
+    let total_reads = (READER_THREADS * READS_PER_READER) as u64;
+    let retry_rate = total_retries as f64 / (total_reads + total_retries) as f64 * 100.0;
 
-    let latch_util_after = take_util_snapshot();
-    record_test_util(
-        "Optimistic Read Under Contention",
-        latch_util_before,
-        latch_util_after,
-    );
+    let util_after = take_util_snapshot();
+    record_test_util("B+Tree Read Under Contention", util_before, util_after);
 
+    tprintln!("  Writer overwrote {} keys during reader load", writes_done);
+    tprintln!("  Reads hit: {} / {}", total_hits, total_reads);
     tprintln!(
-        "  Writer completed {} latch cycles during reader load",
-        keys_written
-    );
-    tprintln!(
-        "  Total reads: {}, retries: {} ({:.2}%)",
-        total_reads,
+        "  Reader retries: {} ({:.3}% of read attempts)",
         total_retries,
         retry_rate
     );
     tprintln!(
-        "  Max read latency: {:.2} us (target: < {} us)",
+        "  Max read latency: {:.2} us (advisory target: < {} us)",
         max_latency_us,
         OPTIMISTIC_READ_MAX_LATENCY_US
     );
 
+    // All reads must find their key: a search returning None under concurrent
+    // overwrite would mean the seqlock exposed a torn/missing leaf, which is a
+    // correctness failure regardless of latency.
+    assert_eq!(
+        total_hits as u64, total_reads,
+        "every search must find its key under concurrent overwrite (no torn reads)"
+    );
+
+    // Reader retry rate on the REAL B+tree seqlock under writer contention.
     check_performance(
-        "Optimistic Read Under Contention",
+        "B+Tree Read Under Contention",
+        "Reader retry rate (%)",
+        retry_rate,
+        LATCH_RETRY_RATE_TARGET_PCT,
+        false,
+    );
+
+    // Max latency is advisory (an OS scheduling hiccup can spike a single read).
+    check_performance(
+        "B+Tree Read Under Contention",
         "Max read latency (us)",
         max_latency_us,
         OPTIMISTIC_READ_MAX_LATENCY_US,
         false,
-    );
-
-    assert_eq!(
-        total_reads,
-        READER_THREADS * READS_PER_READER,
-        "All reads must complete successfully"
-    );
-
-    // Max latency target is advisory for this test. A single OS scheduling delay
-    // can spike latency beyond 10us. Log but assert on p99 instead.
-    // Calculate p99 from total reads: if >99% of reads complete within 10us,
-    // the implementation is correct. We verify via retry rate as proxy.
-    tprintln!(
-        "  Reader retry rate: {:.2}% (indicates write contention frequency)",
-        retry_rate
     );
 }
 
@@ -1341,163 +1351,5 @@ fn test_transaction_microbenchmarks() {
         "Phase 1.5 Microbenchmarks",
         perf_util_before,
         perf_util_after,
-    );
-}
-
-// =============================================================================
-// Transaction: NodeLatch Concurrent Stress Test
-// =============================================================================
-
-/// Stress tests the NodeLatch under concurrent read/write contention.
-/// Measures retry rate and validates correctness.
-#[test]
-fn test_node_latch_concurrent_stress() {
-    zyron_bench_harness::init("transaction");
-    let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-    tprintln!("\n=== Transaction: NodeLatch Concurrent Stress Test ===");
-
-    const WRITER_THREADS: usize = 4;
-    const READER_THREADS: usize = 15;
-    const WRITES_PER_THREAD: usize = 100_000;
-    const READS_PER_THREAD: usize = 200_000;
-
-    let mut retry_rates = Vec::with_capacity(VALIDATION_RUNS);
-
-    for run in 0..VALIDATION_RUNS {
-        tprintln!("\n--- Run {}/{} ---", run + 1, VALIDATION_RUNS);
-
-        let latch = Arc::new(NodeLatch::new());
-        let shared_value = Arc::new(std::sync::atomic::AtomicU64::new(0));
-
-        // Writer threads
-        let writer_handles: Vec<_> = (0..WRITER_THREADS)
-            .map(|_| {
-                let latch = Arc::clone(&latch);
-                let value = Arc::clone(&shared_value);
-                std::thread::spawn(move || {
-                    let mut writes = 0u64;
-                    let mut cas_retries = 0u64;
-                    for _ in 0..WRITES_PER_THREAD {
-                        loop {
-                            match latch.acquire_write() {
-                                Ok(v) => {
-                                    value.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    latch.release_write(v);
-                                    writes += 1;
-                                    break;
-                                }
-                                Err(_) => {
-                                    cas_retries += 1;
-                                    std::hint::spin_loop();
-                                }
-                            }
-                        }
-                    }
-                    (writes, cas_retries)
-                })
-            })
-            .collect();
-
-        // Reader threads: optimistic read protocol
-        let reader_handles: Vec<_> = (0..READER_THREADS)
-            .map(|_| {
-                let latch = Arc::clone(&latch);
-                let value = Arc::clone(&shared_value);
-                std::thread::spawn(move || {
-                    let mut validated = 0u64;
-                    let mut retried = 0u64;
-                    for _ in 0..READS_PER_THREAD {
-                        loop {
-                            match latch.read_version() {
-                                Ok(v) => {
-                                    // Read the shared value
-                                    let _ = std::hint::black_box(
-                                        value.load(std::sync::atomic::Ordering::Relaxed),
-                                    );
-                                    if latch.validate_version(v) {
-                                        validated += 1;
-                                        break;
-                                    } else {
-                                        retried += 1;
-                                    }
-                                }
-                                Err(_) => {
-                                    retried += 1;
-                                    std::hint::spin_loop();
-                                }
-                            }
-                        }
-                    }
-                    (validated, retried)
-                })
-            })
-            .collect();
-
-        let mut total_writes = 0u64;
-        let mut total_write_retries = 0u64;
-        for h in writer_handles {
-            let (w, r) = h.join().unwrap();
-            total_writes += w;
-            total_write_retries += r;
-        }
-
-        let mut total_validated = 0u64;
-        let mut total_read_retries = 0u64;
-        for h in reader_handles {
-            let (v, r) = h.join().unwrap();
-            total_validated += v;
-            total_read_retries += r;
-        }
-
-        let expected_writes = (WRITER_THREADS * WRITES_PER_THREAD) as u64;
-        assert_eq!(total_writes, expected_writes, "All writes must complete");
-        assert_eq!(
-            total_validated,
-            (READER_THREADS * READS_PER_THREAD) as u64,
-            "All reads must validate"
-        );
-
-        // Final value must equal total writes
-        let final_value = shared_value.load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(
-            final_value, expected_writes,
-            "Shared value must equal total writes"
-        );
-
-        // Final version must be 2 * total_writes (each write cycle bumps version by 2)
-        assert_eq!(
-            latch.current_version(),
-            expected_writes * 2,
-            "Version must be 2 * total_writes"
-        );
-
-        let total_read_ops = (READER_THREADS * READS_PER_THREAD) as f64;
-        let retry_rate =
-            total_read_retries as f64 / (total_read_ops + total_read_retries as f64) * 100.0;
-        retry_rates.push(retry_rate);
-
-        tprintln!(
-            "  Writes: {}, read retries: {} ({:.2}%), write CAS retries: {}",
-            total_writes,
-            total_read_retries,
-            retry_rate,
-            total_write_retries
-        );
-    }
-
-    let result = validate_metric(
-        "NodeLatch Stress",
-        "Reader retry rate (%)",
-        retry_rates,
-        LATCH_RETRY_RATE_TARGET_PCT,
-        false,
-    );
-
-    // Retry rate target is advisory. Log but don't fail if slightly over.
-    tprintln!(
-        "  Retry rate target: < {}% (result: {:.2}%)",
-        LATCH_RETRY_RATE_TARGET_PCT,
-        result.average
     );
 }

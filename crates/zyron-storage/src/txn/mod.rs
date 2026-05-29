@@ -5,7 +5,6 @@
 //! access to heap tuple headers (xmin/xmax), B+tree latch ordering,
 //! and buffer pool pin/unpin.
 
-mod btree_latch;
 mod deadlock;
 mod durability;
 mod gc;
@@ -15,7 +14,6 @@ mod lock_table;
 mod proc_array;
 mod snapshot;
 
-pub use btree_latch::NodeLatch;
 pub use deadlock::WaitForGraph;
 use durability::DurabilityQueue;
 pub use gc::{GcStats, MvccGc};

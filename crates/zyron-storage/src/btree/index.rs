@@ -219,6 +219,15 @@ impl BTreeIndex {
         }
     }
 
+    /// Single optimistic-read attempt: `Ok` on a clean read, `Err(())` on a
+    /// torn read (a concurrent writer was observed mid-update). Lets a caller
+    /// run its own retry loop and count retries, e.g. a contention benchmark,
+    /// without adding a counter to the production search_sync hot path.
+    #[inline]
+    pub fn search_attempt(&self, key: &[u8]) -> std::result::Result<Option<TupleId>, ()> {
+        self.search_optimistic(&self.pages, key)
+    }
+
     /// Optimistic search using version stamps. Returns Err(()) if a torn
     /// read is observed at any page in the traversal.
     ///
@@ -351,39 +360,77 @@ impl BTreeIndex {
             // never re-descending (and never re-copying internal pages)
             // per key.
             let (leaf_pn, bound) = self.find_leaf_and_bound(items[i].0.as_ref());
-            let guard = self.pages.lock_for_write(leaf_pn);
-            let mut leaf = BTreeLeafPage::from_bytes(guard.read());
 
+            // Prepare-then-publish: build the updated leaf from a stable
+            // version-stamped snapshot WITHOUT holding the page odd, then
+            // publish the whole run with a single CAS. The page is odd only for
+            // the microsecond-scale CAS+copy, not for the routing loop, so
+            // concurrent readers see the old leaf intact and do not retry while
+            // the run is being built. A publish conflict (another writer changed
+            // the leaf between our read and CAS) rebuilds from a fresh snapshot.
+            // This mirrors insert_optimistic; CAS interlocks with lock_for_write
+            // splits via the same even/odd version, so the two stay correct.
             let mut applied = 0usize;
-            let mut full = false;
-            while i + applied < items.len() {
-                // A key at or beyond the leaf's upper bound belongs in a
-                // sibling: stop and re-descend for it. Sorted order means
-                // every later key is also beyond the bound.
-                if let Some(ref b) = bound {
-                    if compare_keys(items[i + applied].0.as_ref(), b).is_ge() {
-                        break;
+            let mut need_split = false;
+            loop {
+                let (data, version) = match self.pages.try_read_versioned(leaf_pn) {
+                    Some(Ok(dv)) => dv,
+                    // Writer active (odd) or torn read: re-read until stable.
+                    Some(Err(())) => {
+                        std::hint::spin_loop();
+                        continue;
                     }
-                }
-                let tid = items[i + applied].1;
-                let key = Bytes::copy_from_slice(items[i + applied].0.as_ref());
-                match leaf.insert(key, tid) {
-                    Ok(()) => applied += 1,
-                    Err(ZyronError::NodeFull) => {
-                        full = true;
-                        break;
+                    None => {
+                        return Err(ZyronError::Internal(
+                            "btree leaf page not installed during insert_many".into(),
+                        ));
                     }
-                    Err(e) => return Err(e),
-                }
-            }
+                };
+                let mut leaf = BTreeLeafPage::from_bytes(data);
 
-            if applied > 0 {
-                guard.write(leaf.as_bytes());
+                let mut a = 0usize;
+                let mut full = false;
+                while i + a < items.len() {
+                    // A key at or beyond the leaf's upper bound belongs in a
+                    // sibling: stop and re-descend for it. Sorted order means
+                    // every later key is also beyond the bound.
+                    if let Some(ref b) = bound {
+                        if compare_keys(items[i + a].0.as_ref(), b).is_ge() {
+                            break;
+                        }
+                    }
+                    let key = Bytes::copy_from_slice(items[i + a].0.as_ref());
+                    match leaf.insert(key, items[i + a].1) {
+                        Ok(()) => a += 1,
+                        Err(ZyronError::NodeFull) => {
+                            full = true;
+                            break;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                if a == 0 {
+                    // The first routed key did not fit (leaf full): nothing to
+                    // publish, route it through the split path below.
+                    need_split = full;
+                    break;
+                }
+
+                // Publish the built leaf. On conflict, rebuild from a fresh read.
+                if self
+                    .pages
+                    .try_versioned_write(leaf_pn, leaf.as_bytes(), version)
+                {
+                    applied = a;
+                    need_split = full;
+                    break;
+                }
+                std::hint::spin_loop();
             }
-            drop(guard);
 
             i += applied;
-            if full {
+            if need_split {
                 // The current leaf cannot hold items[i], fall through to the
                 // single-key split path which allocates a sibling, propagates
                 // the split key into the parent, and shrinks the left half.
@@ -741,64 +788,107 @@ impl BTreeIndex {
         }
     }
 
-    /// Insert with split handling. Acquires lock_for_write on the leaf
-    /// for the entire structural mutation so optimistic CAS writers and
-    /// readers retry against the in-progress version. Unrelated leaves
-    /// proceed in parallel because the lock is per-page.
+    /// Insert with split handling, prepare-then-publish. The split halves are
+    /// built off-lock from a version-stamped leaf snapshot and the right-half
+    /// page is written off-lock (it is unreachable from the parent, so no
+    /// reader observes it). The leaf is then held odd only for the publish:
+    /// install the split key in the parent and write the shrunk left-half.
+    /// Concurrent CAS writers and readers retry against the in-progress
+    /// version only during that publish, not while the halves are built or
+    /// the sibling is written. Unrelated leaves proceed in parallel because
+    /// the lock is per-page.
     ///
-    /// Ordering inside the lock:
-    ///   1. Write the freshly allocated right-leaf page (not reachable
-    ///      from the parent yet, so no reader observes it).
-    ///   2. Install the split key in the parent, making the right-leaf
-    ///      visible. Concurrent readers may now route to either half.
-    ///   3. Write the shrunk left-leaf into the guard, which becomes
-    ///      visible when the guard drops at the end of the function.
+    /// If the leaf changed between the snapshot read and the publish lock,
+    /// the split is rebuilt from a fresh snapshot. The sibling page is
+    /// allocated once and reused across rebuilds so a lost publish race does
+    /// not leak pages.
+    ///
+    /// Publish ordering (leaf held odd):
+    ///   1. Install the split key in the parent, making the right-half
+    ///      reachable. Concurrent readers may now route to either half.
+    ///   2. Write the shrunk left-half into the guard, which becomes
+    ///      visible when the guard drops.
     fn insert_with_split_sync(&self, key: Bytes, tuple_id: TupleId) -> Result<()> {
-        let (path, path_len) = self.find_path_sync(&key);
-        if path_len == 0 {
-            return Err(ZyronError::BTreeCorrupted("empty path".to_string()));
-        }
+        let mut sibling: Option<(u32, PageId)> = None;
 
-        let leaf_page_num = path[path_len - 1];
-        let leaf_guard = self.pages.lock_for_write(leaf_page_num);
-        let leaf_bytes = leaf_guard.read();
-        let mut leaf = BTreeLeafPage::from_bytes(leaf_bytes);
-
-        // The leaf may have shrunk between find_path_sync and the lock,
-        // either a concurrent split moved the high half elsewhere or
-        // a delete freed space. Re-attempt the in-slice insert before
-        // committing to a structural split.
-        match leaf.insert(key.clone(), tuple_id) {
-            Ok(()) => {
-                leaf_guard.write(leaf.as_bytes());
-                return Ok(());
+        loop {
+            let (path, path_len) = self.find_path_sync(&key);
+            if path_len == 0 {
+                return Err(ZyronError::BTreeCorrupted("empty path".to_string()));
             }
-            Err(ZyronError::NodeFull) => {}
-            Err(e) => return Err(e),
+            let leaf_page_num = path[path_len - 1];
+
+            // Version-stamped snapshot read, no lock. Readers do not retry
+            // while we build the split halves from this snapshot.
+            let (leaf_bytes, version) = match self.pages.try_read_versioned(leaf_page_num) {
+                Some(Ok(dv)) => dv,
+                Some(Err(())) => {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                None => {
+                    return Err(ZyronError::BTreeCorrupted(
+                        "leaf page not installed during split".to_string(),
+                    ));
+                }
+            };
+            let mut leaf = BTreeLeafPage::from_bytes(leaf_bytes);
+
+            // The leaf may have gained room (a concurrent delete) since it
+            // last read full. Publish a plain in-slice insert via CAS and
+            // skip the structural split.
+            match leaf.insert(key.clone(), tuple_id) {
+                Ok(()) => {
+                    if self
+                        .pages
+                        .try_versioned_write(leaf_page_num, leaf.as_bytes(), version)
+                    {
+                        return Ok(());
+                    }
+                    std::hint::spin_loop();
+                    continue;
+                }
+                Err(ZyronError::NodeFull) => {}
+                Err(e) => return Err(e),
+            }
+
+            // Allocate the sibling once, lazily, reused across rebuilds.
+            let (sibling_pn, sibling_id) = *sibling.get_or_insert_with(|| {
+                let pn = self.pages.allocate();
+                (pn, PageId::new(self.file_id, pn as u64))
+            });
+
+            // Right-bias when the inserting key is the new rightmost so
+            // monotonic workloads avoid the 50% page-utilization penalty
+            // of midpoint splits.
+            let (split_key, mut right_leaf) = leaf.split_for_key(Some(key.as_ref()), sibling_id);
+            if key.as_ref() < split_key.as_ref() {
+                leaf.insert(key.clone(), tuple_id)?;
+            } else {
+                right_leaf.insert(key.clone(), tuple_id)?;
+            }
+
+            // Write the right-half off-lock. Not reachable from the parent
+            // until the publish below installs it, so no reader observes it.
+            self.pages.force_write(sibling_pn, right_leaf.as_bytes());
+
+            // Publish only if the leaf is byte-for-byte the snapshot we split.
+            // A concurrent writer that changed it bumps the version, so we
+            // rebuild from a fresh read.
+            let leaf_guard = match self.pages.try_lock_for_write_at(leaf_page_num, version) {
+                Some(g) => g,
+                None => {
+                    std::hint::spin_loop();
+                    continue;
+                }
+            };
+
+            // Step 1: install split key in parent (makes the right-half
+            // reachable). Step 2: shrink left-half, visible when guard drops.
+            self.propagate_split_sync(split_key, sibling_pn, &path[..path_len])?;
+            leaf_guard.write(leaf.as_bytes());
+            return Ok(());
         }
-
-        let new_page_num = self.pages.allocate();
-        let new_page_id = PageId::new(self.file_id, new_page_num as u64);
-        // Right-bias when the inserting key is the new rightmost so
-        // monotonic workloads avoid the 50% page-utilization penalty
-        // of midpoint splits
-        let (split_key, mut right_leaf) = leaf.split_for_key(Some(key.as_ref()), new_page_id);
-
-        if key.as_ref() < split_key.as_ref() {
-            leaf.insert(key.clone(), tuple_id)?;
-        } else {
-            right_leaf.insert(key.clone(), tuple_id)?;
-        }
-
-        // Step 1: publish right-leaf (unreachable from parent until step 2).
-        self.pages.force_write(new_page_num, right_leaf.as_bytes());
-
-        // Step 2: install split key in parent.
-        self.propagate_split_sync(split_key, new_page_num, &path[..path_len])?;
-
-        // Step 3: shrink left-leaf, becomes visible when guard drops.
-        leaf_guard.write(leaf.as_bytes());
-        Ok(())
     }
 
     /// Propagate a split up the tree. Each parent is locked individually

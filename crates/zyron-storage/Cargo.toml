@@ -10,6 +10,7 @@ zyron-buffer = { path = "../zyron-buffer" }
 zyron-wal = { path = "../zyron-wal" }
 tokio.workspace = true
 parking_lot.workspace = true
+crossbeam.workspace = true
 bytes.workspace = true
 hashbrown.workspace = true
 scc.workspace = true
