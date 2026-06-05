@@ -1,0 +1,145 @@
+{
+  "id": "2026-06-05_030638_db3e344-local",
+  "date": "2026-06-05 03:07:07Z",
+  "ts": 1780628827,
+  "commit": "db3e344-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Startup": {
+      "cold boot latency (ms)": {
+        "average": 29.511200,
+        "runs": [29.51],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Bootstrap": {
+      "first ReadyForQuery (ms)": {
+        "average": 0.393400,
+        "runs": [0.39],
+        "target": 50.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "schema DDL total (ms)": {
+        "average": 3.925900,
+        "runs": [3.93],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "seed insert (rows/sec)": {
+        "average": 469708.498906,
+        "runs": [469708.50],
+        "target": 50000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "OLTP": {
+      "c1 tps": {
+        "average": 15890.693913,
+        "runs": [15890.69],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "c1 p99 us": {
+        "average": 191.000000,
+        "runs": [191.00],
+        "target": inf,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "c4 tps": {
+        "average": 47685.569009,
+        "runs": [47685.57],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "c4 p99 us": {
+        "average": 247.000000,
+        "runs": [247.00],
+        "target": inf,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "c16 tps": {
+        "average": 75807.227491,
+        "runs": [75807.23],
+        "target": 30000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "c16 p99 us": {
+        "average": 471.000000,
+        "runs": [471.00],
+        "target": 5000.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "c64 tps": {
+        "average": 77141.152438,
+        "runs": [77141.15],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "c64 p99 us": {
+        "average": 1489.000000,
+        "runs": [1489.00],
+        "target": inf,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "c256 tps": {
+        "average": 72312.340350,
+        "runs": [72312.34],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "c256 p99 us": {
+        "average": 6458.000000,
+        "runs": [6458.00],
+        "target": inf,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Analytics": {
+      "median query us": {
+        "average": 2176.000000,
+        "runs": [2176.00],
+        "target": 1500.000000,
+        "passed": false,
+        "higher_is_better": false
+      }
+    },
+    "Gateway": {
+      "pipeline ops/sec": {
+        "average": 27466490.881125,
+        "runs": [27466490.88],
+        "target": 300000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Shutdown": {
+      "teardown (ms)": {
+        "average": 54.549000,
+        "runs": [54.55],
+        "target": 250.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    }
+  }
+}

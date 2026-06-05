@@ -1,0 +1,93 @@
+{
+  "id": "2026-06-05_025624_db3e344-local",
+  "date": "2026-06-05 02:56:39Z",
+  "ts": 1780628199,
+  "commit": "db3e344-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "B+Tree Split Under Concurrency": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 15.97 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 15.95 },
+      "Split insert throughput (ops/sec)": {
+        "average": 6911847.475955,
+        "runs": [7470945.03, 6739452.76, 6969339.26, 6609248.82, 6770251.51],
+        "target": 4000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Phase 1.5 Microbenchmarks": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 16.05 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 16.03 },
+      "durable begin()+commit() latency floor (ns/op)": {
+        "average": 51678.360000,
+        "runs": [48951.60, 53395.50, 51500.95, 51501.45, 53042.30],
+        "target": 5000000.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "is_visible() latency (ns/op)": {
+        "average": 1.368940,
+        "runs": [1.37, 1.35, 1.36, 1.36, 1.40],
+        "target": 15.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "lock_row() latency (ns/op)": {
+        "average": 76.118800,
+        "runs": [74.80, 75.77, 76.60, 78.75, 74.66],
+        "target": 80.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Snapshot::new() latency (ns/op)": {
+        "average": 20.337400,
+        "runs": [20.35, 20.25, 20.73, 20.15, 20.21],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "GC sweep throughput (tuples/sec)": {
+        "average": 1933691655.375050,
+        "runs": [1921229586.94, 1967342120.79, 1967342120.79, 1934610176.05, 1877934272.30],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Concurrent B+Tree Insert": {
+      "util_before": { "cpu_pct": 4.0, "ram_used_gb": 16.02 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 16.04 },
+      "Insert throughput (ops/sec)": {
+        "average": 6630709.303500,
+        "runs": [6685720.97, 6522545.59, 6745675.39, 6636498.25, 6563106.32],
+        "target": 4000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "B+Tree Read Under Contention": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 16.03 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 16.09 },
+      "Reader retry rate (%)": {
+        "average": 0.000000,
+        "runs": [0.00],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Max read latency (us)": {
+        "average": 28541.600000,
+        "runs": [28541.60],
+        "target": 10.000000,
+        "passed": false,
+        "higher_is_better": false
+      }
+    }
+  }
+}

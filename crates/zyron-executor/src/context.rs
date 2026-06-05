@@ -95,6 +95,11 @@ pub struct ExecutionContext {
     pub snapshot: Snapshot,
     /// When set to true, operators check this flag and bail with a cancellation error.
     cancelled: AtomicBool,
+    /// Set by DML operators when they append a WAL data record. The server
+    /// reads it after execution to decide whether the transaction must commit
+    /// durably; a transaction that wrote nothing commits without a WAL commit
+    /// record or a flush wait.
+    wrote_wal: AtomicBool,
     /// When true, operators collect per-operator metrics (rows, timing).
     pub analyze: bool,
     /// Optional CDC hook invoked by DML operators after mutations.
@@ -160,6 +165,7 @@ impl ExecutionContext {
             txn_id,
             snapshot,
             cancelled: AtomicBool::new(false),
+            wrote_wal: AtomicBool::new(false),
             analyze: false,
             cdc_hook: None,
             dml_hook: None,
@@ -186,6 +192,19 @@ impl ExecutionContext {
     #[inline]
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
+    }
+
+    /// Records that a WAL data record was appended during this execution.
+    /// DML operators call this when they log inserts, updates, or deletes.
+    #[inline]
+    pub fn mark_wrote_wal(&self) {
+        self.wrote_wal.store(true, Ordering::Relaxed);
+    }
+
+    /// Returns true if a WAL data record was appended during this execution.
+    #[inline]
+    pub fn wrote_wal(&self) -> bool {
+        self.wrote_wal.load(Ordering::Relaxed)
     }
 
     /// Checks cancellation and returns an error if cancelled.

@@ -3,9 +3,10 @@
 //! Uses a contiguous byte buffer with atomic cursors.
 //! Writers claim space with a single fetch_add and write directly.
 
-use crate::record::Lsn;
+use crate::constants::{CHECKSUM_SIZE, HEADER_SIZE, OFF_LSN, OFF_PAYLOAD_LEN, OFF_RECORD_TYPE};
+use crate::record::{LogRecordType, Lsn};
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 /// Contiguous ring buffer for WAL records.
 ///
@@ -33,23 +34,35 @@ pub struct RingBuffer {
     /// Bitmask for power-of-2 modulo (buffer_size - 1). Bitwise AND replaces
     /// integer division for offset calculation: 1 cycle vs 20-40 cycles on x86.
     buffer_mask: usize,
+    /// log2(buffer_size). The wrap generation of an absolute offset is
+    /// offset >> buffer_shift, used to stamp and validate per-record publish
+    /// markers so a stale byte from a previous wrap can never be read as
+    /// written data.
+    buffer_shift: u32,
+    /// Per-byte-offset publish markers, one entry per ring byte. A producer
+    /// stamps published[offset & mask] with the wrap-generation marker of the
+    /// record claimed at that offset, as a Release store after the record's
+    /// bytes are written. The flush thread (sole consumer) reads them with
+    /// Acquire to compute the contiguous written watermark. A never-written or
+    /// previous-generation slot carries a different marker, so the consumer
+    /// never advances over an unwritten slot. This replaces in-order producer
+    /// publish: producers no longer wait on each other, so commit throughput
+    /// does not convoy under high concurrency.
+    published: Box<[AtomicU8]>,
     /// Write cursor: next byte offset to claim. Hit by every writer claim,
     /// isolated on its own cache line so flush-thread reads of other cursors
     /// don't force writers to refetch.
     write_cursor: CachePadded<AtomicU64>,
-    /// Committed cursor - bytes ready to drain. Writer commits, flush reads.
-    /// Paired with max_lsn because both are updated in commit_write (one
-    /// cache line dirty per commit instead of two).
+    /// Committed cursor - the contiguous written watermark. Advanced solely by
+    /// the flush thread in advance_committed by walking publish markers; the
+    /// drain reads [read_cursor, committed_cursor).
     committed_cursor: CachePadded<AtomicU64>,
-    /// Maximum LSN written. Co-located with committed_cursor (see above).
-    /// Logically on the same cache line via the commit pairing; keeping it
-    /// on its own CachePadded field prevents packing with write_cursor.
+    /// Maximum LSN written, computed by the flush thread as it advances the
+    /// watermark over published records.
     max_lsn: CachePadded<AtomicU64>,
-    /// Total record count committed to the buffer. Updated synchronously in
-    /// commit_write so that observers (zyron_stat_wal, tests) see record
-    /// counts immediately without waiting on the flush thread to drain.
-    /// Co-located with committed_cursor on its own padded line so commit_write
-    /// dirties one cache line per commit, not three
+    /// Total non-padding record count drained past the watermark, advanced by
+    /// the flush thread so observers (zyron_stat_wal, tests) see counts without
+    /// the writer maintaining a contended counter on the hot path.
     committed_records: CachePadded<AtomicU64>,
     /// Read cursor: bytes already drained. Owned by the flush thread;
     /// writers only read it in the slow path (wait_for_space_slow).
@@ -83,11 +96,20 @@ impl RingBuffer {
             capacity_bytes,
         );
         let buffer = vec![0u8; capacity_bytes].into_boxed_slice();
+        // One publish marker per ring byte. Zero means "no record published at
+        // this offset for the current generation"; the first generation stamps
+        // marker 1, so the initial zero never reads as published.
+        let published: Box<[AtomicU8]> = (0..capacity_bytes)
+            .map(|_| AtomicU8::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
 
         Self {
             buffer: UnsafeCell::new(buffer),
             buffer_size: capacity_bytes,
             buffer_mask: capacity_bytes - 1,
+            buffer_shift: capacity_bytes.trailing_zeros(),
+            published,
             write_cursor: CachePadded(AtomicU64::new(0)),
             committed_cursor: CachePadded(AtomicU64::new(0)),
             read_cursor: CachePadded(AtomicU64::new(0)),
@@ -109,9 +131,10 @@ impl RingBuffer {
     ///
     /// # Safety
     /// Caller must write exactly `size` bytes to the returned pointer before calling
-    /// `commit_write`. The pointer is valid until the ring buffer wraps past this region.
+    /// `commit_write` with the returned claim offset. The pointer is valid until the
+    /// ring buffer wraps past this region.
     #[inline]
-    pub unsafe fn write_record(&self, size: usize) -> *mut u8 {
+    pub unsafe fn write_record(&self, size: usize) -> (*mut u8, u64) {
         let offset = self.write_cursor.fetch_add(size as u64, Ordering::Relaxed);
 
         // Fast-path backpressure: compare against cached limit (written by flush
@@ -124,10 +147,66 @@ impl RingBuffer {
         let buf_offset = (offset as usize) & self.buffer_mask;
 
         if buf_offset + size <= self.buffer_size {
-            return unsafe { (*self.buffer.get()).as_mut_ptr().add(buf_offset) };
+            return (
+                unsafe { (*self.buffer.get()).as_mut_ptr().add(buf_offset) },
+                offset,
+            );
         }
 
-        unsafe { self.write_record_straddle(size) }
+        unsafe { self.write_record_straddle(offset, size) }
+    }
+
+    /// Wrap-generation marker for a record claimed at absolute `offset`, in the
+    /// range 1..=255. The generation is offset / buffer_size; the marker is
+    /// (gen mod 255) + 1, so it is never 0. The consumer resets a slot to 0
+    /// after walking past it (see advance_committed), so a slot is non-zero only
+    /// during the live publish window of its current generation: 0 means
+    /// unpublished, a non-zero value means published this generation. The
+    /// generation in the marker is a second layer of defense; the reset alone
+    /// makes the scan correct regardless of how the byte's record boundaries
+    /// shift across wraps.
+    #[inline]
+    fn gen_marker(&self, offset: u64) -> u8 {
+        (((offset >> self.buffer_shift) % 255) as u8) + 1
+    }
+
+    /// Publishes the record claimed at `offset`, wait-free. Stamps the publish
+    /// marker for this offset with a Release store after the caller has written
+    /// the record's bytes, so the flush thread that reads the marker with
+    /// Acquire also observes the record bytes. Producers do not wait on each
+    /// other; the flush thread computes the contiguous written watermark in
+    /// advance_committed.
+    #[inline]
+    pub fn publish(&self, offset: u64) {
+        let slot = (offset as usize) & self.buffer_mask;
+        self.published[slot].store(self.gen_marker(offset), Ordering::Release);
+    }
+
+    /// Stamps a valid padding record (LogRecordType::Invalid) of `size` bytes
+    /// at logical `offset`, handling the wrap boundary byte by byte. Only the
+    /// record_type and payload_len header fields are written; the rest of the
+    /// header and the payload are left as-is and the checksum is backfilled by
+    /// the flush thread before the segment write. That is self-consistent
+    /// because the checksum is computed over whatever bytes are drained, and
+    /// recovery skips a padding record's content entirely. Without this the
+    /// straddle gap would drain as stale bytes that break recovery's parser.
+    #[inline]
+    unsafe fn write_padding_record(&self, offset: u64, size: usize) {
+        debug_assert!(
+            size >= HEADER_SIZE + CHECKSUM_SIZE,
+            "padding region {} smaller than an empty record",
+            size
+        );
+        let payload_len = (size - HEADER_SIZE - CHECKSUM_SIZE) as u16;
+        let buf = unsafe { (*self.buffer.get()).as_mut_ptr() };
+        let mask = self.buffer_mask;
+        let off = offset as usize;
+        unsafe {
+            *buf.add((off + OFF_RECORD_TYPE) & mask) = LogRecordType::Invalid as u8;
+            let pl = payload_len.to_le_bytes();
+            *buf.add((off + OFF_PAYLOAD_LEN) & mask) = pl[0];
+            *buf.add((off + OFF_PAYLOAD_LEN + 1) & mask) = pl[1];
+        }
     }
 
     /// Slow path: the writer has claimed space past the cached safe_write_limit.
@@ -152,7 +231,7 @@ impl RingBuffer {
     /// the record fits contiguously.
     #[cold]
     #[inline(never)]
-    unsafe fn write_record_straddle(&self, size: usize) -> *mut u8 {
+    unsafe fn write_record_straddle(&self, first_offset: u64, size: usize) -> (*mut u8, u64) {
         debug_assert!(
             size <= self.buffer_size,
             "Record size ({} bytes) exceeds ring buffer capacity ({} bytes)",
@@ -160,9 +239,11 @@ impl RingBuffer {
             self.buffer_size,
         );
 
-        // Commit the initial straddling claim as padding.
-        self.committed_cursor
-            .fetch_add(size as u64, Ordering::Release);
+        // Stamp the initial straddling claim with a padding record and publish
+        // it. The header is written before the publish marker store, so the
+        // flush thread that observes the marker never drains stale bytes for it.
+        unsafe { self.write_padding_record(first_offset, size) };
+        self.publish(first_offset);
 
         loop {
             let offset = self.write_cursor.fetch_add(size as u64, Ordering::Relaxed);
@@ -175,40 +256,100 @@ impl RingBuffer {
             let buf_offset = (offset as usize) & self.buffer_mask;
 
             if buf_offset + size <= self.buffer_size {
-                return unsafe { (*self.buffer.get()).as_mut_ptr().add(buf_offset) };
+                // Real record fits here; its publish happens via publish(offset)
+                // after the caller writes the record bytes.
+                return (
+                    unsafe { (*self.buffer.get()).as_mut_ptr().add(buf_offset) },
+                    offset,
+                );
             }
 
-            self.committed_cursor
-                .fetch_add(size as u64, Ordering::Release);
+            // This claim also straddles: stamp it as padding and publish it.
+            unsafe { self.write_padding_record(offset, size) };
+            self.publish(offset);
         }
     }
 
-    /// Marks `size` bytes as committed and records `lsn` as the latest written LSN.
-    /// Must be called after `write_record` once the data has been written.
+    /// Advances the contiguous written watermark (committed_cursor) over every
+    /// record that producers have published since the last call. Called only by
+    /// the flush thread (the sole consumer), so committed_cursor, max_lsn and
+    /// committed_records have a single writer and need no RMW.
     ///
-    /// Uses store instead of fetch_max for max_lsn. LSNs are assigned
-    /// monotonically by the sequencer, so the latest committed LSN is always
-    /// the highest. For concurrent writers, commit order may differ from assign
-    /// order, but drain_into reads max_lsn after draining all committed bytes,
-    /// so a briefly stale value just means flushed_lsn lags slightly.
-    /// wait_for_flush retries until the target LSN is reached.
-    #[inline]
-    pub fn commit_write(&self, size: usize, lsn: Lsn) {
-        self.commit_write_n(size, lsn, 1);
-    }
+    /// Walks records from the current watermark: at each record start it reads
+    /// the publish marker with Acquire and stops at the first slot whose marker
+    /// does not match the expected generation (an unpublished or
+    /// previous-generation slot). A matching marker guarantees the record's
+    /// header and payload bytes are visible, so it reads the record length to
+    /// step to the next record. Reads are wrap-aware so a straddling padding
+    /// record's header (written across the ring boundary) is parsed correctly.
+    pub fn advance_committed(&self) {
+        let mask = self.buffer_mask;
+        let write = self.write_cursor.load(Ordering::Acquire);
+        let mut w = self.committed_cursor.load(Ordering::Relaxed);
+        if w >= write {
+            return;
+        }
+        let buf = unsafe { (*self.buffer.get()).as_ptr() };
+        let mut max_lsn = self.max_lsn.load(Ordering::Relaxed);
+        let mut max_lsn_dirty = false;
+        let mut new_records: u64 = 0;
+        let mut advanced = false;
 
-    /// Same as commit_write but advances the record counter by `records`,
-    /// used by the batch append paths that pack multiple records into a
-    /// single contiguous write
-    #[inline]
-    pub fn commit_write_n(&self, size: usize, lsn: Lsn, records: u32) {
-        // committed_cursor Release pairs with drain_into's Acquire load,
-        // guaranteeing the max_lsn Relaxed store below is visible to the reader.
-        self.committed_cursor
-            .fetch_add(size as u64, Ordering::Release);
-        self.max_lsn.store(lsn.0, Ordering::Relaxed);
-        self.committed_records
-            .fetch_add(records as u64, Ordering::Relaxed);
+        while w < write {
+            let slot = (w as usize) & mask;
+            if self.published[slot].load(Ordering::Acquire) != self.gen_marker(w) {
+                // Record at this offset is not yet published; the watermark
+                // stops here until its producer stamps the marker.
+                break;
+            }
+            // Reset the marker now that the watermark covers this record. The
+            // slot cannot be reused by a later generation until the drain
+            // advances read_cursor past it (backpressure gates reuse on
+            // read_cursor, not on this marker), so resetting here is race-free
+            // and leaves the slot at 0 = unpublished for its next generation.
+            self.published[slot].store(0, Ordering::Relaxed);
+            // SAFETY: the Acquire marker load above synchronizes with the
+            // producer's Release publish, so this record's header bytes are
+            // visible. Byte reads are masked to handle a header that wraps the
+            // ring boundary (straddling padding record).
+            let base = w as usize;
+            let record_type = unsafe { *buf.add((base + OFF_RECORD_TYPE) & mask) };
+            let pl_lo = unsafe { *buf.add((base + OFF_PAYLOAD_LEN) & mask) };
+            let pl_hi = unsafe { *buf.add((base + OFF_PAYLOAD_LEN + 1) & mask) };
+            let payload_len = u16::from_le_bytes([pl_lo, pl_hi]) as usize;
+            let record_size = HEADER_SIZE + payload_len + CHECKSUM_SIZE;
+
+            // Padding records (LogRecordType::Invalid == 0) carry no LSN and are
+            // not counted; only real records advance max_lsn and the count.
+            if record_type != 0 {
+                let mut lsn_bytes = [0u8; 8];
+                for (i, b) in lsn_bytes.iter_mut().enumerate() {
+                    *b = unsafe { *buf.add((base + OFF_LSN + i) & mask) };
+                }
+                let lsn = u64::from_le_bytes(lsn_bytes);
+                if lsn > max_lsn {
+                    max_lsn = lsn;
+                    max_lsn_dirty = true;
+                }
+                new_records += 1;
+            }
+
+            w += record_size as u64;
+            advanced = true;
+        }
+
+        if advanced {
+            if max_lsn_dirty {
+                self.max_lsn.store(max_lsn, Ordering::Relaxed);
+            }
+            if new_records > 0 {
+                self.committed_records
+                    .fetch_add(new_records, Ordering::Relaxed);
+            }
+            // Release so a drain that Acquire-loads committed_cursor observes
+            // all the record bytes the watermark now covers.
+            self.committed_cursor.store(w, Ordering::Release);
+        }
     }
 
     /// Drains all committed bytes into `output`.
@@ -217,6 +358,10 @@ impl RingBuffer {
     /// data was committed since the last drain.
     #[inline]
     pub fn drain_into(&self, output: &mut Vec<u8>) -> Lsn {
+        // Advance the contiguous watermark over newly published records before
+        // copying, so a caller that drains directly (tests, rotation residual)
+        // sees all published data without a separate advance call.
+        self.advance_committed();
         let committed = self.committed_cursor.load(Ordering::Acquire);
         let read = self.read_cursor.load(Ordering::Acquire);
 
@@ -285,20 +430,38 @@ impl RingBuffer {
         self.committed_records.load(Ordering::Relaxed)
     }
 
-    /// Returns true if no data has been committed since the last drain.
+    /// Returns true when the ring is fully quiescent: every claimed byte has
+    /// been drained. Used by the flush loop's idle check and by flush()/shutdown
+    /// to know nothing remains to write.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.committed_cursor.load(Ordering::Acquire) == self.read_cursor.load(Ordering::Acquire)
+        self.write_cursor.load(Ordering::Acquire) == self.read_cursor.load(Ordering::Acquire)
     }
 
-    /// Spins until all claimed write space is committed.
-    ///
-    /// Called before a rotation drain to ensure in-flight writes (write_record
-    /// called but commit_write not yet called) complete before the ring buffer
-    /// is drained for the last time into the old segment.
+    /// Returns true when producers have claimed space not yet drained. A hint
+    /// for the flush thread: there is eventual work even if those records are
+    /// not published yet (the producer is mid-write between claim and publish).
+    #[inline]
+    pub fn has_pending(&self) -> bool {
+        self.write_cursor.load(Ordering::Acquire) > self.read_cursor.load(Ordering::Acquire)
+    }
+
+    /// Returns true when the watermark has advanced past the read cursor, i.e.
+    /// there are published records ready to copy to disk. Reads committed_cursor
+    /// as last advanced by advance_committed; call that first to refresh it.
+    #[inline]
+    pub fn has_drainable(&self) -> bool {
+        self.committed_cursor.load(Ordering::Acquire) > self.read_cursor.load(Ordering::Acquire)
+    }
+
+    /// Advances the watermark, then spins until every claimed byte is published
+    /// and covered by it. Called by the flush thread before a rotation drain so
+    /// in-flight writes (claimed via write_record but not yet published)
+    /// complete before the ring is drained into the old segment.
     #[inline]
     pub fn wait_until_committed(&self) {
         loop {
+            self.advance_committed();
             let write = self.write_cursor.load(Ordering::Acquire);
             let committed = self.committed_cursor.load(Ordering::Acquire);
             if committed >= write {
@@ -312,29 +475,48 @@ impl RingBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::record::{LogRecord, record_size_for_payload, serialize_raw_deferred};
     use std::sync::Arc;
     use std::thread;
 
-    fn write_bytes(buf: &RingBuffer, data: &[u8], lsn: Lsn) {
+    /// Writes one valid WAL record with `payload` as its body. The watermark
+    /// parses record headers, so tests must write real records, not raw bytes.
+    /// Returns the on-disk record size.
+    fn write_record(buf: &RingBuffer, payload: &[u8], lsn: Lsn) -> usize {
+        let size = record_size_for_payload(payload.len());
+        let offset;
         unsafe {
-            let ptr = buf.write_record(data.len());
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+            let (ptr, off) = buf.write_record(size);
+            offset = off;
+            serialize_raw_deferred(
+                ptr,
+                lsn,
+                Lsn::INVALID,
+                1,
+                LogRecordType::Insert as u8,
+                0,
+                payload,
+            );
         }
-        buf.commit_write(data.len(), lsn);
+        buf.publish(offset);
+        size
     }
 
     #[test]
     fn test_ring_buffer_basic() {
         let buf = RingBuffer::new(16 * 1024);
-        let data = b"test record";
+        let payload = b"test record";
 
-        write_bytes(&buf, data, Lsn::new(0, 64));
+        write_record(&buf, payload, Lsn::new(0, 64));
 
         let mut output = Vec::new();
         let max_lsn = buf.drain_into(&mut output);
 
         assert_eq!(max_lsn, Lsn::new(0, 64));
-        assert_eq!(&output[..data.len()], data);
+        // Checksums are deferred (zero placeholder); parse without verification.
+        let recs = LogRecord::parse_all_trusted(bytes::Bytes::from(output));
+        assert_eq!(recs.len(), 1);
+        assert_eq!(&recs[0].payload[..], payload);
     }
 
     #[test]
@@ -343,34 +525,41 @@ mod tests {
 
         for i in 0u32..10 {
             let data = format!("record {}", i);
-            write_bytes(&buf, data.as_bytes(), Lsn::new(0, 64 + i * 32));
+            write_record(&buf, data.as_bytes(), Lsn::new(0, 64 + i * 32));
         }
 
         let mut output = Vec::new();
         let max_lsn = buf.drain_into(&mut output);
         assert!(max_lsn.is_valid());
-        assert!(!output.is_empty());
+        let recs = LogRecord::parse_all_trusted(bytes::Bytes::from(output));
+        assert_eq!(recs.len(), 10);
     }
 
     #[test]
     fn test_ring_buffer_wrap_around() {
-        // Small buffer to force wrap-around
-        let buf = RingBuffer::new(128);
-        let data = b"batch1-x"; // 8 bytes each
+        // Small ring to force wrap-around and straddle padding. Drain after each
+        // record so the single-threaded writer never blocks on backpressure
+        // (no flush thread here to advance the read cursor). 8-byte payload =>
+        // 36-byte record; over 30 writes the 256-byte ring wraps several times,
+        // exercising the straddle padding and the watermark walk over it.
+        let buf = RingBuffer::new(256);
+        let payload = b"batch1-x";
 
-        for i in 0u32..8 {
-            write_bytes(&buf, data, Lsn::new(0, i * 8));
+        for n in 0u32..30 {
+            write_record(&buf, payload, Lsn::new(0, n + 1));
+            let mut output = Vec::new();
+            buf.drain_into(&mut output);
+            // The drain may include a leading Invalid padding record when the
+            // real record straddled the wrap boundary; the real record must be
+            // present with its payload intact.
+            let recs = LogRecord::parse_all_trusted(bytes::Bytes::from(output));
+            let real: Vec<_> = recs
+                .iter()
+                .filter(|r| r.record_type == LogRecordType::Insert)
+                .collect();
+            assert_eq!(real.len(), 1, "exactly one real record per drain");
+            assert_eq!(&real[0].payload[..], payload);
         }
-        let mut output = Vec::new();
-        buf.drain_into(&mut output);
-        assert_eq!(output.len(), 64);
-
-        output.clear();
-        for i in 0u32..8 {
-            write_bytes(&buf, data, Lsn::new(0, 64 + i * 8));
-        }
-        buf.drain_into(&mut output);
-        assert_eq!(output.len(), 64);
     }
 
     #[test]
@@ -378,15 +567,16 @@ mod tests {
         let buf = Arc::new(RingBuffer::new(1024 * 1024));
         let threads = 4;
         let records_per_thread: u32 = 100;
-        let record_size = 32;
+        let payload = vec![0u8; 32];
+        let record_size = record_size_for_payload(payload.len());
 
         let handles: Vec<_> = (0..threads)
             .map(|t| {
                 let buf = Arc::clone(&buf);
+                let payload = payload.clone();
                 thread::spawn(move || {
-                    let data = vec![0u8; record_size];
                     for i in 0u32..records_per_thread {
-                        write_bytes(&buf, &data, Lsn::new(0, t * 10000 + i));
+                        write_record(&buf, &payload, Lsn::new(0, t * 10000 + i + 1));
                     }
                 })
             })
@@ -402,6 +592,8 @@ mod tests {
             output.len(),
             threads as usize * records_per_thread as usize * record_size
         );
+        let recs = LogRecord::parse_all_trusted(bytes::Bytes::from(output));
+        assert_eq!(recs.len(), threads as usize * records_per_thread as usize);
     }
 
     #[test]
@@ -418,7 +610,7 @@ mod tests {
         let buf = RingBuffer::new(16 * 1024);
         assert!(buf.is_empty());
 
-        write_bytes(&buf, b"data", Lsn::new(0, 64));
+        write_record(&buf, b"data", Lsn::new(0, 64));
         assert!(!buf.is_empty());
 
         let mut output = Vec::new();
@@ -429,9 +621,9 @@ mod tests {
     #[test]
     fn test_ring_buffer_wait_until_committed() {
         let buf = RingBuffer::new(16 * 1024);
-        // Single-threaded: write_cursor and committed_cursor stay in sync after commit_write.
-        write_bytes(&buf, b"hello", Lsn::new(0, 64));
-        buf.wait_until_committed(); // returns immediately when all writes are committed
-        assert!(!buf.is_empty());
+        write_record(&buf, b"hello", Lsn::new(0, 64));
+        buf.wait_until_committed();
+        // Published but not drained: claimed bytes still outstanding.
+        assert!(buf.has_pending());
     }
 }

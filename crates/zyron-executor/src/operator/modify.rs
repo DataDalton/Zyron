@@ -480,6 +480,7 @@ impl Operator for InsertOperator {
                 // per-record Vec<Lsn> allocation, callers further down the
                 // pipeline only need the last LSN to chain to the Commit record
                 let last_lsn = self.ctx.wal.log_insert_batch_last_lsn(&batch_records)?;
+                self.ctx.mark_wrote_wal();
 
                 let tuple_ids = heap_file.insert_batch(&tuples).await?;
 
@@ -731,6 +732,7 @@ impl Operator for DeleteOperator {
                         pl.extend_from_slice(&rowid.to_le_bytes());
                         pl.extend_from_slice(&(txn_id as u64).to_le_bytes());
                         let lsn = self.ctx.wal.log_columnar_supersede(&pl)?;
+                        self.ctx.mark_wrote_wal();
                         store.append_supersede(file_id, rowid, txn_id as u64, lsn.0)?;
                     }
                     total_deleted += locs.len() as i64;
@@ -769,6 +771,7 @@ impl Operator for DeleteOperator {
                 let batch_records: Vec<(u32, &[u8])> =
                     payloads.iter().map(|p| (txn_id, p.as_slice())).collect();
                 let lsns = self.ctx.wal.log_delete_batch(&batch_records)?;
+                self.ctx.mark_wrote_wal();
                 let last_lsn = lsns.last().copied().unwrap_or(zyron_wal::Lsn::INVALID);
 
                 let deleted = heap_file.delete_batch(&tuple_ids).await?;
@@ -954,6 +957,7 @@ impl Operator for UpdateOperator {
                             pl.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
                             pl.extend_from_slice(&bytes);
                             let lsn = self.ctx.wal.log_columnar_patch(&pl)?;
+                            self.ctx.mark_wrote_wal();
                             store.append_value_patch(
                                 file_id,
                                 rowid,
@@ -1021,6 +1025,7 @@ impl Operator for UpdateOperator {
                     .map(|p| (txn_id, p.as_slice()))
                     .collect();
                 let del_lsns = self.ctx.wal.log_delete_batch(&delete_records)?;
+                self.ctx.mark_wrote_wal();
                 let del_last_lsn = del_lsns.last().copied().unwrap_or(zyron_wal::Lsn::INVALID);
                 heap_file.delete_batch(&tuple_ids).await?;
 

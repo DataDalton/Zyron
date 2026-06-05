@@ -1076,6 +1076,7 @@ impl<T: WireTransport> Connection<T> {
                             self.mark_failed_if_in_transaction();
                         }
                     }
+                    self.note_ctx_writes(&ctx);
                 } else {
                     // Re-parse and execute the stored query
                     let query = ps.query.clone();
@@ -1212,6 +1213,7 @@ impl<T: WireTransport> Connection<T> {
                             continue;
                         }
                     }
+                    self.note_ctx_writes(&ctx);
                 }
 
                 // Collect row data from cursor into owned values to avoid
@@ -1440,6 +1442,7 @@ impl<T: WireTransport> Connection<T> {
                                     self.mark_failed_if_in_transaction();
                                 }
                             }
+                            self.note_ctx_writes(&ctx);
                         }
                         Err(e) => {
                             self.send_error(&e).await?;
@@ -1686,6 +1689,7 @@ impl<T: WireTransport> Connection<T> {
 
         // Execute
         let batches = execute(plan, &ctx).await.map_err(ProtocolError::Database)?;
+        self.note_ctx_writes(&ctx);
 
         // Return the security context to the session so subsequent queries
         // can reuse the cached privilege decisions.
@@ -1878,6 +1882,7 @@ impl<T: WireTransport> Connection<T> {
         let is_select = !output_schema.is_empty() && is_query_plan(&plan);
 
         let batches = execute(plan, &ctx).await.map_err(ProtocolError::Database)?;
+        self.note_ctx_writes(&ctx);
 
         if let Ok(mut unwrapped) = Arc::try_unwrap(ctx) {
             if let Some(session) = self.session.as_mut() {
@@ -1957,6 +1962,7 @@ impl<T: WireTransport> Connection<T> {
             let (_batches, metrics) = execute_analyze(plan, &ctx)
                 .await
                 .map_err(ProtocolError::Database)?;
+            self.note_ctx_writes(&ctx);
 
             let mut tree = explain_tree;
             if let Some(m) = metrics {
@@ -2300,8 +2306,20 @@ impl<T: WireTransport> Connection<T> {
         ctx_owned.heap_files = Some(Arc::clone(&self.server.heap_files));
         ctx_owned.btree_indexes = Some(Arc::clone(&self.server.btree_indexes));
         let ctx = Arc::new(ctx_owned);
+        let exec_result = execute(Arc::unwrap_or_clone(plan), &ctx).await;
 
-        match execute(Arc::unwrap_or_clone(plan), &ctx).await {
+        // A statement that appended a WAL data record, or any non-query
+        // statement, makes the transaction non-read-only so its commit is
+        // durable. A pure SELECT that logged nothing leaves the transaction
+        // read-only and skips the commit record and flush wait. Marked
+        // conservatively (also on the error path) so a write is never missed.
+        if ctx.wrote_wal() || !is_select {
+            if let Some(txn) = self.transaction.as_mut() {
+                txn.mark_wrote_data();
+            }
+        }
+
+        match exec_result {
             Ok(batches) => {
                 if is_select {
                     let row_count = self
@@ -2449,7 +2467,14 @@ impl<T: WireTransport> Connection<T> {
             }
             zyron_parser::Statement::Commit(_) => {
                 if let Some(mut txn) = self.transaction.take() {
-                    match self.server.txn_manager.commit(&mut txn).await {
+                    // A transaction that wrote nothing commits without a
+                    // commit record or flush wait.
+                    let commit_result = if txn.wrote_data() {
+                        self.server.txn_manager.commit(&mut txn).await
+                    } else {
+                        self.server.txn_manager.commit_read_only(&mut txn)
+                    };
+                    match commit_result {
                         Ok(()) => {
                             if let Some(session) = self.session.as_mut() {
                                 session.set_transaction_state(TransactionState::Idle);
@@ -3143,6 +3168,19 @@ impl<T: WireTransport> Connection<T> {
         Ok(())
     }
 
+    /// Records on the current transaction whether `ctx` appended a WAL data
+    /// record during execution. A transaction that never wrote commits without
+    /// a commit record or a flush wait, so this must be called after every
+    /// statement execution that runs against the transaction.
+    #[inline]
+    fn note_ctx_writes(&mut self, ctx: &ExecutionContext) {
+        if ctx.wrote_wal() {
+            if let Some(txn) = self.transaction.as_mut() {
+                txn.mark_wrote_data();
+            }
+        }
+    }
+
     /// Auto-commits implicit transactions (when not inside an explicit BEGIN block).
     async fn auto_commit_if_needed(&mut self) {
         let in_explicit_txn = self
@@ -3158,8 +3196,11 @@ impl<T: WireTransport> Connection<T> {
             if let Some(mut txn) = self.transaction.take() {
                 if self.session_ref().transaction_state() == TransactionState::Failed {
                     let _ = self.server.txn_manager.abort(&mut txn);
-                } else {
+                } else if txn.wrote_data() {
                     let _ = self.server.txn_manager.commit(&mut txn).await;
+                } else {
+                    // Read-only transaction: no commit record, no flush wait.
+                    let _ = self.server.txn_manager.commit_read_only(&mut txn);
                 }
             }
         }

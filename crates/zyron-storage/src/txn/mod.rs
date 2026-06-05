@@ -68,6 +68,10 @@ pub struct Transaction {
     /// Index of the proc-array slot this transaction occupies, returned to
     /// the pool on commit or abort.
     slot_idx: usize,
+    /// True once this transaction has appended a WAL data record. A
+    /// transaction that never wrote commits without a commit record or a
+    /// flush wait, since it has nothing to make durable.
+    wrote_data: bool,
 }
 
 impl Transaction {
@@ -75,6 +79,19 @@ impl Transaction {
     #[inline]
     pub fn txn_id(&self) -> u64 {
         self.txn_id
+    }
+
+    /// Marks that this transaction has appended a WAL data record. Set by the
+    /// server after a statement logs an insert, update, or delete.
+    #[inline]
+    pub fn mark_wrote_data(&mut self) {
+        self.wrote_data = true;
+    }
+
+    /// Returns true if this transaction has appended a WAL data record.
+    #[inline]
+    pub fn wrote_data(&self) -> bool {
+        self.wrote_data
     }
 
     /// Returns the last LSN written by this transaction.
@@ -263,6 +280,7 @@ impl TransactionManager {
             last_lsn: lsn,
             savepoints: Vec::new(),
             slot_idx,
+            wrote_data: false,
         })
     }
 
@@ -306,6 +324,31 @@ impl TransactionManager {
     pub async fn commit(&self, txn: &mut Transaction) -> Result<()> {
         let lsn = self.commit_inner(txn)?;
         self.wait_durable(lsn).await;
+        Ok(())
+    }
+
+    /// Commits a read-only transaction: one that appended no WAL data record.
+    /// Such a transaction has nothing to make durable, so it writes no commit
+    /// record and does no flush wait. It still releases locks, the wait-for
+    /// graph edges, and the proc-array slot, and marks itself committed.
+    /// Matches the standard read-only commit fast path: a transaction that
+    /// only read leaves no trace that recovery must reconstruct.
+    pub fn commit_read_only(&self, txn: &mut Transaction) -> Result<()> {
+        if txn.status != TransactionStatus::Active {
+            return Err(ZyronError::TransactionAborted(format!(
+                "transaction {} is not active (status: {:?})",
+                txn.txn_id, txn.status
+            )));
+        }
+
+        txn.status = TransactionStatus::Committed;
+
+        self.lock_table.unlock_all(txn.txn_id);
+        self.intent_locks.unlock_all(txn.txn_id);
+        self.wait_for_graph.remove_transaction(txn.txn_id);
+
+        self.proc_array.release(txn.slot_idx);
+
         Ok(())
     }
 
