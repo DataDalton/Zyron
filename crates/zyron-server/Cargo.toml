@@ -36,6 +36,11 @@ crossbeam.workspace = true
 sha2.workspace = true
 socket2.workspace = true
 
+[features]
+# Compiles in the phase profiler across the build (zyron-common::profile). Pass
+# --features profile to a bench run, then set ZYRON_PROFILE at runtime.
+profile = ["zyron-common/profile"]
+
 [dev-dependencies]
 tempfile = "3"
 zyron-bench-harness = { path = "../zyron-bench-harness" }

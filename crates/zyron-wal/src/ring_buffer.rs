@@ -7,6 +7,7 @@ use crate::constants::{CHECKSUM_SIZE, HEADER_SIZE, OFF_LSN, OFF_PAYLOAD_LEN, OFF
 use crate::record::{LogRecordType, Lsn};
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use zyron_common::profile::{self, Phase};
 
 /// Contiguous ring buffer for WAL records.
 ///
@@ -361,7 +362,11 @@ impl RingBuffer {
         // Advance the contiguous watermark over newly published records before
         // copying, so a caller that drains directly (tests, rotation residual)
         // sees all published data without a separate advance call.
-        self.advance_committed();
+        {
+            let _s = profile::scope(Phase::FlushAdvance);
+            self.advance_committed();
+        }
+        let _drain_span = profile::scope(Phase::FlushDrain);
         let committed = self.committed_cursor.load(Ordering::Acquire);
         let read = self.read_cursor.load(Ordering::Acquire);
 

@@ -120,6 +120,16 @@ EXTRA = [
         "%",
     ),
     ("wire", "QUIC PG Handshake", "QUIC PG handshake latency (us)", "Wire", "QUIC PostgreSQL handshake", 1, 0, " us"),
+    (
+        "transaction",
+        "Phase 1.5 Microbenchmarks",
+        "durable begin()+commit() latency floor (ns/op)",
+        "Transactions",
+        "Durable commit floor (device write)",
+        1e3,
+        1,
+        " us",
+    ),
 ]
 
 
@@ -184,6 +194,18 @@ def main():
     for suite, group, key, label in LATENCY:
         lat_labels.append(label)
         lat_vals.append(metric(doc(suite), group, key))
+
+    # Durable group-commit: peak storage-engine commit throughput and the
+    # serial-to-peak amplification factor. Levels are discovered from the
+    # JSON so a change to CONCURRENCY_LEVELS flows through automatically.
+    txn = doc("transaction")["tests"].get("Concurrent Txns", {})
+    dc_levels = sorted(
+        (int(m.group(1)) for k in txn if (m := re.fullmatch(r"durable_commit_c(\d+)_txn_per_sec", k))),
+        key=int,
+    )
+    dc_peak = max(metric(doc("transaction"), "Concurrent Txns", f"durable_commit_c{n}_txn_per_sec") for n in dc_levels)
+    dc_serial = metric(doc("transaction"), "Concurrent Txns", f"durable_commit_c{dc_levels[0]}_txn_per_sec")
+    dc_amplification = dc_peak / dc_serial
 
     # End-to-end: a client talking to a running server over the wire.
     e2e = doc("end_to_end")
@@ -252,6 +274,10 @@ def main():
     for suite, group, key, sub, mlabel, div, dec, suffix in EXTRA:
         v = metric(doc(suite), group, key) / div
         extra_rows.append(f"| {sub} | {mlabel} | ~{v:.{dec}f}{suffix} |")
+    extra_rows.append(f"| Transactions | Durable group-commit peak | ~{dc_peak/1000:.0f}K txn/sec |")
+    extra_rows.append(
+        f"| Transactions | Group-commit amplification (c={dc_levels[0]} to c={dc_levels[-1]}) | ~{dc_amplification:.1f}x |"
+    )
     extra_table = (
         "A few more numbers not shown in the charts above:\n\n"
         "| Subsystem | Metric | Result |\n"

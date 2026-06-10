@@ -346,7 +346,7 @@ fn test_concurrent_transactions() {
     zyron_bench_harness::init("transaction");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    const CONCURRENCY_LEVELS: &[usize] = &[1, 16, 64, 256];
+    const CONCURRENCY_LEVELS: &[usize] = &[1, 16, 64, 256, 512];
     const TXNS_PER_THREAD: usize = 1_000;
 
     tprintln!("\n=== Transaction: Durable Commit Throughput vs Concurrency ===");
@@ -362,6 +362,9 @@ fn test_concurrent_transactions() {
         let total_txns = threads * TXNS_PER_THREAD;
         let (run_mgr, _run_wal, _run_dir) = create_txn_manager();
         let mgr_arc = Arc::clone(&run_mgr);
+
+        // Clean profile window so the per-phase table reflects this level only.
+        zyron_common::profile::reset();
 
         let start = Instant::now();
         let handles: Vec<_> = (0..threads)
@@ -419,6 +422,22 @@ fn test_concurrent_transactions() {
             serial_ops_sec = ops_sec;
         }
         peak_ops_sec = peak_ops_sec.max(ops_sec);
+
+        // Record this level's durable throughput so it lands in the run JSON.
+        // Per-level durable throughput is device-bound and intentionally not
+        // pinned to an absolute target (the structural gate below is the real
+        // assertion), so the target here is a liveness floor that just logs the
+        // value for trend tracking.
+        check_performance(
+            "Concurrent Txns",
+            &format!("durable_commit_c{}_txn_per_sec", threads),
+            ops_sec,
+            1.0,
+            true,
+        );
+
+        // Per-phase wall-clock breakdown for this concurrency level (ZYRON_PROFILE).
+        zyron_common::profile::dump(&format!("durable commit c={}", threads));
     }
 
     let txn_util_after = take_util_snapshot();
@@ -435,11 +454,19 @@ fn test_concurrent_transactions() {
     // throughput must materially exceed the serial (single-committer) rate.
     // This proves group commit works without pinning an arbitrary ops/sec goal
     // that the device latency may or may not permit at a given concurrency.
-    assert!(
-        peak_ops_sec >= serial_ops_sec * 4.0,
-        "group commit not batching: peak {:.0} txn/sec vs serial {:.0} txn/sec (expected >=4x)",
+    // Recorded as a metric (target = 4x serial) so the gate lands in the JSON,
+    // and asserted below for a hard CI failure.
+    let peak_ratio_ok = check_performance(
+        "Concurrent Txns",
+        "peak_durable_txn_per_sec",
         peak_ops_sec,
-        serial_ops_sec,
+        serial_ops_sec * 4.0,
+        true,
+    );
+    assert!(
+        peak_ratio_ok,
+        "group commit not batching: peak {:.0} txn/sec vs serial {:.0} txn/sec (expected >=4x)",
+        peak_ops_sec, serial_ops_sec,
     );
 }
 

@@ -16,6 +16,7 @@ use crate::transport::WireTransport;
 
 use zyron_buffer::BufferPool;
 use zyron_catalog::Catalog;
+use zyron_common::profile::{self, Phase};
 use zyron_common::{Result as ZyronResult, ZyronError};
 use zyron_executor::batch::DataBatch;
 use zyron_executor::column::ScalarValue;
@@ -2279,6 +2280,7 @@ impl<T: WireTransport> Connection<T> {
             }
         };
 
+        let setup_span = profile::scope(Phase::WireExecSetup);
         let plan = portal.plan.clone();
         let output_schema = portal.output_schema.clone();
         let result_formats = portal.result_formats.clone();
@@ -2306,7 +2308,12 @@ impl<T: WireTransport> Connection<T> {
         ctx_owned.heap_files = Some(Arc::clone(&self.server.heap_files));
         ctx_owned.btree_indexes = Some(Arc::clone(&self.server.btree_indexes));
         let ctx = Arc::new(ctx_owned);
-        let exec_result = execute(Arc::unwrap_or_clone(plan), &ctx).await;
+        drop(setup_span);
+
+        let exec_result = {
+            let _s = profile::scope(Phase::WireExecute);
+            execute(Arc::unwrap_or_clone(plan), &ctx).await
+        };
 
         // A statement that appended a WAL data record, or any non-query
         // statement, makes the transaction non-read-only so its commit is
@@ -2319,6 +2326,7 @@ impl<T: WireTransport> Connection<T> {
             }
         }
 
+        let _send_span = profile::scope(Phase::WireSend);
         match exec_result {
             Ok(batches) => {
                 if is_select {
@@ -2409,7 +2417,10 @@ impl<T: WireTransport> Connection<T> {
 
     async fn handle_sync(&mut self) -> Result<(), ProtocolError> {
         // Auto-commit implicit transactions on Sync
-        self.auto_commit_if_needed().await;
+        {
+            let _s = profile::scope(Phase::WireAutoCommit);
+            self.auto_commit_if_needed().await;
+        }
         self.send_ready_for_query().await?;
         Ok(())
     }

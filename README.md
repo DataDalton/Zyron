@@ -228,14 +228,14 @@ xychart-beta
     title "Hot-path latency (nanoseconds, lower is better)"
     x-axis ["MVCC visible", "Version lookup", "B+tree lookup", "Branch resolve", "Row lock", "Legal-hold check", "Bloom probe", "Selectivity est"]
     y-axis "ns/op" 0 --> 136
-    bar [1.4, 10.8, 14.1, 39.0, 76.1, 6.0, 5.9, 118.5]
+    bar [1.4, 10.8, 14.1, 39.0, 74.2, 6.0, 5.9, 118.5]
 ```
 
 A few more numbers not shown in the charts above:
 
 | Subsystem | Metric | Result |
 |-----------|--------|--------|
-| MVCC | GC sweep | ~1.9B tuples/sec |
+| MVCC | GC sweep | ~2.0B tuples/sec |
 | Columnar | .zyr scan throughput | ~3.0 GB/sec |
 | Columnar | Compaction pipeline | ~4.0M rows/sec |
 | Columnar | HybridScan overhead vs heap-only | ~-4.7% |
@@ -243,6 +243,9 @@ A few more numbers not shown in the charts above:
 | Temporal | Picosecond timestamp decode | ~528M rows/sec |
 | Versioning | Time-travel scan overhead | ~17% |
 | Wire | QUIC PostgreSQL handshake | ~4 us |
+| Transactions | Durable commit floor (device write) | ~65.8 us |
+| Transactions | Durable group-commit peak | ~672K txn/sec |
+| Transactions | Group-commit amplification (c=1 to c=512) | ~40.0x |
 
 29 benchmark suites cover storage, executor, optimizer, encoding, wire, search, analytics, CDC, versioning, transactions, temporal, columnar, types, lifecycle, gateway, Zyron-to-Zyron, and end-to-end. Each run writes a timestamped JSON/TXT pair under `benchmarks/<suite>/`.
 <!-- BENCH:END -->

@@ -9,6 +9,7 @@
 
 pub mod checksum;
 pub mod constants;
+pub mod durability;
 pub mod reader;
 pub mod record;
 pub mod ring_buffer;

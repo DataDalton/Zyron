@@ -16,6 +16,11 @@ hashbrown.workspace = true
 scc.workspace = true
 xxhash-rust.workspace = true
 
+[features]
+# Compiles in the phase profiler across the build (zyron-common::profile). Pass
+# --features profile to a bench run, then set ZYRON_PROFILE at runtime.
+profile = ["zyron-common/profile"]
+
 [dev-dependencies]
 tempfile = "3.27.0"
 rand = "0.10"

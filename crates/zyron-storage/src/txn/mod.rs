@@ -25,6 +25,7 @@ pub use snapshot::Snapshot;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use zyron_common::profile::{self, Phase};
 use zyron_common::{Result, ZyronError};
 use zyron_wal::WalWriter;
 use zyron_wal::record::Lsn;
@@ -243,6 +244,7 @@ impl TransactionManager {
     /// record. If the WAL append fails the slot is released so the table
     /// does not leak.
     pub fn begin(&self, isolation: IsolationLevel) -> Result<Transaction> {
+        let _s = profile::scope(Phase::TxnBegin);
         let txn_id = self.next_txn_id.fetch_add(1, Ordering::Relaxed);
 
         let slot_idx = self.proc_array.claim(txn_id)?;
@@ -302,15 +304,24 @@ impl TransactionManager {
         }
 
         let txn_id_u32 = txn.txn_id_u32()?;
-        let lsn = self.wal.log_commit(txn_id_u32, txn.last_lsn)?;
+        let lsn = {
+            let _s = profile::scope(Phase::CommitRecordAppend);
+            self.wal.log_commit(txn_id_u32, txn.last_lsn)?
+        };
         txn.last_lsn = lsn;
         txn.status = TransactionStatus::Committed;
 
-        self.lock_table.unlock_all(txn.txn_id);
-        self.intent_locks.unlock_all(txn.txn_id);
-        self.wait_for_graph.remove_transaction(txn.txn_id);
+        {
+            let _s = profile::scope(Phase::LockRelease);
+            self.lock_table.unlock_all(txn.txn_id);
+            self.intent_locks.unlock_all(txn.txn_id);
+            self.wait_for_graph.remove_transaction(txn.txn_id);
+        }
 
-        self.proc_array.release(txn.slot_idx);
+        {
+            let _s = profile::scope(Phase::ProcArrayRelease);
+            self.proc_array.release(txn.slot_idx);
+        }
 
         Ok(lsn)
     }
@@ -323,7 +334,10 @@ impl TransactionManager {
     /// so the cost is one flush of latency, not one fsync per transaction.
     pub async fn commit(&self, txn: &mut Transaction) -> Result<()> {
         let lsn = self.commit_inner(txn)?;
-        self.wait_durable(lsn).await;
+        {
+            let _s = profile::scope(Phase::DurabilityWait);
+            self.wait_durable(lsn).await;
+        }
         Ok(())
     }
 
@@ -362,7 +376,10 @@ impl TransactionManager {
         // The dedicated WAL flush thread is the sole flusher and group-commit
         // leader; wait_for_flush nudges it and parks until the commit record is
         // durable. Concurrent committers are batched into one device write.
-        self.wal.wait_for_flush(lsn)?;
+        {
+            let _s = profile::scope(Phase::DurabilityWait);
+            self.wal.wait_for_flush(lsn)?;
+        }
         Ok(())
     }
 

@@ -9,6 +9,7 @@ pub mod interval;
 pub mod obs_metrics;
 pub mod page;
 pub mod prng;
+pub mod profile;
 pub mod types;
 pub mod zerocopy;
 

@@ -7,6 +7,7 @@
 //! The hot path (append) is lock-free, making this writer scale well under
 //! concurrent load from multiple transactions.
 
+use crate::durability::DurabilityNotifier;
 use crate::record::{
     LogRecordType, Lsn, backfill_checksums, record_size_for_payload, serialize_raw_deferred,
 };
@@ -18,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
+use zyron_common::profile::{self, Phase};
 use zyron_common::{Result, ZyronError};
 
 /// Atomic state machine for coordinating segment rotation between append() and the flush thread.
@@ -215,6 +217,12 @@ pub struct WalWriter {
     /// waiter can be woken without this crate depending on an async runtime.
     /// Set once via register_flush_waker.
     durable_waker: Arc<OnceLock<FlushWaker>>,
+    /// Wakes sync durability waiters off the flush thread's critical path. The
+    /// flush thread pokes it after each flush; it resumes only the committers a
+    /// flush satisfied, overlapped with the next device write.
+    notifier: Arc<DurabilityNotifier>,
+    /// Notifier thread join handle, joined in close().
+    notifier_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// Callback invoked by the flush thread after every flush cycle, used to wake
@@ -251,6 +259,13 @@ impl WalWriter {
         let flush_io_error = Arc::new(AtomicBool::new(false));
         let wal_syncs = Arc::new(AtomicU64::new(0));
         let durable_waker: Arc<OnceLock<FlushWaker>> = Arc::new(OnceLock::new());
+        let notifier = DurabilityNotifier::new(
+            flushed_lsn.clone(),
+            flush_io_error.clone(),
+            shutdown.clone(),
+            durable_waker.clone(),
+        );
+        let notifier_thread = notifier.spawn();
         let flush_thread = Self::spawn_flush_thread(
             ring_buffer.clone(),
             segment.clone(),
@@ -265,7 +280,7 @@ impl WalWriter {
             config.segment_size,
             flush_io_error.clone(),
             wal_syncs.clone(),
-            durable_waker.clone(),
+            notifier.clone(),
         );
 
         Ok(Self {
@@ -283,6 +298,8 @@ impl WalWriter {
             wal_syncs,
             retention_hook: parking_lot::RwLock::new(None),
             durable_waker,
+            notifier,
+            notifier_thread: Mutex::new(Some(notifier_thread)),
         })
     }
 
@@ -357,7 +374,7 @@ impl WalWriter {
         segment_size: u32,
         flush_io_error: Arc<AtomicBool>,
         wal_syncs_counter: Arc<AtomicU64>,
-        durable_waker: Arc<OnceLock<FlushWaker>>,
+        notifier: Arc<DurabilityNotifier>,
     ) -> JoinHandle<()> {
         std::thread::spawn(move || {
             // Register this thread for unpark wakeup. The waker is stored in
@@ -495,10 +512,10 @@ impl WalWriter {
                             break;
                         }
                     }
-                    // Wake any commit awaiting durability before the thread exits.
-                    if let Some(waker) = durable_waker.get() {
-                        waker();
-                    }
+                    // Wake any commit awaiting durability before the thread
+                    // exits. The notifier drains satisfied waiters and the async
+                    // waker; close() also pokes it and joins it.
+                    notifier.poke();
                     break;
                 }
 
@@ -518,13 +535,14 @@ impl WalWriter {
                     &wal_syncs_counter,
                 );
 
-                // Wake commit durability waiters now that flushed_lsn has
-                // advanced (and been fsync'd when durability is enabled). A
-                // spurious wake when nothing flushed is harmless: waiters
-                // re-check flushed_lsn and resume waiting.
-                if let Some(waker) = durable_waker.get() {
-                    waker();
-                }
+                // Poke the notifier so it wakes the committers this flush
+                // satisfied, off this thread's critical path. A single cheap
+                // unpark; the per-committer resumes happen on the notifier
+                // thread, overlapped with the next device write below. The
+                // notifier also drives the async durability waker. A spurious
+                // poke when nothing flushed is harmless: the notifier re-reads
+                // flushed_lsn and wakes no one.
+                notifier.poke();
 
                 // Pre-allocate the next segment when the live segment is
                 // 75% full so the eventual rotation does not pay file
@@ -756,9 +774,29 @@ impl WalWriter {
             return;
         }
 
+        // Count whole records drained this flush, for the per-flush amortization
+        // denominator. Only when profiling is enabled.
+        if profile::is_enabled() {
+            use crate::constants::{CHECKSUM_SIZE, HEADER_SIZE, OFF_PAYLOAD_LEN};
+            let mut off = 0usize;
+            let mut n = 0u64;
+            while off + HEADER_SIZE + CHECKSUM_SIZE <= batch_buffer.len() {
+                let pl = u16::from_le_bytes([
+                    batch_buffer[off + OFF_PAYLOAD_LEN],
+                    batch_buffer[off + OFF_PAYLOAD_LEN + 1],
+                ]) as usize;
+                off += HEADER_SIZE + pl + CHECKSUM_SIZE;
+                n += 1;
+            }
+            profile::record_value(Phase::FlushBatchRecords, n);
+        }
+
         // Compute checksums for all records in the batch before writing to disk.
         // Deferred from append() hot path to amortize checksum cost in the flush thread
-        backfill_checksums(batch_buffer);
+        {
+            let _s = profile::scope(Phase::FlushChecksum);
+            backfill_checksums(batch_buffer);
+        }
 
         let mut current_seg_id: u32 = 0;
         let mut overflow = false;
@@ -780,6 +818,7 @@ impl WalWriter {
                 written_max_lsn = prefix_max_lsn;
 
                 if to_write_len > 0 {
+                    let _s = profile::scope(Phase::FlushSegWrite);
                     if let Err(e) = seg.append_batch(&batch_buffer[..to_write_len]) {
                         eprintln!(
                             "WAL flush error seg={} write_off={} chunk={} err={:?}",
@@ -800,6 +839,7 @@ impl WalWriter {
                 }
 
                 if fsync_enabled && to_write_len > 0 {
+                    let _s = profile::scope(Phase::FlushFsync);
                     if let Err(e) = seg.sync() {
                         eprintln!("WAL sync error: {:?}", e);
                         flush_io_error.store(true, Ordering::Release);
@@ -837,14 +877,15 @@ impl WalWriter {
             }
         }
 
-        // Wake threads parked on the flushed-LSN address (futex / WaitOnAddress
-        // via parking_lot_core). The store above is Release and unpark_all takes
-        // the parking bucket lock, while a parked waiter re-reads flushed_lsn in
-        // its park-validate closure under that same bucket lock, so the advance
-        // is never lost to a wake that fires before the waiter parks. No-op cost
-        // when no thread is parked on this key.
+        // Wake any flush() callers parked on the flushed-LSN address. Sync commit
+        // durability waiters no longer park here (they use the notifier), so this
+        // bucket is normally empty and the call is a cheap lock-and-check. The
+        // store above is Release and unpark_all takes the parking bucket lock,
+        // while a parked flush() caller re-reads its drained predicate under that
+        // same bucket lock, so a state change is never lost to a wake that fires
+        // before it parks.
         // SAFETY: the key is the address of this same flushed_lsn atomic, which
-        // is exactly the key sync waiters park on.
+        // is exactly the key flush() callers park on.
         unsafe {
             parking_lot_core::unpark_all(
                 flushed_lsn as *const AtomicU64 as usize,
@@ -1027,52 +1068,19 @@ impl WalWriter {
         }
     }
 
-    /// Blocks until the given LSN has been flushed (and fsync'd) to disk.
-    ///
     /// Blocks until the WAL has durably flushed at least up to `target_lsn`.
     ///
-    /// The dedicated flush thread is the sole flusher and group-commit leader.
-    /// This caller nudges it once (the record is already in the ring) and parks
-    /// on the flushed-LSN address until the thread's next flush advances it.
-    /// The flush thread stores flushed_lsn (Release) then unpark_all on this
-    /// same address; park's validate closure re-reads flushed_lsn under the
-    /// parking bucket lock, so a flush completing between the check and the park
-    /// is observed, not lost. No mutex on the wait path, no per-waiter
-    /// allocation, no polling timer.
+    /// Nudges the flush thread so the committer's record is written, then waits
+    /// via the durability notifier: a bounded pre-spin catches the fastest
+    /// commits, otherwise the committer registers its target LSN and parks. The
+    /// flush thread, after storing flushed_lsn, pokes the notifier, which wakes
+    /// only the committers a flush satisfied, off the flush thread's critical
+    /// path. No broadcast wake of every parked committer, no flush-thread stall
+    /// behind the wakes.
     pub fn wait_for_flush(&self, target_lsn: Lsn) -> Result<()> {
-        let key = self.flushed_lsn_key();
         // Ensure the flush thread runs even if it had parked on an idle ring.
         self.wake_flush_thread();
-        loop {
-            if self.flushed_lsn() >= target_lsn {
-                return Ok(());
-            }
-            // A failed flush never advances flushed_lsn; surface the error
-            // instead of waiting forever.
-            if self.flush_io_error.load(Ordering::Acquire) {
-                return Err(ZyronError::WalWriteFailed(
-                    "flush thread encountered an I/O error".into(),
-                ));
-            }
-            // SAFETY: key is the address of self.flushed_lsn, the same address
-            // flush_records_sync wakes by. The validate closure re-reads
-            // flushed_lsn under the parking bucket lock that unpark_all also
-            // takes, so a flush completing between the outer check and the park
-            // is observed, never lost.
-            unsafe {
-                parking_lot_core::park(
-                    key,
-                    || {
-                        self.flushed_lsn().0 < target_lsn.0
-                            && !self.flush_io_error.load(Ordering::Acquire)
-                    },
-                    || self.wake_flush_thread(),
-                    |_, _| {},
-                    parking_lot_core::DEFAULT_PARK_TOKEN,
-                    None,
-                );
-            }
-        }
+        self.notifier.wait(target_lsn)
     }
 
     /// Returns the last flushed LSN.
@@ -1226,6 +1234,13 @@ impl WalWriter {
         // the flush thread is between drain_into() and seg.append_batch(),
         // causing the flush thread to see None and silently drop the batch.
         if let Some(handle) = self.flush_thread.lock().take() {
+            let _ = handle.join();
+        }
+
+        // Wake and join the notifier thread after the flush thread has settled,
+        // so its final drain delivers any last durability wakes before exit.
+        self.notifier.poke();
+        if let Some(handle) = self.notifier_thread.lock().take() {
             let _ = handle.join();
         }
 
@@ -1528,6 +1543,12 @@ impl Drop for WalWriter {
 
         // Wait for flush thread (get_mut is safe in Drop since we have &mut self)
         if let Some(handle) = self.flush_thread.get_mut().take() {
+            let _ = handle.join();
+        }
+
+        // Wake and join the notifier thread.
+        self.notifier.poke();
+        if let Some(handle) = self.notifier_thread.get_mut().take() {
             let _ = handle.join();
         }
     }
