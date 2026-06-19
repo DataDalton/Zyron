@@ -375,13 +375,36 @@ impl CompactionWorker {
 
         // Incremental merge pass: rewrite segments whose patch overlay has
         // fully settled (every overlay xid below the oldest-active horizon),
-        // folding patches into a fresh segment and dropping dead rows. Append
-        // only data is never touched, so write amplification tracks churn.
+        // folding reclaimable patches into a fresh segment and dropping rows
+        // deleted at or below the table's retention floor. Within-window history
+        // (superseded versions and value patches committed after the floor) is
+        // carried forward, so time-travel stays correct while old history is
+        // reclaimed. Append-only data is never touched, so write amplification
+        // tracks churn.
+        let now_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
         for table in &tables {
             if shutdown.map(|s| s.load(Ordering::Acquire)).unwrap_or(false) {
                 break;
             }
-            if let Err(e) = Self::merge_table(rt, catalog, table.id, oldest_active, wal, config) {
+            let floor = zyron_executor::operator::modify::effective_retention_floor(
+                table.as_ref(),
+                txn_manager.status_map(),
+                txn_manager.retention_clock(),
+                now_micros,
+            );
+            if let Err(e) = Self::merge_table(
+                rt,
+                catalog,
+                table.id,
+                oldest_active,
+                floor,
+                txn_manager.status_map(),
+                wal,
+                config,
+            ) {
                 warn!("Columnar merge for table {} failed: {}", table.name, e);
             }
         }
@@ -393,11 +416,14 @@ impl CompactionWorker {
     /// base, preserves sys_rowid, swaps the registry, deletes the old .zyr,
     /// and compacts the patch log. Skips a segment with any unsettled overlay
     /// xid so a merged base is always snapshot-independent.
+    #[allow(clippy::too_many_arguments)]
     fn merge_table(
         rt: &tokio::runtime::Runtime,
         catalog: &Catalog,
         table_id: zyron_catalog::TableId,
         oldest_active: u64,
+        floor: u64,
+        status_map: &zyron_storage::TxnStatusMap,
         wal: &Arc<WalWriter>,
         config: &CompactionWorkerConfig,
     ) -> std::result::Result<(), String> {
@@ -415,10 +441,13 @@ impl CompactionWorker {
         let store = zyron_storage::columnar::ColumnarPatchManager::global(&columnar_dir)
             .store(table_id.0 as u64)
             .map_err(|e| format!("patch store: {}", e))?;
-        // Collapse committed-below-horizon versions and drop rows deleted
-        // below the horizon so overlay memory stays bounded between merges,
-        // not just when a whole file is merged away.
-        store.trim_below(oldest_active);
+        // A patch or supersede is reclaimable once its transaction committed at
+        // or below the retention floor: no retained version reads the value
+        // before it. Within-window history (committed after the floor) is kept.
+        let reclaimable = |xid: u64| status_map.is_reclaimable_below(xid, floor);
+        // Collapse only reclaimable value-patch history; within-window patches
+        // are preserved so a retained version still sees the pre-patch value.
+        store.trim_below(oldest_active, reclaimable);
         if store.is_empty() {
             return Ok(());
         }
@@ -493,6 +522,14 @@ impl CompactionWorker {
             // Resolve survivors.
             let mut keep_rowid: Vec<u64> = Vec::new();
             let mut keep_xmin: Vec<u64> = Vec::new();
+            // Carried-forward supersede per kept row: 0 for a live row, or the
+            // delete's transaction id for a row deleted within the retention
+            // window, written into the new segment's sys_supersede so AS OF
+            // before the delete still sees it.
+            let mut keep_supersede: Vec<u64> = Vec::new();
+            // Within-window value patches (committed after the floor) to migrate
+            // to the new segment so a retained version still reads them.
+            let mut migrate: Vec<(u64, u32, u64, Vec<u8>)> = Vec::new();
             let mut col_vals: Vec<Vec<Option<Vec<u8>>>> = vec![Vec::new(); columns.len()];
             let mut dropped = 0usize;
             let mut patched = 0usize;
@@ -502,15 +539,36 @@ impl CompactionWorker {
             for r in 0..row_count {
                 let rid = read_u64(&rowid_b, r);
                 let ov = seg_overlay.get(&rid);
+                // Dead: deleted at or before the floor, so no retained version
+                // sees it alive. Reclaimable subsumes the settled check (commit
+                // LSN <= floor implies committed below the active horizon).
                 let dead = ov
-                    .map(|o| o.supersedes.iter().any(|x| *x < oldest_active))
+                    .map(|o| {
+                        o.supersedes
+                            .iter()
+                            .any(|x| *x < oldest_active && reclaimable(*x))
+                    })
                     .unwrap_or(false);
                 if dead {
                     dropped += 1;
                     continue;
                 }
+                // Within-window delete: carry the earliest committed supersede
+                // forward so AS OF within the window still hides it after merge.
+                let carried = ov
+                    .and_then(|o| {
+                        o.supersedes
+                            .iter()
+                            .copied()
+                            .filter(|x| *x < oldest_active)
+                            .filter_map(|x| status_map.commit_lsn(x).map(|cl| (cl, x)))
+                            .min()
+                            .map(|(_, x)| x)
+                    })
+                    .unwrap_or(0);
                 keep_rowid.push(rid);
                 keep_xmin.push(read_u64(&xmin_b, r));
+                keep_supersede.push(carried);
                 // Churn is counted once per patched row, not once per patched
                 // cell: a row with N changed columns is one mutation for the
                 // rewrite trigger, not N, so multi-column updates do not
@@ -518,18 +576,34 @@ impl CompactionWorker {
                 let mut row_has_patch = false;
                 for (ci, c) in columns.iter().enumerate() {
                     let (bytes, nb, vs, isv) = &user_dec[ci];
-                    let patched_val = ov.and_then(|o| {
-                        o.patches.get(&(c.id.0 as u32)).and_then(|chain| {
-                            chain
-                                .iter()
-                                .filter(|p| p.patch_xid < oldest_active)
-                                .max_by_key(|p| p.patch_xid)
-                                .map(|p| p.value.clone())
-                        })
-                    });
-                    if let Some(v) = patched_val {
+                    let col_id = c.id.0 as u32;
+                    // Fold the newest reclaimable patch into the base (the value
+                    // as of the floor). Keep within-window patches for migration
+                    // so a retained version still reads the pre-patch value.
+                    let mut newest_reclaimable: Option<&zyron_storage::columnar::ValuePatch> = None;
+                    if let Some(o) = ov {
+                        if let Some(chain) = o.patches.get(&col_id) {
+                            for p in chain {
+                                if p.patch_xid >= oldest_active {
+                                    continue;
+                                }
+                                if reclaimable(p.patch_xid) {
+                                    match newest_reclaimable {
+                                        Some(b) if b.patch_xid >= p.patch_xid => {}
+                                        _ => newest_reclaimable = Some(p),
+                                    }
+                                } else {
+                                    // Within-window patch: migrated to the new
+                                    // segment, but it is not reclaimable work, so
+                                    // it does not by itself justify a rewrite.
+                                    migrate.push((rid, col_id, p.patch_xid, p.value.clone()));
+                                }
+                            }
+                        }
+                    }
+                    if let Some(p) = newest_reclaimable {
                         row_has_patch = true;
-                        col_vals[ci].push(Some(v));
+                        col_vals[ci].push(Some(p.value.clone()));
                         continue;
                     }
                     let is_null = !nb.is_empty() && (nb[r / 8] >> (r % 8)) & 1 == 1;
@@ -610,9 +684,12 @@ impl CompactionWorker {
                 value_size: 8,
                 is_primary_key: false,
             });
+            // Carry within-window deletes forward as sys_supersede so AS OF
+            // before the delete still sees the row; live rows write 0.
             column_data.push(
-                (0..kept)
-                    .map(|_| Some(0u64.to_le_bytes().to_vec()))
+                keep_supersede
+                    .iter()
+                    .map(|x| Some(x.to_le_bytes().to_vec()))
                     .collect(),
             );
 
@@ -697,6 +774,19 @@ impl CompactionWorker {
             store
                 .drop_file(seg.file_id, &patch_path)
                 .map_err(|e| format!("patch drop: {}", e))?;
+            // Migrate within-window value patches to the new segment so a
+            // retained version still reads the pre-patch value. The base in the
+            // new .zyr is the value as of the floor; these patches reconstruct
+            // values committed after it. Written at the current persisted LSN
+            // high-water so recovery does not regress or re-replay them.
+            if !migrate.is_empty() {
+                let hwm = store.max_persisted_lsn();
+                for (rid, col_id, patch_xid, value) in &migrate {
+                    store
+                        .append_value_patch(new_file_id, *rid, *col_id, *patch_xid, hwm, value)
+                        .map_err(|e| format!("patch migrate: {}", e))?;
+                }
+            }
         }
         Ok(())
     }

@@ -120,6 +120,7 @@ impl ExplainNode {
                 columns,
                 predicate,
                 cost,
+                ..
             } => {
                 let mut details = vec![
                     ("table_id".to_string(), format!("{}", table_id.0)),
@@ -218,6 +219,20 @@ impl ExplainNode {
                     Self::from_physical_plan(left),
                     Self::from_physical_plan(right),
                 ],
+            },
+            PhysicalPlan::LateralJoin {
+                left,
+                join_type,
+                cost,
+                ..
+            } => Self {
+                operator_name: "LateralJoin".to_string(),
+                details: vec![("join_type".to_string(), format!("{:?}", join_type))],
+                estimated_cost: Some(*cost),
+                actual_metrics: None,
+                // The lateral subquery is executed per left row, not a static
+                // child plan, so only the left input shows as a child.
+                children: vec![Self::from_physical_plan(left)],
             },
             PhysicalPlan::HashJoin {
                 left,

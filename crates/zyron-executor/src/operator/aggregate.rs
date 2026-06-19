@@ -7,9 +7,9 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use zyron_catalog::{TableEntry, TableId};
+use zyron_catalog::{ColumnId, TableEntry, TableId};
 use zyron_common::{Result, TypeId, ZyronError};
-use zyron_planner::binder::BoundExpr;
+use zyron_planner::binder::{BoundExpr, BoundUda};
 use zyron_planner::logical::{AggregateExpr, LogicalColumn};
 
 use crate::batch::DataBatch;
@@ -57,6 +57,28 @@ trait Accumulator: std::any::Any + Send {
     /// aggregation.
     fn supports_parallel_merge(&self) -> bool {
         false
+    }
+
+    /// Fallible counterparts used by the operators so a user-defined aggregate
+    /// can surface an evaluation error from its state or final function instead
+    /// of losing it. Built-in accumulators inherit the infallible defaults.
+    fn update_checked(&mut self, value: &ScalarValue) -> Result<()> {
+        self.update(value);
+        Ok(())
+    }
+
+    fn update_typed_checked(&mut self, col: &Column, row: usize) -> Result<()> {
+        self.update_typed(col, row);
+        Ok(())
+    }
+
+    fn add_count_checked(&mut self, n: usize) -> Result<()> {
+        self.add_count(n);
+        Ok(())
+    }
+
+    fn finalize_checked(&self) -> Result<ScalarValue> {
+        Ok(self.finalize())
     }
 }
 
@@ -328,13 +350,191 @@ impl Accumulator for DistinctAccumulator {
     fn finalize(&self) -> ScalarValue {
         self.inner.finalize()
     }
+    fn update_checked(&mut self, value: &ScalarValue) -> Result<()> {
+        if !value.is_null() && self.seen.insert(value.clone()) {
+            self.inner.update_checked(value)?;
+        }
+        Ok(())
+    }
+    fn update_typed_checked(&mut self, col: &Column, row: usize) -> Result<()> {
+        if col.is_null(row) {
+            return Ok(());
+        }
+        let value = col.get_scalar(row);
+        if self.seen.insert(value.clone()) {
+            self.inner.update_checked(&value)?;
+        }
+        Ok(())
+    }
+    fn finalize_checked(&self) -> Result<ScalarValue> {
+        self.inner.finalize_checked()
+    }
 }
 
-fn create_accumulator(name: &str, args_count: usize, distinct: bool) -> Box<dyn Accumulator> {
-    let inner = build_accumulator(name, args_count);
+/// Builds a synthetic logical column for a user-defined aggregate's state or
+/// input, addressed by the column id the binder used (0 = state, 1 = input).
+fn uda_column(column_id: u16, type_id: TypeId) -> LogicalColumn {
+    LogicalColumn {
+        table_idx: Some(0),
+        column_id: ColumnId(column_id),
+        name: String::new(),
+        type_id,
+        nullable: true,
+        ts_precision: None,
+    }
+}
+
+/// Builds a one-row column holding a single scalar, carrying a null bitmap when
+/// the value is NULL so the state or input reaches the bound function as NULL.
+fn scalar_to_col(value: &ScalarValue, type_id: TypeId) -> Column {
+    if value.is_null() {
+        Column::null_column(type_id, 1)
+    } else {
+        Column::new(ColumnData::from_scalar(value, 1), type_id)
+    }
+}
+
+/// Reads a one-row column's value, returning NULL when the row is null.
+fn col_scalar(col: &Column, row: usize) -> ScalarValue {
+    if col.is_null(row) {
+        ScalarValue::Null
+    } else {
+        col.data.get_scalar(row)
+    }
+}
+
+/// Evaluates a bound constant expression (no input columns) to a scalar.
+fn eval_const(expr: &BoundExpr) -> Result<ScalarValue> {
+    let batch = DataBatch {
+        columns: Vec::new(),
+        num_rows: 1,
+    };
+    let col = crate::expr::evaluate(expr, &batch, &[], &[])?;
+    Ok(col_scalar(&col, 0))
+}
+
+/// Accumulator for a user-defined aggregate. Holds the running state and folds
+/// each input value by evaluating the bound state-transition function over a
+/// one-row (state, input) batch. The optional final function runs once at
+/// finalize. NULL inputs are skipped, matching built-in aggregate semantics.
+/// The first evaluation error is retained and surfaced through the fallible
+/// accumulator methods so a query fails rather than returning a wrong result.
+struct UdaAccumulator {
+    sfunc: BoundExpr,
+    finalfunc: Option<BoundExpr>,
+    state_type: TypeId,
+    input_type: TypeId,
+    state: ScalarValue,
+    sfunc_schema: Vec<LogicalColumn>,
+    final_schema: Vec<LogicalColumn>,
+    error: Option<String>,
+}
+
+impl UdaAccumulator {
+    fn new(uda: &BoundUda) -> Self {
+        let state_type = uda.state_type;
+        let input_type = uda.input_types.first().copied().unwrap_or(TypeId::Null);
+        let (state, error) = match &uda.init {
+            Some(init_expr) => match eval_const(init_expr) {
+                Ok(v) => (v, None),
+                Err(e) => (ScalarValue::Null, Some(e.to_string())),
+            },
+            None => (ScalarValue::Null, None),
+        };
+        Self {
+            sfunc: uda.sfunc.clone(),
+            finalfunc: uda.finalfunc.clone(),
+            state_type,
+            input_type,
+            state,
+            sfunc_schema: vec![uda_column(0, state_type), uda_column(1, input_type)],
+            final_schema: vec![uda_column(0, state_type)],
+            error,
+        }
+    }
+
+    fn fold(&mut self, value: &ScalarValue) -> Result<()> {
+        if let Some(e) = &self.error {
+            return Err(ZyronError::ExecutionError(e.clone()));
+        }
+        let state_col = scalar_to_col(&self.state, self.state_type);
+        let input_col = Column::new(ColumnData::from_scalar(value, 1), self.input_type);
+        let batch = DataBatch {
+            columns: vec![state_col, input_col],
+            num_rows: 1,
+        };
+        match crate::expr::evaluate(&self.sfunc, &batch, &self.sfunc_schema, &[]) {
+            Ok(col) => {
+                self.state = col_scalar(&col, 0);
+                Ok(())
+            }
+            Err(e) => {
+                self.error = Some(e.to_string());
+                Err(e)
+            }
+        }
+    }
+
+    fn finalize_inner(&self) -> Result<ScalarValue> {
+        if let Some(e) = &self.error {
+            return Err(ZyronError::ExecutionError(e.clone()));
+        }
+        match &self.finalfunc {
+            Some(ff) => {
+                let state_col = scalar_to_col(&self.state, self.state_type);
+                let batch = DataBatch {
+                    columns: vec![state_col],
+                    num_rows: 1,
+                };
+                let col = crate::expr::evaluate(ff, &batch, &self.final_schema, &[])?;
+                Ok(col_scalar(&col, 0))
+            }
+            None => Ok(self.state.clone()),
+        }
+    }
+}
+
+impl Accumulator for UdaAccumulator {
+    fn update(&mut self, value: &ScalarValue) {
+        if value.is_null() {
+            return;
+        }
+        let _ = self.fold(value);
+    }
+    fn update_typed(&mut self, col: &Column, row: usize) {
+        if col.is_null(row) {
+            return;
+        }
+        let _ = self.fold(&col.data.get_scalar(row));
+    }
+    fn finalize(&self) -> ScalarValue {
+        self.finalize_inner().unwrap_or(ScalarValue::Null)
+    }
+    fn update_checked(&mut self, value: &ScalarValue) -> Result<()> {
+        if value.is_null() {
+            return Ok(());
+        }
+        self.fold(value)
+    }
+    fn update_typed_checked(&mut self, col: &Column, row: usize) -> Result<()> {
+        if col.is_null(row) {
+            return Ok(());
+        }
+        self.fold(&col.data.get_scalar(row))
+    }
+    fn finalize_checked(&self) -> Result<ScalarValue> {
+        self.finalize_inner()
+    }
+}
+
+fn create_accumulator(agg: &AggregateExpr) -> Box<dyn Accumulator> {
+    let inner: Box<dyn Accumulator> = match &agg.uda {
+        Some(uda) => Box::new(UdaAccumulator::new(uda)),
+        None => build_accumulator(&agg.function_name, agg.args.len()),
+    };
     // DISTINCT only applies to aggregates over an argument; COUNT(*) has no
     // argument to deduplicate.
-    if distinct && args_count > 0 {
+    if agg.distinct && !agg.args.is_empty() {
         Box::new(DistinctAccumulator {
             seen: std::collections::HashSet::new(),
             inner,
@@ -402,6 +602,11 @@ fn is_supported_aggregate(name: &str) -> bool {
 /// instead of letting an unimplemented function silently degrade to COUNT.
 fn validate_aggregates(aggregates: &[AggregateExpr]) -> Result<()> {
     for agg in aggregates {
+        // A user-defined aggregate carries its bound state/final functions, so
+        // it is always executable regardless of the built-in name set.
+        if agg.uda.is_some() {
+            continue;
+        }
         if !is_supported_aggregate(&agg.function_name) {
             return Err(ZyronError::ExecutionError(format!(
                 "aggregate function '{}' is not implemented",
@@ -568,11 +773,8 @@ impl HashAggregateOperator {
         // Pre-create the single accumulator vector and skip every hashing,
         // group-store, and collision-check step in the inner loop.
         if num_group_cols == 0 {
-            let accs: Vec<Box<dyn Accumulator>> = self
-                .aggregates
-                .iter()
-                .map(|agg| create_accumulator(&agg.function_name, agg.args.len(), agg.distinct))
-                .collect();
+            let accs: Vec<Box<dyn Accumulator>> =
+                self.aggregates.iter().map(create_accumulator).collect();
             group_accumulators.push(accs);
             num_groups = 1;
 
@@ -610,13 +812,13 @@ impl HashAggregateOperator {
                             match &agg_arg_cols[i] {
                                 // COUNT(*)-style: fold the whole batch in one
                                 // add instead of a per-row loop.
-                                None => acc.add_count(num_rows),
+                                None => acc.add_count_checked(num_rows)?,
                                 // Aggregates over a column still walk rows so
                                 // nulls and per-value math are handled.
                                 Some(col) => {
                                     let c = col.as_ref();
                                     for row in 0..num_rows {
-                                        acc.update_typed(c, row);
+                                        acc.update_typed_checked(c, row)?;
                                     }
                                 }
                             }
@@ -659,7 +861,7 @@ impl HashAggregateOperator {
             num_groups,
             num_group_cols,
             &self.output_schema,
-        ));
+        )?);
         Ok(())
     }
 }
@@ -673,7 +875,7 @@ fn finalize_groups(
     num_groups: usize,
     num_group_cols: usize,
     output_schema: &[LogicalColumn],
-) -> DataBatch {
+) -> Result<DataBatch> {
     let mut col_builders: Vec<(ColumnData, NullBitmap, TypeId)> =
         Vec::with_capacity(output_schema.len());
     for col_def in output_schema {
@@ -692,7 +894,7 @@ fn finalize_groups(
             data.push_from(&store_col.data, gidx);
         }
         for (i, acc) in group_accumulators[gidx].iter().enumerate() {
-            let val = acc.finalize();
+            let val = acc.finalize_checked()?;
             let (data, nulls, _) = &mut col_builders[num_group_cols + i];
             nulls.push(val.is_null());
             data.push_scalar(&val);
@@ -704,7 +906,7 @@ fn finalize_groups(
         .map(|(data, nulls, type_id)| Column::with_nulls(data, nulls, type_id))
         .collect();
 
-    DataBatch::new(columns)
+    Ok(DataBatch::new(columns))
 }
 
 /// Partial grouped-aggregation state for one partition. The parallel aggregate
@@ -791,20 +993,13 @@ impl GroupAccumulatorState {
                 &group_refs,
                 row,
                 hashes[row],
-                || {
-                    aggregates
-                        .iter()
-                        .map(|agg| {
-                            create_accumulator(&agg.function_name, agg.args.len(), agg.distinct)
-                        })
-                        .collect()
-                },
+                || aggregates.iter().map(create_accumulator).collect(),
             );
             let accs = &mut group_accumulators[gidx];
             for (i, acc) in accs.iter_mut().enumerate() {
                 match &agg_arg_cols[i] {
-                    Some(col) => acc.update_typed(col.as_ref(), row),
-                    None => acc.update(&ScalarValue::Int64(1)),
+                    Some(col) => acc.update_typed_checked(col.as_ref(), row)?,
+                    None => acc.update_checked(&ScalarValue::Int64(1))?,
                 }
             }
         }
@@ -846,14 +1041,7 @@ impl GroupAccumulatorState {
                 &other_refs,
                 ogidx,
                 hashes[ogidx],
-                || {
-                    aggregates
-                        .iter()
-                        .map(|agg| {
-                            create_accumulator(&agg.function_name, agg.args.len(), agg.distinct)
-                        })
-                        .collect()
-                },
+                || aggregates.iter().map(create_accumulator).collect(),
             );
             let dst = &mut group_accumulators[gidx];
             for (i, acc) in dst.iter_mut().enumerate() {
@@ -1154,7 +1342,7 @@ impl ParallelHashAggregateOperator {
             merged.num_groups,
             self.group_by.len(),
             &self.output_schema,
-        ));
+        )?);
         Ok(())
     }
 }
@@ -1197,13 +1385,23 @@ mod tests {
     use zyron_planner::binder::ColumnRef;
 
     // DISTINCT aggregates must fold each value only once.
+    fn one_arg_agg(name: &str, distinct: bool) -> AggregateExpr {
+        AggregateExpr {
+            function_name: name.to_string(),
+            args: vec![col_ref(0, TypeId::Int64)],
+            distinct,
+            return_type: TypeId::Int64,
+            uda: None,
+        }
+    }
+
     #[test]
     fn distinct_aggregates_dedup() {
         let vals = [1i64, 1, 2, 3, 3];
 
-        let mut count_distinct = create_accumulator("count", 1, true);
-        let mut sum_distinct = create_accumulator("sum", 1, true);
-        let mut count_all = create_accumulator("count", 1, false);
+        let mut count_distinct = create_accumulator(&one_arg_agg("count", true));
+        let mut sum_distinct = create_accumulator(&one_arg_agg("sum", true));
+        let mut count_all = create_accumulator(&one_arg_agg("count", false));
         for &v in &vals {
             count_distinct.update(&ScalarValue::Int64(v));
             sum_distinct.update(&ScalarValue::Int64(v));
@@ -1215,7 +1413,7 @@ mod tests {
         assert_eq!(count_all.finalize(), ScalarValue::Int64(5));
 
         // NULLs are ignored by distinct too.
-        let mut count_with_nulls = create_accumulator("count", 1, true);
+        let mut count_with_nulls = create_accumulator(&one_arg_agg("count", true));
         count_with_nulls.update(&ScalarValue::Null);
         count_with_nulls.update(&ScalarValue::Int64(7));
         count_with_nulls.update(&ScalarValue::Null);
@@ -1246,6 +1444,7 @@ mod tests {
             args: vec![],
             distinct: false,
             return_type: TypeId::Int64,
+            uda: None,
         }
     }
 
@@ -1255,6 +1454,7 @@ mod tests {
             args: vec![col_ref(column_id, TypeId::Int64)],
             distinct: false,
             return_type: TypeId::Float64,
+            uda: None,
         }
     }
 
@@ -1354,7 +1554,8 @@ mod tests {
             serial.num_groups,
             1,
             &out_schema,
-        );
+        )
+        .expect("finalize serial");
 
         // Parallel: one partition per batch, then merge.
         let mut merged = GroupAccumulatorState::new();
@@ -1369,7 +1570,8 @@ mod tests {
             merged.num_groups,
             1,
             &out_schema,
-        );
+        )
+        .expect("finalize merged");
 
         assert_eq!(result_map(&serial_out), result_map(&merged_out));
         // Known answer: key 1 -> count 3 sum 65, key 2 -> 3 38, key 3 -> 3 8.

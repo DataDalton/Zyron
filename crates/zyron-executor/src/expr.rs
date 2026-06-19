@@ -372,6 +372,25 @@ fn next_hlc() -> u64 {
     }
 }
 
+/// Casts two numeric columns to their common type so a comparison sees matching
+/// types, mirroring the coercion the binary-comparison path applies. Non-numeric
+/// or already-equal pairs are left untouched.
+fn coerce_numeric_pair(left: &mut Column, right: &mut Column) -> Result<()> {
+    let lt = left.type_id;
+    let rt = right.type_id;
+    if lt != rt {
+        if let Some(common) = common_numeric_type(lt, rt) {
+            if lt != common {
+                *left = compute::cast_column(left, common)?;
+            }
+            if rt != common {
+                *right = compute::cast_column(right, common)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[inline]
 fn is_ts_col(col: &Column) -> bool {
     matches!(col.type_id, TypeId::Timestamp | TypeId::TimestampTz)
@@ -722,6 +741,7 @@ fn evaluate_in_list(
     let mut e0 = expr_col.clone();
     let mut f0 = first;
     normalize_ts_pair(&mut e0, &mut f0)?;
+    coerce_numeric_pair(&mut e0, &mut f0)?;
     let mut combined = compare(&e0, &f0, CmpOp::Eq)?;
 
     for item in &list[1..] {
@@ -729,6 +749,7 @@ fn evaluate_in_list(
         let mut e = expr_col.clone();
         let mut it = item_col;
         normalize_ts_pair(&mut e, &mut it)?;
+        coerce_numeric_pair(&mut e, &mut it)?;
         let cmp_result = compare(&e, &it, CmpOp::Eq)?;
         combined = bool_or(&combined, &cmp_result)?;
     }

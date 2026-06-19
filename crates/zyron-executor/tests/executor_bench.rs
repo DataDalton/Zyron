@@ -587,6 +587,7 @@ async fn test_aggregate_throughput() {
         args: vec![],
         distinct: false,
         return_type: TypeId::Int64,
+        uda: None,
     }];
 
     let output_schema = make_schema(&[("count", TypeId::Int64)]);
@@ -682,24 +683,28 @@ async fn test_aggregate_correctness() {
             args: vec![col_ref(0, 1, TypeId::Int64)],
             distinct: false,
             return_type: TypeId::Int64,
+            uda: None,
         },
         AggregateExpr {
             function_name: "sum".to_string(),
             args: vec![col_ref(0, 1, TypeId::Int64)],
             distinct: false,
             return_type: TypeId::Float64,
+            uda: None,
         },
         AggregateExpr {
             function_name: "min".to_string(),
             args: vec![col_ref(0, 1, TypeId::Int64)],
             distinct: false,
             return_type: TypeId::Int64,
+            uda: None,
         },
         AggregateExpr {
             function_name: "max".to_string(),
             args: vec![col_ref(0, 1, TypeId::Int64)],
             distinct: false,
             return_type: TypeId::Int64,
+            uda: None,
         },
     ];
 
@@ -1387,6 +1392,7 @@ async fn test_hash_build_throughput() {
         args: vec![],
         distinct: false,
         return_type: TypeId::Int64,
+        uda: None,
     }];
     let output_schema = make_schema(&[("key", TypeId::Int64), ("count", TypeId::Int64)]);
 

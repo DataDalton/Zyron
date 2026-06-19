@@ -18,7 +18,9 @@ use crate::operator::column_scan::{
 };
 use crate::operator::distinct::HashDistinctOperator;
 use crate::operator::filter::FilterOperator;
-use crate::operator::join::{HashJoinOperator, MergeJoinOperator, NestedLoopJoinOperator};
+use crate::operator::join::{
+    HashJoinOperator, MergeJoinOperator, NestedLoopJoinOperator, ParallelHashJoinOperator,
+};
 use crate::operator::limit::LimitOperator;
 use crate::operator::modify::{DeleteOperator, InsertOperator, UpdateOperator, ValuesOperator};
 use crate::operator::project::ProjectOperator;
@@ -81,6 +83,7 @@ fn build_operator_tree(
             } => {
                 // Resolve the AS OF qualifier into a concrete scan parameter
                 let mut effective_predicate = predicate;
+                let mut branch_override: Option<u64> = None;
                 let as_of_version = match &as_of {
                     Some(AsOfTarget::Version(v)) => Some(*v),
                     Some(AsOfTarget::Timestamp(ts)) => {
@@ -103,19 +106,38 @@ fn build_operator_tree(
                         None
                     }
                     Some(AsOfTarget::Branch(name)) => {
-                        return Err(zyron_common::ZyronError::ExecutionError(format!(
-                            "IN BRANCH '{}' is parsed and bound but executor branch lookup is not yet wired",
-                            name
-                        )));
+                        // Resolve the per-query branch name to an id; the scan
+                        // routes page reads through that branch's overrides.
+                        let bid = ctx
+                            .branch_catalog
+                            .as_ref()
+                            .and_then(|c| c.branch_id_by_name(name))
+                            .ok_or_else(|| {
+                                zyron_common::ZyronError::BranchNotFound(name.clone())
+                            })?;
+                        branch_override = Some(bid);
+                        None
                     }
                     None => None,
                 };
 
-                // ParallelSeqScan does not support as_of, fall back to serial in that case
+                // Materialize uncorrelated subqueries the planner folded into the
+                // scan predicate before the synchronous evaluator runs.
+                let effective_predicate = match effective_predicate {
+                    Some(p) if crate::subquery::contains_subquery(&p) => {
+                        Some(crate::subquery::materialize_expr(p, ctx).await?)
+                    }
+                    other => other,
+                };
+
+                // ParallelSeqScan does not support as_of or per-query branch
+                // routing, fall back to serial in those cases.
                 let num_pages = ctx.get_heap_file(table_id).await?.num_pages_cached() as u64;
 
                 if as_of_version.is_none()
                     && as_of.is_none()
+                    && branch_override.is_none()
+                    && ctx.active_branch_id.is_none()
                     && should_use_parallel_scan(num_pages, false)
                 {
                     let op = ParallelSeqScanOperator::new(
@@ -128,7 +150,7 @@ fn build_operator_tree(
                     let br = BuildResult::new(Box::new(op));
                     Ok(br.with_metrics("ParallelSeqScan", analyze, vec![]))
                 } else {
-                    let op = SeqScanOperator::new(
+                    let mut op = SeqScanOperator::new(
                         ctx.clone(),
                         table_id,
                         columns,
@@ -137,6 +159,9 @@ fn build_operator_tree(
                         as_of_version,
                     )
                     .await?;
+                    if let Some(bid) = branch_override {
+                        op = op.with_branch(Some(bid));
+                    }
                     let br = BuildResult::new(Box::new(op));
                     Ok(br.with_metrics("SeqScan", analyze, vec![]))
                 }
@@ -146,20 +171,34 @@ fn build_operator_tree(
                 table_id,
                 columns,
                 predicate,
+                as_of,
                 ..
             } => {
                 // Columnar segments union the heap residual. Folded rows were
                 // physically deleted from the heap, so the two sets are
-                // disjoint under one snapshot: no double count.
+                // disjoint under one snapshot: no double count. Under AS OF
+                // VERSION both stores date their rows by commit LSN, so a query
+                // as of a past version sees folded rows too.
+                let as_of_version = match &as_of {
+                    Some(AsOfTarget::Version(v)) => Some(*v),
+                    _ => None,
+                };
                 let columnar = ColumnScanOperator::new(
                     ctx.clone(),
                     table_id,
                     columns.clone(),
                     predicate.clone(),
-                )?;
-                let heap =
-                    SeqScanOperator::new(ctx.clone(), table_id, columns, predicate, false, None)
-                        .await?;
+                )?
+                .with_as_of(as_of_version);
+                let heap = SeqScanOperator::new(
+                    ctx.clone(),
+                    table_id,
+                    columns,
+                    predicate,
+                    false,
+                    as_of_version,
+                )
+                .await?;
                 let op = HybridScanOperator::new(columnar, heap);
                 let br = BuildResult::new(Box::new(op));
                 Ok(br.with_metrics("HybridScan", analyze, vec![]))
@@ -184,8 +223,37 @@ fn build_operator_tree(
                 columns,
                 predicate,
                 remaining_predicate,
+                as_of,
                 ..
             } => {
+                // A per-query `IN BRANCH` index plan carries no branch
+                // resolution in the index node, so run a branch-aware
+                // sequential scan with the full predicate instead. A
+                // session-active branch (USE BRANCH) is handled inside
+                // IndexScanOperator via the execution context.
+                if let Some(AsOfTarget::Branch(name)) = &as_of {
+                    let bid = ctx
+                        .branch_catalog
+                        .as_ref()
+                        .and_then(|c| c.branch_id_by_name(name))
+                        .ok_or_else(|| zyron_common::ZyronError::BranchNotFound(name.clone()))?;
+                    let combined = match remaining_predicate {
+                        Some(rest) => combine_with_and(predicate, rest),
+                        None => predicate,
+                    };
+                    let op = SeqScanOperator::new(
+                        ctx.clone(),
+                        table_id,
+                        columns,
+                        Some(combined),
+                        false,
+                        None,
+                    )
+                    .await?
+                    .with_branch(Some(bid));
+                    let br = BuildResult::new(Box::new(op));
+                    return Ok(br.with_metrics("SeqScan", analyze, vec![]));
+                }
                 let btree = ctx.get_index(index_id);
                 let op = IndexScanOperator::new(
                     ctx.clone(),
@@ -399,6 +467,29 @@ fn build_operator_tree(
             } => {
                 let input_schema = child.output_schema();
                 let params = ctx.params.clone();
+                if crate::correlated::expr_has_correlated_subquery(&predicate) {
+                    // A correlated subquery in the predicate runs once per row
+                    // against the current outer row's values.
+                    let child_br = build_operator_tree(*child, ctx).await?;
+                    let child_m = collect_metrics(&[&child_br.metrics]);
+                    let op = crate::correlated::build_correlated_filter(
+                        child_br.op,
+                        predicate,
+                        input_schema,
+                        params,
+                        ctx,
+                    )
+                    .await?;
+                    let br = BuildResult::new(Box::new(op));
+                    return Ok(br.with_metrics("CorrelatedFilter", analyze, child_m));
+                }
+                // Materialize any uncorrelated subquery in the predicate to a
+                // constant before the synchronous evaluator runs.
+                let predicate = if crate::subquery::contains_subquery(&predicate) {
+                    crate::subquery::materialize_expr(predicate, ctx).await?
+                } else {
+                    predicate
+                };
                 let child_br = build_operator_tree(*child, ctx).await?;
                 let child_m = collect_metrics(&[&child_br.metrics]);
                 let br = BuildResult::new(Box::new(FilterOperator::with_params(
@@ -415,14 +506,40 @@ fn build_operator_tree(
             } => {
                 let input_schema = child.output_schema();
                 let params = ctx.params.clone();
+                if expressions
+                    .iter()
+                    .any(crate::correlated::expr_has_correlated_subquery)
+                {
+                    // At least one projection has a correlated subquery, run
+                    // each subquery once per row.
+                    let child_br = build_operator_tree(*child, ctx).await?;
+                    let child_m = collect_metrics(&[&child_br.metrics]);
+                    let op = crate::correlated::build_correlated_project(
+                        child_br.op,
+                        expressions,
+                        input_schema,
+                        params,
+                        ctx,
+                    )
+                    .await?;
+                    let br = BuildResult::new(Box::new(op));
+                    return Ok(br.with_metrics("CorrelatedProject", analyze, child_m));
+                }
+                // Materialize uncorrelated subqueries in the projection list.
+                let mut expressions = expressions;
+                if expressions.iter().any(crate::subquery::contains_subquery) {
+                    let mut rewritten = Vec::with_capacity(expressions.len());
+                    for e in expressions {
+                        rewritten.push(crate::subquery::materialize_expr(e, ctx).await?);
+                    }
+                    expressions = rewritten;
+                }
                 let child_br = build_operator_tree(*child, ctx).await?;
                 let child_m = collect_metrics(&[&child_br.metrics]);
-                let br = BuildResult::new(Box::new(ProjectOperator::with_params(
-                    child_br.op,
-                    expressions,
-                    input_schema,
-                    params,
-                )));
+                let br = BuildResult::new(Box::new(
+                    ProjectOperator::with_params(child_br.op, expressions, input_schema, params)
+                        .with_context(Arc::clone(ctx)),
+                ));
                 Ok(br.with_metrics("Project", analyze, child_m))
             }
 
@@ -438,15 +555,59 @@ fn build_operator_tree(
                 let left_br = build_operator_tree(*left, ctx).await?;
                 let right_br = build_operator_tree(*right, ctx).await?;
                 let child_m = collect_metrics(&[&left_br.metrics, &right_br.metrics]);
-                let br = BuildResult::new(Box::new(NestedLoopJoinOperator::new(
+                let has_subquery_cond = condition
+                    .as_ref()
+                    .is_some_and(zyron_planner::binder::expr_contains_subquery);
+                let mut op = NestedLoopJoinOperator::new(
                     left_br.op,
                     right_br.op,
+                    join_type,
+                    condition.clone(),
+                    left_schema,
+                    right_schema,
+                );
+                if has_subquery_cond {
+                    // The ON condition has a subquery (an outer join; inner joins
+                    // are lowered to Cross + Filter). Evaluate it per joined row
+                    // through a prepared correlated predicate.
+                    let input_schema = op.input_schema().to_vec();
+                    let pred = crate::correlated::CorrelatedPredicate::prepare(
+                        condition.expect("subquery condition present"),
+                        input_schema,
+                        ctx.params.clone(),
+                        ctx,
+                    )
+                    .await?;
+                    op = op.with_correlated_condition(Arc::clone(ctx), pred);
+                }
+                let br = BuildResult::new(Box::new(op));
+                Ok(br.with_metrics("NestedLoopJoin", analyze, child_m))
+            }
+
+            PhysicalPlan::LateralJoin {
+                left,
+                subquery,
+                join_type,
+                condition,
+                left_schema,
+                right_schema,
+                ..
+            } => {
+                let params = ctx.params.clone();
+                let left_br = build_operator_tree(*left, ctx).await?;
+                let child_m = collect_metrics(&[&left_br.metrics]);
+                let op = crate::correlated::build_lateral_join(
+                    left_br.op,
+                    subquery,
                     join_type,
                     condition,
                     left_schema,
                     right_schema,
-                )));
-                Ok(br.with_metrics("NestedLoopJoin", analyze, child_m))
+                    params,
+                    ctx,
+                )?;
+                let br = BuildResult::new(Box::new(op));
+                Ok(br.with_metrics("LateralJoin", analyze, child_m))
             }
 
             PhysicalPlan::HashJoin {
@@ -670,16 +831,21 @@ fn build_operator_tree(
             }
 
             PhysicalPlan::Values { rows, schema, .. } => {
-                let br = BuildResult::new(Box::new(ValuesOperator::with_params(
-                    rows,
-                    schema,
-                    ctx.params.clone(),
-                )));
+                let br = BuildResult::new(Box::new(
+                    ValuesOperator::with_params(rows, schema, ctx.params.clone())
+                        .with_context(Arc::clone(ctx)),
+                ));
                 Ok(br.with_metrics("Values", analyze, vec![]))
             }
 
             PhysicalPlan::Insert {
-                table_id, source, ..
+                table_id,
+                source,
+                target_columns,
+                column_defaults,
+                check_constraints,
+                expectations,
+                ..
             } => {
                 let source_br = build_operator_tree(*source, ctx).await?;
                 let child_m = collect_metrics(&[&source_br.metrics]);
@@ -687,6 +853,10 @@ fn build_operator_tree(
                     source_br.op,
                     ctx.clone(),
                     table_id,
+                    target_columns,
+                    column_defaults,
+                    check_constraints,
+                    expectations,
                 )));
                 Ok(br.with_metrics("Insert", analyze, child_m))
             }
@@ -707,6 +877,7 @@ fn build_operator_tree(
             PhysicalPlan::Update {
                 table_id,
                 assignments,
+                check_constraints,
                 child,
                 ..
             } => {
@@ -719,6 +890,7 @@ fn build_operator_tree(
                     table_id,
                     assignments,
                     input_schema,
+                    check_constraints,
                 )));
                 Ok(br.with_metrics("Update", analyze, child_m))
             }
@@ -730,14 +902,32 @@ fn build_operator_tree(
                 predicate,
                 ..
             } => {
-                let op =
-                    ParallelSeqScanOperator::new(ctx.clone(), table_id, columns, predicate).await?;
-                let br = BuildResult::new(Box::new(op));
-                Ok(br.with_metrics("ParallelSeqScan", analyze, Vec::new()))
+                // Parallel scan splits only the main page range and is not
+                // branch-aware; with a branch active, use the sequential scan
+                // which also reads the branch append range.
+                if ctx.active_branch_id.is_some() {
+                    let op = SeqScanOperator::new(
+                        ctx.clone(),
+                        table_id,
+                        columns,
+                        predicate,
+                        false,
+                        None,
+                    )
+                    .await?;
+                    let br = BuildResult::new(Box::new(op));
+                    Ok(br.with_metrics("SeqScan", analyze, Vec::new()))
+                } else {
+                    let op =
+                        ParallelSeqScanOperator::new(ctx.clone(), table_id, columns, predicate)
+                            .await?;
+                    let br = BuildResult::new(Box::new(op));
+                    Ok(br.with_metrics("ParallelSeqScan", analyze, Vec::new()))
+                }
             }
 
-            // Parallel hash join: fall back to serial hash join for now.
-            // The planner marks it parallel for cost estimation purposes.
+            // Parallel hash join: partitions both inputs by join-key hash and
+            // joins each partition concurrently on a runtime worker thread.
             PhysicalPlan::ParallelHashJoin {
                 left,
                 right,
@@ -752,7 +942,7 @@ fn build_operator_tree(
                 let left_br = build_operator_tree(*left, ctx).await?;
                 let right_br = build_operator_tree(*right, ctx).await?;
                 let child_m = collect_metrics(&[&left_br.metrics, &right_br.metrics]);
-                let br = BuildResult::new(Box::new(HashJoinOperator::new(
+                let br = BuildResult::new(Box::new(ParallelHashJoinOperator::new(
                     left_br.op,
                     right_br.op,
                     join_type,
@@ -854,6 +1044,7 @@ fn build_scan_with_tuple_ids(
                 ..
             } => {
                 let mut effective_predicate = predicate;
+                let mut branch_override: Option<u64> = None;
                 let as_of_version = match &as_of {
                     Some(AsOfTarget::Version(v)) => Some(*v),
                     Some(AsOfTarget::Timestamp(ts)) => {
@@ -872,14 +1063,19 @@ fn build_scan_with_tuple_ids(
                         None
                     }
                     Some(AsOfTarget::Branch(name)) => {
-                        return Err(zyron_common::ZyronError::ExecutionError(format!(
-                            "IN BRANCH '{}' is parsed and bound but executor branch lookup is not yet wired",
-                            name
-                        )));
+                        let bid = ctx
+                            .branch_catalog
+                            .as_ref()
+                            .and_then(|c| c.branch_id_by_name(name))
+                            .ok_or_else(|| {
+                                zyron_common::ZyronError::BranchNotFound(name.clone())
+                            })?;
+                        branch_override = Some(bid);
+                        None
                     }
                     None => None,
                 };
-                let op = SeqScanOperator::new(
+                let mut op = SeqScanOperator::new(
                     ctx.clone(),
                     table_id,
                     columns,
@@ -888,6 +1084,9 @@ fn build_scan_with_tuple_ids(
                     as_of_version,
                 )
                 .await?;
+                if let Some(bid) = branch_override {
+                    op = op.with_branch(Some(bid));
+                }
                 let br = BuildResult::new(Box::new(op) as Box<dyn Operator>);
                 Ok(br.with_metrics("SeqScan", analyze, vec![]))
             }
@@ -901,7 +1100,13 @@ fn build_scan_with_tuple_ids(
                 remaining_predicate,
                 ..
             } => {
-                let btree = ctx.get_index(index_id);
+                // Force the branch-aware sequential fallback when a branch is
+                // active so UPDATE/DELETE see branch overlay rows and tombstones.
+                let btree = if ctx.active_branch_id.is_some() {
+                    None
+                } else {
+                    ctx.get_index(index_id)
+                };
                 let op = IndexScanOperator::new(
                     ctx.clone(),
                     table_id,
@@ -949,21 +1154,35 @@ fn build_scan_with_tuple_ids(
                 table_id,
                 columns,
                 predicate,
+                as_of,
                 ..
             } => {
                 // DML over a folded table. The columnar scan emits
                 // (file_id, sys_rowid) locators so UPDATE/DELETE route those
                 // rows to the patch log; the heap scan tracks tuple ids for
-                // the not-yet-folded residual. Disjoint by construction.
+                // the not-yet-folded residual. Disjoint by construction. A
+                // filtered AS OF VERSION read reaches this arm too, so both
+                // stores date their rows by commit LSN.
+                let as_of_version = match &as_of {
+                    Some(AsOfTarget::Version(v)) => Some(*v),
+                    _ => None,
+                };
                 let columnar = ColumnScanOperator::new_for_dml(
                     ctx.clone(),
                     table_id,
                     columns.clone(),
                     predicate.clone(),
-                )?;
-                let heap =
-                    SeqScanOperator::new(ctx.clone(), table_id, columns, predicate, true, None)
-                        .await?;
+                )?
+                .with_as_of(as_of_version);
+                let heap = SeqScanOperator::new(
+                    ctx.clone(),
+                    table_id,
+                    columns,
+                    predicate,
+                    true,
+                    as_of_version,
+                )
+                .await?;
                 let op = HybridScanOperator::new(columnar, heap);
                 let br = BuildResult::new(Box::new(op) as Box<dyn Operator>);
                 Ok(br.with_metrics("HybridScan", analyze, vec![]))

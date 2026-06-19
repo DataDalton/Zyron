@@ -10,9 +10,10 @@ use std::sync::Arc;
 use zyron_common::{Result, ZyronError};
 use zyron_planner::logical::LogicalColumn;
 
-use crate::batch::DataBatch;
+use crate::batch::{ColumnBuilder, DataBatch, decode_tuple_into_builders};
 use crate::column::{Column, ColumnData, NullBitmap};
 use crate::context::ExecutionContext;
+use crate::operator::scan::read_page_through_pool;
 use crate::operator::{ExecutionBatch, Operator, OperatorResult};
 
 /// The type of graph algorithm to execute.
@@ -56,24 +57,25 @@ impl GraphAlgorithmOperator {
         // For graph schemas, the privilege is checked at the schema level
         ctx.check_search_privilege(privilege, 0)?;
 
-        let graph_mgr = ctx.graph_manager.as_ref().ok_or_else(|| {
+        let graph_mgr = ctx.graph_manager.clone().ok_or_else(|| {
             ZyronError::GraphSchemaNotFound("graph manager not configured".to_string())
         })?;
 
-        let _schema = graph_mgr
+        let schema = graph_mgr
             .get_schema(&schema_name)
             .ok_or_else(|| ZyronError::GraphSchemaNotFound(schema_name.clone()))?;
 
-        // Build or retrieve cached CSR
-        // For now, we need edge data from the backing tables. This would normally
-        // be loaded from the heap pages. As a placeholder, use the cached CSR
-        // or return an error if not cached.
-        let csr = graph_mgr.get_cached_csr(&schema_name).ok_or_else(|| {
-            ZyronError::GraphAlgorithmError(format!(
-                "no cached CSR for graph schema '{}'. Run a graph query to build it first.",
-                schema_name
-            ))
-        })?;
+        // Use the cached CSR when present, otherwise load the edges from the
+        // backing edge tables' heaps (honoring the statement snapshot) and build
+        // the CSR. The cache is invalidated by DML on the backing tables, so a
+        // cold or post-mutation query rebuilds it here rather than failing.
+        let csr = match graph_mgr.get_cached_csr(&schema_name) {
+            Some(cached) => cached,
+            None => {
+                let edges = load_graph_edges(&ctx, &schema).await?;
+                graph_mgr.get_or_build_csr(&schema_name, &edges)?
+            }
+        };
 
         // Execute the algorithm
         let batches = match algorithm {
@@ -135,6 +137,146 @@ impl Operator for GraphAlgorithmOperator {
             self.cursor += 1;
             Ok(Some(ExecutionBatch::new(batch)))
         })
+    }
+}
+
+/// Loads every edge of a graph schema from its backing edge tables' heaps.
+/// Each edge table follows the graph convention of `from_node`/`to_node`
+/// node-id columns plus an optional `weight` column. Only rows visible to the
+/// statement snapshot are read. An undirected edge label contributes both
+/// directions so directed algorithms traverse it symmetrically.
+async fn load_graph_edges(
+    ctx: &Arc<ExecutionContext>,
+    schema: &zyron_search::graph::GraphSchema,
+) -> Result<Vec<(u64, u64, Option<f64>)>> {
+    let mut edges: Vec<(u64, u64, Option<f64>)> = Vec::new();
+
+    for edge_label in &schema.edge_labels {
+        let table = ctx
+            .catalog
+            .get_table_by_id(zyron_catalog::TableId(edge_label.edge_table_id))?;
+
+        let column_pos = |name: &str| table.columns.iter().position(|c| c.name == name);
+        let from_pos = column_pos("from_node").ok_or_else(|| {
+            ZyronError::GraphAlgorithmError(format!(
+                "edge table for label '{}' has no from_node column",
+                edge_label.name
+            ))
+        })?;
+        let to_pos = column_pos("to_node").ok_or_else(|| {
+            ZyronError::GraphAlgorithmError(format!(
+                "edge table for label '{}' has no to_node column",
+                edge_label.name
+            ))
+        })?;
+        let weight_pos = column_pos("weight");
+
+        // Decode only the node-id (and optional weight) columns: map every other
+        // table column to None so the decoder skips it.
+        let mut col_to_builder: Vec<Option<u16>> = vec![None; table.columns.len()];
+        let mut builders: Vec<ColumnBuilder> = Vec::with_capacity(3);
+        col_to_builder[from_pos] = Some(builders.len() as u16);
+        builders.push(ColumnBuilder::new(table.columns[from_pos].type_id, 0));
+        col_to_builder[to_pos] = Some(builders.len() as u16);
+        builders.push(ColumnBuilder::new(table.columns[to_pos].type_id, 0));
+        let weight_builder = weight_pos.map(|wp| {
+            let idx = builders.len();
+            col_to_builder[wp] = Some(idx as u16);
+            builders.push(ColumnBuilder::new(table.columns[wp].type_id, 0));
+            idx
+        });
+
+        let heap = ctx.get_heap_file(table.id).await?;
+        let num_pages = heap.num_pages_cached() as u32;
+        for page_num in 0..num_pages {
+            ctx.check_cancelled()?;
+            let page_id = zyron_common::page::PageId::new(table.heap_file_id, page_num as u64);
+            let page_data =
+                read_page_through_pool(&ctx.buffer_pool, &ctx.disk_manager, page_id).await?;
+            let header = zyron_storage::HeapPage::heap_header_from_slice(&page_data);
+            if header.slot_count == 0 {
+                continue;
+            }
+            let page = zyron_storage::HeapPage::from_bytes(page_data);
+            for slot in 0..header.slot_count {
+                let Some(view) = page.get_tuple_view(zyron_storage::SlotId(slot)) else {
+                    continue;
+                };
+                if view.is_deleted() || !view.header.is_visible_to(&ctx.snapshot) {
+                    continue;
+                }
+                decode_tuple_into_builders(
+                    view.data,
+                    &table.columns,
+                    &col_to_builder,
+                    &mut builders,
+                );
+            }
+        }
+
+        let columns: Vec<Column> = builders.into_iter().map(|b| b.finish()).collect();
+        let from_col = &columns[0];
+        let to_col = &columns[1];
+        let weight_col = weight_builder.map(|i| &columns[i]);
+        let row_count = from_col.len();
+        for row in 0..row_count {
+            if from_col.is_null(row) || to_col.is_null(row) {
+                continue;
+            }
+            let (Some(from), Some(to)) = (
+                scalar_to_node_id(&from_col.get_scalar(row)),
+                scalar_to_node_id(&to_col.get_scalar(row)),
+            ) else {
+                continue;
+            };
+            let weight = weight_col.and_then(|c| {
+                if c.is_null(row) {
+                    None
+                } else {
+                    scalar_to_weight(&c.get_scalar(row))
+                }
+            });
+            edges.push((from, to, weight));
+            if !edge_label.directed {
+                edges.push((to, from, weight));
+            }
+        }
+    }
+
+    Ok(edges)
+}
+
+/// Reads a node-id column value as a u64, accepting any integer width.
+fn scalar_to_node_id(s: &crate::column::ScalarValue) -> Option<u64> {
+    use crate::column::ScalarValue as V;
+    match s {
+        V::Int8(v) => Some(*v as u64),
+        V::Int16(v) => Some(*v as u64),
+        V::Int32(v) => Some(*v as u64),
+        V::Int64(v) => Some(*v as u64),
+        V::UInt8(v) => Some(*v as u64),
+        V::UInt16(v) => Some(*v as u64),
+        V::UInt32(v) => Some(*v as u64),
+        V::UInt64(v) => Some(*v),
+        _ => None,
+    }
+}
+
+/// Reads an edge-weight column value as f64, accepting float or integer types.
+fn scalar_to_weight(s: &crate::column::ScalarValue) -> Option<f64> {
+    use crate::column::ScalarValue as V;
+    match s {
+        V::Float32(v) => Some(*v as f64),
+        V::Float64(v) => Some(*v),
+        V::Int8(v) => Some(*v as f64),
+        V::Int16(v) => Some(*v as f64),
+        V::Int32(v) => Some(*v as f64),
+        V::Int64(v) => Some(*v as f64),
+        V::UInt8(v) => Some(*v as f64),
+        V::UInt16(v) => Some(*v as f64),
+        V::UInt32(v) => Some(*v as f64),
+        V::UInt64(v) => Some(*v as f64),
+        _ => None,
     }
 }
 

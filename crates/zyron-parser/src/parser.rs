@@ -208,6 +208,27 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Reads the next token as a bare word, accepting any keyword as its
+    /// lexeme. Used where the grammar expects a fixed vocabulary word that may
+    /// collide with a reserved keyword (e.g. a pipeline stage MODE of FULL or
+    /// MERGE).
+    fn parse_keyword_or_ident(&mut self) -> Result<String> {
+        match &self.current.token {
+            Token::Ident(_) => self.parse_ident(),
+            Token::Keyword(kw) => {
+                let s = keyword_to_ident_str(*kw)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| kw.to_string());
+                self.advance()?;
+                Ok(s)
+            }
+            _ => Err(self.error(&format!(
+                "Expected identifier or keyword, found {}",
+                self.current.token
+            ))),
+        }
+    }
+
     fn parse_comma_separated<T>(
         &mut self,
         mut parse_fn: impl FnMut(&mut Self) -> Result<T>,
@@ -1226,6 +1247,7 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Model) => self.parse_drop_model(),
             Token::Keyword(Keyword::Graph) => self.parse_drop_graph_schema(),
             Token::Keyword(Keyword::Branch) => self.parse_drop_branch(),
+            Token::Keyword(Keyword::Version) => self.parse_drop_version(),
             Token::Keyword(Keyword::Replication) => self.parse_drop_replication_slot(),
             Token::Keyword(Keyword::Cdc) => self.parse_drop_cdc(),
             Token::Keyword(Keyword::Streaming) => self.parse_drop_streaming_job(),
@@ -1750,7 +1772,13 @@ impl<'a> Parser<'a> {
                 self.expect_token(&Token::LParen)?;
                 let column = self.parse_ident()?;
                 self.expect_token(&Token::RParen)?;
-                constraints.push(ColumnConstraint::References { table, column });
+                let (on_delete, on_update) = self.parse_referential_actions()?;
+                constraints.push(ColumnConstraint::References {
+                    table,
+                    column,
+                    on_delete,
+                    on_update,
+                });
             } else {
                 break;
             }
@@ -1802,14 +1830,67 @@ impl<'a> Parser<'a> {
             self.expect_token(&Token::LParen)?;
             let ref_columns = self.parse_comma_separated(|p| p.parse_ident())?;
             self.expect_token(&Token::RParen)?;
+            let (on_delete, on_update) = self.parse_referential_actions()?;
             Ok(TableConstraint::ForeignKey {
                 columns,
                 ref_table,
                 ref_columns,
+                on_delete,
+                on_update,
             })
         } else {
             Err(self.error(&format!(
                 "Expected PRIMARY KEY, UNIQUE, CHECK, or FOREIGN KEY, found {}",
+                self.current.token
+            )))
+        }
+    }
+
+    /// Parses optional ON DELETE and ON UPDATE referential action clauses in
+    /// either order. Returns (on_delete, on_update), defaulting to NoAction.
+    fn parse_referential_actions(&mut self) -> Result<(ReferentialAction, ReferentialAction)> {
+        let mut on_delete = ReferentialAction::NoAction;
+        let mut on_update = ReferentialAction::NoAction;
+        while self.at_keyword(Keyword::On) {
+            self.advance()?;
+            if self.consume_keyword(Keyword::Delete)? {
+                on_delete = self.parse_referential_action()?;
+            } else if self.consume_keyword(Keyword::Update)? {
+                on_update = self.parse_referential_action()?;
+            } else {
+                return Err(self.error(&format!(
+                    "Expected DELETE or UPDATE after ON in foreign key clause, found {}",
+                    self.current.token
+                )));
+            }
+        }
+        Ok((on_delete, on_update))
+    }
+
+    /// Parses a single referential action: CASCADE, RESTRICT, NO ACTION,
+    /// SET NULL, or SET DEFAULT.
+    fn parse_referential_action(&mut self) -> Result<ReferentialAction> {
+        if self.consume_keyword(Keyword::Cascade)? {
+            Ok(ReferentialAction::Cascade)
+        } else if self.consume_keyword(Keyword::Restrict)? {
+            Ok(ReferentialAction::Restrict)
+        } else if self.consume_keyword(Keyword::No)? {
+            self.expect_keyword(Keyword::Action)?;
+            Ok(ReferentialAction::NoAction)
+        } else if self.consume_keyword(Keyword::Set)? {
+            if self.consume_keyword(Keyword::Null)? {
+                Ok(ReferentialAction::SetNull)
+            } else if self.consume_keyword(Keyword::Default)? {
+                Ok(ReferentialAction::SetDefault)
+            } else {
+                Err(self.error(&format!(
+                    "Expected NULL or DEFAULT after SET in referential action, found {}",
+                    self.current.token
+                )))
+            }
+        } else {
+            Err(self.error(&format!(
+                "Expected CASCADE, RESTRICT, NO ACTION, SET NULL, or SET DEFAULT, found {}",
                 self.current.token
             )))
         }
@@ -2171,7 +2252,7 @@ impl<'a> Parser<'a> {
     // Pratt expression parser
     // -----------------------------------------------------------------------
 
-    fn parse_expr(&mut self) -> Result<Expr> {
+    pub fn parse_expr(&mut self) -> Result<Expr> {
         self.parse_expr_bp(0)
     }
 
@@ -3977,7 +4058,7 @@ impl<'a> Parser<'a> {
         let mut min_value = None;
         let mut max_value = None;
         let mut start = None;
-        let restart = None;
+        let mut restart = None;
         let mut cache = None;
         let mut cycle = None;
         loop {
@@ -3991,6 +4072,16 @@ impl<'a> Parser<'a> {
             } else if self.consume_keyword(Keyword::Start)? {
                 self.consume_keyword(Keyword::With)?;
                 start = Some(self.parse_integer_value()?);
+            } else if self.consume_keyword(Keyword::Restart)? {
+                // RESTART [WITH n]: with a value restarts at n, bare RESTART
+                // restarts at the sequence start value.
+                if self.consume_keyword(Keyword::With)? {
+                    restart = Some(Some(self.parse_integer_value()?));
+                } else if matches!(self.current.token, Token::Integer(_)) {
+                    restart = Some(Some(self.parse_integer_value()?));
+                } else {
+                    restart = Some(None);
+                }
             } else if self.consume_keyword(Keyword::Cache)? {
                 cache = Some(self.parse_integer_value()?);
             } else if self.consume_keyword(Keyword::Cycle)? {
@@ -4756,7 +4847,7 @@ impl<'a> Parser<'a> {
                 target = self.parse_ident()?;
                 self.consume_token(&Token::Comma)?;
             } else if self.consume_keyword(Keyword::Mode)? {
-                mode = Some(self.parse_ident()?);
+                mode = Some(self.parse_keyword_or_ident()?);
                 self.consume_token(&Token::Comma)?;
             } else if self.consume_keyword(Keyword::Transform)? {
                 self.expect_keyword(Keyword::As)?;
@@ -5148,6 +5239,22 @@ impl<'a> Parser<'a> {
             name,
             table,
             at_version,
+        })))
+    }
+
+    fn parse_drop_version(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Version)?;
+        let if_exists = if self.at_keyword(Keyword::If) {
+            self.advance()?; // IF
+            self.expect_keyword(Keyword::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_ident()?;
+        Ok(Statement::DropVersion(Box::new(DropVersionStatement {
+            name,
+            if_exists,
         })))
     }
 
@@ -8302,6 +8409,52 @@ mod tests {
                     &ct.constraints[1],
                     TableConstraint::ForeignKey { ref_table, .. } if ref_table == "users"
                 ));
+            }
+            _ => panic!("Expected CREATE TABLE"),
+        }
+    }
+
+    #[test]
+    fn test_foreign_key_referential_actions() {
+        let stmt = parse_one(
+            "CREATE TABLE orders (
+                id INT,
+                user_id INT REFERENCES users(id) ON DELETE CASCADE ON UPDATE SET NULL,
+                region_id INT,
+                FOREIGN KEY (region_id) REFERENCES regions(id) ON DELETE RESTRICT
+            )",
+        );
+        match stmt {
+            Statement::CreateTable(ct) => {
+                let inline = ct.columns[1]
+                    .constraints
+                    .iter()
+                    .find_map(|c| match c {
+                        ColumnConstraint::References {
+                            on_delete,
+                            on_update,
+                            ..
+                        } => Some((*on_delete, *on_update)),
+                        _ => None,
+                    })
+                    .expect("inline REFERENCES");
+                assert_eq!(inline.0, ReferentialAction::Cascade);
+                assert_eq!(inline.1, ReferentialAction::SetNull);
+
+                let table_fk = ct
+                    .constraints
+                    .iter()
+                    .find_map(|c| match c {
+                        TableConstraint::ForeignKey {
+                            on_delete,
+                            on_update,
+                            ..
+                        } => Some((*on_delete, *on_update)),
+                        _ => None,
+                    })
+                    .expect("table FOREIGN KEY");
+                assert_eq!(table_fk.0, ReferentialAction::Restrict);
+                assert_eq!(table_fk.1, ReferentialAction::NoAction);
             }
             _ => panic!("Expected CREATE TABLE"),
         }
@@ -12268,6 +12421,24 @@ mod tests {
                 assert!(v.at_version.is_some());
             }
             _ => panic!("Expected CreateVersion"),
+        }
+    }
+
+    #[test]
+    fn test_drop_version() {
+        match parse_one("DROP VERSION v1") {
+            Statement::DropVersion(v) => {
+                assert_eq!(v.name, "v1");
+                assert!(!v.if_exists);
+            }
+            _ => panic!("Expected DropVersion"),
+        }
+        match parse_one("DROP VERSION IF EXISTS v1") {
+            Statement::DropVersion(v) => {
+                assert_eq!(v.name, "v1");
+                assert!(v.if_exists);
+            }
+            _ => panic!("Expected DropVersion"),
         }
     }
 

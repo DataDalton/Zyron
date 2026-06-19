@@ -500,6 +500,7 @@ fn output_dispatch(f: EndpointOutputFormat) -> (&'static str, FormatKind) {
         EndpointOutputFormat::ArrowIpc => {
             ("application/vnd.apache.arrow.stream", FormatKind::ArrowIpc)
         }
+        EndpointOutputFormat::Protobuf => ("application/x-protobuf", FormatKind::Protobuf),
     }
 }
 

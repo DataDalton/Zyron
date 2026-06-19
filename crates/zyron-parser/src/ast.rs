@@ -147,6 +147,7 @@ pub enum Statement {
     UseBranch(Box<UseBranchStatement>),
     /// CREATE VERSION name ON table [AS OF VERSION expr]
     CreateVersion(Box<CreateVersionStatement>),
+    DropVersion(Box<DropVersionStatement>),
     /// CREATE REPLICATION SLOT name PLUGIN 'plugin_name'
     CreateReplicationSlot(Box<CreateReplicationSlotStatement>),
     /// DROP REPLICATION SLOT name
@@ -1303,6 +1304,12 @@ pub struct CreateVersionStatement {
     pub name: String,
     pub table: String,
     pub at_version: Option<Expr>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropVersionStatement {
+    pub name: String,
+    pub if_exists: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -2515,6 +2522,23 @@ impl DataType {
 // Constraints
 // ---------------------------------------------------------------------------
 
+/// Referential action for a foreign key ON DELETE / ON UPDATE clause.
+/// NoAction is the SQL default when no action is specified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferentialAction {
+    NoAction,
+    Restrict,
+    Cascade,
+    SetNull,
+    SetDefault,
+}
+
+impl Default for ReferentialAction {
+    fn default() -> Self {
+        ReferentialAction::NoAction
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnConstraint {
     PrimaryKey,
@@ -2522,7 +2546,12 @@ pub enum ColumnConstraint {
     NotNull,
     Default(Expr),
     Check(Expr),
-    References { table: String, column: String },
+    References {
+        table: String,
+        column: String,
+        on_delete: ReferentialAction,
+        on_update: ReferentialAction,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2534,6 +2563,8 @@ pub enum TableConstraint {
         columns: Vec<String>,
         ref_table: String,
         ref_columns: Vec<String>,
+        on_delete: ReferentialAction,
+        on_update: ReferentialAction,
     },
 }
 

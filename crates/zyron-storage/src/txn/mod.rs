@@ -12,7 +12,9 @@ mod intent_lock;
 mod isolation;
 mod lock_table;
 mod proc_array;
+mod retention_clock;
 mod snapshot;
+mod status_map;
 
 pub use deadlock::WaitForGraph;
 use durability::DurabilityQueue;
@@ -21,7 +23,9 @@ pub use intent_lock::IntentLockTable;
 pub use isolation::IsolationLevel;
 pub use lock_table::LockTable;
 pub use proc_array::ProcArray;
+pub use retention_clock::RetentionClock;
 pub use snapshot::Snapshot;
+pub use status_map::{TxnStatus, TxnStatusMap};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -183,10 +187,19 @@ pub struct TransactionManager {
     wal: Arc<WalWriter>,
     /// Row-level lock table for write-write conflict detection.
     lock_table: LockTable,
-    /// Intent lock table for B+Tree key-level conflict detection.
-    intent_locks: IntentLockTable,
+    /// Intent lock table for B+Tree key-level conflict detection. Shared so the
+    /// executor can take key locks (e.g. to serialize unique-index inserts of
+    /// the same value); released by commit/abort via `unlock_all`.
+    intent_locks: Arc<IntentLockTable>,
     /// Wait-for graph for deadlock detection.
     wait_for_graph: WaitForGraph,
+    /// Durable commit-status map consulted by MVCC visibility so an aborted
+    /// transaction's writes never appear committed. Shared into every snapshot.
+    status_map: Arc<TxnStatusMap>,
+    /// Wall-clock to WAL-LSN sample log for time-based time-travel retention.
+    /// Sampled by the vacuum worker, read by vacuum and manual VACUUM to turn a
+    /// retention window into a floor LSN.
+    retention_clock: Arc<RetentionClock>,
     /// Targeted commit-durability wakeups. A committing transaction registers
     /// its commit LSN and is woken only when a flush satisfies that LSN, instead
     /// of waking on every flush. Driven by the WAL flush thread via the
@@ -203,8 +216,10 @@ impl TransactionManager {
             proc_array: ProcArray::new(),
             wal,
             lock_table: LockTable::new(),
-            intent_locks: IntentLockTable::new(),
+            intent_locks: Arc::new(IntentLockTable::new()),
             wait_for_graph: WaitForGraph::new(),
+            status_map: Arc::new(TxnStatusMap::new()),
+            retention_clock: Arc::new(RetentionClock::new()),
             durability,
         }
     }
@@ -218,10 +233,25 @@ impl TransactionManager {
             proc_array: ProcArray::new(),
             wal,
             lock_table: LockTable::new(),
-            intent_locks: IntentLockTable::new(),
+            intent_locks: Arc::new(IntentLockTable::new()),
             wait_for_graph: WaitForGraph::new(),
+            status_map: Arc::new(TxnStatusMap::new()),
+            retention_clock: Arc::new(RetentionClock::new()),
             durability,
         }
+    }
+
+    /// Returns the commit-status map for recovery reconstruction, checkpoint
+    /// persistence, vacuum, and unique-constraint probes.
+    #[inline]
+    pub fn status_map(&self) -> &Arc<TxnStatusMap> {
+        &self.status_map
+    }
+
+    /// Returns the wall-clock to WAL-LSN sample log used by time-based
+    /// time-travel retention.
+    pub fn retention_clock(&self) -> &Arc<RetentionClock> {
+        &self.retention_clock
     }
 
     /// Builds the durability queue and registers a flush waker that drains it.
@@ -254,7 +284,7 @@ impl TransactionManager {
         // on the common begin; snapshot_into grows it only when peers are live.
         let mut active_ids: Vec<u64> = Vec::new();
         self.proc_array.snapshot_into(txn_id, &mut active_ids);
-        let snapshot = Snapshot::new(txn_id, active_ids);
+        let snapshot = Snapshot::new(txn_id, active_ids, Arc::clone(&self.status_map));
 
         let txn_id_u32 = match u32::try_from(txn_id) {
             Ok(v) => v,
@@ -317,6 +347,12 @@ impl TransactionManager {
             self.intent_locks.unlock_all(txn.txn_id);
             self.wait_for_graph.remove_transaction(txn.txn_id);
         }
+
+        // Publish the committed status BEFORE leaving the active set, so no
+        // snapshot can observe this transaction as neither active nor committed.
+        // The commit-record LSN dates the transaction for time-travel; it is
+        // stored only while commit-LSN tracking is enabled.
+        self.status_map.record_committed_at(txn.txn_id, lsn.0);
 
         {
             let _s = profile::scope(Phase::ProcArrayRelease);
@@ -421,6 +457,10 @@ impl TransactionManager {
         self.intent_locks.unlock_all(txn.txn_id);
         self.wait_for_graph.remove_transaction(txn.txn_id);
 
+        // Record the abort so this transaction's writes stay invisible after it
+        // leaves the active set. The engine performs no physical undo.
+        self.status_map.record_aborted(txn.txn_id);
+
         self.proc_array.release(txn.slot_idx);
 
         Ok(())
@@ -436,7 +476,7 @@ impl TransactionManager {
     pub fn refresh_snapshot(&self, txn: &Transaction) -> Snapshot {
         let mut active_ids: Vec<u64> = Vec::with_capacity(16);
         self.proc_array.snapshot_into(txn.txn_id, &mut active_ids);
-        Snapshot::new(txn.txn_id, active_ids)
+        Snapshot::new(txn.txn_id, active_ids, Arc::clone(&self.status_map))
     }
 
     /// Returns a reference to the row-level lock table.
@@ -444,8 +484,10 @@ impl TransactionManager {
         &self.lock_table
     }
 
-    /// Returns a reference to the intent lock table.
-    pub fn intent_locks(&self) -> &IntentLockTable {
+    /// Returns the shared intent lock table. The executor takes key locks
+    /// through this (e.g. to serialize concurrent unique-index inserts of the
+    /// same value); the locks are released by this transaction's commit/abort.
+    pub fn intent_locks(&self) -> &Arc<IntentLockTable> {
         &self.intent_locks
     }
 

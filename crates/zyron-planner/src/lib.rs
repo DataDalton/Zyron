@@ -20,9 +20,22 @@ pub use physical::PhysicalPlan;
 
 use std::sync::Arc;
 
-use zyron_catalog::{Catalog, DatabaseId};
+use zyron_catalog::{Catalog, DatabaseId, TableEntry};
 use zyron_common::Result;
 use zyron_parser::Statement;
+
+/// Binds a table's CHECK constraint predicates (against a canonical table_idx of
+/// 0) so an executor-internal write path that lacks a bound statement (FK
+/// cascade, branch merge) can still enforce them. CHECK predicates reference
+/// only the table's own columns, so the resolver scope is irrelevant.
+pub async fn bind_table_check_constraints(
+    catalog: &Catalog,
+    entry: &TableEntry,
+) -> Result<Vec<binder::BoundExpr>> {
+    let resolver = catalog.resolver(DatabaseId(1), vec!["public".to_string()]);
+    let mut binder = Binder::new(resolver, catalog);
+    binder.bind_check_constraints(entry).await
+}
 
 /// One row-security predicate for a table. `permissive` predicates within a
 /// table are OR'd together then AND'd with the user filter; non-permissive

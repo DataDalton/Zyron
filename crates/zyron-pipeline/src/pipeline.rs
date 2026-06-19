@@ -13,6 +13,19 @@ pub enum RefreshMode {
     Merge,
 }
 
+impl RefreshMode {
+    /// Parses a stage MODE identifier. An unspecified or unrecognized mode
+    /// maps to a full rebuild.
+    pub fn from_mode_str(mode: Option<&str>) -> RefreshMode {
+        match mode.map(|m| m.to_ascii_uppercase()).as_deref() {
+            Some("INCREMENTAL") => RefreshMode::Incremental,
+            Some("APPEND") | Some("APPEND_ONLY") | Some("APPENDONLY") => RefreshMode::AppendOnly,
+            Some("MERGE") | Some("UPSERT") => RefreshMode::Merge,
+            _ => RefreshMode::Full,
+        }
+    }
+}
+
 /// Current execution status of a pipeline.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PipelineStatus {

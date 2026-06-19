@@ -332,6 +332,55 @@ impl Server {
             start_txn_id,
         ));
 
+        // Reconstruct the commit-status map. Load the persisted commit log
+        // (statuses durable as of the last checkpoint), then mark every redo
+        // (post-checkpoint, committed) transaction committed and every
+        // undo (uncommitted-at-crash) transaction aborted. Transactions never
+        // recorded stay not-committed and therefore invisible. The engine does
+        // no physical undo, so this is what keeps an aborted transaction's
+        // on-disk rows from reappearing as committed after recovery.
+        txn_manager
+            .status_map()
+            .load(&self.config.storage.data_dir)?;
+        // Time-travel dates transactions by commit LSN. Enable commit-LSN
+        // tracking when a retained version exists so the redo tail and future
+        // commits are dated; a database with no version tags pays nothing.
+        // Set the retention floor to the oldest tagged version so vacuum keeps
+        // every tuple still visible there. Load the wall-clock sample log and,
+        // if any table has a time-based retention window, keep commit-LSN
+        // segments so the window's floor stays computable.
+        txn_manager
+            .retention_clock()
+            .load(&self.config.storage.data_dir)?;
+        {
+            let status_map = txn_manager.status_map();
+            let tags = catalog.list_version_tags();
+            if !tags.is_empty() {
+                status_map.enable_lsn_tracking();
+                for tag in &tags {
+                    status_map.retain_version(tag.version_id);
+                }
+            }
+            if catalog
+                .list_all_tables()
+                .iter()
+                .any(|t| t.time_travel_retention_secs != 0)
+            {
+                status_map.enable_lsn_tracking();
+            }
+        }
+        if let Some(ref rr) = recovery_result {
+            let status_map = txn_manager.status_map();
+            // Mark committed transactions and date them by their commit-record
+            // LSN, reconstructing the post-checkpoint commit-LSN map.
+            for &(txn_id, commit_lsn) in &rr.committed_txns {
+                status_map.record_committed_at(txn_id as u64, commit_lsn);
+            }
+            for &t in &rr.undo_txns {
+                status_map.record_aborted(t as u64);
+            }
+        }
+
         // 8. Create SecurityManager with heap-backed auth storage
         let auth_storage: Arc<dyn zyron_auth::storage::AuthStorage> = Arc::new(
             zyron_auth::HeapAuthStorage::new(Arc::clone(&disk_manager), Arc::clone(&buffer_pool))?,
@@ -409,15 +458,61 @@ impl Server {
         let uda_reg_arc = Arc::new(zyron_pipeline::aggregate::UdaRegistry::new());
         let proc_reg_arc = Arc::new(zyron_pipeline::stored_procedure::ProcedureRegistry::new());
         let pipeline_mgr_arc = Arc::new(zyron_pipeline::pipeline::PipelineManager::new());
+        // Rebuild the in-memory pipeline DAGs from the recovered catalog so the
+        // manager reflects persisted pipelines after a restart.
+        for entry in catalog.list_pipelines() {
+            if let Ok(parsed) = zyron_parser::parse(&entry.definition_sql) {
+                if let Some(zyron_parser::Statement::CreatePipeline(def)) =
+                    parsed.into_iter().next()
+                {
+                    let stages = def
+                        .stages
+                        .iter()
+                        .map(|s| zyron_pipeline::pipeline::PipelineStageConfig {
+                            name: s.name.clone(),
+                            source: s.source.clone(),
+                            target: s.target.clone(),
+                            refresh_mode: zyron_pipeline::pipeline::RefreshMode::from_mode_str(
+                                s.mode.as_deref(),
+                            ),
+                            transform_sql: None,
+                            quality_checks: Vec::new(),
+                        })
+                        .collect();
+                    let _ = pipeline_mgr_arc.create_pipeline(zyron_pipeline::pipeline::Pipeline {
+                        id: zyron_pipeline::ids::PipelineId(entry.id),
+                        name: entry.name.clone(),
+                        stages,
+                        enabled: entry.enabled,
+                        created_at: entry.created_at,
+                        sla: None,
+                    });
+                }
+            }
+        }
         let sched_mgr_arc = Arc::new(zyron_pipeline::schedule::ScheduleManager::new());
         let event_disp_arc = Arc::new(zyron_pipeline::event_handler::EventDispatcher::new());
+        // Rebuild the in-memory event handler registry from the recovered
+        // catalog so handlers fire after a restart.
+        for entry in catalog.list_event_handlers() {
+            let _ = event_disp_arc.register(zyron_pipeline::event_handler::EventHandler {
+                id: zyron_pipeline::ids::EventHandlerId(entry.id),
+                name: entry.name.clone(),
+                eventType: zyron_pipeline::event_handler::EventType::from_label(&entry.event_type),
+                condition: entry.condition_sql.clone(),
+                functionName: entry.execute_function.clone(),
+                enabled: entry.enabled,
+            });
+        }
         let mv_mgr_arc =
             Arc::new(zyron_pipeline::materialized_view::MaterializedViewManager::new());
 
         let stream_mgr_arc = Arc::new(parking_lot::Mutex::new(
             zyron_streaming::job::StreamJobManager::new(),
         ));
-        let branch_mgr_arc = Arc::new(zyron_versioning::BranchManager::new(data_dir.clone()));
+        let branch_mgr = zyron_versioning::BranchManager::new(data_dir.clone());
+        branch_mgr.load()?;
+        let branch_mgr_arc = Arc::new(branch_mgr);
         let notif_arc = Arc::new(zyron_wire::notifications::NotificationChannels::new());
 
         // Full-text search manager: load persisted FTS indexes from catalog.
@@ -626,6 +721,11 @@ impl Server {
                 ..compaction_config
             }
         };
+        // Shared B+tree index registry: the same instance the connection and DML
+        // paths use, so the vacuum worker deletes reclaimed rows' index entries
+        // from the live indexes rather than a private copy.
+        let btree_indexes: Arc<scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>> =
+            Arc::new(scc::HashMap::new());
         let mut background = BackgroundWorkers::start(
             Arc::clone(&catalog),
             Arc::clone(&wal),
@@ -640,9 +740,11 @@ impl Server {
             compaction_config,
             compaction_metrics,
             wal_dir,
+            self.config.storage.data_dir.clone(),
             None, // WAL archiving disabled unless configured
             Some(Arc::clone(&cdc_registry_arc)),
             Some(Arc::clone(&stream_mgr_arc)),
+            Arc::clone(&btree_indexes),
         );
 
         // Attach the QuotaGossip worker with the default no-op transport.
@@ -661,11 +763,9 @@ impl Server {
         let data_dir_for_alter = data_dir.clone();
 
         let session_mgr_for_view = Arc::clone(&self.session_mgr);
-        let ckpt_wake = {
-            let _ckpt_ref = background.checkpoint();
-            let waker: Option<Arc<dyn Fn() + Send + Sync>> = None;
-            // CheckpointWorker does not expose a wake method via Arc. Skip for now.
-            waker
+        let ckpt_wake: Option<Arc<dyn Fn() + Send + Sync>> = {
+            let trigger = background.checkpoint_trigger();
+            Some(Arc::new(move || trigger.checkpoint_blocking()))
         };
 
         // -------------------------------------------------------------------
@@ -876,7 +976,7 @@ impl Server {
             pub_sub_state: Arc::new(zyron_wire::subscription::PubSubServerState::new()),
             subscription_shutdown: Arc::clone(&self.shutdown),
             heap_files: Arc::new(scc::HashMap::new()),
-            btree_indexes: Arc::new(scc::HashMap::new()),
+            btree_indexes,
             plan_cache: Arc::new(zyron_wire::plan_cache::ServerPlanCache::new()),
             vacuum_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             analytics_registry: zyron_analytics::default_registry(),
@@ -1017,6 +1117,36 @@ impl Server {
                 )
                 .await;
             });
+
+            let server_recycle = Arc::clone(&server_state);
+            let sh_recycle = Arc::clone(&self.shutdown);
+            tokio::spawn(async move {
+                background::recycle_reaper::recycle_reaper_loop(
+                    server_recycle,
+                    sh_recycle,
+                    background::recycle_reaper::DEFAULT_INTERVAL_SECS,
+                )
+                .await;
+            });
+
+            let server_cdc_pump = Arc::clone(&server_state);
+            let sh_cdc_pump = Arc::clone(&self.shutdown);
+            tokio::spawn(async move {
+                background::cdc_stream_pump::cdc_stream_pump_loop(
+                    server_cdc_pump,
+                    sh_cdc_pump,
+                    background::cdc_stream_pump::DEFAULT_INTERVAL_SECS,
+                )
+                .await;
+            });
+
+            // Inbound CDC ingest worker runs on a dedicated thread (the source
+            // fetch performs synchronous network IO). Exits on the shutdown flag.
+            let _ = background::cdc_ingest::start(
+                Arc::clone(&server_state),
+                Arc::clone(&self.shutdown),
+                background::cdc_ingest::DEFAULT_INTERVAL_SECS,
+            );
 
             let sh_dlq = Arc::clone(&self.shutdown);
             tokio::spawn(async move {
@@ -1205,6 +1335,35 @@ impl Server {
                 "catalog checkpoint failed during shutdown: {}",
                 e
             );
+        }
+
+        // Persist the commit-status map so aborted/committed status survives a
+        // restart even if the final checkpoint below is skipped. The checkpoint
+        // pre-truncate hook also persists it, this is a belt-and-suspenders write.
+        if let Err(e) = state_for_shutdown
+            .txn_manager
+            .status_map()
+            .persist(&state_for_shutdown.data_dir)
+        {
+            warn!(
+                target: "zyron::shutdown",
+                "commit-status map persist failed during shutdown: {}",
+                e
+            );
+        }
+
+        // Persist branch overlay metadata (file-id map, append page counts, and
+        // page overrides) so writable branches survive restart. The overlay
+        // page bytes live in their own data files and are flushed by the final
+        // checkpoint below; this records the metadata needed to resolve them.
+        if let Some(mgr) = &state_for_shutdown.branch_manager {
+            if let Err(e) = mgr.persist() {
+                warn!(
+                    target: "zyron::shutdown",
+                    "branch overlay persist failed during shutdown: {}",
+                    e
+                );
+            }
         }
 
         // Stop background workers (runs final checkpoint)

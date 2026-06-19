@@ -114,6 +114,7 @@ use std::sync::Arc;
 
 use crate::rcu::RcuMap;
 use zyron_common::Result;
+use zyron_common::ZyronError;
 
 /// Top-level coordinator that owns all auth subsystems.
 pub struct SecurityManager {
@@ -140,6 +141,9 @@ pub struct SecurityManager {
     pub password_cache: RcuMap<String, String>,
     /// Cached user ID lookup by name.
     pub user_id_cache: RcuMap<String, UserId>,
+    /// Full user records keyed by name. Backs login account-status checks
+    /// (locked, can_login, valid_until) and ALTER/DROP USER without a heap scan.
+    pub user_cache: RcuMap<String, crate::user::User>,
     /// Cached role lookup by name. Populated at startup, updated on create/drop.
     pub role_cache: RcuMap<String, Role>,
     /// Cached TOTP secrets keyed by username for TOTP authentication.
@@ -158,6 +162,9 @@ pub struct SecurityManager {
     /// Monotonic counter for generating unique role IDs. Initialized from
     /// the max existing role ID at startup to survive restarts.
     next_role_id: std::sync::atomic::AtomicU32,
+    /// Monotonic counter for generating unique user IDs. Initialized from the
+    /// max existing user ID at startup to survive restarts.
+    next_user_id: std::sync::atomic::AtomicU32,
     /// Monotonic counter for ABAC policy IDs, recovered from the max existing
     /// policy id at startup.
     next_abac_policy_id: std::sync::atomic::AtomicU32,
@@ -194,6 +201,7 @@ impl SecurityManager {
         let webauthn_store = WebAuthnCredentialStore::new();
         let password_cache: RcuMap<String, String> = RcuMap::empty_map();
         let user_id_cache: RcuMap<String, UserId> = RcuMap::empty_map();
+        let user_cache: RcuMap<String, crate::user::User> = RcuMap::empty_map();
         let role_cache: RcuMap<String, Role> = RcuMap::empty_map();
         let totp_secret_cache: RcuMap<String, Vec<u8>> = RcuMap::empty_map();
         let api_key_cache: RcuMap<String, (String, Vec<u8>)> = RcuMap::empty_map();
@@ -220,6 +228,7 @@ impl SecurityManager {
             webauthn_store,
             password_cache,
             user_id_cache,
+            user_cache,
             role_cache,
             totp_secret_cache,
             api_key_cache,
@@ -229,6 +238,7 @@ impl SecurityManager {
             webauthn_rp_config,
             auth_storage,
             next_role_id: std::sync::atomic::AtomicU32::new(1),
+            next_user_id: std::sync::atomic::AtomicU32::new(1),
             next_abac_policy_id: std::sync::atomic::AtomicU32::new(1),
             credential_cache: Arc::new(CredentialCache::new()),
             mtls_pinning: CertFingerprintStore::new(),
@@ -249,6 +259,18 @@ impl SecurityManager {
         manager
             .next_role_id
             .store(max_id + 1, std::sync::atomic::Ordering::Relaxed);
+
+        // Initialize the user ID counter from the max existing user ID.
+        let max_user_id = manager
+            .user_cache
+            .load()
+            .values()
+            .map(|u| u.id.0)
+            .max()
+            .unwrap_or(0);
+        manager
+            .next_user_id
+            .store(max_user_id + 1, std::sync::atomic::Ordering::Relaxed);
 
         // Recover the ABAC policy id counter from the loaded policies.
         manager.next_abac_policy_id.store(
@@ -347,6 +369,7 @@ impl SecurityManager {
         let mut pw_map = HashMap::with_capacity(users.len());
         let mut totp_map = HashMap::new();
         let mut api_key_map = HashMap::new();
+        let mut user_map = HashMap::with_capacity(users.len());
         for user in &users {
             id_map.insert(user.name.clone(), user.id);
             if let Some(ref hash) = user.password_hash {
@@ -358,11 +381,13 @@ impl SecurityManager {
             if let (Some(prefix), Some(hash)) = (&user.api_key_prefix, &user.api_key_hash) {
                 api_key_map.insert(user.name.clone(), (prefix.clone(), hash.clone()));
             }
+            user_map.insert(user.name.clone(), user.clone());
         }
         self.user_id_cache.store(id_map);
         self.password_cache.store(pw_map);
         self.totp_secret_cache.store(totp_map);
         self.api_key_cache.store(api_key_map);
+        self.user_cache.store(user_map);
 
         // Cache roles by name for O(1) lookup
         let roles = self.auth_storage.load_roles().await?;
@@ -434,6 +459,133 @@ impl SecurityManager {
         self.auth_storage.store_role(&role).await?;
         self.role_cache.insert(role.name.clone(), role);
         Ok(())
+    }
+
+    /// Allocates a unique monotonic user ID.
+    pub fn allocate_user_id(&self) -> UserId {
+        UserId(
+            self.next_user_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Looks up a full user record by name from the cache.
+    pub fn lookup_user(&self, name: &str) -> Option<crate::user::User> {
+        self.user_cache.get(&name.to_string())
+    }
+
+    /// Refreshes every name-keyed cache from a user record. Credential caches
+    /// drop the entry when the corresponding credential is absent so a cleared
+    /// password or API key stops authenticating immediately.
+    fn refresh_user_caches(&self, user: &crate::user::User) {
+        self.user_id_cache.insert(user.name.clone(), user.id);
+        self.user_cache.insert(user.name.clone(), user.clone());
+        match &user.password_hash {
+            Some(hash) => self.password_cache.insert(user.name.clone(), hash.clone()),
+            None => {
+                self.password_cache.remove(&user.name);
+            }
+        }
+        match &user.totp_secret {
+            Some(secret) => self
+                .totp_secret_cache
+                .insert(user.name.clone(), secret.clone()),
+            None => {
+                self.totp_secret_cache.remove(&user.name);
+            }
+        }
+        match (&user.api_key_prefix, &user.api_key_hash) {
+            (Some(prefix), Some(hash)) => self
+                .api_key_cache
+                .insert(user.name.clone(), (prefix.clone(), hash.clone())),
+            _ => {
+                self.api_key_cache.remove(&user.name);
+            }
+        }
+    }
+
+    /// Removes every name-keyed cache entry for a user name.
+    fn evict_user_caches(&self, name: &str) {
+        self.user_id_cache.remove(&name.to_string());
+        self.user_cache.remove(&name.to_string());
+        self.password_cache.remove(&name.to_string());
+        self.totp_secret_cache.remove(&name.to_string());
+        self.api_key_cache.remove(&name.to_string());
+    }
+
+    /// Creates a user, persists it, and refreshes the auth caches. Allocates a
+    /// new id when user.id is zero. Rejects a duplicate name.
+    pub async fn create_user(&self, user: &crate::user::User) -> Result<()> {
+        if self.user_cache.get(&user.name).is_some() {
+            return Err(ZyronError::Internal(format!(
+                "user \"{}\" already exists",
+                user.name
+            )));
+        }
+        let mut user = user.clone();
+        if user.id.0 == 0 {
+            user.id = self.allocate_user_id();
+        }
+        self.auth_storage.store_user(&user).await?;
+        self.refresh_user_caches(&user);
+        Ok(())
+    }
+
+    /// Persists an updated user record (same id) and refreshes the caches.
+    pub async fn update_user(&self, user: &crate::user::User) -> Result<()> {
+        self.auth_storage.store_user(user).await?;
+        self.refresh_user_caches(user);
+        Ok(())
+    }
+
+    /// Renames a user, preserving its id and credentials, and re-keys every
+    /// cache. Rejects when the source is missing or the target name is taken.
+    pub async fn rename_user(&self, old_name: &str, new_name: &str) -> Result<()> {
+        if self.user_cache.get(&new_name.to_string()).is_some() {
+            return Err(ZyronError::Internal(format!(
+                "user \"{new_name}\" already exists"
+            )));
+        }
+        let mut user = self
+            .lookup_user(old_name)
+            .ok_or_else(|| ZyronError::Internal(format!("user \"{old_name}\" does not exist")))?;
+        user.name = new_name.to_string();
+        self.auth_storage.store_user(&user).await?;
+        self.evict_user_caches(old_name);
+        self.refresh_user_caches(&user);
+        Ok(())
+    }
+
+    /// Drops a user by name, removing it from storage and every cache. Returns
+    /// whether a user existed.
+    pub async fn drop_user(&self, name: &str) -> Result<bool> {
+        let Some(user) = self.lookup_user(name) else {
+            return Ok(false);
+        };
+        self.auth_storage.delete_user(user.id).await?;
+        self.evict_user_caches(name);
+        Ok(true)
+    }
+
+    /// Renames a role, preserving its id, and re-keys the role cache. Used by
+    /// ALTER ROLE RENAME and to keep a user's same-named role in sync on
+    /// ALTER USER RENAME. Rejects when the source is missing or the target is
+    /// taken. A missing source role is a no-op success so a user without a
+    /// companion role can still be renamed.
+    pub async fn rename_role(&self, old_name: &str, new_name: &str) -> Result<bool> {
+        if self.role_cache.get(&new_name.to_string()).is_some() {
+            return Err(ZyronError::Internal(format!(
+                "role \"{new_name}\" already exists"
+            )));
+        }
+        let Some(mut role) = self.role_cache.get(&old_name.to_string()) else {
+            return Ok(false);
+        };
+        role.name = new_name.to_string();
+        self.auth_storage.store_role(&role).await?;
+        self.role_cache.remove(&old_name.to_string());
+        self.role_cache.insert(new_name.to_string(), role);
+        Ok(true)
     }
 
     /// Drops a role, removes it from storage and the in-memory cache.

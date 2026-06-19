@@ -62,17 +62,55 @@ pub enum WriteMode {
 }
 
 // ---------------------------------------------------------------------------
-// StreamS3Sink (stub)
+// StreamS3Sink
 // ---------------------------------------------------------------------------
 
-/// S3 sink connector stub. Fields are placeholders for the real S3 client
-/// wiring; the stub impl only counts records.
-#[allow(dead_code)]
+/// Converts a column scalar to a JSON value. i128 is rendered as a string so it
+/// survives JSON's f64-backed number range; binary is hex-encoded.
+fn scalar_to_json(s: crate::column::ScalarValue) -> serde_json::Value {
+    use crate::column::ScalarValue as S;
+    use serde_json::Value;
+    match s {
+        S::Null => Value::Null,
+        S::Boolean(b) => Value::Bool(b),
+        S::Int8(v) => Value::from(v),
+        S::Int16(v) => Value::from(v),
+        S::Int32(v) => Value::from(v),
+        S::Int64(v) => Value::from(v),
+        S::Int128(v) => Value::String(v.to_string()),
+        S::UInt8(v) => Value::from(v),
+        S::UInt16(v) => Value::from(v),
+        S::UInt32(v) => Value::from(v),
+        S::UInt64(v) => Value::from(v),
+        S::Float32(v) => serde_json::Number::from_f64(v as f64)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+        S::Float64(v) => serde_json::Number::from_f64(v)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+        S::Utf8(v) => Value::String(v),
+        S::Binary(v) => Value::String(hex::encode(v)),
+    }
+}
+
+fn s3_extension(format: &str) -> &'static str {
+    match format.to_lowercase().as_str() {
+        "jsonl" | "ndjson" => "jsonl",
+        _ => "json",
+    }
+}
+
+/// S3 sink connector. Buffers rows as JSON objects and, on commit, uploads the
+/// buffer as a single object via the opendal S3 backend. Credentials resolve
+/// from the standard AWS environment, region from AWS_REGION (default
+/// us-east-1). Only JSON output is produced.
 pub struct StreamS3Sink {
     bucket: String,
     prefix: String,
     format: String,
+    buffer: Vec<serde_json::Value>,
     records_written: u64,
+    seq: u64,
 }
 
 impl StreamS3Sink {
@@ -81,33 +119,103 @@ impl StreamS3Sink {
             bucket,
             prefix,
             format,
+            buffer: Vec::new(),
             records_written: 0,
+            seq: 0,
         }
     }
 
     pub fn records_written(&self) -> u64 {
         self.records_written
     }
+
+    /// Serializes the buffered rows and uploads them as one S3 object.
+    fn upload(&mut self) -> Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let fmt = self.format.to_lowercase();
+        let body: Vec<u8> = match fmt.as_str() {
+            "jsonl" | "ndjson" => {
+                let mut buf = Vec::new();
+                for v in &self.buffer {
+                    buf.extend_from_slice(serde_json::to_vec(v).unwrap_or_default().as_slice());
+                    buf.push(b'\n');
+                }
+                buf
+            }
+            "json" => serde_json::to_vec(&self.buffer)
+                .map_err(|e| ZyronError::StreamingError(format!("S3 JSON encode failed: {e}")))?,
+            other => {
+                return Err(ZyronError::StreamingError(format!(
+                    "S3 sink output format \"{other}\" is not supported; use json or jsonl"
+                )));
+            }
+        };
+
+        let region = std::env::var("AWS_REGION")
+            .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|_| "us-east-1".to_string());
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let ext = s3_extension(&self.format);
+        let key = if self.prefix.is_empty() || self.prefix.ends_with('/') {
+            format!("{}part-{:020}-{:010}.{}", self.prefix, ts, self.seq, ext)
+        } else {
+            format!("{}/part-{:020}-{:010}.{}", self.prefix, ts, self.seq, ext)
+        };
+        self.seq += 1;
+
+        let bucket = self.bucket.clone();
+        zyron_cdc::sink_io::block_on_io(async move {
+            use opendal::Operator;
+            use opendal::services::S3;
+            let builder = S3::default().bucket(&bucket).region(&region);
+            let op = Operator::new(builder)
+                .map_err(|e| ZyronError::StreamingError(format!("S3 operator build failed: {e}")))?
+                .finish();
+            op.write(&key, body).await.map_err(|e| {
+                ZyronError::StreamingError(format!("S3 write to {key} failed: {e}"))
+            })?;
+            Ok::<(), ZyronError>(())
+        })?;
+
+        self.buffer.clear();
+        Ok(())
+    }
 }
 
 impl SinkConnector for StreamS3Sink {
     fn write_batch(&mut self, records: &[StreamRecord]) -> Result<()> {
         for record in records {
-            self.records_written += record.num_rows() as u64;
+            let num_cols = record.batch.num_columns();
+            let num_rows = record.num_rows();
+            for row in 0..num_rows {
+                let mut obj = serde_json::Map::with_capacity(num_cols);
+                for c in 0..num_cols {
+                    let scalar = record.batch.column(c).get_scalar(row);
+                    obj.insert(format!("c{c}"), scalar_to_json(scalar));
+                }
+                self.buffer.push(serde_json::Value::Object(obj));
+            }
+            self.records_written += num_rows as u64;
         }
         Ok(())
     }
 
     fn commit(&mut self) -> Result<()> {
-        Ok(())
+        self.upload()
     }
 
     fn rollback(&mut self) -> Result<()> {
+        self.buffer.clear();
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
-        Ok(())
+        self.upload()
     }
 }
 
@@ -509,10 +617,13 @@ mod tests {
     }
 
     #[test]
-    fn test_s3_sink_stub() {
-        let mut sink = StreamS3Sink::new("my-bucket".into(), "prefix/".into(), "parquet".into());
+    fn test_s3_sink_buffers_rows() {
+        // write_batch buffers rows without contacting S3; the upload happens on
+        // commit/close. This exercises the buffering and counter path.
+        let mut sink = StreamS3Sink::new("my-bucket".into(), "prefix/".into(), "json".into());
         let record = make_test_record(3);
         sink.write_batch(&[record]).expect("write should succeed");
         assert_eq!(sink.records_written(), 3);
+        sink.rollback().expect("rollback clears the buffer");
     }
 }

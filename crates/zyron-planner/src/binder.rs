@@ -72,7 +72,7 @@ pub struct BoundColumnDef {
 
 /// Scope for name resolution. Tracks visible tables and their columns.
 /// A new context is pushed for each subquery.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BindContext {
     pub tables: Vec<BoundTableRef>,
     pub ctes: HashMap<String, BoundCte>,
@@ -168,6 +168,10 @@ pub enum BoundExpr {
         args: Vec<BoundExpr>,
         distinct: bool,
         return_type: TypeId,
+        /// Set for a user-defined aggregate. Carries the bound state-transition
+        /// and final functions so the executor folds without a catalog lookup.
+        /// None for built-in aggregates (count/sum/avg/min/max/...).
+        uda: Option<Box<BoundUda>>,
     },
     Cast {
         expr: Box<BoundExpr>,
@@ -335,14 +339,16 @@ impl PartialEq for BoundExpr {
                     args: a1,
                     distinct: d1,
                     return_type: r1,
+                    uda: u1,
                 },
                 BoundExpr::AggregateFunction {
                     name: n2,
                     args: a2,
                     distinct: d2,
                     return_type: r2,
+                    uda: u2,
                 },
-            ) => n1 == n2 && d1 == d2 && r1 == r2 && a1 == a2,
+            ) => n1 == n2 && d1 == d2 && r1 == r2 && a1 == a2 && u1 == u2,
             (
                 BoundExpr::Cast {
                     expr: e1,
@@ -1358,6 +1364,11 @@ pub enum BoundFromItem {
     Subquery {
         table_idx: usize,
         query: Box<BoundSelect>,
+        /// True when this derived table is a LATERAL subquery: its plan may
+        /// reference columns from preceding FROM items, so the logical builder
+        /// emits a LateralJoin (per-outer-row execution) instead of a plain
+        /// cross join.
+        lateral: bool,
     },
     GraphQuery {
         table_idx: usize,
@@ -1383,6 +1394,290 @@ pub enum BoundJoinCondition {
     None,
 }
 
+// ---------------------------------------------------------------------------
+// Correlation analysis
+// ---------------------------------------------------------------------------
+
+/// Inserts into `set` every table_idx a subquery plan introduces: its FROM
+/// items (recursing joins and nested subqueries), set operations, and CTEs. A
+/// column reference whose table_idx is not in this set points to an enclosing
+/// query, which is what makes the subquery correlated.
+pub fn subquery_owned_indices(plan: &BoundSelect, set: &mut std::collections::HashSet<usize>) {
+    for item in &plan.from {
+        owned_from_indices(item, set);
+    }
+    for sop in &plan.set_ops {
+        subquery_owned_indices(&sop.right, set);
+    }
+    for cte in &plan.ctes {
+        subquery_owned_indices(&cte.query, set);
+    }
+}
+
+fn owned_from_indices(item: &BoundFromItem, set: &mut std::collections::HashSet<usize>) {
+    match item {
+        BoundFromItem::BaseTable { table_idx, .. }
+        | BoundFromItem::GraphQuery { table_idx, .. }
+        | BoundFromItem::AnalyticsFunction { table_idx, .. } => {
+            set.insert(*table_idx);
+        }
+        BoundFromItem::Subquery {
+            table_idx, query, ..
+        } => {
+            set.insert(*table_idx);
+            subquery_owned_indices(query, set);
+        }
+        BoundFromItem::Join { left, right, .. } => {
+            owned_from_indices(left, set);
+            owned_from_indices(right, set);
+        }
+    }
+}
+
+/// Calls `f` on every column reference in a subquery plan's expressions,
+/// descending into joins, set operations, CTEs, and nested subqueries so a
+/// deeply nested outer reference is still visited.
+pub fn for_each_subquery_ref(plan: &BoundSelect, f: &mut dyn FnMut(&ColumnRef)) {
+    for item in &plan.projections {
+        if let BoundSelectItem::Expr(e, _) = item {
+            for_each_ref_in_bound_expr(e, f);
+        }
+    }
+    if let Some(w) = &plan.where_clause {
+        for_each_ref_in_bound_expr(w, f);
+    }
+    for e in &plan.group_by {
+        for_each_ref_in_bound_expr(e, f);
+    }
+    if let Some(h) = &plan.having {
+        for_each_ref_in_bound_expr(h, f);
+    }
+    for o in &plan.order_by {
+        for_each_ref_in_bound_expr(&o.expr, f);
+    }
+    if let Some(l) = &plan.limit {
+        for_each_ref_in_bound_expr(l, f);
+    }
+    if let Some(o) = &plan.offset {
+        for_each_ref_in_bound_expr(o, f);
+    }
+    for item in &plan.from {
+        for_each_ref_in_from(item, f);
+    }
+    for sop in &plan.set_ops {
+        for_each_subquery_ref(&sop.right, f);
+    }
+    for cte in &plan.ctes {
+        for_each_subquery_ref(&cte.query, f);
+    }
+}
+
+fn for_each_ref_in_from(item: &BoundFromItem, f: &mut dyn FnMut(&ColumnRef)) {
+    match item {
+        BoundFromItem::BaseTable { .. } => {}
+        BoundFromItem::Subquery { query, .. } => for_each_subquery_ref(query, f),
+        BoundFromItem::Join {
+            left,
+            right,
+            condition,
+            ..
+        } => {
+            for_each_ref_in_from(left, f);
+            for_each_ref_in_from(right, f);
+            if let BoundJoinCondition::On(e) = condition {
+                for_each_ref_in_bound_expr(e, f);
+            }
+        }
+        BoundFromItem::GraphQuery { params, .. } => {
+            for (_, e) in params {
+                for_each_ref_in_bound_expr(e, f);
+            }
+        }
+        BoundFromItem::AnalyticsFunction {
+            params, positional, ..
+        } => {
+            for (_, e) in params {
+                for_each_ref_in_bound_expr(e, f);
+            }
+            for e in positional {
+                for_each_ref_in_bound_expr(e, f);
+            }
+        }
+    }
+}
+
+fn for_each_ref_in_bound_expr(expr: &BoundExpr, f: &mut dyn FnMut(&ColumnRef)) {
+    match expr {
+        BoundExpr::ColumnRef(cr) => f(cr),
+        BoundExpr::Literal { .. } | BoundExpr::Parameter { .. } => {}
+        BoundExpr::BinaryOp { left, right, .. } => {
+            for_each_ref_in_bound_expr(left, f);
+            for_each_ref_in_bound_expr(right, f);
+        }
+        BoundExpr::UnaryOp { expr, .. }
+        | BoundExpr::IsNull { expr, .. }
+        | BoundExpr::Cast { expr, .. }
+        | BoundExpr::Nested(expr)
+        | BoundExpr::TemporalRef { inner: expr, .. } => for_each_ref_in_bound_expr(expr, f),
+        BoundExpr::Between {
+            expr, low, high, ..
+        } => {
+            for_each_ref_in_bound_expr(expr, f);
+            for_each_ref_in_bound_expr(low, f);
+            for_each_ref_in_bound_expr(high, f);
+        }
+        BoundExpr::InList { expr, list, .. } => {
+            for_each_ref_in_bound_expr(expr, f);
+            for item in list {
+                for_each_ref_in_bound_expr(item, f);
+            }
+        }
+        BoundExpr::Like { expr, pattern, .. } | BoundExpr::ILike { expr, pattern, .. } => {
+            for_each_ref_in_bound_expr(expr, f);
+            for_each_ref_in_bound_expr(pattern, f);
+        }
+        BoundExpr::Function { args, .. } | BoundExpr::AggregateFunction { args, .. } => {
+            for arg in args {
+                for_each_ref_in_bound_expr(arg, f);
+            }
+        }
+        BoundExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(o) = operand {
+                for_each_ref_in_bound_expr(o, f);
+            }
+            for w in conditions {
+                for_each_ref_in_bound_expr(&w.condition, f);
+                for_each_ref_in_bound_expr(&w.result, f);
+            }
+            if let Some(e) = else_result {
+                for_each_ref_in_bound_expr(e, f);
+            }
+        }
+        BoundExpr::WindowFunction {
+            function,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for_each_ref_in_bound_expr(function, f);
+            for e in partition_by {
+                for_each_ref_in_bound_expr(e, f);
+            }
+            for o in order_by {
+                for_each_ref_in_bound_expr(&o.expr, f);
+            }
+        }
+        BoundExpr::Subquery { plan, .. } | BoundExpr::Exists { plan, .. } => {
+            for_each_subquery_ref(plan, f)
+        }
+        BoundExpr::InSubquery { expr, plan, .. } => {
+            for_each_ref_in_bound_expr(expr, f);
+            for_each_subquery_ref(plan, f);
+        }
+    }
+}
+
+/// Returns true when an expression tree contains a subquery node anywhere.
+pub fn expr_contains_subquery(expr: &BoundExpr) -> bool {
+    let mut found = false;
+    walk_for_subquery(expr, &mut found);
+    found
+}
+
+fn walk_for_subquery(expr: &BoundExpr, found: &mut bool) {
+    if *found {
+        return;
+    }
+    match expr {
+        BoundExpr::Subquery { .. } | BoundExpr::Exists { .. } | BoundExpr::InSubquery { .. } => {
+            *found = true;
+        }
+        BoundExpr::BinaryOp { left, right, .. } => {
+            walk_for_subquery(left, found);
+            walk_for_subquery(right, found);
+        }
+        BoundExpr::UnaryOp { expr, .. }
+        | BoundExpr::IsNull { expr, .. }
+        | BoundExpr::Cast { expr, .. }
+        | BoundExpr::Nested(expr)
+        | BoundExpr::TemporalRef { inner: expr, .. } => walk_for_subquery(expr, found),
+        BoundExpr::Between {
+            expr, low, high, ..
+        } => {
+            walk_for_subquery(expr, found);
+            walk_for_subquery(low, found);
+            walk_for_subquery(high, found);
+        }
+        BoundExpr::InList { expr, list, .. } => {
+            walk_for_subquery(expr, found);
+            for item in list {
+                walk_for_subquery(item, found);
+            }
+        }
+        BoundExpr::Like { expr, pattern, .. } | BoundExpr::ILike { expr, pattern, .. } => {
+            walk_for_subquery(expr, found);
+            walk_for_subquery(pattern, found);
+        }
+        BoundExpr::Function { args, .. } | BoundExpr::AggregateFunction { args, .. } => {
+            for a in args {
+                walk_for_subquery(a, found);
+            }
+        }
+        BoundExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(o) = operand {
+                walk_for_subquery(o, found);
+            }
+            for w in conditions {
+                walk_for_subquery(&w.condition, found);
+                walk_for_subquery(&w.result, found);
+            }
+            if let Some(e) = else_result {
+                walk_for_subquery(e, found);
+            }
+        }
+        BoundExpr::WindowFunction {
+            function,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            walk_for_subquery(function, found);
+            for e in partition_by {
+                walk_for_subquery(e, found);
+            }
+            for o in order_by {
+                walk_for_subquery(&o.expr, found);
+            }
+        }
+        BoundExpr::ColumnRef(_) | BoundExpr::Literal { .. } | BoundExpr::Parameter { .. } => {}
+    }
+}
+
+/// Returns true when a subquery references a column not produced within itself,
+/// meaning it correlates to an enclosing query and must be evaluated per outer
+/// row rather than decorrelated into a join or folded once.
+pub fn subquery_is_correlated(plan: &BoundSelect) -> bool {
+    let mut owned = std::collections::HashSet::new();
+    subquery_owned_indices(plan, &mut owned);
+    let mut correlated = false;
+    for_each_subquery_ref(plan, &mut |cr| {
+        if !owned.contains(&cr.table_idx) {
+            correlated = true;
+        }
+    });
+    correlated
+}
+
 #[derive(Debug, Clone)]
 pub struct BoundSetOp {
     pub op: SetOpType,
@@ -1395,8 +1690,50 @@ pub struct BoundInsert {
     pub table_id: TableId,
     pub table_entry: Arc<TableEntry>,
     pub target_columns: Vec<ColumnId>,
+    /// Bound default expressions for columns the statement omits that carry a
+    /// DEFAULT. The executor evaluates these to fill the omitted columns;
+    /// omitted columns with no default are filled with NULL.
+    pub column_defaults: Vec<(ColumnId, BoundExpr)>,
+    /// CHECK constraint predicates bound against the table at table_idx 0. The
+    /// executor evaluates each over the inserted rows and rejects any row for
+    /// which a predicate is false.
+    pub check_constraints: Vec<BoundExpr>,
+    /// Data-quality expectation predicates bound against the table at table_idx
+    /// 0. The executor evaluates each over the inserted rows and applies the
+    /// expectation's action to violating rows.
+    pub expectations: Vec<BoundExpectation>,
     pub source: BoundInsertSource,
     pub returning: Option<Vec<BoundSelectItem>>,
+}
+
+/// A bound user-defined aggregate. The state-transition and final functions
+/// are bound at plan time over synthetic columns so the executor can fold a
+/// group without a catalog lookup or async binding. The state-transition
+/// function `sfunc` references column 0 as the running state and columns 1..
+/// as the aggregate input arguments. The final function `finalfunc`, when
+/// present, references column 0 as the final state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundUda {
+    pub sfunc: BoundExpr,
+    pub finalfunc: Option<BoundExpr>,
+    /// Initial state, a bound constant expression. None means the state starts
+    /// as NULL.
+    pub init: Option<BoundExpr>,
+    pub state_type: TypeId,
+    pub input_types: Vec<TypeId>,
+    pub return_type: TypeId,
+}
+
+/// A bound data-quality expectation. The predicate holds when a row passes; a
+/// row for which the predicate is false violates the expectation and the
+/// action is applied. A NULL (unknown) result passes, matching CHECK semantics.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundExpectation {
+    pub name: String,
+    pub predicate: BoundExpr,
+    pub on_violation: zyron_catalog::ExpectationAction,
+    /// Target table for Quarantine actions; None for other actions.
+    pub quarantine_table_id: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -1411,6 +1748,10 @@ pub struct BoundUpdate {
     pub table_entry: Arc<TableEntry>,
     pub assignments: Vec<BoundAssignment>,
     pub where_clause: Option<BoundExpr>,
+    /// CHECK constraint predicates bound against the table at table_idx 0. The
+    /// executor evaluates each over the updated row image and rejects any row
+    /// for which a predicate is false.
+    pub check_constraints: Vec<BoundExpr>,
     pub returning: Option<Vec<BoundSelectItem>>,
 }
 
@@ -1697,7 +2038,6 @@ fn map_endpoint_auth(spec: EndpointAuthSpec) -> EndpointAuthMode {
 }
 
 /// Maps the parser output format enum to the catalog output format enum.
-/// Protobuf is not supported by the catalog yet, fall back to Json.
 fn map_endpoint_output_format(spec: EndpointOutputFormatSpec) -> EndpointOutputFormat {
     match spec {
         EndpointOutputFormatSpec::Json => EndpointOutputFormat::Json,
@@ -1705,7 +2045,7 @@ fn map_endpoint_output_format(spec: EndpointOutputFormatSpec) -> EndpointOutputF
         EndpointOutputFormatSpec::Csv => EndpointOutputFormat::Csv,
         EndpointOutputFormatSpec::Parquet => EndpointOutputFormat::Parquet,
         EndpointOutputFormatSpec::Arrow => EndpointOutputFormat::ArrowIpc,
-        EndpointOutputFormatSpec::Protobuf => EndpointOutputFormat::Json,
+        EndpointOutputFormatSpec::Protobuf => EndpointOutputFormat::Protobuf,
     }
 }
 
@@ -1894,6 +2234,13 @@ pub struct Binder<'a> {
     // is a cache lookup or, on a miss, a heap scan. The lock is taken only
     // for the get/insert, never across the resolver await.
     table_memo: std::sync::Mutex<HashMap<(Option<String>, String), Arc<TableEntry>>>,
+    // Names of views currently being expanded, used to detect a reference
+    // cycle (a view that transitively selects from itself) and fail with a
+    // clear error instead of recursing without bound.
+    view_stack: Vec<String>,
+    // (name, arity) of SQL functions currently being inlined, to detect a
+    // recursive function body and fail rather than recurse without bound.
+    function_stack: Vec<(String, usize)>,
 }
 
 impl<'a> Binder<'a> {
@@ -1904,6 +2251,8 @@ impl<'a> Binder<'a> {
             next_table_idx: 0,
             row_security: None,
             table_memo: std::sync::Mutex::new(HashMap::new()),
+            view_stack: Vec::new(),
+            function_stack: Vec::new(),
         }
     }
 
@@ -2226,7 +2575,7 @@ impl<'a> Binder<'a> {
                 injected_security,
             );
             let where_clause = if let Some(expr) = &effective_where {
-                Some(self.bind_expr(ctx, expr).await?)
+                Some(self.bind_scalar(ctx, expr).await?)
             } else {
                 None
             };
@@ -2234,12 +2583,12 @@ impl<'a> Binder<'a> {
             // Bind GROUP BY
             let mut group_by = Vec::with_capacity(stmt.group_by.len());
             for e in &stmt.group_by {
-                group_by.push(self.bind_expr(ctx, e).await?);
+                group_by.push(self.bind_scalar(ctx, e).await?);
             }
 
             // Bind HAVING
             let having = if let Some(expr) = &stmt.having {
-                Some(self.bind_expr(ctx, expr).await?)
+                Some(self.bind_scalar(ctx, expr).await?)
             } else {
                 None
             };
@@ -2258,12 +2607,12 @@ impl<'a> Binder<'a> {
 
             // Bind LIMIT / OFFSET
             let limit = if let Some(expr) = &stmt.limit {
-                Some(self.bind_expr(ctx, expr).await?)
+                Some(self.bind_scalar(ctx, expr).await?)
             } else {
                 None
             };
             let offset = if let Some(expr) = &stmt.offset {
-                Some(self.bind_expr(ctx, expr).await?)
+                Some(self.bind_scalar(ctx, expr).await?)
             } else {
                 None
             };
@@ -2338,6 +2687,81 @@ impl<'a> Binder<'a> {
                         return Ok(BoundFromItem::Subquery {
                             table_idx: idx,
                             query: cte.query.clone(),
+                            lateral: false,
+                        });
+                    }
+
+                    // View expansion: a reference to a view binds the view's
+                    // stored query as a derived table, exposed under the view
+                    // name (or the supplied alias). The view reduces to a
+                    // subquery so the rest of planning and execution is shared.
+                    if let Some(view) = self.catalog.find_view_by_name(name)? {
+                        if self.view_stack.iter().any(|v| v == &view.name) {
+                            return Err(ZyronError::PlanError(format!(
+                                "view '{}' references itself",
+                                view.name
+                            )));
+                        }
+                        let parsed = zyron_parser::parse(&view.definition_sql).map_err(|e| {
+                            ZyronError::PlanError(format!(
+                                "view '{}' definition failed to parse: {e}",
+                                view.name
+                            ))
+                        })?;
+                        let query = match parsed.into_iter().next() {
+                            Some(zyron_parser::ast::Statement::CreateView(cv)) => cv.query,
+                            _ => {
+                                return Err(ZyronError::PlanError(format!(
+                                    "view '{}' definition is not a CREATE VIEW",
+                                    view.name
+                                )));
+                            }
+                        };
+
+                        self.view_stack.push(view.name.clone());
+                        let bound_query = self.bind_select(&mut BindContext::new(), &query).await;
+                        self.view_stack.pop();
+                        let bound_query = bound_query?;
+
+                        let idx = self.alloc_table_idx();
+                        let mut columns = bound_query.output_schema.clone();
+                        if !view.column_aliases.is_empty() {
+                            if view.column_aliases.len() != columns.len() {
+                                return Err(ZyronError::PlanError(format!(
+                                    "view '{}' declares {} column aliases but its query produces {}",
+                                    view.name,
+                                    view.column_aliases.len(),
+                                    columns.len()
+                                )));
+                            }
+                            for (col, alias_name) in
+                                columns.iter_mut().zip(view.column_aliases.iter())
+                            {
+                                col.name = alias_name.clone();
+                            }
+                        }
+                        // The derived table exposes its columns positionally;
+                        // assign ordinal column ids so outer references match
+                        // the relabeled projection the logical builder emits.
+                        for (i, col) in columns.iter_mut().enumerate() {
+                            col.column_id = ColumnId(i as u16);
+                            col.ordinal = i as u16;
+                        }
+
+                        let bare = name.rsplit('.').next().unwrap_or(name);
+                        let view_alias = alias.clone().unwrap_or_else(|| bare.to_string());
+                        let bound_table = BoundTableRef {
+                            table_idx: idx,
+                            table_id: None,
+                            alias: view_alias,
+                            columns,
+                            entry: None,
+                        };
+                        ctx.tables.push(bound_table);
+                        return Ok(BoundFromItem::Subquery {
+                            table_idx: idx,
+                            query: Box::new(bound_query),
+                            lateral: false,
                         });
                     }
 
@@ -2382,7 +2806,24 @@ impl<'a> Binder<'a> {
                             Some(BoundAsOfTarget::Timestamp(literal_to_timestamp_micros(e)?))
                         }
                         Some(zyron_parser::ast::AsOf::Version(e)) => {
-                            Some(BoundAsOfTarget::Version(literal_to_u64(e)?))
+                            // An integer literal is a raw version number; a
+                            // string literal is a named version tag resolved
+                            // through the catalog (CREATE VERSION).
+                            match literal_to_u64(e) {
+                                Ok(v) => Some(BoundAsOfTarget::Version(v)),
+                                Err(_) => {
+                                    let vname = literal_to_string(e)?;
+                                    let tag = self
+                                        .catalog
+                                        .get_version_tag_by_name(&vname)
+                                        .ok_or_else(|| {
+                                            ZyronError::ExecutionError(format!(
+                                                "version '{vname}' not found"
+                                            ))
+                                        })?;
+                                    Some(BoundAsOfTarget::Version(tag.version_id))
+                                }
+                            }
                         }
                         Some(zyron_parser::ast::AsOf::Branch(e)) => {
                             Some(BoundAsOfTarget::Branch(literal_to_string(e)?))
@@ -2414,10 +2855,19 @@ impl<'a> Binder<'a> {
                     })
                 }
                 TableRef::Subquery { query, alias } => {
+                    // A plain derived table cannot see the enclosing FROM, so it
+                    // binds in a fresh scope with no outer.
                     let mut sub_ctx = BindContext::new();
                     let bound_query = self.bind_select(&mut sub_ctx, query).await?;
                     let idx = self.alloc_table_idx();
-                    let columns = bound_query.output_schema.clone();
+                    let mut columns = bound_query.output_schema.clone();
+                    // Expose the derived columns positionally so outer
+                    // references match the relabeled projection emitted for
+                    // the subquery in the logical builder.
+                    for (i, col) in columns.iter_mut().enumerate() {
+                        col.column_id = ColumnId(i as u16);
+                        col.ordinal = i as u16;
+                    }
                     let bound_table = BoundTableRef {
                         table_idx: idx,
                         table_id: None,
@@ -2429,11 +2879,72 @@ impl<'a> Binder<'a> {
                     Ok(BoundFromItem::Subquery {
                         table_idx: idx,
                         query: Box::new(bound_query),
+                        lateral: false,
                     })
                 }
                 TableRef::Lateral { subquery } => {
-                    // Treat LATERAL as a regular subquery for now
-                    self.bind_table_ref(ctx, subquery).await
+                    // A LATERAL derived table may reference the preceding FROM
+                    // items, so its query binds with the current context as the
+                    // outer scope. Only a subquery form carries correlation; any
+                    // other inner ref has nothing to correlate and binds plainly.
+                    if let TableRef::Subquery { query, alias } = subquery.as_ref() {
+                        let mut sub_ctx = BindContext::with_outer(Box::new(ctx.clone()));
+                        let bound_query = self.bind_select(&mut sub_ctx, query).await?;
+                        let idx = self.alloc_table_idx();
+                        let mut columns = bound_query.output_schema.clone();
+                        for (i, col) in columns.iter_mut().enumerate() {
+                            col.column_id = ColumnId(i as u16);
+                            col.ordinal = i as u16;
+                        }
+                        let bound_table = BoundTableRef {
+                            table_idx: idx,
+                            table_id: None,
+                            alias: alias.clone(),
+                            columns,
+                            entry: None,
+                        };
+                        ctx.tables.push(bound_table);
+                        Ok(BoundFromItem::Subquery {
+                            table_idx: idx,
+                            query: Box::new(bound_query),
+                            lateral: true,
+                        })
+                    } else {
+                        // LATERAL correlation is meaningful only for a subquery.
+                        // A LATERAL table function or table reference binds
+                        // plainly. A table function consumes a whole graph or
+                        // table, not per-row values, so if its arguments
+                        // reference a preceding FROM column there is no valid
+                        // per-row execution: reject it with a clear error rather
+                        // than fail cryptically downstream.
+                        let bound = self.bind_table_ref(ctx, subquery).await?;
+                        let mut outer_ref = false;
+                        let mut mark = |_: &ColumnRef| outer_ref = true;
+                        match &bound {
+                            BoundFromItem::GraphQuery { params, .. } => {
+                                for (_, e) in params {
+                                    for_each_ref_in_bound_expr(e, &mut mark);
+                                }
+                            }
+                            BoundFromItem::AnalyticsFunction {
+                                params, positional, ..
+                            } => {
+                                for (_, e) in params {
+                                    for_each_ref_in_bound_expr(e, &mut mark);
+                                }
+                                for e in positional {
+                                    for_each_ref_in_bound_expr(e, &mut mark);
+                                }
+                            }
+                            _ => {}
+                        }
+                        if outer_ref {
+                            return Err(ZyronError::PlanError(
+                                "LATERAL may correlate only a subquery; a LATERAL table function cannot reference columns from preceding FROM items".to_string(),
+                            ));
+                        }
+                        Ok(bound)
+                    }
                 }
                 TableRef::TableFunction(tf) => {
                     let name = &tf.name;
@@ -2476,11 +2987,11 @@ impl<'a> Binder<'a> {
                         for arg in args.iter() {
                             match arg {
                                 FunctionArg::Named { name: pn, value } => {
-                                    let bound = self.bind_expr(ctx, value).await?;
+                                    let bound = self.bind_scalar(ctx, value).await?;
                                     named_params.push((pn.clone(), bound));
                                 }
                                 FunctionArg::Unnamed(value) => {
-                                    let bound = self.bind_expr(ctx, value).await?;
+                                    let bound = self.bind_scalar(ctx, value).await?;
                                     positional.push(bound);
                                 }
                                 FunctionArg::Wildcard => {
@@ -2566,11 +3077,11 @@ impl<'a> Binder<'a> {
                                 name: param_name,
                                 value,
                             } => {
-                                let bound = self.bind_expr(ctx, value).await?;
+                                let bound = self.bind_scalar(ctx, value).await?;
                                 params.push((param_name.clone(), bound));
                             }
                             FunctionArg::Unnamed(value) => {
-                                let bound = self.bind_expr(ctx, value).await?;
+                                let bound = self.bind_scalar(ctx, value).await?;
                                 params.push((String::new(), bound));
                             }
                             FunctionArg::Wildcard => {
@@ -2679,6 +3190,12 @@ impl<'a> Binder<'a> {
                     };
 
                     let idx = self.alloc_table_idx();
+                    // Tag the output columns with this FROM item's table index so
+                    // a projection above the graph query resolves them.
+                    let mut output_columns = output_columns;
+                    for col in &mut output_columns {
+                        col.table_idx = Some(idx);
+                    }
                     let tbl_alias = alias.clone().unwrap_or_else(|| algo.clone());
                     let bound_cols: Vec<BoundColumnDef> = output_columns
                         .iter()
@@ -2720,7 +3237,7 @@ impl<'a> Binder<'a> {
     ) -> Result<BoundJoinCondition> {
         match condition {
             JoinCondition::On(expr) => {
-                let bound = self.bind_expr(ctx, expr).await?;
+                let bound = self.bind_scalar(ctx, expr).await?;
                 Ok(BoundJoinCondition::On(bound))
             }
             JoinCondition::Using(cols) => {
@@ -2751,12 +3268,62 @@ impl<'a> Binder<'a> {
     // Expression binding
     // -----------------------------------------------------------------------
 
+    /// Binds an expression, taking the synchronous leaf path when it applies so
+    /// a leaf (column ref, literal, parameter) binds without allocating the
+    /// boxed future that the recursive `bind_expr` needs. Callers that bind a
+    /// single scalar (WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, projections,
+    /// VALUES) route through here instead of `bind_expr` directly. This is a
+    /// plain async fn, so the leaf path adds no heap allocation.
+    async fn bind_scalar(&mut self, ctx: &BindContext, expr: &Expr) -> Result<BoundExpr> {
+        match self.bind_atom(ctx, expr) {
+            Some(r) => r,
+            None => self.bind_expr(ctx, expr).await,
+        }
+    }
+
+    /// Synchronously binds the leaf expressions that need neither recursion nor
+    /// catalog I/O: column references, literals, and parameters. Returns None
+    /// for any other expression, which the caller binds through the async
+    /// `bind_expr`. These leaves are the bulk of nodes in real predicates and
+    /// projections, so binding them inline avoids allocating a boxed future per
+    /// node on the hot path.
+    fn bind_atom(&self, ctx: &BindContext, expr: &Expr) -> Option<Result<BoundExpr>> {
+        match expr {
+            Expr::Identifier(name) => {
+                Some(self.resolve_column(ctx, name).map(BoundExpr::ColumnRef))
+            }
+            Expr::QualifiedIdentifier { table, column } => Some(
+                self.resolve_qualified_column(ctx, table, column)
+                    .map(BoundExpr::ColumnRef),
+            ),
+            Expr::Literal(lit) => Some(Ok(BoundExpr::Literal {
+                value: lit.clone(),
+                type_id: literal_type(lit),
+            })),
+            Expr::Parameter(idx) => Some(Ok(BoundExpr::Parameter {
+                index: *idx,
+                type_id: TypeId::Null,
+            })),
+            _ => None,
+        }
+    }
+
     fn bind_expr<'b>(
         &'b mut self,
         ctx: &'b BindContext,
         expr: &'b Expr,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BoundExpr>> + Send + 'b>> {
         Box::pin(async move {
+            // Bind a child expression, taking the synchronous leaf path when it
+            // applies to avoid a boxed-future allocation for that child.
+            macro_rules! bind_child {
+                ($child:expr) => {
+                    match self.bind_atom(ctx, $child) {
+                        Some(r) => r?,
+                        None => self.bind_expr(ctx, $child).await?,
+                    }
+                };
+            }
             match expr {
                 Expr::Identifier(name) => {
                     let cr = self.resolve_column(ctx, name)?;
@@ -2774,8 +3341,8 @@ impl<'a> Binder<'a> {
                     })
                 }
                 Expr::BinaryOp { left, op, right } => {
-                    let left_bound = self.bind_expr(ctx, left).await?;
-                    let right_bound = self.bind_expr(ctx, right).await?;
+                    let left_bound = bind_child!(left);
+                    let right_bound = bind_child!(right);
                     let type_id =
                         infer_binary_type(op, left_bound.type_id(), right_bound.type_id())?;
                     Ok(BoundExpr::BinaryOp {
@@ -2786,7 +3353,7 @@ impl<'a> Binder<'a> {
                     })
                 }
                 Expr::UnaryOp { op, expr: inner } => {
-                    let bound = self.bind_expr(ctx, inner).await?;
+                    let bound = bind_child!(inner);
                     let type_id = match op {
                         UnaryOperator::Not => TypeId::Boolean,
                         UnaryOperator::Minus => bound.type_id(),
@@ -2801,7 +3368,7 @@ impl<'a> Binder<'a> {
                     expr: inner,
                     negated,
                 } => {
-                    let bound = self.bind_expr(ctx, inner).await?;
+                    let bound = bind_child!(inner);
                     Ok(BoundExpr::IsNull {
                         expr: Box::new(bound),
                         negated: *negated,
@@ -2812,10 +3379,10 @@ impl<'a> Binder<'a> {
                     list,
                     negated,
                 } => {
-                    let bound_expr = self.bind_expr(ctx, inner).await?;
+                    let bound_expr = bind_child!(inner);
                     let mut bound_list = Vec::with_capacity(list.len());
                     for e in list {
-                        bound_list.push(self.bind_expr(ctx, e).await?);
+                        bound_list.push(bind_child!(e));
                     }
                     Ok(BoundExpr::InList {
                         expr: Box::new(bound_expr),
@@ -2829,9 +3396,9 @@ impl<'a> Binder<'a> {
                     high,
                     negated,
                 } => {
-                    let bound_expr = self.bind_expr(ctx, inner).await?;
-                    let bound_low = self.bind_expr(ctx, low).await?;
-                    let bound_high = self.bind_expr(ctx, high).await?;
+                    let bound_expr = bind_child!(inner);
+                    let bound_low = bind_child!(low);
+                    let bound_high = bind_child!(high);
                     Ok(BoundExpr::Between {
                         expr: Box::new(bound_expr),
                         low: Box::new(bound_low),
@@ -2844,8 +3411,8 @@ impl<'a> Binder<'a> {
                     pattern,
                     negated,
                 } => {
-                    let bound_expr = self.bind_expr(ctx, inner).await?;
-                    let bound_pattern = self.bind_expr(ctx, pattern).await?;
+                    let bound_expr = bind_child!(inner);
+                    let bound_pattern = bind_child!(pattern);
                     Ok(BoundExpr::Like {
                         expr: Box::new(bound_expr),
                         pattern: Box::new(bound_pattern),
@@ -2857,8 +3424,8 @@ impl<'a> Binder<'a> {
                     pattern,
                     negated,
                 } => {
-                    let bound_expr = self.bind_expr(ctx, inner).await?;
-                    let bound_pattern = self.bind_expr(ctx, pattern).await?;
+                    let bound_expr = bind_child!(inner);
+                    let bound_pattern = bind_child!(pattern);
                     Ok(BoundExpr::ILike {
                         expr: Box::new(bound_expr),
                         pattern: Box::new(bound_pattern),
@@ -2891,6 +3458,7 @@ impl<'a> Binder<'a> {
                             args: Vec::new(),
                             distinct: *distinct,
                             return_type: TypeId::Int64,
+                            uda: None,
                         });
                     }
 
@@ -2901,7 +3469,7 @@ impl<'a> Binder<'a> {
                             FunctionArg::Named { value, .. } => value,
                             FunctionArg::Wildcard => unreachable!("wildcard handled above"),
                         };
-                        bound_args.push(self.bind_expr(ctx, e).await?);
+                        bound_args.push(bind_child!(e));
                     }
 
                     let arg_types: Vec<TypeId> = bound_args.iter().map(|a| a.type_id()).collect();
@@ -2913,6 +3481,56 @@ impl<'a> Binder<'a> {
                             args: bound_args,
                             distinct: *distinct,
                             return_type,
+                            uda: None,
+                        })
+                    } else if let Some(agg) = self.catalog.find_aggregate(name, &arg_types) {
+                        // User-defined aggregate: bind its state-transition and
+                        // final functions over synthetic columns so the executor
+                        // folds each group without an async catalog lookup.
+                        let uda = self.bind_uda(&agg).await?;
+                        Ok(BoundExpr::AggregateFunction {
+                            name: name.to_lowercase(),
+                            args: bound_args,
+                            distinct: *distinct,
+                            return_type: agg.return_type,
+                            uda: Some(Box::new(uda)),
+                        })
+                    } else if let Some(func) = self.catalog.find_function(name, &arg_types) {
+                        // SQL scalar UDF: inline the body with the call's
+                        // argument expressions substituted for the parameters,
+                        // then bind the result. Nested calls of the same
+                        // function (in arguments) are fine; only unbounded
+                        // recursion is rejected, via a depth bound.
+                        const MAX_FUNCTION_INLINE_DEPTH: usize = 16;
+                        let key = (func.name.clone(), func.param_names.len());
+                        let depth = self.function_stack.iter().filter(|k| **k == key).count();
+                        if depth >= MAX_FUNCTION_INLINE_DEPTH {
+                            return Err(ZyronError::PlanError(format!(
+                                "function '{}' exceeded the maximum inline depth ({}); it may be recursive",
+                                func.name, MAX_FUNCTION_INLINE_DEPTH
+                            )));
+                        }
+                        let arg_exprs = function_arg_exprs(args)?;
+                        if arg_exprs.len() != func.param_names.len() {
+                            return Err(ZyronError::PlanError(format!(
+                                "function '{}' expects {} arguments, got {}",
+                                func.name,
+                                func.param_names.len(),
+                                arg_exprs.len()
+                            )));
+                        }
+                        let body_expr = parse_function_body(&func.body_sql, &func.name)?;
+                        let substituted =
+                            substitute_function_params(&body_expr, &func.param_names, &arg_exprs);
+                        self.function_stack.push(key);
+                        let bound = self.bind_expr(ctx, &substituted).await;
+                        self.function_stack.pop();
+                        let bound = bound?;
+                        // Coerce to the declared return type so the call's type
+                        // matches the signature regardless of body inference.
+                        Ok(BoundExpr::Cast {
+                            expr: Box::new(bound),
+                            target_type: func.return_type,
                         })
                     } else {
                         let return_type = infer_function_type(name, &arg_types);
@@ -2928,7 +3546,7 @@ impl<'a> Binder<'a> {
                     expr: inner,
                     data_type,
                 } => {
-                    let bound = self.bind_expr(ctx, inner).await?;
+                    let bound = bind_child!(inner);
                     let target_type = data_type.to_type_id();
                     Ok(BoundExpr::Cast {
                         expr: Box::new(bound),
@@ -2941,19 +3559,19 @@ impl<'a> Binder<'a> {
                     else_result,
                 } => {
                     let bound_operand = if let Some(e) = operand.as_ref() {
-                        Some(self.bind_expr(ctx, e).await?)
+                        Some(bind_child!(e))
                     } else {
                         None
                     };
                     let mut bound_conditions = Vec::with_capacity(conditions.len());
                     for wc in conditions {
                         bound_conditions.push(BoundWhen {
-                            condition: self.bind_expr(ctx, &wc.condition).await?,
-                            result: self.bind_expr(ctx, &wc.result).await?,
+                            condition: bind_child!(&wc.condition),
+                            result: bind_child!(&wc.result),
                         });
                     }
                     let bound_else = if let Some(e) = else_result.as_ref() {
-                        Some(self.bind_expr(ctx, e).await?)
+                        Some(bind_child!(e))
                     } else {
                         None
                     };
@@ -2972,15 +3590,14 @@ impl<'a> Binder<'a> {
                     })
                 }
                 Expr::Nested(inner) => {
-                    let bound = self.bind_expr(ctx, inner).await?;
+                    let bound = bind_child!(inner);
                     Ok(BoundExpr::Nested(Box::new(bound)))
                 }
                 Expr::Subquery(query) => {
-                    let mut sub_ctx = BindContext::new();
-                    // Copy outer scope for correlated subquery support
-                    for table in &ctx.tables {
-                        sub_ctx.tables.push(table.clone());
-                    }
+                    // Push a child scope whose outer is the current context, so
+                    // the subquery's own FROM owns its names and only unresolved
+                    // references fall through to the outer scope (correlation).
+                    let mut sub_ctx = BindContext::with_outer(Box::new(ctx.clone()));
                     let bound = Box::pin(self.bind_select(&mut sub_ctx, query)).await?;
                     let type_id = bound
                         .output_schema
@@ -2993,10 +3610,7 @@ impl<'a> Binder<'a> {
                     })
                 }
                 Expr::Exists { query, negated } => {
-                    let mut sub_ctx = BindContext::new();
-                    for table in &ctx.tables {
-                        sub_ctx.tables.push(table.clone());
-                    }
+                    let mut sub_ctx = BindContext::with_outer(Box::new(ctx.clone()));
                     let bound = Box::pin(self.bind_select(&mut sub_ctx, query)).await?;
                     Ok(BoundExpr::Exists {
                         plan: Box::new(bound),
@@ -3008,11 +3622,8 @@ impl<'a> Binder<'a> {
                     query,
                     negated,
                 } => {
-                    let bound_expr = self.bind_expr(ctx, inner).await?;
-                    let mut sub_ctx = BindContext::new();
-                    for table in &ctx.tables {
-                        sub_ctx.tables.push(table.clone());
-                    }
+                    let bound_expr = bind_child!(inner);
+                    let mut sub_ctx = BindContext::with_outer(Box::new(ctx.clone()));
                     let bound_query = Box::pin(self.bind_select(&mut sub_ctx, query)).await?;
                     Ok(BoundExpr::InSubquery {
                         expr: Box::new(bound_expr),
@@ -3026,10 +3637,10 @@ impl<'a> Binder<'a> {
                     order_by,
                     frame,
                 } => {
-                    let bound_func = self.bind_expr(ctx, function).await?;
+                    let bound_func = bind_child!(function);
                     let mut bound_partition = Vec::with_capacity(partition_by.len());
                     for e in partition_by {
-                        bound_partition.push(self.bind_expr(ctx, e).await?);
+                        bound_partition.push(bind_child!(e));
                     }
                     let mut bound_order = Vec::with_capacity(order_by.len());
                     for o in order_by {
@@ -3048,22 +3659,56 @@ impl<'a> Binder<'a> {
                     index: *idx,
                     type_id: TypeId::Null, // Resolved at execution time
                 }),
-                // JSON and array operators: bind as generic binary ops for now
-                Expr::JsonAccess { left, right, .. }
-                | Expr::JsonContains { left, right, .. }
-                | Expr::JsonExists { left, right, .. } => {
-                    let bound_left = self.bind_expr(ctx, left).await?;
-                    let bound_right = self.bind_expr(ctx, right).await?;
+                // JSON access operators bind to distinct functions so the
+                // executor knows which operator was used and its return type.
+                Expr::JsonAccess { left, op, right } => {
+                    let bound_left = bind_child!(left);
+                    let bound_right = bind_child!(right);
+                    let (name, return_type) = match op {
+                        JsonOperator::Arrow => ("json_get", TypeId::Jsonb),
+                        JsonOperator::DoubleArrow => ("json_get_text", TypeId::Text),
+                        JsonOperator::HashArrow => ("json_get_path", TypeId::Jsonb),
+                        JsonOperator::HashDoubleArrow => ("json_get_path_text", TypeId::Text),
+                    };
                     Ok(BoundExpr::Function {
-                        name: "json_op".to_string(),
+                        name: name.to_string(),
                         args: vec![bound_left, bound_right],
-                        return_type: TypeId::Jsonb,
+                        return_type,
+                        distinct: false,
+                    })
+                }
+                Expr::JsonContains { left, op, right } => {
+                    let bound_left = bind_child!(left);
+                    let bound_right = bind_child!(right);
+                    let name = match op {
+                        JsonContainsOp::Contains => "jsonb_contains",
+                        JsonContainsOp::ContainedBy => "jsonb_contained_by",
+                    };
+                    Ok(BoundExpr::Function {
+                        name: name.to_string(),
+                        args: vec![bound_left, bound_right],
+                        return_type: TypeId::Boolean,
+                        distinct: false,
+                    })
+                }
+                Expr::JsonExists { left, op, right } => {
+                    let bound_left = bind_child!(left);
+                    let bound_right = bind_child!(right);
+                    let name = match op {
+                        JsonExistsOp::Exists => "jsonb_exists",
+                        JsonExistsOp::ExistsAny => "jsonb_exists_any",
+                        JsonExistsOp::ExistsAll => "jsonb_exists_all",
+                    };
+                    Ok(BoundExpr::Function {
+                        name: name.to_string(),
+                        args: vec![bound_left, bound_right],
+                        return_type: TypeId::Boolean,
                         distinct: false,
                     })
                 }
                 Expr::VectorDistance { left, op, right } => {
-                    let bound_left = self.bind_expr(ctx, left).await?;
-                    let bound_right = self.bind_expr(ctx, right).await?;
+                    let bound_left = bind_child!(left);
+                    let bound_right = bind_child!(right);
                     let func_name = match op {
                         VectorDistanceOp::Cosine => "vector_distance_cosine",
                         VectorDistanceOp::L2 => "vector_distance_l2",
@@ -3079,7 +3724,7 @@ impl<'a> Binder<'a> {
                 Expr::ArrayConstructor(elements) => {
                     let mut bound_elements = Vec::with_capacity(elements.len());
                     for e in elements {
-                        bound_elements.push(self.bind_expr(ctx, e).await?);
+                        bound_elements.push(bind_child!(e));
                     }
                     Ok(BoundExpr::Function {
                         name: "array".to_string(),
@@ -3089,8 +3734,8 @@ impl<'a> Binder<'a> {
                     })
                 }
                 Expr::ArraySubscript { array, index } => {
-                    let bound_array = self.bind_expr(ctx, array).await?;
-                    let bound_index = self.bind_expr(ctx, index).await?;
+                    let bound_array = bind_child!(array);
+                    let bound_index = bind_child!(index);
                     Ok(BoundExpr::Function {
                         name: "array_subscript".to_string(),
                         args: vec![bound_array, bound_index],
@@ -3113,7 +3758,7 @@ impl<'a> Binder<'a> {
                 }
                 Expr::MatchAgainst { columns, query, .. } => {
                     // Bind as a function call with the match columns and query
-                    let bound_query = self.bind_expr(ctx, query).await?;
+                    let bound_query = bind_child!(query);
                     let mut args = Vec::with_capacity(columns.len() + 1);
                     for col_name in columns {
                         let cr = self.resolve_column(ctx, col_name)?;
@@ -3131,7 +3776,7 @@ impl<'a> Binder<'a> {
                     // Preserve the temporal qualifier on the bound tree so
                     // ROW_DIFF and friends can detect it. Plain consumers that
                     // walk the bound tree see the inner expression's value
-                    let bound_inner = self.bind_expr(ctx, inner).await?;
+                    let bound_inner = bind_child!(inner);
                     Ok(BoundExpr::TemporalRef {
                         inner: Box::new(bound_inner),
                         temporal: temporal.clone(),
@@ -3223,7 +3868,7 @@ impl<'a> Binder<'a> {
         for item in items {
             match item {
                 SelectItem::Expr(expr, alias) => {
-                    let bound = self.bind_expr(ctx, expr).await?;
+                    let bound = self.bind_scalar(ctx, expr).await?;
                     result.push(BoundSelectItem::Expr(bound, alias.clone()));
                 }
                 SelectItem::Wildcard => {
@@ -3308,7 +3953,7 @@ impl<'a> Binder<'a> {
         ctx: &BindContext,
         order: &OrderByExpr,
     ) -> Result<BoundOrderBy> {
-        let bound_expr = self.bind_expr(ctx, &order.expr).await?;
+        let bound_expr = self.bind_scalar(ctx, &order.expr).await?;
         Ok(BoundOrderBy {
             expr: bound_expr,
             asc: order.asc.unwrap_or(true),
@@ -3319,6 +3964,234 @@ impl<'a> Binder<'a> {
     // -----------------------------------------------------------------------
     // INSERT binding
     // -----------------------------------------------------------------------
+
+    /// Binds the table's CHECK constraint predicates against the table at a
+    /// canonical table_idx of 0, so the executor can rebuild the matching
+    /// evaluation schema (table columns in order, table_idx 0) without the plan
+    /// carrying it. A stored predicate that no longer parses fails closed: the
+    /// statement errors rather than skip an unverifiable constraint.
+    pub async fn bind_check_constraints(&mut self, entry: &TableEntry) -> Result<Vec<BoundExpr>> {
+        let has_check = entry.constraints.iter().any(|c| {
+            c.constraint_type == zyron_catalog::ConstraintType::Check && c.check_expr.is_some()
+        });
+        if !has_check {
+            return Ok(Vec::new());
+        }
+
+        let columns: Vec<BoundColumnDef> = entry
+            .columns
+            .iter()
+            .map(|c| BoundColumnDef {
+                column_id: c.id,
+                name: c.name.clone(),
+                type_id: c.type_id,
+                nullable: c.nullable,
+                ordinal: c.ordinal,
+                ts_precision: c.ts_precision,
+            })
+            .collect();
+        let mut ctx = BindContext::new();
+        ctx.tables.push(BoundTableRef {
+            table_idx: 0,
+            table_id: Some(entry.id),
+            alias: entry.name.clone(),
+            columns,
+            entry: None,
+        });
+
+        let mut checks = Vec::new();
+        for con in &entry.constraints {
+            if con.constraint_type != zyron_catalog::ConstraintType::Check {
+                continue;
+            }
+            let Some(sql) = &con.check_expr else {
+                continue;
+            };
+            let expr_ast = zyron_parser::parse_expr(sql).map_err(|e| {
+                ZyronError::PlanError(format!("cannot parse CHECK constraint '{}': {e}", con.name))
+            })?;
+            checks.push(self.bind_expr(&ctx, &expr_ast).await?);
+        }
+        Ok(checks)
+    }
+
+    /// Binds each data-quality expectation predicate against the table at
+    /// table_idx 0, the same binding context as CHECK constraints. The bound
+    /// predicate carries its violation action and quarantine target so the
+    /// executor can route violating rows without another catalog lookup.
+    pub async fn bind_expectations(&mut self, entry: &TableEntry) -> Result<Vec<BoundExpectation>> {
+        if entry.expectations.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let columns: Vec<BoundColumnDef> = entry
+            .columns
+            .iter()
+            .map(|c| BoundColumnDef {
+                column_id: c.id,
+                name: c.name.clone(),
+                type_id: c.type_id,
+                nullable: c.nullable,
+                ordinal: c.ordinal,
+                ts_precision: c.ts_precision,
+            })
+            .collect();
+        let mut ctx = BindContext::new();
+        ctx.tables.push(BoundTableRef {
+            table_idx: 0,
+            table_id: Some(entry.id),
+            alias: entry.name.clone(),
+            columns,
+            entry: None,
+        });
+
+        let mut bound = Vec::with_capacity(entry.expectations.len());
+        for exp in &entry.expectations {
+            let expr_ast = zyron_parser::parse_expr(&exp.predicate_sql).map_err(|e| {
+                ZyronError::PlanError(format!("cannot parse expectation '{}': {e}", exp.name))
+            })?;
+            bound.push(BoundExpectation {
+                name: exp.name.clone(),
+                predicate: self.bind_expr(&ctx, &expr_ast).await?,
+                on_violation: exp.on_violation,
+                quarantine_table_id: exp.quarantine_table_id,
+            });
+        }
+        Ok(bound)
+    }
+
+    /// Binds a user-defined aggregate's state-transition and final functions
+    /// into expressions the executor folds per row. The state function is bound
+    /// over synthetic columns: column 0 is the running state, columns 1.. are
+    /// the input arguments, named after the function's parameters so its body
+    /// resolves against them. The final function (when present) is bound over a
+    /// single state column. The result of each is cast to the declared type so
+    /// the state stays stable across iterations.
+    pub async fn bind_uda(
+        &mut self,
+        agg: &zyron_catalog::schema::AggregateEntry,
+    ) -> Result<BoundUda> {
+        let mut sfunc_arg_types = Vec::with_capacity(1 + agg.input_types.len());
+        sfunc_arg_types.push(agg.state_type);
+        sfunc_arg_types.extend_from_slice(&agg.input_types);
+        let sfunc = self
+            .catalog
+            .find_function(&agg.sfunc_name, &sfunc_arg_types)
+            .ok_or_else(|| {
+                ZyronError::PlanError(format!(
+                    "aggregate '{}' references undefined state function '{}'",
+                    agg.name, agg.sfunc_name
+                ))
+            })?;
+        if sfunc.param_names.len() != 1 + agg.input_types.len() {
+            return Err(ZyronError::PlanError(format!(
+                "state function '{}' must take {} argument(s): the state plus {} input(s)",
+                agg.sfunc_name,
+                1 + agg.input_types.len(),
+                agg.input_types.len()
+            )));
+        }
+        let mut state_cols: Vec<BoundColumnDef> = Vec::with_capacity(sfunc.param_names.len());
+        state_cols.push(BoundColumnDef {
+            column_id: ColumnId(0),
+            name: sfunc.param_names[0].clone(),
+            type_id: agg.state_type,
+            nullable: true,
+            ordinal: 0,
+            ts_precision: None,
+        });
+        for (i, input_type) in agg.input_types.iter().enumerate() {
+            state_cols.push(BoundColumnDef {
+                column_id: ColumnId((i + 1) as u16),
+                name: sfunc.param_names[i + 1].clone(),
+                type_id: *input_type,
+                nullable: true,
+                ordinal: (i + 1) as u16,
+                ts_precision: None,
+            });
+        }
+        let mut sctx = BindContext::new();
+        sctx.tables.push(BoundTableRef {
+            table_idx: 0,
+            table_id: None,
+            alias: "__uda".to_string(),
+            columns: state_cols,
+            entry: None,
+        });
+        let sbody = parse_function_body(&sfunc.body_sql, &sfunc.name)?;
+        let sbound = self.bind_expr(&sctx, &sbody).await?;
+        let sfunc_expr = BoundExpr::Cast {
+            expr: Box::new(sbound),
+            target_type: agg.state_type,
+        };
+
+        let finalfunc = if let Some(fname) = &agg.finalfunc_name {
+            let ff = self
+                .catalog
+                .find_function(fname, &[agg.state_type])
+                .ok_or_else(|| {
+                    ZyronError::PlanError(format!(
+                        "aggregate '{}' references undefined final function '{}'",
+                        agg.name, fname
+                    ))
+                })?;
+            if ff.param_names.len() != 1 {
+                return Err(ZyronError::PlanError(format!(
+                    "final function '{}' must take exactly one argument: the state",
+                    fname
+                )));
+            }
+            let mut fctx = BindContext::new();
+            fctx.tables.push(BoundTableRef {
+                table_idx: 0,
+                table_id: None,
+                alias: "__uda".to_string(),
+                columns: vec![BoundColumnDef {
+                    column_id: ColumnId(0),
+                    name: ff.param_names[0].clone(),
+                    type_id: agg.state_type,
+                    nullable: true,
+                    ordinal: 0,
+                    ts_precision: None,
+                }],
+                entry: None,
+            });
+            let fbody = parse_function_body(&ff.body_sql, &ff.name)?;
+            let fbound = self.bind_expr(&fctx, &fbody).await?;
+            Some(BoundExpr::Cast {
+                expr: Box::new(fbound),
+                target_type: agg.return_type,
+            })
+        } else {
+            None
+        };
+
+        let init = if let Some(ic) = &agg.initcond {
+            let ic_ast = zyron_parser::parse_expr(ic).map_err(|e| {
+                ZyronError::PlanError(format!(
+                    "cannot parse aggregate '{}' initial condition: {e}",
+                    agg.name
+                ))
+            })?;
+            let ctx0 = BindContext::new();
+            let bound = self.bind_expr(&ctx0, &ic_ast).await?;
+            Some(BoundExpr::Cast {
+                expr: Box::new(bound),
+                target_type: agg.state_type,
+            })
+        } else {
+            None
+        };
+
+        Ok(BoundUda {
+            sfunc: sfunc_expr,
+            finalfunc,
+            init,
+            state_type: agg.state_type,
+            input_types: agg.input_types.clone(),
+            return_type: agg.return_type,
+        })
+    }
 
     async fn bind_insert(&mut self, stmt: &InsertStatement) -> Result<BoundInsert> {
         let (schema_name, table_name) = if let Some(dot_pos) = stmt.table.find('.') {
@@ -3384,16 +4257,44 @@ impl<'a> Binder<'a> {
             }
         };
 
+        // Bind a default expression for each omitted column that has one, so the
+        // executor fills it instead of leaving NULL. Defaults are constant or
+        // volatile-function expressions with no column references, so they bind
+        // in an empty scope. A default that no longer parses (an exotic stored
+        // form) is skipped and the column falls back to NULL.
+        let empty_ctx = BindContext::new();
+        let mut column_defaults: Vec<(ColumnId, BoundExpr)> = Vec::new();
+        for col in &entry.columns {
+            if target_columns.contains(&col.id) {
+                continue;
+            }
+            let Some(default_sql) = &col.default_expr else {
+                continue;
+            };
+            let Ok(expr_ast) = zyron_parser::parse_expr(default_sql) else {
+                continue;
+            };
+            if let Ok(bound) = self.bind_expr(&empty_ctx, &expr_ast).await {
+                column_defaults.push((col.id, bound));
+            }
+        }
+
         let returning = if let Some(items) = &stmt.returning {
             Some(self.bind_select_items(&ctx, items).await?)
         } else {
             None
         };
 
+        let check_constraints = self.bind_check_constraints(&entry).await?;
+        let expectations = self.bind_expectations(&entry).await?;
+
         Ok(BoundInsert {
             table_id: entry.id,
             table_entry: entry,
             target_columns,
+            column_defaults,
+            check_constraints,
+            expectations,
             source,
             returning,
         })
@@ -3462,11 +4363,14 @@ impl<'a> Binder<'a> {
             None
         };
 
+        let check_constraints = self.bind_check_constraints(&entry).await?;
+
         Ok(BoundUpdate {
             table_id: entry.id,
             table_entry: entry,
             assignments,
             where_clause,
+            check_constraints,
             returning,
         })
     }
@@ -5749,6 +6653,8 @@ fn infer_function_type(name: &str, arg_types: &[TypeId]) -> TypeId {
         }
         "now" | "current_timestamp" => TypeId::TimestampTz,
         "hlc_now" => TypeId::Hlc,
+        // Sequence functions return the 64-bit sequence value.
+        "nextval" | "currval" | "lastval" | "setval" => TypeId::Int64,
         // time_bucket(width, ts) / time_bucket_gapfill(width, ts) return the
         // timestamp argument's type.
         "time_bucket" | "time_bucket_gapfill" => {
@@ -5768,6 +6674,209 @@ fn infer_function_type(name: &str, arg_types: &[TypeId]) -> TypeId {
             }
             arg_types.first().copied().unwrap_or(TypeId::Null)
         }
+    }
+}
+
+/// Extracts the argument expressions from a function call's argument list for
+/// SQL function inlining. A `*` argument is rejected.
+fn function_arg_exprs(
+    args: &[zyron_parser::ast::FunctionArg],
+) -> Result<Vec<zyron_parser::ast::Expr>> {
+    use zyron_parser::ast::FunctionArg;
+    let mut out = Vec::with_capacity(args.len());
+    for a in args {
+        match a {
+            FunctionArg::Unnamed(e) => out.push(e.clone()),
+            FunctionArg::Named { value, .. } => out.push(value.clone()),
+            FunctionArg::Wildcard => {
+                return Err(ZyronError::PlanError(
+                    "'*' is not a valid argument to a user-defined function".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Parses a SQL scalar function body into a single expression. Accepts both a
+/// bare expression and a `SELECT <expr>` form; a body with a FROM clause or
+/// multiple projections is rejected as not scalar.
+fn parse_function_body(body: &str, name: &str) -> Result<zyron_parser::ast::Expr> {
+    let trimmed = body.trim().trim_end_matches(';').trim();
+    let expr_src = {
+        let mut it = trimmed.splitn(2, char::is_whitespace);
+        match (it.next(), it.next()) {
+            (Some(kw), Some(rest)) if kw.eq_ignore_ascii_case("select") => rest.trim(),
+            _ => trimmed,
+        }
+    };
+    zyron_parser::parse_expr(expr_src).map_err(|e| {
+        ZyronError::PlanError(format!(
+            "function '{name}' body is not a scalar SQL expression: {e}"
+        ))
+    })
+}
+
+/// Substitutes a SQL function's parameter references in its body with the
+/// call's argument expressions. Parameters are matched by name (case
+/// insensitive) and by positional placeholder ($1, $2, ...). Subquery and
+/// window sub-trees are passed through unchanged.
+fn substitute_function_params(
+    expr: &zyron_parser::ast::Expr,
+    param_names: &[String],
+    args: &[zyron_parser::ast::Expr],
+) -> zyron_parser::ast::Expr {
+    use zyron_parser::ast::Expr;
+    let recurse = |e: &Expr| Box::new(substitute_function_params(e, param_names, args));
+    match expr {
+        Expr::Identifier(n) => {
+            if let Some(i) = param_names.iter().position(|p| p.eq_ignore_ascii_case(n)) {
+                args[i].clone()
+            } else {
+                expr.clone()
+            }
+        }
+        Expr::Parameter(k) => {
+            if *k >= 1 && *k <= args.len() {
+                args[*k - 1].clone()
+            } else {
+                expr.clone()
+            }
+        }
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: recurse(left),
+            op: *op,
+            right: recurse(right),
+        },
+        Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
+            op: *op,
+            expr: recurse(inner),
+        },
+        Expr::IsNull {
+            expr: inner,
+            negated,
+        } => Expr::IsNull {
+            expr: recurse(inner),
+            negated: *negated,
+        },
+        Expr::InList {
+            expr: inner,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: recurse(inner),
+            list: list
+                .iter()
+                .map(|e| substitute_function_params(e, param_names, args))
+                .collect(),
+            negated: *negated,
+        },
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            negated,
+        } => Expr::Between {
+            expr: recurse(inner),
+            low: recurse(low),
+            high: recurse(high),
+            negated: *negated,
+        },
+        Expr::Like {
+            expr: inner,
+            pattern,
+            negated,
+        } => Expr::Like {
+            expr: recurse(inner),
+            pattern: recurse(pattern),
+            negated: *negated,
+        },
+        Expr::ILike {
+            expr: inner,
+            pattern,
+            negated,
+        } => Expr::ILike {
+            expr: recurse(inner),
+            pattern: recurse(pattern),
+            negated: *negated,
+        },
+        Expr::Function {
+            name,
+            args: call_args,
+            distinct,
+        } => Expr::Function {
+            name: name.clone(),
+            args: call_args
+                .iter()
+                .map(|a| match a {
+                    zyron_parser::ast::FunctionArg::Unnamed(e) => {
+                        zyron_parser::ast::FunctionArg::Unnamed(substitute_function_params(
+                            e,
+                            param_names,
+                            args,
+                        ))
+                    }
+                    zyron_parser::ast::FunctionArg::Named { name: an, value } => {
+                        zyron_parser::ast::FunctionArg::Named {
+                            name: an.clone(),
+                            value: substitute_function_params(value, param_names, args),
+                        }
+                    }
+                    zyron_parser::ast::FunctionArg::Wildcard => {
+                        zyron_parser::ast::FunctionArg::Wildcard
+                    }
+                })
+                .collect(),
+            distinct: *distinct,
+        },
+        Expr::Cast {
+            expr: inner,
+            data_type,
+        } => Expr::Cast {
+            expr: recurse(inner),
+            data_type: data_type.clone(),
+        },
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => Expr::Case {
+            operand: operand.as_ref().map(|e| recurse(e)),
+            conditions: conditions
+                .iter()
+                .map(|wc| zyron_parser::ast::WhenClause {
+                    condition: substitute_function_params(&wc.condition, param_names, args),
+                    result: substitute_function_params(&wc.result, param_names, args),
+                })
+                .collect(),
+            else_result: else_result.as_ref().map(|e| recurse(e)),
+        },
+        Expr::Nested(inner) => Expr::Nested(recurse(inner)),
+        Expr::ArrayConstructor(items) => Expr::ArrayConstructor(
+            items
+                .iter()
+                .map(|e| substitute_function_params(e, param_names, args))
+                .collect(),
+        ),
+        Expr::ArraySubscript { array, index } => Expr::ArraySubscript {
+            array: recurse(array),
+            index: recurse(index),
+        },
+        Expr::JsonAccess { left, op, right } => Expr::JsonAccess {
+            left: recurse(left),
+            op: *op,
+            right: recurse(right),
+        },
+        Expr::VectorDistance { left, op, right } => Expr::VectorDistance {
+            left: recurse(left),
+            op: *op,
+            right: recurse(right),
+        },
+        // Subquery, window, temporal, and other compound forms are passed
+        // through unchanged: parameter substitution inside them is not
+        // supported, so an unsubstituted reference surfaces as a bind error
+        // rather than a silently wrong result.
+        other => other.clone(),
     }
 }
 

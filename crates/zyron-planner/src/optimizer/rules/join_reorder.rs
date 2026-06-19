@@ -12,6 +12,7 @@ use crate::binder::BoundExpr;
 use crate::cost::{CostModel, PlanCost};
 use crate::logical::{JoinCondition, LogicalPlan};
 use crate::optimizer::OptimizationRule;
+use std::sync::Arc;
 use zyron_catalog::Catalog;
 use zyron_parser::ast::JoinType;
 
@@ -83,35 +84,54 @@ fn reorder_joins(plan: &LogicalPlan, cost_model: &CostModel, catalog: &Catalog) 
         // Recurse into other plan nodes
         LogicalPlan::Filter { predicate, child } => LogicalPlan::Filter {
             predicate: predicate.clone(),
-            child: Box::new(reorder_joins(child, cost_model, catalog)),
+            child: Arc::new(reorder_joins(child, cost_model, catalog)),
         },
-        LogicalPlan::Project { expressions, aliases, child } => LogicalPlan::Project {
+        LogicalPlan::Project {
+            expressions,
+            aliases,
+            child,
+            output_table_idx,
+        } => LogicalPlan::Project {
             expressions: expressions.clone(),
             aliases: aliases.clone(),
-            child: Box::new(reorder_joins(child, cost_model, catalog)),
+            child: Arc::new(reorder_joins(child, cost_model, catalog)),
+            output_table_idx: *output_table_idx,
         },
-        LogicalPlan::Aggregate { group_by, aggregates, child } => LogicalPlan::Aggregate {
+        LogicalPlan::Aggregate {
+            group_by,
+            aggregates,
+            child,
+        } => LogicalPlan::Aggregate {
             group_by: group_by.clone(),
             aggregates: aggregates.clone(),
-            child: Box::new(reorder_joins(child, cost_model, catalog)),
+            child: Arc::new(reorder_joins(child, cost_model, catalog)),
         },
         LogicalPlan::Sort { order_by, child } => LogicalPlan::Sort {
             order_by: order_by.clone(),
-            child: Box::new(reorder_joins(child, cost_model, catalog)),
+            child: Arc::new(reorder_joins(child, cost_model, catalog)),
         },
-        LogicalPlan::Limit { limit, offset, child } => LogicalPlan::Limit {
+        LogicalPlan::Limit {
+            limit,
+            offset,
+            child,
+        } => LogicalPlan::Limit {
             limit: *limit,
             offset: *offset,
-            child: Box::new(reorder_joins(child, cost_model, catalog)),
+            child: Arc::new(reorder_joins(child, cost_model, catalog)),
         },
         LogicalPlan::Distinct { child } => LogicalPlan::Distinct {
-            child: Box::new(reorder_joins(child, cost_model, catalog)),
+            child: Arc::new(reorder_joins(child, cost_model, catalog)),
         },
-        LogicalPlan::SetOp { op, all, left, right } => LogicalPlan::SetOp {
+        LogicalPlan::SetOp {
+            op,
+            all,
+            left,
+            right,
+        } => LogicalPlan::SetOp {
             op: *op,
             all: *all,
-            left: Box::new(reorder_joins(left, cost_model, catalog)),
-            right: Box::new(reorder_joins(right, cost_model, catalog)),
+            left: Arc::new(reorder_joins(left, cost_model, catalog)),
+            right: Arc::new(reorder_joins(right, cost_model, catalog)),
         },
         other => other.clone(),
     }
@@ -124,14 +144,24 @@ fn flatten_join_tree(
     predicates: &mut Vec<BoundExpr>,
 ) {
     match plan {
-        LogicalPlan::Join { left, right, join_type: JoinType::Inner, condition } => {
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type: JoinType::Inner,
+            condition,
+        } => {
             flatten_join_tree(left, relations, predicates);
             flatten_join_tree(right, relations, predicates);
             if let JoinCondition::On(expr) = condition {
                 predicates.push(expr.clone());
             }
         }
-        LogicalPlan::Join { left, right, join_type: JoinType::Cross, .. } => {
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type: JoinType::Cross,
+            ..
+        } => {
             flatten_join_tree(left, relations, predicates);
             flatten_join_tree(right, relations, predicates);
         }
@@ -192,13 +222,9 @@ fn dp_join_order(
             while sub > 0 {
                 let complement = mask & !sub;
                 if complement > 0 && sub < complement {
-                    if let (Some(left_entry), Some(right_entry)) =
-                        (&dp[sub], &dp[complement])
-                    {
-                        let join_cost = cost_model.cost_hash_join(
-                            &left_entry.plan_cost,
-                            &right_entry.plan_cost,
-                        );
+                    if let (Some(left_entry), Some(right_entry)) = (&dp[sub], &dp[complement]) {
+                        let join_cost = cost_model
+                            .cost_hash_join(&left_entry.plan_cost, &right_entry.plan_cost);
                         let total = left_entry.cumulative_cost
                             + right_entry.cumulative_cost
                             + join_cost.total();
@@ -249,11 +275,16 @@ fn reconstruct_plan(
     let left = reconstruct_plan(entry.left_mask, dp, relations, predicates);
     let right = reconstruct_plan(entry.right_mask, dp, relations, predicates);
 
-    let condition = find_join_predicate(predicates, entry.left_mask as u32, entry.right_mask as u32, relations);
+    let condition = find_join_predicate(
+        predicates,
+        entry.left_mask as u32,
+        entry.right_mask as u32,
+        relations,
+    );
 
     LogicalPlan::Join {
-        left: Box::new(left),
-        right: Box::new(right),
+        left: Arc::new(left),
+        right: Arc::new(right),
         join_type: JoinType::Inner,
         condition,
     }
@@ -298,8 +329,8 @@ fn greedy_join_order(
 
         let join_cost = cost_model.cost_hash_join(&left_cost, &right_cost);
         let join = LogicalPlan::Join {
-            left: Box::new(left),
-            right: Box::new(right),
+            left: Arc::new(left),
+            right: Arc::new(right),
             join_type: JoinType::Inner,
             condition: JoinCondition::Cross,
         };
@@ -311,7 +342,7 @@ fn greedy_join_order(
     for pred in predicates {
         plan = LogicalPlan::Filter {
             predicate: pred,
-            child: Box::new(plan),
+            child: Arc::new(plan),
         };
     }
     plan
@@ -338,8 +369,8 @@ fn build_left_deep(mut relations: Vec<LogicalPlan>, predicates: Vec<BoundExpr>) 
     let mut plan = relations.remove(0);
     for relation in relations {
         plan = LogicalPlan::Join {
-            left: Box::new(plan),
-            right: Box::new(relation),
+            left: Arc::new(plan),
+            right: Arc::new(relation),
             join_type: JoinType::Inner,
             condition: JoinCondition::Cross,
         };
@@ -348,7 +379,7 @@ fn build_left_deep(mut relations: Vec<LogicalPlan>, predicates: Vec<BoundExpr>) 
     for pred in predicates {
         plan = LogicalPlan::Filter {
             predicate: pred,
-            child: Box::new(plan),
+            child: Arc::new(plan),
         };
     }
     plan

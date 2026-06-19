@@ -184,8 +184,14 @@ impl NameResolver {
             .load_table_by_name(schema_id, table_name)
             .await?
         {
+            // Populate the cache so the recycle-bin reaper and UNDROP can find
+            // the entry, but a soft-dropped table is invisible to name
+            // resolution.
+            let dropped = table.dropped_at.is_some();
             self.cache.put_table(table.clone());
-            return Ok(Arc::new(table));
+            if !dropped {
+                return Ok(Arc::new(table));
+            }
         }
 
         Err(ZyronError::TableNotFound(table_name.to_string()))
@@ -263,6 +269,123 @@ mod tests {
             unimplemented!()
         }
         async fn delete_streaming_job(&self, _: StreamingJobId) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn load_sequences(&self) -> Result<Vec<SequenceEntry>> {
+            Ok(vec![])
+        }
+        async fn store_sequence(&self, _: &SequenceEntry) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn update_sequence(&self, _: &SequenceEntry) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn delete_sequence(&self, _: u32) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn load_views(&self) -> Result<Vec<ViewEntry>> {
+            Ok(vec![])
+        }
+        async fn store_view(&self, _: &ViewEntry) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn update_view(&self, _: &ViewEntry) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn delete_view(&self, _: u32) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn load_mviews(&self) -> Result<Vec<MaterializedViewEntry>> {
+            Ok(vec![])
+        }
+        async fn store_mview(&self, _: &MaterializedViewEntry) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn update_mview(&self, _: &MaterializedViewEntry) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn delete_mview(&self, _: u32) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn load_functions(&self) -> Result<Vec<FunctionEntry>> {
+            Ok(vec![])
+        }
+        async fn store_function(&self, _: &FunctionEntry) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn delete_function(&self, _: u32) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn load_comments(&self) -> Result<Vec<CommentEntry>> {
+            Ok(vec![])
+        }
+        async fn store_comment(&self, _: &CommentEntry) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn delete_comment(&self, _: u32) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn load_aggregates(&self) -> Result<Vec<AggregateEntry>> {
+            Ok(vec![])
+        }
+        async fn store_aggregate(&self, _: &AggregateEntry) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn delete_aggregate(&self, _: u32) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn load_procedures(&self) -> Result<Vec<ProcedureEntry>> {
+            Ok(vec![])
+        }
+        async fn store_procedure(&self, _: &ProcedureEntry) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn delete_procedure(&self, _: u32) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn load_schedules(&self) -> Result<Vec<ScheduleEntry>> {
+            Ok(vec![])
+        }
+        async fn store_schedule(&self, _: &ScheduleEntry) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn delete_schedule(&self, _: u32) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn load_triggers(&self) -> Result<Vec<TriggerEntry>> {
+            Ok(vec![])
+        }
+        async fn store_trigger(&self, _: &TriggerEntry) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn delete_trigger(&self, _: u32) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn load_pipelines(&self) -> Result<Vec<PipelineEntry>> {
+            Ok(vec![])
+        }
+        async fn store_pipeline(&self, _: &PipelineEntry) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn delete_pipeline(&self, _: u32) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn load_event_handlers(&self) -> Result<Vec<EventHandlerEntry>> {
+            Ok(vec![])
+        }
+        async fn store_event_handler(&self, _: &EventHandlerEntry) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn delete_event_handler(&self, _: u32) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn load_version_tags(&self) -> Result<Vec<VersionTagEntry>> {
+            Ok(vec![])
+        }
+        async fn store_version_tag(&self, _: &VersionTagEntry) -> Result<TupleId> {
+            unimplemented!()
+        }
+        async fn delete_version_tag(&self, _: u32) -> Result<bool> {
             unimplemented!()
         }
         async fn load_external_sources(&self) -> Result<Vec<ExternalSourceEntry>> {
@@ -471,6 +594,9 @@ mod tests {
                     cdf_retention_days: 0,
                     lifecycle: Default::default(),
                     columnar: Default::default(),
+                    dropped_at: None,
+                    expectations: Vec::new(),
+                    time_travel_retention_secs: 0,
                 },
                 TableEntry {
                     id: TableId(20),
@@ -489,6 +615,9 @@ mod tests {
                     cdf_retention_days: 0,
                     lifecycle: Default::default(),
                     columnar: Default::default(),
+                    dropped_at: None,
+                    expectations: Vec::new(),
+                    time_travel_retention_secs: 0,
                 },
             ],
         });

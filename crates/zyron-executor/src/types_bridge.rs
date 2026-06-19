@@ -111,6 +111,31 @@ pub fn evaluate_types_function(
         "json_merge_patch" => two_string_to_string(&evaluated_args, |target, patch| {
             json_merge_patch_strings(target, patch)
         }),
+
+        // ---------- JSON access operators (->, ->>, #>, #>>, @>, <@, ?, ?|, ?&) ----------
+        "json_get" => two_string_to_nullable_string(&evaluated_args, |json, key| {
+            json_get_impl(json, key, false)
+        }),
+        "json_get_text" => two_string_to_nullable_string(&evaluated_args, |json, key| {
+            json_get_impl(json, key, true)
+        }),
+        "json_get_path" => two_string_to_nullable_string(&evaluated_args, |json, path| {
+            json_get_path_impl(json, path, false)
+        }),
+        "json_get_path_text" => two_string_to_nullable_string(&evaluated_args, |json, path| {
+            json_get_path_impl(json, path, true)
+        }),
+        "jsonb_contains" => two_string_to_bool(&evaluated_args, json_contains_impl),
+        "jsonb_contained_by" => {
+            two_string_to_bool(&evaluated_args, |a, b| json_contains_impl(b, a))
+        }
+        "jsonb_exists" => two_string_to_bool(&evaluated_args, json_exists_impl),
+        "jsonb_exists_any" => two_string_to_bool(&evaluated_args, |json, keys| {
+            json_exists_any_all(json, keys, false)
+        }),
+        "jsonb_exists_all" => two_string_to_bool(&evaluated_args, |json, keys| {
+            json_exists_any_all(json, keys, true)
+        }),
         "text_diff" => two_string_to_string(&evaluated_args, |a, b| text_diff_strings(a, b)),
         "text_patch" => two_string_to_string(&evaluated_args, |orig, patch| {
             text_patch_strings(orig, patch)
@@ -715,6 +740,197 @@ fn text_diff_strings(a: &str, b: &str) -> String {
 fn text_patch_strings(orig: &str, patch_json: &str) -> String {
     zyron_types::diff::text_patch(orig, patch_json)
         .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e.to_string().replace('"', "\\\"")))
+}
+
+// ---------------------------------------------------------------------------
+// JSON access operators
+// ---------------------------------------------------------------------------
+
+/// Applies a two-string predicate row-wise, producing a boolean column. A NULL
+/// in either input yields NULL.
+fn two_string_to_bool<F: Fn(&str, &str) -> bool>(args: &[Column], f: F) -> Result<Column> {
+    arg_count_check(args, 2)?;
+    let a = column_strings(&args[0])?;
+    let b = column_strings(&args[1])?;
+    if a.len() != b.len() {
+        return Err(ZyronError::ExecutionError(
+            "two_string_to_bool: column length mismatch".to_string(),
+        ));
+    }
+    let mut data = Vec::with_capacity(a.len());
+    let mut nulls = NullBitmap::none(a.len());
+    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        if args[0].nulls.is_null(i) || args[1].nulls.is_null(i) {
+            data.push(false);
+            nulls.set_null(i);
+        } else {
+            data.push(f(x, y));
+        }
+    }
+    Ok(Column::with_nulls(
+        ColumnData::Boolean(data),
+        nulls,
+        TypeId::Boolean,
+    ))
+}
+
+/// Applies a two-string function row-wise where the result may be absent. A
+/// NULL input or a `None` result yields SQL NULL, matching Postgres `->`/`->>`
+/// returning NULL for a missing key.
+fn two_string_to_nullable_string<F: Fn(&str, &str) -> Option<String>>(
+    args: &[Column],
+    f: F,
+) -> Result<Column> {
+    arg_count_check(args, 2)?;
+    let a = column_strings(&args[0])?;
+    let b = column_strings(&args[1])?;
+    if a.len() != b.len() {
+        return Err(ZyronError::ExecutionError(
+            "two_string_to_nullable_string: column length mismatch".to_string(),
+        ));
+    }
+    let mut data = Vec::with_capacity(a.len());
+    let mut nulls = NullBitmap::none(a.len());
+    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        if args[0].nulls.is_null(i) || args[1].nulls.is_null(i) {
+            data.push(String::new());
+            nulls.set_null(i);
+            continue;
+        }
+        match f(x, y) {
+            Some(s) => data.push(s),
+            None => {
+                data.push(String::new());
+                nulls.set_null(i);
+            }
+        }
+    }
+    Ok(Column::with_nulls(
+        ColumnData::Utf8(data),
+        nulls,
+        TypeId::Varchar,
+    ))
+}
+
+/// Serializes a resolved JSON value for output. `as_text` unwraps a JSON string
+/// to its raw text and maps JSON null to SQL NULL (Postgres `->>` semantics);
+/// otherwise the value is serialized as JSON text (Postgres `->`).
+fn json_output(v: &serde_json::Value, as_text: bool) -> Option<String> {
+    if as_text {
+        match v {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(s) => Some(s.clone()),
+            other => Some(other.to_string()),
+        }
+    } else {
+        Some(v.to_string())
+    }
+}
+
+/// Resolves an array element index, supporting Postgres negative indexing.
+fn json_array_index(arr: &[serde_json::Value], key: &str) -> Option<usize> {
+    let idx: i64 = key.parse().ok()?;
+    let resolved = if idx < 0 { arr.len() as i64 + idx } else { idx };
+    if resolved < 0 || resolved as usize >= arr.len() {
+        None
+    } else {
+        Some(resolved as usize)
+    }
+}
+
+/// `->` / `->>`: object field by key or array element by integer index.
+fn json_get_impl(json: &str, key: &str, as_text: bool) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let got = match &v {
+        serde_json::Value::Object(map) => map.get(key)?,
+        serde_json::Value::Array(arr) => arr.get(json_array_index(arr, key)?)?,
+        _ => return None,
+    };
+    json_output(got, as_text)
+}
+
+/// Parses a Postgres text-array path literal like `{a,b,0}` into its elements.
+fn parse_text_array(s: &str) -> Vec<String> {
+    let trimmed = s.trim();
+    let inner = trimmed
+        .strip_prefix('{')
+        .and_then(|x| x.strip_suffix('}'))
+        .unwrap_or(trimmed);
+    if inner.trim().is_empty() {
+        return Vec::new();
+    }
+    inner
+        .split(',')
+        .map(|p| p.trim().trim_matches('"').to_string())
+        .collect()
+}
+
+/// `#>` / `#>>`: extract by a text-array path, walking objects and arrays.
+fn json_get_path_impl(json: &str, path: &str, as_text: bool) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let mut cur = &v;
+    for key in parse_text_array(path) {
+        cur = match cur {
+            serde_json::Value::Object(map) => map.get(&key)?,
+            serde_json::Value::Array(arr) => arr.get(json_array_index(arr, &key)?)?,
+            _ => return None,
+        };
+    }
+    json_output(cur, as_text)
+}
+
+/// `@>`: deep containment of `b` within `a`.
+fn json_contains_impl(a: &str, b: &str) -> bool {
+    match (
+        serde_json::from_str::<serde_json::Value>(a),
+        serde_json::from_str::<serde_json::Value>(b),
+    ) {
+        (Ok(av), Ok(bv)) => json_value_contains(&av, &bv),
+        _ => false,
+    }
+}
+
+fn json_value_contains(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match (a, b) {
+        (Value::Object(am), Value::Object(bm)) => bm
+            .iter()
+            .all(|(k, bv)| am.get(k).is_some_and(|av| json_value_contains(av, bv))),
+        (Value::Array(aa), Value::Array(ba)) => ba
+            .iter()
+            .all(|be| aa.iter().any(|ae| json_value_contains(ae, be))),
+        _ => a == b,
+    }
+}
+
+/// `?`: does `key` exist as a top-level object key or array string element.
+fn json_exists_impl(json: &str, key: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(json) {
+        Ok(serde_json::Value::Object(m)) => m.contains_key(key),
+        Ok(serde_json::Value::Array(a)) => a.iter().any(|v| v.as_str() == Some(key)),
+        Ok(serde_json::Value::String(s)) => s == key,
+        _ => false,
+    }
+}
+
+/// `?|` (any) / `?&` (all): does the json contain any/all of the given keys.
+fn json_exists_any_all(json: &str, keys: &str, require_all: bool) -> bool {
+    let parsed = serde_json::from_str::<serde_json::Value>(json).ok();
+    let key_list = parse_text_array(keys);
+    if key_list.is_empty() {
+        return require_all;
+    }
+    let exists = |k: &str| match &parsed {
+        Some(serde_json::Value::Object(m)) => m.contains_key(k),
+        Some(serde_json::Value::Array(a)) => a.iter().any(|v| v.as_str() == Some(k)),
+        Some(serde_json::Value::String(s)) => s == k,
+        _ => false,
+    };
+    if require_all {
+        key_list.iter().all(|k| exists(k))
+    } else {
+        key_list.iter().any(|k| exists(k))
+    }
 }
 
 #[cfg(test)]

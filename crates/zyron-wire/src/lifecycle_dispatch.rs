@@ -20,65 +20,13 @@ fn now_micros() -> i64 {
         .unwrap_or(0)
 }
 
-/// Minimal SQL renderer for stored legal-hold predicates. Covers the predicate
-/// shapes the parser produces; falls back to a parenthesized debug form.
-fn expr_to_sql(e: &lc_ast::Expr) -> String {
-    use lc_ast::{BinaryOperator as B, Expr, LiteralValue as L, UnaryOperator as U};
-    match e {
-        Expr::Identifier(n) => n.clone(),
-        Expr::QualifiedIdentifier { table, column } => format!("{table}.{column}"),
-        Expr::Literal(L::Integer(i)) => i.to_string(),
-        Expr::Literal(L::Float(f)) => f.to_string(),
-        Expr::Literal(L::String(s)) => format!("'{}'", s.replace('\'', "''")),
-        Expr::Literal(L::Boolean(b)) => b.to_string(),
-        Expr::Literal(L::Null) => "NULL".to_string(),
-        Expr::Literal(L::Interval(_)) => "INTERVAL".to_string(),
-        Expr::BinaryOp { left, op, right } => {
-            let o = match op {
-                B::Plus => "+",
-                B::Minus => "-",
-                B::Multiply => "*",
-                B::Divide => "/",
-                B::Modulo => "%",
-                B::Eq => "=",
-                B::Neq => "<>",
-                B::Lt => "<",
-                B::Gt => ">",
-                B::LtEq => "<=",
-                B::GtEq => ">=",
-                B::And => "AND",
-                B::Or => "OR",
-                B::Concat => "||",
-            };
-            format!("({} {} {})", expr_to_sql(left), o, expr_to_sql(right))
-        }
-        Expr::UnaryOp { op, expr } => {
-            let o = match op {
-                U::Not => "NOT ",
-                U::Minus => "-",
-            };
-            format!("{}{}", o, expr_to_sql(expr))
-        }
-        Expr::InList {
-            expr,
-            list,
-            negated,
-        } => {
-            let items: Vec<String> = list.iter().map(expr_to_sql).collect();
-            format!(
-                "{} {}IN ({})",
-                expr_to_sql(expr),
-                if *negated { "NOT " } else { "" },
-                items.join(", ")
-            )
-        }
-        Expr::IsNull { expr, negated } => format!(
-            "{} IS {}NULL",
-            expr_to_sql(expr),
-            if *negated { "NOT " } else { "" }
-        ),
-        other => format!("({other:?})"),
-    }
+/// Minimal SQL renderer for stored legal-hold predicates and column defaults.
+/// Covers the expression shapes the parser produces; falls back to a
+/// parenthesized debug form for shapes not yet rendered.
+/// Renders an expression as SQL. Backed by the parser's serializer so storage
+/// (column defaults, CHECK constraints) and this dispatch path stay consistent.
+pub(crate) fn expr_to_sql(e: &lc_ast::Expr) -> String {
+    zyron_parser::expr_to_sql(e)
 }
 
 /// Appends a tamper-evident compliance log entry. A failed audit write fails
@@ -491,17 +439,49 @@ pub async fn handle_alter_table_options(
             "recycle_window" => entry.lifecycle.recycle_window_seconds = parse_duration_secs(v),
             "data_residency" => entry.lifecycle.residency_region = v.clone(),
             "immutable" => entry.lifecycle.immutable = v == "true",
+            "time_travel_retention" | "time_travel_retention_period" => {
+                entry.time_travel_retention_secs = parse_time_travel_retention(v)?;
+            }
             _ => {}
         }
     }
     let tid = entry.id.0;
+    let retention = entry.time_travel_retention_secs;
     server
         .catalog
         .update_table(entry)
         .await
         .map_err(ProtocolError::Database)?;
+    // A finite or unlimited retention window dates deletes by commit LSN, so
+    // commit-LSN tracking must be on from here forward (zero cost when unused).
+    // The commit-LSN dawn watermark advances on the retention floor, so segments
+    // within the window are kept automatically without a separate flag.
+    if retention != 0 {
+        server.txn_manager.status_map().enable_lsn_tracking();
+    }
     audit(server, 8, &stmt.table, tid, "set lifecycle options").await?;
     Ok(DdlResult::Tag("ALTER TABLE".to_string()))
+}
+
+/// Parses a time-travel retention setting into seconds. `unlimited` is u64::MAX
+/// (keep forever); `default`/`off`/`0`/empty is 0 (the aggressive default);
+/// anything else is a duration like `30 days` or `12 hours`. Rejects an
+/// unparseable duration so a typo is not silently treated as the default.
+pub(crate) fn parse_time_travel_retention(v: &str) -> Result<u64, ProtocolError> {
+    let vl = v.trim().to_ascii_lowercase();
+    if vl == "unlimited" || vl == "forever" {
+        return Ok(u64::MAX);
+    }
+    if vl.is_empty() || vl == "default" || vl == "off" || vl == "0" {
+        return Ok(0);
+    }
+    let secs = parse_duration_secs(&vl);
+    if secs <= 0 {
+        return Err(ProtocolError::Database(ZyronError::ParseError(format!(
+            "invalid time_travel_retention '{v}': expected a duration like '30 days', 'unlimited', or 'default'"
+        ))));
+    }
+    Ok(secs as u64)
 }
 
 pub async fn handle_legal_hold(
@@ -884,15 +864,51 @@ pub async fn handle_restore_soft_delete(
         zyron_auth::PrivilegeType::ManageDataLifecycle,
         table.id.0,
     )?;
+
+    // Restore only applies to a soft-delete-enabled table. Resolve its tombstone
+    // columns and clear them on the matching tombstoned rows.
+    let cfg = zyron_lifecycle::soft_delete::soft_delete_config(&table).ok_or_else(|| {
+        ProtocolError::Database(ZyronError::Internal(format!(
+            "table '{}' does not have soft delete enabled",
+            stmt.table
+        )))
+    })?;
+
+    // Target tombstoned rows (is_deleted = true). The UPDATE binder injects only
+    // the row-security predicate, not the soft-delete filter, so this WHERE
+    // reaches the deleted rows directly.
+    let mut where_sql = format!("\"{}\" = true", cfg.is_deleted_column);
+    if let Some(user_where) = &stmt.where_clause {
+        where_sql = format!("({}) AND ({})", where_sql, expr_to_sql(user_where));
+    }
+    let restore_sql = format!(
+        "UPDATE \"{}\" SET \"{}\" = false, \"{}\" = NULL WHERE {}",
+        stmt.table, cfg.is_deleted_column, cfg.deleted_at_column, where_sql
+    );
+
+    let (rows_restored, _) = run_sql(server, &restore_sql, true).await?;
+
     audit(
         server,
         2,
         &stmt.table,
         table.id.0,
-        "restore soft-deleted rows",
+        &format!("restore soft-deleted rows: {rows_restored} restored"),
     )
     .await?;
-    Ok(DdlResult::Tag("RESTORE".to_string()))
+    Ok(DdlResult::Tag(format!("RESTORE {rows_restored}")))
+}
+
+/// Resolves a table column name from its stored column id (0 = unset).
+fn column_name_by_id(table: &zyron_catalog::schema::TableEntry, col_id: u32) -> Option<String> {
+    if col_id == 0 {
+        return None;
+    }
+    table
+        .columns
+        .iter()
+        .find(|c| c.id.0 as u32 == col_id)
+        .map(|c| c.name.clone())
 }
 
 pub async fn handle_run_retention_job(
@@ -906,29 +922,112 @@ pub async fn handle_run_retention_job(
         zyron_auth::PrivilegeType::ManageRetention,
         0,
     )?;
-    let target = stmt.table.clone().unwrap_or_else(|| "ALL".to_string());
-    server
-        .catalog
-        .store_retention_job(&zyron_catalog::schema::RetentionJobEntry {
-            job_id: now_micros() as u64,
-            table_id: 0,
-            kind: 0,
-            scheduled_at: now_micros(),
-            started_at: now_micros(),
-            finished_at: if stmt.dry_run { now_micros() } else { 0 },
-            rows_affected: 0,
-            status: if stmt.dry_run { 4 } else { 0 },
-            detail: format!("manual retention job on {target}"),
-        })
-        .await
-        .map_err(ProtocolError::Database)?;
-    audit(server, 0, &target, 0, "run retention job").await?;
-    let tag = if stmt.dry_run {
-        "RUN RETENTION JOB (DRY RUN)"
-    } else {
-        "RUN RETENTION JOB"
+
+    // Resolve the target tables: a single named table, or every table with a
+    // TTL/retention policy configured.
+    let tables: Vec<std::sync::Arc<zyron_catalog::schema::TableEntry>> = match &stmt.table {
+        Some(name) => {
+            let (_, schema_id) = get_session_schema(session, server, None)?;
+            vec![
+                server
+                    .catalog
+                    .get_table(schema_id, name)
+                    .map_err(ProtocolError::Database)?,
+            ]
+        }
+        None => server.catalog.list_all_tables(),
     };
-    Ok(DdlResult::Tag(tag.to_string()))
+
+    let started = now_micros();
+    let mut total_rows = 0u64;
+    let mut tables_processed = 0u64;
+    let mut skipped: Vec<String> = Vec::new();
+
+    for table in &tables {
+        let lc = &table.lifecycle;
+
+        // Expiry predicate: a per-row retention column compares directly to now;
+        // a TTL column compares to a cutoff `now - ttl_seconds`. Temporal columns
+        // store i64 microseconds, so the comparison is against a micro cutoff.
+        let where_sql = if lc.retention_column_id != 0 {
+            column_name_by_id(table, lc.retention_column_id)
+                .map(|col| format!("\"{col}\" < {started}"))
+        } else if lc.ttl_column_id != 0 && lc.ttl_seconds > 0 {
+            let cutoff = started - lc.ttl_seconds.saturating_mul(1_000_000);
+            column_name_by_id(table, lc.ttl_column_id).map(|col| format!("\"{col}\" < {cutoff}"))
+        } else {
+            None
+        };
+        let Some(where_sql) = where_sql else {
+            continue; // no retention/TTL policy on this table
+        };
+
+        // The delete path handles TTL action Delete (0). Archive (1) and
+        // Anonymize (2) require the tiering/masking paths and are recorded as
+        // skipped rather than silently treated as deletes.
+        if lc.ttl_action != 0 {
+            skipped.push(format!("{} (action={})", table.name, lc.ttl_action));
+            continue;
+        }
+
+        let (rows, status) = if stmt.dry_run {
+            let sel = format!(
+                "SELECT * FROM \"{}\" WHERE {} INCLUDING DELETED",
+                table.name, where_sql
+            );
+            let (n, _) = run_sql(server, &sel, false).await?;
+            (n, 4u8) // skipped/dry-run
+        } else {
+            let del = format!("DELETE FROM \"{}\" WHERE {} HARD", table.name, where_sql);
+            let (n, _) = run_sql(server, &del, true).await?;
+            (n, 2u8) // done
+        };
+
+        server
+            .catalog
+            .store_retention_job(&zyron_catalog::schema::RetentionJobEntry {
+                job_id: now_micros() as u64,
+                table_id: table.id.0,
+                kind: 0, // ttl_delete
+                scheduled_at: started,
+                started_at: started,
+                finished_at: now_micros(),
+                rows_affected: rows,
+                status,
+                detail: format!(
+                    "{} retention on {}: {} rows",
+                    if stmt.dry_run { "dry-run" } else { "purge" },
+                    table.name,
+                    rows
+                ),
+            })
+            .await
+            .map_err(ProtocolError::Database)?;
+
+        total_rows += rows;
+        tables_processed += 1;
+    }
+
+    let target = stmt.table.clone().unwrap_or_else(|| "ALL".to_string());
+    let detail = format!(
+        "retention job on {} dry_run={}: {} rows across {} tables{}",
+        target,
+        stmt.dry_run,
+        total_rows,
+        tables_processed,
+        if skipped.is_empty() {
+            String::new()
+        } else {
+            format!("; skipped non-delete actions: {}", skipped.join(", "))
+        }
+    );
+    audit(server, 0, &target, 0, &detail).await?;
+    let tag = if stmt.dry_run {
+        format!("RUN RETENTION JOB (DRY RUN: {total_rows} rows, {tables_processed} tables)")
+    } else {
+        format!("RUN RETENTION JOB {total_rows}")
+    };
+    Ok(DdlResult::Tag(tag))
 }
 
 pub async fn handle_undrop_table(
@@ -942,6 +1041,12 @@ pub async fn handle_undrop_table(
         zyron_auth::PrivilegeType::ManageDataLifecycle,
         0,
     )?;
+    let (_, schema_id) = get_session_schema(session, server, None)?;
+    server
+        .catalog
+        .undrop_table(schema_id, &stmt.table)
+        .await
+        .map_err(ProtocolError::Database)?;
     audit(server, 11, &stmt.table, 0, "undrop table").await?;
     Ok(DdlResult::Tag("UNDROP TABLE".to_string()))
 }

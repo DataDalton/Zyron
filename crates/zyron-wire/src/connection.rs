@@ -491,19 +491,39 @@ impl<T: WireTransport> Connection<T> {
                 sm.auth_resolver
                     .resolve(conn_type, &database, &user, self.peer_addr.as_deref());
 
-            // Reject immediately without prompting for credentials
-            if matches!(method, zyron_auth::auth_rules::AuthMethod::Reject) {
+            // Reject immediately without prompting for credentials.
+            // Certificate (mTLS) auth is validated at the TLS layer, not via a
+            // password challenge; until that path is wired it returns an
+            // immediate FATAL rather than a doomed cleartext-password prompt.
+            if matches!(
+                method,
+                zyron_auth::auth_rules::AuthMethod::Reject
+                    | zyron_auth::auth_rules::AuthMethod::Certificate
+            ) {
+                let (message, reason) =
+                    if matches!(method, zyron_auth::auth_rules::AuthMethod::Certificate) {
+                        (
+                            "Certificate authentication is not supported on this connection"
+                                .to_string(),
+                            "certificate auth not supported",
+                        )
+                    } else {
+                        (
+                            "Connection rejected by authentication rule".to_string(),
+                            "rejected by auth rule",
+                        )
+                    };
                 self.feed(BackendMessage::ErrorResponse(ErrorFields {
                     severity: "FATAL".into(),
                     code: "28000".into(),
-                    message: "Connection rejected by authentication rule".to_string(),
+                    message,
                     detail: None,
                     hint: None,
                     position: None,
                 }))
                 .await?;
                 self.flush().await?;
-                return Err(ProtocolError::AuthFailed("rejected by auth rule".into()));
+                return Err(ProtocolError::AuthFailed(reason.into()));
             }
 
             // Map auth method to brute force gate code.
@@ -617,6 +637,31 @@ impl<T: WireTransport> Connection<T> {
         // Looks up the user's role and builds a SecurityContext with effective
         // roles, clearance, session attributes, and query limits.
         let security_context = if let Some(ref sm) = self.server.security_manager {
+            // Enforce account status for identities backed by a user record.
+            // Trust-auth identities with no record are unaffected.
+            if let Some(account) = sm.lookup_user(&user) {
+                if !account.can_login {
+                    return Err(ProtocolError::Malformed(format!(
+                        "user \"{user}\" is not permitted to log in (NOLOGIN)"
+                    )));
+                }
+                if account.locked {
+                    return Err(ProtocolError::Malformed(format!(
+                        "user \"{user}\" account is locked"
+                    )));
+                }
+                if let Some(expires_at) = account.valid_until {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    if now >= expires_at {
+                        return Err(ProtocolError::Malformed(format!(
+                            "user \"{user}\" account has expired"
+                        )));
+                    }
+                }
+            }
             let peer_ip = self
                 .peer_addr
                 .clone()
@@ -1677,9 +1722,17 @@ impl<T: WireTransport> Connection<T> {
             txn_id as u32,
             snapshot,
         );
-        ctx.security_context = sec_ctx;
+        ctx.security_context = sec_ctx.map(Arc::new);
         ctx.heap_files = Some(Arc::clone(&self.server.heap_files));
         ctx.btree_indexes = Some(Arc::clone(&self.server.btree_indexes));
+        ctx.intent_locks = Some(Arc::clone(self.server.txn_manager.intent_locks()));
+        ctx.session_sequences = self.session.as_ref().map(|s| Arc::clone(&s.sequence_state));
+        if let Some(mgr) = &self.server.branch_manager {
+            ctx.branch_catalog = Some(Arc::clone(mgr) as Arc<dyn zyron_common::BranchCatalog>);
+            if let Some(name) = &self.active_branch {
+                ctx.active_branch_id = mgr.get_branch_by_name(name).ok().map(|e| e.id.0);
+            }
+        }
         if let Some(ref hook) = self.server.cdc_hook {
             ctx.cdc_hook = Some(Arc::clone(hook));
         }
@@ -1696,7 +1749,13 @@ impl<T: WireTransport> Connection<T> {
         // can reuse the cached privilege decisions.
         if let Ok(mut unwrapped) = Arc::try_unwrap(ctx) {
             if let Some(session) = self.session.as_mut() {
-                session.security_context = unwrapped.security_context.take();
+                // Recover the owned context from the Arc to return it to the
+                // session with its privilege cache intact. Any child context
+                // from a nested plan has been dropped, so the refcount is one.
+                session.security_context = unwrapped
+                    .security_context
+                    .take()
+                    .and_then(|a| Arc::try_unwrap(a).ok());
             }
         }
 
@@ -1867,9 +1926,17 @@ impl<T: WireTransport> Connection<T> {
             snapshot,
         );
         ctx.params = params;
-        ctx.security_context = sec_ctx;
+        ctx.security_context = sec_ctx.map(Arc::new);
         ctx.heap_files = Some(Arc::clone(&self.server.heap_files));
         ctx.btree_indexes = Some(Arc::clone(&self.server.btree_indexes));
+        ctx.intent_locks = Some(Arc::clone(self.server.txn_manager.intent_locks()));
+        ctx.session_sequences = self.session.as_ref().map(|s| Arc::clone(&s.sequence_state));
+        if let Some(mgr) = &self.server.branch_manager {
+            ctx.branch_catalog = Some(Arc::clone(mgr) as Arc<dyn zyron_common::BranchCatalog>);
+            if let Some(name) = &self.active_branch {
+                ctx.active_branch_id = mgr.get_branch_by_name(name).ok().map(|e| e.id.0);
+            }
+        }
         if let Some(ref hook) = self.server.cdc_hook {
             ctx.cdc_hook = Some(Arc::clone(hook));
         }
@@ -1887,7 +1954,13 @@ impl<T: WireTransport> Connection<T> {
 
         if let Ok(mut unwrapped) = Arc::try_unwrap(ctx) {
             if let Some(session) = self.session.as_mut() {
-                session.security_context = unwrapped.security_context.take();
+                // Recover the owned context from the Arc to return it to the
+                // session with its privilege cache intact. Any child context
+                // from a nested plan has been dropped, so the refcount is one.
+                session.security_context = unwrapped
+                    .security_context
+                    .take()
+                    .and_then(|a| Arc::try_unwrap(a).ok());
             }
         }
 
@@ -2307,6 +2380,13 @@ impl<T: WireTransport> Connection<T> {
         ctx_owned.params = params;
         ctx_owned.heap_files = Some(Arc::clone(&self.server.heap_files));
         ctx_owned.btree_indexes = Some(Arc::clone(&self.server.btree_indexes));
+        if let Some(mgr) = &self.server.branch_manager {
+            ctx_owned.branch_catalog =
+                Some(Arc::clone(mgr) as Arc<dyn zyron_common::BranchCatalog>);
+            if let Some(name) = &self.active_branch {
+                ctx_owned.active_branch_id = mgr.get_branch_by_name(name).ok().map(|e| e.id.0);
+            }
+        }
         let ctx = Arc::new(ctx_owned);
         drop(setup_span);
 
@@ -2666,8 +2746,11 @@ impl<T: WireTransport> Connection<T> {
                 }
             }
             zyron_parser::Statement::Checkpoint(_) => {
-                if let Some(ref wake) = self.server.checkpoint_wake {
-                    wake();
+                // CHECKPOINT forces a checkpoint and blocks until it completes
+                // (Postgres semantics). The trigger parks on a condvar, so run
+                // it on a blocking thread to avoid stalling the async runtime.
+                if let Some(wake) = self.server.checkpoint_wake.clone() {
+                    let _ = tokio::task::spawn_blocking(move || wake()).await;
                 }
                 Some(
                     self.feed(BackendMessage::CommandComplete {
@@ -2707,8 +2790,7 @@ impl<T: WireTransport> Connection<T> {
     /// instead of running concurrently
     async fn handle_vacuum(&mut self, table_name: Option<&str>) -> Result<(), ProtocolError> {
         use std::sync::atomic::Ordering;
-        use zyron_common::page::PAGE_SIZE;
-        use zyron_storage::{HeapFile, HeapFileConfig, HeapPage, MvccGc, TupleHeader};
+        use zyron_storage::{HeapFile, HeapFileConfig, HeapPage};
 
         // CAS-acquire the vacuum lock. If already held, emit a Notice and
         // complete with success tag, matching PostgreSQL's behaviour for
@@ -2770,6 +2852,14 @@ impl<T: WireTransport> Connection<T> {
         let mut _total_reclaimed = 0u64;
         let mut _total_pages = 0u64;
 
+        // Manual VACUUM uses the same reclamation logic as the background
+        // worker: a tuple is dead when its inserter aborted, or its deleter
+        // committed below the oldest active transaction and no retained version
+        // still sees it. This is commit-status aware (an aborted deleter leaves
+        // the row live, never reclaimed) and retention aware (time-travel
+        // history survives). Each reclaimed row's B+tree index entries are
+        // deleted so stale entries do not accumulate.
+        let status_map = self.server.txn_manager.status_map();
         for table in &target_tables {
             let heap_file = match HeapFile::new(
                 Arc::clone(&self.server.disk_manager),
@@ -2791,64 +2881,63 @@ impl<T: WireTransport> Connection<T> {
             let page_ids = scan_guard.page_ids().to_vec();
             drop(scan_guard);
 
+            let index_snap = self.server.catalog.index_snapshot(table.id);
+            let btree = &index_snap.btree;
+            let clean_indexes = !btree.is_empty();
+
+            // Per-table effective floor: keep versions still visible at a tagged
+            // version or within the table's time-travel window.
+            let now_us = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as u64)
+                .unwrap_or(0);
+            let retention_floor = zyron_executor::operator::modify::effective_retention_floor(
+                table.as_ref(),
+                status_map,
+                self.server.txn_manager.retention_clock(),
+                now_us,
+            );
+
+            let is_dead = |xmin: u32, x: u32| {
+                status_map.is_aborted(xmin as u64)
+                    || (x != 0
+                        && status_map.is_committed(x as u64)
+                        && (x as u64) < oldest_active
+                        && status_map.is_reclaimable_below(x as u64, retention_floor))
+            };
+            let is_aborted = |xid: u32| status_map.is_aborted(xid as u64);
+
             for page_id in &page_ids {
                 _total_pages += 1;
 
-                let page_data = match self.server.buffer_pool.fetch_page(*page_id) {
-                    Some(frame) => {
-                        let guard = frame.read_data();
-                        let data: [u8; PAGE_SIZE] = **guard;
-                        drop(guard);
-                        self.server.buffer_pool.unpin_page(*page_id, false);
-                        data
-                    }
-                    None => continue,
-                };
-
-                let header = HeapPage::heap_header_from_slice(&page_data);
-                if header.slot_count == 0 {
+                let Some(frame) = self.server.buffer_pool.fetch_page(*page_id) else {
                     continue;
-                }
-
-                let mut modified_page = page_data;
-                let mut reclaimed_on_page = 0u64;
-
-                for i in 0..header.slot_count {
-                    let slot_offset = HeapPage::DATA_START + (i as usize) * 4;
-                    let slot_len = u16::from_le_bytes([
-                        modified_page[slot_offset + 2],
-                        modified_page[slot_offset + 3],
-                    ]);
-                    if slot_len == 0 {
-                        continue;
+                };
+                let mut dead: Vec<(u16, Vec<u8>)> = Vec::new();
+                let (reclaimed_on_page, modified) = {
+                    let mut guard = frame.write_data();
+                    let data: &mut [u8] = &mut guard[..];
+                    if HeapPage::heap_header_from_slice(data).slot_count == 0 {
+                        (0u64, false)
+                    } else if clean_indexes {
+                        HeapPage::vacuum_in_slice_collect(data, &is_dead, &is_aborted, &mut dead)
+                    } else {
+                        HeapPage::vacuum_in_slice(data, &is_dead, &is_aborted)
                     }
+                };
+                self.server.buffer_pool.unpin_page(*page_id, modified);
 
-                    let tuple_offset = u16::from_le_bytes([
-                        modified_page[slot_offset],
-                        modified_page[slot_offset + 1],
-                    ]) as usize;
-
-                    if tuple_offset + TupleHeader::SIZE <= PAGE_SIZE {
-                        let xmax = u32::from_le_bytes([
-                            modified_page[tuple_offset + 8],
-                            modified_page[tuple_offset + 9],
-                            modified_page[tuple_offset + 10],
-                            modified_page[tuple_offset + 11],
-                        ]);
-
-                        if MvccGc::is_reclaimable(xmax, oldest_active) {
-                            modified_page[slot_offset + 2] = 0;
-                            modified_page[slot_offset + 3] = 0;
-                            reclaimed_on_page += 1;
-                        }
-                    }
+                if clean_indexes && !dead.is_empty() {
+                    zyron_executor::operator::modify::vacuum_index_cleanup(
+                        table.as_ref(),
+                        *page_id,
+                        &dead,
+                        btree,
+                        &self.server.btree_indexes,
+                    );
                 }
 
                 if reclaimed_on_page > 0 {
-                    if let Some(frame) = self.server.buffer_pool.fetch_page(*page_id) {
-                        frame.copy_from(&modified_page);
-                        self.server.buffer_pool.unpin_page(*page_id, true);
-                    }
                     _total_reclaimed += reclaimed_on_page;
                 }
             }
@@ -3667,6 +3756,14 @@ impl<T: WireTransport> Connection<T> {
         let mut current_schema = publication.schema_fingerprint;
         let pump_pub_id = publication.id;
 
+        // Per-publication outbound rate limit (00g). When max_rows_per_sec is
+        // set, a token bucket throttles rows pushed to this subscriber: tokens
+        // refill at the configured rate and the pump sleeps when a batch would
+        // exceed the available budget. Unset means unlimited.
+        let rate_limit = publication.max_rows_per_sec.filter(|&r| r > 0);
+        let mut rl_tokens: f64 = rate_limit.map(|r| r as f64).unwrap_or(0.0);
+        let mut rl_last_refill = Instant::now();
+
         // The pump loop returns a Result so write/read failures land in the
         // same cleanup arm as a graceful exit. Previously a stream write
         // error short-circuited via `?` before deregistering the context
@@ -3717,6 +3814,23 @@ impl<T: WireTransport> Connection<T> {
                         let encoded_len = encoded.len() as u64;
                         let row_count = batch.row_count as u64;
                         let end_lsn = batch.end_lsn;
+
+                        // Throttle to the publication's max_rows_per_sec, if set.
+                        if let Some(rate) = rate_limit {
+                            let rate_f = rate as f64;
+                            let elapsed = rl_last_refill.elapsed().as_secs_f64();
+                            rl_tokens = (rl_tokens + elapsed * rate_f).min(rate_f);
+                            rl_last_refill = Instant::now();
+                            let need = row_count as f64;
+                            if need > rl_tokens {
+                                let wait = (need - rl_tokens) / rate_f;
+                                tokio::time::sleep(Duration::from_secs_f64(wait)).await;
+                                rl_tokens = 0.0;
+                            } else {
+                                rl_tokens -= need;
+                            }
+                        }
+
                         self.stream
                             .write_all(&encoded)
                             .await
@@ -4296,15 +4410,13 @@ fn build_authenticator(
         }
         AuthMethod::ApiKey => Box::new(crate::auth::ApiKeyAuthenticator::new(Arc::clone(sm))),
         AuthMethod::Jwt => Box::new(crate::auth::JwtAuthenticator::new(Arc::clone(sm))),
-        AuthMethod::Certificate => {
-            warn!(
-                "Auth method {:?} not yet implemented, rejecting connection",
-                method
-            );
-            Box::new(crate::auth::CleartextAuthenticator::new(
-                std::collections::HashMap::new(),
-            ))
-        }
+        // Certificate (mTLS) auth is intercepted earlier in process_startup
+        // with an immediate FATAL, so this arm is not reached on the live path.
+        // It returns an authenticator with no valid passwords so any attempt
+        // that somehow reaches it still fails closed.
+        AuthMethod::Certificate => Box::new(crate::auth::CleartextAuthenticator::new(
+            std::collections::HashMap::new(),
+        )),
     }
 }
 

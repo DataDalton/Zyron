@@ -9,6 +9,7 @@ use crate::binder::BoundExpr;
 use crate::logical::LogicalPlan;
 use crate::optimizer::OptimizationRule;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 use zyron_catalog::{Catalog, ColumnId, TableId};
 
@@ -81,6 +82,9 @@ impl IndexAdvisor {
             LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
                 self.walk_and_record(left);
                 self.walk_and_record(right);
+            }
+            LogicalPlan::LateralJoin { left, .. } => {
+                self.walk_and_record(left);
             }
         }
     }
@@ -252,7 +256,7 @@ mod tests {
                 nullable: false,
                 ts_precision: None,
             }),
-            child: Box::new(scan),
+            child: Arc::new(scan),
         };
         advisor.walk_and_record(&filter);
 

@@ -32,6 +32,10 @@ pub struct Session {
     pub rate_limiters: std::sync::Arc<zyron_types::scheduling::RateLimiterRegistry>,
     /// Per-session quota registry.
     pub quotas: std::sync::Arc<zyron_types::scheduling::QuotaRegistry>,
+    /// Per-session sequence state backing currval and lastval. Shared into each
+    /// query's execution context so currval('s') returns the value the
+    /// session's last nextval('s') produced.
+    pub sequence_state: std::sync::Arc<zyron_executor::sequence::SessionSeqState>,
 }
 
 impl Session {
@@ -80,6 +84,7 @@ impl Session {
             ),
             rate_limiters: std::sync::Arc::new(zyron_types::scheduling::RateLimiterRegistry::new()),
             quotas: std::sync::Arc::new(zyron_types::scheduling::QuotaRegistry::new()),
+            sequence_state: std::sync::Arc::new(zyron_executor::sequence::SessionSeqState::new()),
         }
     }
 

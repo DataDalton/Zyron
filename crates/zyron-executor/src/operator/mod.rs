@@ -6,9 +6,11 @@
 
 pub mod aggregate;
 pub mod analytics_table_fn;
+pub mod branch_write;
 pub mod column_scan;
 pub mod distinct;
 pub mod filter;
+pub mod fk;
 pub mod fts_scan;
 pub mod gapfill;
 pub mod graph_scan;

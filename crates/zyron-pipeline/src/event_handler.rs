@@ -28,6 +28,28 @@ pub enum EventType {
 }
 
 impl EventType {
+    /// Parses an event type from its label (case-insensitive). An unrecognized
+    /// label becomes a Custom event so user-defined events are supported.
+    pub fn from_label(s: &str) -> EventType {
+        match s.to_ascii_lowercase().as_str() {
+            "tablecreated" | "table_created" => EventType::TableCreated,
+            "tabledropped" | "table_dropped" => EventType::TableDropped,
+            "indexcreated" | "index_created" => EventType::IndexCreated,
+            "indexdropped" | "index_dropped" => EventType::IndexDropped,
+            "schemachanged" | "schema_changed" => EventType::SchemaChanged,
+            "pipelinecompleted" | "pipeline_completed" => EventType::PipelineCompleted,
+            "pipelineslabreach" | "pipeline_sla_breach" => EventType::PipelineSlaBreach,
+            "qualitycheckfailed" | "quality_check_failed" => EventType::QualityCheckFailed,
+            "qualitydriftdetected" | "quality_drift_detected" => EventType::QualityDriftDetected,
+            "checkpointcompleted" | "checkpoint_completed" => EventType::CheckpointCompleted,
+            "erroroccurred" | "error_occurred" => EventType::ErrorOccurred,
+            "triggerrecursionlimithit" | "trigger_recursion_limit_hit" => {
+                EventType::TriggerRecursionLimitHit
+            }
+            _ => EventType::Custom(s.to_string()),
+        }
+    }
+
     /// Returns a static string label for display purposes.
     pub fn label(&self) -> &str {
         match self {

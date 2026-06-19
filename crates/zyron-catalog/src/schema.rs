@@ -196,6 +196,62 @@ pub enum ConstraintType {
     NotNull = 4,
 }
 
+/// Action taken when a row fails a data-quality expectation predicate.
+/// Fail aborts the statement. Warn keeps the row and counts the violation.
+/// Drop discards the violating row from the insert. Quarantine moves the
+/// violating row into the table's companion quarantine table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum ExpectationAction {
+    Fail = 0,
+    Warn = 1,
+    Drop = 2,
+    Quarantine = 3,
+}
+
+impl ExpectationAction {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => ExpectationAction::Warn,
+            2 => ExpectationAction::Drop,
+            3 => ExpectationAction::Quarantine,
+            _ => ExpectationAction::Fail,
+        }
+    }
+}
+
+/// Referential action applied on ON DELETE / ON UPDATE for a foreign key.
+/// NoAction and Restrict both reject the parent change when child rows
+/// reference the key. Cascade propagates the delete or key update to children.
+/// SetNull and SetDefault rewrite the child's FK columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum ReferentialAction {
+    NoAction = 0,
+    Restrict = 1,
+    Cascade = 2,
+    SetNull = 3,
+    SetDefault = 4,
+}
+
+impl ReferentialAction {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => ReferentialAction::Restrict,
+            2 => ReferentialAction::Cascade,
+            3 => ReferentialAction::SetNull,
+            4 => ReferentialAction::SetDefault,
+            _ => ReferentialAction::NoAction,
+        }
+    }
+}
+
+impl Default for ReferentialAction {
+    fn default() -> Self {
+        ReferentialAction::NoAction
+    }
+}
+
 /// Catalog entry for a table constraint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConstraintEntry {
@@ -205,6 +261,12 @@ pub struct ConstraintEntry {
     pub ref_table_id: Option<TableId>,
     pub ref_columns: Vec<ColumnId>,
     pub check_expr: Option<String>,
+    /// Foreign-key ON DELETE action. NoAction for non-FK constraints.
+    #[serde(default)]
+    pub on_delete: ReferentialAction,
+    /// Foreign-key ON UPDATE action. NoAction for non-FK constraints.
+    #[serde(default)]
+    pub on_update: ReferentialAction,
 }
 
 impl ConstraintEntry {
@@ -228,6 +290,8 @@ impl ConstraintEntry {
             write_u16(&mut buf, col.0);
         }
         write_option_string(&mut buf, &self.check_expr);
+        write_u8(&mut buf, self.on_delete as u8);
+        write_u8(&mut buf, self.on_update as u8);
         buf
     }
 
@@ -252,6 +316,8 @@ impl ConstraintEntry {
             ref_columns.push(ColumnId(read_u16(data, offset)?));
         }
         let check_expr = read_option_string(data, offset)?;
+        let on_delete = ReferentialAction::from_u8(read_u8(data, offset)?);
+        let on_update = ReferentialAction::from_u8(read_u8(data, offset)?);
         Ok(Self {
             name,
             constraint_type,
@@ -259,6 +325,56 @@ impl ConstraintEntry {
             ref_table_id,
             ref_columns,
             check_expr,
+            on_delete,
+            on_update,
+        })
+    }
+}
+
+/// Catalog entry for a data-quality expectation attached to a table. The
+/// predicate is stored as SQL text and re-parsed and bound at plan time, the
+/// same way a CHECK constraint expression is. `quarantine_table_id` is set
+/// only for Quarantine expectations and points at the companion table that
+/// receives violating rows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpectationEntry {
+    pub name: String,
+    pub predicate_sql: String,
+    pub on_violation: ExpectationAction,
+    pub quarantine_table_id: Option<u32>,
+}
+
+impl ExpectationEntry {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(64);
+        write_string(&mut buf, &self.name);
+        write_string(&mut buf, &self.predicate_sql);
+        write_u8(&mut buf, self.on_violation as u8);
+        match self.quarantine_table_id {
+            None => write_u8(&mut buf, 0),
+            Some(id) => {
+                write_u8(&mut buf, 1);
+                write_u32(&mut buf, id);
+            }
+        }
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8], offset: &mut usize) -> Result<Self> {
+        let name = read_string(data, offset)?;
+        let predicate_sql = read_string(data, offset)?;
+        let on_violation = ExpectationAction::from_u8(read_u8(data, offset)?);
+        let has_q = read_u8(data, offset)?;
+        let quarantine_table_id = if has_q != 0 {
+            Some(read_u32(data, offset)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            name,
+            predicate_sql,
+            on_violation,
+            quarantine_table_id,
         })
     }
 }
@@ -297,6 +413,24 @@ pub struct TableEntry {
     /// thread folds rows into .zyr segments.
     #[serde(default)]
     pub columnar: ColumnarRegistry,
+    /// Epoch seconds when this table was soft-dropped into the recycle bin.
+    /// None for a live table. Set when DROP TABLE runs against a table whose
+    /// lifecycle.recycle_window_seconds > 0. Cleared by UNDROP TABLE. The
+    /// reaper physically finalizes the drop after the window elapses.
+    #[serde(default)]
+    pub dropped_at: Option<u64>,
+    /// Data-quality expectations attached via ALTER TABLE ADD EXPECTATION
+    /// (tail-appended). Empty for tables with no expectations.
+    #[serde(default)]
+    pub expectations: Vec<ExpectationEntry>,
+    /// Time-travel history retention window in seconds (tail-appended). 0 means
+    /// the default: old MVCC versions are reclaimed as soon as no live snapshot
+    /// needs them. u64::MAX means unlimited (history kept forever). Any other
+    /// value keeps versions whose delete committed within that many seconds of
+    /// now. Set via WITH (time_travel_retention = '...'). CREATE VERSION tags
+    /// pin history regardless of this window.
+    #[serde(default)]
+    pub time_travel_retention_secs: u64,
 }
 
 /// Per-table data lifecycle configuration. All fields default to off so a
@@ -510,6 +644,26 @@ impl TableEntry {
         // Columnar registry (tail-appended)
         self.columnar.write_into(&mut buf);
 
+        // Recycle-bin drop marker (tail-appended)
+        match self.dropped_at {
+            Some(ts) => {
+                buf.push(1);
+                write_u64(&mut buf, ts);
+            }
+            None => buf.push(0),
+        }
+
+        // Data-quality expectations (tail-appended)
+        write_u16(&mut buf, self.expectations.len() as u16);
+        for exp in &self.expectations {
+            let exp_bytes = exp.to_bytes();
+            write_u32(&mut buf, exp_bytes.len() as u32);
+            buf.extend_from_slice(&exp_bytes);
+        }
+
+        // Time-travel retention window in seconds (tail-appended)
+        write_u64(&mut buf, self.time_travel_retention_secs);
+
         buf
     }
 
@@ -590,6 +744,41 @@ impl TableEntry {
         // Columnar registry (tail-appended, defaults when absent).
         let columnar = ColumnarRegistry::read_from(data, &mut off)?;
 
+        // Recycle-bin drop marker (tail-appended, None when absent).
+        let dropped_at = if off < data.len() {
+            let flag = data[off];
+            off += 1;
+            if flag != 0 {
+                Some(read_u64(data, &mut off)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Data-quality expectations (tail-appended, empty when absent).
+        let expectations = if off < data.len() {
+            let exp_count = read_u16(data, &mut off)? as usize;
+            let mut exps = Vec::with_capacity(exp_count);
+            for _ in 0..exp_count {
+                let exp_len = read_u32(data, &mut off)? as usize;
+                let mut exp_off = off;
+                exps.push(ExpectationEntry::from_bytes(data, &mut exp_off)?);
+                off += exp_len;
+            }
+            exps
+        } else {
+            Vec::new()
+        };
+
+        // Time-travel retention window in seconds (tail-appended, 0 when absent).
+        let time_travel_retention_secs = if off + 8 <= data.len() {
+            read_u64(data, &mut off)?
+        } else {
+            0
+        };
+
         Ok(Self {
             id,
             schema_id,
@@ -607,6 +796,9 @@ impl TableEntry {
             cdf_retention_days,
             lifecycle,
             columnar,
+            dropped_at,
+            expectations,
+            time_travel_retention_secs,
         })
     }
 }
@@ -726,6 +918,731 @@ impl IndexEntry {
             index_file_id,
             index_type,
             parameters,
+        })
+    }
+}
+
+/// Catalog entry for a sequence. Holds the immutable definition plus
+/// `reserved`, the highest value durably allocated. The live SequenceManager
+/// hands out values from memory up to `reserved` and bumps `reserved` by
+/// `cache` (persisting this entry) when the in-memory block is exhausted, so a
+/// crash skips at most `cache` values rather than reusing any.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SequenceEntry {
+    pub id: u32,
+    pub schema_id: SchemaId,
+    pub name: String,
+    pub increment: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub start: i64,
+    pub cache: i64,
+    pub cycle: bool,
+    /// Highest value durably reserved. `start - increment` when no value has
+    /// been handed out yet, so the first nextval returns `start`.
+    pub reserved: i64,
+}
+
+impl SequenceEntry {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(80);
+        write_u32(&mut buf, self.id);
+        write_u32(&mut buf, self.schema_id.0);
+        write_string(&mut buf, &self.name);
+        write_u64(&mut buf, self.increment as u64);
+        write_u64(&mut buf, self.min_value as u64);
+        write_u64(&mut buf, self.max_value as u64);
+        write_u64(&mut buf, self.start as u64);
+        write_u64(&mut buf, self.cache as u64);
+        write_bool(&mut buf, self.cycle);
+        write_u64(&mut buf, self.reserved as u64);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut off = 0;
+        let id = read_u32(data, &mut off)?;
+        let schema_id = SchemaId(read_u32(data, &mut off)?);
+        let name = read_string(data, &mut off)?;
+        let increment = read_u64(data, &mut off)? as i64;
+        let min_value = read_u64(data, &mut off)? as i64;
+        let max_value = read_u64(data, &mut off)? as i64;
+        let start = read_u64(data, &mut off)? as i64;
+        let cache = read_u64(data, &mut off)? as i64;
+        let cycle = read_bool(data, &mut off)?;
+        let reserved = read_u64(data, &mut off)? as i64;
+        Ok(Self {
+            id,
+            schema_id,
+            name,
+            increment,
+            min_value,
+            max_value,
+            start,
+            cache,
+            cycle,
+            reserved,
+        })
+    }
+}
+
+/// Catalog entry for a view. Stores the full CREATE VIEW statement text so the
+/// binder re-parses and expands the view's query in place of a table scan when
+/// a query references the view. `column_aliases` renames the query's output
+/// columns when the view was defined with an explicit column list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewEntry {
+    pub id: u32,
+    pub schema_id: SchemaId,
+    pub name: String,
+    pub definition_sql: String,
+    pub column_aliases: Vec<String>,
+}
+
+impl ViewEntry {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(64 + self.definition_sql.len());
+        write_u32(&mut buf, self.id);
+        write_u32(&mut buf, self.schema_id.0);
+        write_string(&mut buf, &self.name);
+        write_string(&mut buf, &self.definition_sql);
+        write_u32(&mut buf, self.column_aliases.len() as u32);
+        for alias in &self.column_aliases {
+            write_string(&mut buf, alias);
+        }
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut off = 0;
+        let id = read_u32(data, &mut off)?;
+        let schema_id = SchemaId(read_u32(data, &mut off)?);
+        let name = read_string(data, &mut off)?;
+        let definition_sql = read_string(data, &mut off)?;
+        let alias_count = read_u32(data, &mut off)? as usize;
+        let mut column_aliases = Vec::with_capacity(alias_count);
+        for _ in 0..alias_count {
+            column_aliases.push(read_string(data, &mut off)?);
+        }
+        Ok(Self {
+            id,
+            schema_id,
+            name,
+            definition_sql,
+            column_aliases,
+        })
+    }
+}
+
+/// Catalog entry for a materialized view. The query result is stored in a
+/// backing table (`backing_table_id`); a SELECT against the view reads that
+/// table directly. `definition_sql` is the full CREATE MATERIALIZED VIEW text,
+/// re-parsed and re-executed on REFRESH to repopulate the backing table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaterializedViewEntry {
+    pub id: u32,
+    pub schema_id: SchemaId,
+    pub name: String,
+    pub definition_sql: String,
+    pub backing_table_id: u32,
+}
+
+impl MaterializedViewEntry {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(48 + self.definition_sql.len());
+        write_u32(&mut buf, self.id);
+        write_u32(&mut buf, self.schema_id.0);
+        write_string(&mut buf, &self.name);
+        write_string(&mut buf, &self.definition_sql);
+        write_u32(&mut buf, self.backing_table_id);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut off = 0;
+        let id = read_u32(data, &mut off)?;
+        let schema_id = SchemaId(read_u32(data, &mut off)?);
+        let name = read_string(data, &mut off)?;
+        let definition_sql = read_string(data, &mut off)?;
+        let backing_table_id = read_u32(data, &mut off)?;
+        Ok(Self {
+            id,
+            schema_id,
+            name,
+            definition_sql,
+            backing_table_id,
+        })
+    }
+}
+
+/// Catalog entry for a SQL scalar user-defined function. The binder expands a
+/// call by parsing `body_sql` and substituting the parameter references with
+/// the call's argument expressions. `param_types` distinguishes overloads of
+/// the same name (resolved by argument count plus types).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionEntry {
+    pub id: u32,
+    pub schema_id: SchemaId,
+    pub name: String,
+    pub param_names: Vec<String>,
+    pub param_types: Vec<TypeId>,
+    pub return_type: TypeId,
+    pub body_sql: String,
+}
+
+impl FunctionEntry {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(48 + self.body_sql.len());
+        write_u32(&mut buf, self.id);
+        write_u32(&mut buf, self.schema_id.0);
+        write_string(&mut buf, &self.name);
+        write_u32(&mut buf, self.param_names.len() as u32);
+        for n in &self.param_names {
+            write_string(&mut buf, n);
+        }
+        write_u32(&mut buf, self.param_types.len() as u32);
+        for t in &self.param_types {
+            write_u8(&mut buf, *t as u8);
+        }
+        write_u8(&mut buf, self.return_type as u8);
+        write_string(&mut buf, &self.body_sql);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut off = 0;
+        let id = read_u32(data, &mut off)?;
+        let schema_id = SchemaId(read_u32(data, &mut off)?);
+        let name = read_string(data, &mut off)?;
+        let pn_count = read_u32(data, &mut off)? as usize;
+        let mut param_names = Vec::with_capacity(pn_count);
+        for _ in 0..pn_count {
+            param_names.push(read_string(data, &mut off)?);
+        }
+        let pt_count = read_u32(data, &mut off)? as usize;
+        let mut param_types = Vec::with_capacity(pt_count);
+        for _ in 0..pt_count {
+            param_types.push(type_id_from_u8(read_u8(data, &mut off)?)?);
+        }
+        let return_type = type_id_from_u8(read_u8(data, &mut off)?)?;
+        let body_sql = read_string(data, &mut off)?;
+        Ok(Self {
+            id,
+            schema_id,
+            name,
+            param_names,
+            param_types,
+            return_type,
+            body_sql,
+        })
+    }
+}
+
+/// Catalog entry for a SQL user-defined aggregate. The state-transition
+/// function (`sfunc_name`) and optional final function (`finalfunc_name`) are
+/// SQL scalar functions: sfunc takes (state, input) and returns the next
+/// state, finalfunc takes (state) and returns the aggregate result. The binder
+/// resolves and inlines both at plan time. `input_types` distinguishes
+/// overloads of the same name (resolved by argument count plus types).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AggregateEntry {
+    pub id: u32,
+    pub schema_id: SchemaId,
+    pub name: String,
+    pub input_types: Vec<TypeId>,
+    pub state_type: TypeId,
+    pub return_type: TypeId,
+    pub sfunc_name: String,
+    pub finalfunc_name: Option<String>,
+    pub combinefunc_name: Option<String>,
+    pub initcond: Option<String>,
+}
+
+impl AggregateEntry {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(64);
+        write_u32(&mut buf, self.id);
+        write_u32(&mut buf, self.schema_id.0);
+        write_string(&mut buf, &self.name);
+        write_u32(&mut buf, self.input_types.len() as u32);
+        for t in &self.input_types {
+            write_u8(&mut buf, *t as u8);
+        }
+        write_u8(&mut buf, self.state_type as u8);
+        write_u8(&mut buf, self.return_type as u8);
+        write_string(&mut buf, &self.sfunc_name);
+        write_option_string(&mut buf, &self.finalfunc_name);
+        write_option_string(&mut buf, &self.combinefunc_name);
+        write_option_string(&mut buf, &self.initcond);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut off = 0;
+        let id = read_u32(data, &mut off)?;
+        let schema_id = SchemaId(read_u32(data, &mut off)?);
+        let name = read_string(data, &mut off)?;
+        let it_count = read_u32(data, &mut off)? as usize;
+        let mut input_types = Vec::with_capacity(it_count);
+        for _ in 0..it_count {
+            input_types.push(type_id_from_u8(read_u8(data, &mut off)?)?);
+        }
+        let state_type = type_id_from_u8(read_u8(data, &mut off)?)?;
+        let return_type = type_id_from_u8(read_u8(data, &mut off)?)?;
+        let sfunc_name = read_string(data, &mut off)?;
+        let finalfunc_name = read_option_string(data, &mut off)?;
+        let combinefunc_name = read_option_string(data, &mut off)?;
+        let initcond = read_option_string(data, &mut off)?;
+        Ok(Self {
+            id,
+            schema_id,
+            name,
+            input_types,
+            state_type,
+            return_type,
+            sfunc_name,
+            finalfunc_name,
+            combinefunc_name,
+            initcond,
+        })
+    }
+}
+
+/// Catalog entry for a SQL stored procedure. The body is one or more SQL
+/// statements that reference the procedure's parameters positionally as $1,
+/// $2, ... CALL evaluates its arguments, binds them as those parameters, and
+/// runs the body statements in one transaction. `param_types` distinguishes
+/// procedures of the same name by argument count plus types.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcedureEntry {
+    pub id: u32,
+    pub schema_id: SchemaId,
+    pub name: String,
+    pub param_names: Vec<String>,
+    pub param_types: Vec<TypeId>,
+    pub body_sql: String,
+}
+
+impl ProcedureEntry {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(48 + self.body_sql.len());
+        write_u32(&mut buf, self.id);
+        write_u32(&mut buf, self.schema_id.0);
+        write_string(&mut buf, &self.name);
+        write_u32(&mut buf, self.param_names.len() as u32);
+        for n in &self.param_names {
+            write_string(&mut buf, n);
+        }
+        write_u32(&mut buf, self.param_types.len() as u32);
+        for t in &self.param_types {
+            write_u8(&mut buf, *t as u8);
+        }
+        write_string(&mut buf, &self.body_sql);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut off = 0;
+        let id = read_u32(data, &mut off)?;
+        let schema_id = SchemaId(read_u32(data, &mut off)?);
+        let name = read_string(data, &mut off)?;
+        let pn_count = read_u32(data, &mut off)? as usize;
+        let mut param_names = Vec::with_capacity(pn_count);
+        for _ in 0..pn_count {
+            param_names.push(read_string(data, &mut off)?);
+        }
+        let pt_count = read_u32(data, &mut off)? as usize;
+        let mut param_types = Vec::with_capacity(pt_count);
+        for _ in 0..pt_count {
+            param_types.push(type_id_from_u8(read_u8(data, &mut off)?)?);
+        }
+        let body_sql = read_string(data, &mut off)?;
+        Ok(Self {
+            id,
+            schema_id,
+            name,
+            param_names,
+            param_types,
+            body_sql,
+        })
+    }
+}
+
+/// Catalog entry for a scheduled task. The body is a single SQL statement run
+/// on the schedule by a background worker. Exactly one of `cron_expr` (a 5-field
+/// cron expression) or `interval_secs` (a fixed period) is set. `last_run` and
+/// `next_run` are epoch microseconds; `next_run` drives when the worker fires.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleEntry {
+    pub id: u32,
+    pub schema_id: SchemaId,
+    pub name: String,
+    pub cron_expr: Option<String>,
+    pub interval_secs: Option<u64>,
+    pub body_sql: String,
+    pub paused: bool,
+    pub last_run: Option<i64>,
+    pub next_run: Option<i64>,
+}
+
+impl ScheduleEntry {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(64 + self.body_sql.len());
+        write_u32(&mut buf, self.id);
+        write_u32(&mut buf, self.schema_id.0);
+        write_string(&mut buf, &self.name);
+        write_option_string(&mut buf, &self.cron_expr);
+        match self.interval_secs {
+            Some(v) => {
+                write_u8(&mut buf, 1);
+                write_u64(&mut buf, v);
+            }
+            None => write_u8(&mut buf, 0),
+        }
+        write_string(&mut buf, &self.body_sql);
+        write_bool(&mut buf, self.paused);
+        match self.last_run {
+            Some(v) => {
+                write_u8(&mut buf, 1);
+                write_u64(&mut buf, v as u64);
+            }
+            None => write_u8(&mut buf, 0),
+        }
+        match self.next_run {
+            Some(v) => {
+                write_u8(&mut buf, 1);
+                write_u64(&mut buf, v as u64);
+            }
+            None => write_u8(&mut buf, 0),
+        }
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut off = 0;
+        let id = read_u32(data, &mut off)?;
+        let schema_id = SchemaId(read_u32(data, &mut off)?);
+        let name = read_string(data, &mut off)?;
+        let cron_expr = read_option_string(data, &mut off)?;
+        let interval_secs = if read_u8(data, &mut off)? != 0 {
+            Some(read_u64(data, &mut off)?)
+        } else {
+            None
+        };
+        let body_sql = read_string(data, &mut off)?;
+        let paused = read_bool(data, &mut off)?;
+        let last_run = if read_u8(data, &mut off)? != 0 {
+            Some(read_u64(data, &mut off)? as i64)
+        } else {
+            None
+        };
+        let next_run = if read_u8(data, &mut off)? != 0 {
+            Some(read_u64(data, &mut off)? as i64)
+        } else {
+            None
+        };
+        Ok(Self {
+            id,
+            schema_id,
+            name,
+            cron_expr,
+            interval_secs,
+            body_sql,
+            paused,
+            last_run,
+            next_run,
+        })
+    }
+}
+
+/// Catalog entry for a declarative data pipeline. `definition_sql` holds the
+/// full CREATE PIPELINE statement text and is re-parsed on RUN and on recovery
+/// to recover the stage transforms and expectations (the AST is not serialized
+/// field by field, matching the materialized-view definition model). The run
+/// state fields (`last_run`, `last_success`, `rows_processed`, `status_code`,
+/// `status_msg`) are re-logged after each RUN so a restart recovers the latest
+/// outcome. `status_code`: 0 Idle, 1 Running, 2 Completed, 3 Failed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineEntry {
+    pub id: u32,
+    pub schema_id: SchemaId,
+    pub name: String,
+    pub definition_sql: String,
+    pub enabled: bool,
+    pub created_at: i64,
+    pub last_run: Option<i64>,
+    pub last_success: Option<i64>,
+    pub rows_processed: u64,
+    pub status_code: u8,
+    pub status_msg: Option<String>,
+}
+
+impl PipelineEntry {
+    pub const STATUS_IDLE: u8 = 0;
+    pub const STATUS_RUNNING: u8 = 1;
+    pub const STATUS_COMPLETED: u8 = 2;
+    pub const STATUS_FAILED: u8 = 3;
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(64 + self.definition_sql.len());
+        write_u32(&mut buf, self.id);
+        write_u32(&mut buf, self.schema_id.0);
+        write_string(&mut buf, &self.name);
+        write_string(&mut buf, &self.definition_sql);
+        write_bool(&mut buf, self.enabled);
+        write_u64(&mut buf, self.created_at as u64);
+        match self.last_run {
+            Some(v) => {
+                write_u8(&mut buf, 1);
+                write_u64(&mut buf, v as u64);
+            }
+            None => write_u8(&mut buf, 0),
+        }
+        match self.last_success {
+            Some(v) => {
+                write_u8(&mut buf, 1);
+                write_u64(&mut buf, v as u64);
+            }
+            None => write_u8(&mut buf, 0),
+        }
+        write_u64(&mut buf, self.rows_processed);
+        write_u8(&mut buf, self.status_code);
+        write_option_string(&mut buf, &self.status_msg);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut off = 0;
+        let id = read_u32(data, &mut off)?;
+        let schema_id = SchemaId(read_u32(data, &mut off)?);
+        let name = read_string(data, &mut off)?;
+        let definition_sql = read_string(data, &mut off)?;
+        let enabled = read_bool(data, &mut off)?;
+        let created_at = read_u64(data, &mut off)? as i64;
+        let last_run = if read_u8(data, &mut off)? != 0 {
+            Some(read_u64(data, &mut off)? as i64)
+        } else {
+            None
+        };
+        let last_success = if read_u8(data, &mut off)? != 0 {
+            Some(read_u64(data, &mut off)? as i64)
+        } else {
+            None
+        };
+        let rows_processed = read_u64(data, &mut off)?;
+        let status_code = read_u8(data, &mut off)?;
+        let status_msg = read_option_string(data, &mut off)?;
+        Ok(Self {
+            id,
+            schema_id,
+            name,
+            definition_sql,
+            enabled,
+            created_at,
+            last_run,
+            last_success,
+            rows_processed,
+            status_code,
+            status_msg,
+        })
+    }
+}
+
+/// Catalog entry for a database event handler. When a matching event fires
+/// (e.g. TableCreated), the event dispatcher runs `execute_function` (a stored
+/// procedure) with the event payload as a JSON parameter. `condition_sql`, when
+/// present, is a constant boolean predicate gating the firing. `event_type` is
+/// the EventType label.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventHandlerEntry {
+    pub id: u32,
+    pub schema_id: SchemaId,
+    pub name: String,
+    pub event_type: String,
+    pub condition_sql: Option<String>,
+    pub execute_function: String,
+    pub enabled: bool,
+}
+
+impl EventHandlerEntry {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(48 + self.name.len() + self.execute_function.len());
+        write_u32(&mut buf, self.id);
+        write_u32(&mut buf, self.schema_id.0);
+        write_string(&mut buf, &self.name);
+        write_string(&mut buf, &self.event_type);
+        write_option_string(&mut buf, &self.condition_sql);
+        write_string(&mut buf, &self.execute_function);
+        write_bool(&mut buf, self.enabled);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut off = 0;
+        let id = read_u32(data, &mut off)?;
+        let schema_id = SchemaId(read_u32(data, &mut off)?);
+        let name = read_string(data, &mut off)?;
+        let event_type = read_string(data, &mut off)?;
+        let condition_sql = read_option_string(data, &mut off)?;
+        let execute_function = read_string(data, &mut off)?;
+        let enabled = read_bool(data, &mut off)?;
+        Ok(Self {
+            id,
+            schema_id,
+            name,
+            event_type,
+            condition_sql,
+            execute_function,
+            enabled,
+        })
+    }
+}
+
+/// Catalog entry for a named version tag: an immutable label pointing at a
+/// specific version of a table's data, created by CREATE VERSION. Time-travel
+/// queries resolve `VERSION AS OF '<name>'` to `version_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionTagEntry {
+    pub id: u32,
+    pub schema_id: SchemaId,
+    pub name: String,
+    pub table_id: u32,
+    pub version_id: u64,
+}
+
+impl VersionTagEntry {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32 + self.name.len());
+        write_u32(&mut buf, self.id);
+        write_u32(&mut buf, self.schema_id.0);
+        write_string(&mut buf, &self.name);
+        write_u32(&mut buf, self.table_id);
+        write_u64(&mut buf, self.version_id);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut off = 0;
+        let id = read_u32(data, &mut off)?;
+        let schema_id = SchemaId(read_u32(data, &mut off)?);
+        let name = read_string(data, &mut off)?;
+        let table_id = read_u32(data, &mut off)?;
+        let version_id = read_u64(data, &mut off)?;
+        Ok(Self {
+            id,
+            schema_id,
+            name,
+            table_id,
+            version_id,
+        })
+    }
+}
+
+/// Catalog entry for a row- or statement-level trigger. On a matching DML
+/// event the executor fires `execute_function` (a stored procedure) with the
+/// affected row's columns bound as positional parameters ($1..$N). `events` is
+/// a bitmask (Insert=1, Update=2, Delete=4); `timing` is 0=Before, 1=After;
+/// `for_each` is 0=Row, 1=Statement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriggerEntry {
+    pub id: u32,
+    pub schema_id: SchemaId,
+    pub table_id: u32,
+    pub name: String,
+    pub timing: u8,
+    pub events: u8,
+    pub for_each: u8,
+    pub execute_function: String,
+    pub enabled: bool,
+}
+
+impl TriggerEntry {
+    pub const EVENT_INSERT: u8 = 1;
+    pub const EVENT_UPDATE: u8 = 2;
+    pub const EVENT_DELETE: u8 = 4;
+    pub const TIMING_BEFORE: u8 = 0;
+    pub const TIMING_AFTER: u8 = 1;
+    pub const FOR_EACH_ROW: u8 = 0;
+    pub const FOR_EACH_STATEMENT: u8 = 1;
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(48);
+        write_u32(&mut buf, self.id);
+        write_u32(&mut buf, self.schema_id.0);
+        write_u32(&mut buf, self.table_id);
+        write_string(&mut buf, &self.name);
+        write_u8(&mut buf, self.timing);
+        write_u8(&mut buf, self.events);
+        write_u8(&mut buf, self.for_each);
+        write_string(&mut buf, &self.execute_function);
+        write_bool(&mut buf, self.enabled);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut off = 0;
+        let id = read_u32(data, &mut off)?;
+        let schema_id = SchemaId(read_u32(data, &mut off)?);
+        let table_id = read_u32(data, &mut off)?;
+        let name = read_string(data, &mut off)?;
+        let timing = read_u8(data, &mut off)?;
+        let events = read_u8(data, &mut off)?;
+        let for_each = read_u8(data, &mut off)?;
+        let execute_function = read_string(data, &mut off)?;
+        let enabled = read_bool(data, &mut off)?;
+        Ok(Self {
+            id,
+            schema_id,
+            table_id,
+            name,
+            timing,
+            events,
+            for_each,
+            execute_function,
+            enabled,
+        })
+    }
+}
+
+/// Catalog entry for an object comment (COMMENT ON ...). Identified by the
+/// object kind, object name, and an optional column name (empty when the
+/// comment targets the object itself rather than a column). Introspection
+/// tooling reads these to describe schema objects.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommentEntry {
+    pub id: u32,
+    /// Object kind discriminant (table, column, index, schema, sequence, view).
+    pub object_type: u8,
+    pub object_name: String,
+    /// Column name when the comment targets a column, empty otherwise.
+    pub column_name: String,
+    pub comment: String,
+}
+
+impl CommentEntry {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32 + self.comment.len());
+        write_u32(&mut buf, self.id);
+        write_u8(&mut buf, self.object_type);
+        write_string(&mut buf, &self.object_name);
+        write_string(&mut buf, &self.column_name);
+        write_string(&mut buf, &self.comment);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut off = 0;
+        let id = read_u32(data, &mut off)?;
+        let object_type = read_u8(data, &mut off)?;
+        let object_name = read_string(data, &mut off)?;
+        let column_name = read_string(data, &mut off)?;
+        let comment = read_string(data, &mut off)?;
+        Ok(Self {
+            id,
+            object_type,
+            object_name,
+            column_name,
+            comment,
         })
     }
 }
@@ -1757,6 +2674,7 @@ pub enum EndpointOutputFormat {
     Csv = 2,
     Parquet = 3,
     ArrowIpc = 4,
+    Protobuf = 5,
 }
 
 impl EndpointOutputFormat {
@@ -1767,6 +2685,7 @@ impl EndpointOutputFormat {
             2 => Ok(EndpointOutputFormat::Csv),
             3 => Ok(EndpointOutputFormat::Parquet),
             4 => Ok(EndpointOutputFormat::ArrowIpc),
+            5 => Ok(EndpointOutputFormat::Protobuf),
             _ => Err(zyron_common::ZyronError::CatalogCorrupted(format!(
                 "unknown EndpointOutputFormat value: {v}"
             ))),
@@ -2490,6 +3409,8 @@ mod tests {
                 ref_table_id: None,
                 ref_columns: vec![],
                 check_expr: None,
+                on_delete: ReferentialAction::NoAction,
+                on_update: ReferentialAction::NoAction,
             }],
             created_at: 1700000000,
             versioning_enabled: false,
@@ -2500,6 +3421,9 @@ mod tests {
             cdf_retention_days: 0,
             lifecycle: Default::default(),
             columnar: Default::default(),
+            dropped_at: None,
+            expectations: Vec::new(),
+            time_travel_retention_secs: 0,
         };
         let bytes = entry.to_bytes();
         let decoded = TableEntry::from_bytes(&bytes).unwrap();
@@ -2525,6 +3449,8 @@ mod tests {
             ref_table_id: Some(TableId(100)),
             ref_columns: vec![ColumnId(0)],
             check_expr: None,
+            on_delete: ReferentialAction::Cascade,
+            on_update: ReferentialAction::Restrict,
         };
         let bytes = entry.to_bytes();
         let mut off = 0;
@@ -2532,6 +3458,8 @@ mod tests {
         assert_eq!(decoded.constraint_type, ConstraintType::ForeignKey);
         assert_eq!(decoded.ref_table_id, Some(TableId(100)));
         assert_eq!(decoded.ref_columns.len(), 1);
+        assert_eq!(decoded.on_delete, ReferentialAction::Cascade);
+        assert_eq!(decoded.on_update, ReferentialAction::Restrict);
     }
 
     #[test]
@@ -2647,6 +3575,9 @@ mod tests {
             cdf_retention_days: 0,
             lifecycle: Default::default(),
             columnar: Default::default(),
+            dropped_at: None,
+            expectations: Vec::new(),
+            time_travel_retention_secs: 0,
         };
         let bytes = entry.to_bytes();
         let decoded = TableEntry::from_bytes(&bytes).unwrap();

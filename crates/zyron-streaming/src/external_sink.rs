@@ -157,6 +157,7 @@ fn extension_for(kind: FormatKind) -> &'static str {
         FormatKind::Parquet => "parquet",
         FormatKind::ArrowIpc => "arrow",
         FormatKind::Avro => "avro",
+        FormatKind::Protobuf => "pb",
     }
 }
 

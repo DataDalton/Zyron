@@ -25,6 +25,6 @@ pub use interval::{
     parse_timestamp_micros, ymd_from_days,
 };
 pub use obs_metrics::{LabeledMetrics, TlsDirection};
-pub use page::{PAGE_SIZE, PageHeader, PageId};
+pub use page::{BranchCatalog, BranchFiles, PAGE_SIZE, PageHeader, PageId};
 pub use prng::{ReservoirL, Xoshiro256pp, splitMix64};
 pub use types::TypeId;

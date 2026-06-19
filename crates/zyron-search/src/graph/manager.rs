@@ -104,6 +104,34 @@ impl GraphManager {
         self.csr_cache.invalidate(schema_name);
     }
 
+    /// Invalidates the cached CSR of every schema backed by `table_id` (as a
+    /// node or edge table). DML operators call this after mutating a table so a
+    /// later graph algorithm rebuilds the CSR from current data. Returns without
+    /// scanning when no graph schemas are registered (the common case).
+    pub fn invalidate_for_table(&self, table_id: u32) {
+        if self.schemas.is_empty() {
+            return;
+        }
+        let mut affected: Vec<String> = Vec::new();
+        self.schemas.iter_sync(|name, schema| {
+            let backs = schema
+                .node_labels
+                .iter()
+                .any(|n| n.node_table_id == table_id)
+                || schema
+                    .edge_labels
+                    .iter()
+                    .any(|e| e.edge_table_id == table_id);
+            if backs {
+                affected.push(name.clone());
+            }
+            true
+        });
+        for name in affected {
+            self.csr_cache.invalidate(&name);
+        }
+    }
+
     /// Populates the in-memory registry from a list of serialized schemas.
     pub fn load_schemas(&self, schemas: Vec<GraphSchema>) -> Result<()> {
         for schema in schemas {
@@ -266,6 +294,34 @@ mod tests {
 
         mgr.invalidate_csr("graph1");
         assert!(mgr.get_cached_csr("graph1").is_none());
+    }
+
+    #[test]
+    fn test_invalidate_for_table_targets_backing_tables() {
+        let mgr = GraphManager::new();
+        let mut schema = GraphSchema::new("social".to_string(), 1);
+        let person = schema.add_node_label("Person".to_string(), vec![], 200);
+        schema
+            .add_edge_label("Knows".to_string(), person, person, vec![], 10001, true)
+            .expect("edge label");
+        mgr.create_schema(schema).expect("create");
+
+        let edges = vec![(1u64, 2u64, None)];
+        mgr.get_or_build_csr("social", &edges).expect("build");
+        assert!(mgr.get_cached_csr("social").is_some());
+
+        // A mutation to an unrelated table leaves the cache intact.
+        mgr.invalidate_for_table(999);
+        assert!(mgr.get_cached_csr("social").is_some());
+
+        // A mutation to the edge table drops the cache.
+        mgr.invalidate_for_table(10001);
+        assert!(mgr.get_cached_csr("social").is_none());
+
+        // The node table also backs the schema.
+        mgr.get_or_build_csr("social", &edges).expect("rebuild");
+        mgr.invalidate_for_table(200);
+        assert!(mgr.get_cached_csr("social").is_none());
     }
 
     #[test]

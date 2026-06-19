@@ -3,10 +3,11 @@
 //! Narrows scan columns to only those needed by upstream operators,
 //! reducing IO and memory usage.
 
-use crate::binder::BoundExpr;
+use crate::binder::{BoundExpr, BoundSelect};
 use crate::logical::{LogicalColumn, LogicalPlan};
 use crate::optimizer::OptimizationRule;
 use std::collections::HashSet;
+use std::sync::Arc;
 use zyron_catalog::{Catalog, ColumnId};
 
 pub struct ProjectionPushdown;
@@ -79,6 +80,7 @@ fn push_projections(
             expressions,
             aliases,
             child,
+            output_table_idx,
         } => {
             // Collect columns needed by the projection expressions
             let mut child_needed = HashSet::new();
@@ -88,7 +90,8 @@ fn push_projections(
             LogicalPlan::Project {
                 expressions: expressions.clone(),
                 aliases: aliases.clone(),
-                child: Box::new(push_projections(child, Some(&child_needed))),
+                child: Arc::new(push_projections(child, Some(&child_needed))),
+                output_table_idx: *output_table_idx,
             }
         }
         LogicalPlan::Filter { predicate, child } => {
@@ -96,7 +99,7 @@ fn push_projections(
             collect_needed_columns(predicate, &mut child_needed);
             LogicalPlan::Filter {
                 predicate: predicate.clone(),
-                child: Box::new(push_projections(child, Some(&child_needed))),
+                child: Arc::new(push_projections(child, Some(&child_needed))),
             }
         }
         LogicalPlan::Join {
@@ -128,7 +131,7 @@ fn push_projections(
             }
 
             LogicalPlan::Join {
-                left: Box::new(push_projections(
+                left: Arc::new(push_projections(
                     left,
                     if left_needed.is_empty() {
                         None
@@ -136,7 +139,7 @@ fn push_projections(
                         Some(&left_needed)
                     },
                 )),
-                right: Box::new(push_projections(
+                right: Arc::new(push_projections(
                     right,
                     if right_needed.is_empty() {
                         None
@@ -165,7 +168,7 @@ fn push_projections(
             LogicalPlan::Aggregate {
                 group_by: group_by.clone(),
                 aggregates: aggregates.clone(),
-                child: Box::new(push_projections(child, Some(&child_needed))),
+                child: Arc::new(push_projections(child, Some(&child_needed))),
             }
         }
         LogicalPlan::Sort { order_by, child } => {
@@ -175,7 +178,7 @@ fn push_projections(
             }
             LogicalPlan::Sort {
                 order_by: order_by.clone(),
-                child: Box::new(push_projections(child, Some(&child_needed))),
+                child: Arc::new(push_projections(child, Some(&child_needed))),
             }
         }
         // Pass through for other node types
@@ -186,10 +189,10 @@ fn push_projections(
         } => LogicalPlan::Limit {
             limit: *limit,
             offset: *offset,
-            child: Box::new(push_projections(child, needed)),
+            child: Arc::new(push_projections(child, needed)),
         },
         LogicalPlan::Distinct { child } => LogicalPlan::Distinct {
-            child: Box::new(push_projections(child, needed)),
+            child: Arc::new(push_projections(child, needed)),
         },
         LogicalPlan::SetOp {
             op,
@@ -199,8 +202,8 @@ fn push_projections(
         } => LogicalPlan::SetOp {
             op: *op,
             all: *all,
-            left: Box::new(push_projections(left, needed)),
-            right: Box::new(push_projections(right, needed)),
+            left: Arc::new(push_projections(left, needed)),
+            right: Arc::new(push_projections(right, needed)),
         },
         other => other.clone(),
     }
@@ -273,8 +276,31 @@ fn collect_needed_columns(expr: &BoundExpr, out: &mut HashSet<(usize, ColumnId)>
                 collect_needed_columns(&ob.expr, out);
             }
         }
+        // A subquery's correlated references point at outer columns the scan
+        // must still produce; the subquery's own columns are owned by its plan.
+        BoundExpr::Subquery { plan, .. } | BoundExpr::Exists { plan, .. } => {
+            collect_correlated_outer_columns(plan, out);
+        }
+        BoundExpr::InSubquery { expr, plan, .. } => {
+            collect_needed_columns(expr, out);
+            collect_correlated_outer_columns(plan, out);
+        }
         _ => {}
     }
+}
+
+/// Adds the outer (correlated) column references a subquery plan uses to `out`.
+/// These are columns the enclosing scan must still produce so the correlated
+/// subquery reads the current outer row's values. Columns the subquery produces
+/// itself are owned by its own plan and excluded.
+fn collect_correlated_outer_columns(plan: &BoundSelect, out: &mut HashSet<(usize, ColumnId)>) {
+    let mut owned = HashSet::new();
+    crate::binder::subquery_owned_indices(plan, &mut owned);
+    crate::binder::for_each_subquery_ref(plan, &mut |cr| {
+        if !owned.contains(&cr.table_idx) {
+            out.insert((cr.table_idx, cr.column_id));
+        }
+    });
 }
 
 /// Collects all table indices from scan nodes in a plan.

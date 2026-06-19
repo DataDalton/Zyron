@@ -4,6 +4,8 @@
 //! in the correct order. On shutdown, runs a final checkpoint for
 //! zero-replay restart.
 
+pub mod cdc_ingest;
+pub mod cdc_stream_pump;
 pub mod cdc_writer;
 pub mod checkpoint;
 pub mod compaction;
@@ -16,7 +18,9 @@ pub mod host_health;
 pub mod mv_refresh;
 pub mod publication_retention;
 pub mod quota_gossip;
+pub mod recycle_reaper;
 pub mod retention;
+pub mod schedule;
 pub mod stats;
 pub mod stream_monitor;
 pub mod vacuum;
@@ -46,6 +50,7 @@ use self::quota_gossip::{
     NoopTransport, QuotaGossipConfig, QuotaGossipTransport, QuotaGossipWorker,
 };
 use self::retention::{RetentionWorker, RetentionWorkerConfig};
+use self::schedule::{ScheduleWorker, ScheduleWorkerConfig};
 use self::stats::{StatsCollector, StatsCollectorConfig};
 use self::stream_monitor::{StreamMonitor, StreamMonitorConfig};
 use self::vacuum::{VacuumWorker, VacuumWorkerConfig};
@@ -61,6 +66,7 @@ pub struct BackgroundWorkers {
     vacuum: VacuumWorker,
     compaction: CompactionWorker,
     retention: RetentionWorker,
+    schedule: ScheduleWorker,
     wal_archiver: Option<WalArchiver>,
     cdc_writer: CdcWriter,
     mv_refresh: MvRefreshWorker,
@@ -85,9 +91,11 @@ impl BackgroundWorkers {
         compaction_config: CompactionWorkerConfig,
         metrics: Option<Arc<MetricsRegistry>>,
         wal_dir: PathBuf,
+        data_dir: PathBuf,
         archive_dir: Option<PathBuf>,
         cdc_registry: Option<Arc<zyron_cdc::CdfRegistry>>,
         stream_job_manager: Option<Arc<parking_lot::Mutex<zyron_streaming::job::StreamJobManager>>>,
+        btree_indexes: Arc<scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>>,
     ) -> Self {
         info!("Starting background workers");
 
@@ -104,6 +112,20 @@ impl BackgroundWorkers {
             tracker,
             coord_config,
         ));
+
+        // Persist the commit-status map and the retention clock as part of every
+        // checkpoint, after the page flush and before WAL truncation, so an
+        // aborted transaction's status and the time-to-LSN samples survive a
+        // crash even once their WAL is reclaimed.
+        {
+            let clog_status = Arc::clone(txn_manager.status_map());
+            let retention_clock = Arc::clone(txn_manager.retention_clock());
+            let clog_dir = data_dir.clone();
+            coordinator.set_pre_truncate_hook(Arc::new(move || {
+                clog_status.persist(&clog_dir)?;
+                retention_clock.persist(&clog_dir)
+            }));
+        }
 
         let checkpoint = CheckpointWorker::start(coordinator, wal.clone(), ckpt_config);
 
@@ -123,6 +145,14 @@ impl BackgroundWorkers {
             disk_manager.clone(),
             RetentionWorkerConfig::default(),
         );
+        let schedule = ScheduleWorker::start(
+            catalog.clone(),
+            txn_manager.clone(),
+            wal.clone(),
+            buffer_pool.clone(),
+            disk_manager.clone(),
+            ScheduleWorkerConfig::default(),
+        );
         let compaction = CompactionWorker::start(
             catalog.clone(),
             txn_manager.clone(),
@@ -138,6 +168,7 @@ impl BackgroundWorkers {
             disk_manager,
             buffer_pool,
             wal,
+            btree_indexes,
             vacuum_config,
         );
 
@@ -169,6 +200,7 @@ impl BackgroundWorkers {
             vacuum,
             compaction,
             retention,
+            schedule,
             wal_archiver,
             cdc_writer,
             mv_refresh,
@@ -216,6 +248,12 @@ impl BackgroundWorkers {
         &self.checkpoint
     }
 
+    /// Returns a cloneable handle that forces a checkpoint and blocks until it
+    /// completes. Used to wire the SQL CHECKPOINT command.
+    pub fn checkpoint_trigger(&self) -> checkpoint::CheckpointTrigger {
+        self.checkpoint.trigger()
+    }
+
     /// Returns the checkpoint worker stats Arc.
     pub fn checkpoint_stats(&self) -> Arc<checkpoint::CheckpointWorkerStats> {
         Arc::clone(self.checkpoint.stats())
@@ -259,6 +297,7 @@ impl BackgroundWorkers {
         if let Some(ref mut archiver) = self.wal_archiver {
             archiver.shutdown();
         }
+        self.schedule.shutdown();
         self.retention.shutdown();
         self.vacuum.shutdown();
         self.stats.shutdown();

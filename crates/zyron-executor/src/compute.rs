@@ -306,6 +306,41 @@ pub fn arithmetic(left: &Column, right: &Column, op: ArithOp) -> Result<Column> 
         ));
     }
 
+    // Int32 fast path.
+    if let (ColumnData::Int32(l), ColumnData::Int32(r)) = (&left.data, &right.data) {
+        let mut result = Vec::with_capacity(len);
+        let mut nulls = NullBitmap::none(len);
+        for i in 0..len {
+            if left.is_null(i) || right.is_null(i) {
+                nulls.set_null(i);
+                result.push(0);
+            } else {
+                result.push(match op {
+                    ArithOp::Add => l[i].wrapping_add(r[i]),
+                    ArithOp::Sub => l[i].wrapping_sub(r[i]),
+                    ArithOp::Mul => l[i].wrapping_mul(r[i]),
+                    ArithOp::Div => {
+                        if r[i] == 0 {
+                            return Err(ZyronError::ExecutionError("division by zero".to_string()));
+                        }
+                        l[i] / r[i]
+                    }
+                    ArithOp::Mod => {
+                        if r[i] == 0 {
+                            return Err(ZyronError::ExecutionError("modulo by zero".to_string()));
+                        }
+                        l[i] % r[i]
+                    }
+                });
+            }
+        }
+        return Ok(Column::with_nulls(
+            ColumnData::Int32(result),
+            nulls,
+            TypeId::Int32,
+        ));
+    }
+
     // Float64 fast path.
     if let (ColumnData::Float64(l), ColumnData::Float64(r)) = (&left.data, &right.data) {
         let mut result = Vec::with_capacity(len);
@@ -342,58 +377,80 @@ pub fn arithmetic(left: &Column, right: &Column, op: ArithOp) -> Result<Column> 
         } else {
             let l = left.data.get_scalar(i);
             let r = right.data.get_scalar(i);
-            let result = apply_arith(&l, &r, op)?;
+            let result = apply_arith(&l, &r, op, out_type)?;
             data.push_scalar(&result);
         }
     }
     Ok(Column::with_nulls(data, nulls, out_type))
 }
 
-/// Applies arithmetic on two scalar values.
-fn apply_arith(left: &ScalarValue, right: &ScalarValue, op: ArithOp) -> Result<ScalarValue> {
-    match (left, right) {
-        (ScalarValue::Int64(l), ScalarValue::Int64(r)) => {
-            let result = match op {
-                ArithOp::Add => l.wrapping_add(*r),
-                ArithOp::Sub => l.wrapping_sub(*r),
-                ArithOp::Mul => l.wrapping_mul(*r),
+/// Applies arithmetic on two scalar values, producing a result whose variant
+/// matches `out_type` so it can be pushed into a column of that type. Integer
+/// operands compute exactly in i128 and narrow to the output integer type;
+/// floating-point operands compute in f64. A float output type or a float
+/// operand forces the floating-point path.
+fn apply_arith(
+    left: &ScalarValue,
+    right: &ScalarValue,
+    op: ArithOp,
+    out_type: TypeId,
+) -> Result<ScalarValue> {
+    let out_float = matches!(out_type, TypeId::Float32 | TypeId::Float64);
+    let operand_float = matches!(left, ScalarValue::Float32(_) | ScalarValue::Float64(_))
+        || matches!(right, ScalarValue::Float32(_) | ScalarValue::Float64(_));
+
+    if !out_float && !operand_float {
+        if let (Some(l), Some(r)) = (left.to_i128(), right.to_i128()) {
+            let v = match op {
+                ArithOp::Add => l.wrapping_add(r),
+                ArithOp::Sub => l.wrapping_sub(r),
+                ArithOp::Mul => l.wrapping_mul(r),
                 ArithOp::Div => {
-                    if *r == 0 {
+                    if r == 0 {
                         return Err(ZyronError::ExecutionError("division by zero".to_string()));
                     }
                     l / r
                 }
                 ArithOp::Mod => {
-                    if *r == 0 {
+                    if r == 0 {
                         return Err(ZyronError::ExecutionError("modulo by zero".to_string()));
                     }
                     l % r
                 }
             };
-            Ok(ScalarValue::Int64(result))
+            return Ok(int_scalar_for_type(out_type, v));
         }
-        (ScalarValue::Float64(l), ScalarValue::Float64(r)) => {
-            let result = match op {
-                ArithOp::Add => l + r,
-                ArithOp::Sub => l - r,
-                ArithOp::Mul => l * r,
-                ArithOp::Div => l / r,
-                ArithOp::Mod => l % r,
-            };
-            Ok(ScalarValue::Float64(result))
-        }
-        _ => {
-            let l = left.to_f64().unwrap_or(0.0);
-            let r = right.to_f64().unwrap_or(0.0);
-            let result = match op {
-                ArithOp::Add => l + r,
-                ArithOp::Sub => l - r,
-                ArithOp::Mul => l * r,
-                ArithOp::Div => l / r,
-                ArithOp::Mod => l % r,
-            };
-            Ok(ScalarValue::Float64(result))
-        }
+    }
+
+    let l = left.to_f64().unwrap_or(0.0);
+    let r = right.to_f64().unwrap_or(0.0);
+    let result = match op {
+        ArithOp::Add => l + r,
+        ArithOp::Sub => l - r,
+        ArithOp::Mul => l * r,
+        ArithOp::Div => l / r,
+        ArithOp::Mod => l % r,
+    };
+    if out_type == TypeId::Float32 {
+        Ok(ScalarValue::Float32(result as f32))
+    } else {
+        Ok(ScalarValue::Float64(result))
+    }
+}
+
+/// Builds an integer ScalarValue of the given type from an i128 result.
+fn int_scalar_for_type(out_type: TypeId, v: i128) -> ScalarValue {
+    match out_type {
+        TypeId::Int8 => ScalarValue::Int8(v as i8),
+        TypeId::Int16 => ScalarValue::Int16(v as i16),
+        TypeId::Int32 => ScalarValue::Int32(v as i32),
+        TypeId::Int64 => ScalarValue::Int64(v as i64),
+        TypeId::Int128 => ScalarValue::Int128(v),
+        TypeId::UInt8 => ScalarValue::UInt8(v as u8),
+        TypeId::UInt16 => ScalarValue::UInt16(v as u16),
+        TypeId::UInt32 => ScalarValue::UInt32(v as u32),
+        TypeId::UInt64 => ScalarValue::UInt64(v as u64),
+        _ => ScalarValue::Int64(v as i64),
     }
 }
 
@@ -2112,6 +2169,34 @@ mod ps_tests {
             (ColumnData::Int128(a), ColumnData::Int128(b)) => assert_eq!(a, b),
             _ => panic!("expected Int128"),
         }
+    }
+
+    #[test]
+    fn test_arithmetic_int32_columns_preserve_type_and_values() {
+        // Int32 is neither the Int64 nor Float64 fast path; column-column math
+        // must still produce correct Int32 results, not zeros.
+        let l = Column::new(ColumnData::Int32(vec![3, 1, 2]), TypeId::Int32);
+        let r = Column::new(ColumnData::Int32(vec![1, 2, 3]), TypeId::Int32);
+
+        let add = arithmetic(&l, &r, ArithOp::Add).unwrap();
+        assert_eq!(add.type_id, TypeId::Int32);
+        assert!(matches!(add.data, ColumnData::Int32(ref v) if v == &[4, 3, 5]));
+
+        let sub = arithmetic(&r, &l, ArithOp::Sub).unwrap();
+        assert!(matches!(sub.data, ColumnData::Int32(ref v) if v == &[-2, 1, 1]));
+
+        let mul = arithmetic(&l, &r, ArithOp::Mul).unwrap();
+        assert!(matches!(mul.data, ColumnData::Int32(ref v) if v == &[3, 2, 6]));
+    }
+
+    #[test]
+    fn test_arithmetic_int16_columns_compute_exactly() {
+        // Smaller integer width also routes through the scalar fallback.
+        let l = Column::new(ColumnData::Int16(vec![100, -5]), TypeId::Int16);
+        let r = Column::new(ColumnData::Int16(vec![25, 5]), TypeId::Int16);
+        let add = arithmetic(&l, &r, ArithOp::Add).unwrap();
+        assert_eq!(add.type_id, TypeId::Int16);
+        assert!(matches!(add.data, ColumnData::Int16(ref v) if v == &[125, 0]));
     }
 
     #[test]

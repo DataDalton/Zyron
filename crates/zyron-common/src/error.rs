@@ -364,6 +364,15 @@ pub enum ZyronError {
     #[error("Cannot drop {object}, depended on by: {dependents}")]
     DependencyViolation { object: String, dependents: String },
 
+    #[error("Foreign key violation: {0}")]
+    ForeignKeyViolation(String),
+
+    #[error("Unique constraint violation: {0}")]
+    UniqueViolation(String),
+
+    #[error("Check constraint violation: {0}")]
+    CheckViolation(String),
+
     // Streaming errors
     #[error("Streaming error: {0}")]
     StreamingError(String),

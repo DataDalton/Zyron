@@ -8,9 +8,10 @@
 use crate::binder::{BoundExpr, ColumnRef};
 use crate::logical::LogicalPlan;
 use crate::optimizer::OptimizationRule;
+use std::sync::Arc;
 use zyron_catalog::Catalog;
 use zyron_common::TypeId;
-use zyron_parser::ast::BinaryOperator;
+use zyron_parser::ast::{BinaryOperator, JoinType};
 
 pub struct PredicatePushdown;
 
@@ -54,19 +55,40 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
                     let left_tables = collect_table_indices(left);
                     let right_tables = collect_table_indices(right);
 
+                    // A predicate may only be pushed into a side that the join
+                    // never fills with NULLs. Pushing a predicate into the
+                    // null-supplying side of an outer join changes the result:
+                    // it filters base rows before the join manufactures the
+                    // unmatched NULL row, so the common `LEFT JOIN ... WHERE
+                    // right.col IS NULL` anti-join would lose its semantics.
+                    let (can_push_left, can_push_right) = match join_type {
+                        JoinType::Inner | JoinType::Cross => (true, true),
+                        JoinType::Left => (true, false),
+                        JoinType::Right => (false, true),
+                        JoinType::Full => (false, false),
+                    };
+
                     let mut left_preds = Vec::new();
                     let mut right_preds = Vec::new();
                     let mut remaining = Vec::new();
 
                     for conj in conjuncts {
+                        // A conjunct containing a subquery stays above the join.
+                        // Its correlated columns may reference either side and are
+                        // not seen by the column-ref scan, so pushing it into one
+                        // side could strip a column the subquery needs.
+                        if crate::binder::expr_contains_subquery(&conj) {
+                            remaining.push(conj);
+                            continue;
+                        }
                         let refs = collect_column_refs(&conj);
                         let touches_left = refs.iter().any(|r| left_tables.contains(&r.table_idx));
                         let touches_right =
                             refs.iter().any(|r| right_tables.contains(&r.table_idx));
 
-                        if touches_left && !touches_right {
+                        if touches_left && !touches_right && can_push_left {
                             left_preds.push(conj);
-                        } else if touches_right && !touches_left {
+                        } else if touches_right && !touches_left && can_push_right {
                             right_preds.push(conj);
                         } else {
                             remaining.push(conj);
@@ -83,7 +105,7 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
                     } else {
                         LogicalPlan::Filter {
                             predicate: combine_conjuncts(left_preds),
-                            child: Box::new(left.as_ref().clone()),
+                            child: Arc::new(left.as_ref().clone()),
                         }
                     };
 
@@ -92,7 +114,7 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
                     } else {
                         LogicalPlan::Filter {
                             predicate: combine_conjuncts(right_preds),
-                            child: Box::new(right.as_ref().clone()),
+                            child: Arc::new(right.as_ref().clone()),
                         }
                     };
 
@@ -100,8 +122,8 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
                     let (pushed_right, _) = push_predicates(&new_right);
 
                     let join = LogicalPlan::Join {
-                        left: Box::new(pushed_left),
-                        right: Box::new(pushed_right),
+                        left: Arc::new(pushed_left),
+                        right: Arc::new(pushed_right),
                         join_type: *join_type,
                         condition: condition.clone(),
                     };
@@ -112,37 +134,92 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
                         (
                             LogicalPlan::Filter {
                                 predicate: combine_conjuncts(remaining),
-                                child: Box::new(join),
+                                child: Arc::new(join),
                             },
                             true,
                         )
                     }
                 }
-                // Filter above Project: keep filter above for now
+                // Filter above Project: push down conjuncts that reference only
+                // columns the projection passes through verbatim. ColumnRef is a
+                // stable (table_idx, column_id) identity, so a conjunct over
+                // passthrough columns evaluates identically below the projection.
+                // A conjunct touching a computed/aliased output stays above,
+                // since that column does not exist beneath the projection.
                 LogicalPlan::Project {
                     expressions,
                     aliases,
                     child: proj_child,
+                    output_table_idx,
                 } => {
-                    let (pushed_proj_child, _) = push_predicates(proj_child);
-                    (
-                        LogicalPlan::Filter {
-                            predicate: predicate.clone(),
-                            child: Box::new(LogicalPlan::Project {
-                                expressions: expressions.clone(),
-                                aliases: aliases.clone(),
-                                child: Box::new(pushed_proj_child),
-                            }),
-                        },
-                        child_changed,
-                    )
+                    let passthrough: Vec<(usize, u16)> = expressions
+                        .iter()
+                        .filter_map(|e| match e {
+                            BoundExpr::ColumnRef(cr) => Some((cr.table_idx, cr.column_id.0)),
+                            _ => None,
+                        })
+                        .collect();
+
+                    let mut pushable = Vec::new();
+                    let mut keep_above = Vec::new();
+                    for conjunct in split_conjuncts(predicate) {
+                        let refs = collect_column_refs(&conjunct);
+                        let pushes = !refs.is_empty()
+                            && refs
+                                .iter()
+                                .all(|r| passthrough.contains(&(r.table_idx, r.column_id.0)));
+                        if pushes {
+                            pushable.push(conjunct);
+                        } else {
+                            keep_above.push(conjunct);
+                        }
+                    }
+
+                    if pushable.is_empty() {
+                        let (pushed_proj_child, _) = push_predicates(proj_child);
+                        (
+                            LogicalPlan::Filter {
+                                predicate: predicate.clone(),
+                                child: Arc::new(LogicalPlan::Project {
+                                    expressions: expressions.clone(),
+                                    aliases: aliases.clone(),
+                                    child: Arc::new(pushed_proj_child),
+                                    output_table_idx: *output_table_idx,
+                                }),
+                            },
+                            child_changed,
+                        )
+                    } else {
+                        let filtered_child = LogicalPlan::Filter {
+                            predicate: combine_conjuncts(pushable),
+                            child: Arc::new(proj_child.as_ref().clone()),
+                        };
+                        let (pushed_child, _) = push_predicates(&filtered_child);
+                        let project = LogicalPlan::Project {
+                            expressions: expressions.clone(),
+                            aliases: aliases.clone(),
+                            child: Arc::new(pushed_child),
+                            output_table_idx: *output_table_idx,
+                        };
+                        if keep_above.is_empty() {
+                            (project, true)
+                        } else {
+                            (
+                                LogicalPlan::Filter {
+                                    predicate: combine_conjuncts(keep_above),
+                                    child: Arc::new(project),
+                                },
+                                true,
+                            )
+                        }
+                    }
                 }
                 _ => {
                     if child_changed {
                         (
                             LogicalPlan::Filter {
                                 predicate: predicate.clone(),
-                                child: Box::new(child_plan),
+                                child: Arc::new(child_plan),
                             },
                             true,
                         )
@@ -157,6 +234,7 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
             expressions,
             aliases,
             child,
+            output_table_idx,
         } => {
             let (fc, changed) = push_predicates(child);
             if changed {
@@ -164,7 +242,8 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
                     LogicalPlan::Project {
                         expressions: expressions.clone(),
                         aliases: aliases.clone(),
-                        child: Box::new(fc),
+                        child: Arc::new(fc),
+                        output_table_idx: *output_table_idx,
                     },
                     true,
                 )
@@ -183,8 +262,8 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
             if lc || rc {
                 (
                     LogicalPlan::Join {
-                        left: Box::new(fl),
-                        right: Box::new(fr),
+                        left: Arc::new(fl),
+                        right: Arc::new(fr),
                         join_type: *join_type,
                         condition: condition.clone(),
                     },
@@ -205,7 +284,7 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
                     LogicalPlan::Aggregate {
                         group_by: group_by.clone(),
                         aggregates: aggregates.clone(),
-                        child: Box::new(fc),
+                        child: Arc::new(fc),
                     },
                     true,
                 )
@@ -219,7 +298,7 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
                 (
                     LogicalPlan::Sort {
                         order_by: order_by.clone(),
-                        child: Box::new(fc),
+                        child: Arc::new(fc),
                     },
                     true,
                 )
@@ -238,7 +317,7 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
                     LogicalPlan::Limit {
                         limit: *limit,
                         offset: *offset,
-                        child: Box::new(fc),
+                        child: Arc::new(fc),
                     },
                     true,
                 )
@@ -251,7 +330,7 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
             if changed {
                 (
                     LogicalPlan::Distinct {
-                        child: Box::new(fc),
+                        child: Arc::new(fc),
                     },
                     true,
                 )
@@ -272,8 +351,8 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
                     LogicalPlan::SetOp {
                         op: *op,
                         all: *all,
-                        left: Box::new(fl),
-                        right: Box::new(fr),
+                        left: Arc::new(fl),
+                        right: Arc::new(fr),
                     },
                     true,
                 )
@@ -284,6 +363,9 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
         LogicalPlan::Insert {
             table_id,
             target_columns,
+            column_defaults,
+            check_constraints,
+            expectations,
             source,
         } => {
             let (fs, changed) = push_predicates(source);
@@ -292,7 +374,10 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
                     LogicalPlan::Insert {
                         table_id: *table_id,
                         target_columns: target_columns.clone(),
-                        source: Box::new(fs),
+                        column_defaults: column_defaults.clone(),
+                        check_constraints: check_constraints.clone(),
+                        expectations: expectations.clone(),
+                        source: Arc::new(fs),
                     },
                     true,
                 )
@@ -303,6 +388,7 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
         LogicalPlan::Update {
             table_id,
             assignments,
+            check_constraints,
             child,
         } => {
             let (fc, changed) = push_predicates(child);
@@ -311,7 +397,8 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
                     LogicalPlan::Update {
                         table_id: *table_id,
                         assignments: assignments.clone(),
-                        child: Box::new(fc),
+                        check_constraints: check_constraints.clone(),
+                        child: Arc::new(fc),
                     },
                     true,
                 )
@@ -325,7 +412,7 @@ fn push_predicates(plan: &LogicalPlan) -> (LogicalPlan, bool) {
                 (
                     LogicalPlan::Delete {
                         table_id: *table_id,
-                        child: Box::new(fc),
+                        child: Arc::new(fc),
                     },
                     true,
                 )
@@ -451,6 +538,7 @@ fn collect_column_refs_recursive(expr: &BoundExpr, out: &mut Vec<ColumnRef>) {
                 collect_column_refs_recursive(e, out);
             }
         }
+        BoundExpr::InSubquery { expr, .. } => collect_column_refs_recursive(expr, out),
         _ => {}
     }
 }
@@ -459,6 +547,7 @@ fn collect_column_refs_recursive(expr: &BoundExpr, out: &mut Vec<ColumnRef>) {
 mod tests {
     use super::*;
     use crate::binder::ColumnRef;
+    use crate::logical::JoinCondition;
     use zyron_catalog::ColumnId;
     use zyron_common::TypeId;
     use zyron_parser::ast::LiteralValue;
@@ -504,6 +593,87 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn make_is_null(table_idx: usize, col: u16) -> BoundExpr {
+        BoundExpr::IsNull {
+            expr: Box::new(make_col_ref(table_idx, col)),
+            negated: false,
+        }
+    }
+
+    fn scan(table_idx: usize) -> LogicalPlan {
+        LogicalPlan::Scan {
+            table_id: zyron_catalog::TableId(table_idx as u32),
+            table_idx,
+            columns: vec![],
+            alias: String::new(),
+            encoding_hints: None,
+            as_of: None,
+        }
+    }
+
+    // A right-side predicate over a LEFT join must stay above the join. Pushing
+    // it into the null-supplying side would break the anti-join idiom.
+    #[test]
+    fn test_no_pushdown_into_null_supplying_side_of_left_join() {
+        let join = LogicalPlan::Join {
+            left: Arc::new(scan(0)),
+            right: Arc::new(scan(1)),
+            join_type: JoinType::Left,
+            condition: JoinCondition::On(BoundExpr::BinaryOp {
+                left: Box::new(make_col_ref(0, 0)),
+                op: BinaryOperator::Eq,
+                right: Box::new(make_col_ref(1, 0)),
+                type_id: TypeId::Boolean,
+            }),
+        };
+        let plan = LogicalPlan::Filter {
+            predicate: make_is_null(1, 0),
+            child: Arc::new(join),
+        };
+        let (pushed, changed) = push_predicates(&plan);
+        assert!(
+            !changed,
+            "right-side predicate must not move below a LEFT join"
+        );
+        assert!(
+            matches!(pushed, LogicalPlan::Filter { child, .. } if matches!(*child, LogicalPlan::Join { .. }))
+        );
+    }
+
+    // The preserved side of a LEFT join still accepts pushed predicates.
+    #[test]
+    fn test_pushdown_into_preserved_side_of_left_join() {
+        let join = LogicalPlan::Join {
+            left: Arc::new(scan(0)),
+            right: Arc::new(scan(1)),
+            join_type: JoinType::Left,
+            condition: JoinCondition::On(BoundExpr::BinaryOp {
+                left: Box::new(make_col_ref(0, 0)),
+                op: BinaryOperator::Eq,
+                right: Box::new(make_col_ref(1, 0)),
+                type_id: TypeId::Boolean,
+            }),
+        };
+        let plan = LogicalPlan::Filter {
+            predicate: BoundExpr::BinaryOp {
+                left: Box::new(make_col_ref(0, 0)),
+                op: BinaryOperator::Eq,
+                right: Box::new(make_lit_int(5)),
+                type_id: TypeId::Boolean,
+            },
+            child: Arc::new(join),
+        };
+        let (pushed, changed) = push_predicates(&plan);
+        assert!(
+            changed,
+            "left-side predicate should push into the preserved side"
+        );
+        assert!(
+            matches!(pushed, LogicalPlan::Join { .. }),
+            "filter dissolves into the join"
+        );
     }
 
     #[test]

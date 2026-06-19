@@ -7,34 +7,52 @@
 //! - Tuples deleted by committed transactions before the snapshot are invisible.
 //! - Tuples inserted or deleted by the owning transaction follow self-visibility rules.
 
+use std::sync::Arc;
+
+use super::status_map::TxnStatusMap;
+
 /// Immutable snapshot of active transactions taken at BEGIN time.
 ///
 /// Used for MVCC visibility checks. The active_txn_ids list is sorted
-/// for binary search during visibility checks.
+/// for binary search during visibility checks. The shared commit-status map
+/// lets visibility distinguish a committed transaction's writes from an aborted
+/// one's once the transaction has left the active set.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     /// Transaction ID of the owning transaction.
     pub txn_id: u64,
     /// Sorted list of transaction IDs that were active at snapshot time.
     active_txn_ids: Vec<u64>,
+    /// Shared transaction commit-status map (cheap Arc clone per snapshot).
+    status: Arc<TxnStatusMap>,
+    /// Every transaction below this id is committed and ended before this
+    /// snapshot, so visibility resolves it with a single comparison and no
+    /// status-map lookup. Captured once at snapshot creation.
+    frozen_below: u64,
 }
 
 impl Snapshot {
-    /// Creates a new snapshot with the given active transaction set.
+    /// Creates a new snapshot with the given active transaction set and the
+    /// shared commit-status map.
     ///
     /// `active_txns` must already be sorted in ascending order; the visibility
     /// fast paths use binary search and corruption is silent if the invariant
-    /// is broken. The transaction manager is the only producer and now
-    /// returns a pre-sorted vec (`active_txn_ids`), so this constructor no
-    /// longer re-sorts.
-    pub fn new(txn_id: u64, active_txns: Vec<u64>) -> Self {
+    /// is broken. The transaction manager is the only production producer and
+    /// returns a pre-sorted vec, so this constructor does not re-sort.
+    pub fn new(txn_id: u64, active_txns: Vec<u64>, status: Arc<TxnStatusMap>) -> Self {
         debug_assert!(
             active_txns.windows(2).all(|w| w[0] <= w[1]),
             "Snapshot::new requires a sorted active_txn list"
         );
+        // Oldest transaction still in flight (or this txn if none): every txn
+        // below the frozen horizon committed and ended before this snapshot.
+        let oldest_active = active_txns.first().copied().unwrap_or(txn_id);
+        let frozen_below = status.frozen_below(oldest_active);
         Self {
             txn_id,
             active_txn_ids: active_txns,
+            status,
+            frozen_below,
         }
     }
 
@@ -53,49 +71,77 @@ impl Snapshot {
             return xmax != self.txn_id;
         }
 
-        // Case 2: Check if inserting transaction is visible
-        // Invisible if xmin >= our txn_id (started after us)
+        // Invisible if xmin started after us.
         if xmin >= self.txn_id {
             return false;
         }
 
-        // Fast path: when no active transactions at snapshot time, skip binary searches.
-        // Common case for read-only workloads and low-concurrency OLTP.
-        if self.active_txn_ids.is_empty() {
-            return xmax == 0 || xmax >= self.txn_id;
-        }
-
-        // Invisible if xmin is still active (uncommitted at snapshot time)
-        if self.is_txn_active(xmin) {
+        // Resolve whether xmin committed before this snapshot. The frozen-horizon
+        // fast path (a single comparison, no atomic load) covers the dominant
+        // case of scanning rows older than any active transaction; only newer
+        // rows fall back to the active-set + status-map check.
+        let xmin_committed = if xmin < self.frozen_below {
+            true
+        } else if self.is_txn_active(xmin) {
+            return false;
+        } else {
+            self.status.is_committed(xmin)
+        };
+        if !xmin_committed {
             return false;
         }
 
-        // xmin is committed and started before us, so tuple was validly inserted.
-
-        // Case 3: Check deletion
+        // Case 3: not deleted.
         if xmax == 0 {
-            // Not deleted
             return true;
         }
 
-        // Case 4: Check if deleting transaction is visible to us
+        // Case 4: is the deletion visible to us?
         if xmax == self.txn_id {
-            // We deleted it ourselves
+            // We deleted it ourselves.
             return false;
         }
-
         if xmax >= self.txn_id {
-            // Deleting txn started after us, so deletion is invisible. Tuple is still visible.
+            // Deleter started after us: deletion invisible, tuple still visible.
             return true;
         }
-
+        // Deleter ended before our snapshot. Below the frozen horizon it is
+        // committed (the tuple is deleted); otherwise consult the active set and
+        // status map. An aborted delete leaves the tuple visible.
+        if xmax < self.frozen_below {
+            return false;
+        }
         if self.is_txn_active(xmax) {
-            // Deleting txn is still active (uncommitted), so deletion is invisible. Tuple is still visible.
             return true;
         }
+        !self.status.is_committed(xmax)
+    }
 
-        // Deleting txn committed before our snapshot. Tuple is deleted (invisible).
-        false
+    /// Returns true if a tuple is a live, committed row as of NOW (not as of
+    /// this snapshot): its inserter committed and it has no committed deleter.
+    /// Used by unique-constraint enforcement, which must consider the latest
+    /// committed state rather than the inserting transaction's frozen snapshot.
+    #[inline]
+    pub fn is_live_latest(&self, xmin: u64, xmax: u64) -> bool {
+        self.status.is_committed(xmin) && (xmax == 0 || !self.status.is_committed(xmax))
+    }
+
+    /// Returns the prune horizon for this snapshot: every transaction below it
+    /// committed and ended before the oldest transaction active when this
+    /// snapshot was taken. A version with `xmax` below this horizon is a
+    /// committed delete invisible to every live snapshot, so on-access pruning
+    /// can reclaim it. Because the active set is system-wide, this horizon is
+    /// globally safe, not merely safe for this snapshot.
+    #[inline]
+    pub fn prune_horizon(&self) -> u64 {
+        self.frozen_below
+    }
+
+    /// Returns the shared commit-status map, so callers that prune dead tuples
+    /// can test whether an inserter aborted.
+    #[inline]
+    pub fn status_map(&self) -> &Arc<TxnStatusMap> {
+        &self.status
     }
 
     /// Returns true if the given transaction ID was active at snapshot time.
@@ -119,72 +165,126 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::txn::status_map::TxnStatusMap;
+
+    /// A status map that reports every transaction committed, for tests that do
+    /// not exercise abort visibility.
+    fn committed() -> Arc<TxnStatusMap> {
+        Arc::new(TxnStatusMap::all_committed())
+    }
+
+    /// A real status map seeded with explicit committed and aborted ids.
+    fn status(commit: &[u64], abort: &[u64]) -> Arc<TxnStatusMap> {
+        let m = TxnStatusMap::new();
+        for &c in commit {
+            m.record_committed(c);
+        }
+        for &a in abort {
+            m.record_aborted(a);
+        }
+        Arc::new(m)
+    }
 
     #[test]
     fn test_own_insert_visible() {
-        let snapshot = Snapshot::new(10, vec![]);
-        // xmin=10 (own txn), xmax=0 (not deleted)
+        let snapshot = Snapshot::new(10, vec![], committed());
         assert!(snapshot.is_visible(10, 0));
     }
 
     #[test]
     fn test_own_insert_then_delete_invisible() {
-        let snapshot = Snapshot::new(10, vec![]);
-        // xmin=10 (own txn), xmax=10 (self-deleted)
+        let snapshot = Snapshot::new(10, vec![], committed());
         assert!(!snapshot.is_visible(10, 10));
     }
 
     #[test]
     fn test_committed_insert_visible() {
-        let snapshot = Snapshot::new(10, vec![]);
-        // xmin=5 (committed before us), xmax=0 (not deleted)
+        let snapshot = Snapshot::new(10, vec![], committed());
         assert!(snapshot.is_visible(5, 0));
     }
 
     #[test]
     fn test_active_insert_invisible() {
-        let snapshot = Snapshot::new(10, vec![5]);
-        // xmin=5 (still active at snapshot time), xmax=0
+        let snapshot = Snapshot::new(10, vec![5], committed());
         assert!(!snapshot.is_visible(5, 0));
     }
 
     #[test]
     fn test_future_insert_invisible() {
-        let snapshot = Snapshot::new(10, vec![]);
-        // xmin=15 (started after us), xmax=0
+        let snapshot = Snapshot::new(10, vec![], committed());
         assert!(!snapshot.is_visible(15, 0));
     }
 
     #[test]
     fn test_committed_delete_invisible() {
-        let snapshot = Snapshot::new(10, vec![]);
-        // xmin=3 (committed), xmax=7 (committed delete before us)
+        let snapshot = Snapshot::new(10, vec![], committed());
         assert!(!snapshot.is_visible(3, 7));
     }
 
     #[test]
     fn test_active_delete_still_visible() {
-        let snapshot = Snapshot::new(10, vec![7]);
-        // xmin=3 (committed), xmax=7 (active, so deletion not yet committed)
+        let snapshot = Snapshot::new(10, vec![7], committed());
         assert!(snapshot.is_visible(3, 7));
     }
 
     #[test]
     fn test_future_delete_still_visible() {
-        let snapshot = Snapshot::new(10, vec![]);
-        // xmin=3 (committed), xmax=15 (started after us, deletion invisible)
+        let snapshot = Snapshot::new(10, vec![], committed());
         assert!(snapshot.is_visible(3, 15));
+    }
+
+    // An aborted inserter's row is invisible even though it left the active set.
+    #[test]
+    fn test_aborted_insert_invisible() {
+        let snapshot = Snapshot::new(10, vec![], status(&[], &[5]));
+        assert!(!snapshot.is_visible(5, 0));
+    }
+
+    // A row whose deleter aborted stays visible (the delete did not happen).
+    #[test]
+    fn test_aborted_delete_keeps_row_visible() {
+        let snapshot = Snapshot::new(10, vec![], status(&[3], &[7]));
+        assert!(snapshot.is_visible(3, 7));
+    }
+
+    // A committed insert later deleted by an aborted txn remains visible.
+    #[test]
+    fn test_committed_insert_aborted_delete_visible() {
+        let snapshot = Snapshot::new(10, vec![], status(&[2], &[8]));
+        assert!(snapshot.is_visible(2, 8));
+        // Same row deleted by a committed txn is invisible.
+        let snapshot2 = Snapshot::new(10, vec![], status(&[2, 8], &[]));
+        assert!(!snapshot2.is_visible(2, 8));
+    }
+
+    // A transaction at or above the frozen horizon that never recorded a commit
+    // (e.g. in flight) is treated as not committed, so its inserts are invisible.
+    // An early abort (id 1) caps the frozen horizon so id 5 is above it and must
+    // take the status-map path rather than the frozen fast path.
+    #[test]
+    fn test_unrecorded_insert_invisible() {
+        let snapshot = Snapshot::new(10, vec![], status(&[], &[1]));
+        assert!(!snapshot.is_visible(5, 0));
+    }
+
+    // The frozen-horizon fast path: a transaction below the horizon is treated
+    // as committed without a status-map entry (recovery records every ended
+    // transaction, so nothing below the horizon is silently uncommitted).
+    #[test]
+    fn test_frozen_below_horizon_visible() {
+        let snapshot = Snapshot::new(10, vec![], status(&[], &[]));
+        // No aborts and no active txns: horizon is the snapshot txn id, so id 5
+        // resolves visible via the fast path.
+        assert!(snapshot.is_visible(5, 0));
     }
 
     #[test]
     fn test_is_txn_active_binary_search() {
-        let snapshot = Snapshot::new(100, vec![5, 10, 20, 50]);
-
+        let snapshot = Snapshot::new(100, vec![5, 10, 20, 50], committed());
         assert!(snapshot.is_txn_active(5));
         assert!(snapshot.is_txn_active(10));
         assert!(snapshot.is_txn_active(20));
         assert!(snapshot.is_txn_active(50));
-
         assert!(!snapshot.is_txn_active(1));
         assert!(!snapshot.is_txn_active(15));
         assert!(!snapshot.is_txn_active(100));
@@ -192,38 +292,24 @@ mod tests {
 
     #[test]
     fn test_empty_active_set() {
-        let snapshot = Snapshot::new(10, vec![]);
+        let snapshot = Snapshot::new(10, vec![], committed());
         assert_eq!(snapshot.active_count(), 0);
         assert!(!snapshot.is_txn_active(5));
     }
 
     #[test]
     fn test_snapshot_preserves_sorted_input() {
-        // Snapshot::new no longer sorts, the manager produces pre-sorted Vecs
-        // and visibility checks rely on that invariant for binary search,
-        // this test documents the contract by passing already-sorted input
-        let snapshot = Snapshot::new(100, vec![10, 20, 30, 50]);
+        let snapshot = Snapshot::new(100, vec![10, 20, 30, 50], committed());
         assert_eq!(snapshot.active_txn_ids(), &[10, 20, 30, 50]);
     }
 
     #[test]
     fn test_complex_visibility_scenario() {
-        // Txn 10 sees committed txns 1-5, active txns 6,8, committed txn 7
-        let snapshot = Snapshot::new(10, vec![6, 8]);
-
-        // Committed insert by txn 3, not deleted
+        let snapshot = Snapshot::new(10, vec![6, 8], committed());
         assert!(snapshot.is_visible(3, 0));
-
-        // Committed insert by txn 3, deleted by committed txn 7
         assert!(!snapshot.is_visible(3, 7));
-
-        // Committed insert by txn 3, deleted by active txn 6 (not yet committed)
         assert!(snapshot.is_visible(3, 6));
-
-        // Active insert by txn 6 (not committed)
         assert!(!snapshot.is_visible(6, 0));
-
-        // Insert by txn 8 (active, not committed)
         assert!(!snapshot.is_visible(8, 0));
     }
 }

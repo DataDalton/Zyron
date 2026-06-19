@@ -21,8 +21,9 @@ use zyron_common::{FX_K, IdentityBuildHasher, fx_finalize, fx_mix};
 /// in via `Arc` so readers take no locks.
 #[derive(Debug, Clone, Default)]
 pub struct TableIndexSnapshot {
-    /// (index_id, indexed leading column_id) pairs for B+Tree indexes.
-    pub btree: Vec<(IndexId, ColumnId)>,
+    /// (index_id, indexed leading column_id, unique) tuples for B+Tree indexes.
+    /// The unique flag drives constraint enforcement on insert.
+    pub btree: Vec<(IndexId, ColumnId, bool)>,
     /// (index_id, indexed leading column_id) pairs for spatial R-tree indexes.
     pub spatial: Vec<(IndexId, ColumnId)>,
     /// Index ids for full-text indexes.
@@ -316,6 +317,7 @@ impl CatalogCache {
     pub fn get_table(&self, id: TableId) -> Option<Arc<TableEntry>> {
         self.tables_by_id
             .read_sync(&id, |_, entry| Arc::clone(entry))
+            .filter(|e| e.dropped_at.is_none())
     }
 
     pub fn get_table_mut(&self, id: TableId) -> Option<Arc<TableEntry>> {
@@ -327,13 +329,46 @@ impl CatalogCache {
         let key = name_key(schema_id.0, name);
         self.table_by_name
             .read_sync(&key, |_, entry| {
-                if entry.schema_id == schema_id && entry.name == name {
+                if entry.schema_id == schema_id && entry.name == name && entry.dropped_at.is_none()
+                {
                     Some(Arc::clone(entry))
                 } else {
                     None
                 }
             })
             .flatten()
+    }
+
+    /// Lock-free id lookup that includes soft-dropped tables. The recycle-bin
+    /// reaper and UNDROP use this to reach an entry that normal lookups hide.
+    pub fn get_table_including_dropped(&self, id: TableId) -> Option<Arc<TableEntry>> {
+        self.tables_by_id
+            .read_sync(&id, |_, entry| Arc::clone(entry))
+    }
+
+    /// Returns a soft-dropped table by name, or None if no recycled table with
+    /// that name exists. Scans the LRU map since the by-name index can be
+    /// shadowed by a live table created with the reused name.
+    pub fn get_dropped_table_by_name(
+        &self,
+        schema_id: SchemaId,
+        name: &str,
+    ) -> Option<Arc<TableEntry>> {
+        self.tables
+            .read()
+            .values()
+            .find(|t| t.schema_id == schema_id && t.name == name && t.dropped_at.is_some())
+            .cloned()
+    }
+
+    /// Returns all soft-dropped tables across all schemas for the reaper.
+    pub fn list_dropped_tables(&self) -> Vec<Arc<TableEntry>> {
+        self.tables
+            .read()
+            .values()
+            .filter(|t| t.dropped_at.is_some())
+            .cloned()
+            .collect()
     }
 
     pub fn put_table(&self, entry: TableEntry) {
@@ -383,19 +418,26 @@ impl CatalogCache {
         }
     }
 
-    /// Returns all cached tables for a given schema.
+    /// Returns all cached live tables for a given schema. Recycle-bin entries
+    /// are excluded.
     pub fn list_tables(&self, schema_id: SchemaId) -> Vec<Arc<TableEntry>> {
         self.tables
             .read()
             .values()
-            .filter(|t| t.schema_id == schema_id)
+            .filter(|t| t.schema_id == schema_id && t.dropped_at.is_none())
             .cloned()
             .collect()
     }
 
-    /// Returns all cached tables across all schemas.
+    /// Returns all cached live tables across all schemas. Recycle-bin entries
+    /// are excluded.
     pub fn list_all_tables(&self) -> Vec<Arc<TableEntry>> {
-        self.tables.read().values().cloned().collect()
+        self.tables
+            .read()
+            .values()
+            .filter(|t| t.dropped_at.is_none())
+            .cloned()
+            .collect()
     }
 
     // -----------------------------------------------------------------------
@@ -445,7 +487,7 @@ impl CatalogCache {
                     match entry.index_type {
                         IndexType::BTree => {
                             if let Some(col) = entry.columns.first() {
-                                s.btree.push((entry.id, col.column_id));
+                                s.btree.push((entry.id, col.column_id, entry.unique));
                             }
                         }
                         IndexType::Spatial => {
@@ -965,6 +1007,9 @@ mod tests {
             cdf_retention_days: 0,
             lifecycle: Default::default(),
             columnar: Default::default(),
+            dropped_at: None,
+            expectations: Vec::new(),
+            time_travel_retention_secs: 0,
         }
     }
 

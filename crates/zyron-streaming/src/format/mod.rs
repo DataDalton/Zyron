@@ -17,6 +17,7 @@ pub mod csv;
 pub mod json;
 pub mod jsonl;
 pub mod parquet;
+pub mod protobuf;
 pub mod record_batch;
 pub mod schema;
 
@@ -38,6 +39,7 @@ pub enum FormatKind {
     Parquet,
     ArrowIpc,
     Avro,
+    Protobuf,
 }
 
 // -----------------------------------------------------------------------------
@@ -114,6 +116,7 @@ pub fn reader_for(kind: FormatKind) -> Box<dyn FormatReader> {
         FormatKind::Parquet => Box::new(parquet::ParquetReader),
         FormatKind::ArrowIpc => Box::new(arrow_ipc::ArrowIpcReader),
         FormatKind::Avro => Box::new(avro::AvroReader),
+        FormatKind::Protobuf => Box::new(protobuf::ProtobufReader),
     }
 }
 
@@ -126,10 +129,12 @@ pub fn infer_schema(kind: FormatKind, bytes: &[u8]) -> Result<Vec<ColumnSpec>> {
         FormatKind::Parquet => infer_parquet_schema(bytes),
         FormatKind::ArrowIpc => infer_arrow_ipc_schema(bytes),
         FormatKind::Avro => infer_avro_schema(bytes),
-        FormatKind::Json | FormatKind::JsonLines | FormatKind::Csv => Err(ZyronError::PlanError(
-            "schema inference requires a self-describing format (Parquet, Arrow IPC, or Avro)"
-                .to_string(),
-        )),
+        FormatKind::Json | FormatKind::JsonLines | FormatKind::Csv | FormatKind::Protobuf => {
+            Err(ZyronError::PlanError(
+                "schema inference requires a self-describing format (Parquet, Arrow IPC, or Avro)"
+                    .to_string(),
+            ))
+        }
     }
 }
 
@@ -142,6 +147,7 @@ pub fn writer_for(kind: FormatKind) -> Box<dyn FormatWriter> {
         FormatKind::Parquet => Box::new(parquet::ParquetWriter),
         FormatKind::ArrowIpc => Box::new(arrow_ipc::ArrowIpcWriter),
         FormatKind::Avro => Box::new(avro::AvroWriter),
+        FormatKind::Protobuf => Box::new(protobuf::ProtobufWriter),
     }
 }
 

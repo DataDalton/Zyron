@@ -447,6 +447,110 @@ impl HeapFile {
         Ok(deleted_count)
     }
 
+    /// MVCC delete: stamps `xmax` on each tuple in place instead of freeing the
+    /// slot. The rows stay physically present and are hidden by snapshot
+    /// visibility once the deleting transaction commits; an aborted delete
+    /// leaves them visible, and vacuum reclaims the space later. Space is NOT
+    /// returned to the FSM here (the slots are not free yet). Returns the number
+    /// of tuples stamped. Groups by page so each page is read and written once.
+    pub async fn mark_deleted_batch(
+        &self,
+        tuple_ids: &[TupleId],
+        xmax: u32,
+        prune_horizon: u64,
+        status: Option<&crate::TxnStatusMap>,
+        retain_history: bool,
+    ) -> Result<usize> {
+        use std::collections::HashMap;
+
+        if tuple_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut pages: HashMap<PageId, Vec<u16>> = HashMap::new();
+        for tuple_id in tuple_ids {
+            pages
+                .entry(tuple_id.page_id)
+                .or_default()
+                .push(tuple_id.slot_id);
+        }
+
+        let mut marked = 0;
+        for (page_id, slot_ids) in pages {
+            // Pin the frame, then take the exclusive frame write lock and mutate
+            // in place. The lock-free burst-append path holds the shared frame
+            // lock, so this exclusive lock prevents a concurrent append from
+            // being lost (the old copy-out, modify, copy-in pattern could clobber
+            // an append that landed between the read and the write).
+            let frame = match self.pool.fetch_page(page_id) {
+                Some(frame) => frame,
+                None => {
+                    let disk_data = match self.disk.read_page(page_id).await {
+                        Ok(d) => d,
+                        Err(ZyronError::IoError(_)) => continue,
+                        Err(e) => return Err(e),
+                    };
+                    let (frame, evicted) = self.pool.load_page(page_id, &disk_data)?;
+                    if let Some(ev) = evicted {
+                        self.disk.write_page(ev.page_id, &ev.data).await?;
+                    }
+                    frame
+                }
+            };
+
+            let mut page_modified = false;
+            let mut reclaimed_free: Option<usize> = None;
+            {
+                let mut guard = frame.write_data();
+                let data: &mut [u8] = &mut guard[..];
+                for slot_id in slot_ids {
+                    if HeapPage::set_tuple_xmax_in_slice(data, SlotId(slot_id), xmax) {
+                        marked += 1;
+                        page_modified = true;
+                    }
+                }
+                // On-access pruning: the page is already locked, so reclaim any
+                // versions dead to every live snapshot (a committed delete below
+                // the frozen horizon, or an aborted insert). This keeps
+                // MVCC-updated heaps compact without waiting for the vacuum cycle.
+                if let Some(status) = status
+                    && prune_horizon > 0
+                {
+                    let is_dead = |xmin: u32, x: u32| {
+                        // Aborted insert: never visible at any version, always
+                        // reclaimable. Committed delete below the frozen horizon:
+                        // reclaim only if no retained version still sees the row
+                        // alive (the deleter committed at or before the floor).
+                        // When the table has a time-travel retention policy,
+                        // skip committed-delete reclamation here entirely and
+                        // leave it to the retention-aware background vacuum, so
+                        // an on-access prune never drops history early.
+                        status.is_aborted(xmin as u64)
+                            || (!retain_history
+                                && x != 0
+                                && (x as u64) < prune_horizon
+                                && status.version_reclaimable(x as u64))
+                    };
+                    if HeapPage::prune_dead_in_slice(data, &is_dead) {
+                        page_modified = true;
+                        reclaimed_free = Some(HeapPage::free_space_in_slice(data));
+                    }
+                }
+            }
+            self.pool.unpin_page(page_id, page_modified);
+
+            // Publish reclaimed free space so the insert path reuses this page
+            // instead of growing the heap.
+            if let Some(free) = reclaimed_free {
+                self.defer_fsm_update(page_id.page_num as u32, free);
+            }
+        }
+        if marked > 0 {
+            self.flush_fsm_updates().await?;
+        }
+        Ok(marked)
+    }
+
     /// Updates a tuple in place if the new tuple fits.
     ///
     /// Returns error if the new tuple is larger than the old one.
@@ -725,6 +829,12 @@ impl HeapFile {
                     .expect("just pinned this page");
                 // balance the extra pin from this fetch
                 self.pool.unpin_page(page_id, false);
+                // Hold the shared frame lock for the duration of the append.
+                // Appenders share this lock and write disjoint regions claimed
+                // via the header CAS; the delete/prune path takes the exclusive
+                // lock, so compaction can never move tuples out from under an
+                // in-flight append.
+                let _shared = frame.read_data();
                 let raw: *mut [u8; PAGE_SIZE] = frame.data_ptr_mut();
                 HeapPage::insert_tuples_burst(
                     raw as *mut u8,
@@ -775,6 +885,32 @@ impl HeapFile {
         let current = self.current_insert_page.load(Ordering::Acquire);
         if current != observed_page {
             return Ok(current);
+        }
+
+        // The page that just filled has no room: drop it from the hint cache so
+        // the reuse lookup below never picks it again.
+        if observed_page != u32::MAX {
+            self.hint_slots.remove(observed_page);
+        }
+
+        // Reuse a page that pruning reclaimed space on before growing the heap.
+        // This is the slow path (only on page fill), so the hint lookup adds no
+        // per-insert cost, and it keeps MVCC-updated heaps from growing
+        // unbounded between vacuum cycles. Require at least an eighth of a page
+        // of contiguous free space so a reused page absorbs several inserts.
+        const MIN_REUSE_SPACE: usize = PAGE_SIZE / 8;
+        if let Some(reuse_page) = self.hint_slots.find_page_with_space(MIN_REUSE_SPACE)
+            && reuse_page != observed_page
+        {
+            match self.current_insert_page.compare_exchange(
+                observed_page,
+                reuse_page,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(reuse_page),
+                Err(other) => return Ok(other),
+            }
         }
 
         let new_page_id = self.disk.allocate_page(self.config.heap_file_id).await?;

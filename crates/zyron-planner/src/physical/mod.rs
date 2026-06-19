@@ -60,6 +60,10 @@ pub enum PhysicalPlan {
         table_id: TableId,
         columns: Vec<LogicalColumn>,
         predicate: Option<BoundExpr>,
+        /// Time-travel target. None for a current read; Some(Version) routes the
+        /// columnar and heap scans to commit-LSN version visibility so a query
+        /// as of a past version sees folded rows too.
+        as_of: Option<super::logical::AsOfTarget>,
         cost: PlanCost,
     },
 
@@ -102,6 +106,10 @@ pub enum PhysicalPlan {
         aliases: Vec<Option<String>>,
         child: Box<PhysicalPlan>,
         cost: PlanCost,
+        /// Table index stamped on output columns when this projection
+        /// materializes a derived table (view or FROM-subquery), so the
+        /// enclosing query addresses them by `(table_idx, ordinal)`.
+        output_table_idx: Option<usize>,
     },
 
     /// Nested loop join.
@@ -110,6 +118,22 @@ pub enum PhysicalPlan {
         right: Box<PhysicalPlan>,
         join_type: JoinType,
         condition: Option<BoundExpr>,
+        cost: PlanCost,
+    },
+
+    /// LATERAL join. The right side is a subquery executed once per left row
+    /// with the referenced left columns bound as parameters. Held as a bound
+    /// select so the executor parameterizes and plans it against the current
+    /// outer row. join_type is Inner/Cross (drop left rows with no match) or
+    /// Left (NULL-extend); condition is the optional ON predicate.
+    LateralJoin {
+        left: Box<PhysicalPlan>,
+        subquery: crate::binder::BoundSelect,
+        subquery_table_idx: usize,
+        join_type: JoinType,
+        condition: Option<BoundExpr>,
+        left_schema: Vec<LogicalColumn>,
+        right_schema: Vec<LogicalColumn>,
         cost: PlanCost,
     },
 
@@ -197,6 +221,12 @@ pub enum PhysicalPlan {
     Insert {
         table_id: TableId,
         target_columns: Vec<ColumnId>,
+        /// Bound default expressions for omitted columns that carry a DEFAULT.
+        column_defaults: Vec<(ColumnId, crate::binder::BoundExpr)>,
+        /// CHECK constraint predicates (bound at table_idx 0) to enforce per row.
+        check_constraints: Vec<crate::binder::BoundExpr>,
+        /// Data-quality expectations (bound at table_idx 0) applied per row.
+        expectations: Vec<crate::binder::BoundExpectation>,
         source: Box<PhysicalPlan>,
         cost: PlanCost,
     },
@@ -212,6 +242,8 @@ pub enum PhysicalPlan {
     Update {
         table_id: TableId,
         assignments: Vec<BoundAssignment>,
+        /// CHECK constraint predicates (bound at table_idx 0) to enforce per row.
+        check_constraints: Vec<crate::binder::BoundExpr>,
         child: Box<PhysicalPlan>,
         cost: PlanCost,
     },
@@ -381,6 +413,7 @@ impl PhysicalPlan {
             | PhysicalPlan::Filter { cost, .. }
             | PhysicalPlan::Project { cost, .. }
             | PhysicalPlan::NestedLoopJoin { cost, .. }
+            | PhysicalPlan::LateralJoin { cost, .. }
             | PhysicalPlan::HashJoin { cost, .. }
             | PhysicalPlan::MergeJoin { cost, .. }
             | PhysicalPlan::HashAggregate { cost, .. }
@@ -420,6 +453,7 @@ impl PhysicalPlan {
             PhysicalPlan::Project {
                 expressions,
                 aliases,
+                output_table_idx,
                 ..
             } => expressions
                 .iter()
@@ -430,7 +464,7 @@ impl PhysicalPlan {
                         .and_then(|a| a.clone())
                         .unwrap_or_else(|| format!("col{}", i));
                     LogicalColumn {
-                        table_idx: None,
+                        table_idx: *output_table_idx,
                         column_id: ColumnId(i as u16),
                         name,
                         type_id: expr.type_id(),
@@ -445,6 +479,15 @@ impl PhysicalPlan {
             | PhysicalPlan::ParallelHashJoin { left, right, .. } => {
                 let mut schema = left.output_schema();
                 schema.extend(right.output_schema());
+                schema
+            }
+            PhysicalPlan::LateralJoin {
+                left_schema,
+                right_schema,
+                ..
+            } => {
+                let mut schema = left_schema.clone();
+                schema.extend(right_schema.clone());
                 schema
             }
             PhysicalPlan::HashAggregate {
@@ -561,6 +604,9 @@ impl PhysicalPlan {
             | PhysicalPlan::ParallelHashJoin { left, right, .. } => {
                 left.total_cost().add(&right.total_cost())
             }
+            // The lateral subquery is planned at execution time, so only the
+            // left input contributes child cost here.
+            PhysicalPlan::LateralJoin { left, .. } => left.total_cost(),
         };
         PlanCost {
             io_cost: own.io_cost + children_cost.io_cost,

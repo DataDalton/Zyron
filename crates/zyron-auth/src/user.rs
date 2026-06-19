@@ -11,6 +11,7 @@ use zyron_catalog::encoding::{
 use zyron_common::{Result, ZyronError};
 
 /// A database user account with credentials and account status.
+#[derive(Clone)]
 pub struct User {
     pub id: UserId,
     pub name: String,
@@ -24,6 +25,11 @@ pub struct User {
     pub locked_at: Option<u64>,
     pub locked_reason: Option<String>,
     pub created_at: u64,
+    /// Grants elevated access that bypasses RBAC privilege checks.
+    pub superuser: bool,
+    /// Whether the account may open a session. A NOLOGIN account exists for
+    /// privilege grouping but cannot authenticate.
+    pub can_login: bool,
 }
 
 impl User {
@@ -82,6 +88,8 @@ impl User {
         write_option_string(&mut buf, &self.locked_reason);
 
         write_u64(&mut buf, self.created_at);
+        write_bool(&mut buf, self.superuser);
+        write_bool(&mut buf, self.can_login);
         buf
     }
 
@@ -165,6 +173,8 @@ impl User {
         let locked_reason = read_option_string(data, &mut off)?;
 
         let created_at = read_u64(data, &mut off)?;
+        let superuser = read_bool(data, &mut off)?;
+        let can_login = read_bool(data, &mut off)?;
 
         Ok(Self {
             id,
@@ -179,6 +189,8 @@ impl User {
             locked_at,
             locked_reason,
             created_at,
+            superuser,
+            can_login,
         })
     }
 }
@@ -241,10 +253,14 @@ mod tests {
             locked_at: None,
             locked_reason: None,
             created_at: 1700000000,
+            superuser: true,
+            can_login: true,
         };
         let bytes = user.to_bytes();
         let restored = User::from_bytes(&bytes).expect("from_bytes failed");
         assert_eq!(restored.id, UserId(42));
+        assert!(restored.superuser);
+        assert!(restored.can_login);
         assert_eq!(restored.name, "alice");
         assert_eq!(
             restored.password_hash,
@@ -276,10 +292,14 @@ mod tests {
             locked_at: None,
             locked_reason: None,
             created_at: 1700000000,
+            superuser: false,
+            can_login: true,
         };
         let bytes = user.to_bytes();
         let restored = User::from_bytes(&bytes).expect("from_bytes failed");
         assert_eq!(restored.id, UserId(1));
+        assert!(!restored.superuser);
+        assert!(restored.can_login);
         assert_eq!(restored.name, "bob");
         assert!(restored.password_hash.is_none());
         assert!(restored.api_key_prefix.is_none());
@@ -308,6 +328,8 @@ mod tests {
             locked_at: Some(1700001000),
             locked_reason: Some("too many failed login attempts".to_string()),
             created_at: 1700000000,
+            superuser: false,
+            can_login: true,
         };
         let bytes = user.to_bytes();
         let restored = User::from_bytes(&bytes).expect("from_bytes failed");

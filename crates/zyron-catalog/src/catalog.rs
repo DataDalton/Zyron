@@ -50,6 +50,44 @@ const DDL_CREATE_SECURITY_MAP: u8 = 0x1B;
 const DDL_DROP_SECURITY_MAP: u8 = 0x1C;
 const DDL_ADD_PUBLICATION_TABLE: u8 = 0x1D;
 const DDL_REMOVE_PUBLICATION_TABLE: u8 = 0x1E;
+const DDL_CREATE_SEQUENCE: u8 = 0x1F;
+const DDL_DROP_SEQUENCE: u8 = 0x20;
+const DDL_UPDATE_SEQUENCE: u8 = 0x21;
+const DDL_CREATE_VIEW: u8 = 0x22;
+const DDL_DROP_VIEW: u8 = 0x23;
+const DDL_UPDATE_VIEW: u8 = 0x24;
+const DDL_CREATE_MVIEW: u8 = 0x25;
+const DDL_DROP_MVIEW: u8 = 0x26;
+const DDL_UPDATE_MVIEW: u8 = 0x27;
+const DDL_CREATE_FUNCTION: u8 = 0x28;
+const DDL_DROP_FUNCTION: u8 = 0x29;
+const DDL_SET_COMMENT: u8 = 0x2A;
+const DDL_DROP_COMMENT: u8 = 0x2B;
+const DDL_CREATE_AGGREGATE: u8 = 0x2C;
+const DDL_DROP_AGGREGATE: u8 = 0x2D;
+const DDL_CREATE_PROCEDURE: u8 = 0x2E;
+const DDL_DROP_PROCEDURE: u8 = 0x2F;
+const DDL_CREATE_SCHEDULE: u8 = 0x30;
+const DDL_DROP_SCHEDULE: u8 = 0x31;
+const DDL_CREATE_TRIGGER: u8 = 0x32;
+const DDL_DROP_TRIGGER: u8 = 0x33;
+const DDL_CREATE_PIPELINE: u8 = 0x34;
+const DDL_DROP_PIPELINE: u8 = 0x35;
+const DDL_CREATE_EVENT_HANDLER: u8 = 0x36;
+const DDL_DROP_EVENT_HANDLER: u8 = 0x37;
+const DDL_CREATE_VERSION_TAG: u8 = 0x38;
+const DDL_DROP_VERSION_TAG: u8 = 0x39;
+
+/// Result of a `drop_table` call. `soft_dropped` is true when the table went
+/// to the recycle bin (entry and backing files retained for UNDROP); false
+/// when it was physically removed and the caller should reclaim the files.
+#[derive(Debug, Clone)]
+pub struct DropOutcome {
+    pub soft_dropped: bool,
+    pub table_id: TableId,
+    pub heap_file_id: u32,
+    pub fsm_file_id: u32,
+}
 
 /// Central catalog manager.
 pub struct Catalog {
@@ -67,6 +105,60 @@ pub struct Catalog {
     /// plan caches read this with a single atomic load to validate that a
     /// cached PhysicalPlan is still consistent with the live catalog.
     schema_version: std::sync::atomic::AtomicU64,
+    /// Live sequence managers keyed by (schema_id, name) for resolution and by
+    /// id for default-value lookup. Each value is shared so concurrent
+    /// sessions hand out values from one block cursor.
+    sequences_by_name: RwLock<HashMap<(u32, String), Arc<crate::sequence::LiveSequence>>>,
+    sequences_by_id: RwLock<HashMap<u32, Arc<crate::sequence::LiveSequence>>>,
+    /// View definitions keyed by (schema_id, name) for binder expansion and by
+    /// id for drop/alter. Read-mostly: queries look up by name on every bind.
+    views_by_name: RwLock<HashMap<(u32, String), Arc<crate::schema::ViewEntry>>>,
+    views_by_id: RwLock<HashMap<u32, Arc<crate::schema::ViewEntry>>>,
+    /// Materialized view definitions keyed by (schema_id, name) and by id. The
+    /// query result lives in a backing table; these entries carry the query
+    /// text for REFRESH and the backing table id.
+    mviews_by_name: RwLock<HashMap<(u32, String), Arc<crate::schema::MaterializedViewEntry>>>,
+    mviews_by_id: RwLock<HashMap<u32, Arc<crate::schema::MaterializedViewEntry>>>,
+    /// SQL scalar functions keyed by bare name, each name mapping to its
+    /// overloads (distinguished by parameter count/types). The binder resolves
+    /// a call against these and inlines the body. Also indexed by id for drop.
+    functions_by_name: RwLock<HashMap<String, Vec<Arc<crate::schema::FunctionEntry>>>>,
+    functions_by_id: RwLock<HashMap<u32, Arc<crate::schema::FunctionEntry>>>,
+    /// Object comments keyed by (object kind, object name, column name). The
+    /// column name is empty for object-level comments. Introspection reads
+    /// these to describe schema objects.
+    comments: RwLock<HashMap<(u8, String, String), Arc<crate::schema::CommentEntry>>>,
+    /// SQL user-defined aggregates keyed by bare name, each name mapping to its
+    /// overloads (distinguished by input count/types). The binder resolves an
+    /// aggregate call against these and inlines the state and final functions.
+    /// Also indexed by id for drop.
+    aggregates_by_name: RwLock<HashMap<String, Vec<Arc<crate::schema::AggregateEntry>>>>,
+    aggregates_by_id: RwLock<HashMap<u32, Arc<crate::schema::AggregateEntry>>>,
+    /// SQL stored procedures keyed by bare name, each name mapping to its
+    /// overloads (distinguished by input count/types). CALL resolves against
+    /// these and runs the body. Also indexed by id for drop.
+    procedures_by_name: RwLock<HashMap<String, Vec<Arc<crate::schema::ProcedureEntry>>>>,
+    procedures_by_id: RwLock<HashMap<u32, Arc<crate::schema::ProcedureEntry>>>,
+    /// Scheduled tasks keyed by name (unique). The background worker reads the
+    /// active ones and fires those whose next_run has elapsed. Also indexed by
+    /// id for drop and run-state persistence.
+    schedules_by_name: RwLock<HashMap<String, Arc<crate::schema::ScheduleEntry>>>,
+    schedules_by_id: RwLock<HashMap<u32, Arc<crate::schema::ScheduleEntry>>>,
+    /// Triggers indexed by id (for drop) and by table id (for the executor's
+    /// per-event lookup on the DML hot path).
+    triggers_by_id: RwLock<HashMap<u32, Arc<crate::schema::TriggerEntry>>>,
+    triggers_by_table: RwLock<HashMap<u32, Vec<Arc<crate::schema::TriggerEntry>>>>,
+    /// Declarative pipelines keyed by name (unique) and by id (for drop and
+    /// run-state persistence). The definition SQL is re-parsed on RUN.
+    pipelines_by_name: RwLock<HashMap<String, Arc<crate::schema::PipelineEntry>>>,
+    pipelines_by_id: RwLock<HashMap<u32, Arc<crate::schema::PipelineEntry>>>,
+    /// Event handlers keyed by name (unique) and by id (for drop). The event
+    /// dispatcher is rebuilt from these on startup.
+    event_handlers_by_name: RwLock<HashMap<String, Arc<crate::schema::EventHandlerEntry>>>,
+    event_handlers_by_id: RwLock<HashMap<u32, Arc<crate::schema::EventHandlerEntry>>>,
+    /// Named version tags keyed by name (unique) and by id (for drop).
+    version_tags_by_name: RwLock<HashMap<String, Arc<crate::schema::VersionTagEntry>>>,
+    version_tags_by_id: RwLock<HashMap<u32, Arc<crate::schema::VersionTagEntry>>>,
 }
 
 impl Catalog {
@@ -83,6 +175,29 @@ impl Catalog {
             oid_allocator: OidAllocator::new(USER_OID_START),
             stats: RwLock::new(HashMap::new()),
             schema_version: std::sync::atomic::AtomicU64::new(1),
+            sequences_by_name: RwLock::new(HashMap::new()),
+            sequences_by_id: RwLock::new(HashMap::new()),
+            views_by_name: RwLock::new(HashMap::new()),
+            views_by_id: RwLock::new(HashMap::new()),
+            mviews_by_name: RwLock::new(HashMap::new()),
+            mviews_by_id: RwLock::new(HashMap::new()),
+            functions_by_name: RwLock::new(HashMap::new()),
+            functions_by_id: RwLock::new(HashMap::new()),
+            comments: RwLock::new(HashMap::new()),
+            aggregates_by_name: RwLock::new(HashMap::new()),
+            aggregates_by_id: RwLock::new(HashMap::new()),
+            procedures_by_name: RwLock::new(HashMap::new()),
+            procedures_by_id: RwLock::new(HashMap::new()),
+            schedules_by_name: RwLock::new(HashMap::new()),
+            schedules_by_id: RwLock::new(HashMap::new()),
+            triggers_by_id: RwLock::new(HashMap::new()),
+            triggers_by_table: RwLock::new(HashMap::new()),
+            pipelines_by_name: RwLock::new(HashMap::new()),
+            pipelines_by_id: RwLock::new(HashMap::new()),
+            event_handlers_by_name: RwLock::new(HashMap::new()),
+            event_handlers_by_id: RwLock::new(HashMap::new()),
+            version_tags_by_name: RwLock::new(HashMap::new()),
+            version_tags_by_id: RwLock::new(HashMap::new()),
         };
 
         if !catalog.storage.is_bootstrapped().await? {
@@ -271,6 +386,90 @@ impl Catalog {
             .into_iter()
             .map(|e| e.id.0)
             .collect();
+        let mut have_sequences: HashSet<u32> = self
+            .storage
+            .load_sequences()
+            .await?
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        let mut have_views: HashSet<u32> = self
+            .storage
+            .load_views()
+            .await?
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        let mut have_mviews: HashSet<u32> = self
+            .storage
+            .load_mviews()
+            .await?
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        let mut have_functions: HashSet<u32> = self
+            .storage
+            .load_functions()
+            .await?
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        let mut have_comments: HashSet<u32> = self
+            .storage
+            .load_comments()
+            .await?
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        let mut have_aggregates: HashSet<u32> = self
+            .storage
+            .load_aggregates()
+            .await?
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        let mut have_procedures: HashSet<u32> = self
+            .storage
+            .load_procedures()
+            .await?
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        let mut have_schedules: HashSet<u32> = self
+            .storage
+            .load_schedules()
+            .await?
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        let mut have_triggers: HashSet<u32> = self
+            .storage
+            .load_triggers()
+            .await?
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        let mut have_pipelines: HashSet<u32> = self
+            .storage
+            .load_pipelines()
+            .await?
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        let mut have_event_handlers: HashSet<u32> = self
+            .storage
+            .load_event_handlers()
+            .await?
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        let mut have_version_tags: HashSet<u32> = self
+            .storage
+            .load_version_tags()
+            .await?
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
 
         // Pre-dedupe redo records in LSN order, keeping only the latest
         // record per (entity-kind, id) tuple. Subsequent records for the
@@ -416,6 +615,124 @@ impl Catalog {
                     };
                     Some((12, id as u64))
                 }
+                DDL_CREATE_SEQUENCE | DDL_UPDATE_SEQUENCE | DDL_DROP_SEQUENCE => {
+                    let id: u32 = if ddl_type == DDL_DROP_SEQUENCE {
+                        id_u32(entry_bytes)?
+                    } else {
+                        SequenceEntry::from_bytes(entry_bytes).ok().map(|e| e.id)?
+                    };
+                    Some((13, id as u64))
+                }
+                DDL_CREATE_VIEW | DDL_UPDATE_VIEW | DDL_DROP_VIEW => {
+                    let id: u32 = if ddl_type == DDL_DROP_VIEW {
+                        id_u32(entry_bytes)?
+                    } else {
+                        crate::schema::ViewEntry::from_bytes(entry_bytes)
+                            .ok()
+                            .map(|e| e.id)?
+                    };
+                    Some((14, id as u64))
+                }
+                DDL_CREATE_MVIEW | DDL_UPDATE_MVIEW | DDL_DROP_MVIEW => {
+                    let id: u32 = if ddl_type == DDL_DROP_MVIEW {
+                        id_u32(entry_bytes)?
+                    } else {
+                        crate::schema::MaterializedViewEntry::from_bytes(entry_bytes)
+                            .ok()
+                            .map(|e| e.id)?
+                    };
+                    Some((15, id as u64))
+                }
+                DDL_CREATE_FUNCTION | DDL_DROP_FUNCTION => {
+                    let id: u32 = if ddl_type == DDL_DROP_FUNCTION {
+                        id_u32(entry_bytes)?
+                    } else {
+                        crate::schema::FunctionEntry::from_bytes(entry_bytes)
+                            .ok()
+                            .map(|e| e.id)?
+                    };
+                    Some((16, id as u64))
+                }
+                DDL_SET_COMMENT | DDL_DROP_COMMENT => {
+                    let id: u32 = if ddl_type == DDL_DROP_COMMENT {
+                        id_u32(entry_bytes)?
+                    } else {
+                        crate::schema::CommentEntry::from_bytes(entry_bytes)
+                            .ok()
+                            .map(|e| e.id)?
+                    };
+                    Some((17, id as u64))
+                }
+                DDL_CREATE_AGGREGATE | DDL_DROP_AGGREGATE => {
+                    let id: u32 = if ddl_type == DDL_DROP_AGGREGATE {
+                        id_u32(entry_bytes)?
+                    } else {
+                        crate::schema::AggregateEntry::from_bytes(entry_bytes)
+                            .ok()
+                            .map(|e| e.id)?
+                    };
+                    Some((18, id as u64))
+                }
+                DDL_CREATE_PROCEDURE | DDL_DROP_PROCEDURE => {
+                    let id: u32 = if ddl_type == DDL_DROP_PROCEDURE {
+                        id_u32(entry_bytes)?
+                    } else {
+                        crate::schema::ProcedureEntry::from_bytes(entry_bytes)
+                            .ok()
+                            .map(|e| e.id)?
+                    };
+                    Some((19, id as u64))
+                }
+                DDL_CREATE_SCHEDULE | DDL_DROP_SCHEDULE => {
+                    let id: u32 = if ddl_type == DDL_DROP_SCHEDULE {
+                        id_u32(entry_bytes)?
+                    } else {
+                        crate::schema::ScheduleEntry::from_bytes(entry_bytes)
+                            .ok()
+                            .map(|e| e.id)?
+                    };
+                    Some((20, id as u64))
+                }
+                DDL_CREATE_TRIGGER | DDL_DROP_TRIGGER => {
+                    let id: u32 = if ddl_type == DDL_DROP_TRIGGER {
+                        id_u32(entry_bytes)?
+                    } else {
+                        crate::schema::TriggerEntry::from_bytes(entry_bytes)
+                            .ok()
+                            .map(|e| e.id)?
+                    };
+                    Some((21, id as u64))
+                }
+                DDL_CREATE_PIPELINE | DDL_DROP_PIPELINE => {
+                    let id: u32 = if ddl_type == DDL_DROP_PIPELINE {
+                        id_u32(entry_bytes)?
+                    } else {
+                        crate::schema::PipelineEntry::from_bytes(entry_bytes)
+                            .ok()
+                            .map(|e| e.id)?
+                    };
+                    Some((22, id as u64))
+                }
+                DDL_CREATE_EVENT_HANDLER | DDL_DROP_EVENT_HANDLER => {
+                    let id: u32 = if ddl_type == DDL_DROP_EVENT_HANDLER {
+                        id_u32(entry_bytes)?
+                    } else {
+                        crate::schema::EventHandlerEntry::from_bytes(entry_bytes)
+                            .ok()
+                            .map(|e| e.id)?
+                    };
+                    Some((23, id as u64))
+                }
+                DDL_CREATE_VERSION_TAG | DDL_DROP_VERSION_TAG => {
+                    let id: u32 = if ddl_type == DDL_DROP_VERSION_TAG {
+                        id_u32(entry_bytes)?
+                    } else {
+                        crate::schema::VersionTagEntry::from_bytes(entry_bytes)
+                            .ok()
+                            .map(|e| e.id)?
+                    };
+                    Some((24, id as u64))
+                }
                 _ => None,
             }
         }
@@ -508,10 +825,15 @@ impl Catalog {
                 }
                 DDL_CREATE_INDEX => {
                     if let Ok(entry) = IndexEntry::from_bytes(entry_bytes) {
-                        if !have_indexes.contains(&entry.id.0) {
-                            let _ = self.storage.store_index(&entry).await;
-                            have_indexes.insert(entry.id.0);
+                        // CREATE INDEX records are re-emitted by ALTER INDEX
+                        // RENAME. When the id is already present treat the record
+                        // as an update so the index name stays in sync with the
+                        // latest committed state.
+                        if have_indexes.contains(&entry.id.0) {
+                            let _ = self.storage.delete_index(entry.id).await;
                         }
+                        let _ = self.storage.store_index(&entry).await;
+                        have_indexes.insert(entry.id.0);
                     }
                 }
                 DDL_DROP_INDEX => {
@@ -546,6 +868,273 @@ impl Catalog {
                         ]);
                         if have_streaming_jobs.remove(&id) {
                             let _ = self.storage.delete_streaming_job(StreamingJobId(id)).await;
+                        }
+                    }
+                }
+                DDL_CREATE_SEQUENCE | DDL_UPDATE_SEQUENCE => {
+                    if let Ok(entry) = SequenceEntry::from_bytes(entry_bytes) {
+                        if have_sequences.contains(&entry.id) {
+                            let _ = self.storage.update_sequence(&entry).await;
+                        } else {
+                            let _ = self.storage.store_sequence(&entry).await;
+                            have_sequences.insert(entry.id);
+                        }
+                    }
+                }
+                DDL_DROP_SEQUENCE => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_sequences.remove(&id) {
+                            let _ = self.storage.delete_sequence(id).await;
+                        }
+                    }
+                }
+                DDL_CREATE_VIEW | DDL_UPDATE_VIEW => {
+                    if let Ok(entry) = crate::schema::ViewEntry::from_bytes(entry_bytes) {
+                        if have_views.contains(&entry.id) {
+                            let _ = self.storage.update_view(&entry).await;
+                        } else {
+                            let _ = self.storage.store_view(&entry).await;
+                            have_views.insert(entry.id);
+                        }
+                    }
+                }
+                DDL_DROP_VIEW => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_views.remove(&id) {
+                            let _ = self.storage.delete_view(id).await;
+                        }
+                    }
+                }
+                DDL_CREATE_MVIEW | DDL_UPDATE_MVIEW => {
+                    if let Ok(entry) = crate::schema::MaterializedViewEntry::from_bytes(entry_bytes)
+                    {
+                        if have_mviews.contains(&entry.id) {
+                            let _ = self.storage.update_mview(&entry).await;
+                        } else {
+                            let _ = self.storage.store_mview(&entry).await;
+                            have_mviews.insert(entry.id);
+                        }
+                    }
+                }
+                DDL_DROP_MVIEW => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_mviews.remove(&id) {
+                            let _ = self.storage.delete_mview(id).await;
+                        }
+                    }
+                }
+                DDL_CREATE_FUNCTION => {
+                    if let Ok(entry) = crate::schema::FunctionEntry::from_bytes(entry_bytes) {
+                        if !have_functions.contains(&entry.id) {
+                            let _ = self.storage.store_function(&entry).await;
+                            have_functions.insert(entry.id);
+                        }
+                    }
+                }
+                DDL_DROP_FUNCTION => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_functions.remove(&id) {
+                            let _ = self.storage.delete_function(id).await;
+                        }
+                    }
+                }
+                DDL_SET_COMMENT => {
+                    if let Ok(entry) = crate::schema::CommentEntry::from_bytes(entry_bytes) {
+                        if have_comments.contains(&entry.id) {
+                            let _ = self.storage.delete_comment(entry.id).await;
+                        }
+                        let _ = self.storage.store_comment(&entry).await;
+                        have_comments.insert(entry.id);
+                    }
+                }
+                DDL_DROP_COMMENT => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_comments.remove(&id) {
+                            let _ = self.storage.delete_comment(id).await;
+                        }
+                    }
+                }
+                DDL_CREATE_AGGREGATE => {
+                    if let Ok(entry) = crate::schema::AggregateEntry::from_bytes(entry_bytes) {
+                        if !have_aggregates.contains(&entry.id) {
+                            let _ = self.storage.store_aggregate(&entry).await;
+                            have_aggregates.insert(entry.id);
+                        }
+                    }
+                }
+                DDL_DROP_AGGREGATE => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_aggregates.remove(&id) {
+                            let _ = self.storage.delete_aggregate(id).await;
+                        }
+                    }
+                }
+                DDL_CREATE_PROCEDURE => {
+                    if let Ok(entry) = crate::schema::ProcedureEntry::from_bytes(entry_bytes) {
+                        if !have_procedures.contains(&entry.id) {
+                            let _ = self.storage.store_procedure(&entry).await;
+                            have_procedures.insert(entry.id);
+                        }
+                    }
+                }
+                DDL_DROP_PROCEDURE => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_procedures.remove(&id) {
+                            let _ = self.storage.delete_procedure(id).await;
+                        }
+                    }
+                }
+                DDL_CREATE_SCHEDULE => {
+                    if let Ok(entry) = crate::schema::ScheduleEntry::from_bytes(entry_bytes) {
+                        // Re-emitted by pause/resume and run-state updates, so
+                        // treat an existing id as an update.
+                        if have_schedules.contains(&entry.id) {
+                            let _ = self.storage.delete_schedule(entry.id).await;
+                        }
+                        let _ = self.storage.store_schedule(&entry).await;
+                        have_schedules.insert(entry.id);
+                    }
+                }
+                DDL_DROP_SCHEDULE => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_schedules.remove(&id) {
+                            let _ = self.storage.delete_schedule(id).await;
+                        }
+                    }
+                }
+                DDL_CREATE_TRIGGER => {
+                    if let Ok(entry) = crate::schema::TriggerEntry::from_bytes(entry_bytes) {
+                        if !have_triggers.contains(&entry.id) {
+                            let _ = self.storage.store_trigger(&entry).await;
+                            have_triggers.insert(entry.id);
+                        }
+                    }
+                }
+                DDL_DROP_TRIGGER => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_triggers.remove(&id) {
+                            let _ = self.storage.delete_trigger(id).await;
+                        }
+                    }
+                }
+                DDL_CREATE_PIPELINE => {
+                    if let Ok(entry) = crate::schema::PipelineEntry::from_bytes(entry_bytes) {
+                        // Re-emitted after each RUN for run-state updates, so
+                        // treat an existing id as an update.
+                        if have_pipelines.contains(&entry.id) {
+                            let _ = self.storage.delete_pipeline(entry.id).await;
+                        }
+                        let _ = self.storage.store_pipeline(&entry).await;
+                        have_pipelines.insert(entry.id);
+                    }
+                }
+                DDL_DROP_PIPELINE => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_pipelines.remove(&id) {
+                            let _ = self.storage.delete_pipeline(id).await;
+                        }
+                    }
+                }
+                DDL_CREATE_EVENT_HANDLER => {
+                    if let Ok(entry) = crate::schema::EventHandlerEntry::from_bytes(entry_bytes) {
+                        if have_event_handlers.contains(&entry.id) {
+                            let _ = self.storage.delete_event_handler(entry.id).await;
+                        }
+                        let _ = self.storage.store_event_handler(&entry).await;
+                        have_event_handlers.insert(entry.id);
+                    }
+                }
+                DDL_DROP_EVENT_HANDLER => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_event_handlers.remove(&id) {
+                            let _ = self.storage.delete_event_handler(id).await;
+                        }
+                    }
+                }
+                DDL_CREATE_VERSION_TAG => {
+                    if let Ok(entry) = crate::schema::VersionTagEntry::from_bytes(entry_bytes) {
+                        if !have_version_tags.contains(&entry.id) {
+                            let _ = self.storage.store_version_tag(&entry).await;
+                            have_version_tags.insert(entry.id);
+                        }
+                    }
+                }
+                DDL_DROP_VERSION_TAG => {
+                    if entry_bytes.len() >= 4 {
+                        let id = u32::from_le_bytes([
+                            entry_bytes[0],
+                            entry_bytes[1],
+                            entry_bytes[2],
+                            entry_bytes[3],
+                        ]);
+                        if have_version_tags.remove(&id) {
+                            let _ = self.storage.delete_version_tag(id).await;
                         }
                     }
                 }
@@ -744,6 +1333,18 @@ impl Catalog {
             subscriptions,
             endpoints,
             security_maps,
+            sequences,
+            views,
+            mviews,
+            functions,
+            comments,
+            aggregates,
+            procedures,
+            schedules,
+            triggers,
+            pipelines,
+            event_handlers,
+            version_tags,
         ) = tokio::try_join!(
             self.storage.load_databases(),
             self.storage.load_schemas(),
@@ -757,6 +1358,18 @@ impl Catalog {
             self.storage.load_subscriptions(),
             self.storage.load_endpoints(),
             self.storage.load_security_maps(),
+            self.storage.load_sequences(),
+            self.storage.load_views(),
+            self.storage.load_mviews(),
+            self.storage.load_functions(),
+            self.storage.load_comments(),
+            self.storage.load_aggregates(),
+            self.storage.load_procedures(),
+            self.storage.load_schedules(),
+            self.storage.load_triggers(),
+            self.storage.load_pipelines(),
+            self.storage.load_event_handlers(),
+            self.storage.load_version_tags(),
         )?;
 
         let mut max_oid: u32 = USER_OID_START;
@@ -845,6 +1458,195 @@ impl Catalog {
             self.cache.put_security_map(sm);
         }
 
+        {
+            let mut by_name = self.sequences_by_name.write();
+            let mut by_id = self.sequences_by_id.write();
+            by_name.clear();
+            by_id.clear();
+            for seq in sequences {
+                if seq.id >= max_oid {
+                    max_oid = seq.id + 1;
+                }
+                let live = Arc::new(crate::sequence::LiveSequence::from_entry(&seq));
+                by_name.insert((seq.schema_id.0, seq.name.clone()), Arc::clone(&live));
+                by_id.insert(seq.id, live);
+            }
+        }
+
+        {
+            let mut by_name = self.views_by_name.write();
+            let mut by_id = self.views_by_id.write();
+            by_name.clear();
+            by_id.clear();
+            for view in views {
+                if view.id >= max_oid {
+                    max_oid = view.id + 1;
+                }
+                let entry = Arc::new(view);
+                by_name.insert((entry.schema_id.0, entry.name.clone()), Arc::clone(&entry));
+                by_id.insert(entry.id, entry);
+            }
+        }
+
+        {
+            let mut by_name = self.mviews_by_name.write();
+            let mut by_id = self.mviews_by_id.write();
+            by_name.clear();
+            by_id.clear();
+            for mview in mviews {
+                if mview.id >= max_oid {
+                    max_oid = mview.id + 1;
+                }
+                let entry = Arc::new(mview);
+                by_name.insert((entry.schema_id.0, entry.name.clone()), Arc::clone(&entry));
+                by_id.insert(entry.id, entry);
+            }
+        }
+
+        {
+            let mut by_name = self.functions_by_name.write();
+            let mut by_id = self.functions_by_id.write();
+            by_name.clear();
+            by_id.clear();
+            for func in functions {
+                if func.id >= max_oid {
+                    max_oid = func.id + 1;
+                }
+                let entry = Arc::new(func);
+                by_name
+                    .entry(entry.name.clone())
+                    .or_default()
+                    .push(Arc::clone(&entry));
+                by_id.insert(entry.id, entry);
+            }
+        }
+
+        {
+            let mut map = self.comments.write();
+            map.clear();
+            for c in comments {
+                if c.id >= max_oid {
+                    max_oid = c.id + 1;
+                }
+                let key = (c.object_type, c.object_name.clone(), c.column_name.clone());
+                map.insert(key, Arc::new(c));
+            }
+        }
+
+        {
+            let mut by_name = self.aggregates_by_name.write();
+            let mut by_id = self.aggregates_by_id.write();
+            by_name.clear();
+            by_id.clear();
+            for agg in aggregates {
+                if agg.id >= max_oid {
+                    max_oid = agg.id + 1;
+                }
+                let entry = Arc::new(agg);
+                by_name
+                    .entry(entry.name.clone())
+                    .or_default()
+                    .push(Arc::clone(&entry));
+                by_id.insert(entry.id, entry);
+            }
+        }
+
+        {
+            let mut by_name = self.procedures_by_name.write();
+            let mut by_id = self.procedures_by_id.write();
+            by_name.clear();
+            by_id.clear();
+            for proc in procedures {
+                if proc.id >= max_oid {
+                    max_oid = proc.id + 1;
+                }
+                let entry = Arc::new(proc);
+                by_name
+                    .entry(entry.name.clone())
+                    .or_default()
+                    .push(Arc::clone(&entry));
+                by_id.insert(entry.id, entry);
+            }
+        }
+
+        {
+            let mut by_name = self.schedules_by_name.write();
+            let mut by_id = self.schedules_by_id.write();
+            by_name.clear();
+            by_id.clear();
+            for sched in schedules {
+                if sched.id >= max_oid {
+                    max_oid = sched.id + 1;
+                }
+                let entry = Arc::new(sched);
+                by_name.insert(entry.name.clone(), Arc::clone(&entry));
+                by_id.insert(entry.id, entry);
+            }
+        }
+
+        {
+            let mut by_id = self.triggers_by_id.write();
+            let mut by_table = self.triggers_by_table.write();
+            by_id.clear();
+            by_table.clear();
+            for trig in triggers {
+                if trig.id >= max_oid {
+                    max_oid = trig.id + 1;
+                }
+                let entry = Arc::new(trig);
+                by_table
+                    .entry(entry.table_id)
+                    .or_default()
+                    .push(Arc::clone(&entry));
+                by_id.insert(entry.id, entry);
+            }
+        }
+
+        {
+            let mut by_name = self.pipelines_by_name.write();
+            let mut by_id = self.pipelines_by_id.write();
+            by_name.clear();
+            by_id.clear();
+            for pipe in pipelines {
+                if pipe.id >= max_oid {
+                    max_oid = pipe.id + 1;
+                }
+                let entry = Arc::new(pipe);
+                by_name.insert(entry.name.clone(), Arc::clone(&entry));
+                by_id.insert(entry.id, entry);
+            }
+        }
+
+        {
+            let mut by_name = self.event_handlers_by_name.write();
+            let mut by_id = self.event_handlers_by_id.write();
+            by_name.clear();
+            by_id.clear();
+            for handler in event_handlers {
+                if handler.id >= max_oid {
+                    max_oid = handler.id + 1;
+                }
+                let entry = Arc::new(handler);
+                by_name.insert(entry.name.clone(), Arc::clone(&entry));
+                by_id.insert(entry.id, entry);
+            }
+        }
+
+        {
+            let mut by_name = self.version_tags_by_name.write();
+            let mut by_id = self.version_tags_by_id.write();
+            by_name.clear();
+            by_id.clear();
+            for tag in version_tags {
+                if tag.id >= max_oid {
+                    max_oid = tag.id + 1;
+                }
+                let entry = Arc::new(tag);
+                by_name.insert(entry.name.clone(), Arc::clone(&entry));
+                by_id.insert(entry.id, entry);
+            }
+        }
+
         self.oid_allocator.reset(max_oid);
         Ok(())
     }
@@ -852,6 +1654,13 @@ impl Catalog {
     /// Allocates the next OID.
     pub fn next_oid(&self) -> Oid {
         self.oid_allocator.next()
+    }
+
+    /// Allocates a fresh (heap_file_id, fsm_file_id) pair. The table-rewrite
+    /// engine uses this to build the new heap in side files before swapping
+    /// the catalog, so the old heap stays intact until the rewrite commits.
+    pub fn alloc_heap_files(&self) -> (u32, u32) {
+        self.storage.next_heap_file_id()
     }
 
     /// Creates a NameResolver bound to the given database and search path.
@@ -1020,6 +1829,34 @@ impl Catalog {
         // Convert parser constraints to catalog ConstraintEntries
         let mut constraints = convert_table_constraints(table_constraints, &columns)?;
 
+        // Resolve table-level FOREIGN KEY targets to catalog ids. The conversion
+        // above preserves order, so each ForeignKey table constraint lines up
+        // with its produced entry. The referenced table and columns must exist.
+        for (tc, entry) in table_constraints.iter().zip(constraints.iter_mut()) {
+            if let TableConstraint::ForeignKey {
+                ref_table,
+                ref_columns,
+                ..
+            } = tc
+            {
+                let ref_entry = self
+                    .cache
+                    .get_table_by_name(schema_id, ref_table)
+                    .ok_or_else(|| ZyronError::TableNotFound(ref_table.clone()))?;
+                let mut ref_col_ids = Vec::with_capacity(ref_columns.len());
+                for rc in ref_columns {
+                    let c = ref_entry
+                        .columns
+                        .iter()
+                        .find(|c| c.name == *rc)
+                        .ok_or_else(|| ZyronError::ColumnNotFound(format!("{ref_table}.{rc}")))?;
+                    ref_col_ids.push(c.id);
+                }
+                entry.ref_table_id = Some(ref_entry.id);
+                entry.ref_columns = ref_col_ids;
+            }
+        }
+
         // Extract inline column constraints (PrimaryKey, Unique, NotNull, Check, References)
         for (i, col_def) in column_defs.iter().enumerate() {
             for cc in &col_def.constraints {
@@ -1033,6 +1870,8 @@ impl Catalog {
                             ref_table_id: None,
                             ref_columns: vec![],
                             check_expr: None,
+                            on_delete: ReferentialAction::NoAction,
+                            on_update: ReferentialAction::NoAction,
                         });
                     }
                     ColumnConstraint::Unique => {
@@ -1043,6 +1882,8 @@ impl Catalog {
                             ref_table_id: None,
                             ref_columns: vec![],
                             check_expr: None,
+                            on_delete: ReferentialAction::NoAction,
+                            on_update: ReferentialAction::NoAction,
                         });
                     }
                     ColumnConstraint::NotNull => {
@@ -1053,6 +1894,8 @@ impl Catalog {
                             ref_table_id: None,
                             ref_columns: vec![],
                             check_expr: None,
+                            on_delete: ReferentialAction::NoAction,
+                            on_update: ReferentialAction::NoAction,
                         });
                     }
                     ColumnConstraint::Check(expr) => {
@@ -1062,23 +1905,39 @@ impl Catalog {
                             columns: vec![col_id],
                             ref_table_id: None,
                             ref_columns: vec![],
-                            check_expr: Some(format!("{:?}", expr)),
+                            check_expr: Some(zyron_parser::expr_to_sql(expr)),
+                            on_delete: ReferentialAction::NoAction,
+                            on_update: ReferentialAction::NoAction,
                         });
                     }
                     ColumnConstraint::References {
-                        table: _,
-                        column: _,
+                        table: ref_table,
+                        column: ref_column,
+                        on_delete,
+                        on_update,
                     } => {
-                        // Foreign key references need the referenced table to be resolved.
-                        // Store the constraint with the reference info as a string for now.
-                        // Full resolution happens at query time.
+                        // Resolve the referenced table and column to catalog ids
+                        // so foreign keys can be enforced. The target must exist.
+                        let ref_entry = self
+                            .cache
+                            .get_table_by_name(schema_id, ref_table)
+                            .ok_or_else(|| ZyronError::TableNotFound(ref_table.clone()))?;
+                        let ref_col = ref_entry
+                            .columns
+                            .iter()
+                            .find(|c| c.name == *ref_column)
+                            .ok_or_else(|| {
+                                ZyronError::ColumnNotFound(format!("{ref_table}.{ref_column}"))
+                            })?;
                         constraints.push(ConstraintEntry {
                             name: format!("fk_{}_{}", name, col_def.name),
                             constraint_type: ConstraintType::ForeignKey,
                             columns: vec![col_id],
-                            ref_table_id: None,
-                            ref_columns: vec![],
+                            ref_table_id: Some(ref_entry.id),
+                            ref_columns: vec![ref_col.id],
                             check_expr: None,
+                            on_delete: map_ref_action(*on_delete),
+                            on_update: map_ref_action(*on_update),
                         });
                     }
                     ColumnConstraint::Default(_) => {
@@ -1105,6 +1964,9 @@ impl Catalog {
             cdf_retention_days: 0,
             lifecycle: Default::default(),
             columnar: Default::default(),
+            dropped_at: None,
+            expectations: Vec::new(),
+            time_travel_retention_secs: 0,
         };
 
         self.log_ddl(DDL_CREATE_TABLE, &entry.to_bytes())?;
@@ -1113,7 +1975,7 @@ impl Catalog {
         Ok(table_id)
     }
 
-    pub async fn drop_table(&self, schema_id: SchemaId, name: &str) -> Result<()> {
+    pub async fn drop_table(&self, schema_id: SchemaId, name: &str) -> Result<DropOutcome> {
         if schema_id == SYSTEM_SCHEMA_ID {
             return Err(ZyronError::PermissionDenied(format!(
                 "tables in `{}` are reserved for Zyron internals and cannot be dropped",
@@ -1126,12 +1988,123 @@ impl Catalog {
             .ok_or_else(|| ZyronError::TableNotFound(name.to_string()))?;
 
         let id = table.id;
+        let heap_file_id = table.heap_file_id;
+        let fsm_file_id = table.fsm_file_id;
+
+        // Recycle bin: tables configured with a recycle window are hidden from
+        // lookups but kept intact so UNDROP can restore them. The reaper purges
+        // them physically once the window elapses. Files and indexes stay live.
+        if table.lifecycle.recycle_window_seconds > 0 {
+            let mut entry = (*table).clone();
+            entry.dropped_at = Some(current_timestamp());
+            self.update_table(entry).await?;
+            return Ok(DropOutcome {
+                soft_dropped: true,
+                table_id: id,
+                heap_file_id,
+                fsm_file_id,
+            });
+        }
+
         let mut payload = vec![0u8; 4];
         payload[..4].copy_from_slice(&id.0.to_le_bytes());
         self.log_ddl(DDL_DROP_TABLE, &payload)?;
         self.storage.delete_table(id).await?;
         self.cache.invalidate_table(id);
+        Ok(DropOutcome {
+            soft_dropped: false,
+            table_id: id,
+            heap_file_id,
+            fsm_file_id,
+        })
+    }
+
+    /// Restores a soft-dropped table from the recycle bin by clearing its drop
+    /// marker. Fails if a live table already holds the name, or if no recycled
+    /// table with the name exists. Storage and indexes were retained on the
+    /// soft drop, so the restored table is immediately queryable.
+    pub async fn undrop_table(&self, schema_id: SchemaId, name: &str) -> Result<()> {
+        if self.cache.get_table_by_name(schema_id, name).is_some() {
+            return Err(ZyronError::TableAlreadyExists(format!(
+                "{} exists as a live table, rename or drop it before restoring the recycled copy",
+                name
+            )));
+        }
+        // Cache first, then a storage scan in case the recycle-bin entry was
+        // evicted from the bounded cache.
+        let dropped = match self.cache.get_dropped_table_by_name(schema_id, name) {
+            Some(e) => (*e).clone(),
+            None => self
+                .storage
+                .load_tables()
+                .await?
+                .into_iter()
+                .find(|t| t.schema_id == schema_id && t.name == name && t.dropped_at.is_some())
+                .ok_or_else(|| {
+                    ZyronError::TableNotFound(format!(
+                        "no recycled table named {} to restore",
+                        name
+                    ))
+                })?,
+        };
+        let mut entry = dropped;
+        entry.dropped_at = None;
+        self.update_table(entry).await?;
         Ok(())
+    }
+
+    /// Physically purges a soft-dropped table once its recycle window elapses.
+    /// Drops the table's index catalog entries and the table entry, then returns
+    /// the removed entry so the caller can reclaim the backing heap/index files
+    /// and in-memory index handles. Returns None if the table is not soft-dropped
+    /// (already restored or already purged), making the reaper idempotent.
+    pub async fn finalize_dropped_table(&self, id: TableId) -> Result<Option<Arc<TableEntry>>> {
+        let entry = match self.cache.get_table_including_dropped(id) {
+            Some(e) if e.dropped_at.is_some() => e,
+            _ => return Ok(None),
+        };
+
+        for idx in self.cache.get_indexes_for_table(id) {
+            let mut p = vec![0u8; 4];
+            p[..4].copy_from_slice(&idx.id.0.to_le_bytes());
+            self.log_ddl(DDL_DROP_INDEX, &p)?;
+            self.storage.delete_index(idx.id).await?;
+            self.cache.invalidate_index(idx.id);
+        }
+
+        let mut payload = vec![0u8; 4];
+        payload[..4].copy_from_slice(&id.0.to_le_bytes());
+        self.log_ddl(DDL_DROP_TABLE, &payload)?;
+        self.storage.delete_table(id).await?;
+        self.cache.invalidate_table(id);
+        Ok(Some(entry))
+    }
+
+    /// Returns all tables currently in the recycle bin (soft-dropped). Used by
+    /// the background reaper to find tables whose window has elapsed.
+    pub fn list_dropped_tables(&self) -> Vec<Arc<TableEntry>> {
+        self.cache.list_dropped_tables()
+    }
+
+    /// Returns every foreign-key constraint in any table that references the
+    /// given parent table, paired with the child table that owns it. Used by
+    /// the executor to enforce ON DELETE / ON UPDATE actions when a parent row
+    /// changes. Scans the cached table set, which holds the full catalog.
+    pub fn referencing_constraints(
+        &self,
+        parent_id: TableId,
+    ) -> Vec<(Arc<TableEntry>, ConstraintEntry)> {
+        let mut out = Vec::new();
+        for table in self.cache.list_all_tables() {
+            for con in &table.constraints {
+                if con.constraint_type == ConstraintType::ForeignKey
+                    && con.ref_table_id == Some(parent_id)
+                {
+                    out.push((Arc::clone(&table), con.clone()));
+                }
+            }
+        }
+        out
     }
 
     pub fn get_table(&self, schema_id: SchemaId, name: &str) -> Result<Arc<TableEntry>> {
@@ -1296,6 +2269,33 @@ impl Catalog {
         self.cache.get_indexes_for_table(table_id)
     }
 
+    /// Renames an index. The index id, columns, and backing file are unchanged;
+    /// only the catalog name is updated. The renamed entry is re-logged so a
+    /// restart recovers the new name (CREATE INDEX recovery upserts by id).
+    pub async fn rename_index(
+        &self,
+        table_id: TableId,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<()> {
+        let indexes = self.cache.get_indexes_for_table(table_id);
+        if indexes.iter().any(|i| i.name == new_name) {
+            return Err(ZyronError::IndexAlreadyExists(new_name.to_string()));
+        }
+        let idx = indexes
+            .iter()
+            .find(|i| i.name == old_name)
+            .ok_or_else(|| ZyronError::IndexNotFound(old_name.to_string()))?;
+        let mut entry = (**idx).clone();
+        entry.name = new_name.to_string();
+        self.log_ddl(DDL_CREATE_INDEX, &entry.to_bytes())?;
+        self.storage.delete_index(entry.id).await?;
+        self.storage.store_index(&entry).await?;
+        self.cache.invalidate_index(entry.id);
+        self.cache.put_index(entry);
+        Ok(())
+    }
+
     /// Returns the lock-free, pre-partitioned index snapshot for a table.
     /// DML operators consult this once per statement instead of hitting four
     /// separate catalog `RwLock` reads + allocations per batch.
@@ -1384,6 +2384,1323 @@ impl Catalog {
         self.cache.invalidate_streaming_job(id);
         self.cache.put_streaming_job(updated);
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Sequence operations
+    // -----------------------------------------------------------------------
+
+    /// Creates a sequence. The entry's `reserved` is set to `start -
+    /// increment` so the first nextval returns `start`. Assigns an id when the
+    /// entry carries 0. Errors when a sequence of the same name already exists
+    /// in the schema.
+    pub async fn create_sequence(&self, mut entry: SequenceEntry) -> Result<u32> {
+        let key = (entry.schema_id.0, entry.name.clone());
+        if self.sequences_by_name.read().contains_key(&key) {
+            return Err(ZyronError::Internal(format!(
+                "sequence '{}' already exists",
+                entry.name
+            )));
+        }
+        if entry.cache < 1 {
+            entry.cache = 1;
+        }
+        if entry.id == 0 {
+            entry.id = self.oid_allocator.next();
+        }
+        entry.reserved = entry.start.saturating_sub(entry.increment);
+
+        let id = entry.id;
+        self.log_ddl(DDL_CREATE_SEQUENCE, &entry.to_bytes())?;
+        self.storage.store_sequence(&entry).await?;
+
+        let live = Arc::new(crate::sequence::LiveSequence::from_entry(&entry));
+        self.sequences_by_name
+            .write()
+            .insert(key, Arc::clone(&live));
+        self.sequences_by_id.write().insert(id, live);
+        Ok(id)
+    }
+
+    /// Resolves a live sequence by schema and name.
+    pub fn get_sequence(
+        &self,
+        schema_id: SchemaId,
+        name: &str,
+    ) -> Option<Arc<crate::sequence::LiveSequence>> {
+        self.sequences_by_name
+            .read()
+            .get(&(schema_id.0, name.to_string()))
+            .map(Arc::clone)
+    }
+
+    /// Resolves a live sequence by id.
+    pub fn get_sequence_by_id(&self, id: u32) -> Option<Arc<crate::sequence::LiveSequence>> {
+        self.sequences_by_id.read().get(&id).map(Arc::clone)
+    }
+
+    /// Lists every live sequence.
+    pub fn list_sequences(&self) -> Vec<Arc<crate::sequence::LiveSequence>> {
+        self.sequences_by_name
+            .read()
+            .values()
+            .map(Arc::clone)
+            .collect()
+    }
+
+    /// Resolves a sequence by its bare name (the last dotted component) across
+    /// all schemas. Used by nextval/currval/setval at execution time where the
+    /// session schema is not threaded into the executor. Errors when the name
+    /// is ambiguous across schemas or not found.
+    pub fn find_sequence_by_name(&self, name: &str) -> Result<Arc<crate::sequence::LiveSequence>> {
+        let bare = name.rsplit('.').next().unwrap_or(name);
+        let map = self.sequences_by_name.read();
+        let mut found: Option<Arc<crate::sequence::LiveSequence>> = None;
+        for ((_, n), live) in map.iter() {
+            if n == bare {
+                if found.is_some() {
+                    return Err(ZyronError::Internal(format!(
+                        "sequence name '{bare}' is ambiguous across schemas; qualify it"
+                    )));
+                }
+                found = Some(Arc::clone(live));
+            }
+        }
+        found.ok_or_else(|| ZyronError::Internal(format!("sequence '{name}' not found")))
+    }
+
+    /// Drops a sequence and removes its durable entry.
+    pub async fn drop_sequence(&self, schema_id: SchemaId, name: &str) -> Result<()> {
+        let key = (schema_id.0, name.to_string());
+        let live = self
+            .sequences_by_name
+            .read()
+            .get(&key)
+            .map(Arc::clone)
+            .ok_or_else(|| ZyronError::Internal(format!("sequence '{name}' not found")))?;
+
+        let id = live.id;
+        self.log_ddl(DDL_DROP_SEQUENCE, &id.to_le_bytes())?;
+        self.storage.delete_sequence(id).await?;
+        self.sequences_by_name.write().remove(&key);
+        self.sequences_by_id.write().remove(&id);
+        Ok(())
+    }
+
+    /// Replaces a sequence definition. Builds a fresh entry from the supplied
+    /// fields, persists it, and swaps the live manager so the next nextval
+    /// reflects the new parameters. The cursor resets to the new `reserved`.
+    pub async fn alter_sequence(&self, entry: SequenceEntry) -> Result<()> {
+        let key = (entry.schema_id.0, entry.name.clone());
+        let existing_id = self
+            .sequences_by_name
+            .read()
+            .get(&key)
+            .map(|s| s.id)
+            .ok_or_else(|| ZyronError::Internal(format!("sequence '{}' not found", entry.name)))?;
+
+        let mut entry = entry;
+        entry.id = existing_id;
+        if entry.cache < 1 {
+            entry.cache = 1;
+        }
+
+        self.log_ddl(DDL_UPDATE_SEQUENCE, &entry.to_bytes())?;
+        self.storage.update_sequence(&entry).await?;
+
+        let live = Arc::new(crate::sequence::LiveSequence::from_entry(&entry));
+        self.sequences_by_name
+            .write()
+            .insert(key, Arc::clone(&live));
+        self.sequences_by_id.write().insert(existing_id, live);
+        Ok(())
+    }
+
+    /// Returns the next value of the sequence. Hands out from the cached block
+    /// when possible; otherwise reserves and durably persists a new block
+    /// before returning, so a crash skips at most `cache` values.
+    pub async fn sequence_nextval(&self, schema_id: SchemaId, name: &str) -> Result<i64> {
+        let live = self
+            .get_sequence(schema_id, name)
+            .ok_or_else(|| ZyronError::Internal(format!("sequence '{name}' not found")))?;
+        self.nextval_on(&live).await
+    }
+
+    /// nextval against an already-resolved live sequence. The DEFAULT path
+    /// resolves by id once and reuses the handle for every inserted row.
+    pub async fn nextval_on(&self, live: &Arc<crate::sequence::LiveSequence>) -> Result<i64> {
+        if let Some(v) = live.try_next() {
+            return Ok(v);
+        }
+        let _gate = live.lock_refill().await;
+        // Another session may have reserved a block while this one waited.
+        if let Some(v) = live.try_next() {
+            return Ok(v);
+        }
+        let (entry, slot) = live.plan_refill()?;
+        self.log_sequence_reserve(&entry)?;
+        self.storage.update_sequence(&entry).await?;
+        live.install_refill(slot)
+    }
+
+    /// Sets the sequence value. With `is_called` true the value becomes the
+    /// current value and the next nextval returns `value + increment`; with
+    /// false the next nextval returns `value`.
+    pub async fn sequence_setval(
+        &self,
+        schema_id: SchemaId,
+        name: &str,
+        value: i64,
+        is_called: bool,
+    ) -> Result<i64> {
+        let live = self
+            .get_sequence(schema_id, name)
+            .ok_or_else(|| ZyronError::Internal(format!("sequence '{name}' not found")))?;
+        self.setval_on(&live, value, is_called).await
+    }
+
+    /// setval against an already-resolved live sequence.
+    pub async fn setval_on(
+        &self,
+        live: &Arc<crate::sequence::LiveSequence>,
+        value: i64,
+        is_called: bool,
+    ) -> Result<i64> {
+        let _gate = live.lock_refill().await;
+        let (entry, slot) = live.plan_setval(value, is_called)?;
+        self.log_sequence_reserve(&entry)?;
+        self.storage.update_sequence(&entry).await?;
+        live.install_window(slot);
+        Ok(value)
+    }
+
+    /// Persists an advanced sequence high-water to the WAL and waits for its
+    /// durability. Unlike `log_ddl` this does not bump `schema_version`: a
+    /// reserved-block advance is not a schema change and must not invalidate
+    /// cached plans.
+    fn log_sequence_reserve(&self, entry: &SequenceEntry) -> Result<Lsn> {
+        let bytes = entry.to_bytes();
+        let txn_id = self.wal.allocate_txn_id();
+        let begin_lsn = self.wal.log_begin(txn_id)?;
+        let mut payload = Vec::with_capacity(1 + bytes.len());
+        payload.push(DDL_UPDATE_SEQUENCE);
+        payload.extend_from_slice(&bytes);
+        let insert_lsn = self.wal.log_insert(txn_id, begin_lsn, &payload)?;
+        let commit_lsn = self.wal.log_commit(txn_id, insert_lsn)?;
+        self.wal.wait_for_flush(commit_lsn)?;
+        Ok(commit_lsn)
+    }
+
+    // -----------------------------------------------------------------------
+    // View operations
+    // -----------------------------------------------------------------------
+
+    /// Creates a view. Assigns an id when the entry carries 0. With
+    /// `or_replace` an existing view of the same name is overwritten; otherwise
+    /// a duplicate name is an error.
+    pub async fn create_view(
+        &self,
+        mut entry: crate::schema::ViewEntry,
+        or_replace: bool,
+    ) -> Result<u32> {
+        let key = (entry.schema_id.0, entry.name.clone());
+        let existing_id = self.views_by_name.read().get(&key).map(|v| v.id);
+        match existing_id {
+            Some(id) if or_replace => {
+                entry.id = id;
+                self.log_ddl(DDL_UPDATE_VIEW, &entry.to_bytes())?;
+                self.storage.update_view(&entry).await?;
+                let e = Arc::new(entry);
+                self.views_by_name.write().insert(key, Arc::clone(&e));
+                self.views_by_id.write().insert(id, e);
+                Ok(id)
+            }
+            Some(_) => Err(ZyronError::Internal(format!(
+                "view '{}' already exists",
+                entry.name
+            ))),
+            None => {
+                if entry.id == 0 {
+                    entry.id = self.oid_allocator.next();
+                }
+                let id = entry.id;
+                self.log_ddl(DDL_CREATE_VIEW, &entry.to_bytes())?;
+                self.storage.store_view(&entry).await?;
+                let e = Arc::new(entry);
+                self.views_by_name.write().insert(key, Arc::clone(&e));
+                self.views_by_id.write().insert(id, e);
+                Ok(id)
+            }
+        }
+    }
+
+    /// Resolves a view by schema and name.
+    pub fn get_view(
+        &self,
+        schema_id: SchemaId,
+        name: &str,
+    ) -> Option<Arc<crate::schema::ViewEntry>> {
+        self.views_by_name
+            .read()
+            .get(&(schema_id.0, name.to_string()))
+            .map(Arc::clone)
+    }
+
+    /// Resolves a view by its bare name across all schemas. Used by the binder,
+    /// which resolves view references without a threaded schema. Errors when
+    /// the bare name is ambiguous across schemas.
+    pub fn find_view_by_name(&self, name: &str) -> Result<Option<Arc<crate::schema::ViewEntry>>> {
+        let bare = name.rsplit('.').next().unwrap_or(name);
+        let map = self.views_by_name.read();
+        let mut found: Option<Arc<crate::schema::ViewEntry>> = None;
+        for ((_, n), entry) in map.iter() {
+            if n == bare {
+                if found.is_some() {
+                    return Err(ZyronError::Internal(format!(
+                        "view name '{bare}' is ambiguous across schemas; qualify it"
+                    )));
+                }
+                found = Some(Arc::clone(entry));
+            }
+        }
+        Ok(found)
+    }
+
+    /// Lists every view.
+    pub fn list_views(&self) -> Vec<Arc<crate::schema::ViewEntry>> {
+        self.views_by_name.read().values().map(Arc::clone).collect()
+    }
+
+    /// Drops a view and removes its durable entry.
+    pub async fn drop_view(&self, schema_id: SchemaId, name: &str) -> Result<()> {
+        let key = (schema_id.0, name.to_string());
+        let id = self
+            .views_by_name
+            .read()
+            .get(&key)
+            .map(|v| v.id)
+            .ok_or_else(|| ZyronError::Internal(format!("view '{name}' not found")))?;
+
+        self.log_ddl(DDL_DROP_VIEW, &id.to_le_bytes())?;
+        self.storage.delete_view(id).await?;
+        self.views_by_name.write().remove(&key);
+        self.views_by_id.write().remove(&id);
+        Ok(())
+    }
+
+    /// Renames a view. Rewrites the entry under the new name and rebuilds the
+    /// lookup maps.
+    pub async fn rename_view(&self, schema_id: SchemaId, name: &str, new_name: &str) -> Result<()> {
+        let old_key = (schema_id.0, name.to_string());
+        let existing = self
+            .views_by_name
+            .read()
+            .get(&old_key)
+            .map(Arc::clone)
+            .ok_or_else(|| ZyronError::Internal(format!("view '{name}' not found")))?;
+        if self
+            .views_by_name
+            .read()
+            .contains_key(&(schema_id.0, new_name.to_string()))
+        {
+            return Err(ZyronError::Internal(format!(
+                "view '{new_name}' already exists"
+            )));
+        }
+
+        let mut entry = (*existing).clone();
+        entry.name = new_name.to_string();
+        self.log_ddl(DDL_UPDATE_VIEW, &entry.to_bytes())?;
+        self.storage.update_view(&entry).await?;
+
+        let id = entry.id;
+        let e = Arc::new(entry);
+        {
+            let mut by_name = self.views_by_name.write();
+            by_name.remove(&old_key);
+            by_name.insert((schema_id.0, new_name.to_string()), Arc::clone(&e));
+        }
+        self.views_by_id.write().insert(id, e);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Materialized view operations
+    // -----------------------------------------------------------------------
+
+    /// Creates a table from pre-resolved column entries, bypassing parser
+    /// ColumnDefs. Used to build a materialized view's backing table from the
+    /// query's output schema, whose types are already resolved to TypeIds.
+    pub async fn create_table_from_columns(
+        &self,
+        schema_id: SchemaId,
+        name: &str,
+        columns: &[(String, zyron_common::TypeId, bool, Option<u8>)],
+    ) -> Result<TableId> {
+        if self.cache.get_table_by_name(schema_id, name).is_some() {
+            return Err(ZyronError::TableAlreadyExists(name.to_string()));
+        }
+        let table_id = TableId(self.oid_allocator.next());
+        let (heap_file_id, fsm_file_id) = self.storage.next_heap_file_id();
+        let column_entries: Vec<ColumnEntry> = columns
+            .iter()
+            .enumerate()
+            .map(
+                |(i, (col_name, type_id, nullable, ts_precision))| ColumnEntry {
+                    id: ColumnId(i as u16),
+                    table_id,
+                    name: col_name.clone(),
+                    type_id: *type_id,
+                    ordinal: i as u16,
+                    nullable: *nullable,
+                    default_expr: None,
+                    max_length: None,
+                    ts_precision: *ts_precision,
+                    tz_offset_secs: None,
+                },
+            )
+            .collect();
+
+        let entry = TableEntry {
+            id: table_id,
+            schema_id,
+            name: name.to_string(),
+            heap_file_id,
+            fsm_file_id,
+            columns: column_entries,
+            constraints: Vec::new(),
+            created_at: current_timestamp(),
+            versioning_enabled: false,
+            scd_type: None,
+            system_versioned: false,
+            history_table_id: None,
+            cdf_enabled: false,
+            cdf_retention_days: 0,
+            lifecycle: Default::default(),
+            columnar: Default::default(),
+            dropped_at: None,
+            expectations: Vec::new(),
+            time_travel_retention_secs: 0,
+        };
+        self.log_ddl(DDL_CREATE_TABLE, &entry.to_bytes())?;
+        self.storage.store_table(&entry).await?;
+        self.cache.put_table(entry);
+        Ok(table_id)
+    }
+
+    /// Registers a materialized view. The backing table must already exist
+    /// (created via `create_table_from_columns` and populated by the caller).
+    pub async fn create_mview(
+        &self,
+        mut entry: crate::schema::MaterializedViewEntry,
+    ) -> Result<u32> {
+        let key = (entry.schema_id.0, entry.name.clone());
+        if self.mviews_by_name.read().contains_key(&key) {
+            return Err(ZyronError::Internal(format!(
+                "materialized view '{}' already exists",
+                entry.name
+            )));
+        }
+        if entry.id == 0 {
+            entry.id = self.oid_allocator.next();
+        }
+        let id = entry.id;
+        self.log_ddl(DDL_CREATE_MVIEW, &entry.to_bytes())?;
+        self.storage.store_mview(&entry).await?;
+        let e = Arc::new(entry);
+        self.mviews_by_name.write().insert(key, Arc::clone(&e));
+        self.mviews_by_id.write().insert(id, e);
+        Ok(id)
+    }
+
+    /// Resolves a materialized view by schema and name.
+    pub fn get_mview(
+        &self,
+        schema_id: SchemaId,
+        name: &str,
+    ) -> Option<Arc<crate::schema::MaterializedViewEntry>> {
+        self.mviews_by_name
+            .read()
+            .get(&(schema_id.0, name.to_string()))
+            .map(Arc::clone)
+    }
+
+    /// Resolves a materialized view by its bare name across all schemas.
+    pub fn find_mview_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<Arc<crate::schema::MaterializedViewEntry>>> {
+        let bare = name.rsplit('.').next().unwrap_or(name);
+        let map = self.mviews_by_name.read();
+        let mut found: Option<Arc<crate::schema::MaterializedViewEntry>> = None;
+        for ((_, n), entry) in map.iter() {
+            if n == bare {
+                if found.is_some() {
+                    return Err(ZyronError::Internal(format!(
+                        "materialized view name '{bare}' is ambiguous across schemas; qualify it"
+                    )));
+                }
+                found = Some(Arc::clone(entry));
+            }
+        }
+        Ok(found)
+    }
+
+    /// Lists every materialized view.
+    pub fn list_mviews(&self) -> Vec<Arc<crate::schema::MaterializedViewEntry>> {
+        self.mviews_by_name
+            .read()
+            .values()
+            .map(Arc::clone)
+            .collect()
+    }
+
+    /// Drops a materialized view's metadata entry. The caller drops the backing
+    /// table separately.
+    pub async fn drop_mview(&self, schema_id: SchemaId, name: &str) -> Result<()> {
+        let key = (schema_id.0, name.to_string());
+        let id = self
+            .mviews_by_name
+            .read()
+            .get(&key)
+            .map(|m| m.id)
+            .ok_or_else(|| ZyronError::Internal(format!("materialized view '{name}' not found")))?;
+        self.log_ddl(DDL_DROP_MVIEW, &id.to_le_bytes())?;
+        self.storage.delete_mview(id).await?;
+        self.mviews_by_name.write().remove(&key);
+        self.mviews_by_id.write().remove(&id);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Function operations
+    // -----------------------------------------------------------------------
+
+    /// Registers a SQL scalar function. With `or_replace` an existing overload
+    /// with the same name and parameter types is replaced; otherwise a
+    /// duplicate signature is an error.
+    pub async fn create_function(
+        &self,
+        mut entry: crate::schema::FunctionEntry,
+        or_replace: bool,
+    ) -> Result<u32> {
+        // Detect an existing overload with the identical signature.
+        let existing_id = {
+            let map = self.functions_by_name.read();
+            map.get(&entry.name).and_then(|overloads| {
+                overloads
+                    .iter()
+                    .find(|f| f.param_types == entry.param_types)
+                    .map(|f| f.id)
+            })
+        };
+        if let Some(id) = existing_id {
+            if !or_replace {
+                return Err(ZyronError::Internal(format!(
+                    "function '{}' with these parameter types already exists",
+                    entry.name
+                )));
+            }
+            // Replace: drop the old overload first.
+            self.remove_function_by_id(id).await?;
+        }
+
+        if entry.id == 0 {
+            entry.id = self.oid_allocator.next();
+        }
+        let id = entry.id;
+        self.log_ddl(DDL_CREATE_FUNCTION, &entry.to_bytes())?;
+        self.storage.store_function(&entry).await?;
+        let e = Arc::new(entry);
+        self.functions_by_name
+            .write()
+            .entry(e.name.clone())
+            .or_default()
+            .push(Arc::clone(&e));
+        self.functions_by_id.write().insert(id, e);
+        Ok(id)
+    }
+
+    /// Resolves a function overload by bare name and argument count. When
+    /// several overloads share the arity, the one whose parameter types match
+    /// `arg_types` wins; otherwise the first same-arity overload is returned.
+    pub fn find_function(
+        &self,
+        name: &str,
+        arg_types: &[zyron_common::TypeId],
+    ) -> Option<Arc<crate::schema::FunctionEntry>> {
+        let bare = name.rsplit('.').next().unwrap_or(name);
+        let map = self.functions_by_name.read();
+        let overloads = map.get(bare)?;
+        let same_arity: Vec<&Arc<crate::schema::FunctionEntry>> = overloads
+            .iter()
+            .filter(|f| f.param_types.len() == arg_types.len())
+            .collect();
+        if same_arity.is_empty() {
+            return None;
+        }
+        same_arity
+            .iter()
+            .find(|f| f.param_types.as_slice() == arg_types)
+            .or_else(|| same_arity.first())
+            .map(|f| Arc::clone(f))
+    }
+
+    /// Lists every registered function.
+    pub fn list_functions(&self) -> Vec<Arc<crate::schema::FunctionEntry>> {
+        self.functions_by_id
+            .read()
+            .values()
+            .map(Arc::clone)
+            .collect()
+    }
+
+    /// Drops every overload of a function by name. Errors when none exist.
+    pub async fn drop_function(&self, name: &str) -> Result<()> {
+        let bare = name.rsplit('.').next().unwrap_or(name);
+        let ids: Vec<u32> = {
+            let map = self.functions_by_name.read();
+            match map.get(bare) {
+                Some(overloads) => overloads.iter().map(|f| f.id).collect(),
+                None => Vec::new(),
+            }
+        };
+        if ids.is_empty() {
+            return Err(ZyronError::Internal(format!("function '{name}' not found")));
+        }
+        for id in ids {
+            self.remove_function_by_id(id).await?;
+        }
+        Ok(())
+    }
+
+    /// Removes a single function overload by id from storage and both maps.
+    async fn remove_function_by_id(&self, id: u32) -> Result<()> {
+        self.log_ddl(DDL_DROP_FUNCTION, &id.to_le_bytes())?;
+        self.storage.delete_function(id).await?;
+        let name = self
+            .functions_by_id
+            .write()
+            .remove(&id)
+            .map(|e| e.name.clone());
+        if let Some(name) = name {
+            let mut by_name = self.functions_by_name.write();
+            if let Some(overloads) = by_name.get_mut(&name) {
+                overloads.retain(|f| f.id != id);
+                if overloads.is_empty() {
+                    by_name.remove(&name);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Aggregate operations
+    // -----------------------------------------------------------------------
+
+    /// Registers a user-defined aggregate. Overloads with distinct input types
+    /// coexist under the same name. An identical signature is rejected unless
+    /// `or_replace` is set, in which case the prior overload is dropped first.
+    pub async fn create_aggregate(
+        &self,
+        mut entry: crate::schema::AggregateEntry,
+        or_replace: bool,
+    ) -> Result<u32> {
+        let existing_id = {
+            let map = self.aggregates_by_name.read();
+            map.get(&entry.name).and_then(|overloads| {
+                overloads
+                    .iter()
+                    .find(|a| a.input_types == entry.input_types)
+                    .map(|a| a.id)
+            })
+        };
+        if let Some(id) = existing_id {
+            if !or_replace {
+                return Err(ZyronError::Internal(format!(
+                    "aggregate '{}' with these input types already exists",
+                    entry.name
+                )));
+            }
+            self.remove_aggregate_by_id(id).await?;
+        }
+
+        if entry.id == 0 {
+            entry.id = self.oid_allocator.next();
+        }
+        let id = entry.id;
+        self.log_ddl(DDL_CREATE_AGGREGATE, &entry.to_bytes())?;
+        self.storage.store_aggregate(&entry).await?;
+        let e = Arc::new(entry);
+        self.aggregates_by_name
+            .write()
+            .entry(e.name.clone())
+            .or_default()
+            .push(Arc::clone(&e));
+        self.aggregates_by_id.write().insert(id, e);
+        Ok(id)
+    }
+
+    /// Resolves an aggregate overload by bare name and argument count. When
+    /// several overloads share the arity, the one whose input types match
+    /// `arg_types` wins; otherwise the first same-arity overload is returned.
+    pub fn find_aggregate(
+        &self,
+        name: &str,
+        arg_types: &[zyron_common::TypeId],
+    ) -> Option<Arc<crate::schema::AggregateEntry>> {
+        let bare = name.rsplit('.').next().unwrap_or(name);
+        let map = self.aggregates_by_name.read();
+        let overloads = map.get(bare)?;
+        let same_arity: Vec<&Arc<crate::schema::AggregateEntry>> = overloads
+            .iter()
+            .filter(|a| a.input_types.len() == arg_types.len())
+            .collect();
+        if same_arity.is_empty() {
+            return None;
+        }
+        same_arity
+            .iter()
+            .find(|a| a.input_types.as_slice() == arg_types)
+            .or_else(|| same_arity.first())
+            .map(|a| Arc::clone(a))
+    }
+
+    /// Returns true when any aggregate overload is registered under the name.
+    pub fn is_aggregate(&self, name: &str) -> bool {
+        let bare = name.rsplit('.').next().unwrap_or(name);
+        self.aggregates_by_name.read().contains_key(bare)
+    }
+
+    /// Lists every registered aggregate.
+    pub fn list_aggregates(&self) -> Vec<Arc<crate::schema::AggregateEntry>> {
+        self.aggregates_by_id
+            .read()
+            .values()
+            .map(Arc::clone)
+            .collect()
+    }
+
+    /// Drops every overload of an aggregate by name. Errors when none exist.
+    pub async fn drop_aggregate(&self, name: &str) -> Result<()> {
+        let bare = name.rsplit('.').next().unwrap_or(name);
+        let ids: Vec<u32> = {
+            let map = self.aggregates_by_name.read();
+            match map.get(bare) {
+                Some(overloads) => overloads.iter().map(|a| a.id).collect(),
+                None => Vec::new(),
+            }
+        };
+        if ids.is_empty() {
+            return Err(ZyronError::Internal(format!(
+                "aggregate '{name}' not found"
+            )));
+        }
+        for id in ids {
+            self.remove_aggregate_by_id(id).await?;
+        }
+        Ok(())
+    }
+
+    /// Removes a single aggregate overload by id from storage and both maps.
+    async fn remove_aggregate_by_id(&self, id: u32) -> Result<()> {
+        self.log_ddl(DDL_DROP_AGGREGATE, &id.to_le_bytes())?;
+        self.storage.delete_aggregate(id).await?;
+        let name = self
+            .aggregates_by_id
+            .write()
+            .remove(&id)
+            .map(|e| e.name.clone());
+        if let Some(name) = name {
+            let mut by_name = self.aggregates_by_name.write();
+            if let Some(overloads) = by_name.get_mut(&name) {
+                overloads.retain(|a| a.id != id);
+                if overloads.is_empty() {
+                    by_name.remove(&name);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Procedure operations
+    // -----------------------------------------------------------------------
+
+    /// Registers a stored procedure. Overloads with distinct input types coexist
+    /// under the same name. An identical signature is rejected unless
+    /// `or_replace` is set, in which case the prior overload is dropped first.
+    pub async fn create_procedure(
+        &self,
+        mut entry: crate::schema::ProcedureEntry,
+        or_replace: bool,
+    ) -> Result<u32> {
+        let existing_id = {
+            let map = self.procedures_by_name.read();
+            map.get(&entry.name).and_then(|overloads| {
+                overloads
+                    .iter()
+                    .find(|p| p.param_types == entry.param_types)
+                    .map(|p| p.id)
+            })
+        };
+        if let Some(id) = existing_id {
+            if !or_replace {
+                return Err(ZyronError::Internal(format!(
+                    "procedure '{}' with these parameter types already exists",
+                    entry.name
+                )));
+            }
+            self.remove_procedure_by_id(id).await?;
+        }
+
+        if entry.id == 0 {
+            entry.id = self.oid_allocator.next();
+        }
+        let id = entry.id;
+        self.log_ddl(DDL_CREATE_PROCEDURE, &entry.to_bytes())?;
+        self.storage.store_procedure(&entry).await?;
+        let e = Arc::new(entry);
+        self.procedures_by_name
+            .write()
+            .entry(e.name.clone())
+            .or_default()
+            .push(Arc::clone(&e));
+        self.procedures_by_id.write().insert(id, e);
+        Ok(id)
+    }
+
+    /// Resolves a procedure overload by bare name and argument count. When
+    /// several overloads share the arity, the one whose parameter types match
+    /// `arg_types` wins; otherwise the first same-arity overload is returned.
+    pub fn find_procedure(
+        &self,
+        name: &str,
+        arg_types: &[zyron_common::TypeId],
+    ) -> Option<Arc<crate::schema::ProcedureEntry>> {
+        let bare = name.rsplit('.').next().unwrap_or(name);
+        let map = self.procedures_by_name.read();
+        let overloads = map.get(bare)?;
+        let same_arity: Vec<&Arc<crate::schema::ProcedureEntry>> = overloads
+            .iter()
+            .filter(|p| p.param_types.len() == arg_types.len())
+            .collect();
+        if same_arity.is_empty() {
+            return None;
+        }
+        same_arity
+            .iter()
+            .find(|p| p.param_types.as_slice() == arg_types)
+            .or_else(|| same_arity.first())
+            .map(|p| Arc::clone(p))
+    }
+
+    /// Resolves a procedure by bare name, ignoring argument types. Used by CALL
+    /// to find the single overload when only the name is known.
+    pub fn find_procedure_by_name(&self, name: &str) -> Option<Arc<crate::schema::ProcedureEntry>> {
+        let bare = name.rsplit('.').next().unwrap_or(name);
+        self.procedures_by_name
+            .read()
+            .get(bare)
+            .and_then(|overloads| overloads.first().map(Arc::clone))
+    }
+
+    /// Lists every registered procedure.
+    pub fn list_procedures(&self) -> Vec<Arc<crate::schema::ProcedureEntry>> {
+        self.procedures_by_id
+            .read()
+            .values()
+            .map(Arc::clone)
+            .collect()
+    }
+
+    /// Drops every overload of a procedure by name. Errors when none exist.
+    pub async fn drop_procedure(&self, name: &str) -> Result<()> {
+        let bare = name.rsplit('.').next().unwrap_or(name);
+        let ids: Vec<u32> = {
+            let map = self.procedures_by_name.read();
+            match map.get(bare) {
+                Some(overloads) => overloads.iter().map(|p| p.id).collect(),
+                None => Vec::new(),
+            }
+        };
+        if ids.is_empty() {
+            return Err(ZyronError::Internal(format!(
+                "procedure '{name}' not found"
+            )));
+        }
+        for id in ids {
+            self.remove_procedure_by_id(id).await?;
+        }
+        Ok(())
+    }
+
+    /// Removes a single procedure overload by id from storage and both maps.
+    async fn remove_procedure_by_id(&self, id: u32) -> Result<()> {
+        self.log_ddl(DDL_DROP_PROCEDURE, &id.to_le_bytes())?;
+        self.storage.delete_procedure(id).await?;
+        let name = self
+            .procedures_by_id
+            .write()
+            .remove(&id)
+            .map(|e| e.name.clone());
+        if let Some(name) = name {
+            let mut by_name = self.procedures_by_name.write();
+            if let Some(overloads) = by_name.get_mut(&name) {
+                overloads.retain(|p| p.id != id);
+                if overloads.is_empty() {
+                    by_name.remove(&name);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Schedule operations
+    // -----------------------------------------------------------------------
+
+    /// Registers a scheduled task. Names are unique; an existing name is rejected
+    /// unless `or_replace` is set, in which case the prior schedule is dropped.
+    pub async fn create_schedule(
+        &self,
+        mut entry: crate::schema::ScheduleEntry,
+        or_replace: bool,
+    ) -> Result<u32> {
+        let existing_id = self.schedules_by_name.read().get(&entry.name).map(|e| e.id);
+        if let Some(id) = existing_id {
+            if !or_replace {
+                return Err(ZyronError::Internal(format!(
+                    "schedule '{}' already exists",
+                    entry.name
+                )));
+            }
+            self.remove_schedule_by_id(id).await?;
+        }
+
+        if entry.id == 0 {
+            entry.id = self.oid_allocator.next();
+        }
+        let id = entry.id;
+        self.log_ddl(DDL_CREATE_SCHEDULE, &entry.to_bytes())?;
+        self.storage.store_schedule(&entry).await?;
+        let e = Arc::new(entry);
+        self.schedules_by_name
+            .write()
+            .insert(e.name.clone(), Arc::clone(&e));
+        self.schedules_by_id.write().insert(id, e);
+        Ok(id)
+    }
+
+    /// Persists a mutated schedule (pause/resume or last_run/next_run advance).
+    /// Re-logs the entry so a restart recovers the latest state.
+    pub async fn update_schedule(&self, entry: crate::schema::ScheduleEntry) -> Result<()> {
+        self.log_ddl(DDL_CREATE_SCHEDULE, &entry.to_bytes())?;
+        self.storage.delete_schedule(entry.id).await?;
+        self.storage.store_schedule(&entry).await?;
+        let e = Arc::new(entry);
+        self.schedules_by_name
+            .write()
+            .insert(e.name.clone(), Arc::clone(&e));
+        self.schedules_by_id.write().insert(e.id, e);
+        Ok(())
+    }
+
+    pub fn get_schedule_by_name(&self, name: &str) -> Option<Arc<crate::schema::ScheduleEntry>> {
+        self.schedules_by_name.read().get(name).map(Arc::clone)
+    }
+
+    pub fn list_schedules(&self) -> Vec<Arc<crate::schema::ScheduleEntry>> {
+        self.schedules_by_id
+            .read()
+            .values()
+            .map(Arc::clone)
+            .collect()
+    }
+
+    pub async fn drop_schedule(&self, name: &str) -> Result<()> {
+        let id = self.schedules_by_name.read().get(name).map(|e| e.id);
+        match id {
+            Some(id) => self.remove_schedule_by_id(id).await,
+            None => Err(ZyronError::Internal(format!("schedule '{name}' not found"))),
+        }
+    }
+
+    async fn remove_schedule_by_id(&self, id: u32) -> Result<()> {
+        self.log_ddl(DDL_DROP_SCHEDULE, &id.to_le_bytes())?;
+        self.storage.delete_schedule(id).await?;
+        let name = self
+            .schedules_by_id
+            .write()
+            .remove(&id)
+            .map(|e| e.name.clone());
+        if let Some(name) = name {
+            self.schedules_by_name.write().remove(&name);
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Pipeline operations
+
+    /// Registers a new pipeline definition. Rejects a duplicate name unless
+    /// `or_replace`, which drops the prior definition (and its run state) first.
+    pub async fn create_pipeline(
+        &self,
+        mut entry: crate::schema::PipelineEntry,
+        or_replace: bool,
+    ) -> Result<u32> {
+        let existing_id = self.pipelines_by_name.read().get(&entry.name).map(|e| e.id);
+        if let Some(id) = existing_id {
+            if !or_replace {
+                return Err(ZyronError::Internal(format!(
+                    "pipeline '{}' already exists",
+                    entry.name
+                )));
+            }
+            self.remove_pipeline_by_id(id).await?;
+        }
+
+        if entry.id == 0 {
+            entry.id = self.oid_allocator.next();
+        }
+        let id = entry.id;
+        self.log_ddl(DDL_CREATE_PIPELINE, &entry.to_bytes())?;
+        self.storage.store_pipeline(&entry).await?;
+        let e = Arc::new(entry);
+        self.pipelines_by_name
+            .write()
+            .insert(e.name.clone(), Arc::clone(&e));
+        self.pipelines_by_id.write().insert(id, e);
+        Ok(id)
+    }
+
+    /// Persists a mutated pipeline (run-state advance after RUN). Re-logs the
+    /// entry so a restart recovers the latest outcome.
+    pub async fn update_pipeline(&self, entry: crate::schema::PipelineEntry) -> Result<()> {
+        self.log_ddl(DDL_CREATE_PIPELINE, &entry.to_bytes())?;
+        self.storage.delete_pipeline(entry.id).await?;
+        self.storage.store_pipeline(&entry).await?;
+        let e = Arc::new(entry);
+        self.pipelines_by_name
+            .write()
+            .insert(e.name.clone(), Arc::clone(&e));
+        self.pipelines_by_id.write().insert(e.id, e);
+        Ok(())
+    }
+
+    pub fn get_pipeline_by_name(&self, name: &str) -> Option<Arc<crate::schema::PipelineEntry>> {
+        self.pipelines_by_name.read().get(name).map(Arc::clone)
+    }
+
+    pub fn list_pipelines(&self) -> Vec<Arc<crate::schema::PipelineEntry>> {
+        self.pipelines_by_id
+            .read()
+            .values()
+            .map(Arc::clone)
+            .collect()
+    }
+
+    pub async fn drop_pipeline(&self, name: &str) -> Result<()> {
+        let id = self.pipelines_by_name.read().get(name).map(|e| e.id);
+        match id {
+            Some(id) => self.remove_pipeline_by_id(id).await,
+            None => Err(ZyronError::Internal(format!("pipeline '{name}' not found"))),
+        }
+    }
+
+    async fn remove_pipeline_by_id(&self, id: u32) -> Result<()> {
+        self.log_ddl(DDL_DROP_PIPELINE, &id.to_le_bytes())?;
+        self.storage.delete_pipeline(id).await?;
+        let name = self
+            .pipelines_by_id
+            .write()
+            .remove(&id)
+            .map(|e| e.name.clone());
+        if let Some(name) = name {
+            self.pipelines_by_name.write().remove(&name);
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Event handler operations
+
+    /// Registers a new event handler. Rejects a duplicate name unless
+    /// `or_replace`, which drops the prior handler first.
+    pub async fn create_event_handler(
+        &self,
+        mut entry: crate::schema::EventHandlerEntry,
+        or_replace: bool,
+    ) -> Result<u32> {
+        let existing_id = self
+            .event_handlers_by_name
+            .read()
+            .get(&entry.name)
+            .map(|e| e.id);
+        if let Some(id) = existing_id {
+            if !or_replace {
+                return Err(ZyronError::Internal(format!(
+                    "event handler '{}' already exists",
+                    entry.name
+                )));
+            }
+            self.remove_event_handler_by_id(id).await?;
+        }
+
+        if entry.id == 0 {
+            entry.id = self.oid_allocator.next();
+        }
+        let id = entry.id;
+        self.log_ddl(DDL_CREATE_EVENT_HANDLER, &entry.to_bytes())?;
+        self.storage.store_event_handler(&entry).await?;
+        let e = Arc::new(entry);
+        self.event_handlers_by_name
+            .write()
+            .insert(e.name.clone(), Arc::clone(&e));
+        self.event_handlers_by_id.write().insert(id, e);
+        Ok(id)
+    }
+
+    pub fn get_event_handler_by_name(
+        &self,
+        name: &str,
+    ) -> Option<Arc<crate::schema::EventHandlerEntry>> {
+        self.event_handlers_by_name.read().get(name).map(Arc::clone)
+    }
+
+    pub fn list_event_handlers(&self) -> Vec<Arc<crate::schema::EventHandlerEntry>> {
+        self.event_handlers_by_id
+            .read()
+            .values()
+            .map(Arc::clone)
+            .collect()
+    }
+
+    pub async fn drop_event_handler(&self, name: &str) -> Result<()> {
+        let id = self.event_handlers_by_name.read().get(name).map(|e| e.id);
+        match id {
+            Some(id) => self.remove_event_handler_by_id(id).await,
+            None => Err(ZyronError::Internal(format!(
+                "event handler '{name}' not found"
+            ))),
+        }
+    }
+
+    async fn remove_event_handler_by_id(&self, id: u32) -> Result<()> {
+        self.log_ddl(DDL_DROP_EVENT_HANDLER, &id.to_le_bytes())?;
+        self.storage.delete_event_handler(id).await?;
+        let name = self
+            .event_handlers_by_id
+            .write()
+            .remove(&id)
+            .map(|e| e.name.clone());
+        if let Some(name) = name {
+            self.event_handlers_by_name.write().remove(&name);
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Version tag operations
+
+    /// Registers a named version tag. Rejects a duplicate name.
+    pub async fn create_version_tag(
+        &self,
+        mut entry: crate::schema::VersionTagEntry,
+    ) -> Result<u32> {
+        if self.version_tags_by_name.read().contains_key(&entry.name) {
+            return Err(ZyronError::Internal(format!(
+                "version '{}' already exists",
+                entry.name
+            )));
+        }
+        if entry.id == 0 {
+            entry.id = self.oid_allocator.next();
+        }
+        let id = entry.id;
+        self.log_ddl(DDL_CREATE_VERSION_TAG, &entry.to_bytes())?;
+        self.storage.store_version_tag(&entry).await?;
+        let e = Arc::new(entry);
+        self.version_tags_by_name
+            .write()
+            .insert(e.name.clone(), Arc::clone(&e));
+        self.version_tags_by_id.write().insert(id, e);
+        Ok(id)
+    }
+
+    pub fn get_version_tag_by_name(
+        &self,
+        name: &str,
+    ) -> Option<Arc<crate::schema::VersionTagEntry>> {
+        self.version_tags_by_name.read().get(name).map(Arc::clone)
+    }
+
+    pub fn list_version_tags(&self) -> Vec<Arc<crate::schema::VersionTagEntry>> {
+        self.version_tags_by_id
+            .read()
+            .values()
+            .map(Arc::clone)
+            .collect()
+    }
+
+    pub async fn drop_version_tag(&self, name: &str) -> Result<()> {
+        let id = self.version_tags_by_name.read().get(name).map(|e| e.id);
+        match id {
+            Some(id) => {
+                self.log_ddl(DDL_DROP_VERSION_TAG, &id.to_le_bytes())?;
+                self.storage.delete_version_tag(id).await?;
+                self.version_tags_by_id.write().remove(&id);
+                self.version_tags_by_name.write().remove(name);
+                Ok(())
+            }
+            None => Err(ZyronError::Internal(format!("version '{name}' not found"))),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Trigger operations
+    // -----------------------------------------------------------------------
+
+    /// Registers a trigger on a table. Trigger names are unique per table.
+    pub async fn create_trigger(&self, mut entry: crate::schema::TriggerEntry) -> Result<u32> {
+        {
+            let by_table = self.triggers_by_table.read();
+            if let Some(v) = by_table.get(&entry.table_id) {
+                if v.iter().any(|t| t.name == entry.name) {
+                    return Err(ZyronError::Internal(format!(
+                        "trigger '{}' already exists on this table",
+                        entry.name
+                    )));
+                }
+            }
+        }
+        if entry.id == 0 {
+            entry.id = self.oid_allocator.next();
+        }
+        let id = entry.id;
+        self.log_ddl(DDL_CREATE_TRIGGER, &entry.to_bytes())?;
+        self.storage.store_trigger(&entry).await?;
+        let e = Arc::new(entry);
+        self.triggers_by_table
+            .write()
+            .entry(e.table_id)
+            .or_default()
+            .push(Arc::clone(&e));
+        self.triggers_by_id.write().insert(id, e);
+        Ok(id)
+    }
+
+    /// Returns every trigger defined on a table. The executor calls this per DML
+    /// event; it is a single read-lock + clone of the small per-table vector.
+    pub fn triggers_for_table(&self, table_id: TableId) -> Vec<Arc<crate::schema::TriggerEntry>> {
+        self.triggers_by_table
+            .read()
+            .get(&table_id.0)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn find_trigger(
+        &self,
+        table_id: TableId,
+        name: &str,
+    ) -> Option<Arc<crate::schema::TriggerEntry>> {
+        self.triggers_by_table
+            .read()
+            .get(&table_id.0)
+            .and_then(|v| v.iter().find(|t| t.name == name).map(Arc::clone))
+    }
+
+    pub async fn drop_trigger(&self, table_id: TableId, name: &str) -> Result<()> {
+        let id = self
+            .find_trigger(table_id, name)
+            .map(|t| t.id)
+            .ok_or_else(|| {
+                ZyronError::Internal(format!("trigger '{name}' not found on this table"))
+            })?;
+        self.log_ddl(DDL_DROP_TRIGGER, &id.to_le_bytes())?;
+        self.storage.delete_trigger(id).await?;
+        self.triggers_by_id.write().remove(&id);
+        let mut by_table = self.triggers_by_table.write();
+        if let Some(v) = by_table.get_mut(&table_id.0) {
+            v.retain(|t| t.id != id);
+            if v.is_empty() {
+                by_table.remove(&table_id.0);
+            }
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Comment operations
+    // -----------------------------------------------------------------------
+
+    /// Sets or removes a comment on an object. `comment` of None removes any
+    /// existing comment for the key; Some replaces it. `column_name` is empty
+    /// for an object-level comment.
+    pub async fn set_comment(
+        &self,
+        object_type: u8,
+        object_name: &str,
+        column_name: &str,
+        comment: Option<String>,
+    ) -> Result<()> {
+        let key = (
+            object_type,
+            object_name.to_string(),
+            column_name.to_string(),
+        );
+        let existing_id = self.comments.read().get(&key).map(|e| e.id);
+        match comment {
+            Some(text) => {
+                let id = existing_id.unwrap_or_else(|| self.oid_allocator.next());
+                let entry = crate::schema::CommentEntry {
+                    id,
+                    object_type,
+                    object_name: object_name.to_string(),
+                    column_name: column_name.to_string(),
+                    comment: text,
+                };
+                self.log_ddl(DDL_SET_COMMENT, &entry.to_bytes())?;
+                if existing_id.is_some() {
+                    self.storage.delete_comment(id).await?;
+                }
+                self.storage.store_comment(&entry).await?;
+                self.comments.write().insert(key, Arc::new(entry));
+            }
+            None => {
+                if let Some(id) = existing_id {
+                    self.log_ddl(DDL_DROP_COMMENT, &id.to_le_bytes())?;
+                    self.storage.delete_comment(id).await?;
+                    self.comments.write().remove(&key);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the comment text on an object, if any.
+    pub fn get_comment(
+        &self,
+        object_type: u8,
+        object_name: &str,
+        column_name: &str,
+    ) -> Option<String> {
+        self.comments
+            .read()
+            .get(&(
+                object_type,
+                object_name.to_string(),
+                column_name.to_string(),
+            ))
+            .map(|e| e.comment.clone())
+    }
+
+    /// Lists every stored comment.
+    pub fn list_comments(&self) -> Vec<Arc<crate::schema::CommentEntry>> {
+        self.comments.read().values().map(Arc::clone).collect()
     }
 
     // -----------------------------------------------------------------------
@@ -2014,7 +4331,9 @@ fn convert_column_defs(table_id: TableId, defs: &[ColumnDef]) -> Result<Vec<Colu
         let type_id = def.data_type.to_type_id();
         let max_length = extract_max_length(&def.data_type);
         let nullable = def.nullable.unwrap_or(true);
-        let default_expr = def.default.as_ref().map(|e| format!("{:?}", e));
+        // Store the default as re-parseable SQL so INSERT can fill an omitted
+        // column with it (a debug rendering would not round-trip).
+        let default_expr = def.default.as_ref().map(zyron_parser::expr_to_sql);
 
         entries.push(ColumnEntry {
             id: ColumnId(i as u16),
@@ -2044,7 +4363,10 @@ fn extract_max_length(dt: &DataType) -> Option<usize> {
     }
 }
 
-/// Converts parser TableConstraints to catalog ConstraintEntries.
+/// Converts parser TableConstraints to catalog ConstraintEntries. Foreign-key
+/// reference targets are resolved by the caller (create_table) which has
+/// catalog access; here a ForeignKey records its local columns with the
+/// reference left unresolved.
 fn convert_table_constraints(
     constraints: &[TableConstraint],
     columns: &[ColumnEntry],
@@ -2059,6 +4381,8 @@ fn convert_table_constraints(
                 ref_table_id: None,
                 ref_columns: vec![],
                 check_expr: None,
+                on_delete: ReferentialAction::NoAction,
+                on_update: ReferentialAction::NoAction,
             },
             TableConstraint::Unique(col_names) => ConstraintEntry {
                 name: format!("uq_{}", col_names.join("_")),
@@ -2067,6 +4391,8 @@ fn convert_table_constraints(
                 ref_table_id: None,
                 ref_columns: vec![],
                 check_expr: None,
+                on_delete: ReferentialAction::NoAction,
+                on_update: ReferentialAction::NoAction,
             },
             TableConstraint::Check(expr) => ConstraintEntry {
                 name: "ck_table".to_string(),
@@ -2074,12 +4400,16 @@ fn convert_table_constraints(
                 columns: vec![],
                 ref_table_id: None,
                 ref_columns: vec![],
-                check_expr: Some(format!("{:?}", expr)),
+                check_expr: Some(zyron_parser::expr_to_sql(expr)),
+                on_delete: ReferentialAction::NoAction,
+                on_update: ReferentialAction::NoAction,
             },
             TableConstraint::ForeignKey {
                 columns: col_names,
                 ref_table: _,
                 ref_columns: _,
+                on_delete,
+                on_update,
             } => ConstraintEntry {
                 name: format!("fk_{}", col_names.join("_")),
                 constraint_type: ConstraintType::ForeignKey,
@@ -2087,11 +4417,25 @@ fn convert_table_constraints(
                 ref_table_id: None,
                 ref_columns: vec![],
                 check_expr: None,
+                on_delete: map_ref_action(*on_delete),
+                on_update: map_ref_action(*on_update),
             },
         };
         result.push(entry);
     }
     Ok(result)
+}
+
+/// Maps a parser referential action to its catalog representation.
+fn map_ref_action(a: zyron_parser::ast::ReferentialAction) -> ReferentialAction {
+    use zyron_parser::ast::ReferentialAction as P;
+    match a {
+        P::NoAction => ReferentialAction::NoAction,
+        P::Restrict => ReferentialAction::Restrict,
+        P::Cascade => ReferentialAction::Cascade,
+        P::SetNull => ReferentialAction::SetNull,
+        P::SetDefault => ReferentialAction::SetDefault,
+    }
 }
 
 /// Resolves column names to ColumnIds. Returns an error if any column name is not found.

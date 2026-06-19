@@ -7,6 +7,7 @@
 use crate::binder::BoundExpr;
 use crate::logical::LogicalPlan;
 use crate::optimizer::OptimizationRule;
+use std::sync::Arc;
 use zyron_catalog::Catalog;
 use zyron_common::TypeId;
 use zyron_parser::ast::{BinaryOperator, LiteralValue};
@@ -51,7 +52,7 @@ fn fold_plan(plan: &LogicalPlan) -> (LogicalPlan, bool) {
                 (
                     LogicalPlan::Filter {
                         predicate: folded_pred,
-                        child: Box::new(folded_child),
+                        child: Arc::new(folded_child),
                     },
                     true,
                 )
@@ -63,6 +64,7 @@ fn fold_plan(plan: &LogicalPlan) -> (LogicalPlan, bool) {
             expressions,
             aliases,
             child,
+            output_table_idx,
         } => {
             let (folded_child, child_changed) = fold_plan(child);
             let mut any_expr_changed = false;
@@ -82,7 +84,8 @@ fn fold_plan(plan: &LogicalPlan) -> (LogicalPlan, bool) {
                     LogicalPlan::Project {
                         expressions: folded_exprs,
                         aliases: aliases.clone(),
-                        child: Box::new(folded_child),
+                        child: Arc::new(folded_child),
+                        output_table_idx: *output_table_idx,
                     },
                     true,
                 )
@@ -108,8 +111,8 @@ fn fold_plan(plan: &LogicalPlan) -> (LogicalPlan, bool) {
             if left_changed || right_changed || cond_changed {
                 (
                     LogicalPlan::Join {
-                        left: Box::new(folded_left),
-                        right: Box::new(folded_right),
+                        left: Arc::new(folded_left),
+                        right: Arc::new(folded_right),
                         join_type: *join_type,
                         condition: folded_condition,
                     },
@@ -141,7 +144,7 @@ fn fold_plan(plan: &LogicalPlan) -> (LogicalPlan, bool) {
                     LogicalPlan::Aggregate {
                         group_by: folded_group_by,
                         aggregates: aggregates.clone(),
-                        child: Box::new(folded_child),
+                        child: Arc::new(folded_child),
                     },
                     true,
                 )
@@ -155,7 +158,7 @@ fn fold_plan(plan: &LogicalPlan) -> (LogicalPlan, bool) {
                 (
                     LogicalPlan::Sort {
                         order_by: order_by.clone(),
-                        child: Box::new(folded_child),
+                        child: Arc::new(folded_child),
                     },
                     true,
                 )
@@ -174,7 +177,7 @@ fn fold_plan(plan: &LogicalPlan) -> (LogicalPlan, bool) {
                     LogicalPlan::Limit {
                         limit: *limit,
                         offset: *offset,
-                        child: Box::new(folded_child),
+                        child: Arc::new(folded_child),
                     },
                     true,
                 )
@@ -187,7 +190,7 @@ fn fold_plan(plan: &LogicalPlan) -> (LogicalPlan, bool) {
             if changed {
                 (
                     LogicalPlan::Distinct {
-                        child: Box::new(folded_child),
+                        child: Arc::new(folded_child),
                     },
                     true,
                 )
@@ -208,8 +211,8 @@ fn fold_plan(plan: &LogicalPlan) -> (LogicalPlan, bool) {
                     LogicalPlan::SetOp {
                         op: *op,
                         all: *all,
-                        left: Box::new(fl),
-                        right: Box::new(fr),
+                        left: Arc::new(fl),
+                        right: Arc::new(fr),
                     },
                     true,
                 )
@@ -220,6 +223,9 @@ fn fold_plan(plan: &LogicalPlan) -> (LogicalPlan, bool) {
         LogicalPlan::Insert {
             table_id,
             target_columns,
+            column_defaults,
+            check_constraints,
+            expectations,
             source,
         } => {
             let (fs, changed) = fold_plan(source);
@@ -228,7 +234,10 @@ fn fold_plan(plan: &LogicalPlan) -> (LogicalPlan, bool) {
                     LogicalPlan::Insert {
                         table_id: *table_id,
                         target_columns: target_columns.clone(),
-                        source: Box::new(fs),
+                        column_defaults: column_defaults.clone(),
+                        check_constraints: check_constraints.clone(),
+                        expectations: expectations.clone(),
+                        source: Arc::new(fs),
                     },
                     true,
                 )
@@ -239,6 +248,7 @@ fn fold_plan(plan: &LogicalPlan) -> (LogicalPlan, bool) {
         LogicalPlan::Update {
             table_id,
             assignments,
+            check_constraints,
             child,
         } => {
             let (fc, changed) = fold_plan(child);
@@ -247,7 +257,8 @@ fn fold_plan(plan: &LogicalPlan) -> (LogicalPlan, bool) {
                     LogicalPlan::Update {
                         table_id: *table_id,
                         assignments: assignments.clone(),
-                        child: Box::new(fc),
+                        check_constraints: check_constraints.clone(),
+                        child: Arc::new(fc),
                     },
                     true,
                 )
@@ -261,7 +272,7 @@ fn fold_plan(plan: &LogicalPlan) -> (LogicalPlan, bool) {
                 (
                     LogicalPlan::Delete {
                         table_id: *table_id,
-                        child: Box::new(fc),
+                        child: Arc::new(fc),
                     },
                     true,
                 )

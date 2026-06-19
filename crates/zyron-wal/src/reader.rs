@@ -302,7 +302,9 @@ impl RecoveryManager {
         let estimated = (self.reader.total_data_bytes() / 48).max(64);
         let mut redo_records = Vec::with_capacity(estimated);
         let mut active_txns = std::collections::HashMap::with_capacity(256);
-        let mut committed_txns = std::collections::HashSet::with_capacity(1024);
+        // Maps each committed transaction to its commit-record LSN, which dates
+        // the transaction for time-travel after recovery.
+        let mut committed_txns = std::collections::HashMap::with_capacity(1024);
         let mut aborted_txns = std::collections::HashSet::with_capacity(64);
         let mut checkpoint_lsn: Option<u64> = None;
 
@@ -332,7 +334,7 @@ impl RecoveryManager {
                 }
                 LogRecordType::Commit => {
                     active_txns.remove(&txn_id);
-                    committed_txns.insert(txn_id);
+                    committed_txns.insert(txn_id, record.lsn.0);
                 }
                 LogRecordType::Abort => {
                     active_txns.remove(&txn_id);
@@ -350,13 +352,15 @@ impl RecoveryManager {
 
         // Only redo committed transactions. retain() filters in-place
         // without allocating a second Vec or touching Bytes Arc refcounts.
-        redo_records.retain(|r| committed_txns.contains(&r.txn_id));
+        redo_records.retain(|r| committed_txns.contains_key(&r.txn_id));
 
         let undo_txns: Vec<_> = active_txns.keys().copied().collect();
+        let committed_txns: Vec<(u32, u64)> = committed_txns.into_iter().collect();
 
         Ok(RecoveryResult {
             redo_records,
             undo_txns,
+            committed_txns,
             last_lsn: self.reader.last_segment_id().map(|id| Lsn::new(id.0, 0)),
             checkpoint_lsn,
         })
@@ -370,6 +374,9 @@ pub struct RecoveryResult {
     pub redo_records: Vec<LogRecord>,
     /// Transaction IDs to undo (uncommitted at crash).
     pub undo_txns: Vec<u32>,
+    /// Committed transactions paired with their commit-record LSN, used to date
+    /// each transaction for time-travel visibility after recovery.
+    pub committed_txns: Vec<(u32, u64)>,
     /// Last LSN found in the WAL.
     pub last_lsn: Option<Lsn>,
     /// Checkpoint LSN from the last CheckpointEnd record payload, if present.
@@ -382,6 +389,7 @@ impl RecoveryResult {
         Self {
             redo_records: Vec::new(),
             undo_txns: Vec::new(),
+            committed_txns: Vec::new(),
             last_lsn: None,
             checkpoint_lsn: None,
         }

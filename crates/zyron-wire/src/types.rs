@@ -505,13 +505,75 @@ pub fn text_to_scalar(bytes: &[u8], type_oid: i32) -> Result<ScalarValue, Protoc
         PG_INTERVAL_OID => zyron_common::parse_interval_string(text)
             .map(ScalarValue::Interval)
             .map_err(|e| ProtocolError::Malformed(format!("Invalid interval: {}", e))),
-        PG_DATE_OID | PG_TIME_OID | PG_TIMESTAMP_OID | PG_TIMESTAMPTZ_OID => {
-            // Store temporal types as strings for now.
-            // Full temporal type handling requires date/time parsing.
-            Ok(ScalarValue::Utf8(text.to_string()))
-        }
+        // Temporal types parse to the engine's canonical physical form so they
+        // compare and order correctly against stored temporal columns: DATE is
+        // i32 days since the Unix epoch, TIME is i64 microseconds since
+        // midnight, TIMESTAMP/TIMESTAMPTZ are i64 microseconds since the Unix
+        // epoch (per 12-temporal-precision.md).
+        PG_DATE_OID => zyron_common::parse_date_days(text)
+            .map(ScalarValue::Int32)
+            .map_err(|e| ProtocolError::Malformed(format!("Invalid date: {e}"))),
+        PG_TIME_OID => parse_time_to_micros(text).map(ScalarValue::Int64),
+        PG_TIMESTAMP_OID | PG_TIMESTAMPTZ_OID => zyron_common::parse_timestamp_micros(text)
+            .map(ScalarValue::Int64)
+            .map_err(|e| ProtocolError::Malformed(format!("Invalid timestamp: {e}"))),
         _ => Ok(ScalarValue::Utf8(text.to_string())),
     }
+}
+
+/// Microseconds between the Unix epoch (1970-01-01) and the Postgres binary
+/// temporal epoch (2000-01-01). Binary timestamp/timestamptz values are i64
+/// microseconds relative to 2000-01-01.
+const PG_EPOCH_OFFSET_MICROS: i64 = 946_684_800_000_000;
+/// Days between 1970-01-01 and 2000-01-01, for binary DATE values.
+const PG_EPOCH_OFFSET_DAYS: i32 = 10_957;
+
+/// Parses a TIME string ("HH:MM:SS[.ffffff]", optional timezone ignored) into
+/// microseconds since midnight.
+fn parse_time_to_micros(s: &str) -> Result<i64, ProtocolError> {
+    let core = s.trim();
+    // Drop any timezone suffix; a plain TIME has no offset semantics here.
+    let core = core
+        .split(['+', 'Z', 'z'])
+        .next()
+        .unwrap_or(core)
+        .trim_end();
+    let mut parts = core.split(':');
+    let invalid = || ProtocolError::Malformed(format!("Invalid time: {s}"));
+    let h: i64 = parts
+        .next()
+        .ok_or_else(invalid)?
+        .trim()
+        .parse()
+        .map_err(|_| invalid())?;
+    let m: i64 = parts
+        .next()
+        .ok_or_else(invalid)?
+        .parse()
+        .map_err(|_| invalid())?;
+    let (sec, micros) = match parts.next() {
+        Some(sec_part) => {
+            let mut sp = sec_part.split('.');
+            let sec: i64 = sp
+                .next()
+                .ok_or_else(invalid)?
+                .parse()
+                .map_err(|_| invalid())?;
+            let micros = match sp.next() {
+                Some(frac) => {
+                    let frac6: String = frac.chars().take(6).collect();
+                    format!("{frac6:0<6}").parse::<i64>().unwrap_or(0)
+                }
+                None => 0,
+            };
+            (sec, micros)
+        }
+        None => (0, 0),
+    };
+    if !(0..24).contains(&h) || !(0..60).contains(&m) || !(0..=60).contains(&sec) {
+        return Err(invalid());
+    }
+    Ok((h * 3600 + m * 60 + sec) * 1_000_000 + micros)
 }
 
 /// Parses a binary-format parameter value into a ScalarValue.
@@ -586,6 +648,33 @@ pub fn binary_to_scalar(bytes: &[u8], type_oid: i32) -> Result<ScalarValue, Prot
             Ok(ScalarValue::Interval(
                 zyron_common::Interval::from_le_bytes(&arr),
             ))
+        }
+        // Binary temporal values are relative to the Postgres epoch
+        // (2000-01-01); shift to the Unix epoch the engine stores internally.
+        PG_TIMESTAMP_OID | PG_TIMESTAMPTZ_OID => {
+            if bytes.len() != 8 {
+                return Err(ProtocolError::Malformed(
+                    "Timestamp requires 8 bytes".into(),
+                ));
+            }
+            let pg_micros = i64::from_be_bytes(bytes[..8].try_into().unwrap());
+            Ok(ScalarValue::Int64(pg_micros + PG_EPOCH_OFFSET_MICROS))
+        }
+        PG_DATE_OID => {
+            if bytes.len() != 4 {
+                return Err(ProtocolError::Malformed("Date requires 4 bytes".into()));
+            }
+            let pg_days = i32::from_be_bytes(bytes[..4].try_into().unwrap());
+            Ok(ScalarValue::Int32(pg_days + PG_EPOCH_OFFSET_DAYS))
+        }
+        PG_TIME_OID => {
+            if bytes.len() != 8 {
+                return Err(ProtocolError::Malformed("Time requires 8 bytes".into()));
+            }
+            // TIME binary is already microseconds since midnight.
+            Ok(ScalarValue::Int64(i64::from_be_bytes(
+                bytes[..8].try_into().unwrap(),
+            )))
         }
         _ => {
             // Fall back to text interpretation. Validate UTF-8 in-place, then allocate once.

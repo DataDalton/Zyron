@@ -335,6 +335,23 @@ impl ScalarValue {
         }
     }
 
+    /// Converts an integer scalar to i128 for exact integer arithmetic. Float
+    /// and non-numeric variants return None.
+    pub fn to_i128(&self) -> Option<i128> {
+        match self {
+            ScalarValue::Int8(v) => Some(*v as i128),
+            ScalarValue::Int16(v) => Some(*v as i128),
+            ScalarValue::Int32(v) => Some(*v as i128),
+            ScalarValue::Int64(v) => Some(*v as i128),
+            ScalarValue::Int128(v) => Some(*v),
+            ScalarValue::UInt8(v) => Some(*v as i128),
+            ScalarValue::UInt16(v) => Some(*v as i128),
+            ScalarValue::UInt32(v) => Some(*v as i128),
+            ScalarValue::UInt64(v) => Some(*v as i128),
+            _ => None,
+        }
+    }
+
     /// Returns true if this is a Null variant.
     pub fn is_null(&self) -> bool {
         matches!(self, ScalarValue::Null)

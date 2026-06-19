@@ -33,7 +33,6 @@ impl<'a> Optimizer<'a> {
             Box::new(rules::ConstantFolding),
             Box::new(rules::PredicatePushdown),
             Box::new(rules::ProjectionPushdown),
-            Box::new(rules::SubqueryDecorrelate),
             Box::new(rules::JoinReorder::new()),
             Box::new(rules::EncodingPushdown),
             Box::new(rules::IndexAdvisor::new()),
@@ -56,12 +55,29 @@ impl<'a> Optimizer<'a> {
             return Ok(plan);
         }
         let mut current = plan;
+        let n = self.rules.len();
+        // A rule is worth running initially, and again whenever a different
+        // rule changes the plan (a change can expose a new opportunity for it).
+        // A rule that returns None is marked clean and skipped on later passes
+        // until re-dirtied, so a converged rule does not re-walk the tree every
+        // pass while other rules are still firing.
+        let mut dirty = vec![true; n];
         for _ in 0..self.max_iterations {
             let mut changed = false;
-            for rule in &self.rules {
-                if let Some(new_plan) = rule.apply(&current, self.catalog) {
+            for i in 0..n {
+                if !dirty[i] {
+                    continue;
+                }
+                if let Some(new_plan) = self.rules[i].apply(&current, self.catalog) {
                     current = new_plan;
                     changed = true;
+                    for (j, d) in dirty.iter_mut().enumerate() {
+                        if j != i {
+                            *d = true;
+                        }
+                    }
+                } else {
+                    dirty[i] = false;
                 }
             }
             if !changed {

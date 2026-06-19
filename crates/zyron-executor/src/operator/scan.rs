@@ -34,7 +34,7 @@ use crate::operator::{ExecutionBatch, Operator, OperatorResult};
 /// when present (and freshly inserted pages live there before the background
 /// writer flushes them), otherwise loads from disk into the pool and returns
 /// the loaded data. Any dirty page evicted during the load is written back.
-async fn read_page_through_pool(
+pub(crate) async fn read_page_through_pool(
     pool: &BufferPool,
     disk: &DiskManager,
     page_id: PageId,
@@ -57,6 +57,25 @@ async fn read_page_through_pool(
     drop(guard);
     pool.unpin_page(page_id, false);
     Ok(data)
+}
+
+/// Resolves a branch's append overlay file id and page count for a table, or
+/// (None, 0) on the main line. The scan reads this range after the main range.
+fn branch_append_range(
+    ctx: &ExecutionContext,
+    branch_id: Option<u64>,
+    heap_file_id: u32,
+) -> (Option<u32>, u64) {
+    match (branch_id, &ctx.branch_catalog) {
+        (Some(bid), Some(cat)) => {
+            let files = cat.branch_files_for(bid, heap_file_id);
+            (
+                Some(files.append_file_id),
+                cat.append_page_count(bid, heap_file_id),
+            )
+        }
+        _ => (None, 0),
+    }
 }
 
 /// Minimum number of pages before parallel scan is used.
@@ -89,6 +108,21 @@ pub struct SeqScanOperator {
     track_tuple_ids: bool,
     /// When set, use version-based visibility instead of MVCC snapshot.
     as_of_version: Option<u64>,
+    /// Effective branch for this scan. When set, each page id is resolved
+    /// through the branch override chain before reading.
+    branch_id: Option<u64>,
+    /// Append overlay file id for the active branch, holding rows the branch
+    /// inserted. None on the main line. Scanned as a second range after the
+    /// main range.
+    branch_append_file_id: Option<u32>,
+    /// Number of pages in the branch append file to scan.
+    num_append_pages: u64,
+    /// False while scanning the main range, true once scanning the append range.
+    in_append_phase: bool,
+    /// When true the main range is skipped entirely and only the branch append
+    /// range is scanned. Used by the branch-aware index scan to read the insert
+    /// delta after draining the main index.
+    append_only: bool,
 }
 
 impl SeqScanOperator {
@@ -101,6 +135,7 @@ impl SeqScanOperator {
         track_tuple_ids: bool,
         as_of_version: Option<u64>,
     ) -> Result<Self> {
+        let branch_id = ctx.active_branch_id;
         let table_entry = ctx.get_table_entry(table_id)?;
         // cached atomic load instead of disk_manager.num_pages which would
         // queue on the per-file tokio Mutex under concurrency
@@ -109,6 +144,8 @@ impl SeqScanOperator {
         let output_ids: Vec<zyron_catalog::ColumnId> =
             columns.iter().map(|c| c.column_id).collect();
         let column_to_builder = build_column_to_builder_map(&table_entry.columns, &output_ids);
+        let (branch_append_file_id, num_append_pages) =
+            branch_append_range(&ctx, branch_id, table_entry.heap_file_id);
 
         Ok(Self {
             ctx,
@@ -122,7 +159,43 @@ impl SeqScanOperator {
             finished: false,
             track_tuple_ids,
             as_of_version,
+            branch_id,
+            branch_append_file_id,
+            num_append_pages,
+            in_append_phase: false,
+            append_only: false,
         })
+    }
+
+    /// Overrides the scan's branch (used for a per-query `IN BRANCH name` that
+    /// differs from the session's active branch). Recomputes the append range
+    /// for the new branch.
+    pub fn with_branch(mut self, branch_id: Option<u64>) -> Self {
+        self.branch_id = branch_id;
+        let (af, np) = branch_append_range(&self.ctx, branch_id, self.table_entry.heap_file_id);
+        self.branch_append_file_id = af;
+        self.num_append_pages = np;
+        self
+    }
+
+    /// Restricts the scan to the branch append range, skipping the main range.
+    /// The branch-aware index scan uses this to read the insert delta the main
+    /// index does not cover.
+    pub fn append_only(mut self) -> Self {
+        self.append_only = true;
+        self.in_append_phase = true;
+        self
+    }
+
+    /// Points the scan at an explicit append file range, skipping the main
+    /// range, independent of any session branch. MERGE uses this to read a
+    /// branch's inserted rows so it can replay them onto the main line.
+    pub fn scan_append_file(mut self, append_file_id: u32, num_pages: u64) -> Self {
+        self.branch_append_file_id = Some(append_file_id);
+        self.num_append_pages = num_pages;
+        self.append_only = true;
+        self.in_append_phase = true;
+        self
     }
 
     /// Enforces column-level security on a result batch. Delegates to the
@@ -157,8 +230,30 @@ impl Operator for SeqScanOperator {
             };
             let mut row_count: usize = 0;
 
-            while row_count < batch_size && self.page_cursor < self.num_pages {
-                let page_id = PageId::new(self.table_entry.heap_file_id, self.page_cursor);
+            while row_count < batch_size {
+                // The main range resolves each page through the branch override
+                // chain; once it is exhausted the scan continues into the
+                // branch append range, read directly with snapshot visibility.
+                let page_id = if !self.in_append_phase {
+                    if self.page_cursor >= self.num_pages {
+                        if self.branch_append_file_id.is_some() && self.num_append_pages > 0 {
+                            self.in_append_phase = true;
+                            self.page_cursor = 0;
+                            self.slot_cursor = 0;
+                            continue;
+                        }
+                        break;
+                    }
+                    self.ctx.resolve_branch_page(
+                        self.branch_id,
+                        PageId::new(self.table_entry.heap_file_id, self.page_cursor),
+                    )
+                } else {
+                    if self.page_cursor >= self.num_append_pages {
+                        break;
+                    }
+                    PageId::new(self.branch_append_file_id.unwrap(), self.page_cursor)
+                };
 
                 let page_data: [u8; PAGE_SIZE] =
                     read_page_through_pool(&self.ctx.buffer_pool, &self.ctx.disk_manager, page_id)
@@ -187,25 +282,19 @@ impl Operator for SeqScanOperator {
                     if tuple.is_deleted() {
                         continue;
                     }
-                    // Version-based visibility for time travel queries,
-                    // MVCC snapshot visibility for normal queries
-                    //
-                    // When as_of_version is set, the tuple's base header
-                    // xmin/xmax are reinterpreted as version bounds via
-                    // is_visible (version_id <= target, deleted_at > target)
-                    // This works because versioned tables store version_id
-                    // in xmin and deleted_at_version in xmax on the base
-                    // TupleHeader, keeping the same visibility predicate shape
-                    //
-                    // Non-versioned tuples in a time travel query fall back
-                    // to MVCC snapshot visibility as a safety measure
+                    // Time-travel visibility dates each tuple by its
+                    // transactions' commit LSNs: visible at version N when the
+                    // inserter committed at an LSN <= N and the deleter (if any)
+                    // committed at an LSN > N. This reconstructs the committed
+                    // state as of N from the MVCC versions the heap already
+                    // holds. Normal queries use live-snapshot MVCC visibility.
                     let hdr = tuple.header;
                     if let Some(target_version) = self.as_of_version {
-                        if hdr.flags.has_version() {
-                            if !hdr.is_visible(target_version as u32) {
-                                continue;
-                            }
-                        } else if !hdr.is_visible_to(&self.ctx.snapshot) {
+                        if !self.ctx.snapshot.status_map().is_visible_at_version(
+                            hdr.xmin as u64,
+                            hdr.xmax as u64,
+                            target_version,
+                        ) {
                             continue;
                         }
                     } else if !hdr.is_visible_to(&self.ctx.snapshot) {
@@ -461,7 +550,10 @@ impl<'a> PageRangeScanner<'a> {
             let mut row_count = 0usize;
 
             while row_count < batch_size && self.page_cursor < self.end_page {
-                let page_id = PageId::new(self.table_entry.heap_file_id, self.page_cursor);
+                let page_id = self.ctx.resolve_branch_page(
+                    self.ctx.active_branch_id,
+                    PageId::new(self.table_entry.heap_file_id, self.page_cursor),
+                );
 
                 let page_data: [u8; PAGE_SIZE] =
                     read_page_through_pool(&self.ctx.buffer_pool, &self.ctx.disk_manager, page_id)
@@ -1010,6 +1102,10 @@ pub struct IndexScanOperator {
     index_state: Option<IndexScanState>,
     /// Fallback sequential scan when no index instance is available.
     fallback: Option<SeqScanOperator>,
+    /// Branch insert delta scan, drained after the main index path. Present only
+    /// when a branch is active: the main B+ tree does not index branch-inserted
+    /// rows, so they are read from the append range with the predicate applied.
+    append_delta: Option<SeqScanOperator>,
 }
 
 /// State for an active B+ tree index scan.
@@ -1025,6 +1121,10 @@ struct IndexScanState {
     tuple_ids: Vec<TupleId>,
     /// Current position in the tuple_ids vector.
     cursor: usize,
+    /// Active branch for this scan. Main index tids are resolved through this
+    /// branch's override chain so rows the branch deleted or modified (their
+    /// cow page slot is tombstoned) drop out on fetch.
+    branch_id: Option<u64>,
     finished: bool,
 }
 
@@ -1047,35 +1147,47 @@ impl IndexScanOperator {
         if let (Some(index_entry), Some(btree_index)) = (&index, &btree) {
             let bounds = extract_scan_bounds(&predicate, index_entry, &ctx.params);
 
-            // If bounds extraction could not narrow the scan to a single
-            // key range, the predicate still has to filter the result so
-            // we do not return rows that do not match. Push it into the
-            // remaining_predicate so the post-filter catches them. This
-            // keeps correctness intact for any predicate shape that the
-            // bounds extractor does not yet decompose (function calls,
-            // OR, unsupported scalar shapes) without silently degrading
-            // an indexed lookup into an open scan.
-            let effective_remaining = if bounds.start_key.is_none() && bounds.end_key.is_none() {
-                match remaining_predicate {
-                    Some(rest) => Some(BoundExpr::BinaryOp {
-                        left: Box::new(predicate.clone()),
-                        op: BinaryOperator::And,
-                        right: Box::new(rest),
-                        type_id: zyron_common::TypeId::Boolean,
-                    }),
-                    None => Some(predicate.clone()),
-                }
-            } else {
-                remaining_predicate
+            // Always re-apply the index predicate as a post-filter, never trust
+            // the index entry alone. Under MVCC, deleted rows keep their index
+            // entries (filtered here by the per-row visibility check) and a
+            // vacuumed-then-reused heap slot can be reached through a stale
+            // entry whose key no longer matches the row now in that slot; the
+            // post-filter rechecks the actual column value so such a row is
+            // dropped. This also covers predicate shapes the bounds extractor
+            // cannot decompose (functions, OR, unsupported scalars).
+            let effective_remaining = match remaining_predicate {
+                Some(rest) => Some(BoundExpr::BinaryOp {
+                    left: Box::new(predicate.clone()),
+                    op: BinaryOperator::And,
+                    right: Box::new(rest),
+                    type_id: zyron_common::TypeId::Boolean,
+                }),
+                None => Some(predicate.clone()),
             };
 
             let table_entry = ctx.get_table_entry(table_id)?;
             let heap_file_id = table_entry.heap_file_id;
 
+            // Index keys are composite: indexed value followed by a tuple-id
+            // suffix so duplicate values coexist. Pad the value bounds to span
+            // the whole suffix range: the lower bound gets all-zero suffix bytes,
+            // the upper bound all-ones, so a value's every entry is included.
+            let suffix_len = crate::operator::modify::INDEX_TID_SUFFIX_LEN;
+            let start_key = bounds.start_key.as_ref().map(|k| {
+                let mut v = k.clone();
+                v.extend(std::iter::repeat(0u8).take(suffix_len));
+                v
+            });
+            let end_key = bounds.end_key.as_ref().map(|k| {
+                let mut v = k.clone();
+                v.extend(std::iter::repeat(0xFFu8).take(suffix_len));
+                v
+            });
+
             let mut tuple_ids = Vec::new();
             btree_index.range_scan_for_each(
-                bounds.start_key.as_deref(),
-                bounds.end_key.as_deref(),
+                start_key.as_deref(),
+                end_key.as_deref(),
                 |_key, tid| {
                     let corrected_tid =
                         TupleId::new(PageId::new(heap_file_id, tid.page_id.page_num), tid.slot_id);
@@ -1088,6 +1200,36 @@ impl IndexScanOperator {
                 columns.iter().map(|c| c.column_id).collect();
             let column_to_builder = build_column_to_builder_map(&table_entry.columns, &output_ids);
 
+            // With a branch active, the main index does not cover rows the
+            // branch inserted, so scan the append delta with the full predicate
+            // after the main index path. Index scans are only branch-accelerated
+            // for reads; DML (track_tuple_ids) stays on the sequential path.
+            let branch_id = ctx.active_branch_id;
+            let append_delta = if branch_id.is_some() && !track_tuple_ids {
+                let full_predicate = match &effective_remaining {
+                    Some(rest) => BoundExpr::BinaryOp {
+                        left: Box::new(predicate.clone()),
+                        op: BinaryOperator::And,
+                        right: Box::new(rest.clone()),
+                        type_id: zyron_common::TypeId::Boolean,
+                    },
+                    None => predicate.clone(),
+                };
+                let delta = SeqScanOperator::new(
+                    ctx.clone(),
+                    table_id,
+                    columns.clone(),
+                    Some(full_predicate),
+                    false,
+                    None,
+                )
+                .await?
+                .append_only();
+                Some(delta)
+            } else {
+                None
+            };
+
             return Ok(Self {
                 index_state: Some(IndexScanState {
                     ctx,
@@ -1098,9 +1240,11 @@ impl IndexScanOperator {
                     track_tuple_ids,
                     tuple_ids,
                     cursor: 0,
+                    branch_id,
                     finished: false,
                 }),
                 fallback: None,
+                append_delta,
             });
         }
 
@@ -1129,6 +1273,7 @@ impl IndexScanOperator {
         Ok(Self {
             index_state: None,
             fallback: Some(inner),
+            append_delta: None,
         })
     }
 }
@@ -1141,125 +1286,143 @@ impl Operator for IndexScanOperator {
         }
 
         Box::pin(async move {
-            let state = self.index_state.as_mut().unwrap();
-
-            if state.finished {
-                return Ok(None);
-            }
-            state.ctx.check_cancelled()?;
-
-            let batch_size = state.ctx.batch_size;
-            let mut builders = create_builders(&state.output_columns, batch_size);
-            let mut result_tuple_ids: Vec<TupleId> = if state.track_tuple_ids {
-                Vec::with_capacity(batch_size)
-            } else {
-                Vec::new()
-            };
-            let mut row_count: usize = 0;
-
-            // Fetch tuples from the heap using pre-collected TupleIds.
-            // Read directly from the buffer pool frame's data via the read
-            // lock, avoids the 16KB stack copy + Box allocation that
-            // read_page_through_pool would do per call. Concurrent atomic
-            // inserts coordinate via the slot's AtomicU32 commit so our
-            // read sees either uncommitted (length=0, skip) or committed
-            // bytes consistently
-            while row_count < batch_size && state.cursor < state.tuple_ids.len() {
-                let tid = state.tuple_ids[state.cursor];
-                state.cursor += 1;
-
-                let frame_present = state.ctx.buffer_pool.fetch_page(tid.page_id).is_some();
-                if !frame_present {
-                    let disk_data = state.ctx.disk_manager.read_page(tid.page_id).await?;
-                    let (_, evicted) = state.ctx.buffer_pool.load_page(tid.page_id, &disk_data)?;
-                    if let Some(ev) = evicted {
-                        state
-                            .ctx
-                            .disk_manager
-                            .write_page(ev.page_id, &ev.data)
-                            .await?;
+            // Drain the main index path first; when it is exhausted, drain the
+            // branch insert delta (present only for branch-active reads).
+            if let Some(state) = self.index_state.as_mut() {
+                if !state.finished {
+                    if let Some(batch) = state.next_batch().await? {
+                        return Ok(Some(batch));
                     }
-                    // load_page pinned, frame_present path's fetch_page also
-                    // pinned, in both cases we have one extra pin to balance
+                    state.finished = true;
                 }
+            }
+            if let Some(delta) = self.append_delta.as_mut() {
+                return delta.next().await;
+            }
+            Ok(None)
+        })
+    }
+}
 
-                let frame = state
-                    .ctx
-                    .buffer_pool
-                    .fetch_page(tid.page_id)
-                    .expect("just pinned this page");
-                state.ctx.buffer_pool.unpin_page(tid.page_id, false);
+impl IndexScanState {
+    /// Produces the next batch from the pre-collected index tuple ids, or None
+    /// when they are exhausted. Each tuple id is resolved through the active
+    /// branch's override chain before fetch so branch deletes and modifications
+    /// (their cow page slot is tombstoned) drop out.
+    async fn next_batch(&mut self) -> Result<Option<ExecutionBatch>> {
+        self.ctx.check_cancelled()?;
 
-                let visible = {
-                    let guard = frame.read_data();
-                    let slot_id = zyron_storage::SlotId(tid.slot_id);
-                    match HeapPage::get_tuple_view_from_slice(&**guard, slot_id) {
-                        None => false,
-                        Some(view) => {
-                            if view.is_deleted() || !view.header.is_visible_to(&state.ctx.snapshot)
-                            {
-                                false
-                            } else {
-                                decode_tuple_into_builders(
-                                    view.data,
-                                    &state.table_entry.columns,
-                                    &state.column_to_builder,
-                                    &mut builders,
-                                );
-                                true
-                            }
+        let batch_size = self.ctx.batch_size;
+        let mut builders = create_builders(&self.output_columns, batch_size);
+        let mut result_tuple_ids: Vec<TupleId> = if self.track_tuple_ids {
+            Vec::with_capacity(batch_size)
+        } else {
+            Vec::new()
+        };
+        let mut row_count: usize = 0;
+
+        // Fetch tuples from the heap using pre-collected TupleIds.
+        // Read directly from the buffer pool frame's data via the read
+        // lock, avoids the 16KB stack copy + Box allocation that
+        // read_page_through_pool would do per call. Concurrent atomic
+        // inserts coordinate via the slot's AtomicU32 commit so our
+        // read sees either uncommitted (length=0, skip) or committed
+        // bytes consistently
+        while row_count < batch_size && self.cursor < self.tuple_ids.len() {
+            let tid = self.tuple_ids[self.cursor];
+            self.cursor += 1;
+            // Resolve to the branch-local page when the branch copied it; the
+            // slot id is preserved by the page copy.
+            let phys_page = self.ctx.resolve_branch_page(self.branch_id, tid.page_id);
+
+            let frame_present = self.ctx.buffer_pool.fetch_page(phys_page).is_some();
+            if !frame_present {
+                let disk_data = self.ctx.disk_manager.read_page(phys_page).await?;
+                let (_, evicted) = self.ctx.buffer_pool.load_page(phys_page, &disk_data)?;
+                if let Some(ev) = evicted {
+                    self.ctx
+                        .disk_manager
+                        .write_page(ev.page_id, &ev.data)
+                        .await?;
+                }
+                // load_page pinned, frame_present path's fetch_page also
+                // pinned, in both cases we have one extra pin to balance
+            }
+
+            let frame = self
+                .ctx
+                .buffer_pool
+                .fetch_page(phys_page)
+                .expect("just pinned this page");
+            self.ctx.buffer_pool.unpin_page(phys_page, false);
+
+            let visible = {
+                let guard = frame.read_data();
+                let slot_id = zyron_storage::SlotId(tid.slot_id);
+                match HeapPage::get_tuple_view_from_slice(&**guard, slot_id) {
+                    None => false,
+                    Some(view) => {
+                        if view.is_deleted() || !view.header.is_visible_to(&self.ctx.snapshot) {
+                            false
+                        } else {
+                            decode_tuple_into_builders(
+                                view.data,
+                                &self.table_entry.columns,
+                                &self.column_to_builder,
+                                &mut builders,
+                            );
+                            true
                         }
                     }
-                };
-                state.ctx.buffer_pool.unpin_page(tid.page_id, false);
-
-                if visible {
-                    if state.track_tuple_ids {
-                        result_tuple_ids.push(tid);
-                    }
-                    row_count += 1;
                 }
-            }
+            };
+            self.ctx.buffer_pool.unpin_page(phys_page, false);
 
-            if row_count == 0 {
-                state.finished = true;
-                return Ok(None);
-            }
-
-            let batch = finalize_builders(builders);
-
-            // Apply remaining predicate as a post-filter.
-            if let Some(ref pred) = state.remaining_predicate {
-                let mask_col = evaluate(pred, &batch, &state.output_columns, &state.ctx.params)?;
-                let mask = column_to_mask(&mask_col);
-                let filtered = batch.filter(&mask);
-
-                if state.track_tuple_ids {
-                    let filtered_ids: Vec<TupleId> = mask
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, &keep)| {
-                            if keep {
-                                Some(result_tuple_ids[i])
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    return Ok(Some(ExecutionBatch::with_tuple_ids(filtered, filtered_ids)));
+            if visible {
+                if self.track_tuple_ids {
+                    result_tuple_ids.push(tid);
                 }
+                row_count += 1;
+            }
+        }
 
-                return Ok(Some(ExecutionBatch::new(filtered)));
+        if row_count == 0 {
+            return Ok(None);
+        }
+
+        let batch = finalize_builders(builders);
+
+        // Apply remaining predicate as a post-filter.
+        if let Some(ref pred) = self.remaining_predicate {
+            let mask_col = evaluate(pred, &batch, &self.output_columns, &self.ctx.params)?;
+            let mask = column_to_mask(&mask_col);
+            let filtered = batch.filter(&mask);
+
+            if self.track_tuple_ids {
+                let filtered_ids: Vec<TupleId> = mask
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &keep)| {
+                        if keep {
+                            Some(result_tuple_ids[i])
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                return Ok(Some(ExecutionBatch::with_tuple_ids(filtered, filtered_ids)));
             }
 
-            if state.track_tuple_ids {
-                Ok(Some(ExecutionBatch::with_tuple_ids(
-                    batch,
-                    result_tuple_ids,
-                )))
-            } else {
-                Ok(Some(ExecutionBatch::new(batch)))
-            }
-        })
+            return Ok(Some(ExecutionBatch::new(filtered)));
+        }
+
+        if self.track_tuple_ids {
+            Ok(Some(ExecutionBatch::with_tuple_ids(
+                batch,
+                result_tuple_ids,
+            )))
+        } else {
+            Ok(Some(ExecutionBatch::new(batch)))
+        }
     }
 }

@@ -6,6 +6,7 @@
 use crate::binder::BoundExpr;
 use crate::logical::{JoinCondition, LogicalPlan};
 use crate::optimizer::OptimizationRule;
+use std::sync::Arc;
 use zyron_catalog::Catalog;
 use zyron_common::TypeId;
 use zyron_parser::ast::{BinaryOperator, JoinType};
@@ -71,7 +72,7 @@ fn decorrelate_plan(plan: &LogicalPlan) -> LogicalPlan {
 
             LogicalPlan::Filter {
                 predicate: predicate.clone(),
-                child: Box::new(child),
+                child: Arc::new(child),
             }
         }
         // Recursively process children
@@ -79,10 +80,12 @@ fn decorrelate_plan(plan: &LogicalPlan) -> LogicalPlan {
             expressions,
             aliases,
             child,
+            output_table_idx,
         } => LogicalPlan::Project {
             expressions: expressions.clone(),
             aliases: aliases.clone(),
-            child: Box::new(decorrelate_plan(child)),
+            child: Arc::new(decorrelate_plan(child)),
+            output_table_idx: *output_table_idx,
         },
         LogicalPlan::Join {
             left,
@@ -90,8 +93,8 @@ fn decorrelate_plan(plan: &LogicalPlan) -> LogicalPlan {
             join_type,
             condition,
         } => LogicalPlan::Join {
-            left: Box::new(decorrelate_plan(left)),
-            right: Box::new(decorrelate_plan(right)),
+            left: Arc::new(decorrelate_plan(left)),
+            right: Arc::new(decorrelate_plan(right)),
             join_type: *join_type,
             condition: condition.clone(),
         },
@@ -102,11 +105,11 @@ fn decorrelate_plan(plan: &LogicalPlan) -> LogicalPlan {
         } => LogicalPlan::Aggregate {
             group_by: group_by.clone(),
             aggregates: aggregates.clone(),
-            child: Box::new(decorrelate_plan(child)),
+            child: Arc::new(decorrelate_plan(child)),
         },
         LogicalPlan::Sort { order_by, child } => LogicalPlan::Sort {
             order_by: order_by.clone(),
-            child: Box::new(decorrelate_plan(child)),
+            child: Arc::new(decorrelate_plan(child)),
         },
         LogicalPlan::Limit {
             limit,
@@ -115,10 +118,10 @@ fn decorrelate_plan(plan: &LogicalPlan) -> LogicalPlan {
         } => LogicalPlan::Limit {
             limit: *limit,
             offset: *offset,
-            child: Box::new(decorrelate_plan(child)),
+            child: Arc::new(decorrelate_plan(child)),
         },
         LogicalPlan::Distinct { child } => LogicalPlan::Distinct {
-            child: Box::new(decorrelate_plan(child)),
+            child: Arc::new(decorrelate_plan(child)),
         },
         other => other.clone(),
     }
@@ -131,6 +134,12 @@ fn try_decorrelate_exists(predicate: &BoundExpr, child: &LogicalPlan) -> Option<
             plan: subquery,
             negated: false,
         } => {
+            // A correlated EXISTS references the outer row and is evaluated per
+            // row by the executor's correlated filter; only an uncorrelated one
+            // is rewritten to a join here.
+            if crate::binder::subquery_is_correlated(subquery) {
+                return None;
+            }
             // Convert the subquery's FROM into a join with the outer plan.
             // This is a simplified decorrelation: wrap the subquery as a Distinct + Join.
             let subquery_plan = crate::logical::builder::build_logical_plan(
@@ -139,9 +148,9 @@ fn try_decorrelate_exists(predicate: &BoundExpr, child: &LogicalPlan) -> Option<
             .ok()?;
 
             Some(LogicalPlan::Join {
-                left: Box::new(child.clone()),
-                right: Box::new(LogicalPlan::Distinct {
-                    child: Box::new(subquery_plan),
+                left: Arc::new(child.clone()),
+                right: Arc::new(LogicalPlan::Distinct {
+                    child: Arc::new(subquery_plan),
                 }),
                 join_type: JoinType::Inner,
                 condition: JoinCondition::Cross,
@@ -159,6 +168,11 @@ fn try_decorrelate_in_subquery(predicate: &BoundExpr, child: &LogicalPlan) -> Op
             plan: subquery,
             negated: false,
         } => {
+            // A correlated IN is evaluated per outer row by the executor; only
+            // an uncorrelated one is rewritten to a semi-join here.
+            if crate::binder::subquery_is_correlated(subquery) {
+                return None;
+            }
             let subquery_plan = crate::logical::builder::build_logical_plan(
                 &crate::binder::BoundStatement::Select(*subquery.clone()),
             )
@@ -184,9 +198,9 @@ fn try_decorrelate_in_subquery(predicate: &BoundExpr, child: &LogicalPlan) -> Op
             };
 
             Some(LogicalPlan::Join {
-                left: Box::new(child.clone()),
-                right: Box::new(LogicalPlan::Distinct {
-                    child: Box::new(subquery_plan),
+                left: Arc::new(child.clone()),
+                right: Arc::new(LogicalPlan::Distinct {
+                    child: Arc::new(subquery_plan),
                 }),
                 join_type: JoinType::Inner,
                 condition: JoinCondition::On(join_condition),

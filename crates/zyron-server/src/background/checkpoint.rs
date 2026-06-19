@@ -6,7 +6,7 @@
 //! for idle systems and a minimum gap to prevent thrashing.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -58,9 +58,49 @@ impl CheckpointWorkerStats {
 pub struct CheckpointWorker {
     shutdown: Arc<AtomicBool>,
     waker: Arc<OnceLock<thread::Thread>>,
+    /// Set by an explicit SQL CHECKPOINT to force a checkpoint on the next
+    /// worker cycle, bypassing the byte/time thresholds and the minimum gap.
+    force: Arc<AtomicBool>,
+    /// Monotonic count of forced-checkpoint requests. A requester reads its
+    /// generation here and waits until `completed` reaches it.
+    requested: Arc<AtomicU64>,
+    /// (highest completed forced-request generation, condvar). The worker bumps
+    /// this and notifies after each forced checkpoint so blocking requesters
+    /// return only once their checkpoint has actually run.
+    completed: Arc<(Mutex<u64>, Condvar)>,
     thread: Option<JoinHandle<()>>,
     stats: Arc<CheckpointWorkerStats>,
     coordinator: Arc<CheckpointCoordinator>,
+}
+
+/// Cloneable handle that forces a checkpoint and blocks until the worker
+/// completes it. All checkpoints run on the single worker thread, so an
+/// explicit CHECKPOINT never races the periodic checkpoint (concurrent
+/// `run_checkpoint` calls would interleave WAL begin/end markers).
+#[derive(Clone)]
+pub struct CheckpointTrigger {
+    force: Arc<AtomicBool>,
+    waker: Arc<OnceLock<thread::Thread>>,
+    requested: Arc<AtomicU64>,
+    completed: Arc<(Mutex<u64>, Condvar)>,
+}
+
+impl CheckpointTrigger {
+    /// Requests a checkpoint and blocks until the worker has run it. Safe to
+    /// call from any thread; do not call from an async task without
+    /// `spawn_blocking`/`block_in_place` since it parks on a condvar.
+    pub fn checkpoint_blocking(&self) {
+        let generation = self.requested.fetch_add(1, Ordering::AcqRel) + 1;
+        self.force.store(true, Ordering::Release);
+        if let Some(t) = self.waker.get() {
+            t.unpark();
+        }
+        let (lock, cvar) = &*self.completed;
+        let mut done = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while *done < generation {
+            done = cvar.wait(done).unwrap_or_else(|e| e.into_inner());
+        }
+    }
 }
 
 impl CheckpointWorker {
@@ -72,10 +112,16 @@ impl CheckpointWorker {
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let waker = Arc::new(OnceLock::new());
+        let force = Arc::new(AtomicBool::new(false));
+        let requested = Arc::new(AtomicU64::new(0));
+        let completed = Arc::new((Mutex::new(0u64), Condvar::new()));
         let stats = Arc::new(CheckpointWorkerStats::new());
 
         let thread_shutdown = Arc::clone(&shutdown);
         let thread_waker = Arc::clone(&waker);
+        let thread_force = Arc::clone(&force);
+        let thread_requested = Arc::clone(&requested);
+        let thread_completed = Arc::clone(&completed);
         let thread_stats = Arc::clone(&stats);
         let thread_coordinator = Arc::clone(&coordinator);
 
@@ -88,6 +134,9 @@ impl CheckpointWorker {
                     &wal,
                     &config,
                     &thread_shutdown,
+                    &thread_force,
+                    &thread_requested,
+                    &thread_completed,
                     &thread_stats,
                 );
             })
@@ -96,18 +145,36 @@ impl CheckpointWorker {
         Self {
             shutdown,
             waker,
+            force,
+            requested,
+            completed,
             thread: Some(handle),
             stats,
             coordinator,
         }
     }
 
+    /// Returns a cloneable handle for forcing a checkpoint and blocking until
+    /// it completes. Used to wire the SQL CHECKPOINT command.
+    pub fn trigger(&self) -> CheckpointTrigger {
+        CheckpointTrigger {
+            force: Arc::clone(&self.force),
+            waker: Arc::clone(&self.waker),
+            requested: Arc::clone(&self.requested),
+            completed: Arc::clone(&self.completed),
+        }
+    }
+
     /// Main worker loop. Checks WAL bytes, time elapsed, and min gap each cycle.
+    #[allow(clippy::too_many_arguments)]
     fn worker_loop(
         coordinator: &CheckpointCoordinator,
         wal: &WalWriter,
         config: &CheckpointWorkerConfig,
         shutdown: &AtomicBool,
+        force: &AtomicBool,
+        requested: &AtomicU64,
+        completed: &(Mutex<u64>, Condvar),
         stats: &CheckpointWorkerStats,
     ) {
         let mut last_checkpoint_time = Instant::now();
@@ -116,6 +183,45 @@ impl CheckpointWorker {
         loop {
             if shutdown.load(Ordering::Acquire) {
                 return;
+            }
+
+            // An explicit SQL CHECKPOINT forces a checkpoint regardless of the
+            // byte/time thresholds and the minimum gap. Running it here, on the
+            // single worker thread, keeps it serialized against the periodic
+            // checkpoint. Blocking requesters are released only after the run.
+            if force.swap(false, Ordering::AcqRel) {
+                let target_generation = requested.load(Ordering::Acquire);
+                match coordinator.run_checkpoint() {
+                    Ok(result) => {
+                        stats.checkpoints_completed.fetch_add(1, Ordering::Relaxed);
+                        stats
+                            .total_segments_deleted
+                            .fetch_add(result.segments_deleted as u64, Ordering::Relaxed);
+                        stats
+                            .last_checkpoint_lsn
+                            .store(result.checkpoint_lsn.0, Ordering::Release);
+                        last_checkpoint_time = Instant::now();
+                        last_checkpoint_lsn = result.checkpoint_lsn.0;
+                        info!(
+                            "Forced checkpoint complete: lsn={}, segments_deleted={}, wait={}ms",
+                            result.checkpoint_lsn,
+                            result.segments_deleted,
+                            result.wait_duration.as_millis()
+                        );
+                    }
+                    Err(e) => {
+                        error!("Forced checkpoint failed: {}", e);
+                    }
+                }
+                // Release waiters whether the checkpoint succeeded or failed so
+                // an explicit CHECKPOINT never hangs; a failure was logged.
+                let (lock, cvar) = completed;
+                let mut done = lock.lock().unwrap_or_else(|e| e.into_inner());
+                if *done < target_generation {
+                    *done = target_generation;
+                }
+                cvar.notify_all();
+                continue;
             }
 
             let elapsed = last_checkpoint_time.elapsed();

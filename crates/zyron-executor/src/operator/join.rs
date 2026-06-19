@@ -9,6 +9,8 @@
 //! accumulating multiple rows before emitting a DataBatch. This
 //! eliminates per-row DataBatch allocation overhead.
 
+use std::sync::Arc;
+
 use zyron_common::{Result, TypeId};
 use zyron_parser::ast::JoinType;
 use zyron_planner::binder::BoundExpr;
@@ -17,6 +19,7 @@ use zyron_planner::logical::LogicalColumn;
 use crate::batch::{BATCH_SIZE, DataBatch};
 use crate::column::{Column, ColumnData, NullBitmap};
 use crate::compute::{self, FlatHashTable};
+use crate::context::ExecutionContext;
 use crate::expr::{evaluate, resolve_column_index};
 use crate::operator::{ExecutionBatch, Operator, OperatorResult};
 
@@ -168,6 +171,14 @@ pub struct NestedLoopJoinOperator {
     unmatched_rb_idx: usize,
     unmatched_rr_idx: usize,
     output_buffer: Option<JoinOutputBuffer>,
+    /// Set when the ON condition contains a subquery. The condition is then
+    /// evaluated per joined row through this prepared predicate (which runs any
+    /// correlated subquery against that row) instead of the synchronous
+    /// evaluator. `condition` is None in this mode.
+    correlated: Option<(
+        Arc<ExecutionContext>,
+        crate::correlated::CorrelatedPredicate,
+    )>,
 }
 
 impl NestedLoopJoinOperator {
@@ -204,7 +215,27 @@ impl NestedLoopJoinOperator {
             unmatched_rb_idx: 0,
             unmatched_rr_idx: 0,
             output_buffer: None,
+            correlated: None,
         }
+    }
+
+    /// Returns the join's input schema (left columns followed by right),
+    /// used to prepare a correlated ON condition before attaching it.
+    pub fn input_schema(&self) -> &[LogicalColumn] {
+        &self.input_schema
+    }
+
+    /// Evaluates the ON condition through a prepared correlated predicate so a
+    /// subquery in the condition runs per joined row. Clears the synchronous
+    /// condition; the outer-join row-matching and NULL-extension are unchanged.
+    pub fn with_correlated_condition(
+        mut self,
+        ctx: Arc<ExecutionContext>,
+        predicate: crate::correlated::CorrelatedPredicate,
+    ) -> Self {
+        self.condition = None;
+        self.correlated = Some((ctx, predicate));
+        self
     }
 }
 
@@ -312,7 +343,11 @@ impl Operator for NestedLoopJoinOperator {
                         self.right_row += 1;
 
                         // For condition evaluation, build a single-row combined batch.
-                        let matches_cond = if let Some(ref cond) = self.condition {
+                        let matches_cond = if let Some((cctx, pred)) = &self.correlated {
+                            let combined = combine_rows_single(left_batch, self.left_row, rb, rr);
+                            let mask = pred.eval_mask(cctx, &combined).await?;
+                            mask.first().copied().unwrap_or(false)
+                        } else if let Some(ref cond) = self.condition {
                             let combined = combine_rows_single(left_batch, self.left_row, rb, rr);
                             let mask = evaluate(cond, &combined, &self.input_schema, &[])?;
                             !mask.is_null(0) && mask.get_bool(0)
@@ -1167,5 +1202,492 @@ impl MergeJoinOperator {
 impl Operator for MergeJoinOperator {
     fn next(&mut self) -> OperatorResult<'_> {
         self.inner.next()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ParallelHashJoinOperator
+// ---------------------------------------------------------------------------
+
+/// Yields one pre-materialized batch then stops. Feeds a partition's rows into
+/// a per-partition serial hash join. A None batch yields nothing, so an empty
+/// partition side needs no zero-row batch allocation.
+struct SingleBatchSource {
+    batch: Option<DataBatch>,
+}
+
+impl Operator for SingleBatchSource {
+    fn next(&mut self) -> OperatorResult<'_> {
+        Box::pin(async move { Ok(self.batch.take().map(ExecutionBatch::new)) })
+    }
+}
+
+/// Total input rows below which partition + task-spawn overhead outweighs the
+/// gain, so a single serial hash join runs instead.
+const PARALLEL_JOIN_MIN_ROWS: usize = 8192;
+
+/// Hash-partitioned parallel hash join. Drains both inputs, partitions their
+/// rows by join-key hash into P buckets so equal keys co-locate, then runs P
+/// independent serial hash joins concurrently and concatenates their output.
+/// Outer-join semantics hold because a build row and every probe row that could
+/// match it hash to the same partition, so unmatched detection stays correct
+/// within each partition.
+pub struct ParallelHashJoinOperator {
+    left: Option<Box<dyn Operator>>,
+    right: Option<Box<dyn Operator>>,
+    join_type: JoinType,
+    left_keys: Vec<BoundExpr>,
+    right_keys: Vec<BoundExpr>,
+    remaining_condition: Option<BoundExpr>,
+    left_schema: Vec<LogicalColumn>,
+    right_schema: Vec<LogicalColumn>,
+    output: Vec<DataBatch>,
+    output_idx: usize,
+    started: bool,
+}
+
+impl ParallelHashJoinOperator {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        left: Box<dyn Operator>,
+        right: Box<dyn Operator>,
+        join_type: JoinType,
+        left_keys: Vec<BoundExpr>,
+        right_keys: Vec<BoundExpr>,
+        remaining_condition: Option<BoundExpr>,
+        left_schema: Vec<LogicalColumn>,
+        right_schema: Vec<LogicalColumn>,
+    ) -> Self {
+        Self {
+            left: Some(left),
+            right: Some(right),
+            join_type,
+            left_keys,
+            right_keys,
+            remaining_condition,
+            left_schema,
+            right_schema,
+            output: Vec::new(),
+            output_idx: 0,
+            started: false,
+        }
+    }
+
+    /// Builds a serial hash join over two pre-materialized partition batches.
+    fn build_partition_join(
+        &self,
+        build: Option<DataBatch>,
+        probe: Option<DataBatch>,
+    ) -> Box<dyn Operator> {
+        let left_src = Box::new(SingleBatchSource { batch: build });
+        let right_src = Box::new(SingleBatchSource { batch: probe });
+        Box::new(HashJoinOperator::new(
+            left_src,
+            right_src,
+            self.join_type,
+            self.left_keys.clone(),
+            self.right_keys.clone(),
+            self.remaining_condition.clone(),
+            self.left_schema.clone(),
+            self.right_schema.clone(),
+        ))
+    }
+
+    async fn run(&mut self) -> Result<()> {
+        let left = self.left.take().expect("left taken once");
+        let right = self.right.take().expect("right taken once");
+        let build = merge_drained(left).await?;
+        let probe = merge_drained(right).await?;
+
+        let build_rows = build.as_ref().map(|b| b.num_rows).unwrap_or(0);
+        let probe_rows = probe.as_ref().map(|b| b.num_rows).unwrap_or(0);
+
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(1, 16);
+
+        // Small inputs, no build rows, or a single worker: a single serial join
+        // is cheaper than partition + spawn overhead.
+        if workers <= 1 || build_rows == 0 || build_rows + probe_rows < PARALLEL_JOIN_MIN_ROWS {
+            let op = self.build_partition_join(build, probe);
+            self.output = drain_operator(op).await?;
+            return Ok(());
+        }
+
+        let part_count = workers;
+        let build = build.unwrap();
+        let build_parts = self.partition_rows(
+            &build,
+            &self.left_keys,
+            &self.left_schema,
+            &probe,
+            part_count,
+        )?;
+        let probe_parts = match &probe {
+            Some(pb) => {
+                self.partition_rows_for(pb, &self.right_keys, &self.right_schema, part_count)?
+            }
+            None => vec![Vec::new(); part_count],
+        };
+
+        // Spawn one serial join per non-empty partition. Each is self-contained
+        // (no shared state), so they run concurrently across worker threads.
+        let mut handles = Vec::with_capacity(part_count);
+        for p in 0..part_count {
+            let build_idx = &build_parts[p];
+            let probe_idx = &probe_parts[p];
+            if build_idx.is_empty() && probe_idx.is_empty() {
+                continue;
+            }
+            let build_part = if build_idx.is_empty() {
+                None
+            } else {
+                Some(take_rows(&build, build_idx))
+            };
+            let probe_part = match (&probe, probe_idx.is_empty()) {
+                (Some(pb), false) => Some(take_rows(pb, probe_idx)),
+                _ => None,
+            };
+            let op = self.build_partition_join(build_part, probe_part);
+            handles.push(tokio::spawn(async move { drain_operator(op).await }));
+        }
+
+        let mut output = Vec::new();
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(batches)) => output.extend(batches),
+                Ok(Err(e)) => return Err(e),
+                Err(e) => {
+                    return Err(zyron_common::ZyronError::ExecutionError(format!(
+                        "parallel hash join partition task failed: {e}"
+                    )));
+                }
+            }
+        }
+        self.output = output;
+        Ok(())
+    }
+
+    /// Partition index per build row, casting each key to the common type it
+    /// shares with the matching probe key so equal values hash identically.
+    fn partition_rows(
+        &self,
+        build: &DataBatch,
+        keys: &[BoundExpr],
+        schema: &[LogicalColumn],
+        probe: &Option<DataBatch>,
+        part_count: usize,
+    ) -> Result<Vec<Vec<u32>>> {
+        let common_types = self.key_common_types(build, keys, schema, probe)?;
+        let hashes = hash_keys(build, keys, schema, &common_types)?;
+        Ok(bucket_indices(&hashes, part_count))
+    }
+
+    /// Partitions probe rows using the same per-key common types.
+    fn partition_rows_for(
+        &self,
+        probe: &DataBatch,
+        keys: &[BoundExpr],
+        schema: &[LogicalColumn],
+        part_count: usize,
+    ) -> Result<Vec<Vec<u32>>> {
+        let common_types = self.probe_common_types(probe, keys, schema)?;
+        let hashes = hash_keys(probe, keys, schema, &common_types)?;
+        Ok(bucket_indices(&hashes, part_count))
+    }
+
+    fn key_common_types(
+        &self,
+        build: &DataBatch,
+        keys: &[BoundExpr],
+        schema: &[LogicalColumn],
+        probe: &Option<DataBatch>,
+    ) -> Result<Vec<TypeId>> {
+        let mut out = Vec::with_capacity(keys.len());
+        for (i, k) in keys.iter().enumerate() {
+            let lt = evaluate(k, build, schema, &[])?.type_id;
+            let rt = match probe {
+                Some(pb) if pb.num_rows > 0 => {
+                    evaluate(&self.right_keys[i], pb, &self.right_schema, &[])?.type_id
+                }
+                _ => lt,
+            };
+            out.push(join_key_common_type(lt, rt));
+        }
+        Ok(out)
+    }
+
+    fn probe_common_types(
+        &self,
+        probe: &DataBatch,
+        keys: &[BoundExpr],
+        schema: &[LogicalColumn],
+    ) -> Result<Vec<TypeId>> {
+        let mut out = Vec::with_capacity(keys.len());
+        for (i, k) in keys.iter().enumerate() {
+            let rt = evaluate(k, probe, schema, &[])?.type_id;
+            // The left key declared type pairs with the probe key so both sides
+            // agree on the common type without re-materializing the build batch.
+            let lt = self.left_keys[i].type_id();
+            out.push(join_key_common_type(lt, rt));
+        }
+        Ok(out)
+    }
+}
+
+impl Operator for ParallelHashJoinOperator {
+    fn next(&mut self) -> OperatorResult<'_> {
+        Box::pin(async move {
+            if !self.started {
+                self.started = true;
+                self.run().await?;
+            }
+            if self.output_idx < self.output.len() {
+                let batch = std::mem::replace(
+                    &mut self.output[self.output_idx],
+                    DataBatch::new(Vec::new()),
+                );
+                self.output_idx += 1;
+                return Ok(Some(ExecutionBatch::new(batch)));
+            }
+            Ok(None)
+        })
+    }
+}
+
+/// Drives an operator to completion, collecting all output batches.
+async fn drain_operator(mut op: Box<dyn Operator>) -> Result<Vec<DataBatch>> {
+    let mut out = Vec::new();
+    while let Some(eb) = op.next().await? {
+        out.push(eb.batch);
+    }
+    Ok(out)
+}
+
+/// Drains an operator and merges its batches into one contiguous batch, or None
+/// when it produced no rows.
+async fn merge_drained(mut op: Box<dyn Operator>) -> Result<Option<DataBatch>> {
+    let mut batches: Vec<DataBatch> = Vec::new();
+    let mut total = 0usize;
+    while let Some(eb) = op.next().await? {
+        total += eb.batch.num_rows;
+        batches.push(eb.batch);
+    }
+    if total == 0 || batches.is_empty() {
+        return Ok(None);
+    }
+    if batches.len() == 1 {
+        return Ok(Some(batches.pop().unwrap()));
+    }
+    let num_cols = batches[0].num_columns();
+    let mut cols = Vec::with_capacity(num_cols);
+    for c in 0..num_cols {
+        let type_id = batches[0].columns[c].type_id;
+        let mut data = ColumnData::with_capacity(type_id, total);
+        let mut nulls = NullBitmap::empty();
+        for b in &batches {
+            data.extend_from(&b.columns[c].data);
+            nulls.extend_from(&b.columns[c].nulls);
+        }
+        cols.push(Column::with_nulls(data, nulls, type_id));
+    }
+    Ok(Some(DataBatch::new(cols)))
+}
+
+/// Builds a row-subset batch by taking the given row indices from every column.
+fn take_rows(batch: &DataBatch, indices: &[u32]) -> DataBatch {
+    let cols = batch.columns.iter().map(|c| c.take(indices)).collect();
+    DataBatch::new(cols)
+}
+
+/// Hashes each row's join-key columns after casting them to common_types so
+/// equal values hash identically regardless of declared key width.
+fn hash_keys(
+    batch: &DataBatch,
+    keys: &[BoundExpr],
+    schema: &[LogicalColumn],
+    common_types: &[TypeId],
+) -> Result<Vec<u64>> {
+    let mut key_cols: Vec<Column> = Vec::with_capacity(keys.len());
+    for (i, k) in keys.iter().enumerate() {
+        let col = evaluate(k, batch, schema, &[])?;
+        let col = if col.type_id != common_types[i] {
+            compute::cast_column(&col, common_types[i])?
+        } else {
+            col
+        };
+        key_cols.push(col);
+    }
+    let refs: Vec<&Column> = key_cols.iter().collect();
+    Ok(compute::hash_column_batch(&refs, batch.num_rows))
+}
+
+/// Assigns each hashed row to a partition bucket.
+fn bucket_indices(hashes: &[u64], part_count: usize) -> Vec<Vec<u32>> {
+    let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); part_count];
+    for (row, &h) in hashes.iter().enumerate() {
+        let p = (h % part_count as u64) as usize;
+        buckets[p].push(row as u32);
+    }
+    buckets
+}
+
+/// Common type two join-key columns must share so equal values hash identically.
+/// Equal types pass through; mixed integers widen to Int64; any float pairing
+/// widens to Float64; otherwise the left type is used.
+fn join_key_common_type(a: TypeId, b: TypeId) -> TypeId {
+    if a == b {
+        return a;
+    }
+    let a_num = is_integer_type(a) || is_float_type(a);
+    let b_num = is_integer_type(b) || is_float_type(b);
+    if a_num && b_num {
+        if is_float_type(a) || is_float_type(b) {
+            TypeId::Float64
+        } else {
+            TypeId::Int64
+        }
+    } else {
+        a
+    }
+}
+
+fn is_integer_type(t: TypeId) -> bool {
+    matches!(
+        t,
+        TypeId::Int8
+            | TypeId::Int16
+            | TypeId::Int32
+            | TypeId::Int64
+            | TypeId::Int128
+            | TypeId::UInt8
+            | TypeId::UInt16
+            | TypeId::UInt32
+            | TypeId::UInt64
+            | TypeId::UInt128
+    )
+}
+
+fn is_float_type(t: TypeId) -> bool {
+    matches!(t, TypeId::Float32 | TypeId::Float64)
+}
+
+#[cfg(test)]
+mod parallel_join_tests {
+    use super::*;
+    use crate::column::ColumnData;
+    use zyron_catalog::ColumnId;
+    use zyron_planner::binder::ColumnRef;
+
+    fn int_col(vals: Vec<i64>) -> Column {
+        Column::new(ColumnData::Int64(vals), TypeId::Int64)
+    }
+
+    fn lcol(table_idx: usize, col: u16, name: &str) -> LogicalColumn {
+        LogicalColumn {
+            table_idx: Some(table_idx),
+            column_id: ColumnId(col),
+            name: name.to_string(),
+            type_id: TypeId::Int64,
+            nullable: false,
+            ts_precision: None,
+        }
+    }
+
+    fn key_ref(table_idx: usize, col: u16) -> BoundExpr {
+        BoundExpr::ColumnRef(ColumnRef {
+            table_idx,
+            column_id: ColumnId(col),
+            type_id: TypeId::Int64,
+            nullable: false,
+            ts_precision: None,
+        })
+    }
+
+    fn src(batch: DataBatch) -> Box<dyn Operator> {
+        Box::new(SingleBatchSource { batch: Some(batch) })
+    }
+
+    async fn collect_key0(mut op: Box<dyn Operator>) -> Vec<i64> {
+        let mut out = Vec::new();
+        while let Some(eb) = op.next().await.unwrap() {
+            if let ColumnData::Int64(v) = &eb.batch.columns[0].data {
+                out.extend_from_slice(v);
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_inner_matches_serial() {
+        let n: i64 = 20_000; // above PARALLEL_JOIN_MIN_ROWS to force partitioning
+        let build = DataBatch::new(vec![
+            int_col((0..n).collect()),
+            int_col((0..n).map(|i| i * 10).collect()),
+        ]);
+        // Probe keys repeat the lower half so each match is exercised many times.
+        let probe = DataBatch::new(vec![int_col((0..n).map(|i| i % (n / 2)).collect())]);
+
+        let lschema = vec![lcol(0, 0, "k"), lcol(0, 1, "payload")];
+        let rschema = vec![lcol(1, 0, "rk")];
+
+        let serial = Box::new(HashJoinOperator::new(
+            src(build.clone()),
+            src(probe.clone()),
+            JoinType::Inner,
+            vec![key_ref(0, 0)],
+            vec![key_ref(1, 0)],
+            None,
+            lschema.clone(),
+            rschema.clone(),
+        ));
+        let parallel = Box::new(ParallelHashJoinOperator::new(
+            src(build),
+            src(probe),
+            JoinType::Inner,
+            vec![key_ref(0, 0)],
+            vec![key_ref(1, 0)],
+            None,
+            lschema,
+            rschema,
+        ));
+
+        let s = collect_key0(serial).await;
+        let p = collect_key0(parallel).await;
+        assert_eq!(
+            s.len(),
+            p.len(),
+            "row counts match (serial={}, parallel={})",
+            s.len(),
+            p.len()
+        );
+        assert_eq!(s, p, "joined left-key multisets match");
+        assert!(!s.is_empty(), "join produced rows");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_left_outer_keeps_unmatched() {
+        let n: i64 = 20_000;
+        // Build keys 0..n; probe keys only n..2n so nothing matches.
+        let build = DataBatch::new(vec![int_col((0..n).collect())]);
+        let probe = DataBatch::new(vec![int_col((n..2 * n).collect())]);
+        let lschema = vec![lcol(0, 0, "k")];
+        let rschema = vec![lcol(1, 0, "rk")];
+
+        let parallel = Box::new(ParallelHashJoinOperator::new(
+            src(build),
+            src(probe),
+            JoinType::Left,
+            vec![key_ref(0, 0)],
+            vec![key_ref(1, 0)],
+            None,
+            lschema,
+            rschema,
+        ));
+        let p = collect_key0(parallel).await;
+        // LEFT join with no matches still emits every build row once.
+        assert_eq!(p.len(), n as usize, "all unmatched build rows preserved");
     }
 }

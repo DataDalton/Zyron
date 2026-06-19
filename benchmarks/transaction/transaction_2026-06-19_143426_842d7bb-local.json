@@ -1,0 +1,139 @@
+{
+  "id": "2026-06-19_143426_842d7bb-local",
+  "date": "2026-06-19 14:34:42Z",
+  "ts": 1781879682,
+  "commit": "842d7bb-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "B+Tree Split Under Concurrency": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 15.98 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 16.04 },
+      "Split insert throughput (ops/sec)": {
+        "average": 6281055.354986,
+        "runs": [6461957.25, 6139277.18, 6189555.13, 6231160.48, 6383326.75],
+        "target": 4000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Concurrent B+Tree Insert": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 16.02 },
+      "util_after": { "cpu_pct": 15.0, "ram_used_gb": 16.02 },
+      "Insert throughput (ops/sec)": {
+        "average": 6947542.817747,
+        "runs": [9716874.57, 6604610.84, 6031135.74, 6255693.66, 6129399.28],
+        "target": 4000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Concurrent Txns": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 16.02 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 16.07 },
+      "durable_commit_c1_txn_per_sec": {
+        "average": 17094.017094,
+        "runs": [17094.02],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "durable_commit_c16_txn_per_sec": {
+        "average": 107711.105352,
+        "runs": [107711.11],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "durable_commit_c64_txn_per_sec": {
+        "average": 315122.843747,
+        "runs": [315122.84],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "durable_commit_c256_txn_per_sec": {
+        "average": 753924.382562,
+        "runs": [753924.38],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "durable_commit_c512_txn_per_sec": {
+        "average": 596712.116240,
+        "runs": [596712.12],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "peak_durable_txn_per_sec": {
+        "average": 753924.382562,
+        "runs": [753924.38],
+        "target": 68376.068376,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "B+Tree Read Under Contention": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 16.08 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 16.20 },
+      "Reader retry rate (%)": {
+        "average": 0.000000,
+        "runs": [0.00],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Max read latency (us)": {
+        "average": 1512.500000,
+        "runs": [1512.50],
+        "target": 10.000000,
+        "passed": false,
+        "higher_is_better": false
+      }
+    },
+    "Phase 1.5 Microbenchmarks": {
+      "util_before": { "cpu_pct": 14.0, "ram_used_gb": 16.16 },
+      "util_after": { "cpu_pct": 25.0, "ram_used_gb": 16.16 },
+      "durable begin()+commit() latency floor (ns/op)": {
+        "average": 55343.240000,
+        "runs": [53364.45, 55811.25, 58115.90, 52662.70, 56761.90],
+        "target": 5000000.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "is_visible() latency (ns/op)": {
+        "average": 1.486340,
+        "runs": [1.48, 1.50, 1.48, 1.47, 1.49],
+        "target": 15.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "lock_row() latency (ns/op)": {
+        "average": 69.045400,
+        "runs": [72.58, 68.46, 66.15, 69.45, 68.59],
+        "target": 80.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Snapshot::new() latency (ns/op)": {
+        "average": 25.434000,
+        "runs": [25.32, 25.36, 26.02, 25.37, 25.11],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "GC sweep throughput (tuples/sec)": {
+        "average": 1915898500.027151,
+        "runs": [1941370607.65, 1967342120.79, 1962708537.78, 1756851721.71, 1951219512.20],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}

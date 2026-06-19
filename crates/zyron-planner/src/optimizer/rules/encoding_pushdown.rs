@@ -8,6 +8,7 @@
 use crate::binder::BoundExpr;
 use crate::logical::LogicalPlan;
 use crate::optimizer::OptimizationRule;
+use std::sync::Arc;
 use zyron_catalog::Catalog;
 use zyron_parser::ast::BinaryOperator;
 
@@ -205,7 +206,7 @@ impl EncodingPushdown {
                         };
                         return Some(LogicalPlan::Filter {
                             predicate: predicate.clone(),
-                            child: Box::new(new_scan),
+                            child: Arc::new(new_scan),
                         });
                     }
                 }
@@ -214,7 +215,7 @@ impl EncodingPushdown {
                 if let Some(new_child) = self.transform(child) {
                     return Some(LogicalPlan::Filter {
                         predicate: predicate.clone(),
-                        child: Box::new(new_child),
+                        child: Arc::new(new_child),
                     });
                 }
                 None
@@ -224,15 +225,17 @@ impl EncodingPushdown {
                 expressions,
                 aliases,
                 child,
+                output_table_idx,
             } => self.transform(child).map(|new_child| LogicalPlan::Project {
                 expressions: expressions.clone(),
                 aliases: aliases.clone(),
-                child: Box::new(new_child),
+                child: Arc::new(new_child),
+                output_table_idx: *output_table_idx,
             }),
             LogicalPlan::Sort { order_by, child } => {
                 self.transform(child).map(|new_child| LogicalPlan::Sort {
                     order_by: order_by.clone(),
-                    child: Box::new(new_child),
+                    child: Arc::new(new_child),
                 })
             }
             LogicalPlan::Limit {
@@ -242,12 +245,12 @@ impl EncodingPushdown {
             } => self.transform(child).map(|new_child| LogicalPlan::Limit {
                 limit: *limit,
                 offset: *offset,
-                child: Box::new(new_child),
+                child: Arc::new(new_child),
             }),
             LogicalPlan::Distinct { child } => {
                 self.transform(child)
                     .map(|new_child| LogicalPlan::Distinct {
-                        child: Box::new(new_child),
+                        child: Arc::new(new_child),
                     })
             }
             LogicalPlan::Aggregate {
@@ -259,7 +262,7 @@ impl EncodingPushdown {
                 .map(|new_child| LogicalPlan::Aggregate {
                     group_by: group_by.clone(),
                     aggregates: aggregates.clone(),
-                    child: Box::new(new_child),
+                    child: Arc::new(new_child),
                 }),
             // Recurse into two-child nodes
             LogicalPlan::Join {
@@ -272,8 +275,8 @@ impl EncodingPushdown {
                 let new_right = self.transform(right);
                 if new_left.is_some() || new_right.is_some() {
                     Some(LogicalPlan::Join {
-                        left: Box::new(new_left.unwrap_or_else(|| left.as_ref().clone())),
-                        right: Box::new(new_right.unwrap_or_else(|| right.as_ref().clone())),
+                        left: Arc::new(new_left.unwrap_or_else(|| left.as_ref().clone())),
+                        right: Arc::new(new_right.unwrap_or_else(|| right.as_ref().clone())),
                         join_type: join_type.clone(),
                         condition: condition.clone(),
                     })
@@ -293,8 +296,8 @@ impl EncodingPushdown {
                     Some(LogicalPlan::SetOp {
                         op: op.clone(),
                         all: *all,
-                        left: Box::new(new_left.unwrap_or_else(|| left.as_ref().clone())),
-                        right: Box::new(new_right.unwrap_or_else(|| right.as_ref().clone())),
+                        left: Arc::new(new_left.unwrap_or_else(|| left.as_ref().clone())),
+                        right: Arc::new(new_right.unwrap_or_else(|| right.as_ref().clone())),
                     })
                 } else {
                     None
@@ -304,29 +307,54 @@ impl EncodingPushdown {
             LogicalPlan::Insert {
                 table_id,
                 target_columns,
+                column_defaults,
+                check_constraints,
+                expectations,
                 source,
             } => self
                 .transform(source)
                 .map(|new_source| LogicalPlan::Insert {
                     table_id: *table_id,
                     target_columns: target_columns.clone(),
-                    source: Box::new(new_source),
+                    column_defaults: column_defaults.clone(),
+                    check_constraints: check_constraints.clone(),
+                    expectations: expectations.clone(),
+                    source: Arc::new(new_source),
                 }),
             LogicalPlan::Update {
                 table_id,
                 assignments,
+                check_constraints,
                 child,
             } => self.transform(child).map(|new_child| LogicalPlan::Update {
                 table_id: *table_id,
                 assignments: assignments.clone(),
-                child: Box::new(new_child),
+                check_constraints: check_constraints.clone(),
+                child: Arc::new(new_child),
             }),
             LogicalPlan::Delete { table_id, child } => {
                 self.transform(child).map(|new_child| LogicalPlan::Delete {
                     table_id: *table_id,
-                    child: Box::new(new_child),
+                    child: Arc::new(new_child),
                 })
             }
+            // Recurse into the left input; the lateral subquery is planned at
+            // execution time and not visited here.
+            LogicalPlan::LateralJoin {
+                left,
+                subquery,
+                subquery_table_idx,
+                join_type,
+                condition,
+            } => self
+                .transform(left)
+                .map(|new_left| LogicalPlan::LateralJoin {
+                    left: Arc::new(new_left),
+                    subquery: subquery.clone(),
+                    subquery_table_idx: *subquery_table_idx,
+                    join_type: join_type.clone(),
+                    condition: condition.clone(),
+                }),
             // Leaf nodes: no transformation
             LogicalPlan::Scan { .. }
             | LogicalPlan::Values { .. }

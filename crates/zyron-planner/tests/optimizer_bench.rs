@@ -7,6 +7,7 @@
 //!
 //! Run: cargo test -p zyron-planner --test optimizer_bench --release -- --nocapture
 
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 use zyron_catalog::{ColumnId, ColumnStats, TableId, TableStats};
@@ -1321,7 +1322,7 @@ fn test_v7_index_advisor() {
         };
         let filter = LogicalPlan::Filter {
             predicate: binop(col_ref(7), BinaryOperator::Eq, lit_int(42)),
-            child: Box::new(scan),
+            child: Arc::new(scan),
         };
         // Walk the Filter -> Scan pattern and record column refs
         walk_and_record_columns(&advisor2, &filter);

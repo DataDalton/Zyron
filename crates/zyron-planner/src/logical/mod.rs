@@ -9,6 +9,7 @@ pub mod builder;
 
 use crate::binder::{BoundAssignment, BoundExpr, BoundOrderBy};
 use crate::optimizer::rules::encoding_pushdown::EncodingHint;
+use std::sync::Arc;
 use zyron_catalog::{ColumnId, TableId};
 use zyron_common::TypeId;
 use zyron_parser::ast::{JoinType, SetOpType};
@@ -80,60 +81,87 @@ pub enum LogicalPlan {
     /// Predicate filter.
     Filter {
         predicate: BoundExpr,
-        child: Box<LogicalPlan>,
+        child: Arc<LogicalPlan>,
     },
 
     /// Column projection.
     Project {
         expressions: Vec<BoundExpr>,
         aliases: Vec<Option<String>>,
-        child: Box<LogicalPlan>,
+        child: Arc<LogicalPlan>,
+        /// When set, the projection's output columns carry this table index so
+        /// an enclosing query can address them by `(table_idx, ordinal)`. Used
+        /// to relabel a derived table (view or FROM-subquery) under the table
+        /// index the binder allocated for it. None for an ordinary final
+        /// projection, whose outputs are positional and unaddressable.
+        output_table_idx: Option<usize>,
     },
 
     /// Join two relations.
     Join {
-        left: Box<LogicalPlan>,
-        right: Box<LogicalPlan>,
+        left: Arc<LogicalPlan>,
+        right: Arc<LogicalPlan>,
         join_type: JoinType,
         condition: JoinCondition,
+    },
+
+    /// LATERAL join: the right side is a subquery that may reference columns
+    /// from the left, so it is executed once per left row with those columns
+    /// bound as parameters. The subquery is held as a bound select (not a
+    /// LogicalPlan child) because it is planned and parameterized at execution
+    /// time against the current outer row. join_type is Inner for a comma or
+    /// CROSS JOIN LATERAL and Left for a LEFT JOIN LATERAL; condition is the
+    /// optional ON predicate.
+    LateralJoin {
+        left: Arc<LogicalPlan>,
+        subquery: LateralSubquery,
+        subquery_table_idx: usize,
+        join_type: JoinType,
+        condition: Option<BoundExpr>,
     },
 
     /// Group-by aggregation.
     Aggregate {
         group_by: Vec<BoundExpr>,
         aggregates: Vec<AggregateExpr>,
-        child: Box<LogicalPlan>,
+        child: Arc<LogicalPlan>,
     },
 
     /// Sort by order-by expressions.
     Sort {
         order_by: Vec<BoundOrderBy>,
-        child: Box<LogicalPlan>,
+        child: Arc<LogicalPlan>,
     },
 
     /// Limit and/or offset.
     Limit {
         limit: Option<u64>,
         offset: Option<u64>,
-        child: Box<LogicalPlan>,
+        child: Arc<LogicalPlan>,
     },
 
     /// Distinct elimination.
-    Distinct { child: Box<LogicalPlan> },
+    Distinct { child: Arc<LogicalPlan> },
 
     /// Set operations (UNION, INTERSECT, EXCEPT).
     SetOp {
         op: SetOpType,
         all: bool,
-        left: Box<LogicalPlan>,
-        right: Box<LogicalPlan>,
+        left: Arc<LogicalPlan>,
+        right: Arc<LogicalPlan>,
     },
 
     /// Insert rows into a table.
     Insert {
         table_id: TableId,
         target_columns: Vec<ColumnId>,
-        source: Box<LogicalPlan>,
+        /// Bound default expressions for omitted columns that carry a DEFAULT.
+        column_defaults: Vec<(ColumnId, crate::binder::BoundExpr)>,
+        /// CHECK constraint predicates (bound at table_idx 0) to enforce per row.
+        check_constraints: Vec<crate::binder::BoundExpr>,
+        /// Data-quality expectations (bound at table_idx 0) applied per row.
+        expectations: Vec<crate::binder::BoundExpectation>,
+        source: Arc<LogicalPlan>,
     },
 
     /// Inline values (for INSERT ... VALUES or standalone VALUES).
@@ -146,13 +174,15 @@ pub enum LogicalPlan {
     Update {
         table_id: TableId,
         assignments: Vec<BoundAssignment>,
-        child: Box<LogicalPlan>,
+        /// CHECK constraint predicates (bound at table_idx 0) to enforce per row.
+        check_constraints: Vec<crate::binder::BoundExpr>,
+        child: Arc<LogicalPlan>,
     },
 
     /// Delete rows.
     Delete {
         table_id: TableId,
-        child: Box<LogicalPlan>,
+        child: Arc<LogicalPlan>,
     },
 
     /// Graph algorithm execution over a named graph schema.
@@ -172,6 +202,20 @@ pub enum LogicalPlan {
         positional_args: Vec<BoundExpr>,
         output_columns: Vec<LogicalColumn>,
     },
+}
+
+/// Holds a LATERAL subquery's bound plan inside a LogicalPlan node. BoundSelect
+/// has no PartialEq (it holds Arc<TableEntry>), and no optimization rule mutates
+/// a lateral subquery, so it is invariant under optimization and compares equal.
+/// Real plan changes are still detected through the LateralJoin node's left and
+/// condition fields, which compare normally.
+#[derive(Debug, Clone)]
+pub struct LateralSubquery(pub Box<crate::binder::BoundSelect>);
+
+impl PartialEq for LateralSubquery {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +242,9 @@ pub struct AggregateExpr {
     pub args: Vec<BoundExpr>,
     pub distinct: bool,
     pub return_type: TypeId,
+    /// Set for a user-defined aggregate, carrying the bound state-transition
+    /// and final functions. None for built-in aggregates.
+    pub uda: Option<Box<crate::binder::BoundUda>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +260,7 @@ impl LogicalPlan {
             LogicalPlan::Project {
                 expressions,
                 aliases,
+                output_table_idx,
                 ..
             } => expressions
                 .iter()
@@ -223,7 +271,7 @@ impl LogicalPlan {
                         .and_then(|a| a.clone())
                         .unwrap_or_else(|| format!("col{}", i));
                     LogicalColumn {
-                        table_idx: None,
+                        table_idx: *output_table_idx,
                         column_id: ColumnId(i as u16),
                         name,
                         type_id: expr.type_id(),
@@ -235,6 +283,29 @@ impl LogicalPlan {
             LogicalPlan::Join { left, right, .. } => {
                 let mut schema = left.output_schema();
                 schema.extend(right.output_schema());
+                schema
+            }
+            LogicalPlan::LateralJoin {
+                left,
+                subquery,
+                subquery_table_idx,
+                join_type,
+                ..
+            } => {
+                let mut schema = left.output_schema();
+                // A LEFT JOIN LATERAL produces NULLs when the subquery yields no
+                // rows for an outer row, so its right columns are nullable.
+                let force_nullable = matches!(join_type, JoinType::Left | JoinType::Full);
+                for (i, col) in subquery.0.output_schema.iter().enumerate() {
+                    schema.push(LogicalColumn {
+                        table_idx: Some(*subquery_table_idx),
+                        column_id: ColumnId(i as u16),
+                        name: col.name.clone(),
+                        type_id: col.type_id,
+                        nullable: col.nullable || force_nullable,
+                        ts_precision: col.ts_precision,
+                    });
+                }
                 schema
             }
             LogicalPlan::Aggregate {
@@ -299,28 +370,9 @@ impl LogicalPlan {
             LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
                 vec![left, right]
             }
-        }
-    }
-
-    /// Returns mutable references to all child plan nodes.
-    pub fn children_mut(&mut self) -> Vec<&mut LogicalPlan> {
-        match self {
-            LogicalPlan::Scan { .. }
-            | LogicalPlan::Values { .. }
-            | LogicalPlan::GraphAlgorithm { .. }
-            | LogicalPlan::AnalyticsTableFunction { .. } => vec![],
-            LogicalPlan::Filter { child, .. }
-            | LogicalPlan::Project { child, .. }
-            | LogicalPlan::Aggregate { child, .. }
-            | LogicalPlan::Sort { child, .. }
-            | LogicalPlan::Limit { child, .. }
-            | LogicalPlan::Distinct { child }
-            | LogicalPlan::Insert { source: child, .. }
-            | LogicalPlan::Update { child, .. }
-            | LogicalPlan::Delete { child, .. } => vec![child],
-            LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
-                vec![left, right]
-            }
+            // The lateral subquery is not a LogicalPlan child; it is planned at
+            // execution time, so only the left input is a child here.
+            LogicalPlan::LateralJoin { left, .. } => vec![left],
         }
     }
 }
@@ -385,7 +437,7 @@ mod tests {
                 value: zyron_parser::ast::LiteralValue::Boolean(true),
                 type_id: TypeId::Boolean,
             },
-            child: Box::new(scan),
+            child: Arc::new(scan),
         };
         let schema = filter.output_schema();
         assert_eq!(schema.len(), 1);
@@ -425,8 +477,8 @@ mod tests {
             as_of: None,
         };
         let join = LogicalPlan::Join {
-            left: Box::new(left),
-            right: Box::new(right),
+            left: Arc::new(left),
+            right: Arc::new(right),
             join_type: JoinType::Inner,
             condition: JoinCondition::Cross,
         };
@@ -453,7 +505,7 @@ mod tests {
                 value: zyron_parser::ast::LiteralValue::Boolean(true),
                 type_id: TypeId::Boolean,
             },
-            child: Box::new(scan),
+            child: Arc::new(scan),
         };
         assert_eq!(filter.children().len(), 1);
     }

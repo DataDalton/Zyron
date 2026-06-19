@@ -44,25 +44,68 @@ impl<'a> PhysicalPlanner<'a> {
                 ..
             } => self.plan_scan(table_id, columns, None, encoding_hints, as_of),
             LogicalPlan::Filter { predicate, child } => {
-                // Try to push the filter into a scan (index scan opportunity)
-                if let LogicalPlan::Scan {
-                    table_id,
-                    columns,
-                    encoding_hints,
-                    as_of,
-                    ..
-                } = *child
-                {
-                    return self.plan_scan(
+                // Try to push the filter into a scan (index scan opportunity).
+                // Probe by reference, then take ownership only on the matching
+                // path so the shared Arc child is moved out at most once.
+                if matches!(child.as_ref(), LogicalPlan::Scan { .. }) {
+                    if let LogicalPlan::Scan {
                         table_id,
                         columns,
-                        Some(predicate),
                         encoding_hints,
                         as_of,
-                    );
+                        ..
+                    } = Arc::unwrap_or_clone(child)
+                    {
+                        // A subquery in the predicate is evaluated by a Filter
+                        // operator, not the scan: a correlated subquery needs the
+                        // outer row the scan does not carry, and an uncorrelated
+                        // one is folded at the Filter. Split the conjuncts so
+                        // subquery-free ones still push into the scan and only the
+                        // subquery-bearing ones stay above it.
+                        let conjuncts = split_conjuncts(&predicate);
+                        let (sub_conjuncts, simple_conjuncts): (Vec<_>, Vec<_>) =
+                            conjuncts.into_iter().partition(predicate_has_subquery);
+                        if sub_conjuncts.is_empty() {
+                            return self.plan_scan(
+                                table_id,
+                                columns,
+                                Some(predicate),
+                                encoding_hints,
+                                as_of,
+                            );
+                        }
+                        let scan_predicate = if simple_conjuncts.is_empty() {
+                            None
+                        } else {
+                            Some(combine_conjuncts(simple_conjuncts))
+                        };
+                        let scan = self.plan_scan(
+                            table_id,
+                            columns,
+                            scan_predicate,
+                            encoding_hints,
+                            as_of,
+                        )?;
+                        let scan_cost = *scan.cost();
+                        let filter_predicate = combine_conjuncts(sub_conjuncts);
+                        let selectivity =
+                            self.cost_model
+                                .estimate_selectivity(&filter_predicate, None, None);
+                        let cost = PlanCost {
+                            io_cost: 0.0,
+                            cpu_cost: scan_cost.row_count * self.cost_model.cpu_operator_cost,
+                            row_count: (scan_cost.row_count * selectivity).max(1.0),
+                        };
+                        return Ok(PhysicalPlan::Filter {
+                            predicate: filter_predicate,
+                            child: Box::new(scan),
+                            cost,
+                        });
+                    }
+                    unreachable!("child matched Scan above");
                 }
 
-                let child_plan = self.plan(*child)?;
+                let child_plan = self.plan(Arc::unwrap_or_clone(child))?;
                 let child_cost = *child_plan.cost();
                 let selectivity = self.cost_model.estimate_selectivity(&predicate, None, None);
                 let cost = PlanCost {
@@ -80,8 +123,9 @@ impl<'a> PhysicalPlanner<'a> {
                 expressions,
                 aliases,
                 child,
+                output_table_idx,
             } => {
-                let child_plan = self.plan(*child)?;
+                let child_plan = self.plan(Arc::unwrap_or_clone(child))?;
                 let child_cost = *child_plan.cost();
                 let cost = PlanCost {
                     io_cost: 0.0,
@@ -130,6 +174,7 @@ impl<'a> PhysicalPlanner<'a> {
                         aliases,
                         child: Box::new(window_plan),
                         cost,
+                        output_table_idx,
                     });
                 }
 
@@ -138,6 +183,7 @@ impl<'a> PhysicalPlanner<'a> {
                     aliases,
                     child: Box::new(child_plan),
                     cost,
+                    output_table_idx,
                 })
             }
             LogicalPlan::Join {
@@ -145,14 +191,63 @@ impl<'a> PhysicalPlanner<'a> {
                 right,
                 join_type,
                 condition,
-            } => self.plan_join(*left, *right, join_type, condition),
+            } => self.plan_join(
+                Arc::unwrap_or_clone(left),
+                Arc::unwrap_or_clone(right),
+                join_type,
+                condition,
+            ),
+            LogicalPlan::LateralJoin {
+                left,
+                subquery,
+                subquery_table_idx,
+                join_type,
+                condition,
+            } => {
+                let left_plan = self.plan(Arc::unwrap_or_clone(left))?;
+                let left_cost = *left_plan.cost();
+                let left_schema = left_plan.output_schema();
+                // The right schema is the lateral output relabeled under the
+                // subquery's table index, NULLable when the join is a LEFT join.
+                let force_nullable = matches!(join_type, JoinType::Left | JoinType::Full);
+                let right_schema: Vec<LogicalColumn> = subquery
+                    .0
+                    .output_schema
+                    .iter()
+                    .enumerate()
+                    .map(|(i, col)| LogicalColumn {
+                        table_idx: Some(subquery_table_idx),
+                        column_id: zyron_catalog::ColumnId(i as u16),
+                        name: col.name.clone(),
+                        type_id: col.type_id,
+                        nullable: col.nullable || force_nullable,
+                        ts_precision: col.ts_precision,
+                    })
+                    .collect();
+                let cost = PlanCost {
+                    io_cost: left_cost.io_cost,
+                    cpu_cost: left_cost.cpu_cost
+                        + left_cost.row_count * self.cost_model.cpu_operator_cost * 4.0,
+                    row_count: left_cost.row_count,
+                };
+                Ok(PhysicalPlan::LateralJoin {
+                    left: Box::new(left_plan),
+                    subquery: *subquery.0,
+                    subquery_table_idx,
+                    join_type,
+                    condition,
+                    left_schema,
+                    right_schema,
+                    cost,
+                })
+            }
             LogicalPlan::Aggregate {
                 group_by,
                 aggregates,
                 child,
-            } => self.plan_aggregate(group_by, aggregates, *child),
+            } => self.plan_aggregate(group_by, aggregates, Arc::unwrap_or_clone(child)),
             LogicalPlan::Sort { order_by, child } => {
-                let child_plan = self.plan(*child)?;
+                let child_plan = self.plan(Arc::unwrap_or_clone(child))?;
                 let child_cost = *child_plan.cost();
                 let sort_cost = self.cost_model.cost_sort(&child_cost);
                 Ok(PhysicalPlan::Sort {
@@ -172,7 +267,7 @@ impl<'a> PhysicalPlanner<'a> {
                 child,
             } => {
                 // Check if there's a Sort below for top-N optimization
-                let child_plan = self.plan(*child)?;
+                let child_plan = self.plan(Arc::unwrap_or_clone(child))?;
                 let rows = limit
                     .map(|l| (l as f64).min(child_plan.cost().row_count))
                     .unwrap_or(child_plan.cost().row_count);
@@ -189,7 +284,7 @@ impl<'a> PhysicalPlanner<'a> {
                 })
             }
             LogicalPlan::Distinct { child } => {
-                let child_plan = self.plan(*child)?;
+                let child_plan = self.plan(Arc::unwrap_or_clone(child))?;
                 let child_cost = *child_plan.cost();
                 let cost = PlanCost {
                     io_cost: 0.0,
@@ -207,8 +302,8 @@ impl<'a> PhysicalPlanner<'a> {
                 left,
                 right,
             } => {
-                let left_plan = self.plan(*left)?;
-                let right_plan = self.plan(*right)?;
+                let left_plan = self.plan(Arc::unwrap_or_clone(left))?;
+                let right_plan = self.plan(Arc::unwrap_or_clone(right))?;
                 let cost = PlanCost {
                     io_cost: 0.0,
                     cpu_cost: (left_plan.cost().row_count + right_plan.cost().row_count)
@@ -226,13 +321,19 @@ impl<'a> PhysicalPlanner<'a> {
             LogicalPlan::Insert {
                 table_id,
                 target_columns,
+                column_defaults,
+                check_constraints,
+                expectations,
                 source,
             } => {
-                let source_plan = self.plan(*source)?;
+                let source_plan = self.plan(Arc::unwrap_or_clone(source))?;
                 let cost = *source_plan.cost();
                 Ok(PhysicalPlan::Insert {
                     table_id,
                     target_columns,
+                    column_defaults,
+                    check_constraints,
+                    expectations,
                     source: Box::new(source_plan),
                     cost,
                 })
@@ -248,19 +349,21 @@ impl<'a> PhysicalPlanner<'a> {
             LogicalPlan::Update {
                 table_id,
                 assignments,
+                check_constraints,
                 child,
             } => {
-                let child_plan = self.plan(*child)?;
+                let child_plan = self.plan(Arc::unwrap_or_clone(child))?;
                 let cost = *child_plan.cost();
                 Ok(PhysicalPlan::Update {
                     table_id,
                     assignments,
+                    check_constraints,
                     child: Box::new(child_plan),
                     cost,
                 })
             }
             LogicalPlan::Delete { table_id, child } => {
-                let child_plan = self.plan(*child)?;
+                let child_plan = self.plan(Arc::unwrap_or_clone(child))?;
                 let cost = *child_plan.cost();
                 Ok(PhysicalPlan::Delete {
                     table_id,
@@ -373,9 +476,13 @@ impl<'a> PhysicalPlanner<'a> {
         // Columnar correctness gate. When the table has registered .zyr
         // segments, folded rows were physically deleted from the heap, so a
         // heap-only SeqScan or IndexScan would silently miss them. Only the
-        // hybrid scan reads both stores. Time travel (AS OF) stays on the
-        // heap/version path and is not folded, so it keeps the heap scan.
-        if as_of.is_none()
+        // hybrid scan reads both stores. A current read and an AS OF VERSION
+        // read both use it: the hybrid scan dates the columnar and heap rows by
+        // commit LSN under AS OF, so a past version sees folded rows too. AS OF
+        // TIMESTAMP and AS OF BRANCH stay on the heap path (their predicate and
+        // branch-overlay handling is heap-only).
+        let as_of_hybrid = matches!(as_of, None | Some(crate::logical::AsOfTarget::Version(_)));
+        if as_of_hybrid
             && let Ok(te) = self.catalog.get_table_by_id(table_id)
             && !te.columnar.segments.is_empty()
         {
@@ -399,6 +506,7 @@ impl<'a> PhysicalPlanner<'a> {
                 table_id,
                 columns,
                 predicate,
+                as_of,
                 cost,
             });
         }
@@ -498,39 +606,48 @@ impl<'a> PhysicalPlanner<'a> {
 
         // Try to find a B-tree index scan opportunity. Equality on indexed
         // columns prefers IndexScan even without stats, since index lookup
-        // is by definition more selective than a full table scan
-        if let Some(pred) = &predicate {
-            for index in &indexes {
-                if let Some((index_pred, remaining)) = match_index(pred, index) {
-                    let (selectivity, cost) = if let Some(s) = &table_stats {
-                        let (ts, cs) = (&s.0, &s.1);
-                        let sel =
-                            self.cost_model
-                                .estimate_selectivity(&index_pred, Some(ts), Some(cs));
-                        (sel, self.cost_model.cost_index_scan(ts, sel))
-                    } else {
-                        let sel = 0.001f64;
-                        (
-                            sel,
-                            PlanCost {
-                                io_cost: 1.0,
-                                cpu_cost: 5.0,
-                                row_count: 10.0,
-                            },
-                        )
-                    };
-                    if selectivity < INDEX_SCAN_SELECTIVITY_THRESHOLD {
-                        return Ok(PhysicalPlan::IndexScan {
-                            table_id,
-                            index_id: index.id,
-                            index: Arc::clone(index),
-                            columns,
-                            predicate: index_pred,
-                            remaining_predicate: remaining,
-                            scan_direction: ScanDirection::Forward,
-                            cost,
-                            as_of: as_of.clone(),
-                        });
+        // is by definition more selective than a full table scan.
+        // Time travel (AS OF) stays on the sequential heap path: visibility is
+        // dated per tuple by commit LSN, so every version of a row must be
+        // examined, and the index carries no version information. This also
+        // keeps AS OF TIMESTAMP and AS OF BRANCH on their predicate/overlay
+        // handling, which only the sequential scan applies.
+        if as_of.is_none() {
+            if let Some(pred) = &predicate {
+                for index in &indexes {
+                    if let Some((index_pred, remaining)) = match_index(pred, index) {
+                        let (selectivity, cost) = if let Some(s) = &table_stats {
+                            let (ts, cs) = (&s.0, &s.1);
+                            let sel = self.cost_model.estimate_selectivity(
+                                &index_pred,
+                                Some(ts),
+                                Some(cs),
+                            );
+                            (sel, self.cost_model.cost_index_scan(ts, sel))
+                        } else {
+                            let sel = 0.001f64;
+                            (
+                                sel,
+                                PlanCost {
+                                    io_cost: 1.0,
+                                    cpu_cost: 5.0,
+                                    row_count: 10.0,
+                                },
+                            )
+                        };
+                        if selectivity < INDEX_SCAN_SELECTIVITY_THRESHOLD {
+                            return Ok(PhysicalPlan::IndexScan {
+                                table_id,
+                                index_id: index.id,
+                                index: Arc::clone(index),
+                                columns,
+                                predicate: index_pred,
+                                remaining_predicate: remaining,
+                                scan_direction: ScanDirection::Forward,
+                                cost,
+                                as_of: as_of.clone(),
+                            });
+                        }
                     }
                 }
             }
@@ -650,6 +767,24 @@ impl<'a> PhysicalPlanner<'a> {
 
         match &condition {
             JoinCondition::On(expr) => {
+                // A subquery in the ON predicate cannot be a hash or merge key and
+                // is evaluated per joined row by the nested-loop operator's
+                // correlated path. Force a nested loop with the full condition so
+                // no equi-key extraction strands the subquery on an unsupported
+                // operator. (Inner joins are already lowered to Cross + Filter in
+                // the logical builder, so this path is reached by outer joins.)
+                if predicate_has_subquery(expr) {
+                    let nl_cost = self
+                        .cost_model
+                        .cost_nested_loop_join(&left_cost, &right_cost);
+                    return Ok(PhysicalPlan::NestedLoopJoin {
+                        left: Box::new(left_plan),
+                        right: Box::new(right_plan),
+                        join_type,
+                        condition: Some(expr.clone()),
+                        cost: nl_cost,
+                    });
+                }
                 // Try to extract equi-join keys
                 if let Some((left_keys, right_keys, remaining)) = extract_equi_keys(expr) {
                     // Cost all three strategies
@@ -899,9 +1034,10 @@ impl<'a> PhysicalPlanner<'a> {
 
         // Detect a time_bucket_gapfill(width, ts) grouping key: it groups
         // exactly like time_bucket, then a GapFill node densifies the result.
-        let gapfill = group_by.iter().enumerate().find_map(|(i, g)| {
-            gapfill_width(g).map(|w| (i, w))
-        });
+        let gapfill = group_by
+            .iter()
+            .enumerate()
+            .find_map(|(i, g)| gapfill_width(g).map(|w| (i, w)));
 
         // Use HashAggregate by default (better for random group distributions)
         let agg = PhysicalPlan::HashAggregate {
@@ -1302,6 +1438,64 @@ fn is_column_ref(expr: &BoundExpr) -> bool {
     matches!(expr, BoundExpr::ColumnRef(_))
 }
 
+/// Returns true when an expression tree contains a subquery node. Such a
+/// predicate is evaluated by a Filter operator rather than fused into a scan,
+/// so the scan never sees an outer reference it cannot resolve.
+fn predicate_has_subquery(expr: &BoundExpr) -> bool {
+    match expr {
+        BoundExpr::Subquery { .. } | BoundExpr::Exists { .. } | BoundExpr::InSubquery { .. } => {
+            true
+        }
+        BoundExpr::BinaryOp { left, right, .. } => {
+            predicate_has_subquery(left) || predicate_has_subquery(right)
+        }
+        BoundExpr::UnaryOp { expr, .. }
+        | BoundExpr::IsNull { expr, .. }
+        | BoundExpr::Cast { expr, .. }
+        | BoundExpr::Nested(expr)
+        | BoundExpr::TemporalRef { inner: expr, .. } => predicate_has_subquery(expr),
+        BoundExpr::Between {
+            expr, low, high, ..
+        } => {
+            predicate_has_subquery(expr)
+                || predicate_has_subquery(low)
+                || predicate_has_subquery(high)
+        }
+        BoundExpr::InList { expr, list, .. } => {
+            predicate_has_subquery(expr) || list.iter().any(predicate_has_subquery)
+        }
+        BoundExpr::Like { expr, pattern, .. } | BoundExpr::ILike { expr, pattern, .. } => {
+            predicate_has_subquery(expr) || predicate_has_subquery(pattern)
+        }
+        BoundExpr::Function { args, .. } | BoundExpr::AggregateFunction { args, .. } => {
+            args.iter().any(predicate_has_subquery)
+        }
+        BoundExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand.as_deref().is_some_and(predicate_has_subquery)
+                || conditions.iter().any(|w| {
+                    predicate_has_subquery(&w.condition) || predicate_has_subquery(&w.result)
+                })
+                || else_result.as_deref().is_some_and(predicate_has_subquery)
+        }
+        BoundExpr::WindowFunction {
+            function,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            predicate_has_subquery(function)
+                || partition_by.iter().any(predicate_has_subquery)
+                || order_by.iter().any(|o| predicate_has_subquery(&o.expr))
+        }
+        BoundExpr::ColumnRef(_) | BoundExpr::Literal { .. } | BoundExpr::Parameter { .. } => false,
+    }
+}
+
 /// Walks a BoundExpr tree and replaces WindowFunction nodes with ColumnRefs
 /// pointing to positions in an auxiliary window-output column list.
 /// Collects the WindowFunction expressions into `collected`.
@@ -1494,6 +1688,7 @@ fn rewrite_window_refs(
             args,
             distinct,
             return_type,
+            uda,
         } => BE::AggregateFunction {
             name: name.clone(),
             args: args
@@ -1502,6 +1697,7 @@ fn rewrite_window_refs(
                 .collect(),
             distinct: *distinct,
             return_type: *return_type,
+            uda: uda.clone(),
         },
         BE::Cast {
             expr: inner,

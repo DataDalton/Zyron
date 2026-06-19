@@ -259,6 +259,7 @@ fn logical_op_name(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::Filter { .. } => "Filter",
         LogicalPlan::Project { .. } => "Project",
         LogicalPlan::Join { .. } => "Join",
+        LogicalPlan::LateralJoin { .. } => "LateralJoin",
         LogicalPlan::Aggregate { .. } => "Aggregate",
         LogicalPlan::Sort { .. } => "Sort",
         LogicalPlan::Limit { .. } => "Limit",

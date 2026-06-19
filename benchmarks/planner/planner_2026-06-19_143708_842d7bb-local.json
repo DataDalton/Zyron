@@ -1,0 +1,81 @@
+{
+  "id": "2026-06-19_143708_842d7bb-local",
+  "date": "2026-06-19 14:37:12Z",
+  "ts": 1781879832,
+  "commit": "842d7bb-local",
+  "cpu": "Intel(R) Core(TM) i9-14900KS",
+  "cores": 32,
+  "ram_gb": 31.8,
+  "gpus": ["Intel(R) UHD Graphics 770","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Planner Performance": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 16.51 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 16.36 },
+      "Binding latency (us)": {
+        "average": 2.136360,
+        "runs": [2.61, 2.02, 2.04, 2.01, 2.01],
+        "target": 2.000000,
+        "passed": false,
+        "higher_is_better": false
+      },
+      "Logical plan latency (us)": {
+        "average": 0.510220,
+        "runs": [0.57, 0.50, 0.53, 0.48, 0.47],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Optimization latency (us)": {
+        "average": 12.022500,
+        "runs": [11.71, 12.28, 12.05, 12.11, 11.96],
+        "target": 25.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Physical plan latency (us)": {
+        "average": 0.418800,
+        "runs": [0.94, 0.36, 0.28, 0.41, 0.10],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Join reorder latency (us, 5 tables)": {
+        "average": 21.246000,
+        "runs": [22.61, 21.21, 20.29, 21.23, 20.89],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Index selection latency (us)": {
+        "average": 0.010000,
+        "runs": [0.01, 0.01, 0.01, 0.01, 0.01],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Full pipeline latency (us)": {
+        "average": 27.996320,
+        "runs": [28.54, 28.29, 27.87, 28.06, 27.21],
+        "target": 50.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Plan cache hit rate": {
+        "average": 0.999000,
+        "runs": [1.00],
+        "target": 0.980000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "Cardinality estimation error factor": {
+        "average": 1.000000,
+        "runs": [1.00],
+        "target": 2.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    }
+  }
+}

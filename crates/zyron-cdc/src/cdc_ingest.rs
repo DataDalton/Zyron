@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use zyron_common::{Result, ZyronError};
 
 use crate::cdc_stream::OutputFormat;
+use crate::decoder::DecoderPlugin;
 
 // ---------------------------------------------------------------------------
 // CdcIngestSource
@@ -62,6 +63,8 @@ pub struct CdcIngestConfig {
     pub primary_key_columns: Vec<String>,
     pub on_conflict: OnConflict,
     pub dead_letter_table_id: Option<u32>,
+    /// Wire format of the inbound records, used to pick the decoder.
+    pub decoder: DecoderPlugin,
     pub batch_size: usize,
     pub active: bool,
 }
@@ -319,6 +322,7 @@ mod tests {
             primary_key_columns: vec!["id".into()],
             on_conflict: OnConflict::Update,
             dead_letter_table_id: None,
+            decoder: DecoderPlugin::Debezium,
             batch_size: 1000,
             active: true,
         }

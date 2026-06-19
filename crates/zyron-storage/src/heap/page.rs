@@ -269,6 +269,131 @@ impl HeapPage {
         free + tuple_area_size.saturating_sub(active_tuple_space)
     }
 
+    /// Stamps `xmax` on a tuple in place within a page slice. The xmax field is
+    /// the last 4 bytes of the 12-byte tuple header. Returns false if the slot
+    /// is empty. Used by the delete/update path while holding the frame write
+    /// lock so the change is not lost to a concurrent append.
+    pub fn set_tuple_xmax_in_slice(data: &mut [u8], slot_id: SlotId, xmax: u32) -> bool {
+        let header = Self::heap_header_from_slice(data);
+        let Some(slot) = Self::get_slot_from_slice(data, slot_id, header.slot_count) else {
+            return false;
+        };
+        if slot.is_empty() {
+            return false;
+        }
+        let off = slot.offset as usize + TupleHeader::SIZE - 4;
+        data[off..off + 4].copy_from_slice(&xmax.to_le_bytes());
+        true
+    }
+
+    /// Prunes tuples for which `is_dead(xmin, xmax)` returns true and reclaims
+    /// their space by zeroing the slot and compacting the page. The caller
+    /// supplies a predicate that is true only for versions dead to every live
+    /// snapshot (a committed delete below the frozen horizon, or an aborted
+    /// insert). Slot ids of surviving tuples are preserved by compaction, so
+    /// outstanding tuple and index references stay valid. Returns true if any
+    /// tuple was pruned. This is the on-access pruning that keeps MVCC-updated
+    /// heaps compact without waiting for vacuum.
+    pub fn prune_dead_in_slice(data: &mut [u8], is_dead: &impl Fn(u32, u32) -> bool) -> bool {
+        let header = Self::heap_header_from_slice(data);
+        let mut pruned = false;
+        for i in 0..header.slot_count {
+            let slot_id = SlotId(i);
+            let Some(slot) = Self::get_slot_from_slice(data, slot_id, header.slot_count) else {
+                continue;
+            };
+            if slot.is_empty() {
+                continue;
+            }
+            let off = slot.offset as usize;
+            let hdr = TupleHeader::from_bytes(&data[off..off + TupleHeader::SIZE]);
+            if is_dead(hdr.xmin, hdr.xmax) {
+                // Mark the slot empty; compaction below reclaims the bytes.
+                Self::set_slot_in_slice(data, slot_id, TupleSlot::new(slot.offset, 0));
+                pruned = true;
+            }
+        }
+        if pruned {
+            Self::compact_in_slice(data);
+        }
+        pruned
+    }
+
+    /// Vacuums a page slice in place. Two actions:
+    /// 1. Clears the `xmax` stamp on a live row whose deleter aborted, so a row
+    ///    that is still visible never carries a reference to an aborted
+    ///    transaction below the frozen horizon (which would let the horizon, or
+    ///    commit-status truncation, make it look deleted).
+    /// 2. Prunes tuples dead to every snapshot (aborted insert, or committed
+    ///    delete below the horizon) and compacts to reclaim their bytes.
+    ///
+    /// `is_dead(xmin, xmax)` marks reclaimable versions; `is_aborted(xid)` marks
+    /// a transaction that aborted. Returns (tuples reclaimed, page modified).
+    pub fn vacuum_in_slice(
+        data: &mut [u8],
+        is_dead: &impl Fn(u32, u32) -> bool,
+        is_aborted: &impl Fn(u32) -> bool,
+    ) -> (u64, bool) {
+        Self::vacuum_in_slice_inner(data, is_dead, is_aborted, None)
+    }
+
+    /// Same as `vacuum_in_slice` but, before pruning, records each reclaimed
+    /// tuple as (slot_id, row data) into `dead_out`. The vacuum worker uses this
+    /// to delete the reclaimed rows' B+tree index entries: the composite index
+    /// key includes the row's value and tuple id, so the entry is removed using
+    /// the row image that is about to disappear from the heap.
+    pub fn vacuum_in_slice_collect(
+        data: &mut [u8],
+        is_dead: &impl Fn(u32, u32) -> bool,
+        is_aborted: &impl Fn(u32) -> bool,
+        dead_out: &mut Vec<(u16, Vec<u8>)>,
+    ) -> (u64, bool) {
+        Self::vacuum_in_slice_inner(data, is_dead, is_aborted, Some(dead_out))
+    }
+
+    fn vacuum_in_slice_inner(
+        data: &mut [u8],
+        is_dead: &impl Fn(u32, u32) -> bool,
+        is_aborted: &impl Fn(u32) -> bool,
+        mut dead_out: Option<&mut Vec<(u16, Vec<u8>)>>,
+    ) -> (u64, bool) {
+        let header = Self::heap_header_from_slice(data);
+        let mut reclaimed = 0u64;
+        let mut modified = false;
+        for i in 0..header.slot_count {
+            let slot_id = SlotId(i);
+            let Some(slot) = Self::get_slot_from_slice(data, slot_id, header.slot_count) else {
+                continue;
+            };
+            if slot.is_empty() {
+                continue;
+            }
+            let off = slot.offset as usize;
+            let hdr = TupleHeader::from_bytes(&data[off..off + TupleHeader::SIZE]);
+            if is_dead(hdr.xmin, hdr.xmax) {
+                reclaimed += 1;
+                // Capture the row image before prune_dead_in_slice zeroes it, so
+                // its index entries can be removed against the heap-resident key.
+                if let Some(out) = dead_out.as_deref_mut() {
+                    let ds = off + TupleHeader::SIZE;
+                    let de = ds + hdr.data_len as usize;
+                    if de <= data.len() {
+                        out.push((i, data[ds..de].to_vec()));
+                    }
+                }
+            } else if hdr.xmax != 0 && is_aborted(hdr.xmax) {
+                // Live row whose deleter aborted: clear the stale stamp.
+                let xoff = off + TupleHeader::SIZE - 4;
+                data[xoff..xoff + 4].copy_from_slice(&0u32.to_le_bytes());
+                modified = true;
+            }
+        }
+        if Self::prune_dead_in_slice(data, is_dead) {
+            modified = true;
+        }
+        (reclaimed, modified)
+    }
+
     /// Compacts a page slice by moving all active tuples together.
     /// Eliminates holes from deleted tuples and maximizes contiguous free space.
     fn compact_in_slice(data: &mut [u8]) {
@@ -878,6 +1003,24 @@ impl HeapPage {
         }
     }
 
+    /// Stamps a tuple's `xmax` with the deleting transaction id, in place,
+    /// without freeing the slot. This is the MVCC delete: the row stays
+    /// physically present and is hidden by snapshot visibility once the deleting
+    /// transaction commits, so an aborted delete leaves the row visible and
+    /// vacuum reclaims the space later. Returns false if the slot is empty.
+    pub fn set_tuple_xmax(&mut self, slot_id: SlotId, xmax: u32) -> bool {
+        let Some(slot) = self.get_slot(slot_id) else {
+            return false;
+        };
+        if slot.is_empty() {
+            return false;
+        }
+        // xmax is the last 4 bytes of the 12-byte tuple header.
+        let off = slot.offset as usize + TupleHeader::SIZE - 4;
+        self.data[off..off + 4].copy_from_slice(&xmax.to_le_bytes());
+        true
+    }
+
     /// Deletes a tuple from the page.
     ///
     /// This marks the slot as empty but doesn't reclaim space immediately.
@@ -1079,6 +1222,95 @@ mod tests {
 
         assert_eq!(page.slot_count(), 0);
         assert!(page.free_space() > 0);
+    }
+
+    #[test]
+    fn test_prune_dead_in_slice_preserves_live_slots() {
+        let mut page = create_test_page();
+        let s0 = page
+            .insert_tuple(&Tuple::new(b"alpha".to_vec(), 10))
+            .unwrap();
+        let s1 = page
+            .insert_tuple(&Tuple::new(b"bravo".to_vec(), 11))
+            .unwrap();
+        let s2 = page
+            .insert_tuple(&Tuple::new(b"charlie".to_vec(), 12))
+            .unwrap();
+
+        // Mark the middle tuple deleted by a committed transaction below horizon.
+        assert!(page.set_tuple_xmax(s1, 50));
+        let free_before = page.free_space();
+
+        let is_dead = |_xmin: u32, xmax: u32| xmax != 0 && xmax < 100;
+        assert!(HeapPage::prune_dead_in_slice(page.as_bytes_mut(), &is_dead));
+
+        // Survivors keep their slot ids and data; the pruned slot reads empty.
+        assert_eq!(page.get_tuple(s0).unwrap().data(), b"alpha");
+        assert!(page.get_tuple(s1).is_none());
+        assert_eq!(page.get_tuple(s2).unwrap().data(), b"charlie");
+        // Pruning reclaimed the middle tuple's bytes.
+        assert!(page.free_space() > free_before);
+    }
+
+    #[test]
+    fn test_prune_dead_in_slice_keeps_live_rows() {
+        let mut page = create_test_page();
+        let s0 = page
+            .insert_tuple(&Tuple::new(b"keep".to_vec(), 10))
+            .unwrap();
+        // A live row (xmax == 0) and a delete above the horizon must survive.
+        let s1 = page
+            .insert_tuple(&Tuple::new(b"recent".to_vec(), 11))
+            .unwrap();
+        assert!(page.set_tuple_xmax(s1, 200));
+
+        let is_dead = |_xmin: u32, xmax: u32| xmax != 0 && xmax < 100;
+        assert!(!HeapPage::prune_dead_in_slice(
+            page.as_bytes_mut(),
+            &is_dead
+        ));
+        assert_eq!(page.get_tuple(s0).unwrap().data(), b"keep");
+        assert_eq!(page.get_tuple(s1).unwrap().data(), b"recent");
+    }
+
+    #[test]
+    fn test_vacuum_in_slice_clears_aborted_delete_and_reclaims_dead() {
+        let mut page = create_test_page();
+        // live: committed inserter, not deleted.
+        let s_live = page
+            .insert_tuple(&Tuple::new(b"live".to_vec(), 10))
+            .unwrap();
+        // aborted insert: inserter aborted -> dead.
+        let s_ai = page
+            .insert_tuple(&Tuple::new(b"abrt-ins".to_vec(), 20))
+            .unwrap();
+        // committed delete below horizon -> dead.
+        let s_cd = page
+            .insert_tuple(&Tuple::new(b"cmt-del".to_vec(), 11))
+            .unwrap();
+        assert!(page.set_tuple_xmax(s_cd, 12));
+        // aborted delete: deleter aborted, row stays live, stamp must clear.
+        let s_ad = page
+            .insert_tuple(&Tuple::new(b"abrt-del".to_vec(), 13))
+            .unwrap();
+        assert!(page.set_tuple_xmax(s_ad, 21));
+
+        let is_dead = |xmin: u32, xmax: u32| xmin == 20 || xmax == 12;
+        let is_aborted = |xid: u32| xid == 20 || xid == 21;
+        let (reclaimed, modified) =
+            HeapPage::vacuum_in_slice(page.as_bytes_mut(), &is_dead, &is_aborted);
+
+        assert!(modified);
+        assert_eq!(reclaimed, 2); // aborted insert + committed delete
+        // Dead rows are gone.
+        assert!(page.get_tuple(s_ai).is_none());
+        assert!(page.get_tuple(s_cd).is_none());
+        // Live row intact.
+        assert_eq!(page.get_tuple(s_live).unwrap().data(), b"live");
+        // Aborted-delete row stays live and its xmax stamp is cleared.
+        let ad = page.get_tuple(s_ad).unwrap();
+        assert_eq!(ad.data(), b"abrt-del");
+        assert_eq!(ad.header().xmax, 0);
     }
 
     #[test]

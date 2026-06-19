@@ -13,10 +13,17 @@ use tracing::{debug, info};
 
 use zyron_buffer::BufferPool;
 use zyron_catalog::{Catalog, TableEntry};
-use zyron_common::page::PAGE_SIZE;
 use zyron_storage::txn::TransactionManager;
-use zyron_storage::{DiskManager, HeapFile, HeapFileConfig, HeapPage, MvccGc, TupleHeader};
+use zyron_storage::{DiskManager, HeapFile, HeapFileConfig, HeapPage};
 use zyron_wal::WalWriter;
+
+/// Current wall-clock time in microseconds since the Unix epoch.
+fn now_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
+}
 
 /// Configuration for the vacuum worker.
 #[derive(Debug, Clone)]
@@ -72,6 +79,7 @@ impl VacuumWorker {
         disk_manager: Arc<DiskManager>,
         buffer_pool: Arc<BufferPool>,
         _wal: Arc<WalWriter>,
+        btree_indexes: Arc<scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>>,
         config: VacuumWorkerConfig,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -88,6 +96,8 @@ impl VacuumWorker {
                 let _ = thread_waker.set(thread::current());
                 Self::vacuum_loop(
                     &catalog,
+                    &btree_indexes,
+                    &_wal,
                     &txn_manager,
                     &disk_manager,
                     &buffer_pool,
@@ -109,6 +119,8 @@ impl VacuumWorker {
     /// Main vacuum loop.
     fn vacuum_loop(
         catalog: &Catalog,
+        btree_indexes: &scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>,
+        wal: &Arc<WalWriter>,
         txn_manager: &TransactionManager,
         disk_manager: &Arc<DiskManager>,
         buffer_pool: &Arc<BufferPool>,
@@ -136,9 +148,41 @@ impl VacuumWorker {
                 active_txns[0] // already sorted
             };
 
+            // Record a (now, durable LSN) sample so time-based retention can map
+            // a window to a floor LSN. The vacuum interval is the sample
+            // resolution, far finer than the day-scale windows it serves.
+            let now_micros = now_micros();
+            txn_manager
+                .retention_clock()
+                .record(now_micros, wal.flushed_lsn().0);
+
+            // The catalog's version tags are the source of truth for the tag
+            // retention floor. Recompute it each cycle so a dropped tag raises
+            // the floor (resuming reclamation) and any DDL race self-heals. A
+            // freshly created tag is honored immediately by CREATE VERSION's own
+            // fetch-min, so this never reclaims a new tag's history early.
+            let tag_floor = catalog
+                .list_version_tags()
+                .iter()
+                .map(|t| t.version_id)
+                .min()
+                .unwrap_or(u64::MAX);
+            txn_manager
+                .status_map()
+                .set_version_retention_floor(tag_floor);
+
             let tables = catalog.list_all_tables();
             let mut total_reclaimed = 0u64;
             let mut total_pages = 0u64;
+            // A full sweep (no page cap) that touches every table reclaims all
+            // aborted-insert tuples and committed-deleted tuples below the
+            // horizon, so the commit-status frozen watermark can advance past
+            // them. Any error or page cap leaves dead tuples behind, so hold off.
+            let mut full_sweep = config.max_pages_per_cycle == 0;
+            // Smallest retention floor across all tables (version tags + time
+            // windows). Commit LSNs at or below it are no longer needed to date
+            // any retained version, so their segments can be freed.
+            let mut global_floor = u64::MAX;
 
             for table_entry in &tables {
                 if shutdown.load(Ordering::Acquire) {
@@ -146,13 +190,28 @@ impl VacuumWorker {
                 }
 
                 // Vacuum each table: scan heap pages, identify dead tuples,
-                // reclaim space, update FSM.
+                // reclaim space, update FSM, and delete the reclaimed rows'
+                // B+tree index entries so stale entries do not accumulate.
+                // The effective retention floor keeps versions still visible at
+                // a tagged version or within the table's time-travel window.
+                let index_snap = catalog.index_snapshot(table_entry.id);
+                let retention_floor = zyron_executor::operator::modify::effective_retention_floor(
+                    table_entry,
+                    txn_manager.status_map(),
+                    txn_manager.retention_clock(),
+                    now_micros,
+                );
+                global_floor = global_floor.min(retention_floor);
                 match Self::vacuum_table(
                     &table_entry,
                     oldest_active,
                     config.max_pages_per_cycle,
                     disk_manager,
                     buffer_pool,
+                    txn_manager.status_map(),
+                    retention_floor,
+                    &index_snap.btree,
+                    btree_indexes,
                 ) {
                     Ok((reclaimed, pages)) => {
                         total_reclaimed += reclaimed;
@@ -160,8 +219,62 @@ impl VacuumWorker {
                     }
                     Err(e) => {
                         debug!("Vacuum for table {} failed: {}", table_entry.name, e);
+                        full_sweep = false;
                     }
                 }
+            }
+
+            // Bound the retention clock: keep samples back to the longest finite
+            // retention window across tables; unlimited and unset tables need no
+            // historical samples (their floor is 0 or u64::MAX).
+            let max_window_secs = tables
+                .iter()
+                .map(|t| t.time_travel_retention_secs)
+                .filter(|&s| s != 0 && s != u64::MAX)
+                .max()
+                .unwrap_or(0);
+            let keep_from = if max_window_secs > 0 {
+                now_micros.saturating_sub(
+                    max_window_secs
+                        .saturating_mul(1_000_000)
+                        .saturating_add(3_600_000_000),
+                )
+            } else {
+                now_micros
+            };
+            txn_manager.retention_clock().prune_before(keep_from);
+
+            // Advance the frozen horizon: after a clean full sweep, every tuple
+            // below `oldest_active` is committed (aborted inserts reclaimed,
+            // aborted-delete stamps cleared), so visibility can treat ids below
+            // it as committed without a status lookup. With the horizon past
+            // them, the commit-status segments below it are unreachable and their
+            // memory can be reclaimed.
+            if full_sweep {
+                let status_map = txn_manager.status_map();
+                status_map.advance_vacuum_frozen(oldest_active);
+                let freed = status_map.truncate_below(oldest_active);
+                if freed > 0 {
+                    debug!(
+                        "Truncated {} commit-status segments below {}",
+                        freed, oldest_active
+                    );
+                }
+            }
+
+            // Free commit-LSN segments no longer needed to date any retained
+            // version: those whose transactions all committed at or below the
+            // global retention floor. Capped at the status truncation watermark
+            // (so aborts there are already gone). Bounds commit-LSN memory to the
+            // retention window.
+            let freed_lsn = txn_manager
+                .status_map()
+                .advance_commit_lsn_dawn(global_floor);
+            if freed_lsn > 0 {
+                debug!(
+                    "Freed {} commit-LSN segments below the retention floor",
+                    freed_lsn
+                );
             }
 
             stats.cycles_completed.fetch_add(1, Ordering::Relaxed);
@@ -184,16 +297,21 @@ impl VacuumWorker {
     /// Vacuums a single table. Returns (tuples_reclaimed, pages_scanned).
     ///
     /// Scans heap pages sequentially through the buffer pool. For each page,
-    /// reads every tuple slot and checks the TupleHeader xmax against the
-    /// oldest_active horizon using MvccGc::is_reclaimable(). Dead tuples
-    /// have their slots zeroed (length = 0), reclaiming space for new inserts.
-    /// The FSM is updated after processing each modified page.
+    /// reads every tuple's xmin/xmax and uses `is_dead_tuple` (commit-status
+    /// aware) to find rows whose inserter aborted or whose deleter committed
+    /// before the oldest active transaction. Dead tuples have their slots zeroed
+    /// (length = 0), reclaiming space for new inserts.
+    #[allow(clippy::too_many_arguments)]
     fn vacuum_table(
         table: &TableEntry,
         oldest_active: u64,
         max_pages: usize,
         disk_manager: &Arc<DiskManager>,
         buffer_pool: &Arc<BufferPool>,
+        status_map: &zyron_storage::TxnStatusMap,
+        retention_floor: u64,
+        btree: &[(zyron_catalog::IndexId, zyron_catalog::ColumnId, bool)],
+        btree_indexes: &scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>,
     ) -> std::result::Result<(u64, u64), String> {
         let heap_file = HeapFile::new(
             Arc::clone(disk_manager),
@@ -220,125 +338,62 @@ impl VacuumWorker {
             page_ids.len()
         };
 
+        // Predicates shared across pages. A tuple is dead when its inserter
+        // aborted or its committed deleter is older than the oldest active
+        // transaction and no retained version still sees the row alive. An
+        // aborted-delete stamp on a still-live row is cleared.
+        let is_dead = |xmin: u32, xmax: u32| {
+            status_map.is_aborted(xmin as u64)
+                || (xmax != 0
+                    && status_map.is_committed(xmax as u64)
+                    && (xmax as u64) < oldest_active
+                    && status_map.is_reclaimable_below(xmax as u64, retention_floor))
+        };
+        let is_aborted = |xid: u32| status_map.is_aborted(xid as u64);
+        let clean_indexes = !btree.is_empty();
+
         for &page_id in page_ids.iter().take(page_limit) {
             pages_scanned += 1;
 
-            // Fetch the page data from the buffer pool
-            let page_data = match buffer_pool.fetch_page(page_id) {
-                Some(frame) => {
-                    let guard = frame.read_data();
-                    let data: [u8; PAGE_SIZE] = **guard;
-                    drop(guard);
-                    buffer_pool.unpin_page(page_id, false);
-                    data
-                }
-                None => continue,
+            // Pin the frame and mutate in place under the exclusive frame write
+            // lock. The insert burst path holds the shared lock, so vacuum never
+            // clobbers a concurrent append.
+            let Some(frame) = buffer_pool.fetch_page(page_id) else {
+                continue;
             };
-
-            let header = HeapPage::heap_header_from_slice(&page_data);
-            if header.slot_count == 0 {
-                continue;
-            }
-
-            // First pass: count dead tuples on this page
-            let mut dead_count = 0u64;
-            let mut total_count = 0u64;
-
-            for i in 0..header.slot_count {
-                let slot_offset = HeapPage::DATA_START + (i as usize) * 4;
-                let slot_len =
-                    u16::from_le_bytes([page_data[slot_offset + 2], page_data[slot_offset + 3]]);
-                if slot_len == 0 {
-                    continue;
+            // Reclaimed rows' images, captured under the lock so their index
+            // entries can be deleted after the lock is released.
+            let mut dead: Vec<(u16, Vec<u8>)> = Vec::new();
+            let (reclaimed_on_page, modified) = {
+                let mut guard = frame.write_data();
+                let data: &mut [u8] = &mut guard[..];
+                if HeapPage::heap_header_from_slice(data).slot_count == 0 {
+                    (0u64, false)
+                } else if clean_indexes {
+                    HeapPage::vacuum_in_slice_collect(data, &is_dead, &is_aborted, &mut dead)
+                } else {
+                    HeapPage::vacuum_in_slice(data, &is_dead, &is_aborted)
                 }
-                total_count += 1;
+            };
+            buffer_pool.unpin_page(page_id, modified);
 
-                let tuple_offset =
-                    u16::from_le_bytes([page_data[slot_offset], page_data[slot_offset + 1]])
-                        as usize;
-
-                // Read xmax from the tuple header (offset 8 within the 12-byte header)
-                if tuple_offset + TupleHeader::SIZE <= PAGE_SIZE {
-                    let xmax = u32::from_le_bytes([
-                        page_data[tuple_offset + 8],
-                        page_data[tuple_offset + 9],
-                        page_data[tuple_offset + 10],
-                        page_data[tuple_offset + 11],
-                    ]);
-
-                    if MvccGc::is_reclaimable(xmax, oldest_active) {
-                        dead_count += 1;
-                    }
-                }
-            }
-
-            if dead_count == 0 {
-                continue;
-            }
-
-            // Second pass: reclaim dead tuples by zeroing slot lengths
-            let mut modified_page = page_data;
-            let mut reclaimed_on_page = 0u64;
-
-            for i in 0..header.slot_count {
-                let slot_offset = HeapPage::DATA_START + (i as usize) * 4;
-                let slot_len = u16::from_le_bytes([
-                    modified_page[slot_offset + 2],
-                    modified_page[slot_offset + 3],
-                ]);
-                if slot_len == 0 {
-                    continue;
-                }
-
-                let tuple_offset = u16::from_le_bytes([
-                    modified_page[slot_offset],
-                    modified_page[slot_offset + 1],
-                ]) as usize;
-
-                if tuple_offset + TupleHeader::SIZE <= PAGE_SIZE {
-                    let xmax = u32::from_le_bytes([
-                        modified_page[tuple_offset + 8],
-                        modified_page[tuple_offset + 9],
-                        modified_page[tuple_offset + 10],
-                        modified_page[tuple_offset + 11],
-                    ]);
-
-                    if MvccGc::is_reclaimable(xmax, oldest_active) {
-                        // Zero the slot length to mark as deleted
-                        modified_page[slot_offset + 2] = 0;
-                        modified_page[slot_offset + 3] = 0;
-                        reclaimed_on_page += 1;
-                    }
-                }
+            // Delete the reclaimed rows' B+tree entries outside the frame lock,
+            // so a stale entry never outlives the heap tuple it points at.
+            if clean_indexes && !dead.is_empty() {
+                zyron_executor::operator::modify::vacuum_index_cleanup(
+                    table,
+                    page_id,
+                    &dead,
+                    btree,
+                    btree_indexes,
+                );
             }
 
             if reclaimed_on_page > 0 {
-                // Write the modified page back through the buffer pool
-                if let Some(frame) = buffer_pool.fetch_page(page_id) {
-                    frame.copy_from(&modified_page);
-                    buffer_pool.unpin_page(page_id, true); // Mark dirty
-                } else if let Ok((_, evicted)) = buffer_pool.load_page(page_id, &modified_page) {
-                    // Page was evicted between read and write. Load it back.
-                    if let Some(evicted_page) = evicted {
-                        // Write evicted page synchronously
-                        let path = disk_manager
-                            .data_dir()
-                            .join(format!("{:08}.dat", evicted_page.page_id.file_id));
-                        if let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(&path) {
-                            use std::io::{Seek, SeekFrom, Write};
-                            let offset = evicted_page.page_id.page_num * (PAGE_SIZE as u64);
-                            let _ = file.seek(SeekFrom::Start(offset));
-                            let _ = file.write_all(evicted_page.data.as_ref());
-                        }
-                    }
-                    buffer_pool.unpin_page(page_id, true);
-                }
-
                 tuples_reclaimed += reclaimed_on_page;
-
                 debug!(
-                    "Vacuumed page {:?}: reclaimed {} dead tuples out of {} total",
-                    page_id, reclaimed_on_page, total_count
+                    "Vacuumed page {:?}: reclaimed {} dead tuples",
+                    page_id, reclaimed_on_page
                 );
             }
         }
@@ -376,13 +431,28 @@ impl Drop for VacuumWorker {
 
 /// Runs a single vacuum pass on a table. Called by the VACUUM SQL command.
 /// Returns (tuples_reclaimed, pages_scanned).
+#[allow(clippy::too_many_arguments)]
 pub fn vacuum_table_immediate(
     table: &TableEntry,
     oldest_active: u64,
     disk_manager: &Arc<DiskManager>,
     buffer_pool: &Arc<BufferPool>,
+    status_map: &zyron_storage::TxnStatusMap,
+    retention_floor: u64,
+    btree: &[(zyron_catalog::IndexId, zyron_catalog::ColumnId, bool)],
+    btree_indexes: &scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>,
 ) -> std::result::Result<(u64, u64), String> {
-    VacuumWorker::vacuum_table(table, oldest_active, 0, disk_manager, buffer_pool)
+    VacuumWorker::vacuum_table(
+        table,
+        oldest_active,
+        0,
+        disk_manager,
+        buffer_pool,
+        status_map,
+        retention_floor,
+        btree,
+        btree_indexes,
+    )
 }
 
 #[cfg(test)]

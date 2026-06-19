@@ -33,6 +33,7 @@ opendal = { version = "0.55", default-features = false, features = [
     "services-memory",
 ] }
 globset = "0.4"
+hex = "0.4"
 cron = "0.16"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 uuid = { version = "1", features = ["v4"] }

@@ -505,6 +505,17 @@ impl CostModel {
                     row_count: rows,
                 }
             }
+            LogicalPlan::LateralJoin { left, .. } => {
+                // The subquery runs once per left row. Estimate its per-row cost
+                // as a small constant fanout since its plan is not costed here.
+                let left_cost = self.estimate_plan_cost(left, catalog);
+                let per_row = self.cpu_operator_cost * 4.0;
+                PlanCost {
+                    io_cost: left_cost.io_cost,
+                    cpu_cost: left_cost.cpu_cost + left_cost.row_count * per_row,
+                    row_count: left_cost.row_count,
+                }
+            }
             LogicalPlan::Aggregate {
                 group_by, child, ..
             } => {

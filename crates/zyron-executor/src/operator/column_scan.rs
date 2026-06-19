@@ -58,6 +58,10 @@ pub struct ColumnScanOperator {
     /// When set, emit (file_id, sys_rowid) per surviving row for the DML
     /// patch path instead of plain batches.
     emit_locators: bool,
+    /// When set, rows are dated by commit LSN for time-travel: a row is visible
+    /// at this version when its sys_xmin committed at or before it and its
+    /// supersede (if any) committed after it. None uses live-snapshot MVCC.
+    as_of_version: Option<u64>,
     pending: std::collections::VecDeque<ExecutionBatch>,
     finished: bool,
 }
@@ -162,9 +166,32 @@ impl ColumnScanOperator {
             seg_idx: 0,
             patch_store,
             emit_locators,
+            as_of_version: None,
             pending: std::collections::VecDeque::new(),
             finished: false,
         })
+    }
+
+    /// Sets the time-travel version. Rows are then dated by commit LSN instead
+    /// of resolved against the live snapshot, so a query as of a past version
+    /// sees the folded rows that were live at that version.
+    pub fn with_as_of(mut self, as_of_version: Option<u64>) -> Self {
+        self.as_of_version = as_of_version;
+        self
+    }
+
+    /// Visibility oracle for one row: commit-LSN version visibility under
+    /// time-travel, live-snapshot MVCC otherwise.
+    #[inline]
+    fn visible(&self, xmin: u64, xmax: u64) -> bool {
+        match self.as_of_version {
+            Some(v) => self
+                .ctx
+                .snapshot
+                .status_map()
+                .is_visible_at_version(xmin, xmax, v),
+            None => self.ctx.snapshot.is_visible(xmin, xmax),
+        }
     }
 
     fn decode_column(
@@ -241,7 +268,7 @@ impl ColumnScanOperator {
             for p in chain {
                 // A patch is the value for S when its creating transaction is
                 // visible to S (treated as an xmin with no delete).
-                if self.ctx.snapshot.is_visible(p.patch_xid, 0) {
+                if self.visible(p.patch_xid, 0) {
                     match best {
                         Some(b) if b.patch_xid >= p.patch_xid => {}
                         _ => best = Some(p),
@@ -471,13 +498,13 @@ impl ColumnScanOperator {
 
             // Visibility: base supersede plus every overlay supersede. A
             // delete is visible to S when is_visible(xmin, sup) is false.
-            if !self.ctx.snapshot.is_visible(xmin, base_supersede) {
+            if !self.visible(xmin, base_supersede) {
                 continue;
             }
             if let Some(ov) = overlay {
                 let mut hidden = false;
                 for &sup in &ov.supersedes {
-                    if !self.ctx.snapshot.is_visible(xmin, sup) {
+                    if !self.visible(xmin, sup) {
                         hidden = true;
                         break;
                     }

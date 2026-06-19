@@ -3439,6 +3439,26 @@ pub fn data_matrix_decode(image: &[u8]) -> Result<String> {
         .map_err(|e| ZyronError::ExecutionError(format!("DataMatrix payload not utf-8: {}", e)))
 }
 
+/// Maps a DataMatrix C40 shift-set-2 value (0..=26) to its ASCII byte.
+fn c40_set2_char(v: u8) -> Option<u8> {
+    const SET2: &[u8; 27] = b"!\"#$%&'()*+,-./:;<=>?@[\\]^_";
+    SET2.get(v as usize).copied()
+}
+
+/// Maps a DataMatrix C40 shift-set-3 value (0..=31) to its ASCII byte.
+fn c40_set3_char(v: u8) -> Option<u8> {
+    match v {
+        0 => Some(b'`'),
+        1..=26 => Some(b'a' + (v - 1)),
+        27 => Some(b'{'),
+        28 => Some(b'|'),
+        29 => Some(b'}'),
+        30 => Some(b'~'),
+        31 => Some(0x7F),
+        _ => None,
+    }
+}
+
 /// Decodes a DataMatrix codeword stream supporting ASCII, C40, and Base 256 modes
 /// `total_data_cw` is the count of codeword bytes that belong to the data
 /// section of the symbol (used to compute Base 256 randomization positions)
@@ -3447,6 +3467,10 @@ fn dm_decode_codewords(data_cw: &[u8], _total_data_cw: usize) -> Result<Vec<u8>>
     let mut i = 0usize;
     let mut in_c40 = false;
     let mut c40_buf: Vec<u8> = Vec::new();
+    // C40 shift state: 0 = basic set, 1/2/3 = the next C40 value decodes from
+    // shift set 1/2/3. A shift can straddle a triple boundary, so the state
+    // persists across iterations.
+    let mut c40_shift: u8 = 0;
     let mut in_base256 = false;
     let mut base256_remaining = 0usize;
     while i < data_cw.len() {
@@ -3485,17 +3509,40 @@ fn dm_decode_codewords(data_cw: &[u8], _total_data_cw: usize) -> Result<Vec<u8>>
             let v2 = ((p / 40) % 40) as u8;
             let v3 = (p % 40) as u8;
             for &v in &[v1, v2, v3] {
-                if v == 0 {
-                    // Shift to set 1, 2, or 3 (not implemented in this minimal decoder)
-                    continue;
+                match c40_shift {
+                    // Basic set (Set 0). Values 0/1/2 latch a one-value shift
+                    // into set 1/2/3; the rest are space, digits, and letters.
+                    0 => match v {
+                        0 => c40_shift = 1,
+                        1 => c40_shift = 2,
+                        2 => c40_shift = 3,
+                        3 => c40_buf.push(b' '),
+                        4..=13 => c40_buf.push(b'0' + (v - 4)),
+                        14..=39 => c40_buf.push(b'A' + (v - 14)),
+                        _ => {}
+                    },
+                    // Set 1: ASCII control characters 0x00..=0x1F mapped directly.
+                    1 => {
+                        if v <= 31 {
+                            c40_buf.push(v);
+                        }
+                        c40_shift = 0;
+                    }
+                    // Set 2: punctuation.
+                    2 => {
+                        if let Some(ch) = c40_set2_char(v) {
+                            c40_buf.push(ch);
+                        }
+                        c40_shift = 0;
+                    }
+                    // Set 3: lowercase letters and the remaining punctuation.
+                    _ => {
+                        if let Some(ch) = c40_set3_char(v) {
+                            c40_buf.push(ch);
+                        }
+                        c40_shift = 0;
+                    }
                 }
-                let ch = match v {
-                    3 => b' ',
-                    4..=13 => b'0' + (v - 4),
-                    14..=39 => b'A' + (v - 14),
-                    _ => continue,
-                };
-                c40_buf.push(ch);
             }
             // Flush full triples but keep buffer in case of unlatch with leftover
             out.extend(c40_buf.drain(..));

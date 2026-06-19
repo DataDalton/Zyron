@@ -116,13 +116,35 @@ impl BranchPageTracker {
 
     /// Records a page modification.
     fn set_modified(&self, page_num: u64, original: PageId, local: PageId) {
+        self.mark_bit(page_num);
+        // Always insert into HashMap regardless of bitset capacity
+        let _ = self.overrides.insert_sync(original, local);
+    }
+
+    /// Sets the bitset bit for a page number.
+    #[inline]
+    fn mark_bit(&self, page_num: u64) {
         let word_idx = (page_num / 64) as usize;
         if word_idx < self.modified_bitset.len() {
             let bit = 1u64 << (page_num % 64);
             self.modified_bitset[word_idx].fetch_or(bit, Ordering::Relaxed);
         }
-        // Always insert into HashMap regardless of bitset capacity
-        let _ = self.overrides.insert_sync(original, local);
+    }
+
+    /// Inserts an override only when the original page has none yet, returning
+    /// the page that wins. Used by copy-on-write so two writers copying the same
+    /// page converge on one branch-local page.
+    fn get_or_insert_override(&self, original: PageId, local: PageId) -> PageId {
+        match self.overrides.insert_sync(original, local) {
+            Ok(()) => {
+                self.mark_bit(original.page_num);
+                local
+            }
+            Err(_) => self
+                .overrides
+                .read_sync(&original, |_, l| *l)
+                .unwrap_or(local),
+        }
     }
 
     /// Resolves a page: returns the branch-local page_id if modified.
@@ -158,8 +180,25 @@ impl BranchPageTracker {
 pub struct BranchManager {
     branches: scc::HashMap<u64, BranchEntry>,
     page_trackers: scc::HashMap<u64, BranchPageTracker>,
+    /// Branch-local overlay file ids per (branch_id, table heap_file_id).
+    branch_table_files: scc::HashMap<u128, zyron_common::BranchFiles>,
+    /// Count of pages a branch appended per (branch_id, table heap_file_id).
+    append_counts: scc::HashMap<u128, u64>,
     next_branch_id: AtomicU64,
+    /// Allocator for branch-local overlay file ids. Starts above user table and
+    /// index file id ranges so branch files never collide.
+    next_branch_file_id: std::sync::atomic::AtomicU32,
     data_dir: PathBuf,
+}
+
+/// First file id handed out for branch-local overlay files. User table heap
+/// files start at 200 and index files at 10000, so this range is disjoint.
+const BRANCH_FILE_ID_BASE: u32 = 2_000_000;
+
+/// Packs a (branch_id, heap_file_id) pair into one key.
+#[inline]
+fn branch_table_key(branch_id: u64, heap_file_id: u32) -> u128 {
+    ((branch_id as u128) << 32) | (heap_file_id as u128)
 }
 
 impl BranchManager {
@@ -168,7 +207,10 @@ impl BranchManager {
         Self {
             branches: scc::HashMap::new(),
             page_trackers: scc::HashMap::new(),
+            branch_table_files: scc::HashMap::new(),
+            append_counts: scc::HashMap::new(),
             next_branch_id: AtomicU64::new(1),
+            next_branch_file_id: std::sync::atomic::AtomicU32::new(BRANCH_FILE_ID_BASE),
             data_dir,
         }
     }
@@ -211,6 +253,8 @@ impl BranchManager {
             .page_trackers
             .insert_sync(id.0, BranchPageTracker::new(1024));
 
+        // Persistence is the caller's responsibility (the DDL command boundary)
+        // so the in-memory create stays off the fsync path.
         Ok(id)
     }
 
@@ -379,6 +423,354 @@ impl BranchManager {
         self.page_trackers
             .read_sync(&branch_id.0, |_, tracker| tracker.modified_count())
             .unwrap_or(0)
+    }
+
+    /// Returns the branch's copy-on-write overrides for one table as
+    /// (original main page, branch cow page) pairs. Used by MERGE to apply the
+    /// branch's row tombstones to the main line.
+    pub fn cow_overrides(&self, branch_id: BranchId, heap_file_id: u32) -> Vec<(PageId, PageId)> {
+        let mut out = Vec::new();
+        self.page_trackers.read_sync(&branch_id.0, |_, tracker| {
+            tracker.for_each_override(|original, local| {
+                if original.file_id == heap_file_id {
+                    out.push((original, local));
+                }
+            });
+        });
+        out
+    }
+
+    /// Returns a branch's overlay file ids for a table without allocating them.
+    /// None when the branch never wrote to the table.
+    pub fn branch_files_lookup(
+        &self,
+        branch_id: BranchId,
+        heap_file_id: u32,
+    ) -> Option<zyron_common::BranchFiles> {
+        self.branch_table_files
+            .read_sync(&branch_table_key(branch_id.0, heap_file_id), |_, f| *f)
+    }
+
+    /// Returns the number of pages a branch appended for a table.
+    pub fn append_pages(&self, branch_id: BranchId, heap_file_id: u32) -> u64 {
+        self.append_counts
+            .read_sync(&branch_table_key(branch_id.0, heap_file_id), |_, v| *v)
+            .unwrap_or(0)
+    }
+
+    /// Path of the branch metadata file.
+    fn state_path(&self) -> PathBuf {
+        self.data_dir.join(".zybranches")
+    }
+
+    /// Persists branch metadata and the copy-on-write overlay (file-id map,
+    /// append page counts, page overrides, and the file-id allocator) to disk
+    /// with an atomic rename so a crash mid-write never leaves a torn file. The
+    /// overlay page bytes themselves live in their own data files and are
+    /// flushed through the buffer pool; this records the metadata needed to
+    /// resolve them again after restart.
+    pub fn persist(&self) -> Result<()> {
+        let branches = self.list_branches();
+        let mut buf = Vec::with_capacity(128 + branches.len() * 64);
+        buf.extend_from_slice(&(branches.len() as u32).to_le_bytes());
+        for b in &branches {
+            buf.extend_from_slice(&b.id.0.to_le_bytes());
+            match b.parent_branch_id {
+                Some(p) => {
+                    buf.push(1);
+                    buf.extend_from_slice(&p.0.to_le_bytes());
+                }
+                None => buf.push(0),
+            }
+            buf.extend_from_slice(&b.base_version_id.0.to_le_bytes());
+            buf.extend_from_slice(&b.created_at.to_le_bytes());
+            write_str(&mut buf, &b.name);
+            write_str(&mut buf, &b.description);
+        }
+
+        // File-id allocator high-water mark so reused ids never collide.
+        buf.extend_from_slice(
+            &self
+                .next_branch_file_id
+                .load(Ordering::Relaxed)
+                .to_le_bytes(),
+        );
+
+        // Branch overlay file ids per (branch, table).
+        let mut files_entries: Vec<(u64, u32, zyron_common::BranchFiles)> = Vec::new();
+        self.branch_table_files.iter_sync(|k, f| {
+            files_entries.push(((*k >> 32) as u64, (*k & 0xFFFF_FFFF) as u32, *f));
+            true
+        });
+        buf.extend_from_slice(&(files_entries.len() as u32).to_le_bytes());
+        for (bid, hfid, f) in &files_entries {
+            buf.extend_from_slice(&bid.to_le_bytes());
+            buf.extend_from_slice(&hfid.to_le_bytes());
+            buf.extend_from_slice(&f.cow_file_id.to_le_bytes());
+            buf.extend_from_slice(&f.append_file_id.to_le_bytes());
+            buf.extend_from_slice(&f.append_fsm_file_id.to_le_bytes());
+        }
+
+        // Append page counts per (branch, table).
+        let mut count_entries: Vec<(u64, u32, u64)> = Vec::new();
+        self.append_counts.iter_sync(|k, v| {
+            count_entries.push(((*k >> 32) as u64, (*k & 0xFFFF_FFFF) as u32, *v));
+            true
+        });
+        buf.extend_from_slice(&(count_entries.len() as u32).to_le_bytes());
+        for (bid, hfid, c) in &count_entries {
+            buf.extend_from_slice(&bid.to_le_bytes());
+            buf.extend_from_slice(&hfid.to_le_bytes());
+            buf.extend_from_slice(&c.to_le_bytes());
+        }
+
+        // Page overrides (original main page -> branch cow page) per branch.
+        let mut branch_ids: Vec<u64> = Vec::new();
+        self.page_trackers.iter_sync(|k, _| {
+            branch_ids.push(*k);
+            true
+        });
+        let mut ov_entries: Vec<(u64, PageId, PageId)> = Vec::new();
+        for bid in &branch_ids {
+            self.page_trackers.read_sync(bid, |_, tracker| {
+                tracker.for_each_override(|orig, local| ov_entries.push((*bid, orig, local)));
+            });
+        }
+        buf.extend_from_slice(&(ov_entries.len() as u32).to_le_bytes());
+        for (bid, orig, local) in &ov_entries {
+            buf.extend_from_slice(&bid.to_le_bytes());
+            write_page_id(&mut buf, *orig);
+            write_page_id(&mut buf, *local);
+        }
+
+        let path = self.state_path();
+        let tmp = path.with_extension("zybranches.tmp");
+        {
+            let mut f = std::fs::File::create(&tmp).map_err(ZyronError::Io)?;
+            use std::io::Write;
+            f.write_all(&buf).map_err(ZyronError::Io)?;
+            f.sync_all().map_err(ZyronError::Io)?;
+        }
+        std::fs::rename(&tmp, &path).map_err(ZyronError::Io)?;
+        Ok(())
+    }
+
+    /// Loads branch metadata from disk, repopulating the branch map and the id
+    /// allocator. Page-override trackers start empty (overrides are rebuilt by
+    /// the storage recovery path). Missing or empty file is a clean no-op.
+    pub fn load(&self) -> Result<()> {
+        let path = self.state_path();
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(ZyronError::Io(e)),
+        };
+        if data.len() < 4 {
+            return Ok(());
+        }
+        let mut off = 0usize;
+        let count = read_u32(&data, &mut off)? as usize;
+        let mut max_id = 0u64;
+        for _ in 0..count {
+            let id = read_u64(&data, &mut off)?;
+            let has_parent = read_u8(&data, &mut off)?;
+            let parent = if has_parent != 0 {
+                Some(BranchId(read_u64(&data, &mut off)?))
+            } else {
+                None
+            };
+            let base_version = read_u64(&data, &mut off)?;
+            let created_at = read_i64(&data, &mut off)?;
+            let name = read_str(&data, &mut off)?;
+            let description = read_str(&data, &mut off)?;
+            max_id = max_id.max(id);
+            let entry = BranchEntry {
+                id: BranchId(id),
+                name,
+                parent_branch_id: parent,
+                base_version_id: VersionId(base_version),
+                created_at,
+                description,
+                is_active: true,
+            };
+            let _ = self.branches.insert_sync(id, entry);
+            let _ = self
+                .page_trackers
+                .insert_sync(id, BranchPageTracker::new(1024));
+        }
+        self.next_branch_id.store(max_id + 1, Ordering::Relaxed);
+
+        // Older state files end after the branch section and carry no overlay.
+        if off >= data.len() {
+            return Ok(());
+        }
+
+        // File-id allocator high-water mark.
+        let nbf = read_u32(&data, &mut off)?;
+        self.next_branch_file_id.store(nbf, Ordering::Relaxed);
+
+        // Branch overlay file ids.
+        let files_count = read_u32(&data, &mut off)? as usize;
+        for _ in 0..files_count {
+            let bid = read_u64(&data, &mut off)?;
+            let hfid = read_u32(&data, &mut off)?;
+            let cow_file_id = read_u32(&data, &mut off)?;
+            let append_file_id = read_u32(&data, &mut off)?;
+            let append_fsm_file_id = read_u32(&data, &mut off)?;
+            let _ = self.branch_table_files.insert_sync(
+                branch_table_key(bid, hfid),
+                zyron_common::BranchFiles {
+                    cow_file_id,
+                    append_file_id,
+                    append_fsm_file_id,
+                },
+            );
+        }
+
+        // Append page counts.
+        let counts = read_u32(&data, &mut off)? as usize;
+        for _ in 0..counts {
+            let bid = read_u64(&data, &mut off)?;
+            let hfid = read_u32(&data, &mut off)?;
+            let c = read_u64(&data, &mut off)?;
+            let _ = self
+                .append_counts
+                .insert_sync(branch_table_key(bid, hfid), c);
+        }
+
+        // Page overrides.
+        let overrides = read_u32(&data, &mut off)? as usize;
+        for _ in 0..overrides {
+            let bid = read_u64(&data, &mut off)?;
+            let orig = read_page_id(&data, &mut off)?;
+            let local = read_page_id(&data, &mut off)?;
+            self.page_trackers.read_sync(&bid, |_, tracker| {
+                tracker.set_modified(orig.page_num, orig, local)
+            });
+        }
+
+        Ok(())
+    }
+}
+
+fn write_page_id(buf: &mut Vec<u8>, p: PageId) {
+    buf.extend_from_slice(&p.file_id.to_le_bytes());
+    buf.extend_from_slice(&p.page_num.to_le_bytes());
+}
+
+fn read_page_id(data: &[u8], off: &mut usize) -> Result<PageId> {
+    let file_id = read_u32(data, off)?;
+    let page_num = read_u64(data, off)?;
+    Ok(PageId::new(file_id, page_num))
+}
+
+fn write_str(buf: &mut Vec<u8>, s: &str) {
+    buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    buf.extend_from_slice(s.as_bytes());
+}
+
+fn read_u8(data: &[u8], off: &mut usize) -> Result<u8> {
+    let v = *data
+        .get(*off)
+        .ok_or_else(|| ZyronError::Internal("branch state truncated".into()))?;
+    *off += 1;
+    Ok(v)
+}
+
+fn read_u32(data: &[u8], off: &mut usize) -> Result<u32> {
+    let end = *off + 4;
+    let slice = data
+        .get(*off..end)
+        .ok_or_else(|| ZyronError::Internal("branch state truncated".into()))?;
+    *off = end;
+    Ok(u32::from_le_bytes(slice.try_into().unwrap()))
+}
+
+fn read_u64(data: &[u8], off: &mut usize) -> Result<u64> {
+    let end = *off + 8;
+    let slice = data
+        .get(*off..end)
+        .ok_or_else(|| ZyronError::Internal("branch state truncated".into()))?;
+    *off = end;
+    Ok(u64::from_le_bytes(slice.try_into().unwrap()))
+}
+
+fn read_i64(data: &[u8], off: &mut usize) -> Result<i64> {
+    Ok(read_u64(data, off)? as i64)
+}
+
+fn read_str(data: &[u8], off: &mut usize) -> Result<String> {
+    let len = read_u32(data, off)? as usize;
+    let end = *off + len;
+    let slice = data
+        .get(*off..end)
+        .ok_or_else(|| ZyronError::Internal("branch state truncated".into()))?;
+    *off = end;
+    String::from_utf8(slice.to_vec())
+        .map_err(|e| ZyronError::Internal(format!("branch name utf8: {e}")))
+}
+
+impl zyron_common::BranchCatalog for BranchManager {
+    fn resolve_page_for(&self, branch_id: u64, page_id: PageId) -> PageId {
+        self.resolve_page(BranchId(branch_id), page_id)
+    }
+
+    fn branch_id_by_name(&self, name: &str) -> Option<u64> {
+        self.get_branch_by_name(name).ok().map(|e| e.id.0)
+    }
+
+    fn branch_files_for(&self, branch_id: u64, heap_file_id: u32) -> zyron_common::BranchFiles {
+        let key = branch_table_key(branch_id, heap_file_id);
+        if let Some(f) = self.branch_table_files.read_sync(&key, |_, f| *f) {
+            return f;
+        }
+        // Three consecutive ids: cow data, append data, append fsm.
+        let base = self.next_branch_file_id.fetch_add(3, Ordering::Relaxed);
+        let files = zyron_common::BranchFiles {
+            cow_file_id: base,
+            append_file_id: base + 1,
+            append_fsm_file_id: base + 2,
+        };
+        match self.branch_table_files.insert_sync(key, files) {
+            Ok(()) => files,
+            // Lost the race, the winner's ids are authoritative; our reserved
+            // ids leak harmlessly.
+            Err(_) => self
+                .branch_table_files
+                .read_sync(&key, |_, f| *f)
+                .unwrap_or(files),
+        }
+    }
+
+    fn lookup_cow_page(&self, branch_id: u64, original_page: PageId) -> Option<PageId> {
+        self.page_trackers
+            .read_sync(&branch_id, |_, tracker| tracker.resolve(original_page))
+            .flatten()
+    }
+
+    fn record_cow_page(&self, branch_id: u64, original_page: PageId, local_page: PageId) -> PageId {
+        self.page_trackers
+            .read_sync(&branch_id, |_, tracker| {
+                tracker.get_or_insert_override(original_page, local_page)
+            })
+            .unwrap_or(local_page)
+    }
+
+    fn append_page_count(&self, branch_id: u64, heap_file_id: u32) -> u64 {
+        self.append_counts
+            .read_sync(&branch_table_key(branch_id, heap_file_id), |_, v| *v)
+            .unwrap_or(0)
+    }
+
+    fn set_append_page_count(&self, branch_id: u64, heap_file_id: u32, count: u64) {
+        let key = branch_table_key(branch_id, heap_file_id);
+        if self
+            .append_counts
+            .update_sync(&key, |_, v| *v = count)
+            .is_none()
+        {
+            let _ = self.append_counts.insert_sync(key, count);
+        }
     }
 }
 
@@ -622,5 +1014,133 @@ mod tests {
             mgr.merge_branch(BranchId(999), main_id, VersionId(1))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn test_persist_and_reload_branches() {
+        let dir = make_temp_dir();
+        {
+            let mgr = BranchManager::new(dir.path().to_path_buf());
+            let dev = mgr
+                .create_branch("dev", None, VersionId(5), "dev branch", 1000)
+                .expect("dev");
+            mgr.create_branch("feature", Some(dev), VersionId(7), "", 2000)
+                .expect("feature");
+            // Persistence is explicit (the DDL boundary does this in production).
+            mgr.persist().expect("persist");
+        }
+        // A fresh manager over the same dir recovers both branches and the id
+        // allocator so the next branch does not reuse an id.
+        let reloaded = BranchManager::new(dir.path().to_path_buf());
+        reloaded.load().expect("load");
+        let names: Vec<String> = reloaded
+            .list_branches()
+            .into_iter()
+            .map(|b| b.name)
+            .collect();
+        assert!(names.contains(&"dev".to_string()));
+        assert!(names.contains(&"feature".to_string()));
+        let feature = reloaded.get_branch_by_name("feature").expect("feature");
+        assert_eq!(feature.base_version_id, VersionId(7));
+        assert!(feature.parent_branch_id.is_some());
+        let next = reloaded
+            .create_branch("third", None, VersionId(9), "", 3000)
+            .expect("third");
+        assert_eq!(next, BranchId(3), "id allocator resumed past reloaded max");
+    }
+
+    #[test]
+    fn test_branch_cow_write_methods() {
+        use zyron_common::BranchCatalog;
+        let dir = make_temp_dir();
+        let mgr = BranchManager::new(dir.path().to_path_buf());
+        let bid = mgr
+            .create_branch("dev", None, VersionId(1), "", 1000)
+            .expect("dev")
+            .0;
+
+        // Overlay file ids are stable and distinct across tables.
+        let f200 = mgr.branch_files_for(bid, 200);
+        let f201 = mgr.branch_files_for(bid, 201);
+        assert_eq!(mgr.branch_files_for(bid, 200), f200, "stable per table");
+        assert_ne!(f200.cow_file_id, f201.cow_file_id);
+        assert!(f200.cow_file_id >= 2_000_000);
+        assert_ne!(f200.cow_file_id, f200.append_file_id);
+        assert_ne!(f200.append_file_id, f200.append_fsm_file_id);
+
+        // No cow copy until one is recorded.
+        let main_page = page(200, 7);
+        assert_eq!(mgr.lookup_cow_page(bid, main_page), None);
+        let cow = page(f200.cow_file_id, 0);
+        assert_eq!(mgr.record_cow_page(bid, main_page, cow), cow);
+        assert_eq!(mgr.lookup_cow_page(bid, main_page), Some(cow));
+        // Re-recording returns the first winner, not the new candidate.
+        let other = page(f200.cow_file_id, 99);
+        assert_eq!(mgr.record_cow_page(bid, main_page, other), cow);
+        assert_eq!(mgr.resolve_page_for(bid, main_page), cow);
+
+        // Append page count round-trips.
+        assert_eq!(mgr.append_page_count(bid, 200), 0);
+        mgr.set_append_page_count(bid, 200, 5);
+        assert_eq!(mgr.append_page_count(bid, 200), 5);
+        mgr.set_append_page_count(bid, 200, 6);
+        assert_eq!(mgr.append_page_count(bid, 200), 6);
+        assert_eq!(mgr.append_page_count(bid, 201), 0, "per table");
+    }
+
+    #[test]
+    fn test_persist_and_reload_overlay() {
+        use zyron_common::BranchCatalog;
+        let dir = make_temp_dir();
+        let orig = page(200, 5);
+        let (bid, files, cowpage);
+        {
+            let mgr = BranchManager::new(dir.path().to_path_buf());
+            bid = mgr
+                .create_branch("dev", None, VersionId(1), "", 1000)
+                .expect("dev");
+            files = mgr.branch_files_for(bid.0, 200);
+            cowpage = page(files.cow_file_id, 0);
+            mgr.record_cow_page(bid.0, orig, cowpage);
+            mgr.set_append_page_count(bid.0, 200, 3);
+            mgr.persist().expect("persist");
+        }
+        // A fresh manager recovers the overlay: file-id map, append counts, and
+        // page overrides all survive, and the file-id allocator does not reuse
+        // an id already handed out.
+        let reloaded = BranchManager::new(dir.path().to_path_buf());
+        reloaded.load().expect("load");
+        assert_eq!(reloaded.branch_files_lookup(bid, 200), Some(files));
+        assert_eq!(reloaded.append_pages(bid, 200), 3);
+        assert_eq!(
+            reloaded.resolve_page(bid, orig),
+            cowpage,
+            "override resolves after reload"
+        );
+        let files2 = reloaded.branch_files_for(bid.0, 201);
+        assert_ne!(
+            files2.cow_file_id, files.cow_file_id,
+            "allocator resumed past the reloaded high-water mark"
+        );
+    }
+
+    #[test]
+    fn test_branch_catalog_trait() {
+        use zyron_common::BranchCatalog;
+        let dir = make_temp_dir();
+        let mgr = BranchManager::new(dir.path().to_path_buf());
+        let id = mgr
+            .create_branch("dev", None, VersionId(1), "", 1000)
+            .expect("dev");
+        // Name resolution through the trait the executor uses.
+        assert_eq!(mgr.branch_id_by_name("dev"), Some(id.0));
+        assert_eq!(mgr.branch_id_by_name("missing"), None);
+        // With no override, resolve returns the same page.
+        let pid = page(200, 3);
+        assert_eq!(mgr.resolve_page_for(id.0, pid), pid);
+        // After recording an override, the trait returns the branch-local page.
+        let local = page(50000, 9);
+        mgr.record_page_override(id, pid, local).expect("override");
+        assert_eq!(mgr.resolve_page_for(id.0, pid), local);
     }
 }

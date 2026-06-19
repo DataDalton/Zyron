@@ -110,7 +110,10 @@ pub struct ExecutionContext {
     pub params: Vec<ScalarValue>,
     /// Per-session security context for privilege checks. None when the auth
     /// system is not configured or for internal queries that bypass auth.
-    pub security_context: Option<zyron_auth::SecurityContext>,
+    /// Held behind an Arc so a nested execution (a correlated subquery or a
+    /// LATERAL inner plan) shares the same clearance and masking policy as the
+    /// enclosing query rather than running unsecured.
+    pub security_context: Option<Arc<zyron_auth::SecurityContext>>,
     /// Live B+ tree index instances keyed by IndexId. Registered by the
     /// server layer so the index scan operator can perform actual tree lookups.
     indexes: HashMap<IndexId, Arc<BTreeIndex>>,
@@ -144,6 +147,26 @@ pub struct ExecutionContext {
     /// operators look up here via get_index, DML operators maintain entries
     /// here on insert/update/delete
     pub btree_indexes: Option<Arc<scc::HashMap<u32, Arc<BTreeIndex>>>>,
+    /// Branch override resolver. Set when a session has a branch active or a
+    /// query reads `IN BRANCH`. Heap reads route page ids through this so a
+    /// branch sees its copy-on-write pages. None means the main line.
+    pub branch_catalog: Option<Arc<dyn zyron_common::BranchCatalog>>,
+    /// Active branch id for this execution (from USE BRANCH). A per-query
+    /// `IN BRANCH name` resolves its own id at the scan that carries it.
+    pub active_branch_id: Option<u64>,
+    /// Shared intent-lock table for key-level conflict detection. When present,
+    /// unique-index inserts take a key lock on the indexed value so concurrent
+    /// transactions inserting the same value serialize (first locker wins, the
+    /// loser gets a conflict). None disables key locking (single-threaded paths).
+    pub intent_locks: Option<Arc<zyron_storage::IntentLockTable>>,
+    /// Per-session sequence state for currval and lastval. Shared across the
+    /// session's queries so currval('s') reads the value the session's last
+    /// nextval('s') produced. None for internal queries with no session.
+    pub session_sequences: Option<Arc<crate::sequence::SessionSeqState>>,
+    /// Number of triggers currently on the firing stack. A trigger action runs
+    /// in a nested context with this incremented; firing stops past a fixed
+    /// depth so a trigger that re-triggers itself cannot recurse without bound.
+    pub trigger_depth: usize,
 }
 
 impl ExecutionContext {
@@ -180,6 +203,64 @@ impl ExecutionContext {
             spatial_manager: None,
             heap_files: None,
             btree_indexes: None,
+            branch_catalog: None,
+            active_branch_id: None,
+            intent_locks: None,
+            session_sequences: None,
+            trigger_depth: 0,
+        }
+    }
+
+    /// Builds a child context for executing a nested plan (a correlated
+    /// subquery's per-row evaluation or a LATERAL inner plan) that shares this
+    /// context's transaction, snapshot, storage caches, index managers, and
+    /// security context but carries its own parameter set. Cancellation and
+    /// wrote_wal start fresh because the child is read-only and short lived.
+    pub fn child_with_params(&self, params: Vec<ScalarValue>) -> Self {
+        Self {
+            catalog: Arc::clone(&self.catalog),
+            wal: Arc::clone(&self.wal),
+            buffer_pool: Arc::clone(&self.buffer_pool),
+            disk_manager: Arc::clone(&self.disk_manager),
+            batch_size: self.batch_size,
+            txn_id: self.txn_id,
+            snapshot: self.snapshot.clone(),
+            cancelled: AtomicBool::new(false),
+            wrote_wal: AtomicBool::new(false),
+            analyze: false,
+            cdc_hook: self.cdc_hook.clone(),
+            dml_hook: self.dml_hook.clone(),
+            params,
+            security_context: self.security_context.clone(),
+            indexes: self.indexes.clone(),
+            fts_indexes: self.fts_indexes.clone(),
+            fts_manager: self.fts_manager.clone(),
+            security_manager: self.security_manager.clone(),
+            vector_manager: self.vector_manager.clone(),
+            graph_manager: self.graph_manager.clone(),
+            spatial_manager: self.spatial_manager.clone(),
+            heap_files: self.heap_files.clone(),
+            btree_indexes: self.btree_indexes.clone(),
+            branch_catalog: self.branch_catalog.clone(),
+            active_branch_id: self.active_branch_id,
+            intent_locks: self.intent_locks.clone(),
+            session_sequences: self.session_sequences.clone(),
+            trigger_depth: self.trigger_depth,
+        }
+    }
+
+    /// Resolves a heap page through the active branch's override chain. Returns
+    /// `page_id` unchanged when no branch is active or the branch has not
+    /// modified the page. `branch_id` is the scan's effective branch.
+    #[inline]
+    pub fn resolve_branch_page(
+        &self,
+        branch_id: Option<u64>,
+        page_id: zyron_common::PageId,
+    ) -> zyron_common::PageId {
+        match (branch_id, &self.branch_catalog) {
+            (Some(bid), Some(cat)) => cat.resolve_page_for(bid, page_id),
+            _ => page_id,
         }
     }
 
@@ -265,6 +346,49 @@ impl ExecutionContext {
                     fsm_file_id: entry.fsm_file_id,
                 },
             )?;
+            hf.init_cache().await?;
+            Ok(Arc::new(hf))
+        }
+    }
+
+    /// Returns a `HeapFile` bound to a branch's append overlay files, building
+    /// and caching it in the shared heap file cache keyed by the append file id.
+    /// Branch append file ids are disjoint from table heap file ids, so the same
+    /// cache holds both without collision.
+    pub async fn branch_append_heap(
+        &self,
+        append_file_id: u32,
+        append_fsm_file_id: u32,
+    ) -> Result<Arc<HeapFile>> {
+        let build = || -> Result<HeapFile> {
+            HeapFile::new(
+                self.disk_manager.clone(),
+                self.buffer_pool.clone(),
+                HeapFileConfig {
+                    heap_file_id: append_file_id,
+                    fsm_file_id: append_fsm_file_id,
+                },
+            )
+        };
+        if let Some(cache) = &self.heap_files {
+            if let Some(hit) = cache.get_async(&append_file_id).await {
+                return Ok(Arc::clone(hit.get()));
+            }
+            let hf = build()?;
+            hf.init_cache().await?;
+            let arc = Arc::new(hf);
+            match cache.insert_async(append_file_id, Arc::clone(&arc)).await {
+                Ok(()) => Ok(arc),
+                Err(_) => {
+                    let hit = cache
+                        .get_async(&append_file_id)
+                        .await
+                        .expect("racer just inserted");
+                    Ok(Arc::clone(hit.get()))
+                }
+            }
+        } else {
+            let hf = build()?;
             hf.init_cache().await?;
             Ok(Arc::new(hf))
         }
@@ -440,6 +564,6 @@ impl ExecutionContext {
     /// table. Lock-free read from the catalog index snapshot.
     pub fn btree_indexes_for_table(&self, table_id: u32) -> Vec<(u32, zyron_catalog::ColumnId)> {
         let snap = self.index_snapshot_for_table(table_id);
-        snap.btree.iter().map(|(id, col)| (id.0, *col)).collect()
+        snap.btree.iter().map(|(id, col, _)| (id.0, *col)).collect()
     }
 }

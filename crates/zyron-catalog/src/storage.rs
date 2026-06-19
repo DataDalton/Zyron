@@ -48,6 +48,30 @@ const RETENTION_JOBS_HEAP_FILE_ID: u32 = 152;
 const RETENTION_JOBS_FSM_FILE_ID: u32 = 153;
 const COMPLIANCE_LOG_HEAP_FILE_ID: u32 = 154;
 const COMPLIANCE_LOG_FSM_FILE_ID: u32 = 155;
+const SEQUENCES_HEAP_FILE_ID: u32 = 156;
+const SEQUENCES_FSM_FILE_ID: u32 = 157;
+const VIEWS_HEAP_FILE_ID: u32 = 158;
+const VIEWS_FSM_FILE_ID: u32 = 159;
+const MVIEWS_HEAP_FILE_ID: u32 = 160;
+const MVIEWS_FSM_FILE_ID: u32 = 161;
+const FUNCTIONS_HEAP_FILE_ID: u32 = 162;
+const FUNCTIONS_FSM_FILE_ID: u32 = 163;
+const COMMENTS_HEAP_FILE_ID: u32 = 164;
+const COMMENTS_FSM_FILE_ID: u32 = 165;
+const AGGREGATES_HEAP_FILE_ID: u32 = 166;
+const AGGREGATES_FSM_FILE_ID: u32 = 167;
+const PROCEDURES_HEAP_FILE_ID: u32 = 168;
+const PROCEDURES_FSM_FILE_ID: u32 = 169;
+const SCHEDULES_HEAP_FILE_ID: u32 = 170;
+const SCHEDULES_FSM_FILE_ID: u32 = 171;
+const TRIGGERS_HEAP_FILE_ID: u32 = 172;
+const TRIGGERS_FSM_FILE_ID: u32 = 173;
+const PIPELINES_HEAP_FILE_ID: u32 = 174;
+const PIPELINES_FSM_FILE_ID: u32 = 175;
+const EVENT_HANDLERS_HEAP_FILE_ID: u32 = 176;
+const EVENT_HANDLERS_FSM_FILE_ID: u32 = 177;
+const VERSION_TAGS_HEAP_FILE_ID: u32 = 178;
+const VERSION_TAGS_FSM_FILE_ID: u32 = 179;
 
 /// Starting file ID for user-created heap files (heap=200, fsm=201, ...).
 const USER_HEAP_FILE_START: u32 = 200;
@@ -97,6 +121,69 @@ pub trait CatalogStorage: Send + Sync {
     async fn load_indexes(&self) -> Result<Vec<IndexEntry>>;
     async fn store_index(&self, entry: &IndexEntry) -> Result<TupleId>;
     async fn delete_index(&self, id: IndexId) -> Result<bool>;
+
+    // Sequence operations
+    async fn load_sequences(&self) -> Result<Vec<SequenceEntry>>;
+    async fn store_sequence(&self, entry: &SequenceEntry) -> Result<TupleId>;
+    async fn update_sequence(&self, entry: &SequenceEntry) -> Result<bool>;
+    async fn delete_sequence(&self, id: u32) -> Result<bool>;
+
+    // View operations
+    async fn load_views(&self) -> Result<Vec<ViewEntry>>;
+    async fn store_view(&self, entry: &ViewEntry) -> Result<TupleId>;
+    async fn update_view(&self, entry: &ViewEntry) -> Result<bool>;
+    async fn delete_view(&self, id: u32) -> Result<bool>;
+
+    // Materialized view operations
+    async fn load_mviews(&self) -> Result<Vec<MaterializedViewEntry>>;
+    async fn store_mview(&self, entry: &MaterializedViewEntry) -> Result<TupleId>;
+    async fn update_mview(&self, entry: &MaterializedViewEntry) -> Result<bool>;
+    async fn delete_mview(&self, id: u32) -> Result<bool>;
+
+    // Function operations
+    async fn load_functions(&self) -> Result<Vec<FunctionEntry>>;
+    async fn store_function(&self, entry: &FunctionEntry) -> Result<TupleId>;
+    async fn delete_function(&self, id: u32) -> Result<bool>;
+
+    // Comment operations
+    async fn load_comments(&self) -> Result<Vec<CommentEntry>>;
+    async fn store_comment(&self, entry: &CommentEntry) -> Result<TupleId>;
+    async fn delete_comment(&self, id: u32) -> Result<bool>;
+
+    // Aggregate operations
+    async fn load_aggregates(&self) -> Result<Vec<AggregateEntry>>;
+    async fn store_aggregate(&self, entry: &AggregateEntry) -> Result<TupleId>;
+    async fn delete_aggregate(&self, id: u32) -> Result<bool>;
+
+    // Procedure operations
+    async fn load_procedures(&self) -> Result<Vec<ProcedureEntry>>;
+    async fn store_procedure(&self, entry: &ProcedureEntry) -> Result<TupleId>;
+    async fn delete_procedure(&self, id: u32) -> Result<bool>;
+
+    // Schedule operations
+    async fn load_schedules(&self) -> Result<Vec<ScheduleEntry>>;
+    async fn store_schedule(&self, entry: &ScheduleEntry) -> Result<TupleId>;
+    async fn delete_schedule(&self, id: u32) -> Result<bool>;
+
+    // Trigger operations
+    async fn load_triggers(&self) -> Result<Vec<TriggerEntry>>;
+    async fn store_trigger(&self, entry: &TriggerEntry) -> Result<TupleId>;
+    async fn delete_trigger(&self, id: u32) -> Result<bool>;
+
+    // Pipeline operations
+    async fn load_pipelines(&self) -> Result<Vec<PipelineEntry>>;
+    async fn store_pipeline(&self, entry: &PipelineEntry) -> Result<TupleId>;
+    async fn delete_pipeline(&self, id: u32) -> Result<bool>;
+
+    // Event handler operations
+    async fn load_event_handlers(&self) -> Result<Vec<EventHandlerEntry>>;
+    async fn store_event_handler(&self, entry: &EventHandlerEntry) -> Result<TupleId>;
+    async fn delete_event_handler(&self, id: u32) -> Result<bool>;
+
+    // Version tag operations
+    async fn load_version_tags(&self) -> Result<Vec<VersionTagEntry>>;
+    async fn store_version_tag(&self, entry: &VersionTagEntry) -> Result<TupleId>;
+    async fn delete_version_tag(&self, id: u32) -> Result<bool>;
 
     // Streaming job operations
     async fn load_streaming_jobs(&self) -> Result<Vec<StreamingJobEntry>>;
@@ -218,6 +305,18 @@ pub struct HeapCatalogStorage {
     retention_policies_heap: HeapFile,
     retention_jobs_heap: HeapFile,
     compliance_log_heap: HeapFile,
+    sequences_heap: HeapFile,
+    views_heap: HeapFile,
+    mviews_heap: HeapFile,
+    functions_heap: HeapFile,
+    comments_heap: HeapFile,
+    aggregates_heap: HeapFile,
+    procedures_heap: HeapFile,
+    schedules_heap: HeapFile,
+    triggers_heap: HeapFile,
+    pipelines_heap: HeapFile,
+    event_handlers_heap: HeapFile,
+    version_tags_heap: HeapFile,
     next_heap_file: AtomicU32,
     next_index_file: AtomicU32,
     init_done: std::sync::atomic::AtomicBool,
@@ -367,6 +466,102 @@ impl HeapCatalogStorage {
                 fsm_file_id: COMPLIANCE_LOG_FSM_FILE_ID,
             },
         )?;
+        let sequences_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: SEQUENCES_HEAP_FILE_ID,
+                fsm_file_id: SEQUENCES_FSM_FILE_ID,
+            },
+        )?;
+        let views_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: VIEWS_HEAP_FILE_ID,
+                fsm_file_id: VIEWS_FSM_FILE_ID,
+            },
+        )?;
+        let mviews_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: MVIEWS_HEAP_FILE_ID,
+                fsm_file_id: MVIEWS_FSM_FILE_ID,
+            },
+        )?;
+        let functions_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: FUNCTIONS_HEAP_FILE_ID,
+                fsm_file_id: FUNCTIONS_FSM_FILE_ID,
+            },
+        )?;
+        let comments_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: COMMENTS_HEAP_FILE_ID,
+                fsm_file_id: COMMENTS_FSM_FILE_ID,
+            },
+        )?;
+        let aggregates_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: AGGREGATES_HEAP_FILE_ID,
+                fsm_file_id: AGGREGATES_FSM_FILE_ID,
+            },
+        )?;
+        let procedures_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: PROCEDURES_HEAP_FILE_ID,
+                fsm_file_id: PROCEDURES_FSM_FILE_ID,
+            },
+        )?;
+        let schedules_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: SCHEDULES_HEAP_FILE_ID,
+                fsm_file_id: SCHEDULES_FSM_FILE_ID,
+            },
+        )?;
+        let triggers_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: TRIGGERS_HEAP_FILE_ID,
+                fsm_file_id: TRIGGERS_FSM_FILE_ID,
+            },
+        )?;
+        let pipelines_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: PIPELINES_HEAP_FILE_ID,
+                fsm_file_id: PIPELINES_FSM_FILE_ID,
+            },
+        )?;
+        let event_handlers_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: EVENT_HANDLERS_HEAP_FILE_ID,
+                fsm_file_id: EVENT_HANDLERS_FSM_FILE_ID,
+            },
+        )?;
+        let version_tags_heap = HeapFile::new(
+            Arc::clone(&disk),
+            Arc::clone(&pool),
+            HeapFileConfig {
+                heap_file_id: VERSION_TAGS_HEAP_FILE_ID,
+                fsm_file_id: VERSION_TAGS_FSM_FILE_ID,
+            },
+        )?;
 
         Ok(Self {
             databases_heap,
@@ -386,6 +581,18 @@ impl HeapCatalogStorage {
             retention_policies_heap,
             retention_jobs_heap,
             compliance_log_heap,
+            sequences_heap,
+            views_heap,
+            mviews_heap,
+            functions_heap,
+            comments_heap,
+            aggregates_heap,
+            procedures_heap,
+            schedules_heap,
+            triggers_heap,
+            pipelines_heap,
+            event_handlers_heap,
+            version_tags_heap,
             next_heap_file: AtomicU32::new(USER_HEAP_FILE_START),
             next_index_file: AtomicU32::new(USER_INDEX_FILE_START),
             init_done: std::sync::atomic::AtomicBool::new(false),
@@ -426,6 +633,18 @@ impl HeapCatalogStorage {
             self.retention_policies_heap.init_cache(),
             self.retention_jobs_heap.init_cache(),
             self.compliance_log_heap.init_cache(),
+            self.sequences_heap.init_cache(),
+            self.views_heap.init_cache(),
+            self.mviews_heap.init_cache(),
+            self.functions_heap.init_cache(),
+            self.comments_heap.init_cache(),
+            self.aggregates_heap.init_cache(),
+            self.procedures_heap.init_cache(),
+            self.schedules_heap.init_cache(),
+            self.triggers_heap.init_cache(),
+            self.pipelines_heap.init_cache(),
+            self.event_handlers_heap.init_cache(),
+            self.version_tags_heap.init_cache(),
         )?;
         Ok(())
     }
@@ -514,6 +733,30 @@ impl CatalogStorage for HeapCatalogStorage {
             RETENTION_JOBS_FSM_FILE_ID,
             COMPLIANCE_LOG_HEAP_FILE_ID,
             COMPLIANCE_LOG_FSM_FILE_ID,
+            SEQUENCES_HEAP_FILE_ID,
+            SEQUENCES_FSM_FILE_ID,
+            VIEWS_HEAP_FILE_ID,
+            VIEWS_FSM_FILE_ID,
+            MVIEWS_HEAP_FILE_ID,
+            MVIEWS_FSM_FILE_ID,
+            FUNCTIONS_HEAP_FILE_ID,
+            FUNCTIONS_FSM_FILE_ID,
+            COMMENTS_HEAP_FILE_ID,
+            COMMENTS_FSM_FILE_ID,
+            AGGREGATES_HEAP_FILE_ID,
+            AGGREGATES_FSM_FILE_ID,
+            PROCEDURES_HEAP_FILE_ID,
+            PROCEDURES_FSM_FILE_ID,
+            SCHEDULES_HEAP_FILE_ID,
+            SCHEDULES_FSM_FILE_ID,
+            TRIGGERS_HEAP_FILE_ID,
+            TRIGGERS_FSM_FILE_ID,
+            PIPELINES_HEAP_FILE_ID,
+            PIPELINES_FSM_FILE_ID,
+            EVENT_HANDLERS_HEAP_FILE_ID,
+            EVENT_HANDLERS_FSM_FILE_ID,
+            VERSION_TAGS_HEAP_FILE_ID,
+            VERSION_TAGS_FSM_FILE_ID,
         ]
         .into_iter()
         .collect();
@@ -788,6 +1031,468 @@ impl CatalogStorage for HeapCatalogStorage {
         });
         match target {
             Some(tid) => self.streaming_jobs_heap.delete(tid).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn load_sequences(&self) -> Result<Vec<SequenceEntry>> {
+        let mut entries = Vec::new();
+        let guard = self.sequences_heap.scan()?;
+        guard.for_each(|_tid, view| {
+            if let Ok(entry) = SequenceEntry::from_bytes(view.data) {
+                entries.push(entry);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_sequence(&self, entry: &SequenceEntry) -> Result<TupleId> {
+        let tuple = Tuple::new(entry.to_bytes(), 0);
+        let ids = self.sequences_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
+    }
+
+    async fn update_sequence(&self, entry: &SequenceEntry) -> Result<bool> {
+        let mut target = None;
+        let guard = self.sequences_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(existing) = SequenceEntry::from_bytes(view.data) {
+                if existing.id == entry.id {
+                    target = Some(tid);
+                }
+            }
+        });
+        drop(guard);
+        match target {
+            Some(tid) => {
+                self.sequences_heap.delete(tid).await?;
+                let tuple = Tuple::new(entry.to_bytes(), 0);
+                self.sequences_heap.insert_batch(&[tuple]).await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn delete_sequence(&self, id: u32) -> Result<bool> {
+        let mut target = None;
+        let guard = self.sequences_heap.scan()?;
+        guard.for_each(|tid, view| {
+            if let Ok(entry) = SequenceEntry::from_bytes(view.data) {
+                if entry.id == id {
+                    target = Some(tid);
+                }
+            }
+        });
+        match target {
+            Some(tid) => self.sequences_heap.delete(tid).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn load_views(&self) -> Result<Vec<ViewEntry>> {
+        let mut entries = Vec::new();
+        let guard = self.views_heap.scan()?;
+        guard.for_each(|_tid, row| {
+            if let Ok(entry) = ViewEntry::from_bytes(row.data) {
+                entries.push(entry);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_view(&self, entry: &ViewEntry) -> Result<TupleId> {
+        let tuple = Tuple::new(entry.to_bytes(), 0);
+        let ids = self.views_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
+    }
+
+    async fn update_view(&self, entry: &ViewEntry) -> Result<bool> {
+        let mut target = None;
+        let guard = self.views_heap.scan()?;
+        guard.for_each(|tid, row| {
+            if let Ok(existing) = ViewEntry::from_bytes(row.data) {
+                if existing.id == entry.id {
+                    target = Some(tid);
+                }
+            }
+        });
+        drop(guard);
+        match target {
+            Some(tid) => {
+                self.views_heap.delete(tid).await?;
+                let tuple = Tuple::new(entry.to_bytes(), 0);
+                self.views_heap.insert_batch(&[tuple]).await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn delete_view(&self, id: u32) -> Result<bool> {
+        let mut target = None;
+        let guard = self.views_heap.scan()?;
+        guard.for_each(|tid, row| {
+            if let Ok(entry) = ViewEntry::from_bytes(row.data) {
+                if entry.id == id {
+                    target = Some(tid);
+                }
+            }
+        });
+        match target {
+            Some(tid) => self.views_heap.delete(tid).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn load_mviews(&self) -> Result<Vec<MaterializedViewEntry>> {
+        let mut entries = Vec::new();
+        let guard = self.mviews_heap.scan()?;
+        guard.for_each(|_tid, row| {
+            if let Ok(entry) = MaterializedViewEntry::from_bytes(row.data) {
+                entries.push(entry);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_mview(&self, entry: &MaterializedViewEntry) -> Result<TupleId> {
+        let tuple = Tuple::new(entry.to_bytes(), 0);
+        let ids = self.mviews_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
+    }
+
+    async fn update_mview(&self, entry: &MaterializedViewEntry) -> Result<bool> {
+        let mut target = None;
+        let guard = self.mviews_heap.scan()?;
+        guard.for_each(|tid, row| {
+            if let Ok(existing) = MaterializedViewEntry::from_bytes(row.data) {
+                if existing.id == entry.id {
+                    target = Some(tid);
+                }
+            }
+        });
+        drop(guard);
+        match target {
+            Some(tid) => {
+                self.mviews_heap.delete(tid).await?;
+                let tuple = Tuple::new(entry.to_bytes(), 0);
+                self.mviews_heap.insert_batch(&[tuple]).await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn delete_mview(&self, id: u32) -> Result<bool> {
+        let mut target = None;
+        let guard = self.mviews_heap.scan()?;
+        guard.for_each(|tid, row| {
+            if let Ok(entry) = MaterializedViewEntry::from_bytes(row.data) {
+                if entry.id == id {
+                    target = Some(tid);
+                }
+            }
+        });
+        match target {
+            Some(tid) => self.mviews_heap.delete(tid).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn load_functions(&self) -> Result<Vec<FunctionEntry>> {
+        let mut entries = Vec::new();
+        let guard = self.functions_heap.scan()?;
+        guard.for_each(|_tid, row| {
+            if let Ok(entry) = FunctionEntry::from_bytes(row.data) {
+                entries.push(entry);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_function(&self, entry: &FunctionEntry) -> Result<TupleId> {
+        let tuple = Tuple::new(entry.to_bytes(), 0);
+        let ids = self.functions_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
+    }
+
+    async fn delete_function(&self, id: u32) -> Result<bool> {
+        let mut target = None;
+        let guard = self.functions_heap.scan()?;
+        guard.for_each(|tid, row| {
+            if let Ok(entry) = FunctionEntry::from_bytes(row.data) {
+                if entry.id == id {
+                    target = Some(tid);
+                }
+            }
+        });
+        match target {
+            Some(tid) => self.functions_heap.delete(tid).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn load_comments(&self) -> Result<Vec<CommentEntry>> {
+        let mut entries = Vec::new();
+        let guard = self.comments_heap.scan()?;
+        guard.for_each(|_tid, row| {
+            if let Ok(entry) = CommentEntry::from_bytes(row.data) {
+                entries.push(entry);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_comment(&self, entry: &CommentEntry) -> Result<TupleId> {
+        let tuple = Tuple::new(entry.to_bytes(), 0);
+        let ids = self.comments_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
+    }
+
+    async fn delete_comment(&self, id: u32) -> Result<bool> {
+        let mut target = None;
+        let guard = self.comments_heap.scan()?;
+        guard.for_each(|tid, row| {
+            if let Ok(entry) = CommentEntry::from_bytes(row.data) {
+                if entry.id == id {
+                    target = Some(tid);
+                }
+            }
+        });
+        match target {
+            Some(tid) => self.comments_heap.delete(tid).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn load_aggregates(&self) -> Result<Vec<AggregateEntry>> {
+        let mut entries = Vec::new();
+        let guard = self.aggregates_heap.scan()?;
+        guard.for_each(|_tid, row| {
+            if let Ok(entry) = AggregateEntry::from_bytes(row.data) {
+                entries.push(entry);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_aggregate(&self, entry: &AggregateEntry) -> Result<TupleId> {
+        let tuple = Tuple::new(entry.to_bytes(), 0);
+        let ids = self.aggregates_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
+    }
+
+    async fn delete_aggregate(&self, id: u32) -> Result<bool> {
+        let mut target = None;
+        let guard = self.aggregates_heap.scan()?;
+        guard.for_each(|tid, row| {
+            if let Ok(entry) = AggregateEntry::from_bytes(row.data) {
+                if entry.id == id {
+                    target = Some(tid);
+                }
+            }
+        });
+        match target {
+            Some(tid) => self.aggregates_heap.delete(tid).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn load_procedures(&self) -> Result<Vec<ProcedureEntry>> {
+        let mut entries = Vec::new();
+        let guard = self.procedures_heap.scan()?;
+        guard.for_each(|_tid, row| {
+            if let Ok(entry) = ProcedureEntry::from_bytes(row.data) {
+                entries.push(entry);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_procedure(&self, entry: &ProcedureEntry) -> Result<TupleId> {
+        let tuple = Tuple::new(entry.to_bytes(), 0);
+        let ids = self.procedures_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
+    }
+
+    async fn delete_procedure(&self, id: u32) -> Result<bool> {
+        let mut target = None;
+        let guard = self.procedures_heap.scan()?;
+        guard.for_each(|tid, row| {
+            if let Ok(entry) = ProcedureEntry::from_bytes(row.data) {
+                if entry.id == id {
+                    target = Some(tid);
+                }
+            }
+        });
+        match target {
+            Some(tid) => self.procedures_heap.delete(tid).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn load_schedules(&self) -> Result<Vec<ScheduleEntry>> {
+        let mut entries = Vec::new();
+        let guard = self.schedules_heap.scan()?;
+        guard.for_each(|_tid, row| {
+            if let Ok(entry) = ScheduleEntry::from_bytes(row.data) {
+                entries.push(entry);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_schedule(&self, entry: &ScheduleEntry) -> Result<TupleId> {
+        let tuple = Tuple::new(entry.to_bytes(), 0);
+        let ids = self.schedules_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
+    }
+
+    async fn delete_schedule(&self, id: u32) -> Result<bool> {
+        let mut target = None;
+        let guard = self.schedules_heap.scan()?;
+        guard.for_each(|tid, row| {
+            if let Ok(entry) = ScheduleEntry::from_bytes(row.data) {
+                if entry.id == id {
+                    target = Some(tid);
+                }
+            }
+        });
+        match target {
+            Some(tid) => self.schedules_heap.delete(tid).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn load_triggers(&self) -> Result<Vec<TriggerEntry>> {
+        let mut entries = Vec::new();
+        let guard = self.triggers_heap.scan()?;
+        guard.for_each(|_tid, row| {
+            if let Ok(entry) = TriggerEntry::from_bytes(row.data) {
+                entries.push(entry);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_trigger(&self, entry: &TriggerEntry) -> Result<TupleId> {
+        let tuple = Tuple::new(entry.to_bytes(), 0);
+        let ids = self.triggers_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
+    }
+
+    async fn delete_trigger(&self, id: u32) -> Result<bool> {
+        let mut target = None;
+        let guard = self.triggers_heap.scan()?;
+        guard.for_each(|tid, row| {
+            if let Ok(entry) = TriggerEntry::from_bytes(row.data) {
+                if entry.id == id {
+                    target = Some(tid);
+                }
+            }
+        });
+        match target {
+            Some(tid) => self.triggers_heap.delete(tid).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn load_pipelines(&self) -> Result<Vec<PipelineEntry>> {
+        let mut entries = Vec::new();
+        let guard = self.pipelines_heap.scan()?;
+        guard.for_each(|_tid, row| {
+            if let Ok(entry) = PipelineEntry::from_bytes(row.data) {
+                entries.push(entry);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_pipeline(&self, entry: &PipelineEntry) -> Result<TupleId> {
+        let tuple = Tuple::new(entry.to_bytes(), 0);
+        let ids = self.pipelines_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
+    }
+
+    async fn delete_pipeline(&self, id: u32) -> Result<bool> {
+        let mut target = None;
+        let guard = self.pipelines_heap.scan()?;
+        guard.for_each(|tid, row| {
+            if let Ok(entry) = PipelineEntry::from_bytes(row.data) {
+                if entry.id == id {
+                    target = Some(tid);
+                }
+            }
+        });
+        match target {
+            Some(tid) => self.pipelines_heap.delete(tid).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn load_event_handlers(&self) -> Result<Vec<EventHandlerEntry>> {
+        let mut entries = Vec::new();
+        let guard = self.event_handlers_heap.scan()?;
+        guard.for_each(|_tid, row| {
+            if let Ok(entry) = EventHandlerEntry::from_bytes(row.data) {
+                entries.push(entry);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_event_handler(&self, entry: &EventHandlerEntry) -> Result<TupleId> {
+        let tuple = Tuple::new(entry.to_bytes(), 0);
+        let ids = self.event_handlers_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
+    }
+
+    async fn delete_event_handler(&self, id: u32) -> Result<bool> {
+        let mut target = None;
+        let guard = self.event_handlers_heap.scan()?;
+        guard.for_each(|tid, row| {
+            if let Ok(entry) = EventHandlerEntry::from_bytes(row.data) {
+                if entry.id == id {
+                    target = Some(tid);
+                }
+            }
+        });
+        match target {
+            Some(tid) => self.event_handlers_heap.delete(tid).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn load_version_tags(&self) -> Result<Vec<VersionTagEntry>> {
+        let mut entries = Vec::new();
+        let guard = self.version_tags_heap.scan()?;
+        guard.for_each(|_tid, row| {
+            if let Ok(entry) = VersionTagEntry::from_bytes(row.data) {
+                entries.push(entry);
+            }
+        });
+        Ok(entries)
+    }
+
+    async fn store_version_tag(&self, entry: &VersionTagEntry) -> Result<TupleId> {
+        let tuple = Tuple::new(entry.to_bytes(), 0);
+        let ids = self.version_tags_heap.insert_batch(&[tuple]).await?;
+        Ok(ids[0])
+    }
+
+    async fn delete_version_tag(&self, id: u32) -> Result<bool> {
+        let mut target = None;
+        let guard = self.version_tags_heap.scan()?;
+        guard.for_each(|tid, row| {
+            if let Ok(entry) = VersionTagEntry::from_bytes(row.data) {
+                if entry.id == id {
+                    target = Some(tid);
+                }
+            }
+        });
+        match target {
+            Some(tid) => self.version_tags_heap.delete(tid).await,
             None => Ok(false),
         }
     }

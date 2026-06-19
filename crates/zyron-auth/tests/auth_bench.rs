@@ -19,8 +19,8 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use zyron_auth::abac::{
-    AbacEffect, AbacOperator, AbacPolicy, AbacRule, AbacRuleStore, AbacStore, AttributeCondition,
-    SessionAttributes,
+    AbacEffect, AbacOperator, AbacPolicy, AbacRule, AbacRuleStore, AbacStore, AbacTarget,
+    AttributeCondition, SessionAttributes,
 };
 use zyron_auth::auth_rules::{AuthMethod, AuthResolver, AuthRule, ConnectionType};
 use zyron_auth::balloon::{self, BalloonParams};
@@ -2452,6 +2452,7 @@ fn test_abac_policies() {
             id: 1,
             name: "eng_access".to_string(),
             table_id: 100,
+            target: AbacTarget::Table,
             predicate: "department = 'engineering'".to_string(),
             enabled: true,
             permissive: true,
@@ -2463,6 +2464,7 @@ fn test_abac_policies() {
             id: 2,
             name: "region_filter".to_string(),
             table_id: 100,
+            target: AbacTarget::Table,
             predicate: "region = 'us-east'".to_string(),
             enabled: true,
             permissive: false,
@@ -2482,6 +2484,7 @@ fn test_abac_policies() {
         id: 42,
         name: "test".to_string(),
         table_id: 300,
+        target: AbacTarget::Table,
         predicate: "clearance >= 'confidential'".to_string(),
         enabled: true,
         permissive: true,

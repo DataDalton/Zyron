@@ -144,15 +144,7 @@ impl PatchStore {
                 if record_checksum(&buf[pos..pos + REC_HEADER + val_len]) != stored_crc {
                     break; // torn / corrupt tail
                 }
-                Self::apply_overlay(
-                    &mut overlay,
-                    kind,
-                    file_id,
-                    sys_rowid,
-                    epoch,
-                    col_id,
-                    value,
-                );
+                Self::apply_overlay(&mut overlay, kind, file_id, sys_rowid, epoch, col_id, value);
                 if lsn > hwm {
                     hwm = lsn;
                 }
@@ -321,15 +313,9 @@ impl PatchStore {
     /// Snapshots the overlay for one file into a local map under a single
     /// read-lock acquisition. O(rows-in-file). The scan then resolves per row
     /// from the local map with no per-row locking.
-    pub fn file_overlay(
-        &self,
-        file_id: u64,
-    ) -> std::collections::HashMap<u64, Arc<RowOverlay>> {
+    pub fn file_overlay(&self, file_id: u64) -> std::collections::HashMap<u64, Arc<RowOverlay>> {
         match read_through(&self.overlay).get(&file_id) {
-            Some(m) => m
-                .iter()
-                .map(|(r, v)| (*r, Arc::clone(v)))
-                .collect(),
+            Some(m) => m.iter().map(|(r, v)| (*r, Arc::clone(v))).collect(),
             None => std::collections::HashMap::new(),
         }
     }
@@ -348,30 +334,34 @@ impl PatchStore {
     }
 
     /// Collapses redundant value-patch history to bound overlay memory
-    /// between merges. For each column chain only the newest patch with
-    /// `patch_xid < horizon` is kept (every snapshot sees at least that one
-    /// and resolution picks the newest visible), plus all patches at or above
-    /// the horizon. Supersedes and rows are never removed: a sub-horizon
-    /// supersede is the delete marker the merge still needs to physically
-    /// drop the dead row from the base segment, and `drop_file` clears it
-    /// once that merge completes. In-memory only.
-    pub fn trim_below(&self, horizon: u64) {
+    /// between merges. A patch is collapsible when it is settled
+    /// (`patch_xid < horizon`) and `reclaimable(patch_xid)` is true, meaning no
+    /// retained version still needs to read the value before it. For each column
+    /// chain only the newest collapsible patch is kept (every reader sees at
+    /// least that one and resolution picks the newest visible); all other
+    /// patches, including any a retained version still needs, are preserved.
+    /// Supersedes and rows are never removed here: a settled supersede is the
+    /// delete marker the merge needs to physically drop or carry forward the
+    /// dead row, and the merge clears it once it completes. In-memory only.
+    pub fn trim_below(&self, horizon: u64, reclaimable: impl Fn(u64) -> bool) {
         let mut ov = write_through(&self.overlay);
         for rows in ov.values_mut() {
             for arc in rows.values_mut() {
+                let collapsible =
+                    |p: &ValuePatch| p.patch_xid < horizon && reclaimable(p.patch_xid);
                 let needs_trim = arc
                     .patches
                     .values()
-                    .any(|chain| chain.iter().filter(|p| p.patch_xid < horizon).count() > 1);
+                    .any(|chain| chain.iter().filter(|p| collapsible(p)).count() > 1);
                 if !needs_trim {
                     continue;
                 }
                 let row = Arc::make_mut(arc);
                 for chain in row.patches.values_mut() {
-                    // Index of the newest patch strictly below the horizon.
+                    // Index of the newest collapsible patch.
                     let mut newest_below: Option<usize> = None;
                     for (i, p) in chain.iter().enumerate() {
-                        if p.patch_xid < horizon {
+                        if collapsible(p) {
                             match newest_below {
                                 Some(j) if chain[j].patch_xid > p.patch_xid => {}
                                 _ => newest_below = Some(i),
@@ -383,7 +373,7 @@ impl PatchStore {
                     chain.retain(|p| {
                         let k = idx;
                         idx += 1;
-                        p.patch_xid >= horizon || k == keep
+                        !collapsible(p) || k == keep
                     });
                 }
             }
@@ -408,16 +398,7 @@ impl PatchStore {
         for (fid, rows) in ov.iter() {
             for (rid, row) in rows.iter() {
                 for s in &row.supersedes {
-                    Self::push_record(
-                        &mut buf,
-                        PATCH_KIND_SUPERSEDE,
-                        *fid,
-                        *rid,
-                        *s,
-                        hwm,
-                        0,
-                        &[],
-                    );
+                    Self::push_record(&mut buf, PATCH_KIND_SUPERSEDE, *fid, *rid, *s, hwm, 0, &[]);
                 }
                 for (col, chain) in &row.patches {
                     for p in chain {
@@ -515,8 +496,8 @@ impl ColumnarPatchManager {
         // overlay and silently lose patches. Falls back to the raw path when
         // the dir does not exist yet (the manager is created before the
         // first fold makes the directory).
-        let key = std::fs::canonicalize(columnar_dir)
-            .unwrap_or_else(|_| columnar_dir.to_path_buf());
+        let key =
+            std::fs::canonicalize(columnar_dir).unwrap_or_else(|_| columnar_dir.to_path_buf());
         let map = GLOBAL.get_or_init(|| RwLock::new(HashMap::new()));
         {
             if let Ok(r) = map.read()
@@ -612,11 +593,30 @@ mod tests {
         // A separate row deleted below the horizon keeps its supersede: the
         // merge still needs that marker to physically drop the dead row.
         s.append_supersede(1, 8, 50, 4).expect("sup");
-        s.trim_below(200);
+        // All patches reclaimable (no retention): collapse to the newest below.
+        s.trim_below(200, |_| true);
         let o = s.row_overlay(1, 7).expect("row 7 kept");
         assert_eq!(o.patches[&0].len(), 1, "old versions collapsed");
         assert_eq!(o.patches[&0][0].patch_xid, 102, "newest below horizon kept");
         let d = s.row_overlay(1, 8).expect("superseded row kept for merge");
         assert_eq!(d.supersedes, vec![50], "supersede marker preserved");
+    }
+
+    #[test]
+    fn test_trim_below_keeps_unreclaimable_patches() {
+        let dir = tempdir().expect("tmp");
+        let path = dir.path().join("4.zyrpatch");
+        let s = PatchStore::open(&path).expect("open");
+        s.append_value_patch(1, 7, 0, 100, 1, b"v1").expect("p1");
+        s.append_value_patch(1, 7, 0, 101, 2, b"v2").expect("p2");
+        s.append_value_patch(1, 7, 0, 102, 3, b"v3").expect("p3");
+        // A retention floor keeps patches with xid >= 101 (still within the
+        // window); only the older ones may collapse. The newest reclaimable
+        // (100) plus all unreclaimable (101, 102) survive.
+        s.trim_below(200, |xid| xid < 101);
+        let o = s.row_overlay(1, 7).expect("row 7 kept");
+        let mut xids: Vec<u64> = o.patches[&0].iter().map(|p| p.patch_xid).collect();
+        xids.sort();
+        assert_eq!(xids, vec![100, 101, 102], "within-window patches preserved");
     }
 }

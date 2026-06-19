@@ -45,6 +45,9 @@ fn table_entry_lifecycle_roundtrip() {
         cdf_retention_days: 0,
         lifecycle: lc.clone(),
         columnar: Default::default(),
+        dropped_at: None,
+        expectations: Vec::new(),
+        time_travel_retention_secs: 0,
     };
     let bytes = entry.to_bytes();
     let decoded = TableEntry::from_bytes(&bytes).expect("decode");
@@ -74,6 +77,9 @@ fn table_entry_backward_compatible_without_lifecycle() {
         cdf_retention_days: 0,
         lifecycle: LifecycleConfig::default(),
         columnar: Default::default(),
+        dropped_at: None,
+        expectations: Vec::new(),
+        time_travel_retention_secs: 0,
     };
     let decoded = TableEntry::from_bytes(&entry.to_bytes()).expect("decode");
     assert_eq!(decoded.lifecycle, LifecycleConfig::default());
@@ -123,6 +129,9 @@ fn table_entry_columnar_registry_roundtrip() {
         cdf_retention_days: 0,
         lifecycle: LifecycleConfig::default(),
         columnar: columnar.clone(),
+        dropped_at: None,
+        expectations: Vec::new(),
+        time_travel_retention_secs: 0,
     };
     let decoded = TableEntry::from_bytes(&entry.to_bytes()).expect("decode");
     assert_eq!(decoded.columnar, columnar);

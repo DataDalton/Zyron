@@ -1345,6 +1345,20 @@ pub struct AnnIndex {
 }
 
 impl AnnIndex {
+    /// Returns a clone of the HNSW configuration (m, efConstruction, efSearch,
+    /// metric). The table-rewrite engine reads this to recreate the index with
+    /// identical tuning after a heap rewrite changes all row ids.
+    pub fn hnsw_config(&self) -> HnswConfig {
+        self.config.clone()
+    }
+
+    /// Returns the vector dimensionality this index was built for.
+    pub fn dimension_count(&self) -> u16 {
+        self.dimensions
+    }
+}
+
+impl AnnIndex {
     pub fn new(
         indexId: u32,
         tableId: u32,

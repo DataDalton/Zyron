@@ -291,12 +291,23 @@ impl RateLimitedSource {
     }
 }
 
+/// Wall-clock milliseconds since the Unix epoch, for token-bucket refill.
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 impl SourceConnector for RateLimitedSource {
     fn open(&mut self, offset: Option<&[u8]>) -> Result<()> {
         self.inner.open(offset)
     }
 
     fn next_batch(&mut self) -> Result<Option<StreamRecord>> {
+        // Replenish the bucket based on elapsed wall-clock time before checking
+        // capacity, otherwise tokens drain to zero and never recover.
+        self.refill_tokens(now_millis());
         if self.tokens == 0 {
             return Ok(None);
         }

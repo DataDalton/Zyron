@@ -208,9 +208,7 @@ fn test_rollback_abort() {
     // abort removes from active set but the physical xmax write is done by the
     // caller. So we simulate xmax set to xmin (self-deleted scenario).
     for header in &headers {
-        // Aborted inserts: in a real system the recovery/abort handler would
-        // set xmax = xmin. The snapshot will see xmin committed (not in active set)
-        // but with xmax=xmin meaning it was immediately deleted.
+        // A row carrying a self-delete marker (xmax == xmin) is invisible.
         let aborted_header = TupleHeader::with_xmax(header.data_len, xmin_a, xmin_a);
         assert!(
             !aborted_header.is_visible_to(&txn_b.snapshot),
@@ -218,21 +216,20 @@ fn test_rollback_abort() {
         );
     }
 
-    // Verify that without xmax marking, a committed-looking tuple is visible.
-    // This validates that the abort handler sets xmax.
+    // The commit-status map records the abort, so an aborted transaction's
+    // inserted row (xmin = aborted txn, xmax = 0) is invisible to a later
+    // snapshot WITHOUT any physical xmax marking. This is the MVCC abort fix:
+    // visibility consults the status map, not just the active set.
     let live_header = TupleHeader::new(8, xmin_a);
-    // xmin_a < txn_b.txn_id, xmin_a not in active set -> visible
-    // This is expected: the TransactionManager removes from active set on abort,
-    // so the physical layer must set xmax to prevent visibility.
     assert!(
-        live_header.is_visible_to(&txn_b.snapshot),
-        "Without xmax marking, aborted row appears committed (physical layer must set xmax)"
+        !live_header.is_visible_to(&txn_b.snapshot),
+        "Aborted transaction's inserted row must be invisible via the commit-status map"
     );
 
     tprintln!("  Rollback (abort): PASS");
     tprintln!("    Aborted txn removed from active set: verified");
-    tprintln!("    xmax=xmin marking makes aborted rows invisible: verified");
-    tprintln!("    Physical layer must set xmax on abort: verified");
+    tprintln!("    Aborted txn recorded in commit-status map: verified");
+    tprintln!("    Aborted inserts invisible without physical xmax: verified");
 }
 
 // =============================================================================
@@ -1275,7 +1272,11 @@ fn test_transaction_microbenchmarks() {
     let mut vis_runs = Vec::with_capacity(VALIDATION_RUNS);
     for _ in 0..VALIDATION_RUNS {
         const OPS: usize = 1_000_000;
-        let snapshot = Snapshot::new(1000, (1..100).collect());
+        let snapshot = Snapshot::new(
+            1000,
+            (1..100).collect(),
+            std::sync::Arc::new(zyron_storage::TxnStatusMap::all_committed()),
+        );
         let header = TupleHeader::new(8, 50);
 
         // Warmup
@@ -1331,10 +1332,15 @@ fn test_transaction_microbenchmarks() {
     for _ in 0..VALIDATION_RUNS {
         const OPS: usize = 100_000;
         let active_set: Vec<u64> = (1..20).collect();
+        let status = std::sync::Arc::new(zyron_storage::TxnStatusMap::all_committed());
 
         let start = Instant::now();
         for i in 0..OPS {
-            std::hint::black_box(Snapshot::new(1000 + i as u64, active_set.clone()));
+            std::hint::black_box(Snapshot::new(
+                1000 + i as u64,
+                active_set.clone(),
+                status.clone(),
+            ));
         }
         let duration = start.elapsed();
         let ns_per_op = duration.as_nanos() as f64 / OPS as f64;

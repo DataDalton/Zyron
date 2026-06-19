@@ -12,25 +12,31 @@ pub mod encoding;
 pub mod ids;
 pub mod resolver;
 pub mod schema;
+pub mod sequence;
 pub mod stats;
 pub mod storage;
 
 pub use cache::{CatalogCache, TableIndexSnapshot};
-pub use catalog::Catalog;
+pub use catalog::{Catalog, DropOutcome};
 pub use ids::{
     ColumnId, DatabaseId, EndpointId, ExternalSinkId, ExternalSourceId, IndexId, Oid, OidAllocator,
     PublicationId, SYSTEM_DATABASE_ID, SYSTEM_SCHEMA_ID, SYSTEM_SCHEMA_NAME, SchemaId,
     SecurityMapId, SequenceId, StreamingJobId, SubscriptionId, TableId, USER_OID_START,
 };
 pub use resolver::NameResolver;
+pub use schema::SequenceEntry;
 pub use schema::{
-    BackpressurePolicy, CatalogClassification, CatalogStreamingWriteMode, ColumnEntry,
-    ConstraintEntry, ConstraintType, DatabaseEntry, EndpointAuthMode, EndpointEntry, EndpointKind,
-    EndpointMessageFormat, EndpointOutputFormat, ExternalBackend, ExternalFormat, ExternalMode,
-    ExternalSinkEntry, ExternalSourceEntry, HttpMethod, IndexColumnEntry, IndexEntry, IndexType,
-    PublicationEntry, PublicationTableEntry, RateLimitPeriod, RateLimitScope, RateLimitSpec,
-    RowFormat, SchemaEntry, SecurityMapEntry, SecurityMapKind, StreamingJobEntry,
+    AggregateEntry, BackpressurePolicy, CatalogClassification, CatalogStreamingWriteMode,
+    ColumnEntry, CommentEntry, ConstraintEntry, ConstraintType, DatabaseEntry, EndpointAuthMode,
+    EndpointEntry, EndpointKind, EndpointMessageFormat, EndpointOutputFormat, EventHandlerEntry,
+    ExpectationAction, ExpectationEntry, ExternalBackend, ExternalFormat, ExternalMode,
+    ExternalSinkEntry, ExternalSourceEntry, FunctionEntry, HttpMethod, IndexColumnEntry,
+    IndexEntry, IndexType, MaterializedViewEntry, PipelineEntry, ProcedureEntry, PublicationEntry,
+    PublicationTableEntry, RateLimitPeriod, RateLimitScope, RateLimitSpec, ReferentialAction,
+    RowFormat, ScheduleEntry, SchemaEntry, SecurityMapEntry, SecurityMapKind, StreamingJobEntry,
     StreamingJobStatus, SubscriptionEntry, SubscriptionMode, SubscriptionState, TableEntry,
+    TriggerEntry, VersionTagEntry, ViewEntry,
 };
+pub use sequence::LiveSequence;
 pub use stats::{ColumnStats, Histogram, TableStats, analyze_table};
 pub use storage::{CatalogStorage, HeapCatalogStorage};

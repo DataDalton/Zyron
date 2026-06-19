@@ -62,6 +62,12 @@ pub struct CheckpointCoordinator {
     background_writer: Arc<BackgroundWriter>,
     tracker: Arc<CheckpointTracker>,
     config: CheckpointCoordinatorConfig,
+    /// Runs after all dirty pages are flushed and the CheckpointEnd is logged,
+    /// but before WAL segments are truncated. Used to durably persist the
+    /// commit-status map so that, once the WAL covering a transaction is
+    /// reclaimed, its committed/aborted status is still recoverable. A hook
+    /// failure aborts the checkpoint before truncation, leaving the WAL intact.
+    pre_truncate_hook: std::sync::OnceLock<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
 }
 
 impl CheckpointCoordinator {
@@ -79,7 +85,14 @@ impl CheckpointCoordinator {
             background_writer,
             tracker,
             config,
+            pre_truncate_hook: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Registers the hook run after flush and before WAL truncation. Set once at
+    /// startup before the checkpoint worker begins.
+    pub fn set_pre_truncate_hook(&self, hook: Arc<dyn Fn() -> Result<()> + Send + Sync>) {
+        let _ = self.pre_truncate_hook.set(hook);
     }
 
     /// Runs a full checkpoint. Writers are never blocked during this process.
@@ -101,6 +114,14 @@ impl CheckpointCoordinator {
         // 5. Serialize and log CheckpointEnd with payload
         let payload = self.serialize_checkpoint_payload(checkpoint_lsn);
         self.wal.log_checkpoint_end(&payload)?;
+
+        // 5b. Persist the commit-status map durably before any WAL segment is
+        // reclaimed, so a transaction's committed/aborted status survives even
+        // after the WAL covering it is truncated. A failure aborts the
+        // checkpoint here, before truncation, so the WAL stays authoritative.
+        if let Some(hook) = self.pre_truncate_hook.get() {
+            hook()?;
+        }
 
         // 6. Advance all per-table checkpoint LSNs
         self.tracker.advance_all_tables(checkpoint_lsn.0);

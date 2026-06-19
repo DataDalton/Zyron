@@ -67,6 +67,22 @@ impl VectorIndex {
             VectorIndex::Hnsw(idx) => idx.columnId,
         }
     }
+
+    /// Returns the HNSW configuration so callers can recreate an identical
+    /// index. Used by the table-rewrite engine when ALTER TABLE changes the
+    /// heap and all vector indexes must be rebuilt.
+    pub fn hnsw_config(&self) -> HnswConfig {
+        match self {
+            VectorIndex::Hnsw(idx) => idx.hnsw_config(),
+        }
+    }
+
+    /// Returns the vector dimensionality this index was built for.
+    pub fn dimension_count(&self) -> u16 {
+        match self {
+            VectorIndex::Hnsw(idx) => idx.dimension_count(),
+        }
+    }
 }
 
 /// Central manager for vector indexes, providing lifecycle management

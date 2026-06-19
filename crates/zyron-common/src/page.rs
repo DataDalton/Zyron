@@ -54,6 +54,59 @@ impl PageId {
     }
 }
 
+/// Branch-local file identifiers for one table's copy-on-write overlay.
+///
+/// A branch keeps copies of pre-existing heap pages it modified in `cow_file_id`
+/// (reached only by resolving a main page id through the override chain) and the
+/// rows it inserts in `append_file_id` (scanned as a separate range). Splitting
+/// the two avoids visiting a page twice during a branch scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BranchFiles {
+    /// File id holding copy-on-write copies of modified pre-existing pages.
+    pub cow_file_id: u32,
+    /// File id holding rows the branch inserted.
+    pub append_file_id: u32,
+    /// Free space map file id for the append heap file.
+    pub append_fsm_file_id: u32,
+}
+
+/// Resolves heap page reads through a branch's copy-on-write override chain and
+/// drives the branch-local write overlay.
+///
+/// Defined here so the executor can read and write branch-local pages without
+/// depending on the versioning crate. The branch manager implements it; branch
+/// ids are plain u64 to keep this layer free of versioning types.
+pub trait BranchCatalog: Send + Sync {
+    /// Returns the page to actually read for the given branch, walking the
+    /// branch chain. Returns `page_id` unchanged when no override applies.
+    fn resolve_page_for(&self, branch_id: u64, page_id: PageId) -> PageId;
+
+    /// Resolves a branch name to its id, or None when no active branch matches.
+    fn branch_id_by_name(&self, name: &str) -> Option<u64>;
+
+    /// Returns the branch-local overlay file ids for a table, allocating them on
+    /// first use. Stable for the life of the branch.
+    fn branch_files_for(&self, branch_id: u64, heap_file_id: u32) -> BranchFiles;
+
+    /// Returns this branch's own copy-on-write page for a modified original
+    /// page, or None when the branch has not copied it yet. Does not walk the
+    /// parent chain: a child that has not copied a page parented elsewhere
+    /// reports None so the caller copies it into the child.
+    fn lookup_cow_page(&self, branch_id: u64, original_page: PageId) -> Option<PageId>;
+
+    /// Records that `original_page` was copied to `local_page` for this branch,
+    /// returning the page that wins when another writer recorded a copy first.
+    /// The caller allocates `local_page` and copies the bytes before calling.
+    fn record_cow_page(&self, branch_id: u64, original_page: PageId, local_page: PageId) -> PageId;
+
+    /// Number of pages the branch has appended for the given table. The scan
+    /// reads this range from the append file in addition to the main range.
+    fn append_page_count(&self, branch_id: u64, heap_file_id: u32) -> u64;
+
+    /// Publishes the append file page count after the branch inserts rows.
+    fn set_append_page_count(&self, branch_id: u64, heap_file_id: u32, count: u64);
+}
+
 impl std::fmt::Display for PageId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{}", self.file_id, self.page_num)
