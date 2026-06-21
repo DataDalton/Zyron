@@ -862,6 +862,11 @@ fn test_e2e_consumer_deployment() {
         tprintln!("\n=== OLTP workload ({}s at each concurrency) ===", OLTP_DURATION.as_secs());
         let mut oltp_results: Vec<(usize, OltpOutcome)> = Vec::new();
         for &conc in OLTP_CONCURRENCY_LEVELS {
+            // Reset phase counters so the breakdown below covers this
+            // concurrency point alone. Compiled out entirely without
+            // --features profile; gated again at runtime by ZYRON_PROFILE.
+            #[cfg(feature = "profile")]
+            zyron_common::profile::reset();
             let outcome = run_oltp(server.addr, "app", conc).await;
             let total_ops = outcome.success_ops + outcome.failed_ops;
             let fail_pct = if total_ops == 0 {
@@ -878,6 +883,15 @@ fn test_e2e_consumer_deployment() {
             );
             if let Some(ref err) = outcome.sample {
                 tprintln!("    first error: {}", err);
+            }
+            // Full-stack per-phase wall-clock breakdown for this concurrency,
+            // written through tprintln so it lands in the benchmark .txt file.
+            // wire.* isolates protocol/parse/plan/execute, txn.* the commit
+            // path, flush.* the WAL. Compiled out entirely without --features
+            // profile; gated again at runtime by ZYRON_PROFILE.
+            #[cfg(feature = "profile")]
+            if zyron_common::profile::is_enabled() {
+                tprintln!("[OLTP c={}]\n{}", conc, zyron_common::profile::report());
             }
             // Non-trivial failure rate means the workload isn't exercising
             // what the SLO pretends to measure

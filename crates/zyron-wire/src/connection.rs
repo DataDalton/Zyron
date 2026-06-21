@@ -16,6 +16,7 @@ use crate::transport::WireTransport;
 
 use zyron_buffer::BufferPool;
 use zyron_catalog::Catalog;
+#[cfg(feature = "profile")]
 use zyron_common::profile::{self, Phase};
 use zyron_common::{Result as ZyronResult, ZyronError};
 use zyron_executor::batch::DataBatch;
@@ -724,6 +725,10 @@ impl<T: WireTransport> Connection<T> {
 
     async fn message_loop(&mut self) -> Result<(), ProtocolError> {
         loop {
+            // Time spent blocked here is the connection waiting for the client's
+            // next request. Large with idle worker CPU = client/harness-bound.
+            #[cfg(feature = "profile")]
+            let read_wait = profile::scope(Phase::WireReadWait);
             let msg = match self.read_message().await {
                 Ok(msg) => msg,
                 Err(ProtocolError::ConnectionClosed) => {
@@ -732,6 +737,8 @@ impl<T: WireTransport> Connection<T> {
                 }
                 Err(e) => return Err(e),
             };
+            #[cfg(feature = "profile")]
+            drop(read_wait);
 
             match msg {
                 FrontendMessage::Query { sql } => {
@@ -2095,6 +2102,10 @@ impl<T: WireTransport> Connection<T> {
     ) -> Result<(), ProtocolError> {
         debug!("Parse: name={}, query={}", name, query);
 
+        // Covers statement-cache lookup plus the parse+plan it skips on a hit.
+        #[cfg(feature = "profile")]
+        let _recv_parse = profile::scope(Phase::WireRecvParse);
+
         // Statement cache lookup: build the composite key and skip the
         // parse + plan round trip when the same text was bound under the
         // same search path, identity, and schema version. The extended
@@ -2241,6 +2252,11 @@ impl<T: WireTransport> Connection<T> {
     ) -> Result<(), ProtocolError> {
         debug!("Bind: portal={}, stmt={}", portal_name, stmt_name);
 
+        // Covers param decode, plan resolution (cache clone or re-plan), and
+        // portal construction.
+        #[cfg(feature = "profile")]
+        let _plan_span = profile::scope(Phase::WirePlan);
+
         let stmt = self.statements.get(&stmt_name).ok_or_else(|| {
             ProtocolError::Malformed(format!("Prepared statement \"{}\" not found", stmt_name))
         })?;
@@ -2353,6 +2369,7 @@ impl<T: WireTransport> Connection<T> {
             }
         };
 
+        #[cfg(feature = "profile")]
         let setup_span = profile::scope(Phase::WireExecSetup);
         let plan = portal.plan.clone();
         let output_schema = portal.output_schema.clone();
@@ -2388,9 +2405,11 @@ impl<T: WireTransport> Connection<T> {
             }
         }
         let ctx = Arc::new(ctx_owned);
+        #[cfg(feature = "profile")]
         drop(setup_span);
 
         let exec_result = {
+            #[cfg(feature = "profile")]
             let _s = profile::scope(Phase::WireExecute);
             execute(Arc::unwrap_or_clone(plan), &ctx).await
         };
@@ -2406,6 +2425,7 @@ impl<T: WireTransport> Connection<T> {
             }
         }
 
+        #[cfg(feature = "profile")]
         let _send_span = profile::scope(Phase::WireSend);
         match exec_result {
             Ok(batches) => {
@@ -2498,6 +2518,7 @@ impl<T: WireTransport> Connection<T> {
     async fn handle_sync(&mut self) -> Result<(), ProtocolError> {
         // Auto-commit implicit transactions on Sync
         {
+            #[cfg(feature = "profile")]
             let _s = profile::scope(Phase::WireAutoCommit);
             self.auto_commit_if_needed().await;
         }

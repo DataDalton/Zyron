@@ -1299,6 +1299,9 @@ impl Operator for InsertOperator {
 
                 // Enforce unique constraints before any write. Abort does not
                 // undo heap rows here, so the check must precede the mutation.
+                #[cfg(feature = "profile")]
+                let _uc_span =
+                    zyron_common::profile::scope(zyron_common::profile::Phase::ExecUniqueCheck);
                 check_unique_constraints(
                     &self.ctx,
                     &table_entry,
@@ -1307,6 +1310,8 @@ impl Operator for InsertOperator {
                     &[],
                 )
                 .await?;
+                #[cfg(feature = "profile")]
+                drop(_uc_span);
 
                 let tuples = batch_to_tuples(&exec_batch.batch, &table_entry.columns, txn_id);
 
@@ -1348,7 +1353,12 @@ impl Operator for InsertOperator {
                 let last_lsn = self.ctx.wal.log_insert_batch_last_lsn(&batch_records)?;
                 self.ctx.mark_wrote_wal();
 
+                #[cfg(feature = "profile")]
+                let _heap_span =
+                    zyron_common::profile::scope(zyron_common::profile::Phase::ExecHeapInsert);
                 let tuple_ids = heap_file.insert_batch(&tuples).await?;
+                #[cfg(feature = "profile")]
+                drop(_heap_span);
 
                 // Drop any graph CSR built from this table so the next graph
                 // algorithm rebuilds from current data.
@@ -1474,6 +1484,9 @@ impl Operator for InsertOperator {
                 }
 
                 // Maintain B+Tree indexes for the inserted rows.
+                #[cfg(feature = "profile")]
+                let _idx_span =
+                    zyron_common::profile::scope(zyron_common::profile::Phase::ExecIndexInsert);
                 maintain_btree_insert(
                     &self.ctx,
                     &table_entry,
@@ -1481,6 +1494,8 @@ impl Operator for InsertOperator {
                     &tuple_ids,
                     &index_snap,
                 );
+                #[cfg(feature = "profile")]
+                drop(_idx_span);
 
                 // Notify CDC hook if present.
                 if let Some(ref hook) = self.ctx.cdc_hook {
@@ -2025,6 +2040,9 @@ impl Operator for UpdateOperator {
                 // value is not a conflict). Abort does not undo heap rows.
                 {
                     let index_snap = self.ctx.index_snapshot_for_table(self.table_id.0);
+                    #[cfg(feature = "profile")]
+                    let _uc_span =
+                        zyron_common::profile::scope(zyron_common::profile::Phase::ExecUniqueCheck);
                     check_unique_constraints(
                         &self.ctx,
                         &table_entry,
@@ -2108,7 +2126,12 @@ impl Operator for UpdateOperator {
                     new_tuples.iter().map(|t| (txn_id, t.data())).collect();
                 let ins_lsns = self.ctx.wal.log_insert_batch(&insert_records)?;
                 let ins_last_lsn = ins_lsns.last().copied().unwrap_or(zyron_wal::Lsn::INVALID);
+                #[cfg(feature = "profile")]
+                let _heap_span =
+                    zyron_common::profile::scope(zyron_common::profile::Phase::ExecHeapInsert);
                 let new_tuple_ids = heap_file.insert_batch(&new_tuples).await?;
+                #[cfg(feature = "profile")]
+                drop(_heap_span);
 
                 // Stamp inserted pages with WAL LSN for checkpoint ordering.
                 for tid in &new_tuple_ids {
@@ -2127,6 +2150,9 @@ impl Operator for UpdateOperator {
                 // mean the new entry never collides with the old one.
                 {
                     let index_snap = self.ctx.index_snapshot_for_table(self.table_id.0);
+                    #[cfg(feature = "profile")]
+                    let _idx_span =
+                        zyron_common::profile::scope(zyron_common::profile::Phase::ExecIndexInsert);
                     maintain_btree_insert(
                         &self.ctx,
                         &table_entry,

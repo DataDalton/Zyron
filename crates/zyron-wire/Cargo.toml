@@ -4,6 +4,11 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+# Compiles in the wall-clock phase profiler scopes (zyron-common::profile).
+# Off by default; enable for a bench run, then set ZYRON_PROFILE at runtime.
+profile = ["zyron-common/profile"]
+
 [dependencies]
 zyron-common = { path = "../zyron-common" }
 zyron-parser = { path = "../zyron-parser" }

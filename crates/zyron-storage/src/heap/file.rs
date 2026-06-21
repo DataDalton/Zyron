@@ -180,8 +180,34 @@ pub struct HeapFile {
     /// Pending FSM updates. Uses Mutex because Vec append is not lock-free.
     /// Only contended during FSM flush and page boundary transitions.
     pending_fsm: parking_lot::Mutex<Vec<PendingFsmUpdate>>,
-    /// Active insertion page for the atomic insert path, u32::MAX = none yet
-    current_insert_page: std::sync::atomic::AtomicU32,
+    /// Sharded insertion points: one tail page per writer thread so concurrent
+    /// appends claim space on different pages (different cache lines), giving
+    /// each shard a single writer and an uncontended header claim. Each shard is
+    /// u32::MAX until a thread first inserts here, so a table written by K
+    /// threads uses K tail pages: adaptive, with no waste for cold or
+    /// single-writer tables.
+    insert_shards: Box<[CachePaddedU32]>,
+}
+
+/// Cache-line-aligned AtomicU32 so per-shard insertion pointers written by
+/// different writer threads never false-share an adjacent shard.
+#[repr(align(64))]
+struct CachePaddedU32(std::sync::atomic::AtomicU32);
+
+/// Upper bound on sharded heap insertion points. The live count is
+/// `min(this, available_parallelism)`; 64 covers any core count. Shards are
+/// lazy, so an unused shard costs one atomic slot, never a page.
+const MAX_INSERT_SHARDS: usize = 64;
+
+/// Source of stable per-thread writer slots. The first heap insert from a thread
+/// claims the next slot; modulo a file's shard count it selects that thread's
+/// shard, so a worker thread keeps appending to the same tail page (cache-local)
+/// and distinct workers spread across pages.
+static NEXT_WRITER_SLOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+std::thread_local! {
+    static WRITER_SLOT: usize =
+        NEXT_WRITER_SLOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 impl HeapFile {
@@ -203,7 +229,15 @@ impl HeapFile {
             cached_fsm_pages: AtomicU32::new(0),
             hint_slots: AtomicHintSlots::new(),
             pending_fsm: parking_lot::Mutex::new(Vec::with_capacity(64)),
-            current_insert_page: AtomicU32::new(u32::MAX),
+            insert_shards: {
+                let shard_count = std::thread::available_parallelism()
+                    .map(|p| p.get())
+                    .unwrap_or(8)
+                    .clamp(1, MAX_INSERT_SHARDS);
+                (0..shard_count)
+                    .map(|_| CachePaddedU32(AtomicU32::new(u32::MAX)))
+                    .collect()
+            },
         })
     }
 
@@ -216,10 +250,12 @@ impl HeapFile {
             .store(heap_pages as u32, Ordering::Relaxed);
         self.cached_fsm_pages
             .store(fsm_pages as u32, Ordering::Relaxed);
-        // Resume appending into the last existing page if any. The first
-        // insert will atomically detect PageFull and roll over via CAS
+        // Resume appending into the last existing page on one shard; the others
+        // stay lazy and roll into fresh or reused pages on first use. The first
+        // insert on the resumed shard detects PageFull and rolls over via CAS.
         if heap_pages > 0 {
-            self.current_insert_page
+            self.insert_shards[0]
+                .0
                 .store((heap_pages - 1) as u32, Ordering::Relaxed);
         }
         Ok(())
@@ -244,6 +280,16 @@ impl HeapFile {
     fn increment_heap_pages(&self) {
         use std::sync::atomic::Ordering;
         self.cached_heap_pages.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// This thread's insertion shard. A stable per-thread slot keeps each shard
+    /// single-writer while writer threads do not exceed the shard count, so the
+    /// page-header claim is uncontended; beyond that the slots wrap and a few
+    /// threads share a shard, degrading gracefully to the prior behavior.
+    #[inline]
+    fn insert_shard(&self) -> &std::sync::atomic::AtomicU32 {
+        let idx = WRITER_SLOT.with(|s| *s) % self.insert_shards.len();
+        &self.insert_shards[idx].0
     }
 
     /// Increments cached FSM page count.
@@ -760,13 +806,18 @@ impl HeapFile {
     ///
     /// Multi-page batches pre-allocate locally in one allocate_pages_batch
     /// call and consume from a local Vec, single-page batches go through
-    /// the shared current_insert_page CAS path
+    /// this thread's insertion shard so concurrent writers append to distinct
+    /// tail pages.
     pub async fn insert_batch(&self, tuples: &[Tuple]) -> Result<Vec<TupleId>> {
         use std::sync::atomic::Ordering;
 
         if tuples.is_empty() {
             return Ok(Vec::new());
         }
+
+        // This thread's insertion shard, used for every single-page append and
+        // rollover below so concurrent writers do not share one tail page.
+        let insert_shard = self.insert_shard();
 
         let usable_per_page = PAGE_SIZE - DATA_START;
         let total_bytes: usize = tuples
@@ -797,9 +848,9 @@ impl HeapFile {
             let (page_id, is_fresh) = if let Some(pid) = local_pages.pop() {
                 (pid, true)
             } else {
-                let mut page_num = self.current_insert_page.load(Ordering::Acquire);
+                let mut page_num = insert_shard.load(Ordering::Acquire);
                 if page_num == u32::MAX {
-                    page_num = self.advance_insert_page(u32::MAX).await?;
+                    page_num = self.advance_insert_page(insert_shard, u32::MAX).await?;
                 }
                 (
                     PageId::new(self.config.heap_file_id, page_num as u64),
@@ -847,7 +898,9 @@ impl HeapFile {
             if inserted == 0 {
                 self.pool.unpin_page(page_id, false);
                 if !is_fresh {
-                    let _ = self.advance_insert_page(page_id.page_num as u32).await?;
+                    let _ = self
+                        .advance_insert_page(insert_shard, page_id.page_num as u32)
+                        .await?;
                 }
                 continue;
             }
@@ -857,11 +910,12 @@ impl HeapFile {
             last_used_page = Some(page_id.page_num as u32);
         }
 
-        // monotonic publish of the last used page for future single-tuple inserts
+        // monotonic publish of the last used page into this thread's shard for
+        // its future single-tuple inserts
         if let Some(last) = last_used_page {
-            let mut current = self.current_insert_page.load(Ordering::Acquire);
+            let mut current = insert_shard.load(Ordering::Acquire);
             while current == u32::MAX || last > current {
-                match self.current_insert_page.compare_exchange_weak(
+                match insert_shard.compare_exchange_weak(
                     current,
                     last,
                     Ordering::AcqRel,
@@ -877,12 +931,17 @@ impl HeapFile {
         Ok(results)
     }
 
-    /// Allocates a successor page and publishes it via CAS, losers leak an
-    /// empty page that SeqScan filters via slot_count == 0
-    async fn advance_insert_page(&self, observed_page: u32) -> Result<u32> {
+    /// Rolls `shard` to a successor page and publishes it via CAS; losers leak
+    /// an empty page that SeqScan filters via slot_count == 0. Operating on the
+    /// caller's shard keeps each writer's rollover independent of the others.
+    async fn advance_insert_page(
+        &self,
+        shard: &std::sync::atomic::AtomicU32,
+        observed_page: u32,
+    ) -> Result<u32> {
         use std::sync::atomic::Ordering;
 
-        let current = self.current_insert_page.load(Ordering::Acquire);
+        let current = shard.load(Ordering::Acquire);
         if current != observed_page {
             return Ok(current);
         }
@@ -902,7 +961,7 @@ impl HeapFile {
         if let Some(reuse_page) = self.hint_slots.find_page_with_space(MIN_REUSE_SPACE)
             && reuse_page != observed_page
         {
-            match self.current_insert_page.compare_exchange(
+            match shard.compare_exchange(
                 observed_page,
                 reuse_page,
                 Ordering::AcqRel,
@@ -925,7 +984,7 @@ impl HeapFile {
         }
         self.pool.unpin_page(new_page_id, true);
 
-        match self.current_insert_page.compare_exchange(
+        match shard.compare_exchange(
             observed_page,
             new_page_num,
             Ordering::AcqRel,

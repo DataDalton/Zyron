@@ -55,6 +55,18 @@ pub enum Phase {
     // Accumulates records-per-flush (a count, not nanoseconds): the "ns" field
     // sums batch sizes so ns/count reads as the average commit-batch size.
     FlushBatchRecords,
+
+    // Executor write-path decomposition: each spans both the acquisition wait
+    // and the critical section, so a contended latch shows up as inflated
+    // ns/call that grows with concurrency.
+    ExecUniqueCheck,
+    ExecHeapInsert,
+    ExecIndexInsert,
+
+    // Time a connection spends blocked reading the next client request. Large
+    // here with idle worker CPU means the load is client/harness-bound, not
+    // server-bound.
+    WireReadWait,
 }
 
 #[cfg(feature = "profile")]
@@ -68,7 +80,7 @@ mod imp {
     impl Phase {
         /// Every phase, in discriminant order. COUNT and all indexing derive
         /// from this, so adding a phase to the enum and here cannot drift apart.
-        const ALL: [Phase; 23] = [
+        const ALL: [Phase; 27] = [
             Phase::WireRecvParse,
             Phase::WirePlan,
             Phase::WireExecSetup,
@@ -92,6 +104,10 @@ mod imp {
             Phase::FlushFsync,
             Phase::FlushWake,
             Phase::FlushBatchRecords,
+            Phase::ExecUniqueCheck,
+            Phase::ExecHeapInsert,
+            Phase::ExecIndexInsert,
+            Phase::WireReadWait,
         ];
 
         const COUNT: usize = Phase::ALL.len();
@@ -121,6 +137,10 @@ mod imp {
                 Phase::FlushFsync => "flush.fsync",
                 Phase::FlushWake => "flush.wake",
                 Phase::FlushBatchRecords => "flush.batch_records(avg)",
+                Phase::ExecUniqueCheck => "exec.unique_check",
+                Phase::ExecHeapInsert => "exec.heap_insert",
+                Phase::ExecIndexInsert => "exec.index_insert",
+                Phase::WireReadWait => "wire.read_wait",
             }
         }
     }
