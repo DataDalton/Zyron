@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use zyron_common::{Result, TypeId, ZyronError};
 use zyron_parser::ast::LiteralValue;
-use zyron_planner::binder::{BoundExpr, BoundSelect, BoundStatement, BoundWhen};
+use zyron_planner::binder::{BoundExpr, BoundOrderBy, BoundSelect, BoundStatement, BoundWhen};
 use zyron_planner::optimizer::Optimizer;
 
 use crate::column::ScalarValue;
@@ -55,8 +55,55 @@ pub fn contains_subquery(expr: &BoundExpr) -> bool {
                 || else_result.as_deref().is_some_and(contains_subquery)
         }
         BoundExpr::Function { args, .. } => args.iter().any(contains_subquery),
+        BoundExpr::AggregateFunction { args, .. } => args.iter().any(contains_subquery),
+        BoundExpr::WindowFunction {
+            function,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            contains_subquery(function)
+                || partition_by.iter().any(contains_subquery)
+                || order_by.iter().any(|o| contains_subquery(&o.expr))
+        }
         _ => false,
     }
+}
+
+/// Materializes uncorrelated subqueries in a single expression, returning it
+/// unchanged when it holds none. Used by operator builders that evaluate a
+/// scalar expression (sort key, aggregate argument) the synchronous evaluator
+/// cannot run a subquery for.
+pub async fn materialize_one(expr: BoundExpr, ctx: &Arc<ExecutionContext>) -> Result<BoundExpr> {
+    if contains_subquery(&expr) {
+        materialize_expr(expr, ctx).await
+    } else {
+        Ok(expr)
+    }
+}
+
+/// Materializes uncorrelated subqueries in an optional predicate, leaving None
+/// and subquery-free predicates untouched.
+pub async fn materialize_opt(
+    expr: Option<BoundExpr>,
+    ctx: &Arc<ExecutionContext>,
+) -> Result<Option<BoundExpr>> {
+    match expr {
+        Some(e) => Ok(Some(materialize_one(e, ctx).await?)),
+        None => Ok(None),
+    }
+}
+
+/// Materializes uncorrelated subqueries across a list of expressions in order.
+pub async fn materialize_vec(
+    exprs: Vec<BoundExpr>,
+    ctx: &Arc<ExecutionContext>,
+) -> Result<Vec<BoundExpr>> {
+    let mut out = Vec::with_capacity(exprs.len());
+    for e in exprs {
+        out.push(materialize_one(e, ctx).await?);
+    }
+    Ok(out)
 }
 
 /// Rewrites a bound expression, materializing every uncorrelated subquery it
@@ -188,6 +235,53 @@ pub fn materialize_expr<'a>(
                     args: new_args,
                     return_type,
                     distinct,
+                })
+            }
+            BoundExpr::AggregateFunction {
+                name,
+                args,
+                distinct,
+                return_type,
+                uda,
+            } => {
+                let mut new_args = Vec::with_capacity(args.len());
+                for a in args {
+                    new_args.push(materialize_expr(a, ctx).await?);
+                }
+                Ok(BoundExpr::AggregateFunction {
+                    name,
+                    args: new_args,
+                    distinct,
+                    return_type,
+                    uda,
+                })
+            }
+            BoundExpr::WindowFunction {
+                function,
+                partition_by,
+                order_by,
+                frame,
+                type_id,
+            } => {
+                let function = Box::new(materialize_expr(*function, ctx).await?);
+                let mut new_partition = Vec::with_capacity(partition_by.len());
+                for p in partition_by {
+                    new_partition.push(materialize_expr(p, ctx).await?);
+                }
+                let mut new_order = Vec::with_capacity(order_by.len());
+                for o in order_by {
+                    new_order.push(BoundOrderBy {
+                        expr: materialize_expr(o.expr, ctx).await?,
+                        asc: o.asc,
+                        nulls_first: o.nulls_first,
+                    });
+                }
+                Ok(BoundExpr::WindowFunction {
+                    function,
+                    partition_by: new_partition,
+                    order_by: new_order,
+                    frame,
+                    type_id,
                 })
             }
             other => Ok(other),

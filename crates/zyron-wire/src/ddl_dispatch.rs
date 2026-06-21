@@ -638,6 +638,19 @@ async fn handle_add_expectation(
         table.id.0,
     )?;
 
+    // A data-quality expectation is evaluated per row on the insert path, so its
+    // predicate must reference only the inserted row's columns. Reject a subquery
+    // at definition time rather than letting it persist and fail every insert.
+    if zyron_parser::ast::expr_contains_subquery(&stmt.expr) {
+        return Err(ProtocolError::Database(ZyronError::InvalidParameter {
+            name: "expectation predicate".to_string(),
+            value: format!(
+                "expectation \"{}\" may not contain a subquery; expectations are row-local checks evaluated per row",
+                stmt.name
+            ),
+        }));
+    }
+
     let mut entry = (*table).clone();
     if entry.expectations.iter().any(|e| e.name == stmt.name) {
         return Err(ProtocolError::Database(ZyronError::Internal(format!(

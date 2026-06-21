@@ -2162,6 +2162,85 @@ pub enum Expr {
     },
 }
 
+/// Returns true if the expression tree contains a SQL subquery in any position
+/// (scalar subquery, IN/EXISTS/ANY/ALL subquery). Used to reject subqueries in
+/// contexts where they are not permitted, such as data-quality expectation
+/// predicates, which are evaluated per row and must reference only that row.
+pub fn expr_contains_subquery(expr: &Expr) -> bool {
+    match expr {
+        Expr::Subquery(_)
+        | Expr::InSubquery { .. }
+        | Expr::Exists { .. }
+        | Expr::AnySubquery { .. }
+        | Expr::AllSubquery { .. } => true,
+        Expr::Identifier(_)
+        | Expr::QualifiedIdentifier { .. }
+        | Expr::Literal(_)
+        | Expr::Parameter(_) => false,
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_subquery(left) || expr_contains_subquery(right)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Nested(expr) => expr_contains_subquery(expr),
+        Expr::InList { expr, list, .. } => {
+            expr_contains_subquery(expr) || list.iter().any(expr_contains_subquery)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_contains_subquery(expr)
+                || expr_contains_subquery(low)
+                || expr_contains_subquery(high)
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            expr_contains_subquery(expr) || expr_contains_subquery(pattern)
+        }
+        Expr::Function { args, .. } => args.iter().any(|a| match a {
+            FunctionArg::Unnamed(e) | FunctionArg::Named { value: e, .. } => {
+                expr_contains_subquery(e)
+            }
+            FunctionArg::Wildcard => false,
+        }),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            operand.as_deref().is_some_and(expr_contains_subquery)
+                || conditions.iter().any(|w| {
+                    expr_contains_subquery(&w.condition) || expr_contains_subquery(&w.result)
+                })
+                || else_result.as_deref().is_some_and(expr_contains_subquery)
+        }
+        Expr::WindowFunction {
+            function,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            expr_contains_subquery(function)
+                || partition_by.iter().any(expr_contains_subquery)
+                || order_by.iter().any(|o| expr_contains_subquery(&o.expr))
+        }
+        Expr::ArrayConstructor(items) => items.iter().any(expr_contains_subquery),
+        Expr::ArraySubscript { array, index } => {
+            expr_contains_subquery(array) || expr_contains_subquery(index)
+        }
+        Expr::JsonAccess { left, right, .. }
+        | Expr::JsonContains { left, right, .. }
+        | Expr::JsonExists { left, right, .. } => {
+            expr_contains_subquery(left) || expr_contains_subquery(right)
+        }
+        Expr::VectorDistance { left, right, .. } => {
+            expr_contains_subquery(left) || expr_contains_subquery(right)
+        }
+        Expr::MatchAgainst { query, .. } => expr_contains_subquery(query),
+        Expr::TemporalRef { inner, .. } => expr_contains_subquery(inner),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiteralValue {
     Integer(i64),

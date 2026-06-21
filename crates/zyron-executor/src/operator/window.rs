@@ -15,6 +15,9 @@ use zyron_planner::logical::LogicalColumn;
 use crate::batch::DataBatch;
 use crate::column::{Column, ColumnData, NullBitmap, ScalarValue};
 use crate::expr::evaluate;
+use crate::operator::aggregate::{
+    build_accumulator, coerce_aggregate_scalar, is_supported_aggregate,
+};
 use crate::operator::{ExecutionBatch, Operator, OperatorResult};
 
 /// Per-partition window function evaluator.
@@ -117,6 +120,7 @@ impl WindowOperator {
                 &partition_boundaries,
                 order_by,
                 frame,
+                window_expr.type_id(),
             )?;
 
             // Unsort: scatter the window values back to their original row positions.
@@ -339,6 +343,137 @@ enum WindowOutputKind {
     MatchFirstArg,
 }
 
+/// Computes a built-in aggregate (SUM/COUNT/AVG/MIN/MAX, etc.) as a window
+/// function over each partition, reusing the same accumulators as the aggregate
+/// operator so results never diverge. Produces a column of `out_type` in sorted
+/// order (the caller unsorts it back to input order).
+///
+/// Frame semantics:
+/// - explicit ROWS/RANGE frame: aggregate over each row's resolved frame.
+/// - no frame, no ORDER BY: whole-partition aggregate broadcast to every row.
+/// - no frame, with ORDER BY: running aggregate over RANGE UNBOUNDED PRECEDING
+///   AND CURRENT ROW, so peer rows (equal order keys) share the cumulative value.
+#[allow(clippy::too_many_arguments)]
+fn compute_window_aggregate(
+    name: &str,
+    args_len: usize,
+    arg_col: Option<&Column>,
+    partition_boundaries: &[usize],
+    order_by: &[BoundOrderBy],
+    frame: Option<&WindowFrame>,
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    total_rows: usize,
+    out_type: TypeId,
+) -> Result<Column> {
+    let mut data = ColumnData::with_capacity(out_type, total_rows);
+    let mut nulls = NullBitmap::empty();
+
+    // Aggregate the argument column over the absolute row range [lo, hi).
+    let agg_range = |lo: usize, hi: usize| -> Result<ScalarValue> {
+        let mut acc = build_accumulator(name, args_len);
+        if args_len == 0 {
+            // COUNT(*): every row in the frame counts.
+            acc.add_count(hi - lo);
+        } else if let Some(col) = arg_col {
+            for r in lo..hi {
+                acc.update_typed(col, r);
+            }
+        }
+        coerce_aggregate_scalar(acc.finalize(), out_type)
+    };
+
+    // ORDER BY key columns (evaluated once over the whole sorted batch) drive
+    // peer detection for the running default frame and RANGE frame bounds.
+    let order_cols: Vec<Column> = if order_by.is_empty() {
+        Vec::new()
+    } else {
+        order_by
+            .iter()
+            .map(|ob| evaluate(&ob.expr, batch, schema, &[]))
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    let mut push = |val: ScalarValue, data: &mut ColumnData, nulls: &mut NullBitmap| {
+        nulls.push(val.is_null());
+        data.push_scalar(&val);
+    };
+
+    for window in partition_boundaries.windows(2) {
+        let start = window[0];
+        let end = window[1];
+        if end <= start {
+            continue;
+        }
+        let plen = end - start;
+
+        if let Some(f) = frame {
+            // Explicit frame: aggregate each row's resolved [lo, hi).
+            let order_values = if matches!(f.mode, WindowFrameMode::Range) {
+                let oc = order_cols.first().ok_or_else(|| {
+                    ZyronError::ExecutionError("RANGE frame requires ORDER BY".into())
+                })?;
+                Some(extract_order_values(oc, start, end))
+            } else {
+                None
+            };
+            for pos in 0..plen {
+                let (lo, hi) = match f.mode {
+                    WindowFrameMode::Rows => resolve_row_frame(pos, plen, f),
+                    WindowFrameMode::Range => {
+                        resolve_range_frame(pos, plen, f, order_values.as_ref().unwrap())
+                    }
+                };
+                let val = if hi > lo {
+                    agg_range(start + lo, start + hi)?
+                } else {
+                    ScalarValue::Null
+                };
+                push(val, &mut data, &mut nulls);
+            }
+        } else if order_by.is_empty() {
+            // Whole partition: one fold, broadcast to every row.
+            let val = agg_range(start, end)?;
+            for _ in 0..plen {
+                push(val.clone(), &mut data, &mut nulls);
+            }
+        } else {
+            // Running RANGE UNBOUNDED PRECEDING AND CURRENT ROW: advance one
+            // accumulator across the partition, grouping peers so equal order
+            // keys share the cumulative value.
+            let mut acc = build_accumulator(name, args_len);
+            let mut pos = start;
+            while pos < end {
+                let mut peer_end = pos + 1;
+                while peer_end < end {
+                    let tied = order_cols.iter().all(|c| {
+                        compare_col_rows(c, peer_end - 1, peer_end) == std::cmp::Ordering::Equal
+                    });
+                    if tied {
+                        peer_end += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if args_len == 0 {
+                    acc.add_count(peer_end - pos);
+                } else if let Some(col) = arg_col {
+                    for r in pos..peer_end {
+                        acc.update_typed(col, r);
+                    }
+                }
+                let val = coerce_aggregate_scalar(acc.finalize(), out_type)?;
+                for _ in pos..peer_end {
+                    push(val.clone(), &mut data, &mut nulls);
+                }
+                pos = peer_end;
+            }
+        }
+    }
+
+    Ok(Column::with_nulls(data, nulls, out_type))
+}
+
 fn window_function_kind(name: &str) -> Result<WindowOutputKind> {
     match name {
         "ema"
@@ -362,6 +497,7 @@ fn window_function_kind(name: &str) -> Result<WindowOutputKind> {
 }
 
 /// Evaluates a window function over each partition. Dispatches on function name.
+#[allow(clippy::too_many_arguments)]
 fn evaluate_window_function(
     function: &BoundExpr,
     sorted_columns: &[Column],
@@ -369,6 +505,7 @@ fn evaluate_window_function(
     partition_boundaries: &[usize],
     order_by: &[BoundOrderBy],
     frame: Option<&WindowFrame>,
+    result_type: TypeId,
 ) -> Result<Column> {
     let (name, args) = match function {
         BoundExpr::Function { name, args, .. } => (name.to_lowercase(), args),
@@ -387,6 +524,24 @@ fn evaluate_window_function(
     let mut arg_cols: Vec<Column> = Vec::with_capacity(args.len());
     for a in args {
         arg_cols.push(evaluate(a, &batch, schema, &[])?);
+    }
+
+    // A built-in aggregate used as a window function (SUM/COUNT/AVG/MIN/MAX OVER)
+    // folds the aggregate over each partition's frame. result_type is the
+    // aggregate's declared output type.
+    if is_supported_aggregate(&name) {
+        return compute_window_aggregate(
+            &name,
+            args.len(),
+            arg_cols.first(),
+            partition_boundaries,
+            order_by,
+            frame,
+            &batch,
+            schema,
+            total_rows,
+            result_type,
+        );
     }
 
     // Evaluate the ORDER BY expression (used as the time axis for rate/derivative

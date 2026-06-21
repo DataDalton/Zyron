@@ -24,7 +24,7 @@ use crate::operator::{ExecutionBatch, Operator, OperatorResult};
 // Accumulator trait and built-in implementations
 // ---------------------------------------------------------------------------
 
-trait Accumulator: std::any::Any + Send {
+pub(crate) trait Accumulator: std::any::Any + Send {
     fn update(&mut self, value: &ScalarValue);
 
     /// Typed update directly from a column at a given row, avoiding ScalarValue.
@@ -142,16 +142,46 @@ impl Accumulator for CountStarAccumulator {
     }
 }
 
+/// Sums numeric input. Integer inputs accumulate exactly in i128 so a large
+/// integer sum keeps full precision an f64 accumulator would lose past 2^53;
+/// floating inputs accumulate in f64. finalize yields the natural scalar (an
+/// i128 for integer-only input, an f64 once any floating input is seen);
+/// finalize_groups then coerces it to the aggregate's declared output type.
 struct SumAccumulator {
-    sum: f64,
+    int_sum: i128,
+    float_sum: f64,
+    saw_float: bool,
     has_value: bool,
+}
+
+impl SumAccumulator {
+    fn finalize_inner(&self) -> ScalarValue {
+        if !self.has_value {
+            ScalarValue::Null
+        } else if self.saw_float {
+            ScalarValue::Float64(self.float_sum + self.int_sum as f64)
+        } else {
+            ScalarValue::Int128(self.int_sum)
+        }
+    }
 }
 
 impl Accumulator for SumAccumulator {
     fn update(&mut self, value: &ScalarValue) {
-        if let Some(f) = value.to_f64() {
-            self.sum += f;
-            self.has_value = true;
+        match value {
+            ScalarValue::Float32(_) | ScalarValue::Float64(_) => {
+                if let Some(f) = value.to_f64() {
+                    self.float_sum += f;
+                    self.saw_float = true;
+                    self.has_value = true;
+                }
+            }
+            _ => {
+                if let Some(i) = value.to_i128() {
+                    self.int_sum += i;
+                    self.has_value = true;
+                }
+            }
         }
     }
     fn update_typed(&mut self, col: &Column, row: usize) {
@@ -160,35 +190,37 @@ impl Accumulator for SumAccumulator {
         }
         match &col.data {
             ColumnData::Int64(v) => {
-                self.sum += v[row] as f64;
-                self.has_value = true;
-            }
-            ColumnData::Float64(v) => {
-                self.sum += v[row];
+                self.int_sum += v[row] as i128;
                 self.has_value = true;
             }
             ColumnData::Int32(v) => {
-                self.sum += v[row] as f64;
+                self.int_sum += v[row] as i128;
+                self.has_value = true;
+            }
+            ColumnData::Float64(v) => {
+                self.float_sum += v[row];
+                self.saw_float = true;
                 self.has_value = true;
             }
             ColumnData::Float32(v) => {
-                self.sum += v[row] as f64;
+                self.float_sum += v[row] as f64;
+                self.saw_float = true;
                 self.has_value = true;
             }
+            // Other numeric widths (Int8/16/128, UInt*) route through the scalar
+            // path, which sorts them into the integer or floating accumulator.
             _ => self.update(&col.get_scalar(row)),
         }
     }
     fn finalize(&self) -> ScalarValue {
-        if self.has_value {
-            ScalarValue::Float64(self.sum)
-        } else {
-            ScalarValue::Null
-        }
+        self.finalize_inner()
     }
     fn merge(&mut self, other: &dyn Accumulator) {
         let o = merge_peer::<SumAccumulator>(other);
         if o.has_value {
-            self.sum += o.sum;
+            self.int_sum += o.int_sum;
+            self.float_sum += o.float_sum;
+            self.saw_float |= o.saw_float;
             self.has_value = true;
         }
     }
@@ -544,7 +576,7 @@ fn create_accumulator(agg: &AggregateExpr) -> Box<dyn Accumulator> {
     }
 }
 
-fn build_accumulator(name: &str, args_count: usize) -> Box<dyn Accumulator> {
+pub(crate) fn build_accumulator(name: &str, args_count: usize) -> Box<dyn Accumulator> {
     match name.to_lowercase().as_str() {
         "count" => {
             if args_count == 0 {
@@ -554,7 +586,9 @@ fn build_accumulator(name: &str, args_count: usize) -> Box<dyn Accumulator> {
             }
         }
         "sum" => Box::new(SumAccumulator {
-            sum: 0.0,
+            int_sum: 0,
+            float_sum: 0.0,
+            saw_float: false,
             has_value: false,
         }),
         "avg" => Box::new(AvgAccumulator { sum: 0.0, count: 0 }),
@@ -580,7 +614,7 @@ fn build_accumulator(name: &str, args_count: usize) -> Box<dyn Accumulator> {
 /// MUST list the same set as the matched arms above; the catch-all there
 /// returns a COUNT accumulator, so callers validate up front and error rather
 /// than silently computing a COUNT for an unimplemented aggregate.
-fn is_supported_aggregate(name: &str) -> bool {
+pub(crate) fn is_supported_aggregate(name: &str) -> bool {
     matches!(
         name.to_lowercase().as_str(),
         "count"
@@ -869,6 +903,62 @@ impl HashAggregateOperator {
 /// Builds the output batch from materialized group keys and accumulators.
 /// Shared by the serial and parallel aggregate paths so both emit identical
 /// column layouts.
+/// Coerces an aggregate's finalized scalar to the output column's declared type.
+/// Accumulators finalize to their natural scalar (SUM over integers yields an
+/// i128, for example) while the output column is built from the binder's
+/// declared aggregate return type. This casts a numeric result to that type so
+/// the column data matches its schema; a value that does not fit the target
+/// integer width is an overflow error, not a silent truncation. A value that
+/// already matches, a NULL, or a target with no numeric scalar form (MIN/MAX
+/// over a temporal column) passes through unchanged.
+pub(crate) fn coerce_aggregate_scalar(val: ScalarValue, target: TypeId) -> Result<ScalarValue> {
+    if matches!(val, ScalarValue::Null) || val.type_id() == target {
+        return Ok(val);
+    }
+    let src = val.type_id();
+    let int_val = val
+        .to_i128()
+        .or_else(|| val.to_f64().map(|f| f.round() as i128));
+    let float_val = val.to_f64();
+    let fit = |o: Option<ScalarValue>| {
+        o.ok_or_else(|| {
+            ZyronError::ExecutionError(format!(
+                "aggregate result of type {src:?} does not fit output type {target:?}"
+            ))
+        })
+    };
+    match target {
+        TypeId::Int8 => fit(int_val
+            .and_then(|i| i8::try_from(i).ok())
+            .map(ScalarValue::Int8)),
+        TypeId::Int16 => fit(int_val
+            .and_then(|i| i16::try_from(i).ok())
+            .map(ScalarValue::Int16)),
+        TypeId::Int32 => fit(int_val
+            .and_then(|i| i32::try_from(i).ok())
+            .map(ScalarValue::Int32)),
+        TypeId::Int64 => fit(int_val
+            .and_then(|i| i64::try_from(i).ok())
+            .map(ScalarValue::Int64)),
+        TypeId::Int128 | TypeId::Decimal => fit(int_val.map(ScalarValue::Int128)),
+        TypeId::UInt8 => fit(int_val
+            .and_then(|i| u8::try_from(i).ok())
+            .map(ScalarValue::UInt8)),
+        TypeId::UInt16 => fit(int_val
+            .and_then(|i| u16::try_from(i).ok())
+            .map(ScalarValue::UInt16)),
+        TypeId::UInt32 => fit(int_val
+            .and_then(|i| u32::try_from(i).ok())
+            .map(ScalarValue::UInt32)),
+        TypeId::UInt64 => fit(int_val
+            .and_then(|i| u64::try_from(i).ok())
+            .map(ScalarValue::UInt64)),
+        TypeId::Float32 => fit(float_val.map(|f| ScalarValue::Float32(f as f32))),
+        TypeId::Float64 => fit(float_val.map(ScalarValue::Float64)),
+        _ => Ok(val),
+    }
+}
+
 fn finalize_groups(
     group_key_store: &[Column],
     group_accumulators: &[Vec<Box<dyn Accumulator>>],
@@ -894,8 +984,9 @@ fn finalize_groups(
             data.push_from(&store_col.data, gidx);
         }
         for (i, acc) in group_accumulators[gidx].iter().enumerate() {
-            let val = acc.finalize_checked()?;
-            let (data, nulls, _) = &mut col_builders[num_group_cols + i];
+            let raw = acc.finalize_checked()?;
+            let (data, nulls, ty) = &mut col_builders[num_group_cols + i];
+            let val = coerce_aggregate_scalar(raw, *ty)?;
             nulls.push(val.is_null());
             data.push_scalar(&val);
         }
@@ -1408,8 +1499,10 @@ mod tests {
             count_all.update(&ScalarValue::Int64(v));
         }
         // 3 distinct values {1,2,3}; sum of distinct = 6; non-distinct counts all 5.
+        // SUM accumulates integers exactly, so the natural finalize is an i128;
+        // finalize_groups coerces it to the aggregate's declared output type.
         assert_eq!(count_distinct.finalize(), ScalarValue::Int64(3));
-        assert_eq!(sum_distinct.finalize(), ScalarValue::Float64(6.0));
+        assert_eq!(sum_distinct.finalize(), ScalarValue::Int128(6));
         assert_eq!(count_all.finalize(), ScalarValue::Int64(5));
 
         // NULLs are ignored by distinct too.

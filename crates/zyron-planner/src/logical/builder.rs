@@ -457,6 +457,27 @@ fn extract_aggregates(
     (has_agg, aggregates)
 }
 
+/// Equality for an aggregate's argument list, used to match an aggregate against
+/// the extracted list during dedup and post-aggregate rewrite. The fast path is
+/// structural equality, which covers every subquery-free argument. When that
+/// fails only because an argument contains a subquery (BoundExpr compares
+/// subqueries as always-unequal, a conservative choice for the optimizer's
+/// change-detection), it falls back to a Debug-representation comparison: the
+/// derived Debug reflects every field, including the subquery plan, so it stays
+/// correct as the AST evolves. The compared expressions are clones of the same
+/// bound source, so an identical subquery formats identically. The fallback runs
+/// only for subquery-bearing aggregates, which are rare.
+fn agg_args_equal(a: &[BoundExpr], b: &[BoundExpr]) -> bool {
+    if a == b {
+        return true;
+    }
+    let has_subquery = a
+        .iter()
+        .chain(b.iter())
+        .any(crate::binder::expr_contains_subquery);
+    has_subquery && format!("{a:?}") == format!("{b:?}")
+}
+
 /// Removes repeated aggregate expressions so an aggregate referenced in both
 /// the projection list and HAVING is computed once. Identity matches the key
 /// `rewrite_post_aggregate` uses: function name, args, and DISTINCT flag.
@@ -464,7 +485,9 @@ fn dedup_aggregates(aggregates: &mut Vec<AggregateExpr>) {
     let mut seen: Vec<AggregateExpr> = Vec::new();
     aggregates.retain(|a| {
         let dup = seen.iter().any(|s| {
-            s.function_name == a.function_name && s.args == a.args && s.distinct == a.distinct
+            s.function_name == a.function_name
+                && agg_args_equal(&s.args, &a.args)
+                && s.distinct == a.distinct
         });
         if dup {
             false
@@ -518,14 +541,18 @@ fn rewrite_post_aggregate(
                 return_type: *return_type,
                 uda: None,
             };
-            let agg_idx = aggregates
-                .iter()
-                .position(|a| {
-                    a.function_name == needle.function_name
-                        && a.args == needle.args
-                        && a.distinct == needle.distinct
-                })
-                .expect("aggregate referenced in projection must exist in plan's aggregate list");
+            let Some(agg_idx) = aggregates.iter().position(|a| {
+                a.function_name == needle.function_name
+                    && agg_args_equal(&a.args, &needle.args)
+                    && a.distinct == needle.distinct
+            }) else {
+                // Defensive: every aggregate in the projection was collected into
+                // the list by extract_aggregates, so a match always exists
+                // (agg_args_equal handles subquery-bearing args). If one somehow
+                // is not found, leave the node in place so the executor returns a
+                // clear error rather than the planner panicking.
+                return;
+            };
             let column_idx = group_by.len() + agg_idx;
             *expr = BoundExpr::ColumnRef(crate::binder::ColumnRef {
                 table_idx: AGGREGATE_TABLE_IDX,

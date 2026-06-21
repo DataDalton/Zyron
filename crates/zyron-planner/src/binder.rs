@@ -4050,9 +4050,19 @@ impl<'a> Binder<'a> {
             let expr_ast = zyron_parser::parse_expr(&exp.predicate_sql).map_err(|e| {
                 ZyronError::PlanError(format!("cannot parse expectation '{}': {e}", exp.name))
             })?;
+            let predicate = self.bind_expr(&ctx, &expr_ast).await?;
+            // Defense in depth: ADD EXPECTATION already rejects a subquery at
+            // definition time. Guard here too so no path binds a per-row
+            // expectation that depends on a subquery.
+            if expr_contains_subquery(&predicate) {
+                return Err(ZyronError::PlanError(format!(
+                    "data-quality expectation '{}' may not contain a subquery; it must reference only the row being inserted",
+                    exp.name
+                )));
+            }
             bound.push(BoundExpectation {
                 name: exp.name.clone(),
-                predicate: self.bind_expr(&ctx, &expr_ast).await?,
+                predicate,
                 on_violation: exp.on_violation,
                 quarantine_table_id: exp.quarantine_table_id,
             });

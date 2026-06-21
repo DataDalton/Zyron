@@ -548,14 +548,19 @@ impl PhysicalPlan {
                 ..
             } => {
                 let mut schema = child.output_schema();
+                // Window outputs are appended after the input columns and
+                // addressed by (WINDOW_TABLE_IDX, window index). Using the index
+                // (not a positional column_id) keeps the address stable and free
+                // of collisions with input column ids when projection pushdown
+                // trims the input. Must match rewrite_window_refs in the builder.
                 for (i, expr) in window_exprs.iter().enumerate() {
                     let name = window_names
                         .get(i)
                         .cloned()
                         .unwrap_or_else(|| format!("window{}", i));
                     schema.push(LogicalColumn {
-                        table_idx: None,
-                        column_id: ColumnId((schema.len()) as u16),
+                        table_idx: Some(super::logical::WINDOW_TABLE_IDX),
+                        column_id: ColumnId(i as u16),
                         name,
                         type_id: expr.type_id(),
                         nullable: true,

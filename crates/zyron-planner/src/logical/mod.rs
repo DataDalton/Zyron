@@ -27,6 +27,15 @@ use zyron_parser::ast::{JoinType, SetOpType};
 /// it cannot collide with a base-table or subquery alias.
 pub const AGGREGATE_TABLE_IDX: usize = usize::MAX;
 
+/// Synthetic `table_idx` for window-function output columns, appended to the
+/// Window node's output schema after the input columns. The physical planner
+/// rewrites each `WindowFunction` in the projection to a `ColumnRef` with this
+/// `table_idx` and a `column_id` equal to the window's index, so the executor's
+/// resolver matches it to the appended output column regardless of how many
+/// input columns survived projection pushdown. Distinct from
+/// `AGGREGATE_TABLE_IDX` so the two never alias.
+pub const WINDOW_TABLE_IDX: usize = usize::MAX - 1;
+
 /// A column in the output schema of a logical plan node.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogicalColumn {

@@ -139,7 +139,6 @@ impl<'a> PhysicalPlanner<'a> {
                 // appended window output column.
                 let mut window_exprs: Vec<crate::binder::BoundExpr> = Vec::new();
                 let mut window_names: Vec<String> = Vec::new();
-                let input_schema = child_plan.output_schema();
 
                 let rewritten: Vec<crate::binder::BoundExpr> = expressions
                     .iter()
@@ -149,7 +148,6 @@ impl<'a> PhysicalPlanner<'a> {
                             e,
                             &mut window_exprs,
                             &mut window_names,
-                            input_schema.len(),
                             aliases.get(i).and_then(|a| a.clone()),
                         )
                     })
@@ -1503,7 +1501,6 @@ fn rewrite_window_refs(
     expr: &BoundExpr,
     collected: &mut Vec<BoundExpr>,
     names: &mut Vec<String>,
-    input_schema_len: usize,
     alias_hint: Option<String>,
 ) -> BoundExpr {
     use crate::binder::{BoundExpr as BE, BoundWhen, ColumnRef};
@@ -1515,13 +1512,14 @@ fn rewrite_window_refs(
             collected.push(expr.clone());
             let name = alias_hint.unwrap_or_else(|| format!("window_{}", idx));
             names.push(name);
-            // Window output columns are appended after input_schema_len input columns.
-            // Column indices in the batch are 0..N, but ColumnRef is by (table_idx, column_id).
-            // The executor's expr resolver uses column_id to index into schema. Window
-            // columns in the Window output schema have column_id = (input_schema_len + idx).
+            // Window output columns are appended after the input columns and
+            // addressed by (WINDOW_TABLE_IDX, window index). The sentinel
+            // table_idx cannot collide with an input column's (table_idx,
+            // column_id), which the old positional column_id did once projection
+            // pushdown trimmed the input. Must match Window::output_schema.
             BE::ColumnRef(ColumnRef {
-                table_idx: 0,
-                column_id: ColumnId((input_schema_len + idx) as u16),
+                table_idx: crate::logical::WINDOW_TABLE_IDX,
+                column_id: ColumnId(idx as u16),
                 type_id: *type_id,
                 nullable: true,
                 // Window-output precision finalized in B5.
@@ -1535,21 +1533,9 @@ fn rewrite_window_refs(
             right,
             type_id,
         } => BE::BinaryOp {
-            left: Box::new(rewrite_window_refs(
-                left,
-                collected,
-                names,
-                input_schema_len,
-                None,
-            )),
+            left: Box::new(rewrite_window_refs(left, collected, names, None)),
             op: op.clone(),
-            right: Box::new(rewrite_window_refs(
-                right,
-                collected,
-                names,
-                input_schema_len,
-                None,
-            )),
+            right: Box::new(rewrite_window_refs(right, collected, names, None)),
             type_id: *type_id,
         },
         BE::UnaryOp {
@@ -1558,26 +1544,14 @@ fn rewrite_window_refs(
             type_id,
         } => BE::UnaryOp {
             op: op.clone(),
-            expr: Box::new(rewrite_window_refs(
-                inner,
-                collected,
-                names,
-                input_schema_len,
-                None,
-            )),
+            expr: Box::new(rewrite_window_refs(inner, collected, names, None)),
             type_id: *type_id,
         },
         BE::IsNull {
             expr: inner,
             negated,
         } => BE::IsNull {
-            expr: Box::new(rewrite_window_refs(
-                inner,
-                collected,
-                names,
-                input_schema_len,
-                None,
-            )),
+            expr: Box::new(rewrite_window_refs(inner, collected, names, None)),
             negated: *negated,
         },
         BE::InList {
@@ -1585,16 +1559,10 @@ fn rewrite_window_refs(
             list,
             negated,
         } => BE::InList {
-            expr: Box::new(rewrite_window_refs(
-                inner,
-                collected,
-                names,
-                input_schema_len,
-                None,
-            )),
+            expr: Box::new(rewrite_window_refs(inner, collected, names, None)),
             list: list
                 .iter()
-                .map(|e| rewrite_window_refs(e, collected, names, input_schema_len, None))
+                .map(|e| rewrite_window_refs(e, collected, names, None))
                 .collect(),
             negated: *negated,
         },
@@ -1604,27 +1572,9 @@ fn rewrite_window_refs(
             high,
             negated,
         } => BE::Between {
-            expr: Box::new(rewrite_window_refs(
-                inner,
-                collected,
-                names,
-                input_schema_len,
-                None,
-            )),
-            low: Box::new(rewrite_window_refs(
-                low,
-                collected,
-                names,
-                input_schema_len,
-                None,
-            )),
-            high: Box::new(rewrite_window_refs(
-                high,
-                collected,
-                names,
-                input_schema_len,
-                None,
-            )),
+            expr: Box::new(rewrite_window_refs(inner, collected, names, None)),
+            low: Box::new(rewrite_window_refs(low, collected, names, None)),
+            high: Box::new(rewrite_window_refs(high, collected, names, None)),
             negated: *negated,
         },
         BE::Like {
@@ -1632,20 +1582,8 @@ fn rewrite_window_refs(
             pattern,
             negated,
         } => BE::Like {
-            expr: Box::new(rewrite_window_refs(
-                inner,
-                collected,
-                names,
-                input_schema_len,
-                None,
-            )),
-            pattern: Box::new(rewrite_window_refs(
-                pattern,
-                collected,
-                names,
-                input_schema_len,
-                None,
-            )),
+            expr: Box::new(rewrite_window_refs(inner, collected, names, None)),
+            pattern: Box::new(rewrite_window_refs(pattern, collected, names, None)),
             negated: *negated,
         },
         BE::ILike {
@@ -1653,20 +1591,8 @@ fn rewrite_window_refs(
             pattern,
             negated,
         } => BE::ILike {
-            expr: Box::new(rewrite_window_refs(
-                inner,
-                collected,
-                names,
-                input_schema_len,
-                None,
-            )),
-            pattern: Box::new(rewrite_window_refs(
-                pattern,
-                collected,
-                names,
-                input_schema_len,
-                None,
-            )),
+            expr: Box::new(rewrite_window_refs(inner, collected, names, None)),
+            pattern: Box::new(rewrite_window_refs(pattern, collected, names, None)),
             negated: *negated,
         },
         BE::Function {
@@ -1678,7 +1604,7 @@ fn rewrite_window_refs(
             name: name.clone(),
             args: args
                 .iter()
-                .map(|a| rewrite_window_refs(a, collected, names, input_schema_len, None))
+                .map(|a| rewrite_window_refs(a, collected, names, None))
                 .collect(),
             return_type: *return_type,
             distinct: *distinct,
@@ -1693,7 +1619,7 @@ fn rewrite_window_refs(
             name: name.clone(),
             args: args
                 .iter()
-                .map(|a| rewrite_window_refs(a, collected, names, input_schema_len, None))
+                .map(|a| rewrite_window_refs(a, collected, names, None))
                 .collect(),
             distinct: *distinct,
             return_type: *return_type,
@@ -1703,13 +1629,7 @@ fn rewrite_window_refs(
             expr: inner,
             target_type,
         } => BE::Cast {
-            expr: Box::new(rewrite_window_refs(
-                inner,
-                collected,
-                names,
-                input_schema_len,
-                None,
-            )),
+            expr: Box::new(rewrite_window_refs(inner, collected, names, None)),
             target_type: *target_type,
         },
         BE::Case {
@@ -1718,62 +1638,28 @@ fn rewrite_window_refs(
             else_result,
             type_id,
         } => BE::Case {
-            operand: operand.as_ref().map(|o| {
-                Box::new(rewrite_window_refs(
-                    o,
-                    collected,
-                    names,
-                    input_schema_len,
-                    None,
-                ))
-            }),
+            operand: operand
+                .as_ref()
+                .map(|o| Box::new(rewrite_window_refs(o, collected, names, None))),
             conditions: conditions
                 .iter()
                 .map(|w| BoundWhen {
-                    condition: rewrite_window_refs(
-                        &w.condition,
-                        collected,
-                        names,
-                        input_schema_len,
-                        None,
-                    ),
-                    result: rewrite_window_refs(
-                        &w.result,
-                        collected,
-                        names,
-                        input_schema_len,
-                        None,
-                    ),
+                    condition: rewrite_window_refs(&w.condition, collected, names, None),
+                    result: rewrite_window_refs(&w.result, collected, names, None),
                 })
                 .collect(),
-            else_result: else_result.as_ref().map(|e| {
-                Box::new(rewrite_window_refs(
-                    e,
-                    collected,
-                    names,
-                    input_schema_len,
-                    None,
-                ))
-            }),
+            else_result: else_result
+                .as_ref()
+                .map(|e| Box::new(rewrite_window_refs(e, collected, names, None))),
             type_id: *type_id,
         },
-        BE::Nested(inner) => BE::Nested(Box::new(rewrite_window_refs(
-            inner,
-            collected,
-            names,
-            input_schema_len,
-            None,
-        ))),
+        BE::Nested(inner) => {
+            BE::Nested(Box::new(rewrite_window_refs(inner, collected, names, None)))
+        }
         // Subqueries don't participate in window rewriting at this level.
         BE::Subquery { .. } | BE::Exists { .. } | BE::InSubquery { .. } => expr.clone(),
         BE::TemporalRef { inner, temporal } => BE::TemporalRef {
-            inner: Box::new(rewrite_window_refs(
-                inner,
-                collected,
-                names,
-                input_schema_len,
-                None,
-            )),
+            inner: Box::new(rewrite_window_refs(inner, collected, names, None)),
             temporal: temporal.clone(),
         },
     }

@@ -429,3 +429,247 @@ async fn uncorrelated_in_subquery_still_works() {
     .await;
     assert_eq!(sorted_col(&rows, 0), vec![1, 2, 3]);
 }
+
+#[tokio::test]
+async fn uncorrelated_subquery_in_order_by() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    seed(&server, &mut session).await;
+    // min(y) over t2 = 5. Sort key x+5: id3=10, id4=14, id1=105, id2=205.
+    // col_i64 preserves emitted order, so the result is the sorted id sequence.
+    let rows = exec(
+        &server,
+        &mut session,
+        "SELECT id FROM t1 ORDER BY x + (SELECT min(y) FROM t2)",
+    )
+    .await;
+    assert_eq!(col_i64(&rows, 0), vec![3, 4, 1, 2]);
+}
+
+#[tokio::test]
+async fn sum_over_integer_column_is_exact() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    seed(&server, &mut session).await;
+    // SUM over an INT (Int32) column returns the exact integer total, not 0.
+    // x = 100+200+5+9 = 314 globally; grouped by g: g10=300, g20=5, g30=9.
+    let total = exec(&server, &mut session, "SELECT sum(x) FROM t1").await;
+    assert_eq!(col_i64(&total, 0), vec![314]);
+
+    let grouped = exec(&server, &mut session, "SELECT g, sum(x) FROM t1 GROUP BY g").await;
+    let gs = col_i64(&grouped, 0);
+    let sums = col_i64(&grouped, 1);
+    let mut pairs: Vec<(i64, i64)> = gs.into_iter().zip(sums).collect();
+    pairs.sort_unstable();
+    assert_eq!(pairs, vec![(10, 300), (20, 5), (30, 9)]);
+}
+
+#[tokio::test]
+async fn uncorrelated_subquery_in_aggregate_arg() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    seed(&server, &mut session).await;
+    // min(y) over t2 = 5. sum(x + 5) over t1 = 105+205+10+14 = 334.
+    let rows = exec(
+        &server,
+        &mut session,
+        "SELECT sum(x + (SELECT min(y) FROM t2)) FROM t1",
+    )
+    .await;
+    assert_eq!(col_i64(&rows, 0), vec![334]);
+}
+
+#[tokio::test]
+async fn window_row_number_assigns_correct_ranks() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    seed(&server, &mut session).await;
+    // row_number() over the rows ordered by x ascending: id3(5),id4(9),id1(100),
+    // id2(200) -> 1,2,3,4. The window output column is addressed by a sentinel
+    // table_idx so it does not collide with input columns.
+    let rows = exec(
+        &server,
+        &mut session,
+        "SELECT id, row_number() OVER (ORDER BY x) FROM t1",
+    )
+    .await;
+    let ids = col_i64(&rows, 0);
+    let rns = col_i64(&rows, 1);
+    let mut pairs: Vec<(i64, i64)> = ids.into_iter().zip(rns).collect();
+    pairs.sort_unstable();
+    assert_eq!(pairs, vec![(1, 3), (2, 4), (3, 1), (4, 2)]);
+}
+
+#[tokio::test]
+async fn window_aggregate_whole_partition() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    seed(&server, &mut session).await;
+    // sum(x) OVER () with no ORDER BY aggregates the whole partition and
+    // broadcasts the total (314) to every row.
+    let rows = exec(&server, &mut session, "SELECT sum(x) OVER () FROM t1").await;
+    assert_eq!(col_i64(&rows, 0), vec![314, 314, 314, 314]);
+}
+
+#[tokio::test]
+async fn window_aggregate_partitioned_count() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    seed(&server, &mut session).await;
+    // count(*) OVER (PARTITION BY g): g10 has 2 rows, g20 has 1, g30 has 1.
+    let rows = exec(
+        &server,
+        &mut session,
+        "SELECT g, count(*) OVER (PARTITION BY g) FROM t1",
+    )
+    .await;
+    let gs = col_i64(&rows, 0);
+    let cnts = col_i64(&rows, 1);
+    let mut pairs: Vec<(i64, i64)> = gs.into_iter().zip(cnts).collect();
+    pairs.sort_unstable();
+    assert_eq!(pairs, vec![(10, 2), (10, 2), (20, 1), (30, 1)]);
+}
+
+#[tokio::test]
+async fn window_aggregate_running_sum() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    seed(&server, &mut session).await;
+    // sum(x) OVER (ORDER BY x) is a running total over RANGE UNBOUNDED PRECEDING
+    // AND CURRENT ROW. Ordered x: 5,9,100,200 -> cumulative 5,14,114,314, mapped
+    // to id3,id4,id1,id2.
+    let rows = exec(
+        &server,
+        &mut session,
+        "SELECT id, sum(x) OVER (ORDER BY x) FROM t1",
+    )
+    .await;
+    let ids = col_i64(&rows, 0);
+    let sums = col_i64(&rows, 1);
+    let mut pairs: Vec<(i64, i64)> = ids.into_iter().zip(sums).collect();
+    pairs.sort_unstable();
+    assert_eq!(pairs, vec![(1, 114), (2, 314), (3, 5), (4, 14)]);
+}
+
+#[tokio::test]
+async fn uncorrelated_subquery_in_window_order_by() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    seed(&server, &mut session).await;
+    // The window ORDER BY holds a subquery: order by x + min(y over t2) = x + 5,
+    // which ranks ids by x ascending: id3,id4,id1,id2 -> row numbers 1,2,3,4.
+    let rows = exec(
+        &server,
+        &mut session,
+        "SELECT id, row_number() OVER (ORDER BY x + (SELECT min(y) FROM t2)) FROM t1",
+    )
+    .await;
+    let ids = col_i64(&rows, 0);
+    let rns = col_i64(&rows, 1);
+    let mut pairs: Vec<(i64, i64)> = ids.into_iter().zip(rns).collect();
+    pairs.sort_unstable();
+    assert_eq!(pairs, vec![(1, 3), (2, 4), (3, 1), (4, 2)]);
+}
+
+#[tokio::test]
+async fn uncorrelated_subquery_in_window_partition_by() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    seed(&server, &mut session).await;
+    // PARTITION BY a constant subquery puts every row in one partition; ordering
+    // by x ranks ids by x ascending: id3,id4,id1,id2 -> row numbers 1,2,3,4.
+    let rows = exec(
+        &server,
+        &mut session,
+        "SELECT id, row_number() OVER (PARTITION BY (SELECT 1) ORDER BY x) FROM t1",
+    )
+    .await;
+    let ids = col_i64(&rows, 0);
+    let rns = col_i64(&rows, 1);
+    let mut pairs: Vec<(i64, i64)> = ids.into_iter().zip(rns).collect();
+    pairs.sort_unstable();
+    assert_eq!(pairs, vec![(1, 3), (2, 4), (3, 1), (4, 2)]);
+}
+
+#[tokio::test]
+async fn subquery_in_data_quality_expectation_is_rejected() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    seed(&server, &mut session).await;
+    // A data-quality expectation is a per-row check and must not contain a
+    // subquery; ADD EXPECTATION rejects it at definition time.
+    let result = try_exec(
+        &server,
+        &mut session,
+        "ALTER TABLE t1 ADD EXPECTATION chk EXPECT (x < (SELECT max(y) FROM t2)) ON VIOLATION FAIL",
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "expectation with a subquery should be rejected, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn uncorrelated_subquery_in_group_by_key() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    seed(&server, &mut session).await;
+    // Group by a constant subquery: one group of all four t1 rows.
+    let rows = exec(
+        &server,
+        &mut session,
+        "SELECT count(*) FROM t1 GROUP BY (SELECT 1)",
+    )
+    .await;
+    assert_eq!(col_i64(&rows, 0), vec![4]);
+}
+
+#[tokio::test]
+async fn uncorrelated_subquery_in_update_set() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    seed(&server, &mut session).await;
+    // max(y) over t2 = 70. Every t1.x becomes 70.
+    exec(
+        &server,
+        &mut session,
+        "UPDATE t1 SET x = (SELECT max(y) FROM t2)",
+    )
+    .await;
+    let rows = exec(&server, &mut session, "SELECT x FROM t1").await;
+    assert_eq!(sorted_col(&rows, 0), vec![70, 70, 70, 70]);
+}
+
+#[tokio::test]
+async fn uncorrelated_subquery_in_insert_values() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    seed(&server, &mut session).await;
+    // count(*) over t2 = 4. The inserted row's x is 4.
+    exec(
+        &server,
+        &mut session,
+        "INSERT INTO t1 (id, g, x) VALUES (5, 40, (SELECT count(*) FROM t2))",
+    )
+    .await;
+    let rows = exec(&server, &mut session, "SELECT x FROM t1 WHERE id = 5").await;
+    assert_eq!(col_i64(&rows, 0), vec![4]);
+}
+
+#[tokio::test]
+async fn uncorrelated_subquery_in_indexed_predicate() {
+    let (server, _schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    seed(&server, &mut session).await;
+    // An index on id lets the planner push id = (subquery) as the index bound.
+    // The result is correct regardless of the scan the planner picks.
+    exec(&server, &mut session, "CREATE INDEX t1_id_idx ON t1 (id)").await;
+    let rows = exec(
+        &server,
+        &mut session,
+        "SELECT id FROM t1 WHERE id = (SELECT min(fk) FROM t2)",
+    )
+    .await;
+    assert_eq!(sorted_col(&rows, 0), vec![1]);
+}

@@ -226,6 +226,12 @@ fn build_operator_tree(
                 as_of,
                 ..
             } => {
+                // Fold any uncorrelated subquery in the index bound or the
+                // residual predicate to a constant before the synchronous
+                // evaluator runs in the scan operator.
+                let predicate = crate::subquery::materialize_one(predicate, ctx).await?;
+                let remaining_predicate =
+                    crate::subquery::materialize_opt(remaining_predicate, ctx).await?;
                 // A per-query `IN BRANCH` index plan carries no branch
                 // resolution in the index node, so run a branch-aware
                 // sequential scan with the full predicate instead. A
@@ -289,6 +295,8 @@ fn build_operator_tree(
                 .await?;
                 let mut br = BuildResult::new(Box::new(op));
                 // Apply remaining predicate as a filter on top of the FTS scan.
+                let remaining_predicate =
+                    crate::subquery::materialize_opt(remaining_predicate, ctx).await?;
                 if let Some(pred) = remaining_predicate {
                     br = BuildResult::new(Box::new(FilterOperator::with_params(
                         br.op,
@@ -322,6 +330,8 @@ fn build_operator_tree(
                 )
                 .await?;
                 let mut br = BuildResult::new(Box::new(op));
+                let remaining_predicate =
+                    crate::subquery::materialize_opt(remaining_predicate, ctx).await?;
                 if let Some(pred) = remaining_predicate {
                     br = BuildResult::new(Box::new(FilterOperator::with_params(
                         br.op,
@@ -351,6 +361,8 @@ fn build_operator_tree(
                 )
                 .await?;
                 let mut br = BuildResult::new(Box::new(op));
+                let remaining_predicate =
+                    crate::subquery::materialize_opt(remaining_predicate, ctx).await?;
                 if let Some(pred) = remaining_predicate {
                     br = BuildResult::new(Box::new(FilterOperator::with_params(
                         br.op,
@@ -371,6 +383,14 @@ fn build_operator_tree(
             } => {
                 use crate::operator::graph_scan::{GraphAlgorithmKind, GraphAlgorithmOperator};
                 use zyron_planner::physical::GraphAlgorithmType;
+
+                // Fold uncorrelated subqueries in algorithm params to constants so
+                // the literal extraction below sees a value, not a subquery node.
+                let mut materialized_params = Vec::with_capacity(params.len());
+                for (n, e) in params {
+                    materialized_params.push((n, crate::subquery::materialize_one(e, ctx).await?));
+                }
+                let params = materialized_params;
 
                 // Extract algorithm-specific parameters from bound expressions.
                 let extract_f64 = |ps: &[(String, zyron_planner::binder::BoundExpr)],
@@ -451,6 +471,14 @@ fn build_operator_tree(
                 ..
             } => {
                 use crate::operator::analytics_table_fn::AnalyticsTableFunctionOperator;
+                // Fold uncorrelated subqueries in the function arguments.
+                let mut materialized_named = Vec::with_capacity(named_args.len());
+                for (n, e) in named_args {
+                    materialized_named.push((n, crate::subquery::materialize_one(e, ctx).await?));
+                }
+                let named_args = materialized_named;
+                let positional_args =
+                    crate::subquery::materialize_vec(positional_args, ctx).await?;
                 let op = AnalyticsTableFunctionOperator::new(
                     Arc::clone(&ctx),
                     function_name,
@@ -624,6 +652,10 @@ fn build_operator_tree(
                 let left_br = build_operator_tree(*left, ctx).await?;
                 let right_br = build_operator_tree(*right, ctx).await?;
                 let child_m = collect_metrics(&[&left_br.metrics, &right_br.metrics]);
+                let left_keys = crate::subquery::materialize_vec(left_keys, ctx).await?;
+                let right_keys = crate::subquery::materialize_vec(right_keys, ctx).await?;
+                let remaining_condition =
+                    crate::subquery::materialize_opt(remaining_condition, ctx).await?;
                 let br = BuildResult::new(Box::new(HashJoinOperator::new(
                     left_br.op,
                     right_br.op,
@@ -650,6 +682,8 @@ fn build_operator_tree(
                 let left_br = build_operator_tree(*left, ctx).await?;
                 let right_br = build_operator_tree(*right, ctx).await?;
                 let child_m = collect_metrics(&[&left_br.metrics, &right_br.metrics]);
+                let left_keys = crate::subquery::materialize_vec(left_keys, ctx).await?;
+                let right_keys = crate::subquery::materialize_vec(right_keys, ctx).await?;
                 let br = BuildResult::new(Box::new(MergeJoinOperator::new(
                     left_br.op,
                     right_br.op,
@@ -670,6 +704,11 @@ fn build_operator_tree(
             } => {
                 let input_schema = child.output_schema();
                 let output_schema = build_aggregate_schema(&group_by, &aggregates);
+
+                // Fold uncorrelated subqueries in the group keys and aggregate
+                // arguments to constants before either aggregation path runs.
+                let group_by = crate::subquery::materialize_vec(group_by, ctx).await?;
+                let aggregates = materialize_aggregate_args(aggregates, ctx).await?;
 
                 // Fuse with a parallel heap scan when the child is a plain scan
                 // large enough for parallelism and every aggregate combines
@@ -711,6 +750,7 @@ fn build_operator_tree(
                         ..
                     } = *child
                     {
+                        let predicate = crate::subquery::materialize_opt(predicate, ctx).await?;
                         let op = ParallelHashAggregateOperator::new(
                             ctx.clone(),
                             table_id,
@@ -762,6 +802,8 @@ fn build_operator_tree(
             } => {
                 let input_schema = child.output_schema();
                 let output_schema = build_aggregate_schema(&group_by, &aggregates);
+                let group_by = crate::subquery::materialize_vec(group_by, ctx).await?;
+                let aggregates = materialize_aggregate_args(aggregates, ctx).await?;
                 let child_br = build_operator_tree(*child, ctx).await?;
                 let child_m = collect_metrics(&[&child_br.metrics]);
                 let br = BuildResult::new(Box::new(SortAggregateOperator::new(
@@ -783,6 +825,16 @@ fn build_operator_tree(
                 let input_schema = child.output_schema();
                 let child_br = build_operator_tree(*child, ctx).await?;
                 let child_m = collect_metrics(&[&child_br.metrics]);
+                // Fold uncorrelated subqueries in sort keys to constants.
+                let mut materialized_order = Vec::with_capacity(order_by.len());
+                for o in order_by {
+                    materialized_order.push(zyron_planner::binder::BoundOrderBy {
+                        expr: crate::subquery::materialize_one(o.expr, ctx).await?,
+                        asc: o.asc,
+                        nulls_first: o.nulls_first,
+                    });
+                }
+                let order_by = materialized_order;
                 let br = BuildResult::new(Box::new(SortOperator::new(
                     child_br.op,
                     order_by,
@@ -831,6 +883,12 @@ fn build_operator_tree(
             }
 
             PhysicalPlan::Values { rows, schema, .. } => {
+                // Fold uncorrelated subqueries in VALUES expressions to constants.
+                let mut materialized_rows = Vec::with_capacity(rows.len());
+                for row in rows {
+                    materialized_rows.push(crate::subquery::materialize_vec(row, ctx).await?);
+                }
+                let rows = materialized_rows;
                 let br = BuildResult::new(Box::new(
                     ValuesOperator::with_params(rows, schema, ctx.params.clone())
                         .with_context(Arc::clone(ctx)),
@@ -849,6 +907,16 @@ fn build_operator_tree(
             } => {
                 let source_br = build_operator_tree(*source, ctx).await?;
                 let child_m = collect_metrics(&[&source_br.metrics]);
+                // Fold uncorrelated subqueries in DEFAULT expressions and CHECK
+                // predicates to constants before the per-row evaluator runs.
+                let mut materialized_defaults = Vec::with_capacity(column_defaults.len());
+                for (cid, e) in column_defaults {
+                    materialized_defaults
+                        .push((cid, crate::subquery::materialize_one(e, ctx).await?));
+                }
+                let column_defaults = materialized_defaults;
+                let check_constraints =
+                    crate::subquery::materialize_vec(check_constraints, ctx).await?;
                 let br = BuildResult::new(Box::new(InsertOperator::new(
                     source_br.op,
                     ctx.clone(),
@@ -884,6 +952,17 @@ fn build_operator_tree(
                 let input_schema = child.output_schema();
                 let child_br = build_scan_with_tuple_ids(*child, ctx).await?;
                 let child_m = collect_metrics(&[&child_br.metrics]);
+                // Fold uncorrelated subqueries in SET values and CHECK predicates.
+                let mut materialized_assignments = Vec::with_capacity(assignments.len());
+                for a in assignments {
+                    materialized_assignments.push(zyron_planner::binder::BoundAssignment {
+                        column_id: a.column_id,
+                        value: crate::subquery::materialize_one(a.value, ctx).await?,
+                    });
+                }
+                let assignments = materialized_assignments;
+                let check_constraints =
+                    crate::subquery::materialize_vec(check_constraints, ctx).await?;
                 let br = BuildResult::new(Box::new(UpdateOperator::new(
                     child_br.op,
                     ctx.clone(),
@@ -905,6 +984,7 @@ fn build_operator_tree(
                 // Parallel scan splits only the main page range and is not
                 // branch-aware; with a branch active, use the sequential scan
                 // which also reads the branch append range.
+                let predicate = crate::subquery::materialize_opt(predicate, ctx).await?;
                 if ctx.active_branch_id.is_some() {
                     let op = SeqScanOperator::new(
                         ctx.clone(),
@@ -942,6 +1022,10 @@ fn build_operator_tree(
                 let left_br = build_operator_tree(*left, ctx).await?;
                 let right_br = build_operator_tree(*right, ctx).await?;
                 let child_m = collect_metrics(&[&left_br.metrics, &right_br.metrics]);
+                let left_keys = crate::subquery::materialize_vec(left_keys, ctx).await?;
+                let right_keys = crate::subquery::materialize_vec(right_keys, ctx).await?;
+                let remaining_condition =
+                    crate::subquery::materialize_opt(remaining_condition, ctx).await?;
                 let br = BuildResult::new(Box::new(ParallelHashJoinOperator::new(
                     left_br.op,
                     right_br.op,
@@ -984,6 +1068,9 @@ fn build_operator_tree(
                 let input_schema = child.output_schema();
                 let child_br = build_operator_tree(*child, ctx).await?;
                 let child_m = collect_metrics(&[&child_br.metrics]);
+                // Fold uncorrelated subqueries inside window function args,
+                // PARTITION BY, and ORDER BY keys to constants.
+                let window_exprs = crate::subquery::materialize_vec(window_exprs, ctx).await?;
                 let op = crate::operator::window::WindowOperator::new(
                     child_br.op,
                     window_exprs,
@@ -994,6 +1081,22 @@ fn build_operator_tree(
         };
         result
     })
+}
+
+/// Folds uncorrelated subqueries in each aggregate's argument list to constants
+/// so the aggregate operator's synchronous evaluator can run them.
+async fn materialize_aggregate_args(
+    aggregates: Vec<zyron_planner::logical::AggregateExpr>,
+    ctx: &Arc<ExecutionContext>,
+) -> Result<Vec<zyron_planner::logical::AggregateExpr>> {
+    let mut out = Vec::with_capacity(aggregates.len());
+    for a in aggregates {
+        out.push(zyron_planner::logical::AggregateExpr {
+            args: crate::subquery::materialize_vec(a.args, ctx).await?,
+            ..a
+        });
+    }
+    Ok(out)
 }
 
 /// Builds the output schema for aggregate operators.
