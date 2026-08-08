@@ -597,6 +597,56 @@ impl HeapFile {
         Ok(marked)
     }
 
+    /// Stamps a single tuple's `xmax` under the page write lock. Used by ROLLBACK
+    /// TO SAVEPOINT to self-delete a row the transaction inserted after the
+    /// savepoint, making it invisible to the still-open transaction (and, after
+    /// commit, to every transaction). Frees no space, leaves index entries in
+    /// place (heap visibility filters them, vacuum reclaims them later), matching
+    /// the MVCC-delete invariant. Returns true if the tuple was stamped.
+    pub async fn set_xmax(&self, tuple_id: TupleId, xmax: u32) -> Result<bool> {
+        self.mutate_tuple_xmax(tuple_id, Some(xmax)).await
+    }
+
+    /// Clears a single tuple's `xmax` back to 0 under the page write lock. Used
+    /// by ROLLBACK TO SAVEPOINT to restore a row the transaction deleted after
+    /// the savepoint. Returns true if the tuple was restored.
+    pub async fn clear_xmax(&self, tuple_id: TupleId) -> Result<bool> {
+        self.mutate_tuple_xmax(tuple_id, None).await
+    }
+
+    /// Shared body for set_xmax/clear_xmax. Pins the page, takes the exclusive
+    /// frame write lock (the same lock mark_deleted_batch takes, so a concurrent
+    /// burst-append cannot be clobbered), and stamps or clears the tuple's xmax.
+    async fn mutate_tuple_xmax(&self, tuple_id: TupleId, xmax: Option<u32>) -> Result<bool> {
+        let page_id = tuple_id.page_id;
+        let frame = match self.pool.fetch_page(page_id) {
+            Some(frame) => frame,
+            None => {
+                let disk_data = match self.disk.read_page(page_id).await {
+                    Ok(d) => d,
+                    Err(ZyronError::IoError(_)) => return Ok(false),
+                    Err(e) => return Err(e),
+                };
+                let (frame, evicted) = self.pool.load_page(page_id, &disk_data)?;
+                if let Some(ev) = evicted {
+                    self.disk.write_page(ev.page_id, &ev.data).await?;
+                }
+                frame
+            }
+        };
+
+        let changed = {
+            let mut guard = frame.write_data();
+            let data: &mut [u8] = &mut guard[..];
+            match xmax {
+                Some(x) => HeapPage::set_tuple_xmax_in_slice(data, SlotId(tuple_id.slot_id), x),
+                None => HeapPage::clear_tuple_xmax_in_slice(data, SlotId(tuple_id.slot_id)),
+            }
+        };
+        self.pool.unpin_page(page_id, changed);
+        Ok(changed)
+    }
+
     /// Updates a tuple in place if the new tuple fits.
     ///
     /// Returns error if the new tuple is larger than the old one.

@@ -12,6 +12,20 @@ use zyron_common::{Result, ZyronError};
 
 use crate::change_feed::ChangeType;
 
+/// Renders a JSON scalar field as its text value. String values pass through
+/// unquoted, numbers and booleans render to their literal text, null and
+/// non-scalar values render to an empty string. Used to extract column values
+/// from JSON change envelopes without losing numeric or boolean content.
+fn json_scalar_text(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Null => String::new(),
+        _ => String::new(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DecoderPlugin
 // ---------------------------------------------------------------------------
@@ -375,16 +389,24 @@ impl LogicalDecoder for DebeziumDecoder {
             .unwrap_or("")
             .to_string();
 
-        let commit_lsn = envelope["source"]["lsn"].as_u64().unwrap_or(0);
-        let ts_ms = envelope["ts_ms"].as_i64().unwrap_or(0);
-        let txn_id_str = envelope["transaction"]["id"].as_str().unwrap_or("0");
-        let txn_id: u32 = txn_id_str.parse().unwrap_or(0);
+        let commit_lsn = envelope["source"]["lsn"].as_u64().ok_or_else(|| {
+            ZyronError::CdcDecoderError("missing or non-integer source.lsn field".into())
+        })?;
+        let ts_ms = envelope["ts_ms"].as_i64().ok_or_else(|| {
+            ZyronError::CdcDecoderError("missing or non-integer ts_ms field".into())
+        })?;
+        let txn_id_str = envelope["transaction"]["id"]
+            .as_str()
+            .ok_or_else(|| ZyronError::CdcDecoderError("missing transaction.id field".into()))?;
+        let txn_id: u32 = txn_id_str.parse().map_err(|_| {
+            ZyronError::CdcDecoderError(format!("transaction.id is not a u32: {txn_id_str}"))
+        })?;
         let schema_version = envelope["source"]["schema_version"].as_u64().unwrap_or(0) as u32;
 
         fn extract_kv(val: &serde_json::Value) -> Option<Vec<(String, String)>> {
             val.as_object().map(|obj| {
                 obj.iter()
-                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                    .map(|(k, v)| (k.clone(), json_scalar_text(v)))
                     .collect()
             })
         }
@@ -509,12 +531,7 @@ impl LogicalDecoder for Wal2JsonDecoder {
                 names
                     .iter()
                     .zip(vals)
-                    .map(|(n, v)| {
-                        (
-                            n.as_str().unwrap_or("").to_string(),
-                            v.as_str().unwrap_or("").to_string(),
-                        )
-                    })
+                    .map(|(n, v)| (n.as_str().unwrap_or("").to_string(), json_scalar_text(v)))
                     .collect::<Vec<_>>()
             })
         });
@@ -524,12 +541,7 @@ impl LogicalDecoder for Wal2JsonDecoder {
                 names
                     .iter()
                     .zip(vals)
-                    .map(|(n, v)| {
-                        (
-                            n.as_str().unwrap_or("").to_string(),
-                            v.as_str().unwrap_or("").to_string(),
-                        )
-                    })
+                    .map(|(n, v)| (n.as_str().unwrap_or("").to_string(), json_scalar_text(v)))
                     .collect::<Vec<_>>()
             })
         });
@@ -540,9 +552,15 @@ impl LogicalDecoder for Wal2JsonDecoder {
             operation,
             old_values,
             new_values,
-            commit_lsn: wrapper["lsn"].as_u64().unwrap_or(0),
-            commit_timestamp: wrapper["timestamp"].as_i64().unwrap_or(0),
-            txn_id: wrapper["xid"].as_u64().unwrap_or(0) as u32,
+            commit_lsn: wrapper["lsn"].as_u64().ok_or_else(|| {
+                ZyronError::CdcDecoderError("missing or non-integer lsn field".into())
+            })?,
+            commit_timestamp: wrapper["timestamp"].as_i64().ok_or_else(|| {
+                ZyronError::CdcDecoderError("missing or non-integer timestamp field".into())
+            })?,
+            txn_id: wrapper["xid"].as_u64().ok_or_else(|| {
+                ZyronError::CdcDecoderError("missing or non-integer xid field".into())
+            })? as u32,
             is_last_in_txn: false,
             schema_version: 0,
         })
@@ -557,24 +575,328 @@ impl LogicalDecoder for Wal2JsonDecoder {
 // AvroDecoder
 // ---------------------------------------------------------------------------
 
-/// Apache Avro format decoder. Serializes changes as JSON with an Avro-style
-/// schema envelope. Full Avro binary encoding requires a schema registry,
-/// which is deferred to the sink layer.
-pub struct AvroDecoder;
+/// Object Container File magic prefix that begins every Avro OCF stream.
+const AVRO_OCF_MAGIC: &[u8] = b"Obj\x01";
+
+/// Avro record schema for the change envelope. before and after are nullable
+/// maps of string column values matching the DecodedChange old_values and
+/// new_values pairs. Numeric and boolean columns are rendered to text on the
+/// producing side, mirroring json_scalar_text.
+const AVRO_CHANGE_SCHEMA: &str = r#"{
+  "type": "record",
+  "name": "ZyronChange",
+  "namespace": "zyrondb.cdc",
+  "fields": [
+    {"name": "table_name", "type": "string"},
+    {"name": "table_id", "type": "long"},
+    {"name": "op", "type": "string"},
+    {"name": "before", "type": ["null", {"type": "map", "values": "string"}], "default": null},
+    {"name": "after", "type": ["null", {"type": "map", "values": "string"}], "default": null},
+    {"name": "commit_lsn", "type": "long"},
+    {"name": "commit_timestamp", "type": "long"},
+    {"name": "txn_id", "type": "long"},
+    {"name": "is_last_in_txn", "type": "boolean"},
+    {"name": "schema_version", "type": "long"}
+  ]
+}"#;
+
+/// Renders an Avro scalar value as its text value. Strings pass through, numbers
+/// and booleans render to their literal text, null renders to an empty string.
+/// Mirrors json_scalar_text so Avro and JSON column values are formatted alike.
+fn avro_scalar_text(v: &apache_avro::types::Value) -> String {
+    use apache_avro::types::Value as AvroValue;
+    match v {
+        AvroValue::String(s) => s.clone(),
+        AvroValue::Boolean(b) => b.to_string(),
+        AvroValue::Int(n) => n.to_string(),
+        AvroValue::Long(n) => n.to_string(),
+        AvroValue::Float(n) => n.to_string(),
+        AvroValue::Double(n) => n.to_string(),
+        AvroValue::Null => String::new(),
+        AvroValue::Union(_, inner) => avro_scalar_text(inner),
+        _ => String::new(),
+    }
+}
+
+/// Maps a ChangeType to its single-letter op code shared with the Debezium envelope.
+fn avro_op_code(change_type: &ChangeType) -> &'static str {
+    match change_type {
+        ChangeType::Insert => "c",
+        ChangeType::UpdatePreimage | ChangeType::UpdatePostimage => "u",
+        ChangeType::Delete => "d",
+        ChangeType::SchemaChange => "s",
+        ChangeType::Truncate => "t",
+    }
+}
+
+/// Maps an op code back to its ChangeType.
+fn avro_op_from_code(op: &str) -> Result<ChangeType> {
+    match op {
+        "c" => Ok(ChangeType::Insert),
+        "u" => Ok(ChangeType::UpdatePostimage),
+        "d" => Ok(ChangeType::Delete),
+        "s" => Ok(ChangeType::SchemaChange),
+        "t" => Ok(ChangeType::Truncate),
+        _ => Err(ZyronError::CdcDecoderError(format!(
+            "unknown avro op: {op}"
+        ))),
+    }
+}
+
+/// Apache Avro format decoder backed by real binary Avro. serialize emits an
+/// Object Container File with the writer schema embedded. deserialize accepts
+/// either an OCF stream (schema read from the container) or a raw single Avro
+/// datum, which requires writer_schema to be configured.
+pub struct AvroDecoder {
+    /// Writer schema used to decode raw single Avro datums. None means only OCF
+    /// input is decodable and raw binary is reported as a missing input error.
+    writer_schema: Option<apache_avro::Schema>,
+}
+
+impl AvroDecoder {
+    /// Builds a decoder that handles OCF input and serialization. Raw single
+    /// Avro datums are rejected because no writer schema is configured.
+    pub fn new() -> Self {
+        Self {
+            writer_schema: None,
+        }
+    }
+
+    /// Builds a decoder that additionally decodes raw single Avro datums using
+    /// the provided writer schema JSON. The schema string is the Avro JSON
+    /// describing the records the upstream producer emits.
+    pub fn with_schema_str(schema_json: &str) -> Result<Self> {
+        let schema = apache_avro::Schema::parse_str(schema_json)
+            .map_err(|e| ZyronError::CdcDecoderError(format!("invalid avro writer schema: {e}")))?;
+        Ok(Self {
+            writer_schema: Some(schema),
+        })
+    }
+
+    /// Returns the change envelope schema used by serialize and OCF round-trips.
+    fn change_schema() -> Result<apache_avro::Schema> {
+        apache_avro::Schema::parse_str(AVRO_CHANGE_SCHEMA).map_err(|e| {
+            ZyronError::CdcDecoderError(format!("avro change schema parse failed: {e}"))
+        })
+    }
+
+    /// Builds the Avro record value for a change using the change envelope schema.
+    fn change_to_value(change: &DecodedChange) -> apache_avro::types::Value {
+        use apache_avro::types::Value as AvroValue;
+
+        let to_map = |pairs: &Vec<(String, String)>| {
+            let mut map = std::collections::HashMap::with_capacity(pairs.len());
+            for (k, v) in pairs {
+                map.insert(k.clone(), AvroValue::String(v.clone()));
+            }
+            AvroValue::Map(map)
+        };
+
+        // before and after are union ["null", map] so absent values encode as
+        // branch 0 (null) and present values as branch 1 (map)
+        let before = match &change.old_values {
+            Some(pairs) => AvroValue::Union(1, Box::new(to_map(pairs))),
+            None => AvroValue::Union(0, Box::new(AvroValue::Null)),
+        };
+        let after = match &change.new_values {
+            Some(pairs) => AvroValue::Union(1, Box::new(to_map(pairs))),
+            None => AvroValue::Union(0, Box::new(AvroValue::Null)),
+        };
+
+        AvroValue::Record(vec![
+            (
+                "table_name".into(),
+                AvroValue::String(change.table_name.clone()),
+            ),
+            ("table_id".into(), AvroValue::Long(change.table_id as i64)),
+            (
+                "op".into(),
+                AvroValue::String(avro_op_code(&change.operation).into()),
+            ),
+            ("before".into(), before),
+            ("after".into(), after),
+            (
+                "commit_lsn".into(),
+                AvroValue::Long(change.commit_lsn as i64),
+            ),
+            (
+                "commit_timestamp".into(),
+                AvroValue::Long(change.commit_timestamp),
+            ),
+            ("txn_id".into(), AvroValue::Long(change.txn_id as i64)),
+            (
+                "is_last_in_txn".into(),
+                AvroValue::Boolean(change.is_last_in_txn),
+            ),
+            (
+                "schema_version".into(),
+                AvroValue::Long(change.schema_version as i64),
+            ),
+        ])
+    }
+
+    /// Maps a decoded Avro record value to a DecodedChange. Missing required
+    /// fields return a decode error so the caller dead-letters the record.
+    fn value_to_change(value: apache_avro::types::Value) -> Result<DecodedChange> {
+        use apache_avro::types::Value as AvroValue;
+
+        let fields = match value {
+            AvroValue::Record(fields) => fields,
+            AvroValue::Union(_, inner) => match *inner {
+                AvroValue::Record(fields) => fields,
+                _ => {
+                    return Err(ZyronError::CdcDecoderError(
+                        "avro record expected, found non-record union branch".into(),
+                    ));
+                }
+            },
+            _ => {
+                return Err(ZyronError::CdcDecoderError(
+                    "avro record expected at top level".into(),
+                ));
+            }
+        };
+
+        let find = |name: &str| fields.iter().find(|(k, _)| k == name).map(|(_, v)| v);
+        let missing = |name: &str| {
+            ZyronError::CdcDecoderError(format!("avro missing required field: {name}"))
+        };
+
+        let unwrap_union = |v: &AvroValue| -> AvroValue {
+            match v {
+                AvroValue::Union(_, inner) => (**inner).clone(),
+                other => other.clone(),
+            }
+        };
+
+        let table_name = match find("table_name").map(unwrap_union) {
+            Some(AvroValue::String(s)) => s,
+            _ => return Err(missing("table_name")),
+        };
+
+        let table_id = match find("table_id").map(unwrap_union) {
+            Some(AvroValue::Long(n)) => n as u32,
+            Some(AvroValue::Int(n)) => n as u32,
+            _ => return Err(missing("table_id")),
+        };
+
+        let op = match find("op").map(unwrap_union) {
+            Some(AvroValue::String(s)) => s,
+            _ => return Err(missing("op")),
+        };
+        let operation = avro_op_from_code(&op)?;
+
+        let extract_map = |v: Option<&AvroValue>| -> Option<Vec<(String, String)>> {
+            let unwrapped = v.map(unwrap_union)?;
+            match unwrapped {
+                AvroValue::Map(map) => {
+                    let mut pairs: Vec<(String, String)> = map
+                        .iter()
+                        .map(|(k, val)| (k.clone(), avro_scalar_text(val)))
+                        .collect();
+                    // map iteration order is unspecified, sort for deterministic output
+                    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+                    Some(pairs)
+                }
+                AvroValue::Null => None,
+                _ => None,
+            }
+        };
+        let old_values = extract_map(find("before"));
+        let new_values = extract_map(find("after"));
+
+        let commit_lsn = match find("commit_lsn").map(unwrap_union) {
+            Some(AvroValue::Long(n)) => n as u64,
+            Some(AvroValue::Int(n)) => n as u64,
+            _ => return Err(missing("commit_lsn")),
+        };
+
+        let commit_timestamp = match find("commit_timestamp").map(unwrap_union) {
+            Some(AvroValue::Long(n)) => n,
+            Some(AvroValue::Int(n)) => n as i64,
+            _ => return Err(missing("commit_timestamp")),
+        };
+
+        let txn_id = match find("txn_id").map(unwrap_union) {
+            Some(AvroValue::Long(n)) => n as u32,
+            Some(AvroValue::Int(n)) => n as u32,
+            _ => return Err(missing("txn_id")),
+        };
+
+        let is_last_in_txn = match find("is_last_in_txn").map(unwrap_union) {
+            Some(AvroValue::Boolean(b)) => b,
+            None => false,
+            _ => return Err(missing("is_last_in_txn")),
+        };
+
+        let schema_version = match find("schema_version").map(unwrap_union) {
+            Some(AvroValue::Long(n)) => n as u32,
+            Some(AvroValue::Int(n)) => n as u32,
+            None => 0,
+            _ => return Err(missing("schema_version")),
+        };
+
+        Ok(DecodedChange {
+            table_name,
+            table_id,
+            operation,
+            old_values,
+            new_values,
+            commit_lsn,
+            commit_timestamp,
+            txn_id,
+            is_last_in_txn,
+            schema_version,
+        })
+    }
+}
+
+impl Default for AvroDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl LogicalDecoder for AvroDecoder {
     fn serialize(&self, change: &DecodedChange) -> Result<Bytes> {
-        // Avro logical format: JSON with schema metadata.
-        // Full binary Avro encoding is done by the sink (Kafka/S3) using
-        // a schema registry. Here we produce the logical representation.
-        let data = serde_json::to_vec(change)
+        let schema = Self::change_schema()?;
+        let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+        writer
+            .append_value_ref(&Self::change_to_value(change))
             .map_err(|e| ZyronError::CdcDecoderError(format!("avro serialize failed: {e}")))?;
+        let data = writer.into_inner().map_err(|e| {
+            ZyronError::CdcDecoderError(format!("avro serialize flush failed: {e}"))
+        })?;
         Ok(Bytes::from(data))
     }
 
     fn deserialize(&self, data: &[u8]) -> Result<DecodedChange> {
-        serde_json::from_slice(data)
-            .map_err(|e| ZyronError::CdcDecoderError(format!("avro deserialize failed: {e}")))
+        // OCF input carries the writer schema in the container header
+        if data.starts_with(AVRO_OCF_MAGIC) {
+            let reader = apache_avro::Reader::new(data).map_err(|e| {
+                ZyronError::CdcDecoderError(format!("avro ocf reader init failed: {e}"))
+            })?;
+            let mut iter = reader.into_iter();
+            let first = iter.next().ok_or_else(|| {
+                ZyronError::CdcDecoderError("avro ocf contained no records".into())
+            })?;
+            let value = first.map_err(|e| {
+                ZyronError::CdcDecoderError(format!("avro ocf record decode failed: {e}"))
+            })?;
+            return Self::value_to_change(value);
+        }
+
+        // raw single Avro datum requires a configured writer schema
+        let schema = self.writer_schema.as_ref().ok_or_else(|| {
+            ZyronError::CdcDecoderError(
+                "raw avro binary received but no writer schema is configured; supply a schema via CREATE CDC INGEST or send Object Container File input".into(),
+            )
+        })?;
+
+        let mut cursor = std::io::Cursor::new(data);
+        let value = apache_avro::from_avro_datum(schema, &mut cursor, None)
+            .map_err(|e| ZyronError::CdcDecoderError(format!("avro datum decode failed: {e}")))?;
+        Self::value_to_change(value)
     }
 
     fn plugin(&self) -> DecoderPlugin {
@@ -586,7 +908,9 @@ impl LogicalDecoder for AvroDecoder {
 // Factory
 // ---------------------------------------------------------------------------
 
-/// Creates a decoder instance for the given plugin.
+/// Creates a decoder instance for the given plugin. The Avro decoder built here
+/// handles OCF input only; raw single Avro datums require a writer schema, use
+/// create_decoder_with_schema to supply one.
 pub fn create_decoder(plugin: DecoderPlugin) -> Box<dyn LogicalDecoder> {
     match plugin {
         DecoderPlugin::ZyronCdc => Box::new(ZyronCdcDecoder),
@@ -594,7 +918,24 @@ pub fn create_decoder(plugin: DecoderPlugin) -> Box<dyn LogicalDecoder> {
             Box::new(DebeziumDecoder::new("zyrondb".into(), "default".into()))
         }
         DecoderPlugin::Wal2Json => Box::new(Wal2JsonDecoder),
-        DecoderPlugin::Avro => Box::new(AvroDecoder),
+        DecoderPlugin::Avro => Box::new(AvroDecoder::new()),
+    }
+}
+
+/// Creates a decoder instance, threading an optional Avro writer schema so raw
+/// single Avro datums can be decoded. schema_json is the Avro JSON describing
+/// the upstream records. For non-Avro plugins the schema is ignored. Returns a
+/// decode error if an Avro schema is supplied but does not parse.
+pub fn create_decoder_with_schema(
+    plugin: DecoderPlugin,
+    schema_json: Option<&str>,
+) -> Result<Box<dyn LogicalDecoder>> {
+    match plugin {
+        DecoderPlugin::Avro => match schema_json {
+            Some(json) => Ok(Box::new(AvroDecoder::with_schema_str(json)?)),
+            None => Ok(Box::new(AvroDecoder::new())),
+        },
+        other => Ok(create_decoder(other)),
     }
 }
 
@@ -732,13 +1073,93 @@ mod tests {
     }
 
     #[test]
-    fn test_avro_roundtrip() {
-        let decoder = AvroDecoder;
+    fn test_avro_ocf_roundtrip() {
+        let decoder = AvroDecoder::new();
+        let change = sample_update();
+        let bytes = decoder.serialize(&change).unwrap();
+
+        // serialize emits a real Object Container File
+        assert!(bytes.starts_with(b"Obj\x01"));
+
+        let decoded = decoder.deserialize(&bytes).unwrap();
+        assert_eq!(decoded.table_name, "users");
+        assert_eq!(decoded.table_id, 42);
+        assert_eq!(decoded.operation, ChangeType::UpdatePostimage);
+        assert_eq!(decoded.commit_lsn, 12346);
+        assert_eq!(decoded.txn_id, 101);
+        assert_eq!(decoded.schema_version, 1);
+        assert!(decoded.is_last_in_txn);
+
+        let old = decoded.old_values.expect("before present");
+        assert!(old.contains(&("id".to_string(), "1".to_string())));
+        assert!(old.contains(&("name".to_string(), "Alice".to_string())));
+        let new = decoded.new_values.expect("after present");
+        assert!(new.contains(&("name".to_string(), "Bob".to_string())));
+    }
+
+    #[test]
+    fn test_avro_ocf_insert_has_no_before() {
+        let decoder = AvroDecoder::new();
         let change = sample_change();
         let bytes = decoder.serialize(&change).unwrap();
         let decoded = decoder.deserialize(&bytes).unwrap();
+        assert_eq!(decoded.operation, ChangeType::Insert);
+        assert!(decoded.old_values.is_none());
+        assert!(decoded.new_values.is_some());
+    }
+
+    #[test]
+    fn test_avro_raw_datum_with_schema() {
+        // encode a raw single Avro datum against a writer schema, then decode it
+        // through a schema-configured decoder
+        let schema = apache_avro::Schema::parse_str(AVRO_CHANGE_SCHEMA).unwrap();
+        let value = AvroDecoder::change_to_value(&sample_change());
+        let raw = apache_avro::to_avro_datum(&schema, value).unwrap();
+
+        // raw datum has no OCF magic header
+        assert!(!raw.starts_with(b"Obj\x01"));
+
+        let decoder = AvroDecoder::with_schema_str(AVRO_CHANGE_SCHEMA).unwrap();
+        let decoded = decoder.deserialize(&raw).unwrap();
         assert_eq!(decoded.table_name, "users");
         assert_eq!(decoded.commit_lsn, 12345);
+        assert_eq!(decoded.operation, ChangeType::Insert);
+        let new = decoded.new_values.expect("after present");
+        assert!(new.contains(&("id".to_string(), "1".to_string())));
+    }
+
+    #[test]
+    fn test_avro_raw_datum_without_schema_errors() {
+        // a raw Avro datum with no configured writer schema is a missing input
+        // condition, not a stub, and must surface a decode error
+        let schema = apache_avro::Schema::parse_str(AVRO_CHANGE_SCHEMA).unwrap();
+        let value = AvroDecoder::change_to_value(&sample_change());
+        let raw = apache_avro::to_avro_datum(&schema, value).unwrap();
+
+        let decoder = AvroDecoder::new();
+        let err = decoder.deserialize(&raw).unwrap_err();
+        match err {
+            ZyronError::CdcDecoderError(msg) => {
+                assert!(msg.contains("no writer schema is configured"));
+            }
+            other => panic!("expected CdcDecoderError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_create_decoder_with_schema_avro() {
+        let d = create_decoder_with_schema(DecoderPlugin::Avro, Some(AVRO_CHANGE_SCHEMA)).unwrap();
+        assert_eq!(d.plugin(), DecoderPlugin::Avro);
+
+        let d = create_decoder_with_schema(DecoderPlugin::Avro, None).unwrap();
+        assert_eq!(d.plugin(), DecoderPlugin::Avro);
+
+        // non-Avro plugin ignores schema
+        let d = create_decoder_with_schema(DecoderPlugin::Wal2Json, None).unwrap();
+        assert_eq!(d.plugin(), DecoderPlugin::Wal2Json);
+
+        // an unparseable Avro schema surfaces an error
+        assert!(create_decoder_with_schema(DecoderPlugin::Avro, Some("not json")).is_err());
     }
 
     #[test]

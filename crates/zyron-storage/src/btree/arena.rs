@@ -3,6 +3,12 @@
 use super::constants::ARENA_NODE_SIZE;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// The version word is the first 8 bytes of every node header (both
+/// ArenaInternalNodeHeader and ArenaLeafNodeHeader start with `version: u64`).
+/// even = stable, odd = a writer is mid-update. Readers use it as a seqlock
+/// to validate that a node was not mutated during their read.
+const VERSION_OFFSET: usize = 0;
+
 /// Internal node header layout.
 /// +------------------+ 0
 /// | version: u64     | 8  (for optimistic locking)
@@ -109,6 +115,18 @@ impl BTreeArena {
         unsafe {
             let ptr = self.node_ptr(offset) as *const ArenaLeafNodeHeader;
             *ptr
+        }
+    }
+
+    /// Reads a node's seqlock version word with Acquire ordering. The version
+    /// is the first 8 bytes of every node header. A reader loads it before and
+    /// after copying the node, retrying when it is odd (writer mid-update) or
+    /// changed between the two loads (the node was mutated during the read).
+    #[inline(always)]
+    pub fn read_version_acquire(&self, offset: u64) -> u64 {
+        unsafe {
+            let ptr = self.node_ptr(offset).add(VERSION_OFFSET) as *const AtomicU64;
+            (*ptr).load(Ordering::Acquire)
         }
     }
 }

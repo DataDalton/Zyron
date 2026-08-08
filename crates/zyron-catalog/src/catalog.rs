@@ -14,7 +14,9 @@ use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use zyron_common::{Result, ZyronError};
-use zyron_parser::ast::{ColumnConstraint, ColumnDef, DataType, TableConstraint};
+use zyron_parser::ast::{
+    ColumnConstraint, ColumnDef, DataType, TableConstraint, TableConstraintKind,
+};
 use zyron_wal::RecoveryManager;
 use zyron_wal::record::{LogRecordType, Lsn};
 use zyron_wal::writer::WalWriter;
@@ -159,6 +161,10 @@ pub struct Catalog {
     /// Named version tags keyed by name (unique) and by id (for drop).
     version_tags_by_name: RwLock<HashMap<String, Arc<crate::schema::VersionTagEntry>>>,
     version_tags_by_id: RwLock<HashMap<u32, Arc<crate::schema::VersionTagEntry>>>,
+    /// Serializes compliance-log appends so the tamper-evident hash chain is
+    /// linear. The load-compute-store sequence runs under this lock so two
+    /// concurrent appends cannot read the same tail and fork the chain.
+    compliance_append_lock: tokio::sync::Mutex<()>,
 }
 
 impl Catalog {
@@ -198,6 +204,7 @@ impl Catalog {
             event_handlers_by_id: RwLock::new(HashMap::new()),
             version_tags_by_name: RwLock::new(HashMap::new()),
             version_tags_by_id: RwLock::new(HashMap::new()),
+            compliance_append_lock: tokio::sync::Mutex::new(()),
         };
 
         if !catalog.storage.is_bootstrapped().await? {
@@ -286,14 +293,8 @@ impl Catalog {
     /// existing rows; deletes are no-ops when the row is already absent.
     async fn recover_unflushed_ddl(&self) -> Result<()> {
         let wal_dir = self.wal.wal_dir().to_path_buf();
-        let rm = match RecoveryManager::new(&wal_dir) {
-            Ok(rm) => rm,
-            Err(_) => return Ok(()),
-        };
-        let result = match rm.recover() {
-            Ok(r) => r,
-            Err(_) => return Ok(()),
-        };
+        let rm = RecoveryManager::new(&wal_dir)?;
+        let result = rm.recover()?;
         if result.redo_records.is_empty() {
             return Ok(());
         }
@@ -737,6 +738,73 @@ impl Catalog {
             }
         }
 
+        // Records carrying a recognized ddl_type but a payload that fails to
+        // decode are real catalog writes that recovery cannot apply. Skipping
+        // them would silently drop a committed object, so a known ddl_type
+        // whose entry does not decode fails recovery.
+        fn known_ddl_type(ddl_type: u8) -> bool {
+            matches!(
+                ddl_type,
+                DDL_CREATE_DATABASE
+                    | DDL_DROP_DATABASE
+                    | DDL_CREATE_SCHEMA
+                    | DDL_DROP_SCHEMA
+                    | DDL_CREATE_TABLE
+                    | DDL_DROP_TABLE
+                    | DDL_CREATE_INDEX
+                    | DDL_DROP_INDEX
+                    | DDL_CREATE_STREAMING_JOB
+                    | DDL_ALTER_STREAMING_JOB
+                    | DDL_DROP_STREAMING_JOB
+                    | DDL_CREATE_EXTERNAL_SOURCE
+                    | DDL_ALTER_EXTERNAL_SOURCE
+                    | DDL_DROP_EXTERNAL_SOURCE
+                    | DDL_CREATE_EXTERNAL_SINK
+                    | DDL_ALTER_EXTERNAL_SINK
+                    | DDL_DROP_EXTERNAL_SINK
+                    | DDL_CREATE_PUBLICATION
+                    | DDL_ALTER_PUBLICATION
+                    | DDL_DROP_PUBLICATION
+                    | DDL_ADD_PUBLICATION_TABLE
+                    | DDL_REMOVE_PUBLICATION_TABLE
+                    | DDL_CREATE_SUBSCRIPTION
+                    | DDL_UPDATE_SUBSCRIPTION
+                    | DDL_DROP_SUBSCRIPTION
+                    | DDL_CREATE_ENDPOINT
+                    | DDL_ALTER_ENDPOINT
+                    | DDL_DROP_ENDPOINT
+                    | DDL_CREATE_SECURITY_MAP
+                    | DDL_DROP_SECURITY_MAP
+                    | DDL_CREATE_SEQUENCE
+                    | DDL_UPDATE_SEQUENCE
+                    | DDL_DROP_SEQUENCE
+                    | DDL_CREATE_VIEW
+                    | DDL_UPDATE_VIEW
+                    | DDL_DROP_VIEW
+                    | DDL_CREATE_MVIEW
+                    | DDL_UPDATE_MVIEW
+                    | DDL_DROP_MVIEW
+                    | DDL_CREATE_FUNCTION
+                    | DDL_DROP_FUNCTION
+                    | DDL_SET_COMMENT
+                    | DDL_DROP_COMMENT
+                    | DDL_CREATE_AGGREGATE
+                    | DDL_DROP_AGGREGATE
+                    | DDL_CREATE_PROCEDURE
+                    | DDL_DROP_PROCEDURE
+                    | DDL_CREATE_SCHEDULE
+                    | DDL_DROP_SCHEDULE
+                    | DDL_CREATE_TRIGGER
+                    | DDL_DROP_TRIGGER
+                    | DDL_CREATE_PIPELINE
+                    | DDL_DROP_PIPELINE
+                    | DDL_CREATE_EVENT_HANDLER
+                    | DDL_DROP_EVENT_HANDLER
+                    | DDL_CREATE_VERSION_TAG
+                    | DDL_DROP_VERSION_TAG
+            )
+        }
+
         let mut latest: HashMap<(u8, u64), zyron_wal::record::LogRecord> = HashMap::new();
         for record in redo
             .into_iter()
@@ -744,8 +812,17 @@ impl Catalog {
         {
             let ddl_type = record.payload[0];
             let entry_bytes = &record.payload[1..];
-            if let Some(key) = entity_key(ddl_type, entry_bytes) {
-                latest.insert(key, record);
+            match entity_key(ddl_type, entry_bytes) {
+                Some(key) => {
+                    latest.insert(key, record);
+                }
+                None if known_ddl_type(ddl_type) => {
+                    return Err(ZyronError::CatalogCorrupted(format!(
+                        "redo record ddl_type {} at lsn {} failed to decode its entry",
+                        ddl_type, record.lsn.0
+                    )));
+                }
+                None => {}
             }
         }
         let mut deduped: Vec<zyron_wal::record::LogRecord> = latest.into_values().collect();
@@ -1833,11 +1910,11 @@ impl Catalog {
         // above preserves order, so each ForeignKey table constraint lines up
         // with its produced entry. The referenced table and columns must exist.
         for (tc, entry) in table_constraints.iter().zip(constraints.iter_mut()) {
-            if let TableConstraint::ForeignKey {
+            if let TableConstraintKind::ForeignKey {
                 ref_table,
                 ref_columns,
                 ..
-            } = tc
+            } = &tc.kind
             {
                 let ref_entry = self
                     .cache
@@ -2006,9 +2083,34 @@ impl Catalog {
             });
         }
 
-        let mut payload = vec![0u8; 4];
-        payload[..4].copy_from_slice(&id.0.to_le_bytes());
-        self.log_ddl(DDL_DROP_TABLE, &payload)?;
+        // Cascade dependent catalog rows before removing the table entry.
+        // Indexes and comments are stored as their own rows, so dropping only
+        // the table entry would orphan them. Expectations live on the table
+        // entry itself and are removed with it. Every removal is logged in one
+        // transaction with a single durable flush, so drop latency is one fsync
+        // regardless of how many indexes and comments the table has.
+        let indexes = self.cache.get_indexes_for_table(id);
+        let comment_ids = self.stale_comment_ids(name);
+
+        let mut ddl_records: Vec<(u8, Vec<u8>)> =
+            Vec::with_capacity(indexes.len() + comment_ids.len() + 1);
+        for idx in &indexes {
+            ddl_records.push((DDL_DROP_INDEX, idx.id.0.to_le_bytes().to_vec()));
+        }
+        for cid in &comment_ids {
+            ddl_records.push((DDL_DROP_COMMENT, cid.to_le_bytes().to_vec()));
+        }
+        ddl_records.push((DDL_DROP_TABLE, id.0.to_le_bytes().to_vec()));
+        self.log_ddl_batch(&ddl_records)?;
+
+        // Apply the storage and cache mutations now that the batch is durable.
+        // Storage deletes are buffered and the WAL is the source of truth, so a
+        // crash here is redone as a unit on recovery.
+        for idx in &indexes {
+            self.storage.delete_index(idx.id).await?;
+            self.cache.invalidate_index(idx.id);
+        }
+        self.purge_table_comments(&comment_ids, name).await?;
         self.storage.delete_table(id).await?;
         self.cache.invalidate_table(id);
         Ok(DropOutcome {
@@ -2017,6 +2119,34 @@ impl Catalog {
             heap_file_id,
             fsm_file_id,
         })
+    }
+
+    /// Collects the ids of table-level and column-level comments attached to a
+    /// table so a cascading drop can log their removal in one batch. Comments
+    /// are keyed by object kind and name (table kind 0, column kind 1), both
+    /// addressed by table name.
+    fn stale_comment_ids(&self, table_name: &str) -> Vec<u32> {
+        self.comments
+            .read()
+            .values()
+            .filter(|c| (c.object_type == 0 || c.object_type == 1) && c.object_name == table_name)
+            .map(|c| c.id)
+            .collect()
+    }
+
+    /// Removes a dropped table's comments from storage and the in-memory map
+    /// after their removal has been logged. Storage deletes are buffered, so no
+    /// per-comment flush happens here.
+    async fn purge_table_comments(&self, ids: &[u32], table_name: &str) -> Result<()> {
+        for id in ids {
+            self.storage.delete_comment(*id).await?;
+        }
+        if !ids.is_empty() {
+            self.comments.write().retain(|_, c| {
+                !((c.object_type == 0 || c.object_type == 1) && c.object_name == table_name)
+            });
+        }
+        Ok(())
     }
 
     /// Restores a soft-dropped table from the recycle bin by clearing its drop
@@ -2064,17 +2194,28 @@ impl Catalog {
             _ => return Ok(None),
         };
 
-        for idx in self.cache.get_indexes_for_table(id) {
-            let mut p = vec![0u8; 4];
-            p[..4].copy_from_slice(&idx.id.0.to_le_bytes());
-            self.log_ddl(DDL_DROP_INDEX, &p)?;
+        // Log the table and its dependent index/comment removals in one
+        // transaction with a single durable flush, then apply the buffered
+        // storage and cache mutations.
+        let indexes = self.cache.get_indexes_for_table(id);
+        let comment_ids = self.stale_comment_ids(&entry.name);
+
+        let mut ddl_records: Vec<(u8, Vec<u8>)> =
+            Vec::with_capacity(indexes.len() + comment_ids.len() + 1);
+        for idx in &indexes {
+            ddl_records.push((DDL_DROP_INDEX, idx.id.0.to_le_bytes().to_vec()));
+        }
+        for cid in &comment_ids {
+            ddl_records.push((DDL_DROP_COMMENT, cid.to_le_bytes().to_vec()));
+        }
+        ddl_records.push((DDL_DROP_TABLE, id.0.to_le_bytes().to_vec()));
+        self.log_ddl_batch(&ddl_records)?;
+
+        for idx in &indexes {
             self.storage.delete_index(idx.id).await?;
             self.cache.invalidate_index(idx.id);
         }
-
-        let mut payload = vec![0u8; 4];
-        payload[..4].copy_from_slice(&id.0.to_le_bytes());
-        self.log_ddl(DDL_DROP_TABLE, &payload)?;
+        self.purge_table_comments(&comment_ids, &entry.name).await?;
         self.storage.delete_table(id).await?;
         self.cache.invalidate_table(id);
         Ok(Some(entry))
@@ -2506,7 +2647,12 @@ impl Catalog {
         }
 
         self.log_ddl(DDL_UPDATE_SEQUENCE, &entry.to_bytes())?;
-        self.storage.update_sequence(&entry).await?;
+        if !self.storage.update_sequence(&entry).await? {
+            return Err(ZyronError::CatalogCorrupted(format!(
+                "sequence '{}' row missing or undecodable on update",
+                entry.name
+            )));
+        }
 
         let live = Arc::new(crate::sequence::LiveSequence::from_entry(&entry));
         self.sequences_by_name
@@ -2539,7 +2685,12 @@ impl Catalog {
         }
         let (entry, slot) = live.plan_refill()?;
         self.log_sequence_reserve(&entry)?;
-        self.storage.update_sequence(&entry).await?;
+        if !self.storage.update_sequence(&entry).await? {
+            return Err(ZyronError::CatalogCorrupted(format!(
+                "sequence id {} row missing or undecodable on refill",
+                entry.id
+            )));
+        }
         live.install_refill(slot)
     }
 
@@ -2569,7 +2720,12 @@ impl Catalog {
         let _gate = live.lock_refill().await;
         let (entry, slot) = live.plan_setval(value, is_called)?;
         self.log_sequence_reserve(&entry)?;
-        self.storage.update_sequence(&entry).await?;
+        if !self.storage.update_sequence(&entry).await? {
+            return Err(ZyronError::CatalogCorrupted(format!(
+                "sequence id {} row missing or undecodable on setval",
+                entry.id
+            )));
+        }
         live.install_window(slot);
         Ok(value)
     }
@@ -2580,7 +2736,7 @@ impl Catalog {
     /// cached plans.
     fn log_sequence_reserve(&self, entry: &SequenceEntry) -> Result<Lsn> {
         let bytes = entry.to_bytes();
-        let txn_id = self.wal.allocate_txn_id();
+        let txn_id = self.wal.allocate_txn_id()?;
         let begin_lsn = self.wal.log_begin(txn_id)?;
         let mut payload = Vec::with_capacity(1 + bytes.len());
         payload.push(DDL_UPDATE_SEQUENCE);
@@ -2609,7 +2765,12 @@ impl Catalog {
             Some(id) if or_replace => {
                 entry.id = id;
                 self.log_ddl(DDL_UPDATE_VIEW, &entry.to_bytes())?;
-                self.storage.update_view(&entry).await?;
+                if !self.storage.update_view(&entry).await? {
+                    return Err(ZyronError::CatalogCorrupted(format!(
+                        "view '{}' row missing or undecodable on replace",
+                        entry.name
+                    )));
+                }
                 let e = Arc::new(entry);
                 self.views_by_name.write().insert(key, Arc::clone(&e));
                 self.views_by_id.write().insert(id, e);
@@ -2711,7 +2872,12 @@ impl Catalog {
         let mut entry = (*existing).clone();
         entry.name = new_name.to_string();
         self.log_ddl(DDL_UPDATE_VIEW, &entry.to_bytes())?;
-        self.storage.update_view(&entry).await?;
+        if !self.storage.update_view(&entry).await? {
+            return Err(ZyronError::CatalogCorrupted(format!(
+                "view '{}' row missing or undecodable on rename",
+                entry.name
+            )));
+        }
 
         let id = entry.id;
         let e = Arc::new(entry);
@@ -4187,7 +4353,7 @@ impl Catalog {
     /// crash-safe end-to-end and lets recover_unflushed_ddl on the next
     /// boot put storage back in sync.
     fn log_ddl(&self, ddl_type: u8, entry_bytes: &[u8]) -> Result<Lsn> {
-        let txn_id = self.wal.allocate_txn_id();
+        let txn_id = self.wal.allocate_txn_id()?;
         let begin_lsn = self.wal.log_begin(txn_id)?;
 
         // Build DDL payload: 1-byte type prefix + entry bytes
@@ -4201,6 +4367,29 @@ impl Catalog {
         // Bump the schema version so any cached PhysicalPlans become stale
         // and the wire layer re-plans on the next reference. AcqRel pairs
         // with the Acquire load in plan-cache lookup.
+        self.schema_version
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(commit_lsn)
+    }
+
+    /// Logs several DDL records under one transaction with a single durable
+    /// flush, instead of one begin/commit/fsync per record. Cascading DDL
+    /// (DROP TABLE removes the table plus each of its indexes and comments)
+    /// uses this so drop latency is one flush regardless of how many dependent
+    /// objects exist, rather than scaling with their count. The records are
+    /// applied in order under one begin/commit and recovery redoes them as a
+    /// unit. Returns the commit LSN.
+    fn log_ddl_batch(&self, records: &[(u8, Vec<u8>)]) -> Result<Lsn> {
+        let txn_id = self.wal.allocate_txn_id()?;
+        let mut chain_lsn = self.wal.log_begin(txn_id)?;
+        for (ddl_type, entry_bytes) in records {
+            let mut payload = Vec::with_capacity(1 + entry_bytes.len());
+            payload.push(*ddl_type);
+            payload.extend_from_slice(entry_bytes);
+            chain_lsn = self.wal.log_insert(txn_id, chain_lsn, &payload)?;
+        }
+        let commit_lsn = self.wal.log_commit(txn_id, chain_lsn)?;
+        self.wal.wait_for_flush(commit_lsn)?;
         self.schema_version
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok(commit_lsn)
@@ -4290,6 +4479,9 @@ impl Catalog {
         &self,
         mut entry: crate::schema::ComplianceLogEntry,
     ) -> Result<()> {
+        // Serialize the read-modify-write so concurrent appends chain off the
+        // same tail in sequence rather than racing and forking the chain.
+        let _guard = self.compliance_append_lock.lock().await;
         let existing = self.storage.load_compliance_log().await?;
         let prev_hash = existing.last().map(|e| e.entry_hash).unwrap_or(0);
         let next_id = existing.last().map(|e| e.event_id + 1).unwrap_or(1);
@@ -4373,9 +4565,12 @@ fn convert_table_constraints(
 ) -> Result<Vec<ConstraintEntry>> {
     let mut result = Vec::with_capacity(constraints.len());
     for tc in constraints {
-        let entry = match tc {
-            TableConstraint::PrimaryKey(col_names) => ConstraintEntry {
-                name: format!("pk_{}", col_names.join("_")),
+        let entry = match &tc.kind {
+            TableConstraintKind::PrimaryKey(col_names) => ConstraintEntry {
+                name: tc
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("pk_{}", col_names.join("_"))),
                 constraint_type: ConstraintType::PrimaryKey,
                 columns: resolve_column_ids(col_names, columns)?,
                 ref_table_id: None,
@@ -4384,8 +4579,11 @@ fn convert_table_constraints(
                 on_delete: ReferentialAction::NoAction,
                 on_update: ReferentialAction::NoAction,
             },
-            TableConstraint::Unique(col_names) => ConstraintEntry {
-                name: format!("uq_{}", col_names.join("_")),
+            TableConstraintKind::Unique(col_names) => ConstraintEntry {
+                name: tc
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("uq_{}", col_names.join("_"))),
                 constraint_type: ConstraintType::Unique,
                 columns: resolve_column_ids(col_names, columns)?,
                 ref_table_id: None,
@@ -4394,8 +4592,8 @@ fn convert_table_constraints(
                 on_delete: ReferentialAction::NoAction,
                 on_update: ReferentialAction::NoAction,
             },
-            TableConstraint::Check(expr) => ConstraintEntry {
-                name: "ck_table".to_string(),
+            TableConstraintKind::Check(expr) => ConstraintEntry {
+                name: tc.name.clone().unwrap_or_else(|| "ck_table".to_string()),
                 constraint_type: ConstraintType::Check,
                 columns: vec![],
                 ref_table_id: None,
@@ -4404,14 +4602,17 @@ fn convert_table_constraints(
                 on_delete: ReferentialAction::NoAction,
                 on_update: ReferentialAction::NoAction,
             },
-            TableConstraint::ForeignKey {
+            TableConstraintKind::ForeignKey {
                 columns: col_names,
                 ref_table: _,
                 ref_columns: _,
                 on_delete,
                 on_update,
             } => ConstraintEntry {
-                name: format!("fk_{}", col_names.join("_")),
+                name: tc
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("fk_{}", col_names.join("_"))),
                 constraint_type: ConstraintType::ForeignKey,
                 columns: resolve_column_ids(col_names, columns)?,
                 ref_table_id: None,
@@ -4532,8 +4733,14 @@ mod tests {
             },
         ];
         let tcs = vec![
-            TableConstraint::PrimaryKey(vec!["a".to_string()]),
-            TableConstraint::Unique(vec!["a".to_string(), "b".to_string()]),
+            TableConstraint {
+                name: None,
+                kind: TableConstraintKind::PrimaryKey(vec!["a".to_string()]),
+            },
+            TableConstraint {
+                name: None,
+                kind: TableConstraintKind::Unique(vec!["a".to_string(), "b".to_string()]),
+            },
         ];
         let result = convert_table_constraints(&tcs, &cols).unwrap();
         assert_eq!(result.len(), 2);

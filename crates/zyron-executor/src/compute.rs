@@ -928,13 +928,30 @@ pub fn cast_scalar(value: &ScalarValue, target: TypeId) -> Result<ScalarValue> {
                 ZyronError::ExecutionError(format!("value {value} out of range for TINYINT"))
             })?,
         )),
-        TypeId::UInt64 | TypeId::UInt32 | TypeId::UInt16 | TypeId::UInt8 => {
+        TypeId::UInt64 => match value {
+            // A full-width u64 above i64::MAX cannot pass through checked_int,
+            // so parse the unsigned text form directly before the i128 path.
+            ScalarValue::Utf8(s) => s
+                .parse::<u64>()
+                .map(ScalarValue::UInt64)
+                .map_err(|_| ZyronError::ExecutionError(format!("cannot cast '{s}' to UInt64"))),
+            ScalarValue::UInt64(v) => Ok(ScalarValue::UInt64(*v)),
+            _ => {
+                let raw = checked_int(value, "unsigned integer")?;
+                if raw < 0 || raw > u64::MAX as i128 {
+                    return Err(ZyronError::ExecutionError(format!(
+                        "value {value} out of range for UInt64"
+                    )));
+                }
+                Ok(ScalarValue::UInt64(raw as u64))
+            }
+        },
+        TypeId::UInt32 | TypeId::UInt16 | TypeId::UInt8 => {
             let raw = checked_int(value, "unsigned integer")?;
             let max: i128 = match target {
                 TypeId::UInt8 => u8::MAX as i128,
                 TypeId::UInt16 => u16::MAX as i128,
-                TypeId::UInt32 => u32::MAX as i128,
-                _ => u64::MAX as i128,
+                _ => u32::MAX as i128,
             };
             if raw < 0 || raw > max {
                 return Err(ZyronError::ExecutionError(format!(
@@ -944,12 +961,72 @@ pub fn cast_scalar(value: &ScalarValue, target: TypeId) -> Result<ScalarValue> {
             Ok(match target {
                 TypeId::UInt8 => ScalarValue::UInt8(raw as u8),
                 TypeId::UInt16 => ScalarValue::UInt16(raw as u16),
-                TypeId::UInt32 => ScalarValue::UInt32(raw as u32),
-                _ => ScalarValue::UInt64(raw as u64),
+                _ => ScalarValue::UInt32(raw as u32),
             })
         }
+        TypeId::Int128 | TypeId::UInt128 => match value {
+            // Parse the exact decimal text form so a 128-bit value above the
+            // i64 range round-trips. Non-text inputs keep widening behavior.
+            ScalarValue::Utf8(s) => s.parse::<i128>().map(ScalarValue::Int128).map_err(|_| {
+                ZyronError::ExecutionError(format!("cannot cast '{s}' to {target:?}"))
+            }),
+            ScalarValue::Int128(v) => Ok(ScalarValue::Int128(*v)),
+            _ => checked_int(value, "128-bit integer").map(ScalarValue::Int128),
+        },
+        TypeId::Binary | TypeId::Bytea => match value {
+            ScalarValue::Binary(b) => Ok(ScalarValue::Binary(b.clone())),
+            ScalarValue::FixedBinary16(b) => Ok(ScalarValue::Binary(b.to_vec())),
+            ScalarValue::Utf8(s) => decode_hex(s)
+                .map(ScalarValue::Binary)
+                .ok_or_else(|| ZyronError::ExecutionError(format!("cannot cast '{s}' to Binary"))),
+            _ => Err(ZyronError::ExecutionError(format!(
+                "cannot cast {value} to Binary"
+            ))),
+        },
+        TypeId::Uuid => match value {
+            ScalarValue::FixedBinary16(b) => Ok(ScalarValue::FixedBinary16(*b)),
+            ScalarValue::Binary(b) if b.len() == 16 => {
+                let mut out = [0u8; 16];
+                out.copy_from_slice(b);
+                Ok(ScalarValue::FixedBinary16(out))
+            }
+            ScalarValue::Utf8(s) => {
+                let bytes = decode_hex(s).filter(|b| b.len() == 16).ok_or_else(|| {
+                    ZyronError::ExecutionError(format!("cannot cast '{s}' to FixedBinary16"))
+                })?;
+                let mut out = [0u8; 16];
+                out.copy_from_slice(&bytes);
+                Ok(ScalarValue::FixedBinary16(out))
+            }
+            _ => Err(ZyronError::ExecutionError(format!(
+                "cannot cast {value} to FixedBinary16"
+            ))),
+        },
         _ => Ok(value.clone()),
     }
+}
+
+/// Decodes a hex string into bytes, ignoring an optional 0x or \x prefix.
+/// Returns None when the input has an odd length or a non-hex digit.
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    let trimmed = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .or_else(|| s.strip_prefix("\\x"))
+        .unwrap_or(s);
+    if trimmed.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = trimmed.as_bytes();
+    let mut out = Vec::with_capacity(trimmed.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char).to_digit(16)?;
+        let lo = (bytes[i + 1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+        i += 2;
+    }
+    Some(out)
 }
 
 /// Coerces an integer-like scalar to an i128 for range-checked narrowing.
@@ -2100,6 +2177,65 @@ fn column_values_equal(data: &ColumnData, a: usize, b: usize) -> bool {
         ColumnData::Binary(v) => v[a] == v[b],
         ColumnData::FixedBinary16(v) => v[a] == v[b],
         ColumnData::Interval(v) => v[a] == v[b],
+    }
+}
+
+/// Compares one value in column a against one value in column b.
+/// The two columns hold the same logical type but live in different batches.
+/// NULL is never equal to anything including another NULL.
+#[inline]
+pub fn cross_column_value_equal(a: &Column, a_idx: usize, b: &Column, b_idx: usize) -> bool {
+    if a.is_null(a_idx) || b.is_null(b_idx) {
+        return false;
+    }
+    cross_column_data_equal(&a.data, a_idx, &b.data, b_idx)
+}
+
+#[inline]
+fn cross_column_data_equal(a: &ColumnData, a_idx: usize, b: &ColumnData, b_idx: usize) -> bool {
+    match (a, b) {
+        (ColumnData::Boolean(x), ColumnData::Boolean(y)) => x[a_idx] == y[b_idx],
+        (ColumnData::Int8(x), ColumnData::Int8(y)) => x[a_idx] == y[b_idx],
+        (ColumnData::Int16(x), ColumnData::Int16(y)) => x[a_idx] == y[b_idx],
+        (ColumnData::Int32(x), ColumnData::Int32(y)) => x[a_idx] == y[b_idx],
+        (ColumnData::Int64(x), ColumnData::Int64(y)) => x[a_idx] == y[b_idx],
+        (ColumnData::Int128(x), ColumnData::Int128(y)) => x[a_idx] == y[b_idx],
+        (ColumnData::UInt8(x), ColumnData::UInt8(y)) => x[a_idx] == y[b_idx],
+        (ColumnData::UInt16(x), ColumnData::UInt16(y)) => x[a_idx] == y[b_idx],
+        (ColumnData::UInt32(x), ColumnData::UInt32(y)) => x[a_idx] == y[b_idx],
+        (ColumnData::UInt64(x), ColumnData::UInt64(y)) => x[a_idx] == y[b_idx],
+        (ColumnData::Float32(x), ColumnData::Float32(y)) => {
+            x[a_idx].to_bits() == y[b_idx].to_bits()
+        }
+        (ColumnData::Float64(x), ColumnData::Float64(y)) => {
+            x[a_idx].to_bits() == y[b_idx].to_bits()
+        }
+        (ColumnData::Utf8(x), ColumnData::Utf8(y)) => x[a_idx] == y[b_idx],
+        (ColumnData::Binary(x), ColumnData::Binary(y)) => x[a_idx] == y[b_idx],
+        (ColumnData::FixedBinary16(x), ColumnData::FixedBinary16(y)) => x[a_idx] == y[b_idx],
+        (ColumnData::Interval(x), ColumnData::Interval(y)) => x[a_idx] == y[b_idx],
+        // Mixed integer widths compare by value so a probe key narrower or wider
+        // than the build key still matches when the numeric value is identical.
+        _ => match (numeric_as_i128(a, a_idx), numeric_as_i128(b, b_idx)) {
+            (Some(x), Some(y)) => x == y,
+            _ => false,
+        },
+    }
+}
+
+#[inline]
+fn numeric_as_i128(data: &ColumnData, idx: usize) -> Option<i128> {
+    match data {
+        ColumnData::Int8(v) => Some(v[idx] as i128),
+        ColumnData::Int16(v) => Some(v[idx] as i128),
+        ColumnData::Int32(v) => Some(v[idx] as i128),
+        ColumnData::Int64(v) => Some(v[idx] as i128),
+        ColumnData::Int128(v) => Some(v[idx]),
+        ColumnData::UInt8(v) => Some(v[idx] as i128),
+        ColumnData::UInt16(v) => Some(v[idx] as i128),
+        ColumnData::UInt32(v) => Some(v[idx] as i128),
+        ColumnData::UInt64(v) => Some(v[idx] as i128),
+        _ => None,
     }
 }
 

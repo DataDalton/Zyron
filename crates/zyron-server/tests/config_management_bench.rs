@@ -29,7 +29,6 @@
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use tempfile::tempdir;
@@ -86,11 +85,6 @@ health_port = 9091
 data_dir = "/var/lib/zyrondb/data"
 page_size = 16384
 buffer_pool_size = "256MB"
-temp_dir = "/tmp/zyrondb"
-
-[buffer]
-pool_size = "1GB"
-eviction_policy = "clock"
 
 [wal]
 segment_size = "32MB"
@@ -150,9 +144,6 @@ max_result_rows = 2000000
         assert_eq!(config.server.port, 5433);
         assert_eq!(config.server.max_connections, 500);
         assert_eq!(config.storage.buffer_pool_size, 256 * 1024 * 1024);
-        assert_eq!(config.storage.temp_dir, Some(PathBuf::from("/tmp/zyrondb")));
-        assert_eq!(config.buffer.pool_size, 1024 * 1024 * 1024);
-        assert_eq!(config.buffer.eviction_policy, "clock");
         assert_eq!(config.wal.segment_size, 32 * 1024 * 1024);
         assert_eq!(config.wal.ring_buffer_capacity, 32 * 1024 * 1024);
         assert_eq!(config.wal.sync_mode, "fsync");
@@ -261,10 +252,10 @@ sync_mode = "invalid"
     config.logging.file_path = None;
     tprintln!("  logging.output='file' without file_path would be rejected: PASS");
 
-    // Invalid eviction policy
+    // Invalid default isolation
     let mut config = ZyronConfig::default();
-    config.buffer.eviction_policy = "random".into();
-    tprintln!("  Invalid eviction_policy 'random' would be rejected: PASS");
+    config.query.default_isolation = "serializable".into();
+    tprintln!("  Invalid default_isolation 'serializable' would be rejected: PASS");
 }
 
 // =============================================================================
@@ -294,7 +285,7 @@ fn test_show_command_latency() {
         let start = Instant::now();
         for _ in 0..iterations {
             let _ = std::hint::black_box(config.get_config_value("server.port"));
-            let _ = std::hint::black_box(config.get_config_value("buffer.eviction_policy"));
+            let _ = std::hint::black_box(config.get_config_value("wal.sync_mode"));
             let _ = std::hint::black_box(config.get_config_value("query.default_isolation"));
             let _ = std::hint::black_box(config.get_config_value("vacuum.dead_tuple_threshold"));
             let _ = std::hint::black_box(config.get_config_value("server_version"));
@@ -321,8 +312,8 @@ fn test_show_command_latency() {
     // Verify correctness
     assert_eq!(config.get_config_value("server.port"), Some("5432".into()));
     assert_eq!(
-        config.get_config_value("buffer.eviction_policy"),
-        Some("clock".into())
+        config.get_config_value("wal.sync_mode"),
+        Some("fsync".into())
     );
     assert_eq!(
         config.get_config_value("query.default_isolation"),
@@ -1020,6 +1011,12 @@ async fn test_wal_stats_counters() {
             .expect("WAL insert failed");
     }
 
+    // log_insert publishes each record wait-free; the committed-records and
+    // committed-bytes counters are advanced by the flush thread's consumer
+    // watermark, not synchronously on publish. Flush to drain the ring so the
+    // watermark covers all published records before reading the counters.
+    wal.flush().expect("WAL flush failed");
+
     let records_written = wal.wal_records_written();
     let bytes_written = wal.wal_bytes_written();
 
@@ -1149,8 +1146,7 @@ fn test_config_introspection_comprehensive() {
         ("server.host", "[::]"),
         ("server.port", "5432"),
         ("server.max_connections", "1000"),
-        ("buffer.pool_size", "134217728"),
-        ("buffer.eviction_policy", "clock"),
+        ("storage.buffer_pool_size", "134217728"),
         ("wal.sync_mode", "fsync"),
         ("checkpoint.max_interval_secs", "600"),
         ("checkpoint.min_interval_secs", "5"),

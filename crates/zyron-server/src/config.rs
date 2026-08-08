@@ -14,7 +14,6 @@ use zyron_common::{Result, ZyronError};
 pub struct ZyronConfig {
     pub server: ServerSection,
     pub storage: StorageSection,
-    pub buffer: BufferSection,
     pub wal: WalSection,
     pub checkpoint: CheckpointSection,
     pub auth: AuthSection,
@@ -30,7 +29,6 @@ impl Default for ZyronConfig {
         Self {
             server: ServerSection::default(),
             storage: StorageSection::default(),
-            buffer: BufferSection::default(),
             wal: WalSection::default(),
             checkpoint: CheckpointSection::default(),
             auth: AuthSection::default(),
@@ -177,16 +175,6 @@ impl ZyronConfig {
                         self.storage.buffer_pool_size = v;
                     }
                 }
-                "temp_dir" => self.storage.temp_dir = Some(PathBuf::from(value)),
-                _ => {}
-            },
-            "buffer" => match key {
-                "pool_size" => {
-                    if let Ok(v) = parse_size(value) {
-                        self.buffer.pool_size = v;
-                    }
-                }
-                "eviction_policy" => self.buffer.eviction_policy = value.into(),
                 _ => {}
             },
             "wal" => match key {
@@ -386,7 +374,7 @@ impl ZyronConfig {
         }
         if let Ok(val) = std::env::var("ZYRON_BUFFER_POOL_SIZE") {
             match parse_size(&val) {
-                Ok(v) => self.buffer.pool_size = v,
+                Ok(v) => self.storage.buffer_pool_size = v,
                 Err(_) => tracing::warn!("ZYRON_BUFFER_POOL_SIZE='{}' is not valid, ignoring", val),
             }
         }
@@ -446,9 +434,6 @@ impl ZyronConfig {
                 self.auth.tls_required = v;
             }
         }
-        if let Ok(val) = std::env::var("ZYRON_STORAGE_TEMP_DIR") {
-            self.storage.temp_dir = Some(PathBuf::from(val));
-        }
     }
 
     /// Validates the config for logical consistency.
@@ -495,19 +480,6 @@ impl ZyronConfig {
                 )));
             }
         }
-        // Buffer section
-        if self.buffer.pool_size == 0 {
-            return Err(ZyronError::Internal("buffer.pool_size cannot be 0".into()));
-        }
-        match self.buffer.eviction_policy.as_str() {
-            "clock" | "lru" => {}
-            other => {
-                return Err(ZyronError::Internal(format!(
-                    "Invalid buffer.eviction_policy '{}', expected 'clock' or 'lru'",
-                    other
-                )));
-            }
-        }
         // Compaction section
         if self.compaction.max_concurrent == 0 {
             return Err(ZyronError::Internal(
@@ -527,10 +499,10 @@ impl ZyronConfig {
         }
         // Query section
         match self.query.default_isolation.as_str() {
-            "snapshot" | "read_committed" | "serializable" => {}
+            "snapshot" | "read_committed" => {}
             other => {
                 return Err(ZyronError::Internal(format!(
-                    "Invalid query.default_isolation '{}', expected 'snapshot', 'read_committed', or 'serializable'",
+                    "Invalid query.default_isolation '{}', expected 'snapshot' or 'read_committed'",
                     other
                 )));
             }
@@ -604,14 +576,6 @@ impl ZyronConfig {
             .unwrap_or_else(|| self.storage.data_dir.join("wal"))
     }
 
-    /// Returns the effective temp directory.
-    pub fn temp_dir(&self) -> PathBuf {
-        self.storage
-            .temp_dir
-            .clone()
-            .unwrap_or_else(|| self.storage.data_dir.join("tmp"))
-    }
-
     /// Looks up a config value by dotted key (e.g. "server.port").
     /// Returns the current value as a string, or None if the key is not recognized.
     pub fn get_config_value(&self, key: &str) -> Option<String> {
@@ -633,10 +597,6 @@ impl ZyronConfig {
             "storage.data_dir" => Some(self.storage.data_dir.display().to_string()),
             "storage.page_size" => Some(self.storage.page_size.to_string()),
             "storage.buffer_pool_size" => Some(self.storage.buffer_pool_size.to_string()),
-            "storage.temp_dir" => Some(self.temp_dir().display().to_string()),
-            // Buffer
-            "buffer.pool_size" => Some(self.buffer.pool_size.to_string()),
-            "buffer.eviction_policy" => Some(self.buffer.eviction_policy.clone()),
             // WAL
             "wal.wal_dir" => Some(self.wal_dir().display().to_string()),
             "wal.segment_size" => Some(self.wal.segment_size.to_string()),
@@ -751,21 +711,6 @@ impl ZyronConfig {
                 "storage.buffer_pool_size".into(),
                 self.storage.buffer_pool_size.to_string(),
                 "Buffer pool size in bytes".into(),
-            ),
-            (
-                "storage.temp_dir".into(),
-                self.temp_dir().display().to_string(),
-                "Temporary file directory".into(),
-            ),
-            (
-                "buffer.pool_size".into(),
-                self.buffer.pool_size.to_string(),
-                "Buffer pool size in bytes".into(),
-            ),
-            (
-                "buffer.eviction_policy".into(),
-                self.buffer.eviction_policy.clone(),
-                "Buffer eviction policy (clock or lru)".into(),
             ),
             (
                 "wal.wal_dir".into(),
@@ -965,8 +910,6 @@ pub struct StorageSection {
     /// Buffer pool size in bytes. Accepts human-readable strings via parse_size.
     #[serde(deserialize_with = "deserialize_size")]
     pub buffer_pool_size: usize,
-    /// Temporary file directory. Falls back to data_dir/tmp when not set.
-    pub temp_dir: Option<PathBuf>,
 }
 
 impl Default for StorageSection {
@@ -975,7 +918,6 @@ impl Default for StorageSection {
             data_dir: PathBuf::from("./data"),
             page_size: 16384,
             buffer_pool_size: 128 * 1024 * 1024, // 128 MB
-            temp_dir: None,
         }
     }
 }
@@ -1034,7 +976,6 @@ impl Default for CheckpointSection {
 #[serde(default)]
 pub struct AuthSection {
     pub method: String,
-    pub password_file: Option<PathBuf>,
     pub password_encryption: String,
     pub balloon_space_cost: Option<usize>,
     pub balloon_time_cost: Option<usize>,
@@ -1064,7 +1005,6 @@ impl Default for AuthSection {
     fn default() -> Self {
         Self {
             method: "trust".into(),
-            password_file: None,
             password_encryption: "balloon-sha-256".into(),
             balloon_space_cost: None,
             balloon_time_cost: None,
@@ -1106,26 +1046,6 @@ impl Default for LoggingSection {
             format: "text".into(),
             output: "stdout".into(),
             file_path: None,
-        }
-    }
-}
-
-/// [buffer] section of the config file.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct BufferSection {
-    /// Buffer pool size in bytes. Accepts human-readable strings like "1GB".
-    #[serde(deserialize_with = "deserialize_size")]
-    pub pool_size: usize,
-    /// Eviction policy: "clock" (default) or "lru".
-    pub eviction_policy: String,
-}
-
-impl Default for BufferSection {
-    fn default() -> Self {
-        Self {
-            pool_size: 128 * 1024 * 1024, // 128 MB
-            eviction_policy: "clock".into(),
         }
     }
 }
@@ -1219,7 +1139,7 @@ impl Default for VacuumSection {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct QuerySection {
-    /// Default transaction isolation level: "snapshot", "read_committed", "serializable".
+    /// Default transaction isolation level: "snapshot" or "read_committed".
     pub default_isolation: String,
     /// Maximum seconds a statement can run before being canceled. 0 = no limit.
     pub statement_timeout_secs: u64,
@@ -1415,8 +1335,6 @@ mod tests {
         assert_eq!(config.logging.output, "stdout");
         assert!(config.logging.file_path.is_none());
         // New sections
-        assert_eq!(config.buffer.pool_size, 128 * 1024 * 1024);
-        assert_eq!(config.buffer.eviction_policy, "clock");
         assert!(config.metrics.enabled);
         assert_eq!(config.metrics.port, 9090);
         assert_eq!(config.metrics.path, "/metrics");
@@ -1430,7 +1348,6 @@ mod tests {
         assert_eq!(config.query.default_isolation, "snapshot");
         assert_eq!(config.query.statement_timeout_secs, 300);
         assert_eq!(config.query.max_result_rows, 1_000_000);
-        assert!(config.storage.temp_dir.is_none());
     }
 
     #[test]
@@ -1456,7 +1373,6 @@ min_interval_secs = 3
 
 [auth]
 method = "scram-sha-256"
-password_file = "/etc/zyrondb/passwords"
 
 [logging]
 level = "debug"
@@ -1555,10 +1471,6 @@ wal_bytes_threshold = 33554432
         assert!(config.validate().is_err());
 
         let mut config = ZyronConfig::default();
-        config.buffer.eviction_policy = "random".into();
-        assert!(config.validate().is_err());
-
-        let mut config = ZyronConfig::default();
         config.compaction.max_concurrent = 0;
         assert!(config.validate().is_err());
 
@@ -1589,10 +1501,6 @@ wal_bytes_threshold = 33554432
     #[test]
     fn test_new_sections_toml() {
         let toml_str = r#"
-[buffer]
-pool_size = "2GB"
-eviction_policy = "lru"
-
 [metrics]
 enabled = false
 port = 8080
@@ -1610,7 +1518,7 @@ interval_secs = 120
 dead_tuple_threshold = 0.3
 
 [query]
-default_isolation = "serializable"
+default_isolation = "read_committed"
 statement_timeout_secs = 60
 max_result_rows = 500000
 
@@ -1624,13 +1532,8 @@ tls_required = true
 [wal]
 ring_buffer_capacity = "32MB"
 sync_mode = "fdatasync"
-
-[storage]
-temp_dir = "/tmp/zyron"
 "#;
         let config: ZyronConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.buffer.pool_size, 2 * 1024 * 1024 * 1024);
-        assert_eq!(config.buffer.eviction_policy, "lru");
         assert!(!config.metrics.enabled);
         assert_eq!(config.metrics.port, 8080);
         assert_eq!(config.metrics.path, "/prom");
@@ -1641,7 +1544,7 @@ temp_dir = "/tmp/zyron"
         assert!(!config.vacuum.enabled);
         assert_eq!(config.vacuum.interval_secs, 120);
         assert!((config.vacuum.dead_tuple_threshold - 0.3).abs() < f64::EPSILON);
-        assert_eq!(config.query.default_isolation, "serializable");
+        assert_eq!(config.query.default_isolation, "read_committed");
         assert_eq!(config.query.statement_timeout_secs, 60);
         assert_eq!(config.query.max_result_rows, 500_000);
         assert_eq!(config.logging.output, "file");
@@ -1652,7 +1555,6 @@ temp_dir = "/tmp/zyron"
         assert!(config.auth.tls_required);
         assert_eq!(config.wal.ring_buffer_capacity, 32 * 1024 * 1024);
         assert_eq!(config.wal.sync_mode, "fdatasync");
-        assert_eq!(config.storage.temp_dir, Some(PathBuf::from("/tmp/zyron")));
     }
 
     #[test]
@@ -1660,8 +1562,8 @@ temp_dir = "/tmp/zyron"
         let config = ZyronConfig::default();
         assert_eq!(config.get_config_value("server.port"), Some("5432".into()));
         assert_eq!(
-            config.get_config_value("buffer.eviction_policy"),
-            Some("clock".into())
+            config.get_config_value("wal.sync_mode"),
+            Some("fsync".into())
         );
         assert_eq!(
             config.get_config_value("vacuum.dead_tuple_threshold"),
@@ -1701,7 +1603,7 @@ temp_dir = "/tmp/zyron"
         // Write an override
         ZyronConfig::write_auto_conf(&dir, "server.port", "9999").unwrap();
         ZyronConfig::write_auto_conf(&dir, "vacuum.enabled", "false").unwrap();
-        ZyronConfig::write_auto_conf(&dir, "query.default_isolation", "serializable").unwrap();
+        ZyronConfig::write_auto_conf(&dir, "query.default_isolation", "read_committed").unwrap();
 
         // Load and apply
         let mut config = ZyronConfig::default();
@@ -1709,7 +1611,7 @@ temp_dir = "/tmp/zyron"
 
         assert_eq!(config.server.port, 9999);
         assert!(!config.vacuum.enabled);
-        assert_eq!(config.query.default_isolation, "serializable");
+        assert_eq!(config.query.default_isolation, "read_committed");
 
         // Clean up
         let _ = std::fs::remove_dir_all(&dir);

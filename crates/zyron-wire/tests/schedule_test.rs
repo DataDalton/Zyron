@@ -118,6 +118,11 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         feature_store: zyron_analytics::featureStore(),
         feature_lineage: zyron_analytics::featureLineageRegistry(),
         model_cache: zyron_analytics::modelCache(),
+        default_isolation: zyron_storage::IsolationLevel::ReadCommitted,
+        statement_timeout: None,
+        max_result_rows: None,
+        balloon_params: None,
+        default_auth_method: zyron_auth::auth_rules::AuthMethod::Trust,
     });
     (state, public_schema, tmp)
 }
@@ -300,7 +305,16 @@ async fn due_schedule_runs_body_and_advances() {
         .get_schedule_by_name("s")
         .expect("schedule s");
     assert_eq!(sched.last_run, Some(FAR_FUTURE));
-    assert_eq!(sched.next_run, Some(FAR_FUTURE + 1_000_000));
+    // next_run advances in whole intervals from the schedule's phase (set from
+    // the wall clock at creation), landing on the first fire strictly after the
+    // sweep time and within one interval of it. The exact instant depends on the
+    // sub-second creation phase, so assert the interval-bounded invariant rather
+    // than an exact value.
+    let next_run = sched.next_run.expect("next_run set");
+    assert!(
+        next_run > FAR_FUTURE && next_run <= FAR_FUTURE + 1_000_000,
+        "next_run {next_run} not within one interval after the sweep time"
+    );
 
     // The body's insert is visible.
     let ids = col_i64(&exec(&server, &mut session, "SELECT id FROM t").await, 0);

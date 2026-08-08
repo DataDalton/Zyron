@@ -359,6 +359,41 @@ impl LogRecord {
         })
     }
 
+    /// Returns true when a structurally valid, checksum-verified record begins
+    /// at `offset`. After a record that does not validate, this distinguishes
+    /// interior corruption (a valid record follows, so committed data sits after
+    /// the bad record and stopping would silently drop it) from a torn tail (the
+    /// bad record is the last write, followed by the unwritten zero-filled
+    /// preallocated region, which holds no valid record). The check validates a
+    /// single record and runs only once, when the scan would otherwise stop, so
+    /// it adds no steady-state cost.
+    fn valid_record_at(data: &[u8], offset: usize) -> bool {
+        let data_len = data.len();
+        if offset + HEADER_SIZE + CHECKSUM_SIZE > data_len {
+            return false;
+        }
+        if LogRecordType::try_from(data[offset + OFF_RECORD_TYPE]).is_err() {
+            return false;
+        }
+        let payload_len = u16::from_le_bytes([
+            data[offset + OFF_PAYLOAD_LEN],
+            data[offset + OFF_PAYLOAD_LEN + 1],
+        ]) as usize;
+        let record_size = HEADER_SIZE + payload_len + CHECKSUM_SIZE;
+        if offset + record_size > data_len {
+            return false;
+        }
+        let checksum_offset = offset + HEADER_SIZE + payload_len;
+        let stored = u32::from_le_bytes([
+            data[checksum_offset],
+            data[checksum_offset + 1],
+            data[checksum_offset + 2],
+            data[checksum_offset + 3],
+        ]);
+        let computed = crate::checksum::wal_checksum(&data[offset..checksum_offset], HEADER_SIZE);
+        stored == computed
+    }
+
     /// Parses all records from a contiguous Bytes buffer with checksum verification.
     /// Uses zero-copy slicing for payload data to avoid per-record allocation.
     /// Pointer-based parsing eliminates bounds checks after initial validation.
@@ -392,6 +427,8 @@ impl LogRecord {
 
             let record_size = HEADER_SIZE + payload_len + CHECKSUM_SIZE;
             if offset + record_size > data_len {
+                // Fewer bytes remain than a full record of the declared length
+                // this is a torn final write at the unwritten tail, stop cleanly
                 break;
             }
 
@@ -408,11 +445,28 @@ impl LogRecord {
             };
             let computed_checksum = crate::checksum::wal_checksum(data_slice, HEADER_SIZE);
             if stored_checksum != computed_checksum {
+                // A full record's worth of bytes is present but the checksum
+                // fails. If a valid record follows, this is interior corruption
+                // that would silently drop committed records after it, so
+                // hard-error. If only the unwritten preallocated tail follows,
+                // this is a torn final write and the scan stops cleanly.
+                if Self::valid_record_at(data.as_ref(), offset + record_size) {
+                    return Err(ZyronError::WalCorrupted {
+                        lsn: u64::from_le(lsn_raw),
+                        reason: format!(
+                            "interior checksum mismatch at offset {} stored {} computed {}",
+                            offset, stored_checksum, computed_checksum
+                        ),
+                    });
+                }
                 break;
             }
 
             let record_type = match LogRecordType::try_from(record_type_byte) {
                 Ok(rt) => rt,
+                // An unrecognized type means the header is not a real record, so
+                // payload_len and record_size are untrustworthy. This is the torn
+                // tail or garbage past the write cursor; stop cleanly.
                 Err(_) => break,
             };
 
@@ -505,9 +559,11 @@ impl LogRecord {
     /// Parses records from a contiguous Bytes buffer, calling f for each valid record.
     ///
     /// Same parsing and checksum logic as parse_all but with no intermediate Vec.
-    /// Each record is handed to the callback immediately after parsing.
+    /// Each record is handed to the callback immediately after parsing. Returns an
+    /// error on interior corruption (a checksum or type failure before the written
+    /// tail) and stops cleanly on a torn final record.
     #[inline]
-    pub fn for_each<F>(data: Bytes, mut f: F)
+    pub fn for_each<F>(data: Bytes, mut f: F) -> Result<()>
     where
         F: FnMut(LogRecord),
     {
@@ -538,6 +594,7 @@ impl LogRecord {
 
             let record_size = HEADER_SIZE + payload_len + CHECKSUM_SIZE;
             if offset + record_size > data_len {
+                // Torn final write at the unwritten tail, stop cleanly
                 break;
             }
 
@@ -553,11 +610,26 @@ impl LogRecord {
             };
             let computed_checksum = crate::checksum::wal_checksum(data_slice, HEADER_SIZE);
             if stored_checksum != computed_checksum {
+                // A valid record after a bad one is interior corruption that
+                // would silently drop committed records, so hard-error. Only the
+                // unwritten preallocated tail after it is a torn final write.
+                if Self::valid_record_at(data.as_ref(), offset + record_size) {
+                    return Err(ZyronError::WalCorrupted {
+                        lsn: u64::from_le(lsn_raw),
+                        reason: format!(
+                            "interior checksum mismatch at offset {} stored {} computed {}",
+                            offset, stored_checksum, computed_checksum
+                        ),
+                    });
+                }
                 break;
             }
 
             let record_type = match LogRecordType::try_from(record_type_byte) {
                 Ok(rt) => rt,
+                // An unrecognized type means the header is not a real record, so
+                // record_size is untrustworthy; this is the torn tail or garbage
+                // past the write cursor. Stop cleanly.
                 Err(_) => break,
             };
 
@@ -579,6 +651,8 @@ impl LogRecord {
 
             offset += record_size;
         }
+
+        Ok(())
     }
 }
 

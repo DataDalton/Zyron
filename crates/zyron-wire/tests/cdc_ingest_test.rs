@@ -124,6 +124,11 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         feature_store: zyron_analytics::featureStore(),
         feature_lineage: zyron_analytics::featureLineageRegistry(),
         model_cache: zyron_analytics::modelCache(),
+        default_isolation: zyron_storage::IsolationLevel::ReadCommitted,
+        statement_timeout: None,
+        max_result_rows: None,
+        balloon_params: None,
+        default_auth_method: zyron_auth::auth_rules::AuthMethod::Trust,
     });
     (state, public_schema, tmp)
 }
@@ -276,6 +281,7 @@ fn config(target: u32, on_conflict: OnConflict, dead_letter: Option<u32>) -> Cdc
         on_conflict,
         dead_letter_table_id: dead_letter,
         decoder: DecoderPlugin::ZyronCdc,
+        avro_writer_schema: None,
         batch_size: 100,
         active: true,
     }

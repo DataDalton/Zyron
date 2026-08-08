@@ -370,10 +370,13 @@ const U64MAP_LOAD_DENOM: usize = 4;
 #[inline(always)]
 unsafe fn group_match_4(keys_ptr: *const u64, target: u64) -> u32 {
     use std::arch::x86_64::*;
-    let group = _mm256_loadu_si256(keys_ptr as *const __m256i);
-    let needle = _mm256_set1_epi64x(target as i64);
-    let cmp = _mm256_cmpeq_epi64(group, needle);
-    _mm256_movemask_pd(_mm256_castsi256_pd(cmp)) as u32
+    // SAFETY: caller guarantees 4 readable u64s at keys_ptr and an AVX2 CPU
+    unsafe {
+        let group = _mm256_loadu_si256(keys_ptr as *const __m256i);
+        let needle = _mm256_set1_epi64x(target as i64);
+        let cmp = _mm256_cmpeq_epi64(group, needle);
+        _mm256_movemask_pd(_mm256_castsi256_pd(cmp)) as u32
+    }
 }
 
 /// AVX-512: compare 8 u64 keys in one instruction.
@@ -381,7 +384,8 @@ unsafe fn group_match_4(keys_ptr: *const u64, target: u64) -> u32 {
 #[target_feature(enable = "avx512f")]
 unsafe fn group_match_8(keys_ptr: *const u64, target: u64) -> u32 {
     use std::arch::x86_64::*;
-    let group = _mm512_loadu_si512(keys_ptr as *const __m512i);
+    // SAFETY: caller guarantees 8 readable u64s at keys_ptr
+    let group = unsafe { _mm512_loadu_si512(keys_ptr as *const __m512i) };
     let needle = _mm512_set1_epi64(target as i64);
     _mm512_cmpeq_epi64_mask(group, needle) as u32
 }
@@ -391,12 +395,15 @@ unsafe fn group_match_8(keys_ptr: *const u64, target: u64) -> u32 {
 #[inline(always)]
 unsafe fn group_match_2(keys_ptr: *const u64, target: u64) -> u32 {
     use std::arch::aarch64::*;
-    let group = vld1q_u64(keys_ptr);
-    let needle = vdupq_n_u64(target);
-    let cmp = vceqq_u64(group, needle);
-    let b0 = if vgetq_lane_u64(cmp, 0) != 0 { 1u32 } else { 0 };
-    let b1 = if vgetq_lane_u64(cmp, 1) != 0 { 2u32 } else { 0 };
-    b0 | b1
+    // SAFETY: caller guarantees 2 readable u64s at keys_ptr
+    unsafe {
+        let group = vld1q_u64(keys_ptr);
+        let needle = vdupq_n_u64(target);
+        let cmp = vceqq_u64(group, needle);
+        let b0 = if vgetq_lane_u64(cmp, 0) != 0 { 1u32 } else { 0 };
+        let b1 = if vgetq_lane_u64(cmp, 1) != 0 { 2u32 } else { 0 };
+        b0 | b1
+    }
 }
 
 /// Function pointer type for SIMD group match. Set once at map creation.
@@ -421,7 +428,8 @@ fn select_group_match_fn() -> GroupMatchFn {
 fn select_group_match_fn() -> GroupMatchFn {
     #[inline(always)]
     unsafe fn scalar_match(keys_ptr: *const u64, target: u64) -> u32 {
-        if *keys_ptr == target { 1 } else { 0 }
+        // SAFETY: caller guarantees 1 readable u64 at keys_ptr
+        if unsafe { *keys_ptr } == target { 1 } else { 0 }
     }
     scalar_match
 }

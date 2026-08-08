@@ -111,18 +111,21 @@ impl BufferFrame {
     }
 
     /// Returns the current pin count.
+    /// Acquire so a reader observing pin_count == 0 also observes the prior
+    /// unpinner's writes, matching the eviction-time read.
     #[inline]
     pub fn pin_count(&self) -> u32 {
-        // Relaxed: only used for statistics and debugging
-        self.pin_count.load(Ordering::Relaxed)
+        self.pin_count.load(Ordering::Acquire)
     }
 
     /// Increments the pin count and returns the previous pin count.
     /// Returns 0 if the frame was unpinned before this call.
     /// Only sets reference bit on 0->1 transition to reduce atomic stores.
+    /// Acquire so the pin is ordered before any later eviction-time pin_count
+    /// read, an evictor that observes this pin cannot reorder its check ahead of it.
     #[inline(always)]
     pub fn pin(&self) -> u32 {
-        let prev = self.pin_count.fetch_add(1, Ordering::Relaxed);
+        let prev = self.pin_count.fetch_add(1, Ordering::Acquire);
         if prev == 0 {
             self.reference_bit.store(true, Ordering::Relaxed);
         }
@@ -131,23 +134,34 @@ impl BufferFrame {
 
     /// Decrements the pin count.
     /// Returns the new pin count.
-    /// Uses Relaxed ordering - replacer lock provides synchronization when needed.
+    /// Release so the pinner's page accesses are visible before the frame
+    /// becomes evictable. Saturating compare-exchange loop refuses to drop
+    /// below 0 and never blindly stores over a concurrent pin or unpin.
     #[inline(always)]
     pub fn unpin(&self) -> u32 {
-        let prev = self.pin_count.fetch_sub(1, Ordering::Relaxed);
-        if prev == 0 {
-            // Underflow protection: restore to 0
-            self.pin_count.store(0, Ordering::Relaxed);
-            return 0;
+        let mut current = self.pin_count.load(Ordering::Relaxed);
+        loop {
+            if current == 0 {
+                // Already at floor, nothing to decrement
+                return 0;
+            }
+            match self.pin_count.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return current - 1,
+                Err(observed) => current = observed,
+            }
         }
-        prev - 1
     }
 
     /// Returns true if this frame is pinned.
+    /// Acquire pairs with pin's Acquire so an eviction check happens-after any pin.
     #[inline]
     pub fn is_pinned(&self) -> bool {
-        // Relaxed: eviction correctness ensured by replacer lock
-        self.pin_count.load(Ordering::Relaxed) > 0
+        self.pin_count.load(Ordering::Acquire) > 0
     }
 
     /// Returns true if this frame is dirty.

@@ -142,6 +142,16 @@ pub enum Keyword {
     Savepoint,
     Release,
     Transaction,
+    Work,
+    Isolation,
+    Level,
+    Read,
+    Uncommitted,
+    Committed,
+    Repeatable,
+    Serializable,
+    Snapshot,
+    Deferrable,
 
     // Query analysis
     Explain,
@@ -851,6 +861,16 @@ pub fn lookup_keyword(word: &str) -> Option<Keyword> {
         "SAVEPOINT" => Some(Keyword::Savepoint),
         "RELEASE" => Some(Keyword::Release),
         "TRANSACTION" => Some(Keyword::Transaction),
+        "WORK" => Some(Keyword::Work),
+        "ISOLATION" => Some(Keyword::Isolation),
+        "LEVEL" => Some(Keyword::Level),
+        "READ" => Some(Keyword::Read),
+        "UNCOMMITTED" => Some(Keyword::Uncommitted),
+        "COMMITTED" => Some(Keyword::Committed),
+        "REPEATABLE" => Some(Keyword::Repeatable),
+        "SERIALIZABLE" => Some(Keyword::Serializable),
+        "SNAPSHOT" => Some(Keyword::Snapshot),
+        "DEFERRABLE" => Some(Keyword::Deferrable),
 
         // Query analysis
         "EXPLAIN" => Some(Keyword::Explain),

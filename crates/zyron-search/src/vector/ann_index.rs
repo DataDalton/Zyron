@@ -8,7 +8,7 @@
 
 use std::cell::RefCell;
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
@@ -22,6 +22,9 @@ thread_local! {
     /// Thread-local reusable beam search state so per-layer searches within a
     /// query and subsequent queries on the same thread reuse the same heaps.
     static SEARCH_STATE: RefCell<SearchState> = RefCell::new(SearchState::new(128));
+    /// Thread-local reusable beam state for the layer-0 quantized query search,
+    /// so its heaps are not reallocated on every query.
+    static SEARCH_STATE_Q: RefCell<SearchStateQ> = RefCell::new(SearchStateQ::new(128));
     /// Thread-local scratch buffer for quantizing the query vector on the
     /// search path. Avoids a per-query allocation of a dims-sized Vec<u8>.
     static SEARCH_QUANT_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::new());
@@ -373,16 +376,13 @@ fn searchLayerReuse(
     visited.insert(entryIdx as u32);
 
     let nnodes = store.len();
+    // farthest tracks state.results max (the pruning bound), refreshed only when
+    // results changes so the hot loop avoids a heap peek per neighbor. Always
+    // equals state.results.peek().dist, so pruning decisions are unchanged.
+    let mut farthest = entryDist;
     while let Some(Reverse(current)) = state.candidates.pop() {
-        if state.results.len() >= ef {
-            let farthest = state
-                .results
-                .peek()
-                .map(|e| e.dist)
-                .unwrap_or(f32::INFINITY);
-            if current.dist > farthest {
-                break;
-            }
+        if state.results.len() >= ef && current.dist > farthest {
+            break;
         }
         let neighbors = store.neighbors(current.idx, layer);
         if neighbors.is_empty() {
@@ -418,17 +418,17 @@ fn searchLayerReuse(
             }
 
             let dist = distWithFn(distFn, query, arenaSlice(arena, dims, ni));
-            let farthest = state
-                .results
-                .peek()
-                .map(|e| e.dist)
-                .unwrap_or(f32::INFINITY);
             if dist < farthest || state.results.len() < ef {
                 state.candidates.push(Reverse(DistEntry { dist, idx: ni }));
                 state.results.push(DistEntry { dist, idx: ni });
                 if state.results.len() > ef {
                     state.results.pop();
                 }
+                farthest = state
+                    .results
+                    .peek()
+                    .map(|e| e.dist)
+                    .unwrap_or(f32::INFINITY);
             }
         }
     }
@@ -450,45 +450,66 @@ fn searchLayerQuantized(
     store: &NodeStore,
     quantizedArena: &[u8],
     visited: &mut VisitedSet,
-) -> Vec<(usize, u32)> {
-    let mut candidates: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::with_capacity(ef + 16);
-    let mut results: BinaryHeap<(u32, usize)> = BinaryHeap::with_capacity(ef + 16);
-
+    state: &mut SearchStateQ,
+) {
+    state.clear();
     let entrySlice = &quantizedArena[entryIdx * dims..(entryIdx + 1) * dims];
     let entryDist = euclideanQuantized(queryQuantized, entrySlice);
 
-    candidates.push(Reverse((entryDist, entryIdx)));
-    results.push((entryDist, entryIdx));
+    state.candidates.push(Reverse((entryDist, entryIdx)));
+    state.results.push((entryDist, entryIdx));
     visited.insert(entryIdx as u32);
 
     let nnodes = store.len();
-    while let Some(Reverse((curDist, curIdx))) = candidates.pop() {
-        if results.len() >= ef {
-            let farthest = results.peek().map(|&(d, _)| d).unwrap_or(u32::MAX);
-            if curDist > farthest {
-                break;
-            }
+    // farthest tracks results max (pruning bound), refreshed only when results
+    // changes; equals results.peek().0 at every decision, so pruning is unchanged.
+    let mut farthest = entryDist;
+    while let Some(Reverse((curDist, curIdx))) = state.candidates.pop() {
+        if state.results.len() >= ef && curDist > farthest {
+            break;
         }
         let neighbors = store.neighbors(curIdx, 0);
-        for &neighborIdx in neighbors {
+        let nlen = neighbors.len();
+        for nPos in 0..nlen {
+            let neighborIdx = neighbors[nPos];
             let ni = neighborIdx as usize;
             if ni >= nnodes || !visited.insert(neighborIdx) {
                 continue;
             }
+            #[cfg(target_arch = "x86_64")]
+            {
+                if nPos + 1 < nlen {
+                    let nextNi = neighbors[nPos + 1] as usize;
+                    if nextNi < nnodes {
+                        let prefetchOffset = nextNi * dims;
+                        unsafe {
+                            use std::arch::x86_64::*;
+                            let base = quantizedArena.as_ptr().add(prefetchOffset) as *const i8;
+                            let cacheLines = (dims + 63) / 64;
+                            for cl in 0..cacheLines {
+                                _mm_prefetch(base.add(cl * 64), _MM_HINT_T0);
+                            }
+                        }
+                    }
+                }
+            }
             let ns = &quantizedArena[ni * dims..(ni + 1) * dims];
             let dist = euclideanQuantized(queryQuantized, ns);
-            let farthest = results.peek().map(|&(d, _)| d).unwrap_or(u32::MAX);
-            if dist < farthest || results.len() < ef {
-                candidates.push(Reverse((dist, ni)));
-                results.push((dist, ni));
-                if results.len() > ef {
-                    results.pop();
+            if dist < farthest || state.results.len() < ef {
+                state.candidates.push(Reverse((dist, ni)));
+                state.results.push((dist, ni));
+                if state.results.len() > ef {
+                    state.results.pop();
                 }
+                farthest = state.results.peek().map(|&(d, _)| d).unwrap_or(u32::MAX);
             }
         }
     }
 
-    results.drain().map(|(d, idx)| (idx, d)).collect()
+    state.output.clear();
+    state
+        .output
+        .extend(state.results.drain().map(|(d, idx)| (idx, d)));
 }
 
 // ---------------------------------------------------------------------------
@@ -788,17 +809,14 @@ fn searchLayerBuild(
     visited.insert(entryIdx as u32);
 
     let nnodes = graph.levels.len();
+    // farthest tracks state.results max (the pruning bound), refreshed only when
+    // results changes so the hot loop avoids a heap peek per neighbor. It always
+    // equals state.results.peek().dist, so pruning decisions are unchanged.
+    let mut farthest = entryDist;
 
     while let Some(Reverse(current)) = state.candidates.pop() {
-        if state.results.len() >= ef {
-            let farthest = state
-                .results
-                .peek()
-                .map(|e| e.dist)
-                .unwrap_or(f32::INFINITY);
-            if current.dist > farthest {
-                break;
-            }
+        if state.results.len() >= ef && current.dist > farthest {
+            break;
         }
 
         graph.read_neighbors(current.idx, layer, neighborBuf);
@@ -835,11 +853,6 @@ fn searchLayerBuild(
             }
 
             let dist = distWithFn(distFn, query, arenaSlice(arena, dims, ni));
-            let farthest = state
-                .results
-                .peek()
-                .map(|e| e.dist)
-                .unwrap_or(f32::INFINITY);
 
             if dist < farthest || state.results.len() < ef {
                 state.candidates.push(Reverse(DistEntry { dist, idx: ni }));
@@ -847,6 +860,11 @@ fn searchLayerBuild(
                 if state.results.len() > ef {
                     state.results.pop();
                 }
+                farthest = state
+                    .results
+                    .peek()
+                    .map(|e| e.dist)
+                    .unwrap_or(f32::INFINITY);
             }
         }
     }
@@ -884,13 +902,14 @@ fn searchLayerBuildQuantized(
     visited.insert(entryIdx as u32);
 
     let nnodes = graph.levels.len();
+    // farthest tracks state.results max (the pruning bound), refreshed only when
+    // results changes so the hot loop avoids a heap peek per neighbor. It always
+    // equals state.results.peek().0, so pruning decisions are unchanged.
+    let mut farthest = entryDist;
 
     while let Some(Reverse((curDist, curIdx))) = state.candidates.pop() {
-        if state.results.len() >= ef {
-            let farthest = state.results.peek().map(|&(d, _)| d).unwrap_or(u32::MAX);
-            if curDist > farthest {
-                break;
-            }
+        if state.results.len() >= ef && curDist > farthest {
+            break;
         }
 
         graph.read_neighbors(curIdx, layer, neighborBuf);
@@ -926,7 +945,6 @@ fn searchLayerBuildQuantized(
 
             let nQ = &quantizedArena[ni * dims..(ni + 1) * dims];
             let dist = euclideanQuantized(queryQuantized, nQ);
-            let farthest = state.results.peek().map(|&(d, _)| d).unwrap_or(u32::MAX);
 
             if dist < farthest || state.results.len() < ef {
                 state.candidates.push(Reverse((dist, ni)));
@@ -934,6 +952,7 @@ fn searchLayerBuildQuantized(
                 if state.results.len() > ef {
                     state.results.pop();
                 }
+                farthest = state.results.peek().map(|&(d, _)| d).unwrap_or(u32::MAX);
             }
         }
     }
@@ -959,7 +978,8 @@ fn searchLayerBuildQuantized(
 //      profile so the heuristic does not reject valid neighbors.
 
 fn concurrentBuild(
-    vectors: &[(VectorId, &[f32])],
+    arena: Vec<f32>,
+    ids: &[VectorId],
     dims: usize,
     config: &HnswConfig,
     nThreads: usize,
@@ -974,22 +994,27 @@ fn concurrentBuild(
     u64,
     u16,
 )> {
-    let n = vectors.len();
+    let n = ids.len();
     let m_u = config.m as usize;
     let m_u32 = config.m as u32;
     let metric = config.metric;
     let distFn = resolveDistFn(metric);
     let efConstruction = config.efConstruction as usize;
 
-    let mut arena: Vec<f32> = try_alloc_vec(n * dims)?;
-    for &(_, vec) in vectors {
-        if vec.len() != dims {
-            return Err(ZyronError::InvalidParameter {
-                name: "vector.len()".to_string(),
-                value: format!("expected {} dimensions, got {}", dims, vec.len()),
-            });
-        }
-        arena.extend_from_slice(vec);
+    // The arena is moved in already laid out as n contiguous dims-length rows,
+    // one per id in order. It is used in place and returned as the index arena,
+    // so no second copy of the vectors is made.
+    if arena.len() != n * dims {
+        return Err(ZyronError::InvalidParameter {
+            name: "arena.len()".to_string(),
+            value: format!(
+                "expected {} floats ({} vectors x {} dims), got {}",
+                n * dims,
+                n,
+                dims,
+                arena.len()
+            ),
+        });
     }
 
     // Quantize upfront for Euclidean so the build's beam search can use cheap
@@ -1012,9 +1037,7 @@ fn concurrentBuild(
     }
 
     let mut graph = BuildGraph::new(m_u32, &levels)?;
-    for &(id, _) in vectors {
-        graph.ids.push(id);
-    }
+    graph.ids.extend_from_slice(ids);
 
     let entryPoint = AtomicU64::new(0);
     let maxLayer = AtomicU16::new(levels[0] as u16);
@@ -1285,24 +1308,31 @@ fn concurrentBuild(
     let ep = entryPoint.load(Ordering::Acquire);
     let ml = maxLayer.load(Ordering::Acquire);
 
-    let total_slots = graph.conn_data.len();
-    let mut store = NodeStore::with_capacity(m_u32, n, total_slots)?;
-    let mut idPairs: Vec<(VectorId, usize)> = Vec::with_capacity(n);
-    for i in 0..n {
-        let idx = store.push_node(graph.ids[i], graph.levels[i])?;
-        idPairs.push((graph.ids[i], idx));
-        let max_l = graph.levels[i] as usize;
-        for l in 0..=max_l {
-            let src_off = graph.layer_offset(i, l);
-            let dst_off = store.layer_offset(idx, l);
-            let len = graph.conn_data[src_off].load(Ordering::Relaxed) as usize;
-            store.conn_data[dst_off] = len as u32;
-            for j in 0..len {
-                store.conn_data[dst_off + 1 + j] =
-                    graph.conn_data[src_off + 1 + j].load(Ordering::Relaxed);
-            }
-        }
-    }
+    // Move BuildGraph's arenas straight into the NodeStore. Both use the same
+    // slot layout and node_offsets (derived sequentially from slots_per_node with
+    // the same m and per-node levels), so conn_data is bit-for-bit compatible;
+    // AtomicU32 and u32 share size and alignment, so the atomic cells reinterpret
+    // as plain u32 with no copy and no second arena allocation. push_node's
+    // per-node index equals its position i, so id->index pairs are (ids[i], i).
+    let idPairs: Vec<(VectorId, usize)> = graph
+        .ids
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| (id, i))
+        .collect();
+    let conn_data: Vec<u32> = {
+        let mut cd = std::mem::ManuallyDrop::new(graph.conn_data);
+        unsafe { Vec::from_raw_parts(cd.as_mut_ptr() as *mut u32, cd.len(), cd.capacity()) }
+    };
+    let deleted: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
+    let store = NodeStore {
+        ids: graph.ids,
+        levels: graph.levels,
+        deleted,
+        conn_data,
+        node_offsets: graph.node_offsets,
+        m: m_u32,
+    };
 
     Ok((
         store,
@@ -1336,7 +1366,7 @@ pub struct AnnIndex {
     quantMins: Vec<f32>,
     /// Per-dimension scale factors: 255 / (max - min).
     quantScales: Vec<f32>,
-    idMap: scc::HashMap<VectorId, usize>,
+    idMap: RwLock<HashMap<VectorId, usize>>,
     entryPoint: AtomicU64,
     maxLayer: AtomicU16,
     nodeCount: AtomicU64,
@@ -1381,7 +1411,7 @@ impl AnnIndex {
             quantizedArena: RwLock::new(Vec::new()),
             quantMins: Vec::new(),
             quantScales: Vec::new(),
-            idMap: scc::HashMap::new(),
+            idMap: RwLock::new(HashMap::new()),
             entryPoint: AtomicU64::new(u64::MAX),
             maxLayer: AtomicU16::new(0),
             nodeCount: AtomicU64::new(0),
@@ -1407,9 +1437,11 @@ impl AnnIndex {
         let dims = dimensions as usize;
         let n = vectors.len();
 
-        let sampleSize = n.min(1000);
-        let sampleSlices: Vec<&[f32]> = vectors[..sampleSize].iter().map(|(_, v)| *v).collect();
-        let profile = DataProfile::compute(&sampleSlices, n, dimensions, config.metric);
+        // build receives a fully-formed config, so the only profile field it
+        // needs is the core count for parallelThreshold. Skip the pairwise
+        // distance scan; callers that auto-tune parameters compute their own
+        // profile before calling build.
+        let profile = DataProfile::lightweight(n, dimensions);
 
         // Use 75% of available cores for the build so the rest of the
         // database (query executor, WAL writer, connection acceptor, and
@@ -1427,6 +1459,48 @@ impl AnnIndex {
             );
         }
 
+        // Copy the borrowed vectors into an owned arena once, then hand ownership
+        // to the concurrent builder which moves it straight into the index. This
+        // is the single unavoidable copy for the borrowed API; callers that
+        // already own a contiguous buffer should use build_owned to skip it.
+        let mut arena: Vec<f32> = try_alloc_vec(n * dims)?;
+        for &(_, vec) in vectors {
+            if vec.len() != dims {
+                return Err(ZyronError::InvalidParameter {
+                    name: "vector.len()".to_string(),
+                    value: format!("expected {} dimensions, got {}", dims, vec.len()),
+                });
+            }
+            arena.extend_from_slice(vec);
+        }
+        let ids: Vec<VectorId> = vectors.iter().map(|&(id, _)| id).collect();
+        let result = concurrentBuild(arena, &ids, dims, &config, nThreads, indexId)?;
+        Ok(Self::assembleConcurrent(
+            indexId, tableId, columnId, config, dimensions, profile, result,
+        ))
+    }
+
+    /// Assembles an AnnIndex from a concurrentBuild result tuple. Shared by
+    /// build and build_owned so the field wiring lives in one place.
+    #[allow(clippy::too_many_arguments)]
+    fn assembleConcurrent(
+        indexId: u32,
+        tableId: u32,
+        columnId: u16,
+        config: HnswConfig,
+        dimensions: u16,
+        profile: DataProfile,
+        result: (
+            NodeStore,
+            Vec<f32>,
+            Vec<u8>,
+            Vec<f32>,
+            Vec<f32>,
+            Vec<(VectorId, usize)>,
+            u64,
+            u16,
+        ),
+    ) -> Self {
         let (
             store,
             mergedArena,
@@ -1436,18 +1510,18 @@ impl AnnIndex {
             mergedIdPairs,
             globalEntryPoint,
             globalMaxLayer,
-        ) = concurrentBuild(vectors, dims, &config, nThreads, indexId)?;
+        ) = result;
         let totalNodes = store.len();
 
-        let idMap: scc::HashMap<VectorId, usize> = scc::HashMap::new();
+        let mut idMap: HashMap<VectorId, usize> = HashMap::with_capacity(mergedIdPairs.len());
         for &(vid, idx) in &mergedIdPairs {
-            let _ = idMap.insert_sync(vid, idx);
+            idMap.insert(vid, idx);
         }
 
         let rngSeed = (indexId as u64)
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1);
-        Ok(Self {
+        Self {
             indexId,
             tableId,
             columnId,
@@ -1458,13 +1532,75 @@ impl AnnIndex {
             quantizedArena: RwLock::new(mergedQuantized),
             quantMins: qMins,
             quantScales: qScales,
-            idMap,
+            idMap: RwLock::new(idMap),
             entryPoint: AtomicU64::new(globalEntryPoint),
             maxLayer: AtomicU16::new(globalMaxLayer),
             nodeCount: AtomicU64::new(totalNodes as u64),
             rngCounter: AtomicU64::new(rngSeed.wrapping_add(totalNodes as u64)),
             profile: Some(profile),
-        })
+        }
+    }
+
+    /// Builds an index taking ownership of a flat, row-major vector arena
+    /// (n*dims f32, one dims-length row per id in order) plus its ids. The arena
+    /// is moved directly into the index with no copy, unlike build which copies
+    /// borrowed slices. Use this when the caller already owns a contiguous buffer
+    /// so only one full copy of the vectors is resident during the build.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_owned(
+        arena: Vec<f32>,
+        ids: Vec<VectorId>,
+        dims: usize,
+        indexId: u32,
+        tableId: u32,
+        columnId: u16,
+        config: HnswConfig,
+    ) -> Result<Self> {
+        if ids.is_empty() {
+            return Ok(Self::new(indexId, tableId, columnId, 0, config));
+        }
+        if dims == 0 || arena.len() != ids.len() * dims {
+            return Err(ZyronError::InvalidParameter {
+                name: "arena.len()".to_string(),
+                value: format!(
+                    "expected {} floats ({} vectors x {} dims), got {}",
+                    ids.len().saturating_mul(dims),
+                    ids.len(),
+                    dims,
+                    arena.len()
+                ),
+            });
+        }
+        let dimensions = dims as u16;
+        let n = ids.len();
+
+        // Only parallelThreshold (core count) is read from the profile here;
+        // skip the pairwise distance scan. See build for the rationale.
+        let profile = DataProfile::lightweight(n, dimensions);
+
+        let nThreads = std::thread::available_parallelism()
+            .map(|p| (p.get() * 3 / 4).max(1))
+            .unwrap_or(1)
+            .min(n);
+        let parallelThreshold = profile.parallelThreshold();
+
+        if n < parallelThreshold || nThreads <= 1 {
+            // Small inputs use the single-threaded path, which copies from
+            // borrowed slices; the copy is negligible at this size.
+            let refs: Vec<(VectorId, &[f32])> = ids
+                .iter()
+                .enumerate()
+                .map(|(i, &id)| (id, &arena[i * dims..(i + 1) * dims]))
+                .collect();
+            return Self::buildSingleThreadWithProfile(
+                &refs, indexId, tableId, columnId, config, profile,
+            );
+        }
+
+        let result = concurrentBuild(arena, &ids, dims, &config, nThreads, indexId)?;
+        Ok(Self::assembleConcurrent(
+            indexId, tableId, columnId, config, dimensions, profile, result,
+        ))
     }
 
     /// Single-threaded build for small inputs or single-core systems.
@@ -1636,9 +1772,9 @@ impl AnnIndex {
             }
         }
 
-        let idMap: scc::HashMap<VectorId, usize> = scc::HashMap::new();
+        let mut idMap: HashMap<VectorId, usize> = HashMap::with_capacity(idVec.len());
         for (vid, idx) in idVec {
-            let _ = idMap.insert_sync(vid, idx);
+            idMap.insert(vid, idx);
         }
 
         let (qMins, qMaxs) = computeQuantizationBounds(&arena, dims);
@@ -1655,7 +1791,7 @@ impl AnnIndex {
             quantizedArena: RwLock::new(quantized),
             quantMins: qMins,
             quantScales: qScales,
-            idMap,
+            idMap: RwLock::new(idMap),
             entryPoint: AtomicU64::new(entryPoint),
             maxLayer: AtomicU16::new(maxLayer),
             nodeCount: AtomicU64::new(vectors.len() as u64),
@@ -1715,7 +1851,7 @@ impl AnnIndex {
             });
         }
 
-        let _ = self.idMap.insert_sync(id, newIdx);
+        self.idMap.write().insert(id, newIdx);
 
         let currentEntry = self.entryPoint.load(Ordering::Acquire);
         if currentEntry == u64::MAX {
@@ -1967,7 +2103,7 @@ impl AnnIndex {
         let m_u32 = m as u32;
         let mut store = NodeStore::with_capacity(m_u32, nodeCount as usize, 0)?;
         let mut vectorArena: Vec<f32> = try_alloc_vec(nodeCount as usize * dimensions as usize)?;
-        let idMap = scc::HashMap::new();
+        let mut idMap: HashMap<VectorId, usize> = HashMap::with_capacity(nodeCount as usize);
 
         for i in 0..nodeCount as usize {
             file.read_exact(&mut buf8)?;
@@ -2010,7 +2146,7 @@ impl AnnIndex {
                 store.set_neighbors(i, l, &edges);
             }
 
-            let _ = idMap.insert_sync(id, i);
+            idMap.insert(id, i);
         }
 
         let dims = dimensions as usize;
@@ -2031,7 +2167,7 @@ impl AnnIndex {
             quantizedArena: RwLock::new(quantized),
             quantMins: qMins,
             quantScales: qScales,
-            idMap,
+            idMap: RwLock::new(idMap),
             entryPoint: AtomicU64::new(entryPoint),
             maxLayer: AtomicU16::new(maxLayer),
             nodeCount: AtomicU64::new(nodeCount),
@@ -2079,7 +2215,7 @@ impl VectorSearch for AnnIndex {
         let ef = (effectiveEf as usize).max(k);
 
         let nodeCount = storeGuard.len();
-        let result = SEARCH_VISITED.with(|vcell| {
+        let result: Vec<usize> = SEARCH_VISITED.with(|vcell| {
             SEARCH_STATE.with(|scell| {
                 let mut visited = vcell.borrow_mut();
                 let mut state = scell.borrow_mut();
@@ -2105,34 +2241,37 @@ impl VectorSearch for AnnIndex {
 
                 visited.prepare(nodeCount);
 
-                // Quantized Euclidean search is only valid when the stored
-                // arena and bounds match the query metric. Other metrics
-                // fall through to the exact f32 path.
+                // Quantized Euclidean search is only valid when the stored arena
+                // and bounds match the query metric. Other metrics fall through
+                // to the exact f32 path. Both branches yield candidate indices;
+                // the exact rerank below recomputes distances, so the beam
+                // distance is not carried out (no throwaway u32->f32 map).
                 let quantGuard = self.quantizedArena.read();
                 if !quantGuard.is_empty()
                     && !self.quantMins.is_empty()
                     && metric == DistanceMetric::Euclidean
                 {
-                    let quantResults = SEARCH_QUANT_BUF.with(|cell| {
-                        let mut queryQ = cell.borrow_mut();
-                        if queryQ.len() != dims {
-                            queryQ.resize(dims, 0);
-                        }
-                        quantizeVector(query, &self.quantMins, &self.quantScales, &mut queryQ);
-                        searchLayerQuantized(
-                            dims,
-                            &queryQ,
-                            currentEp,
-                            ef,
-                            &storeGuard,
-                            &quantGuard,
-                            &mut visited,
-                        )
-                    });
-                    quantResults
-                        .into_iter()
-                        .map(|(idx, d)| (idx, d as f32))
-                        .collect()
+                    SEARCH_STATE_Q.with(|qcell| {
+                        let mut stateQ = qcell.borrow_mut();
+                        SEARCH_QUANT_BUF.with(|cell| {
+                            let mut queryQ = cell.borrow_mut();
+                            if queryQ.len() != dims {
+                                queryQ.resize(dims, 0);
+                            }
+                            quantizeVector(query, &self.quantMins, &self.quantScales, &mut queryQ);
+                            searchLayerQuantized(
+                                dims,
+                                &queryQ,
+                                currentEp,
+                                ef,
+                                &storeGuard,
+                                &quantGuard,
+                                &mut visited,
+                                &mut stateQ,
+                            );
+                        });
+                        stateQ.output.iter().map(|&(idx, _)| idx).collect()
+                    })
                 } else {
                     searchLayerReuse(
                         distFn,
@@ -2146,7 +2285,7 @@ impl VectorSearch for AnnIndex {
                         &mut visited,
                         &mut state,
                     );
-                    std::mem::take(&mut state.output)
+                    state.output.iter().map(|&(idx, _)| idx).collect()
                 }
             })
         });
@@ -2155,10 +2294,10 @@ impl VectorSearch for AnnIndex {
         // Quantized ordering is approximate, so a top-k cut at quantized
         // distance would miss true neighbors.
         let mut output: Vec<(VectorId, f32)> = Vec::with_capacity(result.len());
-        for (idx, _approxDist) in &result {
-            if !storeGuard.deleted[*idx].load(Ordering::Relaxed) {
-                let exactDist = distWithFn(distFn, query, arenaSlice(&arenaGuard, dims, *idx));
-                output.push((storeGuard.ids[*idx], exactDist));
+        for &idx in &result {
+            if !storeGuard.deleted[idx].load(Ordering::Relaxed) {
+                let exactDist = distWithFn(distFn, query, arenaSlice(&arenaGuard, dims, idx));
+                output.push((storeGuard.ids[idx], exactDist));
             }
         }
         output.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
@@ -2172,7 +2311,7 @@ impl VectorSearch for AnnIndex {
     }
 
     fn delete(&self, id: VectorId) -> Result<()> {
-        let idx = self.idMap.read_sync(&id, |_, &v| v);
+        let idx = self.idMap.read().get(&id).copied();
         match idx {
             Some(i) => {
                 let storeGuard = self.nodes.read();
@@ -2236,6 +2375,51 @@ mod tests {
         let results = index.search(query, 1, 64).expect("search");
         assert!(!results.is_empty());
         assert_eq!(results[0].0, 42);
+    }
+
+    #[test]
+    fn buildOwnedConcurrentRecall() {
+        // N above parallelThreshold (>=10k) so build_owned takes the concurrent
+        // path where the arena is moved straight into the index with no copy.
+        // Verifies the moved-arena build still yields a correct, high-recall graph.
+        let dims = 16usize;
+        let n = 12_000usize;
+        let mut rng = 0x1234_5678u64;
+        let mut arena: Vec<f32> = Vec::with_capacity(n * dims);
+        for _ in 0..n * dims {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            arena.push(((rng >> 33) as f32 / (1u64 << 31) as f32) - 1.0);
+        }
+        let ids: Vec<VectorId> = (0..n as u64).collect();
+        let arenaCopy = arena.clone();
+        let index =
+            AnnIndex::build_owned(arena, ids, dims, 7, 7, 0, makeConfig()).expect("build_owned");
+
+        let k = 10;
+        let (mut hits, mut total) = (0usize, 0usize);
+        for &qi in &[0usize, 111, 2500, 6000, 9999, 11999] {
+            let q = &arenaCopy[qi * dims..(qi + 1) * dims];
+            let mut dists: Vec<(f32, u64)> = (0..n)
+                .map(|i| {
+                    let v = &arenaCopy[i * dims..(i + 1) * dims];
+                    let s: f32 = (0..dims)
+                        .map(|d| {
+                            let df = q[d] - v[d];
+                            df * df
+                        })
+                        .sum();
+                    (s, i as u64)
+                })
+                .collect();
+            dists.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let truth: std::collections::HashSet<u64> =
+                dists[..k].iter().map(|&(_, id)| id).collect();
+            let results = index.search(q, k, 200).expect("search");
+            hits += results.iter().filter(|r| truth.contains(&r.0)).count();
+            total += k;
+        }
+        let recall = hits as f64 / total as f64;
+        assert!(recall >= 0.9, "build_owned recall too low: {recall}");
     }
 
     #[test]

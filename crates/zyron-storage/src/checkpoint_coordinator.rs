@@ -155,6 +155,17 @@ impl CheckpointCoordinator {
                 return Ok(());
             }
 
+            // A durable write or fsync failure means pages below the boundary
+            // cannot be made durable. Fail the checkpoint with the real cause
+            // instead of waiting for the timeout.
+            if self.background_writer.durable_error() {
+                self.background_writer.clear_durable_error();
+                return Err(ZyronError::Internal(format!(
+                    "Checkpoint aborted: background writer reported a durable write or fsync failure with dirty pages below LSN {}",
+                    checkpoint_lsn
+                )));
+            }
+
             if start.elapsed() > timeout {
                 return Err(ZyronError::Internal(format!(
                     "Checkpoint timed out after {}s waiting for background writer. Dirty pages remain below LSN {}",
@@ -207,6 +218,13 @@ impl CheckpointCoordinator {
     }
 }
 
+/// Consecutive checkpoint failures before the scheduler raises the
+/// unhealthy flag. A persistently failing checkpoint stops WAL truncation
+/// and dirty-page flush, so WAL segments and dirty pages grow unbounded.
+/// Surfacing the condition lets health checks react instead of silently
+/// accumulating until disk exhaustion.
+const CHECKPOINT_FAILURE_ESCALATION: u64 = 3;
+
 /// Cumulative statistics from the checkpoint scheduler.
 pub struct CheckpointStats {
     /// Total checkpoints completed since scheduler start.
@@ -215,6 +233,14 @@ pub struct CheckpointStats {
     pub total_segments_deleted: AtomicU64,
     /// LSN of the most recent completed checkpoint.
     pub last_checkpoint_lsn: AtomicU64,
+    /// Total checkpoint attempts that returned an error.
+    pub checkpoints_failed: AtomicU64,
+    /// Consecutive failures since the last success. Reset to 0 on success.
+    pub consecutive_failures: AtomicU64,
+    /// Set true once consecutive_failures reaches the escalation threshold,
+    /// cleared on the next success. Health checks read this to report a
+    /// degraded checkpoint subsystem.
+    pub unhealthy: AtomicBool,
 }
 
 impl CheckpointStats {
@@ -223,7 +249,16 @@ impl CheckpointStats {
             checkpoints_completed: AtomicU64::new(0),
             total_segments_deleted: AtomicU64::new(0),
             last_checkpoint_lsn: AtomicU64::new(0),
+            checkpoints_failed: AtomicU64::new(0),
+            consecutive_failures: AtomicU64::new(0),
+            unhealthy: AtomicBool::new(false),
         }
+    }
+
+    /// True when consecutive checkpoint failures crossed the escalation
+    /// threshold and no checkpoint has succeeded since.
+    pub fn is_unhealthy(&self) -> bool {
+        self.unhealthy.load(Ordering::Acquire)
     }
 }
 
@@ -309,12 +344,31 @@ impl CheckpointScheduler {
                         stats
                             .last_checkpoint_lsn
                             .store(result.checkpoint_lsn.0, Ordering::Release);
+                        stats.consecutive_failures.store(0, Ordering::Release);
+                        stats.unhealthy.store(false, Ordering::Release);
 
                         last_checkpoint_time = Instant::now();
                         last_checkpoint_segment_id = wal.segment_id();
                     }
-                    Err(_) => {
-                        // Checkpoint failed. Continue polling, will retry next cycle.
+                    Err(e) => {
+                        // Checkpoint failed. WAL segments and dirty pages are
+                        // not reclaimed this cycle. Count the failure, log the
+                        // cause, and raise the unhealthy flag after repeated
+                        // consecutive failures so a stuck checkpoint is visible
+                        // instead of growing storage unbounded in silence. The
+                        // trigger conditions stay set, so the next cycle retries.
+                        stats.checkpoints_failed.fetch_add(1, Ordering::Relaxed);
+                        let consecutive =
+                            stats.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
+                        if consecutive >= CHECKPOINT_FAILURE_ESCALATION {
+                            stats.unhealthy.store(true, Ordering::Release);
+                            eprintln!(
+                                "checkpoint failed {} times consecutively, WAL and dirty pages are not being reclaimed: {}",
+                                consecutive, e
+                            );
+                        } else {
+                            eprintln!("checkpoint failed (attempt {}): {}", consecutive, e);
+                        }
                     }
                 }
             }
@@ -326,6 +380,12 @@ impl CheckpointScheduler {
     /// Returns a reference to the cumulative checkpoint stats.
     pub fn stats(&self) -> &Arc<CheckpointStats> {
         &self.stats
+    }
+
+    /// True when consecutive checkpoint failures crossed the escalation
+    /// threshold. Health checks read this to report a degraded subsystem.
+    pub fn is_unhealthy(&self) -> bool {
+        self.stats.is_unhealthy()
     }
 
     /// Wakes the scheduler thread early (e.g. for testing).
@@ -456,6 +516,83 @@ mod tests {
                 .load(Ordering::Relaxed),
             0
         );
+    }
+
+    #[test]
+    fn test_scheduler_escalates_on_repeated_failure() {
+        // A pre_truncate_hook that always errors makes every run_checkpoint
+        // fail. After CHECKPOINT_FAILURE_ESCALATION consecutive failures the
+        // scheduler must raise the unhealthy flag and count the failures.
+        let tmp_dir = tempfile::tempdir().unwrap();
+
+        let wal = Arc::new(
+            WalWriter::new(zyron_wal::WalWriterConfig {
+                wal_dir: tmp_dir.path().to_path_buf(),
+                segment_size: 1024 * 1024,
+                fsync_enabled: false,
+                ring_buffer_capacity: 256 * 1024,
+            })
+            .unwrap(),
+        );
+
+        let pool = Arc::new(zyron_buffer::BufferPool::new(
+            zyron_buffer::BufferPoolConfig { num_frames: 100 },
+        ));
+
+        let write_fn: zyron_buffer::WriteFn = Arc::new(|_pid, _data| Ok(()));
+        let fsync_fn: zyron_buffer::FsyncFn = Arc::new(|_fid| Ok(()));
+        let bg_writer = Arc::new(zyron_buffer::BackgroundWriter::new(
+            Arc::clone(&pool),
+            write_fn,
+            fsync_fn,
+            zyron_buffer::BackgroundWriterConfig::default(),
+        ));
+
+        let tracker = Arc::new(CheckpointTracker::new());
+
+        let coordinator = CheckpointCoordinator::new(
+            Arc::clone(&pool),
+            Arc::clone(&wal),
+            bg_writer,
+            tracker,
+            CheckpointCoordinatorConfig::default(),
+        );
+        coordinator.set_pre_truncate_hook(Arc::new(|| {
+            Err(ZyronError::Internal("forced hook failure".into()))
+        }));
+
+        let stats = CheckpointStats::new();
+        let shutdown = AtomicBool::new(false);
+        // Time trigger fires immediately (interval 0), so the loop attempts a
+        // checkpoint each cycle. Drive a few cycles by waking the loop after
+        // it parks, then signal shutdown once escalation is reached.
+        let config = CheckpointCoordinatorConfig {
+            checkpoint_interval_secs: 0,
+            max_wal_segments: 1000,
+            ..Default::default()
+        };
+
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                CheckpointScheduler::scheduler_loop(&coordinator, &wal, &config, &shutdown, &stats);
+            });
+            // Wait until escalation, then stop the loop.
+            let start = Instant::now();
+            while !stats.is_unhealthy() && start.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            shutdown.store(true, Ordering::Release);
+        });
+
+        assert!(
+            stats.is_unhealthy(),
+            "expected unhealthy flag after repeated checkpoint failures"
+        );
+        assert!(
+            stats.checkpoints_failed.load(Ordering::Relaxed) >= CHECKPOINT_FAILURE_ESCALATION,
+            "expected failure count to reach escalation threshold"
+        );
+        assert_eq!(stats.checkpoints_completed.load(Ordering::Relaxed), 0);
     }
 
     #[test]

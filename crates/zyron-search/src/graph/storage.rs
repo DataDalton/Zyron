@@ -22,10 +22,10 @@ pub struct CompactGraph {
     pub edges: Vec<u32>,
     /// Optional edge weights, parallel to edges[].
     pub weights: Option<Vec<f64>>,
-    /// Maps dense index back to original NodeId.
+    /// Maps dense index back to original NodeId. Ascending (node ids are sorted),
+    /// so the reverse NodeId->index lookup is a binary search over this array
+    /// rather than a resident HashMap.
     pub index_to_node_id: Vec<NodeId>,
-    /// Maps original NodeId to dense index.
-    pub node_id_to_index: HashMap<NodeId, u32>,
 }
 
 impl CompactGraph {
@@ -41,7 +41,6 @@ impl CompactGraph {
                 edges: Vec::new(),
                 weights: None,
                 index_to_node_id: Vec::new(),
-                node_id_to_index: HashMap::new(),
             };
         }
 
@@ -109,7 +108,6 @@ impl CompactGraph {
             edges,
             weights: if has_weights { Some(weights) } else { None },
             index_to_node_id,
-            node_id_to_index,
         }
     }
 
@@ -146,7 +144,10 @@ impl CompactGraph {
     /// Translates a NodeId to its dense index, if present.
     #[inline]
     pub fn to_index(&self, node_id: NodeId) -> Option<u32> {
-        self.node_id_to_index.get(&node_id).copied()
+        self.index_to_node_id
+            .binary_search(&node_id)
+            .ok()
+            .map(|i| i as u32)
     }
 
     /// Translates a dense index back to its original NodeId.

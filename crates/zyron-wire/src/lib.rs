@@ -10,6 +10,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub mod auth;
 pub mod auto_param;
+pub mod bound_predicate_sql;
 pub mod codec;
 pub mod connection;
 pub mod copy;

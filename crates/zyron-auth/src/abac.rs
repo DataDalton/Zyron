@@ -639,9 +639,14 @@ impl AbacRule {
 pub fn evaluate_condition(attributes: &SessionAttributes, condition: &AttributeCondition) -> bool {
     let attr_value = match condition.attribute_key.as_str() {
         "connection_time" => {
-            // Compare numerically for time-based conditions
+            // Compare numerically for time-based conditions. A malformed
+            // threshold makes the condition not satisfied rather than
+            // defaulting the threshold to 0
             let attr_num = attributes.connection_time;
-            let cond_num: u64 = condition.value.parse().unwrap_or(0);
+            let cond_num: u64 = match condition.value.parse() {
+                Ok(n) => n,
+                Err(_) => return false,
+            };
             return match condition.operator {
                 AbacOperator::Eq => attr_num == cond_num,
                 AbacOperator::NotEq => attr_num != cond_num,
@@ -652,7 +657,12 @@ pub fn evaluate_condition(attributes: &SessionAttributes, condition: &AttributeC
         }
         "clearance" => {
             let level = attributes.clearance as u8;
-            let cond_level: u8 = condition.value.parse().unwrap_or(0);
+            // A malformed clearance threshold makes the condition not satisfied
+            // rather than defaulting the threshold to 0
+            let cond_level: u8 = match condition.value.parse() {
+                Ok(n) => n,
+                Err(_) => return false,
+            };
             return match condition.operator {
                 AbacOperator::Eq => level == cond_level,
                 AbacOperator::NotEq => level != cond_level,
@@ -672,7 +682,12 @@ pub fn evaluate_condition(attributes: &SessionAttributes, condition: &AttributeC
         AbacOperator::NotEq => attr_value != condition.value,
         AbacOperator::In => condition.value.split(',').any(|v| v.trim() == attr_value),
         AbacOperator::Contains => attr_value.contains(&condition.value),
-        AbacOperator::Matches => attr_value == condition.value, // Simple match (regex would need a dep)
+        AbacOperator::Matches => match regex::Regex::new(&condition.value) {
+            Ok(re) => re.is_match(attr_value),
+            // An invalid pattern leaves the condition not satisfied rather than
+            // panicking or failing open
+            Err(_) => false,
+        },
         AbacOperator::Gt => {
             // Try numeric comparison first, fall back to lexicographic
             match (attr_value.parse::<f64>(), condition.value.parse::<f64>()) {
@@ -745,6 +760,11 @@ impl AbacRuleStore {
         action: Option<u8>,
     ) -> bool {
         let sorted = self.sorted_rules.load();
+        // Tracks whether any Allow rule targets this request (role resource action)
+        // regardless of whether its conditions matched. Under whitelist semantics
+        // an applicable Allow rule whose conditions fail must default-deny
+        let mut allow_applicable = false;
+        // Tracks whether an Allow rule fully matched and grants access
         let mut has_allow = false;
 
         for rule in sorted.iter() {
@@ -781,6 +801,13 @@ impl AbacRuleStore {
                 }
             }
 
+            // Rule targets this request by role resource and action. An Allow
+            // rule that reaches this point is applicable even if its conditions
+            // later fail to match
+            if matches!(rule.effect, AbacEffect::Allow) {
+                allow_applicable = true;
+            }
+
             // Evaluate all conditions (all must be true for the rule to apply)
             let all_match = rule
                 .conditions
@@ -797,11 +824,14 @@ impl AbacRuleStore {
             }
         }
 
-        // If no rules matched at all, default allow (ABAC is additive to privilege checks)
-        if !has_allow {
-            return true;
+        // No Deny rule blocked the request. Under whitelist semantics any
+        // applicable Allow rule must have matched to grant access
+        if allow_applicable {
+            return has_allow;
         }
 
+        // No Allow rule targets this request so ABAC does not restrict it
+        // (ABAC is additive to privilege checks)
         true
     }
 

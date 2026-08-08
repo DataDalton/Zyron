@@ -5,11 +5,16 @@
 //! Runs on a dedicated std::thread with parking_lot::Condvar for wake/sleep.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use zyron_common::Result;
 use zyron_common::types::TypeId;
 
 use crate::columnar::file::{SortOrder, ZyrFileHeader, ZyrFileWriter};
 use crate::columnar::segment::ColumnSegment;
+
+/// Monotonic per-process counter that makes folded filenames unique even when
+/// two folds land in the same nanosecond
+static FOLD_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Configuration for the background compaction thread.
 #[derive(Debug, Clone)]
@@ -304,7 +309,11 @@ where
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let fileName = format!("table_{}_{}_{}.zyr", table_id, rowCount, timestamp);
+    let uniqueSuffix = FOLD_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let fileName = format!(
+        "table_{}_{}_{}_{}.zyr",
+        table_id, rowCount, timestamp, uniqueSuffix
+    );
     let outputPath = config.columnar_dir.join(&fileName);
 
     if let Some(parent) = outputPath.parent() {

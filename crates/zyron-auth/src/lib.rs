@@ -59,7 +59,9 @@ pub use classification::{ClassificationLevel, ClassificationStore, ColumnClassif
 pub use column_security::{MaskingPolicy, MaskingPolicyStore};
 pub use context::SecurityContext;
 pub use credentials::{
-    ApiKeyCredential, JwtAlgorithm, JwtClaims, JwtCredential, PasswordCredential, TotpCredential,
+    ApiKeyCredential, JwtAlgorithm, JwtClaims, JwtCredential, PasswordCredential, ScramSecret,
+    TotpCredential, md5_password_credential, parse_scram_secret, scram_sha256_secret,
+    scram_sha256_secret_with_salt,
 };
 pub use encryption::{
     ColumnEncryption, EncryptionAlgorithm, EncryptionStore, KeyStore, LocalKeyStore,
@@ -139,6 +141,11 @@ pub struct SecurityManager {
     /// Cached password hashes keyed by username. Loaded at startup and updated
     /// on user create/alter. Avoids heap scans per connection.
     pub password_cache: RcuMap<String, String>,
+    /// Cached SCRAM-SHA-256 secrets keyed by username for SCRAM authentication.
+    pub scram_cache: RcuMap<String, String>,
+    /// Cached md5(password + username) values keyed by username for MD5
+    /// authentication.
+    pub md5_cache: RcuMap<String, String>,
     /// Cached user ID lookup by name.
     pub user_id_cache: RcuMap<String, UserId>,
     /// Full user records keyed by name. Backs login account-status checks
@@ -200,6 +207,8 @@ impl SecurityManager {
         let mac = MandatoryAccessControl::new();
         let webauthn_store = WebAuthnCredentialStore::new();
         let password_cache: RcuMap<String, String> = RcuMap::empty_map();
+        let scram_cache: RcuMap<String, String> = RcuMap::empty_map();
+        let md5_cache: RcuMap<String, String> = RcuMap::empty_map();
         let user_id_cache: RcuMap<String, UserId> = RcuMap::empty_map();
         let user_cache: RcuMap<String, crate::user::User> = RcuMap::empty_map();
         let role_cache: RcuMap<String, Role> = RcuMap::empty_map();
@@ -227,6 +236,8 @@ impl SecurityManager {
             mac,
             webauthn_store,
             password_cache,
+            scram_cache,
+            md5_cache,
             user_id_cache,
             user_cache,
             role_cache,
@@ -279,6 +290,33 @@ impl SecurityManager {
         );
 
         Ok(manager)
+    }
+
+    /// Sets the authentication method used when no auth rule matches a
+    /// connection. Accepts the methods that the credential store can verify:
+    /// Trust always succeeds, Password and BalloonSha256 verify a cleartext
+    /// password against the stored Balloon PHC string, Md5 verifies against the
+    /// stored md5(password + username), and ScramSha256 verifies against the
+    /// stored SCRAM secret. Set-time derivation populates all four credentials
+    /// from one plaintext, so any of them works as the fallback. Other methods
+    /// require per-user material the password store does not hold and are
+    /// rejected here so the misconfiguration surfaces at startup.
+    pub fn set_auth_fallback(&mut self, method: auth_rules::AuthMethod) -> Result<()> {
+        use auth_rules::AuthMethod;
+        match method {
+            AuthMethod::Trust
+            | AuthMethod::Password
+            | AuthMethod::BalloonSha256
+            | AuthMethod::Md5
+            | AuthMethod::ScramSha256 => {
+                self.auth_resolver.set_fallback(method);
+                Ok(())
+            }
+            other => Err(ZyronError::ConfigError(format!(
+                "auth method {:?} cannot be the default fallback: it cannot verify against the password credential store, use trust, password, balloon-sha256, md5, or scram-sha-256",
+                other
+            ))),
+        }
     }
 
     /// Creates an ABAC policy: allocates an id (when zero), adds it to the
@@ -367,6 +405,8 @@ impl SecurityManager {
         let users = self.auth_storage.load_users().await?;
         let mut id_map = HashMap::with_capacity(users.len());
         let mut pw_map = HashMap::with_capacity(users.len());
+        let mut scram_map = HashMap::with_capacity(users.len());
+        let mut md5_map = HashMap::with_capacity(users.len());
         let mut totp_map = HashMap::new();
         let mut api_key_map = HashMap::new();
         let mut user_map = HashMap::with_capacity(users.len());
@@ -374,6 +414,12 @@ impl SecurityManager {
             id_map.insert(user.name.clone(), user.id);
             if let Some(ref hash) = user.password_hash {
                 pw_map.insert(user.name.clone(), hash.clone());
+            }
+            if let Some(ref secret) = user.scram_secret {
+                scram_map.insert(user.name.clone(), secret.clone());
+            }
+            if let Some(ref md5) = user.md5_credential {
+                md5_map.insert(user.name.clone(), md5.clone());
             }
             if let Some(ref secret) = user.totp_secret {
                 totp_map.insert(user.name.clone(), secret.clone());
@@ -385,6 +431,8 @@ impl SecurityManager {
         }
         self.user_id_cache.store(id_map);
         self.password_cache.store(pw_map);
+        self.scram_cache.store(scram_map);
+        self.md5_cache.store(md5_map);
         self.totp_secret_cache.store(totp_map);
         self.api_key_cache.store(api_key_map);
         self.user_cache.store(user_map);
@@ -486,6 +534,18 @@ impl SecurityManager {
                 self.password_cache.remove(&user.name);
             }
         }
+        match &user.scram_secret {
+            Some(secret) => self.scram_cache.insert(user.name.clone(), secret.clone()),
+            None => {
+                self.scram_cache.remove(&user.name);
+            }
+        }
+        match &user.md5_credential {
+            Some(md5) => self.md5_cache.insert(user.name.clone(), md5.clone()),
+            None => {
+                self.md5_cache.remove(&user.name);
+            }
+        }
         match &user.totp_secret {
             Some(secret) => self
                 .totp_secret_cache
@@ -509,6 +569,8 @@ impl SecurityManager {
         self.user_id_cache.remove(&name.to_string());
         self.user_cache.remove(&name.to_string());
         self.password_cache.remove(&name.to_string());
+        self.scram_cache.remove(&name.to_string());
+        self.md5_cache.remove(&name.to_string());
         self.totp_secret_cache.remove(&name.to_string());
         self.api_key_cache.remove(&name.to_string());
     }

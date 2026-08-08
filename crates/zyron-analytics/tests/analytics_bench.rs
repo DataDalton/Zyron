@@ -1945,7 +1945,7 @@ fn test_25_batch_prediction_correctness() {
         testXs.push(rng.nextNormal());
     }
     let mut out = vec![0.0f64; mPredict];
-    predictBatch(&model, &testXs, mPredict, 1, &mut out);
+    predictBatch(&model, &testXs, mPredict, 1, &mut out).unwrap();
 
     let mut finite = 0usize;
     for v in &out {
@@ -2348,7 +2348,7 @@ fn test_33_batch_predict_performance() {
     for run in 0..VALIDATION_RUNS {
         let mut out = vec![0.0f64; predictN];
         let start = Instant::now();
-        predictBatch(&model, &testXs, predictN, p, &mut out);
+        predictBatch(&model, &testXs, predictN, p, &mut out).unwrap();
         let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
         latencies.push(elapsed_ms);
         tprintln!("  Run {}: {:.2}ms", run + 1, elapsed_ms);

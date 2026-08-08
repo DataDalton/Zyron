@@ -136,6 +136,60 @@ async fn create_test_state(
 
     let txn_manager = Arc::new(TransactionManager::new(Arc::clone(&wal)));
 
+    // Subsystem managers backed by the harness data dir so DDL handlers run the
+    // real feature paths instead of returning not-configured errors. Built the
+    // same minimal-but-real way the production server does in lib.rs.
+    let data_dir_mgr = tmp.path().join("data");
+    let cdc_registry_arc = Arc::new(zyron_cdc::CdfRegistry::new(data_dir_mgr.clone()));
+    let slot_mgr_arc = Arc::new(
+        zyron_cdc::SlotManager::open(&data_dir_mgr, zyron_cdc::SlotLagConfig::default())
+            .expect("SlotManager open failed"),
+    );
+    let pub_mgr_arc = Arc::new(
+        zyron_cdc::PublicationManager::open(&data_dir_mgr).expect("PublicationManager open failed"),
+    );
+    let cdc_stream_mgr_arc = Arc::new(
+        zyron_cdc::CdcStreamManager::new(&data_dir_mgr).expect("CdcStreamManager new failed"),
+    );
+    let cdc_ingest_mgr_arc = Arc::new(
+        zyron_cdc::CdcIngestManager::new(&data_dir_mgr).expect("CdcIngestManager new failed"),
+    );
+    let trigger_mgr_arc = Arc::new(zyron_pipeline::trigger::TriggerManager::new());
+    let udf_reg_arc = Arc::new(zyron_pipeline::udf::UdfRegistry::new());
+    let uda_reg_arc = Arc::new(zyron_pipeline::aggregate::UdaRegistry::new());
+    let proc_reg_arc = Arc::new(zyron_pipeline::stored_procedure::ProcedureRegistry::new());
+    let pipeline_mgr_arc = Arc::new(zyron_pipeline::pipeline::PipelineManager::new());
+    let sched_mgr_arc = Arc::new(zyron_pipeline::schedule::ScheduleManager::new());
+    let event_disp_arc = Arc::new(zyron_pipeline::event_handler::EventDispatcher::new());
+    let mv_mgr_arc = Arc::new(zyron_pipeline::materialized_view::MaterializedViewManager::new());
+    let branch_mgr = zyron_versioning::BranchManager::new(data_dir_mgr.clone());
+    branch_mgr.load().expect("BranchManager load failed");
+    let branch_mgr_arc = Arc::new(branch_mgr);
+
+    // CHECKPOINT runs this coordinator directly. The production server hands off
+    // to a worker thread that parks on a condvar; in the harness the closure runs
+    // the checkpoint inline so the command completes honestly with no worker.
+    let ckpt_coordinator = Arc::new(CheckpointCoordinator::new(
+        Arc::clone(&pool),
+        Arc::clone(&wal),
+        Arc::clone(&bg_writer),
+        Arc::new(CheckpointTracker::new()),
+        CheckpointCoordinatorConfig::default(),
+    ));
+    let ckpt_wake: Arc<dyn Fn() + Send + Sync> = {
+        let coordinator = Arc::clone(&ckpt_coordinator);
+        Arc::new(move || {
+            let _ = coordinator.run_checkpoint();
+        })
+    };
+
+    // Stat-view closures read from the wired managers so the CDC and slot views
+    // report real state.
+    let cdc_feed_reg = Arc::clone(&cdc_registry_arc);
+    let cdc_slot_mgr = Arc::clone(&slot_mgr_arc);
+    let cdc_stream_view_mgr = Arc::clone(&cdc_stream_mgr_arc);
+    let cdc_ingest_view_mgr = Arc::clone(&cdc_ingest_mgr_arc);
+
     let state = Arc::new(ServerState {
         catalog: Arc::clone(&catalog),
         wal: Arc::clone(&wal),
@@ -159,27 +213,58 @@ async fn create_test_state(
         session_info_collector: None,
         checkpoint_stats: None,
         vacuum_stats: None,
-        checkpoint_wake: None,
+        checkpoint_wake: Some(ckpt_wake),
         alter_system_set: None,
-        cdc_feed_stats: None,
-        cdc_slot_stats: None,
-        cdc_stream_stats: None,
-        cdc_ingest_stats: None,
-        cdc_registry: None,
-        slot_manager: None,
-        publication_manager: None,
-        cdc_stream_manager: None,
-        cdc_ingest_manager: None,
-        trigger_manager: None,
-        udf_registry: None,
-        uda_registry: None,
-        procedure_registry: None,
-        pipeline_manager: None,
-        schedule_manager: None,
-        event_dispatcher: None,
-        mv_manager: None,
+        cdc_feed_stats: Some(Arc::new(move || -> Vec<(u32, u64, u64, u32)> {
+            cdc_feed_reg.list_feeds()
+        })),
+        cdc_slot_stats: Some(Arc::new(
+            move || -> Vec<(String, String, u64, u64, bool, u64)> {
+                cdc_slot_mgr
+                    .list_slots()
+                    .into_iter()
+                    .map(|s| {
+                        (
+                            s.name,
+                            format!("{:?}", s.plugin),
+                            s.confirmed_lsn,
+                            s.restart_lsn,
+                            s.active,
+                            0u64,
+                        )
+                    })
+                    .collect()
+            },
+        )),
+        cdc_stream_stats: Some(Arc::new(move || -> Vec<(String, u32, bool, String)> {
+            cdc_stream_view_mgr
+                .list_streams()
+                .into_iter()
+                .map(|s| (s.name, s.table_id, s.active, s.slot_name))
+                .collect()
+        })),
+        cdc_ingest_stats: Some(Arc::new(move || -> Vec<(String, u32, bool, u64, u64)> {
+            cdc_ingest_view_mgr
+                .list_ingests()
+                .into_iter()
+                .map(|i| (i.name, i.target_table_id, i.active, 0u64, 0u64))
+                .collect()
+        })),
+        cdc_registry: Some(Arc::clone(&cdc_registry_arc)),
+        slot_manager: Some(Arc::clone(&slot_mgr_arc)),
+        publication_manager: Some(Arc::clone(&pub_mgr_arc)),
+        cdc_stream_manager: Some(Arc::clone(&cdc_stream_mgr_arc)),
+        cdc_ingest_manager: Some(Arc::clone(&cdc_ingest_mgr_arc)),
+        trigger_manager: Some(Arc::clone(&trigger_mgr_arc)),
+        udf_registry: Some(Arc::clone(&udf_reg_arc)),
+        uda_registry: Some(Arc::clone(&uda_reg_arc)),
+        procedure_registry: Some(Arc::clone(&proc_reg_arc)),
+        pipeline_manager: Some(Arc::clone(&pipeline_mgr_arc)),
+        schedule_manager: Some(Arc::clone(&sched_mgr_arc)),
+        event_dispatcher: Some(Arc::clone(&event_disp_arc)),
+        mv_manager: Some(Arc::clone(&mv_mgr_arc)),
         stream_job_manager: None,
-        branch_manager: None,
+        branch_manager: Some(Arc::clone(&branch_mgr_arc)),
         fts_manager: None,
         vector_manager: None,
         graph_manager: None,
@@ -204,6 +289,11 @@ async fn create_test_state(
         feature_store: zyron_analytics::featureStore(),
         feature_lineage: zyron_analytics::featureLineageRegistry(),
         model_cache: zyron_analytics::modelCache(),
+        default_isolation: zyron_storage::IsolationLevel::ReadCommitted,
+        statement_timeout: None,
+        max_result_rows: None,
+        balloon_params: None,
+        default_auth_method: zyron_auth::auth_rules::AuthMethod::Trust,
     });
 
     (state, wal, pool, disk, bg_writer, catalog)
@@ -684,12 +774,12 @@ fn test_05_transaction_isolation() {
 
     // Savepoint test
     let mut txn4 = txn_mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
-    txn4.savepoint("sp1".into(), 0);
-    txn4.savepoint("sp2".into(), 5);
+    txn4.savepoint("sp1".into(), 0, 0);
+    txn4.savepoint("sp2".into(), 5, 0);
     assert_eq!(txn4.savepoint_count(), 2);
 
-    let lock_count = txn4.rollback_to_savepoint("sp1");
-    assert_eq!(lock_count, Some(0));
+    let rb = txn4.rollback_to_savepoint("sp1").expect("sp1 exists");
+    assert_eq!(rb.row_lock_count, 0);
     assert_eq!(txn4.savepoint_count(), 1);
     tprintln!("  Savepoint rollback: PASS");
 
@@ -2004,7 +2094,7 @@ server_test!(
             .await;
             assert_query_ok(
                 client,
-                "CREATE REPLICATION SLOT sub_slot PLUGIN 'zyron'",
+                "CREATE REPLICATION SLOT sub_slot PLUGIN 'zyron_cdc'",
                 "CREATE_REPLICATION_SLOT",
                 "create slot",
             )
@@ -2026,7 +2116,17 @@ server_test!(
             )
             .await;
             assert_query_ok(client, "DROP FUNCTION sub_fn", "DROP FUNCTION", "drop fn").await;
-            assert_query_ok(client, "CREATE TRIGGER sub_trg BEFORE INSERT ON sub_t FOR EACH ROW EXECUTE FUNCTION sub_fn()", "CREATE TRIGGER", "create trigger").await;
+            // Trigger and event handler actions are stored procedures, so create
+            // a procedure that both reference. It is dropped after the event
+            // handler is created.
+            assert_query_ok(
+                client,
+                "CREATE PROCEDURE sub_action() AS 'SELECT 1' LANGUAGE SQL",
+                "CREATE PROCEDURE",
+                "create action proc",
+            )
+            .await;
+            assert_query_ok(client, "CREATE TRIGGER sub_trg BEFORE INSERT ON sub_t FOR EACH ROW EXECUTE FUNCTION sub_action()", "CREATE TRIGGER", "create trigger").await;
             assert_query_ok(
                 client,
                 "DROP TRIGGER sub_trg ON sub_t",
@@ -2041,6 +2141,7 @@ server_test!(
                 "create proc",
             )
             .await;
+            assert_query_ok(client, "CALL sub_proc()", "CALL", "call proc").await;
             assert_query_ok(
                 client,
                 "DROP PROCEDURE sub_proc",
@@ -2048,12 +2149,19 @@ server_test!(
                 "drop proc",
             )
             .await;
-            assert_query_ok(client, "CALL sub_proc()", "CALL", "call proc").await;
 
-            // Aggregate
+            // Aggregate. The state function takes (state, input) and must exist
+            // as a SQL function before the aggregate references it.
             assert_query_ok(
                 client,
-                "CREATE AGGREGATE sub_agg(val INT) (SFUNC = int4pl, STYPE = INT)",
+                "CREATE FUNCTION sub_sfunc(s INT, v INT) RETURNS INT AS 'SELECT s + v' LANGUAGE SQL",
+                "CREATE FUNCTION",
+                "create sfunc",
+            )
+            .await;
+            assert_query_ok(
+                client,
+                "CREATE AGGREGATE sub_agg(val INT) (SFUNC = sub_sfunc, STYPE = INT)",
                 "CREATE AGGREGATE",
                 "create agg",
             )
@@ -2063,6 +2171,13 @@ server_test!(
                 "DROP AGGREGATE sub_agg",
                 "DROP AGGREGATE",
                 "drop agg",
+            )
+            .await;
+            assert_query_ok(
+                client,
+                "DROP FUNCTION sub_sfunc",
+                "DROP FUNCTION",
+                "drop sfunc",
             )
             .await;
 
@@ -2099,7 +2214,7 @@ server_test!(
             // Event handlers
             assert_query_ok(
                 client,
-                "CREATE EVENT HANDLER sub_eh WHEN table_change EXECUTE FUNCTION sub_fn",
+                "CREATE EVENT HANDLER sub_eh WHEN table_change EXECUTE FUNCTION sub_action",
                 "CREATE EVENT HANDLER",
                 "create eh",
             )
@@ -2111,6 +2226,13 @@ server_test!(
                 "drop eh",
             )
             .await;
+            assert_query_ok(
+                client,
+                "DROP PROCEDURE sub_action",
+                "DROP PROCEDURE",
+                "drop action proc",
+            )
+            .await;
 
             // VALUES query
             let msgs = query_full(client, "VALUES (1, 2, 3)")
@@ -2120,7 +2242,7 @@ server_test!(
             assert!(has_data_row(&msgs), "VALUES should return data rows");
 
             assert_query_ok(client, "DROP TABLE sub_t", "DROP TABLE", "cleanup").await;
-            tprintln!("  28 subsystem DDL operations verified");
+            tprintln!("  subsystem DDL operations verified");
         })
     }
 );
@@ -2147,7 +2269,7 @@ server_test!(test_20_cdc_roundtrip, "CDC DDL Roundtrip Test", |client| {
         .await;
         assert_query_ok(
             client,
-            "CREATE REPLICATION SLOT cdc_slot PLUGIN 'zyron'",
+            "CREATE REPLICATION SLOT cdc_slot PLUGIN 'zyron_cdc'",
             "CREATE_REPLICATION_SLOT",
             "create slot",
         )
@@ -2206,7 +2328,16 @@ server_test!(
                 "create fn",
             )
             .await;
-            assert_query_ok(client, "CREATE TRIGGER trg_b BEFORE INSERT ON trg_t FOR EACH ROW EXECUTE FUNCTION trg_fn()", "CREATE TRIGGER", "create before trigger").await;
+            // A trigger action is a stored procedure that receives the row
+            // columns as $1..$N, so the trigger references a procedure.
+            assert_query_ok(
+                client,
+                "CREATE PROCEDURE trg_proc_fn() AS 'SELECT 1' LANGUAGE SQL",
+                "CREATE PROCEDURE",
+                "create trigger proc",
+            )
+            .await;
+            assert_query_ok(client, "CREATE TRIGGER trg_b BEFORE INSERT ON trg_t FOR EACH ROW EXECUTE FUNCTION trg_proc_fn()", "CREATE TRIGGER", "create before trigger").await;
             assert_query_ok(
                 client,
                 "DROP TRIGGER trg_b ON trg_t",
@@ -2214,10 +2345,24 @@ server_test!(
                 "drop trigger",
             )
             .await;
+            assert_query_ok(
+                client,
+                "DROP PROCEDURE trg_proc_fn",
+                "DROP PROCEDURE",
+                "drop trigger proc",
+            )
+            .await;
             assert_query_ok(client, "DROP FUNCTION trg_fn", "DROP FUNCTION", "drop fn").await;
             assert_query_ok(
                 client,
-                "CREATE AGGREGATE trg_agg(val INT) (SFUNC = int4pl, STYPE = INT)",
+                "CREATE FUNCTION trg_sfunc(s INT, v INT) RETURNS INT AS 'SELECT s + v' LANGUAGE SQL",
+                "CREATE FUNCTION",
+                "create sfunc",
+            )
+            .await;
+            assert_query_ok(
+                client,
+                "CREATE AGGREGATE trg_agg(val INT) (SFUNC = trg_sfunc, STYPE = INT)",
                 "CREATE AGGREGATE",
                 "create agg",
             )
@@ -2227,6 +2372,13 @@ server_test!(
                 "DROP AGGREGATE trg_agg",
                 "DROP AGGREGATE",
                 "drop agg",
+            )
+            .await;
+            assert_query_ok(
+                client,
+                "DROP FUNCTION trg_sfunc",
+                "DROP FUNCTION",
+                "drop sfunc",
             )
             .await;
             assert_query_ok(
@@ -2244,7 +2396,7 @@ server_test!(
             )
             .await;
             assert_query_ok(client, "DROP TABLE trg_t", "DROP TABLE", "cleanup").await;
-            tprintln!("  10 trigger/function DDL operations verified");
+            tprintln!("  trigger/function DDL operations verified");
         })
     }
 );
@@ -2347,7 +2499,11 @@ server_test!(
                     "CREATE FUNCTION",
                 ),
                 (
-                    "CREATE TRIGGER smoke_trg BEFORE INSERT ON smoke_t FOR EACH ROW EXECUTE FUNCTION smoke_fn()",
+                    "CREATE PROCEDURE smoke_proc() AS 'SELECT 1' LANGUAGE SQL",
+                    "CREATE PROCEDURE",
+                ),
+                (
+                    "CREATE TRIGGER smoke_trg BEFORE INSERT ON smoke_t FOR EACH ROW EXECUTE FUNCTION smoke_proc()",
                     "CREATE TRIGGER",
                 ),
                 (
@@ -2400,6 +2556,7 @@ server_test!(
                 ("DROP BRANCH smoke_branch", "DROP BRANCH"),
                 ("DROP PUBLICATION smoke_pub", "DROP PUBLICATION"),
                 ("DROP TRIGGER smoke_trg ON smoke_t", "DROP TRIGGER"),
+                ("DROP PROCEDURE smoke_proc", "DROP PROCEDURE"),
                 ("DROP FUNCTION smoke_fn", "DROP FUNCTION"),
                 ("DROP MATERIALIZED VIEW smoke_mv", "DROP MATERIALIZED VIEW"),
                 ("DROP VIEW smoke_v", "DROP VIEW"),

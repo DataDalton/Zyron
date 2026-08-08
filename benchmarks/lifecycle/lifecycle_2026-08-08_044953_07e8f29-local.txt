@@ -1,0 +1,47 @@
+
+=== Row-Level TTL ===
+
+=== Tiered Storage ===
+
+=== Soft Delete ===
+
+=== Soft-Delete Purge ===
+
+=== Legal Hold ===
+
+=== Performance (5-run average) ===
+
+=== FORGET USER (cross-table) ===
+
+=== Compliance Report ===
+
+=== Partition-Scoped TTL ===
+
+=== Archive + Restore ===
+  SOX retention validation + PII detection: PASS
+  Row-level TTL delete + retention boundary: PASS
+  Soft-delete purge after grace window: PASS
+  Partition-scoped TTL (predicate drop): PASS
+  Tiered storage transparent query + cost model: PASS
+  Legal hold blocks DELETE/UPDATE/TTL, release restores: PASS
+  Soft delete + visibility modifiers + HARD: PASS
+  FORGET USER cross-table erasure + PII detect: PASS
+  Archive write + delete + restore round-trip: PASS
+  latency (ns/op) [PASS/OK]:
+    Runs: [7, 8, 8, 8, 7]
+    Average: 8 <= 50 (target)
+    Min/Max: 7 / 8, StdDev: 0
+  latency (s) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 5 (target)
+    Min/Max: 0 / 0, StdDev: 0
+  throughput (rows/sec) [PASS/OK]:
+    Runs: [7,712,776, 7,972,511, 12,503,595, 10,352,128, 10,580,331]
+    Average: 9,824,268 >= 500,000 (target)
+    Min/Max: 7,712,776 / 12,503,595, StdDev: 1,784,178
+  throughput (rows/sec) [PASS/OK]:
+    Runs: [48,435,532, 49,545,421, 48,508,368, 47,992,705, 49,538,058]
+    Average: 48,804,017 >= 500,000 (target)
+    Min/Max: 47,992,705 / 49,545,421, StdDev: 627,680
+
+  Performance suite complete.

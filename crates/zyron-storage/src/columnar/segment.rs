@@ -483,15 +483,18 @@ impl ColumnSegment {
                     let start = i * valueSize;
                     let end = start + valueSize;
                     let raw_len = rawData.len();
-                    if v.len() == valueSize && end <= raw_len {
-                        rawData[start..end].copy_from_slice(v);
-                    } else {
-                        // Mismatched length, zero the slot so encoders see
-                        // deterministic placeholder bytes since rawData was
-                        // allocated uninitialized
-                        let cap_end = end.min(raw_len);
-                        rawData[start..cap_end].fill(0);
+                    if v.len() != valueSize || end > raw_len {
+                        // A non-null value whose width does not match the fixed
+                        // column value size cannot be packed into its slot, fail
+                        // instead of zero-filling and corrupting the value
+                        return Err(ZyronError::EncodingFailed(format!(
+                            "non-null value at row {} has length {} expected {}",
+                            i,
+                            v.len(),
+                            valueSize
+                        )));
                     }
+                    rawData[start..end].copy_from_slice(v);
                 }
             }
         }

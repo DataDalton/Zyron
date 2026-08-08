@@ -59,56 +59,102 @@ impl BTreeArenaIndex {
     // Lock-Free Read Path
     // =========================================================================
 
-    /// Direct search without version overhead.
-    /// Writes use &mut self which provides exclusive access.
+    /// Search the tree for a key. Lock-free against the single writer via a
+    /// seqlock validated descent, so a concurrent insert never returns torn
+    /// data to a reader.
     #[inline(always)]
     pub fn search(&self, key: &[u8]) -> Option<TupleId> {
         self.search_optimistic(key)
     }
 
-    /// Direct search without version checking.
-    /// Writes use &mut self which provides exclusive access.
-    /// Relaxed ordering is safe since writes are exclusive.
+    /// Seqlock-validated search. The single writer publishes each node mutation
+    /// by bumping the node's version odd before the in-place shift and even
+    /// after (with a Release fence). A reader validates every node it visits:
+    /// it loads the version (Acquire), and if odd retries the whole descent;
+    /// after using the node it re-reads the version and retries on any change.
+    /// The root/height pair is snapshotted with the same discipline so a
+    /// concurrent root split never makes the reader descend to the wrong depth.
     #[inline(always)]
     fn search_optimistic(&self, key: &[u8]) -> Option<TupleId> {
         let search_key = self.key_to_u64(key);
-        let mut current_offset = self.root_offset.load(Ordering::Relaxed);
-        let height = self.height.load(Ordering::Relaxed);
 
-        // Fast path for height=1 (root is leaf)
-        if height == 1 {
-            return self.search_leaf_interpolation(current_offset, search_key);
+        loop {
+            // Snapshot (height, root). Read height, then root, then re-read
+            // height; a changed height means a concurrent root split moved the
+            // pair, so retry. create_new_root stores root before bumping
+            // height, so a stable height here pairs with a matching root.
+            let height = self.height.load(Ordering::Acquire);
+            let root_offset = self.root_offset.load(Ordering::Acquire);
+            if self.height.load(Ordering::Acquire) != height {
+                std::hint::spin_loop();
+                continue;
+            }
+
+            // Fast path for height=1 (root is leaf).
+            if height == 1 {
+                match self.search_leaf_validated(root_offset, search_key) {
+                    Some(result) => return result,
+                    None => {
+                        std::hint::spin_loop();
+                        continue;
+                    }
+                }
+            }
+
+            // Traverse internal nodes, validating each before descending.
+            let mut current_offset = root_offset;
+            let mut levels_remaining = height - 1;
+            let mut torn = false;
+            while levels_remaining > 0 {
+                match self.traverse_internal_validated(
+                    current_offset,
+                    search_key,
+                    levels_remaining == 1,
+                ) {
+                    Some(child) => current_offset = child,
+                    None => {
+                        torn = true;
+                        break;
+                    }
+                }
+                levels_remaining -= 1;
+            }
+            if torn {
+                std::hint::spin_loop();
+                continue;
+            }
+
+            match self.search_leaf_validated(current_offset, search_key) {
+                Some(result) => return result,
+                None => {
+                    std::hint::spin_loop();
+                    continue;
+                }
+            }
         }
-
-        // Traverse internal nodes with leaf prefetching
-        // Height 2: 1 internal level, height 3: 2 internal levels, etc.
-        let mut levels_remaining = height - 1;
-        while levels_remaining > 0 {
-            current_offset = self.traverse_internal_node_prefetch(
-                current_offset,
-                search_key,
-                levels_remaining == 1,
-            );
-            levels_remaining -= 1;
-        }
-
-        // Search leaf node using interpolation search
-        self.search_leaf_interpolation(current_offset, search_key)
     }
 
-    /// Traverse internal node with optional prefetch of child node.
-    /// When at last internal level, prefetches the target leaf node header
-    /// and first cache line of entries.
+    /// Reads the child offset for `search_key` from an internal node under
+    /// seqlock validation. Returns None when the node was mutated during the
+    /// read so the caller retries the descent.
     #[inline(always)]
-    fn traverse_internal_node_prefetch(
+    fn traverse_internal_validated(
         &self,
         offset: u64,
         search_key: u64,
         prefetch_child: bool,
-    ) -> u64 {
+    ) -> Option<u64> {
+        let v1 = self.arena.read_version_acquire(offset);
+        if v1 & 1 != 0 {
+            return None;
+        }
         let header = self.arena.read_internal_header(offset);
         let child_idx = self.find_child_idx_branchless(offset, search_key, header.num_keys);
         let child_offset = self.read_child_ptr(offset, child_idx);
+        let v2 = self.arena.read_version_acquire(offset);
+        if v1 != v2 {
+            return None;
+        }
 
         if prefetch_child {
             #[cfg(target_arch = "x86_64")]
@@ -125,7 +171,24 @@ impl BTreeArenaIndex {
             }
         }
 
-        child_offset
+        Some(child_offset)
+    }
+
+    /// Searches a leaf under seqlock validation. The inner Option is the search
+    /// result (Some(tid) / None); the outer Option is None when the leaf was
+    /// mutated during the read so the caller retries the descent.
+    #[inline(always)]
+    fn search_leaf_validated(&self, offset: u64, search_key: u64) -> Option<Option<TupleId>> {
+        let v1 = self.arena.read_version_acquire(offset);
+        if v1 & 1 != 0 {
+            return None;
+        }
+        let result = self.search_leaf_interpolation(offset, search_key);
+        let v2 = self.arena.read_version_acquire(offset);
+        if v1 != v2 {
+            return None;
+        }
+        Some(result)
     }
 
     /// Branchless binary search for child index in internal node.
@@ -523,8 +586,15 @@ impl BTreeArenaIndex {
             std::ptr::write_unaligned(child1_ptr, right_child);
         }
 
-        self.height.fetch_add(1, Ordering::Release);
+        // Store the new root before bumping height so a concurrent reader
+        // never sees the taller height while still pointing at the old root,
+        // which would make it descend one level too deep past the leaves.
+        // The reader loads root_offset then height (Acquire); publishing root
+        // first (Release) with height second (Release) keeps the reader's
+        // pair consistent: it either sees the old (root, height) or the new
+        // (root, height), never a height that outruns the root.
         self.root_offset.store(new_root_offset, Ordering::Release);
+        self.height.fetch_add(1, Ordering::Release);
     }
 
     /// Propagate split up to parent internal nodes.
@@ -725,9 +795,17 @@ impl BTreeArenaIndex {
         let capacity = (end.saturating_sub(start).saturating_add(1) as usize).min(8192);
         let mut results: Vec<(u64, u64)> = Vec::with_capacity(capacity);
 
-        // Find starting leaf
-        let height = self.height.load(Ordering::Relaxed);
-        let mut current = self.root_offset.load(Ordering::Relaxed);
+        // Find starting leaf. Snapshot (height, root) with Acquire and a
+        // height recheck so a concurrent root split never makes the descent
+        // overshoot past the leaves.
+        let (height, mut current) = loop {
+            let h = self.height.load(Ordering::Acquire);
+            let r = self.root_offset.load(Ordering::Acquire);
+            if self.height.load(Ordering::Acquire) == h {
+                break (h, r);
+            }
+            std::hint::spin_loop();
+        };
 
         for _ in 0..(height - 1) {
             let header = self.arena.read_internal_header(current);
@@ -855,11 +933,12 @@ impl BTreeArenaIndex {
     // =========================================================================
 
     /// Convert key bytes to u64 (big-endian for sort order).
-    /// Uses a direct 8-byte read for the common case (single load + bswap).
+    /// Reads the first 8 bytes via a safe slice conversion (single load +
+    /// bswap), no unaligned typed pointer deref.
     #[inline(always)]
     fn key_to_u64(&self, key: &[u8]) -> u64 {
         if key.len() >= 8 {
-            u64::from_be_bytes(unsafe { *(key.as_ptr() as *const [u8; 8]) })
+            u64::from_be_bytes(key[..8].try_into().unwrap())
         } else {
             let mut padded = [0u8; 8];
             padded[..key.len()].copy_from_slice(key);
@@ -971,9 +1050,12 @@ impl BTreeArenaIndex {
                 }
             }
 
-            // Finalize current batch version
+            // Finalize current batch version. Release fence first so the
+            // merged entries are visible to a seqlock reader before the version
+            // returns even.
             if batch_active {
                 unsafe {
+                    std::sync::atomic::fence(Ordering::Release);
                     let header_ptr = batch_leaf_ptr as *mut ArenaLeafNodeHeader;
                     (*header_ptr).version = batch_version + 2;
                 }
@@ -1013,10 +1095,13 @@ impl BTreeArenaIndex {
                 batch_leaf_ptr = self.arena.node_ptr_mut(leaf_offset);
                 leaf_existing_count = header.num_entries;
 
-                // Bump version (odd = write in progress)
+                // Bump version (odd = write in progress). Release fence after
+                // so a seqlock reader sees the odd version before any entry
+                // mutation lands.
                 unsafe {
                     let header_ptr = batch_leaf_ptr as *mut ArenaLeafNodeHeader;
                     (*header_ptr).version = batch_version + 1;
+                    std::sync::atomic::fence(Ordering::Release);
                 }
 
                 batch_max_key = leaf_separator;
@@ -1052,9 +1137,11 @@ impl BTreeArenaIndex {
             }
         }
 
-        // Finalize last batch version
+        // Finalize last batch version. Release fence first so the merged
+        // entries publish before the version returns even.
         if batch_active {
             unsafe {
+                std::sync::atomic::fence(Ordering::Release);
                 let header_ptr = batch_leaf_ptr as *mut ArenaLeafNodeHeader;
                 (*header_ptr).version = batch_version + 2;
             }
@@ -1156,5 +1243,102 @@ impl BTreeArenaIndex {
         }
 
         (current_offset, path, path_len)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zyron_common::page::PageId;
+
+    fn tid(n: u64) -> TupleId {
+        TupleId {
+            page_id: PageId {
+                file_id: 0,
+                page_num: n,
+            },
+            slot_id: (n & 0xFFFF) as u16,
+        }
+    }
+
+    fn key(n: u64) -> [u8; 8] {
+        n.to_be_bytes()
+    }
+
+    #[test]
+    fn insert_and_search_across_splits() {
+        // Enough keys to force several leaf splits and a multi-level tree, so
+        // the search descends through internal nodes created by root splits.
+        let mut t = BTreeArenaIndex::new(4096);
+        let n = 50_000u64;
+        for i in 0..n {
+            t.insert(&key(i), tid(i)).unwrap();
+        }
+        assert!(t.height() > 1, "expected a multi-level tree");
+        for i in 0..n {
+            assert_eq!(t.search(&key(i)), Some(tid(i)), "missing key {}", i);
+        }
+        assert_eq!(t.search(&key(n + 1)), None);
+    }
+
+    #[test]
+    fn search_correct_across_root_splits() {
+        // The arena index is single-writer-exclusive: writes take &mut self,
+        // so Rust forbids a concurrent reader aliasing the same instance
+        // without unsafe. The seqlock read path plus the create_new_root
+        // store-root-before-height ordering harden the &self read so that if a
+        // reader ever observes a node mid-update it retries rather than reading
+        // torn data or descending one level too deep. This test verifies the
+        // hardened read path returns correct results as the tree grows through
+        // multiple root splits (height increases), exercising the ordering.
+        let mut t = BTreeArenaIndex::new(8192);
+        let mut last_height = t.height();
+        let n = 80_000u64;
+        for i in 0..n {
+            t.insert(&key(i), tid(i)).unwrap();
+            let h = t.height();
+            if h != last_height {
+                // Right after a height change, every prior key must resolve.
+                for j in (0..i).step_by(997) {
+                    assert_eq!(t.search(&key(j)), Some(tid(j)), "lost {} after split", j);
+                }
+                last_height = h;
+            }
+        }
+        assert!(t.height() >= 2, "expected at least one root split");
+        for i in 0..n {
+            assert_eq!(t.search(&key(i)), Some(tid(i)), "missing key {}", i);
+        }
+    }
+
+    #[test]
+    fn seqlock_read_retries_on_odd_version() {
+        // A leaf whose version word is left odd (writer mid-update) must make
+        // the validated leaf read report "retry" rather than return data.
+        let mut t = BTreeArenaIndex::new(64);
+        for i in 0..10u64 {
+            t.insert(&key(i), tid(i)).unwrap();
+        }
+        let root = t.root_offset.load(Ordering::Acquire);
+        // Force the root leaf's version odd to simulate a writer in progress.
+        unsafe {
+            let header_ptr = t.arena.node_ptr_mut(root) as *mut ArenaLeafNodeHeader;
+            (*header_ptr).version |= 1;
+        }
+        let sk = t.key_to_u64(&key(5));
+        assert!(
+            t.search_leaf_validated(root, sk).is_none(),
+            "odd version must signal retry"
+        );
+        // Restore even version: the read now succeeds.
+        unsafe {
+            let header_ptr = t.arena.node_ptr_mut(root) as *mut ArenaLeafNodeHeader;
+            (*header_ptr).version &= !1;
+        }
+        assert_eq!(
+            t.search_leaf_validated(root, sk),
+            Some(Some(tid(5))),
+            "even version must return the result"
+        );
     }
 }

@@ -124,7 +124,17 @@ impl PatchStore {
             }
             let mut pos = 8usize;
             let mut valid_end = 8usize;
-            while pos + REC_HEADER <= buf.len() {
+            loop {
+                if pos == buf.len() {
+                    break; // clean end of log
+                }
+                if pos + REC_HEADER > buf.len() {
+                    // A partial header at the very end is an unwritten torn
+                    // tail. Truncate it. A partial header anywhere a full
+                    // record could still follow cannot occur, the file only
+                    // grows by whole fsynced records.
+                    break;
+                }
                 let kind = buf[pos];
                 let file_id = u64::from_le_bytes(buf[pos + 1..pos + 9].try_into().unwrap());
                 let sys_rowid = u64::from_le_bytes(buf[pos + 9..pos + 17].try_into().unwrap());
@@ -135,15 +145,28 @@ impl PatchStore {
                     u32::from_le_bytes(buf[pos + 37..pos + 41].try_into().unwrap()) as usize;
                 let rec_end = pos + REC_HEADER + val_len + 4;
                 if rec_end > buf.len() {
-                    break; // torn tail
+                    break; // torn tail, record does not fit the file
                 }
-                let value = buf[pos + REC_HEADER..pos + REC_HEADER + val_len].to_vec();
                 let stored_crc = u32::from_le_bytes(
                     buf[pos + REC_HEADER + val_len..rec_end].try_into().unwrap(),
                 );
                 if record_checksum(&buf[pos..pos + REC_HEADER + val_len]) != stored_crc {
+                    // A CRC mismatch is a torn tail only when nothing valid
+                    // follows. If a later region parses as a well formed
+                    // record, this is interior corruption: truncating here
+                    // would silently drop committed patches that follow. Fail
+                    // recovery so the operator can restore from backup rather
+                    // than lose data.
+                    if Self::well_formed_record_follows(&buf, rec_end) {
+                        return Err(ZyronError::IoError(format!(
+                            "patch file {} has interior corruption at offset {}, a later record is intact so this is not a torn tail",
+                            path.display(),
+                            pos
+                        )));
+                    }
                     break; // torn / corrupt tail
                 }
+                let value = buf[pos + REC_HEADER..pos + REC_HEADER + val_len].to_vec();
                 Self::apply_overlay(&mut overlay, kind, file_id, sys_rowid, epoch, col_id, value);
                 if lsn > hwm {
                     hwm = lsn;
@@ -167,6 +190,33 @@ impl PatchStore {
             overlay: RwLock::new(overlay),
             persisted_lsn: AtomicU64::new(hwm),
         })
+    }
+
+    /// Scans from `from` for any record whose CRC validates. A match means a
+    /// well formed record region follows a corrupt one, so the corruption is
+    /// interior, not a torn tail. The scan starts at the record boundary the
+    /// corrupt record claims and then slides byte by byte, because a flipped
+    /// length field could mis-size that boundary. A CRC over the record bytes
+    /// makes a coincidental match astronomically unlikely.
+    fn well_formed_record_follows(buf: &[u8], from: usize) -> bool {
+        let mut scan = from;
+        while scan + REC_HEADER + 4 <= buf.len() {
+            let val_len =
+                u32::from_le_bytes(buf[scan + 37..scan + 41].try_into().unwrap()) as usize;
+            let rec_end = scan + REC_HEADER + val_len + 4;
+            if rec_end <= buf.len() {
+                let stored_crc = u32::from_le_bytes(
+                    buf[scan + REC_HEADER + val_len..rec_end]
+                        .try_into()
+                        .unwrap(),
+                );
+                if record_checksum(&buf[scan..scan + REC_HEADER + val_len]) == stored_crc {
+                    return true;
+                }
+            }
+            scan += 1;
+        }
+        false
     }
 
     fn apply_overlay(
@@ -226,7 +276,11 @@ impl PatchStore {
                 .map_err(|e| ZyronError::IoError(format!("patch fsync: {}", e)))?;
         }
 
-        self.persisted_lsn.fetch_max(lsn, Ordering::AcqRel);
+        // Update the in-memory overlay BEFORE advancing the persisted LSN
+        // high-water. A reader that observes the new high-water must also see
+        // the patch in the live overlay. Advancing the high-water first would
+        // expose a window where the patch reads as persisted but absent from
+        // the overlay, so a concurrent scan would miss a durable patch.
         let mut ov = write_through(&self.overlay);
         Self::apply_overlay(
             &mut ov,
@@ -237,6 +291,8 @@ impl PatchStore {
             col_id,
             value.to_vec(),
         );
+        self.persisted_lsn.fetch_max(lsn, Ordering::AcqRel);
+        drop(ov);
         Ok(())
     }
 
@@ -579,6 +635,59 @@ mod tests {
         // A fresh well-formed append still works after truncation.
         s.append_supersede(2, 1, 20, 6).expect("supersede");
         assert_eq!(s.row_overlay(2, 1).expect("o").supersedes, vec![20]);
+    }
+
+    #[test]
+    fn test_interior_corruption_rejected() {
+        // Two well formed records. Corrupting the first record's value byte
+        // must fail recovery, not silently truncate and drop the second
+        // committed record.
+        let dir = tempdir().expect("tmp");
+        let path = dir.path().join("11.zyrpatch");
+        {
+            let s = PatchStore::open(&path).expect("open");
+            s.append_value_patch(1, 1, 0, 10, 5, b"first").expect("p1");
+            s.append_value_patch(1, 2, 0, 11, 6, b"second").expect("p2");
+        }
+        // Flip a byte inside the first record's value, after the magic header.
+        // The first value "first" starts at offset 8 + REC_HEADER.
+        {
+            use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .expect("open");
+            let corrupt_at = (8 + REC_HEADER) as u64;
+            f.seek(SeekFrom::Start(corrupt_at)).unwrap();
+            let mut b = [0u8; 1];
+            f.read_exact(&mut b).unwrap();
+            b[0] ^= 0xFF;
+            f.seek(SeekFrom::Start(corrupt_at)).unwrap();
+            f.write_all(&b).unwrap();
+            f.sync_all().unwrap();
+        }
+        let err = PatchStore::open(&path);
+        assert!(
+            err.is_err(),
+            "interior corruption must fail recovery instead of truncating committed records"
+        );
+    }
+
+    #[test]
+    fn test_overlay_visible_when_persisted_lsn_advances() {
+        // After an append returns, the persisted LSN high-water and the live
+        // overlay must agree: a reader seeing the new high-water must find the
+        // patch in the overlay.
+        let dir = tempdir().expect("tmp");
+        let path = dir.path().join("12.zyrpatch");
+        let s = PatchStore::open(&path).expect("open");
+        s.append_value_patch(1, 5, 2, 100, 42, b"x").expect("patch");
+        assert_eq!(s.max_persisted_lsn(), 42);
+        let o = s
+            .row_overlay(1, 5)
+            .expect("overlay present once persisted lsn reflects the patch");
+        assert_eq!(o.patches[&2][0].value, b"x");
     }
 
     #[test]

@@ -15,6 +15,20 @@ pub struct CurrencyInfo {
     pub numeric: u16,
 }
 
+/// Rounds an f64 amount to i64 minor units and rejects values that fall
+/// outside the i64 range. A direct cast saturates silently so the bounds are
+/// checked against the exact i64 limits before converting.
+fn round_to_i64(value: f64) -> Result<i64> {
+    let rounded = value.round();
+    if !rounded.is_finite() || rounded < i64::MIN as f64 || rounded > i64::MAX as f64 {
+        return Err(ZyronError::ExecutionError(format!(
+            "Money value out of range: {}",
+            value
+        )));
+    }
+    Ok(rounded as i64)
+}
+
 /// Looks up currency information by ISO 4217 alpha code.
 pub fn currency_lookup(code: &str) -> Option<CurrencyInfo> {
     let upper = code.to_ascii_uppercase();
@@ -35,7 +49,7 @@ pub fn money_create(amount: f64, currency: &str) -> Result<(i64, u16)> {
     let info = currency_lookup(currency)
         .ok_or_else(|| ZyronError::ExecutionError(format!("Unknown currency: {}", currency)))?;
     let factor = 10i64.pow(info.decimals as u32);
-    let minor_units = (amount * factor as f64).round() as i64;
+    let minor_units = round_to_i64(amount * factor as f64)?;
     Ok((minor_units, info.numeric))
 }
 
@@ -110,9 +124,9 @@ pub fn money_subtract(a_val: i64, a_cur: u16, b_val: i64, b_cur: u16) -> Result<
 }
 
 /// Multiplies a money value by a scalar factor.
-pub fn money_multiply(val: i64, cur: u16, factor: f64) -> (i64, u16) {
-    let result = (val as f64 * factor).round() as i64;
-    (result, cur)
+pub fn money_multiply(val: i64, cur: u16, factor: f64) -> Result<(i64, u16)> {
+    let result = round_to_i64(val as f64 * factor)?;
+    Ok((result, cur))
 }
 
 /// Converts a money value from one currency to another with an explicit exchange rate.
@@ -130,7 +144,7 @@ pub fn money_convert(val: i64, from_cur: u16, to_cur: u16, rate: f64) -> Result<
 
     let decimal_amount = (val as f64) / from_factor;
     let converted = decimal_amount * rate;
-    let target_units = (converted * to_factor).round() as i64;
+    let target_units = round_to_i64(converted * to_factor)?;
 
     Ok((target_units, to_cur))
 }
@@ -572,9 +586,24 @@ mod tests {
 
     #[test]
     fn test_money_multiply() {
-        let (val, cur) = money_multiply(1000, 840, 2.5);
+        let (val, cur) = money_multiply(1000, 840, 2.5).unwrap();
         assert_eq!(val, 2500);
         assert_eq!(cur, 840);
+    }
+
+    #[test]
+    fn test_money_multiply_overflow() {
+        assert!(money_multiply(i64::MAX, 840, 2.0).is_err());
+    }
+
+    #[test]
+    fn test_money_create_overflow() {
+        assert!(money_create(1e30, "USD").is_err());
+    }
+
+    #[test]
+    fn test_money_convert_overflow() {
+        assert!(money_convert(i64::MAX, 840, 978, 1e10).is_err());
     }
 
     #[test]

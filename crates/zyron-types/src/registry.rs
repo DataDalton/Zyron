@@ -76,11 +76,9 @@ pub fn infer_types_scalar_return_type(name: &str, arg_types: &[TypeId]) -> Optio
         | "overlap_coefficient"
         | "ngram_similarity" => Some(TypeId::Float64),
         "qgram_distance" => Some(TypeId::Int32),
-        "fuzzy_join_candidates" => Some(TypeId::Array),
 
         // ---------- entity_resolution ----------
         "address_similarity" | "name_similarity" | "company_similarity" => Some(TypeId::Float64),
-        "entity_resolve" | "merge_records" => Some(TypeId::Array),
 
         // ---------- fingerprint ----------
         "minhash_signature" | "minhash_encode" => Some(TypeId::Bytea),

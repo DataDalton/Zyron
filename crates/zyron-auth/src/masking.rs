@@ -438,25 +438,20 @@ pub fn apply_credit_card_mask(value: &str) -> String {
     result
 }
 
-/// Shows the first N characters and masks the rest with asterisks. Non-ASCII
-/// input is returned unchanged.
+/// Shows the first N characters and masks the rest with asterisks. Operates
+/// over chars so non-ASCII input is masked on character boundaries.
 pub fn apply_partial_mask(value: &str, show_chars: u8) -> String {
-    if !value.is_ascii() {
-        return value.to_string();
-    }
-    let bytes = value.as_bytes();
-    let len = bytes.len();
     let show = show_chars as usize;
-    if len <= show {
+    let char_count = value.chars().count();
+    if char_count <= show {
         return value.to_string();
     }
-    let mut result = String::with_capacity(len);
-    unsafe {
-        let out = result.as_mut_vec();
-        out.set_len(len);
-        let ptr = out.as_mut_ptr();
-        for i in 0..len {
-            *ptr.add(i) = if i < show { bytes[i] } else { b'*' };
+    let mut result = String::with_capacity(value.len());
+    for (i, c) in value.chars().enumerate() {
+        if i < show {
+            result.push(c);
+        } else {
+            result.push('*');
         }
     }
     result
@@ -528,34 +523,26 @@ pub fn apply_bucket_mask(value: &str, boundaries: &[f64]) -> String {
 
 /// Shows the first N and last M characters, masking the middle with mask_char.
 /// If the value is shorter than show_first + show_last, returns it unchanged.
-/// Non-ASCII input is returned unchanged.
+/// Operates over chars so non-ASCII input is masked on character boundaries.
 pub fn apply_partial_mask_extended(
     value: &str,
     show_first: u8,
     show_last: u8,
     mask_char: u8,
 ) -> String {
-    if !value.is_ascii() {
-        return value.to_string();
-    }
-    let bytes = value.as_bytes();
-    let len = bytes.len();
     let first = show_first as usize;
     let last = show_last as usize;
-    if len <= first + last {
+    let char_count = value.chars().count();
+    if char_count <= first + last {
         return value.to_string();
     }
-    let mut result = String::with_capacity(len);
-    unsafe {
-        let out = result.as_mut_vec();
-        out.set_len(len);
-        let ptr = out.as_mut_ptr();
-        for i in 0..len {
-            *ptr.add(i) = if i < first || i >= len - last {
-                bytes[i]
-            } else {
-                mask_char
-            };
+    let mask = mask_char as char;
+    let mut result = String::with_capacity(value.len());
+    for (i, c) in value.chars().enumerate() {
+        if i < first || i >= char_count - last {
+            result.push(c);
+        } else {
+            result.push(mask);
         }
     }
     result
@@ -580,7 +567,10 @@ pub fn apply_mask(value: &str, function: &MaskFunction, buf: &mut String) -> boo
                 MaskFunction::CreditCard => apply_credit_card_mask(value),
                 MaskFunction::Partial(n) => apply_partial_mask(value, *n),
                 MaskFunction::Redact => "[REDACTED]".to_string(),
-                MaskFunction::Custom(_) => value.to_string(),
+                // No custom masking function registry exists so a named custom
+                // function cannot be resolved. Fail closed with full redaction
+                // rather than returning the plaintext value
+                MaskFunction::Custom(_) => "[REDACTED]".to_string(),
                 MaskFunction::NoiseMask { factor } => apply_noise_mask(value, *factor),
                 MaskFunction::BucketMask { boundaries } => apply_bucket_mask(value, boundaries),
                 MaskFunction::PartialMask {
@@ -819,14 +809,16 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_mask_custom_passthrough() {
+    fn test_apply_mask_custom_fails_closed() {
+        // No custom masking function registry exists so a named custom function
+        // fails closed with full redaction rather than leaking the plaintext
         let mut buf = String::new();
         assert!(apply_mask(
             "data",
             &MaskFunction::Custom("my_fn".to_string()),
             &mut buf
         ));
-        assert_eq!(buf, "data");
+        assert_eq!(buf, "[REDACTED]");
     }
 
     #[test]

@@ -55,6 +55,9 @@ pub struct BackgroundWriter {
     target_lsn: Arc<AtomicU64>,
     /// Lowest unflushed dirty_lsn across all frames, updated each cycle.
     min_dirty_lsn: Arc<AtomicU64>,
+    /// Set when a page write or fsync fails durably. The checkpointer reads this
+    /// to fail a checkpoint instead of waiting on pages that cannot be made durable.
+    durable_error: Arc<AtomicBool>,
     /// Shutdown signal.
     shutdown: Arc<AtomicBool>,
     /// Thread handle for park/unpark wakeup.
@@ -78,6 +81,7 @@ impl BackgroundWriter {
     ) -> Self {
         let target_lsn = Arc::new(AtomicU64::new(0));
         let min_dirty_lsn = Arc::new(AtomicU64::new(u64::MAX));
+        let durable_error = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
         let writer_thread_waker = Arc::new(OnceLock::new());
         let pages_flushed = Arc::new(AtomicU64::new(0));
@@ -85,6 +89,7 @@ impl BackgroundWriter {
         let thread_pool = Arc::clone(&pool);
         let thread_target = Arc::clone(&target_lsn);
         let thread_min_dirty = Arc::clone(&min_dirty_lsn);
+        let thread_durable_error = Arc::clone(&durable_error);
         let thread_shutdown = Arc::clone(&shutdown);
         let thread_waker = Arc::clone(&writer_thread_waker);
         let thread_flushed = Arc::clone(&pages_flushed);
@@ -102,6 +107,7 @@ impl BackgroundWriter {
                     &fsync_fn,
                     &thread_target,
                     &thread_min_dirty,
+                    &thread_durable_error,
                     &thread_shutdown,
                     &thread_flushed,
                     &thread_config,
@@ -112,6 +118,7 @@ impl BackgroundWriter {
         Self {
             target_lsn,
             min_dirty_lsn,
+            durable_error,
             shutdown,
             writer_thread_waker,
             writer_thread: Some(handle),
@@ -126,6 +133,7 @@ impl BackgroundWriter {
         fsync_fn: &FsyncFn,
         target_lsn: &AtomicU64,
         min_dirty_lsn: &AtomicU64,
+        durable_error: &AtomicBool,
         shutdown: &AtomicBool,
         pages_flushed: &AtomicU64,
         config: &BackgroundWriterConfig,
@@ -139,6 +147,7 @@ impl BackgroundWriter {
                     fsync_fn,
                     u64::MAX,
                     min_dirty_lsn,
+                    durable_error,
                     pages_flushed,
                     config.pages_per_cycle,
                 );
@@ -155,6 +164,7 @@ impl BackgroundWriter {
                 fsync_fn,
                 threshold,
                 min_dirty_lsn,
+                durable_error,
                 pages_flushed,
                 config.pages_per_cycle,
             );
@@ -176,6 +186,7 @@ impl BackgroundWriter {
         fsync_fn: &FsyncFn,
         threshold: u64,
         min_dirty_lsn: &AtomicU64,
+        durable_error: &AtomicBool,
         pages_flushed: &AtomicU64,
         pages_per_cycle: usize,
     ) -> usize {
@@ -191,28 +202,32 @@ impl BackgroundWriter {
 
         let mut flushed = 0;
         let mut new_min = u64::MAX;
-        // Track touched file_ids so fsync runs once per file at the end,
-        // not once per page. Most batches touch a handful of files so the
-        // pre-reserved Vec stays small. Linear `contains` over <=8 entries
-        // is faster than a HashSet hash for these sizes.
-        let mut touched: Vec<u32> = Vec::with_capacity(8);
+        // Per-file record of pages written this cycle. fsync is batched per file,
+        // so a fsync failure must re-dirty exactly the pages whose durability it
+        // covered. Each entry is (file_id, [(page_id, dirty_lsn)]).
+        let mut written: Vec<(u32, Vec<(PageId, u64)>)> = Vec::with_capacity(8);
 
         for &(page_id, frame_id, dlsn) in &dirty_pages {
             match pool.flush_dirty_frame(page_id, frame_id, dlsn, |pid, data| write_fn(pid, data)) {
                 Ok(true) => {
                     flushed += 1;
-                    if !touched.contains(&page_id.file_id) {
-                        touched.push(page_id.file_id);
+                    match written.iter_mut().find(|(fid, _)| *fid == page_id.file_id) {
+                        Some((_, pages)) => pages.push((page_id, dlsn)),
+                        None => written.push((page_id.file_id, vec![(page_id, dlsn)])),
                     }
                 }
                 Ok(false) => {
-                    // Page was evicted or already clean, track its LSN as still pending
-                    if dlsn < new_min {
-                        new_min = dlsn;
-                    }
+                    // The frame was reassigned to a different page or is already
+                    // clean. This frame no longer holds this dirty page, so its
+                    // stale lsn must not hold the checkpoint floor down. The page,
+                    // if still dirty, lives in another frame and is found on the
+                    // next collect.
                 }
                 Err(_) => {
-                    // I/O error, page remains dirty. Track its LSN.
+                    // Page write failed. flush_dirty_frame leaves the page dirty
+                    // so it is retried. Hold the floor at its lsn and record the
+                    // durable error.
+                    durable_error.store(true, Ordering::Release);
                     if dlsn < new_min {
                         new_min = dlsn;
                     }
@@ -220,9 +235,19 @@ impl BackgroundWriter {
             }
         }
 
-        // One fsync per touched file replaces 64 fsyncs per cycle.
-        for &file_id in &touched {
-            let _ = fsync_fn(file_id);
+        // One fsync per touched file replaces one fsync per page. A fsync failure
+        // means the file's just-written pages are not durable, so re-dirty them
+        // for a later retry, hold the floor at their lsn, and flag the error.
+        for (file_id, pages) in &written {
+            if fsync_fn(*file_id).is_err() {
+                durable_error.store(true, Ordering::Release);
+                for &(page_id, dlsn) in pages {
+                    pool.mark_dirty_with_lsn(page_id, dlsn);
+                    if dlsn < new_min {
+                        new_min = dlsn;
+                    }
+                }
+            }
         }
 
         pages_flushed.fetch_add(flushed as u64, Ordering::Relaxed);
@@ -254,6 +279,19 @@ impl BackgroundWriter {
     /// Returns the lowest unflushed dirty_lsn. u64::MAX means no dirty pages.
     pub fn min_dirty_lsn(&self) -> u64 {
         self.min_dirty_lsn.load(Ordering::Acquire)
+    }
+
+    /// Returns true if a page write or fsync has failed durably since the last
+    /// clear. The checkpointer reads this to fail a checkpoint rather than wait
+    /// on pages that cannot be made durable.
+    pub fn durable_error(&self) -> bool {
+        self.durable_error.load(Ordering::Acquire)
+    }
+
+    /// Clears the durable-error flag. Called after the error has been surfaced
+    /// so a later successful flush cycle is observable.
+    pub fn clear_durable_error(&self) {
+        self.durable_error.store(false, Ordering::Release);
     }
 
     /// Returns total pages flushed since creation.

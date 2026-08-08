@@ -1134,6 +1134,26 @@ fn generateRandomVector(state: &mut u64, dims: usize) -> Vec<f32> {
     (0..dims).map(|_| randomF32(state)).collect()
 }
 
+/// Generates `count` vectors of `dims` into one contiguous arena (count*dims
+/// f32, row-major). Building indexes from slices into this single allocation
+/// avoids the N separate small Vec<f32> heap objects that fragment the allocator
+/// under large N (and are never returned to the OS on Windows), which is what
+/// made the serial benchmark accumulate memory and OOM.
+fn genFlatArena(state: &mut u64, count: usize, dims: usize) -> Vec<f32> {
+    let mut arena = Vec::with_capacity(count * dims);
+    for _ in 0..count * dims {
+        arena.push(randomF32(state));
+    }
+    arena
+}
+
+/// Borrows a flat arena as `count` (id, slice) pairs with sequential ids.
+fn flatRefs(arena: &[f32], count: usize, dims: usize) -> Vec<(u64, &[f32])> {
+    (0..count)
+        .map(|i| (i as u64, &arena[i * dims..(i + 1) * dims]))
+        .collect()
+}
+
 /// Box-Muller transform for Gaussian-distributed samples.
 /// Produces N(0, 1) random values from uniform sources.
 fn gaussianF32(state: &mut u64) -> f32 {
@@ -1187,7 +1207,7 @@ fn bruteForceKnn(
 ) -> Vec<u64> {
     let mut dists: Vec<(u64, f32)> = vectors
         .iter()
-        .map(|(id, v)| (*id, computeDistance(metric, query, v)))
+        .map(|(id, v)| (*id, computeDistance(metric, query, v).unwrap()))
         .collect();
     dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     dists.truncate(k);
@@ -1234,12 +1254,10 @@ fn test_vector_insert_and_query() {
     let count = 10_000u64;
     let mut rng = 42u64;
 
-    let vectors: Vec<(u64, Vec<f32>)> = (0..count)
-        .map(|id| (id, generateRandomVector(&mut rng, dims)))
-        .collect();
+    let flat = genFlatArena(&mut rng, count as usize, dims);
 
     let start = Instant::now();
-    let vecRefs: Vec<(u64, &[f32])> = vectors.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+    let vecRefs: Vec<(u64, &[f32])> = flatRefs(&flat, count as usize, dims);
     let index =
         AnnIndex::build(&vecRefs, 1, 100, 0, HnswConfig::default()).expect("build 10K index");
     let buildTime = start.elapsed();
@@ -1252,7 +1270,7 @@ fn test_vector_insert_and_query() {
     assert_eq!(index.len(), count as usize);
 
     // Sanity check: querying for an existing vector should find itself.
-    let sanityQuery = &vectors[0].1;
+    let sanityQuery = &flat[0..dims];
     let sanityResults = index.search(sanityQuery, 10, 0).expect("search");
     assert!(!sanityResults.is_empty(), "search returned no results");
     assert_eq!(
@@ -1270,7 +1288,7 @@ fn test_vector_insert_and_query() {
     );
 
     // Verify recall against brute force using independent query.
-    let vecRefs: Vec<(u64, &[f32])> = vectors.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+    let vecRefs: Vec<(u64, &[f32])> = flatRefs(&flat, count as usize, dims);
     let truthIds = bruteForceKnn(&query, &vecRefs, 10, DistanceMetric::Cosine);
     let recall = measureRecall(&results, &truthIds);
     tprintln!("  Recall@10: {:.3}", recall);
@@ -1299,7 +1317,7 @@ fn test_distance_metrics() {
     // Cosine: identical vectors -> 0.0
     let a = vec![1.0f32, 2.0, 3.0];
     let b = vec![1.0f32, 2.0, 3.0];
-    let d = computeDistance(DistanceMetric::Cosine, &a, &b);
+    let d = computeDistance(DistanceMetric::Cosine, &a, &b).unwrap();
     tprintln!("  Cosine(identical): {d:.6}");
     assert!(
         d.abs() < 0.001,
@@ -1309,7 +1327,7 @@ fn test_distance_metrics() {
     // Cosine: orthogonal vectors -> 1.0
     let a = vec![1.0f32, 0.0, 0.0];
     let b = vec![0.0f32, 1.0, 0.0];
-    let d = computeDistance(DistanceMetric::Cosine, &a, &b);
+    let d = computeDistance(DistanceMetric::Cosine, &a, &b).unwrap();
     tprintln!("  Cosine(orthogonal): {d:.6}");
     assert!(
         (d - 1.0).abs() < 0.001,
@@ -1321,7 +1339,8 @@ fn test_distance_metrics() {
         DistanceMetric::Euclidean,
         &[1.0, 2.0, 3.0],
         &[1.0, 2.0, 3.0],
-    );
+    )
+    .unwrap();
     tprintln!("  Euclidean(identical): {d:.6}");
     assert!(
         d.abs() < 0.001,
@@ -1333,7 +1352,8 @@ fn test_distance_metrics() {
         DistanceMetric::Euclidean,
         &[1.0, 0.0, 0.0],
         &[0.0, 1.0, 0.0],
-    );
+    )
+    .unwrap();
     tprintln!("  Euclidean([1,0,0],[0,1,0]): {d:.6}");
     assert!(
         (d - std::f32::consts::SQRT_2).abs() < 0.01,
@@ -1345,7 +1365,8 @@ fn test_distance_metrics() {
         DistanceMetric::DotProduct,
         &[1.0, 2.0, 3.0],
         &[4.0, 5.0, 6.0],
-    );
+    )
+    .unwrap();
     tprintln!("  DotProduct([1,2,3],[4,5,6]): {d:.6}");
     assert!(
         (d - (-32.0)).abs() < 0.01,
@@ -1357,7 +1378,8 @@ fn test_distance_metrics() {
         DistanceMetric::Manhattan,
         &[1.0, 0.0, 0.0],
         &[0.0, 1.0, 0.0],
-    );
+    )
+    .unwrap();
     tprintln!("  Manhattan([1,0,0],[0,1,0]): {d:.6}");
     assert!((d - 2.0).abs() < 0.01, "manhattan should be 2.0, got {d}");
 
@@ -1367,10 +1389,10 @@ fn test_distance_metrics() {
         let a = generateRandomVector(&mut rng, dims);
         let b = generateRandomVector(&mut rng, dims);
 
-        let cosine = computeDistance(DistanceMetric::Cosine, &a, &b);
-        let euclidean = computeDistance(DistanceMetric::Euclidean, &a, &b);
-        let dot = computeDistance(DistanceMetric::DotProduct, &a, &b);
-        let manhattan = computeDistance(DistanceMetric::Manhattan, &a, &b);
+        let cosine = computeDistance(DistanceMetric::Cosine, &a, &b).unwrap();
+        let euclidean = computeDistance(DistanceMetric::Euclidean, &a, &b).unwrap();
+        let dot = computeDistance(DistanceMetric::DotProduct, &a, &b).unwrap();
+        let manhattan = computeDistance(DistanceMetric::Manhattan, &a, &b).unwrap();
 
         tprintln!(
             "  Dims={dims}: cosine={cosine:.4}, euclidean={euclidean:.4}, dot={dot:.4}, manhattan={manhattan:.4}"
@@ -1389,7 +1411,7 @@ fn test_distance_metrics() {
     let iterations = 100_000;
     let start = Instant::now();
     for _ in 0..iterations {
-        std::hint::black_box(computeDistance(DistanceMetric::Cosine, &a, &b));
+        std::hint::black_box(computeDistance(DistanceMetric::Cosine, &a, &b).unwrap());
     }
     let elapsed = start.elapsed();
     let perCallUs = elapsed.as_secs_f64() * 1_000_000.0 / iterations as f64;
@@ -1421,16 +1443,14 @@ fn test_ann_recall() {
     let mut rng = 777u64;
 
     tprintln!("  Generating {} vectors ({}-dim)...", count, dims);
-    let vectors: Vec<(u64, Vec<f32>)> = (0..count)
-        .map(|id| (id, generateRandomVector(&mut rng, dims)))
-        .collect();
+    let flat = genFlatArena(&mut rng, count as usize, dims);
 
-    let vecRefs: Vec<(u64, &[f32])> = vectors.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+    let vecRefs: Vec<(u64, &[f32])> = flatRefs(&flat, count as usize, dims);
 
     // Compute DataProfile and derive config automatically.
-    let sampleSlices: Vec<&[f32]> = vectors[..vectors.len().min(1000)]
-        .iter()
-        .map(|(_, v)| v.as_slice())
+    let sampleCount = (count as usize).min(1000);
+    let sampleSlices: Vec<&[f32]> = (0..sampleCount)
+        .map(|i| &flat[i * dims..(i + 1) * dims])
         .collect();
     let profile = DataProfile::compute(
         &sampleSlices,
@@ -1466,8 +1486,7 @@ fn test_ann_recall() {
         .map(|_| generateRandomVector(&mut queryRng, dims))
         .collect();
 
-    let vecRefsForTruth: Vec<(u64, &[f32])> =
-        vectors.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+    let vecRefsForTruth: Vec<(u64, &[f32])> = flatRefs(&flat, count as usize, dims);
 
     for q in 0..numQueries {
         let query = &queries[q];
@@ -1550,10 +1569,8 @@ fn test_recall_diagnostic() {
     tprintln!("\n  --- Test 1: efSearch Sweep (50K, m=32, efC=200) ---");
     let n1 = 50_000u64;
     let mut rng1 = 777u64;
-    let vecs1: Vec<(u64, Vec<f32>)> = (0..n1)
-        .map(|id| (id, generateRandomVector(&mut rng1, dims)))
-        .collect();
-    let refs1: Vec<(u64, &[f32])> = vecs1.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+    let flat1 = genFlatArena(&mut rng1, n1 as usize, dims);
+    let refs1: Vec<(u64, &[f32])> = flatRefs(&flat1, n1 as usize, dims);
 
     let cfg1 = HnswConfig {
         m: 32,
@@ -1570,7 +1587,7 @@ fn test_recall_diagnostic() {
         tprintln!("  {:>10} {:>10.4}", ef, r);
     }
     drop(idx1);
-    drop(vecs1);
+    drop(flat1);
 
     // -----------------------------------------------------------------------
     // Test 2: Single-thread vs parallel build (50K, same config)
@@ -1578,10 +1595,8 @@ fn test_recall_diagnostic() {
     tprintln!("\n  --- Test 2: Single-Thread vs Parallel (50K) ---");
     let n2 = 50_000u64;
     let mut rng2 = 12345u64;
-    let vecs2: Vec<(u64, Vec<f32>)> = (0..n2)
-        .map(|id| (id, generateRandomVector(&mut rng2, dims)))
-        .collect();
-    let refs2: Vec<(u64, &[f32])> = vecs2.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+    let flat2 = genFlatArena(&mut rng2, n2 as usize, dims);
+    let refs2: Vec<(u64, &[f32])> = flatRefs(&flat2, n2 as usize, dims);
 
     let cfgSingle = HnswConfig {
         m: 32,
@@ -1620,7 +1635,7 @@ fn test_recall_diagnostic() {
     );
     drop(idxParallel);
     drop(idxSingle);
-    drop(vecs2);
+    drop(flat2);
 
     // -----------------------------------------------------------------------
     // Test 3: N scaling with proportional efSearch
@@ -1630,10 +1645,8 @@ fn test_recall_diagnostic() {
 
     for &n in &[10_000u64, 50_000, 100_000] {
         let mut rng = 42u64;
-        let vecs: Vec<(u64, Vec<f32>)> = (0..n)
-            .map(|id| (id, generateRandomVector(&mut rng, dims)))
-            .collect();
-        let refs: Vec<(u64, &[f32])> = vecs.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+        let flat = genFlatArena(&mut rng, n as usize, dims);
+        let refs: Vec<(u64, &[f32])> = flatRefs(&flat, n as usize, dims);
 
         let ef = (n / 50).max(50) as u16;
         let cfg = HnswConfig {
@@ -1699,12 +1712,12 @@ fn test_recall_diagnostic() {
     tprintln!("\n  --- Test 4: IVF-PQ Probe Sweep (50K) ---");
     let n4 = 50_000u64;
     let mut rng4 = 999u64;
-    let vecs4: Vec<(u64, Vec<f32>)> = (0..n4)
-        .map(|id| (id, generateRandomVector(&mut rng4, dims)))
-        .collect();
-    let refs4: Vec<(u64, &[f32])> = vecs4.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+    let flat4 = genFlatArena(&mut rng4, n4 as usize, dims);
+    let refs4: Vec<(u64, &[f32])> = flatRefs(&flat4, n4 as usize, dims);
 
-    let sampleSlices4: Vec<&[f32]> = vecs4[..1000].iter().map(|(_, v)| v.as_slice()).collect();
+    let sampleSlices4: Vec<&[f32]> = (0..1000)
+        .map(|i| &flat4[i * dims..(i + 1) * dims])
+        .collect();
     let profile4 = DataProfile::compute(
         &sampleSlices4,
         n4 as usize,
@@ -1734,7 +1747,7 @@ fn test_recall_diagnostic() {
         tprintln!("  {:>10} {:>10.4}", probes, r);
     }
     drop(ivfIdx);
-    drop(vecs4);
+    drop(flat4);
 
     // -----------------------------------------------------------------------
     // Test 5: IVF-PQ N scaling with proportional probes
@@ -1750,14 +1763,12 @@ fn test_recall_diagnostic() {
 
     for &n in &[10_000u64, 50_000] {
         let mut rng = 42u64;
-        let vecs: Vec<(u64, Vec<f32>)> = (0..n)
-            .map(|id| (id, generateRandomVector(&mut rng, dims)))
-            .collect();
-        let refs: Vec<(u64, &[f32])> = vecs.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+        let flat = genFlatArena(&mut rng, n as usize, dims);
+        let refs: Vec<(u64, &[f32])> = flatRefs(&flat, n as usize, dims);
 
-        let slices: Vec<&[f32]> = vecs[..vecs.len().min(1000)]
-            .iter()
-            .map(|(_, v)| v.as_slice())
+        let sampleCount = (n as usize).min(1000);
+        let slices: Vec<&[f32]> = (0..sampleCount)
+            .map(|i| &flat[i * dims..(i + 1) * dims])
             .collect();
         let prof =
             DataProfile::compute(&slices, n as usize, dims as u16, DistanceMetric::Euclidean);
@@ -1927,26 +1938,36 @@ fn runUniformScale(n: usize, seed: u64) {
         cfg.efSearch,
     );
 
-    let start = Instant::now();
-    let idx = AnnIndex::build(&refs, 200, 200, 0, cfg.clone()).expect("build");
-    tprintln!("  Build time: {:.2}s", start.elapsed().as_secs_f64());
-
     let numQueries = 50;
     let k = 10;
     let queries: Vec<Vec<f32>> = (0..numQueries)
         .map(|i| {
-            let idx = (i * n / numQueries).min(n - 1);
-            flatArena[idx * dims..(idx + 1) * dims].to_vec()
+            let qi = (i * n / numQueries).min(n - 1);
+            flatArena[qi * dims..(qi + 1) * dims].to_vec()
         })
         .collect();
+    // Ground truth is independent of efSearch, so compute it once here while the
+    // source vectors are still borrowed, before the arena is moved into the index.
+    let truths: Vec<_> = queries
+        .iter()
+        .map(|q| bruteForceKnn(q, &refs, k, DistanceMetric::Euclidean))
+        .collect();
+
+    // Release the borrowed views and hand the arena to the index by value so only
+    // one copy of the vectors is resident during the build (build_owned moves the
+    // buffer straight into the index instead of copying it).
+    drop(refs);
+    let ids: Vec<u64> = (0..n as u64).collect();
+    let start = Instant::now();
+    let idx = AnnIndex::build_owned(flatArena, ids, dims, 200, 200, 0, cfg.clone()).expect("build");
+    tprintln!("  Build time: {:.2}s", start.elapsed().as_secs_f64());
 
     tprintln!("  {:>10} {:>10}", "efSearch", "recall@10");
     for &ef in &[200u16, 500, 1000, 2000, 5000] {
         let mut total = 0.0;
-        for q in &queries {
+        for (qi, q) in queries.iter().enumerate() {
             let results = idx.search(q, k, ef).expect("search");
-            let truth = bruteForceKnn(q, &refs, k, DistanceMetric::Euclidean);
-            total += measureRecall(&results, &truth);
+            total += measureRecall(&results, &truths[qi]);
         }
         tprintln!("  {:>10} {:>10.4}", ef, total / queries.len() as f64);
     }
@@ -1998,16 +2019,14 @@ fn test_quantized_index() {
     let mut rng = 12345u64;
 
     tprintln!("  Generating {} vectors ({}-dim)...", count, dims);
-    let vectors: Vec<(u64, Vec<f32>)> = (0..count)
-        .map(|id| (id, generateRandomVector(&mut rng, dims)))
-        .collect();
+    let flat = genFlatArena(&mut rng, count as usize, dims);
 
-    let vecRefs: Vec<(u64, &[f32])> = vectors.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+    let vecRefs: Vec<(u64, &[f32])> = flatRefs(&flat, count as usize, dims);
 
     // Compute DataProfile and derive config automatically.
-    let sampleSlices: Vec<&[f32]> = vectors[..vectors.len().min(1000)]
-        .iter()
-        .map(|(_, v)| v.as_slice())
+    let sampleCount = (count as usize).min(1000);
+    let sampleSlices: Vec<&[f32]> = (0..sampleCount)
+        .map(|i| &flat[i * dims..(i + 1) * dims])
         .collect();
     let profile = DataProfile::compute(
         &sampleSlices,
@@ -2045,8 +2064,7 @@ fn test_quantized_index() {
         .map(|_| generateRandomVector(&mut queryRng, dims))
         .collect();
 
-    let vecRefsForTruth: Vec<(u64, &[f32])> =
-        vectors.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+    let vecRefsForTruth: Vec<(u64, &[f32])> = flatRefs(&flat, count as usize, dims);
 
     for numProbes in probeValues {
         let mut totalRecall = 0.0;

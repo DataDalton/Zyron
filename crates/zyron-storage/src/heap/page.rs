@@ -286,6 +286,22 @@ impl HeapPage {
         true
     }
 
+    /// Clears `xmax` back to 0 on a tuple in place within a page slice, undoing a
+    /// self-delete stamp. Returns false if the slot is empty. Used by ROLLBACK TO
+    /// SAVEPOINT to restore a row the transaction deleted after the savepoint.
+    pub fn clear_tuple_xmax_in_slice(data: &mut [u8], slot_id: SlotId) -> bool {
+        let header = Self::heap_header_from_slice(data);
+        let Some(slot) = Self::get_slot_from_slice(data, slot_id, header.slot_count) else {
+            return false;
+        };
+        if slot.is_empty() {
+            return false;
+        }
+        let off = slot.offset as usize + TupleHeader::SIZE - 4;
+        data[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
+        true
+    }
+
     /// Prunes tuples for which `is_dead(xmin, xmax)` returns true and reclaims
     /// their space by zeroing the slot and compacting the page. The caller
     /// supplies a predicate that is true only for versions dead to every live

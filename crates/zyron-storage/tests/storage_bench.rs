@@ -1309,18 +1309,19 @@ async fn test_wal_checksum_integrity() {
         std::fs::write(&seg_path, &corrupted).unwrap();
 
         let reader = WalReader::new(dir.path()).unwrap();
-        let records = reader.scan_all().unwrap();
+        // A bit flip in an interior record corrupts its checksum while valid
+        // committed records still follow, so recovery surfaces an error rather
+        // than silently dropping them. A flip in the unwritten tail just shortens
+        // the read. Either way the corruption is detected.
+        let detected = match reader.scan_all() {
+            Err(_) => true,
+            Ok(records) => records.len() < record_count,
+        };
         assert!(
-            records.len() < record_count,
-            "Bit flip should cause reader to stop early. Got {} records, expected fewer than {}",
-            records.len(),
-            record_count
+            detected,
+            "Bit flip must be detected as corruption or a short read"
         );
-        tprintln!(
-            "  Bit flip detection: PASSED (read {} of {} before corruption)",
-            records.len(),
-            record_count
-        );
+        tprintln!("  Bit flip detection: PASSED");
     }
 
     // 3. Zeroed region: wipe 8 bytes in the payload area
@@ -1333,17 +1334,15 @@ async fn test_wal_checksum_integrity() {
         std::fs::write(&seg_path, &corrupted).unwrap();
 
         let reader = WalReader::new(dir.path()).unwrap();
-        let records = reader.scan_all().unwrap();
+        let detected = match reader.scan_all() {
+            Err(_) => true,
+            Ok(records) => records.len() < record_count,
+        };
         assert!(
-            records.len() < record_count,
-            "Zeroed region should cause reader to stop early. Got {} records",
-            records.len()
+            detected,
+            "Zeroed interior region must be detected as corruption or a short read"
         );
-        tprintln!(
-            "  Zeroed region detection: PASSED (read {} of {} before corruption)",
-            records.len(),
-            record_count
-        );
+        tprintln!("  Zeroed region detection: PASSED");
     }
 
     // 4. Truncation: chop the file in half

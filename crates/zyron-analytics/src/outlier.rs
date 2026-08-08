@@ -9,6 +9,9 @@ use zyron_common::PreHashMap;
 pub enum OutlierDecision {
     Inlier,
     Outlier,
+    // A NaN input cannot be ranked against a threshold so it is flagged as a
+    // distinct non-inlier state rather than silently classified as an inlier
+    Missing,
 }
 
 impl OutlierDecision {
@@ -99,7 +102,9 @@ pub fn iqr_outlier(values: &[f64], multiplier: f64) -> Vec<OutlierDecision> {
     values
         .iter()
         .map(|v| {
-            if *v < lo || *v > hi {
+            if v.is_nan() {
+                OutlierDecision::Missing
+            } else if *v < lo || *v > hi {
                 OutlierDecision::Outlier
             } else {
                 OutlierDecision::Inlier
@@ -159,7 +164,9 @@ pub fn mad_outlier(values: &[f64], threshold: f64) -> Vec<OutlierDecision> {
     values
         .iter()
         .map(|v| {
-            if d.score(*v).abs() > threshold {
+            if v.is_nan() {
+                OutlierDecision::Missing
+            } else if d.score(*v).abs() > threshold {
                 OutlierDecision::Outlier
             } else {
                 OutlierDecision::Inlier
@@ -412,6 +419,15 @@ mod tests {
         for d in r {
             assert_eq!(d, OutlierDecision::Inlier);
         }
+    }
+
+    #[test]
+    fn nan_flagged_as_missing() {
+        let xs = [1.0, 2.0, 3.0, f64::NAN, 5.0, 100.0];
+        let iqr = iqr_outlier(&xs, 1.5);
+        assert_eq!(iqr[3], OutlierDecision::Missing);
+        let mad = mad_outlier(&xs, 3.5);
+        assert_eq!(mad[3], OutlierDecision::Missing);
     }
 
     #[test]

@@ -180,7 +180,7 @@ flowchart TB
 Two views: what a client actually gets from a running server, and the raw subsystem numbers underneath it. Every figure is extracted from the committed result files in [`benchmarks/`](benchmarks/); the tables and charts are regenerated from them by [`scripts/gen_bench_charts.py`](scripts/gen_bench_charts.py).
 
 <!-- BENCH:START -->
-_Release build, single machine: Intel(R) Core(TM) i9-14900KS, 32 cores, 31.8 GB RAM, windows/x86_64. Regenerated from `benchmarks/` by `scripts/gen_bench_charts.py`._
+_Release build, single machine: Intel(R) Core(TM) Ultra 7 270K Plus, 24 cores, 31.4 GB RAM, windows/x86_64. Regenerated from `benchmarks/` by `scripts/gen_bench_charts.py`._
 
 ### End-to-end
 
@@ -188,25 +188,25 @@ What a client sees from a running server over the wire protocol, from cold start
 
 | Lifecycle / workload | Result |
 |----------------------|--------|
-| Cold boot to accepting queries | 30 ms |
-| First `ReadyForQuery` | 0.39 ms |
-| Schema DDL bootstrap | 3.9 ms |
-| Seed insert | 470K rows/sec |
-| OLTP, 1 client | 15.9K tps, p99 191 us |
-| OLTP, 4 clients | 47.7K tps, p99 247 us |
-| OLTP, 16 clients | 75.8K tps, p99 471 us |
-| OLTP, 64 clients | 77.1K tps, p99 1489 us |
-| OLTP, 256 clients | 72.3K tps, p99 6458 us |
-| Analytical query (median) | 2.18 ms |
-| Graceful shutdown | 55 ms |
+| Cold boot to accepting queries | 40 ms |
+| First `ReadyForQuery` | 0.60 ms |
+| Schema DDL bootstrap | 7.2 ms |
+| Seed insert | 251K rows/sec |
+| OLTP, 1 client | 12.0K tps, p99 263 us |
+| OLTP, 4 clients | 33.4K tps, p99 360 us |
+| OLTP, 16 clients | 65.1K tps, p99 493 us |
+| OLTP, 64 clients | 60.5K tps, p99 1824 us |
+| OLTP, 256 clients | 55.2K tps, p99 8487 us |
+| Analytical query (median) | 1.30 ms |
+| Graceful shutdown | 53 ms |
 
 ```mermaid
 %%{init: {'theme':'base','themeVariables':{'xyChart':{'backgroundColor':'transparent','titleColor':'#e6edf3','xAxisLabelColor':'#e6edf3','xAxisTitleColor':'#e6edf3','xAxisTickColor':'#1f6feb','xAxisLineColor':'#1f6feb','yAxisLabelColor':'#e6edf3','yAxisTitleColor':'#e6edf3','yAxisTickColor':'#1f6feb','yAxisLineColor':'#1f6feb','plotColorPalette':'#1f6feb'}},'xyChart':{'width':750,'height':360}}}%%
 xychart-beta
     title "OLTP throughput vs. concurrent clients (thousand tps, higher is better)"
     x-axis ["1 client", "4 clients", "16 clients", "64 clients", "256 clients"]
-    y-axis "K tps" 0 --> 88
-    bar [15.9, 47.7, 75.8, 77.1, 72.3]
+    y-axis "K tps" 0 --> 74
+    bar [12.0, 33.4, 65.1, 60.5, 55.2]
 ```
 
 ### Engine internals
@@ -218,8 +218,8 @@ Raw subsystem throughput and hot-path latency under microbenchmark:
 xychart-beta
     title "Throughput (million ops/sec, higher is better)"
     x-axis ["B+tree insert", "B+tree delete", "Hash join build", "SCD-2 merge", "COPY FROM", "Row serialize", "SQL parse", "TTL purge", "Archive"]
-    y-axis "M ops/sec" 0 --> 133
-    bar [39.2, 46.3, 116.3, 45.8, 23.2, 18.2, 2.2, 15.2, 83.8]
+    y-axis "M ops/sec" 0 --> 142
+    bar [40.0, 22.7, 124.2, 45.9, 24.5, 17.7, 2.1, 9.8, 48.8]
 ```
 
 ```mermaid
@@ -227,25 +227,25 @@ xychart-beta
 xychart-beta
     title "Hot-path latency (nanoseconds, lower is better)"
     x-axis ["MVCC visible", "Version lookup", "B+tree lookup", "Branch resolve", "Row lock", "Legal-hold check", "Bloom probe", "Selectivity est"]
-    y-axis "ns/op" 0 --> 136
-    bar [1.4, 10.8, 14.1, 39.0, 74.2, 6.0, 5.9, 118.5]
+    y-axis "ns/op" 0 --> 114
+    bar [1.7, 13.5, 21.4, 54.3, 97.0, 7.7, 6.9, 99.8]
 ```
 
 A few more numbers not shown in the charts above:
 
 | Subsystem | Metric | Result |
 |-----------|--------|--------|
-| MVCC | GC sweep | ~2.0B tuples/sec |
+| MVCC | GC sweep | ~1.8B tuples/sec |
 | Columnar | .zyr scan throughput | ~3.0 GB/sec |
-| Columnar | Compaction pipeline | ~4.0M rows/sec |
-| Columnar | HybridScan overhead vs heap-only | ~-4.7% |
-| Columnar | Metadata-aggregate pruning speedup | ~14.2x |
-| Temporal | Picosecond timestamp decode | ~528M rows/sec |
-| Versioning | Time-travel scan overhead | ~17% |
-| Wire | QUIC PostgreSQL handshake | ~4 us |
-| Transactions | Durable commit floor (device write) | ~65.8 us |
-| Transactions | Durable group-commit peak | ~672K txn/sec |
-| Transactions | Group-commit amplification (c=1 to c=512) | ~40.0x |
+| Columnar | Compaction pipeline | ~3.4M rows/sec |
+| Columnar | HybridScan overhead vs heap-only | ~-2.5% |
+| Columnar | Metadata-aggregate pruning speedup | ~3.1x |
+| Temporal | Picosecond timestamp decode | ~310M rows/sec |
+| Versioning | Time-travel scan overhead | ~20% |
+| Wire | QUIC PostgreSQL handshake | ~5 us |
+| Transactions | Durable commit floor (device write) | ~80.7 us |
+| Transactions | Durable group-commit peak | ~703K txn/sec |
+| Transactions | Group-commit amplification (c=1 to c=512) | ~70.9x |
 
 29 benchmark suites cover storage, executor, optimizer, encoding, wire, search, analytics, CDC, versioning, transactions, temporal, columnar, types, lifecycle, gateway, Zyron-to-Zyron, and end-to-end. Each run writes a timestamped JSON/TXT pair under `benchmarks/<suite>/`.
 <!-- BENCH:END -->

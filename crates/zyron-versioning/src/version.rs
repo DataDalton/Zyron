@@ -89,13 +89,19 @@ pub struct VersionEntry {
 // On-disk packed format (40 bytes)
 // ---------------------------------------------------------------------------
 
-const PACKED_ENTRY_SIZE: usize = 40;
+const PACKED_ENTRY_SIZE: usize = 44;
 
-/// Packed on-disk representation of a version entry.
+/// Byte offset of the checksum field within the fixed record. The checksum
+/// hashes every fixed byte before it plus the variable metadata bytes.
+const CHECKSUM_OFFSET: usize = 40;
+
+/// Packed on-disk representation of a version entry's fixed prefix. A variable
+/// metadata block of `metadata_len` bytes follows immediately after each record
+/// on disk. The checksum covers the fixed prefix and the metadata bytes.
 /// Layout:
 ///   version_id(8) + commit_timestamp(8) + transaction_id(8) +
-///   operation_type(1) + reserved(3) + row_count_delta(4) +
-///   metadata_len(4) + checksum(4) = 40 bytes
+///   operation_type(1) + reserved(3) + row_count_delta(8) +
+///   metadata_len(4) + checksum(4) = 44 bytes
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct PackedVersionEntry {
@@ -104,7 +110,7 @@ struct PackedVersionEntry {
     transaction_id: u64,
     operation_type: u8,
     reserved: [u8; 3],
-    row_count_delta: i32,
+    row_count_delta: i64,
     metadata_len: u32,
     checksum: u32,
 }
@@ -113,34 +119,48 @@ const _: () = {
     assert!(std::mem::size_of::<PackedVersionEntry>() == PACKED_ENTRY_SIZE);
 };
 
-impl PackedVersionEntry {
-    fn compute_checksum(&self) -> u32 {
-        // Specialized inline 4-multiply hash over the fixed 36-byte prefix.
-        // The central hash32 routes through dispatch + lane-init even on the
-        // small-input path, which measured at -31% throughput on append_batch.
-        // Hashing a fixed layout with a stable inline mixer removes that cost.
-        const MIX_A: u64 = 0x517cc1b727220a95;
-        const MIX_B: u64 = 0xff51afd7ed558ccd;
-        let ptr = self as *const _ as *const u8;
-        unsafe {
-            let w0 = (ptr as *const u64).read_unaligned();
-            let w1 = (ptr.add(8) as *const u64).read_unaligned();
-            let w2 = (ptr.add(16) as *const u64).read_unaligned();
-            let w3 = (ptr.add(24) as *const u64).read_unaligned();
-            let w4 = (ptr.add(32) as *const u32).read_unaligned() as u64;
-            let mut la = MIX_A ^ 36u64;
-            let mut lb = MIX_A.rotate_left(32) ^ 36u64;
-            la = (la ^ w0).wrapping_mul(MIX_A);
-            lb = (lb ^ w1).wrapping_mul(MIX_A);
-            la = (la ^ w2).wrapping_mul(MIX_A);
-            lb = (lb ^ w3).wrapping_mul(MIX_A);
-            la = (la ^ w4).wrapping_mul(MIX_A);
-            let mut h = la ^ lb;
-            h ^= h >> 33;
-            h = h.wrapping_mul(MIX_B);
-            h ^= h >> 33;
-            h as u32
+/// Stable inline mixer over an arbitrary byte slice. Used for the version-entry
+/// checksum so the fixed prefix and the variable metadata are covered together.
+fn version_entry_hash(bytes: &[u8]) -> u32 {
+    const MIX_A: u64 = 0x517cc1b727220a95;
+    const MIX_B: u64 = 0xff51afd7ed558ccd;
+    let mut la = MIX_A ^ (bytes.len() as u64);
+    let mut lb = MIX_A.rotate_left(32) ^ (bytes.len() as u64);
+    let mut chunks = bytes.chunks_exact(8);
+    let mut toggle = false;
+    for c in &mut chunks {
+        let w = u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
+        if toggle {
+            lb = (lb ^ w).wrapping_mul(MIX_A);
+        } else {
+            la = (la ^ w).wrapping_mul(MIX_A);
         }
+        toggle = !toggle;
+    }
+    let rem = chunks.remainder();
+    if !rem.is_empty() {
+        let mut tail = [0u8; 8];
+        tail[..rem.len()].copy_from_slice(rem);
+        let w = u64::from_le_bytes(tail);
+        la = (la ^ w).wrapping_mul(MIX_A);
+    }
+    let mut h = la ^ lb;
+    h ^= h >> 33;
+    h = h.wrapping_mul(MIX_B);
+    h ^= h >> 33;
+    h as u32
+}
+
+impl PackedVersionEntry {
+    /// Computes the checksum over the fixed prefix (every byte before the
+    /// checksum field) and the trailing metadata bytes.
+    fn compute_checksum(&self, metadata: &[u8]) -> u32 {
+        let ptr = self as *const _ as *const u8;
+        let prefix = unsafe { std::slice::from_raw_parts(ptr, CHECKSUM_OFFSET) };
+        let mut buf = Vec::with_capacity(CHECKSUM_OFFSET + metadata.len());
+        buf.extend_from_slice(prefix);
+        buf.extend_from_slice(metadata);
+        version_entry_hash(&buf)
     }
 
     fn to_bytes(&self) -> [u8; PACKED_ENTRY_SIZE] {
@@ -158,6 +178,67 @@ impl PackedVersionEntry {
     fn from_bytes(buf: &[u8; PACKED_ENTRY_SIZE]) -> Self {
         unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const Self) }
     }
+}
+
+/// Serializes a metadata map to a length-prefixed byte block. Layout: pair
+/// count (u32) then each key and value as a u32 length prefix followed by the
+/// UTF-8 bytes. An empty or absent map serializes to a zero pair count.
+fn encode_metadata(metadata: &Option<HashMap<String, String>>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    match metadata {
+        Some(m) if !m.is_empty() => {
+            buf.extend_from_slice(&(m.len() as u32).to_le_bytes());
+            // Sort by key so the encoding is deterministic across runs.
+            let mut pairs: Vec<(&String, &String)> = m.iter().collect();
+            pairs.sort_by(|a, b| a.0.cmp(b.0));
+            for (k, v) in pairs {
+                buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
+                buf.extend_from_slice(k.as_bytes());
+                buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                buf.extend_from_slice(v.as_bytes());
+            }
+        }
+        _ => buf.extend_from_slice(&0u32.to_le_bytes()),
+    }
+    buf
+}
+
+/// Decodes a metadata block produced by `encode_metadata`. Returns None for an
+/// empty map so callers keep the common no-metadata case allocation-free.
+fn decode_metadata(bytes: &[u8]) -> Result<Option<HashMap<String, String>>> {
+    if bytes.len() < 4 {
+        return Ok(None);
+    }
+    let mut off = 0usize;
+    let read_u32 = |b: &[u8], off: &mut usize| -> Result<u32> {
+        let end = *off + 4;
+        let slice = b
+            .get(*off..end)
+            .ok_or_else(|| ZyronError::Internal("version metadata truncated".into()))?;
+        *off = end;
+        Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+    };
+    let read_str = |b: &[u8], off: &mut usize| -> Result<String> {
+        let len = read_u32(b, off)? as usize;
+        let end = *off + len;
+        let slice = b
+            .get(*off..end)
+            .ok_or_else(|| ZyronError::Internal("version metadata truncated".into()))?;
+        *off = end;
+        String::from_utf8(slice.to_vec())
+            .map_err(|e| ZyronError::Internal(format!("version metadata utf8: {e}")))
+    };
+    let count = read_u32(bytes, &mut off)? as usize;
+    if count == 0 {
+        return Ok(None);
+    }
+    let mut map = HashMap::with_capacity(count);
+    for _ in 0..count {
+        let k = read_str(bytes, &mut off)?;
+        let v = read_str(bytes, &mut off)?;
+        map.insert(k, v);
+    }
+    Ok(Some(map))
 }
 
 // ---------------------------------------------------------------------------
@@ -409,34 +490,48 @@ impl VersionLog {
             .open(&file_path)?;
 
         let file_len = file.metadata()?.len();
-        let valid_len = (file_len / PACKED_ENTRY_SIZE as u64) * PACKED_ENTRY_SIZE as u64;
 
-        // Truncate partial trailing entry
-        if valid_len < file_len {
-            file.set_len(valid_len)?;
-        }
-
-        let entry_count = valid_len / PACKED_ENTRY_SIZE as u64;
-        let mut entries = Vec::with_capacity(entry_count as usize);
+        // Records are variable length: a fixed PACKED_ENTRY_SIZE prefix carrying
+        // metadata_len, followed by that many metadata bytes. Read forward,
+        // verifying the checksum over prefix plus metadata, and truncate at the
+        // first record that is short or fails its checksum.
+        let mut entries = Vec::new();
         let mut next_version: u64 = 1;
+        let mut pos = 0u64;
 
-        if entry_count > 0 {
+        if file_len > 0 {
             file.seek(SeekFrom::Start(0))?;
             let mut buf = [0u8; PACKED_ENTRY_SIZE];
-
-            for i in 0..entry_count {
+            loop {
+                if pos + PACKED_ENTRY_SIZE as u64 > file_len {
+                    break;
+                }
                 file.read_exact(&mut buf)
                     .map_err(|e| ZyronError::VersionLogCorrupted {
                         table_id,
-                        reason: format!("read error at entry {i}: {e}"),
+                        reason: format!("read error at offset {pos}: {e}"),
                     })?;
 
                 let packed = PackedVersionEntry::from_bytes(&buf);
-                let expected_checksum = packed.compute_checksum();
+                let meta_len = u32::from_le(packed.metadata_len) as u64;
+                if pos + PACKED_ENTRY_SIZE as u64 + meta_len > file_len {
+                    // Partial trailing metadata, truncate at this record start.
+                    break;
+                }
+
+                let mut meta_bytes = vec![0u8; meta_len as usize];
+                if meta_len > 0 {
+                    file.read_exact(&mut meta_bytes).map_err(|e| {
+                        ZyronError::VersionLogCorrupted {
+                            table_id,
+                            reason: format!("metadata read error at offset {pos}: {e}"),
+                        }
+                    })?;
+                }
+
+                let expected_checksum = packed.compute_checksum(&meta_bytes);
                 if packed.checksum != expected_checksum {
-                    // Truncate at the corrupted entry
-                    let truncate_pos = i * PACKED_ENTRY_SIZE as u64;
-                    file.set_len(truncate_pos)?;
+                    // Truncate at the corrupted record.
                     break;
                 }
 
@@ -446,14 +541,20 @@ impl VersionLog {
                     commit_timestamp: i64::from_le(packed.commit_timestamp),
                     transaction_id: u64::from_le(packed.transaction_id),
                     operation_type: OperationType::from_u8(packed.operation_type)?,
-                    row_count_delta: i32::from_le(packed.row_count_delta) as i64,
-                    metadata: None,
+                    row_count_delta: i64::from_le(packed.row_count_delta),
+                    metadata: decode_metadata(&meta_bytes)?,
                 });
 
                 if version_id >= next_version {
                     next_version = version_id + 1;
                 }
+                pos += PACKED_ENTRY_SIZE as u64 + meta_len;
             }
+        }
+
+        // Drop any partial or corrupted trailing bytes.
+        if pos < file_len {
+            file.set_len(pos)?;
         }
 
         // Seek to end for appending
@@ -482,13 +583,7 @@ impl VersionLog {
         row_count_delta: i64,
         metadata: Option<HashMap<String, String>>,
     ) -> Result<VersionId> {
-        let delta_i32 = if row_count_delta > i32::MAX as i64 {
-            i32::MAX
-        } else if row_count_delta < i32::MIN as i64 {
-            i32::MIN
-        } else {
-            row_count_delta as i32
-        };
+        let meta_bytes = encode_metadata(&metadata);
 
         // Assign version ID and write to file under the same lock.
         // This ensures file entries are always in version order.
@@ -503,13 +598,16 @@ impl VersionLog {
                 transaction_id: txn_id.to_le(),
                 operation_type: op_type as u8,
                 reserved: [0; 3],
-                row_count_delta: delta_i32.to_le(),
-                metadata_len: 0u32.to_le(),
+                row_count_delta: row_count_delta.to_le(),
+                metadata_len: (meta_bytes.len() as u32).to_le(),
                 checksum: 0,
             };
-            packed.checksum = packed.compute_checksum();
+            packed.checksum = packed.compute_checksum(&meta_bytes);
 
-            file.write_all(&packed.to_bytes()).map_err(|e| {
+            let mut record = Vec::with_capacity(PACKED_ENTRY_SIZE + meta_bytes.len());
+            record.extend_from_slice(&packed.to_bytes());
+            record.extend_from_slice(&meta_bytes);
+            file.write_all(&record).map_err(|e| {
                 ZyronError::Internal(format!(
                     "version log write failed for table {}: {e}",
                     self.table_id
@@ -569,13 +667,7 @@ impl VersionLog {
                 let version_id = VersionId(version);
                 version_ids.push(version_id);
 
-                let delta_i32 = if *row_count_delta > i32::MAX as i64 {
-                    i32::MAX
-                } else if *row_count_delta < i32::MIN as i64 {
-                    i32::MIN
-                } else {
-                    *row_count_delta as i32
-                };
+                let meta_bytes = encode_metadata(metadata);
 
                 let mut packed = PackedVersionEntry {
                     version_id: version.to_le(),
@@ -583,20 +675,19 @@ impl VersionLog {
                     transaction_id: txn_id.to_le(),
                     operation_type: *op_type as u8,
                     reserved: [0; 3],
-                    row_count_delta: delta_i32.to_le(),
-                    metadata_len: 0u32.to_le(),
+                    row_count_delta: row_count_delta.to_le(),
+                    metadata_len: (meta_bytes.len() as u32).to_le(),
                     checksum: 0,
                 };
-                packed.checksum = packed.compute_checksum();
-                // Append the packed struct's bytes directly into file_buf. The
-                // previous path went through to_bytes() which copied to a stack
-                // buffer first, then extend_from_slice copied again into the Vec,
-                // totaling two 40-byte memcpies per entry. Reading as a byte slice
-                // via from_raw_parts and extending once halves that cost.
+                packed.checksum = packed.compute_checksum(&meta_bytes);
+                // Append the fixed prefix bytes directly into file_buf, then the
+                // variable metadata block. Reading the struct as a byte slice via
+                // from_raw_parts extends without a separate stack copy.
                 let packed_bytes = unsafe {
                     std::slice::from_raw_parts(&packed as *const _ as *const u8, PACKED_ENTRY_SIZE)
                 };
                 file_buf.extend_from_slice(packed_bytes);
+                file_buf.extend_from_slice(&meta_bytes);
 
                 index_entries.push(VersionEntry {
                     version_id,
@@ -724,23 +815,23 @@ mod tests {
             transaction_id: 42u64.to_le(),
             operation_type: 0,
             reserved: [0; 3],
-            row_count_delta: 10i32.to_le(),
+            row_count_delta: 10i64.to_le(),
             metadata_len: 0u32.to_le(),
             checksum: 0,
         };
-        let cs1 = packed.compute_checksum();
+        let cs1 = packed.compute_checksum(&[]);
         packed.checksum = cs1;
 
         // Roundtrip via bytes
         let bytes = packed.to_bytes();
         let recovered = PackedVersionEntry::from_bytes(&bytes);
-        assert_eq!(recovered.compute_checksum(), cs1);
+        assert_eq!(recovered.compute_checksum(&[]), cs1);
 
         // Mutating any field changes the checksum
         let mut modified = packed;
         modified.version_id = 2u64.to_le();
         modified.checksum = 0;
-        assert_ne!(modified.compute_checksum(), cs1);
+        assert_ne!(modified.compute_checksum(&[]), cs1);
     }
 
     #[test]
@@ -954,16 +1045,39 @@ mod tests {
     }
 
     #[test]
-    fn test_row_count_delta_clamping() {
+    fn test_row_count_delta_full_fidelity() {
         let dir = make_temp_dir();
-        let log = VersionLog::open(dir.path(), 7).expect("open");
-
-        // Large positive delta gets clamped to i32::MAX in packed format
-        // but stored as i64 in memory
-        let v = log
-            .append(1, 100, OperationType::Insert, i64::MAX, None)
-            .expect("append");
-        let entry = log.get_version(v).expect("get");
+        let v;
+        {
+            let log = VersionLog::open(dir.path(), 7).expect("open");
+            // A delta beyond the i32 range persists at full i64 fidelity.
+            v = log
+                .append(1, 100, OperationType::Insert, i64::MAX, None)
+                .expect("append");
+            let entry = log.get_version(v).expect("get");
+            assert_eq!(entry.row_count_delta, i64::MAX);
+        }
+        // Reopen to prove the on-disk record survives a restart unchanged.
+        let reopened = VersionLog::open(dir.path(), 7).expect("reopen");
+        let entry = reopened.get_version(v).expect("get after reopen");
         assert_eq!(entry.row_count_delta, i64::MAX);
+    }
+
+    #[test]
+    fn test_metadata_persists_across_reopen() {
+        let dir = make_temp_dir();
+        let mut meta = HashMap::new();
+        meta.insert("author".to_string(), "alice".to_string());
+        meta.insert("note".to_string(), "initial load".to_string());
+        let v;
+        {
+            let log = VersionLog::open(dir.path(), 8).expect("open");
+            v = log
+                .append(1, 100, OperationType::Insert, 5, Some(meta.clone()))
+                .expect("append");
+        }
+        let reopened = VersionLog::open(dir.path(), 8).expect("reopen");
+        let entry = reopened.get_version(v).expect("get after reopen");
+        assert_eq!(entry.metadata, Some(meta));
     }
 }

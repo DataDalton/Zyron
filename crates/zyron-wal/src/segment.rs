@@ -221,6 +221,12 @@ impl LogSegment {
     }
 
     /// Opens an existing segment file.
+    ///
+    /// Scans records from the header to the end of the last checksum-valid record
+    /// to set the write position, rather than trusting the physical file size. A
+    /// torn trailing write leaves a partial or corrupt record after the last good
+    /// one, so trusting file size would make the next append land past garbage.
+    /// Any trailing bytes beyond the last valid record are truncated.
     pub fn open(path: &Path) -> Result<Self> {
         let mut opts = OpenOptions::new();
         opts.read(true).write(true);
@@ -233,9 +239,29 @@ impl LogSegment {
         let header = SegmentHeader::from_bytes(&header_bytes);
         header.validate()?;
 
-        // Find current write position by seeking to end
         let file_size = file.seek(std::io::SeekFrom::End(0))?;
-        let write_offset = file_size as u32;
+        let data_start = SegmentHeader::SIZE as u64;
+        let data_len = file_size.saturating_sub(data_start) as usize;
+
+        // Scan the record region to find the end of the last checksum-valid
+        // record. valid_data_len is the byte length of contiguous good records.
+        let valid_data_len = if data_len == 0 {
+            0
+        } else {
+            file.seek(std::io::SeekFrom::Start(data_start))?;
+            let mut data = vec![0u8; data_len];
+            file.read_exact(&mut data)?;
+            Self::scan_valid_extent(&data)
+        };
+
+        let write_offset = data_start as u32 + valid_data_len as u32;
+
+        // Truncate trailing garbage beyond the last valid record so the next
+        // append starts on clean ground and the file size matches the data.
+        if (write_offset as u64) < file_size {
+            file.set_len(write_offset as u64)?;
+            file.sync_all()?;
+        }
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -243,6 +269,46 @@ impl LogSegment {
             write_offset,
             file: Some(file),
         })
+    }
+
+    /// Walks the record region and returns the byte length of the contiguous
+    /// prefix of checksum-valid records. Stops at the first record that is
+    /// truncated, fails its checksum, or has an unknown type, which marks the
+    /// end of durable data.
+    fn scan_valid_extent(data: &[u8]) -> usize {
+        use crate::constants::{CHECKSUM_SIZE, HEADER_SIZE, OFF_PAYLOAD_LEN};
+
+        let mut offset = 0;
+        let data_len = data.len();
+
+        while offset + HEADER_SIZE + CHECKSUM_SIZE <= data_len {
+            let payload_len = u16::from_le_bytes([
+                data[offset + OFF_PAYLOAD_LEN],
+                data[offset + OFF_PAYLOAD_LEN + 1],
+            ]) as usize;
+
+            let record_size = HEADER_SIZE + payload_len + CHECKSUM_SIZE;
+            if offset + record_size > data_len {
+                break;
+            }
+
+            let checksum_offset = offset + HEADER_SIZE + payload_len;
+            let stored_checksum = u32::from_le_bytes([
+                data[checksum_offset],
+                data[checksum_offset + 1],
+                data[checksum_offset + 2],
+                data[checksum_offset + 3],
+            ]);
+            let computed_checksum =
+                crate::checksum::wal_checksum(&data[offset..checksum_offset], HEADER_SIZE);
+            if stored_checksum != computed_checksum {
+                break;
+            }
+
+            offset += record_size;
+        }
+
+        offset
     }
 
     /// Returns the segment ID.

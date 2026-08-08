@@ -483,6 +483,7 @@ impl WalWriter {
                                 &wal_dir,
                                 segment_size,
                                 fsync_enabled,
+                                &flush_io_error,
                                 &mut leftover,
                             );
                         }
@@ -571,6 +572,7 @@ impl WalWriter {
                         &wal_dir,
                         segment_size,
                         fsync_enabled,
+                        &flush_io_error,
                         &mut leftover,
                     );
                     // The flush thread acknowledges its own completed rotation
@@ -668,6 +670,7 @@ impl WalWriter {
         wal_dir: &Path,
         segment_size: u32,
         fsync_enabled: bool,
+        flush_io_error: &AtomicBool,
         leftover: &mut Vec<u8>,
     ) {
         // Transition Requested -> InProgress. If no rotation was requested, return.
@@ -694,13 +697,20 @@ impl WalWriter {
 
         let new_segment_id = old_segment_id + 1;
 
-        // Sync old segment before switching
+        // Sync old segment before switching. A failed final sync means the old
+        // segment's last writes may not be durable, so flag the error, abort the
+        // rotation, and let subsequent appends fail fast rather than continuing
+        // onto a new segment over possibly-lost records.
         {
             let mut seg_guard = segment.lock();
             if let Some(ref mut seg) = *seg_guard
                 && fsync_enabled
+                && let Err(e) = seg.sync()
             {
-                let _ = seg.sync();
+                eprintln!("WAL old segment final sync error: {:?}", e);
+                flush_io_error.store(true, Ordering::Release);
+                rotation.complete_rotation();
+                return;
             }
         }
 
@@ -733,7 +743,11 @@ impl WalWriter {
             }
             Err(e) => {
                 eprintln!("WAL segment rotation error: {:?}", e);
-                // Rotation failure is fatal. New appends will fail fast via flush_io_error.
+                // Rotation failure is fatal. Flag the error so new appends fail
+                // fast instead of being released against a full old segment with
+                // staged leftover records silently lost. The sequencer is not
+                // advanced, so no new LSNs are handed out for the missing segment.
+                flush_io_error.store(true, Ordering::Release);
             }
         }
 
@@ -1105,9 +1119,20 @@ impl WalWriter {
     }
 
     /// Allocates a new transaction ID.
+    ///
+    /// The on-disk record format stores txn_id as a 4-byte field and the commit
+    /// status map keys on u32, so ids beyond u32::MAX cannot be represented or
+    /// distinguished. Truncating the u64 counter would reuse a live id, so the
+    /// allocation errors once the space is exhausted instead.
     #[inline]
-    pub fn allocate_txn_id(&self) -> u32 {
-        self.next_txn_id.fetch_add(1, Ordering::Relaxed) as u32
+    pub fn allocate_txn_id(&self) -> Result<u32> {
+        let raw = self.next_txn_id.fetch_add(1, Ordering::Relaxed);
+        if raw > u32::MAX as u64 {
+            return Err(ZyronError::WalWriteFailed(
+                "transaction id space exhausted".to_string(),
+            ));
+        }
+        Ok(raw as u32)
     }
 
     /// Returns the next LSN that will be assigned.
@@ -1564,7 +1589,7 @@ pub struct TxnWalHandle {
 impl TxnWalHandle {
     /// Creates a new transaction handle.
     pub fn new(writer: Arc<WalWriter>) -> Result<Self> {
-        let txn_id = writer.allocate_txn_id();
+        let txn_id = writer.allocate_txn_id()?;
         let last_lsn = writer.log_begin(txn_id)?;
 
         Ok(Self {

@@ -385,6 +385,36 @@ fn run_loop(
     }
 }
 
+/// Runs a runner body under a panic guard. A panic inside the body is caught
+/// and the job is transitioned to Failed in the catalog, matching how an Err
+/// return is handled, instead of unwinding the runner thread silently. The
+/// body is given a runtime so it can update the catalog if it returns normally.
+fn run_guarded<F>(entry: &StreamingJobEntry, catalog: &Arc<Catalog>, body: F)
+where
+    F: FnOnce(),
+{
+    // The runner owns its source, sink, and catalog handle. On a panic the
+    // body's state is dropped and only the failed-status update runs after,
+    // so asserting unwind safety here is sound. AssertUnwindSafe<F> implements
+    // FnOnce, so it is passed directly as the catch_unwind body.
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_err() {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(
+                    job_id = entry.id.0,
+                    "runner panicked and the failed-status runtime build failed: {e}"
+                );
+                return;
+            }
+        };
+        mark_failed(&rt, catalog, entry.id, "runner thread panicked".to_string());
+    }
+}
+
 /// Transitions the job to Failed in the catalog. Swallows update errors
 /// because the runner is already on the exit path and has no recourse.
 fn mark_failed(
@@ -518,26 +548,30 @@ impl StreamJobManager {
         let thread = std::thread::Builder::new()
             .name(format!("zyron-stream-{}", entry.id.0))
             .spawn(move || {
-                if let Some(agg) = spec_for_thread.aggregate.clone() {
-                    crate::agg_runner::run_aggregating_loop(
-                        entry_for_thread,
-                        spec_for_thread.source_types.clone(),
-                        agg,
-                        source,
-                        sink,
-                        catalog_for_thread,
-                        stop_for_thread,
-                    );
-                } else {
-                    run_loop(
-                        entry_for_thread,
-                        spec_for_thread,
-                        source,
-                        sink,
-                        catalog_for_thread,
-                        stop_for_thread,
-                    );
-                }
+                let guard_entry = entry_for_thread.clone();
+                let guard_catalog = Arc::clone(&catalog_for_thread);
+                run_guarded(&guard_entry, &guard_catalog, move || {
+                    if let Some(agg) = spec_for_thread.aggregate.clone() {
+                        crate::agg_runner::run_aggregating_loop(
+                            entry_for_thread,
+                            spec_for_thread.source_types.clone(),
+                            agg,
+                            source,
+                            sink,
+                            catalog_for_thread,
+                            stop_for_thread,
+                        );
+                    } else {
+                        run_loop(
+                            entry_for_thread,
+                            spec_for_thread,
+                            source,
+                            sink,
+                            catalog_for_thread,
+                            stop_for_thread,
+                        );
+                    }
+                });
             })
             .map_err(|e| {
                 ZyronError::StreamingError(format!("failed to spawn runner thread: {e}"))
@@ -881,16 +915,20 @@ impl StreamJobManager {
         let thread = std::thread::Builder::new()
             .name(format!("zyron-ext-in-{}", entry.id.0))
             .spawn(move || {
-                run_external_to_zyron_loop(
-                    entry_for_thread,
-                    spec_for_thread,
-                    source_for_thread,
-                    sink,
-                    catalog_for_thread,
-                    stop_for_thread,
-                    mode,
-                    schedule_cron,
-                );
+                let guard_entry = entry_for_thread.clone();
+                let guard_catalog = Arc::clone(&catalog_for_thread);
+                run_guarded(&guard_entry, &guard_catalog, move || {
+                    run_external_to_zyron_loop(
+                        entry_for_thread,
+                        spec_for_thread,
+                        source_for_thread,
+                        sink,
+                        catalog_for_thread,
+                        stop_for_thread,
+                        mode,
+                        schedule_cron,
+                    );
+                });
             })
             .map_err(|e| ZyronError::StreamingError(format!("spawn external-in: {e}")))?;
         self.register_handle(
@@ -925,14 +963,18 @@ impl StreamJobManager {
         let thread = std::thread::Builder::new()
             .name(format!("zyron-ext-out-{}", entry.id.0))
             .spawn(move || {
-                run_zyron_to_external_loop(
-                    entry_for_thread,
-                    spec_for_thread,
-                    source,
-                    sink_for_thread,
-                    catalog_for_thread,
-                    stop_for_thread,
-                );
+                let guard_entry = entry_for_thread.clone();
+                let guard_catalog = Arc::clone(&catalog_for_thread);
+                run_guarded(&guard_entry, &guard_catalog, move || {
+                    run_zyron_to_external_loop(
+                        entry_for_thread,
+                        spec_for_thread,
+                        source,
+                        sink_for_thread,
+                        catalog_for_thread,
+                        stop_for_thread,
+                    );
+                });
             })
             .map_err(|e| ZyronError::StreamingError(format!("spawn external-out: {e}")))?;
         self.register_handle(
@@ -968,16 +1010,20 @@ impl StreamJobManager {
         let thread = std::thread::Builder::new()
             .name(format!("zyron-ext-ext-{}", entry.id.0))
             .spawn(move || {
-                run_external_loop(
-                    entry_for_thread,
-                    spec_for_thread,
-                    source_for_thread,
-                    sink_for_thread,
-                    catalog_for_thread,
-                    stop_for_thread,
-                    mode,
-                    schedule_cron,
-                );
+                let guard_entry = entry_for_thread.clone();
+                let guard_catalog = Arc::clone(&catalog_for_thread);
+                run_guarded(&guard_entry, &guard_catalog, move || {
+                    run_external_loop(
+                        entry_for_thread,
+                        spec_for_thread,
+                        source_for_thread,
+                        sink_for_thread,
+                        catalog_for_thread,
+                        stop_for_thread,
+                        mode,
+                        schedule_cron,
+                    );
+                });
             })
             .map_err(|e| ZyronError::StreamingError(format!("spawn ext-ext: {e}")))?;
         self.register_handle(
@@ -1214,26 +1260,30 @@ impl StreamJobManager {
         let thread = std::thread::Builder::new()
             .name(format!("zyron-src-runner-{}", entry.id.0))
             .spawn(move || {
-                if let Some(agg) = spec_for_thread.aggregate.clone() {
-                    crate::agg_runner::run_aggregating_loop(
-                        entry_for_thread,
-                        spec_for_thread.source_types.clone(),
-                        agg,
-                        source,
-                        sink,
-                        catalog_for_thread,
-                        stop_for_thread,
-                    );
-                } else {
-                    run_loop(
-                        entry_for_thread,
-                        spec_for_thread,
-                        source,
-                        sink,
-                        catalog_for_thread,
-                        stop_for_thread,
-                    );
-                }
+                let guard_entry = entry_for_thread.clone();
+                let guard_catalog = Arc::clone(&catalog_for_thread);
+                run_guarded(&guard_entry, &guard_catalog, move || {
+                    if let Some(agg) = spec_for_thread.aggregate.clone() {
+                        crate::agg_runner::run_aggregating_loop(
+                            entry_for_thread,
+                            spec_for_thread.source_types.clone(),
+                            agg,
+                            source,
+                            sink,
+                            catalog_for_thread,
+                            stop_for_thread,
+                        );
+                    } else {
+                        run_loop(
+                            entry_for_thread,
+                            spec_for_thread,
+                            source,
+                            sink,
+                            catalog_for_thread,
+                            stop_for_thread,
+                        );
+                    }
+                });
             })
             .map_err(|e| ZyronError::StreamingError(format!("spawn src-runner: {e}")))?;
         self.register_handle(
@@ -1276,15 +1326,19 @@ impl StreamJobManager {
         let thread = std::thread::Builder::new()
             .name(format!("zyron-remote-src-{}", entry.id.0))
             .spawn(move || {
-                run_remote_source_to_zyron_loop(
-                    entry_for_thread,
-                    spec_for_thread,
-                    source,
-                    sink,
-                    catalog_for_thread,
-                    stop_for_thread,
-                    start_lsn,
-                );
+                let guard_entry = entry_for_thread.clone();
+                let guard_catalog = Arc::clone(&catalog_for_thread);
+                run_guarded(&guard_entry, &guard_catalog, move || {
+                    run_remote_source_to_zyron_loop(
+                        entry_for_thread,
+                        spec_for_thread,
+                        source,
+                        sink,
+                        catalog_for_thread,
+                        stop_for_thread,
+                        start_lsn,
+                    );
+                });
             })
             .map_err(|e| ZyronError::StreamingError(format!("spawn remote-src: {e}")))?;
         self.register_handle(

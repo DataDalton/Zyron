@@ -173,6 +173,11 @@ async fn create_test_server(db_name: &str) -> (Arc<ServerState>, tempfile::TempD
         feature_store: zyron_analytics::featureStore(),
         feature_lineage: zyron_analytics::featureLineageRegistry(),
         model_cache: zyron_analytics::modelCache(),
+        default_isolation: zyron_storage::IsolationLevel::ReadCommitted,
+        statement_timeout: None,
+        max_result_rows: None,
+        balloon_params: None,
+        default_auth_method: zyron_auth::auth_rules::AuthMethod::Trust,
     });
 
     (state, tmp)
@@ -945,11 +950,16 @@ fn test_wire_auth_protocols() {
         tprintln!("  TrustAuthenticator: immediate authentication verified\n");
     }
 
-    // Cleartext authenticator - correct password
+    // Cleartext authenticator - correct password verified against Balloon hash
     {
-        let mut passwords = HashMap::new();
-        passwords.insert("alice".to_string(), "secret".to_string());
-        let mut auth = CleartextAuthenticator::new(passwords);
+        let params = zyron_auth::BalloonParams::test();
+        let hash = zyron_auth::PasswordCredential::from_plaintext_with_params("secret", &params)
+            .unwrap()
+            .as_stored()
+            .to_string();
+        let mut hashes = HashMap::new();
+        hashes.insert("alice".to_string(), hash);
+        let mut auth = CleartextAuthenticator::new(hashes);
 
         let result = auth.initial_message("alice");
         assert!(
@@ -965,9 +975,14 @@ fn test_wire_auth_protocols() {
 
     // Cleartext authenticator - wrong password
     {
-        let mut passwords = HashMap::new();
-        passwords.insert("alice".to_string(), "secret".to_string());
-        let mut auth = CleartextAuthenticator::new(passwords);
+        let params = zyron_auth::BalloonParams::test();
+        let hash = zyron_auth::PasswordCredential::from_plaintext_with_params("secret", &params)
+            .unwrap()
+            .as_stored()
+            .to_string();
+        let mut hashes = HashMap::new();
+        hashes.insert("alice".to_string(), hash);
+        let mut auth = CleartextAuthenticator::new(hashes);
         let _ = auth.initial_message("alice");
 
         let response = PasswordMessage::Cleartext("wrong".to_string());
@@ -978,9 +993,12 @@ fn test_wire_auth_protocols() {
 
     // MD5 authenticator - correct password
     {
-        let mut passwords = HashMap::new();
-        passwords.insert("bob".to_string(), "pass123".to_string());
-        let mut auth = Md5Authenticator::new(passwords);
+        let mut creds = HashMap::new();
+        creds.insert(
+            "bob".to_string(),
+            zyron_auth::md5_password_credential("bob", "pass123"),
+        );
+        let mut auth = Md5Authenticator::new(creds);
 
         let result = auth.initial_message("bob");
         // Extract salt from the challenge message
@@ -1250,12 +1268,16 @@ fn test_wire_session_management() {
         "testdb".into(),
         zyron_catalog::DatabaseId(1),
     );
-    session.set_variable("timezone".into(), "US/Eastern".into());
+    session
+        .set_variable("timezone".into(), "US/Eastern".into())
+        .unwrap();
     assert_eq!(session.get_variable("timezone"), Some("US/Eastern"));
     tprintln!("  Custom variable set/get verified\n");
 
     // Search path update
-    session.set_variable("search_path".into(), "public, myschema".into());
+    session
+        .set_variable("search_path".into(), "public, myschema".into())
+        .unwrap();
     assert!(
         session.search_path.contains(&"public".to_string()),
         "Search path should contain public"

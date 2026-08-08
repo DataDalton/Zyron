@@ -75,8 +75,13 @@ async fn profile_checkpoint_stages() {
         (buf2.len() as f64 / 1024.0 / 1024.0) / write_no_fsync.as_secs_f64()
     );
 
-    // Stage 5: Just fsync
-    let file = std::fs::File::open(&tmp_path).unwrap();
+    // Stage 5: Just fsync. Open with write access: Windows FlushFileBuffers
+    // (sync_all) requires a writable handle and rejects a read-only one with
+    // ERROR_ACCESS_DENIED.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&tmp_path)
+        .unwrap();
     let t4 = Instant::now();
     file.sync_all().unwrap();
     let fsync_time = t4.elapsed();

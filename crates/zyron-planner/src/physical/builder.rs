@@ -42,7 +42,7 @@ impl<'a> PhysicalPlanner<'a> {
                 encoding_hints,
                 as_of,
                 ..
-            } => self.plan_scan(table_id, columns, None, encoding_hints, as_of),
+            } => self.plan_scan(table_id, columns, None, encoding_hints, as_of, None),
             LogicalPlan::Filter { predicate, child } => {
                 // Try to push the filter into a scan (index scan opportunity).
                 // Probe by reference, then take ownership only on the matching
@@ -72,6 +72,7 @@ impl<'a> PhysicalPlanner<'a> {
                                 Some(predicate),
                                 encoding_hints,
                                 as_of,
+                                None,
                             );
                         }
                         let scan_predicate = if simple_conjuncts.is_empty() {
@@ -85,6 +86,7 @@ impl<'a> PhysicalPlanner<'a> {
                             scan_predicate,
                             encoding_hints,
                             as_of,
+                            None,
                         )?;
                         let scan_cost = *scan.cost();
                         let filter_predicate = combine_conjuncts(sub_conjuncts);
@@ -264,8 +266,21 @@ impl<'a> PhysicalPlanner<'a> {
                 offset,
                 child,
             } => {
-                // Check if there's a Sort below for top-N optimization
-                let child_plan = self.plan(Arc::unwrap_or_clone(child))?;
+                // When the limit sits directly over a scan (optionally through a
+                // Filter), thread k into the scan so a vector-distance predicate
+                // becomes a real KNN VectorScan. When it sits over a
+                // Sort(ST_Distance) the three nodes collapse into a spatial KNN
+                // scan. Otherwise the child plans normally.
+                let limit_k = limit.map(|l| l as usize);
+                let scan_child = if offset.unwrap_or(0) == 0 {
+                    self.try_plan_knn_under_limit(child.as_ref(), limit_k)?
+                } else {
+                    None
+                };
+                let child_plan = match scan_child {
+                    Some(plan) => plan,
+                    None => self.plan(Arc::unwrap_or_clone(child))?,
+                };
                 let rows = limit
                     .map(|l| (l as f64).min(child_plan.cost().row_count))
                     .unwrap_or(child_plan.cost().row_count);
@@ -456,6 +471,107 @@ impl<'a> PhysicalPlanner<'a> {
         }
     }
 
+    /// Recognizes a KNN-shaped plan directly under a LIMIT and, when matched,
+    /// produces the scan with k threaded in. Two shapes are handled: a vector
+    /// distance predicate (`Limit -> [Filter] -> Scan`) becomes a VectorScan
+    /// serving k rows, and an `ORDER BY ST_Distance(col, q)` over a spatial
+    /// index (`Limit -> Sort -> [Project] -> [Filter] -> Scan`) becomes a
+    /// spatial KNN scan. Returns None when no pattern matches so the caller
+    /// plans the child normally.
+    fn try_plan_knn_under_limit(
+        &self,
+        child: &LogicalPlan,
+        k: Option<usize>,
+    ) -> Result<Option<PhysicalPlan>> {
+        match child {
+            // Vector distance predicate: thread k into the scan so it serves a
+            // bounded nearest-neighbor search.
+            LogicalPlan::Scan {
+                table_id,
+                columns,
+                encoding_hints,
+                as_of,
+                ..
+            } => {
+                let plan = self.plan_scan(
+                    *table_id,
+                    columns.clone(),
+                    None,
+                    encoding_hints.clone(),
+                    as_of.clone(),
+                    k,
+                )?;
+                Ok(matches!(plan, PhysicalPlan::VectorScan { .. }).then_some(plan))
+            }
+            LogicalPlan::Filter { predicate, child } => {
+                if let LogicalPlan::Scan {
+                    table_id,
+                    columns,
+                    encoding_hints,
+                    as_of,
+                    ..
+                } = child.as_ref()
+                {
+                    let plan = self.plan_scan(
+                        *table_id,
+                        columns.clone(),
+                        Some(predicate.clone()),
+                        encoding_hints.clone(),
+                        as_of.clone(),
+                        k,
+                    )?;
+                    return Ok(matches!(plan, PhysicalPlan::VectorScan { .. }).then_some(plan));
+                }
+                Ok(None)
+            }
+            // ORDER BY ST_Distance(col, q) over a spatial index.
+            LogicalPlan::Sort { order_by, child } => {
+                let Some(k) = k else { return Ok(None) };
+                if order_by.len() != 1 || !order_by[0].asc {
+                    return Ok(None);
+                }
+                let Some(query_point) = extract_st_distance_point(&order_by[0].expr) else {
+                    return Ok(None);
+                };
+                // Peel an optional Project then optional Filter to reach the scan.
+                let mut node = child.as_ref();
+                if let LogicalPlan::Project { child, .. } = node {
+                    node = child.as_ref();
+                }
+                let mut remaining_predicate = None;
+                if let LogicalPlan::Filter { predicate, child } = node {
+                    remaining_predicate = Some(predicate.clone());
+                    node = child.as_ref();
+                }
+                let LogicalPlan::Scan {
+                    table_id, columns, ..
+                } = node
+                else {
+                    return Ok(None);
+                };
+                for index in &self.catalog.get_indexes_for_table(*table_id) {
+                    if index.index_type == zyron_catalog::IndexType::Spatial {
+                        let cost = PlanCost {
+                            io_cost: 2.0,
+                            cpu_cost: 8.0,
+                            row_count: k as f64,
+                        };
+                        return Ok(Some(PhysicalPlan::SpatialScan {
+                            table_id: *table_id,
+                            index_id: index.id,
+                            columns: columns.clone(),
+                            kind: SpatialScanKind::Knn { query_point, k },
+                            remaining_predicate,
+                            cost,
+                        }));
+                    }
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Scan planning: SeqScan vs IndexScan
     // -----------------------------------------------------------------------
@@ -467,6 +583,7 @@ impl<'a> PhysicalPlanner<'a> {
         predicate: Option<BoundExpr>,
         encoding_hints: Option<encoding_pushdown::EncodingHint>,
         as_of: Option<crate::logical::AsOfTarget>,
+        limit: Option<usize>,
     ) -> Result<PhysicalPlan> {
         // Get table stats
         let table_stats = self.catalog.get_stats(table_id);
@@ -541,19 +658,31 @@ impl<'a> PhysicalPlanner<'a> {
             if let Some((vec_expr, remaining)) = extract_vector_distance(pred) {
                 for index in &indexes {
                     if index.index_type == zyron_catalog::IndexType::Vector {
+                        // Extract the literal query vector from the non-column
+                        // argument of the distance call. Without one the index
+                        // cannot serve the predicate, so fall through to the
+                        // SeqScan path.
+                        let Some(query_vector) = extract_query_vector(vec_expr) else {
+                            break;
+                        };
+                        // The distance metric is intrinsic to the built index
+                        // and applied inside the search at execution time, so it
+                        // is carried as 0 here and not re-derived at plan time.
+                        let metric = 0;
+                        // k comes from the enclosing LIMIT; default to 10.
+                        let k = limit.unwrap_or(10);
                         let cost = PlanCost {
                             io_cost: 1.0,
                             cpu_cost: 5.0,
-                            row_count: 10.0,
+                            row_count: k as f64,
                         };
-                        let _ = vec_expr; // Referenced columns extracted at execution time
                         return Ok(PhysicalPlan::VectorScan {
                             table_id,
                             index_id: index.id,
                             columns,
-                            query_vector: Vec::new(), // Populated at execution time from bound expr
-                            metric: 0,                // Populated from index config
-                            k: 10,                    // Default, overridden by LIMIT
+                            query_vector,
+                            metric,
+                            k,
                             remaining_predicate: remaining.cloned(),
                             cost,
                         });
@@ -1308,6 +1437,31 @@ fn extract_point_from_expr(expr: &BoundExpr) -> Option<Vec<f64>> {
     None
 }
 
+/// Extracts the query point from an `ST_Distance(col, point)` ordering
+/// expression. The column argument is the indexed geometry and the other is a
+/// literal point. Returns the point when one argument is a column and the other
+/// resolves to a point literal.
+fn extract_st_distance_point(expr: &BoundExpr) -> Option<Vec<f64>> {
+    let inner = match expr {
+        BoundExpr::Nested(e) => e.as_ref(),
+        other => other,
+    };
+    let BoundExpr::Function { name, args, .. } = inner else {
+        return None;
+    };
+    if name != "st_distance" || args.len() != 2 {
+        return None;
+    }
+    // The point is whichever argument is not the indexed column.
+    if extract_column_id_from_expr(&args[0]).is_some() {
+        extract_point_from_expr(&args[1])
+    } else if extract_column_id_from_expr(&args[1]).is_some() {
+        extract_point_from_expr(&args[0])
+    } else {
+        None
+    }
+}
+
 fn extract_envelope_from_expr(expr: &BoundExpr) -> Option<(Vec<f64>, Vec<f64>)> {
     // st_makeenvelope(min_x, min_y, max_x, max_y) or st_make_envelope.
     if let BoundExpr::Function { name, args, .. } = expr {
@@ -1353,6 +1507,44 @@ fn extract_column_id_from_expr(expr: &BoundExpr) -> Option<zyron_catalog::Column
         BoundExpr::Nested(inner) => extract_column_id_from_expr(inner),
         _ => None,
     }
+}
+
+/// Extracts the literal query vector from a `vector_distance_*` call. The call
+/// has two arguments, one the indexed column and the other an array constructor
+/// of numeric literals. Returns the f32 vector when the array side is present.
+fn extract_query_vector(call: &BoundExpr) -> Option<Vec<f32>> {
+    let BoundExpr::Function { args, .. } = call else {
+        return None;
+    };
+    if args.len() != 2 {
+        return None;
+    }
+    // The query side is whichever argument is not the column reference.
+    let query_arg = if extract_column_id_from_expr(&args[0]).is_some() {
+        &args[1]
+    } else {
+        &args[0]
+    };
+    array_literal_to_f32(query_arg)
+}
+
+/// Reads an array constructor of numeric literals into an f32 vector.
+fn array_literal_to_f32(expr: &BoundExpr) -> Option<Vec<f32>> {
+    let inner = match expr {
+        BoundExpr::Nested(e) => e.as_ref(),
+        other => other,
+    };
+    let BoundExpr::Function { name, args, .. } = inner else {
+        return None;
+    };
+    if name != "array" || args.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(args.len());
+    for a in args {
+        out.push(extract_f64_literal(a)? as f32);
+    }
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------

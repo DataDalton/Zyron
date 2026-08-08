@@ -8,11 +8,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
+use std::collections::HashMap;
 use zyron_common::{Result, ZyronError};
 
 use super::distance::{
     computeDistance, distWithFn, euclideanSmall4, resolveDistFn, vectorAddInplace,
-    vectorScaleInplace, vectorSubtract,
+    vectorScaleInplace, vectorSubtract, vectorSubtractInplace,
 };
 use super::memory::{try_alloc_default, try_alloc_filled, try_alloc_vec, validate_file_size};
 use super::profile::DataProfile;
@@ -26,13 +27,14 @@ fn threadCount() -> usize {
 }
 
 /// Distance computation specialized for small subvectors (4d Euclidean).
-/// Falls back to computeDistance for other metrics or dimensions.
+/// Falls back to a resolved distance fn for other metrics or dimensions.
+/// Callers pass equal-length subvectors produced by PQ splitting.
 #[inline(always)]
 fn subvectorDistance(a: &[f32], b: &[f32], metric: DistanceMetric) -> f32 {
     if a.len() == 4 && metric == DistanceMetric::Euclidean {
         euclideanSmall4(a, b)
     } else {
-        computeDistance(metric, a, b)
+        distWithFn(resolveDistFn(metric), a, b)
     }
 }
 
@@ -76,16 +78,21 @@ pub struct IvfPqIndex {
     centroids: Vec<Vec<f32>>,
     /// Residual centroids for ARQ stage 2.
     residualCentroids: Vec<Vec<f32>>,
-    /// invertedLists[centroid_idx] holds (VectorId, arenaIdx, residual_centroid_idx, pq_codes).
-    /// arenaIdx (u32) indexes directly into vectorArena for exact distance lookup.
-    invertedLists: Vec<RwLock<Vec<(VectorId, u32, u16, Vec<u8>)>>>,
+    /// invertedLists[centroid_idx] holds (VectorId, arenaIdx, residual_centroid_idx).
+    /// arenaIdx (u32) indexes into vectorArena for exact distance and into
+    /// codeArena (at arenaIdx * numSubvectors) for this vector's PQ codes.
+    invertedLists: Vec<RwLock<Vec<(VectorId, u32, u16)>>>,
+    /// Flat PQ code arena: codeArena[i*numSub .. (i+1)*numSub] are the codes for
+    /// arena index i. One contiguous allocation instead of a Vec<u8> per entry,
+    /// removing per-entry Vec header overhead and heap fragmentation at scale.
+    codeArena: RwLock<Vec<u8>>,
     /// PQ codebooks for stage 3.
     codebooks: Vec<Vec<Vec<f32>>>,
     /// Flat arena storing all original vectors contiguously for exact distance
     /// computation during search. Behind RwLock for online insert support.
     vectorArena: RwLock<Vec<f32>>,
     /// Maps VectorId to arena index for exact distance lookup.
-    idToArenaIdx: scc::HashMap<VectorId, usize>,
+    idToArenaIdx: RwLock<HashMap<VectorId, usize>>,
     nodeCount: AtomicU64,
     profile: Option<DataProfile>,
 }
@@ -111,9 +118,10 @@ impl IvfPqIndex {
                 centroids: Vec::new(),
                 residualCentroids: Vec::new(),
                 invertedLists: Vec::new(),
+                codeArena: RwLock::new(Vec::new()),
                 codebooks: Vec::new(),
                 vectorArena: RwLock::new(Vec::new()),
-                idToArenaIdx: scc::HashMap::new(),
+                idToArenaIdx: RwLock::new(HashMap::new()),
                 nodeCount: AtomicU64::new(0),
                 config,
                 profile: None,
@@ -173,8 +181,10 @@ impl IvfPqIndex {
         // Clamp numCentroids to the number of vectors.
         let numCentroids = (config.numCentroids as usize).min(vectors.len());
 
-        // Step 1: K-means clustering to find centroids.
-        let vectorSlices: Vec<&[f32]> = vectors.iter().map(|(_, v)| *v).collect();
+        // Step 1: K-means clustering to find centroids. The n-sized slice vector
+        // is allocated fallibly so OOM returns an error instead of aborting.
+        let mut vectorSlices: Vec<&[f32]> = try_alloc_vec(vectors.len())?;
+        vectorSlices.extend(vectors.iter().map(|(_, v)| *v));
         let centroids = kmeans(&vectorSlices, numCentroids, kmeansIters, config.metric)?;
 
         // Step 2: Assign each vector to its nearest centroid and compute stage-1 residuals.
@@ -192,7 +202,8 @@ impl IvfPqIndex {
 
         // Step 2.5 (ARQ Stage 2): Train residual centroids on stage-1 residuals.
         let numResidualCentroids = profile.ivfResidualCentroids().min(vectors.len());
-        let residualSlices: Vec<&[f32]> = residuals1.iter().map(|r| r.as_slice()).collect();
+        let mut residualSlices: Vec<&[f32]> = try_alloc_vec(residuals1.len())?;
+        residualSlices.extend(residuals1.iter().map(|r| r.as_slice()));
         let residualCentroids = kmeans(
             &residualSlices,
             numResidualCentroids,
@@ -201,20 +212,18 @@ impl IvfPqIndex {
         )?;
         drop(residualSlices);
 
-        // Compute stage-2 residuals: stage1_residual - nearest_residual_centroid
+        // Compute stage-2 residuals in place: overwrite each stage-1 residual
+        // with (stage1_residual - nearest_residual_centroid). r1 is read only to
+        // pick the residual centroid, then becomes the stage-2 residual, so no
+        // second n*d*4 buffer is allocated and the two residual sets never
+        // coexist (previously ~2*n*d*4 peak; now ~n*d*4).
         let mut residualAssignments: Vec<u16> = try_alloc_vec(vectors.len())?;
-        let mut residuals2: Vec<Vec<f32>> = try_alloc_vec(vectors.len())?;
-
-        for r1 in &residuals1 {
+        for r1 in residuals1.iter_mut() {
             let rcIdx = findNearest(r1.as_slice(), &residualCentroids, config.metric);
             residualAssignments.push(rcIdx as u16);
-            let mut r2 = vec![0.0f32; dimensions];
-            vectorSubtract(r1, &residualCentroids[rcIdx], &mut r2);
-            residuals2.push(r2);
+            vectorSubtractInplace(r1, &residualCentroids[rcIdx]);
         }
-
-        // Drop residuals1 now that stage-2 is computed. Releases ~n*d*4 bytes.
-        drop(residuals1);
+        let residuals2 = residuals1;
 
         // Step 3: Train PQ codebooks on stage-2 residuals in parallel.
         let codebooks: Vec<Vec<Vec<f32>>> = {
@@ -251,18 +260,23 @@ impl IvfPqIndex {
             results.into_iter().map(|r| r.unwrap_or_default()).collect()
         };
 
-        // Step 4: Encode stage-2 residuals into PQ codes and build inverted lists.
-        let mut invertedLists: Vec<Vec<(VectorId, u32, u16, Vec<u8>)>> =
+        // Step 4: Encode stage-2 residuals into PQ codes. Codes go into one flat
+        // arena indexed by arena index (vecIdx); inverted-list entries carry only
+        // ids/indices, not a per-entry Vec<u8>.
+        let mut invertedLists: Vec<Vec<(VectorId, u32, u16)>> =
             try_alloc_filled(numCentroids, Vec::new())?;
+        let mut codeArena: Vec<u8> = try_alloc_vec(vectors.len() * numSubvectors)?;
+        codeArena.resize(vectors.len() * numSubvectors, 0);
 
         for centroidIdx in 0..numCentroids {
             for &vecIdx in &assignments[centroidIdx] {
                 let codes = encodeResidual(&residuals2[vecIdx], &codebooks, subDim, config.metric);
+                let cs = vecIdx * numSubvectors;
+                codeArena[cs..cs + numSubvectors].copy_from_slice(&codes);
                 invertedLists[centroidIdx].push((
                     vectors[vecIdx].0,
                     vecIdx as u32,
                     residualAssignments[vecIdx],
-                    codes,
                 ));
             }
         }
@@ -270,15 +284,15 @@ impl IvfPqIndex {
         drop(residuals2);
 
         let nodeCount = vectors.len() as u64;
-        let lockedLists: Vec<RwLock<Vec<(VectorId, u32, u16, Vec<u8>)>>> =
+        let lockedLists: Vec<RwLock<Vec<(VectorId, u32, u16)>>> =
             invertedLists.into_iter().map(RwLock::new).collect();
 
         // Build flat vector arena for exact distance computation during search.
         let mut arenaVec: Vec<f32> = try_alloc_vec(vectors.len() * dimensions)?;
-        let idToArenaIdx: scc::HashMap<VectorId, usize> = scc::HashMap::new();
+        let mut idToArenaIdx: HashMap<VectorId, usize> = HashMap::with_capacity(vectors.len());
         for (idx, &(vid, v)) in vectors.iter().enumerate() {
             arenaVec.extend_from_slice(v);
-            let _ = idToArenaIdx.insert_sync(vid, idx);
+            idToArenaIdx.insert(vid, idx);
         }
         let vectorArena = RwLock::new(arenaVec);
 
@@ -291,9 +305,10 @@ impl IvfPqIndex {
             centroids,
             residualCentroids,
             invertedLists: lockedLists,
+            codeArena: RwLock::new(codeArena),
             codebooks,
             vectorArena,
-            idToArenaIdx,
+            idToArenaIdx: RwLock::new(idToArenaIdx),
             nodeCount: AtomicU64::new(nodeCount),
             profile: Some(profile),
         })
@@ -379,15 +394,17 @@ impl IvfPqIndex {
             let guard = list.read();
             let entryCount = guard.len() as u32;
             buf.extend_from_slice(&entryCount.to_le_bytes());
-            for &(id, arenaIdx, rcIdx, ref codes) in guard.iter() {
+            for &(id, arenaIdx, rcIdx) in guard.iter() {
                 buf.extend_from_slice(&id.to_le_bytes());
                 buf.extend_from_slice(&arenaIdx.to_le_bytes());
                 buf.extend_from_slice(&rcIdx.to_le_bytes());
-                let codeLen = codes.len() as u16;
-                buf.extend_from_slice(&codeLen.to_le_bytes());
-                buf.extend_from_slice(codes);
             }
         }
+
+        // Flat PQ code arena (codes for arena index i at i*numSub).
+        let codeGuard = self.codeArena.read();
+        buf.extend_from_slice(&(codeGuard.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&codeGuard);
 
         // Node count.
         let count = self.nodeCount.load(Ordering::Relaxed);
@@ -403,10 +420,9 @@ impl IvfPqIndex {
 
         // IdToArenaIdx map entries.
         let mut mapEntries: Vec<(VectorId, usize)> = Vec::new();
-        self.idToArenaIdx.iter_sync(|&k, &v| {
+        for (&k, &v) in self.idToArenaIdx.read().iter() {
             mapEntries.push((k, v));
-            true
-        });
+        }
         let mapLen = mapEntries.len() as u64;
         buf.extend_from_slice(&mapLen.to_le_bytes());
         for (vid, idx) in &mapEntries {
@@ -592,8 +608,7 @@ impl IvfPqIndex {
                 declared: listCount as u64,
             });
         }
-        let mut invertedLists: Vec<RwLock<Vec<(VectorId, u32, u16, Vec<u8>)>>> =
-            try_alloc_vec(listCount)?;
+        let mut invertedLists: Vec<RwLock<Vec<(VectorId, u32, u16)>>> = try_alloc_vec(listCount)?;
         for _ in 0..listCount {
             let entryCount = readU32(&mut pos)? as usize;
             // Sanity cap: entries per partition shouldn't exceed total vectors.
@@ -603,24 +618,26 @@ impl IvfPqIndex {
                     declared: entryCount as u64,
                 });
             }
-            let mut entries: Vec<(VectorId, u32, u16, Vec<u8>)> = try_alloc_vec(entryCount)?;
+            let mut entries: Vec<(VectorId, u32, u16)> = try_alloc_vec(entryCount)?;
             for _ in 0..entryCount {
                 let id = readU64(&mut pos)?;
                 let arenaIdx = readU32(&mut pos)?;
                 let rcIdx = readU16(&mut pos)?;
-                let codeLen = readU16(&mut pos)? as usize;
-                if pos + codeLen > data.len() {
-                    return Err(ZyronError::InvalidParameter {
-                        name: "file".to_string(),
-                        value: "unexpected end of file reading PQ codes".to_string(),
-                    });
-                }
-                let codes = data[pos..pos + codeLen].to_vec();
-                pos += codeLen;
-                entries.push((id, arenaIdx, rcIdx, codes));
+                entries.push((id, arenaIdx, rcIdx));
             }
             invertedLists.push(RwLock::new(entries));
         }
+
+        // Flat PQ code arena.
+        let codeArenaLen = readU64(&mut pos)? as usize;
+        if pos + codeArenaLen > data.len() {
+            return Err(ZyronError::InvalidParameter {
+                name: "file".to_string(),
+                value: "unexpected end of file reading PQ code arena".to_string(),
+            });
+        }
+        let codeArena = data[pos..pos + codeArenaLen].to_vec();
+        pos += codeArenaLen;
 
         // Node count.
         let nodeCount = if pos + 8 <= data.len() {
@@ -636,7 +653,7 @@ impl IvfPqIndex {
         // Load vector arena and id map if present (format v1.1+).
         // Older files without arena data will fall back to PQ distances.
         let mut arenaVec = Vec::new();
-        let idToArenaIdx = scc::HashMap::new();
+        let mut idToArenaIdx: HashMap<VectorId, usize> = HashMap::new();
         if pos + 8 <= data.len() {
             let arenaLen = readU64(&mut pos)? as usize;
             if arenaLen > 0 && pos + arenaLen * 4 <= data.len() {
@@ -653,7 +670,7 @@ impl IvfPqIndex {
                     }
                     let vid = readU64(&mut pos)?;
                     let idx = readU64(&mut pos)? as usize;
-                    let _ = idToArenaIdx.insert_sync(vid, idx);
+                    idToArenaIdx.insert(vid, idx);
                 }
             }
         }
@@ -668,9 +685,10 @@ impl IvfPqIndex {
             centroids,
             residualCentroids,
             invertedLists,
+            codeArena: RwLock::new(codeArena),
             codebooks,
             vectorArena,
-            idToArenaIdx,
+            idToArenaIdx: RwLock::new(idToArenaIdx),
             nodeCount: AtomicU64::new(nodeCount),
             profile: None,
         })
@@ -715,7 +733,7 @@ impl VectorSearch for IvfPqIndex {
             .centroids
             .iter()
             .enumerate()
-            .map(|(i, c)| (i, computeDistance(self.config.metric, query, c)))
+            .map(|(i, c)| (i, distWithFn(resolveDistFn(self.config.metric), query, c)))
             .collect();
         if numProbes < centroidDists.len() {
             centroidDists.select_nth_unstable_by(numProbes, |a, b| {
@@ -726,6 +744,7 @@ impl VectorSearch for IvfPqIndex {
 
         let dims = self.dimensions as usize;
         let arenaGuard = self.vectorArena.read();
+        let codeGuard = self.codeArena.read();
         let useExactSearch = !arenaGuard.is_empty();
         let metric = self.config.metric;
 
@@ -769,10 +788,12 @@ impl VectorSearch for IvfPqIndex {
                     }
                 }
 
-                for &(id, arenaIdx, _, ref codes) in guard.iter() {
-                    if codes.len() < numSub {
+                for &(id, arenaIdx, _) in guard.iter() {
+                    let cs = arenaIdx as usize * numSub;
+                    if cs + numSub > codeGuard.len() {
                         continue;
                     }
+                    let codes = &codeGuard[cs..cs + numSub];
                     let mut dist = 0.0f32;
                     for s in 0..numSub {
                         dist += adcTable[s * codebookSize + codes[s] as usize];
@@ -796,7 +817,7 @@ impl VectorSearch for IvfPqIndex {
                 let end = offset + dims;
                 if end <= arenaGuard.len() {
                     let originalVec = &arenaGuard[offset..end];
-                    let dist = computeDistance(metric, query, originalVec);
+                    let dist = distWithFn(resolveDistFn(metric), query, originalVec);
                     exactCandidates.push((*id, dist));
                 }
             }
@@ -806,12 +827,12 @@ impl VectorSearch for IvfPqIndex {
             let mut candidates = Vec::new();
             for &(centroidIdx, _) in &centroidDists {
                 let guard = self.invertedLists[centroidIdx].read();
-                for &(id, arenaIdx, _, _) in guard.iter() {
+                for &(id, arenaIdx, _) in guard.iter() {
                     let offset = arenaIdx as usize * dims;
                     let end = offset + dims;
                     if end <= arenaGuard.len() {
                         let originalVec = &arenaGuard[offset..end];
-                        let dist = computeDistance(metric, query, originalVec);
+                        let dist = distWithFn(resolveDistFn(metric), query, originalVec);
                         candidates.push((id, dist));
                     }
                 }
@@ -819,37 +840,35 @@ impl VectorSearch for IvfPqIndex {
             candidates
         } else {
             // PQ approximate distance fallback (loaded indexes without arena).
+            // Reuse a flat ADC table and residual buffer across probes instead of
+            // allocating a nested Vec<Vec> per probe (mirrors the primary path).
             let mut candidates = Vec::new();
+            let mut queryResidual = vec![0.0f32; dims];
+            let mut adcTable = vec![0.0f32; numSub * codebookSize];
             for &(centroidIdx, _) in &centroidDists {
                 let guard = self.invertedLists[centroidIdx].read();
-                let mut queryResidual = vec![0.0f32; dims];
                 vectorSubtract(query, &self.centroids[centroidIdx], &mut queryResidual);
 
-                let mut adcTable = vec![vec![0.0f32; codebookSize]; numSub];
                 for s in 0..numSub {
                     let qStart = s * subDim;
                     let qEnd = qStart + subDim;
                     let qSub = &queryResidual[qStart..qEnd];
+                    let tableOffset = s * codebookSize;
                     for c in 0..self.codebooks[s].len() {
-                        adcTable[s][c] = subvectorDistance(qSub, &self.codebooks[s][c], metric);
+                        adcTable[tableOffset + c] =
+                            subvectorDistance(qSub, &self.codebooks[s][c], metric);
                     }
                 }
 
-                for &(id, _, _, ref codes) in guard.iter() {
-                    debug_assert_eq!(
-                        codes.len(),
-                        numSub,
-                        "PQ codes length {} != expected {} for VectorId {}",
-                        codes.len(),
-                        numSub,
-                        id
-                    );
-                    if codes.len() < numSub {
+                for &(id, arenaIdx, _) in guard.iter() {
+                    let cs = arenaIdx as usize * numSub;
+                    if cs + numSub > codeGuard.len() {
                         continue;
                     }
+                    let codes = &codeGuard[cs..cs + numSub];
                     let mut dist = 0.0f32;
                     for s in 0..numSub {
-                        dist += adcTable[s][codes[s] as usize];
+                        dist += adcTable[s * codebookSize + codes[s] as usize];
                     }
                     candidates.push((id, dist));
                 }
@@ -917,17 +936,21 @@ impl VectorSearch for IvfPqIndex {
 
         let codes = self.encodeVector(&residual2);
 
-        // Update vector arena for exact distance search
+        // Append the vector to the arena and its codes to the flat code arena
+        // under both write locks so arenaIdx stays consistent between them under
+        // concurrent inserts. Lock order (arena, code) matches the search path.
         let arenaIdx = {
             let mut arenaGuard = self.vectorArena.write();
+            let mut codeGuard = self.codeArena.write();
             let idx = arenaGuard.len() / dims;
             arenaGuard.extend_from_slice(vector);
-            let _ = self.idToArenaIdx.insert_sync(id, idx);
+            codeGuard.extend_from_slice(&codes);
+            self.idToArenaIdx.write().insert(id, idx);
             idx as u32
         };
 
         let mut guard = self.invertedLists[centroidIdx].write();
-        guard.push((id, arenaIdx, rcIdx, codes));
+        guard.push((id, arenaIdx, rcIdx));
         self.nodeCount.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -939,7 +962,7 @@ impl VectorSearch for IvfPqIndex {
         for list in &self.invertedLists {
             let mut guard = list.write();
             let before = guard.len();
-            guard.retain(|(vid, _, _, _)| *vid != id);
+            guard.retain(|(vid, _, _)| *vid != id);
             let removed = before - guard.len();
             if removed > 0 {
                 self.nodeCount.fetch_sub(removed as u64, Ordering::Relaxed);
@@ -998,8 +1021,9 @@ fn kmeans(
                 name: "centroids".to_string(),
                 value: "empty centroid list during initialization".to_string(),
             })?;
+        let distFn = resolveDistFn(metric);
         for (i, v) in vectors.iter().enumerate() {
-            let d = computeDistance(metric, v, lastCentroid);
+            let d = distWithFn(distFn, v, lastCentroid);
             if d < minDists[i] {
                 minDists[i] = d;
             }
@@ -1138,7 +1162,7 @@ fn kmeans(
         // Convergence check
         let mut maxShift = 0.0f32;
         for c in 0..k {
-            let d = computeDistance(metric, &centroids[c], &newCentroids[c]);
+            let d = distWithFn(distFn, &centroids[c], &newCentroids[c]);
             if d > maxShift {
                 maxShift = d;
             }
@@ -1369,13 +1393,13 @@ mod tests {
 
         let index = IvfPqIndex::build(&refs, 1, 100, 0, config).expect("build should succeed");
 
-        // Verify PQ codes have the correct length (one byte per subvector).
-        for list in &index.invertedLists {
-            let guard = list.read();
-            for (_, _, _, codes) in guard.iter() {
-                assert_eq!(codes.len(), 8, "PQ codes should have numSubvectors entries");
-            }
-        }
+        // Codes are stored in a flat arena: numSubvectors (8) bytes per vector.
+        let codeArena = index.codeArena.read();
+        assert_eq!(
+            codeArena.len(),
+            100 * 8,
+            "flat code arena should hold numSubvectors bytes per vector"
+        );
     }
 
     #[test]
@@ -1451,7 +1475,7 @@ mod tests {
         // Verify the vector is no longer in any inverted list.
         for list in &index.invertedLists {
             let guard = list.read();
-            for (id, _, _, _) in guard.iter() {
+            for (id, _, _) in guard.iter() {
                 assert_ne!(*id, 10);
             }
         }

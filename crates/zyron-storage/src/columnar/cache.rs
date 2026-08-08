@@ -94,8 +94,14 @@ impl SegmentCache {
         let dataSize = data.len() as u64;
         let packedKey = pack_key(&key);
 
-        // Evict until there is room
-        self.evict_until(dataSize as usize);
+        // Evict until there is room. Accounts for the size of an existing entry
+        // under this key being displaced so the post-insert net stays bounded.
+        let displacedSize = self
+            .entries
+            .read_sync(&packedKey, |_, v| v.size_bytes() as u64)
+            .unwrap_or(0);
+        let netNeeded = dataSize.saturating_sub(displacedSize) as usize;
+        self.evict_until(netNeeded);
 
         let segment = Arc::new(CachedSegment {
             key,
@@ -105,12 +111,29 @@ impl SegmentCache {
 
         let result = Arc::clone(&segment);
 
-        // Insert or update
-        let _ = self.entries.insert_sync(packedKey, segment);
+        // Replace the stored segment under this key. On an existing key, subtract
+        // the displaced entry's size before adding the new size and skip pushing
+        // a duplicate clock_keys entry so accounting and the clock ring stay
+        // consistent.
+        let mut displaced: u64 = 0;
+        let mut wasPresent = false;
+        match self.entries.entry_sync(packedKey) {
+            scc::hash_map::Entry::Occupied(mut entry) => {
+                displaced = entry.get().size_bytes() as u64;
+                *entry.get_mut() = segment;
+                wasPresent = true;
+            }
+            scc::hash_map::Entry::Vacant(entry) => {
+                entry.insert_entry(segment);
+            }
+        }
+
+        if displaced > 0 {
+            self.current_bytes.fetch_sub(displaced, Ordering::Relaxed);
+        }
         self.current_bytes.fetch_add(dataSize, Ordering::Relaxed);
 
-        // Add to clock ring
-        {
+        if !wasPresent {
             let mut keys = self.clock_keys.write();
             keys.push(packedKey);
         }
@@ -199,6 +222,44 @@ impl SegmentCache {
             }
 
             self.clock_hand.store(hand, Ordering::Relaxed);
+        }
+
+        // Final sweep, the second-chance passes above may clear reference bits
+        // without freeing enough for a large item. Force-evict ignoring the
+        // reference bit so insert never pushes current_bytes above max_bytes
+        // while entries remain to reclaim.
+        loop {
+            let currentUsed = self.current_bytes.load(Ordering::Relaxed) as usize;
+            if currentUsed + needed_bytes <= self.max_bytes {
+                break;
+            }
+
+            let packedKey = {
+                let keys = self.clock_keys.read();
+                if keys.is_empty() {
+                    break;
+                }
+                let keyCount = keys.len();
+                let hand = self.clock_hand.load(Ordering::Relaxed) % keyCount;
+                self.clock_hand
+                    .store((hand + 1) % keyCount, Ordering::Relaxed);
+                keys[hand]
+            };
+
+            if let Some((_, removed)) = self.entries.remove_sync(&packedKey) {
+                let size = removed.size_bytes() as u64;
+                self.current_bytes.fetch_sub(size, Ordering::Relaxed);
+                let mut wrKeys = self.clock_keys.write();
+                wrKeys.retain(|k| *k != packedKey);
+            } else {
+                // Stale ring entry already gone from the map, drop it so the
+                // loop makes progress instead of spinning on a dead key
+                let mut wrKeys = self.clock_keys.write();
+                wrKeys.retain(|k| self.entries.contains_sync(k));
+                if wrKeys.is_empty() {
+                    break;
+                }
+            }
         }
     }
 }

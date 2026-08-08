@@ -32,19 +32,24 @@ pub fn is_available() -> bool {
 // u128 <-> __m128i helpers
 // ---------------------------------------------------------------------------
 
+// Both helpers are safe fns: SSE2 is part of the x86_64 baseline and neither
+// imposes a contract on the caller.
 #[inline(always)]
-unsafe fn u128_to_m128i(v: u128) -> __m128i {
+fn u128_to_m128i(v: u128) -> __m128i {
     // _mm_set_epi64x takes (hi, lo) signed 64-bit args and packs them into
     // an XMM register. Cast through u64 to preserve the bit pattern.
     let lo = v as u64;
     let hi = (v >> 64) as u64;
-    _mm_set_epi64x(hi as i64, lo as i64)
+    // SAFETY: sse2 is unconditionally enabled on x86_64, no pointers involved
+    unsafe { _mm_set_epi64x(hi as i64, lo as i64) }
 }
 
 #[inline(always)]
-unsafe fn m128i_to_u128(v: __m128i) -> u128 {
+fn m128i_to_u128(v: __m128i) -> u128 {
     let mut bytes = [0u8; 16];
-    _mm_storeu_si128(bytes.as_mut_ptr() as *mut __m128i, v);
+    // SAFETY: sse2 is unconditionally enabled on x86_64, and storeu writes 16
+    // unaligned bytes into a 16-byte local
+    unsafe { _mm_storeu_si128(bytes.as_mut_ptr() as *mut __m128i, v) };
     u128::from_le_bytes(bytes)
 }
 
@@ -69,14 +74,20 @@ unsafe fn absorb_chunk_aes(lanes: &mut Lanes, chunk: &[u8; CHUNK_BYTES]) {
     let mut l7 = u128_to_m128i(lanes.lanes[7]);
 
     // Load 8 input blocks
-    let b0 = _mm_loadu_si128(ptr);
-    let b1 = _mm_loadu_si128(ptr.add(1));
-    let b2 = _mm_loadu_si128(ptr.add(2));
-    let b3 = _mm_loadu_si128(ptr.add(3));
-    let b4 = _mm_loadu_si128(ptr.add(4));
-    let b5 = _mm_loadu_si128(ptr.add(5));
-    let b6 = _mm_loadu_si128(ptr.add(6));
-    let b7 = _mm_loadu_si128(ptr.add(7));
+    // SAFETY: chunk is CHUNK_BYTES long, which is exactly 8 16-byte blocks,
+    // so offsets 0..=7 stay in bounds. loadu has no alignment requirement
+    let (b0, b1, b2, b3, b4, b5, b6, b7) = unsafe {
+        (
+            _mm_loadu_si128(ptr),
+            _mm_loadu_si128(ptr.add(1)),
+            _mm_loadu_si128(ptr.add(2)),
+            _mm_loadu_si128(ptr.add(3)),
+            _mm_loadu_si128(ptr.add(4)),
+            _mm_loadu_si128(ptr.add(5)),
+            _mm_loadu_si128(ptr.add(6)),
+            _mm_loadu_si128(ptr.add(7)),
+        )
+    };
 
     // XOR input into lane state
     l0 = _mm_xor_si128(l0, b0);
@@ -200,53 +211,61 @@ unsafe fn small_input_aes(bytes: &[u8], seed: u128) -> u128 {
 /// Caller must have verified `is_available()` returns true.
 #[target_feature(enable = "aes,sse2")]
 pub unsafe fn hash_x86_aes(bytes: &[u8], seed: u128) -> u128 {
-    if bytes.len() <= SMALL_INPUT_THRESHOLD {
-        return small_input_aes(bytes, seed);
-    }
+    // SAFETY: this fn already carries the AES-NI availability contract, and
+    // enables aes,sse2 for the whole body
+    unsafe {
+        if bytes.len() <= SMALL_INPUT_THRESHOLD {
+            return small_input_aes(bytes, seed);
+        }
 
-    let mut lanes = Lanes::init(seed);
-    let mut i = 0;
-    while i + CHUNK_BYTES <= bytes.len() {
-        let chunk: &[u8; CHUNK_BYTES] = bytes[i..i + CHUNK_BYTES]
-            .try_into()
-            .expect("chunk length matches");
-        absorb_chunk_aes(&mut lanes, chunk);
-        i += CHUNK_BYTES;
-    }
-    let mut tail = [0u8; CHUNK_BYTES];
-    let tail_bytes = &bytes[i..];
-    tail[..tail_bytes.len()].copy_from_slice(tail_bytes);
-    let len_bytes = (bytes.len() as u64).to_le_bytes();
-    for j in 0..8 {
-        tail[CHUNK_BYTES - 8 + j] ^= len_bytes[j];
-    }
-    absorb_chunk_aes(&mut lanes, &tail);
+        let mut lanes = Lanes::init(seed);
+        let mut i = 0;
+        while i + CHUNK_BYTES <= bytes.len() {
+            let chunk: &[u8; CHUNK_BYTES] = bytes[i..i + CHUNK_BYTES]
+                .try_into()
+                .expect("chunk length matches");
+            absorb_chunk_aes(&mut lanes, chunk);
+            i += CHUNK_BYTES;
+        }
+        let mut tail = [0u8; CHUNK_BYTES];
+        let tail_bytes = &bytes[i..];
+        tail[..tail_bytes.len()].copy_from_slice(tail_bytes);
+        let len_bytes = (bytes.len() as u64).to_le_bytes();
+        for j in 0..8 {
+            tail[CHUNK_BYTES - 8 + j] ^= len_bytes[j];
+        }
+        absorb_chunk_aes(&mut lanes, &tail);
 
-    finalize_aes(&lanes)
+        finalize_aes(&lanes)
+    }
 }
 
 /// Streaming chunk absorption. `# Safety`: AES-NI must be available.
 #[inline]
 pub unsafe fn absorb_chunk(lanes: &mut Lanes, chunk: &[u8; CHUNK_BYTES]) {
-    absorb_chunk_aes(lanes, chunk)
+    // SAFETY: caller guarantees AES-NI is available
+    unsafe { absorb_chunk_aes(lanes, chunk) }
 }
 
 /// Streaming phase-separator mix. `# Safety`: AES-NI must be available.
 #[inline]
 pub unsafe fn finish_phase(lanes: &mut Lanes) {
-    finish_phase_aes(lanes)
+    // SAFETY: caller guarantees AES-NI is available
+    unsafe { finish_phase_aes(lanes) }
 }
 
 /// Streaming finalization. `# Safety`: AES-NI must be available.
 #[inline]
 pub unsafe fn finalize(lanes: &Lanes) -> u128 {
-    finalize_aes(lanes)
+    // SAFETY: caller guarantees AES-NI is available
+    unsafe { finalize_aes(lanes) }
 }
 
 /// Small-input fast path. `# Safety`: AES-NI must be available.
 #[inline]
 pub unsafe fn small_input(bytes: &[u8], seed: u128) -> u128 {
-    small_input_aes(bytes, seed)
+    // SAFETY: caller guarantees AES-NI is available
+    unsafe { small_input_aes(bytes, seed) }
 }
 
 #[cfg(test)]

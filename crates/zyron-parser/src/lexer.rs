@@ -4,6 +4,23 @@ use zyron_common::{Result, ZyronError};
 
 use crate::token::{Span, SpannedToken, Token, lookup_keyword};
 
+/// Returns the byte length of the UTF-8 character whose lead byte is `b`.
+/// Used to copy a whole multi-byte character instead of one byte at a time.
+#[inline]
+fn utf8_char_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b >> 5 == 0b110 {
+        2
+    } else if b >> 4 == 0b1110 {
+        3
+    } else if b >> 3 == 0b11110 {
+        4
+    } else {
+        1
+    }
+}
+
 /// SQL lexer. Produces tokens from an input SQL string.
 pub struct Lexer<'a> {
     input: &'a str,
@@ -77,12 +94,21 @@ impl<'a> Lexer<'a> {
     }
 
     /// Scans a `$N` bind parameter, where `N` is a positive 1-based index.
-    /// Returns `Token::Parameter(N)`. A `$` not followed by digits is rejected.
+    /// Returns `Token::Parameter(N)`. A `$` opening a dollar-quote (`$$` or
+    /// `$tag$`) is lexed as a String. A `$` that is neither is rejected.
     fn scan_parameter(&mut self) -> Result<SpannedToken> {
         let start = self.pos;
         let start_line = self.line;
         let start_col = self.column;
         debug_assert_eq!(self.bytes[self.pos], b'$');
+
+        // A dollar-quoted string opens with `$tag$` where tag is an optional
+        // identifier that does not start with a digit. The body runs verbatim
+        // until the matching `$tag$` closing delimiter.
+        if let Some(tok) = self.try_scan_dollar_quote(start, start_line, start_col)? {
+            return Ok(tok);
+        }
+
         self.pos += 1;
         self.column += 1;
 
@@ -112,6 +138,67 @@ impl<'a> Lexer<'a> {
         }
         let span = Span::new(start, self.pos - start);
         Ok(SpannedToken::new(Token::Parameter(index), span))
+    }
+
+    /// Tries to lex a dollar-quoted string opening at the current `$`. Returns
+    /// the String token on success, None when the `$` does not open a
+    /// dollar-quote (leaving the position unchanged for parameter scanning).
+    fn try_scan_dollar_quote(
+        &mut self,
+        start: usize,
+        start_line: usize,
+        start_col: usize,
+    ) -> Result<Option<SpannedToken>> {
+        // Read the optional tag after the opening `$`. The tag is an identifier
+        // that does not start with a digit.
+        let mut tag_end = self.pos + 1;
+        if tag_end < self.bytes.len() && !self.bytes[tag_end].is_ascii_digit() {
+            while tag_end < self.bytes.len()
+                && (self.bytes[tag_end].is_ascii_alphanumeric() || self.bytes[tag_end] == b'_')
+            {
+                tag_end += 1;
+            }
+        }
+        // The opener is complete only when a closing `$` follows the tag.
+        if tag_end >= self.bytes.len() || self.bytes[tag_end] != b'$' {
+            return Ok(None);
+        }
+
+        // delimiter is the full `$tag$` opener and the matching closer.
+        let delim = &self.input[self.pos..tag_end + 1];
+        let delim_bytes = delim.as_bytes();
+        let body_start = tag_end + 1;
+
+        // Find the next occurrence of the closing delimiter.
+        let mut scan = body_start;
+        let close = loop {
+            if scan + delim_bytes.len() > self.bytes.len() {
+                return Err(ZyronError::ParseError(format!(
+                    "Unterminated dollar-quoted string starting at line {}, column {}",
+                    start_line, start_col
+                )));
+            }
+            if &self.bytes[scan..scan + delim_bytes.len()] == delim_bytes {
+                break scan;
+            }
+            scan += 1;
+        };
+
+        let body = self.input[body_start..close].to_string();
+        // Advance line/column over the consumed opener, body, and closer.
+        let consumed_end = close + delim_bytes.len();
+        for &b in &self.bytes[self.pos..consumed_end] {
+            if b == b'\n' {
+                self.line += 1;
+                self.column = 1;
+            } else {
+                self.column += 1;
+            }
+        }
+        self.pos = consumed_end;
+
+        let span = Span::new(start, self.pos - start);
+        Ok(Some(SpannedToken::new(Token::String(body), span)))
     }
 
     fn skip_whitespace_and_comments(&mut self) -> Result<()> {
@@ -327,11 +414,14 @@ impl<'a> Lexer<'a> {
                 if b == b'\n' {
                     self.line += 1;
                     self.column = 1;
+                    s.push('\n');
+                    self.pos += 1;
                 } else {
                     self.column += 1;
+                    let len = utf8_char_len(b);
+                    s.push_str(&self.input[self.pos..self.pos + len]);
+                    self.pos += len;
                 }
-                s.push(b as char);
-                self.pos += 1;
             }
             s
         };
@@ -403,11 +493,14 @@ impl<'a> Lexer<'a> {
                 if b == b'\n' {
                     self.line += 1;
                     self.column = 1;
+                    s.push('\n');
+                    self.pos += 1;
                 } else {
                     self.column += 1;
+                    let len = utf8_char_len(b);
+                    s.push_str(&self.input[self.pos..self.pos + len]);
+                    self.pos += len;
                 }
-                s.push(b as char);
-                self.pos += 1;
             }
             s
         };

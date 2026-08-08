@@ -39,15 +39,16 @@ const DEFAULT_BATCH_ROWS: usize = 1024;
 /// endpoints and runs the bulk transfer. Returns the number of rows written.
 pub async fn dispatch_external_to_external(
     catalog: &Arc<Catalog>,
+    key_store: &dyn zyron_auth::KeyStore,
     source: &CopyExternal,
     sink: &CopyExternal,
     options: &[(String, String)],
 ) -> Result<CopyResult> {
     let declared = decode_declared_columns(options)?;
 
-    let source_endpoint = build_source_endpoint(catalog, source, declared.as_deref())?;
+    let source_endpoint = build_source_endpoint(catalog, key_store, source, declared.as_deref())?;
     let sink_columns = source_endpoint.columns.clone();
-    let sink_endpoint = build_sink_endpoint(catalog, sink, &sink_columns)?;
+    let sink_endpoint = build_sink_endpoint(catalog, key_store, sink, &sink_columns)?;
 
     run_external_to_external(source_endpoint, sink_endpoint, DEFAULT_BATCH_ROWS).await
 }
@@ -163,6 +164,7 @@ fn type_id_from_u8(v: u8) -> Result<TypeId> {
 
 fn build_source_endpoint(
     catalog: &Arc<Catalog>,
+    key_store: &dyn zyron_auth::KeyStore,
     src: &CopyExternal,
     declared: Option<&[ColumnSpec]>,
 ) -> Result<CopyEndpoint> {
@@ -201,13 +203,14 @@ fn build_source_endpoint(
         }
         CopyExternal::Named(name) => {
             let entry = lookup_source_entry(catalog, name)?;
-            Ok(endpoint_from_source_entry(&entry))
+            endpoint_from_source_entry(&entry, key_store)
         }
     }
 }
 
 fn build_sink_endpoint(
     catalog: &Arc<Catalog>,
+    key_store: &dyn zyron_auth::KeyStore,
     sink: &CopyExternal,
     source_columns: &[ColumnSpec],
 ) -> Result<CopyEndpoint> {
@@ -240,7 +243,7 @@ fn build_sink_endpoint(
         }
         CopyExternal::Named(name) => {
             let entry = lookup_sink_entry(catalog, name)?;
-            Ok(endpoint_from_sink_entry(&entry))
+            endpoint_from_sink_entry(&entry, key_store)
         }
     }
 }
@@ -271,40 +274,72 @@ fn lookup_sink_entry(catalog: &Arc<Catalog>, name: &str) -> Result<ExternalSinkE
     )))
 }
 
-fn endpoint_from_source_entry(entry: &ExternalSourceEntry) -> CopyEndpoint {
-    CopyEndpoint {
-        backend: entry.backend,
-        uri: entry.uri.clone(),
-        format: entry.format,
-        options: entry.options.clone(),
-        // Named sources store credentials as sealed ciphertext. Unsealing
-        // requires the key ring. Until the key ring is wired here, use an
-        // empty credential map. The streaming source builder will then rely
-        // on the operator's environment (for example, AWS config files or
-        // IAM roles) to authenticate. Callers that require sealed creds
-        // should configure OpenDAL via environment.
-        credentials: HashMap::new(),
-        columns: entry
-            .columns
-            .iter()
-            .map(|(name, t)| ColumnSpec::new(name.clone(), *t))
-            .collect(),
+// Unseals a named entry's sealed credential blob into a plaintext key value
+// map. An entry without sealed credentials yields an empty map so the streaming
+// builder falls back to operator environment credentials.
+fn unseal_credentials(
+    key_id: Option<u32>,
+    ciphertext: Option<&[u8]>,
+    key_store: &dyn zyron_auth::KeyStore,
+) -> Result<HashMap<String, String>> {
+    match (key_id, ciphertext) {
+        (Some(kid), Some(ct)) => {
+            let sealed = zyron_auth::SealedCredentials {
+                key_id: kid,
+                ciphertext: ct.to_vec(),
+            };
+            zyron_auth::open_credentials(&sealed, key_store).map_err(|e| {
+                ZyronError::PlanError(format!("failed to unseal COPY credentials: {e}"))
+            })
+        }
+        _ => Ok(HashMap::new()),
     }
 }
 
-fn endpoint_from_sink_entry(entry: &ExternalSinkEntry) -> CopyEndpoint {
-    CopyEndpoint {
+fn endpoint_from_source_entry(
+    entry: &ExternalSourceEntry,
+    key_store: &dyn zyron_auth::KeyStore,
+) -> Result<CopyEndpoint> {
+    let credentials = unseal_credentials(
+        entry.credential_key_id,
+        entry.credential_ciphertext.as_deref(),
+        key_store,
+    )?;
+    Ok(CopyEndpoint {
         backend: entry.backend,
         uri: entry.uri.clone(),
         format: entry.format,
         options: entry.options.clone(),
-        credentials: HashMap::new(),
+        credentials,
         columns: entry
             .columns
             .iter()
             .map(|(name, t)| ColumnSpec::new(name.clone(), *t))
             .collect(),
-    }
+    })
+}
+
+fn endpoint_from_sink_entry(
+    entry: &ExternalSinkEntry,
+    key_store: &dyn zyron_auth::KeyStore,
+) -> Result<CopyEndpoint> {
+    let credentials = unseal_credentials(
+        entry.credential_key_id,
+        entry.credential_ciphertext.as_deref(),
+        key_store,
+    )?;
+    Ok(CopyEndpoint {
+        backend: entry.backend,
+        uri: entry.uri.clone(),
+        format: entry.format,
+        options: entry.options.clone(),
+        credentials,
+        columns: entry
+            .columns
+            .iter()
+            .map(|(name, t)| ColumnSpec::new(name.clone(), *t))
+            .collect(),
+    })
 }
 
 // -----------------------------------------------------------------------------

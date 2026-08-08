@@ -15,6 +15,7 @@ mod proc_array;
 mod retention_clock;
 mod snapshot;
 mod status_map;
+mod undo;
 
 pub use deadlock::WaitForGraph;
 use durability::DurabilityQueue;
@@ -26,6 +27,7 @@ pub use proc_array::ProcArray;
 pub use retention_clock::RetentionClock;
 pub use snapshot::Snapshot;
 pub use status_map::{TxnStatus, TxnStatusMap};
+pub use undo::{TxnUndoLog, UndoEntry};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -51,9 +53,27 @@ pub struct Savepoint {
     pub name: String,
     /// Snapshot at the time the savepoint was created.
     pub snapshot: Snapshot,
-    /// Number of row locks held when the savepoint was created.
-    /// Used to determine which locks were acquired after the savepoint.
-    pub lock_count: usize,
+    /// Number of row locks held when the savepoint was created. Locks beyond
+    /// this count were acquired after the savepoint and are released on rollback.
+    pub row_lock_count: usize,
+    /// Number of intent (B+tree key) locks held when the savepoint was created.
+    pub intent_lock_count: usize,
+    /// Length of the undo log when the savepoint was created. Rolling back to
+    /// this savepoint reverses every undo entry recorded at or after this mark.
+    pub undo_high_water: usize,
+}
+
+/// Result of rolling back to a savepoint. The undo entries are returned in the
+/// order they must be applied (last write first) so the caller reverses each at
+/// the heap-tuple level. The lock counts are the held counts captured when the
+/// savepoint was taken; locks acquired after it are released.
+pub struct SavepointRollback {
+    /// Row-lock count recorded at the savepoint.
+    pub row_lock_count: usize,
+    /// Intent-lock count recorded at the savepoint.
+    pub intent_lock_count: usize,
+    /// Undo entries to reverse, last-recorded first.
+    pub undo: Vec<UndoEntry>,
 }
 
 /// A database transaction with MVCC snapshot isolation.
@@ -77,6 +97,47 @@ pub struct Transaction {
     /// transaction that never wrote commits without a commit record or a
     /// flush wait, since it has nothing to make durable.
     wrote_data: bool,
+    /// True when the transaction was started READ ONLY. Write statements are
+    /// rejected before they touch the heap.
+    read_only: bool,
+    /// Ordered undo log of this transaction's own writes, shared with the
+    /// execution context that performs them. Entries are recorded only while a
+    /// savepoint is open and reversed on ROLLBACK TO SAVEPOINT.
+    undo_log: Arc<TxnUndoLog>,
+    /// Shared cleanup handles cloned from the manager at begin time. They let
+    /// Drop release this transaction's resources if it is dropped while still
+    /// active, so a client disconnect or an early-return error path that never
+    /// reached commit or abort cannot leak the proc-array slot or its locks.
+    proc_array: Arc<ProcArray>,
+    lock_table: Arc<LockTable>,
+    intent_locks: Arc<IntentLockTable>,
+    wait_for_graph: Arc<WaitForGraph>,
+    status_map: Arc<TxnStatusMap>,
+}
+
+impl Drop for Transaction {
+    /// Releases the transaction's resources if it is dropped without an explicit
+    /// commit or abort. A client that disconnects mid-transaction, or an error
+    /// path that returns before committing, would otherwise leak its proc-array
+    /// slot (which pins the MVCC vacuum horizon) and its held locks (which block
+    /// other transactions) for the life of the process. Cleanup is in memory
+    /// only and writes no WAL abort record, recovery already treats a
+    /// transaction with no commit record as aborted, so the durable side is
+    /// correct without it and Drop stays synchronous and infallible. commit and
+    /// abort set status to Committed or Aborted before releasing, so this is a
+    /// no-op after either and never double-frees a slot.
+    fn drop(&mut self) {
+        if self.status != TransactionStatus::Active {
+            return;
+        }
+        self.status = TransactionStatus::Aborted;
+        self.undo_log.clear();
+        self.lock_table.unlock_all(self.txn_id);
+        self.intent_locks.unlock_all(self.txn_id);
+        self.wait_for_graph.remove_transaction(self.txn_id);
+        self.status_map.record_aborted(self.txn_id);
+        self.proc_array.release(self.slot_idx);
+    }
 }
 
 impl Transaction {
@@ -97,6 +158,18 @@ impl Transaction {
     #[inline]
     pub fn wrote_data(&self) -> bool {
         self.wrote_data
+    }
+
+    /// Marks this transaction READ ONLY so write statements are rejected.
+    #[inline]
+    pub fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+    }
+
+    /// Returns true if this transaction was started READ ONLY.
+    #[inline]
+    pub fn read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Returns the last LSN written by this transaction.
@@ -129,37 +202,66 @@ impl Transaction {
         })
     }
 
-    /// Creates a savepoint with the given name.
-    /// Captures the current snapshot and lock count for later rollback.
-    pub fn savepoint(&mut self, name: String, current_lock_count: usize) {
+    /// Returns the shared undo log handle. The execution context clones this so
+    /// DML operators record reversible writes into the same log this transaction
+    /// reverses on ROLLBACK TO SAVEPOINT.
+    #[inline]
+    pub fn undo_log(&self) -> Arc<TxnUndoLog> {
+        Arc::clone(&self.undo_log)
+    }
+
+    /// Creates a savepoint with the given name. Captures the current snapshot,
+    /// the current row and intent lock counts, and the current undo-log length so
+    /// a later rollback reverses only writes made after this point and releases
+    /// only locks taken after it. Opening a savepoint turns on undo recording for
+    /// subsequent writes.
+    pub fn savepoint(&mut self, name: String, row_lock_count: usize, intent_lock_count: usize) {
+        let undo_high_water = self.undo_log.len();
         self.savepoints.push(Savepoint {
             name,
             snapshot: self.snapshot.clone(),
-            lock_count: current_lock_count,
+            row_lock_count,
+            intent_lock_count,
+            undo_high_water,
         });
+        self.undo_log.enter_savepoint();
     }
 
-    /// Rolls back to the named savepoint.
-    /// Restores the snapshot to the savepoint's state and returns the
-    /// lock count at the savepoint (caller is responsible for releasing
-    /// locks acquired after this count).
+    /// Rolls back to the named savepoint. Returns the lock count recorded at the
+    /// savepoint and the undo entries to reverse (last write first), truncating
+    /// the undo log and discarding savepoints created after the target. The
+    /// transaction stays open and its read snapshot is unchanged: a savepoint
+    /// rollback undoes writes, not the visible committed-data snapshot.
     /// Returns None if no savepoint with that name exists.
-    pub fn rollback_to_savepoint(&mut self, name: &str) -> Option<usize> {
-        // Find the savepoint, keeping all savepoints at or before it
+    pub fn rollback_to_savepoint(&mut self, name: &str) -> Option<SavepointRollback> {
+        // Innermost match by name, keeping savepoints at or before it.
         let idx = self.savepoints.iter().rposition(|sp| sp.name == name)?;
-        let sp = &self.savepoints[idx];
-        let lock_count = sp.lock_count;
-        self.snapshot = sp.snapshot.clone();
-        // Remove savepoints created after this one (but keep the named one)
+        let row_lock_count = self.savepoints[idx].row_lock_count;
+        let intent_lock_count = self.savepoints[idx].intent_lock_count;
+        let high_water = self.savepoints[idx].undo_high_water;
+        // Reverse every write recorded at or after this savepoint.
+        let undo = self.undo_log.drain_from(high_water);
+        // Drop savepoints created after the target. The target stays open, so
+        // the open-savepoint count falls by the number discarded.
+        let discarded = self.savepoints.len() - (idx + 1);
         self.savepoints.truncate(idx + 1);
-        Some(lock_count)
+        if discarded > 0 {
+            self.undo_log.leave_savepoints(discarded);
+        }
+        Some(SavepointRollback {
+            row_lock_count,
+            intent_lock_count,
+            undo,
+        })
     }
 
-    /// Releases a savepoint by name. Locks acquired after the savepoint persist.
-    /// Returns false if the savepoint was not found.
+    /// Releases a savepoint by name. Its undo entries remain in the log so an
+    /// outer savepoint rollback still reverses them; only the marker is removed.
+    /// Locks acquired after the savepoint persist. Returns false if not found.
     pub fn release_savepoint(&mut self, name: &str) -> bool {
         if let Some(idx) = self.savepoints.iter().rposition(|sp| sp.name == name) {
             self.savepoints.remove(idx);
+            self.undo_log.leave_savepoints(1);
             true
         } else {
             false
@@ -181,18 +283,21 @@ impl Transaction {
 pub struct TransactionManager {
     /// Monotonically increasing transaction ID counter.
     next_txn_id: AtomicU64,
-    /// Lock-free table of active transaction slots.
-    proc_array: ProcArray,
+    /// Lock-free table of active transaction slots. Shared into every
+    /// transaction so a dropped-while-active transaction releases its slot.
+    proc_array: Arc<ProcArray>,
     /// WAL writer for durability.
     wal: Arc<WalWriter>,
-    /// Row-level lock table for write-write conflict detection.
-    lock_table: LockTable,
+    /// Row-level lock table for write-write conflict detection. Shared into
+    /// every transaction so a dropped-while-active transaction releases locks.
+    lock_table: Arc<LockTable>,
     /// Intent lock table for B+Tree key-level conflict detection. Shared so the
     /// executor can take key locks (e.g. to serialize unique-index inserts of
     /// the same value); released by commit/abort via `unlock_all`.
     intent_locks: Arc<IntentLockTable>,
-    /// Wait-for graph for deadlock detection.
-    wait_for_graph: WaitForGraph,
+    /// Wait-for graph for deadlock detection. Shared into every transaction so
+    /// a dropped-while-active transaction removes its edges.
+    wait_for_graph: Arc<WaitForGraph>,
     /// Durable commit-status map consulted by MVCC visibility so an aborted
     /// transaction's writes never appear committed. Shared into every snapshot.
     status_map: Arc<TxnStatusMap>,
@@ -213,11 +318,11 @@ impl TransactionManager {
         let durability = Self::register_durability(&wal);
         Self {
             next_txn_id: AtomicU64::new(1),
-            proc_array: ProcArray::new(),
+            proc_array: Arc::new(ProcArray::new()),
             wal,
-            lock_table: LockTable::new(),
+            lock_table: Arc::new(LockTable::new()),
             intent_locks: Arc::new(IntentLockTable::new()),
-            wait_for_graph: WaitForGraph::new(),
+            wait_for_graph: Arc::new(WaitForGraph::new()),
             status_map: Arc::new(TxnStatusMap::new()),
             retention_clock: Arc::new(RetentionClock::new()),
             durability,
@@ -230,11 +335,11 @@ impl TransactionManager {
         let durability = Self::register_durability(&wal);
         Self {
             next_txn_id: AtomicU64::new(start_txn_id),
-            proc_array: ProcArray::new(),
+            proc_array: Arc::new(ProcArray::new()),
             wal,
-            lock_table: LockTable::new(),
+            lock_table: Arc::new(LockTable::new()),
             intent_locks: Arc::new(IntentLockTable::new()),
-            wait_for_graph: WaitForGraph::new(),
+            wait_for_graph: Arc::new(WaitForGraph::new()),
             status_map: Arc::new(TxnStatusMap::new()),
             retention_clock: Arc::new(RetentionClock::new()),
             durability,
@@ -313,6 +418,13 @@ impl TransactionManager {
             savepoints: Vec::new(),
             slot_idx,
             wrote_data: false,
+            read_only: false,
+            undo_log: Arc::new(TxnUndoLog::new()),
+            proc_array: self.proc_array_shared(),
+            lock_table: Arc::clone(&self.lock_table),
+            intent_locks: Arc::clone(&self.intent_locks),
+            wait_for_graph: Arc::clone(&self.wait_for_graph),
+            status_map: Arc::clone(&self.status_map),
         })
     }
 
@@ -340,6 +452,10 @@ impl TransactionManager {
         };
         txn.last_lsn = lsn;
         txn.status = TransactionStatus::Committed;
+
+        // The transaction's writes are now permanent, so the undo log is dropped
+        // without replay.
+        txn.undo_log.clear();
 
         {
             let _s = profile::scope(Phase::LockRelease);
@@ -392,6 +508,8 @@ impl TransactionManager {
         }
 
         txn.status = TransactionStatus::Committed;
+
+        txn.undo_log.clear();
 
         self.lock_table.unlock_all(txn.txn_id);
         self.intent_locks.unlock_all(txn.txn_id);
@@ -453,6 +571,10 @@ impl TransactionManager {
         txn.last_lsn = lsn;
         txn.status = TransactionStatus::Aborted;
 
+        // A full abort hides every write via the status map, so the undo log is
+        // discarded without replay.
+        txn.undo_log.clear();
+
         self.lock_table.unlock_all(txn.txn_id);
         self.intent_locks.unlock_all(txn.txn_id);
         self.wait_for_graph.remove_transaction(txn.txn_id);
@@ -482,6 +604,13 @@ impl TransactionManager {
     /// Returns a reference to the row-level lock table.
     pub fn lock_table(&self) -> &LockTable {
         &self.lock_table
+    }
+
+    /// Returns the shared proc array. Cloned into each transaction so a
+    /// dropped-while-active transaction can release its slot.
+    #[inline]
+    fn proc_array_shared(&self) -> Arc<ProcArray> {
+        Arc::clone(&self.proc_array)
     }
 
     /// Returns the shared intent lock table. The executor takes key locks
@@ -571,6 +700,43 @@ mod tests {
         mgr.commit(&mut txn).await.unwrap();
         assert_eq!(txn.status, TransactionStatus::Committed);
         assert_eq!(mgr.active_count(), 0);
+    }
+
+    // A transaction dropped without commit or abort (a client disconnect or an
+    // error path that never finalized it) releases its proc-array slot and
+    // records itself aborted through the Drop net, so a leaked transaction
+    // cannot pin the vacuum horizon or hide as perpetually active.
+    #[test]
+    fn dropped_active_transaction_releases_slot() {
+        let (mgr, _dir) = create_test_manager();
+        let txn_id = {
+            let txn = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
+            assert_eq!(mgr.active_count(), 1);
+            assert!(!mgr.status_map().is_aborted(txn.txn_id));
+            txn.txn_id
+        };
+        assert_eq!(mgr.active_count(), 0);
+        assert!(mgr.status_map().is_aborted(txn_id));
+    }
+
+    // The Drop net releases locks a leaked transaction held, so they do not
+    // block other transactions. After the drop a fresh transaction acquires the
+    // same row lock cleanly.
+    #[test]
+    fn dropped_active_transaction_releases_locks() {
+        let (mgr, _dir) = create_test_manager();
+        let rid = crate::tuple::TupleId::new(zyron_common::page::PageId::new(0, 1), 0);
+        let txn_id = {
+            let txn = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
+            mgr.lock_table().lock_row(txn.txn_id, 7, rid).unwrap();
+            assert_eq!(mgr.lock_table().current_count(txn.txn_id), 1);
+            txn.txn_id
+        };
+        assert_eq!(mgr.lock_table().current_count(txn_id), 0);
+
+        let txn2 = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
+        mgr.lock_table().lock_row(txn2.txn_id, 7, rid).unwrap();
+        assert_eq!(mgr.lock_table().current_count(txn2.txn_id), 1);
     }
 
     // Hammers the async durable commit path under concurrency with fsync on,
@@ -697,10 +863,10 @@ mod tests {
 
         assert_eq!(txn.savepoint_count(), 0);
 
-        txn.savepoint("sp1".into(), 0);
+        txn.savepoint("sp1".into(), 0, 0);
         assert_eq!(txn.savepoint_count(), 1);
 
-        txn.savepoint("sp2".into(), 5);
+        txn.savepoint("sp2".into(), 5, 0);
         assert_eq!(txn.savepoint_count(), 2);
     }
 
@@ -709,12 +875,14 @@ mod tests {
         let (mgr, _dir) = create_test_manager();
         let mut txn = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
 
-        txn.savepoint("sp1".into(), 3);
-        txn.savepoint("sp2".into(), 7);
+        txn.savepoint("sp1".into(), 3, 2);
+        txn.savepoint("sp2".into(), 7, 4);
 
-        // Rollback to sp1 should remove sp2 and return lock count 3
-        let lock_count = txn.rollback_to_savepoint("sp1");
-        assert_eq!(lock_count, Some(3));
+        // Rollback to sp1 should remove sp2 and return the counts captured at sp1
+        let rb = txn.rollback_to_savepoint("sp1").expect("sp1 exists");
+        assert_eq!(rb.row_lock_count, 3);
+        assert_eq!(rb.intent_lock_count, 2);
+        assert!(rb.undo.is_empty()); // no writes recorded
         assert_eq!(txn.savepoint_count(), 1); // sp1 retained
 
         // Rollback to non-existent savepoint
@@ -726,8 +894,8 @@ mod tests {
         let (mgr, _dir) = create_test_manager();
         let mut txn = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
 
-        txn.savepoint("sp1".into(), 0);
-        txn.savepoint("sp2".into(), 5);
+        txn.savepoint("sp1".into(), 0, 0);
+        txn.savepoint("sp2".into(), 5, 0);
 
         // Release sp1
         assert!(txn.release_savepoint("sp1"));

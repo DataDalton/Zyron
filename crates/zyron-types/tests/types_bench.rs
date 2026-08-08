@@ -34,12 +34,10 @@
 //! | Levenshtein 10-char         | latency    | 300ns         |
 //! | Jaro-Winkler 10-char        | latency    | 150ns         |
 //! | Soundex                     | latency    | 80ns          |
-//! | Entity resolve 100K         | latency    | 12s           |
 //! | UUID v7 generation          | throughput | 80M/sec       |
 //! | SLUG 100 chars              | latency    | 500ns         |
 //! | FORMAT_NUMBER               | latency    | 200ns         |
 //! | DATA_PROFILE 1M rows        | latency    | 5s            |
-//! | Fuzzy join 10K x 10K        | latency    | 20s           |
 //!
 //! Validation Requirements:
 //! - Each benchmark runs 5 iterations, averaged.
@@ -61,9 +59,6 @@ use zyron_types::color::{
 use zyron_types::data_quality::{
     profile_column, validate_credit_card, validate_email, validate_uuid,
 };
-use zyron_types::entity_resolution::{
-    BlockingStrategy, ComparisonRule, DeduplicationConfig, MergeStrategy, entity_resolve,
-};
 use zyron_types::financial::{depreciation_sl, irr, npv, pmt};
 use zyron_types::formatting::{format_bytes, format_currency, format_duration, format_number};
 use zyron_types::fuzzy::{
@@ -80,7 +75,6 @@ use zyron_types::matrix::{
     matrix_create, matrix_decode, matrix_determinant, matrix_identity, matrix_inverse,
     matrix_multiply, svd,
 };
-use zyron_types::similarity::FuzzyJoinAlgo;
 use zyron_types::string_ops::{camel_case, slug, snake_case, strip_html};
 use zyron_types::timeseries::{
     interpolate, locf, lttb, time_bucket, time_bucket_calendar, time_bucket_gapfill,
@@ -103,12 +97,10 @@ const SVD_100X100_TARGET_MS: f64 = 3.0;
 const LEVENSHTEIN_TARGET_NS: f64 = 300.0;
 const JARO_WINKLER_TARGET_NS: f64 = 150.0;
 const SOUNDEX_TARGET_NS: f64 = 80.0;
-const ENTITY_RESOLVE_TARGET_SEC: f64 = 12.0;
 const UUID_V7_TARGET_PER_SEC: f64 = 80_000_000.0;
 const SLUG_TARGET_NS: f64 = 500.0;
 const FORMAT_NUMBER_TARGET_NS: f64 = 200.0;
 const DATA_PROFILE_1M_TARGET_SEC: f64 = 5.0;
-const FUZZY_JOIN_10K_TARGET_SEC: f64 = 20.0;
 
 static BENCHMARK_LOCK: Mutex<()> = Mutex::new(());
 
@@ -803,63 +795,6 @@ fn test_jaro_winkler() {
 }
 
 // =============================================================================
-// Entity resolution (small correctness scenario)
-// =============================================================================
-
-#[test]
-fn test_entity_resolution() {
-    zyron_bench_harness::init("types");
-    let _guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-    tprintln!("\n=== Entity Resolution (FUZZY_JOIN) ===");
-
-    // Union of table A and table B into one record list.
-    // Layout: [name, city]
-    let records: Vec<Vec<&str>> = vec![
-        vec!["John Smith", "NYC"],        // 0  A
-        vec!["Jane Doe", "LA"],           // 1  A
-        vec!["Jon Smith", "New York"],    // 2  B
-        vec!["Janet Doe", "Los Angeles"], // 3  B
-    ];
-
-    let config = DeduplicationConfig {
-        blocking_strategy: BlockingStrategy::FirstLetter,
-        blocking_field: 0, // block by first letter of name
-        comparison_rules: vec![ComparisonRule {
-            field_a: 0,
-            field_b: 0,
-            algorithm: FuzzyJoinAlgo::JaroWinkler,
-            weight: 1.0,
-            threshold: 0.0,
-        }],
-        overall_threshold: 0.85,
-        merge_strategy: MergeStrategy::KeepFirst,
-    };
-
-    let matches = entity_resolve(&records, &config).unwrap();
-    tprintln!("  matches: {:?}", matches);
-
-    let has_john_jon = matches
-        .iter()
-        .any(|&(i, j, _)| (i == 0 && j == 2) || (i == 2 && j == 0));
-    let has_jane_janet = matches
-        .iter()
-        .any(|&(i, j, _)| (i == 1 && j == 3) || (i == 3 && j == 1));
-    assert!(has_john_jon, "John Smith <-> Jon Smith did not match");
-    // Jane <-> Janet should be below threshold
-    if has_jane_janet {
-        // If they do match, confidence must reflect the lower similarity
-        let score = matches
-            .iter()
-            .find(|&&(i, j, _)| (i == 1 && j == 3) || (i == 3 && j == 1))
-            .map(|m| m.2)
-            .unwrap();
-        tprintln!("  NOTE: Jane <-> Janet matched at {:.3}", score);
-    }
-    tprintln!("  John-Jon matched PASS");
-}
-
-// =============================================================================
 // ID generation (UUID v7 and Snowflake)
 // =============================================================================
 
@@ -1287,48 +1222,6 @@ fn test_performance_sweep() {
         false,
     );
 
-    // ---- Entity resolve 100K
-    tprintln!("\n--- Entity resolve 100K records (FirstLetter blocking) ---");
-    let names_er: Vec<String> = (0..100_000)
-        .map(|i| match i % 5 {
-            0 => format!("John Smith {}", i),
-            1 => format!("Jane Doe {}", i),
-            2 => format!("Robert Brown {}", i),
-            3 => format!("Mary Jones {}", i),
-            _ => format!("David Wilson {}", i),
-        })
-        .collect();
-    let records: Vec<Vec<&str>> = names_er.iter().map(|s| vec![s.as_str()]).collect();
-    let cfg = DeduplicationConfig {
-        blocking_strategy: BlockingStrategy::FirstLetter,
-        blocking_field: 0,
-        comparison_rules: vec![ComparisonRule {
-            field_a: 0,
-            field_b: 0,
-            algorithm: FuzzyJoinAlgo::JaroWinkler,
-            weight: 1.0,
-            threshold: 0.0,
-        }],
-        overall_threshold: 0.95,
-        merge_strategy: MergeStrategy::KeepFirst,
-    };
-    let mut runs_s = Vec::new();
-    for run in 0..VALIDATION_RUNS {
-        let start = Instant::now();
-        let matches = entity_resolve(&records, &cfg).unwrap();
-        std::hint::black_box(matches.len());
-        let sec = start.elapsed().as_secs_f64();
-        runs_s.push(sec);
-        tprintln!("  Run {}: {:.2} s", run + 1, sec);
-    }
-    let _ = validate_metric(
-        "Performance",
-        "Entity resolve 100K (s)",
-        runs_s,
-        ENTITY_RESOLVE_TARGET_SEC,
-        false,
-    );
-
     // ---- UUID v7 10M throughput
     // black_box the full 16 bytes per call so the optimizer cannot dead-code
     // the random-byte writes, the prior id[0] accumulator made bytes 6-15
@@ -1416,48 +1309,6 @@ fn test_performance_sweep() {
         "DATA_PROFILE 1M rows (s)",
         runs_s,
         DATA_PROFILE_1M_TARGET_SEC,
-        false,
-    );
-
-    // ---- Fuzzy join 10K x 10K
-    tprintln!("\n--- Fuzzy join 10K x 10K (blocked by first letter) ---");
-    let names_fj: Vec<String> = (0..20_000)
-        .map(|i| match i % 5 {
-            0 => format!("John Smith {}", i),
-            1 => format!("Jane Doe {}", i),
-            2 => format!("Robert Brown {}", i),
-            3 => format!("Mary Jones {}", i),
-            _ => format!("David Wilson {}", i),
-        })
-        .collect();
-    let records_fj: Vec<Vec<&str>> = names_fj.iter().map(|s| vec![s.as_str()]).collect();
-    let cfg_fj = DeduplicationConfig {
-        blocking_strategy: BlockingStrategy::FirstLetter,
-        blocking_field: 0,
-        comparison_rules: vec![ComparisonRule {
-            field_a: 0,
-            field_b: 0,
-            algorithm: FuzzyJoinAlgo::JaroWinkler,
-            weight: 1.0,
-            threshold: 0.0,
-        }],
-        overall_threshold: 0.90,
-        merge_strategy: MergeStrategy::KeepFirst,
-    };
-    let mut runs_s = Vec::new();
-    for run in 0..VALIDATION_RUNS {
-        let start = Instant::now();
-        let matches = entity_resolve(&records_fj, &cfg_fj).unwrap();
-        std::hint::black_box(matches.len());
-        let sec = start.elapsed().as_secs_f64();
-        runs_s.push(sec);
-        tprintln!("  Run {}: {:.2} s", run + 1, sec);
-    }
-    let _ = validate_metric(
-        "Performance",
-        "Fuzzy join 20K records (s)",
-        runs_s,
-        FUZZY_JOIN_10K_TARGET_SEC,
         false,
     );
 

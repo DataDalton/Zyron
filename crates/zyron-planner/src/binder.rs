@@ -77,6 +77,9 @@ pub struct BindContext {
     pub tables: Vec<BoundTableRef>,
     pub ctes: HashMap<String, BoundCte>,
     pub outer: Option<Box<BindContext>>,
+    /// Right-side duplicate columns of a USING/NATURAL join, dropped from an
+    /// unqualified wildcard so the shared column appears once in the output.
+    pub suppressed_columns: Vec<(usize, ColumnId)>,
 }
 
 impl BindContext {
@@ -85,6 +88,7 @@ impl BindContext {
             tables: Vec::new(),
             ctes: HashMap::new(),
             outer: None,
+            suppressed_columns: Vec::new(),
         }
     }
 
@@ -93,6 +97,7 @@ impl BindContext {
             tables: Vec::new(),
             ctes: HashMap::new(),
             outer: Some(outer),
+            suppressed_columns: Vec::new(),
         }
     }
 }
@@ -1997,6 +2002,9 @@ fn extract_endpoint_params(sql: &str) -> (Vec<String>, String) {
     let mut names: Vec<String> = Vec::new();
     let mut out = String::with_capacity(sql.len());
     let bytes = sql.as_bytes();
+    // copy_start marks the beginning of the verbatim run not yet flushed. Runs
+    // are copied as &str slices so multi-byte UTF-8 is never split.
+    let mut copy_start = 0;
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
@@ -2014,14 +2022,16 @@ fn extract_endpoint_params(sql: &str) -> (Vec<String>, String) {
                 if !names.iter().any(|n| n == name) {
                     names.push(name.to_string());
                 }
+                out.push_str(&sql[copy_start..i]);
                 out.push_str("NULL");
                 i = end;
+                copy_start = end;
                 continue;
             }
         }
-        out.push(b as char);
         i += 1;
     }
+    out.push_str(&sql[copy_start..]);
     (names, out)
 }
 
@@ -2846,7 +2856,9 @@ impl<'a> Binder<'a> {
                 TableRef::Join(join_ref) => {
                     let left = self.bind_table_ref(ctx, &join_ref.left).await?;
                     let right = self.bind_table_ref(ctx, &join_ref.right).await?;
-                    let condition = self.bind_join_condition(ctx, &join_ref.condition).await?;
+                    let condition = self
+                        .bind_join_condition(ctx, &join_ref.condition, &left, &right)
+                        .await?;
                     Ok(BoundFromItem::Join {
                         left: Box::new(left),
                         join_type: join_ref.join_type,
@@ -3232,35 +3244,126 @@ impl<'a> Binder<'a> {
 
     async fn bind_join_condition(
         &mut self,
-        ctx: &BindContext,
+        ctx: &mut BindContext,
         condition: &JoinCondition,
+        left: &BoundFromItem,
+        right: &BoundFromItem,
     ) -> Result<BoundJoinCondition> {
         match condition {
             JoinCondition::On(expr) => {
                 let bound = self.bind_scalar(ctx, expr).await?;
                 Ok(BoundJoinCondition::On(bound))
             }
+            // USING and NATURAL are lowered to an ON equality over the shared
+            // columns resolved on each side, so the join uses real equi-keys
+            // rather than degenerating to a cross product.
             JoinCondition::Using(cols) => {
-                // Resolve column names to IDs from the last two tables in context
-                let mut ids = Vec::with_capacity(cols.len());
-                for col_name in cols {
-                    // Find the column in any of the tables in scope
-                    let mut found = false;
-                    for table in &ctx.tables {
-                        if let Some(c) = table.columns.iter().find(|c| c.name == *col_name) {
-                            ids.push(c.column_id);
-                            found = true;
-                            break;
-                        }
-                    }
-                    if !found {
-                        return Err(ZyronError::ColumnNotFound(col_name.clone()));
+                let left_cols = self.side_columns(ctx, left);
+                let right_cols = self.side_columns(ctx, right);
+                let names: Vec<String> = cols.clone();
+                let (cond, suppress) = self.build_join_equality(&names, &left_cols, &right_cols)?;
+                ctx.suppressed_columns.extend(suppress);
+                Ok(cond)
+            }
+            JoinCondition::Natural => {
+                let left_cols = self.side_columns(ctx, left);
+                let right_cols = self.side_columns(ctx, right);
+                // Shared columns are those present on both sides, in left order.
+                let mut names = Vec::new();
+                for (name, _) in &left_cols {
+                    if right_cols.iter().any(|(n, _)| n == name) && !names.contains(name) {
+                        names.push(name.clone());
                     }
                 }
-                Ok(BoundJoinCondition::Using(ids))
+                if names.is_empty() {
+                    return Err(ZyronError::PlanError(
+                        "NATURAL JOIN found no columns common to both sides".to_string(),
+                    ));
+                }
+                let (cond, suppress) = self.build_join_equality(&names, &left_cols, &right_cols)?;
+                ctx.suppressed_columns.extend(suppress);
+                Ok(cond)
             }
-            JoinCondition::Natural => Ok(BoundJoinCondition::Natural),
             JoinCondition::None => Ok(BoundJoinCondition::None),
+        }
+    }
+
+    /// Collects the (name, ColumnRef) pairs visible on one side of a join by
+    /// walking its table indices and reading their columns from the bind scope.
+    fn side_columns(&self, ctx: &BindContext, item: &BoundFromItem) -> Vec<(String, ColumnRef)> {
+        let mut idxs = Vec::new();
+        collect_from_item_table_idxs(item, &mut idxs);
+        let mut out = Vec::new();
+        for idx in idxs {
+            if let Some(table) = ctx.tables.iter().find(|t| t.table_idx == idx) {
+                for c in &table.columns {
+                    out.push((
+                        c.name.clone(),
+                        ColumnRef {
+                            table_idx: table.table_idx,
+                            column_id: c.column_id,
+                            type_id: c.type_id,
+                            nullable: c.nullable,
+                            ts_precision: c.ts_precision,
+                        },
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// Builds an ON equality conjunction matching each shared column's left
+    /// reference to its right reference. A name missing or ambiguous on either
+    /// side is an error.
+    fn build_join_equality(
+        &self,
+        names: &[String],
+        left_cols: &[(String, ColumnRef)],
+        right_cols: &[(String, ColumnRef)],
+    ) -> Result<(BoundJoinCondition, Vec<(usize, ColumnId)>)> {
+        let resolve = |side: &[(String, ColumnRef)], name: &str| -> Result<ColumnRef> {
+            let mut matches = side.iter().filter(|(n, _)| n == name);
+            let first = matches.next().map(|(_, cr)| *cr).ok_or_else(|| {
+                ZyronError::ColumnNotFound(format!("join column '{name}' not found on one side"))
+            })?;
+            if matches.next().is_some() {
+                return Err(ZyronError::PlanError(format!(
+                    "join column '{name}' is ambiguous"
+                )));
+            }
+            Ok(first)
+        };
+
+        let mut conjunction: Option<BoundExpr> = None;
+        let mut suppress = Vec::with_capacity(names.len());
+        for name in names {
+            let lref = resolve(left_cols, name)?;
+            let rref = resolve(right_cols, name)?;
+            // The right-side copy of a shared column is dropped from wildcard
+            // output so the column appears once.
+            suppress.push((rref.table_idx, rref.column_id));
+            let eq = BoundExpr::BinaryOp {
+                left: Box::new(BoundExpr::ColumnRef(lref)),
+                op: BinaryOperator::Eq,
+                right: Box::new(BoundExpr::ColumnRef(rref)),
+                type_id: TypeId::Boolean,
+            };
+            conjunction = Some(match conjunction {
+                Some(acc) => BoundExpr::BinaryOp {
+                    left: Box::new(acc),
+                    op: BinaryOperator::And,
+                    right: Box::new(eq),
+                    type_id: TypeId::Boolean,
+                },
+                None => eq,
+            });
+        }
+        match conjunction {
+            Some(expr) => Ok((BoundJoinCondition::On(expr), suppress)),
+            None => Err(ZyronError::PlanError(
+                "join requires at least one shared column".to_string(),
+            )),
         }
     }
 
@@ -3533,7 +3636,7 @@ impl<'a> Binder<'a> {
                             target_type: func.return_type,
                         })
                     } else {
-                        let return_type = infer_function_type(name, &arg_types);
+                        let return_type = infer_function_type(name, &arg_types)?;
                         Ok(BoundExpr::Function {
                             name: name.clone(),
                             args: bound_args,
@@ -3576,11 +3679,16 @@ impl<'a> Binder<'a> {
                         None
                     };
 
-                    // Result type is the type of the first THEN clause
-                    let type_id = bound_conditions
-                        .first()
-                        .map(|w| w.result.type_id())
-                        .unwrap_or(TypeId::Null);
+                    // Result type is the common supertype over every THEN
+                    // branch and the ELSE branch so a CASE whose later branches
+                    // are wider than the first is not truncated.
+                    let mut type_id = TypeId::Null;
+                    for w in &bound_conditions {
+                        type_id = case_result_supertype(type_id, w.result.type_id())?;
+                    }
+                    if let Some(e) = &bound_else {
+                        type_id = case_result_supertype(type_id, e.type_id())?;
+                    }
 
                     Ok(BoundExpr::Case {
                         operand: bound_operand.map(Box::new),
@@ -3736,10 +3844,24 @@ impl<'a> Binder<'a> {
                 Expr::ArraySubscript { array, index } => {
                     let bound_array = bind_child!(array);
                     let bound_index = bind_child!(index);
+                    // Subscripting yields one element. When the array is an
+                    // array constructor its elements carry a concrete type, so
+                    // the result is that element type rather than untyped.
+                    let return_type = match &bound_array {
+                        BoundExpr::Function { name, args, .. }
+                            if name == "array" && !args.is_empty() =>
+                        {
+                            args[0].type_id()
+                        }
+                        other => {
+                            let t = other.type_id();
+                            if t == TypeId::Array { TypeId::Null } else { t }
+                        }
+                    };
                     Ok(BoundExpr::Function {
                         name: "array_subscript".to_string(),
                         args: vec![bound_array, bound_index],
-                        return_type: TypeId::Null, // Element type unknown without full type system
+                        return_type,
                         distinct: false,
                     })
                 }
@@ -3872,7 +3994,35 @@ impl<'a> Binder<'a> {
                     result.push(BoundSelectItem::Expr(bound, alias.clone()));
                 }
                 SelectItem::Wildcard => {
-                    result.push(BoundSelectItem::Wildcard);
+                    if ctx.suppressed_columns.is_empty() {
+                        result.push(BoundSelectItem::Wildcard);
+                    } else {
+                        // A USING/NATURAL join coalesces shared columns. Expand
+                        // the wildcard into explicit column references so the
+                        // right-side duplicates are dropped consistently in both
+                        // the output schema and the produced data.
+                        for table in &ctx.tables {
+                            for col in &table.columns {
+                                if ctx
+                                    .suppressed_columns
+                                    .iter()
+                                    .any(|(ti, ci)| *ti == table.table_idx && *ci == col.column_id)
+                                {
+                                    continue;
+                                }
+                                result.push(BoundSelectItem::Expr(
+                                    BoundExpr::ColumnRef(ColumnRef {
+                                        table_idx: table.table_idx,
+                                        column_id: col.column_id,
+                                        type_id: col.type_id,
+                                        nullable: col.nullable,
+                                        ts_precision: col.ts_precision,
+                                    }),
+                                    Some(col.name.clone()),
+                                ));
+                            }
+                        }
+                    }
                 }
                 SelectItem::QualifiedWildcard(table_name) => {
                     if let Some(table) = ctx.tables.iter().find(|t| t.alias == *table_name) {
@@ -4270,8 +4420,8 @@ impl<'a> Binder<'a> {
         // Bind a default expression for each omitted column that has one, so the
         // executor fills it instead of leaving NULL. Defaults are constant or
         // volatile-function expressions with no column references, so they bind
-        // in an empty scope. A default that no longer parses (an exotic stored
-        // form) is skipped and the column falls back to NULL.
+        // in an empty scope. A default that fails to parse or bind is a real
+        // catalog error and is surfaced instead of silently filling NULL.
         let empty_ctx = BindContext::new();
         let mut column_defaults: Vec<(ColumnId, BoundExpr)> = Vec::new();
         for col in &entry.columns {
@@ -4281,12 +4431,19 @@ impl<'a> Binder<'a> {
             let Some(default_sql) = &col.default_expr else {
                 continue;
             };
-            let Ok(expr_ast) = zyron_parser::parse_expr(default_sql) else {
-                continue;
-            };
-            if let Ok(bound) = self.bind_expr(&empty_ctx, &expr_ast).await {
-                column_defaults.push((col.id, bound));
-            }
+            let expr_ast = zyron_parser::parse_expr(default_sql).map_err(|e| {
+                ZyronError::PlanError(format!(
+                    "failed to parse DEFAULT expression for column '{}': {e}",
+                    col.name
+                ))
+            })?;
+            let bound = self.bind_expr(&empty_ctx, &expr_ast).await.map_err(|e| {
+                ZyronError::PlanError(format!(
+                    "failed to bind DEFAULT expression for column '{}': {e}",
+                    col.name
+                ))
+            })?;
+            column_defaults.push((col.id, bound));
         }
 
         let returning = if let Some(items) = &stmt.returning {
@@ -5824,26 +5981,36 @@ impl<'a> Binder<'a> {
                             )));
                         }
                     }
-                    // Event-time columns resolve to the named event-time
-                    // column on each side. Fall back to the equi-key column
-                    // ordinal when no event-time column is declared, matching
-                    // the pure-filter WATERMARK convention.
-                    let left_event_time_ordinal = match &stmt.watermark {
-                        Some(w) => source_columns
-                            .iter()
-                            .find(|c| c.name.eq_ignore_ascii_case(&w.event_time_column))
-                            .map(|c| c.ordinal)
-                            .unwrap_or(left_key_ordinal),
-                        None => left_key_ordinal,
+                    // An interval JOIN requires a declared WATERMARK so both
+                    // sides resolve the same named event-time column exactly. A
+                    // missing column on either side is an error rather than a
+                    // substring guess that silently picks the wrong column.
+                    let Some(watermark) = &stmt.watermark else {
+                        return Err(ZyronError::PlanError(
+                            "streaming interval JOIN requires a WATERMARK declaring the event-time column"
+                                .to_string(),
+                        ));
                     };
+                    let event_time_name = &watermark.event_time_column;
+                    let left_event_time_ordinal = source_columns
+                        .iter()
+                        .find(|c| c.name.eq_ignore_ascii_case(event_time_name))
+                        .map(|c| c.ordinal)
+                        .ok_or_else(|| {
+                            ZyronError::PlanError(format!(
+                                "streaming interval JOIN event-time column '{event_time_name}' not found on left source"
+                            ))
+                        })?;
                     let right_event_time_ordinal = right_cols
                         .iter()
-                        .position(|c| {
-                            c.name.to_lowercase().contains("event_time")
-                                || c.name.to_lowercase().contains("ts")
-                        })
-                        .map(|i| i as u16)
-                        .unwrap_or(right_key_ordinal);
+                        .find(|c| c.name.eq_ignore_ascii_case(event_time_name))
+                        .map(|c| c.ordinal)
+                        .ok_or_else(|| {
+                            ZyronError::PlanError(format!(
+                                "streaming interval JOIN event-time column '{event_time_name}' not found on right table '{}'",
+                                right_entry.name
+                            ))
+                        })?;
                     let mut combined: Vec<ColumnEntry> = source_columns.clone();
                     combined.extend(right_cols.iter().cloned());
                     let _ = right_key_ordinal; // reserved for engine lookups
@@ -6568,6 +6735,46 @@ fn infer_binary_type(op: &BinaryOperator, left: TypeId, right: TypeId) -> Result
     }
 }
 
+/// Computes the common result type for two CASE branches. NULL on either side
+/// yields the other side, two numeric types promote to their numeric
+/// supertype, otherwise the types must match. Incompatible types are an error
+/// so a CASE never silently truncates or mixes unrelated types.
+fn case_result_supertype(left: TypeId, right: TypeId) -> Result<TypeId> {
+    if left == TypeId::Null {
+        return Ok(right);
+    }
+    if right == TypeId::Null {
+        return Ok(left);
+    }
+    if left == right {
+        return Ok(left);
+    }
+    if left.is_numeric() && right.is_numeric() {
+        return Ok(promote_numeric(left, right));
+    }
+    if left.is_string() && right.is_string() {
+        return Ok(TypeId::Text);
+    }
+    Err(ZyronError::PlanError(format!(
+        "CASE branches have incompatible types {left:?} and {right:?}"
+    )))
+}
+
+/// Collects every table index reachable in a FROM item subtree so a join can
+/// resolve which tables belong to each side.
+fn collect_from_item_table_idxs(item: &BoundFromItem, out: &mut Vec<usize>) {
+    match item {
+        BoundFromItem::BaseTable { table_idx, .. }
+        | BoundFromItem::Subquery { table_idx, .. }
+        | BoundFromItem::GraphQuery { table_idx, .. }
+        | BoundFromItem::AnalyticsFunction { table_idx, .. } => out.push(*table_idx),
+        BoundFromItem::Join { left, right, .. } => {
+            collect_from_item_table_idxs(left, out);
+            collect_from_item_table_idxs(right, out);
+        }
+    }
+}
+
 /// Promotes two numeric types to their common supertype.
 fn promote_numeric(left: TypeId, right: TypeId) -> TypeId {
     if left == right {
@@ -6649,11 +6856,11 @@ fn infer_aggregate_type(name: &str, arg_types: &[TypeId]) -> Result<TypeId> {
     }
 }
 
-/// Infers the return type of a scalar function.
-/// Returns Null for unknown functions (resolved at execution time).
-fn infer_function_type(name: &str, arg_types: &[TypeId]) -> TypeId {
+/// Infers the return type of a scalar function. An unrecognized function name
+/// is a bind error rather than a guess at the first argument's type.
+fn infer_function_type(name: &str, arg_types: &[TypeId]) -> Result<TypeId> {
     let lower = name.to_lowercase();
-    match lower.as_str() {
+    Ok(match lower.as_str() {
         "abs" | "ceil" | "ceiling" | "floor" | "round" | "trunc" | "truncate" => {
             arg_types.first().copied().unwrap_or(TypeId::Float64)
         }
@@ -6680,11 +6887,11 @@ fn infer_function_type(name: &str, arg_types: &[TypeId]) -> TypeId {
         _ => {
             // Delegate to zyron-types registry for extended scalar functions
             if let Some(t) = zyron_types::infer_types_scalar_return_type(&lower, arg_types) {
-                return t;
+                return Ok(t);
             }
-            arg_types.first().copied().unwrap_or(TypeId::Null)
+            return Err(ZyronError::PlanError(format!("unknown function: {name}")));
         }
-    }
+    })
 }
 
 /// Extracts the argument expressions from a function call's argument list for

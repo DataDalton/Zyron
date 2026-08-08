@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use zyron_catalog::DatabaseId;
+use zyron_common::ZyronError;
 
 use crate::messages::TransactionState;
 
@@ -135,13 +136,67 @@ impl Session {
         self.variables.get(name).map(|s| s.as_str())
     }
 
-    /// Sets a session variable. Handles search_path updates by parsing
-    /// the value into the search_path vector for the planner.
-    pub fn set_variable(&mut self, name: String, value: String) {
-        if name == "search_path" {
-            self.search_path = parse_search_path(&value);
+    /// Sets a session variable after validating the value for known keys.
+    /// search_path is parsed into the planner's search_path vector. An invalid
+    /// value for a validated key is rejected so the session never silently keeps
+    /// a bad setting. Role identity changes (SET ROLE / SET SESSION
+    /// AUTHORIZATION) are applied to security_context separately by the caller
+    /// through `apply_role`, which resolves the role name against the role
+    /// registry the session does not hold.
+    pub fn set_variable(&mut self, name: String, value: String) -> Result<(), ZyronError> {
+        match name.to_ascii_lowercase().as_str() {
+            "search_path" => {
+                self.search_path = parse_search_path(&value);
+            }
+            "client_encoding" => {
+                // The server speaks UTF-8 only. Reject any other client
+                // encoding instead of accepting it and then sending UTF-8.
+                let v = value.trim().to_ascii_uppercase();
+                if v != "UTF8" && v != "UTF-8" && v != "UNICODE" {
+                    return Err(ZyronError::ConfigError(format!(
+                        "unsupported client_encoding '{value}', only UTF8 is supported"
+                    )));
+                }
+            }
+            "timezone" => {
+                if value.trim().is_empty() {
+                    return Err(ZyronError::ConfigError(
+                        "timezone must not be empty".to_string(),
+                    ));
+                }
+            }
+            "role" | "session_authorization" => {
+                // A role/identity name must be present. The caller resolves it
+                // against the role registry and applies it to security_context.
+                if value.trim().is_empty() {
+                    return Err(ZyronError::ConfigError(format!("{name} must name a role")));
+                }
+            }
+            _ => {}
         }
         self.variables.insert(name, value);
+        Ok(())
+    }
+
+    /// Applies a resolved role to the session security context so subsequent
+    /// privilege checks run under the new role. SET ROLE NONE / RESET ROLE
+    /// resets to the session login role. Errors if the target is not in the
+    /// session's allowed role set or if no security context is active.
+    pub fn apply_role(
+        &mut self,
+        target: Option<zyron_auth::RoleId>,
+        hierarchy: &zyron_auth::RoleHierarchy,
+    ) -> Result<(), ZyronError> {
+        let sc = self.security_context.as_mut().ok_or_else(|| {
+            ZyronError::ConfigError("no security context active for SET ROLE".to_string())
+        })?;
+        match target {
+            Some(role_id) => sc.set_role(role_id, hierarchy),
+            None => {
+                sc.reset_role(hierarchy);
+                Ok(())
+            }
+        }
     }
 
     /// Parameter keys sent during startup, in protocol order.
@@ -214,22 +269,43 @@ mod tests {
         let mut session = test_session();
         assert_eq!(session.get_variable("nonexistent"), None);
 
-        session.set_variable("TimeZone".into(), "US/Pacific".into());
+        session
+            .set_variable("TimeZone".into(), "US/Pacific".into())
+            .unwrap();
         assert_eq!(session.get_variable("TimeZone"), Some("US/Pacific"));
     }
 
     #[test]
     fn test_set_search_path() {
         let mut session = test_session();
-        session.set_variable("search_path".into(), "myschema, public".into());
+        session
+            .set_variable("search_path".into(), "myschema, public".into())
+            .unwrap();
         assert_eq!(session.search_path, vec!["myschema", "public"]);
     }
 
     #[test]
     fn test_search_path_with_user() {
         let mut session = test_session();
-        session.set_variable("search_path".into(), "\"$user\", public, extra".into());
+        session
+            .set_variable("search_path".into(), "\"$user\", public, extra".into())
+            .unwrap();
         assert_eq!(session.search_path, vec!["public", "extra"]);
+    }
+
+    #[test]
+    fn test_set_variable_rejects_bad_encoding() {
+        let mut session = test_session();
+        assert!(
+            session
+                .set_variable("client_encoding".into(), "LATIN1".into())
+                .is_err()
+        );
+        assert!(
+            session
+                .set_variable("client_encoding".into(), "UTF8".into())
+                .is_ok()
+        );
     }
 
     #[test]

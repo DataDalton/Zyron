@@ -228,6 +228,11 @@ async fn boot_server(db_name: &str) -> (E2EServer, Duration) {
         feature_store: zyron_analytics::featureStore(),
         feature_lineage: zyron_analytics::featureLineageRegistry(),
         model_cache: zyron_analytics::modelCache(),
+        default_isolation: zyron_storage::IsolationLevel::ReadCommitted,
+        statement_timeout: None,
+        max_result_rows: None,
+        balloon_params: None,
+        default_auth_method: zyron_auth::auth_rules::AuthMethod::Trust,
     });
 
     let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.expect("bind"));

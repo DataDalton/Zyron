@@ -25,6 +25,8 @@ fn user(name: &str, hash: Option<String>) -> User {
         id: UserId(0),
         name: name.to_string(),
         password_hash: hash,
+        scram_secret: None,
+        md5_credential: None,
         api_key_prefix: None,
         api_key_hash: None,
         totp_secret: None,

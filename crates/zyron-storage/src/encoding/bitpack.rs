@@ -296,6 +296,9 @@ impl Encoding for BitPackEncoding {
 /// Reads a value from data at the given row index as a u64.
 fn read_value_as_u64(data: &[u8], row: usize, value_size: usize) -> u64 {
     let offset = row * value_size;
+    if offset >= data.len() {
+        return 0;
+    }
     let end = (offset + value_size).min(data.len());
     let slice = &data[offset..end];
     let mut buf = [0u8; 8];
@@ -324,12 +327,14 @@ fn pack_value(packed: &mut [u8], bit_offset: u64, value: u64, bit_width: u8) {
     };
     let val = value & mask;
 
-    let shifted = val << bitIdx;
     let totalBits = bitIdx + bit_width as u32;
     let bytesNeeded = totalBits.div_ceil(8) as usize;
 
+    // shift in u128 so a bitIdx + bit_width that exceeds 64 keeps the spilled
+    // high bits instead of dropping them off the top of a u64
+    let shifted = (val as u128) << bitIdx;
     let shiftedBytes = shifted.to_le_bytes();
-    for j in 0..bytesNeeded.min(8) {
+    for j in 0..bytesNeeded.min(16) {
         if byteIdx + j < packed.len() {
             packed[byteIdx + j] |= shiftedBytes[j];
         }
@@ -408,6 +413,46 @@ mod tests {
         let encoded = enc.encode(&data, 32, 8).unwrap();
         let decoded = enc.decode(&encoded, 32, 8).unwrap();
         assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_pack_unpack_width64_nonzero_offset() {
+        // width 64 at every nonzero bit offset must round-trip the full value
+        // including the spilled high bits in the 9th byte
+        let values = [
+            u64::MAX,
+            u64::MAX - 1,
+            0x8000_0000_0000_0001,
+            0xFEDC_BA98_7654_3210,
+            1,
+        ];
+        for &val in &values {
+            for bitOffset in 0u64..16 {
+                let mut packed = vec![0u8; 32];
+                pack_value(&mut packed, bitOffset, val, 64);
+                let got = unpack_value(&packed, bitOffset, 64);
+                assert_eq!(got, val, "val {:#x} at bit offset {}", val, bitOffset);
+            }
+        }
+    }
+
+    #[test]
+    fn test_pack_unpack_wide_width_spill() {
+        // widths where bitIdx + bit_width can exceed 64 must round-trip
+        for bitWidth in [58u8, 60, 62, 63, 64] {
+            let mask = if bitWidth >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << bitWidth) - 1
+            };
+            for bitOffset in 0u64..8 {
+                let val = mask;
+                let mut packed = vec![0u8; 32];
+                pack_value(&mut packed, bitOffset, val, bitWidth);
+                let got = unpack_value(&packed, bitOffset, bitWidth);
+                assert_eq!(got, val & mask, "width {} offset {}", bitWidth, bitOffset);
+            }
+        }
     }
 
     #[test]

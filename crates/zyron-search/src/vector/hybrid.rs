@@ -41,67 +41,76 @@ fn get_blend_fn() -> BlendFn {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn min_max_avx512(data: *const f32, len: usize) -> (f32, f32) {
     use std::arch::x86_64::*;
-    let chunks = len / 16;
-    let mut vmin = _mm512_set1_ps(f32::INFINITY);
-    let mut vmax = _mm512_set1_ps(f32::NEG_INFINITY);
-    for i in 0..chunks {
-        let v = _mm512_loadu_ps(data.add(i * 16));
-        vmin = _mm512_min_ps(vmin, v);
-        vmax = _mm512_max_ps(vmax, v);
-    }
-    let mut lo = _mm512_reduce_min_ps(vmin);
-    let mut hi = _mm512_reduce_max_ps(vmax);
-    for i in (chunks * 16)..len {
-        let val = *data.add(i);
-        if val < lo {
-            lo = val;
+
+    // SAFETY: caller guarantees the pointers are valid for len f32s and that the required CPU feature is present
+    unsafe {
+        let chunks = len / 16;
+        let mut vmin = _mm512_set1_ps(f32::INFINITY);
+        let mut vmax = _mm512_set1_ps(f32::NEG_INFINITY);
+        for i in 0..chunks {
+            let v = _mm512_loadu_ps(data.add(i * 16));
+            vmin = _mm512_min_ps(vmin, v);
+            vmax = _mm512_max_ps(vmax, v);
         }
-        if val > hi {
-            hi = val;
+        let mut lo = _mm512_reduce_min_ps(vmin);
+        let mut hi = _mm512_reduce_max_ps(vmax);
+        for i in (chunks * 16)..len {
+            let val = *data.add(i);
+            if val < lo {
+                lo = val;
+            }
+            if val > hi {
+                hi = val;
+            }
         }
+        (lo, hi)
     }
-    (lo, hi)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn normalize_avx512(data: *mut f32, len: usize, min: f32, inv_range: f32) {
     use std::arch::x86_64::*;
-    let vmin = _mm512_set1_ps(min);
-    let vscale = _mm512_set1_ps(inv_range);
-    let chunks = len / 16;
-    for i in 0..chunks {
-        let v = _mm512_loadu_ps(data.add(i * 16) as *const f32);
-        let shifted = _mm512_sub_ps(v, vmin);
-        let scaled = _mm512_mul_ps(shifted, vscale);
-        _mm512_storeu_ps(data.add(i * 16), scaled);
-    }
-    for i in (chunks * 16)..len {
-        let val = *data.add(i);
-        *data.add(i) = (val - min) * inv_range;
+
+    // SAFETY: caller guarantees the pointers are valid for len f32s and that the required CPU feature is present
+    unsafe {
+        let vmin = _mm512_set1_ps(min);
+        let vscale = _mm512_set1_ps(inv_range);
+        let chunks = len / 16;
+        for i in 0..chunks {
+            let v = _mm512_loadu_ps(data.add(i * 16) as *const f32);
+            let shifted = _mm512_sub_ps(v, vmin);
+            let scaled = _mm512_mul_ps(shifted, vscale);
+            _mm512_storeu_ps(data.add(i * 16), scaled);
+        }
+        for i in (chunks * 16)..len {
+            let val = *data.add(i);
+            *data.add(i) = (val - min) * inv_range;
+        }
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn blend_avx512(a: *const f32, b: *const f32, out: *mut f32, len: usize, alpha: f32) {
     use std::arch::x86_64::*;
-    let valpha = _mm512_set1_ps(alpha);
-    let vbeta = _mm512_set1_ps(1.0 - alpha);
-    let chunks = len / 16;
-    for i in 0..chunks {
-        let va = _mm512_loadu_ps(a.add(i * 16));
-        let vb = _mm512_loadu_ps(b.add(i * 16));
-        let result = _mm512_add_ps(_mm512_mul_ps(valpha, va), _mm512_mul_ps(vbeta, vb));
-        _mm512_storeu_ps(out.add(i * 16), result);
-    }
-    for i in (chunks * 16)..len {
-        *out.add(i) = alpha * *a.add(i) + (1.0 - alpha) * *b.add(i);
+
+    // SAFETY: caller guarantees the pointers are valid for len f32s and that the required CPU feature is present
+    unsafe {
+        let valpha = _mm512_set1_ps(alpha);
+        let vbeta = _mm512_set1_ps(1.0 - alpha);
+        let chunks = len / 16;
+        for i in 0..chunks {
+            let va = _mm512_loadu_ps(a.add(i * 16));
+            let vb = _mm512_loadu_ps(b.add(i * 16));
+            let result = _mm512_add_ps(_mm512_mul_ps(valpha, va), _mm512_mul_ps(vbeta, vb));
+            _mm512_storeu_ps(out.add(i * 16), result);
+        }
+        for i in (chunks * 16)..len {
+            *out.add(i) = alpha * *a.add(i) + (1.0 - alpha) * *b.add(i);
+        }
     }
 }
 
@@ -111,80 +120,89 @@ unsafe fn blend_avx512(a: *const f32, b: *const f32, out: *mut f32, len: usize, 
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn min_max_avx2(data: *const f32, len: usize) -> (f32, f32) {
     use std::arch::x86_64::*;
-    let chunks = len / 8;
-    let mut vmin = _mm256_set1_ps(f32::INFINITY);
-    let mut vmax = _mm256_set1_ps(f32::NEG_INFINITY);
-    for i in 0..chunks {
-        let v = _mm256_loadu_ps(data.add(i * 8));
-        vmin = _mm256_min_ps(vmin, v);
-        vmax = _mm256_max_ps(vmax, v);
+
+    // SAFETY: caller guarantees the pointers are valid for len f32s and that the required CPU feature is present
+    unsafe {
+        let chunks = len / 8;
+        let mut vmin = _mm256_set1_ps(f32::INFINITY);
+        let mut vmax = _mm256_set1_ps(f32::NEG_INFINITY);
+        for i in 0..chunks {
+            let v = _mm256_loadu_ps(data.add(i * 8));
+            vmin = _mm256_min_ps(vmin, v);
+            vmax = _mm256_max_ps(vmax, v);
+        }
+        // Horizontal reduce
+        let mut arr_min = [0.0f32; 8];
+        let mut arr_max = [0.0f32; 8];
+        _mm256_storeu_ps(arr_min.as_mut_ptr(), vmin);
+        _mm256_storeu_ps(arr_max.as_mut_ptr(), vmax);
+        let mut lo = arr_min[0];
+        let mut hi = arr_max[0];
+        for j in 1..8 {
+            if arr_min[j] < lo {
+                lo = arr_min[j];
+            }
+            if arr_max[j] > hi {
+                hi = arr_max[j];
+            }
+        }
+        for i in (chunks * 8)..len {
+            let val = *data.add(i);
+            if val < lo {
+                lo = val;
+            }
+            if val > hi {
+                hi = val;
+            }
+        }
+        (lo, hi)
     }
-    // Horizontal reduce
-    let mut arr_min = [0.0f32; 8];
-    let mut arr_max = [0.0f32; 8];
-    _mm256_storeu_ps(arr_min.as_mut_ptr(), vmin);
-    _mm256_storeu_ps(arr_max.as_mut_ptr(), vmax);
-    let mut lo = arr_min[0];
-    let mut hi = arr_max[0];
-    for j in 1..8 {
-        if arr_min[j] < lo {
-            lo = arr_min[j];
-        }
-        if arr_max[j] > hi {
-            hi = arr_max[j];
-        }
-    }
-    for i in (chunks * 8)..len {
-        let val = *data.add(i);
-        if val < lo {
-            lo = val;
-        }
-        if val > hi {
-            hi = val;
-        }
-    }
-    (lo, hi)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn normalize_avx2(data: *mut f32, len: usize, min: f32, inv_range: f32) {
     use std::arch::x86_64::*;
-    let vmin = _mm256_set1_ps(min);
-    let vscale = _mm256_set1_ps(inv_range);
-    let chunks = len / 8;
-    for i in 0..chunks {
-        let v = _mm256_loadu_ps(data.add(i * 8) as *const f32);
-        let shifted = _mm256_sub_ps(v, vmin);
-        let scaled = _mm256_mul_ps(shifted, vscale);
-        _mm256_storeu_ps(data.add(i * 8), scaled);
-    }
-    for i in (chunks * 8)..len {
-        let val = *data.add(i);
-        *data.add(i) = (val - min) * inv_range;
+
+    // SAFETY: caller guarantees the pointers are valid for len f32s and that the required CPU feature is present
+    unsafe {
+        let vmin = _mm256_set1_ps(min);
+        let vscale = _mm256_set1_ps(inv_range);
+        let chunks = len / 8;
+        for i in 0..chunks {
+            let v = _mm256_loadu_ps(data.add(i * 8) as *const f32);
+            let shifted = _mm256_sub_ps(v, vmin);
+            let scaled = _mm256_mul_ps(shifted, vscale);
+            _mm256_storeu_ps(data.add(i * 8), scaled);
+        }
+        for i in (chunks * 8)..len {
+            let val = *data.add(i);
+            *data.add(i) = (val - min) * inv_range;
+        }
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn blend_avx2(a: *const f32, b: *const f32, out: *mut f32, len: usize, alpha: f32) {
     use std::arch::x86_64::*;
-    let valpha = _mm256_set1_ps(alpha);
-    let vbeta = _mm256_set1_ps(1.0 - alpha);
-    let chunks = len / 8;
-    for i in 0..chunks {
-        let va = _mm256_loadu_ps(a.add(i * 8));
-        let vb = _mm256_loadu_ps(b.add(i * 8));
-        let result = _mm256_add_ps(_mm256_mul_ps(valpha, va), _mm256_mul_ps(vbeta, vb));
-        _mm256_storeu_ps(out.add(i * 8), result);
-    }
-    for i in (chunks * 8)..len {
-        *out.add(i) = alpha * *a.add(i) + (1.0 - alpha) * *b.add(i);
+
+    // SAFETY: caller guarantees the pointers are valid for len f32s and that the required CPU feature is present
+    unsafe {
+        let valpha = _mm256_set1_ps(alpha);
+        let vbeta = _mm256_set1_ps(1.0 - alpha);
+        let chunks = len / 8;
+        for i in 0..chunks {
+            let va = _mm256_loadu_ps(a.add(i * 8));
+            let vb = _mm256_loadu_ps(b.add(i * 8));
+            let result = _mm256_add_ps(_mm256_mul_ps(valpha, va), _mm256_mul_ps(vbeta, vb));
+            _mm256_storeu_ps(out.add(i * 8), result);
+        }
+        for i in (chunks * 8)..len {
+            *out.add(i) = alpha * *a.add(i) + (1.0 - alpha) * *b.add(i);
+        }
     }
 }
 
@@ -194,69 +212,78 @@ unsafe fn blend_avx2(a: *const f32, b: *const f32, out: *mut f32, len: usize, al
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn min_max_neon(data: *const f32, len: usize) -> (f32, f32) {
     use std::arch::aarch64::*;
-    let chunks = len / 4;
-    let mut vmin = vdupq_n_f32(f32::INFINITY);
-    let mut vmax = vdupq_n_f32(f32::NEG_INFINITY);
-    for i in 0..chunks {
-        let v = vld1q_f32(data.add(i * 4));
-        vmin = vminq_f32(vmin, v);
-        vmax = vmaxq_f32(vmax, v);
-    }
-    let lo = vminvq_f32(vmin);
-    let mut hi = vmaxvq_f32(vmax);
-    let mut lo = lo;
-    for i in (chunks * 4)..len {
-        let val = *data.add(i);
-        if val < lo {
-            lo = val;
+
+    // SAFETY: caller guarantees the pointers are valid for len f32s and that the required CPU feature is present
+    unsafe {
+        let chunks = len / 4;
+        let mut vmin = vdupq_n_f32(f32::INFINITY);
+        let mut vmax = vdupq_n_f32(f32::NEG_INFINITY);
+        for i in 0..chunks {
+            let v = vld1q_f32(data.add(i * 4));
+            vmin = vminq_f32(vmin, v);
+            vmax = vmaxq_f32(vmax, v);
         }
-        if val > hi {
-            hi = val;
+        let lo = vminvq_f32(vmin);
+        let mut hi = vmaxvq_f32(vmax);
+        let mut lo = lo;
+        for i in (chunks * 4)..len {
+            let val = *data.add(i);
+            if val < lo {
+                lo = val;
+            }
+            if val > hi {
+                hi = val;
+            }
         }
+        (lo, hi)
     }
-    (lo, hi)
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn normalize_neon(data: *mut f32, len: usize, min: f32, inv_range: f32) {
     use std::arch::aarch64::*;
-    let vmin = vdupq_n_f32(min);
-    let vscale = vdupq_n_f32(inv_range);
-    let chunks = len / 4;
-    for i in 0..chunks {
-        let v = vld1q_f32(data.add(i * 4) as *const f32);
-        let shifted = vsubq_f32(v, vmin);
-        let scaled = vmulq_f32(shifted, vscale);
-        vst1q_f32(data.add(i * 4), scaled);
-    }
-    for i in (chunks * 4)..len {
-        let val = *data.add(i);
-        *data.add(i) = (val - min) * inv_range;
+
+    // SAFETY: caller guarantees the pointers are valid for len f32s and that the required CPU feature is present
+    unsafe {
+        let vmin = vdupq_n_f32(min);
+        let vscale = vdupq_n_f32(inv_range);
+        let chunks = len / 4;
+        for i in 0..chunks {
+            let v = vld1q_f32(data.add(i * 4) as *const f32);
+            let shifted = vsubq_f32(v, vmin);
+            let scaled = vmulq_f32(shifted, vscale);
+            vst1q_f32(data.add(i * 4), scaled);
+        }
+        for i in (chunks * 4)..len {
+            let val = *data.add(i);
+            *data.add(i) = (val - min) * inv_range;
+        }
     }
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn blend_neon(a: *const f32, b: *const f32, out: *mut f32, len: usize, alpha: f32) {
     use std::arch::aarch64::*;
-    let valpha = vdupq_n_f32(alpha);
-    let vbeta = vdupq_n_f32(1.0 - alpha);
-    let chunks = len / 4;
-    for i in 0..chunks {
-        let va = vld1q_f32(a.add(i * 4));
-        let vb = vld1q_f32(b.add(i * 4));
-        let ra = vmulq_f32(valpha, va);
-        let result = vfmaq_f32(ra, vbeta, vb);
-        vst1q_f32(out.add(i * 4), result);
-    }
-    for i in (chunks * 4)..len {
-        *out.add(i) = alpha * *a.add(i) + (1.0 - alpha) * *b.add(i);
+
+    // SAFETY: caller guarantees the pointers are valid for len f32s and that the required CPU feature is present
+    unsafe {
+        let valpha = vdupq_n_f32(alpha);
+        let vbeta = vdupq_n_f32(1.0 - alpha);
+        let chunks = len / 4;
+        for i in 0..chunks {
+            let va = vld1q_f32(a.add(i * 4));
+            let vb = vld1q_f32(b.add(i * 4));
+            let ra = vmulq_f32(valpha, va);
+            let result = vfmaq_f32(ra, vbeta, vb);
+            vst1q_f32(out.add(i * 4), result);
+        }
+        for i in (chunks * 4)..len {
+            *out.add(i) = alpha * *a.add(i) + (1.0 - alpha) * *b.add(i);
+        }
     }
 }
 
@@ -266,33 +293,42 @@ unsafe fn blend_neon(a: *const f32, b: *const f32, out: *mut f32, len: usize, al
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 unsafe fn min_max_fallback(data: *const f32, len: usize) -> (f32, f32) {
-    let mut lo = f32::INFINITY;
-    let mut hi = f32::NEG_INFINITY;
-    for i in 0..len {
-        let val = *data.add(i);
-        if val < lo {
-            lo = val;
+    // SAFETY: caller guarantees the pointers are valid for len f32s and that the required CPU feature is present
+    unsafe {
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
+        for i in 0..len {
+            let val = *data.add(i);
+            if val < lo {
+                lo = val;
+            }
+            if val > hi {
+                hi = val;
+            }
         }
-        if val > hi {
-            hi = val;
-        }
+        (lo, hi)
     }
-    (lo, hi)
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 unsafe fn normalize_fallback(data: *mut f32, len: usize, min: f32, inv_range: f32) {
-    for i in 0..len {
-        let val = *data.add(i);
-        *data.add(i) = (val - min) * inv_range;
+    // SAFETY: caller guarantees the pointers are valid for len f32s and that the required CPU feature is present
+    unsafe {
+        for i in 0..len {
+            let val = *data.add(i);
+            *data.add(i) = (val - min) * inv_range;
+        }
     }
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 unsafe fn blend_fallback(a: *const f32, b: *const f32, out: *mut f32, len: usize, alpha: f32) {
-    let beta = 1.0 - alpha;
-    for i in 0..len {
-        *out.add(i) = alpha * *a.add(i) + beta * *b.add(i);
+    // SAFETY: caller guarantees the pointers are valid for len f32s and that the required CPU feature is present
+    unsafe {
+        let beta = 1.0 - alpha;
+        for i in 0..len {
+            *out.add(i) = alpha * *a.add(i) + beta * *b.add(i);
+        }
     }
 }
 

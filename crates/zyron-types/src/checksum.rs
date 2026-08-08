@@ -237,14 +237,14 @@ fn hash_len_17_to_32(s: &[u8]) -> u64 {
         rotate(a.wrapping_sub(b), 43)
             .wrapping_add(rotate(c, 30))
             .wrapping_add(d),
-        a.wrapping_add(rotate(b ^ k3_seed(), 18)).wrapping_add(c),
+        a.wrapping_add(rotate(b ^ K3, 20))
+            .wrapping_sub(c)
+            .wrapping_add(len as u64),
     )
 }
 
-#[inline(always)]
-fn k3_seed() -> u64 {
-    0xbf58_476d_1ce4_e5b9
-}
+// Fourth CityHash mixing constant used by the 17 to 32 byte path
+const K3: u64 = 0xc949_d7c7_509e_6557;
 
 fn weak_hash_len32_with_seeds(w: u64, x: u64, y: u64, z: u64, a: u64, b: u64) -> (u64, u64) {
     let a2 = a.wrapping_add(w);
@@ -543,6 +543,18 @@ mod tests {
             city_hash64(b"the quick brown fox jumps over the lazy dog")
         );
         assert_ne!(small, medium);
+    }
+
+    #[test]
+    fn city_hash64_known_answer_17_to_32() {
+        // Canonical CityHash64 (reference v1.0.3) of a 19-byte input. Exercises
+        // the 17 to 32 byte path with the k3 constant 0xc949d7c7509e6557
+        assert_eq!(city_hash64(b"0123456789abcdef012"), 0x162f_a914_1388_fce2);
+        // 26-byte input in the same length class
+        assert_eq!(
+            city_hash64(b"abcdefghijklmnopqrstuvwxyz"),
+            0xd525_f418_c4cb_bc3b
+        );
     }
 
     #[test]

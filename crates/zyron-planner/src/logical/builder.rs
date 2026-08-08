@@ -407,7 +407,10 @@ fn relabel_derived(inner: LogicalPlan, table_idx: usize) -> LogicalPlan {
                 .iter()
                 .map(|c| {
                     BoundExpr::ColumnRef(ColumnRef {
-                        table_idx: c.table_idx.unwrap_or(0),
+                        // Passthrough columns belong to the derived table being
+                        // relabeled, so an unlabeled child column resolves under
+                        // this table_idx rather than a hardcoded table 0.
+                        table_idx: c.table_idx.unwrap_or(table_idx),
                         column_id: c.column_id,
                         type_id: c.type_id,
                         nullable: c.nullable,
@@ -649,6 +652,33 @@ fn rewrite_post_aggregate(
             rewrite_post_aggregate(inner, group_by, aggregates);
             rewrite_group_keys_in_select(plan, group_by);
         }
+        BoundExpr::WindowFunction {
+            function,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            // Rewrite aggregates nested inside the window's arguments and the
+            // partition/order expressions, but leave the windowed function node
+            // itself for the window operator.
+            match function.as_mut() {
+                BoundExpr::Function { args, .. } | BoundExpr::AggregateFunction { args, .. } => {
+                    for arg in args.iter_mut() {
+                        rewrite_post_aggregate(arg, group_by, aggregates);
+                    }
+                }
+                _ => {}
+            }
+            for p in partition_by.iter_mut() {
+                rewrite_post_aggregate(p, group_by, aggregates);
+            }
+            for o in order_by.iter_mut() {
+                rewrite_post_aggregate(&mut o.expr, group_by, aggregates);
+            }
+        }
+        BoundExpr::TemporalRef { inner, .. } => {
+            rewrite_post_aggregate(inner, group_by, aggregates);
+        }
         _ => {}
     }
 }
@@ -889,7 +919,40 @@ fn collect_aggregates_from_expr(
             collect_aggregates_from_expr(expr, out, has_agg);
             collect_aggregates_from_expr(pattern, out, has_agg);
         }
+        BoundExpr::WindowFunction {
+            function,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            // The window's own function (e.g. sum(x) OVER ...) is computed by
+            // the window operator, so it is not collected as a grouping
+            // aggregate. Only aggregates nested inside its arguments and inside
+            // the partition/order expressions are grouping aggregates.
+            for arg in window_function_args(function) {
+                collect_aggregates_from_expr(arg, out, has_agg);
+            }
+            for p in partition_by {
+                collect_aggregates_from_expr(p, out, has_agg);
+            }
+            for o in order_by {
+                collect_aggregates_from_expr(&o.expr, out, has_agg);
+            }
+        }
+        BoundExpr::TemporalRef { inner, .. } => {
+            collect_aggregates_from_expr(inner, out, has_agg);
+        }
         _ => {}
+    }
+}
+
+/// Returns the argument expressions of a window's inner function so an
+/// aggregate nested in an argument is reachable, while the function node itself
+/// (the windowed computation) is not treated as a grouping aggregate.
+fn window_function_args(function: &BoundExpr) -> &[BoundExpr] {
+    match function {
+        BoundExpr::Function { args, .. } | BoundExpr::AggregateFunction { args, .. } => args,
+        _ => &[],
     }
 }
 

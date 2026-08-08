@@ -413,8 +413,24 @@ pub struct TruncateStatement {
 // Transaction control statements
 // ---------------------------------------------------------------------------
 
+/// SQL-standard transaction isolation level names parsed from
+/// BEGIN/START TRANSACTION ISOLATION LEVEL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxnIsolation {
+    ReadUncommitted,
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+    Snapshot,
+}
+
 #[derive(Debug, Clone, PartialEq)]
-pub struct BeginStatement {}
+pub struct BeginStatement {
+    /// Requested isolation level, None means use the server default.
+    pub isolation: Option<TxnIsolation>,
+    /// Some(true) for READ ONLY, Some(false) for READ WRITE, None for default.
+    pub read_only: Option<bool>,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommitStatement {}
@@ -519,6 +535,8 @@ pub struct GrantStatement {
     /// backward compatibility and object == GrantObject::Table(name).
     pub object: GrantObject,
     pub to: String,
+    /// Trailing WITH GRANT OPTION lets the grantee re-grant the privilege.
+    pub with_grant_option: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1184,7 +1202,7 @@ pub struct AlterUserStatement {
 pub enum AlterUserOperation {
     SetPassword(String),
     Rename { new_name: String },
-    SetOption(UserOption),
+    SetOptions(Vec<UserOption>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2633,8 +2651,17 @@ pub enum ColumnConstraint {
     },
 }
 
+/// A table-level constraint with an optional user-supplied name. An unnamed
+/// constraint resolves to a stable auto-generated name at persist time so it
+/// can be addressed by ALTER TABLE DROP CONSTRAINT.
 #[derive(Debug, Clone, PartialEq)]
-pub enum TableConstraint {
+pub struct TableConstraint {
+    pub name: Option<String>,
+    pub kind: TableConstraintKind,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TableConstraintKind {
     PrimaryKey(Vec<String>),
     Unique(Vec<String>),
     Check(Expr),
@@ -3045,7 +3072,10 @@ mod tests {
         }));
         assert!(matches!(truncate, Statement::Truncate(_)));
 
-        let begin = Statement::Begin(Box::new(BeginStatement {}));
+        let begin = Statement::Begin(Box::new(BeginStatement {
+            isolation: None,
+            read_only: None,
+        }));
         assert!(matches!(begin, Statement::Begin(_)));
 
         let explain = Statement::Explain(Box::new(ExplainStatement {

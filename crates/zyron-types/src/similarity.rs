@@ -143,80 +143,6 @@ pub fn qgram_distance(a: &str, b: &str, q: usize) -> usize {
 // Fuzzy join with blocking
 // ---------------------------------------------------------------------------
 
-/// Fuzzy join candidate algorithm specifier.
-#[derive(Debug, Clone, Copy)]
-pub enum FuzzyJoinAlgo {
-    JaroWinkler,
-    Levenshtein,
-    NGram(usize),
-    Jaccard,
-}
-
-/// Finds pairs of indices (i, j) where the fuzzy similarity between
-/// left_keys[i] and right_keys[j] exceeds the threshold.
-///
-/// If a blocking function is provided, only pairs sharing the same block key
-/// are compared, reducing complexity from O(n*m) to O(n*k).
-pub fn fuzzy_join_candidates(
-    left_keys: &[&str],
-    right_keys: &[&str],
-    algorithm: FuzzyJoinAlgo,
-    threshold: f64,
-    blocking_fn: Option<fn(&str) -> String>,
-) -> Vec<(usize, usize, f64)> {
-    let mut results = Vec::new();
-
-    if let Some(block_fn) = blocking_fn {
-        // Group right_keys by block key
-        let mut right_blocks: std::collections::HashMap<String, Vec<usize>> =
-            std::collections::HashMap::new();
-        for (j, k) in right_keys.iter().enumerate() {
-            right_blocks.entry(block_fn(k)).or_default().push(j);
-        }
-
-        // For each left key, only compare against right keys in the same block
-        for (i, left_key) in left_keys.iter().enumerate() {
-            let block = block_fn(left_key);
-            if let Some(candidates) = right_blocks.get(&block) {
-                for &j in candidates {
-                    let sim = compute_similarity(left_key, right_keys[j], algorithm);
-                    if sim >= threshold {
-                        results.push((i, j, sim));
-                    }
-                }
-            }
-        }
-    } else {
-        // Full O(n*m) comparison
-        for (i, left_key) in left_keys.iter().enumerate() {
-            for (j, right_key) in right_keys.iter().enumerate() {
-                let sim = compute_similarity(left_key, right_key, algorithm);
-                if sim >= threshold {
-                    results.push((i, j, sim));
-                }
-            }
-        }
-    }
-
-    results
-}
-
-fn compute_similarity(a: &str, b: &str, algo: FuzzyJoinAlgo) -> f64 {
-    match algo {
-        FuzzyJoinAlgo::JaroWinkler => crate::fuzzy::jaro_winkler(a, b),
-        FuzzyJoinAlgo::Levenshtein => {
-            let mut buf = crate::fuzzy::FuzzyBuffer::new();
-            crate::fuzzy::levenshtein_similarity(a, b, &mut buf)
-        }
-        FuzzyJoinAlgo::NGram(n) => ngram_similarity(a, b, n),
-        FuzzyJoinAlgo::Jaccard => {
-            let tokens_a: Vec<&str> = a.split_whitespace().collect();
-            let tokens_b: Vec<&str> = b.split_whitespace().collect();
-            jaccard_similarity(&tokens_a, &tokens_b)
-        }
-    }
-}
-
 /// Block key: first N characters (case-insensitive).
 pub fn block_first_n(text: &str, n: usize) -> String {
     text.chars()
@@ -358,37 +284,6 @@ mod tests {
     fn test_qgram_distance_different() {
         let d = qgram_distance("hello", "world", 2);
         assert!(d > 0);
-    }
-
-    #[test]
-    fn test_fuzzy_join_no_blocking() {
-        let left = vec!["Alice", "Bob"];
-        let right = vec!["Alicia", "Robert"];
-        let matches = fuzzy_join_candidates(&left, &right, FuzzyJoinAlgo::JaroWinkler, 0.8, None);
-        // Alice ~ Alicia should match
-        assert!(matches.iter().any(|&(i, j, _)| i == 0 && j == 0));
-    }
-
-    #[test]
-    fn test_fuzzy_join_with_blocking() {
-        let left = vec!["Alice", "Bob"];
-        let right = vec!["Alicia", "Robert"];
-        let matches = fuzzy_join_candidates(
-            &left,
-            &right,
-            FuzzyJoinAlgo::JaroWinkler,
-            0.8,
-            Some(block_first_letter),
-        );
-        // Only A-A and B-B blocks considered
-        for (i, j, _) in matches {
-            let l = left[i];
-            let r = right[j];
-            assert_eq!(
-                l.chars().next().unwrap().to_ascii_uppercase(),
-                r.chars().next().unwrap().to_ascii_uppercase()
-            );
-        }
     }
 
     #[test]

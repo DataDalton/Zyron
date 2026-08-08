@@ -16,6 +16,12 @@ pub struct User {
     pub id: UserId,
     pub name: String,
     pub password_hash: Option<String>,
+    /// PostgreSQL-format SCRAM-SHA-256 secret derived from the same plaintext
+    /// as password_hash. Used by SCRAM-SHA-256 wire authentication.
+    pub scram_secret: Option<String>,
+    /// md5(password + username) derived from the same plaintext. Used by MD5
+    /// wire authentication.
+    pub md5_credential: Option<String>,
     pub api_key_prefix: Option<String>,
     pub api_key_hash: Option<Vec<u8>>,
     pub totp_secret: Option<Vec<u8>>,
@@ -39,6 +45,8 @@ impl User {
         write_u32(&mut buf, self.id.0);
         write_string(&mut buf, &self.name);
         write_option_string(&mut buf, &self.password_hash);
+        write_option_string(&mut buf, &self.scram_secret);
+        write_option_string(&mut buf, &self.md5_credential);
         write_option_string(&mut buf, &self.api_key_prefix);
 
         // api_key_hash: 0 for None, 1 + 32 bytes for Some.
@@ -99,6 +107,8 @@ impl User {
         let id = UserId(read_u32(data, &mut off)?);
         let name = read_string(data, &mut off)?;
         let password_hash = read_option_string(data, &mut off)?;
+        let scram_secret = read_option_string(data, &mut off)?;
+        let md5_credential = read_option_string(data, &mut off)?;
         let api_key_prefix = read_option_string(data, &mut off)?;
 
         let api_key_hash = match read_u8(data, &mut off)? {
@@ -180,6 +190,8 @@ impl User {
             id,
             name,
             password_hash,
+            scram_secret,
+            md5_credential,
             api_key_prefix,
             api_key_hash,
             totp_secret,
@@ -244,6 +256,8 @@ mod tests {
             id: UserId(42),
             name: "alice".to_string(),
             password_hash: Some("$balloon-sha256$v=1$s=64,t=3,d=3$salt$hash".to_string()),
+            scram_secret: Some("SCRAM-SHA-256$4096:c2FsdHNhbHQ=$c3RvcmVk:c2VydmVy".to_string()),
+            md5_credential: Some("5f4dcc3b5aa765d61d8327deb882cf99".to_string()),
             api_key_prefix: Some("zyron_ab".to_string()),
             api_key_hash: Some(vec![0xaa; 32]),
             totp_secret: Some(vec![0xbb; 20]),
@@ -266,6 +280,14 @@ mod tests {
             restored.password_hash,
             Some("$balloon-sha256$v=1$s=64,t=3,d=3$salt$hash".to_string())
         );
+        assert_eq!(
+            restored.scram_secret,
+            Some("SCRAM-SHA-256$4096:c2FsdHNhbHQ=$c3RvcmVk:c2VydmVy".to_string())
+        );
+        assert_eq!(
+            restored.md5_credential,
+            Some("5f4dcc3b5aa765d61d8327deb882cf99".to_string())
+        );
         assert_eq!(restored.api_key_prefix, Some("zyron_ab".to_string()));
         assert_eq!(restored.api_key_hash, Some(vec![0xaa; 32]));
         assert_eq!(restored.totp_secret, Some(vec![0xbb; 20]));
@@ -283,6 +305,8 @@ mod tests {
             id: UserId(1),
             name: "bob".to_string(),
             password_hash: None,
+            scram_secret: None,
+            md5_credential: None,
             api_key_prefix: None,
             api_key_hash: None,
             totp_secret: None,
@@ -319,6 +343,8 @@ mod tests {
             id: UserId(7),
             name: "charlie".to_string(),
             password_hash: Some("hash".to_string()),
+            scram_secret: None,
+            md5_credential: None,
             api_key_prefix: None,
             api_key_hash: None,
             totp_secret: None,

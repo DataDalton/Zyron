@@ -9,7 +9,9 @@ rust-version = "1.94"
 [workspace.dependencies]
 # Async runtime and transport
 tokio = { version = "1.50.0", features = ["full"] }
-tokio-quiche = "0.16.1"
+# default features are qlog-gzip + qlog-zstd, which pull in flate2 and zstd.
+# qlog is not used, so they stay off.
+tokio-quiche = { version = "0.19.1", default-features = false }
 async-trait = "0.1.89"
 
 # Serialization

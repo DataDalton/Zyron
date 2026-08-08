@@ -200,9 +200,9 @@ impl WalReader {
                             } else {
                                 byte_offset += record.size_on_disk();
                             }
-                        });
+                        })?;
                     } else {
-                        LogRecord::for_each(data.clone(), &mut f);
+                        LogRecord::for_each(data.clone(), &mut f)?;
                     }
                 }
 
@@ -307,6 +307,9 @@ impl RecoveryManager {
         let mut committed_txns = std::collections::HashMap::with_capacity(1024);
         let mut aborted_txns = std::collections::HashSet::with_capacity(64);
         let mut checkpoint_lsn: Option<u64> = None;
+        // Highest real record LSN observed during the scan, reported as the tail
+        // so recovery resumes after the last durable record rather than at offset 0.
+        let mut max_lsn: Option<Lsn> = None;
 
         // for_each_record_from avoids the intermediate Vec<LogRecord> that scan_from
         // would build, eliminating the struct copies from extend() and the intermediate
@@ -314,11 +317,17 @@ impl RecoveryManager {
         self.reader.for_each_record_from(start_lsn, |record| {
             let txn_id = record.txn_id;
 
+            if max_lsn.map(|m| record.lsn > m).unwrap_or(true) {
+                max_lsn = Some(record.lsn);
+            }
+
             match record.record_type {
                 LogRecordType::CheckpointEnd => {
-                    // Extract checkpoint LSN from the payload (first 8 bytes, little-endian u64).
-                    if record.payload.len() >= 8 {
-                        let bytes: [u8; 8] = record.payload[..8].try_into().unwrap_or([0; 8]);
+                    // The CheckpointEnd payload is caller-defined (log_checkpoint_end
+                    // takes arbitrary bytes). When it carries an 8-byte little-endian
+                    // checkpoint LSN, record it; a shorter payload carries no embedded
+                    // LSN and is not corruption.
+                    if let Ok(bytes) = <[u8; 8]>::try_from(record.payload.get(..8).unwrap_or(&[])) {
                         checkpoint_lsn = Some(u64::from_le_bytes(bytes));
                     }
 
@@ -361,7 +370,9 @@ impl RecoveryManager {
             redo_records,
             undo_txns,
             committed_txns,
-            last_lsn: self.reader.last_segment_id().map(|id| Lsn::new(id.0, 0)),
+            // Report the highest real record LSN observed, not segment offset 0,
+            // so the writer resumes after the last durable record.
+            last_lsn: max_lsn,
             checkpoint_lsn,
         })
     }

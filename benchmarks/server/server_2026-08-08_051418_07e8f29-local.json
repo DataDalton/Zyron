@@ -1,0 +1,130 @@
+{
+  "id": "2026-08-08_051418_07e8f29-local",
+  "date": "2026-08-08 05:14:44Z",
+  "ts": 1786166084,
+  "commit": "07e8f29-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Memory Baseline": {
+      "Core struct overhead (bytes)": {
+        "average": 1160.000000,
+        "runs": [1160.00],
+        "target": 10000000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Server Startup": {
+      "util_before": { "cpu_pct": 6.0, "ram_used_gb": 7.93 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 8.08 },
+      "Cold start latency (ms)": {
+        "average": 17.599320,
+        "runs": [26.02, 14.61, 16.67, 16.24, 14.46],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Warm start latency (ms)": {
+        "average": 15.089380,
+        "runs": [19.60, 12.31, 16.71, 11.73, 15.10],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Checkpoint": {
+      "util_before": { "cpu_pct": 6.0, "ram_used_gb": 8.11 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 8.18 },
+      "Checkpoint latency (ms)": {
+        "average": 0.064660,
+        "runs": [0.07, 0.05, 0.07, 0.06, 0.07],
+        "target": 3.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Health Checks": {
+      "util_before": { "cpu_pct": 5.0, "ram_used_gb": 8.23 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 8.22 },
+      "Health check latency (us)": {
+        "average": 6305.620000,
+        "runs": [519.80, 166.60, 15238.40, 15457.90, 145.40],
+        "target": 100.000000,
+        "passed": false,
+        "higher_is_better": false
+      },
+      "Health endpoint round-trip (us)": {
+        "average": 6305.620000,
+        "runs": [6305.62],
+        "target": 10000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Concurrent Connections": {
+      "Max connections capacity": {
+        "average": 100000.000000,
+        "runs": [100000.00],
+        "target": 100000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "End-to-End Wire": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 8.16 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 8.21 },
+      "Handshake latency (us)": {
+        "average": 383.792400,
+        "runs": [129.09, 733.60, 325.41, 609.93, 120.93],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Graceful Shutdown": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 8.26 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 8.33 },
+      "Shutdown latency (ms)": {
+        "average": 0.056860,
+        "runs": [0.08, 0.05, 0.05, 0.06, 0.05],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Metrics": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 8.36 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 8.35 },
+      "Metrics scrape latency (us)": {
+        "average": 8.800000,
+        "runs": [24.20, 6.20, 5.90, 4.20, 3.50],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Crash Recovery": {
+      "util_before": { "cpu_pct": 5.0, "ram_used_gb": 8.34 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 8.28 },
+      "1MB WAL recovery latency (ms)": {
+        "average": 5.388740,
+        "runs": [6.39, 5.91, 5.02, 4.47, 5.15],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Clean recovery latency (ms)": {
+        "average": 1.154980,
+        "runs": [3.80, 0.63, 0.45, 0.45, 0.45],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    }
+  }
+}

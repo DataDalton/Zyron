@@ -14,5 +14,5 @@ mod replacer;
 
 pub use background_writer::{BackgroundWriter, BackgroundWriterConfig, FsyncFn, WriteFn};
 pub use frame::{BufferFrame, FrameId};
-pub use pool::{BufferPool, BufferPoolConfig, EvictedPage};
+pub use pool::{BufferPool, BufferPoolConfig, EvictWriteFn, EvictedPage};
 pub use replacer::{ClockReplacer, Replacer};

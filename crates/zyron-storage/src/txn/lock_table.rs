@@ -103,6 +103,33 @@ impl LockTable {
         }
     }
 
+    /// Returns the number of row locks the transaction currently holds. Captured
+    /// at SAVEPOINT so a later ROLLBACK TO SAVEPOINT can release exactly the
+    /// locks acquired after the savepoint.
+    pub fn current_count(&self, txn_id: u64) -> usize {
+        self.txn_locks
+            .read_sync(&txn_id, |_, keys| keys.len())
+            .unwrap_or(0)
+    }
+
+    /// Releases the row locks the transaction acquired after `keep`. The per-txn
+    /// key list is in acquisition order, so the locks beyond index `keep` are the
+    /// ones taken after the savepoint that recorded that count. Releases them
+    /// from the global map and truncates the inverse list to `keep`.
+    pub fn unlock_after(&self, txn_id: u64, keep: usize) {
+        if self.txn_locks.is_empty() {
+            return;
+        }
+        self.txn_locks.update_sync(&txn_id, |_, keys| {
+            if keep >= keys.len() {
+                return;
+            }
+            for key in keys.drain(keep..) {
+                let _ = self.locks.remove_sync(&key);
+            }
+        });
+    }
+
     /// Returns the txn_id holding the lock on a row, if any.
     pub fn is_locked_by(&self, table_id: u32, rid: TupleId) -> Option<u64> {
         let key = RowLockKey::new(table_id, rid);

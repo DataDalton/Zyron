@@ -1,7 +1,9 @@
 #![allow(non_snake_case)]
 // Integration tests across analytics modules
 
-use zyron_analytics::ml::{decisionTree, kmeans, linearRegression, logisticRegression, randomForest};
+use zyron_analytics::ml::{
+    decisionTree, kmeans, linearRegression, logisticRegression, randomForest,
+};
 use zyron_analytics::*;
 use zyron_common::Xoshiro256pp;
 
@@ -189,11 +191,18 @@ fn buildOrdersFeatureGroup() -> FeatureGroup {
 #[test]
 fn featureGroupComputesAndRetrieves() {
     let store = FeatureStore::new();
-    store.registerFeatureGroup(buildOrdersFeatureGroup()).unwrap();
+    store
+        .registerFeatureGroup(buildOrdersFeatureGroup())
+        .unwrap();
     for i in 0..100u32 {
         let entity = format!("u{:03}", i);
         store
-            .writeFeatureValue("user_features", &entity, "total_purchases", fv(1000, (i as f64) * 10.0))
+            .writeFeatureValue(
+                "user_features",
+                &entity,
+                "total_purchases",
+                fv(1000, (i as f64) * 10.0),
+            )
             .unwrap();
         store
             .writeFeatureValue("user_features", &entity, "order_count", fv(1000, i as f64))
@@ -221,7 +230,9 @@ fn featureGroupComputesAndRetrieves() {
 #[test]
 fn pointInTimeJoinPreventsLeakage() {
     let store = FeatureStore::new();
-    store.registerFeatureGroup(buildOrdersFeatureGroup()).unwrap();
+    store
+        .registerFeatureGroup(buildOrdersFeatureGroup())
+        .unwrap();
     let janFifteenMs = 1_705_276_800_000i64;
     let janThirtyOneMs = 1_706_659_200_000i64;
     for day in 1..=31i64 {
@@ -269,13 +280,19 @@ fn pointInTimeJoinPreventsLeakage() {
 #[test]
 fn featureVersioningTracksChanges() {
     let store = FeatureStore::new();
-    store.registerFeatureGroup(buildOrdersFeatureGroup()).unwrap();
+    store
+        .registerFeatureGroup(buildOrdersFeatureGroup())
+        .unwrap();
     let mut v1 = fv(1000, 50.0);
     v1.featureVersion = 1;
     let mut v2 = fv(1000, 88.0);
     v2.featureVersion = 2;
-    store.writeFeatureValue("user_features", "u1", "total_purchases", v1).unwrap();
-    store.writeFeatureValue("user_features", "u1", "total_purchases", v2).unwrap();
+    store
+        .writeFeatureValue("user_features", "u1", "total_purchases", v1)
+        .unwrap();
+    store
+        .writeFeatureValue("user_features", "u1", "total_purchases", v2)
+        .unwrap();
     let f1 = store
         .getFeaturesVersioned(
             "user_features",
@@ -419,7 +436,7 @@ fn batchPredictionScalesUp() {
         testXs.push(rng.nextNormal());
     }
     let mut out = vec![0.0f64; mPredict];
-    predictBatch(&model, &testXs, mPredict, 1, &mut out);
+    predictBatch(&model, &testXs, mPredict, 1, &mut out).unwrap();
     let mut min = f64::INFINITY;
     let mut max = f64::NEG_INFINITY;
     for &v in &out {
@@ -455,7 +472,12 @@ fn causalAteRecoversTreatmentEffect() {
     }
     let est = ate(&out, &treat, &cov, 2).unwrap();
     let attEst = att(&out, &treat, &cov, 2).unwrap();
-    assert!((est - trueEffect).abs() < 0.4, "ATE = {} vs {}", est, trueEffect);
+    assert!(
+        (est - trueEffect).abs() < 0.4,
+        "ATE = {} vs {}",
+        est,
+        trueEffect
+    );
     assert!((attEst - trueEffect).abs() < 0.4, "ATT = {}", attEst);
     let probs = propensityScore(&treat, &cov, 2).unwrap();
     for p in probs {
@@ -494,7 +516,11 @@ fn forecastSinusoidalWithTrend() {
             increases += 1;
         }
     }
-    assert!(increases >= 15, "forecast trend not increasing: {}", increases);
+    assert!(
+        increases >= 15,
+        "forecast trend not increasing: {}",
+        increases
+    );
     let aFcst = arima(&v, 10, 1, 1, 1).unwrap();
     assert_eq!(aFcst.len(), 10);
 }

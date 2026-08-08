@@ -86,52 +86,61 @@ fn selectDiffMaxFn() -> DiffMaxFn {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn fillAvx512(data: *mut f64, value: f64, len: usize) {
     use std::arch::x86_64::*;
-    let vec = _mm512_set1_pd(value);
-    let chunks = len / 8;
-    for c in 0..chunks {
-        _mm512_storeu_pd(data.add(c * 8), vec);
-    }
-    for i in (chunks * 8)..len {
-        *data.add(i) = value;
+    // SAFETY: caller guarantees data is writable for len f64s
+    unsafe {
+        let vec = _mm512_set1_pd(value);
+        let chunks = len / 8;
+        for c in 0..chunks {
+            _mm512_storeu_pd(data.add(c * 8), vec);
+        }
+        for i in (chunks * 8)..len {
+            *data.add(i) = value;
+        }
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn fillAvx2(data: *mut f64, value: f64, len: usize) {
     use std::arch::x86_64::*;
-    let vec = _mm256_set1_pd(value);
-    let chunks = len / 4;
-    for c in 0..chunks {
-        _mm256_storeu_pd(data.add(c * 4), vec);
-    }
-    for i in (chunks * 4)..len {
-        *data.add(i) = value;
+    // SAFETY: caller guarantees data is writable for len f64s
+    unsafe {
+        let vec = _mm256_set1_pd(value);
+        let chunks = len / 4;
+        for c in 0..chunks {
+            _mm256_storeu_pd(data.add(c * 4), vec);
+        }
+        for i in (chunks * 4)..len {
+            *data.add(i) = value;
+        }
     }
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn fillNeon(data: *mut f64, value: f64, len: usize) {
     use std::arch::aarch64::*;
-    let vec = vdupq_n_f64(value);
-    let chunks = len / 2;
-    for c in 0..chunks {
-        vst1q_f64(data.add(c * 2), vec);
-    }
-    for i in (chunks * 2)..len {
-        *data.add(i) = value;
+    // SAFETY: caller guarantees data is writable for len f64s
+    unsafe {
+        let vec = vdupq_n_f64(value);
+        let chunks = len / 2;
+        for c in 0..chunks {
+            vst1q_f64(data.add(c * 2), vec);
+        }
+        for i in (chunks * 2)..len {
+            *data.add(i) = value;
+        }
     }
 }
 
 unsafe fn fillFallback(data: *mut f64, value: f64, len: usize) {
-    for i in 0..len {
-        *data.add(i) = value;
+    // SAFETY: caller guarantees data is writable for len f64s
+    unsafe {
+        for i in 0..len {
+            *data.add(i) = value;
+        }
     }
 }
 
@@ -141,96 +150,105 @@ unsafe fn fillFallback(data: *mut f64, value: f64, len: usize) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn diffMaxAvx512(a: *const f64, b: *const f64, len: usize) -> f64 {
     use std::arch::x86_64::*;
-    let signMask = _mm512_set1_pd(f64::from_bits(0x7FFF_FFFF_FFFF_FFFF));
-    let mut maxVec = _mm512_setzero_pd();
-    let chunks = len / 8;
-    for c in 0..chunks {
-        let off = c * 8;
-        let va = _mm512_loadu_pd(a.add(off));
-        let vb = _mm512_loadu_pd(b.add(off));
-        let diff = _mm512_sub_pd(va, vb);
-        let absDiff = _mm512_and_pd(diff, signMask);
-        maxVec = _mm512_max_pd(maxVec, absDiff);
-    }
-    let mut result = _mm512_reduce_max_pd(maxVec);
-    for i in (chunks * 8)..len {
-        let d = (*a.add(i) - *b.add(i)).abs();
-        if d > result {
-            result = d;
+    // SAFETY: caller guarantees a and b are readable for len f64s
+    unsafe {
+        let signMask = _mm512_set1_pd(f64::from_bits(0x7FFF_FFFF_FFFF_FFFF));
+        let mut maxVec = _mm512_setzero_pd();
+        let chunks = len / 8;
+        for c in 0..chunks {
+            let off = c * 8;
+            let va = _mm512_loadu_pd(a.add(off));
+            let vb = _mm512_loadu_pd(b.add(off));
+            let diff = _mm512_sub_pd(va, vb);
+            let absDiff = _mm512_and_pd(diff, signMask);
+            maxVec = _mm512_max_pd(maxVec, absDiff);
         }
+        let mut result = _mm512_reduce_max_pd(maxVec);
+        for i in (chunks * 8)..len {
+            let d = (*a.add(i) - *b.add(i)).abs();
+            if d > result {
+                result = d;
+            }
+        }
+        result
     }
-    result
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn diffMaxAvx2(a: *const f64, b: *const f64, len: usize) -> f64 {
     use std::arch::x86_64::*;
-    let signMask = _mm256_set1_pd(f64::from_bits(0x7FFF_FFFF_FFFF_FFFF));
-    let mut maxVec = _mm256_setzero_pd();
-    let chunks = len / 4;
-    for c in 0..chunks {
-        let off = c * 4;
-        let va = _mm256_loadu_pd(a.add(off));
-        let vb = _mm256_loadu_pd(b.add(off));
-        let diff = _mm256_sub_pd(va, vb);
-        let absDiff = _mm256_and_pd(diff, signMask);
-        maxVec = _mm256_max_pd(maxVec, absDiff);
-    }
-    // Horizontal max of 4 f64 values
-    let hi = _mm256_extractf128_pd(maxVec, 1);
-    let lo = _mm256_castpd256_pd128(maxVec);
-    let pairMax = _mm_max_pd(lo, hi);
-    let swapped = _mm_unpackhi_pd(pairMax, pairMax);
-    let scalarMax = _mm_max_pd(pairMax, swapped);
-    let mut result = _mm_cvtsd_f64(scalarMax);
-    for i in (chunks * 4)..len {
-        let d = (*a.add(i) - *b.add(i)).abs();
-        if d > result {
-            result = d;
+    // SAFETY: caller guarantees a and b are readable for len f64s
+    unsafe {
+        let signMask = _mm256_set1_pd(f64::from_bits(0x7FFF_FFFF_FFFF_FFFF));
+        let mut maxVec = _mm256_setzero_pd();
+        let chunks = len / 4;
+        for c in 0..chunks {
+            let off = c * 4;
+            let va = _mm256_loadu_pd(a.add(off));
+            let vb = _mm256_loadu_pd(b.add(off));
+            let diff = _mm256_sub_pd(va, vb);
+            let absDiff = _mm256_and_pd(diff, signMask);
+            maxVec = _mm256_max_pd(maxVec, absDiff);
         }
+        // Horizontal max of 4 f64 values
+        let hi = _mm256_extractf128_pd(maxVec, 1);
+        let lo = _mm256_castpd256_pd128(maxVec);
+        let pairMax = _mm_max_pd(lo, hi);
+        let swapped = _mm_unpackhi_pd(pairMax, pairMax);
+        let scalarMax = _mm_max_pd(pairMax, swapped);
+        let mut result = _mm_cvtsd_f64(scalarMax);
+        for i in (chunks * 4)..len {
+            let d = (*a.add(i) - *b.add(i)).abs();
+            if d > result {
+                result = d;
+            }
+        }
+        result
     }
-    result
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn diffMaxNeon(a: *const f64, b: *const f64, len: usize) -> f64 {
     use std::arch::aarch64::*;
-    let mut maxVec = vdupq_n_f64(0.0);
-    let chunks = len / 2;
-    for c in 0..chunks {
-        let off = c * 2;
-        let va = vld1q_f64(a.add(off));
-        let vb = vld1q_f64(b.add(off));
-        let diff = vsubq_f64(va, vb);
-        let absDiff = vabsq_f64(diff);
-        maxVec = vmaxq_f64(maxVec, absDiff);
-    }
-    let mut result = vmaxvq_f64(maxVec);
-    for i in (chunks * 2)..len {
-        let d = (*a.add(i) - *b.add(i)).abs();
-        if d > result {
-            result = d;
+    // SAFETY: caller guarantees a and b are readable for len f64s
+    unsafe {
+        let mut maxVec = vdupq_n_f64(0.0);
+        let chunks = len / 2;
+        for c in 0..chunks {
+            let off = c * 2;
+            let va = vld1q_f64(a.add(off));
+            let vb = vld1q_f64(b.add(off));
+            let diff = vsubq_f64(va, vb);
+            let absDiff = vabsq_f64(diff);
+            maxVec = vmaxq_f64(maxVec, absDiff);
         }
+        let mut result = vmaxvq_f64(maxVec);
+        for i in (chunks * 2)..len {
+            let d = (*a.add(i) - *b.add(i)).abs();
+            if d > result {
+                result = d;
+            }
+        }
+        result
     }
-    result
 }
 
 unsafe fn diffMaxFallback(a: *const f64, b: *const f64, len: usize) -> f64 {
-    let mut result = 0.0f64;
-    for i in 0..len {
-        let d = (*a.add(i) - *b.add(i)).abs();
-        if d > result {
-            result = d;
+    // SAFETY: caller guarantees a and b are readable for len f64s
+    unsafe {
+        let mut result = 0.0f64;
+        for i in 0..len {
+            let d = (*a.add(i) - *b.add(i)).abs();
+            if d > result {
+                result = d;
+            }
         }
+        result
     }
-    result
 }
 
 // ---------------------------------------------------------------------------
@@ -567,25 +585,67 @@ fn union(parent: &mut [u32], rank: &mut [u8], x: u32, y: u32) {
 /// Each node starts with its own label and iteratively adopts the most
 /// frequent label among its neighbors. Runs for at most 20 iterations.
 /// The graph is treated as undirected by building a symmetric adjacency view.
+/// Builds a deduplicated, symmetric (undirected) CSR view of the directed graph:
+/// for node i, edges[offsets[i]..offsets[i+1]] are its unique undirected
+/// neighbors. One contiguous offsets+edges pair replaces a Vec<Vec<u32>>
+/// adjacency (no per-node Vec headers, no per-node heap allocations, no push
+/// reallocation churn, cache-friendly traversal). Transient `raw` holds the
+/// pre-dedup edges and is freed on return.
+fn symmetric_csr(graph: &CompactGraph) -> (Vec<u32>, Vec<u32>) {
+    let n = graph.node_count;
+    let mut degree = vec![0u32; n];
+    for src in 0..n {
+        for &dst in graph.neighbors(src as u32) {
+            degree[src] += 1;
+            degree[dst as usize] += 1;
+        }
+    }
+    let mut offsets = vec![0u32; n + 1];
+    for i in 0..n {
+        offsets[i + 1] = offsets[i] + degree[i];
+    }
+    let total = offsets[n] as usize;
+    let mut raw = vec![0u32; total];
+    let mut cursor: Vec<u32> = offsets[..n].to_vec();
+    for src in 0..n {
+        for &dst in graph.neighbors(src as u32) {
+            let si = cursor[src] as usize;
+            raw[si] = dst;
+            cursor[src] += 1;
+            let di = cursor[dst as usize] as usize;
+            raw[di] = src as u32;
+            cursor[dst as usize] += 1;
+        }
+    }
+    // Sort + dedup each node's slice, compacting into the output edge array.
+    let mut edges: Vec<u32> = Vec::with_capacity(total);
+    let mut out_offsets = vec![0u32; n + 1];
+    for i in 0..n {
+        let start = offsets[i] as usize;
+        let end = offsets[i + 1] as usize;
+        out_offsets[i] = edges.len() as u32;
+        let slice = &mut raw[start..end];
+        slice.sort_unstable();
+        let mut last: Option<u32> = None;
+        for &v in slice.iter() {
+            if last != Some(v) {
+                edges.push(v);
+                last = Some(v);
+            }
+        }
+    }
+    out_offsets[n] = edges.len() as u32;
+    (out_offsets, edges)
+}
+
 pub fn community_detection(graph: &CompactGraph) -> Result<Vec<Vec<NodeId>>> {
     let n = graph.node_count;
     if n == 0 {
         return Ok(Vec::new());
     }
 
-    // Build undirected adjacency lists from the directed CSR
-    let mut adjList: Vec<Vec<u32>> = vec![Vec::new(); n];
-    for src in 0..n {
-        for &dst in graph.neighbors(src as u32) {
-            adjList[src].push(dst);
-            adjList[dst as usize].push(src as u32);
-        }
-    }
-    // Deduplicate neighbor lists
-    for neighbors in &mut adjList {
-        neighbors.sort_unstable();
-        neighbors.dedup();
-    }
+    // Deduplicated symmetric CSR view (no per-node Vec adjacency).
+    let (offsets, edges) = symmetric_csr(graph);
 
     let mut labels: Vec<u32> = (0..n as u32).collect();
     let maxIterations = 20usize;
@@ -599,7 +659,7 @@ pub fn community_detection(graph: &CompactGraph) -> Result<Vec<Vec<NodeId>>> {
         let mut changed = false;
 
         for node in 0..n {
-            let neighbors = &adjList[node];
+            let neighbors = &edges[offsets[node] as usize..offsets[node + 1] as usize];
             if neighbors.is_empty() {
                 continue;
             }
@@ -667,38 +727,39 @@ pub fn betweenness_centrality(graph: &CompactGraph) -> Result<Vec<(NodeId, f64)>
         return Ok(Vec::new());
     }
 
-    // Build undirected adjacency for Brandes
-    let mut adjList: Vec<Vec<u32>> = vec![Vec::new(); n];
-    for src in 0..n {
-        for &dst in graph.neighbors(src as u32) {
-            adjList[src].push(dst);
-            adjList[dst as usize].push(src as u32);
-        }
-    }
-    for neighbors in &mut adjList {
-        neighbors.sort_unstable();
-        neighbors.dedup();
-    }
+    // Deduplicated symmetric CSR view (no per-node Vec adjacency).
+    let (offsets, edges) = symmetric_csr(graph);
 
     let mut centrality = vec![0.0f64; n];
 
+    // Brandes per-source working buffers, allocated once and reset each source
+    // instead of reallocated n times.
+    let mut stack: Vec<u32> = Vec::with_capacity(n);
+    let mut predecessors: Vec<Vec<u32>> = (0..n).map(|_| Vec::new()).collect();
+    let mut sigma = vec![0.0f64; n];
+    let mut dist: Vec<i64> = vec![-1; n];
+    let mut delta = vec![0.0f64; n];
+    let mut queue: VecDeque<u32> = VecDeque::new();
+
     for s in 0..n {
-        let mut stack: Vec<u32> = Vec::new();
-        let mut predecessors: Vec<Vec<u32>> = vec![Vec::new(); n];
-        let mut sigma = vec![0.0f64; n]; // number of shortest paths
-        let mut dist: Vec<i64> = vec![-1; n];
-        let mut delta = vec![0.0f64; n];
+        stack.clear();
+        for p in predecessors.iter_mut() {
+            p.clear();
+        }
+        sigma.iter_mut().for_each(|x| *x = 0.0);
+        dist.iter_mut().for_each(|x| *x = -1);
+        delta.iter_mut().for_each(|x| *x = 0.0);
+        queue.clear();
 
         sigma[s] = 1.0;
         dist[s] = 0;
-        let mut queue = VecDeque::new();
         queue.push_back(s as u32);
 
         // BFS phase
         while let Some(v) = queue.pop_front() {
             stack.push(v);
             let vDist = dist[v as usize];
-            for &w in &adjList[v as usize] {
+            for &w in &edges[offsets[v as usize] as usize..offsets[v as usize + 1] as usize] {
                 // First visit to w
                 if dist[w as usize] < 0 {
                     dist[w as usize] = vDist + 1;

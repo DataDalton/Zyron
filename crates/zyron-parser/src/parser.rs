@@ -43,6 +43,7 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Alter) => self.parse_alter(),
             Token::Keyword(Keyword::Truncate) => self.parse_truncate(),
             Token::Keyword(Keyword::Begin) => self.parse_begin(),
+            Token::Keyword(Keyword::Start) => self.parse_begin(),
             Token::Keyword(Keyword::Commit) => self.parse_commit(),
             Token::Keyword(Keyword::Rollback) => self.parse_rollback(),
             Token::Keyword(Keyword::Savepoint) => self.parse_savepoint(),
@@ -102,18 +103,10 @@ impl<'a> Parser<'a> {
         let mut stmts = Vec::new();
 
         while self.current.token != Token::Eof {
-            match self.parse_statement() {
-                Ok(stmt) => stmts.push(stmt),
-                Err(e) => {
-                    // Attempt recovery: skip to next semicolon or statement keyword
-                    if !self.recover_to_next_statement() {
-                        return Err(e);
-                    }
-                    // If we recovered, continue parsing but report this error
-                    // For now, return the error on first failure
-                    return Err(e);
-                }
-            }
+            // Parsing fails on the first error rather than recovering, so the
+            // caller sees the precise failure point.
+            let stmt = self.parse_statement()?;
+            stmts.push(stmt);
 
             // Consume optional trailing semicolons
             while self.current.token == Token::Semicolon {
@@ -248,66 +241,6 @@ impl<'a> Parser<'a> {
             self.lexer.line(),
             self.lexer.column()
         ))
-    }
-
-    fn recover_to_next_statement(&mut self) -> bool {
-        loop {
-            match &self.current.token {
-                Token::Eof => return false,
-                Token::Semicolon => {
-                    let _ = self.advance();
-                    return self.current.token != Token::Eof;
-                }
-                Token::Keyword(
-                    Keyword::Select
-                    | Keyword::Insert
-                    | Keyword::Update
-                    | Keyword::Delete
-                    | Keyword::Create
-                    | Keyword::Drop
-                    | Keyword::Alter
-                    | Keyword::Truncate
-                    | Keyword::Begin
-                    | Keyword::Commit
-                    | Keyword::Rollback
-                    | Keyword::Explain
-                    | Keyword::With
-                    | Keyword::Grant
-                    | Keyword::Revoke
-                    | Keyword::Vacuum
-                    | Keyword::Reindex
-                    | Keyword::Set
-                    | Keyword::Show
-                    | Keyword::Copy
-                    | Keyword::Merge
-                    | Keyword::Prepare
-                    | Keyword::Execute
-                    | Keyword::Deallocate
-                    | Keyword::Listen
-                    | Keyword::Notify
-                    | Keyword::Declare
-                    | Keyword::Fetch
-                    | Keyword::Close
-                    | Keyword::Comment
-                    | Keyword::Refresh
-                    | Keyword::Do
-                    | Keyword::Checkpoint
-                    | Keyword::Values
-                    | Keyword::Optimize
-                    | Keyword::Pause
-                    | Keyword::Resume
-                    | Keyword::Run
-                    | Keyword::Archive
-                    | Keyword::Restore
-                    | Keyword::Analyze,
-                ) => return true,
-                _ => {
-                    if self.advance().is_err() {
-                        return false;
-                    }
-                }
-            }
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -452,7 +385,13 @@ impl<'a> Parser<'a> {
                 self.expect_keyword(Keyword::Share)?;
                 ForLockType::KeyShare
             };
-            let tables = Vec::new();
+            // Optional OF <table>[, <table>...] restricts the lock to the
+            // listed FROM tables.
+            let tables = if self.consume_keyword(Keyword::Of)? {
+                self.parse_comma_separated(|p| p.parse_ident())?
+            } else {
+                Vec::new()
+            };
             let wait = if self.consume_keyword(Keyword::Nowait)? {
                 ForWait::Nowait
             } else if self.at_keyword(Keyword::Skip) {
@@ -693,15 +632,15 @@ impl<'a> Parser<'a> {
                 _ => None,
             };
 
-            // If NATURAL was specified but no join keyword followed, treat as NATURAL JOIN (inner)
+            // NATURAL must be followed by a join keyword. A bare NATURAL with no
+            // JOIN is a syntax error rather than a silent NATURAL INNER JOIN.
             let jt = match join_type {
                 Some(jt) => jt,
                 None => {
                     if natural {
-                        JoinType::Inner
-                    } else {
-                        break;
+                        return Err(self.error("Expected JOIN after NATURAL"));
                     }
+                    break;
                 }
             };
 
@@ -885,7 +824,7 @@ impl<'a> Parser<'a> {
             None
         };
 
-        let alias = if self.consume_keyword(Keyword::As)? {
+        let post_alias = if self.consume_keyword(Keyword::As)? {
             Some(self.parse_ident()?)
         } else if let Token::Ident(_) = &self.current.token {
             // Check that this is not a keyword that starts a clause
@@ -897,6 +836,9 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        // A post-AS-OF alias wins when present, otherwise the alias consumed
+        // before AS OF (the '<table> <alias> AS OF <expr>' form) is the alias.
+        let alias = post_alias.or(pre_as_of_alias);
         Ok(TableRef::Table { name, alias, as_of })
     }
 
@@ -1586,9 +1528,81 @@ impl<'a> Parser<'a> {
     // -----------------------------------------------------------------------
 
     fn parse_begin(&mut self) -> Result<Statement> {
-        self.expect_keyword(Keyword::Begin)?;
-        self.consume_keyword(Keyword::Transaction)?;
-        Ok(Statement::Begin(Box::new(BeginStatement {})))
+        // BEGIN and START TRANSACTION lead the same transaction-control grammar
+        if !self.consume_keyword(Keyword::Begin)? {
+            self.expect_keyword(Keyword::Start)?;
+        }
+        // TRANSACTION and WORK are optional noise words
+        if !self.consume_keyword(Keyword::Transaction)? {
+            self.consume_keyword(Keyword::Work)?;
+        }
+        let (isolation, read_only) = self.parse_transaction_modes()?;
+        Ok(Statement::Begin(Box::new(BeginStatement {
+            isolation,
+            read_only,
+        })))
+    }
+
+    /// Parses zero or more transaction modes in any order with optional commas
+    /// ISOLATION LEVEL ..., READ ONLY | READ WRITE, [NOT] DEFERRABLE
+    /// DEFERRABLE is accepted but has no effect and is not stored.
+    fn parse_transaction_modes(&mut self) -> Result<(Option<TxnIsolation>, Option<bool>)> {
+        let mut isolation = None;
+        let mut read_only = None;
+        loop {
+            if self.consume_keyword(Keyword::Isolation)? {
+                self.expect_keyword(Keyword::Level)?;
+                isolation = Some(self.parse_isolation_level()?);
+            } else if self.consume_keyword(Keyword::Read)? {
+                if self.consume_keyword(Keyword::Only)? {
+                    read_only = Some(true);
+                } else if self.consume_keyword(Keyword::Write)? {
+                    read_only = Some(false);
+                } else {
+                    return Err(self.error(&format!(
+                        "Expected ONLY or WRITE after READ, found {}",
+                        self.current.token
+                    )));
+                }
+            } else if self.consume_keyword(Keyword::Not)? {
+                self.expect_keyword(Keyword::Deferrable)?;
+            } else if self.consume_keyword(Keyword::Deferrable)? {
+                // accepted, no effect
+            } else {
+                break;
+            }
+            // an optional comma separates successive modes
+            self.consume_token(&Token::Comma)?;
+        }
+        Ok((isolation, read_only))
+    }
+
+    /// Parses the level name following ISOLATION LEVEL.
+    fn parse_isolation_level(&mut self) -> Result<TxnIsolation> {
+        if self.consume_keyword(Keyword::Read)? {
+            if self.consume_keyword(Keyword::Uncommitted)? {
+                Ok(TxnIsolation::ReadUncommitted)
+            } else if self.consume_keyword(Keyword::Committed)? {
+                Ok(TxnIsolation::ReadCommitted)
+            } else {
+                Err(self.error(&format!(
+                    "Expected UNCOMMITTED or COMMITTED after READ, found {}",
+                    self.current.token
+                )))
+            }
+        } else if self.consume_keyword(Keyword::Repeatable)? {
+            self.expect_keyword(Keyword::Read)?;
+            Ok(TxnIsolation::RepeatableRead)
+        } else if self.consume_keyword(Keyword::Serializable)? {
+            Ok(TxnIsolation::Serializable)
+        } else if self.consume_keyword(Keyword::Snapshot)? {
+            Ok(TxnIsolation::Snapshot)
+        } else {
+            Err(self.error(&format!(
+                "Expected isolation level name, found {}",
+                self.current.token
+            )))
+        }
     }
 
     fn parse_commit(&mut self) -> Result<Statement> {
@@ -1794,31 +1808,33 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_table_constraint(&mut self) -> Result<TableConstraint> {
-        // Optional CONSTRAINT name
-        if self.consume_keyword(Keyword::Constraint)? {
-            // Consume constraint name (we store it in the AST through the variants)
-            self.parse_ident()?;
-        }
+        // Optional CONSTRAINT name kept on the AST so the constraint can be
+        // addressed by ALTER TABLE DROP CONSTRAINT
+        let name = if self.consume_keyword(Keyword::Constraint)? {
+            Some(self.parse_ident()?)
+        } else {
+            None
+        };
 
-        if self.at_keyword(Keyword::Primary) {
+        let kind = if self.at_keyword(Keyword::Primary) {
             self.advance()?;
             self.expect_keyword(Keyword::Key)?;
             self.expect_token(&Token::LParen)?;
             let columns = self.parse_comma_separated(|p| p.parse_ident())?;
             self.expect_token(&Token::RParen)?;
-            Ok(TableConstraint::PrimaryKey(columns))
+            TableConstraintKind::PrimaryKey(columns)
         } else if self.at_keyword(Keyword::Unique) {
             self.advance()?;
             self.expect_token(&Token::LParen)?;
             let columns = self.parse_comma_separated(|p| p.parse_ident())?;
             self.expect_token(&Token::RParen)?;
-            Ok(TableConstraint::Unique(columns))
+            TableConstraintKind::Unique(columns)
         } else if self.at_keyword(Keyword::Check) {
             self.advance()?;
             self.expect_token(&Token::LParen)?;
             let expr = self.parse_expr()?;
             self.expect_token(&Token::RParen)?;
-            Ok(TableConstraint::Check(expr))
+            TableConstraintKind::Check(expr)
         } else if self.at_keyword(Keyword::Foreign) {
             self.advance()?;
             self.expect_keyword(Keyword::Key)?;
@@ -1831,19 +1847,21 @@ impl<'a> Parser<'a> {
             let ref_columns = self.parse_comma_separated(|p| p.parse_ident())?;
             self.expect_token(&Token::RParen)?;
             let (on_delete, on_update) = self.parse_referential_actions()?;
-            Ok(TableConstraint::ForeignKey {
+            TableConstraintKind::ForeignKey {
                 columns,
                 ref_table,
                 ref_columns,
                 on_delete,
                 on_update,
-            })
+            }
         } else {
-            Err(self.error(&format!(
+            return Err(self.error(&format!(
                 "Expected PRIMARY KEY, UNIQUE, CHECK, or FOREIGN KEY, found {}",
                 self.current.token
-            )))
-        }
+            )));
+        };
+
+        Ok(TableConstraint { name, kind })
     }
 
     /// Parses optional ON DELETE and ON UPDATE referential action clauses in
@@ -3083,6 +3101,20 @@ impl<'a> Parser<'a> {
         let object = self.parse_grant_object()?;
         self.expect_keyword(Keyword::To)?;
         let to = self.parse_ident()?;
+        // Optional trailing WITH GRANT OPTION
+        let with_grant_option = if self.consume_keyword(Keyword::With)? {
+            self.expect_keyword(Keyword::Grant)?;
+            if !self.at_ident_ignore_case("option") {
+                return Err(self.error(&format!(
+                    "Expected OPTION after WITH GRANT, found {}",
+                    self.current.token
+                )));
+            }
+            self.advance()?;
+            true
+        } else {
+            false
+        };
         let on_table = match &object {
             GrantObject::Table(name) => name.clone(),
             _ => String::new(),
@@ -3092,6 +3124,7 @@ impl<'a> Parser<'a> {
             on_table,
             object,
             to,
+            with_grant_option,
         })))
     }
 
@@ -4542,15 +4575,30 @@ impl<'a> Parser<'a> {
             let new_name = self.parse_ident()?;
             AlterUserOperation::Rename { new_name }
         } else if self.consume_keyword(Keyword::With)? {
-            if self.consume_keyword(Keyword::Superuser)? {
-                AlterUserOperation::SetOption(UserOption::Superuser(true))
-            } else if self.consume_keyword(Keyword::Login)? {
-                AlterUserOperation::SetOption(UserOption::Login(true))
-            } else if self.consume_keyword(Keyword::Nologin)? {
-                AlterUserOperation::SetOption(UserOption::Login(false))
-            } else {
+            let mut options = vec![];
+            loop {
+                if self.consume_keyword(Keyword::Superuser)? {
+                    options.push(UserOption::Superuser(true));
+                } else if self.consume_keyword(Keyword::Login)? {
+                    options.push(UserOption::Login(true));
+                } else if self.consume_keyword(Keyword::Nologin)? {
+                    options.push(UserOption::Login(false));
+                } else if self.consume_keyword(Keyword::Valid)? {
+                    self.expect_keyword(Keyword::Until)?;
+                    if let Token::String(until) = &self.current.token {
+                        options.push(UserOption::ValidUntil(until.clone()));
+                        self.advance()?;
+                    } else {
+                        return Err(self.error("Expected date string after VALID UNTIL"));
+                    }
+                } else {
+                    break;
+                }
+            }
+            if options.is_empty() {
                 return Err(self.error("Expected user option after WITH"));
             }
+            AlterUserOperation::SetOptions(options)
         } else {
             return Err(self.error("Expected SET, RENAME, or WITH after ALTER USER name"));
         };
@@ -4568,15 +4616,22 @@ impl<'a> Parser<'a> {
             let new_name = self.parse_ident()?;
             AlterUserOperation::Rename { new_name }
         } else if self.consume_keyword(Keyword::With)? {
-            if self.consume_keyword(Keyword::Superuser)? {
-                AlterUserOperation::SetOption(UserOption::Superuser(true))
-            } else if self.consume_keyword(Keyword::Login)? {
-                AlterUserOperation::SetOption(UserOption::Login(true))
-            } else if self.consume_keyword(Keyword::Nologin)? {
-                AlterUserOperation::SetOption(UserOption::Login(false))
-            } else {
+            let mut options = vec![];
+            loop {
+                if self.consume_keyword(Keyword::Superuser)? {
+                    options.push(UserOption::Superuser(true));
+                } else if self.consume_keyword(Keyword::Login)? {
+                    options.push(UserOption::Login(true));
+                } else if self.consume_keyword(Keyword::Nologin)? {
+                    options.push(UserOption::Login(false));
+                } else {
+                    break;
+                }
+            }
+            if options.is_empty() {
                 return Err(self.error("Expected role option after WITH"));
             }
+            AlterUserOperation::SetOptions(options)
         } else {
             return Err(self.error("Expected RENAME or WITH after ALTER ROLE name"));
         };
@@ -5338,9 +5393,28 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::Into)?;
         let target_table = self.parse_ident()?;
         let mut options = vec![];
+        // Optional SCHEMA '<avro-json>' clause carrying the Avro writer schema.
+        // Stored as the avro_schema option so the handler reads it uniformly.
+        if self.consume_keyword(Keyword::Schema)? {
+            let schema_json = match &self.current.token {
+                Token::String(s) => {
+                    let v = s.clone();
+                    self.advance()?;
+                    v
+                }
+                _ => {
+                    return Err(self.error("Expected a quoted Avro schema string after SCHEMA"));
+                }
+            };
+            options.push(TableOption {
+                key: "avro_schema".to_string(),
+                value: TableOptionValue::String(schema_json),
+            });
+        }
         if self.consume_keyword(Keyword::With)? {
             self.expect_token(&Token::LParen)?;
-            options = self.parse_comma_separated(|p| p.parse_table_option())?;
+            let with_opts = self.parse_comma_separated(|p| p.parse_table_option())?;
+            options.extend(with_opts);
             self.expect_token(&Token::RParen)?;
         }
         Ok(Statement::CreateCdcIngest(Box::new(
@@ -5614,14 +5688,22 @@ impl<'a> Parser<'a> {
                 num_str, unit_word, e
             ))
         })?;
-        // Convert composite interval to microseconds. Months and days are
-        // folded using nominal conversion constants: 30 days per month and
-        // 24 hours per day. Streaming WITHIN windows are always sub-day in
-        // practice, so this approximation is acceptable at bind time.
-        let months_us = (interval.months as i64).saturating_mul(30 * 24 * 3_600_000_000);
+        // Months and years have no exact microsecond length, so a WITHIN
+        // window measured in them is rejected rather than approximated.
+        if interval.months != 0 {
+            return Err(self.error(
+                "WITHIN INTERVAL does not support MONTH or YEAR units, use days or smaller",
+            ));
+        }
+        // Sub-microsecond precision is not representable in the microsecond
+        // window, so a value with a fractional microsecond is rejected rather
+        // than truncated.
+        if interval.nanoseconds % 1_000 != 0 {
+            return Err(self.error("WITHIN INTERVAL does not support sub-microsecond precision"));
+        }
         let days_us = (interval.days as i64).saturating_mul(24 * 3_600_000_000);
         let nanos_us = interval.nanoseconds / 1_000;
-        Ok(months_us.saturating_add(days_us).saturating_add(nanos_us))
+        Ok(days_us.saturating_add(nanos_us))
     }
 
     /// Parses `LATE DATA POLICY DROP | REOPEN | SIDE OUTPUT` after the
@@ -6837,10 +6919,11 @@ impl<'a> Parser<'a> {
         } else if self.at_keyword(Keyword::Drop) {
             self.advance()?;
             ViolationAction::Drop
-        } else {
-            // Default: treat unknown or WARN as Warn
-            let _ = self.parse_ident();
+        } else if self.at_ident_eq("warn") {
+            self.advance()?;
             ViolationAction::Warn
+        } else {
+            return Err(self.error("Expected FAIL, WARN, DROP, or QUARANTINE after ON VIOLATION"));
         };
         Ok(Statement::AddExpectation(Box::new(
             AddExpectationStatement {
@@ -7645,6 +7728,16 @@ fn keyword_to_ident_str(kw: Keyword) -> Option<&'static str> {
         Keyword::Restrict => Some("restrict"),
         Keyword::Release => Some("release"),
         Keyword::Transaction => Some("transaction"),
+        Keyword::Work => Some("work"),
+        Keyword::Isolation => Some("isolation"),
+        Keyword::Level => Some("level"),
+        Keyword::Read => Some("read"),
+        Keyword::Uncommitted => Some("uncommitted"),
+        Keyword::Committed => Some("committed"),
+        Keyword::Repeatable => Some("repeatable"),
+        Keyword::Serializable => Some("serializable"),
+        Keyword::Snapshot => Some("snapshot"),
+        Keyword::Deferrable => Some("deferrable"),
         Keyword::Analyze => Some("analyze"),
         Keyword::Savepoint => Some("savepoint"),
         // Data type keywords that may appear as identifiers
@@ -8402,12 +8495,12 @@ mod tests {
                 assert_eq!(ct.columns.len(), 3);
                 assert_eq!(ct.constraints.len(), 2);
                 assert!(matches!(
-                    &ct.constraints[0],
-                    TableConstraint::PrimaryKey(cols) if cols == &["id"]
+                    &ct.constraints[0].kind,
+                    TableConstraintKind::PrimaryKey(cols) if cols == &["id"]
                 ));
                 assert!(matches!(
-                    &ct.constraints[1],
-                    TableConstraint::ForeignKey { ref_table, .. } if ref_table == "users"
+                    &ct.constraints[1].kind,
+                    TableConstraintKind::ForeignKey { ref_table, .. } if ref_table == "users"
                 ));
             }
             _ => panic!("Expected CREATE TABLE"),
@@ -8444,8 +8537,8 @@ mod tests {
                 let table_fk = ct
                     .constraints
                     .iter()
-                    .find_map(|c| match c {
-                        TableConstraint::ForeignKey {
+                    .find_map(|c| match &c.kind {
+                        TableConstraintKind::ForeignKey {
                             on_delete,
                             on_update,
                             ..
@@ -8766,12 +8859,13 @@ mod tests {
             "ALTER TABLE orders ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users(id)",
         );
         match stmt {
-            Statement::AlterTable(at) => {
-                assert!(matches!(
-                    at.operation,
-                    AlterTableOperation::AddConstraint(TableConstraint::ForeignKey { .. })
-                ));
-            }
+            Statement::AlterTable(at) => match at.operation {
+                AlterTableOperation::AddConstraint(tc) => {
+                    assert_eq!(tc.name.as_deref(), Some("fk_user"));
+                    assert!(matches!(tc.kind, TableConstraintKind::ForeignKey { .. }));
+                }
+                _ => panic!("Expected ADD CONSTRAINT"),
+            },
             _ => panic!("Expected ALTER TABLE"),
         }
     }
@@ -8831,6 +8925,94 @@ mod tests {
     fn test_begin_transaction() {
         let stmt = parse_one("BEGIN TRANSACTION");
         assert!(matches!(stmt, Statement::Begin(_)));
+    }
+
+    fn begin_opts(sql: &str) -> (Option<TxnIsolation>, Option<bool>) {
+        match parse_one(sql) {
+            Statement::Begin(b) => (b.isolation, b.read_only),
+            other => panic!("Expected BEGIN, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_begin_plain_has_no_options() {
+        assert_eq!(begin_opts("BEGIN"), (None, None));
+        assert_eq!(begin_opts("BEGIN WORK"), (None, None));
+        assert_eq!(begin_opts("START TRANSACTION"), (None, None));
+    }
+
+    #[test]
+    fn test_begin_isolation_read_uncommitted() {
+        assert_eq!(
+            begin_opts("BEGIN TRANSACTION ISOLATION LEVEL READ UNCOMMITTED"),
+            (Some(TxnIsolation::ReadUncommitted), None)
+        );
+    }
+
+    #[test]
+    fn test_begin_isolation_read_committed() {
+        assert_eq!(
+            begin_opts("BEGIN ISOLATION LEVEL READ COMMITTED"),
+            (Some(TxnIsolation::ReadCommitted), None)
+        );
+    }
+
+    #[test]
+    fn test_begin_isolation_repeatable_read() {
+        assert_eq!(
+            begin_opts("BEGIN ISOLATION LEVEL REPEATABLE READ"),
+            (Some(TxnIsolation::RepeatableRead), None)
+        );
+    }
+
+    #[test]
+    fn test_begin_isolation_serializable() {
+        assert_eq!(
+            begin_opts("BEGIN ISOLATION LEVEL SERIALIZABLE"),
+            (Some(TxnIsolation::Serializable), None)
+        );
+    }
+
+    #[test]
+    fn test_begin_isolation_snapshot() {
+        assert_eq!(
+            begin_opts("START TRANSACTION ISOLATION LEVEL SNAPSHOT"),
+            (Some(TxnIsolation::Snapshot), None)
+        );
+    }
+
+    #[test]
+    fn test_begin_read_only_and_read_write() {
+        assert_eq!(begin_opts("BEGIN READ ONLY"), (None, Some(true)));
+        assert_eq!(begin_opts("BEGIN READ WRITE"), (None, Some(false)));
+        assert_eq!(
+            begin_opts("START TRANSACTION READ ONLY"),
+            (None, Some(true))
+        );
+    }
+
+    #[test]
+    fn test_begin_deferrable_is_accepted_without_effect() {
+        assert_eq!(begin_opts("BEGIN DEFERRABLE"), (None, None));
+        assert_eq!(begin_opts("BEGIN NOT DEFERRABLE"), (None, None));
+    }
+
+    #[test]
+    fn test_begin_options_any_order_with_commas() {
+        assert_eq!(
+            begin_opts("BEGIN READ ONLY, ISOLATION LEVEL REPEATABLE READ, NOT DEFERRABLE"),
+            (Some(TxnIsolation::RepeatableRead), Some(true))
+        );
+        assert_eq!(
+            begin_opts("START TRANSACTION ISOLATION LEVEL SNAPSHOT READ WRITE DEFERRABLE"),
+            (Some(TxnIsolation::Snapshot), Some(false))
+        );
+    }
+
+    #[test]
+    fn test_begin_rejects_bad_isolation_name() {
+        let err = parse_err("BEGIN ISOLATION LEVEL BOGUS");
+        assert!(err.contains("isolation level name"), "got: {err}");
     }
 
     #[test]

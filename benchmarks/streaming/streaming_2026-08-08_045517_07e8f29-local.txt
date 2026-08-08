@@ -1,0 +1,118 @@
+
+=== Benchmark: Backpressure Monitor ===
+  Backpressure: ratio checks correct, load shedding operational
+  Total time (ms) [PASS/OK]:
+    Runs: [1, 1, 1, 1, 1]
+    Average: 1 <= 500 (target)
+    Min/Max: 1 / 1, StdDev: 0
+
+=== Benchmark: Checkpoint and Recovery ===
+  Populated state backend with 100000 entries (100 bytes each)
+  Snapshot time (s) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 5 (target)
+    Min/Max: 0 / 0, StdDev: 0
+  Restore time (s) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 10 (target)
+    Min/Max: 0 / 0, StdDev: 0
+
+=== E2E: Exactly Once Processing ===
+  Produced 3 output rows from 3 windows
+  Checkpoint: 0 state entries
+  Recovery replay: 3 rows (matches original)
+  Windows processed [PASS]: 3 >= 3 (target)
+
+=== Benchmark: Lookup Join (Cached) ===
+  Events/sec [PASS/OK]:
+    Runs: [60,743,008, 97,200,622, 102,946,324, 102,486,318, 101,194,090]
+    Average: 92,914,073 >= 5,000,000 (target)
+    Min/Max: 60,743,008 / 102,946,324, StdDev: 16,212,245
+
+=== Operator Chain: Filter -> Project -> KeyBy ===
+  Operator 1: 0 state entries
+  Operator 2: 0 state entries
+  Operator 3: 0 state entries
+  Chain: 200 in, 150 after filter, 1 column after project, keys set
+  Output rows [PASS]: 150 >= 150 (target)
+
+=== Correctness: Operator Checkpoint and Recovery ===
+  Checkpoint/recovery: 5 windows, identical SUM values after restore
+
+=== Late Data: Drop Policy ===
+  Drop policy: 3 dropped, 2 passed, counter incremented
+  On-time records [PASS]: 2 >= 2 (target)
+
+=== Correctness: Lookup Join ===
+  Lookup join: enrichment, caching, and TTL expiry verified
+
+=== Late Data: Update Policy ===
+  Update policy: all records returned, late count tracked
+  Records returned [PASS]: 5 >= 5 (target)
+
+=== Benchmark: Tumbling Window Throughput ===
+  Events/sec [PASS/OK]:
+    Runs: [54,010,262, 54,277,914, 54,021,203, 53,800,175, 54,358,166]
+    Average: 54,093,544 >= 8,000,000 (target)
+    Min/Max: 53,800,175 / 54,358,166, StdDev: 201,122
+
+=== Benchmark: Watermark Propagation ===
+  Total time (ms) [PASS/OK]:
+    Runs: [1, 1, 1, 1, 1]
+    Average: 1 <= 20 (target)
+    Min/Max: 1 / 1, StdDev: 0
+
+=== Benchmark: Session Window Throughput ===
+  Events/sec [PASS/OK]:
+    Runs: [250,156,348, 238,612,231, 261,554,155, 246,238,704, 259,322,649]
+    Average: 251,176,817 >= 2,000,000 (target)
+    Min/Max: 238,612,231 / 261,554,155, StdDev: 8,453,861
+
+=== Correctness: Sliding Window ===
+  Sliding window: 10 output rows, overlapping sums verified
+
+=== Benchmark: Sliding Window Throughput ===
+  Events/sec [PASS/OK]:
+    Runs: [42,518,453, 42,538,529, 42,419,795, 42,668,851, 42,764,649]
+    Average: 42,582,055 >= 3,000,000 (target)
+    Min/Max: 42,419,795 / 42,764,649, StdDev: 120,948
+
+=== State Backend: HeapStateBackend + DiskStateBackend ===
+  HeapState: inserted 1000 entries
+  HeapState: verified 1000 reads
+  HeapState: 100 updates, 50 deletes, count = 950
+  HeapState: snapshot/clear/restore verified
+  DiskState: inserted and verified 500 entries
+  DiskState: snapshot/clear/restore verified
+  DiskState: delete and prefix scan verified
+  Total entries verified [PASS]: 1,950 >= 1,950 (target)
+
+=== Benchmark: Stream-Stream Join ===
+  Events/sec [PASS/OK]:
+    Runs: [13,492,363, 14,521,586, 14,433,763, 15,354,379, 14,198,092]
+    Average: 14,400,037 >= 1,000,000 (target)
+    Min/Max: 13,492,363 / 15,354,379, StdDev: 598,554
+
+=== Stream Join Latency Breakdown ===
+  Left insert (no probe):  15.4M/sec (3.3ms for 50000)
+  Right probe+insert:      12.4M/sec (4.0ms for 50000)
+  Hash only:               1315.8M/sec (0.0ms for 50000)
+  Map lookup only:         405.8M/sec (0.1ms for 50000, found=50000)
+  Record clone only:       491.6M/sec (0.1ms for 50000)
+  Combined rate:           13.8M/sec
+
+=== Correctness: Stream-Stream Join ===
+  Stream-stream join: match, no-match, eviction, and re-match verified
+
+=== Correctness: Tumbling Window ===
+  10 tumbling windows verified with correct SUM values
+
+=== Correctness: Session Window ===
+  Session merger: 2 sessions, ranges [0, 2.4M) and [3.6M, 5.7M) verified
+
+=== Correctness: Watermark ===
+  BoundedOutOfOrder watermark: 5 events, monotonic advance verified
+
+=== Late Data: SideOutput Policy ===
+  SideOutput policy: 2 on-time passed, 2 late routed to side output
+  Side output records [PASS]: 2 >= 2 (target)

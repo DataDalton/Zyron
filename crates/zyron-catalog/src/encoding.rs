@@ -157,14 +157,15 @@ pub fn read_option_string(data: &[u8], offset: &mut usize) -> Result<Option<Stri
     }
 }
 
-/// Writes an optional usize: 0 tag for None, 1 tag + u32 value for Some.
+/// Writes an optional usize: 0 tag for None, 1 tag + u64 value for Some. The
+/// u64 width holds a full 64-bit usize without truncation.
 #[inline]
 pub fn write_option_usize(buf: &mut Vec<u8>, val: &Option<usize>) {
     match val {
         None => write_u8(buf, 0),
         Some(v) => {
             write_u8(buf, 1);
-            write_u32(buf, *v as u32);
+            write_u64(buf, *v as u64);
         }
     }
 }
@@ -175,7 +176,7 @@ pub fn read_option_usize(data: &[u8], offset: &mut usize) -> Result<Option<usize
     let tag = read_u8(data, offset)?;
     match tag {
         0 => Ok(None),
-        1 => Ok(Some(read_u32(data, offset)? as usize)),
+        1 => Ok(Some(read_u64(data, offset)? as usize)),
         _ => Err(ZyronError::CatalogCorrupted(format!(
             "invalid option tag {tag}, expected 0 or 1"
         ))),

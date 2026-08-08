@@ -1303,11 +1303,23 @@ pub async fn execute(plan: PhysicalPlan, ctx: &Arc<ExecutionContext>) -> Result<
     let br = build_operator_tree(plan, ctx).await?;
     let mut root = br.op;
     let mut results = Vec::new();
+    let mut total_rows: u64 = 0;
 
     loop {
         ctx.check_cancelled()?;
         match root.next().await? {
-            Some(exec_batch) => results.push(exec_batch.batch),
+            Some(exec_batch) => {
+                total_rows += exec_batch.batch.num_rows as u64;
+                if let Some(cap) = ctx.max_result_rows {
+                    if total_rows > cap {
+                        return Err(zyron_common::ZyronError::Internal(format!(
+                            "result set exceeds max_result_rows {}",
+                            cap
+                        )));
+                    }
+                }
+                results.push(exec_batch.batch);
+            }
             None => break,
         }
     }

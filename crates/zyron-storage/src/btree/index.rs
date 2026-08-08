@@ -273,7 +273,7 @@ impl BTreeIndex {
             let last_eo = u16::from_le_bytes([leaf_data[last_so], leaf_data[last_so + 1]]) as usize;
             let last_kl = u16::from_le_bytes([leaf_data[last_eo], leaf_data[last_eo + 1]]) as usize;
             let last_key = &leaf_data[last_eo + 2..last_eo + 2 + last_kl];
-            if compare_keys(key, last_key).is_le() {
+            if compare_keys(key, last_key).is_lt() {
                 return Ok(None);
             }
             let next_packed = u64::from_le_bytes([
@@ -618,17 +618,32 @@ impl BTreeIndex {
             right_leaf.insert(key, tuple_id)?;
         }
 
-        // Write both leaves
-        pages.write(leaf_page_num, leaf.as_bytes());
+        // Make the split atomic against a propagation error. Write the new
+        // right half first: it is a fresh page no descent can reach until the
+        // parent install below points at it, so writing it early is harmless.
+        // Defer the destructive shrink of the left half until AFTER the parent
+        // install succeeds. If propagation errors, the original leaf still
+        // holds every key and stays reachable through the parent, so no key is
+        // lost, only an unused sibling page is left behind. Publishing the
+        // shrunk left half before a failed install would orphan the right
+        // half's keys (reachable only via right-link, missed by parent-only
+        // descents).
         pages.write(new_page_num, right_leaf.as_bytes());
 
-        // Propagate split up
+        // Propagate split up. The parent install cannot fail with NodeFull:
+        // a full parent is split first, which always makes room, recursing to
+        // the root which is freshly created with a single entry. Any other
+        // error leaves the pre-split leaf intact.
         if path.len() < 2 {
-            // Root was a leaf, create new root
-            self.create_new_root_exclusive(split_key, new_page_num)
+            // Root was a leaf, create new root.
+            self.create_new_root_exclusive(split_key, new_page_num)?;
         } else {
-            self.propagate_split_exclusive(split_key, new_page_num, path)
+            self.propagate_split_exclusive(split_key, new_page_num, path)?;
         }
+
+        // Parent now routes to both halves. Publish the shrunk left half.
+        self.pages.write(leaf_page_num, leaf.as_bytes());
+        Ok(())
     }
 
     /// Propagate split with exclusive access.
@@ -883,10 +898,15 @@ impl BTreeIndex {
                 }
             };
 
-            // Step 1: install split key in parent (makes the right-half
-            // reachable). Step 2: shrink left-half, visible when guard drops.
-            self.propagate_split_sync(split_key, sibling_pn, &path[..path_len])?;
+            // Lehman-Yao publish order. Step 1: shrink and publish the left
+            // half with its right-link pointing at the sibling, so a reader
+            // can reach the right half via the link before the parent knows
+            // about it. Step 2: install the split key in the parent. Doing the
+            // parent install first would leave the on-disk left half holding
+            // the moved keys while the sibling is already reachable, yielding
+            // duplicate rows to a concurrent range scan.
             leaf_guard.write(leaf.as_bytes());
+            self.propagate_split_sync(split_key, sibling_pn, &path[..path_len])?;
             return Ok(());
         }
     }
@@ -980,10 +1000,23 @@ impl BTreeIndex {
         Ok(())
     }
 
-    /// Deletes a key synchronously. The leaf is locked for the rewrite
-    /// so concurrent inserters and other deleters retry against the
-    /// in-progress version, and readers see the deletion atomically when
-    /// the guard drops.
+    /// Deletes a key synchronously on the concurrent (&self) path. The leaf is
+    /// locked for the rewrite so concurrent inserters and other deleters retry
+    /// against the in-progress version, and readers see the deletion atomically
+    /// when the guard drops.
+    ///
+    /// Structural rebalancing (borrow / merge / separator removal) is NOT done
+    /// on this concurrent path. A merge unlinks a leaf and rewires the
+    /// right-link chain that concurrent range scans walk, and removes a parent
+    /// separator that wait-free descents read without a lock. Making that
+    /// provably safe under this tree's per-page latching would need a
+    /// tree-wide structural lock serializing every delete. Per the correctness
+    /// bar, a space leak is strictly preferable to any chance of key loss, so
+    /// the concurrent path only rewrites the leaf in place (no parent or
+    /// right-link mutation, so no structural race is possible). Occupancy is
+    /// restored by delete_exclusive, the &mut self path the executor uses for
+    /// bulk index maintenance, which borrows, merges, removes separators, and
+    /// collapses empty leaves and the root with no concurrent readers present.
     pub fn delete_sync(&self, key: &[u8]) -> bool {
         let leaf_page_num = self.find_leaf_page_num(key);
         let guard = self.pages.lock_for_write(leaf_page_num);
@@ -995,6 +1028,298 @@ impl BTreeIndex {
             }
             DeleteResult::NotFound => false,
         }
+    }
+
+    /// Deletes a key with exclusive access, restoring B+ tree occupancy
+    /// invariants. Borrows from a sibling when one has a spare entry, otherwise
+    /// merges with a sibling and removes the parent separator, recursing up
+    /// until a node is no longer underfull or the root is reached. When the
+    /// root is an internal node left with no separators it is collapsed onto
+    /// its only child and the height drops. Requires &mut self, so no
+    /// concurrent reader can observe an intermediate structural state.
+    pub fn delete_exclusive(&mut self, key: &[u8]) -> bool {
+        let height = *self.height.get_mut() as usize;
+        let root = *self.root_page_num.get_mut();
+
+        // Descend to the leaf, recording at each level the page visited and the
+        // child slot index taken (0 = leftmost child, i = entry[i-1].child).
+        let mut page_path = [0u32; Self::MAX_HEIGHT];
+        let mut child_slot = [0usize; Self::MAX_HEIGHT];
+        let mut depth = 0usize;
+        let mut current = root;
+        page_path[0] = current;
+
+        for _ in 0..height.saturating_sub(1) {
+            let Some(data) = self.pages.get(current) else {
+                return false;
+            };
+            let internal = BTreeInternalPage::from_bytes(*data);
+            let slot = Self::child_slot_for_key(&internal, key);
+            child_slot[depth] = slot;
+            depth += 1;
+            current = Self::child_at(&internal, slot);
+            page_path[depth] = current;
+        }
+
+        // Delete from the leaf.
+        let leaf_page_num = page_path[depth];
+        let Some(leaf_data) = self.pages.get(leaf_page_num) else {
+            return false;
+        };
+        let mut leaf = BTreeLeafPage::from_bytes(*leaf_data);
+        match leaf.delete(key) {
+            DeleteResult::NotFound => return false,
+            DeleteResult::Ok => {
+                self.pages.write(leaf_page_num, leaf.as_bytes());
+                return true;
+            }
+            DeleteResult::Underfull => {
+                self.pages.write(leaf_page_num, leaf.as_bytes());
+            }
+        }
+
+        // The leaf is the root: a single underfull (even empty) leaf root is a
+        // valid tree, nothing to rebalance.
+        if depth == 0 {
+            return true;
+        }
+
+        // Rebalance the leaf against a sibling, then propagate any resulting
+        // internal underflow up the recorded path.
+        self.rebalance_leaf(&page_path, &child_slot, depth);
+        true
+    }
+
+    /// Returns the child slot index a key routes to in an internal node.
+    /// Slot 0 is the leftmost child, slot i (>=1) is entry[i-1].child. The
+    /// separator to the left of slot i is entry[i-1].key.
+    fn child_slot_for_key(internal: &BTreeInternalPage, key: &[u8]) -> usize {
+        let entries = internal.entries();
+        let mut slot = 0usize;
+        for entry in &entries {
+            if compare_keys(key, entry.key.as_ref()).is_ge() {
+                slot += 1;
+            } else {
+                break;
+            }
+        }
+        slot
+    }
+
+    /// Returns the child page number at slot index in an internal node.
+    fn child_at(internal: &BTreeInternalPage, slot: usize) -> u32 {
+        if slot == 0 {
+            internal.leftmost_child().page_num as u32
+        } else {
+            internal.entries()[slot - 1].child_page_id.page_num as u32
+        }
+    }
+
+    /// Rebalances an underfull leaf at the end of the recorded path. Borrows
+    /// one entry from a sibling when possible, otherwise merges with a sibling
+    /// and removes the now-dead parent separator, then propagates any parent
+    /// underflow upward. Exclusive access only.
+    fn rebalance_leaf(&mut self, page_path: &[u32], child_slot: &[usize], depth: usize) {
+        let leaf_pn = page_path[depth];
+        let parent_pn = page_path[depth - 1];
+        let slot = child_slot[depth - 1];
+
+        let parent = BTreeInternalPage::from_bytes(*self.pages.get(parent_pn).unwrap());
+        let parent_keys = parent.num_keys() as usize;
+
+        // Prefer borrowing from the left sibling, then the right, so the tree
+        // stays balanced without removing a separator. Fall back to a merge.
+        let left_slot = if slot > 0 { Some(slot - 1) } else { None };
+        let right_slot = if slot < parent_keys {
+            Some(slot + 1)
+        } else {
+            None
+        };
+
+        // Try borrow from left sibling.
+        if let Some(ls) = left_slot {
+            let left_pn = Self::child_at(&parent, ls);
+            let mut left = BTreeLeafPage::from_bytes(*self.pages.get(left_pn).unwrap());
+            if left.num_entries() > 1 {
+                let mut leaf = BTreeLeafPage::from_bytes(*self.pages.get(leaf_pn).unwrap());
+                if let Some(new_sep) = leaf.borrow_from_left(&mut left) {
+                    self.pages.write(left_pn, left.as_bytes());
+                    self.pages.write(leaf_pn, leaf.as_bytes());
+                    // Separator left of `leaf` is entry[slot-1]; update its key.
+                    self.set_separator(parent_pn, slot - 1, new_sep);
+                    return;
+                }
+            }
+        }
+
+        // Try borrow from right sibling.
+        if let Some(rs) = right_slot {
+            let right_pn = Self::child_at(&parent, rs);
+            let mut right = BTreeLeafPage::from_bytes(*self.pages.get(right_pn).unwrap());
+            if right.num_entries() > 1 {
+                let mut leaf = BTreeLeafPage::from_bytes(*self.pages.get(leaf_pn).unwrap());
+                if let Some(new_sep) = leaf.borrow_from_right(&mut right) {
+                    self.pages.write(right_pn, right.as_bytes());
+                    self.pages.write(leaf_pn, leaf.as_bytes());
+                    // Separator left of `right` is entry[slot]; update its key.
+                    self.set_separator(parent_pn, slot, new_sep);
+                    return;
+                }
+            }
+        }
+
+        // No borrow possible: merge with a sibling. Merge the right sibling
+        // into `leaf` when there is one, else merge `leaf` into the left
+        // sibling. Either way one leaf and one parent separator disappear.
+        let (merged_into_pn, removed_sep_idx) = if let Some(rs) = right_slot {
+            let right_pn = Self::child_at(&parent, rs);
+            let mut leaf = BTreeLeafPage::from_bytes(*self.pages.get(leaf_pn).unwrap());
+            let mut right = BTreeLeafPage::from_bytes(*self.pages.get(right_pn).unwrap());
+            leaf.merge_with_right(&mut right);
+            self.pages.write(leaf_pn, leaf.as_bytes());
+            // The separator between leaf and right is entry[slot].
+            (leaf_pn, slot)
+        } else {
+            // Must have a left sibling (a non-root internal node always has at
+            // least one separator, so slot 0 implies a right sibling existed).
+            let ls = left_slot.unwrap();
+            let left_pn = Self::child_at(&parent, ls);
+            let mut left = BTreeLeafPage::from_bytes(*self.pages.get(left_pn).unwrap());
+            let mut leaf = BTreeLeafPage::from_bytes(*self.pages.get(leaf_pn).unwrap());
+            left.merge_with_right(&mut leaf);
+            self.pages.write(left_pn, left.as_bytes());
+            // The separator between left and leaf is entry[slot-1].
+            (left_pn, slot - 1)
+        };
+        let _ = merged_into_pn;
+
+        // Remove the dead separator from the parent and propagate upward.
+        self.remove_separator_and_propagate(page_path, child_slot, depth - 1, removed_sep_idx);
+    }
+
+    /// Removes the separator at `sep_idx` from the internal node at
+    /// `page_path[level]`, then rebalances that node if it became underfull,
+    /// recursing toward the root. Exclusive access only.
+    fn remove_separator_and_propagate(
+        &mut self,
+        page_path: &[u32],
+        child_slot: &[usize],
+        level: usize,
+        sep_idx: usize,
+    ) {
+        let node_pn = page_path[level];
+        let mut node = BTreeInternalPage::from_bytes(*self.pages.get(node_pn).unwrap());
+        Self::remove_internal_entry(&mut node, sep_idx);
+        self.pages.write(node_pn, node.as_bytes());
+
+        // Root handling: collapse an internal root that lost its last separator.
+        if level == 0 {
+            if node.num_keys() == 0 {
+                let only_child = node.leftmost_child().page_num as u32;
+                *self.root_page_num.get_mut() = only_child;
+                let h = *self.height.get_mut();
+                *self.height.get_mut() = h - 1;
+            }
+            return;
+        }
+
+        if !node.is_underfull() {
+            return;
+        }
+
+        self.rebalance_internal(page_path, child_slot, level);
+    }
+
+    /// Rebalances an underfull internal node at `page_path[level]` against a
+    /// sibling, borrowing a key-child pair or merging and removing the parent
+    /// separator, then propagating upward. Exclusive access only.
+    fn rebalance_internal(&mut self, page_path: &[u32], child_slot: &[usize], level: usize) {
+        let node_pn = page_path[level];
+        let parent_pn = page_path[level - 1];
+        let slot = child_slot[level - 1];
+
+        let parent = BTreeInternalPage::from_bytes(*self.pages.get(parent_pn).unwrap());
+        let parent_keys = parent.num_keys() as usize;
+        let left_slot = if slot > 0 { Some(slot - 1) } else { None };
+        let right_slot = if slot < parent_keys {
+            Some(slot + 1)
+        } else {
+            None
+        };
+
+        // Borrow from the left sibling.
+        if let Some(ls) = left_slot {
+            let left_pn = Self::child_at(&parent, ls);
+            let mut left = BTreeInternalPage::from_bytes(*self.pages.get(left_pn).unwrap());
+            if left.num_keys() > 1 {
+                let sep = Self::separator_key(&parent, slot - 1);
+                let mut node = BTreeInternalPage::from_bytes(*self.pages.get(node_pn).unwrap());
+                if let Some(new_sep) = node.borrow_from_left(&mut left, sep) {
+                    self.pages.write(left_pn, left.as_bytes());
+                    self.pages.write(node_pn, node.as_bytes());
+                    self.set_separator(parent_pn, slot - 1, new_sep);
+                    return;
+                }
+            }
+        }
+
+        // Borrow from the right sibling.
+        if let Some(rs) = right_slot {
+            let right_pn = Self::child_at(&parent, rs);
+            let mut right = BTreeInternalPage::from_bytes(*self.pages.get(right_pn).unwrap());
+            if right.num_keys() > 1 {
+                let sep = Self::separator_key(&parent, slot);
+                let mut node = BTreeInternalPage::from_bytes(*self.pages.get(node_pn).unwrap());
+                if let Some(new_sep) = node.borrow_from_right(&mut right, sep) {
+                    self.pages.write(right_pn, right.as_bytes());
+                    self.pages.write(node_pn, node.as_bytes());
+                    self.set_separator(parent_pn, slot, new_sep);
+                    return;
+                }
+            }
+        }
+
+        // Merge with a sibling, pulling the parent separator down into the
+        // merged node, then remove that separator from the parent.
+        let removed_sep_idx = if let Some(rs) = right_slot {
+            let right_pn = Self::child_at(&parent, rs);
+            let sep = Self::separator_key(&parent, slot);
+            let right = BTreeInternalPage::from_bytes(*self.pages.get(right_pn).unwrap());
+            let mut node = BTreeInternalPage::from_bytes(*self.pages.get(node_pn).unwrap());
+            node.merge_with_right(&right, sep);
+            self.pages.write(node_pn, node.as_bytes());
+            slot
+        } else {
+            let ls = left_slot.unwrap();
+            let left_pn = Self::child_at(&parent, ls);
+            let sep = Self::separator_key(&parent, slot - 1);
+            let node = BTreeInternalPage::from_bytes(*self.pages.get(node_pn).unwrap());
+            let mut left = BTreeInternalPage::from_bytes(*self.pages.get(left_pn).unwrap());
+            left.merge_with_right(&node, sep);
+            self.pages.write(left_pn, left.as_bytes());
+            slot - 1
+        };
+
+        self.remove_separator_and_propagate(page_path, child_slot, level - 1, removed_sep_idx);
+    }
+
+    /// Reads the separator key at entry index `idx` of an internal node.
+    fn separator_key(internal: &BTreeInternalPage, idx: usize) -> Bytes {
+        internal.entries()[idx].key.clone()
+    }
+
+    /// Overwrites the separator key at entry index `idx` of the internal node
+    /// at `page_num`, keeping its child pointer. Used after a borrow shifts the
+    /// boundary between two children.
+    fn set_separator(&mut self, page_num: u32, idx: usize, new_key: Bytes) {
+        let mut node = BTreeInternalPage::from_bytes(*self.pages.get(page_num).unwrap());
+        node.set_separator_key(idx, new_key);
+        self.pages.write(page_num, node.as_bytes());
+    }
+
+    /// Removes entry `idx` (separator + its right child) from an internal node.
+    fn remove_internal_entry(node: &mut BTreeInternalPage, idx: usize) {
+        node.remove_entry(idx);
     }
 
     /// Range scan synchronously. Each leaf page is read via the stable
@@ -1017,6 +1342,10 @@ impl BTreeIndex {
         let ss = BTreeLeafPage::SLOT_SIZE;
         let mut current_page_num = Some(start_leaf_num);
         let mut first_page = true;
+        // Last key emitted, used to skip keys a concurrent split may have copied
+        // into the linked leaf that were already returned from the prior leaf
+        // snapshot, which would otherwise surface as duplicate rows.
+        let mut last_emitted: Option<Bytes> = None;
 
         while let Some(pn) = current_page_num {
             let Some(data) = self.pages.read_stable(pn) else {
@@ -1063,6 +1392,14 @@ impl BTreeIndex {
                     return results;
                 }
 
+                // Skip keys already emitted from the prior leaf snapshot when
+                // crossing a right-link so a concurrent split cannot duplicate
+                if let Some(prev) = &last_emitted
+                    && compare_keys(ek, prev.as_ref()).is_le()
+                {
+                    continue;
+                }
+
                 let to = eo + 2 + kl;
                 let pnv = u32::from_le_bytes([data[to], data[to + 1], data[to + 2], data[to + 3]]);
                 let sid = u16::from_le_bytes([data[to + 4], data[to + 5]]);
@@ -1070,6 +1407,7 @@ impl BTreeIndex {
                     Bytes::copy_from_slice(ek),
                     TupleId::new(PageId::new(0, pnv as u64), sid),
                 ));
+                last_emitted = Some(Bytes::copy_from_slice(ek));
             }
 
             let next = u64::from_le_bytes([
@@ -1109,6 +1447,10 @@ impl BTreeIndex {
         let ss = BTreeLeafPage::SLOT_SIZE;
         let mut current_page_num = Some(start_leaf_num);
         let mut first_page = true;
+        // Last key emitted, used to skip keys a concurrent split may have copied
+        // into the linked leaf that were already returned from the prior leaf
+        // snapshot, which would otherwise surface as duplicate rows.
+        let mut last_emitted: Option<Bytes> = None;
 
         while let Some(pn) = current_page_num {
             let Some(data) = self.pages.read_stable(pn) else {
@@ -1154,9 +1496,18 @@ impl BTreeIndex {
                     return;
                 }
 
+                // Skip keys already emitted from the prior leaf snapshot when
+                // crossing a right-link so a concurrent split cannot duplicate
+                if let Some(prev) = &last_emitted
+                    && compare_keys(ek, prev.as_ref()).is_le()
+                {
+                    continue;
+                }
+
                 let to = eo + 2 + kl;
                 let pnv = u32::from_le_bytes([data[to], data[to + 1], data[to + 2], data[to + 3]]);
                 let sid = u16::from_le_bytes([data[to + 4], data[to + 5]]);
+                last_emitted = Some(Bytes::copy_from_slice(ek));
                 if !f(ek, TupleId::new(PageId::new(0, pnv as u64), sid)) {
                     return;
                 }
@@ -1340,10 +1691,14 @@ impl BTreeIndex {
     pub async fn insert_batch(&mut self, entries: Vec<(Bytes, TupleId)>) -> Result<usize> {
         let mut inserted = 0;
         for (key, tuple_id) in entries {
-            if key.len() <= MAX_KEY_SIZE {
-                self.insert_sync(key.as_ref(), tuple_id)?;
-                inserted += 1;
+            if key.len() > MAX_KEY_SIZE {
+                return Err(ZyronError::KeyTooLarge {
+                    size: key.len(),
+                    max: MAX_KEY_SIZE,
+                });
             }
+            self.insert_sync(key.as_ref(), tuple_id)?;
+            inserted += 1;
         }
         Ok(inserted)
     }
@@ -1371,6 +1726,156 @@ mod tests {
             btree.insert_exclusive(&key, tid).unwrap();
         }
         assert!(btree.search_exclusive(&500u64.to_be_bytes()).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_delete_exclusive_preserves_all_survivors() {
+        // Build a multi-level tree, delete every third key, and verify every
+        // surviving key is still found with its exact tuple id and every
+        // deleted key is gone. This exercises borrow, merge, separator removal,
+        // and root collapse on the exclusive path. No key may be lost.
+        let dir = tempdir().unwrap();
+        let ckpt_dir = dir.path().join("ckpt");
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let mut btree = BTreeIndex::create(0, ckpt_dir).await.unwrap();
+
+        let n = 200_000u64;
+        for i in 0..n {
+            let key = i.to_be_bytes();
+            let tid = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
+            btree.insert_exclusive(&key, tid).unwrap();
+        }
+        assert!(btree.height() > 1, "expected a multi-level tree");
+
+        // Delete every third key.
+        for i in (0..n).step_by(3) {
+            assert!(
+                btree.delete_exclusive(&i.to_be_bytes()),
+                "delete {} failed",
+                i
+            );
+        }
+
+        // Survivors all present with exact tuple id; deleted all absent.
+        for i in 0..n {
+            let key = i.to_be_bytes();
+            let found = btree.search_exclusive(&key);
+            if i % 3 == 0 {
+                assert_eq!(found, None, "key {} should be deleted", i);
+            } else {
+                let expected = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
+                assert_eq!(found, Some(expected), "survivor {} lost", i);
+            }
+        }
+
+        // A range scan returns exactly the survivors in sorted order, proving
+        // the right-link chain and separators stayed consistent through merges.
+        let scanned = btree.range_scan_sync(None, None);
+        let mut expected_keys: Vec<u64> = (0..n).filter(|i| i % 3 != 0).collect();
+        expected_keys.sort_unstable();
+        let scanned_keys: Vec<u64> = scanned
+            .iter()
+            .map(|(k, _)| u64::from_be_bytes(k.as_ref().try_into().unwrap()))
+            .collect();
+        assert_eq!(scanned_keys, expected_keys, "scan lost or reordered keys");
+    }
+
+    #[tokio::test]
+    async fn test_delete_exclusive_all_then_empty() {
+        // Deleting every key must leave a valid, empty, height-1 tree and the
+        // root collapses back to a single leaf.
+        let dir = tempdir().unwrap();
+        let ckpt_dir = dir.path().join("ckpt");
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let mut btree = BTreeIndex::create(0, ckpt_dir).await.unwrap();
+
+        let n = 5_000u64;
+        for i in 0..n {
+            btree
+                .insert_exclusive(&i.to_be_bytes(), TupleId::new(PageId::new(0, 0), 0))
+                .unwrap();
+        }
+        for i in 0..n {
+            assert!(btree.delete_exclusive(&i.to_be_bytes()));
+        }
+        for i in 0..n {
+            assert_eq!(btree.search_exclusive(&i.to_be_bytes()), None);
+        }
+        assert_eq!(btree.height(), 1, "tree should collapse to a single leaf");
+        assert!(btree.range_scan_sync(None, None).is_empty());
+
+        // Reinserting after full deletion still works.
+        btree
+            .insert_exclusive(&42u64.to_be_bytes(), TupleId::new(PageId::new(0, 7), 3))
+            .unwrap();
+        assert_eq!(
+            btree.search_exclusive(&42u64.to_be_bytes()),
+            Some(TupleId::new(PageId::new(0, 7), 3))
+        );
+    }
+
+    #[test]
+    fn test_delete_sync_concurrent_readers_never_miss_survivor() {
+        // The concurrent delete path must never make a surviving key disappear
+        // from a concurrent reader, even while deletes run. Readers continually
+        // search keys known to survive; they must always find them.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering as AtOrd};
+        use std::thread;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempdir().unwrap();
+        let ckpt_dir = dir.path().join("ckpt");
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let btree = Arc::new(rt.block_on(BTreeIndex::create(0, ckpt_dir)).unwrap());
+
+        let n = 100_000u64;
+        // Seed via the concurrent insert path.
+        for i in 0..n {
+            btree
+                .insert_sync(&i.to_be_bytes(), TupleId::new(PageId::new(0, i % 500), 0))
+                .unwrap();
+        }
+
+        // Survivors are the even keys; odd keys will be deleted concurrently.
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let btree = Arc::clone(&btree);
+            let stop = Arc::clone(&stop);
+            readers.push(thread::spawn(move || {
+                while !stop.load(AtOrd::Relaxed) {
+                    for i in (0..n).step_by(2) {
+                        assert!(
+                            btree.search_sync(&i.to_be_bytes()).is_some(),
+                            "survivor {} vanished during concurrent delete",
+                            i
+                        );
+                    }
+                }
+            }));
+        }
+
+        // Delete all odd keys on the concurrent path.
+        for i in (1..n).step_by(2) {
+            assert!(btree.delete_sync(&i.to_be_bytes()));
+        }
+        stop.store(true, AtOrd::Relaxed);
+        for r in readers {
+            r.join().unwrap();
+        }
+
+        // Final check: evens present, odds gone.
+        for i in 0..n {
+            let found = btree.search_sync(&i.to_be_bytes()).is_some();
+            assert_eq!(
+                found,
+                i % 2 == 0,
+                "key {} visibility wrong after deletes",
+                i
+            );
+        }
     }
 
     #[tokio::test]

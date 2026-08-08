@@ -717,7 +717,7 @@ fn test_e2e_exactly_once() {
     tprintln!("\n=== E2E: Exactly Once Processing ===");
     let before = take_util_snapshot();
 
-    // Build a pipeline: InMemorySource -> WindowAggregateOperator -> InMemorySink.
+    // Build a pipeline: source records -> WindowAggregateOperator -> output Vec.
     // Feed data, fire windows via watermark, collect output.
     let window_size_ms = 10_000i64;
 
@@ -730,9 +730,6 @@ fn test_e2e_exactly_once() {
         source_records.push(make_test_record(values, times));
     }
 
-    let mut source = InMemorySource::new(source_records.clone());
-    source.open(None).unwrap();
-
     let mut window_op = WindowAggregateOperator::new(
         1,
         vec![], // No group-by key (global aggregate).
@@ -741,12 +738,9 @@ fn test_e2e_exactly_once() {
         Box::new(TumblingWindowAssigner::new(window_size_ms)),
     );
 
-    let mut sink = InMemorySink::new();
-    let output_handle = sink.output();
-
     // Process all source records.
     let mut processed_batches = 0;
-    while let Some(record) = source.next_batch().unwrap() {
+    for record in source_records.clone() {
         let _ = window_op.process(record).unwrap();
         processed_batches += 1;
     }
@@ -754,13 +748,10 @@ fn test_e2e_exactly_once() {
 
     // Fire windows by advancing watermark past all window ends.
     let results = window_op.on_watermark(Watermark::new(30_000)).unwrap();
-    for result in &results {
-        sink.write_batch(&[result.clone()]).unwrap();
-    }
-    sink.commit().unwrap();
+    let mut output: Vec<StreamRecord> = Vec::new();
+    output.extend(results.iter().cloned());
 
     // Verify output.
-    let output = output_handle.lock();
     assert!(!output.is_empty(), "Should have output records");
     let total_output_rows: usize = output.iter().map(|r| r.num_rows()).sum();
     tprintln!(
@@ -783,22 +774,13 @@ fn test_e2e_exactly_once() {
     window_op.restore(snapshot).unwrap();
 
     // Feed the same data again (simulating replay after recovery).
-    let mut source2 = InMemorySource::new(source_records);
-    source2.open(None).unwrap();
-
-    let mut replay_sink = InMemorySink::new();
-    let replay_handle = replay_sink.output();
-
-    while let Some(record) = source2.next_batch().unwrap() {
+    for record in source_records {
         let _ = window_op.process(record).unwrap();
     }
     let results2 = window_op.on_watermark(Watermark::new(30_000)).unwrap();
-    for result in &results2 {
-        replay_sink.write_batch(&[result.clone()]).unwrap();
-    }
-    replay_sink.commit().unwrap();
+    let mut replay_output: Vec<StreamRecord> = Vec::new();
+    replay_output.extend(results2.iter().cloned());
 
-    let replay_output = replay_handle.lock();
     let replay_rows: usize = replay_output.iter().map(|r| r.num_rows()).sum();
     assert_eq!(
         total_output_rows, replay_rows,

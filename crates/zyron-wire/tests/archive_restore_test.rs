@@ -119,6 +119,11 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         feature_store: zyron_analytics::featureStore(),
         feature_lineage: zyron_analytics::featureLineageRegistry(),
         model_cache: zyron_analytics::modelCache(),
+        default_isolation: zyron_storage::IsolationLevel::ReadCommitted,
+        statement_timeout: None,
+        max_result_rows: None,
+        balloon_params: None,
+        default_auth_method: zyron_auth::auth_rules::AuthMethod::Trust,
     });
     (state, public_schema, tmp)
 }
@@ -234,7 +239,7 @@ async fn archive_removes_matching_rows_and_restore_brings_them_back() {
     exec(
         &server,
         &mut session,
-        "CREATE TABLE t (id INT, name VARCHAR)",
+        "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR)",
     )
     .await;
     exec(
@@ -282,7 +287,7 @@ async fn archive_full_table_then_restore_in_place() {
     let mut session = new_session();
     let dest = archive_dest(&tmp, "full");
 
-    exec(&server, &mut session, "CREATE TABLE t (id INT)").await;
+    exec(&server, &mut session, "CREATE TABLE t (id INT PRIMARY KEY)").await;
     exec(
         &server,
         &mut session,
@@ -319,7 +324,7 @@ async fn archive_dry_run_does_not_remove_rows() {
     let mut session = new_session();
     let dest = archive_dest(&tmp, "dryrun");
 
-    exec(&server, &mut session, "CREATE TABLE t (id INT)").await;
+    exec(&server, &mut session, "CREATE TABLE t (id INT PRIMARY KEY)").await;
     exec(&server, &mut session, "INSERT INTO t (id) VALUES (1), (2)").await;
 
     exec(
@@ -356,7 +361,7 @@ async fn restore_point_in_time_is_rejected() {
     let (server, _schema, tmp) = create_test_server().await;
     let mut session = new_session();
     let dest = archive_dest(&tmp, "pit");
-    exec(&server, &mut session, "CREATE TABLE t (id INT)").await;
+    exec(&server, &mut session, "CREATE TABLE t (id INT PRIMARY KEY)").await;
     exec(&server, &mut session, "INSERT INTO t (id) VALUES (1)").await;
     exec(
         &server,

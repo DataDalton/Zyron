@@ -179,10 +179,44 @@ impl Encoding for FastLanesEncoding {
                 encoded[18],
                 encoded[19],
             ]);
-            let mut out = vec![0u8; row_count * value_size];
-            for i in 0..row_count {
-                let v = first.wrapping_add((i as u64).wrapping_mul(step));
-                write_le(&mut out, i, value_size, v);
+            // The values are the linear sequence first + i*step. Storing through a
+            // typed pointer (instead of the byte-wise write_le) lets the loop
+            // vectorize into SIMD stores; value_size 4 and 8 are the hot column
+            // widths. Output is fully written, so it starts uninitialized to skip
+            // a redundant memset. write_unaligned is used because a Vec<u8> buffer
+            // is only byte-aligned; on x86_64 it compiles to the same store.
+            let out_len = row_count * value_size;
+            #[allow(clippy::uninit_vec)]
+            let mut out: Vec<u8> = {
+                let mut v = Vec::with_capacity(out_len);
+                unsafe { v.set_len(out_len) };
+                v
+            };
+            match value_size {
+                4 => {
+                    let p = out.as_mut_ptr() as *mut u32;
+                    for i in 0..row_count {
+                        let v = first.wrapping_add((i as u64).wrapping_mul(step)) as u32;
+                        unsafe { p.add(i).write_unaligned(v) };
+                    }
+                }
+                8 => {
+                    let p = out.as_mut_ptr() as *mut u64;
+                    for i in 0..row_count {
+                        let v = first.wrapping_add((i as u64).wrapping_mul(step));
+                        unsafe { p.add(i).write_unaligned(v) };
+                    }
+                }
+                _ => {
+                    for i in 0..row_count {
+                        write_le(
+                            &mut out,
+                            i,
+                            value_size,
+                            first.wrapping_add((i as u64).wrapping_mul(step)),
+                        );
+                    }
+                }
             }
             return Ok(out);
         }
@@ -206,9 +240,7 @@ impl Encoding for FastLanesEncoding {
             let mut r = vec![0u64; row_count];
             unpack_batch(packed, bit_width, mask, row_count, &mut r);
             let mut out = vec![0u8; row_count * value_size];
-            for i in 0..row_count {
-                write_le(&mut out, i, value_size, r[i].wrapping_add(base_value));
-            }
+            write_residuals_add_base(&mut out, value_size, &r, base_value);
             for e in 0..exc_count {
                 let o = table_off + e * 12;
                 let pos = u32::from_le_bytes([
@@ -264,9 +296,12 @@ impl Encoding for FastLanesEncoding {
                 let packed = &encoded[off..off + block_bytes];
                 let mut block = vec![0u64; blen];
                 unpack_block_into(packed, bw, blen, &mut block);
-                for (j, &r) in block.iter().enumerate() {
-                    write_le(&mut out, start + j, value_size, r.wrapping_add(base_value));
-                }
+                write_residuals_add_base(
+                    &mut out[start * value_size..],
+                    value_size,
+                    &block,
+                    base_value,
+                );
                 off += block_bytes;
             }
             return Ok(out);
@@ -348,37 +383,53 @@ impl Encoding for FastLanesEncoding {
                         // Unroll 8 bit extractions per byte. Each delta is 0 or 1.
                         // Vec output is pointer-aligned and u32 writes at idx*4 are
                         // always 4-byte aligned, so use aligned write.
-                        accumulator += (byte & 1) as u64;
+                        accumulator = accumulator.wrapping_add((byte & 1) as u64);
                         unsafe {
-                            out32.add(idx).write(accumulator as u32 + base32);
+                            out32
+                                .add(idx)
+                                .write((accumulator as u32).wrapping_add(base32));
                         }
-                        accumulator += ((byte >> 1) & 1) as u64;
+                        accumulator = accumulator.wrapping_add(((byte >> 1) & 1) as u64);
                         unsafe {
-                            out32.add(idx + 1).write(accumulator as u32 + base32);
+                            out32
+                                .add(idx + 1)
+                                .write((accumulator as u32).wrapping_add(base32));
                         }
-                        accumulator += ((byte >> 2) & 1) as u64;
+                        accumulator = accumulator.wrapping_add(((byte >> 2) & 1) as u64);
                         unsafe {
-                            out32.add(idx + 2).write(accumulator as u32 + base32);
+                            out32
+                                .add(idx + 2)
+                                .write((accumulator as u32).wrapping_add(base32));
                         }
-                        accumulator += ((byte >> 3) & 1) as u64;
+                        accumulator = accumulator.wrapping_add(((byte >> 3) & 1) as u64);
                         unsafe {
-                            out32.add(idx + 3).write(accumulator as u32 + base32);
+                            out32
+                                .add(idx + 3)
+                                .write((accumulator as u32).wrapping_add(base32));
                         }
-                        accumulator += ((byte >> 4) & 1) as u64;
+                        accumulator = accumulator.wrapping_add(((byte >> 4) & 1) as u64);
                         unsafe {
-                            out32.add(idx + 4).write(accumulator as u32 + base32);
+                            out32
+                                .add(idx + 4)
+                                .write((accumulator as u32).wrapping_add(base32));
                         }
-                        accumulator += ((byte >> 5) & 1) as u64;
+                        accumulator = accumulator.wrapping_add(((byte >> 5) & 1) as u64);
                         unsafe {
-                            out32.add(idx + 5).write(accumulator as u32 + base32);
+                            out32
+                                .add(idx + 5)
+                                .write((accumulator as u32).wrapping_add(base32));
                         }
-                        accumulator += ((byte >> 6) & 1) as u64;
+                        accumulator = accumulator.wrapping_add(((byte >> 6) & 1) as u64);
                         unsafe {
-                            out32.add(idx + 6).write(accumulator as u32 + base32);
+                            out32
+                                .add(idx + 6)
+                                .write((accumulator as u32).wrapping_add(base32));
                         }
-                        accumulator += ((byte >> 7) & 1) as u64;
+                        accumulator = accumulator.wrapping_add(((byte >> 7) & 1) as u64);
                         unsafe {
-                            out32.add(idx + 7).write(accumulator as u32 + base32);
+                            out32
+                                .add(idx + 7)
+                                .write((accumulator as u32).wrapping_add(base32));
                         }
                     }
                     for i in (fullBytes * 8)..row_count {
@@ -386,7 +437,9 @@ impl Encoding for FastLanesEncoding {
                             unpack_inline(packed_ptr, packed_len, i as u64 * bw, bit_width, mask);
                         accumulator = accumulator.wrapping_add(delta);
                         unsafe {
-                            out32.add(i).write((accumulator + base_value) as u32);
+                            out32
+                                .add(i)
+                                .write(accumulator.wrapping_add(base_value) as u32);
                         }
                     }
                 }
@@ -424,13 +477,13 @@ impl Encoding for FastLanesEncoding {
                         );
 
                         accumulator = accumulator.wrapping_add(d0);
-                        let v0 = (accumulator + base_value) as u32;
+                        let v0 = accumulator.wrapping_add(base_value) as u32;
                         accumulator = accumulator.wrapping_add(d1);
-                        let v1 = (accumulator + base_value) as u32;
+                        let v1 = accumulator.wrapping_add(base_value) as u32;
                         accumulator = accumulator.wrapping_add(d2);
-                        let v2 = (accumulator + base_value) as u32;
+                        let v2 = accumulator.wrapping_add(base_value) as u32;
                         accumulator = accumulator.wrapping_add(d3);
-                        let v3 = (accumulator + base_value) as u32;
+                        let v3 = accumulator.wrapping_add(base_value) as u32;
 
                         unsafe {
                             out32.add(i0).write(v0);
@@ -444,7 +497,9 @@ impl Encoding for FastLanesEncoding {
                             unpack_inline(packed_ptr, packed_len, i as u64 * bw, bit_width, mask);
                         accumulator = accumulator.wrapping_add(delta);
                         unsafe {
-                            out32.add(i).write((accumulator + base_value) as u32);
+                            out32
+                                .add(i)
+                                .write(accumulator.wrapping_add(base_value) as u32);
                         }
                     }
                 }
@@ -457,37 +512,51 @@ impl Encoding for FastLanesEncoding {
                         let byte = unsafe { *packed_ptr.add(b) };
                         let idx = b * 8;
 
-                        accumulator += (byte & 1) as u64;
+                        accumulator = accumulator.wrapping_add((byte & 1) as u64);
                         unsafe {
-                            out64.add(idx).write(accumulator + base_value);
+                            out64.add(idx).write(accumulator.wrapping_add(base_value));
                         }
-                        accumulator += ((byte >> 1) & 1) as u64;
+                        accumulator = accumulator.wrapping_add(((byte >> 1) & 1) as u64);
                         unsafe {
-                            out64.add(idx + 1).write(accumulator + base_value);
+                            out64
+                                .add(idx + 1)
+                                .write(accumulator.wrapping_add(base_value));
                         }
-                        accumulator += ((byte >> 2) & 1) as u64;
+                        accumulator = accumulator.wrapping_add(((byte >> 2) & 1) as u64);
                         unsafe {
-                            out64.add(idx + 2).write(accumulator + base_value);
+                            out64
+                                .add(idx + 2)
+                                .write(accumulator.wrapping_add(base_value));
                         }
-                        accumulator += ((byte >> 3) & 1) as u64;
+                        accumulator = accumulator.wrapping_add(((byte >> 3) & 1) as u64);
                         unsafe {
-                            out64.add(idx + 3).write(accumulator + base_value);
+                            out64
+                                .add(idx + 3)
+                                .write(accumulator.wrapping_add(base_value));
                         }
-                        accumulator += ((byte >> 4) & 1) as u64;
+                        accumulator = accumulator.wrapping_add(((byte >> 4) & 1) as u64);
                         unsafe {
-                            out64.add(idx + 4).write(accumulator + base_value);
+                            out64
+                                .add(idx + 4)
+                                .write(accumulator.wrapping_add(base_value));
                         }
-                        accumulator += ((byte >> 5) & 1) as u64;
+                        accumulator = accumulator.wrapping_add(((byte >> 5) & 1) as u64);
                         unsafe {
-                            out64.add(idx + 5).write(accumulator + base_value);
+                            out64
+                                .add(idx + 5)
+                                .write(accumulator.wrapping_add(base_value));
                         }
-                        accumulator += ((byte >> 6) & 1) as u64;
+                        accumulator = accumulator.wrapping_add(((byte >> 6) & 1) as u64);
                         unsafe {
-                            out64.add(idx + 6).write(accumulator + base_value);
+                            out64
+                                .add(idx + 6)
+                                .write(accumulator.wrapping_add(base_value));
                         }
-                        accumulator += ((byte >> 7) & 1) as u64;
+                        accumulator = accumulator.wrapping_add(((byte >> 7) & 1) as u64);
                         unsafe {
-                            out64.add(idx + 7).write(accumulator + base_value);
+                            out64
+                                .add(idx + 7)
+                                .write(accumulator.wrapping_add(base_value));
                         }
                     }
                     for i in (fullBytes * 8)..row_count {
@@ -495,7 +564,7 @@ impl Encoding for FastLanesEncoding {
                             unpack_inline(packed_ptr, packed_len, i as u64 * bw, bit_width, mask);
                         accumulator = accumulator.wrapping_add(delta);
                         unsafe {
-                            out64.add(i).write(accumulator + base_value);
+                            out64.add(i).write(accumulator.wrapping_add(base_value));
                         }
                     }
                 }
@@ -530,19 +599,25 @@ impl Encoding for FastLanesEncoding {
 
                         accumulator = accumulator.wrapping_add(d0);
                         unsafe {
-                            out64.add(i0).write(accumulator + base_value);
+                            out64.add(i0).write(accumulator.wrapping_add(base_value));
                         }
                         accumulator = accumulator.wrapping_add(d1);
                         unsafe {
-                            out64.add(i0 + 1).write(accumulator + base_value);
+                            out64
+                                .add(i0 + 1)
+                                .write(accumulator.wrapping_add(base_value));
                         }
                         accumulator = accumulator.wrapping_add(d2);
                         unsafe {
-                            out64.add(i0 + 2).write(accumulator + base_value);
+                            out64
+                                .add(i0 + 2)
+                                .write(accumulator.wrapping_add(base_value));
                         }
                         accumulator = accumulator.wrapping_add(d3);
                         unsafe {
-                            out64.add(i0 + 3).write(accumulator + base_value);
+                            out64
+                                .add(i0 + 3)
+                                .write(accumulator.wrapping_add(base_value));
                         }
                     }
                     for i in (chunks * 4)..row_count {
@@ -550,7 +625,7 @@ impl Encoding for FastLanesEncoding {
                             unpack_inline(packed_ptr, packed_len, i as u64 * bw, bit_width, mask);
                         accumulator = accumulator.wrapping_add(delta);
                         unsafe {
-                            out64.add(i).write(accumulator + base_value);
+                            out64.add(i).write(accumulator.wrapping_add(base_value));
                         }
                     }
                 }
@@ -559,7 +634,7 @@ impl Encoding for FastLanesEncoding {
                         let delta =
                             unpack_inline(packed_ptr, packed_len, i as u64 * bw, bit_width, mask);
                         accumulator = accumulator.wrapping_add(delta);
-                        let val = (accumulator + base_value).to_le_bytes();
+                        let val = accumulator.wrapping_add(base_value).to_le_bytes();
                         unsafe {
                             std::ptr::copy_nonoverlapping(
                                 val.as_ptr(),
@@ -603,17 +678,17 @@ impl Encoding for FastLanesEncoding {
                             mask,
                         );
                         unsafe {
-                            out32.add(i0).write((r0 + base_value) as u32);
-                            out32.add(i0 + 1).write((r1 + base_value) as u32);
-                            out32.add(i0 + 2).write((r2 + base_value) as u32);
-                            out32.add(i0 + 3).write((r3 + base_value) as u32);
+                            out32.add(i0).write(r0.wrapping_add(base_value) as u32);
+                            out32.add(i0 + 1).write(r1.wrapping_add(base_value) as u32);
+                            out32.add(i0 + 2).write(r2.wrapping_add(base_value) as u32);
+                            out32.add(i0 + 3).write(r3.wrapping_add(base_value) as u32);
                         }
                     }
                     for i in (chunks * 4)..row_count {
                         let r =
                             unpack_inline(packed_ptr, packed_len, i as u64 * bw, bit_width, mask);
                         unsafe {
-                            out32.add(i).write((r + base_value) as u32);
+                            out32.add(i).write(r.wrapping_add(base_value) as u32);
                         }
                     }
                 }
@@ -646,17 +721,17 @@ impl Encoding for FastLanesEncoding {
                             mask,
                         );
                         unsafe {
-                            out64.add(i0).write(r0 + base_value);
-                            out64.add(i0 + 1).write(r1 + base_value);
-                            out64.add(i0 + 2).write(r2 + base_value);
-                            out64.add(i0 + 3).write(r3 + base_value);
+                            out64.add(i0).write(r0.wrapping_add(base_value));
+                            out64.add(i0 + 1).write(r1.wrapping_add(base_value));
+                            out64.add(i0 + 2).write(r2.wrapping_add(base_value));
+                            out64.add(i0 + 3).write(r3.wrapping_add(base_value));
                         }
                     }
                     for i in (chunks * 4)..row_count {
                         let r =
                             unpack_inline(packed_ptr, packed_len, i as u64 * bw, bit_width, mask);
                         unsafe {
-                            out64.add(i).write(r + base_value);
+                            out64.add(i).write(r.wrapping_add(base_value));
                         }
                     }
                 }
@@ -664,7 +739,7 @@ impl Encoding for FastLanesEncoding {
                     for i in 0..row_count {
                         let r =
                             unpack_inline(packed_ptr, packed_len, i as u64 * bw, bit_width, mask);
-                        let val = (r + base_value).to_le_bytes();
+                        let val = r.wrapping_add(base_value).to_le_bytes();
                         unsafe {
                             std::ptr::copy_nonoverlapping(
                                 val.as_ptr(),
@@ -1057,7 +1132,7 @@ impl Encoding for FastLanesEncoding {
                     None => u64::MAX,
                 };
                 for i in 0..row_count {
-                    let v = residuals[i] + base_value;
+                    let v = residuals[i].wrapping_add(base_value);
                     if v >= loVal && v <= hiVal {
                         bitmask[i / 8] |= 1 << (i % 8);
                     }
@@ -1066,7 +1141,7 @@ impl Encoding for FastLanesEncoding {
             Predicate::Equality(target) => {
                 let targetVal = read_u64_le(target, 0, target.len().min(8));
                 for i in 0..row_count {
-                    if residuals[i] + base_value == targetVal {
+                    if residuals[i].wrapping_add(base_value) == targetVal {
                         bitmask[i / 8] |= 1 << (i % 8);
                     }
                 }
@@ -1077,7 +1152,7 @@ impl Encoding for FastLanesEncoding {
                     .map(|v| read_u64_le(v, 0, v.len().min(8)))
                     .collect();
                 for i in 0..row_count {
-                    let v = residuals[i] + base_value;
+                    let v = residuals[i].wrapping_add(base_value);
                     if targets.contains(&v) {
                         bitmask[i / 8] |= 1 << (i % 8);
                     }
@@ -1092,6 +1167,9 @@ impl Encoding for FastLanesEncoding {
 /// Reads a value of up to 8 bytes from data as a u64 (little-endian).
 #[inline]
 fn read_u64_le(data: &[u8], offset: usize, size: usize) -> u64 {
+    if offset >= data.len() {
+        return 0;
+    }
     let end = (offset + size).min(data.len());
     let slice = &data[offset..end];
     let mut buf = [0u8; 8];
@@ -1295,6 +1373,35 @@ fn write_le(out: &mut [u8], idx: usize, value_size: usize, val: u64) {
     let bytes = val.to_le_bytes();
     let start = idx * value_size;
     out[start..start + value_size].copy_from_slice(&bytes[..value_size]);
+}
+
+/// Adds `base` to each residual and stores it as a value_size-byte little-endian
+/// integer through a typed pointer, so the loop vectorizes into SIMD stores
+/// instead of the byte-wise write_le. value_size 4 and 8 are the hot column
+/// widths; other widths fall back to write_le. write_unaligned is used because
+/// the output buffer is only byte-aligned (on x86_64 it is the same store). The
+/// caller guarantees out holds at least residuals.len()*value_size bytes.
+#[inline]
+fn write_residuals_add_base(out: &mut [u8], value_size: usize, residuals: &[u64], base: u64) {
+    match value_size {
+        4 => {
+            let p = out.as_mut_ptr() as *mut u32;
+            for (i, &r) in residuals.iter().enumerate() {
+                unsafe { p.add(i).write_unaligned(r.wrapping_add(base) as u32) };
+            }
+        }
+        8 => {
+            let p = out.as_mut_ptr() as *mut u64;
+            for (i, &r) in residuals.iter().enumerate() {
+                unsafe { p.add(i).write_unaligned(r.wrapping_add(base)) };
+            }
+        }
+        _ => {
+            for (i, &r) in residuals.iter().enumerate() {
+                write_le(out, i, value_size, r.wrapping_add(base));
+            }
+        }
+    }
 }
 
 /// Reads a 16-byte little-endian u128 at byte `offset` (zero-padded if short).

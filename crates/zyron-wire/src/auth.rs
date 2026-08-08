@@ -10,10 +10,21 @@ use crate::messages::frontend::PasswordMessage;
 
 /// Result of processing an authentication response.
 pub enum AuthProgress {
-    /// Authentication succeeded.
+    /// Authentication succeeded with no further message to send.
     Authenticated,
+    /// Authentication succeeded, send this final message to the client before
+    /// completing. SCRAM uses this to deliver the SaslFinal server signature.
+    AuthenticatedWith(BackendMessage),
     /// Send this message to the client and wait for another response.
     Continue(BackendMessage),
+    /// Send `deliver` then `challenge` to the client and wait for another
+    /// response. Used when a chained factor completes (e.g. SCRAM returns its
+    /// SaslFinal server signature) and the first factor's terminal message must
+    /// reach the client before the next factor's challenge is issued.
+    ContinueAfter {
+        deliver: BackendMessage,
+        challenge: BackendMessage,
+    },
 }
 
 /// Authentication error.
@@ -75,15 +86,17 @@ impl Authenticator for TrustAuthenticator {
 // Cleartext password authenticator
 // ---------------------------------------------------------------------------
 
-/// Cleartext password authentication. Sends the password in plain text.
-/// Only appropriate for testing or when the connection is encrypted.
+/// Cleartext password authentication. The client sends the plaintext password,
+/// which the server verifies against the stored Balloon PHC hash. Only
+/// appropriate when the connection is encrypted.
 pub struct CleartextAuthenticator {
-    passwords: HashMap<String, String>,
+    /// Stored Balloon PHC hash strings keyed by username.
+    password_hashes: HashMap<String, String>,
 }
 
 impl CleartextAuthenticator {
-    pub fn new(passwords: HashMap<String, String>) -> Self {
-        Self { passwords }
+    pub fn new(password_hashes: HashMap<String, String>) -> Self {
+        Self { password_hashes }
     }
 }
 
@@ -104,10 +117,14 @@ impl Authenticator for CleartextAuthenticator {
             _ => return Err(AuthError::UnexpectedMessage),
         };
 
-        match self.passwords.get(user) {
-            Some(expected) if constant_time_eq(expected.as_bytes(), password.as_bytes()) => {
-                Ok(AuthProgress::Authenticated)
-            }
+        let stored = self
+            .password_hashes
+            .get(user)
+            .ok_or_else(|| AuthError::Failed(user.to_string()))?;
+
+        // balloon_verify recomputes the hash and compares in constant time.
+        match zyron_auth::balloon::balloon_verify(password, stored) {
+            Ok(true) => Ok(AuthProgress::Authenticated),
             _ => Err(AuthError::Failed(user.to_string())),
         }
     }
@@ -119,23 +136,30 @@ impl Authenticator for CleartextAuthenticator {
 
 /// MD5 password authentication.
 /// Protocol: client sends md5(md5(password + user) + salt) as "md5" + 32 hex chars.
+/// The map holds the stored inner value md5(password + user) keyed by username.
 pub struct Md5Authenticator {
-    passwords: HashMap<String, String>,
+    inner_credentials: HashMap<String, String>,
     salt: [u8; 4],
 }
 
 impl Md5Authenticator {
-    pub fn new(passwords: HashMap<String, String>) -> Self {
+    pub fn new(inner_credentials: HashMap<String, String>) -> Self {
         let mut salt = [0u8; 4];
         use rand::Rng;
         rand::rng().fill_bytes(&mut salt);
-        Self { passwords, salt }
+        Self {
+            inner_credentials,
+            salt,
+        }
     }
 
     /// Creates an authenticator with a fixed salt (for testing).
     #[cfg(test)]
-    pub fn with_salt(passwords: HashMap<String, String>, salt: [u8; 4]) -> Self {
-        Self { passwords, salt }
+    pub fn with_salt(inner_credentials: HashMap<String, String>, salt: [u8; 4]) -> Self {
+        Self {
+            inner_credentials,
+            salt,
+        }
     }
 }
 
@@ -157,12 +181,12 @@ impl Authenticator for Md5Authenticator {
             _ => return Err(AuthError::UnexpectedMessage),
         };
 
-        let expected_password = match self.passwords.get(user) {
-            Some(pw) => pw,
+        let inner_hex = match self.inner_credentials.get(user) {
+            Some(v) => v,
             None => return Err(AuthError::Failed(user.to_string())),
         };
 
-        let expected = compute_md5_password(user, expected_password, &self.salt);
+        let expected = compute_md5_response(inner_hex, &self.salt);
 
         if constant_time_eq(received, expected.as_bytes()) {
             Ok(AuthProgress::Authenticated)
@@ -172,19 +196,12 @@ impl Authenticator for Md5Authenticator {
     }
 }
 
-/// Computes the MD5 password hash per PostgreSQL spec:
-/// "md5" + md5(md5(password + username) + salt)
-fn compute_md5_password(user: &str, password: &str, salt: &[u8; 4]) -> String {
+/// Computes the MD5 wire response from the stored inner value per PostgreSQL
+/// spec: "md5" + md5(md5(password + username) + salt). inner_hex is the
+/// 32-hex-char md5(password + username) held in the credential store.
+fn compute_md5_response(inner_hex: &str, salt: &[u8; 4]) -> String {
     use md5::{Digest, Md5};
 
-    // Step 1: md5(password + username)
-    let mut hasher = Md5::new();
-    hasher.update(password.as_bytes());
-    hasher.update(user.as_bytes());
-    let inner = hasher.finalize();
-    let inner_hex = format!("{:x}", inner);
-
-    // Step 2: md5(inner_hex + salt)
     let mut hasher = Md5::new();
     hasher.update(inner_hex.as_bytes());
     hasher.update(salt);
@@ -201,8 +218,8 @@ fn compute_md5_password(user: &str, password: &str, salt: &[u8; 4]) -> String {
 /// Multi-round protocol: server sends mechanisms, client sends initial response,
 /// server sends challenge, client sends proof, server sends final verification.
 pub struct ScramAuthenticator {
-    /// Stored passwords for lookup.
-    passwords: HashMap<String, String>,
+    /// Stored PostgreSQL-format SCRAM-SHA-256 secrets keyed by username.
+    scram_secrets: HashMap<String, String>,
     /// Current SCRAM state machine.
     state: ScramState,
 }
@@ -211,8 +228,6 @@ enum ScramState {
     WaitingForInitial,
     WaitingForProof {
         server_nonce: String,
-        _salt: Vec<u8>,
-        _iterations: u32,
         client_first_bare: String,
         server_first: String,
         stored_key: [u8; 32],
@@ -221,9 +236,9 @@ enum ScramState {
 }
 
 impl ScramAuthenticator {
-    pub fn new(passwords: HashMap<String, String>) -> Self {
+    pub fn new(scram_secrets: HashMap<String, String>) -> Self {
         Self {
-            passwords,
+            scram_secrets,
             state: ScramState::WaitingForInitial,
         }
     }
@@ -261,34 +276,33 @@ impl Authenticator for ScramAuthenticator {
                 let client_nonce = extract_field(&client_first_bare, "r=")
                     .ok_or_else(|| AuthError::SaslError("Missing client nonce".into()))?;
 
-                let password = self
-                    .passwords
+                // Load the stored SCRAM secret and use its salt, iterations, and
+                // derived keys instead of re-deriving from a plaintext password.
+                let secret_str = self
+                    .scram_secrets
                     .get(user)
                     .ok_or_else(|| AuthError::Failed(user.to_string()))?;
+                let secret = zyron_auth::parse_scram_secret(secret_str).map_err(|e| {
+                    AuthError::SaslError(format!("Stored SCRAM secret invalid: {e}"))
+                })?;
 
-                // Generate server nonce and salt
+                // Generate server nonce by appending fresh randomness to the
+                // client nonce.
                 let server_nonce = format!("{}{}", client_nonce, generate_nonce());
-                let salt = generate_salt();
-                let iterations = 4096u32;
 
-                // Derive keys from password
-                let salted_password = pbkdf2_sha256(password.as_bytes(), &salt, iterations);
-                let client_key = hmac_sha256(&salted_password, b"Client Key");
-                let stored_key = sha256(&client_key);
-                let server_key = hmac_sha256(&salted_password, b"Server Key");
-
-                let salt_b64 =
-                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &salt);
-                let server_first = format!("r={},s={},i={}", server_nonce, salt_b64, iterations);
+                let salt_b64 = base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &secret.salt,
+                );
+                let server_first =
+                    format!("r={},s={},i={}", server_nonce, salt_b64, secret.iterations);
 
                 self.state = ScramState::WaitingForProof {
                     server_nonce,
-                    _salt: salt,
-                    _iterations: iterations,
                     client_first_bare,
                     server_first: server_first.clone(),
-                    stored_key,
-                    server_key,
+                    stored_key: secret.stored_key,
+                    server_key: secret.server_key,
                 };
 
                 Ok(AuthProgress::Continue(BackendMessage::Authentication(
@@ -364,9 +378,13 @@ impl Authenticator for ScramAuthenticator {
                 );
                 let server_final = format!("v={}", server_sig_b64);
 
-                Ok(AuthProgress::Continue(BackendMessage::Authentication(
-                    AuthenticationMessage::SaslFinal(server_final.into_bytes()),
-                )))
+                // The proof verified. Deliver the SaslFinal server signature and
+                // complete authentication in the same step.
+                Ok(AuthProgress::AuthenticatedWith(
+                    BackendMessage::Authentication(AuthenticationMessage::SaslFinal(
+                        server_final.into_bytes(),
+                    )),
+                ))
             }
         }
     }
@@ -446,14 +464,6 @@ fn generate_nonce() -> String {
     let mut bytes = [0u8; 18];
     rand::rng().fill_bytes(&mut bytes);
     base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes)
-}
-
-/// Generates a random 16-byte salt.
-fn generate_salt() -> Vec<u8> {
-    use rand::Rng;
-    let mut bytes = [0u8; 16];
-    rand::rng().fill_bytes(&mut bytes);
-    bytes.to_vec()
 }
 
 /// Extracts a field value from a SCRAM message (e.g. "r=nonce" -> "nonce").
@@ -735,17 +745,36 @@ impl Authenticator for ComposedAuthenticator {
     ) -> Result<AuthProgress, AuthError> {
         match self.phase {
             ComposedPhase::Password => {
-                match self.password_auth.process_response(user, response)? {
+                let progress = self.password_auth.process_response(user, response)?;
+                match progress {
+                    // The password factor completed with no terminal message,
+                    // so advance to WebAuthn and issue its challenge.
                     AuthProgress::Authenticated => {
-                        // Password phase complete, transition to WebAuthn
                         self.phase = ComposedPhase::WebAuthn;
-                        // Send WebAuthn SASL mechanisms as the next challenge
                         match self.webauthn_auth.initial_message(user) {
                             AuthResult::Challenge(msg) => Ok(AuthProgress::Continue(msg)),
                             AuthResult::Authenticated => Ok(AuthProgress::Authenticated),
                         }
                     }
+                    // The password factor completed with a terminal message
+                    // (the SCRAM SaslFinal server signature). Deliver it to the
+                    // client before the WebAuthn challenge so the SCRAM exchange
+                    // is closed cleanly, then continue with the second factor.
+                    AuthProgress::AuthenticatedWith(deliver) => {
+                        self.phase = ComposedPhase::WebAuthn;
+                        match self.webauthn_auth.initial_message(user) {
+                            AuthResult::Challenge(challenge) => {
+                                Ok(AuthProgress::ContinueAfter { deliver, challenge })
+                            }
+                            AuthResult::Authenticated => {
+                                Ok(AuthProgress::AuthenticatedWith(deliver))
+                            }
+                        }
+                    }
                     AuthProgress::Continue(msg) => Ok(AuthProgress::Continue(msg)),
+                    AuthProgress::ContinueAfter { deliver, challenge } => {
+                        Ok(AuthProgress::ContinueAfter { deliver, challenge })
+                    }
                 }
             }
             ComposedPhase::WebAuthn => self.webauthn_auth.process_response(user, response),
@@ -849,16 +878,35 @@ impl Authenticator for PasswordTotpAuthenticator {
     ) -> Result<AuthProgress, AuthError> {
         match self.phase {
             PasswordTotpPhase::Password => {
-                match self.password_auth.process_response(user, response)? {
+                let progress = self.password_auth.process_response(user, response)?;
+                match progress {
+                    // The password factor completed with no terminal message,
+                    // so advance to TOTP and issue its challenge.
                     AuthProgress::Authenticated => {
-                        // Password phase complete, transition to TOTP
                         self.phase = PasswordTotpPhase::Totp;
                         match self.totp_auth.initial_message(user) {
                             AuthResult::Challenge(msg) => Ok(AuthProgress::Continue(msg)),
                             AuthResult::Authenticated => Ok(AuthProgress::Authenticated),
                         }
                     }
+                    // The password factor completed with a terminal message (the
+                    // SCRAM SaslFinal server signature). Deliver it before the
+                    // TOTP challenge so the SCRAM exchange is closed cleanly.
+                    AuthProgress::AuthenticatedWith(deliver) => {
+                        self.phase = PasswordTotpPhase::Totp;
+                        match self.totp_auth.initial_message(user) {
+                            AuthResult::Challenge(challenge) => {
+                                Ok(AuthProgress::ContinueAfter { deliver, challenge })
+                            }
+                            AuthResult::Authenticated => {
+                                Ok(AuthProgress::AuthenticatedWith(deliver))
+                            }
+                        }
+                    }
                     AuthProgress::Continue(msg) => Ok(AuthProgress::Continue(msg)),
+                    AuthProgress::ContinueAfter { deliver, challenge } => {
+                        Ok(AuthProgress::ContinueAfter { deliver, challenge })
+                    }
                 }
             }
             PasswordTotpPhase::Totp => self.totp_auth.process_response(user, response),
@@ -1052,29 +1100,16 @@ mod tests {
     }
 
     #[test]
-    fn test_cleartext_authenticator_success() {
-        let mut passwords = HashMap::new();
-        passwords.insert("alice".into(), "secret123".into());
-        let mut auth = CleartextAuthenticator::new(passwords);
-
+    fn test_cleartext_authenticator_challenge() {
+        let mut auth = CleartextAuthenticator::new(HashMap::new());
         match auth.initial_message("alice") {
-            AuthResult::Challenge(_) => {}
-            _ => panic!("Should send challenge"),
+            AuthResult::Challenge(BackendMessage::Authentication(
+                AuthenticationMessage::CleartextPassword,
+            )) => {}
+            _ => panic!("Should send cleartext challenge"),
         }
-
-        let result = auth
-            .process_response("alice", &PasswordMessage::Cleartext("secret123".into()))
-            .unwrap();
-        assert!(matches!(result, AuthProgress::Authenticated));
-    }
-
-    #[test]
-    fn test_cleartext_authenticator_wrong_password() {
-        let mut passwords = HashMap::new();
-        passwords.insert("alice".into(), "secret123".into());
-        let mut auth = CleartextAuthenticator::new(passwords);
-
-        let result = auth.process_response("alice", &PasswordMessage::Cleartext("wrong".into()));
+        // No stored hash for the user, so any response fails.
+        let result = auth.process_response("alice", &PasswordMessage::Cleartext("any".into()));
         assert!(result.is_err());
     }
 
@@ -1087,50 +1122,25 @@ mod tests {
     }
 
     #[test]
-    fn test_md5_authenticator() {
-        let mut passwords = HashMap::new();
-        passwords.insert("alice".into(), "secret123".into());
+    fn test_md5_authenticator_challenge() {
         let salt = [0x01, 0x02, 0x03, 0x04];
-        let mut auth = Md5Authenticator::with_salt(passwords.clone(), salt);
-
+        let auth = Md5Authenticator::with_salt(HashMap::new(), salt);
         match auth.initial_message("alice") {
-            AuthResult::Challenge(msg) => match msg {
-                BackendMessage::Authentication(AuthenticationMessage::Md5Password { salt: s }) => {
-                    assert_eq!(s, salt);
-                }
-                _ => panic!("Expected MD5 challenge"),
-            },
-            _ => panic!("Should send challenge"),
+            AuthResult::Challenge(BackendMessage::Authentication(
+                AuthenticationMessage::Md5Password { salt: s },
+            )) => {
+                assert_eq!(s, salt);
+            }
+            _ => panic!("Expected MD5 challenge"),
         }
-
-        // Compute expected hash
-        let expected = compute_md5_password("alice", "secret123", &salt);
-        let result = auth
-            .process_response("alice", &PasswordMessage::Cleartext(expected))
-            .unwrap();
-        assert!(matches!(result, AuthProgress::Authenticated));
     }
 
     #[test]
-    fn test_md5_wrong_password() {
-        let mut passwords = HashMap::new();
-        passwords.insert("alice".into(), "secret123".into());
-        let salt = [0x01, 0x02, 0x03, 0x04];
-        let mut auth = Md5Authenticator::with_salt(passwords, salt);
-
-        let result = auth.process_response(
-            "alice",
-            &PasswordMessage::Cleartext("md5ffffffffffffffffffffffffffffffff".into()),
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_compute_md5_password() {
-        // Verify against known PostgreSQL md5 password behavior
-        let hash = compute_md5_password("user", "pass", &[0, 0, 0, 0]);
-        assert!(hash.starts_with("md5"));
-        assert_eq!(hash.len(), 35); // "md5" + 32 hex chars
+    fn test_compute_md5_response_shape() {
+        let inner = zyron_auth::md5_password_credential("user", "pass");
+        let response = compute_md5_response(&inner, &[0, 0, 0, 0]);
+        assert!(response.starts_with("md5"));
+        assert_eq!(response.len(), 35); // "md5" + 32 hex chars
     }
 
     #[test]
@@ -1177,9 +1187,184 @@ mod tests {
         assert!(!n1.is_empty());
     }
 
+    // -----------------------------------------------------------------------
+    // SCRAM-SHA-256 client side for round-trip tests
+    // -----------------------------------------------------------------------
+
+    /// Runs the SCRAM-SHA-256 client computation for a known password against
+    /// the server-first message, producing the client-final message. Mirrors a
+    /// conforming libpq client.
+    fn scram_client_final(password: &str, client_first_bare: &str, server_first: &str) -> String {
+        let server_nonce = extract_field(server_first, "r=").expect("server nonce");
+        let salt_b64 = extract_field(server_first, "s=").expect("salt");
+        let iterations: u32 = extract_field(server_first, "i=")
+            .expect("iterations")
+            .parse()
+            .expect("iteration count");
+        let salt = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &salt_b64)
+            .expect("decode salt");
+
+        let salted_password = pbkdf2_sha256(password.as_bytes(), &salt, iterations);
+        let client_key = hmac_sha256(&salted_password, b"Client Key");
+        let stored_key = sha256(&client_key);
+
+        let channel_binding =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"n,,");
+        let client_final_without_proof = format!("c={},r={}", channel_binding, server_nonce);
+        let auth_message = format!(
+            "{},{},{}",
+            client_first_bare, server_first, client_final_without_proof
+        );
+
+        let client_signature = hmac_sha256(&stored_key, auth_message.as_bytes());
+        let mut proof = [0u8; 32];
+        for i in 0..32 {
+            proof[i] = client_key[i] ^ client_signature[i];
+        }
+        let proof_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, proof);
+        format!("{},p={}", client_final_without_proof, proof_b64)
+    }
+
     #[test]
-    fn test_generate_salt_length() {
-        let salt = generate_salt();
-        assert_eq!(salt.len(), 16);
+    fn test_cleartext_authenticator_balloon_success() {
+        let params = zyron_auth::BalloonParams::test();
+        let hash = zyron_auth::PasswordCredential::from_plaintext_with_params("secret123", &params)
+            .unwrap()
+            .as_stored()
+            .to_string();
+        let mut hashes = HashMap::new();
+        hashes.insert("alice".to_string(), hash);
+        let mut auth = CleartextAuthenticator::new(hashes);
+
+        let result = auth
+            .process_response("alice", &PasswordMessage::Cleartext("secret123".into()))
+            .unwrap();
+        assert!(matches!(result, AuthProgress::Authenticated));
+    }
+
+    #[test]
+    fn test_cleartext_authenticator_balloon_wrong_password() {
+        let params = zyron_auth::BalloonParams::test();
+        let hash = zyron_auth::PasswordCredential::from_plaintext_with_params("secret123", &params)
+            .unwrap()
+            .as_stored()
+            .to_string();
+        let mut hashes = HashMap::new();
+        hashes.insert("alice".to_string(), hash);
+        let mut auth = CleartextAuthenticator::new(hashes);
+
+        let result = auth.process_response("alice", &PasswordMessage::Cleartext("wrong".into()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_scram_full_round_trip_success() {
+        let secret = zyron_auth::scram_sha256_secret("hunter2");
+        let mut secrets = HashMap::new();
+        secrets.insert("alice".to_string(), secret);
+        let mut auth = ScramAuthenticator::new(secrets);
+
+        let client_first_bare = "n=alice,r=clientnonce123";
+        let client_first = format!("n,,{}", client_first_bare);
+        let cont = auth
+            .process_response(
+                "alice",
+                &PasswordMessage::SaslInitial {
+                    mechanism: "SCRAM-SHA-256".into(),
+                    data: client_first.into_bytes(),
+                },
+            )
+            .unwrap();
+        let server_first = match cont {
+            AuthProgress::Continue(BackendMessage::Authentication(
+                AuthenticationMessage::SaslContinue(bytes),
+            )) => String::from_utf8(bytes).unwrap(),
+            _ => panic!("Expected SaslContinue server-first"),
+        };
+
+        let client_final = scram_client_final("hunter2", client_first_bare, &server_first);
+        let result = auth
+            .process_response(
+                "alice",
+                &PasswordMessage::SaslResponse(client_final.into_bytes()),
+            )
+            .unwrap();
+
+        // A correct proof must complete with the SaslFinal server signature.
+        match result {
+            AuthProgress::AuthenticatedWith(BackendMessage::Authentication(
+                AuthenticationMessage::SaslFinal(bytes),
+            )) => {
+                let server_final = String::from_utf8(bytes).unwrap();
+                assert!(server_final.starts_with("v="));
+            }
+            _ => panic!("Expected AuthenticatedWith(SaslFinal)"),
+        }
+    }
+
+    #[test]
+    fn test_scram_round_trip_wrong_password_fails() {
+        let secret = zyron_auth::scram_sha256_secret("hunter2");
+        let mut secrets = HashMap::new();
+        secrets.insert("alice".to_string(), secret);
+        let mut auth = ScramAuthenticator::new(secrets);
+
+        let client_first_bare = "n=alice,r=clientnonce123";
+        let client_first = format!("n,,{}", client_first_bare);
+        let cont = auth
+            .process_response(
+                "alice",
+                &PasswordMessage::SaslInitial {
+                    mechanism: "SCRAM-SHA-256".into(),
+                    data: client_first.into_bytes(),
+                },
+            )
+            .unwrap();
+        let server_first = match cont {
+            AuthProgress::Continue(BackendMessage::Authentication(
+                AuthenticationMessage::SaslContinue(bytes),
+            )) => String::from_utf8(bytes).unwrap(),
+            _ => panic!("Expected SaslContinue server-first"),
+        };
+
+        // Client computes its proof from the wrong password.
+        let client_final = scram_client_final("wrongpass", client_first_bare, &server_first);
+        let result = auth.process_response(
+            "alice",
+            &PasswordMessage::SaslResponse(client_final.into_bytes()),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_md5_round_trip_with_stored_credential() {
+        // The stored credential is md5(password + username), as derived at set
+        // time by zyron_auth::md5_password_credential.
+        let inner = zyron_auth::md5_password_credential("alice", "secret123");
+        let mut creds = HashMap::new();
+        creds.insert("alice".to_string(), inner.clone());
+        let salt = [0x01, 0x02, 0x03, 0x04];
+        let mut auth = Md5Authenticator::with_salt(creds, salt);
+
+        let expected = compute_md5_response(&inner, &salt);
+        let result = auth
+            .process_response("alice", &PasswordMessage::Cleartext(expected))
+            .unwrap();
+        assert!(matches!(result, AuthProgress::Authenticated));
+    }
+
+    #[test]
+    fn test_md5_round_trip_wrong_password_fails() {
+        let inner = zyron_auth::md5_password_credential("alice", "secret123");
+        let mut creds = HashMap::new();
+        creds.insert("alice".to_string(), inner);
+        let salt = [0x01, 0x02, 0x03, 0x04];
+        let mut auth = Md5Authenticator::with_salt(creds, salt);
+
+        // Response derived from a different password must fail.
+        let wrong_inner = zyron_auth::md5_password_credential("alice", "wrongpass");
+        let wrong = compute_md5_response(&wrong_inner, &salt);
+        let result = auth.process_response("alice", &PasswordMessage::Cleartext(wrong));
+        assert!(result.is_err());
     }
 }

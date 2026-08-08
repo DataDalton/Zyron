@@ -79,6 +79,32 @@ impl IntentLockTable {
         }
     }
 
+    /// Returns the number of intent locks the transaction currently holds.
+    /// Captured at SAVEPOINT so a later ROLLBACK TO SAVEPOINT releases only the
+    /// keys locked after the savepoint.
+    pub fn current_count(&self, txn_id: u64) -> usize {
+        self.txn_locks
+            .read_sync(&txn_id, |_, keys| keys.len())
+            .unwrap_or(0)
+    }
+
+    /// Releases the intent locks the transaction acquired after `keep`. The
+    /// per-txn key list is in acquisition order, so entries beyond index `keep`
+    /// were locked after the savepoint that recorded that count.
+    pub fn unlock_after(&self, txn_id: u64, keep: usize) {
+        if self.txn_locks.is_empty() {
+            return;
+        }
+        self.txn_locks.update_sync(&txn_id, |_, keys| {
+            if keep >= keys.len() {
+                return;
+            }
+            for key in keys.drain(keep..) {
+                let _ = self.locks.remove_sync(&key);
+            }
+        });
+    }
+
     /// Returns the txn_id holding the intent lock on a key, if any.
     pub fn is_locked_by(&self, table_id: u32, key: &[u8]) -> Option<u64> {
         let hash = Self::hash_key(table_id, key);

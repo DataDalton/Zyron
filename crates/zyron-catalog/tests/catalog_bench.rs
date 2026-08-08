@@ -40,7 +40,7 @@ use zyron_catalog::storage::{CatalogStorage, HeapCatalogStorage};
 use zyron_catalog::*;
 use zyron_common::TypeId;
 use zyron_parser::ast::{
-    ColumnConstraint, ColumnDef, DataType, Expr, LiteralValue, TableConstraint,
+    ColumnConstraint, ColumnDef, DataType, Expr, LiteralValue, TableConstraint, TableConstraintKind,
 };
 use zyron_storage::{DiskManager, DiskManagerConfig, HeapFile, HeapFileConfig, Tuple};
 use zyron_wal::{WalWriter, WalWriterConfig};
@@ -816,10 +816,10 @@ async fn test_constraints() {
             constraints: vec![],
         },
     ];
-    let composite_constraints = vec![TableConstraint::PrimaryKey(vec![
-        "a".to_string(),
-        "b".to_string(),
-    ])];
+    let composite_constraints = vec![TableConstraint {
+        name: None,
+        kind: TableConstraintKind::PrimaryKey(vec!["a".to_string(), "b".to_string()]),
+    }];
     let cpk_table_id = catalog
         .create_table(
             test_schema_id,

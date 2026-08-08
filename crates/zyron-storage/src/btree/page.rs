@@ -929,6 +929,24 @@ impl BTreeInternalPage {
         Ok(())
     }
 
+    /// Replaces the separator key at entry index `idx`, keeping its child
+    /// pointer. Used after a borrow shifts the boundary between two children.
+    /// Rewrites the entry region in place; the leftmost child is untouched.
+    pub fn set_separator_key(&mut self, idx: usize, new_key: Bytes) {
+        let mut entries = self.entries();
+        entries[idx].key = new_key;
+        let _ = self.write_entries(&entries);
+    }
+
+    /// Removes entry `idx` (a separator and its right child pointer) from this
+    /// node. The leftmost child pointer is untouched, so the child at slot
+    /// `idx+1` is dropped from routing (callers merge that child away first).
+    pub fn remove_entry(&mut self, idx: usize) {
+        let mut entries = self.entries();
+        entries.remove(idx);
+        let _ = self.write_entries(&entries);
+    }
+
     /// Writes entries to the page using write_to_slice (no BytesMut alloc).
     fn write_entries(&mut self, entries: &[InternalEntry]) -> Result<()> {
         let mut header = self.internal_header();

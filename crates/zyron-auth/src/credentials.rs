@@ -50,6 +50,141 @@ impl PasswordCredential {
 }
 
 // ---------------------------------------------------------------------------
+// SCRAM-SHA-256 verifier derivation
+// ---------------------------------------------------------------------------
+
+/// Iteration count for the SCRAM-SHA-256 PBKDF2 derivation. Matches the
+/// PostgreSQL default and the RFC 7677 minimum recommendation.
+pub const SCRAM_SHA_256_ITERATIONS: u32 = 4096;
+
+/// Derives a PostgreSQL-format SCRAM-SHA-256 secret from a plaintext password
+/// using a fresh random 16-byte salt.
+///
+/// Format: SCRAM-SHA-256$<iterations>:<base64 salt>$<base64 StoredKey>:<base64 ServerKey>
+pub fn scram_sha256_secret(password: &str) -> String {
+    use rand::Rng;
+    let mut salt = [0u8; 16];
+    rand::rng().fill_bytes(&mut salt);
+    scram_sha256_secret_with_salt(password, &salt, SCRAM_SHA_256_ITERATIONS)
+}
+
+/// Derives a SCRAM-SHA-256 secret with an explicit salt and iteration count.
+pub fn scram_sha256_secret_with_salt(password: &str, salt: &[u8], iterations: u32) -> String {
+    let salted_password = pbkdf2_sha256(password.as_bytes(), salt, iterations);
+    let client_key = hmac_sha256(&salted_password, b"Client Key");
+    let stored_key = sha256_hash(&client_key);
+    let server_key = hmac_sha256(&salted_password, b"Server Key");
+
+    use base64::Engine;
+    let std_b64 = base64::engine::general_purpose::STANDARD;
+    format!(
+        "SCRAM-SHA-256${}:{}${}:{}",
+        iterations,
+        std_b64.encode(salt),
+        std_b64.encode(stored_key),
+        std_b64.encode(server_key),
+    )
+}
+
+/// Parsed components of a PostgreSQL SCRAM-SHA-256 secret.
+pub struct ScramSecret {
+    pub iterations: u32,
+    pub salt: Vec<u8>,
+    pub stored_key: [u8; 32],
+    pub server_key: [u8; 32],
+}
+
+/// Parses a stored SCRAM-SHA-256 secret string into its components.
+pub fn parse_scram_secret(secret: &str) -> Result<ScramSecret> {
+    let body = secret.strip_prefix("SCRAM-SHA-256$").ok_or_else(|| {
+        ZyronError::InvalidCredential("SCRAM secret missing SCRAM-SHA-256 prefix".to_string())
+    })?;
+    let (iter_salt, keys) = body.split_once('$').ok_or_else(|| {
+        ZyronError::InvalidCredential("SCRAM secret missing key section".to_string())
+    })?;
+    let (iter_str, salt_b64) = iter_salt
+        .split_once(':')
+        .ok_or_else(|| ZyronError::InvalidCredential("SCRAM secret missing salt".to_string()))?;
+    let (stored_b64, server_b64) = keys.split_once(':').ok_or_else(|| {
+        ZyronError::InvalidCredential("SCRAM secret missing server key".to_string())
+    })?;
+
+    let iterations = iter_str.parse::<u32>().map_err(|_| {
+        ZyronError::InvalidCredential("SCRAM secret invalid iteration count".to_string())
+    })?;
+
+    use base64::Engine;
+    let std_b64 = base64::engine::general_purpose::STANDARD;
+    let salt = std_b64.decode(salt_b64).map_err(|_| {
+        ZyronError::InvalidCredential("SCRAM secret invalid salt base64".to_string())
+    })?;
+    let stored_vec = std_b64.decode(stored_b64).map_err(|_| {
+        ZyronError::InvalidCredential("SCRAM secret invalid stored key base64".to_string())
+    })?;
+    let server_vec = std_b64.decode(server_b64).map_err(|_| {
+        ZyronError::InvalidCredential("SCRAM secret invalid server key base64".to_string())
+    })?;
+    if stored_vec.len() != 32 || server_vec.len() != 32 {
+        return Err(ZyronError::InvalidCredential(
+            "SCRAM secret keys must be 32 bytes".to_string(),
+        ));
+    }
+    let mut stored_key = [0u8; 32];
+    stored_key.copy_from_slice(&stored_vec);
+    let mut server_key = [0u8; 32];
+    server_key.copy_from_slice(&server_vec);
+
+    Ok(ScramSecret {
+        iterations,
+        salt,
+        stored_key,
+        server_key,
+    })
+}
+
+/// Derives the MD5 credential value md5(password + username) as 32 lowercase
+/// hex chars. The wire MD5 flow validates md5(this + salt) against the client
+/// response, so the stored value omits the per-connection salt.
+pub fn md5_password_credential(user: &str, password: &str) -> String {
+    use md5::{Digest, Md5};
+    let mut hasher = Md5::new();
+    hasher.update(password.as_bytes());
+    hasher.update(user.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// PBKDF2-HMAC-SHA-256 single block derivation.
+fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
+    let mut result = [0u8; 32];
+    let mut mac = Hmac::<Sha256>::new_from_slice(password).expect("HMAC accepts any key length");
+    mac.update(salt);
+    mac.update(&1u32.to_be_bytes());
+    let u1 = mac.finalize().into_bytes();
+    result.copy_from_slice(&u1);
+    let mut prev = u1;
+    for _ in 1..iterations {
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(password).expect("HMAC accepts any key length");
+        mac.update(&prev);
+        let ui = mac.finalize().into_bytes();
+        for j in 0..32 {
+            result[j] ^= ui[j];
+        }
+        prev = ui;
+    }
+    result
+}
+
+/// HMAC-SHA-256 returning a fixed 32-byte array.
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(data);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&mac.finalize().into_bytes());
+    out
+}
+
+// ---------------------------------------------------------------------------
 // ApiKeyCredential
 // ---------------------------------------------------------------------------
 
@@ -1055,6 +1190,46 @@ mod tests {
         let stored = cred.as_stored().to_string();
         let restored = PasswordCredential::from_stored(stored);
         assert!(restored.verify("mypass").expect("verify failed"));
+    }
+
+    #[test]
+    fn test_scram_secret_format_and_parse() {
+        let secret = scram_sha256_secret("hunter2");
+        assert!(secret.starts_with("SCRAM-SHA-256$4096:"));
+        let parsed = parse_scram_secret(&secret).expect("parse");
+        assert_eq!(parsed.iterations, 4096);
+        assert_eq!(parsed.salt.len(), 16);
+        assert_eq!(parsed.stored_key.len(), 32);
+        assert_eq!(parsed.server_key.len(), 32);
+    }
+
+    #[test]
+    fn test_scram_secret_deterministic_with_salt() {
+        let salt = [0x11u8; 16];
+        let a = scram_sha256_secret_with_salt("pw", &salt, 4096);
+        let b = scram_sha256_secret_with_salt("pw", &salt, 4096);
+        assert_eq!(a, b);
+        let c = scram_sha256_secret_with_salt("other", &salt, 4096);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_parse_scram_secret_rejects_garbage() {
+        assert!(parse_scram_secret("not-a-secret").is_err());
+        assert!(parse_scram_secret("SCRAM-SHA-256$4096:").is_err());
+    }
+
+    #[test]
+    fn test_md5_credential_known_vector() {
+        // md5("passuser") = the inner PostgreSQL value for password "pass",
+        // user "user".
+        let inner = md5_password_credential("user", "pass");
+        assert_eq!(inner.len(), 32);
+        assert!(inner.chars().all(|c| c.is_ascii_hexdigit()));
+        // Deterministic and dependent on both inputs.
+        assert_eq!(inner, md5_password_credential("user", "pass"));
+        assert_ne!(inner, md5_password_credential("user", "other"));
+        assert_ne!(inner, md5_password_credential("other", "pass"));
     }
 
     #[test]

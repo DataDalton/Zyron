@@ -62,7 +62,7 @@ impl Operator for LimitOperator {
 
                     // Apply limit to the sliced batch.
                     if let Some(limit) = self.limit {
-                        let remaining_limit = (limit - self.rows_emitted) as usize;
+                        let remaining_limit = limit.saturating_sub(self.rows_emitted) as usize;
                         if result_batch.num_rows > remaining_limit {
                             result_batch = result_batch.slice(0, remaining_limit);
                             result_ids = result_ids.map(|ids| ids[..remaining_limit].to_vec());
@@ -81,7 +81,7 @@ impl Operator for LimitOperator {
                 let mut result_ids = exec_batch.tuple_ids;
 
                 if let Some(limit) = self.limit {
-                    let remaining_limit = (limit - self.rows_emitted) as usize;
+                    let remaining_limit = limit.saturating_sub(self.rows_emitted) as usize;
                     if result_batch.num_rows > remaining_limit {
                         result_batch = result_batch.slice(0, remaining_limit);
                         result_ids = result_ids.map(|ids| ids[..remaining_limit].to_vec());

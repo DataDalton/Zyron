@@ -169,16 +169,18 @@ fn two_person_gate(
     )))
 }
 
-/// Identity column names that link a row to a data subject. Used by GDPR
+/// Identity column names that name the row's data subject. Used by GDPR
 /// erasure and DSAR export to discover which tables hold a subject's data.
+/// Authored-by columns (created_by, owner_id, updated_by) are deliberately
+/// excluded: a row a subject authored is not a row about the subject, and
+/// erasing on them would delete other subjects' records the subject merely
+/// touched.
 const IDENTITY_COLUMNS: &[&str] = &[
     "user_id",
     "userid",
     "customer_id",
     "account_id",
     "subject_id",
-    "owner_id",
-    "created_by",
     "email",
 ];
 
@@ -415,14 +417,22 @@ pub async fn handle_alter_table_options(
         match k.to_ascii_lowercase().as_str() {
             "soft_delete" => entry.lifecycle.soft_delete_enabled = v == "true",
             "soft_delete_column" => {
-                if let Some(id) = column_id(&entry, v) {
-                    entry.lifecycle.soft_delete_is_deleted_col_id = id;
-                }
+                let id = column_id(&entry, v).ok_or_else(|| {
+                    ProtocolError::Database(ZyronError::Internal(format!(
+                        "soft_delete_column '{v}' not found on '{}'",
+                        stmt.table
+                    )))
+                })?;
+                entry.lifecycle.soft_delete_is_deleted_col_id = id;
             }
             "soft_delete_timestamp" | "soft_delete_timestamp_column" => {
-                if let Some(id) = column_id(&entry, v) {
-                    entry.lifecycle.soft_delete_deleted_at_col_id = id;
-                }
+                let id = column_id(&entry, v).ok_or_else(|| {
+                    ProtocolError::Database(ZyronError::Internal(format!(
+                        "soft_delete_timestamp column '{v}' not found on '{}'",
+                        stmt.table
+                    )))
+                })?;
+                entry.lifecycle.soft_delete_deleted_at_col_id = id;
             }
             "cold_after" => entry.lifecycle.cold_after_seconds = parse_duration_secs(v),
             "archive_after" | "purge_after_soft_delete" => {
@@ -442,7 +452,21 @@ pub async fn handle_alter_table_options(
             "time_travel_retention" | "time_travel_retention_period" => {
                 entry.time_travel_retention_secs = parse_time_travel_retention(v)?;
             }
-            _ => {}
+            // compliance_profile is expanded into its component options in the
+            // pass above, so the profile key itself is a recognized no-op here.
+            "compliance_profile" => {}
+            // Keys emitted by compliance-profile presets that are enforced by
+            // other subsystems. audit is always-on compliance logging (every
+            // lifecycle op writes a compliance entry); classification is applied
+            // through ALTER COLUMN classification. Recognized here so a preset
+            // does not trip the unknown-key error.
+            "audit" | "classification" => {}
+            other => {
+                return Err(ProtocolError::Database(ZyronError::Internal(format!(
+                    "unknown table option '{other}' on '{}'",
+                    stmt.table
+                ))));
+            }
         }
     }
     let tid = entry.id.0;
@@ -647,21 +671,20 @@ pub async fn handle_forget_user(
         total_rows += deleted;
         tables_touched += 1;
         // System-versioned history scrub so erased data does not survive
-        // time-travel.
+        // time-travel. A failure here leaves PII in history, so propagate it
+        // rather than reporting a successful erasure.
         if t.history_table_id != 0 {
-            if let Ok(hist) = server
+            let hist = server
                 .catalog
                 .get_table_by_id(zyron_catalog::TableId(t.history_table_id))
-            {
-                if hist.columns.iter().any(|c| c.name == t.id_column) {
-                    let h_sql = format!(
-                        "DELETE FROM \"{}\" WHERE \"{}\" = {} HARD",
-                        hist.name, t.id_column, subject
-                    );
-                    if let Ok((hn, _)) = run_sql(server, &h_sql, true).await {
-                        total_rows += hn;
-                    }
-                }
+                .map_err(ProtocolError::Database)?;
+            if hist.columns.iter().any(|c| c.name == t.id_column) {
+                let h_sql = format!(
+                    "DELETE FROM \"{}\" WHERE \"{}\" = {} HARD",
+                    hist.name, t.id_column, subject
+                );
+                let (hn, _) = run_sql(server, &h_sql, true).await?;
+                total_rows += hn;
             }
         }
     }
@@ -761,44 +784,17 @@ pub async fn handle_alter_table_move(
         zyron_auth::PrivilegeType::ManageDataLifecycle,
         table.id.0,
     )?;
-    let tier = zyron_lifecycle::tiered_storage::StorageTier::parse(&stmt.tier)
+    // Validate the requested tier name so a typo is rejected with a clear
+    // message rather than the unsupported-operation error below.
+    let _tier = zyron_lifecycle::tiered_storage::StorageTier::parse(&stmt.tier)
         .map_err(ProtocolError::Database)?;
-    let mut entry = (*table).clone();
-    entry.lifecycle.storage_tier = tier as u8;
-    let tid = entry.id.0;
-    if stmt.dry_run {
-        audit(server, 7, &stmt.table, tid, "move tier (dry run)").await?;
-        return Ok(DdlResult::Tag("ALTER TABLE (DRY RUN)".to_string()));
-    }
-    server
-        .catalog
-        .update_table(entry)
-        .await
-        .map_err(ProtocolError::Database)?;
-    server
-        .catalog
-        .store_retention_job(&zyron_catalog::schema::RetentionJobEntry {
-            job_id: now_micros() as u64,
-            table_id: tid,
-            kind: 1,
-            scheduled_at: now_micros(),
-            started_at: now_micros(),
-            finished_at: now_micros(),
-            rows_affected: 0,
-            status: 2,
-            detail: format!("move to tier {}", stmt.tier),
-        })
-        .await
-        .map_err(ProtocolError::Database)?;
-    audit(
-        server,
-        7,
-        &stmt.table,
-        tid,
-        &format!("move tier {}", stmt.tier),
-    )
-    .await?;
-    Ok(DdlResult::Tag("ALTER TABLE".to_string()))
+    // No storage or executor path relocates rows between tiers. Writing
+    // storage_tier and recording a done retention job would report a move that
+    // never happened, so reject the operation instead of faking completion.
+    Err(ProtocolError::Database(ZyronError::PlanError(format!(
+        "ALTER TABLE MOVE to tier '{}' is not available, tiered storage relocation is not implemented",
+        stmt.tier
+    ))))
 }
 
 pub async fn handle_alter_column_classification(

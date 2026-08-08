@@ -1037,6 +1037,8 @@ fn test_stream_and_ingest_management() {
             primary_key_columns: vec!["id".into()],
             on_conflict: OnConflict::Update,
             dead_letter_table_id: None,
+            decoder: DecoderPlugin::Debezium,
+            avro_writer_schema: None,
             batch_size: 1000,
             active: true,
         })

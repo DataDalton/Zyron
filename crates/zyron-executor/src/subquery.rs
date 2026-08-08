@@ -338,10 +338,7 @@ async fn materialize_scalar(
             value: LiteralValue::Null,
             type_id,
         }),
-        1 => Ok(BoundExpr::Literal {
-            value: scalar_to_literal(&values[0])?,
-            type_id,
-        }),
+        1 => scalar_to_bound_expr(&values[0], type_id),
         n => Err(ZyronError::ExecutionError(format!(
             "scalar subquery returned {n} rows, expected at most one"
         ))),
@@ -373,16 +370,14 @@ async fn materialize_in(
     let values = run_first_column(plan, ctx).await?;
     let mut list = Vec::with_capacity(values.len());
     for v in &values {
-        let lit = scalar_to_literal(v)?;
-        let type_id = if matches!(lit, LiteralValue::Null) {
+        // NULL list elements stay typed Null; every other element is typed as
+        // the probe so the IN comparison matches the probe's column type.
+        let type_id = if matches!(v, ScalarValue::Null) {
             TypeId::Null
         } else {
             probe_type
         };
-        list.push(BoundExpr::Literal {
-            value: lit,
-            type_id,
-        });
+        list.push(scalar_to_bound_expr(v, type_id)?);
     }
     Ok(BoundExpr::InList {
         expr: Box::new(probe),
@@ -391,31 +386,55 @@ async fn materialize_in(
     })
 }
 
-/// Maps a scalar value to a parser literal so it can be spliced into the bound
-/// expression tree. Types with no literal representation raise an explicit
-/// error rather than substituting a wrong value.
-fn scalar_to_literal(s: &ScalarValue) -> Result<LiteralValue> {
+/// Maps a scalar value to a bound expression so it can be spliced into the
+/// bound expression tree. Types with a direct parser-literal carrier produce a
+/// `Literal`; 128-bit integers, full-width unsigned values, and binary values
+/// that exceed the literal carriers are spliced as a `Cast` over their exact
+/// text form so the substituted constant carries the real value.
+fn scalar_to_bound_expr(s: &ScalarValue, type_id: TypeId) -> Result<BoundExpr> {
+    let lit = |value: LiteralValue| BoundExpr::Literal { value, type_id };
     Ok(match s {
-        ScalarValue::Null => LiteralValue::Null,
-        ScalarValue::Boolean(b) => LiteralValue::Boolean(*b),
-        ScalarValue::Int8(v) => LiteralValue::Integer(*v as i64),
-        ScalarValue::Int16(v) => LiteralValue::Integer(*v as i64),
-        ScalarValue::Int32(v) => LiteralValue::Integer(*v as i64),
-        ScalarValue::Int64(v) => LiteralValue::Integer(*v),
-        ScalarValue::UInt8(v) => LiteralValue::Integer(*v as i64),
-        ScalarValue::UInt16(v) => LiteralValue::Integer(*v as i64),
-        ScalarValue::UInt32(v) => LiteralValue::Integer(*v as i64),
-        ScalarValue::Float32(v) => LiteralValue::Float(*v as f64),
-        ScalarValue::Float64(v) => LiteralValue::Float(*v),
-        ScalarValue::Utf8(v) => LiteralValue::String(v.clone()),
-        ScalarValue::Interval(i) => LiteralValue::Interval(*i),
-        ScalarValue::Int128(_)
-        | ScalarValue::UInt64(_)
-        | ScalarValue::Binary(_)
-        | ScalarValue::FixedBinary16(_) => {
-            return Err(ZyronError::ExecutionError(
-                "subquery result type is not representable as a literal for substitution".into(),
-            ));
-        }
+        ScalarValue::Null => lit(LiteralValue::Null),
+        ScalarValue::Boolean(b) => lit(LiteralValue::Boolean(*b)),
+        ScalarValue::Int8(v) => lit(LiteralValue::Integer(*v as i64)),
+        ScalarValue::Int16(v) => lit(LiteralValue::Integer(*v as i64)),
+        ScalarValue::Int32(v) => lit(LiteralValue::Integer(*v as i64)),
+        ScalarValue::Int64(v) => lit(LiteralValue::Integer(*v)),
+        ScalarValue::UInt8(v) => lit(LiteralValue::Integer(*v as i64)),
+        ScalarValue::UInt16(v) => lit(LiteralValue::Integer(*v as i64)),
+        ScalarValue::UInt32(v) => lit(LiteralValue::Integer(*v as i64)),
+        ScalarValue::Float32(v) => lit(LiteralValue::Float(*v as f64)),
+        ScalarValue::Float64(v) => lit(LiteralValue::Float(*v)),
+        ScalarValue::Utf8(v) => lit(LiteralValue::String(v.clone())),
+        ScalarValue::Interval(i) => lit(LiteralValue::Interval(*i)),
+        // Values whose magnitude or representation exceeds an i64 literal are
+        // carried as their exact text and cast back to the column type. The
+        // cast path parses decimal text for 128-bit/unsigned and hex for binary.
+        ScalarValue::Int128(v) => cast_text_to(v.to_string(), TypeId::Int128),
+        ScalarValue::UInt64(v) => cast_text_to(v.to_string(), TypeId::UInt64),
+        ScalarValue::Binary(b) => cast_text_to(encode_hex(b), TypeId::Bytea),
+        ScalarValue::FixedBinary16(b) => cast_text_to(encode_hex(b), TypeId::Uuid),
     })
+}
+
+/// Builds a `Cast` of a string literal to the target type so a value with no
+/// direct literal carrier round-trips through the cast path at evaluation time.
+fn cast_text_to(text: String, target: TypeId) -> BoundExpr {
+    BoundExpr::Cast {
+        expr: Box::new(BoundExpr::Literal {
+            value: LiteralValue::String(text),
+            type_id: TypeId::Text,
+        }),
+        target_type: target,
+    }
+}
+
+/// Encodes bytes as lowercase hex so the cast path can decode them back.
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0'));
+        s.push(char::from_digit((b & 0x0f) as u32, 16).unwrap_or('0'));
+    }
+    s
 }

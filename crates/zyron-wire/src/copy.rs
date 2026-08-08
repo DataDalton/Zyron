@@ -59,6 +59,21 @@ impl CopyOutHandler {
         }
     }
 
+    /// Returns a CopyData message carrying the CSV column-name header line.
+    /// Only valid for CSV output. The names are CSV-escaped and delimited the
+    /// same way data rows are.
+    pub fn csv_header_message(&self) -> BackendMessage {
+        let mut line = BytesMut::with_capacity(64);
+        for (col_idx, column) in self.columns.iter().enumerate() {
+            if col_idx > 0 {
+                line.extend_from_slice(&[self.delimiter]);
+            }
+            csv_escape(&mut line, column.name.as_bytes());
+        }
+        line.extend_from_slice(b"\n");
+        BackendMessage::CopyData(line.to_vec())
+    }
+
     /// Converts a DataBatch to CopyData messages.
     /// For text/CSV: reuses a single BytesMut buffer, writes scalars with escaping.
     /// For binary: PostgreSQL binary COPY format (header + rows + trailer).
@@ -119,7 +134,7 @@ impl CopyOutHandler {
                 let scalar = column.get_scalar(row);
                 scalar_buf.clear();
 
-                if !types::scalar_write_text(&scalar, &mut scalar_buf) {
+                if !types::scalar_write_binary(&scalar, &mut scalar_buf) {
                     // NULL: length = -1
                     buf.extend_from_slice(&(-1i32).to_be_bytes());
                 } else {
@@ -156,6 +171,10 @@ pub struct CopyInHandler {
     buffer: Vec<u8>,
     /// Accumulated rows for the current batch.
     rows: Vec<Vec<Option<Vec<u8>>>>,
+    /// Set once the PostgreSQL binary COPY header has been consumed.
+    binary_header_seen: bool,
+    /// Set once the binary COPY trailer (-1 field count) has been read.
+    binary_trailer_seen: bool,
 }
 
 impl CopyInHandler {
@@ -163,7 +182,7 @@ impl CopyInHandler {
         let (delimiter, null_string) = match format {
             CopyFormat::Text => (b'\t', b"\\N".to_vec()),
             CopyFormat::Csv => (b',', b"".to_vec()),
-            CopyFormat::Binary => (b'\t', b"\\N".to_vec()),
+            CopyFormat::Binary => (b'\0', b"".to_vec()),
         };
         Self {
             columns,
@@ -172,6 +191,8 @@ impl CopyInHandler {
             null_string,
             buffer: Vec::new(),
             rows: Vec::new(),
+            binary_header_seen: false,
+            binary_trailer_seen: false,
         }
     }
 
@@ -192,6 +213,11 @@ impl CopyInHandler {
     /// Uses cursor-based splitting with deferred compaction to minimize byte shifting.
     #[inline]
     pub fn feed(&mut self, data: &[u8]) -> Result<(), ProtocolError> {
+        if self.format == CopyFormat::Binary {
+            self.buffer.extend_from_slice(data);
+            return self.decode_binary_buffer();
+        }
+
         self.buffer.extend_from_slice(data);
 
         // Process complete lines using a cursor. memchr on x86_64 scans up to 32
@@ -228,6 +254,21 @@ impl CopyInHandler {
     /// Called when CopyDone is received. Flushes remaining buffered data
     /// and returns all accumulated rows as column values.
     pub fn finish(mut self) -> Result<Vec<Vec<Option<Vec<u8>>>>, ProtocolError> {
+        if self.format == CopyFormat::Binary {
+            self.decode_binary_buffer()?;
+            if !self.binary_trailer_seen {
+                return Err(ProtocolError::Malformed(
+                    "binary COPY stream ended before the trailer".into(),
+                ));
+            }
+            if !self.buffer.is_empty() {
+                return Err(ProtocolError::Malformed(
+                    "trailing bytes after binary COPY trailer".into(),
+                ));
+            }
+            return Ok(self.rows);
+        }
+
         // Process any remaining data in the buffer
         if !self.buffer.is_empty() {
             let line = std::mem::take(&mut self.buffer);
@@ -237,6 +278,111 @@ impl CopyInHandler {
             }
         }
         Ok(self.rows)
+    }
+
+    /// Decodes as many complete PostgreSQL binary COPY rows as the buffer holds.
+    /// Consumes the 19-byte header once, then per row reads an i16 field count
+    /// and per field an i32 length followed by that many raw bytes (length -1 is
+    /// NULL). A field count of -1 marks the trailer. Partial rows remain buffered
+    /// for the next chunk. Each field's raw bytes are stored for the caller to
+    /// turn into typed values with `binary_to_scalar`.
+    fn decode_binary_buffer(&mut self) -> Result<(), ProtocolError> {
+        const SIGNATURE: &[u8] = b"PGCOPY\n\xff\r\n\x00";
+        let mut pos = 0usize;
+
+        if !self.binary_header_seen {
+            // 11-byte signature + 4-byte flags + 4-byte header extension length.
+            if self.buffer.len() < 19 {
+                return Ok(());
+            }
+            if &self.buffer[0..11] != SIGNATURE {
+                return Err(ProtocolError::Malformed(
+                    "invalid binary COPY signature".into(),
+                ));
+            }
+            let ext_len = u32::from_be_bytes([
+                self.buffer[15],
+                self.buffer[16],
+                self.buffer[17],
+                self.buffer[18],
+            ]) as usize;
+            if self.buffer.len() < 19 + ext_len {
+                return Ok(());
+            }
+            pos = 19 + ext_len;
+            self.binary_header_seen = true;
+        }
+
+        let num_cols = self.columns.len();
+        loop {
+            if self.binary_trailer_seen {
+                break;
+            }
+            if pos + 2 > self.buffer.len() {
+                break;
+            }
+            let field_count = i16::from_be_bytes([self.buffer[pos], self.buffer[pos + 1]]);
+            if field_count == -1 {
+                pos += 2;
+                self.binary_trailer_seen = true;
+                break;
+            }
+            if field_count as usize != num_cols {
+                return Err(ProtocolError::Malformed(format!(
+                    "binary COPY row has {} fields but {} columns are expected",
+                    field_count, num_cols
+                )));
+            }
+            // Compute the full row length before committing so a partial row is
+            // left in the buffer for the next chunk.
+            let mut cursor = pos + 2;
+            let mut row: Vec<Option<Vec<u8>>> = Vec::with_capacity(num_cols);
+            let mut complete = true;
+            for _ in 0..num_cols {
+                if cursor + 4 > self.buffer.len() {
+                    complete = false;
+                    break;
+                }
+                let len = i32::from_be_bytes([
+                    self.buffer[cursor],
+                    self.buffer[cursor + 1],
+                    self.buffer[cursor + 2],
+                    self.buffer[cursor + 3],
+                ]);
+                cursor += 4;
+                if len == -1 {
+                    row.push(None);
+                    continue;
+                }
+                if len < 0 {
+                    return Err(ProtocolError::Malformed(
+                        "binary COPY field has a negative length".into(),
+                    ));
+                }
+                let len = len as usize;
+                if cursor + len > self.buffer.len() {
+                    complete = false;
+                    break;
+                }
+                row.push(Some(self.buffer[cursor..cursor + len].to_vec()));
+                cursor += len;
+            }
+            if !complete {
+                break;
+            }
+            self.rows.push(row);
+            pos = cursor;
+        }
+
+        if pos > 0 {
+            if pos >= self.buffer.len() {
+                self.buffer.clear();
+            } else {
+                self.buffer.copy_within(pos.., 0);
+                self.buffer.truncate(self.buffer.len() - pos);
+            }
+        }
+        Ok(())
     }
 
     /// Returns the number of rows accumulated so far.
@@ -298,24 +444,73 @@ impl CopyInHandler {
         } else {
             let mut current = Vec::with_capacity(avg_field_len + 4);
             let mut i = 0;
+            let mut field_start = 0;
 
             while i < line.len() {
                 if line[i] == self.delimiter {
+                    // The null marker is matched on the raw field bytes before
+                    // de-escaping, so a field equal to \N is NULL while \N
+                    // inside other data de-escapes to N
+                    let raw_null = &line[field_start..i] == self.null_string.as_slice();
                     let field = std::mem::take(&mut current);
                     current = Vec::with_capacity(avg_field_len + 4);
-                    if field.as_slice() == self.null_string.as_slice() {
+                    if raw_null {
                         row.push(None);
                     } else {
                         row.push(Some(field));
                     }
+                    field_start = i + 1;
                 } else if line[i] == b'\\' && i + 1 < line.len() {
                     match line[i + 1] {
                         b'n' => current.push(b'\n'),
                         b'r' => current.push(b'\r'),
                         b't' => current.push(b'\t'),
+                        b'b' => current.push(0x08),
+                        b'f' => current.push(0x0c),
+                        b'v' => current.push(0x0b),
                         b'\\' => current.push(b'\\'),
+                        b'x' => {
+                            // \xH or \xHH hexadecimal byte escape.
+                            let mut value = 0u8;
+                            let mut digits = 0;
+                            while digits < 2 {
+                                let Some(&d) = line.get(i + 2 + digits) else {
+                                    break;
+                                };
+                                let Some(nibble) = hex_nibble(d) else {
+                                    break;
+                                };
+                                value = (value << 4) | nibble;
+                                digits += 1;
+                            }
+                            if digits == 0 {
+                                return Err(ProtocolError::Malformed(
+                                    "invalid \\x escape in COPY text data".into(),
+                                ));
+                            }
+                            current.push(value);
+                            i += digits;
+                        }
+                        d @ b'0'..=b'7' => {
+                            // Octal byte escape of up to three digits.
+                            let mut value = (d - b'0') as u16;
+                            let mut digits = 1;
+                            while digits < 3 {
+                                let Some(&n) = line.get(i + 1 + digits) else {
+                                    break;
+                                };
+                                if !(b'0'..=b'7').contains(&n) {
+                                    break;
+                                }
+                                value = value * 8 + (n - b'0') as u16;
+                                digits += 1;
+                            }
+                            current.push(value as u8);
+                            i += digits - 1;
+                        }
                         other => {
-                            current.push(b'\\');
+                            // An unrecognized escape represents the character
+                            // itself, matching standard COPY text semantics
                             current.push(other);
                         }
                     }
@@ -326,7 +521,7 @@ impl CopyInHandler {
                 i += 1;
             }
             // Last field.
-            if current.as_slice() == self.null_string.as_slice() {
+            if &line[field_start..] == self.null_string.as_slice() {
                 row.push(None);
             } else {
                 row.push(Some(current));
@@ -383,6 +578,17 @@ fn split_text_line(line: &[u8], delimiter: u8) -> Vec<Vec<u8>> {
     }
     fields.push(current);
     fields
+}
+
+/// Converts an ASCII hex digit to its 0..15 value, or None if not a hex digit.
+#[inline]
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Escapes a value for text-format COPY output.

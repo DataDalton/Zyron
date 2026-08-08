@@ -239,17 +239,29 @@ fn read_str(data: &[u8], pos: &mut usize, len: usize) -> Result<String> {
 /// Resolves authentication methods from a priority-sorted list of rules.
 pub struct AuthResolver {
     rules: Vec<AuthRule>,
+    /// Method returned when no rule matches a connection.
+    fallback: AuthMethod,
 }
 
 impl AuthResolver {
-    /// Creates a new resolver, sorting rules by priority (ascending).
+    /// Creates a new resolver, sorting rules by priority (ascending). The
+    /// fallback method for connections that match no rule is Trust until set
+    /// with set_fallback.
     pub fn new(mut rules: Vec<AuthRule>) -> Self {
         rules.sort_by_key(|r| r.priority);
-        Self { rules }
+        Self {
+            rules,
+            fallback: AuthMethod::Trust,
+        }
+    }
+
+    /// Sets the method returned when no rule matches a connection.
+    pub fn set_fallback(&mut self, method: AuthMethod) {
+        self.fallback = method;
     }
 
     /// Returns the authentication method for the first matching rule.
-    /// If no rule matches, returns Trust.
+    /// If no rule matches, returns the configured fallback method.
     pub fn resolve(
         &self,
         conn_type: ConnectionType,
@@ -262,7 +274,7 @@ impl AuthResolver {
                 return rule.method;
             }
         }
-        AuthMethod::Trust
+        self.fallback
     }
 }
 

@@ -16,6 +16,23 @@ const EMPTY_KEY: u64 = u64::MAX;
 /// Sentinel value for deleted key slots (tombstone).
 const TOMBSTONE_KEY: u64 = u64::MAX - 1;
 
+/// Sentinel marking a slot reserved by an in-progress insert_if_absent.
+/// The value is staged under this marker before the real key is published, so a
+/// reader never sees a real key paired with a stale value.
+const INPROGRESS_KEY: u64 = u64::MAX - 2;
+
+/// Result of an atomic insert-if-absent.
+///
+/// `Inserted` means this call installed the frame. `Existing` means another frame
+/// was already mapped for the page id, the caller must release the frame it tried
+/// to install and use the returned winner instead. `TableFull` means the hash
+/// table has no slot.
+pub enum InsertOutcome {
+    Inserted,
+    Existing(FrameId),
+    TableFull,
+}
+
 /// Lock-free page table mapping PageId to FrameId.
 ///
 /// Uses two-tier lookup:
@@ -105,6 +122,68 @@ impl PageTable {
         self.insert_to_hash(page_id, frame_id)
     }
 
+    /// Inserts a page ID to frame ID mapping only if the page id is absent.
+    ///
+    /// Resolves concurrent inserts for the same page id to a single winner so two
+    /// new_page calls for one id cannot install two frames. Returns the existing
+    /// frame when another inserter won the race.
+    pub fn insert_if_absent(&self, page_id: PageId, frame_id: FrameId) -> InsertOutcome {
+        if page_id.file_id == 0 && (page_id.page_num as usize) < DIRECT_PATH_SIZE {
+            match self.direct_path[page_id.page_num as usize].compare_exchange(
+                EMPTY_FRAME,
+                frame_id.0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => InsertOutcome::Inserted,
+                Err(existing) => InsertOutcome::Existing(FrameId(existing)),
+            }
+        } else {
+            self.insert_if_absent_hash(page_id, frame_id)
+        }
+    }
+
+    fn insert_if_absent_hash(&self, page_id: PageId, frame_id: FrameId) -> InsertOutcome {
+        let key = page_id.as_u64();
+        let mut idx = self.hash_index(key);
+
+        for _ in 0..self.hash_keys.len() {
+            let stored_key = self.hash_keys[idx].load(Ordering::Acquire);
+            if stored_key == key {
+                // Another inserter already owns this key
+                let existing = self.hash_values[idx].load(Ordering::Acquire);
+                return InsertOutcome::Existing(FrameId(existing));
+            }
+            if stored_key == EMPTY_KEY || stored_key == TOMBSTONE_KEY {
+                // Reserve the slot exclusively with the in-progress marker before
+                // touching the value, so the staged value is never visible paired
+                // with a real key until this thread publishes it.
+                match self.hash_keys[idx].compare_exchange(
+                    stored_key,
+                    INPROGRESS_KEY,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        // Slot is ours. Stage the value, then publish the real key
+                        // so a reader that loads the key (Acquire) also loads the
+                        // matching value (Acquire).
+                        self.hash_values[idx].store(frame_id.0, Ordering::Release);
+                        self.hash_keys[idx].store(key, Ordering::Release);
+                        return InsertOutcome::Inserted;
+                    }
+                    Err(_) => {
+                        // Lost the slot. Re-examine it on the next loop iteration
+                        // without advancing, the new occupant may be our own key.
+                        continue;
+                    }
+                }
+            }
+            idx = (idx + 1) & self.hash_mask;
+        }
+        InsertOutcome::TableFull
+    }
+
     fn insert_to_hash(&self, page_id: PageId, frame_id: FrameId) -> bool {
         let key = page_id.as_u64();
         let mut idx = self.hash_index(key);
@@ -183,7 +262,7 @@ impl PageTable {
         }
         for slot in self.hash_keys.iter() {
             let val = slot.load(Ordering::Relaxed);
-            if val != EMPTY_KEY && val != TOMBSTONE_KEY {
+            if val != EMPTY_KEY && val != TOMBSTONE_KEY && val != INPROGRESS_KEY {
                 count += 1;
             }
         }
@@ -216,7 +295,7 @@ impl PageTable {
         // Iterate hash table
         for (idx, key_slot) in self.hash_keys.iter().enumerate() {
             let key = key_slot.load(Ordering::Relaxed);
-            if key != EMPTY_KEY && key != TOMBSTONE_KEY {
+            if key != EMPTY_KEY && key != TOMBSTONE_KEY && key != INPROGRESS_KEY {
                 let frame_id = self.hash_values[idx].load(Ordering::Relaxed);
                 let page_id = PageId::from_u64(key);
                 if !f(page_id, FrameId(frame_id)) {

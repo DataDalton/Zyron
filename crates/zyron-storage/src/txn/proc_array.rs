@@ -41,12 +41,11 @@ struct PaddedSlot(AtomicU64);
 
 /// Lock-free table of active transaction IDs.
 ///
-/// `slots` is the actual storage. `active_count` is an authoritative count
-/// of slots currently holding a txn_id, used by `snapshot_into` to early
-/// exit the scan once it has located every active txn. Without this hint
-/// every begin() would scan all 4096 atomic slots, which at high
-/// commit/sec (100K+) saturates multiple CPU cores on the scan alone and
-/// starves the tokio runtime.
+/// `slots` is the actual storage. `active_count` tracks how many slots
+/// currently hold a txn_id and sizes the snapshot result Vec. It is not a
+/// scan termination hint, a concurrent claim/release can change it between
+/// the count load and the slot scan, so a snapshot scans every slot to stay
+/// consistent and never miss a still-active txn in a higher slot.
 pub struct ProcArray {
     slots: Box<[PaddedSlot]>,
     active_count: AtomicUsize,
@@ -66,9 +65,8 @@ impl ProcArray {
 
     /// Claims a free slot and stores `txn_id` into it atomically.
     /// Probes from slot 0 so that occupied slots stay clustered near the
-    /// start of the table. `snapshot_into` then early exits as soon as it
-    /// has found every active txn, which is the hot path the whole array
-    /// exists to keep cheap.
+    /// start of the table, which keeps the snapshot scan cache friendly
+    /// even though it visits every slot.
     pub fn claim(&self, txn_id: u64) -> Result<usize> {
         for i in 0..MAX_SLOTS {
             let slot = &self.slots[i].0;
@@ -97,47 +95,32 @@ impl ProcArray {
 
     /// Fills `into` with the txn_ids of all active transactions, excluding
     /// `exclude_txn_id`. The result is sorted ascending so callers can
-    /// binary search. Scans only as far as needed to locate every active
-    /// slot, using `active_count` as the termination hint, so the cost is
-    /// O(active_txns) in steady state, not O(MAX_SLOTS).
+    /// binary search. Scans every slot for a consistent snapshot. Stopping
+    /// early on a racy `active_count` could skip a still-active txn in a
+    /// higher slot whenever a concurrent claim/release shifts the count
+    /// between the load and the scan, which would treat an uncommitted txn
+    /// as committed. `active_count` is used only to size the result.
     pub fn snapshot_into(&self, exclude_txn_id: u64, into: &mut Vec<u64>) {
         into.clear();
-        let target = self.active_count.load(Ordering::Acquire);
-        if target == 0 {
-            return;
-        }
-        let mut found = 0usize;
+        into.reserve(self.active_count.load(Ordering::Acquire));
         for s in self.slots.iter() {
-            if found >= target {
-                break;
-            }
             let v = s.0.load(Ordering::Acquire);
-            if v != FREE {
-                found += 1;
-                if v != exclude_txn_id {
-                    into.push(v);
-                }
+            if v != FREE && v != exclude_txn_id {
+                into.push(v);
             }
         }
         into.sort_unstable();
     }
 
     /// Returns a fresh sorted Vec of currently active transaction ids.
+    /// Scans every slot for a consistent snapshot, the same reason
+    /// `snapshot_into` does, `active_count` only sizes the Vec.
     pub fn active_txn_ids(&self) -> Vec<u64> {
-        let target = self.active_count.load(Ordering::Acquire);
-        if target == 0 {
-            return Vec::new();
-        }
-        let mut v = Vec::with_capacity(target);
-        let mut found = 0usize;
+        let mut v = Vec::with_capacity(self.active_count.load(Ordering::Acquire));
         for s in self.slots.iter() {
-            if found >= target {
-                break;
-            }
             let val = s.0.load(Ordering::Acquire);
             if val != FREE {
                 v.push(val);
-                found += 1;
             }
         }
         v.sort_unstable();
@@ -203,6 +186,61 @@ mod tests {
         let s2 = p.claim(101).unwrap();
         assert_eq!(p.active_count(), 1);
         p.release(s2);
+    }
+
+    #[test]
+    fn snapshot_includes_high_slot_after_low_release() {
+        // A txn in a higher slot must stay visible after a lower slot is
+        // released, even though active_count drops to 1. An early-exit scan
+        // keyed on active_count would stop before reaching the higher slot
+        // and wrongly omit the still-active txn.
+        let p = ProcArray::new();
+        let s_low = p.claim(100).unwrap();
+        let _s_high = p.claim(200).unwrap();
+        assert_eq!(s_low, 0);
+        p.release(s_low);
+        assert_eq!(p.active_count(), 1);
+        let mut buf = Vec::new();
+        p.snapshot_into(u64::MAX, &mut buf);
+        assert_eq!(buf, vec![200u64]);
+        assert_eq!(p.active_txn_ids(), vec![200u64]);
+    }
+
+    #[test]
+    fn concurrent_release_never_omits_active_txn() {
+        // Stress the count-vs-scan race: one thread churns low slots while
+        // another snapshots. A pinned high-slot txn must appear in every
+        // snapshot regardless of the concurrent count changes.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering as AtOrd};
+        use std::thread;
+
+        let p = Arc::new(ProcArray::new());
+        let _churn_slot = p.claim(10).unwrap();
+        let pinned_slot = p.claim(u64::MAX - 1).unwrap();
+        assert!(pinned_slot > 0);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let churn_p = Arc::clone(&p);
+        let churn_stop = Arc::clone(&stop);
+        let churn = thread::spawn(move || {
+            while !churn_stop.load(AtOrd::Relaxed) {
+                let s = churn_p.claim(11).unwrap();
+                churn_p.release(s);
+            }
+        });
+
+        let mut buf = Vec::new();
+        for _ in 0..50_000 {
+            p.snapshot_into(u64::MAX, &mut buf);
+            assert!(
+                buf.contains(&(u64::MAX - 1)),
+                "pinned high-slot txn missing from snapshot"
+            );
+        }
+        stop.store(true, AtOrd::Relaxed);
+        churn.join().unwrap();
+        p.release(pinned_slot);
     }
 
     #[test]

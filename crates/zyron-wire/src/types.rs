@@ -517,7 +517,12 @@ pub fn text_to_scalar(bytes: &[u8], type_oid: i32) -> Result<ScalarValue, Protoc
         PG_TIMESTAMP_OID | PG_TIMESTAMPTZ_OID => zyron_common::parse_timestamp_micros(text)
             .map(ScalarValue::Int64)
             .map_err(|e| ProtocolError::Malformed(format!("Invalid timestamp: {e}"))),
-        _ => Ok(ScalarValue::Utf8(text.to_string())),
+        // Oid 0 above means the client left the parameter type unspecified, a
+        // legitimate text bind. A nonzero oid that reaches here is a type the
+        // server does not handle, so reject it rather than mis-bind as text.
+        other => Err(ProtocolError::Malformed(format!(
+            "Unsupported parameter type oid {other}"
+        ))),
     }
 }
 
@@ -561,8 +566,13 @@ fn parse_time_to_micros(s: &str) -> Result<i64, ProtocolError> {
                 .map_err(|_| invalid())?;
             let micros = match sp.next() {
                 Some(frac) => {
+                    if frac.is_empty() || !frac.bytes().all(|b| b.is_ascii_digit()) {
+                        return Err(invalid());
+                    }
                     let frac6: String = frac.chars().take(6).collect();
-                    format!("{frac6:0<6}").parse::<i64>().unwrap_or(0)
+                    format!("{frac6:0<6}")
+                        .parse::<i64>()
+                        .map_err(|_| invalid())?
                 }
                 None => 0,
             };
@@ -676,12 +686,12 @@ pub fn binary_to_scalar(bytes: &[u8], type_oid: i32) -> Result<ScalarValue, Prot
                 bytes[..8].try_into().unwrap(),
             )))
         }
-        _ => {
-            // Fall back to text interpretation. Validate UTF-8 in-place, then allocate once.
-            let s = std::str::from_utf8(bytes)
-                .map_err(|e| ProtocolError::Malformed(format!("Invalid UTF-8: {}", e)))?;
-            Ok(ScalarValue::Utf8(s.to_string()))
-        }
+        // A binary-format parameter carries an explicit nonzero type oid. An oid
+        // not handled above has no defined binary layout here, so reject it
+        // rather than mis-decode the bytes as text.
+        other => Err(ProtocolError::Malformed(format!(
+            "Unsupported binary parameter type oid {other}"
+        ))),
     }
 }
 

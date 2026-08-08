@@ -65,6 +65,9 @@ pub struct CdcIngestConfig {
     pub dead_letter_table_id: Option<u32>,
     /// Wire format of the inbound records, used to pick the decoder.
     pub decoder: DecoderPlugin,
+    /// Avro writer schema JSON for the Avro decoder. None for other decoders.
+    #[serde(default)]
+    pub avro_writer_schema: Option<String>,
     pub batch_size: usize,
     pub active: bool,
 }
@@ -80,6 +83,9 @@ pub struct IngestCheckpoint {
     pub last_source_offset: String,
     pub records_applied: u64,
     pub records_failed: u64,
+    /// Records durably written to the dead letter table over the job's life.
+    #[serde(default)]
+    pub dead_letter_count: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -212,17 +218,23 @@ impl CdcIngestManager {
         Ok(())
     }
 
-    /// Returns the status of an ingest job.
+    /// Returns the status of an ingest job. dead_letter_count is the persisted
+    /// running total of records durably written to the dead letter table,
+    /// incremented by the ingest apply path on each successful dead-letter
+    /// write and surviving restarts via the checkpoint.
     pub fn get_ingest_status(&self, name: &str) -> Result<IngestStatus> {
         let config = self.get_ingest(name)?;
         let cp = self.get_checkpoint(name);
+
+        let records_failed = cp.as_ref().map(|c| c.records_failed).unwrap_or(0);
+        let dead_letter_count = cp.as_ref().map(|c| c.dead_letter_count).unwrap_or(0);
 
         Ok(IngestStatus {
             name: name.to_string(),
             active: config.active,
             records_applied: cp.as_ref().map(|c| c.records_applied).unwrap_or(0),
-            records_failed: cp.as_ref().map(|c| c.records_failed).unwrap_or(0),
-            dead_letter_count: 0,
+            records_failed,
+            dead_letter_count,
             last_offset: cp
                 .as_ref()
                 .map(|c| c.last_source_offset.clone())
@@ -323,6 +335,7 @@ mod tests {
             on_conflict: OnConflict::Update,
             dead_letter_table_id: None,
             decoder: DecoderPlugin::Debezium,
+            avro_writer_schema: None,
             batch_size: 1000,
             active: true,
         }
@@ -383,12 +396,14 @@ mod tests {
             last_source_offset: "offset:100".into(),
             records_applied: 50,
             records_failed: 2,
+            dead_letter_count: 3,
         };
         mgr.update_checkpoint(cp).unwrap();
 
         let status = mgr.get_ingest_status("test_ingest").unwrap();
         assert_eq!(status.records_applied, 50);
         assert_eq!(status.records_failed, 2);
+        assert_eq!(status.dead_letter_count, 3);
         assert_eq!(status.last_offset, "offset:100");
     }
 

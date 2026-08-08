@@ -51,7 +51,6 @@ pub struct CliOptions {
     pub port: Option<u16>,
     pub host: Option<String>,
     pub log_level: Option<String>,
-    pub foreground: bool,
     pub single_user: bool,
     pub skip_recovery: bool,
 }
@@ -64,7 +63,6 @@ impl Default for CliOptions {
             port: None,
             host: None,
             log_level: None,
-            foreground: false,
             single_user: false,
             skip_recovery: false,
         }
@@ -128,9 +126,6 @@ pub fn parse_cli_args() -> Option<CliOptions> {
                 }
                 opts.log_level = Some(args[i].clone());
             }
-            "--foreground" | "-f" => {
-                opts.foreground = true;
-            }
             "--single-user" => {
                 opts.single_user = true;
             }
@@ -159,7 +154,6 @@ Options:
   --port <number>       Listen port override
   --host <addr>         Bind address override
   --log-level <level>   Log level: debug, info, warn, error
-  --foreground, -f      Run in foreground
   --single-user         Single-connection mode for maintenance
   --skip-recovery       Skip WAL replay (emergency use only)
   --version, -v         Print version and exit
@@ -173,6 +167,9 @@ pub struct Server {
     session_mgr: Arc<SessionManager>,
     health_state: Arc<HealthState>,
     shutdown: Arc<AtomicBool>,
+    /// When true, skip WAL replay on startup. Set by --skip-recovery for
+    /// emergency boots only.
+    skip_recovery: bool,
 }
 
 impl Server {
@@ -196,17 +193,54 @@ impl Server {
             config.server.max_connections = 1;
         }
 
-        // Initialize tracing
+        // Initialize tracing. The level comes from logging.level, the writer
+        // from logging.output (stdout or a file), and the event format from
+        // logging.format (text or json). try_init ignores the already-set
+        // error so a second Server::init in the same process does not panic.
         let log_level = match config.logging.level.as_str() {
             "debug" => tracing::Level::DEBUG,
             "warn" => tracing::Level::WARN,
             "error" => tracing::Level::ERROR,
             _ => tracing::Level::INFO,
         };
-        tracing_subscriber::fmt()
-            .with_max_level(log_level)
-            .with_target(false)
-            .init();
+        let log_to_file = config.logging.output == "file";
+        let log_file: Option<std::fs::File> = if log_to_file {
+            match config.logging.file_path.as_ref() {
+                Some(path) => std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .ok(),
+                None => None,
+            }
+        } else {
+            None
+        };
+        let json_format = config.logging.format == "json";
+        match log_file {
+            Some(file) => {
+                let builder = tracing_subscriber::fmt()
+                    .with_max_level(log_level)
+                    .with_target(false)
+                    .with_ansi(false)
+                    .with_writer(std::sync::Mutex::new(file));
+                if json_format {
+                    let _ = builder.json().try_init();
+                } else {
+                    let _ = builder.try_init();
+                }
+            }
+            None => {
+                let builder = tracing_subscriber::fmt()
+                    .with_max_level(log_level)
+                    .with_target(false);
+                if json_format {
+                    let _ = builder.json().try_init();
+                } else {
+                    let _ = builder.try_init();
+                }
+            }
+        }
 
         let session_mgr = Arc::new(SessionManager::new(
             config.server.max_connections,
@@ -222,6 +256,7 @@ impl Server {
             session_mgr,
             health_state,
             shutdown,
+            skip_recovery: opts.skip_recovery,
         })
     }
 
@@ -262,6 +297,14 @@ impl Server {
             num_frames: self.config.storage.buffer_pool_size / self.config.storage.page_size,
         }));
 
+        // Flush a dirty victim to disk during eviction so the write is never lost
+        // by a caller that drops the evicted page. Uses a fsync write because the
+        // eviction path has no batched fsync follow-up.
+        let dm_for_evict = Arc::clone(&disk_manager);
+        let evict_writer: zyron_buffer::EvictWriteFn =
+            Arc::new(move |page_id, data| dm_for_evict.write_page_sync(page_id, data));
+        buffer_pool.set_evict_writer(evict_writer)?;
+
         let dm_for_bg = Arc::clone(&disk_manager);
         let write_fn: WriteFn =
             Arc::new(move |page_id, data| dm_for_bg.write_page_sync_no_fsync(page_id, data));
@@ -280,7 +323,9 @@ impl Server {
             wal_dir: wal_dir.clone(),
             segment_size: self.config.wal.segment_size as u32,
             fsync_enabled: self.config.wal.sync_mode == "fsync",
-            ring_buffer_capacity: 256 * 1024, // 256 KB ring buffer
+            // Floor the configured ring buffer at 256 KB so a small or
+            // mis-set value cannot starve the flush pipeline.
+            ring_buffer_capacity: self.config.wal.ring_buffer_capacity.max(256 * 1024),
         })?);
 
         // Pin WAL retention so a checkpoint cannot reclaim a CompactionEnd
@@ -294,7 +339,12 @@ impl Server {
         }));
 
         // 5. WAL recovery
-        let recovery_result = if self.config.storage.data_dir.exists() {
+        let recovery_result = if self.skip_recovery {
+            warn!(
+                "Skipping WAL recovery (--skip-recovery); committed records will not be replayed"
+            );
+            None
+        } else if self.config.storage.data_dir.exists() {
             info!("Running WAL recovery");
             let recovery_mgr = RecoveryManager::new(&wal_dir)?;
             let result = recovery_mgr.recover()?;
@@ -308,10 +358,22 @@ impl Server {
             None
         };
 
-        // Determine starting txn_id from recovery
+        // Determine the next txn_id from the highest recovered transaction id.
+        // Reusing a recovered id would collide with the xmin/xmax already
+        // stamped on on-disk tuples, so the next id is one past the maximum
+        // over the committed and undo (uncommitted-at-crash) id sets.
         let start_txn_id = recovery_result
             .as_ref()
-            .and_then(|r| r.last_lsn.map(|_| 1u64))
+            .map(|r| {
+                let max_committed = r
+                    .committed_txns
+                    .iter()
+                    .map(|&(txn_id, _)| txn_id)
+                    .max()
+                    .unwrap_or(0);
+                let max_undo = r.undo_txns.iter().copied().max().unwrap_or(0);
+                max_committed.max(max_undo) as u64 + 1
+            })
             .unwrap_or(1);
 
         // 6. Create Catalog
@@ -440,18 +502,34 @@ impl Server {
         // 10. Initialize subsystem managers (before background workers so workers can use them)
         let cdc_registry_arc = Arc::new(zyron_cdc::CdfRegistry::new(data_dir.clone()));
         let slot_mgr_arc =
-            zyron_cdc::SlotManager::open(&data_dir, zyron_cdc::SlotLagConfig::default())
-                .ok()
-                .map(Arc::new);
-        let pub_mgr_arc = zyron_cdc::PublicationManager::open(&data_dir)
-            .ok()
-            .map(Arc::new);
-        let cdc_stream_mgr_arc = zyron_cdc::CdcStreamManager::new(&data_dir)
-            .ok()
-            .map(Arc::new);
-        let cdc_ingest_mgr_arc = zyron_cdc::CdcIngestManager::new(&data_dir)
-            .ok()
-            .map(Arc::new);
+            match zyron_cdc::SlotManager::open(&data_dir, zyron_cdc::SlotLagConfig::default()) {
+                Ok(m) => Some(Arc::new(m)),
+                Err(e) => {
+                    warn!("replication slot manager unavailable: {}", e);
+                    None
+                }
+            };
+        let pub_mgr_arc = match zyron_cdc::PublicationManager::open(&data_dir) {
+            Ok(m) => Some(Arc::new(m)),
+            Err(e) => {
+                warn!("publication manager unavailable: {}", e);
+                None
+            }
+        };
+        let cdc_stream_mgr_arc = match zyron_cdc::CdcStreamManager::new(&data_dir) {
+            Ok(m) => Some(Arc::new(m)),
+            Err(e) => {
+                warn!("cdc stream manager unavailable: {}", e);
+                None
+            }
+        };
+        let cdc_ingest_mgr_arc = match zyron_cdc::CdcIngestManager::new(&data_dir) {
+            Ok(m) => Some(Arc::new(m)),
+            Err(e) => {
+                warn!("cdc ingest manager unavailable: {}", e);
+                None
+            }
+        };
 
         let trigger_mgr_arc = Arc::new(zyron_pipeline::trigger::TriggerManager::new());
         let udf_reg_arc = Arc::new(zyron_pipeline::udf::UdfRegistry::new());
@@ -518,7 +596,9 @@ impl Server {
         // Full-text search manager: load persisted FTS indexes from catalog.
         let fts_mgr_arc = {
             let fts_dir = data_dir.join("fts");
-            let _ = std::fs::create_dir_all(&fts_dir);
+            if let Err(e) = std::fs::create_dir_all(&fts_dir) {
+                warn!("failed to create fts dir {}: {}", fts_dir.display(), e);
+            }
             let mgr = zyron_search::FtsManager::with_data_dir(fts_dir.clone());
             let mut fts_entries: Vec<(u32, u32, Vec<u16>)> = Vec::new();
             for table in catalog.list_all_tables() {
@@ -540,7 +620,9 @@ impl Server {
         // Vector index manager: load persisted vector indexes from catalog.
         let vec_mgr_arc = {
             let vec_dir = data_dir.join("vector");
-            let _ = std::fs::create_dir_all(&vec_dir);
+            if let Err(e) = std::fs::create_dir_all(&vec_dir) {
+                warn!("failed to create vector dir {}: {}", vec_dir.display(), e);
+            }
             let mgr = zyron_search::vector::VectorIndexManager::with_data_dir(vec_dir.clone());
             let mut vec_entries: Vec<(u32, u32, u16, u16, zyron_search::vector::HnswConfig)> =
                 Vec::new();
@@ -593,7 +675,9 @@ impl Server {
         // Graph schema manager. Load persisted schemas from disk.
         let graph_mgr_arc = {
             let graph_dir = data_dir.join("graph");
-            let _ = std::fs::create_dir_all(&graph_dir);
+            if let Err(e) = std::fs::create_dir_all(&graph_dir) {
+                warn!("failed to create graph dir {}: {}", graph_dir.display(), e);
+            }
             let mgr = zyron_search::graph::GraphManager::new();
             if let Err(e) = mgr.load_all(&graph_dir) {
                 error!("Graph schema loading failed: {e}");
@@ -610,7 +694,13 @@ impl Server {
         // -------------------------------------------------------------------
         let spatial_mgr_arc = {
             let spatial_dir = data_dir.join("spatial");
-            let _ = std::fs::create_dir_all(&spatial_dir);
+            if let Err(e) = std::fs::create_dir_all(&spatial_dir) {
+                warn!(
+                    "failed to create spatial dir {}: {}",
+                    spatial_dir.display(),
+                    e
+                );
+            }
             let mgr = zyron_types::spatial_index::SpatialIndexManager::new();
 
             for table in catalog.list_all_tables() {
@@ -761,6 +851,48 @@ impl Server {
         let config_for_lookup = self.config.clone();
         let config_for_all = self.config.clone();
         let data_dir_for_alter = data_dir.clone();
+
+        // Config-derived session and auth defaults exposed on ServerState. The
+        // validator restricts the source strings, so parsing here maps a known
+        // value and falls back to the engine default on anything else.
+        let default_isolation = match self.config.query.default_isolation.as_str() {
+            "read_committed" => zyron_storage::IsolationLevel::ReadCommitted,
+            _ => zyron_storage::IsolationLevel::SnapshotIsolation,
+        };
+        let statement_timeout = if self.config.query.statement_timeout_secs == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_secs(
+                self.config.query.statement_timeout_secs,
+            ))
+        };
+        let max_result_rows = if self.config.query.max_result_rows == 0 {
+            None
+        } else {
+            Some(self.config.query.max_result_rows)
+        };
+        // Balloon cost params are exposed only when at least one is set, so the
+        // hasher keeps its built-in defaults otherwise. A missing partner value
+        // falls back to the BalloonParams default for that field.
+        let balloon_params = match (
+            self.config.auth.balloon_space_cost,
+            self.config.auth.balloon_time_cost,
+        ) {
+            (None, None) => None,
+            (space, time) => {
+                let defaults = zyron_auth::BalloonParams::default();
+                Some(zyron_auth::BalloonParams {
+                    space_cost: space.unwrap_or(defaults.space_cost),
+                    time_cost: time.unwrap_or(defaults.time_cost),
+                    delta: defaults.delta,
+                })
+            }
+        };
+        let default_auth_method = parse_auth_method(&self.config.auth.method)?;
+        // Apply the configured method as the resolver fallback for connections
+        // that match no auth rule. Rejected at startup when the method cannot
+        // verify against the Balloon credential store.
+        security_manager.set_auth_fallback(default_auth_method)?;
 
         let session_mgr_for_view = Arc::clone(&self.session_mgr);
         let ckpt_wake: Option<Arc<dyn Fn() + Send + Sync>> = {
@@ -983,6 +1115,11 @@ impl Server {
             feature_store: zyron_analytics::featureStore(),
             feature_lineage: zyron_analytics::featureLineageRegistry(),
             model_cache: zyron_analytics::modelCache(),
+            default_isolation,
+            statement_timeout,
+            max_result_rows,
+            balloon_params,
+            default_auth_method,
         });
 
         // Restore feature groups and trained models from on-disk snapshots
@@ -1071,8 +1208,11 @@ impl Server {
 
         // -------------------------------------------------------------------
         // Spawn Zyron-to-Zyron background workers. Each loop honors the
-        // shared shutdown flag and exits cleanly when the server stops.
+        // shared shutdown flag and exits cleanly when the server stops. The
+        // tokio handles are collected so shutdown can await them after setting
+        // the flag, instead of tearing them down mid-write.
         // -------------------------------------------------------------------
+        let mut spawned_workers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         {
             use std::time::Duration;
             let labeled = Arc::clone(&self.health_state.metrics.labeled);
@@ -1080,7 +1220,7 @@ impl Server {
             let cdc_reg_ret = Some(Arc::clone(&cdc_registry_arc));
             let sh_ret = Arc::clone(&self.shutdown);
             let labeled_ret = Arc::clone(&labeled);
-            tokio::spawn(async move {
+            spawned_workers.push(tokio::spawn(async move {
                 background::publication_retention::publication_retention_loop(
                     catalog_ret,
                     cdc_reg_ret,
@@ -1089,12 +1229,12 @@ impl Server {
                     Some(labeled_ret),
                 )
                 .await;
-            });
+            }));
 
             let catalog_reap = Arc::clone(&catalog);
             let sh_reap = Arc::clone(&self.shutdown);
             let labeled_reap = Arc::clone(&labeled);
-            tokio::spawn(async move {
+            spawned_workers.push(tokio::spawn(async move {
                 background::dead_subscriber_reaper::dead_subscriber_reaper_loop(
                     catalog_reap,
                     sh_reap,
@@ -1103,10 +1243,10 @@ impl Server {
                     Some(labeled_reap),
                 )
                 .await;
-            });
+            }));
 
             let sh_cred = Arc::clone(&self.shutdown);
-            tokio::spawn(async move {
+            spawned_workers.push(tokio::spawn(async move {
                 background::credential_refresh::credential_refresh_loop(
                     sh_cred,
                     background::credential_refresh::DEFAULT_INTERVAL_SECS,
@@ -1116,40 +1256,32 @@ impl Server {
                     |_win| {},
                 )
                 .await;
-            });
+            }));
 
             let server_recycle = Arc::clone(&server_state);
             let sh_recycle = Arc::clone(&self.shutdown);
-            tokio::spawn(async move {
+            spawned_workers.push(tokio::spawn(async move {
                 background::recycle_reaper::recycle_reaper_loop(
                     server_recycle,
                     sh_recycle,
                     background::recycle_reaper::DEFAULT_INTERVAL_SECS,
                 )
                 .await;
-            });
+            }));
 
             let server_cdc_pump = Arc::clone(&server_state);
             let sh_cdc_pump = Arc::clone(&self.shutdown);
-            tokio::spawn(async move {
+            spawned_workers.push(tokio::spawn(async move {
                 background::cdc_stream_pump::cdc_stream_pump_loop(
                     server_cdc_pump,
                     sh_cdc_pump,
                     background::cdc_stream_pump::DEFAULT_INTERVAL_SECS,
                 )
                 .await;
-            });
-
-            // Inbound CDC ingest worker runs on a dedicated thread (the source
-            // fetch performs synchronous network IO). Exits on the shutdown flag.
-            let _ = background::cdc_ingest::start(
-                Arc::clone(&server_state),
-                Arc::clone(&self.shutdown),
-                background::cdc_ingest::DEFAULT_INTERVAL_SECS,
-            );
+            }));
 
             let sh_dlq = Arc::clone(&self.shutdown);
-            tokio::spawn(async move {
+            spawned_workers.push(tokio::spawn(async move {
                 background::dlq_ttl::dlq_ttl_loop(
                     sh_dlq,
                     background::dlq_ttl::DEFAULT_INTERVAL_SECS,
@@ -1157,35 +1289,50 @@ impl Server {
                     |_cutoff| {},
                 )
                 .await;
-            });
+            }));
 
             let sh_host = Arc::clone(&self.shutdown);
-            tokio::spawn(async move {
+            spawned_workers.push(tokio::spawn(async move {
                 background::host_health::host_health_monitor_loop(
                     sh_host,
                     background::host_health::DEFAULT_INTERVAL_SECS,
                     || {},
                 )
                 .await;
-            });
+            }));
         }
 
-        // 11. Start health/metrics HTTP server
-        let health_host = self.config.metrics.host.clone();
-        let health_port = self.config.metrics.port;
-        let health_dual_stack = self.config.metrics.dual_stack;
-        let health_shutdown = Arc::clone(&self.shutdown);
-        let health_state = Arc::clone(&self.health_state);
-        tokio::spawn(async move {
-            health::start_health_server(
-                &health_host,
-                health_port,
-                health_dual_stack,
-                health_state,
-                health_shutdown,
-            )
-            .await;
-        });
+        // Inbound CDC ingest worker runs on a dedicated thread (the source
+        // fetch performs synchronous network IO). Its handle is kept so
+        // shutdown can unpark and join it rather than dropping the handle and
+        // leaking the thread holding an Arc<ServerState>.
+        let cdc_ingest_handle = background::cdc_ingest::start(
+            Arc::clone(&server_state),
+            Arc::clone(&self.shutdown),
+            background::cdc_ingest::DEFAULT_INTERVAL_SECS,
+        );
+
+        // 11. Start health/metrics HTTP server only when metrics are enabled.
+        let health_server_handle = if self.config.metrics.enabled {
+            let health_host = self.config.metrics.host.clone();
+            let health_port = self.config.metrics.port;
+            let health_dual_stack = self.config.metrics.dual_stack;
+            let health_shutdown = Arc::clone(&self.shutdown);
+            let health_state = Arc::clone(&self.health_state);
+            Some(tokio::spawn(async move {
+                health::start_health_server(
+                    &health_host,
+                    health_port,
+                    health_dual_stack,
+                    health_state,
+                    health_shutdown,
+                )
+                .await;
+            }))
+        } else {
+            info!("metrics disabled, health/metrics HTTP server not started");
+            None
+        };
 
         // Mark startup complete
         self.health_state.mark_startup_complete();
@@ -1228,6 +1375,33 @@ impl Server {
                 "Shutdown timeout: {} sessions still active, aborting",
                 self.session_mgr.active_count()
             );
+        }
+
+        // Stop the wire accept loop now, before any persistence or the final
+        // checkpoint, so no new query can write after the checkpoint snapshot.
+        // Active sessions already drained above, so aborting the listener task
+        // closes the door on new connections and in-flight statements.
+        wire_handle.abort();
+
+        // Quiesce the detached worker loops. The shutdown flag is set above, so
+        // each loop exits at its next interval. Awaiting them with a bounded
+        // timeout ensures a worker mid-write finishes before the final
+        // checkpoint runs rather than being torn down by process exit.
+        {
+            let deadline = std::time::Duration::from_secs(5);
+            for handle in spawned_workers {
+                match tokio::time::timeout(deadline, handle).await {
+                    Ok(_) => {}
+                    Err(_) => warn!("background worker did not stop within timeout"),
+                }
+            }
+        }
+
+        // Unpark and join the dedicated CDC ingest thread so it releases its
+        // Arc<ServerState> and finishes the current sweep before checkpoint.
+        cdc_ingest_handle.thread().unpark();
+        if cdc_ingest_handle.join().is_err() {
+            warn!("cdc ingest worker thread panicked during shutdown");
         }
 
         // Persist FTS indexes to disk before stopping workers.
@@ -1366,11 +1540,15 @@ impl Server {
             }
         }
 
-        // Stop background workers (runs final checkpoint)
+        // Stop background workers (runs final checkpoint). The wire listener and
+        // detached workers are already stopped, so nothing can write after the
+        // checkpoint snapshot.
         background.shutdown();
 
-        // Abort the wire server
-        wire_handle.abort();
+        // Stop the health/metrics HTTP server task when it was started.
+        if let Some(handle) = health_server_handle {
+            handle.abort();
+        }
 
         info!("ZyronDB shut down");
         Ok(())
@@ -1513,6 +1691,38 @@ fn map_cat_to_auth_kind(
             zyron_auth::security_map::SecurityMapKind::MtlsFingerprint
         }
     }
+}
+
+// -----------------------------------------------------------------------------
+// Auth method config parsing
+// -----------------------------------------------------------------------------
+
+/// Maps the auth.method config string to an AuthMethod. Accepts the method
+/// names used in pg_hba-style configs. An unknown name is a configuration
+/// error so a typo does not silently fall back to Trust.
+fn parse_auth_method(method: &str) -> zyron_common::Result<zyron_auth::auth_rules::AuthMethod> {
+    use zyron_auth::auth_rules::AuthMethod;
+    let parsed = match method.to_ascii_lowercase().as_str() {
+        "trust" => AuthMethod::Trust,
+        "reject" => AuthMethod::Reject,
+        "password" => AuthMethod::Password,
+        "md5" => AuthMethod::Md5,
+        "scram-sha-256" | "scram_sha_256" | "scram" => AuthMethod::ScramSha256,
+        "balloon-sha-256" | "balloon_sha_256" | "balloon" => AuthMethod::BalloonSha256,
+        "cert" | "certificate" => AuthMethod::Certificate,
+        "jwt" => AuthMethod::Jwt,
+        "apikey" | "api-key" | "api_key" => AuthMethod::ApiKey,
+        "password-totp" | "password_and_totp" => AuthMethod::PasswordAndTotp,
+        "fido2" => AuthMethod::Fido2,
+        "password-fido2" | "password_and_fido2" => AuthMethod::PasswordAndFido2,
+        other => {
+            return Err(zyron_common::ZyronError::Internal(format!(
+                "Unknown auth.method '{}'",
+                other
+            )));
+        }
+    };
+    Ok(parsed)
 }
 
 // -----------------------------------------------------------------------------

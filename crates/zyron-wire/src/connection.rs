@@ -234,6 +234,26 @@ pub struct ServerState {
     pub feature_lineage: Arc<parking_lot::RwLock<zyron_analytics::FeatureLineageRegistry>>,
     /// Server-wide trained-model inference cache
     pub model_cache: Arc<zyron_analytics::ModelCache>,
+
+    // -----------------------------------------------------------------------
+    // Config-derived session and auth defaults
+    // -----------------------------------------------------------------------
+    /// Transaction isolation level applied to sessions that do not set one
+    /// explicitly, parsed from query.default_isolation at startup
+    pub default_isolation: IsolationLevel,
+    /// Per-statement run-time limit applied when a session sets none. None
+    /// when query.statement_timeout_secs is 0
+    pub statement_timeout: Option<std::time::Duration>,
+    /// Maximum rows a single query returns. None when query.max_result_rows
+    /// is 0
+    pub max_result_rows: Option<u64>,
+    /// Balloon password-hash cost parameters from the auth config. None when
+    /// neither balloon_space_cost nor balloon_time_cost is set, leaving the
+    /// hasher on its built-in defaults
+    pub balloon_params: Option<zyron_auth::BalloonParams>,
+    /// Authentication method used as the fallback when no auth rule matches,
+    /// parsed from auth.method at startup
+    pub default_auth_method: zyron_auth::auth_rules::AuthMethod,
 }
 
 /// RAII guard that releases the vacuum_running flag on drop, so a panic
@@ -259,11 +279,16 @@ struct PreparedStatement {
 /// Bound portal: a prepared statement bound to concrete parameter values.
 /// The executor reads `params` through the per-query `ExecutionContext`
 /// to resolve `$1`, `$2`, ... references in the physical plan.
+///
+/// A None `plan` marks a transaction-control, session, or DDL/utility
+/// statement that bypasses the planner. Execute dispatches it through the
+/// same handlers the simple-query path uses, reading the SQL text from `query`.
 struct Portal {
     params: Vec<ScalarValue>,
     result_formats: Vec<i16>,
-    plan: Arc<PhysicalPlan>,
+    plan: Option<Arc<PhysicalPlan>>,
     output_schema: Vec<LogicalColumn>,
+    query: String,
 }
 
 /// Monotonic counter for generating unique process IDs without RNG overhead.
@@ -321,6 +346,25 @@ pub struct CursorState {
     pub position: usize,
     /// Whether the cursor holds across transactions.
     pub with_hold: bool,
+}
+
+/// Maps a parsed SQL isolation level to the engine isolation level.
+/// READ UNCOMMITTED and READ COMMITTED run as ReadCommitted, REPEATABLE READ
+/// and SNAPSHOT run as SnapshotIsolation. SERIALIZABLE has no engine
+/// equivalent and is rejected rather than silently downgraded.
+fn map_isolation_level(level: zyron_parser::TxnIsolation) -> ZyronResult<IsolationLevel> {
+    use zyron_parser::TxnIsolation;
+    match level {
+        TxnIsolation::ReadUncommitted | TxnIsolation::ReadCommitted => {
+            Ok(IsolationLevel::ReadCommitted)
+        }
+        TxnIsolation::RepeatableRead | TxnIsolation::Snapshot => {
+            Ok(IsolationLevel::SnapshotIsolation)
+        }
+        TxnIsolation::Serializable => Err(ZyronError::ExecutionError(
+            "serializable isolation level is not supported, use repeatable read or snapshot".into(),
+        )),
+    }
 }
 
 impl<T: WireTransport> Connection<T> {
@@ -593,8 +637,23 @@ impl<T: WireTransport> Connection<T> {
 
                     match self.authenticator.process_response(&user, &password) {
                         Ok(AuthProgress::Authenticated) => break,
+                        Ok(AuthProgress::AuthenticatedWith(msg)) => {
+                            // Send the terminal message (SCRAM SaslFinal) then
+                            // complete authentication.
+                            self.feed(msg).await?;
+                            self.flush().await?;
+                            break;
+                        }
                         Ok(AuthProgress::Continue(msg)) => {
                             self.feed(msg).await?;
+                            self.flush().await?;
+                        }
+                        Ok(AuthProgress::ContinueAfter { deliver, challenge }) => {
+                            // A chained factor completed and handed back its
+                            // terminal message (the SCRAM SaslFinal). Send it,
+                            // then the next factor's challenge, then keep reading.
+                            self.feed(deliver).await?;
+                            self.feed(challenge).await?;
                             self.flush().await?;
                         }
                         Err(e) => {
@@ -809,6 +868,11 @@ impl<T: WireTransport> Connection<T> {
             return Ok(());
         }
 
+        // Write-buffer length before any response for this query batch. On an
+        // autocommit durability failure the buffered success responses are
+        // truncated back to this mark and replaced with an ErrorResponse.
+        let buf_mark = self.write_buf.len();
+
         // Auto-prepared plan cache fast path. A single-statement DML shape
         // with only literal values is rewritten to a `$N` template, looked
         // up in the per-connection plan cache, and executed directly. On a
@@ -817,7 +881,13 @@ impl<T: WireTransport> Connection<T> {
         // falls through to the full parse path below.
         match self.try_templated_execute(&sql).await {
             Ok(true) => {
-                self.auto_commit_if_needed().await;
+                // auto_commit_if_needed truncates the buffered success and
+                // buffers an ErrorResponse on a durability failure, so the
+                // client never sees CommandComplete for a commit that failed.
+                // ReadyForQuery still follows either way per the protocol.
+                if let Err(e) = self.auto_commit_if_needed(buf_mark).await {
+                    debug!("autocommit failed after templated execute: {}", e);
+                }
                 self.send_ready_for_query().await?;
                 return Ok(());
             }
@@ -825,7 +895,9 @@ impl<T: WireTransport> Connection<T> {
             Err(e) => {
                 self.send_protocol_error(&e).await?;
                 self.mark_failed_if_in_transaction();
-                self.auto_commit_if_needed().await;
+                if let Err(ce) = self.auto_commit_if_needed(buf_mark).await {
+                    debug!("autocommit failed after templated execute error: {}", ce);
+                }
                 self.send_ready_for_query().await?;
                 return Ok(());
             }
@@ -870,6 +942,20 @@ impl<T: WireTransport> Connection<T> {
                     }
                 }
                 continue;
+            }
+
+            // Reject write statements in a READ ONLY transaction before they
+            // reach any operator that touches the heap
+            if let Some(txn) = self.transaction.as_ref() {
+                if txn.read_only() && !is_read_only_safe_statement(&stmt) {
+                    self.send_error(&ZyronError::ExecutionError(format!(
+                        "cannot execute {} in a read-only transaction",
+                        statement_op_name(&stmt)
+                    )))
+                    .await?;
+                    self.mark_failed_if_in_transaction();
+                    continue;
+                }
             }
 
             // Handle SET/SHOW directly
@@ -1104,6 +1190,8 @@ impl<T: WireTransport> Connection<T> {
                     if let Some(ref sec_mgr) = self.server.security_manager {
                         ctx.set_security_manager(Arc::clone(sec_mgr));
                     }
+                    self.attach_undo_log(&mut ctx);
+                    self.apply_session_limits(&mut ctx);
                     let ctx = Arc::new(ctx);
 
                     match execute(plan_clone, &ctx).await {
@@ -1246,14 +1334,17 @@ impl<T: WireTransport> Connection<T> {
                 if cursor.rows.is_empty() {
                     let plan_clone = (*cursor.plan).clone();
                     let (txn_id, snapshot) = self.ensure_transaction()?;
-                    let ctx = Arc::new(ExecutionContext::new(
+                    let mut ctx = ExecutionContext::new(
                         self.server.catalog.clone(),
                         self.server.wal.clone(),
                         self.server.buffer_pool.clone(),
                         self.server.disk_manager.clone(),
                         txn_id as u32,
                         snapshot,
-                    ));
+                    );
+                    self.attach_undo_log(&mut ctx);
+                    self.apply_session_limits(&mut ctx);
+                    let ctx = Arc::new(ctx);
                     match execute(plan_clone, &ctx).await {
                         Ok(batches) => {
                             let cursor = self.cursors.get_mut(&cursor_name).unwrap();
@@ -1385,6 +1476,7 @@ impl<T: WireTransport> Connection<T> {
                         // because no Zyron table is read or written.
                         let res = crate::copy_external_dispatch::dispatch_external_to_external(
                             &self.server.catalog,
+                            self.server.key_store.as_ref(),
                             source,
                             sink,
                             &copy_stmt.options,
@@ -1460,22 +1552,38 @@ impl<T: WireTransport> Connection<T> {
                         Ok(plan) => {
                             let output_schema = plan.output_schema();
                             let (txn_id, snapshot) = self.ensure_transaction()?;
-                            let ctx = Arc::new(ExecutionContext::new(
+                            let mut ctx = ExecutionContext::new(
                                 self.server.catalog.clone(),
                                 self.server.wal.clone(),
                                 self.server.buffer_pool.clone(),
                                 self.server.disk_manager.clone(),
                                 txn_id as u32,
                                 snapshot,
-                            ));
+                            );
+                            self.attach_undo_log(&mut ctx);
+                            self.apply_session_limits(&mut ctx);
+                            let ctx = Arc::new(ctx);
 
                             match execute(plan, &ctx).await {
                                 Ok(batches) => {
+                                    let copy_format = match parse_copy_format(&copy_stmt.options) {
+                                        Ok(f) => f,
+                                        Err(e) => {
+                                            self.send_protocol_error(&e).await?;
+                                            self.mark_failed_if_in_transaction();
+                                            self.note_ctx_writes(&ctx);
+                                            continue;
+                                        }
+                                    };
+                                    let want_header = copy_has_header(&copy_stmt.options);
                                     let handler = crate::copy::CopyOutHandler::new(
                                         output_schema,
-                                        crate::copy::CopyFormat::Text,
+                                        copy_format,
                                     );
                                     self.feed(handler.header_message()).await?;
+                                    if want_header && copy_format == crate::copy::CopyFormat::Csv {
+                                        self.feed(handler.csv_header_message()).await?;
+                                    }
                                     for batch in &batches {
                                         let msgs = handler.format_batch(batch);
                                         for msg in msgs {
@@ -1556,16 +1664,24 @@ impl<T: WireTransport> Connection<T> {
                         }
                     };
 
-                    let mut handler = crate::copy::CopyInHandler::new(
-                        columns.clone(),
-                        crate::copy::CopyFormat::Text,
-                    );
+                    let copy_format = match parse_copy_format(&copy_stmt.options) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            self.send_protocol_error(&e).await?;
+                            self.mark_failed_if_in_transaction();
+                            continue;
+                        }
+                    };
+                    let skip_header = copy_has_header(&copy_stmt.options)
+                        && copy_format != crate::copy::CopyFormat::Binary;
+                    let mut handler = crate::copy::CopyInHandler::new(columns.clone(), copy_format);
 
                     // Send CopyInResponse to tell client to start sending data
                     self.feed(handler.header_message()).await?;
                     self.flush().await?;
 
                     // Read CopyData messages until CopyDone or CopyFail
+                    let mut copy_aborted = false;
                     loop {
                         let msg = self.read_message().await?;
                         match msg {
@@ -1573,6 +1689,7 @@ impl<T: WireTransport> Connection<T> {
                                 if let Err(e) = handler.feed(&data) {
                                     self.send_protocol_error(&e).await?;
                                     self.mark_failed_if_in_transaction();
+                                    copy_aborted = true;
                                     break;
                                 }
                             }
@@ -1584,70 +1701,52 @@ impl<T: WireTransport> Connection<T> {
                                 self.send_error(&ZyronError::Internal("COPY FROM aborted".into()))
                                     .await?;
                                 self.mark_failed_if_in_transaction();
+                                copy_aborted = true;
                                 break;
                             }
                         }
                     }
+                    if copy_aborted {
+                        continue;
+                    }
 
-                    let _row_count = handler.row_count();
-                    match handler.finish() {
-                        Ok(rows) => {
-                            if !rows.is_empty() {
-                                // Build INSERT for the rows via plan_and_execute
-                                let col_names = if copy_columns.is_empty() {
-                                    columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
-                                } else {
-                                    copy_columns.clone()
-                                };
-                                let col_list = col_names.join(", ");
+                    let rows = match handler.finish() {
+                        Ok(r) => r,
+                        Err(e) => {
+                            self.send_protocol_error(&e).await?;
+                            self.mark_failed_if_in_transaction();
+                            continue;
+                        }
+                    };
 
-                                let mut values_parts = Vec::with_capacity(rows.len());
-                                for row in &rows {
-                                    let vals: Vec<String> = row
-                                        .iter()
-                                        .map(|v| match v {
-                                            Some(bytes) => {
-                                                let s = String::from_utf8_lossy(bytes);
-                                                format!("'{}'", s.replace('\'', "''"))
-                                            }
-                                            None => "NULL".to_string(),
-                                        })
-                                        .collect();
-                                    values_parts.push(format!("({})", vals.join(", ")));
-                                }
-                                let insert_sql = format!(
-                                    "INSERT INTO {} ({}) VALUES {}",
-                                    copy_table,
-                                    col_list,
-                                    values_parts.join(", ")
-                                );
-                                match zyron_parser::parse(&insert_sql) {
-                                    Ok(stmts) if !stmts.is_empty() => {
-                                        let insert_stmt = stmts.into_iter().next().unwrap();
-                                        match self.plan_and_execute_statement(insert_stmt).await {
-                                            Ok(()) => {
-                                                // plan_and_execute already emitted a tag.
-                                            }
-                                            Err(e) => {
-                                                self.send_protocol_error(&e).await?;
-                                                self.mark_failed_if_in_transaction();
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                    Ok(_) => {}
-                                    Err(e) => {
-                                        self.send_error(&e).await?;
-                                        self.mark_failed_if_in_transaction();
-                                        continue;
-                                    }
-                                }
-                            }
-                            // The plan_and_execute_statement already sent CommandComplete
-                            // with INSERT tag. For COPY, we want COPY tag instead.
-                            // Since we cannot unsend the INSERT tag, we accept the INSERT
-                            // tag from plan_and_execute. A more refined implementation
-                            // would bypass plan_and_execute for direct tuple insertion.
+                    // The CSV header line, when requested, is the first data row.
+                    let data_rows: &[Vec<Option<Vec<u8>>>] = if skip_header && !rows.is_empty() {
+                        &rows[1..]
+                    } else {
+                        &rows[..]
+                    };
+
+                    let col_names = if copy_columns.is_empty() {
+                        columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+                    } else {
+                        copy_columns.clone()
+                    };
+
+                    match self
+                        .execute_copy_insert(
+                            &copy_table,
+                            &col_names,
+                            &columns,
+                            data_rows,
+                            copy_format,
+                        )
+                        .await
+                    {
+                        Ok(inserted) => {
+                            self.feed(BackendMessage::CommandComplete {
+                                tag: format!("COPY {}", inserted),
+                            })
+                            .await?;
                         }
                         Err(e) => {
                             self.send_protocol_error(&e).await?;
@@ -1673,8 +1772,12 @@ impl<T: WireTransport> Connection<T> {
             }
         }
 
-        // Auto-commit implicit transactions
-        self.auto_commit_if_needed().await;
+        // Auto-commit implicit transactions. A durability failure truncates the
+        // buffered success responses back to buf_mark and buffers an error, so
+        // the client sees the failure rather than a false CommandComplete.
+        if let Err(e) = self.auto_commit_if_needed(buf_mark).await {
+            debug!("autocommit failed after simple query batch: {}", e);
+        }
 
         self.send_ready_for_query().await?;
         Ok(())
@@ -1746,6 +1849,8 @@ impl<T: WireTransport> Connection<T> {
         if let Some(ref hook) = self.server.dml_hook {
             ctx.dml_hook = Some(Arc::clone(hook));
         }
+        self.attach_undo_log(&mut ctx);
+        self.apply_session_limits(&mut ctx);
         let ctx = Arc::new(ctx);
 
         // Execute
@@ -1785,6 +1890,121 @@ impl<T: WireTransport> Connection<T> {
         }
 
         Ok(())
+    }
+
+    /// Inserts COPY FROM rows as typed values. Each field's raw bytes are
+    /// converted to a ScalarValue using the target column's type (text/CSV via
+    /// text_to_scalar, binary via binary_to_scalar), then bound as a parameter to
+    /// a single parameterized INSERT so typed, binary, and NULL values are never
+    /// round-tripped through quoted SQL text. Returns the number of rows
+    /// inserted. Does not emit CommandComplete; the caller emits the COPY tag.
+    async fn execute_copy_insert(
+        &mut self,
+        table: &str,
+        col_names: &[String],
+        columns: &[LogicalColumn],
+        rows: &[Vec<Option<Vec<u8>>>],
+        format: crate::copy::CopyFormat,
+    ) -> Result<usize, ProtocolError> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let num_cols = col_names.len();
+
+        // Map each target column name to its catalog type so the field bytes are
+        // decoded against the column they land in, not by position in the probe.
+        let mut col_type_oids: Vec<i32> = Vec::with_capacity(num_cols);
+        for name in col_names {
+            let type_oid = columns
+                .iter()
+                .find(|c| c.name == *name)
+                .map(|c| types::type_id_to_pg_oid(c.type_id))
+                .unwrap_or(0);
+            col_type_oids.push(type_oid);
+        }
+
+        // Convert every field to a typed scalar and assign sequential $N slots.
+        let mut params: Vec<ScalarValue> = Vec::with_capacity(rows.len() * num_cols);
+        let mut values_parts: Vec<String> = Vec::with_capacity(rows.len());
+        let mut next_param = 1usize;
+        for row in rows {
+            if row.len() != num_cols {
+                return Err(ProtocolError::Malformed(format!(
+                    "COPY row has {} fields but {} columns are expected",
+                    row.len(),
+                    num_cols
+                )));
+            }
+            let mut placeholders: Vec<String> = Vec::with_capacity(num_cols);
+            for (col_idx, field) in row.iter().enumerate() {
+                let scalar = match field {
+                    None => ScalarValue::Null,
+                    Some(bytes) => {
+                        if format == crate::copy::CopyFormat::Binary {
+                            types::binary_to_scalar(bytes, col_type_oids[col_idx])?
+                        } else {
+                            types::text_to_scalar(bytes, col_type_oids[col_idx])?
+                        }
+                    }
+                };
+                params.push(scalar);
+                placeholders.push(format!("${}", next_param));
+                next_param += 1;
+            }
+            values_parts.push(format!("({})", placeholders.join(", ")));
+        }
+
+        let insert_sql = format!(
+            "INSERT INTO {} ({}) VALUES {}",
+            table,
+            col_names.join(", "),
+            values_parts.join(", ")
+        );
+        let stmts = zyron_parser::parse(&insert_sql).map_err(ProtocolError::Database)?;
+        let insert_stmt = stmts
+            .into_iter()
+            .next()
+            .ok_or_else(|| ProtocolError::Malformed("COPY produced an empty INSERT".into()))?;
+
+        let (db_id, search_path) = {
+            let session = self
+                .session
+                .as_ref()
+                .ok_or(ProtocolError::Malformed("No session established".into()))?;
+            (session.database_id, session.search_path.clone())
+        };
+        let plan = zyron_planner::plan(&self.server.catalog, db_id, search_path, insert_stmt)
+            .await
+            .map_err(ProtocolError::Database)?;
+
+        let (txn_id, snapshot) = self.ensure_transaction()?;
+        let mut ctx = ExecutionContext::new(
+            self.server.catalog.clone(),
+            self.server.wal.clone(),
+            self.server.buffer_pool.clone(),
+            self.server.disk_manager.clone(),
+            txn_id as u32,
+            snapshot,
+        );
+        ctx.params = params;
+        ctx.heap_files = Some(Arc::clone(&self.server.heap_files));
+        ctx.btree_indexes = Some(Arc::clone(&self.server.btree_indexes));
+        ctx.intent_locks = Some(Arc::clone(self.server.txn_manager.intent_locks()));
+        if let Some(ref hook) = self.server.cdc_hook {
+            ctx.cdc_hook = Some(Arc::clone(hook));
+        }
+        if let Some(ref hook) = self.server.dml_hook {
+            ctx.dml_hook = Some(Arc::clone(hook));
+        }
+        self.attach_undo_log(&mut ctx);
+        self.apply_session_limits(&mut ctx);
+        let ctx = Arc::new(ctx);
+        let batches = execute(plan, &ctx).await.map_err(ProtocolError::Database)?;
+        self.note_ctx_writes(&ctx);
+        if let Some(txn) = self.transaction.as_mut() {
+            txn.mark_wrote_data();
+        }
+        Ok(count_affected_rows(&batches))
     }
 
     // -----------------------------------------------------------------------
@@ -1950,6 +2170,8 @@ impl<T: WireTransport> Connection<T> {
         if let Some(ref hook) = self.server.dml_hook {
             ctx.dml_hook = Some(Arc::clone(hook));
         }
+        self.attach_undo_log(&mut ctx);
+        self.apply_session_limits(&mut ctx);
         let ctx = Arc::new(ctx);
 
         let plan = (*cached.plan).clone();
@@ -2031,14 +2253,17 @@ impl<T: WireTransport> Connection<T> {
 
         if options.analyze {
             let (txn_id, snapshot) = self.ensure_transaction()?;
-            let ctx = Arc::new(ExecutionContext::new(
+            let mut ctx = ExecutionContext::new(
                 self.server.catalog.clone(),
                 self.server.wal.clone(),
                 self.server.buffer_pool.clone(),
                 self.server.disk_manager.clone(),
                 txn_id as u32,
                 snapshot,
-            ));
+            );
+            self.attach_undo_log(&mut ctx);
+            self.apply_session_limits(&mut ctx);
+            let ctx = Arc::new(ctx);
 
             let (_batches, metrics) = execute_analyze(plan, &ctx)
                 .await
@@ -2291,35 +2516,20 @@ impl<T: WireTransport> Connection<T> {
             }
         }
 
-        // Get or re-plan the statement. Arc clone is a cheap reference count increment.
-        let plan = match &stmt.plan {
-            Some(p) => p.clone(),
-            None => {
-                // Re-parse and plan with the query
-                let session = self
-                    .session
-                    .as_ref()
-                    .ok_or(ProtocolError::Malformed("No session established".into()))?;
-
-                let stmts = zyron_parser::parse(&stmt.query).map_err(ProtocolError::Database)?;
-                if stmts.is_empty() {
-                    return Err(ProtocolError::Malformed("Empty query in Bind".into()));
-                }
-
-                Arc::new(
-                    zyron_planner::plan(
-                        &self.server.catalog,
-                        session.database_id,
-                        session.search_path.clone(),
-                        stmts.into_iter().next().unwrap(),
-                    )
-                    .await
-                    .map_err(ProtocolError::Database)?,
-                )
+        // A None plan marks a transaction-control, session, or DDL/utility
+        // statement that bypasses the planner. It is dispatched at Execute time
+        // through the same handlers the simple-query path uses, so the portal
+        // carries no plan and an empty output schema. A Some plan is a query
+        // whose schema is read directly; the Arc clone is a cheap refcount bump.
+        let query = stmt.query.clone();
+        let (plan, output_schema) = match &stmt.plan {
+            Some(p) => {
+                let plan = p.clone();
+                let schema = plan.output_schema();
+                (Some(plan), schema)
             }
+            None => (None, Vec::new()),
         };
-
-        let output_schema = plan.output_schema();
 
         // Evict a named portal if over capacity.
         if !portal_name.is_empty() && self.portals.len() >= MAX_PORTALS {
@@ -2343,6 +2553,7 @@ impl<T: WireTransport> Connection<T> {
                 result_formats,
                 plan,
                 output_schema,
+                query,
             },
         );
 
@@ -2369,9 +2580,19 @@ impl<T: WireTransport> Connection<T> {
             }
         };
 
+        // A portal with no plan holds a transaction-control, session, or
+        // DDL/utility statement that bypasses the planner. Dispatch it through
+        // the same handlers the simple-query path uses so prepared
+        // BEGIN/COMMIT/ROLLBACK/SET/SHOW/VACUUM/CHECKPOINT and DDL execute
+        // instead of being rejected by the planner.
+        if portal.plan.is_none() {
+            let query = portal.query.clone();
+            return self.execute_utility_portal(&query).await;
+        }
+
         #[cfg(feature = "profile")]
         let setup_span = profile::scope(Phase::WireExecSetup);
-        let plan = portal.plan.clone();
+        let plan = portal.plan.clone().expect("portal plan present");
         let output_schema = portal.output_schema.clone();
         let result_formats = portal.result_formats.clone();
         let params = portal.params.clone();
@@ -2404,6 +2625,7 @@ impl<T: WireTransport> Connection<T> {
                 ctx_owned.active_branch_id = mgr.get_branch_by_name(name).ok().map(|e| e.id.0);
             }
         }
+        self.apply_session_limits(&mut ctx_owned);
         let ctx = Arc::new(ctx_owned);
         #[cfg(feature = "profile")]
         drop(setup_span);
@@ -2449,6 +2671,149 @@ impl<T: WireTransport> Connection<T> {
             }
         }
 
+        Ok(())
+    }
+
+    /// Executes a planner-bypassing statement bound through the extended
+    /// protocol: transaction control, SET/SHOW, EXPLAIN, or DDL/utility. Routes
+    /// through the same handlers as the simple-query path. Does not send
+    /// ReadyForQuery, the extended protocol emits that on Sync.
+    async fn execute_utility_portal(&mut self, query: &str) -> Result<(), ProtocolError> {
+        let stmts = match zyron_parser::parse(query) {
+            Ok(s) => s,
+            Err(e) => {
+                self.send_error(&e).await?;
+                self.mark_failed_if_in_transaction();
+                return Ok(());
+            }
+        };
+        let stmt = match stmts.into_iter().next() {
+            Some(s) => s,
+            None => {
+                self.feed(BackendMessage::EmptyQueryResponse).await?;
+                return Ok(());
+            }
+        };
+
+        // In a failed transaction only ROLLBACK is permitted.
+        if self.session_ref().transaction_state() == TransactionState::Failed && !is_rollback(&stmt)
+        {
+            self.send_error(&ZyronError::TransactionAborted(
+                "current transaction is aborted, commands ignored until end of transaction block"
+                    .into(),
+            ))
+            .await?;
+            return Ok(());
+        }
+
+        // Transaction control: BEGIN/COMMIT/ROLLBACK.
+        if let Some(result) = self.try_handle_transaction_control(&stmt).await {
+            match result {
+                Ok(tag) => self.feed(BackendMessage::CommandComplete { tag }).await?,
+                Err(e) => {
+                    self.send_error(&e).await?;
+                    self.mark_failed_if_in_transaction();
+                }
+            }
+            return Ok(());
+        }
+
+        // Reject write statements in a READ ONLY transaction before they reach
+        // any operator that touches the heap
+        if let Some(txn) = self.transaction.as_ref() {
+            if txn.read_only() && !is_read_only_safe_statement(&stmt) {
+                self.send_error(&ZyronError::ExecutionError(format!(
+                    "cannot execute {} in a read-only transaction",
+                    statement_op_name(&stmt)
+                )))
+                .await?;
+                self.mark_failed_if_in_transaction();
+                return Ok(());
+            }
+        }
+
+        // Session commands: SET/SHOW.
+        if let Some(result) = self.try_handle_session_command(&stmt).await {
+            if let Err(e) = result {
+                self.send_protocol_error(&e).await?;
+                self.mark_failed_if_in_transaction();
+            }
+            return Ok(());
+        }
+
+        // SELECT against a virtual stat view.
+        if let zyron_parser::Statement::Select(ref sel) = stmt {
+            if let Some(view_name) = extract_single_from_table(sel) {
+                if crate::stat_views::is_stat_view(&view_name) {
+                    if let Err(e) = self.handle_stat_view_query(&view_name).await {
+                        self.send_protocol_error(&e).await?;
+                        self.mark_failed_if_in_transaction();
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
+        // EXPLAIN.
+        if let zyron_parser::Statement::Explain(explain_stmt) = stmt {
+            if let Err(e) = self.handle_explain_statement(*explain_stmt).await {
+                self.send_protocol_error(&e).await?;
+                self.mark_failed_if_in_transaction();
+            }
+            return Ok(());
+        }
+
+        // DDL, DCL, and other utility statements.
+        if let Some(result) = crate::ddl_dispatch::try_handle_ddl_utility(
+            &stmt,
+            &self.server,
+            &mut self.session,
+            &mut self.transaction,
+            &mut self.active_branch,
+            query,
+        )
+        .await
+        {
+            match result {
+                Ok(crate::ddl_dispatch::DdlResult::Tag(tag)) => {
+                    self.feed(BackendMessage::CommandComplete { tag }).await?;
+                }
+                Ok(crate::ddl_dispatch::DdlResult::Rows { tag, columns, rows }) => {
+                    let fields: Vec<FieldDescription> = columns
+                        .iter()
+                        .map(|(name, oid)| FieldDescription {
+                            name: name.clone(),
+                            table_oid: 0,
+                            column_attr: 0,
+                            type_oid: *oid,
+                            type_size: -1,
+                            type_modifier: -1,
+                            format: 0,
+                        })
+                        .collect();
+                    self.feed(BackendMessage::RowDescription(fields)).await?;
+                    for row in &rows {
+                        let values: Vec<Option<Vec<u8>>> =
+                            row.iter().map(|v| Some(v.as_bytes().to_vec())).collect();
+                        self.feed(BackendMessage::DataRow(values)).await?;
+                    }
+                    self.feed(BackendMessage::CommandComplete { tag }).await?;
+                }
+                Err(e) => {
+                    self.send_protocol_error(&e).await?;
+                    self.mark_failed_if_in_transaction();
+                }
+            }
+            return Ok(());
+        }
+
+        // No handler claimed the statement. The planner would have rejected it
+        // at Parse time, so reaching here means an unsupported utility shape.
+        self.send_error(&ZyronError::PlanError(format!(
+            "statement cannot be executed through the extended protocol: {query}"
+        )))
+        .await?;
+        self.mark_failed_if_in_transaction();
         Ok(())
     }
 
@@ -2516,11 +2881,19 @@ impl<T: WireTransport> Connection<T> {
     }
 
     async fn handle_sync(&mut self) -> Result<(), ProtocolError> {
-        // Auto-commit implicit transactions on Sync
+        // Auto-commit implicit transactions on Sync. No flush occurs between a
+        // Sync and the previous one, so the extended-protocol responses for
+        // this batch start buffering at write-buffer offset zero. On a commit
+        // failure those responses are truncated and replaced with an error.
         {
             #[cfg(feature = "profile")]
             let _s = profile::scope(Phase::WireAutoCommit);
-            self.auto_commit_if_needed().await;
+            // On a commit failure auto_commit_if_needed truncates the buffered
+            // extended-protocol responses and buffers an ErrorResponse, so the
+            // client sees the durability failure before ReadyForQuery.
+            if let Err(e) = self.auto_commit_if_needed(0).await {
+                debug!("autocommit failed on Sync: {}", e);
+            }
         }
         self.send_ready_for_query().await?;
         Ok(())
@@ -2530,6 +2903,15 @@ impl<T: WireTransport> Connection<T> {
     // Transaction management
     // -----------------------------------------------------------------------
 
+    /// Attaches the current transaction's shared undo log to an execution
+    /// context so DML operators record reverse-ops while a savepoint is open.
+    /// No-op when there is no active transaction.
+    fn attach_undo_log(&self, ctx: &mut ExecutionContext) {
+        if let Some(txn) = self.transaction.as_ref() {
+            ctx.undo_log = Some(txn.undo_log());
+        }
+    }
+
     /// Ensures a transaction exists, starting an implicit one if needed.
     /// Returns the txn_id and snapshot copy to avoid holding a borrow on self.
     fn ensure_transaction(&mut self) -> Result<(u64, Snapshot), ProtocolError> {
@@ -2537,7 +2919,7 @@ impl<T: WireTransport> Connection<T> {
             let txn = self
                 .server
                 .txn_manager
-                .begin(IsolationLevel::ReadCommitted)
+                .begin(self.server.default_isolation)
                 .map_err(ProtocolError::Database)?;
             self.transaction = Some(txn);
         }
@@ -2552,7 +2934,7 @@ impl<T: WireTransport> Connection<T> {
         stmt: &zyron_parser::Statement,
     ) -> Option<ZyronResult<String>> {
         match stmt {
-            zyron_parser::Statement::Begin(_) => {
+            zyron_parser::Statement::Begin(begin) => {
                 if self.transaction.is_some() {
                     // Already in a transaction, warn but allow
                     let _ = self
@@ -2566,8 +2948,18 @@ impl<T: WireTransport> Connection<T> {
                         }))
                         .await;
                 }
-                match self.server.txn_manager.begin(IsolationLevel::ReadCommitted) {
-                    Ok(txn) => {
+                let isolation = match begin.isolation {
+                    Some(level) => match map_isolation_level(level) {
+                        Ok(mapped) => mapped,
+                        Err(e) => return Some(Err(e)),
+                    },
+                    None => self.server.default_isolation,
+                };
+                match self.server.txn_manager.begin(isolation) {
+                    Ok(mut txn) => {
+                        if begin.read_only == Some(true) {
+                            txn.set_read_only(true);
+                        }
                         self.transaction = Some(txn);
                         if let Some(session) = self.session.as_mut() {
                             session.set_transaction_state(TransactionState::InTransaction);
@@ -2614,17 +3006,122 @@ impl<T: WireTransport> Connection<T> {
                     Some(Ok("COMMIT".into()))
                 }
             }
-            zyron_parser::Statement::Rollback(_) => {
-                if let Some(mut txn) = self.transaction.take() {
-                    let _ = self.server.txn_manager.abort(&mut txn);
+            zyron_parser::Statement::Rollback(rb) => {
+                // ROLLBACK TO [SAVEPOINT] name is a partial rollback: reverse the
+                // transaction's writes made after the savepoint and keep the
+                // transaction open. Plain ROLLBACK aborts the whole transaction.
+                if let Some(name) = &rb.savepoint {
+                    return Some(self.partial_rollback_to_savepoint(name).await);
                 }
+                let abort_result = if let Some(mut txn) = self.transaction.take() {
+                    self.server.txn_manager.abort(&mut txn)
+                } else {
+                    Ok(())
+                };
                 if let Some(session) = self.session.as_mut() {
                     session.set_transaction_state(TransactionState::Idle);
                 }
-                Some(Ok("ROLLBACK".into()))
+                match abort_result {
+                    Ok(()) => Some(Ok("ROLLBACK".into())),
+                    Err(e) => Some(Err(e)),
+                }
             }
             _ => None,
         }
+    }
+
+    /// Performs ROLLBACK TO SAVEPOINT: reverses the transaction's writes made
+    /// after the named savepoint at the heap-tuple level and releases the locks
+    /// it acquired after the savepoint, keeping the transaction open. A
+    /// reverse-insert self-deletes a row the transaction inserted (stamp xmax =
+    /// txn id); a reverse-delete restores a row it deleted (clear xmax). Index
+    /// entries are left untouched, matching full-abort semantics: heap
+    /// visibility filters entries pointing at a self-deleted row, and vacuum
+    /// reclaims them. The read snapshot is unchanged.
+    async fn partial_rollback_to_savepoint(&mut self, name: &str) -> ZyronResult<String> {
+        use zyron_storage::{HeapFile, HeapFileConfig, UndoEntry};
+
+        let txn = self.transaction.as_mut().ok_or_else(|| {
+            ZyronError::TransactionAborted(
+                "ROLLBACK TO SAVEPOINT can only be used in a transaction".to_string(),
+            )
+        })?;
+        let txn_id = txn.txn_id();
+        let xmax = u32::try_from(txn_id)
+            .map_err(|_| ZyronError::Internal(format!("txn_id {} exceeds u32::MAX", txn_id)))?;
+
+        let rollback = txn.rollback_to_savepoint(name).ok_or_else(|| {
+            ZyronError::TransactionAborted(format!("savepoint \"{}\" does not exist", name))
+        })?;
+
+        // Reverse each recorded write, last write first. Heap files are cached
+        // per heap_file_id so repeated tuples on the same table reuse one handle.
+        let mut heaps: std::collections::HashMap<u32, Arc<HeapFile>> =
+            std::collections::HashMap::new();
+        for entry in &rollback.undo {
+            let (heap_file_id, fsm_file_id, tid, is_insert) = match entry {
+                UndoEntry::ReverseInsert {
+                    heap_file_id,
+                    fsm_file_id,
+                    tid,
+                } => (*heap_file_id, *fsm_file_id, *tid, true),
+                UndoEntry::ReverseDelete {
+                    heap_file_id,
+                    fsm_file_id,
+                    tid,
+                } => (*heap_file_id, *fsm_file_id, *tid, false),
+            };
+            let heap = match heaps.get(&heap_file_id) {
+                Some(h) => Arc::clone(h),
+                None => {
+                    let h = if let Some(hit) = self.server.heap_files.get_async(&heap_file_id).await
+                    {
+                        Arc::clone(hit.get())
+                    } else {
+                        Arc::new(HeapFile::new(
+                            Arc::clone(&self.server.disk_manager),
+                            Arc::clone(&self.server.buffer_pool),
+                            HeapFileConfig {
+                                heap_file_id,
+                                fsm_file_id,
+                            },
+                        )?)
+                    };
+                    heaps.insert(heap_file_id, Arc::clone(&h));
+                    h
+                }
+            };
+            if is_insert {
+                // Self-delete the row the transaction inserted after the
+                // savepoint by stamping its xmax with the txn id.
+                heap.set_xmax(tid, xmax).await?;
+            } else {
+                // Restore the row the transaction deleted after the savepoint by
+                // clearing its xmax back to 0.
+                heap.clear_xmax(tid).await?;
+            }
+        }
+
+        // Release the row and intent locks acquired after the savepoint. Locks
+        // taken at or before it stay held so the transaction keeps its
+        // write-write conflict protection on rows touched before the savepoint.
+        self.server
+            .txn_manager
+            .lock_table()
+            .unlock_after(txn_id, rollback.row_lock_count);
+        self.server
+            .txn_manager
+            .intent_locks()
+            .unlock_after(txn_id, rollback.intent_lock_count);
+
+        // The transaction stays open. A statement error before this rollback may
+        // have marked the session Failed; ROLLBACK TO SAVEPOINT restores it to a
+        // usable in-transaction state so subsequent statements run.
+        if let Some(session) = self.session.as_mut() {
+            session.set_transaction_state(TransactionState::InTransaction);
+        }
+
+        Ok("ROLLBACK".into())
     }
 
     /// Tries to handle SET/SHOW session commands directly.
@@ -2634,9 +3131,60 @@ impl<T: WireTransport> Connection<T> {
     ) -> Option<Result<(), ProtocolError>> {
         match stmt {
             zyron_parser::Statement::SetVariable(s) => {
+                let val_str = expr_to_string(&s.value);
+                let key = s.name.to_ascii_lowercase();
+
+                // SET ROLE / SET SESSION AUTHORIZATION change the effective
+                // identity, so resolve the role name against the registry before
+                // touching the session. NONE / DEFAULT resets to the login role.
+                let role_change: Option<Option<zyron_auth::RoleId>> =
+                    if key == "role" || key == "session_authorization" {
+                        let reset = val_str.eq_ignore_ascii_case("none")
+                            || val_str.eq_ignore_ascii_case("default");
+                        if reset {
+                            Some(None)
+                        } else {
+                            match &self.server.security_manager {
+                                Some(sm) => match sm.lookup_role(&val_str) {
+                                    Some(role) => Some(Some(role.id)),
+                                    None => {
+                                        return Some(Err(ProtocolError::Database(
+                                            ZyronError::RoleNotFound(format!(
+                                                "role '{val_str}' does not exist"
+                                            )),
+                                        )));
+                                    }
+                                },
+                                None => {
+                                    return Some(Err(ProtocolError::Database(
+                                        ZyronError::ConfigError(
+                                            "role management is not enabled".to_string(),
+                                        ),
+                                    )));
+                                }
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                let hierarchy = self
+                    .server
+                    .security_manager
+                    .as_ref()
+                    .map(|sm| &sm.role_hierarchy);
+
                 if let Some(session) = self.session.as_mut() {
-                    let val_str = expr_to_string(&s.value);
-                    session.set_variable(s.name.clone(), val_str);
+                    if let Err(e) = session.set_variable(s.name.clone(), val_str) {
+                        return Some(Err(ProtocolError::Database(e)));
+                    }
+                    if let Some(target) = role_change {
+                        if let Some(hierarchy) = hierarchy {
+                            if let Err(e) = session.apply_role(target, hierarchy) {
+                                return Some(Err(ProtocolError::Database(e)));
+                            }
+                        }
+                    }
                 }
                 let result = self
                     .feed(BackendMessage::CommandComplete { tag: "SET".into() })
@@ -2770,8 +3318,18 @@ impl<T: WireTransport> Connection<T> {
                 // CHECKPOINT forces a checkpoint and blocks until it completes
                 // (Postgres semantics). The trigger parks on a condvar, so run
                 // it on a blocking thread to avoid stalling the async runtime.
-                if let Some(wake) = self.server.checkpoint_wake.clone() {
-                    let _ = tokio::task::spawn_blocking(move || wake()).await;
+                // No checkpoint trigger configured means no checkpoint can be
+                // performed, so report that instead of a false success.
+                let Some(wake) = self.server.checkpoint_wake.clone() else {
+                    return Some(Err(ProtocolError::Database(ZyronError::ConfigError(
+                        "CHECKPOINT is not available, no checkpoint coordinator is configured"
+                            .to_string(),
+                    ))));
+                };
+                if let Err(e) = tokio::task::spawn_blocking(move || wake()).await {
+                    return Some(Err(ProtocolError::Database(ZyronError::Internal(format!(
+                        "checkpoint failed: {e}"
+                    )))));
                 }
                 Some(
                     self.feed(BackendMessage::CommandComplete {
@@ -2970,67 +3528,244 @@ impl<T: WireTransport> Connection<T> {
         .await
     }
 
-    /// REINDEX rebuilds B+tree indexes from the heap. Emits a Notice every
-    /// 10000 rows showing progress.
+    /// REINDEX rebuilds B+tree indexes from the heap. For each target index it
+    /// creates a fresh empty B+tree (replacing the old on-disk checkpoint),
+    /// scans the table heap, re-extracts the indexed column's key from every
+    /// live row, and inserts the composite (value followed by tuple id) key with
+    /// the same encoding the insert path uses. Emits a Notice every 10000 rows
+    /// showing the true number of entries rebuilt.
     async fn handle_reindex(
         &mut self,
         table_name: Option<&str>,
         index_name: Option<&str>,
     ) -> Result<(), ProtocolError> {
+        use zyron_storage::{HeapFile, HeapFileConfig, HeapPage, TupleHeader};
+
         let tables = self.server.catalog.list_all_tables();
         let target_tables: Vec<_> = if let Some(name) = table_name {
-            tables
-                .into_iter()
-                .filter(|t| t.name == name)
-                .collect::<Vec<_>>()
-        } else if let Some(_idx_name) = index_name {
-            // Single-index reindex: find the table that owns it. The catalog
-            // currently exposes per-table index lists; we walk all tables.
-            tables.into_iter().collect()
+            let matched: Vec<_> = tables.into_iter().filter(|t| t.name == name).collect();
+            if matched.is_empty() {
+                let fields = crate::messages::backend::ErrorFields {
+                    severity: "ERROR".into(),
+                    code: "42P01".into(),
+                    message: format!("relation \"{}\" does not exist", name),
+                    detail: None,
+                    hint: None,
+                    position: None,
+                };
+                let _ = self.feed(BackendMessage::ErrorResponse(fields)).await;
+                return Ok(());
+            }
+            matched
         } else {
-            tables
+            // For a bare index name or REINDEX DATABASE, every table is scanned
+            // and the index filter below selects the matching index.
+            tables.into_iter().collect()
         };
 
-        let total_indexes: usize = target_tables.iter().map(|_t| 1usize).sum();
+        let checkpoint_dir = self.server.data_dir.join("indexes");
+        let _ = std::fs::create_dir_all(&checkpoint_dir);
+
+        let status_map = self.server.txn_manager.status_map().clone();
+        let active_txns = self.server.txn_manager.active_txn_ids();
+        let oldest_active = if active_txns.is_empty() {
+            self.server.txn_manager.next_txn_id()
+        } else {
+            active_txns[0]
+        };
+        let now_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+
+        let mut index_matched = false;
         let mut processed_indexes = 0usize;
-        let mut total_rows: u64 = 0;
+        let mut total_entries: u64 = 0;
         let progress_every: u64 = 10_000;
 
         for table in &target_tables {
             let indexes = self.server.catalog.get_indexes_for_table(table.id);
-            for idx in indexes {
-                if let Some(name) = index_name {
-                    if idx.name != name {
-                        continue;
-                    }
-                }
-                // Drop any cached B+tree handle for this index so the rebuild
-                // starts from a clean slate.
-                let _ = self.server.btree_indexes.remove_sync(&idx.index_file_id);
-                processed_indexes += 1;
-                total_rows = total_rows.saturating_add(progress_every);
-                if total_rows.is_multiple_of(progress_every) {
-                    let pct = if total_indexes == 0 {
-                        100
-                    } else {
-                        (processed_indexes * 100) / total_indexes.max(1)
-                    };
+            let btree_indexes: Vec<_> = indexes
+                .into_iter()
+                .filter(|idx| idx.index_type == zyron_catalog::IndexType::BTree)
+                .filter(|idx| index_name.map(|n| idx.name == n).unwrap_or(true))
+                .collect();
+            if btree_indexes.is_empty() {
+                continue;
+            }
+            index_matched = true;
+
+            // Read the heap once per table and collect every live row's image
+            // keyed by page. A row is live when it is not reclaimable under the
+            // same commit-status and retention rules vacuum applies, so the
+            // rebuilt index matches the heap's live-plus-retained set.
+            let heap_file = match HeapFile::new(
+                Arc::clone(&self.server.disk_manager),
+                Arc::clone(&self.server.buffer_pool),
+                HeapFileConfig {
+                    heap_file_id: table.heap_file_id,
+                    fsm_file_id: table.fsm_file_id,
+                },
+            ) {
+                Ok(hf) => hf,
+                Err(e) => {
                     let fields = crate::messages::backend::ErrorFields {
-                        severity: "INFO".into(),
-                        code: "00000".into(),
-                        message: format!(
-                            "REINDEX progress: {}% ({} indexes processed)",
-                            pct.min(100),
-                            processed_indexes
-                        ),
+                        severity: "ERROR".into(),
+                        code: "XX000".into(),
+                        message: format!("REINDEX failed to open heap: {}", e),
                         detail: None,
                         hint: None,
                         position: None,
                     };
-                    let _ = self.feed(BackendMessage::NoticeResponse(fields)).await;
+                    let _ = self.feed(BackendMessage::ErrorResponse(fields)).await;
+                    return Ok(());
+                }
+            };
+            let scan_guard = match heap_file.scan() {
+                Ok(sg) => sg,
+                Err(e) => {
+                    let fields = crate::messages::backend::ErrorFields {
+                        severity: "ERROR".into(),
+                        code: "XX000".into(),
+                        message: format!("REINDEX scan failed: {}", e),
+                        detail: None,
+                        hint: None,
+                        position: None,
+                    };
+                    let _ = self.feed(BackendMessage::ErrorResponse(fields)).await;
+                    return Ok(());
+                }
+            };
+            let page_ids = scan_guard.page_ids().to_vec();
+            drop(scan_guard);
+
+            let retention_floor = zyron_executor::operator::modify::effective_retention_floor(
+                table.as_ref(),
+                &status_map,
+                self.server.txn_manager.retention_clock(),
+                now_us,
+            );
+            let is_dead = |xmin: u32, x: u32| {
+                status_map.is_aborted(xmin as u64)
+                    || (x != 0
+                        && status_map.is_committed(x as u64)
+                        && (x as u64) < oldest_active
+                        && status_map.is_reclaimable_below(x as u64, retention_floor))
+            };
+
+            // Collect live rows per page as (page_id, slot, row image).
+            let mut live_by_page: Vec<(zyron_common::page::PageId, Vec<(u16, Vec<u8>)>)> =
+                Vec::with_capacity(page_ids.len());
+            for page_id in &page_ids {
+                let Some(frame) = self.server.buffer_pool.fetch_page(*page_id) else {
+                    continue;
+                };
+                let mut live: Vec<(u16, Vec<u8>)> = Vec::new();
+                {
+                    let guard = frame.read_data();
+                    let data: &[u8] = &guard[..];
+                    let header = HeapPage::heap_header_from_slice(data);
+                    for slot in 0..header.slot_count {
+                        let Some(view) =
+                            HeapPage::get_tuple_view_from_slice(data, zyron_storage::SlotId(slot))
+                        else {
+                            continue;
+                        };
+                        let hdr: TupleHeader = view.header;
+                        if is_dead(hdr.xmin, hdr.xmax) {
+                            continue;
+                        }
+                        live.push((slot, view.data.to_vec()));
+                    }
+                }
+                self.server.buffer_pool.unpin_page(*page_id, false);
+                if !live.is_empty() {
+                    live_by_page.push((*page_id, live));
                 }
             }
+
+            for idx in &btree_indexes {
+                // The catalog stores the index column id list; B+tree indexes
+                // are single-column here, so the first column id is the key.
+                let Some(col_id) = idx.columns.first().map(|c| c.column_id) else {
+                    continue;
+                };
+
+                // Replace the old index with a fresh empty tree and drop its
+                // stale on-disk checkpoint so recovery does not reload old keys.
+                let fresh =
+                    zyron_storage::BTreeIndex::create(idx.index_file_id, checkpoint_dir.clone())
+                        .await
+                        .map_err(ProtocolError::Database)?;
+                let fresh = Arc::new(fresh);
+                let checkpoint_path =
+                    checkpoint_dir.join(format!("index_{}.zyridx", idx.index_file_id));
+                if checkpoint_path.exists() {
+                    if let Err(e) = std::fs::remove_file(&checkpoint_path) {
+                        tracing::error!(
+                            target: "zyron::ddl",
+                            index = %idx.name,
+                            "REINDEX failed to remove index checkpoint: {e}"
+                        );
+                    }
+                }
+
+                let mut index_entries: u64 = 0;
+                for (page_id, live) in &live_by_page {
+                    let inserted = zyron_executor::operator::modify::rebuild_btree_index_from_rows(
+                        table.as_ref(),
+                        *page_id,
+                        live,
+                        col_id,
+                        &fresh,
+                    );
+                    index_entries += inserted as u64;
+                    total_entries += inserted as u64;
+                    if total_entries / progress_every
+                        != total_entries.saturating_sub(inserted as u64) / progress_every
+                    {
+                        let fields = crate::messages::backend::ErrorFields {
+                            severity: "INFO".into(),
+                            code: "00000".into(),
+                            message: format!("REINDEX progress: {} entries rebuilt", total_entries),
+                            detail: None,
+                            hint: None,
+                            position: None,
+                        };
+                        let _ = self.feed(BackendMessage::NoticeResponse(fields)).await;
+                    }
+                }
+
+                let _ = self
+                    .server
+                    .btree_indexes
+                    .insert_async(idx.id.0, fresh)
+                    .await;
+                processed_indexes += 1;
+                tracing::info!(
+                    target: "zyron::ddl",
+                    index = %idx.name,
+                    entries = index_entries,
+                    "REINDEX rebuilt index"
+                );
+            }
         }
+
+        if !index_matched {
+            if let Some(name) = index_name {
+                let fields = crate::messages::backend::ErrorFields {
+                    severity: "ERROR".into(),
+                    code: "42704".into(),
+                    message: format!("index \"{}\" does not exist", name),
+                    detail: None,
+                    hint: None,
+                    position: None,
+                };
+                let _ = self.feed(BackendMessage::ErrorResponse(fields)).await;
+                return Ok(());
+            }
+        }
+        let _ = processed_indexes;
 
         self.feed(BackendMessage::CommandComplete {
             tag: "REINDEX".into(),
@@ -3243,6 +3978,10 @@ impl<T: WireTransport> Connection<T> {
             }
         }
 
+        // Collect per-table failures. A table whose heap cannot be opened or
+        // whose scan fails keeps stale stats, so report it rather than letting
+        // ANALYZE claim success while the planner runs on outdated statistics.
+        let mut failures: Vec<String> = Vec::new();
         for table in &target_tables {
             let heap_file = match HeapFile::new(
                 Arc::clone(&self.server.disk_manager),
@@ -3253,14 +3992,30 @@ impl<T: WireTransport> Connection<T> {
                 },
             ) {
                 Ok(hf) => hf,
-                Err(_) => continue,
+                Err(e) => {
+                    failures.push(format!("{}: {e}", table.name));
+                    continue;
+                }
             };
 
-            if let Ok((table_stats, column_stats)) = analyze_table(&table, &heap_file).await {
-                self.server
-                    .catalog
-                    .put_stats(table.id, table_stats, column_stats);
+            match analyze_table(&table, &heap_file).await {
+                Ok((table_stats, column_stats)) => {
+                    self.server
+                        .catalog
+                        .put_stats(table.id, table_stats, column_stats);
+                }
+                Err(e) => failures.push(format!("{}: {e}", table.name)),
             }
+        }
+
+        if !failures.is_empty() {
+            return Err(ProtocolError::Database(ZyronError::ExecutionError(
+                format!(
+                    "ANALYZE failed for {} table(s): {}",
+                    failures.len(),
+                    failures.join("; ")
+                ),
+            )));
         }
 
         self.feed(BackendMessage::CommandComplete {
@@ -3302,8 +4057,35 @@ impl<T: WireTransport> Connection<T> {
         }
     }
 
+    /// Applies the session statement timeout and result-row cap to an
+    /// execution context. The deadline starts now plus statement_timeout, and
+    /// the row cap is the configured max_result_rows. Both are left unset when
+    /// the server has no corresponding limit configured.
+    #[inline]
+    fn apply_session_limits(&self, ctx: &mut ExecutionContext) {
+        if let Some(timeout) = self.server.statement_timeout {
+            ctx.set_deadline(std::time::Instant::now() + timeout);
+        }
+        ctx.max_result_rows = self.server.max_result_rows;
+        // A read-only transaction marks its execution context so write operators
+        // reject before touching the heap. This is the universal enforcement
+        // point, so a write reaches it through any path (direct DML, a prepared
+        // write run via the extended protocol, or a write inside EXECUTE, CALL,
+        // DO, or a trigger), while reads of every kind are allowed.
+        ctx.read_only = self
+            .transaction
+            .as_ref()
+            .map(|t| t.read_only())
+            .unwrap_or(false);
+    }
+
     /// Auto-commits implicit transactions (when not inside an explicit BEGIN block).
-    async fn auto_commit_if_needed(&mut self) {
+    /// `buf_mark` is the write-buffer length captured before this query batch
+    /// buffered its CommandComplete responses. On a commit or abort failure the
+    /// buffered success responses are truncated back to `buf_mark` and an
+    /// ErrorResponse is buffered in their place so the client is never told a
+    /// statement succeeded when its durable commit failed.
+    async fn auto_commit_if_needed(&mut self, buf_mark: usize) -> Result<(), ProtocolError> {
         let in_explicit_txn = self
             .session
             .as_ref()
@@ -3316,15 +4098,33 @@ impl<T: WireTransport> Connection<T> {
         if !in_explicit_txn {
             if let Some(mut txn) = self.transaction.take() {
                 if self.session_ref().transaction_state() == TransactionState::Failed {
-                    let _ = self.server.txn_manager.abort(&mut txn);
+                    if let Err(e) = self.server.txn_manager.abort(&mut txn) {
+                        self.write_buf.truncate(buf_mark);
+                        self.send_error(&e).await?;
+                        return Err(ProtocolError::Database(e));
+                    }
                 } else if txn.wrote_data() {
-                    let _ = self.server.txn_manager.commit(&mut txn).await;
+                    if let Err(e) = self.server.txn_manager.commit(&mut txn).await {
+                        // The implicit transaction failed to durably commit.
+                        // Replace the buffered success responses with an error.
+                        self.write_buf.truncate(buf_mark);
+                        if let Some(session) = self.session.as_mut() {
+                            session.set_transaction_state(TransactionState::Idle);
+                        }
+                        self.send_error(&e).await?;
+                        return Err(ProtocolError::Database(e));
+                    }
                 } else {
                     // Read-only transaction: no commit record, no flush wait.
-                    let _ = self.server.txn_manager.commit_read_only(&mut txn);
+                    if let Err(e) = self.server.txn_manager.commit_read_only(&mut txn) {
+                        self.write_buf.truncate(buf_mark);
+                        self.send_error(&e).await?;
+                        return Err(ProtocolError::Database(e));
+                    }
                 }
             }
         }
+        Ok(())
     }
 
     fn mark_failed_if_in_transaction(&mut self) {
@@ -3444,8 +4244,27 @@ impl<T: WireTransport> Connection<T> {
             .map(|i| i < schema.len() && schema[i].type_id == zyron_common::TypeId::Vector)
             .collect();
 
+        let max_rows = self.server.max_result_rows;
         for batch in batches {
             for row in 0..batch.num_rows {
+                // Stop before encoding a row that would exceed the configured
+                // cap. Flush rows already buffered so the partial stream is
+                // framed, then surface the limit as an error to the client.
+                if let Some(cap) = max_rows {
+                    if total_rows as u64 >= cap {
+                        if !buf.is_empty() {
+                            self.stream
+                                .write_all(&buf)
+                                .await
+                                .map_err(ProtocolError::Io)?;
+                            buf.clear();
+                        }
+                        return Err(ProtocolError::Database(ZyronError::Internal(format!(
+                            "result set exceeds max_result_rows {}",
+                            cap
+                        ))));
+                    }
+                }
                 // DataRow: type 'D' + 4-byte length + 2-byte column count + per-column data
                 buf.put_u8(b'D');
                 let len_pos = buf.len();
@@ -3722,10 +4541,15 @@ impl<T: WireTransport> Connection<T> {
             created_at: now_secs,
             source_id: None,
         };
-        let subscription_id = match self.server.catalog.create_subscription(new_entry).await {
-            Ok(id) => id,
-            Err(_) => zyron_catalog::SubscriptionId(0),
-        };
+        // A failed create must abort the subscription. Falling back to id 0
+        // would run an untracked pump whose cursor never persists, so the
+        // consumer would silently re-receive everything on reconnect.
+        let subscription_id = self
+            .server
+            .catalog
+            .create_subscription(new_entry)
+            .await
+            .map_err(ProtocolError::Database)?;
 
         // Build the per-subscription producer context.
         let peer_addr: std::net::SocketAddr = self
@@ -3857,12 +4681,11 @@ impl<T: WireTransport> Connection<T> {
                             .await
                             .map_err(ProtocolError::Io)?;
                         self.stream.flush().await.map_err(ProtocolError::Io)?;
+                        // Record the push in memory only. The durable cursor is
+                        // not advanced here because the subscriber has not yet
+                        // acked. Persisting end_lsn now would lose data: a crash
+                        // before the ack would resume past unconfirmed rows.
                         ctx.record_push(end_lsn, encoded_len, row_count);
-                        let _ = self
-                            .server
-                            .catalog
-                            .update_subscription_lsn(subscription_id, end_lsn)
-                            .await;
                         continue;
                     }
                 }
@@ -3903,6 +4726,15 @@ impl<T: WireTransport> Connection<T> {
                                 let prev = ctx.last_acked_lsn.load(Ordering::Acquire);
                                 let released = ack.acked_lsn.saturating_sub(prev);
                                 ctx.apply_ack(ack.acked_lsn, released);
+                                // The subscriber confirmed durable receipt up to
+                                // acked_lsn, so advance the persisted cursor only
+                                // now. A persist failure fails the pump rather
+                                // than silently risking redelivery or loss.
+                                self.server
+                                    .catalog
+                                    .update_subscription_lsn(subscription_id, ack.acked_lsn)
+                                    .await
+                                    .map_err(ProtocolError::Database)?;
                             }
                             Ok(crate::messages::frontend::FrontendMessage::EndSubscription(_)) => {
                                 return Ok("client EndSubscription");
@@ -3927,10 +4759,11 @@ impl<T: WireTransport> Connection<T> {
 
         // Single cleanup path covers every exit: graceful end, client
         // disconnect, server shutdown, read error, write error, encode
-        // error. We persist last_pushed_lsn (so the next subscribe
-        // resumes from the same place), mark the subscription Failed when
+        // error. We persist the last acked lsn (not the last pushed) so the
+        // next subscribe resumes from the consumer's confirmed position and
+        // never skips unacknowledged rows, mark the subscription Failed when
         // the pump bailed on an error, and remove the in-memory context.
-        let final_lsn = ctx.last_pushed_lsn.load(Ordering::Acquire);
+        let final_lsn = ctx.last_acked_lsn.load(Ordering::Acquire);
         let _ = self
             .server
             .catalog
@@ -4269,6 +5102,43 @@ fn is_rollback(stmt: &zyron_parser::Statement) -> bool {
     matches!(stmt, zyron_parser::Statement::Rollback(_))
 }
 
+/// Resolves the COPY data format from the statement options. Reads the FORMAT
+/// key (text, csv, binary) and returns an error for an unrecognized value.
+fn parse_copy_format(
+    options: &[(String, String)],
+) -> Result<crate::copy::CopyFormat, ProtocolError> {
+    for (key, value) in options {
+        if key.eq_ignore_ascii_case("format") {
+            return match value.to_ascii_lowercase().as_str() {
+                "text" => Ok(crate::copy::CopyFormat::Text),
+                "csv" => Ok(crate::copy::CopyFormat::Csv),
+                "binary" => Ok(crate::copy::CopyFormat::Binary),
+                other => Err(ProtocolError::Database(ZyronError::PlanError(format!(
+                    "unsupported COPY format \"{}\"",
+                    other
+                )))),
+            };
+        }
+    }
+    Ok(crate::copy::CopyFormat::Text)
+}
+
+/// Returns true when the COPY options request a CSV header line. PostgreSQL
+/// accepts HEADER, HEADER true, HEADER on, and HEADER match.
+fn copy_has_header(options: &[(String, String)]) -> bool {
+    for (key, value) in options {
+        if key.eq_ignore_ascii_case("header") {
+            let v = value.trim();
+            return v.is_empty()
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("on")
+                || v.eq_ignore_ascii_case("match")
+                || v == "1";
+        }
+    }
+    false
+}
+
 /// Collects OperatorMetrics tree into a flat pre-order list of (rows, elapsed_ms, batches).
 fn collect_metrics_flat(metrics: &Arc<OperatorMetrics>) -> Vec<(u64, f64, u64)> {
     let mut result = Vec::new();
@@ -4292,6 +5162,52 @@ fn collect_metrics_recursive(metrics: &OperatorMetrics, result: &mut Vec<(u64, f
 
 /// Returns true if the statement is a DDL/utility type that should bypass
 /// the planner and be dispatched through ddl_dispatch instead.
+/// Returns true when a statement only reads and may run in a READ ONLY
+/// transaction. Anything not on this allow-list mutates data or schema and is
+/// rejected so a new write statement never slips through by default.
+fn is_read_only_safe_statement(stmt: &zyron_parser::Statement) -> bool {
+    use zyron_parser::Statement;
+    matches!(
+        stmt,
+        Statement::Select(_)
+            | Statement::ValuesQuery(_)
+            | Statement::Explain(_)
+            | Statement::Show(_)
+            | Statement::SetVariable(_)
+            | Statement::Begin(_)
+            | Statement::Commit(_)
+            | Statement::Rollback(_)
+            | Statement::Savepoint(_)
+            | Statement::ReleaseSavepoint(_)
+            | Statement::DeclareCursor(_)
+            | Statement::FetchCursor(_)
+            | Statement::CloseCursor(_)
+            | Statement::Prepare(_)
+            | Statement::Deallocate(_)
+            | Statement::Execute(_)
+            | Statement::Listen(_)
+            | Statement::Analyze(_)
+    )
+}
+
+/// Returns the SQL verb for a statement, used in the read-only rejection
+/// message.
+fn statement_op_name(stmt: &zyron_parser::Statement) -> &'static str {
+    use zyron_parser::Statement;
+    match stmt {
+        Statement::Insert(_) => "INSERT",
+        Statement::Update(_) => "UPDATE",
+        Statement::Delete(_) => "DELETE",
+        Statement::Merge(_) => "MERGE",
+        Statement::Copy(_) => "COPY",
+        Statement::Truncate(_) => "TRUNCATE",
+        Statement::Call(_) => "CALL",
+        Statement::DoBlock(_) => "DO",
+        _ if is_ddl_statement(stmt) => "DDL",
+        _ => "statement",
+    }
+}
+
 fn is_ddl_statement(stmt: &zyron_parser::Statement) -> bool {
     use zyron_parser::Statement;
     !matches!(
@@ -4395,10 +5311,16 @@ fn build_authenticator(
 ) -> Box<dyn Authenticator> {
     use zyron_auth::auth_rules::AuthMethod;
 
-    // Build password map from SecurityManager's cached user passwords.
-    // No heap scan needed, passwords were loaded at startup.
-    let load_passwords =
+    // Build credential maps from SecurityManager's caches. No heap scan needed,
+    // credentials were loaded at startup. Cleartext verifies plaintext against
+    // the Balloon PHC hash, MD5 uses md5(password + user), SCRAM uses the
+    // stored SCRAM secret.
+    let load_password_hashes =
         || -> std::collections::HashMap<String, String> { (*sm.password_cache.load()).clone() };
+    let load_md5 =
+        || -> std::collections::HashMap<String, String> { (*sm.md5_cache.load()).clone() };
+    let load_scram =
+        || -> std::collections::HashMap<String, String> { (*sm.scram_cache.load()).clone() };
 
     match method {
         AuthMethod::Trust => Box::new(TrustAuthenticator),
@@ -4408,21 +5330,21 @@ fn build_authenticator(
         AuthMethod::Reject => Box::new(crate::auth::CleartextAuthenticator::new(
             std::collections::HashMap::new(),
         )),
-        AuthMethod::Password | AuthMethod::BalloonSha256 => {
-            Box::new(crate::auth::CleartextAuthenticator::new(load_passwords()))
-        }
-        AuthMethod::Md5 => Box::new(crate::auth::Md5Authenticator::new(load_passwords())),
-        AuthMethod::ScramSha256 => Box::new(ScramAuthenticator::new(load_passwords())),
+        AuthMethod::Password | AuthMethod::BalloonSha256 => Box::new(
+            crate::auth::CleartextAuthenticator::new(load_password_hashes()),
+        ),
+        AuthMethod::Md5 => Box::new(crate::auth::Md5Authenticator::new(load_md5())),
+        AuthMethod::ScramSha256 => Box::new(ScramAuthenticator::new(load_scram())),
         AuthMethod::Fido2 => Box::new(build_webauthn_authenticator(sm)),
         AuthMethod::PasswordAndFido2 => {
             let password_auth: Box<dyn Authenticator> =
-                Box::new(ScramAuthenticator::new(load_passwords()));
+                Box::new(ScramAuthenticator::new(load_scram()));
             let webauthn_auth = build_webauthn_authenticator(sm);
             Box::new(ComposedAuthenticator::new(password_auth, webauthn_auth))
         }
         AuthMethod::PasswordAndTotp => {
             let password_auth: Box<dyn Authenticator> =
-                Box::new(ScramAuthenticator::new(load_passwords()));
+                Box::new(ScramAuthenticator::new(load_scram()));
             let totp_auth = crate::auth::TotpAuthenticator::new(Arc::clone(sm));
             Box::new(crate::auth::PasswordTotpAuthenticator::new(
                 password_auth,
@@ -4656,5 +5578,79 @@ mod subscribe_authz_tests {
         assert!(!allowed);
         assert!(captured.contains("SubscribeDenied"));
         assert!(captured.contains("unauthenticated"));
+    }
+}
+
+#[cfg(test)]
+mod transaction_option_tests {
+    use super::{is_read_only_safe_statement, map_isolation_level, statement_op_name};
+    use zyron_parser::{Parser, TxnIsolation};
+    use zyron_storage::txn::IsolationLevel;
+
+    fn parse(sql: &str) -> zyron_parser::Statement {
+        Parser::new(sql).unwrap().parse_statement().unwrap()
+    }
+
+    #[test]
+    fn read_levels_map_to_read_committed() {
+        assert_eq!(
+            map_isolation_level(TxnIsolation::ReadUncommitted).unwrap(),
+            IsolationLevel::ReadCommitted
+        );
+        assert_eq!(
+            map_isolation_level(TxnIsolation::ReadCommitted).unwrap(),
+            IsolationLevel::ReadCommitted
+        );
+    }
+
+    #[test]
+    fn repeatable_and_snapshot_map_to_snapshot_isolation() {
+        assert_eq!(
+            map_isolation_level(TxnIsolation::RepeatableRead).unwrap(),
+            IsolationLevel::SnapshotIsolation
+        );
+        assert_eq!(
+            map_isolation_level(TxnIsolation::Snapshot).unwrap(),
+            IsolationLevel::SnapshotIsolation
+        );
+    }
+
+    #[test]
+    fn serializable_is_rejected_not_downgraded() {
+        let err = map_isolation_level(TxnIsolation::Serializable).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("serializable isolation level is not supported"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn read_only_transaction_rejects_writes() {
+        // Write statements are not on the read-only allow-list
+        assert!(!is_read_only_safe_statement(&parse(
+            "INSERT INTO t VALUES (1)"
+        )));
+        assert!(!is_read_only_safe_statement(&parse("UPDATE t SET a = 1")));
+        assert!(!is_read_only_safe_statement(&parse("DELETE FROM t")));
+        assert!(!is_read_only_safe_statement(&parse(
+            "CREATE TABLE t (a INT)"
+        )));
+        assert_eq!(
+            statement_op_name(&parse("INSERT INTO t VALUES (1)")),
+            "INSERT"
+        );
+        assert_eq!(statement_op_name(&parse("UPDATE t SET a = 1")), "UPDATE");
+        assert_eq!(statement_op_name(&parse("CREATE TABLE t (a INT)")), "DDL");
+    }
+
+    #[test]
+    fn read_only_transaction_allows_reads() {
+        assert!(is_read_only_safe_statement(&parse("SELECT 1")));
+        assert!(is_read_only_safe_statement(&parse("SHOW work_mem")));
+        // EXECUTE passes the statement gate because a prepared statement may be
+        // a read. A prepared write is rejected at the write operator through the
+        // read-only execution context, not by this classifier.
+        assert!(is_read_only_safe_statement(&parse("EXECUTE q")));
     }
 }

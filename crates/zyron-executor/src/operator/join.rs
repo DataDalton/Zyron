@@ -426,6 +426,24 @@ fn combine_rows_single(
 /// Probe phase: for each probe batch, collects all (build_row, probe_row)
 /// match pairs into flat index arrays, then uses batch gather_from to
 /// produce output columns. This eliminates per-row per-column dispatch.
+/// Compares a build row's key values against a probe row's key values.
+/// Returns true only when every key column is equal and non-NULL on both
+/// sides so a 64-bit hash collision cannot false-join and NULL never matches.
+#[inline]
+fn keys_match_columns(
+    build_keys: &[Column],
+    probe_keys: &[Column],
+    build_row: usize,
+    probe_row: usize,
+) -> bool {
+    for (bk, pk) in build_keys.iter().zip(probe_keys.iter()) {
+        if !compute::cross_column_value_equal(bk, build_row, pk, probe_row) {
+            return false;
+        }
+    }
+    true
+}
+
 pub struct HashJoinOperator {
     left: Option<Box<dyn Operator>>,
     right: Box<dyn Operator>,
@@ -447,6 +465,10 @@ pub struct HashJoinOperator {
     build_entries: Vec<(u32, u32)>,
     /// Maps hash to head entry index in build_entries.
     build_index: FlatHashTable,
+    /// Materialized build key columns, one per join key, indexed by build row.
+    /// Used to compare actual key values after the hi32 hash match so a 64-bit
+    /// hash collision cannot false-join.
+    build_key_columns: Vec<Column>,
     /// Tracks which build rows matched (for LEFT/FULL joins).
     build_matched: Vec<bool>,
     total_build_rows: usize,
@@ -496,6 +518,7 @@ impl HashJoinOperator {
             build_batch: None,
             build_entries: Vec::new(),
             build_index: FlatHashTable::with_capacity(0),
+            build_key_columns: Vec::new(),
             build_matched: Vec::new(),
             total_build_rows: 0,
             build_used_int_hash: false,
@@ -567,6 +590,24 @@ impl HashJoinOperator {
             }
         }
 
+        // Materialize the build key columns once so probe-time can compare
+        // actual key values after the hi32 hash match, and so NULL keys can be
+        // excluded from the build side.
+        let mut build_key_columns: Vec<Column> = Vec::with_capacity(key_col_indices.len());
+        for (ki, src) in key_col_indices.iter().enumerate() {
+            match src {
+                Some(idx) => build_key_columns.push(merged.columns[*idx].clone()),
+                None => {
+                    let col = evaluate(&self.left_keys[ki], &merged, &self.left_schema, &[])?;
+                    build_key_columns.push(col);
+                }
+            }
+        }
+
+        // A build row is excluded when any key column is NULL so NULL never
+        // joins NULL. Rows with no NULL key are insertable.
+        let any_key_has_nulls = build_key_columns.iter().any(|c| c.nulls.has_nulls());
+
         // Build hash table.
         // For single integer keys without nulls, uses fused hash+insert with
         // group-prefetch (PF=16) to hide L3 latency on hash table bucket access.
@@ -575,80 +616,69 @@ impl HashJoinOperator {
         self.build_index = FlatHashTable::with_capacity(total_rows);
 
         let mut fused = false;
-        if key_col_indices.len() == 1 {
+        if key_col_indices.len() == 1 && !any_key_has_nulls {
             if let Some(key_idx) = key_col_indices[0] {
                 let col = &merged.columns[key_idx];
-                if !col.nulls.has_nulls() {
-                    const PF: usize = 16;
-                    macro_rules! fuse_build {
-                        ($v:expr) => {{
-                            let n = $v.len();
-                            let mut pf_buf = [0u64; PF];
-                            let prime = PF.min(n);
-                            for i in 0..prime {
-                                let h = compute::hash_int($v[i] as u64);
-                                pf_buf[i] = h;
+                const PF: usize = 16;
+                macro_rules! fuse_build {
+                    ($v:expr) => {{
+                        let n = $v.len();
+                        let mut pf_buf = [0u64; PF];
+                        let prime = PF.min(n);
+                        for i in 0..prime {
+                            let h = compute::hash_int($v[i] as u64);
+                            pf_buf[i] = h;
+                            self.build_index.prefetch(h);
+                        }
+                        for row in 0..n {
+                            let hash = pf_buf[row % PF];
+                            let ahead = row + PF;
+                            if ahead < n {
+                                let h = compute::hash_int($v[ahead] as u64);
+                                pf_buf[ahead % PF] = h;
                                 self.build_index.prefetch(h);
                             }
-                            for row in 0..n {
-                                let hash = pf_buf[row % PF];
-                                let ahead = row + PF;
-                                if ahead < n {
-                                    let h = compute::hash_int($v[ahead] as u64);
-                                    pf_buf[ahead % PF] = h;
-                                    self.build_index.prefetch(h);
-                                }
-                                let prev = self.build_index.insert(hash, row as u32);
-                                self.build_entries.push((prev, (hash >> 32) as u32));
-                            }
-                            fused = true;
-                            self.build_used_int_hash = true;
-                        }};
-                    }
-                    match &col.data {
-                        ColumnData::Int64(v) => fuse_build!(v),
-                        ColumnData::Int32(v) => fuse_build!(v),
-                        ColumnData::Int16(v) => fuse_build!(v),
-                        ColumnData::Int8(v) => fuse_build!(v),
-                        ColumnData::UInt64(v) => fuse_build!(v),
-                        ColumnData::UInt32(v) => fuse_build!(v),
-                        ColumnData::UInt16(v) => fuse_build!(v),
-                        ColumnData::UInt8(v) => fuse_build!(v),
-                        _ => {}
-                    }
+                            let prev = self.build_index.insert(hash, row as u32);
+                            self.build_entries.push((prev, (hash >> 32) as u32));
+                        }
+                        fused = true;
+                        self.build_used_int_hash = true;
+                    }};
+                }
+                match &col.data {
+                    ColumnData::Int64(v) => fuse_build!(v),
+                    ColumnData::Int32(v) => fuse_build!(v),
+                    ColumnData::Int16(v) => fuse_build!(v),
+                    ColumnData::Int8(v) => fuse_build!(v),
+                    ColumnData::UInt64(v) => fuse_build!(v),
+                    ColumnData::UInt32(v) => fuse_build!(v),
+                    ColumnData::UInt16(v) => fuse_build!(v),
+                    ColumnData::UInt8(v) => fuse_build!(v),
+                    _ => {}
                 }
             }
         }
 
-        // Fallback: multi-key or non-integer key types.
+        // Fallback: multi-key, non-integer key types, or NULL-bearing keys.
         if !fused {
-            let mut owned_key_cols: Vec<Column> = Vec::new();
-            for (ki, src) in key_col_indices.iter().enumerate() {
-                if src.is_none() {
-                    let col = evaluate(&self.left_keys[ki], &merged, &self.left_schema, &[])?;
-                    owned_key_cols.push(col);
-                }
-            }
-            let mut owned_idx = 0;
-            let key_refs: Vec<&Column> = key_col_indices
-                .iter()
-                .map(|src| match src {
-                    Some(idx) => &merged.columns[*idx],
-                    None => {
-                        let col = &owned_key_cols[owned_idx];
-                        owned_idx += 1;
-                        col
-                    }
-                })
-                .collect();
+            let key_refs: Vec<&Column> = build_key_columns.iter().collect();
             let all_hashes = compute::hash_column_batch(&key_refs, total_rows);
 
-            for (row, &hash) in all_hashes.iter().enumerate() {
+            for row in 0..total_rows {
+                // Skip rows with any NULL key so NULL never matches NULL.
+                if any_key_has_nulls && build_key_columns.iter().any(|c| c.is_null(row)) {
+                    // Push a placeholder entry so build_entries stays row-indexed,
+                    // but do not link it into any hash chain.
+                    self.build_entries.push((u32::MAX, 0));
+                    continue;
+                }
+                let hash = all_hashes[row];
                 let prev = self.build_index.insert(hash, row as u32);
                 self.build_entries.push((prev, (hash >> 32) as u32));
             }
         }
 
+        self.build_key_columns = build_key_columns;
         self.build_batch = Some(merged);
 
         if track {
@@ -670,6 +700,30 @@ impl HashJoinOperator {
         Ok(())
     }
 
+    /// Materializes the probe key columns for a probe batch in the same order
+    /// as build_key_columns so values can be compared after the hi32 match.
+    fn materialize_probe_keys(&self, probe_batch: &DataBatch) -> Result<Vec<Column>> {
+        let mut cols = Vec::with_capacity(self.probe_key_col_indices.len());
+        for (ki, src) in self.probe_key_col_indices.iter().enumerate() {
+            match src {
+                Some(idx) => cols.push(probe_batch.columns[*idx].clone()),
+                None => {
+                    let col = evaluate(&self.right_keys[ki], probe_batch, &self.right_schema, &[])?;
+                    cols.push(col);
+                }
+            }
+        }
+        Ok(cols)
+    }
+
+    /// Compares a build row's key values against a probe row's key values.
+    /// Returns true only when every key column is equal and non-NULL on both
+    /// sides, so a 64-bit hash collision cannot false-join.
+    #[inline]
+    fn keys_match(&self, probe_keys: &[Column], build_row: usize, probe_row: usize) -> bool {
+        keys_match_columns(&self.build_key_columns, probe_keys, build_row, probe_row)
+    }
+
     /// Vectorized probe: collects all (build_row, probe_row) match pairs,
     /// then gathers output columns in bulk. Eliminates per-row per-column
     /// dispatch overhead.
@@ -677,6 +731,7 @@ impl HashJoinOperator {
         &mut self,
         probe_batch: &DataBatch,
         probe_hashes: &[u64],
+        probe_keys: &[Column],
     ) -> Vec<DataBatch> {
         let track_right = matches!(self.join_type, JoinType::Right | JoinType::Full);
         let build = self.build_batch.as_ref().unwrap();
@@ -696,6 +751,9 @@ impl HashJoinOperator {
                 let build_row = cursor;
                 cursor = next;
                 if stored_hi32 != hash_hi32 {
+                    continue;
+                }
+                if !self.keys_match(probe_keys, build_row as usize, probe_row) {
                     continue;
                 }
                 build_idx.push(build_row);
@@ -872,6 +930,10 @@ impl Operator for HashJoinOperator {
                 .map(|ki| !merged_probe.columns[ki].nulls.has_nulls())
                 .unwrap_or(false);
 
+            // Materialize probe key columns once for value comparison after the
+            // hi32 hash match across every probe path.
+            let probe_keys = self.materialize_probe_keys(&merged_probe)?;
+
             if fused_col_no_nulls {
                 let key_idx = fused_key_idx.unwrap();
                 let track_right = matches!(self.join_type, JoinType::Right | JoinType::Full);
@@ -916,6 +978,9 @@ impl Operator for HashJoinOperator {
                                 if stored_hi32 != hash_hi32 {
                                     continue;
                                 }
+                                if !self.keys_match(&probe_keys, build_row as usize, probe_row) {
+                                    continue;
+                                }
                                 build_idx.push(build_row);
                                 probe_idx.push(probe_row as u32);
                                 matched = true;
@@ -956,6 +1021,9 @@ impl Operator for HashJoinOperator {
                                 let build_row = cursor;
                                 cursor = next;
                                 if stored_hi32 != hash_hi32 {
+                                    continue;
+                                }
+                                if !self.keys_match(&probe_keys, build_row as usize, probe_row) {
                                     continue;
                                 }
                                 build_idx.push(build_row);
@@ -1075,6 +1143,7 @@ impl Operator for HashJoinOperator {
                 };
 
                 if self.remaining_condition.is_some() {
+                    let build_key_columns = &self.build_key_columns;
                     let buf = self.output_buffer.as_mut().unwrap();
                     let build = self.build_batch.as_ref().unwrap();
                     for probe_row in 0..total_probe_rows {
@@ -1087,6 +1156,14 @@ impl Operator for HashJoinOperator {
                             let build_row = cursor;
                             cursor = next;
                             if stored_hi32 != hash_hi32 {
+                                continue;
+                            }
+                            if !keys_match_columns(
+                                build_key_columns,
+                                &probe_keys,
+                                build_row as usize,
+                                probe_row,
+                            ) {
                                 continue;
                             }
                             let combined = combine_rows_single(
@@ -1127,7 +1204,8 @@ impl Operator for HashJoinOperator {
                         }
                     }
                 } else {
-                    let batches = self.probe_batch_vectorized(&merged_probe, &probe_hashes);
+                    let batches =
+                        self.probe_batch_vectorized(&merged_probe, &probe_hashes, &probe_keys);
                     self.output_queue.extend(batches);
                 }
             }

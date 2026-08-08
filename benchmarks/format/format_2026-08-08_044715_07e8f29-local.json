@@ -1,0 +1,68 @@
+{
+  "id": "2026-08-08_044715_07e8f29-local",
+  "date": "2026-08-08 04:47:18Z",
+  "ts": 1786164438,
+  "commit": "07e8f29-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Arrow IPC Write": {
+      "rows/sec at batch=10000": {
+        "average": 26455631.202743,
+        "runs": [24064203.29, 26607066.84, 26908122.22, 27154727.64, 27544036.03],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Avro Write": {
+      "rows/sec at batch=10000": {
+        "average": 1931239.542020,
+        "runs": [1921842.51, 1927317.02, 1935876.04, 1931516.16, 1939645.98],
+        "target": 300000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "CSV Write": {
+      "rows/sec at batch=10000": {
+        "average": 6312723.543514,
+        "runs": [6305846.15, 6335730.35, 6388714.97, 6225332.12, 6307994.12],
+        "target": 2000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Parquet Write": {
+      "rows/sec at batch=10000": {
+        "average": 7123043.750369,
+        "runs": [6209945.85, 6571079.37, 8138484.45, 6737727.23, 7957981.86],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "JSONL Write": {
+      "rows/sec at batch=10000": {
+        "average": 3549002.131193,
+        "runs": [3506852.39, 3556402.77, 3550455.52, 3577740.73, 3553559.24],
+        "target": 1500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "JSON Write": {
+      "rows/sec at batch=10000": {
+        "average": 2479774.013157,
+        "runs": [2074348.81, 2308429.23, 2553776.14, 2728177.99, 2734137.90],
+        "target": 1000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}

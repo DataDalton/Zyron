@@ -21,7 +21,9 @@ use zyron_planner::binder::BoundExpr;
 use zyron_planner::logical::LogicalColumn;
 use zyron_planner::physical::PhysicalPlan;
 
-/// Compiled ABAC predicate for one table in a publication.
+/// Compiled row predicate for one table in a publication. Combines the
+/// publication's own WHERE filter, the per-table WHERE filter, and any ABAC
+/// policy predicate into one bound expression.
 struct CompiledTablePredicate {
     /// Columns the predicate references, in decode order. The predicate's
     /// ColumnRefs resolve by position in this slice.
@@ -31,10 +33,22 @@ struct CompiledTablePredicate {
     predicate: BoundExpr,
 }
 
-/// Per-subscription row filter enforcing a publication's ABAC policies on the
-/// change stream. Built once at subscribe time.
+/// Per-table column projection. Carries the full table schema and the indices
+/// of the published columns so the streaming path re-encodes each tuple keeping
+/// only the published column values and nulling the rest.
+struct CompiledProjection {
+    table_columns: Vec<ColumnEntry>,
+    /// Column ordinals that remain published. Columns outside this set are
+    /// nulled in the re-encoded tuple.
+    keep: Vec<usize>,
+}
+
+/// Per-subscription row filter enforcing a publication's WHERE predicates, ABAC
+/// policies, and column projection on the change stream. Built once at
+/// subscribe time.
 pub struct PublicationRowFilter {
     per_table: HashMap<u32, CompiledTablePredicate>,
+    projections: HashMap<u32, CompiledProjection>,
 }
 
 impl PublicationRowFilter {
@@ -58,56 +72,120 @@ impl PublicationRowFilter {
             .into_iter()
             .filter(|p| p.enabled && role_applies(&p.roles, subscriber_role))
             .collect();
-        if policies.is_empty() {
-            return Ok(None);
-        }
 
-        let combined = combine_predicates(&policies);
+        // Per-table WHERE predicates and column projections stored on the
+        // publication's table map.
+        let pub_tables = catalog.get_publication_tables(publication.id);
 
         let mut per_table = HashMap::with_capacity(table_ids.len());
+        let mut projections = HashMap::new();
         for &tid in table_ids {
             let table = catalog.get_table_by_id(TableId(tid))?;
             let schema = catalog.get_schema_by_id(table.schema_id)?;
 
-            let sql = format!(
-                "SELECT 1 FROM \"{}\".\"{}\" WHERE {}",
-                schema.name, table.name, combined
-            );
-            let stmt = zyron_parser::parse(&sql)
-                .map_err(|e| {
+            // Collect every predicate that applies to this table: the ABAC
+            // combination, the publication-level WHERE, and the per-table
+            // WHERE. A row must satisfy all of them (AND), so the subscriber
+            // only sees rows that pass every filter.
+            let mut conjuncts: Vec<String> = Vec::new();
+            if !policies.is_empty() {
+                conjuncts.push(format!("({})", combine_predicates(&policies)));
+            }
+            if let Some(p) = publication.where_predicate.as_deref() {
+                if !p.is_empty() {
+                    conjuncts.push(format!("({p})"));
+                }
+            }
+            if let Some(pt) = pub_tables.iter().find(|pt| pt.table_id.0 == tid) {
+                if let Some(p) = pt.where_predicate.as_deref() {
+                    if !p.is_empty() {
+                        conjuncts.push(format!("({p})"));
+                    }
+                }
+            }
+
+            if !conjuncts.is_empty() {
+                let combined = conjuncts.join(" AND ");
+                let sql = format!(
+                    "SELECT 1 FROM \"{}\".\"{}\" WHERE {}",
+                    schema.name, table.name, combined
+                );
+                let stmt = zyron_parser::parse(&sql)
+                    .map_err(|e| {
+                        ZyronError::PlanError(format!(
+                            "publication predicate '{combined}' does not bind against table '{}': {e}",
+                            table.name
+                        ))
+                    })?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        ZyronError::PlanError("publication predicate produced no statement".into())
+                    })?;
+
+                let plan = zyron_planner::plan(
+                    catalog,
+                    schema.database_id,
+                    vec![schema.name.clone()],
+                    stmt,
+                )
+                .await?;
+
+                let (output_columns, predicate) = extract_filter(&plan).ok_or_else(|| {
                     ZyronError::PlanError(format!(
-                        "ABAC publication policy predicate '{combined}' does not bind against table '{}': {e}",
+                        "publication predicate '{combined}' produced no row filter for table '{}'",
                         table.name
                     ))
-                })?
-                .into_iter()
-                .next()
-                .ok_or_else(|| {
-                    ZyronError::PlanError("ABAC publication predicate produced no statement".into())
                 })?;
 
-            let plan =
-                zyron_planner::plan(catalog, schema.database_id, vec![schema.name.clone()], stmt)
-                    .await?;
+                per_table.insert(
+                    tid,
+                    CompiledTablePredicate {
+                        output_columns,
+                        table_columns: table.columns.clone(),
+                        predicate,
+                    },
+                );
+            }
 
-            let (output_columns, predicate) = extract_filter(&plan).ok_or_else(|| {
-                ZyronError::PlanError(format!(
-                    "ABAC publication policy predicate '{combined}' produced no row filter for table '{}'",
-                    table.name
-                ))
-            })?;
-
-            per_table.insert(
-                tid,
-                CompiledTablePredicate {
-                    output_columns,
-                    table_columns: table.columns.clone(),
-                    predicate,
-                },
-            );
+            // Column projection: the published-column set is the per-table
+            // column list, or the publication-level projection when the table
+            // has no specific list. An empty set means publish all columns.
+            let projected: Vec<String> = pub_tables
+                .iter()
+                .find(|pt| pt.table_id.0 == tid)
+                .map(|pt| pt.columns.clone())
+                .filter(|c| !c.is_empty())
+                .unwrap_or_else(|| publication.columns_projection.clone());
+            if !projected.is_empty() {
+                let keep: Vec<usize> = table
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| projected.iter().any(|p| p == &c.name))
+                    .map(|(i, _)| i)
+                    .collect();
+                // Only install a projection when it actually drops columns.
+                if keep.len() < table.columns.len() {
+                    projections.insert(
+                        tid,
+                        CompiledProjection {
+                            table_columns: table.columns.clone(),
+                            keep,
+                        },
+                    );
+                }
+            }
         }
 
-        Ok(Some(Self { per_table }))
+        if per_table.is_empty() && projections.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(Self {
+            per_table,
+            projections,
+        }))
     }
 
     /// Whether this filter has a predicate for the given table.
@@ -130,6 +208,94 @@ impl PublicationRowFilter {
             )?)),
         }
     }
+
+    /// Whether this filter projects columns for the given table.
+    #[inline]
+    pub fn projects(&self, table_id: u32) -> bool {
+        self.projections.contains_key(&table_id)
+    }
+
+    /// Re-encodes one NSM tuple keeping only the published column values and
+    /// nulling the rest, preserving the table's column count so the subscriber
+    /// decodes against the unchanged schema. Returns the original bytes
+    /// unchanged when the tuple is malformed or no projection applies.
+    pub fn project_row(&self, table_id: u32, row: &[u8]) -> Vec<u8> {
+        let Some(proj) = self.projections.get(&table_id) else {
+            return row.to_vec();
+        };
+        project_nsm_tuple(row, &proj.table_columns, &proj.keep).unwrap_or_else(|| row.to_vec())
+    }
+}
+
+/// Re-encodes an NSM tuple nulling every column whose index is absent from
+/// `keep`. Kept columns retain their bytes verbatim. Returns None if the tuple
+/// does not span its declared schema (malformed record).
+fn project_nsm_tuple(data: &[u8], columns: &[ColumnEntry], keep: &[usize]) -> Option<Vec<u8>> {
+    let num_cols = columns.len();
+    let null_bitmap_len = num_cols.div_ceil(8);
+    if data.len() < null_bitmap_len {
+        return None;
+    }
+    let src_bitmap = &data[..null_bitmap_len];
+    let mut offset = null_bitmap_len;
+
+    // Build the new tuple: fresh null bitmap, then each column's value bytes.
+    let mut body: Vec<u8> = Vec::with_capacity(data.len());
+    let mut out_bitmap = vec![0u8; null_bitmap_len];
+
+    for (i, col) in columns.iter().enumerate() {
+        let src_null = (src_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+        let keep_col = keep.contains(&i);
+        let phys = col.physical_type_id();
+
+        if let Some(fixed) = phys.fixed_size() {
+            if offset + fixed > data.len() {
+                return None;
+            }
+            if !keep_col {
+                // Null the column: set the bit and write zero-filled bytes so
+                // the fixed width is preserved for the decoder.
+                out_bitmap[i / 8] |= 1 << (i % 8);
+                body.extend(std::iter::repeat(0u8).take(fixed));
+            } else {
+                if src_null {
+                    out_bitmap[i / 8] |= 1 << (i % 8);
+                }
+                body.extend_from_slice(&data[offset..offset + fixed]);
+            }
+            offset += fixed;
+        } else {
+            if offset + 4 > data.len() {
+                return None;
+            }
+            let len = u32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]) as usize;
+            offset += 4;
+            if offset + len > data.len() {
+                return None;
+            }
+            if !keep_col {
+                // Null the column: set the bit and emit a zero-length value.
+                out_bitmap[i / 8] |= 1 << (i % 8);
+                body.extend_from_slice(&0u32.to_le_bytes());
+            } else {
+                if src_null {
+                    out_bitmap[i / 8] |= 1 << (i % 8);
+                }
+                body.extend_from_slice(&data[offset - 4..offset + len]);
+            }
+            offset += len;
+        }
+    }
+
+    let mut out = Vec::with_capacity(null_bitmap_len + body.len());
+    out.extend_from_slice(&out_bitmap);
+    out.extend_from_slice(&body);
+    Some(out)
 }
 
 /// A policy applies to a subscriber when it targets no specific role, or the

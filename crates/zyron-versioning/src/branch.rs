@@ -375,7 +375,11 @@ impl BranchManager {
         })
     }
 
-    /// Deletes a branch and its page overrides.
+    /// Deletes a branch and its page overrides, removes its copy-on-write
+    /// overlay records (file-id map and append counts), and reclaims the cow,
+    /// append, and append-fsm data files it allocated. Without this the overlay
+    /// records survive restart pointing at a branch that no longer exists and
+    /// the overlay data files leak.
     pub fn delete_branch(&self, branch_id: BranchId) -> Result<()> {
         let removed = self.branches.update_sync(&branch_id.0, |_, entry| {
             entry.is_active = false;
@@ -384,6 +388,44 @@ impl BranchManager {
             return Err(ZyronError::BranchNotFound(format!("{}", branch_id)));
         }
         let _ = self.page_trackers.remove_sync(&branch_id.0);
+
+        // Collect the branch's overlay keys and the data files they allocated.
+        let mut keys: Vec<u128> = Vec::new();
+        let mut files: Vec<zyron_common::BranchFiles> = Vec::new();
+        self.branch_table_files.iter_sync(|k, f| {
+            if (*k >> 32) as u64 == branch_id.0 {
+                keys.push(*k);
+                files.push(*f);
+            }
+            true
+        });
+        for k in &keys {
+            let _ = self.branch_table_files.remove_sync(k);
+        }
+
+        let mut count_keys: Vec<u128> = Vec::new();
+        self.append_counts.iter_sync(|k, _| {
+            if (*k >> 32) as u64 == branch_id.0 {
+                count_keys.push(*k);
+            }
+            true
+        });
+        for k in &count_keys {
+            let _ = self.append_counts.remove_sync(k);
+        }
+
+        // Reclaim the overlay data files. A missing file is not an error since
+        // a branch that never wrote to a table has no file on disk.
+        for f in &files {
+            for file_id in [f.cow_file_id, f.append_file_id, f.append_fsm_file_id] {
+                let path = self.data_dir.join(format!("{:08}.dat", file_id));
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(ZyronError::Io(e)),
+                }
+            }
+        }
         Ok(())
     }
 

@@ -7,7 +7,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::distance::computeDistance;
+use super::distance::{distWithFn, resolveDistFn};
 use super::types::DistanceMetric;
 
 /// Characterizes a vector dataset from a small sample, driving all index
@@ -30,6 +30,25 @@ pub struct DataProfile {
 }
 
 impl DataProfile {
+    /// Builds a profile without the O(sample^2) pairwise distance scan.
+    /// Fills n, d, and numCores (the only fields build/build_owned consume,
+    /// via parallelThreshold) and leaves the distribution fields at neutral
+    /// defaults. Callers that need distSpread/intrinsicDim/isClustered for
+    /// parameter auto-tuning must use compute instead.
+    pub fn lightweight(totalN: usize, d: u16) -> Self {
+        let numCores = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1);
+        Self {
+            n: totalN,
+            d,
+            distSpread: 0.5,
+            intrinsicDim: d as f32,
+            isClustered: false,
+            numCores,
+        }
+    }
+
     /// Computes a DataProfile from a sample of vectors.
     /// Samples min(1000, N) vectors and measures pairwise distance distribution.
     pub fn compute(vectors: &[&[f32]], totalN: usize, d: u16, metric: DistanceMetric) -> Self {
@@ -102,9 +121,10 @@ impl DataProfile {
         let pairCount = sampleSize * (sampleSize - 1) / 2;
         let mut distances = Vec::with_capacity(pairCount);
 
+        let profileDistFn = resolveDistFn(profileMetric);
         for i in 0..sampleSize {
             for j in (i + 1)..sampleSize {
-                let dist = computeDistance(profileMetric, sample[i], sample[j]);
+                let dist = distWithFn(profileDistFn, sample[i], sample[j]);
                 if dist.is_finite() {
                     distances.push(dist);
                 }

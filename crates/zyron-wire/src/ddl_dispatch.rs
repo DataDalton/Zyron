@@ -53,7 +53,7 @@ pub async fn try_handle_ddl_utility(
         ))),
 
         // Standalone VALUES query handled as DDL result with rows
-        Statement::ValuesQuery(s) => Some(handle_values_query(s)),
+        Statement::ValuesQuery(s) => Some(handle_values_query(s, server, session).await),
 
         // Transaction control handled by try_handle_transaction_control
         Statement::Begin(_) | Statement::Commit(_) | Statement::Rollback(_) => None,
@@ -119,7 +119,7 @@ pub async fn try_handle_ddl_utility(
         // (connection.rs handle_optimize / handle_reindex) before this dispatch
         // runs, so these never reach here; route to None for consistency.
         Statement::OptimizeTable(_) | Statement::Reindex(_) => None,
-        Statement::CommentOn(s) => Some(handle_comment_on(s, server).await),
+        Statement::CommentOn(s) => Some(handle_comment_on(s, server, session).await),
 
         // -- Materialized Views --
         Statement::CreateMaterializedView(s) => {
@@ -177,9 +177,9 @@ pub async fn try_handle_ddl_utility(
         }
 
         // -- Versioning --
-        Statement::CreateBranch(s) => Some(handle_create_branch(s, server).await),
-        Statement::MergeBranch(s) => Some(handle_merge_branch(s, server).await),
-        Statement::DropBranch(s) => Some(handle_drop_branch(s, server).await),
+        Statement::CreateBranch(s) => Some(handle_create_branch(s, server, session).await),
+        Statement::MergeBranch(s) => Some(handle_merge_branch(s, server, session).await),
+        Statement::DropBranch(s) => Some(handle_drop_branch(s, server, session).await),
         Statement::UseBranch(s) => Some(handle_use_branch(s, server, active_branch).await),
         Statement::CreateVersion(s) => Some(handle_create_version(s, server, session).await),
         Statement::DropVersion(s) => Some(handle_drop_version(s, server, session).await),
@@ -237,7 +237,7 @@ pub async fn try_handle_ddl_utility(
         Statement::DisableFeature(s) => Some(handle_disable_feature(s, server, session).await),
 
         // -- Transaction extensions --
-        Statement::Savepoint(s) => Some(handle_savepoint(s, txn)),
+        Statement::Savepoint(s) => Some(handle_savepoint(s, txn, server)),
         Statement::ReleaseSavepoint(s) => Some(handle_release_savepoint(s, txn)),
 
         // -- Prepared statements: handled by caller (needs statements map) --
@@ -259,7 +259,7 @@ pub async fn try_handle_ddl_utility(
         Statement::RestoreTable(s) => Some(handle_restore_table(s, server, session).await),
 
         // -- Utility --
-        Statement::DoBlock(s) => Some(handle_do_block(s, server).await),
+        Statement::DoBlock(s) => Some(handle_do_block(s, server, session).await),
 
         // -- Graph schema --
         Statement::CreateGraphSchema(stmt) => {
@@ -1297,18 +1297,15 @@ async fn select_query_batches(
 /// backing tables.
 async fn execute_write_stmt(
     server: &Arc<ServerState>,
+    db_id: zyron_catalog::DatabaseId,
+    search_path: Vec<String>,
     stmt: zyron_parser::Statement,
 ) -> Result<(), ProtocolError> {
     use zyron_executor::context::ExecutionContext;
 
-    let plan = zyron_planner::plan(
-        &server.catalog,
-        zyron_catalog::DatabaseId(1),
-        vec!["public".to_string()],
-        stmt,
-    )
-    .await
-    .map_err(ProtocolError::Database)?;
+    let plan = zyron_planner::plan(&server.catalog, db_id, search_path, stmt)
+        .await
+        .map_err(ProtocolError::Database)?;
 
     let mut txn = server
         .txn_manager
@@ -1513,7 +1510,7 @@ fn build_constraint_entry(
 ) -> Result<zyron_catalog::schema::ConstraintEntry, ProtocolError> {
     use zyron_catalog::ids::ColumnId;
     use zyron_catalog::schema::{ConstraintEntry, ConstraintType};
-    use zyron_parser::ast::TableConstraint as TC;
+    use zyron_parser::ast::TableConstraintKind as TC;
 
     let resolve = |names: &[String]| -> Result<Vec<ColumnId>, ProtocolError> {
         let mut ids = Vec::with_capacity(names.len());
@@ -1527,9 +1524,12 @@ fn build_constraint_entry(
         Ok(ids)
     };
 
-    Ok(match tc {
+    Ok(match &tc.kind {
         TC::PrimaryKey(cols) => ConstraintEntry {
-            name: format!("pk_{table_name}_{}", cols.join("_")),
+            name: tc
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("pk_{table_name}_{}", cols.join("_"))),
             constraint_type: ConstraintType::PrimaryKey,
             columns: resolve(cols)?,
             ref_table_id: None,
@@ -1539,7 +1539,10 @@ fn build_constraint_entry(
             on_update: zyron_catalog::ReferentialAction::NoAction,
         },
         TC::Unique(cols) => ConstraintEntry {
-            name: format!("uq_{table_name}_{}", cols.join("_")),
+            name: tc
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("uq_{table_name}_{}", cols.join("_"))),
             constraint_type: ConstraintType::Unique,
             columns: resolve(cols)?,
             ref_table_id: None,
@@ -1549,7 +1552,10 @@ fn build_constraint_entry(
             on_update: zyron_catalog::ReferentialAction::NoAction,
         },
         TC::Check(expr) => ConstraintEntry {
-            name: format!("ck_{table_name}"),
+            name: tc
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("ck_{table_name}")),
             constraint_type: ConstraintType::Check,
             columns: vec![],
             ref_table_id: None,
@@ -1587,7 +1593,10 @@ fn build_constraint_entry(
                 ids
             };
             ConstraintEntry {
-                name: format!("fk_{table_name}_{}", cols.join("_")),
+                name: tc
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("fk_{table_name}_{}", cols.join("_"))),
                 constraint_type: ConstraintType::ForeignKey,
                 columns: resolve(cols)?,
                 ref_table_id: Some(ref_tbl.id),
@@ -1616,12 +1625,12 @@ async fn validate_constraint_against_existing(
     schema_id: zyron_catalog::ids::SchemaId,
 ) -> Result<(), ProtocolError> {
     use zyron_catalog::schema::ConstraintType;
-    use zyron_parser::ast::TableConstraint as TC;
+    use zyron_parser::ast::TableConstraintKind as TC;
 
     let quote =
         |cols: &[String]| -> Vec<String> { cols.iter().map(|c| format!("\"{c}\"")).collect() };
 
-    match tc {
+    match &tc.kind {
         TC::Check(expr) => {
             let pred = zyron_parser::expr_to_sql(expr);
             let violating = count_query(
@@ -1715,7 +1724,7 @@ async fn validate_constraint_against_existing(
             }
         }
         TC::Unique(cols) | TC::PrimaryKey(cols) => {
-            let is_pk = matches!(tc, TC::PrimaryKey(_));
+            let is_pk = matches!(&tc.kind, TC::PrimaryKey(_));
             let qcols = quote(cols);
 
             if is_pk {
@@ -1897,17 +1906,24 @@ async fn handle_drop_table(
             // reaper reclaims them after the recycle window elapses.
             if !outcome.soft_dropped {
                 let _ = server.heap_files.remove_async(&outcome.heap_file_id).await;
+                // A failed file delete after the catalog entry is gone leaks the
+                // backing files. Surface it to the caller rather than swallowing
+                // it so the leak is not silent.
                 if let Err(e) = server.disk_manager.delete_file(outcome.heap_file_id).await {
-                    eprintln!(
-                        "DROP TABLE: failed to remove heap file {}: {e}",
-                        outcome.heap_file_id
+                    tracing::error!(
+                        target: "zyron::ddl",
+                        heap_file_id = outcome.heap_file_id,
+                        "DROP TABLE failed to remove heap file: {e}"
                     );
+                    return Err(ProtocolError::Database(e));
                 }
                 if let Err(e) = server.disk_manager.delete_file(outcome.fsm_file_id).await {
-                    eprintln!(
-                        "DROP TABLE: failed to remove FSM file {}: {e}",
-                        outcome.fsm_file_id
+                    tracing::error!(
+                        target: "zyron::ddl",
+                        fsm_file_id = outcome.fsm_file_id,
+                        "DROP TABLE failed to remove FSM file: {e}"
                     );
+                    return Err(ProtocolError::Database(e));
                 }
             }
             fire_event(
@@ -1961,6 +1977,34 @@ async fn handle_truncate(
         .truncate_file(table.fsm_file_id)
         .await
         .map_err(|e| ProtocolError::Database(e))?;
+
+    // Clear every B+tree index on the table so it does not point at rows that
+    // no longer exist. Each index is replaced with a fresh empty tree in the
+    // registry and its on-disk checkpoint removed so recovery does not reload
+    // stale entries.
+    let checkpoint_dir = server.data_dir.join("indexes");
+    for index in server.catalog.get_indexes_for_table(table.id) {
+        if index.index_type != zyron_catalog::IndexType::BTree {
+            continue;
+        }
+        let empty = zyron_storage::BTreeIndex::create(index.index_file_id, checkpoint_dir.clone())
+            .await
+            .map_err(ProtocolError::Database)?;
+        let _ = server
+            .btree_indexes
+            .insert_async(index.id.0, Arc::new(empty))
+            .await;
+        let checkpoint_path = checkpoint_dir.join(format!("index_{}.zyridx", index.index_file_id));
+        if checkpoint_path.exists() {
+            if let Err(e) = std::fs::remove_file(&checkpoint_path) {
+                tracing::error!(
+                    target: "zyron::ddl",
+                    index = %index.name,
+                    "TRUNCATE failed to remove index checkpoint: {e}"
+                );
+            }
+        }
+    }
 
     Ok(DdlResult::Tag("TRUNCATE TABLE".to_string()))
 }
@@ -2592,8 +2636,21 @@ async fn handle_alter_view(
 async fn handle_comment_on(
     stmt: &zyron_parser::ast::CommentOnStatement,
     server: &Arc<ServerState>,
+    session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
     use zyron_parser::ast::CommentObjectType;
+
+    // Setting a comment mutates catalog metadata, so require the schema-level
+    // create privilege like the other metadata DDL handlers.
+    let (_, schema_id) = get_session_schema(session, server, None)?;
+    check_ddl_privilege(
+        server,
+        session,
+        zyron_auth::PrivilegeType::Create,
+        zyron_auth::ObjectType::Schema,
+        schema_id.0,
+    )?;
+
     // Stable discriminant for the object kind, persisted with the comment.
     let object_type: u8 = match stmt.object_type {
         CommentObjectType::Table => 0,
@@ -2961,7 +3018,8 @@ async fn handle_call(
         ))));
     }
 
-    let params = eval_call_args(server, &stmt.args).await?;
+    let (db_id, search_path) = session_db_and_search_path(session);
+    let params = eval_call_args(server, &stmt.args, db_id, &search_path).await?;
 
     let body_stmts = zyron_parser::parse(&proc.body_sql).map_err(|e| {
         ProtocolError::Database(ZyronError::Internal(format!(
@@ -2969,7 +3027,7 @@ async fn handle_call(
         )))
     })?;
 
-    execute_call_body(server, body_stmts, params).await?;
+    execute_call_body(server, body_stmts, params, db_id, search_path).await?;
     Ok(DdlResult::Tag("CALL".to_string()))
 }
 
@@ -2979,6 +3037,8 @@ async fn handle_call(
 async fn eval_call_args(
     server: &Arc<ServerState>,
     args: &[zyron_parser::ast::Expr],
+    db_id: zyron_catalog::DatabaseId,
+    search_path: &[String],
 ) -> Result<Vec<zyron_executor::column::ScalarValue>, ProtocolError> {
     use zyron_executor::context::ExecutionContext;
 
@@ -3006,14 +3066,9 @@ async fn eval_call_args(
             ))
         })?;
 
-    let plan = zyron_planner::plan(
-        &server.catalog,
-        zyron_catalog::DatabaseId(1),
-        vec!["public".to_string()],
-        stmt,
-    )
-    .await
-    .map_err(ProtocolError::Database)?;
+    let plan = zyron_planner::plan(&server.catalog, db_id, search_path.to_vec(), stmt)
+        .await
+        .map_err(ProtocolError::Database)?;
 
     let mut txn = server
         .txn_manager
@@ -3065,6 +3120,7 @@ async fn eval_call_args(
 async fn handle_do_block(
     stmt: &zyron_parser::ast::DoBlockStatement,
     server: &Arc<ServerState>,
+    session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
     if let Some(lang) = &stmt.language {
         if !lang.eq_ignore_ascii_case("sql") {
@@ -3081,7 +3137,13 @@ async fn handle_do_block(
         return Ok(DdlResult::Tag("DO".to_string()));
     }
 
-    execute_call_body(server, statements, Vec::new()).await?;
+    let (db_id, search_path) = session_db_and_search_path(session);
+    execute_call_body(server, statements, Vec::new(), db_id, search_path).await?;
+    tracing::info!(
+        target: "zyron::audit",
+        event = "DoBlockExecuted",
+        actor_role = actor_role_id(session),
+    );
     Ok(DdlResult::Tag("DO".to_string()))
 }
 
@@ -3092,6 +3154,8 @@ async fn execute_call_body(
     server: &Arc<ServerState>,
     statements: Vec<zyron_parser::Statement>,
     params: Vec<zyron_executor::column::ScalarValue>,
+    db_id: zyron_catalog::DatabaseId,
+    search_path: Vec<String>,
 ) -> Result<(), ProtocolError> {
     use zyron_executor::context::ExecutionContext;
 
@@ -3103,20 +3167,14 @@ async fn execute_call_body(
         .map_err(|_| ProtocolError::Database(ZyronError::Internal("txn id overflow".into())))?;
 
     for stmt in statements {
-        let plan = match zyron_planner::plan(
-            &server.catalog,
-            zyron_catalog::DatabaseId(1),
-            vec!["public".to_string()],
-            stmt,
-        )
-        .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = server.txn_manager.abort(&mut txn);
-                return Err(ProtocolError::Database(e));
-            }
-        };
+        let plan =
+            match zyron_planner::plan(&server.catalog, db_id, search_path.clone(), stmt).await {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = server.txn_manager.abort(&mut txn);
+                    return Err(ProtocolError::Database(e));
+                }
+            };
 
         let snapshot = txn.snapshot.clone();
         let mut ctx = ExecutionContext::new(
@@ -3400,7 +3458,23 @@ fn next_cron_fire(cron: &zyron_pipeline::schedule::CronSchedule, after_micros: i
 /// Computes the next fire time (epoch micros) for a schedule relative to `now`.
 fn compute_next_run(entry: &zyron_catalog::ScheduleEntry, now_micros: i64) -> Option<i64> {
     if let Some(secs) = entry.interval_secs {
-        Some(now_micros + (secs as i64) * 1_000_000)
+        // Advance from the prior scheduled fire time, not the sweep time, so the
+        // cadence does not drift by the sweep latency each period. When the
+        // schedule has fallen behind (missed sweeps), step forward in whole
+        // intervals until the next fire is in the future, firing once per period
+        // rather than bursting one fire per elapsed interval.
+        let step = (secs as i64) * 1_000_000;
+        if step <= 0 {
+            return Some(now_micros);
+        }
+        let base = entry.next_run.unwrap_or(now_micros);
+        let mut next = base + step;
+        if next <= now_micros {
+            let behind = now_micros - base;
+            let periods = behind / step + 1;
+            next = base + periods * step;
+        }
+        Some(next)
     } else if let Some(expr) = &entry.cron_expr {
         zyron_pipeline::schedule::CronSchedule::parse(expr)
             .ok()
@@ -3563,6 +3637,7 @@ async fn execute_schedule_body(
     buffer_pool: &Arc<zyron_buffer::BufferPool>,
     disk_manager: &Arc<zyron_storage::DiskManager>,
     body_sql: &str,
+    schema_id: zyron_catalog::SchemaId,
 ) -> Result<(), ZyronError> {
     use zyron_executor::context::ExecutionContext;
 
@@ -3572,13 +3647,12 @@ async fn execute_schedule_body(
         .next()
         .ok_or_else(|| ZyronError::Internal("schedule body is empty".to_string()))?;
 
-    let plan = zyron_planner::plan(
-        catalog,
-        zyron_catalog::DatabaseId(1),
-        vec!["public".to_string()],
-        stmt,
-    )
-    .await?;
+    // Plan in the schedule's own database and schema rather than a fixed default
+    // so unqualified names in the body resolve to the namespace it was created
+    // in.
+    let schema = catalog.get_schema_by_id(schema_id)?;
+    let plan =
+        zyron_planner::plan(catalog, schema.database_id, vec![schema.name.clone()], stmt).await?;
 
     let mut txn = txn_manager.begin(zyron_storage::txn::IsolationLevel::ReadCommitted)?;
     let snapshot = txn.snapshot.clone();
@@ -3633,6 +3707,7 @@ pub async fn run_due_schedules(
             buffer_pool,
             disk_manager,
             &sched.body_sql,
+            sched.schema_id,
         )
         .await;
 
@@ -3672,6 +3747,66 @@ fn build_mv_insert(
         on_conflict: None,
         returning: None,
     }))
+}
+
+/// Reads the highest watermark value already loaded into `target` as MAX(key).
+/// Returns None when the target is empty (every source row is new) so the
+/// incremental insert appends without a lower bound.
+async fn read_max_watermark(
+    server: &Arc<ServerState>,
+    db_id: zyron_catalog::DatabaseId,
+    search_path: &[String],
+    target: &str,
+    key: &str,
+) -> Result<Option<zyron_parser::ast::Expr>, ProtocolError> {
+    let sql = format!("SELECT MAX(\"{key}\") AS m FROM \"{target}\"");
+    let stmt = zyron_parser::parse(&sql)
+        .map_err(ProtocolError::Database)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            ProtocolError::Database(ZyronError::Internal("empty watermark query".to_string()))
+        })?;
+    let (_, batches) = run_pipeline_read(server, db_id, search_path.to_vec(), stmt).await?;
+    for b in &batches {
+        if b.num_rows > 0 {
+            if let Some(col) = b.columns.first() {
+                let scalar = col.get_scalar(0);
+                if matches!(scalar, zyron_executor::column::ScalarValue::Null) {
+                    return Ok(None);
+                }
+                return Ok(scalar_to_literal(&scalar).map(zyron_parser::ast::Expr::Literal));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Builds the incremental insert: appends the stage output restricted to rows
+/// whose watermark column exceeds the highest value already loaded. With no
+/// watermark (empty target) it inserts the whole output.
+fn build_incremental_insert(
+    target: String,
+    effective: Box<zyron_parser::ast::SelectStatement>,
+    key: &str,
+    watermark: Option<zyron_parser::ast::Expr>,
+) -> zyron_parser::Statement {
+    use zyron_parser::ast::{BinaryOperator, Expr, SelectItem, SelectStatement, TableRef};
+
+    let mut select: SelectStatement = empty_select();
+    select.projections = vec![SelectItem::Wildcard];
+    select.from = vec![TableRef::Subquery {
+        query: effective,
+        alias: "_src".to_string(),
+    }];
+    if let Some(lit) = watermark {
+        select.where_clause = Some(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(key.to_string())),
+            op: BinaryOperator::Gt,
+            right: Box::new(lit),
+        }));
+    }
+    build_mv_insert(target, Box::new(select))
 }
 
 async fn handle_create_materialized_view(
@@ -3741,9 +3876,15 @@ async fn handle_create_materialized_view(
         .await
         .map_err(ProtocolError::Database)?;
 
-    // Populate the backing table from the query.
+    // Populate the backing table from the query. Plan against the session's
+    // database and search path so the backing table resolves in its own schema.
+    let db_id = get_session_database(session)?;
+    let search_path = session
+        .as_ref()
+        .map(|s| s.search_path.clone())
+        .unwrap_or_default();
     let insert = build_mv_insert(name.clone(), stmt.query.clone());
-    if let Err(e) = execute_write_stmt(server, insert).await {
+    if let Err(e) = execute_write_stmt(server, db_id, search_path, insert).await {
         // Roll back the backing table so a failed populate leaves no orphan.
         let _ = server.catalog.drop_table(schema_id, &name).await;
         return Err(e);
@@ -3796,16 +3937,22 @@ async fn handle_refresh_materialized_view(
         }
     };
 
-    // Clear the backing table, then repopulate from the query.
+    // Clear the backing table, then repopulate from the query. Plan against the
+    // session's database and search path so the backing table resolves.
+    let db_id = get_session_database(session)?;
+    let search_path = session
+        .as_ref()
+        .map(|s| s.search_path.clone())
+        .unwrap_or_default();
     let delete = zyron_parser::Statement::Delete(Box::new(zyron_parser::ast::DeleteStatement {
         table: name.clone(),
         where_clause: None,
         returning: None,
         hard: true,
     }));
-    execute_write_stmt(server, delete).await?;
+    execute_write_stmt(server, db_id, search_path.clone(), delete).await?;
     let insert = build_mv_insert(name.clone(), query);
-    execute_write_stmt(server, insert).await?;
+    execute_write_stmt(server, db_id, search_path, insert).await?;
 
     Ok(DdlResult::Tag("REFRESH MATERIALIZED VIEW".to_string()))
 }
@@ -4485,8 +4632,39 @@ async fn run_pipeline_stages(
                 })));
                 stmts.push(build_mv_insert(stage.target.clone(), effective.clone()));
             }
-            RefreshMode::Incremental | RefreshMode::AppendOnly => {
+            RefreshMode::AppendOnly => {
                 stmts.push(build_mv_insert(stage.target.clone(), effective.clone()));
+            }
+            RefreshMode::Incremental => {
+                // Append only source rows past the highest watermark already
+                // loaded, using the target's single-column primary key as the
+                // monotonic watermark. Aliasing this to AppendOnly re-appends
+                // the whole source each run and duplicates rows.
+                let table = server
+                    .catalog
+                    .get_table(schema_id, &stage.target)
+                    .map_err(ProtocolError::Database)?;
+                let pk = primary_key_columns(&table);
+                if pk.len() != 1 {
+                    return Err(ProtocolError::Database(ZyronError::Internal(format!(
+                        "pipeline stage '{}' uses MODE INCREMENTAL but target '{}' needs a \
+                         single-column primary key to act as the watermark",
+                        stage.name, stage.target
+                    ))));
+                }
+                let key = pk.into_iter().next().unwrap_or_default();
+
+                // Read the current high watermark MAX(pk) from the target.
+                let watermark =
+                    read_max_watermark(server, db_id, search_path, &stage.target, &key).await?;
+
+                let insert = build_incremental_insert(
+                    stage.target.clone(),
+                    effective.clone(),
+                    &key,
+                    watermark,
+                );
+                stmts.push(insert);
             }
             RefreshMode::Merge => {
                 let table = server
@@ -4628,10 +4806,29 @@ fn branch_manager(
     })
 }
 
+/// Requires the schema-level create privilege before a branch lifecycle
+/// operation, matching the other catalog-mutating DDL handlers so a branch
+/// cannot be created, dropped, or merged without authorization.
+fn check_branch_privilege(
+    server: &Arc<ServerState>,
+    session: &mut Option<Session>,
+) -> Result<(), ProtocolError> {
+    let (_, schema_id) = get_session_schema(session, server, None)?;
+    check_ddl_privilege(
+        server,
+        session,
+        zyron_auth::PrivilegeType::Create,
+        zyron_auth::ObjectType::Schema,
+        schema_id.0,
+    )
+}
+
 async fn handle_create_branch(
     stmt: &zyron_parser::ast::CreateBranchStatement,
     server: &Arc<ServerState>,
+    session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
+    check_branch_privilege(server, session)?;
     let mgr = branch_manager(server)?;
     let parent = match &stmt.from_branch {
         Some(name) => Some(
@@ -4783,7 +4980,9 @@ async fn handle_use_branch(
 async fn handle_drop_branch(
     stmt: &zyron_parser::ast::DropBranchStatement,
     server: &Arc<ServerState>,
+    session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
+    check_branch_privilege(server, session)?;
     let mgr = branch_manager(server)?;
     match mgr.get_branch_by_name(&stmt.name) {
         Ok(entry) => {
@@ -4800,7 +4999,9 @@ async fn handle_drop_branch(
 async fn handle_merge_branch(
     stmt: &zyron_parser::ast::MergeBranchStatement,
     server: &Arc<ServerState>,
+    session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
+    check_branch_privilege(server, session)?;
     let mgr = branch_manager(server)?;
     let source = mgr
         .get_branch_by_name(&stmt.source)
@@ -4949,11 +5150,33 @@ fn parse_valid_until(s: &str) -> Result<u64, ProtocolError> {
     Ok((micros / 1_000_000) as u64)
 }
 
-/// Hashes a plaintext password with Balloon hashing for storage.
-fn hash_password(password: &str) -> Result<String, ProtocolError> {
-    zyron_auth::PasswordCredential::from_plaintext(password)
+/// Hashes a plaintext password with Balloon hashing for storage. Uses the
+/// configured cost parameters when set, otherwise the built-in defaults.
+fn hash_password(password: &str, server: &Arc<ServerState>) -> Result<String, ProtocolError> {
+    let credential = match &server.balloon_params {
+        Some(params) => {
+            zyron_auth::PasswordCredential::from_plaintext_with_params(password, params)
+        }
+        None => zyron_auth::PasswordCredential::from_plaintext(password),
+    };
+    credential
         .map(|c| c.as_stored().to_string())
         .map_err(ProtocolError::Database)
+}
+
+/// Derives the three stored credentials from one plaintext password: the
+/// Balloon PHC hash (cleartext/password verify), the SCRAM-SHA-256 secret
+/// (SCRAM verify), and md5(password + username) (MD5 verify). Sets all three
+/// on the user so any configured auth method can validate the same password.
+fn set_user_password(
+    user: &mut zyron_auth::User,
+    password: &str,
+    server: &Arc<ServerState>,
+) -> Result<(), ProtocolError> {
+    user.password_hash = Some(hash_password(password, server)?);
+    user.scram_secret = Some(zyron_auth::scram_sha256_secret(password));
+    user.md5_credential = Some(zyron_auth::md5_password_credential(&user.name, password));
+    Ok(())
 }
 
 async fn handle_create_user(
@@ -4983,16 +5206,14 @@ async fn handle_create_user(
         }
     }
 
-    let password_hash = match &stmt.password {
-        Some(pw) => Some(hash_password(pw)?),
-        None => None,
-    };
     let now = now_secs();
 
-    let user = zyron_auth::User {
+    let mut user = zyron_auth::User {
         id: zyron_auth::UserId(0),
         name: stmt.name.clone(),
-        password_hash,
+        password_hash: None,
+        scram_secret: None,
+        md5_credential: None,
         api_key_prefix: None,
         api_key_hash: None,
         totp_secret: None,
@@ -5005,6 +5226,9 @@ async fn handle_create_user(
         superuser,
         can_login,
     };
+    if let Some(pw) = &stmt.password {
+        set_user_password(&mut user, pw, server)?;
+    }
     sm.create_user(&user)
         .await
         .map_err(ProtocolError::Database)?;
@@ -5052,7 +5276,7 @@ async fn handle_alter_user(
     match &stmt.operation {
         Op::SetPassword(pw) => {
             let mut user = sm.lookup_user(&stmt.name).ok_or_else(user_missing)?;
-            user.password_hash = Some(hash_password(pw)?);
+            set_user_password(&mut user, pw, server)?;
             sm.update_user(&user)
                 .await
                 .map_err(ProtocolError::Database)?;
@@ -5066,12 +5290,14 @@ async fn handle_alter_user(
                 .await
                 .map_err(ProtocolError::Database)?;
         }
-        Op::SetOption(opt) => {
+        Op::SetOptions(opts) => {
             let mut user = sm.lookup_user(&stmt.name).ok_or_else(user_missing)?;
-            match opt {
-                UserOption::Superuser(b) => user.superuser = *b,
-                UserOption::Login(b) => user.can_login = *b,
-                UserOption::ValidUntil(s) => user.valid_until = Some(parse_valid_until(s)?),
+            for opt in opts {
+                match opt {
+                    UserOption::Superuser(b) => user.superuser = *b,
+                    UserOption::Login(b) => user.can_login = *b,
+                    UserOption::ValidUntil(s) => user.valid_until = Some(parse_valid_until(s)?),
+                }
             }
             sm.update_user(&user)
                 .await
@@ -5125,22 +5351,24 @@ async fn handle_alter_role(
                     stmt.name
                 )))
             })?;
-            user.password_hash = Some(hash_password(pw)?);
+            set_user_password(&mut user, pw, server)?;
             sm.update_user(&user)
                 .await
                 .map_err(ProtocolError::Database)?;
         }
-        Op::SetOption(opt) => {
+        Op::SetOptions(opts) => {
             let mut user = sm.lookup_user(&stmt.name).ok_or_else(|| {
                 ProtocolError::Database(ZyronError::Internal(format!(
                     "role \"{}\" has no login account to alter",
                     stmt.name
                 )))
             })?;
-            match opt {
-                UserOption::Superuser(b) => user.superuser = *b,
-                UserOption::Login(b) => user.can_login = *b,
-                UserOption::ValidUntil(s) => user.valid_until = Some(parse_valid_until(s)?),
+            for opt in opts {
+                match opt {
+                    UserOption::Superuser(b) => user.superuser = *b,
+                    UserOption::Login(b) => user.can_login = *b,
+                    UserOption::ValidUntil(s) => user.valid_until = Some(parse_valid_until(s)?),
+                }
             }
             sm.update_user(&user)
                 .await
@@ -5358,13 +5586,22 @@ async fn handle_create_cdc_stream(
     };
 
     // A dedicated replication slot tracks delivery progress for the stream.
+    // Create it checked, then pin WAL retention from the current head so no
+    // change between creation and the consumer's first advance is reclaimed.
     let slot_name = format!("{}_slot", stmt.name);
-    let _ = slot_mgr.create_slot(&slot_name, decoder_plugin, Some(vec![table.id.0]));
+    slot_mgr
+        .create_slot(&slot_name, decoder_plugin, Some(vec![table.id.0]))
+        .map_err(ProtocolError::Database)?;
+    let start = server.wal.next_lsn();
+    if let Err(e) = slot_mgr.advance_slot(&slot_name, start) {
+        let _ = slot_mgr.drop_slot(&slot_name);
+        return Err(ProtocolError::Database(e));
+    }
 
     let stream = CdcOutputStream {
         name: stmt.name.clone(),
         table_id: table.id.0,
-        slot_name,
+        slot_name: slot_name.clone(),
         sink,
         decoder_plugin,
         filter: cdc_opt_str(opts, "filter"),
@@ -5374,7 +5611,11 @@ async fn handle_create_cdc_stream(
         active: true,
         retry_policy: StreamRetryPolicy::default(),
     };
-    mgr.create_stream(stream).map_err(ProtocolError::Database)?;
+    if let Err(e) = mgr.create_stream(stream) {
+        // Roll back the slot so a failed stream registration leaves no orphan.
+        let _ = slot_mgr.drop_slot(&slot_name);
+        return Err(ProtocolError::Database(e));
+    }
 
     Ok(DdlResult::Tag("CREATE CDC STREAM".to_string()))
 }
@@ -5504,6 +5745,10 @@ async fn handle_create_cdc_ingest(
         .and_then(|s| s.parse().ok())
         .unwrap_or(1000usize);
 
+    // Avro writer schema JSON for the Avro decoder, supplied via SCHEMA '...'
+    // or WITH (avro_schema = '...').
+    let avro_writer_schema = cdc_opt_str(opts, "avro_schema");
+
     let config = CdcIngestConfig {
         name: stmt.name.clone(),
         source,
@@ -5512,6 +5757,7 @@ async fn handle_create_cdc_ingest(
         on_conflict,
         dead_letter_table_id,
         decoder,
+        avro_writer_schema,
         batch_size,
         active: true,
     };
@@ -5873,7 +6119,8 @@ pub async fn fire_event(
                 continue;
             }
         };
-        if let Err(e) = execute_call_body(server, body_stmts, params).await {
+        let (db_id, search_path) = session_db_and_search_path(&None);
+        if let Err(e) = execute_call_body(server, body_stmts, params, db_id, search_path).await {
             tracing::warn!(target: "zyron::events", handler = %handler.name, "event handler execution failed: {e:?}");
         }
     }
@@ -5921,6 +6168,7 @@ async fn handle_archive_table(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
+    use zyron_parser::ast::Expr;
     let (schema_id, name) = resolve_qualified_name(&stmt.table, server, session)?;
     let table = server
         .catalog
@@ -5966,6 +6214,107 @@ async fn handle_archive_table(
     }
 
     if count > 0 {
+        // Delete the exact rows that were archived, keyed on the primary key
+        // read from the same batches. Re-running the original predicate would
+        // also delete rows inserted between the read and the delete that were
+        // never archived, losing them. Keying on the archived primary keys
+        // bounds the delete to exactly the archived set.
+        let pk = primary_key_columns(&table);
+        if pk.is_empty() {
+            return Err(ProtocolError::Database(ZyronError::Internal(format!(
+                "ARCHIVE TABLE requires a primary key on '{name}' to delete exactly the archived \
+                 rows; the table has none"
+            ))));
+        }
+
+        // Map each primary-key column to its position in the read output.
+        let mut pk_idx: Vec<usize> = Vec::with_capacity(pk.len());
+        for col in &pk {
+            let idx = schema.iter().position(|(n, _)| n == col).ok_or_else(|| {
+                ProtocolError::Database(ZyronError::Internal(format!(
+                    "ARCHIVE TABLE: primary key column '{col}' missing from the read output"
+                )))
+            })?;
+            pk_idx.push(idx);
+        }
+
+        // Build a predicate matching the archived rows by primary key. A single
+        // column uses an IN list; a composite key uses an OR of per-row AND
+        // equalities.
+        let where_clause = if pk.len() == 1 {
+            let key = pk[0].clone();
+            let key_pos = pk_idx[0];
+            let mut key_lits: Vec<Expr> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for b in &batches {
+                if let Some(col) = b.columns.get(key_pos) {
+                    for r in 0..b.num_rows {
+                        let scalar = col.get_scalar(r);
+                        if matches!(scalar, zyron_executor::column::ScalarValue::Null) {
+                            continue;
+                        }
+                        let lit = scalar_to_literal(&scalar).ok_or_else(|| {
+                            ProtocolError::Database(ZyronError::Internal(format!(
+                                "ARCHIVE TABLE: primary key column '{key}' has an unsupported type"
+                            )))
+                        })?;
+                        if seen.insert(format!("{lit:?}")) {
+                            key_lits.push(Expr::Literal(lit));
+                        }
+                    }
+                }
+            }
+            Some(Box::new(Expr::InList {
+                expr: Box::new(Expr::Identifier(key)),
+                list: key_lits,
+                negated: false,
+            }))
+        } else {
+            let mut row_preds: Vec<Expr> = Vec::new();
+            for b in &batches {
+                for r in 0..b.num_rows {
+                    let mut conj: Option<Expr> = None;
+                    for (col_name, &pos) in pk.iter().zip(pk_idx.iter()) {
+                        let scalar = b
+                            .columns
+                            .get(pos)
+                            .map(|c| c.get_scalar(r))
+                            .unwrap_or(zyron_executor::column::ScalarValue::Null);
+                        let lit = scalar_to_literal(&scalar).ok_or_else(|| {
+                            ProtocolError::Database(ZyronError::Internal(format!(
+                                "ARCHIVE TABLE: primary key column '{col_name}' has an \
+                                 unsupported type"
+                            )))
+                        })?;
+                        let eq = Expr::BinaryOp {
+                            left: Box::new(Expr::Identifier(col_name.clone())),
+                            op: zyron_parser::ast::BinaryOperator::Eq,
+                            right: Box::new(Expr::Literal(lit)),
+                        };
+                        conj = Some(match conj {
+                            None => eq,
+                            Some(c) => Expr::BinaryOp {
+                                left: Box::new(c),
+                                op: zyron_parser::ast::BinaryOperator::And,
+                                right: Box::new(eq),
+                            },
+                        });
+                    }
+                    if let Some(c) = conj {
+                        row_preds.push(c);
+                    }
+                }
+            }
+            row_preds
+                .into_iter()
+                .reduce(|a, b| Expr::BinaryOp {
+                    left: Box::new(a),
+                    op: zyron_parser::ast::BinaryOperator::Or,
+                    right: Box::new(b),
+                })
+                .map(Box::new)
+        };
+
         // Write the archive to durable object storage first, then remove the
         // archived rows. A failed delete leaves the rows present (the archive is
         // a superset), never loses data.
@@ -5973,14 +6322,16 @@ async fn handle_archive_table(
             .await
             .map_err(ProtocolError::Database)?;
 
-        let delete =
-            zyron_parser::Statement::Delete(Box::new(zyron_parser::ast::DeleteStatement {
-                table: name.clone(),
-                where_clause: stmt.where_clause.clone(),
-                returning: None,
-                hard: true,
-            }));
-        run_pipeline_write_txn(server, db_id, search_path, vec![delete]).await?;
+        if let Some(where_clause) = where_clause {
+            let delete =
+                zyron_parser::Statement::Delete(Box::new(zyron_parser::ast::DeleteStatement {
+                    table: name.clone(),
+                    where_clause: Some(where_clause),
+                    returning: None,
+                    hard: true,
+                }));
+            run_pipeline_write_txn(server, db_id, search_path, vec![delete]).await?;
+        }
     }
 
     Ok(DdlResult::Tag(format!("ARCHIVE TABLE {count}")))
@@ -6169,6 +6520,19 @@ pub struct IngestApplyReport {
     pub applied: usize,
     pub skipped: usize,
     pub failed: usize,
+    /// Number of leading records the source offset may advance past. A record
+    /// is committed when it is applied, skipped, or durably routed to the dead
+    /// letter table. Counting stops at the first record that could not be
+    /// committed (a failure with no dead letter table, or a failed dead letter
+    /// write) so the offset never moves past data that was lost.
+    pub committed: usize,
+    /// Records that failed to apply and could not be written to the dead letter
+    /// table (no dead letter configured, or the dead letter write itself
+    /// failed).
+    pub dead_letter_errors: usize,
+    /// Records that failed to apply and were durably written to the dead letter
+    /// table. Accumulated into the persisted per-job dead-letter total.
+    pub dead_lettered: usize,
 }
 
 /// Builds a SQL literal for an inbound string value coerced to the target
@@ -6353,19 +6717,21 @@ async fn ingest_key_exists(
 
 /// Inserts a record that failed to decode or apply into the configured dead
 /// letter table, filling the columns it recognizes by name (payload, error,
-/// ingest) or falling back to the first column for the raw payload.
+/// ingest) or falling back to the first column for the raw payload. Returns
+/// true only when the record was durably written to the dead letter table so
+/// the caller can decide whether the source offset may advance past it.
 async fn route_to_dead_letter(
     server: &Arc<ServerState>,
     dead_letter_table_id: u32,
     raw: &[u8],
     error: &str,
     ingest_name: &str,
-) {
+) -> bool {
     let Ok(dlq) = server
         .catalog
         .get_table_by_id(zyron_catalog::TableId(dead_letter_table_id))
     else {
-        return;
+        return false;
     };
     let payload = String::from_utf8_lossy(raw).into_owned();
     let mut columns = Vec::new();
@@ -6389,7 +6755,7 @@ async fn route_to_dead_letter(
         }
     }
     if columns.is_empty() {
-        return;
+        return false;
     }
     let stmt = zyron_parser::Statement::Insert(Box::new(zyron_parser::ast::InsertStatement {
         table: dlq.name.clone(),
@@ -6399,7 +6765,18 @@ async fn route_to_dead_letter(
         returning: None,
     }));
     let (db_id, search_path) = ingest_search_path(server, dlq.schema_id);
-    let _ = run_pipeline_write_txn(server, db_id, search_path, vec![stmt]).await;
+    match run_pipeline_write_txn(server, db_id, search_path, vec![stmt]).await {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::error!(
+                target: "zyron::cdc",
+                ingest = %ingest_name,
+                dead_letter_table_id,
+                "dead letter write failed: {e:?}"
+            );
+            false
+        }
+    }
 }
 
 /// Decodes and applies a batch of inbound CDC records to an ingest job's target
@@ -6414,12 +6791,42 @@ pub async fn apply_ingest_records(
     raw_records: &[Vec<u8>],
 ) -> IngestApplyReport {
     use zyron_cdc::ChangeType;
-    use zyron_cdc::decoder::create_decoder;
+    use zyron_cdc::decoder::create_decoder_with_schema;
     use zyron_parser::Statement;
     use zyron_parser::ast::DeleteStatement;
 
     let mut report = IngestApplyReport::default();
-    let decoder = create_decoder(config.decoder);
+    // Build the decoder with the configured Avro writer schema. A schema that
+    // fails to parse is a configuration error affecting every record, so each
+    // is routed to the dead letter table and the offset holds at the first that
+    // cannot be durably routed.
+    let decoder =
+        match create_decoder_with_schema(config.decoder, config.avro_writer_schema.as_deref()) {
+            Ok(d) => d,
+            Err(e) => {
+                let reason = format!("decoder construction failed: {e}");
+                let mut blocked = false;
+                for raw in raw_records {
+                    report.failed += 1;
+                    let durable = match config.dead_letter_table_id {
+                        Some(dlq) => {
+                            route_to_dead_letter(server, dlq, raw, &reason, &config.name).await
+                        }
+                        None => false,
+                    };
+                    if durable {
+                        report.dead_lettered += 1;
+                        if !blocked {
+                            report.committed += 1;
+                        }
+                    } else {
+                        report.dead_letter_errors += 1;
+                        blocked = true;
+                    }
+                }
+                return report;
+            }
+        };
 
     let table = match server
         .catalog
@@ -6427,19 +6834,34 @@ pub async fn apply_ingest_records(
     {
         Ok(t) => t,
         Err(_) => {
-            // The target is gone: every record fails and is dead-lettered.
+            // The target is gone: every record fails. Advance only past records
+            // that land durably in the dead letter table; hold the offset at the
+            // first that does not so nothing is lost.
+            let mut blocked = false;
             for raw in raw_records {
-                if let Some(dlq) = config.dead_letter_table_id {
-                    route_to_dead_letter(
-                        server,
-                        dlq,
-                        raw,
-                        "ingest target table not found",
-                        &config.name,
-                    )
-                    .await;
-                }
                 report.failed += 1;
+                let durable = match config.dead_letter_table_id {
+                    Some(dlq) => {
+                        route_to_dead_letter(
+                            server,
+                            dlq,
+                            raw,
+                            "ingest target table not found",
+                            &config.name,
+                        )
+                        .await
+                    }
+                    None => false,
+                };
+                if durable {
+                    report.dead_lettered += 1;
+                    if !blocked {
+                        report.committed += 1;
+                    }
+                } else {
+                    report.dead_letter_errors += 1;
+                    blocked = true;
+                }
             }
             return report;
         }
@@ -6447,48 +6869,48 @@ pub async fn apply_ingest_records(
     let target = table.name.clone();
     let (db_id, search_path) = ingest_search_path(server, table.schema_id);
 
+    // Once a record cannot be committed (failed with no durable dead letter
+    // landing) the source offset must not advance past it, so every later
+    // record in the batch is also held back even if it would apply cleanly.
+    // Holding the offset preserves source ordering on the next sweep.
+    let mut blocked = false;
+
     for raw in raw_records {
+        // A record is "lost" when it failed and could not be dead-lettered. It
+        // blocks the offset and increments the dead-letter-error count.
+        macro_rules! fail_record {
+            ($msg:expr) => {{
+                report.failed += 1;
+                let durable = match config.dead_letter_table_id {
+                    Some(dlq) => route_to_dead_letter(server, dlq, raw, $msg, &config.name).await,
+                    None => false,
+                };
+                if durable {
+                    report.dead_lettered += 1;
+                    if !blocked {
+                        report.committed += 1;
+                    }
+                } else {
+                    report.dead_letter_errors += 1;
+                    blocked = true;
+                }
+                continue;
+            }};
+        }
+
         let change = match decoder.deserialize(raw) {
             Ok(c) => c,
-            Err(e) => {
-                if let Some(dlq) = config.dead_letter_table_id {
-                    route_to_dead_letter(server, dlq, raw, &e.to_string(), &config.name).await;
-                }
-                report.failed += 1;
-                continue;
-            }
+            Err(e) => fail_record!(&e.to_string()),
         };
 
         // Build the statements this record applies.
         let stmts: Vec<Statement> = match change.operation {
             ChangeType::Insert | ChangeType::UpdatePostimage => {
                 let Some(new_values) = change.new_values.as_ref() else {
-                    if let Some(dlq) = config.dead_letter_table_id {
-                        route_to_dead_letter(
-                            server,
-                            dlq,
-                            raw,
-                            "change carries no row image",
-                            &config.name,
-                        )
-                        .await;
-                    }
-                    report.failed += 1;
-                    continue;
+                    fail_record!("change carries no row image");
                 };
                 let Some(insert) = build_ingest_insert(&target, &table, new_values) else {
-                    if let Some(dlq) = config.dead_letter_table_id {
-                        route_to_dead_letter(
-                            server,
-                            dlq,
-                            raw,
-                            "no column matched the target",
-                            &config.name,
-                        )
-                        .await;
-                    }
-                    report.failed += 1;
-                    continue;
+                    fail_record!("no column matched the target");
                 };
 
                 match config.on_conflict {
@@ -6509,6 +6931,9 @@ pub async fn apply_ingest_records(
                             .await
                         {
                             report.skipped += 1;
+                            if !blocked {
+                                report.committed += 1;
+                            }
                             continue;
                         }
                         vec![insert]
@@ -6528,41 +6953,37 @@ pub async fn apply_ingest_records(
                             None => vec![insert],
                         }
                     }
-                    zyron_cdc::cdc_ingest::OnConflict::Error => vec![insert],
+                    zyron_cdc::cdc_ingest::OnConflict::Error => {
+                        // Reject a duplicate key rather than silently appending
+                        // a second row on a target without a unique index.
+                        let keys = ingest_key_pairs(&config.primary_key_columns, new_values);
+                        if !keys.is_empty()
+                            && ingest_key_exists(
+                                server,
+                                db_id,
+                                &search_path,
+                                &target,
+                                &table,
+                                &keys,
+                            )
+                            .await
+                        {
+                            fail_record!("duplicate key on ON CONFLICT ERROR ingest");
+                        }
+                        vec![insert]
+                    }
                 }
             }
             ChangeType::Delete | ChangeType::UpdatePreimage => {
                 let source = change.old_values.as_ref().or(change.new_values.as_ref());
                 let Some(source) = source else {
-                    if let Some(dlq) = config.dead_letter_table_id {
-                        route_to_dead_letter(
-                            server,
-                            dlq,
-                            raw,
-                            "delete carries no key image",
-                            &config.name,
-                        )
-                        .await;
-                    }
-                    report.failed += 1;
-                    continue;
+                    fail_record!("delete carries no key image");
                 };
                 let keys = ingest_key_pairs(&config.primary_key_columns, source);
                 match build_ingest_delete(&target, &table, &keys) {
                     Some(delete) => vec![delete],
                     None => {
-                        if let Some(dlq) = config.dead_letter_table_id {
-                            route_to_dead_letter(
-                                server,
-                                dlq,
-                                raw,
-                                "delete has no usable key",
-                                &config.name,
-                            )
-                            .await;
-                        }
-                        report.failed += 1;
-                        continue;
+                        fail_record!("delete has no usable key");
                     }
                 }
             }
@@ -6577,18 +6998,21 @@ pub async fn apply_ingest_records(
             ChangeType::SchemaChange => {
                 // Schema markers carry no row action.
                 report.applied += 1;
+                if !blocked {
+                    report.committed += 1;
+                }
                 continue;
             }
         };
 
         match run_pipeline_write_txn(server, db_id, search_path.clone(), stmts).await {
-            Ok(_) => report.applied += 1,
-            Err(e) => {
-                if let Some(dlq) = config.dead_letter_table_id {
-                    route_to_dead_letter(server, dlq, raw, &format!("{e:?}"), &config.name).await;
+            Ok(_) => {
+                report.applied += 1;
+                if !blocked {
+                    report.committed += 1;
                 }
-                report.failed += 1;
             }
+            Err(e) => fail_record!(&format!("{e:?}")),
         }
     }
 
@@ -6625,6 +7049,7 @@ pub async fn run_due_ingests(server: &Arc<ServerState>) -> IngestRunReport {
         let cp = mgr.get_checkpoint(&config.name);
         let prior_applied = cp.as_ref().map(|c| c.records_applied).unwrap_or(0);
         let prior_failed = cp.as_ref().map(|c| c.records_failed).unwrap_or(0);
+        let prior_dead_lettered = cp.as_ref().map(|c| c.dead_letter_count).unwrap_or(0);
 
         match &config.source {
             CdcIngestSource::Kafka {
@@ -6666,12 +7091,32 @@ pub async fn run_due_ingests(server: &Arc<ServerState>) -> IngestRunReport {
                 report.applied += r.applied;
                 report.skipped += r.skipped;
                 report.failed += r.failed;
-                let _ = mgr.update_checkpoint(IngestCheckpoint {
+                // Advance only past records that were committed (applied,
+                // skipped, or durably dead-lettered). When every record
+                // committed, jump to the fetch's next offset; otherwise stop at
+                // the first uncommitted record so the next sweep retries it.
+                let committed_offset = if r.committed == records.len() {
+                    next
+                } else {
+                    offset + r.committed as i64
+                };
+                if r.dead_letter_errors > 0 {
+                    tracing::warn!(
+                        target: "zyron::cdc",
+                        ingest = %config.name,
+                        dead_letter_errors = r.dead_letter_errors,
+                        "ingest held offset at uncommitted record"
+                    );
+                }
+                if let Err(e) = mgr.update_checkpoint(IngestCheckpoint {
                     name: config.name.clone(),
-                    last_source_offset: next.to_string(),
+                    last_source_offset: committed_offset.to_string(),
                     records_applied: prior_applied + r.applied as u64,
                     records_failed: prior_failed + r.failed as u64,
-                });
+                    dead_letter_count: prior_dead_lettered + r.dead_lettered as u64,
+                }) {
+                    tracing::error!(target: "zyron::cdc", ingest = %config.name, "ingest checkpoint write failed: {e}");
+                }
             }
             CdcIngestSource::S3 {
                 bucket,
@@ -6701,8 +7146,11 @@ pub async fn run_due_ingests(server: &Arc<ServerState>) -> IngestRunReport {
                 }
                 let mut applied = 0u64;
                 let mut failed = 0u64;
+                let mut dead_lettered = 0u64;
                 // Checkpoint after each object so a mid-batch failure resumes
-                // from the last fully processed key.
+                // from the last fully processed key. Stop advancing the key past
+                // the first object that holds an uncommitted record so its data
+                // is retried on the next sweep rather than skipped.
                 for (key, records) in objects {
                     let r = apply_ingest_records(server, &config, &records).await;
                     report.applied += r.applied;
@@ -6710,12 +7158,28 @@ pub async fn run_due_ingests(server: &Arc<ServerState>) -> IngestRunReport {
                     report.failed += r.failed;
                     applied += r.applied as u64;
                     failed += r.failed as u64;
-                    let _ = mgr.update_checkpoint(IngestCheckpoint {
+                    dead_lettered += r.dead_lettered as u64;
+                    let fully_committed = r.committed == records.len();
+                    if !fully_committed {
+                        tracing::warn!(
+                            target: "zyron::cdc",
+                            ingest = %config.name,
+                            object = %key,
+                            dead_letter_errors = r.dead_letter_errors,
+                            "ingest held S3 key at uncommitted record"
+                        );
+                        break;
+                    }
+                    if let Err(e) = mgr.update_checkpoint(IngestCheckpoint {
                         name: config.name.clone(),
                         last_source_offset: key,
                         records_applied: prior_applied + applied,
                         records_failed: prior_failed + failed,
-                    });
+                        dead_letter_count: prior_dead_lettered + dead_lettered,
+                    }) {
+                        tracing::error!(target: "zyron::cdc", ingest = %config.name, "ingest checkpoint write failed: {e}");
+                        break;
+                    }
                 }
             }
         }
@@ -6785,6 +7249,10 @@ async fn handle_grant(
         .get_table(schema_id, &stmt.on_table)
         .map_err(ProtocolError::Database)?;
 
+    // The grantor is the session's current role, recorded so the privilege
+    // graph attributes the grant to the actor rather than to role 0.
+    let granted_by = zyron_auth::RoleId(actor_role_id(session));
+
     // Grant each privilege on the table
     for priv_ast in &stmt.privileges {
         let priv_types = map_privilege(*priv_ast);
@@ -6796,8 +7264,8 @@ async fn handle_grant(
                 object_id: table.id.0,
                 columns: None,
                 state: zyron_auth::PrivilegeState::Grant,
-                with_grant_option: false,
-                granted_by: zyron_auth::RoleId(0),
+                with_grant_option: stmt.with_grant_option,
+                granted_by,
                 valid_from: None,
                 valid_until: None,
                 time_window: None,
@@ -6811,6 +7279,13 @@ async fn handle_grant(
         }
     }
 
+    tracing::info!(
+        target: "zyron::audit",
+        event = "PrivilegeGranted",
+        grantee = %stmt.to,
+        object = %stmt.on_table,
+        actor_role = granted_by.0,
+    );
     Ok(DdlResult::Tag("GRANT".to_string()))
 }
 
@@ -6849,6 +7324,13 @@ async fn handle_revoke(
         }
     }
 
+    tracing::info!(
+        target: "zyron::audit",
+        event = "PrivilegeRevoked",
+        grantee = %stmt.from,
+        object = %stmt.on_table,
+        actor_role = actor_role_id(session),
+    );
     Ok(DdlResult::Tag("REVOKE".to_string()))
 }
 
@@ -6859,13 +7341,22 @@ async fn handle_revoke(
 fn handle_savepoint(
     stmt: &zyron_parser::ast::SavepointStatement,
     txn: &mut Option<zyron_storage::txn::Transaction>,
+    server: &Arc<ServerState>,
 ) -> Result<DdlResult, ProtocolError> {
     let txn = txn.as_mut().ok_or_else(|| {
         ProtocolError::Database(ZyronError::TransactionAborted(
             "SAVEPOINT can only be used in a transaction".to_string(),
         ))
     })?;
-    txn.savepoint(stmt.name.clone(), 0);
+    // Capture the row and intent lock counts held now so ROLLBACK TO this
+    // savepoint releases exactly the locks acquired after it. Both tables are
+    // keyed by txn id and track per-txn acquisition order.
+    let row_lock_count = server.txn_manager.lock_table().current_count(txn.txn_id());
+    let intent_lock_count = server
+        .txn_manager
+        .intent_locks()
+        .current_count(txn.txn_id());
+    txn.savepoint(stmt.name.clone(), row_lock_count, intent_lock_count);
     Ok(DdlResult::Tag("SAVEPOINT".to_string()))
 }
 
@@ -6891,8 +7382,10 @@ fn handle_release_savepoint(
 // VALUES query handler
 // ---------------------------------------------------------------------------
 
-fn handle_values_query(
+async fn handle_values_query(
     stmt: &zyron_parser::ast::ValuesQueryStatement,
+    server: &Arc<ServerState>,
+    session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
     if stmt.rows.is_empty() {
         return Ok(DdlResult::Tag("SELECT 0".to_string()));
@@ -6910,18 +7403,58 @@ fn handle_values_query(
         }
     }
 
+    // Evaluate the rows by running them through the planner and executor so
+    // every expression form (arithmetic, function calls, casts) resolves to its
+    // computed value. Each row becomes a SELECT of its expressions, joined with
+    // UNION ALL so a single plan computes the whole result.
+    let selects: Vec<String> = stmt
+        .rows
+        .iter()
+        .map(|row| {
+            let cells: Vec<String> = row
+                .iter()
+                .enumerate()
+                .map(|(i, e)| format!("{} AS column{}", zyron_parser::expr_to_sql(e), i + 1))
+                .collect();
+            format!("SELECT {}", cells.join(", "))
+        })
+        .collect();
+    let sql = selects.join(" UNION ALL ");
+
+    let db_id = get_session_database(session)?;
+    let search_path = session
+        .as_ref()
+        .map(|s| s.search_path.clone())
+        .unwrap_or_default();
+    let select_stmt = zyron_parser::parse(&sql)
+        .map_err(ProtocolError::Database)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            ProtocolError::Database(ZyronError::Internal("empty VALUES query".to_string()))
+        })?;
+    let (schema, batches) = run_pipeline_read(server, db_id, search_path, select_stmt).await?;
+
     let columns: Vec<(String, i32)> = (0..num_cols)
         .map(|i| (format!("column{}", i + 1), crate::types::PG_TEXT_OID))
         .collect();
 
-    let mut rows = Vec::with_capacity(stmt.rows.len());
-    for row in &stmt.rows {
-        let mut row_values = Vec::with_capacity(row.len());
-        for expr in row {
-            let value = eval_literal_expr(expr);
-            row_values.push(value);
+    let mut rows = Vec::new();
+    for b in &batches {
+        for r in 0..b.num_rows {
+            let mut row_values = Vec::with_capacity(schema.len());
+            for col in &b.columns {
+                let scalar = col.get_scalar(r);
+                let mut buf = bytes::BytesMut::with_capacity(32);
+                let value = if crate::types::scalar_write_text(&scalar, &mut buf) {
+                    String::from_utf8_lossy(&buf).into_owned()
+                } else {
+                    String::new()
+                };
+                row_values.push(value);
+            }
+            rows.push(row_values);
         }
-        rows.push(row_values);
     }
 
     Ok(DdlResult::Rows {
@@ -6929,25 +7462,6 @@ fn handle_values_query(
         columns,
         rows,
     })
-}
-
-/// Evaluates a simple literal expression to its string representation.
-/// Handles integer, float, string, boolean, and null literals.
-/// Complex expressions evaluate to their debug representation.
-fn eval_literal_expr(expr: &zyron_parser::ast::Expr) -> String {
-    use zyron_parser::ast::{Expr, LiteralValue};
-    match expr {
-        Expr::Literal(LiteralValue::Integer(n)) => n.to_string(),
-        Expr::Literal(LiteralValue::Float(f)) => f.to_string(),
-        Expr::Literal(LiteralValue::String(s)) => s.clone(),
-        Expr::Literal(LiteralValue::Boolean(b)) => b.to_string(),
-        Expr::Literal(LiteralValue::Null) => "".to_string(),
-        Expr::UnaryOp { op, expr } => {
-            let inner = eval_literal_expr(expr);
-            format!("{:?}{}", op, inner)
-        }
-        other => format!("{:?}", other),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6988,6 +7502,26 @@ pub(crate) fn get_session_schema(
     Ok((db_id, schema.id))
 }
 
+/// Returns the session's database id and search_path for executing procedure,
+/// DO, and trigger bodies in the caller's namespace. Falls back to the default
+/// database and the public schema when there is no session (background
+/// dispatch).
+fn session_db_and_search_path(
+    session: &Option<Session>,
+) -> (zyron_catalog::DatabaseId, Vec<String>) {
+    match session.as_ref() {
+        Some(s) => {
+            let path = if s.search_path.is_empty() {
+                vec!["public".to_string()]
+            } else {
+                s.search_path.clone()
+            };
+            (s.database_id, path)
+        }
+        None => (zyron_catalog::DatabaseId(1), vec!["public".to_string()]),
+    }
+}
+
 /// Returns the database ID bound to the active session.
 ///
 /// Used by DDL handlers that operate at the database scope (CREATE SCHEMA,
@@ -7007,8 +7541,8 @@ async fn handle_create_fulltext_index(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    // Resolve table from the default schema
-    let schema_id = zyron_catalog::SchemaId(1); // default public schema
+    // Resolve the schema from the session search_path.
+    let (_, schema_id) = get_session_schema(session, server, None)?;
 
     let table = server
         .catalog
@@ -7066,7 +7600,7 @@ async fn handle_create_vector_index(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let schema_id = zyron_catalog::SchemaId(1); // default public schema
+    let (_, schema_id) = get_session_schema(session, server, None)?;
 
     let table = server
         .catalog
@@ -7082,10 +7616,13 @@ async fn handle_create_vector_index(
         table.id.0,
     )?;
 
-    // Parse distance metric and index parameters from options
+    // Parse distance metric and index parameters from options. A malformed
+    // numeric option is rejected rather than silently substituting a default,
+    // so a typo never builds an index with the wrong graph parameters.
     let mut distance_metric = "cosine".to_string();
     let mut m: u16 = 16;
     let mut ef_construction: u16 = 200;
+    let mut dim_option: Option<u16> = None;
     for opt in &stmt.options {
         let key = opt.key.to_lowercase();
         let val_str = match &opt.value {
@@ -7098,16 +7635,31 @@ async fn handle_create_vector_index(
         match key.as_str() {
             "distance_metric" => distance_metric = val_str,
             "m" => {
-                m = val_str.parse().unwrap_or(16);
+                m = val_str.parse().map_err(|_| {
+                    ProtocolError::Database(ZyronError::ExecutionError(format!(
+                        "vector index option 'm' must be an integer, got '{val_str}'"
+                    )))
+                })?;
             }
             "ef_construction" => {
-                ef_construction = val_str.parse().unwrap_or(200);
+                ef_construction = val_str.parse().map_err(|_| {
+                    ProtocolError::Database(ZyronError::ExecutionError(format!(
+                        "vector index option 'ef_construction' must be an integer, got '{val_str}'"
+                    )))
+                })?;
+            }
+            "dimensions" | "dim" | "dimension" => {
+                dim_option = Some(val_str.parse().map_err(|_| {
+                    ProtocolError::Database(ZyronError::ExecutionError(format!(
+                        "vector index option 'dimensions' must be an integer, got '{val_str}'"
+                    )))
+                })?);
             }
             _ => {}
         }
     }
 
-    // Find the column to determine dimensions
+    // Find the column to determine dimensions.
     let col = table
         .columns
         .iter()
@@ -7119,7 +7671,19 @@ async fn handle_create_vector_index(
             )))
         })?;
 
-    let dimensions = col.max_length.unwrap_or(128) as u16;
+    // Dimension must be explicit: a DIMENSIONS option, or the column's declared
+    // length. Defaulting to a fixed value would build an index that mismatches
+    // the stored vectors, so an absent dimension is an error.
+    let dimensions = dim_option
+        .or_else(|| col.max_length.map(|l| l as u16))
+        .filter(|d| *d > 0)
+        .ok_or_else(|| {
+            ProtocolError::Database(ZyronError::ExecutionError(format!(
+                "vector index on '{}' requires an explicit dimension; declare the column length \
+                 or pass WITH (dimensions = N)",
+                stmt.column
+            )))
+        })?;
 
     // Register in catalog with IndexType::Vector
     let index_id = server
@@ -7163,7 +7727,7 @@ async fn handle_create_spatial_index(
     server: &Arc<ServerState>,
     session: &mut Option<Session>,
 ) -> Result<DdlResult, ProtocolError> {
-    let schema_id = zyron_catalog::SchemaId(1); // default public schema
+    let (_, schema_id) = get_session_schema(session, server, None)?;
 
     let table = server
         .catalog
@@ -7438,6 +8002,18 @@ async fn handle_drop_graph_schema(
         ))
     })?;
 
+    // Resolve the session schema before the irreversible drop so a missing
+    // search_path fails the statement instead of leaving the backing tables
+    // orphaned after the schema is already gone.
+    let (_, schema_id) = get_session_schema(session, server, None)?;
+    check_ddl_privilege(
+        server,
+        session,
+        zyron_auth::PrivilegeType::Create,
+        zyron_auth::ObjectType::Schema,
+        schema_id.0,
+    )?;
+
     // Collect the backing-table names from the schema before dropping it.
     let backing: Vec<String> = match graph_mgr.get_schema(&stmt.name) {
         Some(schema) => schema
@@ -7461,7 +8037,6 @@ async fn handle_drop_graph_schema(
                 .save_all(&graph_dir)
                 .map_err(ProtocolError::Database)?;
             // Drop the backing tables and reclaim their files.
-            let (_, schema_id) = get_session_schema(session, server, None)?;
             rollback_graph_tables(server, schema_id, &backing).await;
             Ok(DdlResult::Tag("DROP GRAPH SCHEMA".to_string()))
         }
@@ -9761,7 +10336,47 @@ async fn handle_create_publication(
 
     let owner_role_id = actor_role_id(session);
     let now = unix_now_secs();
-    let where_predicate = bound.where_predicate.as_ref().map(|_| String::new());
+    // Render the publication-level WHERE predicate to SQL against the first
+    // member table's schema so the streaming read path re-parses and enforces
+    // it. ColumnRefs resolve by column_id, table-specific, so a publication
+    // predicate spanning a single column set binds against each member table.
+    let where_predicate = match bound.where_predicate.as_ref() {
+        None => None,
+        Some(expr) => {
+            let cols = bound
+                .tables
+                .first()
+                .and_then(|t| server.catalog.get_table_by_id(t.table_id).ok())
+                .map(|t| t.columns.clone())
+                .unwrap_or_default();
+            Some(
+                crate::bound_predicate_sql::bound_predicate_to_sql(expr, &cols).ok_or_else(
+                    || {
+                        ProtocolError::Database(ZyronError::Internal(
+                            "publication WHERE predicate is not a supported row filter".to_string(),
+                        ))
+                    },
+                )?,
+            )
+        }
+    };
+    // Column projection restricts the published columns. A publication-level
+    // list is the union of the per-table column selections.
+    let columns_projection: Vec<String> = {
+        let mut names: Vec<String> = Vec::new();
+        for tbl in &bound.tables {
+            if let Ok(t) = server.catalog.get_table_by_id(tbl.table_id) {
+                for cid in &tbl.columns {
+                    if let Some(c) = t.columns.iter().find(|e| e.id == *cid) {
+                        if !names.contains(&c.name) {
+                            names.push(c.name.clone());
+                        }
+                    }
+                }
+            }
+        }
+        names
+    };
 
     let entry = zyron_catalog::PublicationEntry {
         id: zyron_catalog::PublicationId(0),
@@ -9789,7 +10404,7 @@ async fn handle_create_publication(
         classification: bound.classification,
         allow_initial_snapshot: bound.allow_initial_snapshot,
         where_predicate,
-        columns_projection: Vec::new(),
+        columns_projection,
         rls_using_predicate: None,
         tags: Vec::new(),
         schema_fingerprint: bound.schema_fingerprint,
@@ -9818,12 +10433,37 @@ async fn handle_create_publication(
     };
 
     for tbl in &bound.tables {
+        let tbl_cols = server
+            .catalog
+            .get_table_by_id(tbl.table_id)
+            .map(|t| t.columns.clone())
+            .unwrap_or_default();
+        let where_predicate = match tbl.where_predicate.as_ref() {
+            None => None,
+            Some(expr) => Some(
+                crate::bound_predicate_sql::bound_predicate_to_sql(expr, &tbl_cols).ok_or_else(
+                    || {
+                        ProtocolError::Database(ZyronError::Internal(
+                            "publication table WHERE predicate is not a supported row filter"
+                                .to_string(),
+                        ))
+                    },
+                )?,
+            ),
+        };
+        // Persist column names (not numeric ids) so the read path can prune by
+        // name without re-resolving the catalog.
+        let columns: Vec<String> = tbl
+            .columns
+            .iter()
+            .filter_map(|c| tbl_cols.iter().find(|e| e.id == *c).map(|e| e.name.clone()))
+            .collect();
         let tentry = zyron_catalog::PublicationTableEntry {
             id: 0,
             publication_id: pub_id,
             table_id: tbl.table_id,
-            where_predicate: tbl.where_predicate.as_ref().map(|_| String::new()),
-            columns: tbl.columns.iter().map(|c| c.0.to_string()).collect(),
+            where_predicate,
+            columns,
             created_at: now,
         };
         server
@@ -9881,12 +10521,34 @@ async fn handle_alter_publication(
 
     match bound.action {
         BoundAlterPublicationAction::AddTable(t) => {
+            let tbl_cols = server
+                .catalog
+                .get_table_by_id(t.table_id)
+                .map(|e| e.columns.clone())
+                .unwrap_or_default();
+            let where_predicate = match t.where_predicate.as_ref() {
+                None => None,
+                Some(expr) => Some(
+                    crate::bound_predicate_sql::bound_predicate_to_sql(expr, &tbl_cols)
+                        .ok_or_else(|| {
+                            ProtocolError::Database(ZyronError::Internal(
+                                "publication table WHERE predicate is not a supported row filter"
+                                    .to_string(),
+                            ))
+                        })?,
+                ),
+            };
+            let columns: Vec<String> = t
+                .columns
+                .iter()
+                .filter_map(|c| tbl_cols.iter().find(|e| e.id == *c).map(|e| e.name.clone()))
+                .collect();
             let tentry = zyron_catalog::PublicationTableEntry {
                 id: 0,
                 publication_id: current.id,
                 table_id: t.table_id,
-                where_predicate: t.where_predicate.as_ref().map(|_| String::new()),
-                columns: t.columns.iter().map(|c| c.0.to_string()).collect(),
+                where_predicate,
+                columns,
                 created_at: now,
             };
             server
@@ -9937,9 +10599,24 @@ async fn handle_alter_publication(
                 .await
                 .map_err(ProtocolError::Database)?;
         }
-        BoundAlterPublicationAction::SetWhere(_expr) => {
+        BoundAlterPublicationAction::SetWhere(expr) => {
+            // Render against the first member table's schema, matching the
+            // CREATE PUBLICATION publication-level predicate storage.
+            let cols = server
+                .catalog
+                .get_publication_tables(current.id)
+                .first()
+                .and_then(|pt| server.catalog.get_table_by_id(pt.table_id).ok())
+                .map(|t| t.columns.clone())
+                .unwrap_or_default();
+            let rendered = crate::bound_predicate_sql::bound_predicate_to_sql(&expr, &cols)
+                .ok_or_else(|| {
+                    ProtocolError::Database(ZyronError::Internal(
+                        "publication WHERE predicate is not a supported row filter".to_string(),
+                    ))
+                })?;
             let mut updated = (*current).clone();
-            updated.where_predicate = Some(String::new());
+            updated.where_predicate = Some(rendered);
             server
                 .catalog
                 .update_publication(updated)
@@ -10172,19 +10849,24 @@ async fn handle_create_endpoint(
         .map_err(ProtocolError::Database)?;
 
     // Push the newly persisted entry into the live gateway router so HTTP
-    // requests start resolving immediately. A registration failure is logged
-    // and ignored, the catalog row still persists and the operator can
-    // re-register via ALTER ENDPOINT ENABLE.
+    // requests start resolving immediately. A registration failure means the
+    // endpoint is not actually live, so roll back the catalog row and surface
+    // the error rather than reporting a success the client cannot use.
     if let Some(ref registrar) = server.endpoint_registrar {
         if let Some(new_entry) = server.catalog.get_endpoint_by_id(created_id) {
             if let Err(e) = registrar.register(&new_entry).await {
-                tracing::warn!(
+                tracing::error!(
                     target: "zyron::gateway",
                     name = %bound.name,
                     path = %bound.path,
                     error = %e,
                     "endpoint router registration failed after catalog create"
                 );
+                let _ = server
+                    .catalog
+                    .drop_endpoint(bound.schema_id, &bound.name)
+                    .await;
+                return Err(ProtocolError::Database(e));
             }
         }
     }
@@ -10265,13 +10947,18 @@ async fn handle_create_streaming_endpoint(
     if let Some(ref registrar) = server.endpoint_registrar {
         if let Some(new_entry) = server.catalog.get_endpoint_by_id(created_id) {
             if let Err(e) = registrar.register(&new_entry).await {
-                tracing::warn!(
+                tracing::error!(
                     target: "zyron::gateway",
                     name = %bound.name,
                     path = %bound.path,
                     error = %e,
                     "streaming endpoint router registration failed after catalog create"
                 );
+                let _ = server
+                    .catalog
+                    .drop_endpoint(bound.schema_id, &bound.name)
+                    .await;
+                return Err(ProtocolError::Database(e));
             }
         }
     }
@@ -10572,7 +11259,9 @@ async fn handle_drop_security_map(
 
 /// Render an expression AST back to a SQL string for storage and lineage
 fn renderExpr(expr: &zyron_parser::ast::Expr) -> String {
-    format!("{:?}", expr)
+    // Render the transform expression back to SQL so the stored feature
+    // definition re-parses, rather than a debug form that does not round-trip.
+    zyron_parser::expr_to_sql(expr)
 }
 
 /// Convert an AST DataType to a canonical type label
@@ -10847,7 +11536,9 @@ async fn handle_drop_model(
         )));
     }
     server.model_cache.invalidate(&stmt.name);
-    let _ = removeModelFile(server, &stmt.name);
+    // Surface an on-disk delete failure rather than swallowing it, otherwise a
+    // stale model file survives the drop and reloads on restart.
+    removeModelFile(server, &stmt.name).map_err(ProtocolError::Database)?;
     Ok(DdlResult::Tag("DROP MODEL".to_string()))
 }
 

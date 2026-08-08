@@ -30,18 +30,23 @@ fn io_runtime() -> &'static tokio::runtime::Runtime {
 }
 
 /// Runs an async IO future to completion from a synchronous context, including
-/// from within another tokio runtime's worker thread.
-pub fn block_on_io<F>(fut: F) -> F::Output
+/// from within another tokio runtime's worker thread. The future resolves to a
+/// Result so a cancelled or panicked IO task surfaces as a ZyronError on the
+/// calling thread rather than unwinding it.
+pub fn block_on_io<F, T>(fut: F) -> Result<T>
 where
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
+    F: Future<Output = Result<T>> + Send + 'static,
+    T: Send + 'static,
 {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     io_runtime().spawn(async move {
         let _ = tx.send(fut.await);
     });
-    rx.recv()
-        .expect("CDC sink IO task was dropped before completing")
+    rx.recv().unwrap_or_else(|_| {
+        Err(ZyronError::CdcIngestError(
+            "CDC sink IO task was dropped before completing".into(),
+        ))
+    })
 }
 
 /// Shared HTTP client for webhook and S3 sinks. rustls-backed, pure Rust.

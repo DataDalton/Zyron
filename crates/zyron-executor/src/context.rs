@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use zyron_buffer::BufferPool;
 use zyron_catalog::{Catalog, IndexId, TableEntry, TableId, TableIndexSnapshot};
 use zyron_common::{Result, ZyronError};
-use zyron_storage::{BTreeIndex, DiskManager, HeapFile, HeapFileConfig, Snapshot};
+use zyron_storage::{BTreeIndex, DiskManager, HeapFile, HeapFileConfig, Snapshot, TupleId};
 use zyron_wal::WalWriter;
 
 use crate::batch::BATCH_SIZE;
@@ -95,6 +95,14 @@ pub struct ExecutionContext {
     pub snapshot: Snapshot,
     /// When set to true, operators check this flag and bail with a cancellation error.
     cancelled: AtomicBool,
+    /// Wall-clock instant past which the statement is treated as timed out.
+    /// check_cancelled reports cancelled once Instant::now passes this. None
+    /// disables the deadline. Set from the session statement_timeout by wire.
+    deadline: Option<std::time::Instant>,
+    /// Upper bound on rows the top-level execute loop materializes. None
+    /// disables the cap. Set from the session max_result_rows by wire so a
+    /// runaway query is bounded before its full result set lands in memory.
+    pub max_result_rows: Option<u64>,
     /// Set by DML operators when they append a WAL data record. The server
     /// reads it after execution to decide whether the transaction must commit
     /// durably; a transaction that wrote nothing commits without a WAL commit
@@ -167,6 +175,19 @@ pub struct ExecutionContext {
     /// in a nested context with this incremented; firing stops past a fixed
     /// depth so a trigger that re-triggers itself cannot recurse without bound.
     pub trigger_depth: usize,
+    /// Shared undo log of the owning transaction. DML operators record one
+    /// reverse-op per write here, but only while the transaction has an open
+    /// savepoint, so a transaction with no savepoint records nothing. ROLLBACK
+    /// TO SAVEPOINT reverses these entries. None for executions outside a
+    /// savepoint-capable transaction.
+    pub undo_log: Option<Arc<zyron_storage::TxnUndoLog>>,
+    /// True when the enclosing transaction was started READ ONLY. Write
+    /// operators reject before touching the heap, so no execution path (direct
+    /// DML, a prepared write run through the extended protocol, or a write
+    /// inside CALL, DO, or a trigger) can mutate data in a read-only
+    /// transaction. Inherited by child contexts so nested execution stays
+    /// read-only.
+    pub read_only: bool,
 }
 
 impl ExecutionContext {
@@ -188,6 +209,8 @@ impl ExecutionContext {
             txn_id,
             snapshot,
             cancelled: AtomicBool::new(false),
+            deadline: None,
+            max_result_rows: None,
             wrote_wal: AtomicBool::new(false),
             analyze: false,
             cdc_hook: None,
@@ -208,6 +231,8 @@ impl ExecutionContext {
             intent_locks: None,
             session_sequences: None,
             trigger_depth: 0,
+            undo_log: None,
+            read_only: false,
         }
     }
 
@@ -226,6 +251,8 @@ impl ExecutionContext {
             txn_id: self.txn_id,
             snapshot: self.snapshot.clone(),
             cancelled: AtomicBool::new(false),
+            deadline: self.deadline,
+            max_result_rows: self.max_result_rows,
             wrote_wal: AtomicBool::new(false),
             analyze: false,
             cdc_hook: self.cdc_hook.clone(),
@@ -246,6 +273,8 @@ impl ExecutionContext {
             intent_locks: self.intent_locks.clone(),
             session_sequences: self.session_sequences.clone(),
             trigger_depth: self.trigger_depth,
+            undo_log: self.undo_log.clone(),
+            read_only: self.read_only,
         }
     }
 
@@ -269,10 +298,26 @@ impl ExecutionContext {
         self.cancelled.store(true, Ordering::Release);
     }
 
+    /// Sets the wall-clock deadline past which the statement times out.
+    /// Operators observe it through check_cancelled at batch boundaries.
+    pub fn set_deadline(&mut self, deadline: std::time::Instant) {
+        self.deadline = Some(deadline);
+    }
+
     /// Returns true if this query has been cancelled.
     #[inline]
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
+    }
+
+    /// Returns true once the statement deadline has elapsed. Always false
+    /// when no deadline is set.
+    #[inline]
+    pub fn deadline_exceeded(&self) -> bool {
+        match self.deadline {
+            Some(d) => std::time::Instant::now() >= d,
+            None => false,
+        }
     }
 
     /// Records that a WAL data record was appended during this execution.
@@ -282,18 +327,78 @@ impl ExecutionContext {
         self.wrote_wal.store(true, Ordering::Relaxed);
     }
 
+    /// Rejects a write in a read-only transaction. Write operators call this
+    /// before any heap mutation so a read-only transaction cannot write through
+    /// any path. op is the SQL verb for the error message.
+    #[inline]
+    pub fn ensure_writable(&self, op: &str) -> Result<()> {
+        if self.read_only {
+            return Err(ZyronError::ExecutionError(format!(
+                "cannot execute {op} in a read-only transaction"
+            )));
+        }
+        Ok(())
+    }
+
+    /// True when the owning transaction has an open savepoint, so DML operators
+    /// must record reverse-ops for their writes. False on the common path, where
+    /// no undo recording happens. A single relaxed atomic load when an undo log
+    /// is present.
+    #[inline]
+    pub fn recording_undo(&self) -> bool {
+        self.undo_log
+            .as_ref()
+            .is_some_and(|log| log.has_active_savepoint())
+    }
+
+    /// Records a ReverseInsert undo entry for a tuple this transaction inserted,
+    /// so ROLLBACK TO SAVEPOINT self-deletes it. No-op unless a savepoint is
+    /// open. `heap_file_id`/`fsm_file_id` address the heap that holds the tuple.
+    #[inline]
+    pub fn record_insert_undo(&self, heap_file_id: u32, fsm_file_id: u32, tid: TupleId) {
+        if let Some(log) = &self.undo_log {
+            if log.has_active_savepoint() {
+                log.record(zyron_storage::UndoEntry::ReverseInsert {
+                    heap_file_id,
+                    fsm_file_id,
+                    tid,
+                });
+            }
+        }
+    }
+
+    /// Records a ReverseDelete undo entry for a pre-existing tuple this
+    /// transaction deleted (stamped xmax), so ROLLBACK TO SAVEPOINT clears its
+    /// xmax and restores it. No-op unless a savepoint is open.
+    #[inline]
+    pub fn record_delete_undo(&self, heap_file_id: u32, fsm_file_id: u32, tid: TupleId) {
+        if let Some(log) = &self.undo_log {
+            if log.has_active_savepoint() {
+                log.record(zyron_storage::UndoEntry::ReverseDelete {
+                    heap_file_id,
+                    fsm_file_id,
+                    tid,
+                });
+            }
+        }
+    }
+
     /// Returns true if a WAL data record was appended during this execution.
     #[inline]
     pub fn wrote_wal(&self) -> bool {
         self.wrote_wal.load(Ordering::Relaxed)
     }
 
-    /// Checks cancellation and returns an error if cancelled.
-    /// Operators call this at batch boundaries for cooperative cancellation.
+    /// Checks cancellation and the statement deadline, returning an error when
+    /// either trips. Operators call this at batch boundaries for cooperative
+    /// cancellation. A tripped deadline reports a statement timeout so the
+    /// client sees the limit rather than a generic cancellation.
     #[inline]
     pub fn check_cancelled(&self) -> Result<()> {
         if self.is_cancelled() {
             Err(ZyronError::Internal("Query cancelled".into()))
+        } else if self.deadline_exceeded() {
+            Err(ZyronError::Internal("statement timeout".into()))
         } else {
             Ok(())
         }

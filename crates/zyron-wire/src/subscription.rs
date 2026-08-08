@@ -876,10 +876,19 @@ impl ChangeSource for CdcChangeSource {
                         .collect();
                     if let Some(mask) = filter
                         .mask_for(tid, &rows)
-                        .map_err(|e| ProtocolError::Malformed(format!("abac filter: {e}")))?
+                        .map_err(|e| ProtocolError::Malformed(format!("publication filter: {e}")))?
                     {
                         let mut keep = mask.into_iter();
                         candidates.retain(|_| keep.next().unwrap_or(false));
+                    }
+                }
+                // Column projection: rewrite each surviving tuple to publish only
+                // the selected columns. Applied after row filtering so the
+                // predicate sees the full row but the subscriber sees the
+                // projected one.
+                if filter.projects(tid) {
+                    for (delta, _) in candidates.iter_mut() {
+                        delta.row_bytes = filter.project_row(tid, &delta.row_bytes);
                     }
                 }
             }

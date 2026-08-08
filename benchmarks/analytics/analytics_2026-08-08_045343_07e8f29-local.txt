@@ -1,0 +1,291 @@
+
+=== Test 1: ROLLUP Correctness ===
+  Grouping sets expanded: 4
+  Grand total = 2747500.00 (expected 2747500.00)
+  Region subtotal rows: 5, sum 2747500.00
+  Hierarchical subtotals verified: PASS
+  GROUPING() flag values verified: PASS
+
+=== Test 2: CUBE Correctness ===
+  Grouping sets expanded: 4
+  GROUPING_ID(grand_total) = 0b11
+  CUBE all combinations present: PASS
+  GROUPING_ID bitmasks verified: PASS
+
+=== Test 3: GROUPING SETS Correctness ===
+  3 distinct grouping types observed: PASS
+  Grand total matches input sum: PASS
+
+=== Test 6: Funnel Analysis Correctness ===
+  Generated 2978 events across 1000 users
+  page_view      users= 1000 conv=1.000 drop=0.000
+  add_to_cart    users=  961 conv=0.961 drop=0.039
+  checkout       users=  642 conv=0.668 drop=0.332
+  purchase       users=  325 conv=0.506 drop=0.494
+  Step counts are monotonically non-increasing: PASS
+  Drop-off + conversion sums to 1.0 per step: PASS
+  step2=642 step3=325 drop=317 late_events=50
+  Window constraint excludes late events: PASS
+
+=== Test 7: Data Profiling Correctness ===
+  revenue null_count: profile=5000 actual=5000
+  revenue distinct: estimate=4811 actual=4750 err=0.0128
+  revenue p50: estimate=2524.00 actual=2526.00 err=0.0008
+  MCV count: 64
+  All column-level statistics verified: PASS
+
+=== Test 9: Correlation Correctness ===
+  CORR perfect=1.000000 anti=-1.000000 indep=-0.010949
+  Matrix [0,1]=1.0000 [0,2]=-1.0000 [1,2]=-1.0000
+  CORRELATION_MATRIX symmetry + diagonal verified: PASS
+
+=== Test 5: Cohort Retention Correctness ===
+  Generated 2660 events for 1000 users
+  Cohorts: 10, periods per cohort: 12
+  Each user assigned to exactly one cohort: PASS
+  month_0 values are 100% of each cohort's size: PASS
+  Non-monotonic cohort steps: 3
+  Retention decreases over time: PASS
+
+=== Test 13: Cohort Retention Performance (10M events) ===
+  Generated 2693764 events
+  Run 1: 926.98ms
+  Run 2: 886.47ms
+  Run 3: 887.83ms
+  Run 4: 882.48ms
+  Run 5: 885.02ms
+  Latency (ms) [PASS/OK]:
+    Runs: [927, 886, 888, 882, 885]
+    Average: 894 <= 10,000 (target)
+    Min/Max: 882 / 927, StdDev: 17
+
+=== Test 4: Period-over-Period Comparisons ===
+  YOY value alignment verified for 24 months: PASS
+  YOY_GROWTH percentage verified: PASS
+  MOM previous-month value verified: PASS
+  YTD_SUM resets at year boundary: PASS
+  QTD_SUM bucket boundaries verified: PASS
+  PERIOD_COMPARE generic invocation verified: PASS
+
+=== Test 10: ROLLUP Performance (1M rows, 3 cols) ===
+  Run 1: 49.30ms
+  Run 2: 50.23ms
+  Run 3: 49.41ms
+  Run 4: 49.43ms
+  Run 5: 49.82ms
+  Latency (ms) [PASS/OK]:
+    Runs: [49, 50, 49, 49, 50]
+    Average: 50 <= 200 (target)
+    Min/Max: 49 / 50, StdDev: 0
+
+=== Test 12: YOY Performance (10M rows) ===
+  Run 1: 105.09ms
+  Run 2: 104.67ms
+  Run 3: 106.25ms
+  Run 4: 104.27ms
+  Run 5: 104.21ms
+  Latency (ms) [PASS/OK]:
+    Runs: [105, 105, 106, 104, 104]
+    Average: 105 <= 2,000 (target)
+    Min/Max: 104 / 106, StdDev: 1
+
+=== Test 18: CORRELATION_MATRIX Performance (20 cols) ===
+  Run 1: 37.25ms
+  Run 2: 36.99ms
+  Run 3: 36.70ms
+  Run 4: 36.70ms
+  Run 5: 36.85ms
+  Latency (ms) [PASS/OK]:
+    Runs: [37, 37, 37, 37, 37]
+    Average: 37 <= 5,000 (target)
+    Min/Max: 37 / 37, StdDev: 0
+
+=== Test 8: Outlier Detection Correctness ===
+  ZSCORE: 10/10 injected outliers exceed |z|>3
+  ZSCORE false positives on normal data: 0
+  IQR_OUTLIER: 10 injected detected, 0 false positives in normal data
+  MAD_OUTLIER: 10 injected detected
+  All outlier detectors verified: PASS
+
+=== Test 14: Funnel Performance (10M events, 5 steps) ===
+  Total events: 11799916
+  Run 1: 906.68ms
+  Run 2: 891.58ms
+  Run 3: 874.91ms
+  Run 4: 853.97ms
+  Run 5: 849.96ms
+  Latency (ms) [PASS/OK]:
+    Runs: [907, 892, 875, 854, 850]
+    Average: 875 <= 5,000 (target)
+    Min/Max: 850 / 907, StdDev: 22
+
+=== Test 24: Decision Tree Correctness ===
+  Accuracy = 0.9917, nodes = 11: PASS
+
+=== Test 16: ZSCORE Performance (10M rows) ===
+  Run 1: 36.06ms
+  Run 2: 35.96ms
+  Run 3: 35.68ms
+  Run 4: 35.24ms
+  Run 5: 36.08ms
+  Latency (ms) [PASS/OK]:
+    Runs: [36, 36, 36, 35, 36]
+    Average: 36 <= 500 (target)
+    Min/Max: 35 / 36, StdDev: 0
+
+=== Test 17: CORR Performance (10M rows) ===
+  Run 1: 30.31ms
+  Run 2: 30.39ms
+  Run 3: 30.45ms
+  Run 4: 30.26ms
+  Run 5: 30.21ms
+  Latency (ms) [PASS/OK]:
+    Runs: [30, 30, 30, 30, 30]
+    Average: 30 <= 300 (target)
+    Min/Max: 30 / 30, StdDev: 0
+
+=== Test 11: CUBE Performance (1M rows, 3 cols) ===
+  Run 1: 96.34ms
+  Run 2: 96.41ms
+  Run 3: 100.67ms
+  Run 4: 97.06ms
+  Run 5: 96.37ms
+  Latency (ms) [PASS/OK]:
+    Runs: [96, 96, 101, 97, 96]
+    Average: 97 <= 500 (target)
+    Min/Max: 96 / 101, StdDev: 2
+
+=== Test 19: Feature Group Correctness ===
+  100 entities x 5 features verified: PASS
+
+=== Test 20: Point-in-Time Join Correctness ===
+  AS OF Jan 15 = 1500, AS OF Jan 31 = 3100, no leakage: PASS
+
+=== Test 21: Feature Versioning Correctness ===
+  Version 1 = 50, Version 2 = 88: PASS
+  Lineage staleness: PASS
+
+=== Test 23: Logistic Regression Correctness ===
+  Accuracy = 1.0000: PASS
+
+=== Test 15: DATA_PROFILE Performance (10M rows, 20 cols) ===
+  Run 1: 2720.11ms
+  Run 2: 2917.43ms
+  Run 3: 2728.34ms
+  Run 4: 2568.10ms
+  Run 5: 2505.85ms
+  Latency (ms) [PASS/OK]:
+    Runs: [2,720, 2,917, 2,728, 2,568, 2,506]
+    Average: 2,688 <= 30,000 (target)
+    Min/Max: 2,506 / 2,917, StdDev: 143
+
+=== Test 22: Linear Regression Correctness ===
+  Recovered slope = 2.000, intercept = 3.000, R^2 = 1.0000
+
+=== Test 25: Batch Prediction Correctness ===
+  100K predictions, all finite: PASS
+
+=== Test 26: Causal Inference Correctness ===
+  ATE = 0.0796, ATT = 0.0767: PASS
+
+=== Test 27: Forecasting Correctness ===
+  Trend slope = 0.1000, anomaly + ARIMA + decompose: PASS
+
+=== Test 28: Feature Retrieval Performance (1K entities, 10 features) ===
+  Run 1: 0.93ms
+  Run 2: 0.81ms
+  Run 3: 0.71ms
+  Run 4: 0.73ms
+  Run 5: 0.72ms
+  Latency (ms) [PASS/OK]:
+    Runs: [1, 1, 1, 1, 1]
+    Average: 1 <= 200 (target)
+    Min/Max: 1 / 1, StdDev: 0
+
+=== Test 29: PIT Join Performance (1M feature points) ===
+  Run 1: 5.32ms
+  Run 2: 4.45ms
+  Run 3: 3.79ms
+  Run 4: 3.50ms
+  Run 5: 1.94ms
+  Latency (ms) [PASS/OK]:
+    Runs: [5, 4, 4, 4, 2]
+    Average: 4 <= 5,000 (target)
+    Min/Max: 2 / 5, StdDev: 1
+
+=== Test 30: Linear Regression Train (100K rows, 10 features) ===
+  Run 1: 5.19ms (R^2 = 0.9994)
+  Run 2: 4.98ms (R^2 = 0.9994)
+  Run 3: 4.92ms (R^2 = 0.9994)
+  Run 4: 4.92ms (R^2 = 0.9994)
+  Run 5: 5.06ms (R^2 = 0.9994)
+  Latency (ms) [PASS/OK]:
+    Runs: [5, 5, 5, 5, 5]
+    Average: 5 <= 500 (target)
+    Min/Max: 5 / 5, StdDev: 0
+
+=== Test 31: Logistic Regression Train (100K rows, 10 features) ===
+  Run 1: 60.67ms (acc = 0.9941)
+  Run 2: 58.90ms (acc = 0.9941)
+  Run 3: 60.18ms (acc = 0.9941)
+  Run 4: 60.32ms (acc = 0.9941)
+  Run 5: 59.67ms (acc = 0.9941)
+  Latency (ms) [PASS/OK]:
+    Runs: [61, 59, 60, 60, 60]
+    Average: 60 <= 1,000 (target)
+    Min/Max: 59 / 61, StdDev: 1
+
+=== Test 32: Decision Tree Train (100K rows) ===
+  Run 1: 66.18ms (acc = 0.9996)
+  Run 2: 65.33ms (acc = 0.9996)
+  Run 3: 64.77ms (acc = 0.9996)
+  Run 4: 65.47ms (acc = 0.9996)
+  Run 5: 64.54ms (acc = 0.9996)
+  Latency (ms) [PASS/OK]:
+    Runs: [66, 65, 65, 65, 65]
+    Average: 65 <= 2,000 (target)
+    Min/Max: 65 / 66, StdDev: 1
+
+=== Test 33: Batch Predict (1M rows) ===
+  Run 1: 5.38ms
+  Run 2: 6.18ms
+  Run 3: 4.26ms
+  Run 4: 4.03ms
+  Run 5: 4.08ms
+  Latency (ms) [PASS/OK]:
+    Runs: [5, 6, 4, 4, 4]
+    Average: 5 <= 2,000 (target)
+    Min/Max: 4 / 6, StdDev: 1
+
+=== Test 34: Single Predict Latency ===
+  Run 1: 0.008us per predict
+  Run 2: 0.008us per predict
+  Run 3: 0.008us per predict
+  Run 4: 0.008us per predict
+  Run 5: 0.008us per predict
+  Latency (us) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 100 (target)
+    Min/Max: 0 / 0, StdDev: 0
+
+=== Test 35: ATE Estimation (100K observations) ===
+  Run 1: 11.47ms (est = 0.1009)
+  Run 2: 11.14ms (est = 0.1009)
+  Run 3: 11.13ms (est = 0.1009)
+  Run 4: 11.20ms (est = 0.1009)
+  Run 5: 11.27ms (est = 0.1009)
+  Latency (ms) [PASS/OK]:
+    Runs: [11, 11, 11, 11, 11]
+    Average: 11 <= 5,000 (target)
+    Min/Max: 11 / 11, StdDev: 0
+
+=== Test 36: Forecast (10K history) ===
+  Run 1: 0.20ms
+  Run 2: 0.06ms
+  Run 3: 0.06ms
+  Run 4: 0.05ms
+  Run 5: 0.06ms
+  Latency (ms) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 10,000 (target)
+    Min/Max: 0 / 0, StdDev: 0

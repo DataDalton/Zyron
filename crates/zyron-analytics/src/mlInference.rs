@@ -14,6 +14,7 @@ use crate::ml::{ModelData, ModelType, TrainedModel};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
+use zyron_common::error::{Result, ZyronError};
 
 /// Single-row prediction
 pub fn predictOne(model: &TrainedModel, features: &[f64]) -> f64 {
@@ -94,7 +95,13 @@ pub fn predictOne(model: &TrainedModel, features: &[f64]) -> f64 {
 /// Linear and logistic models take a vectorized gemv fast path. Tree-based
 /// and KNN models still loop per-row but only pay the dispatch cost once
 /// per batch via the cached InferenceHandle (F11, F12)
-pub fn predictBatch(model: &TrainedModel, xs: &[f64], n: usize, p: usize, out: &mut [f64]) {
+pub fn predictBatch(
+    model: &TrainedModel,
+    xs: &[f64],
+    n: usize,
+    p: usize,
+    out: &mut [f64],
+) -> Result<()> {
     debug_assert_eq!(xs.len(), n * p);
     debug_assert_eq!(out.len(), n);
     match model.modelType {
@@ -107,7 +114,7 @@ pub fn predictBatch(model: &TrainedModel, xs: &[f64], n: usize, p: usize, out: &
                 && model.featureMean.iter().all(|m| *m == 0.0);
             if allUnit {
                 rowMajorMatvec(xs, w, b, n, p, out);
-                return;
+                return Ok(());
             }
             for i in 0..n {
                 let row = &xs[i * p..i * p + p];
@@ -149,10 +156,10 @@ pub fn predictBatch(model: &TrainedModel, xs: &[f64], n: usize, p: usize, out: &
                 for i in 0..n {
                     out[i] = predictOne(model, &xs[i * p..i * p + p]);
                 }
-                return;
+                return Ok(());
             }
             let chunkRows = (n + nThreads - 1) / nThreads;
-            std::thread::scope(|scope| {
+            let worker_failed = std::thread::scope(|scope| {
                 let mut starts: Vec<usize> = Vec::with_capacity(nThreads);
                 let mut s = 0usize;
                 while s < n {
@@ -175,13 +182,26 @@ pub fn predictBatch(model: &TrainedModel, xs: &[f64], n: usize, p: usize, out: &
                     });
                     handles.push(h);
                 }
+                // A panicked worker leaves its output chunk stale or zero. Detect
+                // any join error so the whole batch fails rather than returning
+                // partial output as success
+                let mut failed = false;
                 for h in handles {
-                    let _ = h.join();
+                    if h.join().is_err() {
+                        failed = true;
+                    }
                 }
+                failed
             });
+            if worker_failed {
+                return Err(ZyronError::ExecutionError(
+                    "predictBatch worker thread panicked".to_string(),
+                ));
+            }
         }
     }
     let _ = dot;
+    Ok(())
 }
 
 /// Server-wide cache of trained models keyed by name
@@ -309,7 +329,7 @@ impl InferenceHandle {
         (self.predictFn)(&self.model, features)
     }
 
-    pub fn predictBatch(&self, xs: &[f64], n: usize, p: usize, out: &mut [f64]) {
+    pub fn predictBatch(&self, xs: &[f64], n: usize, p: usize, out: &mut [f64]) -> Result<()> {
         predictBatch(&self.model, xs, n, p, out)
     }
 }

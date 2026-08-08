@@ -7,6 +7,8 @@
 
 use std::sync::OnceLock;
 
+use zyron_common::{Result, ZyronError};
+
 use super::types::DistanceMetric;
 
 // ---------------------------------------------------------------------------
@@ -43,17 +45,23 @@ fn getManhattanFn() -> DistFn {
 // ---------------------------------------------------------------------------
 
 /// Computes the distance between two f32 slices using the given metric.
-/// Both slices must have the same length. The caller must guarantee this.
-pub fn computeDistance(metric: DistanceMetric, a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len(), "vector lengths must match");
-    let len = a.len().min(b.len());
+/// Returns an error when the slice lengths differ rather than truncating to
+/// the shorter length. Validated in all builds.
+pub fn computeDistance(metric: DistanceMetric, a: &[f32], b: &[f32]) -> Result<f32> {
+    if a.len() != b.len() {
+        return Err(ZyronError::InvalidParameter {
+            name: "vector dimensions".to_string(),
+            value: format!("length mismatch: {} vs {}", a.len(), b.len()),
+        });
+    }
+    let len = a.len();
     let f = match metric {
         DistanceMetric::Cosine => getCosineFn(),
         DistanceMetric::Euclidean => getEuclideanFn(),
         DistanceMetric::DotProduct => getDotProductFn(),
         DistanceMetric::Manhattan => getManhattanFn(),
     };
-    unsafe { f(a.as_ptr(), b.as_ptr(), len) }
+    Ok(unsafe { f(a.as_ptr(), b.as_ptr(), len) })
 }
 
 /// Resolves a distance metric to a raw function pointer once. Call this at the
@@ -69,8 +77,14 @@ pub fn resolveDistFn(metric: DistanceMetric) -> DistFn {
 }
 
 /// Calls a resolved DistFn from safe code. Zero dispatch overhead.
+/// Both slices must have equal length. Hot-path callers in the index establish
+/// this through the dimension check on insert search and build, so the equal
+/// length invariant is validated at those public entry points. The length is
+/// taken from a so unequal inputs never read past a but the entry-point
+/// validation prevents an unequal pair from reaching this helper.
 #[inline(always)]
 pub fn distWithFn(f: DistFn, a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "vector lengths must match");
     let len = a.len().min(b.len());
     unsafe { f(a.as_ptr(), b.as_ptr(), len) }
 }
@@ -110,7 +124,7 @@ pub fn batchDistances(
     vectors: &[&[f32]],
     metric: DistanceMetric,
     out: &mut Vec<f32>,
-) {
+) -> Result<()> {
     out.reserve(vectors.len());
     let f = match metric {
         DistanceMetric::Cosine => getCosineFn(),
@@ -121,6 +135,15 @@ pub fn batchDistances(
     let qPtr = query.as_ptr();
     let qLen = query.len();
     for i in 0..vectors.len() {
+        let v = vectors[i];
+        // Validate each vector against the query length in all builds rather
+        // than truncating to the shorter length
+        if v.len() != qLen {
+            return Err(ZyronError::InvalidParameter {
+                name: "vector dimensions".to_string(),
+                value: format!("length mismatch at index {}: {} vs {}", i, qLen, v.len()),
+            });
+        }
         #[cfg(target_arch = "x86_64")]
         {
             if i + 1 < vectors.len() {
@@ -130,11 +153,10 @@ pub fn batchDistances(
                 }
             }
         }
-        let v = vectors[i];
-        let len = qLen.min(v.len());
-        let d = unsafe { f(qPtr, v.as_ptr(), len) };
+        let d = unsafe { f(qPtr, v.as_ptr(), qLen) };
         out.push(d);
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +237,9 @@ pub fn euclideanQuantized(a: &[u8], b: &[u8]) -> u32 {
     debug_assert_eq!(a.len(), b.len());
     #[cfg(target_arch = "x86_64")]
     {
+        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+            return unsafe { euclideanQuantizedAvx512(a, b) };
+        }
         if is_x86_feature_detected!("avx2") {
             return unsafe { euclideanQuantizedAvx2(a, b) };
         }
@@ -242,81 +267,148 @@ fn euclideanQuantizedScalar(a: &[u8], b: &[u8]) -> u32 {
 #[target_feature(enable = "avx2")]
 unsafe fn euclideanQuantizedAvx2(a: &[u8], b: &[u8]) -> u32 {
     use std::arch::x86_64::*;
-    let len = a.len();
-    let mut acc = _mm256_setzero_si256();
-    let chunks = len / 16;
 
-    // Process 16 u8 bytes per iteration. Unpack to i16, compute diff, square via pmaddwd.
-    for c in 0..chunks {
-        let offset = c * 16;
-        // Load 16 bytes from each input (lower 128 bits of 256-bit reg).
-        let a16 = _mm_loadu_si128(a.as_ptr().add(offset) as *const _);
-        let b16 = _mm_loadu_si128(b.as_ptr().add(offset) as *const _);
-        // Zero-extend 16 u8 to 16 i16 (256-bit reg).
-        let a256 = _mm256_cvtepu8_epi16(a16);
-        let b256 = _mm256_cvtepu8_epi16(b16);
-        // Signed difference (i16).
-        let diff = _mm256_sub_epi16(a256, b256);
-        // Square via pmaddwd: multiplies pairs of i16, adds adjacent pairs to i32.
-        // diff * diff gives squared differences as i32 (8 values per 256-bit reg).
-        let squared = _mm256_madd_epi16(diff, diff);
-        acc = _mm256_add_epi32(acc, squared);
+    // SAFETY: caller guarantees a and b are readable for len elements and that the required CPU feature is present
+    unsafe {
+        let len = a.len();
+        // Two independent i32 accumulators so the pmaddwd->paddd chain does not
+        // serialize on madd latency; 32 bytes per iteration (256-bit loads split
+        // into two 128-bit halves widened to i16). Integer sums are exact, so
+        // reassociating across accumulators is bit-identical.
+        let mut acc0 = _mm256_setzero_si256();
+        let mut acc1 = _mm256_setzero_si256();
+        let blocks = len / 32;
+        for c in 0..blocks {
+            let off = c * 32;
+            let av = _mm256_loadu_si256(a.as_ptr().add(off) as *const _);
+            let bv = _mm256_loadu_si256(b.as_ptr().add(off) as *const _);
+            let dlo = _mm256_sub_epi16(
+                _mm256_cvtepu8_epi16(_mm256_castsi256_si128(av)),
+                _mm256_cvtepu8_epi16(_mm256_castsi256_si128(bv)),
+            );
+            acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(dlo, dlo));
+            let dhi = _mm256_sub_epi16(
+                _mm256_cvtepu8_epi16(_mm256_extracti128_si256(av, 1)),
+                _mm256_cvtepu8_epi16(_mm256_extracti128_si256(bv, 1)),
+            );
+            acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(dhi, dhi));
+        }
+        let mut off = blocks * 32;
+        // Trailing 16-byte chunk (dims a multiple of 16 but not 32).
+        if off + 16 <= len {
+            let d = _mm256_sub_epi16(
+                _mm256_cvtepu8_epi16(_mm_loadu_si128(a.as_ptr().add(off) as *const _)),
+                _mm256_cvtepu8_epi16(_mm_loadu_si128(b.as_ptr().add(off) as *const _)),
+            );
+            acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(d, d));
+            off += 16;
+        }
+
+        let acc = _mm256_add_epi32(acc0, acc1);
+        let hi = _mm256_extracti128_si256(acc, 1);
+        let lo = _mm256_castsi256_si128(acc);
+        let sum128 = _mm_add_epi32(lo, hi);
+        let sum64 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, 0b_01_00_11_10));
+        let sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32(sum64, 0b_00_00_00_01));
+        let mut total = _mm_cvtsi128_si32(sum32) as u32;
+
+        for i in off..len {
+            let diff = a[i] as i32 - b[i] as i32;
+            total += (diff * diff) as u32;
+        }
+        total
     }
+}
 
-    // Horizontal sum of 8 i32 lanes.
-    let hi = _mm256_extracti128_si256(acc, 1);
-    let lo = _mm256_castsi256_si128(acc);
-    let sum128 = _mm_add_epi32(lo, hi);
-    let sum64 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, 0b_01_00_11_10));
-    let sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32(sum64, 0b_00_00_00_01));
-    let mut total = _mm_cvtsi128_si32(sum32) as u32;
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn euclideanQuantizedAvx512(a: &[u8], b: &[u8]) -> u32 {
+    use std::arch::x86_64::*;
 
-    // Scalar tail for remaining bytes.
-    for i in (chunks * 16)..len {
-        let diff = a[i] as i32 - b[i] as i32;
-        total += (diff * diff) as u32;
+    // SAFETY: caller guarantees a and b are readable for len elements and that the required CPU feature is present
+    unsafe {
+        let len = a.len();
+        // Two accumulators, 64 bytes per iteration (each 32 u8 widened to 32 i16 in
+        // a 512-bit register). Exact integer arithmetic, bit-identical to the scalar
+        // and AVX2 paths.
+        let mut acc0 = _mm512_setzero_si512();
+        let mut acc1 = _mm512_setzero_si512();
+        let blocks = len / 64;
+        for c in 0..blocks {
+            let off = c * 64;
+            let d0 = _mm512_sub_epi16(
+                _mm512_cvtepu8_epi16(_mm256_loadu_si256(a.as_ptr().add(off) as *const _)),
+                _mm512_cvtepu8_epi16(_mm256_loadu_si256(b.as_ptr().add(off) as *const _)),
+            );
+            acc0 = _mm512_add_epi32(acc0, _mm512_madd_epi16(d0, d0));
+            let d1 = _mm512_sub_epi16(
+                _mm512_cvtepu8_epi16(_mm256_loadu_si256(a.as_ptr().add(off + 32) as *const _)),
+                _mm512_cvtepu8_epi16(_mm256_loadu_si256(b.as_ptr().add(off + 32) as *const _)),
+            );
+            acc1 = _mm512_add_epi32(acc1, _mm512_madd_epi16(d1, d1));
+        }
+        let mut off = blocks * 64;
+        // Trailing 32-byte chunks.
+        while off + 32 <= len {
+            let d = _mm512_sub_epi16(
+                _mm512_cvtepu8_epi16(_mm256_loadu_si256(a.as_ptr().add(off) as *const _)),
+                _mm512_cvtepu8_epi16(_mm256_loadu_si256(b.as_ptr().add(off) as *const _)),
+            );
+            acc0 = _mm512_add_epi32(acc0, _mm512_madd_epi16(d, d));
+            off += 32;
+        }
+
+        let mut total = _mm512_reduce_add_epi32(_mm512_add_epi32(acc0, acc1)) as u32;
+        for i in off..len {
+            let diff = a[i] as i32 - b[i] as i32;
+            total += (diff * diff) as u32;
+        }
+        total
     }
-    total
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn euclideanQuantizedNeon(a: &[u8], b: &[u8]) -> u32 {
     use std::arch::aarch64::*;
-    let len = a.len();
-    let mut acc = vdupq_n_u32(0);
-    let chunks = len / 16;
 
-    for c in 0..chunks {
-        let offset = c * 16;
-        let av = vld1q_u8(a.as_ptr().add(offset));
-        let bv = vld1q_u8(b.as_ptr().add(offset));
-        // Absolute difference of u8 (preserves ordering as a proxy).
-        // Actually compute squared diff: unpack to u16, subtract, multiply.
-        let a_lo = vmovl_u8(vget_low_u8(av));
-        let a_hi = vmovl_u8(vget_high_u8(av));
-        let b_lo = vmovl_u8(vget_low_u8(bv));
-        let b_hi = vmovl_u8(vget_high_u8(bv));
-        // Signed diff (cast to i16 internally via abdq).
-        let d_lo = vabdq_u16(a_lo, b_lo);
-        let d_hi = vabdq_u16(a_hi, b_hi);
-        // Multiply-accumulate squared diff.
-        let sq_lo_lo = vmull_u16(vget_low_u16(d_lo), vget_low_u16(d_lo));
-        let sq_lo_hi = vmull_u16(vget_high_u16(d_lo), vget_high_u16(d_lo));
-        let sq_hi_lo = vmull_u16(vget_low_u16(d_hi), vget_low_u16(d_hi));
-        let sq_hi_hi = vmull_u16(vget_high_u16(d_hi), vget_high_u16(d_hi));
-        acc = vaddq_u32(acc, sq_lo_lo);
-        acc = vaddq_u32(acc, sq_lo_hi);
-        acc = vaddq_u32(acc, sq_hi_lo);
-        acc = vaddq_u32(acc, sq_hi_hi);
-    }
+    // SAFETY: caller guarantees a and b are readable for len elements and that the required CPU feature is present
+    unsafe {
+        let len = a.len();
+        let mut acc = vdupq_n_u32(0);
+        let chunks = len / 16;
 
-    let mut total = vaddvq_u32(acc);
-    for i in (chunks * 16)..len {
-        let diff = a[i] as i32 - b[i] as i32;
-        total += (diff * diff) as u32;
+        for c in 0..chunks {
+            let offset = c * 16;
+            let av = vld1q_u8(a.as_ptr().add(offset));
+            let bv = vld1q_u8(b.as_ptr().add(offset));
+            // Absolute difference of u8 (preserves ordering as a proxy).
+            // Actually compute squared diff: unpack to u16, subtract, multiply.
+            let a_lo = vmovl_u8(vget_low_u8(av));
+            let a_hi = vmovl_u8(vget_high_u8(av));
+            let b_lo = vmovl_u8(vget_low_u8(bv));
+            let b_hi = vmovl_u8(vget_high_u8(bv));
+            // Signed diff (cast to i16 internally via abdq).
+            let d_lo = vabdq_u16(a_lo, b_lo);
+            let d_hi = vabdq_u16(a_hi, b_hi);
+            // Multiply-accumulate squared diff.
+            let sq_lo_lo = vmull_u16(vget_low_u16(d_lo), vget_low_u16(d_lo));
+            let sq_lo_hi = vmull_u16(vget_high_u16(d_lo), vget_high_u16(d_lo));
+            let sq_hi_lo = vmull_u16(vget_low_u16(d_hi), vget_low_u16(d_hi));
+            let sq_hi_hi = vmull_u16(vget_high_u16(d_hi), vget_high_u16(d_hi));
+            acc = vaddq_u32(acc, sq_lo_lo);
+            acc = vaddq_u32(acc, sq_lo_hi);
+            acc = vaddq_u32(acc, sq_hi_lo);
+            acc = vaddq_u32(acc, sq_hi_hi);
+        }
+
+        let mut total = vaddvq_u32(acc);
+        for i in (chunks * 16)..len {
+            let diff = a[i] as i32 - b[i] as i32;
+            total += (diff * diff) as u32;
+        }
+        total
     }
-    total
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +495,16 @@ pub fn vectorScaleInplace(dst: &mut [f32], scalar: f32) {
 }
 
 /// Element-wise subtraction: out[i] = a[i] - b[i]. All slices must have equal length.
+/// In-place elementwise subtract: a[i] -= b[i]. Overwrites a residual buffer
+/// with the next-stage residual without allocating a second buffer. Auto-
+/// vectorizes; residual computation is not the build hot path (k-means is).
+pub fn vectorSubtractInplace(a: &mut [f32], b: &[f32]) {
+    let len = a.len().min(b.len());
+    for i in 0..len {
+        a[i] -= b[i];
+    }
+}
+
 pub fn vectorSubtract(a: &[f32], b: &[f32], out: &mut [f32]) {
     debug_assert_eq!(a.len(), b.len());
     debug_assert_eq!(a.len(), out.len());
@@ -586,105 +688,154 @@ fn selectManhattanFn() -> DistFn {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn cosineAvx512(a: *const f32, b: *const f32, len: usize) -> f32 {
     use std::arch::x86_64::*;
-    let mut dotAcc = _mm512_setzero_ps();
-    let mut normAacc = _mm512_setzero_ps();
-    let mut normBacc = _mm512_setzero_ps();
-    let chunks = len / 16;
-    for c in 0..chunks {
-        let off = c * 16;
-        let va = _mm512_loadu_ps(a.add(off));
-        let vb = _mm512_loadu_ps(b.add(off));
-        dotAcc = _mm512_fmadd_ps(va, vb, dotAcc);
-        normAacc = _mm512_fmadd_ps(va, va, normAacc);
-        normBacc = _mm512_fmadd_ps(vb, vb, normBacc);
+
+    // SAFETY: caller guarantees a and b are readable for len elements and that the required CPU feature is present
+    unsafe {
+        // Two accumulators per quantity (6 total) so the three FMA chains do not
+        // serialize on the FMA-unit latency.
+        let mut dot0 = _mm512_setzero_ps();
+        let mut dot1 = _mm512_setzero_ps();
+        let mut na0 = _mm512_setzero_ps();
+        let mut na1 = _mm512_setzero_ps();
+        let mut nb0 = _mm512_setzero_ps();
+        let mut nb1 = _mm512_setzero_ps();
+        let chunks = len / 16;
+        let mut c = 0;
+        while c + 2 <= chunks {
+            let off = c * 16;
+            let va0 = _mm512_loadu_ps(a.add(off));
+            let vb0 = _mm512_loadu_ps(b.add(off));
+            let va1 = _mm512_loadu_ps(a.add(off + 16));
+            let vb1 = _mm512_loadu_ps(b.add(off + 16));
+            dot0 = _mm512_fmadd_ps(va0, vb0, dot0);
+            dot1 = _mm512_fmadd_ps(va1, vb1, dot1);
+            na0 = _mm512_fmadd_ps(va0, va0, na0);
+            na1 = _mm512_fmadd_ps(va1, va1, na1);
+            nb0 = _mm512_fmadd_ps(vb0, vb0, nb0);
+            nb1 = _mm512_fmadd_ps(vb1, vb1, nb1);
+            c += 2;
+        }
+        while c < chunks {
+            let off = c * 16;
+            let va = _mm512_loadu_ps(a.add(off));
+            let vb = _mm512_loadu_ps(b.add(off));
+            dot0 = _mm512_fmadd_ps(va, vb, dot0);
+            na0 = _mm512_fmadd_ps(va, va, na0);
+            nb0 = _mm512_fmadd_ps(vb, vb, nb0);
+            c += 1;
+        }
+        let mut dot = _mm512_reduce_add_ps(_mm512_add_ps(dot0, dot1));
+        let mut normA = _mm512_reduce_add_ps(_mm512_add_ps(na0, na1));
+        let mut normB = _mm512_reduce_add_ps(_mm512_add_ps(nb0, nb1));
+        for i in (chunks * 16)..len {
+            let va = *a.add(i);
+            let vb = *b.add(i);
+            dot += va * vb;
+            normA += va * va;
+            normB += vb * vb;
+        }
+        let denom = normA.sqrt() * normB.sqrt();
+        if denom == 0.0 {
+            return 0.0;
+        }
+        1.0 - dot / denom
     }
-    let mut dot = _mm512_reduce_add_ps(dotAcc);
-    let mut normA = _mm512_reduce_add_ps(normAacc);
-    let mut normB = _mm512_reduce_add_ps(normBacc);
-    for i in (chunks * 16)..len {
-        let va = *a.add(i);
-        let vb = *b.add(i);
-        dot += va * vb;
-        normA += va * va;
-        normB += vb * vb;
-    }
-    let denom = normA.sqrt() * normB.sqrt();
-    if denom == 0.0 {
-        return 0.0;
-    }
-    1.0 - dot / denom
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn cosineAvx2(a: *const f32, b: *const f32, len: usize) -> f32 {
     use std::arch::x86_64::*;
-    let mut dotAcc = _mm256_setzero_ps();
-    let mut normAacc = _mm256_setzero_ps();
-    let mut normBacc = _mm256_setzero_ps();
-    let chunks = len / 8;
-    for c in 0..chunks {
-        let off = c * 8;
-        let va = _mm256_loadu_ps(a.add(off));
-        let vb = _mm256_loadu_ps(b.add(off));
-        dotAcc = _mm256_fmadd_ps(va, vb, dotAcc);
-        normAacc = _mm256_fmadd_ps(va, va, normAacc);
-        normBacc = _mm256_fmadd_ps(vb, vb, normBacc);
+
+    // SAFETY: caller guarantees a and b are readable for len elements and that the required CPU feature is present
+    unsafe {
+        // Two accumulators per quantity (6 total) to saturate the FMA units.
+        let mut dot0 = _mm256_setzero_ps();
+        let mut dot1 = _mm256_setzero_ps();
+        let mut na0 = _mm256_setzero_ps();
+        let mut na1 = _mm256_setzero_ps();
+        let mut nb0 = _mm256_setzero_ps();
+        let mut nb1 = _mm256_setzero_ps();
+        let chunks = len / 8;
+        let mut c = 0;
+        while c + 2 <= chunks {
+            let off = c * 8;
+            let va0 = _mm256_loadu_ps(a.add(off));
+            let vb0 = _mm256_loadu_ps(b.add(off));
+            let va1 = _mm256_loadu_ps(a.add(off + 8));
+            let vb1 = _mm256_loadu_ps(b.add(off + 8));
+            dot0 = _mm256_fmadd_ps(va0, vb0, dot0);
+            dot1 = _mm256_fmadd_ps(va1, vb1, dot1);
+            na0 = _mm256_fmadd_ps(va0, va0, na0);
+            na1 = _mm256_fmadd_ps(va1, va1, na1);
+            nb0 = _mm256_fmadd_ps(vb0, vb0, nb0);
+            nb1 = _mm256_fmadd_ps(vb1, vb1, nb1);
+            c += 2;
+        }
+        while c < chunks {
+            let off = c * 8;
+            let va = _mm256_loadu_ps(a.add(off));
+            let vb = _mm256_loadu_ps(b.add(off));
+            dot0 = _mm256_fmadd_ps(va, vb, dot0);
+            na0 = _mm256_fmadd_ps(va, va, na0);
+            nb0 = _mm256_fmadd_ps(vb, vb, nb0);
+            c += 1;
+        }
+        let mut dot = hsum256(_mm256_add_ps(dot0, dot1));
+        let mut normA = hsum256(_mm256_add_ps(na0, na1));
+        let mut normB = hsum256(_mm256_add_ps(nb0, nb1));
+        for i in (chunks * 8)..len {
+            let va = *a.add(i);
+            let vb = *b.add(i);
+            dot += va * vb;
+            normA += va * va;
+            normB += vb * vb;
+        }
+        let denom = normA.sqrt() * normB.sqrt();
+        if denom == 0.0 {
+            return 0.0;
+        }
+        1.0 - dot / denom
     }
-    let dot = hsum256(dotAcc);
-    let mut normA = hsum256(normAacc);
-    let mut normB = hsum256(normBacc);
-    let mut dotScalar = dot;
-    for i in (chunks * 8)..len {
-        let va = *a.add(i);
-        let vb = *b.add(i);
-        dotScalar += va * vb;
-        normA += va * va;
-        normB += vb * vb;
-    }
-    let denom = normA.sqrt() * normB.sqrt();
-    if denom == 0.0 {
-        return 0.0;
-    }
-    1.0 - dotScalar / denom
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn cosineNeon(a: *const f32, b: *const f32, len: usize) -> f32 {
     use std::arch::aarch64::*;
-    let mut dotAcc = vdupq_n_f32(0.0);
-    let mut normAacc = vdupq_n_f32(0.0);
-    let mut normBacc = vdupq_n_f32(0.0);
-    let chunks = len / 4;
-    for c in 0..chunks {
-        let off = c * 4;
-        let va = vld1q_f32(a.add(off));
-        let vb = vld1q_f32(b.add(off));
-        dotAcc = vfmaq_f32(dotAcc, va, vb);
-        normAacc = vfmaq_f32(normAacc, va, va);
-        normBacc = vfmaq_f32(normBacc, vb, vb);
+
+    // SAFETY: caller guarantees a and b are readable for len elements and that the required CPU feature is present
+    unsafe {
+        let mut dotAcc = vdupq_n_f32(0.0);
+        let mut normAacc = vdupq_n_f32(0.0);
+        let mut normBacc = vdupq_n_f32(0.0);
+        let chunks = len / 4;
+        for c in 0..chunks {
+            let off = c * 4;
+            let va = vld1q_f32(a.add(off));
+            let vb = vld1q_f32(b.add(off));
+            dotAcc = vfmaq_f32(dotAcc, va, vb);
+            normAacc = vfmaq_f32(normAacc, va, va);
+            normBacc = vfmaq_f32(normBacc, vb, vb);
+        }
+        let mut dot = vaddvq_f32(dotAcc);
+        let mut normA = vaddvq_f32(normAacc);
+        let mut normB = vaddvq_f32(normBacc);
+        for i in (chunks * 4)..len {
+            let va = *a.add(i);
+            let vb = *b.add(i);
+            dot += va * vb;
+            normA += va * va;
+            normB += vb * vb;
+        }
+        let denom = normA.sqrt() * normB.sqrt();
+        if denom == 0.0 {
+            return 0.0;
+        }
+        1.0 - dot / denom
     }
-    let mut dot = vaddvq_f32(dotAcc);
-    let mut normA = vaddvq_f32(normAacc);
-    let mut normB = vaddvq_f32(normBacc);
-    for i in (chunks * 4)..len {
-        let va = *a.add(i);
-        let vb = *b.add(i);
-        dot += va * vb;
-        normA += va * va;
-        normB += vb * vb;
-    }
-    let denom = normA.sqrt() * normB.sqrt();
-    if denom == 0.0 {
-        return 0.0;
-    }
-    1.0 - dot / denom
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -714,68 +865,130 @@ unsafe fn cosineGeneric(a: *const f32, b: *const f32, len: usize) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn euclideanAvx512(a: *const f32, b: *const f32, len: usize) -> f32 {
     use std::arch::x86_64::*;
-    let mut acc = _mm512_setzero_ps();
-    let chunks = len / 16;
-    for c in 0..chunks {
-        let off = c * 16;
-        let va = _mm512_loadu_ps(a.add(off));
-        let vb = _mm512_loadu_ps(b.add(off));
-        let diff = _mm512_sub_ps(va, vb);
-        acc = _mm512_fmadd_ps(diff, diff, acc);
+
+    // SAFETY: caller guarantees a and b are readable for len elements and that the required CPU feature is present
+    unsafe {
+        // Four independent accumulators so the FMA units stay saturated instead of
+        // stalling on a single serial dependency chain.
+        let mut acc0 = _mm512_setzero_ps();
+        let mut acc1 = _mm512_setzero_ps();
+        let mut acc2 = _mm512_setzero_ps();
+        let mut acc3 = _mm512_setzero_ps();
+        let chunks = len / 16;
+        let mut c = 0;
+        while c + 4 <= chunks {
+            let off = c * 16;
+            let d0 = _mm512_sub_ps(_mm512_loadu_ps(a.add(off)), _mm512_loadu_ps(b.add(off)));
+            let d1 = _mm512_sub_ps(
+                _mm512_loadu_ps(a.add(off + 16)),
+                _mm512_loadu_ps(b.add(off + 16)),
+            );
+            let d2 = _mm512_sub_ps(
+                _mm512_loadu_ps(a.add(off + 32)),
+                _mm512_loadu_ps(b.add(off + 32)),
+            );
+            let d3 = _mm512_sub_ps(
+                _mm512_loadu_ps(a.add(off + 48)),
+                _mm512_loadu_ps(b.add(off + 48)),
+            );
+            acc0 = _mm512_fmadd_ps(d0, d0, acc0);
+            acc1 = _mm512_fmadd_ps(d1, d1, acc1);
+            acc2 = _mm512_fmadd_ps(d2, d2, acc2);
+            acc3 = _mm512_fmadd_ps(d3, d3, acc3);
+            c += 4;
+        }
+        while c < chunks {
+            let off = c * 16;
+            let d = _mm512_sub_ps(_mm512_loadu_ps(a.add(off)), _mm512_loadu_ps(b.add(off)));
+            acc0 = _mm512_fmadd_ps(d, d, acc0);
+            c += 1;
+        }
+        let acc = _mm512_add_ps(_mm512_add_ps(acc0, acc1), _mm512_add_ps(acc2, acc3));
+        let mut sum = _mm512_reduce_add_ps(acc);
+        for i in (chunks * 16)..len {
+            let d = *a.add(i) - *b.add(i);
+            sum += d * d;
+        }
+        sum.sqrt()
     }
-    let mut sum = _mm512_reduce_add_ps(acc);
-    for i in (chunks * 16)..len {
-        let d = *a.add(i) - *b.add(i);
-        sum += d * d;
-    }
-    sum.sqrt()
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn euclideanAvx2(a: *const f32, b: *const f32, len: usize) -> f32 {
     use std::arch::x86_64::*;
-    let mut acc = _mm256_setzero_ps();
-    let chunks = len / 8;
-    for c in 0..chunks {
-        let off = c * 8;
-        let va = _mm256_loadu_ps(a.add(off));
-        let vb = _mm256_loadu_ps(b.add(off));
-        let diff = _mm256_sub_ps(va, vb);
-        acc = _mm256_fmadd_ps(diff, diff, acc);
+
+    // SAFETY: caller guarantees a and b are readable for len elements and that the required CPU feature is present
+    unsafe {
+        // Four independent accumulators to saturate the FMA units.
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
+        let chunks = len / 8;
+        let mut c = 0;
+        while c + 4 <= chunks {
+            let off = c * 8;
+            let d0 = _mm256_sub_ps(_mm256_loadu_ps(a.add(off)), _mm256_loadu_ps(b.add(off)));
+            let d1 = _mm256_sub_ps(
+                _mm256_loadu_ps(a.add(off + 8)),
+                _mm256_loadu_ps(b.add(off + 8)),
+            );
+            let d2 = _mm256_sub_ps(
+                _mm256_loadu_ps(a.add(off + 16)),
+                _mm256_loadu_ps(b.add(off + 16)),
+            );
+            let d3 = _mm256_sub_ps(
+                _mm256_loadu_ps(a.add(off + 24)),
+                _mm256_loadu_ps(b.add(off + 24)),
+            );
+            acc0 = _mm256_fmadd_ps(d0, d0, acc0);
+            acc1 = _mm256_fmadd_ps(d1, d1, acc1);
+            acc2 = _mm256_fmadd_ps(d2, d2, acc2);
+            acc3 = _mm256_fmadd_ps(d3, d3, acc3);
+            c += 4;
+        }
+        while c < chunks {
+            let off = c * 8;
+            let d = _mm256_sub_ps(_mm256_loadu_ps(a.add(off)), _mm256_loadu_ps(b.add(off)));
+            acc0 = _mm256_fmadd_ps(d, d, acc0);
+            c += 1;
+        }
+        let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+        let mut sum = hsum256(acc);
+        for i in (chunks * 8)..len {
+            let d = *a.add(i) - *b.add(i);
+            sum += d * d;
+        }
+        sum.sqrt()
     }
-    let mut sum = hsum256(acc);
-    for i in (chunks * 8)..len {
-        let d = *a.add(i) - *b.add(i);
-        sum += d * d;
-    }
-    sum.sqrt()
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn euclideanNeon(a: *const f32, b: *const f32, len: usize) -> f32 {
     use std::arch::aarch64::*;
-    let mut acc = vdupq_n_f32(0.0);
-    let chunks = len / 4;
-    for c in 0..chunks {
-        let off = c * 4;
-        let va = vld1q_f32(a.add(off));
-        let vb = vld1q_f32(b.add(off));
-        let diff = vsubq_f32(va, vb);
-        acc = vfmaq_f32(acc, diff, diff);
+
+    // SAFETY: caller guarantees a and b are readable for len elements and that the required CPU feature is present
+    unsafe {
+        let mut acc = vdupq_n_f32(0.0);
+        let chunks = len / 4;
+        for c in 0..chunks {
+            let off = c * 4;
+            let va = vld1q_f32(a.add(off));
+            let vb = vld1q_f32(b.add(off));
+            let diff = vsubq_f32(va, vb);
+            acc = vfmaq_f32(acc, diff, diff);
+        }
+        let mut sum = vaddvq_f32(acc);
+        for i in (chunks * 4)..len {
+            let d = *a.add(i) - *b.add(i);
+            sum += d * d;
+        }
+        sum.sqrt()
     }
-    let mut sum = vaddvq_f32(acc);
-    for i in (chunks * 4)..len {
-        let d = *a.add(i) - *b.add(i);
-        sum += d * d;
-    }
-    sum.sqrt()
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -796,62 +1009,135 @@ unsafe fn euclideanGeneric(a: *const f32, b: *const f32, len: usize) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn dotProductAvx512(a: *const f32, b: *const f32, len: usize) -> f32 {
     use std::arch::x86_64::*;
-    let mut acc = _mm512_setzero_ps();
-    let chunks = len / 16;
-    for c in 0..chunks {
-        let off = c * 16;
-        let va = _mm512_loadu_ps(a.add(off));
-        let vb = _mm512_loadu_ps(b.add(off));
-        acc = _mm512_fmadd_ps(va, vb, acc);
+
+    // SAFETY: caller guarantees a and b are readable for len elements and that the required CPU feature is present
+    unsafe {
+        let mut acc0 = _mm512_setzero_ps();
+        let mut acc1 = _mm512_setzero_ps();
+        let mut acc2 = _mm512_setzero_ps();
+        let mut acc3 = _mm512_setzero_ps();
+        let chunks = len / 16;
+        let mut c = 0;
+        while c + 4 <= chunks {
+            let off = c * 16;
+            acc0 = _mm512_fmadd_ps(
+                _mm512_loadu_ps(a.add(off)),
+                _mm512_loadu_ps(b.add(off)),
+                acc0,
+            );
+            acc1 = _mm512_fmadd_ps(
+                _mm512_loadu_ps(a.add(off + 16)),
+                _mm512_loadu_ps(b.add(off + 16)),
+                acc1,
+            );
+            acc2 = _mm512_fmadd_ps(
+                _mm512_loadu_ps(a.add(off + 32)),
+                _mm512_loadu_ps(b.add(off + 32)),
+                acc2,
+            );
+            acc3 = _mm512_fmadd_ps(
+                _mm512_loadu_ps(a.add(off + 48)),
+                _mm512_loadu_ps(b.add(off + 48)),
+                acc3,
+            );
+            c += 4;
+        }
+        while c < chunks {
+            let off = c * 16;
+            acc0 = _mm512_fmadd_ps(
+                _mm512_loadu_ps(a.add(off)),
+                _mm512_loadu_ps(b.add(off)),
+                acc0,
+            );
+            c += 1;
+        }
+        let acc = _mm512_add_ps(_mm512_add_ps(acc0, acc1), _mm512_add_ps(acc2, acc3));
+        let mut sum = _mm512_reduce_add_ps(acc);
+        for i in (chunks * 16)..len {
+            sum += *a.add(i) * *b.add(i);
+        }
+        -sum
     }
-    let mut sum = _mm512_reduce_add_ps(acc);
-    for i in (chunks * 16)..len {
-        sum += *a.add(i) * *b.add(i);
-    }
-    -sum
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn dotProductAvx2(a: *const f32, b: *const f32, len: usize) -> f32 {
     use std::arch::x86_64::*;
-    let mut acc = _mm256_setzero_ps();
-    let chunks = len / 8;
-    for c in 0..chunks {
-        let off = c * 8;
-        let va = _mm256_loadu_ps(a.add(off));
-        let vb = _mm256_loadu_ps(b.add(off));
-        acc = _mm256_fmadd_ps(va, vb, acc);
+
+    // SAFETY: caller guarantees a and b are readable for len elements and that the required CPU feature is present
+    unsafe {
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
+        let chunks = len / 8;
+        let mut c = 0;
+        while c + 4 <= chunks {
+            let off = c * 8;
+            acc0 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(a.add(off)),
+                _mm256_loadu_ps(b.add(off)),
+                acc0,
+            );
+            acc1 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(a.add(off + 8)),
+                _mm256_loadu_ps(b.add(off + 8)),
+                acc1,
+            );
+            acc2 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(a.add(off + 16)),
+                _mm256_loadu_ps(b.add(off + 16)),
+                acc2,
+            );
+            acc3 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(a.add(off + 24)),
+                _mm256_loadu_ps(b.add(off + 24)),
+                acc3,
+            );
+            c += 4;
+        }
+        while c < chunks {
+            let off = c * 8;
+            acc0 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(a.add(off)),
+                _mm256_loadu_ps(b.add(off)),
+                acc0,
+            );
+            c += 1;
+        }
+        let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+        let mut sum = hsum256(acc);
+        for i in (chunks * 8)..len {
+            sum += *a.add(i) * *b.add(i);
+        }
+        -sum
     }
-    let mut sum = hsum256(acc);
-    for i in (chunks * 8)..len {
-        sum += *a.add(i) * *b.add(i);
-    }
-    -sum
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn dotProductNeon(a: *const f32, b: *const f32, len: usize) -> f32 {
     use std::arch::aarch64::*;
-    let mut acc = vdupq_n_f32(0.0);
-    let chunks = len / 4;
-    for c in 0..chunks {
-        let off = c * 4;
-        let va = vld1q_f32(a.add(off));
-        let vb = vld1q_f32(b.add(off));
-        acc = vfmaq_f32(acc, va, vb);
+
+    // SAFETY: caller guarantees a and b are readable for len elements and that the required CPU feature is present
+    unsafe {
+        let mut acc = vdupq_n_f32(0.0);
+        let chunks = len / 4;
+        for c in 0..chunks {
+            let off = c * 4;
+            let va = vld1q_f32(a.add(off));
+            let vb = vld1q_f32(b.add(off));
+            acc = vfmaq_f32(acc, va, vb);
+        }
+        let mut sum = vaddvq_f32(acc);
+        for i in (chunks * 4)..len {
+            sum += *a.add(i) * *b.add(i);
+        }
+        -sum
     }
-    let mut sum = vaddvq_f32(acc);
-    for i in (chunks * 4)..len {
-        sum += *a.add(i) * *b.add(i);
-    }
-    -sum
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -871,70 +1157,127 @@ unsafe fn dotProductGeneric(a: *const f32, b: *const f32, len: usize) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn manhattanAvx512(a: *const f32, b: *const f32, len: usize) -> f32 {
     use std::arch::x86_64::*;
-    // Mask to clear the sign bit of f32 values (0x7FFF_FFFF)
-    let signMask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7FFF_FFFFu32 as i32));
-    let mut acc = _mm512_setzero_ps();
-    let chunks = len / 16;
-    for c in 0..chunks {
-        let off = c * 16;
-        let va = _mm512_loadu_ps(a.add(off));
-        let vb = _mm512_loadu_ps(b.add(off));
-        let diff = _mm512_sub_ps(va, vb);
-        let absDiff = _mm512_and_ps(diff, signMask);
-        acc = _mm512_add_ps(acc, absDiff);
+
+    // SAFETY: caller guarantees a and b are readable for len elements and that the required CPU feature is present
+    unsafe {
+        // Mask to clear the sign bit of f32 values (0x7FFF_FFFF)
+        let signMask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7FFF_FFFFu32 as i32));
+        let mut acc0 = _mm512_setzero_ps();
+        let mut acc1 = _mm512_setzero_ps();
+        let mut acc2 = _mm512_setzero_ps();
+        let mut acc3 = _mm512_setzero_ps();
+        let chunks = len / 16;
+        let mut c = 0;
+        while c + 4 <= chunks {
+            let off = c * 16;
+            let d0 = _mm512_sub_ps(_mm512_loadu_ps(a.add(off)), _mm512_loadu_ps(b.add(off)));
+            let d1 = _mm512_sub_ps(
+                _mm512_loadu_ps(a.add(off + 16)),
+                _mm512_loadu_ps(b.add(off + 16)),
+            );
+            let d2 = _mm512_sub_ps(
+                _mm512_loadu_ps(a.add(off + 32)),
+                _mm512_loadu_ps(b.add(off + 32)),
+            );
+            let d3 = _mm512_sub_ps(
+                _mm512_loadu_ps(a.add(off + 48)),
+                _mm512_loadu_ps(b.add(off + 48)),
+            );
+            acc0 = _mm512_add_ps(acc0, _mm512_and_ps(d0, signMask));
+            acc1 = _mm512_add_ps(acc1, _mm512_and_ps(d1, signMask));
+            acc2 = _mm512_add_ps(acc2, _mm512_and_ps(d2, signMask));
+            acc3 = _mm512_add_ps(acc3, _mm512_and_ps(d3, signMask));
+            c += 4;
+        }
+        while c < chunks {
+            let off = c * 16;
+            let d = _mm512_sub_ps(_mm512_loadu_ps(a.add(off)), _mm512_loadu_ps(b.add(off)));
+            acc0 = _mm512_add_ps(acc0, _mm512_and_ps(d, signMask));
+            c += 1;
+        }
+        let acc = _mm512_add_ps(_mm512_add_ps(acc0, acc1), _mm512_add_ps(acc2, acc3));
+        let mut sum = _mm512_reduce_add_ps(acc);
+        for i in (chunks * 16)..len {
+            sum += (*a.add(i) - *b.add(i)).abs();
+        }
+        sum
     }
-    let mut sum = _mm512_reduce_add_ps(acc);
-    for i in (chunks * 16)..len {
-        sum += (*a.add(i) - *b.add(i)).abs();
-    }
-    sum
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn manhattanAvx2(a: *const f32, b: *const f32, len: usize) -> f32 {
     use std::arch::x86_64::*;
-    // Sign bit mask for f32: set all bits except the sign bit
-    let signBit = _mm256_set1_ps(f32::from_bits(0x8000_0000));
-    let mut acc = _mm256_setzero_ps();
-    let chunks = len / 8;
-    for c in 0..chunks {
-        let off = c * 8;
-        let va = _mm256_loadu_ps(a.add(off));
-        let vb = _mm256_loadu_ps(b.add(off));
-        let diff = _mm256_sub_ps(va, vb);
-        let absDiff = _mm256_andnot_ps(signBit, diff);
-        acc = _mm256_add_ps(acc, absDiff);
+
+    // SAFETY: caller guarantees a and b are readable for len elements and that the required CPU feature is present
+    unsafe {
+        // Sign bit mask for f32: set all bits except the sign bit
+        let signBit = _mm256_set1_ps(f32::from_bits(0x8000_0000));
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
+        let chunks = len / 8;
+        let mut c = 0;
+        while c + 4 <= chunks {
+            let off = c * 8;
+            let d0 = _mm256_sub_ps(_mm256_loadu_ps(a.add(off)), _mm256_loadu_ps(b.add(off)));
+            let d1 = _mm256_sub_ps(
+                _mm256_loadu_ps(a.add(off + 8)),
+                _mm256_loadu_ps(b.add(off + 8)),
+            );
+            let d2 = _mm256_sub_ps(
+                _mm256_loadu_ps(a.add(off + 16)),
+                _mm256_loadu_ps(b.add(off + 16)),
+            );
+            let d3 = _mm256_sub_ps(
+                _mm256_loadu_ps(a.add(off + 24)),
+                _mm256_loadu_ps(b.add(off + 24)),
+            );
+            acc0 = _mm256_add_ps(acc0, _mm256_andnot_ps(signBit, d0));
+            acc1 = _mm256_add_ps(acc1, _mm256_andnot_ps(signBit, d1));
+            acc2 = _mm256_add_ps(acc2, _mm256_andnot_ps(signBit, d2));
+            acc3 = _mm256_add_ps(acc3, _mm256_andnot_ps(signBit, d3));
+            c += 4;
+        }
+        while c < chunks {
+            let off = c * 8;
+            let d = _mm256_sub_ps(_mm256_loadu_ps(a.add(off)), _mm256_loadu_ps(b.add(off)));
+            acc0 = _mm256_add_ps(acc0, _mm256_andnot_ps(signBit, d));
+            c += 1;
+        }
+        let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+        let mut sum = hsum256(acc);
+        for i in (chunks * 8)..len {
+            sum += (*a.add(i) - *b.add(i)).abs();
+        }
+        sum
     }
-    let mut sum = hsum256(acc);
-    for i in (chunks * 8)..len {
-        sum += (*a.add(i) - *b.add(i)).abs();
-    }
-    sum
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn manhattanNeon(a: *const f32, b: *const f32, len: usize) -> f32 {
     use std::arch::aarch64::*;
-    let mut acc = vdupq_n_f32(0.0);
-    let chunks = len / 4;
-    for c in 0..chunks {
-        let off = c * 4;
-        let va = vld1q_f32(a.add(off));
-        let vb = vld1q_f32(b.add(off));
-        acc = vaddq_f32(acc, vabdq_f32(va, vb));
+
+    // SAFETY: caller guarantees a and b are readable for len elements and that the required CPU feature is present
+    unsafe {
+        let mut acc = vdupq_n_f32(0.0);
+        let chunks = len / 4;
+        for c in 0..chunks {
+            let off = c * 4;
+            let va = vld1q_f32(a.add(off));
+            let vb = vld1q_f32(b.add(off));
+            acc = vaddq_f32(acc, vabdq_f32(va, vb));
+        }
+        let mut sum = vaddvq_f32(acc);
+        for i in (chunks * 4)..len {
+            sum += (*a.add(i) - *b.add(i)).abs();
+        }
+        sum
     }
-    let mut sum = vaddvq_f32(acc);
-    for i in (chunks * 4)..len {
-        sum += (*a.add(i) - *b.add(i)).abs();
-    }
-    sum
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -953,7 +1296,6 @@ unsafe fn manhattanGeneric(a: *const f32, b: *const f32, len: usize) -> f32 {
 /// Reduces an __m256 (8 x f32) to a single f32 sum.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[allow(unsafe_op_in_unsafe_fn)]
 #[inline]
 unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
     use std::arch::x86_64::*;
@@ -988,7 +1330,7 @@ mod tests {
     #[test]
     fn cosineIdenticalVectors() {
         let a = vec![1.0, 2.0, 3.0, 4.0];
-        let d = computeDistance(DistanceMetric::Cosine, &a, &a);
+        let d = computeDistance(DistanceMetric::Cosine, &a, &a).unwrap();
         assert!(
             approxEq(d, 0.0),
             "identical vectors should have cosine distance 0, got {d}"
@@ -999,7 +1341,7 @@ mod tests {
     fn cosineOrthogonalVectors() {
         let a = vec![1.0, 0.0, 0.0, 0.0];
         let b = vec![0.0, 1.0, 0.0, 0.0];
-        let d = computeDistance(DistanceMetric::Cosine, &a, &b);
+        let d = computeDistance(DistanceMetric::Cosine, &a, &b).unwrap();
         assert!(
             approxEq(d, 1.0),
             "orthogonal vectors should have cosine distance 1, got {d}"
@@ -1010,7 +1352,7 @@ mod tests {
     fn cosineAntiParallelVectors() {
         let a = vec![1.0, 0.0, 0.0];
         let b = vec![-1.0, 0.0, 0.0];
-        let d = computeDistance(DistanceMetric::Cosine, &a, &b);
+        let d = computeDistance(DistanceMetric::Cosine, &a, &b).unwrap();
         assert!(
             approxEq(d, 2.0),
             "anti-parallel vectors should have cosine distance 2, got {d}"
@@ -1021,7 +1363,7 @@ mod tests {
     fn cosineZeroVectors() {
         let a = vec![0.0, 0.0, 0.0];
         let b = vec![1.0, 2.0, 3.0];
-        let d = computeDistance(DistanceMetric::Cosine, &a, &b);
+        let d = computeDistance(DistanceMetric::Cosine, &a, &b).unwrap();
         assert!(
             approxEq(d, 0.0),
             "zero vector should produce distance 0, got {d}"
@@ -1035,7 +1377,7 @@ mod tests {
     #[test]
     fn euclideanIdenticalVectors() {
         let a = vec![3.0, 4.0, 5.0];
-        let d = computeDistance(DistanceMetric::Euclidean, &a, &a);
+        let d = computeDistance(DistanceMetric::Euclidean, &a, &a).unwrap();
         assert!(
             approxEq(d, 0.0),
             "identical vectors should have euclidean distance 0, got {d}"
@@ -1046,7 +1388,7 @@ mod tests {
     fn euclideanKnownDistance() {
         let a = vec![0.0, 0.0, 0.0];
         let b = vec![3.0, 4.0, 0.0];
-        let d = computeDistance(DistanceMetric::Euclidean, &a, &b);
+        let d = computeDistance(DistanceMetric::Euclidean, &a, &b).unwrap();
         assert!(approxEq(d, 5.0), "expected euclidean distance 5.0, got {d}");
     }
 
@@ -1055,7 +1397,7 @@ mod tests {
         let a = vec![1.0, 0.0];
         let b = vec![0.0, 1.0];
         let expected = std::f32::consts::SQRT_2;
-        let d = computeDistance(DistanceMetric::Euclidean, &a, &b);
+        let d = computeDistance(DistanceMetric::Euclidean, &a, &b).unwrap();
         assert!(approxEq(d, expected), "expected {expected}, got {d}");
     }
 
@@ -1068,7 +1410,7 @@ mod tests {
         let a = vec![1.0, 2.0, 3.0];
         let b = vec![4.0, 5.0, 6.0];
         // dot = 1*4 + 2*5 + 3*6 = 32, returned as -32
-        let d = computeDistance(DistanceMetric::DotProduct, &a, &b);
+        let d = computeDistance(DistanceMetric::DotProduct, &a, &b).unwrap();
         assert!(approxEq(d, -32.0), "expected -32.0, got {d}");
     }
 
@@ -1076,7 +1418,7 @@ mod tests {
     fn dotProductNegativeReturn() {
         let a = vec![1.0, 1.0];
         let b = vec![1.0, 1.0];
-        let d = computeDistance(DistanceMetric::DotProduct, &a, &b);
+        let d = computeDistance(DistanceMetric::DotProduct, &a, &b).unwrap();
         assert!(
             d < 0.0,
             "positive dot product should return negative distance, got {d}"
@@ -1087,7 +1429,7 @@ mod tests {
     fn dotProductOrthogonal() {
         let a = vec![1.0, 0.0];
         let b = vec![0.0, 1.0];
-        let d = computeDistance(DistanceMetric::DotProduct, &a, &b);
+        let d = computeDistance(DistanceMetric::DotProduct, &a, &b).unwrap();
         assert!(
             approxEq(d, 0.0),
             "orthogonal dot product should be 0, got {d}"
@@ -1103,14 +1445,14 @@ mod tests {
         let a = vec![1.0, 2.0, 3.0];
         let b = vec![4.0, 6.0, 3.0];
         // |1-4| + |2-6| + |3-3| = 3 + 4 + 0 = 7
-        let d = computeDistance(DistanceMetric::Manhattan, &a, &b);
+        let d = computeDistance(DistanceMetric::Manhattan, &a, &b).unwrap();
         assert!(approxEq(d, 7.0), "expected manhattan distance 7.0, got {d}");
     }
 
     #[test]
     fn manhattanIdentical() {
         let a = vec![5.0, -3.0, 7.0];
-        let d = computeDistance(DistanceMetric::Manhattan, &a, &a);
+        let d = computeDistance(DistanceMetric::Manhattan, &a, &a).unwrap();
         assert!(
             approxEq(d, 0.0),
             "identical vectors should have manhattan distance 0, got {d}"
@@ -1122,7 +1464,7 @@ mod tests {
         let a = vec![-1.0, -2.0];
         let b = vec![1.0, 2.0];
         // |(-1)-1| + |(-2)-2| = 2 + 4 = 6
-        let d = computeDistance(DistanceMetric::Manhattan, &a, &b);
+        let d = computeDistance(DistanceMetric::Manhattan, &a, &b).unwrap();
         assert!(approxEq(d, 6.0), "expected 6.0, got {d}");
     }
 
@@ -1145,10 +1487,10 @@ mod tests {
             DistanceMetric::Manhattan,
         ] {
             let mut batchOut = Vec::new();
-            batchDistances(&query, &vectors, metric, &mut batchOut);
+            batchDistances(&query, &vectors, metric, &mut batchOut).unwrap();
 
             for (idx, v) in vectors.iter().enumerate() {
-                let individual = computeDistance(metric, &query, v);
+                let individual = computeDistance(metric, &query, v).unwrap();
                 assert!(
                     approxEq(batchOut[idx], individual),
                     "metric {:?} mismatch at index {idx}: batch={}, individual={}",
@@ -1217,7 +1559,7 @@ mod tests {
         for dim in [3, 7, 13, 127, 128, 1536] {
             let a: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.01 + 0.1).collect();
             let b: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.02 + 0.05).collect();
-            let d = computeDistance(DistanceMetric::Cosine, &a, &b);
+            let d = computeDistance(DistanceMetric::Cosine, &a, &b).unwrap();
             assert!(
                 d.is_finite(),
                 "cosine distance should be finite for dim={dim}, got {d}"
@@ -1234,7 +1576,7 @@ mod tests {
         for dim in [3, 7, 13, 127, 128, 1536] {
             let a: Vec<f32> = (0..dim).map(|i| i as f32).collect();
             let b: Vec<f32> = (0..dim).map(|i| i as f32 + 1.0).collect();
-            let d = computeDistance(DistanceMetric::Euclidean, &a, &b);
+            let d = computeDistance(DistanceMetric::Euclidean, &a, &b).unwrap();
             // Each element differs by 1.0, so L2 = sqrt(dim)
             let expected = (dim as f32).sqrt();
             assert!(
@@ -1249,7 +1591,7 @@ mod tests {
         for dim in [3, 7, 13, 127, 128, 1536] {
             let a: Vec<f32> = vec![1.0; dim];
             let b: Vec<f32> = vec![2.0; dim];
-            let d = computeDistance(DistanceMetric::DotProduct, &a, &b);
+            let d = computeDistance(DistanceMetric::DotProduct, &a, &b).unwrap();
             let expected = -(dim as f32 * 2.0);
             assert!(
                 approxEq(d, expected),
@@ -1263,7 +1605,7 @@ mod tests {
         for dim in [3, 7, 13, 127, 128, 1536] {
             let a: Vec<f32> = vec![0.0; dim];
             let b: Vec<f32> = vec![1.0; dim];
-            let d = computeDistance(DistanceMetric::Manhattan, &a, &b);
+            let d = computeDistance(DistanceMetric::Manhattan, &a, &b).unwrap();
             let expected = dim as f32;
             assert!(
                 approxEq(d, expected),

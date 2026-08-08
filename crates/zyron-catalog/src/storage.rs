@@ -79,6 +79,37 @@ const USER_HEAP_FILE_START: u32 = 200;
 /// Starting file ID for user-created index files.
 const USER_INDEX_FILE_START: u32 = 10000;
 
+/// Scans every tuple in a catalog heap and decodes it, returning CatalogCorrupted
+/// on the first tuple that fails to decode. A decode failure means a catalog row
+/// is unreadable, dropping it would silently lose a table, index, or other object,
+/// so recovery stops loudly instead.
+fn scan_decode<T>(
+    heap: &HeapFile,
+    entity: &str,
+    decode: impl Fn(&[u8]) -> Result<T>,
+) -> Result<Vec<T>> {
+    let mut entries = Vec::new();
+    let mut decode_err: Option<ZyronError> = None;
+    let guard = heap.scan()?;
+    guard.try_for_each(|_tid, view| match decode(view.data) {
+        Ok(entry) => {
+            entries.push(entry);
+            true
+        }
+        Err(e) => {
+            decode_err = Some(ZyronError::CatalogCorrupted(format!(
+                "{} catalog tuple failed to decode: {}",
+                entity, e
+            )));
+            false
+        }
+    });
+    if let Some(e) = decode_err {
+        return Err(e);
+    }
+    Ok(entries)
+}
+
 /// Abstraction over catalog persistence.
 #[async_trait]
 pub trait CatalogStorage: Send + Sync {
@@ -783,14 +814,7 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_databases(&self) -> Result<Vec<DatabaseEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.databases_heap.scan()?;
-        guard.for_each(|_tid, view| {
-            if let Ok(entry) = DatabaseEntry::from_bytes(view.data) {
-                entries.push(entry);
-            }
-        });
-        Ok(entries)
+        scan_decode(&self.databases_heap, "database", DatabaseEntry::from_bytes)
     }
 
     async fn store_database(&self, entry: &DatabaseEntry) -> Result<TupleId> {
@@ -817,14 +841,7 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_schemas(&self) -> Result<Vec<SchemaEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.schemas_heap.scan()?;
-        guard.for_each(|_tid, view| {
-            if let Ok(entry) = SchemaEntry::from_bytes(view.data) {
-                entries.push(entry);
-            }
-        });
-        Ok(entries)
+        scan_decode(&self.schemas_heap, "schema", SchemaEntry::from_bytes)
     }
 
     async fn store_schema(&self, entry: &SchemaEntry) -> Result<TupleId> {
@@ -851,14 +868,7 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_tables(&self) -> Result<Vec<TableEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.tables_heap.scan()?;
-        guard.for_each(|_tid, view| {
-            if let Ok(entry) = TableEntry::from_bytes(view.data) {
-                entries.push(entry);
-            }
-        });
-        Ok(entries)
+        scan_decode(&self.tables_heap, "table", TableEntry::from_bytes)
     }
 
     async fn load_table_by_name(
@@ -868,15 +878,26 @@ impl CatalogStorage for HeapCatalogStorage {
     ) -> Result<Option<TableEntry>> {
         let guard = self.tables_heap.scan()?;
         let mut found = None;
-        guard.try_for_each(|_tid, view| {
-            if let Ok(entry) = TableEntry::from_bytes(view.data) {
+        let mut decode_err: Option<ZyronError> = None;
+        guard.try_for_each(|_tid, view| match TableEntry::from_bytes(view.data) {
+            Ok(entry) => {
                 if entry.schema_id == schema_id && entry.name == name {
                     found = Some(entry);
                     return false; // stop scanning at the first match
                 }
+                true
             }
-            true
+            Err(e) => {
+                decode_err = Some(ZyronError::CatalogCorrupted(format!(
+                    "table catalog tuple failed to decode: {}",
+                    e
+                )));
+                false
+            }
         });
+        if let Some(e) = decode_err {
+            return Err(e);
+        }
         Ok(found)
     }
 
@@ -904,15 +925,8 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_columns(&self, table_id: TableId) -> Result<Vec<ColumnEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.columns_heap.scan()?;
-        guard.for_each(|_tid, view| {
-            if let Ok(entry) = ColumnEntry::from_bytes(view.data) {
-                if entry.table_id == table_id {
-                    entries.push(entry);
-                }
-            }
-        });
+        let mut entries = scan_decode(&self.columns_heap, "column", ColumnEntry::from_bytes)?;
+        entries.retain(|c| c.table_id == table_id);
         entries.sort_by_key(|c| c.ordinal);
         Ok(entries)
     }
@@ -945,14 +959,7 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_indexes(&self) -> Result<Vec<IndexEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.indexes_heap.scan()?;
-        guard.for_each(|_tid, view| {
-            if let Ok(entry) = IndexEntry::from_bytes(view.data) {
-                entries.push(entry);
-            }
-        });
-        Ok(entries)
+        scan_decode(&self.indexes_heap, "index", IndexEntry::from_bytes)
     }
 
     async fn store_index(&self, entry: &IndexEntry) -> Result<TupleId> {
@@ -979,14 +986,11 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_streaming_jobs(&self) -> Result<Vec<StreamingJobEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.streaming_jobs_heap.scan()?;
-        guard.for_each(|_tid, view| {
-            if let Ok(entry) = StreamingJobEntry::from_bytes(view.data) {
-                entries.push(entry);
-            }
-        });
-        Ok(entries)
+        scan_decode(
+            &self.streaming_jobs_heap,
+            "streaming job",
+            StreamingJobEntry::from_bytes,
+        )
     }
 
     async fn store_streaming_job(&self, entry: &StreamingJobEntry) -> Result<TupleId> {
@@ -1036,14 +1040,7 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_sequences(&self) -> Result<Vec<SequenceEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.sequences_heap.scan()?;
-        guard.for_each(|_tid, view| {
-            if let Ok(entry) = SequenceEntry::from_bytes(view.data) {
-                entries.push(entry);
-            }
-        });
-        Ok(entries)
+        scan_decode(&self.sequences_heap, "sequence", SequenceEntry::from_bytes)
     }
 
     async fn store_sequence(&self, entry: &SequenceEntry) -> Result<TupleId> {
@@ -1091,14 +1088,7 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_views(&self) -> Result<Vec<ViewEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.views_heap.scan()?;
-        guard.for_each(|_tid, row| {
-            if let Ok(entry) = ViewEntry::from_bytes(row.data) {
-                entries.push(entry);
-            }
-        });
-        Ok(entries)
+        scan_decode(&self.views_heap, "view", ViewEntry::from_bytes)
     }
 
     async fn store_view(&self, entry: &ViewEntry) -> Result<TupleId> {
@@ -1146,14 +1136,11 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_mviews(&self) -> Result<Vec<MaterializedViewEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.mviews_heap.scan()?;
-        guard.for_each(|_tid, row| {
-            if let Ok(entry) = MaterializedViewEntry::from_bytes(row.data) {
-                entries.push(entry);
-            }
-        });
-        Ok(entries)
+        scan_decode(
+            &self.mviews_heap,
+            "materialized view",
+            MaterializedViewEntry::from_bytes,
+        )
     }
 
     async fn store_mview(&self, entry: &MaterializedViewEntry) -> Result<TupleId> {
@@ -1201,14 +1188,7 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_functions(&self) -> Result<Vec<FunctionEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.functions_heap.scan()?;
-        guard.for_each(|_tid, row| {
-            if let Ok(entry) = FunctionEntry::from_bytes(row.data) {
-                entries.push(entry);
-            }
-        });
-        Ok(entries)
+        scan_decode(&self.functions_heap, "function", FunctionEntry::from_bytes)
     }
 
     async fn store_function(&self, entry: &FunctionEntry) -> Result<TupleId> {
@@ -1234,14 +1214,7 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_comments(&self) -> Result<Vec<CommentEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.comments_heap.scan()?;
-        guard.for_each(|_tid, row| {
-            if let Ok(entry) = CommentEntry::from_bytes(row.data) {
-                entries.push(entry);
-            }
-        });
-        Ok(entries)
+        scan_decode(&self.comments_heap, "comment", CommentEntry::from_bytes)
     }
 
     async fn store_comment(&self, entry: &CommentEntry) -> Result<TupleId> {
@@ -1267,14 +1240,11 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_aggregates(&self) -> Result<Vec<AggregateEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.aggregates_heap.scan()?;
-        guard.for_each(|_tid, row| {
-            if let Ok(entry) = AggregateEntry::from_bytes(row.data) {
-                entries.push(entry);
-            }
-        });
-        Ok(entries)
+        scan_decode(
+            &self.aggregates_heap,
+            "aggregate",
+            AggregateEntry::from_bytes,
+        )
     }
 
     async fn store_aggregate(&self, entry: &AggregateEntry) -> Result<TupleId> {
@@ -1300,14 +1270,11 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_procedures(&self) -> Result<Vec<ProcedureEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.procedures_heap.scan()?;
-        guard.for_each(|_tid, row| {
-            if let Ok(entry) = ProcedureEntry::from_bytes(row.data) {
-                entries.push(entry);
-            }
-        });
-        Ok(entries)
+        scan_decode(
+            &self.procedures_heap,
+            "procedure",
+            ProcedureEntry::from_bytes,
+        )
     }
 
     async fn store_procedure(&self, entry: &ProcedureEntry) -> Result<TupleId> {
@@ -1333,14 +1300,7 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_schedules(&self) -> Result<Vec<ScheduleEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.schedules_heap.scan()?;
-        guard.for_each(|_tid, row| {
-            if let Ok(entry) = ScheduleEntry::from_bytes(row.data) {
-                entries.push(entry);
-            }
-        });
-        Ok(entries)
+        scan_decode(&self.schedules_heap, "schedule", ScheduleEntry::from_bytes)
     }
 
     async fn store_schedule(&self, entry: &ScheduleEntry) -> Result<TupleId> {
@@ -1366,14 +1326,7 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_triggers(&self) -> Result<Vec<TriggerEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.triggers_heap.scan()?;
-        guard.for_each(|_tid, row| {
-            if let Ok(entry) = TriggerEntry::from_bytes(row.data) {
-                entries.push(entry);
-            }
-        });
-        Ok(entries)
+        scan_decode(&self.triggers_heap, "trigger", TriggerEntry::from_bytes)
     }
 
     async fn store_trigger(&self, entry: &TriggerEntry) -> Result<TupleId> {
@@ -1399,14 +1352,7 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_pipelines(&self) -> Result<Vec<PipelineEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.pipelines_heap.scan()?;
-        guard.for_each(|_tid, row| {
-            if let Ok(entry) = PipelineEntry::from_bytes(row.data) {
-                entries.push(entry);
-            }
-        });
-        Ok(entries)
+        scan_decode(&self.pipelines_heap, "pipeline", PipelineEntry::from_bytes)
     }
 
     async fn store_pipeline(&self, entry: &PipelineEntry) -> Result<TupleId> {
@@ -1432,14 +1378,11 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_event_handlers(&self) -> Result<Vec<EventHandlerEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.event_handlers_heap.scan()?;
-        guard.for_each(|_tid, row| {
-            if let Ok(entry) = EventHandlerEntry::from_bytes(row.data) {
-                entries.push(entry);
-            }
-        });
-        Ok(entries)
+        scan_decode(
+            &self.event_handlers_heap,
+            "event handler",
+            EventHandlerEntry::from_bytes,
+        )
     }
 
     async fn store_event_handler(&self, entry: &EventHandlerEntry) -> Result<TupleId> {
@@ -1465,14 +1408,11 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_version_tags(&self) -> Result<Vec<VersionTagEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.version_tags_heap.scan()?;
-        guard.for_each(|_tid, row| {
-            if let Ok(entry) = VersionTagEntry::from_bytes(row.data) {
-                entries.push(entry);
-            }
-        });
-        Ok(entries)
+        scan_decode(
+            &self.version_tags_heap,
+            "version tag",
+            VersionTagEntry::from_bytes,
+        )
     }
 
     async fn store_version_tag(&self, entry: &VersionTagEntry) -> Result<TupleId> {
@@ -1498,14 +1438,11 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_external_sources(&self) -> Result<Vec<ExternalSourceEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.external_sources_heap.scan()?;
-        guard.for_each(|_tid, view| {
-            if let Ok(entry) = ExternalSourceEntry::from_bytes(view.data) {
-                entries.push(entry);
-            }
-        });
-        Ok(entries)
+        scan_decode(
+            &self.external_sources_heap,
+            "external source",
+            ExternalSourceEntry::from_bytes,
+        )
     }
 
     async fn store_external_source(&self, entry: &ExternalSourceEntry) -> Result<TupleId> {
@@ -1555,14 +1492,11 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_external_sinks(&self) -> Result<Vec<ExternalSinkEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.external_sinks_heap.scan()?;
-        guard.for_each(|_tid, view| {
-            if let Ok(entry) = ExternalSinkEntry::from_bytes(view.data) {
-                entries.push(entry);
-            }
-        });
-        Ok(entries)
+        scan_decode(
+            &self.external_sinks_heap,
+            "external sink",
+            ExternalSinkEntry::from_bytes,
+        )
     }
 
     async fn store_external_sink(&self, entry: &ExternalSinkEntry) -> Result<TupleId> {
@@ -1612,14 +1546,11 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_publications(&self) -> Result<Vec<PublicationEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.publications_heap.scan()?;
-        guard.for_each(|_tid, view| {
-            if let Ok(entry) = PublicationEntry::from_bytes(view.data) {
-                entries.push(entry);
-            }
-        });
-        Ok(entries)
+        scan_decode(
+            &self.publications_heap,
+            "publication",
+            PublicationEntry::from_bytes,
+        )
     }
 
     async fn store_publication(&self, entry: &PublicationEntry) -> Result<TupleId> {
@@ -1669,14 +1600,11 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_publication_tables(&self) -> Result<Vec<PublicationTableEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.publication_tables_heap.scan()?;
-        guard.for_each(|_tid, view| {
-            if let Ok(entry) = PublicationTableEntry::from_bytes(view.data) {
-                entries.push(entry);
-            }
-        });
-        Ok(entries)
+        scan_decode(
+            &self.publication_tables_heap,
+            "publication table",
+            PublicationTableEntry::from_bytes,
+        )
     }
 
     async fn store_publication_table(&self, entry: &PublicationTableEntry) -> Result<TupleId> {
@@ -1730,14 +1658,11 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_subscriptions(&self) -> Result<Vec<SubscriptionEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.subscriptions_heap.scan()?;
-        guard.for_each(|_tid, view| {
-            if let Ok(entry) = SubscriptionEntry::from_bytes(view.data) {
-                entries.push(entry);
-            }
-        });
-        Ok(entries)
+        scan_decode(
+            &self.subscriptions_heap,
+            "subscription",
+            SubscriptionEntry::from_bytes,
+        )
     }
 
     async fn store_subscription(&self, entry: &SubscriptionEntry) -> Result<TupleId> {
@@ -1787,14 +1712,7 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_endpoints(&self) -> Result<Vec<EndpointEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.endpoints_heap.scan()?;
-        guard.for_each(|_tid, view| {
-            if let Ok(entry) = EndpointEntry::from_bytes(view.data) {
-                entries.push(entry);
-            }
-        });
-        Ok(entries)
+        scan_decode(&self.endpoints_heap, "endpoint", EndpointEntry::from_bytes)
     }
 
     async fn store_endpoint(&self, entry: &EndpointEntry) -> Result<TupleId> {
@@ -1844,14 +1762,11 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_security_maps(&self) -> Result<Vec<SecurityMapEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.security_maps_heap.scan()?;
-        guard.for_each(|_tid, view| {
-            if let Ok(entry) = SecurityMapEntry::from_bytes(view.data) {
-                entries.push(entry);
-            }
-        });
-        Ok(entries)
+        scan_decode(
+            &self.security_maps_heap,
+            "security map",
+            SecurityMapEntry::from_bytes,
+        )
     }
 
     async fn store_security_map(&self, entry: &SecurityMapEntry) -> Result<TupleId> {
@@ -1903,14 +1818,11 @@ impl CatalogStorage for HeapCatalogStorage {
     // ----- Data lifecycle (Phase 17) -----
 
     async fn load_legal_holds(&self) -> Result<Vec<LegalHoldEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.legal_holds_heap.scan()?;
-        guard.for_each(|_tid, view| {
-            if let Ok(e) = LegalHoldEntry::from_bytes(view.data) {
-                entries.push(e);
-            }
-        });
-        Ok(entries)
+        scan_decode(
+            &self.legal_holds_heap,
+            "legal hold",
+            LegalHoldEntry::from_bytes,
+        )
     }
 
     async fn store_legal_hold(&self, entry: &LegalHoldEntry) -> Result<TupleId> {
@@ -1958,14 +1870,11 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_retention_policies(&self) -> Result<Vec<RetentionPolicyEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.retention_policies_heap.scan()?;
-        guard.for_each(|_tid, view| {
-            if let Ok(e) = RetentionPolicyEntry::from_bytes(view.data) {
-                entries.push(e);
-            }
-        });
-        Ok(entries)
+        scan_decode(
+            &self.retention_policies_heap,
+            "retention policy",
+            RetentionPolicyEntry::from_bytes,
+        )
     }
 
     async fn store_retention_policy(&self, entry: &RetentionPolicyEntry) -> Result<TupleId> {
@@ -1980,15 +1889,29 @@ impl CatalogStorage for HeapCatalogStorage {
         entries: &[RetentionPolicyEntry],
     ) -> Result<()> {
         let mut stale = Vec::new();
+        let mut decode_err: Option<ZyronError> = None;
         let guard = self.retention_policies_heap.scan()?;
-        guard.for_each(|tid, view| {
-            if let Ok(e) = RetentionPolicyEntry::from_bytes(view.data) {
-                if e.table_id == table_id {
-                    stale.push(tid);
+        guard.try_for_each(
+            |tid, view| match RetentionPolicyEntry::from_bytes(view.data) {
+                Ok(e) => {
+                    if e.table_id == table_id {
+                        stale.push(tid);
+                    }
+                    true
                 }
-            }
-        });
+                Err(e) => {
+                    decode_err = Some(ZyronError::CatalogCorrupted(format!(
+                        "retention policy catalog tuple failed to decode: {}",
+                        e
+                    )));
+                    false
+                }
+            },
+        );
         drop(guard);
+        if let Some(e) = decode_err {
+            return Err(e);
+        }
         for tid in stale {
             self.retention_policies_heap.delete(tid).await?;
         }
@@ -2000,14 +1923,11 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_retention_jobs(&self) -> Result<Vec<RetentionJobEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.retention_jobs_heap.scan()?;
-        guard.for_each(|_tid, view| {
-            if let Ok(e) = RetentionJobEntry::from_bytes(view.data) {
-                entries.push(e);
-            }
-        });
-        Ok(entries)
+        scan_decode(
+            &self.retention_jobs_heap,
+            "retention job",
+            RetentionJobEntry::from_bytes,
+        )
     }
 
     async fn store_retention_job(&self, entry: &RetentionJobEntry) -> Result<TupleId> {
@@ -2017,13 +1937,11 @@ impl CatalogStorage for HeapCatalogStorage {
     }
 
     async fn load_compliance_log(&self) -> Result<Vec<ComplianceLogEntry>> {
-        let mut entries = Vec::new();
-        let guard = self.compliance_log_heap.scan()?;
-        guard.for_each(|_tid, view| {
-            if let Ok(e) = ComplianceLogEntry::from_bytes(view.data) {
-                entries.push(e);
-            }
-        });
+        let mut entries = scan_decode(
+            &self.compliance_log_heap,
+            "compliance log",
+            ComplianceLogEntry::from_bytes,
+        )?;
         entries.sort_by_key(|e| e.event_id);
         Ok(entries)
     }

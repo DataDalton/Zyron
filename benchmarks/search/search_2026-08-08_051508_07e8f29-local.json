@@ -1,0 +1,249 @@
+{
+  "id": "2026-08-08_051508_07e8f29-local",
+  "date": "2026-08-08 05:49:55Z",
+  "ts": 1786168195,
+  "commit": "07e8f29-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Autocomplete": {
+      "Latency (ms)": {
+        "average": 0.400120,
+        "runs": [0.43, 0.40, 0.38, 0.39, 0.40],
+        "target": 2.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Performance": {
+      "util_before": { "cpu_pct": 22.0, "ram_used_gb": 7.95 },
+      "util_after": { "cpu_pct": 7.0, "ram_used_gb": 9.07 },
+      "Indexing throughput SimpleAnalyzer (docs/sec)": {
+        "average": 400464.694400,
+        "runs": [402982.78, 404429.06, 400661.97, 398772.75, 395476.90],
+        "target": 300000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "Indexing throughput StandardAnalyzer (docs/sec)": {
+        "average": 297143.745672,
+        "runs": [297640.25, 297793.53, 299113.90, 292545.54, 298625.50],
+        "target": 300000.000000,
+        "passed": false,
+        "higher_is_better": true
+      },
+      "Index size ratio": {
+        "average": 0.219516,
+        "runs": [0.22],
+        "target": 0.250000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Single-term query latency (ms)": {
+        "average": 1.800240,
+        "runs": [4.16, 1.42, 1.20, 1.08, 1.15],
+        "target": 3.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Phrase query latency (ms)": {
+        "average": 2.670560,
+        "runs": [2.88, 2.73, 2.62, 2.56, 2.55],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Boolean query latency (ms)": {
+        "average": 4.343380,
+        "runs": [4.76, 4.33, 4.15, 4.22, 4.25],
+        "target": 8.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Fuzzy query latency (ms)": {
+        "average": 1.075260,
+        "runs": [1.23, 1.10, 1.01, 1.02, 1.01],
+        "target": 20.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Top-10 ranking latency (ms)": {
+        "average": 1.502020,
+        "runs": [1.24, 2.11, 1.65, 1.28, 1.24],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Highlight latency (us)": {
+        "average": 1.278840,
+        "runs": [1.36, 1.26, 1.25, 1.26, 1.26],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "test_ann_recall": {
+      "recall@100_default": {
+        "average": 0.999200,
+        "runs": [1.00],
+        "target": 0.900000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "recall@100_high": {
+        "average": 0.999200,
+        "runs": [1.00],
+        "target": 0.990000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "test_distance": {
+      "cosine_1536d_us": {
+        "average": 0.072991,
+        "runs": [0.07],
+        "target": 2.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "test_quantized": {
+      "recall@10_probes110": {
+        "average": 0.770000,
+        "runs": [0.77],
+        "target": 0.500000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "recall@10_probes221": {
+        "average": 0.974000,
+        "runs": [0.97],
+        "target": 0.850000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "recall@10_probes134": {
+        "average": 0.830000,
+        "runs": [0.83],
+        "target": 0.500000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "test_vector_graph_perf": {
+      "ann_build_sec": {
+        "average": 456.958333,
+        "runs": [456.96],
+        "target": 40.000000,
+        "passed": false,
+        "higher_is_better": false
+      },
+      "ann_search_qps": {
+        "average": 50.568138,
+        "runs": [50.57],
+        "target": 8000.000000,
+        "passed": false,
+        "higher_is_better": true
+      },
+      "ann_recall@10": {
+        "average": 1.000000,
+        "runs": [1.00],
+        "target": 0.950000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "pq_build_sec": {
+        "average": 77.727994,
+        "runs": [77.73],
+        "target": 20.000000,
+        "passed": false,
+        "higher_is_better": false
+      },
+      "pq_search_qps": {
+        "average": 39.687205,
+        "runs": [39.69],
+        "target": 12000.000000,
+        "passed": false,
+        "higher_is_better": true
+      },
+      "pagerank_sec": {
+        "average": 0.133157,
+        "runs": [0.13],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "shortest_path_ms": {
+        "average": 19.254400,
+        "runs": [19.25],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "hybrid_search_ms": {
+        "average": 0.019841,
+        "runs": [0.02],
+        "target": 8.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "graph_1hop_us": {
+        "average": 0.002820,
+        "runs": [0.00],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "test_vector_graph_realistic": {
+      "ann_build_sec": {
+        "average": 129.020683,
+        "runs": [129.02],
+        "target": 25.000000,
+        "passed": false,
+        "higher_is_better": false
+      },
+      "ann_search_qps": {
+        "average": 294.135235,
+        "runs": [294.14],
+        "target": 5000.000000,
+        "passed": false,
+        "higher_is_better": true
+      },
+      "ann_recall@10": {
+        "average": 0.604000,
+        "runs": [0.60],
+        "target": 0.900000,
+        "passed": false,
+        "higher_is_better": true
+      },
+      "pq_build_sec": {
+        "average": 121.874113,
+        "runs": [121.87],
+        "target": 30.000000,
+        "passed": false,
+        "higher_is_better": false
+      },
+      "pq_search_qps": {
+        "average": 76.741877,
+        "runs": [76.74],
+        "target": 8000.000000,
+        "passed": false,
+        "higher_is_better": true
+      }
+    },
+    "test_vector_insert_query": {
+      "recall@10": {
+        "average": 1.000000,
+        "runs": [1.00],
+        "target": 0.950000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}

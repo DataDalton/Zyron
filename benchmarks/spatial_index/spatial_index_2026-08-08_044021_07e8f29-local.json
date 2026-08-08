@@ -1,0 +1,72 @@
+{
+  "id": "2026-08-08_044021_07e8f29-local",
+  "date": "2026-08-08 04:40:28Z",
+  "ts": 1786164028,
+  "commit": "07e8f29-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "tests": {
+    "Performance": {
+      "bulk_load 100K points/sec": {
+        "average": 4824058.847649,
+        "runs": [4524456.95, 4921308.28, 4830637.84, 4934445.89, 4909445.28],
+        "target": 1500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "bulk_load 1M points/sec (parallel STR)": {
+        "average": 3640155.249755,
+        "runs": [3530531.15, 3700037.93, 3708665.07, 3637183.66, 3624358.44],
+        "target": 2000000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "delete_by_data/sec": {
+        "average": 698681.246323,
+        "runs": [702311.31, 698007.19, 683405.55, 691539.02, 718143.17],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "insert points/sec": {
+        "average": 180534.789708,
+        "runs": [181937.53, 185202.75, 177931.13, 180196.48, 177406.06],
+        "target": 300000.000000,
+        "passed": false,
+        "higher_is_better": true
+      },
+      "dwithin 100K r=500 (us)": {
+        "average": 5.484824,
+        "runs": [5.50, 5.49, 5.48, 5.47, 5.48],
+        "target": 1500.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "range 100K 1% area (us)": {
+        "average": 7.351804,
+        "runs": [7.23, 7.29, 7.83, 7.22, 7.20],
+        "target": 1500.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "KNN 100K k=10 (us)": {
+        "average": 4.221084,
+        "runs": [4.27, 4.24, 4.20, 4.19, 4.21],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "snapshot roundtrip 100K (ms)": {
+        "average": 27.816740,
+        "runs": [27.65, 28.73, 26.86, 26.93, 28.91],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    }
+  }
+}

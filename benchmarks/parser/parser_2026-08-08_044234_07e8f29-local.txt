@@ -1,0 +1,175 @@
+
+=== Error Recovery Performance Test ===
+  Bad queries: 5, 100,000 iterations per run
+  Validation runs: 5
+  Run 1: 0.259 us/error
+  Run 2: 0.259 us/error
+  Run 3: 0.259 us/error
+  Run 4: 0.259 us/error
+  Run 5: 0.260 us/error
+  Latency (us/error) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 2 (target)
+    Min/Max: 0 / 0, StdDev: 0
+
+=== Lexer Throughput Performance Test ===
+  Workload: 12300 bytes, 1000 iterations per run
+  Validation runs: 5
+  Run 1: 231.7 MB/sec
+  Run 2: 231.8 MB/sec
+  Run 3: 232.0 MB/sec
+  Run 4: 231.6 MB/sec
+  Run 5: 231.6 MB/sec
+  Throughput (MB/sec) [PASS/OK]:
+    Runs: [232, 232, 232, 232, 232]
+    Average: 232 >= 200 (target)
+    Min/Max: 232 / 232, StdDev: 0
+
+=== Memory per Parse Performance Test ===
+  Statement enum: 16 bytes
+  SelectStatement: 304 bytes
+  Expr enum: 64 bytes
+  TableRef enum: 56 bytes
+  Estimated per-parse (bytes) [PASS]: 832 <= 1,024 (target)
+
+=== Parser Complex Query Performance Test ===
+  Iterations per run: 10,000
+  Validation runs: 5
+  Run 1: 8.17 us/parse
+  Run 2: 8.13 us/parse
+  Run 3: 8.13 us/parse
+  Run 4: 8.13 us/parse
+  Run 5: 8.13 us/parse
+  Latency (us/parse) [PASS/OK]:
+    Runs: [8, 8, 8, 8, 8]
+    Average: 8 <= 20 (target)
+    Min/Max: 8 / 8, StdDev: 0
+
+=== Expression - BETWEEN, IN, LIKE ===
+  BETWEEN: PASS
+  IN list: PASS
+  LIKE: PASS
+  IS NULL: PASS
+  IS NOT NULL: PASS
+
+=== Expression - Functions ===
+  COUNT(*): PASS
+  SUM(amount): PASS
+  COALESCE(a, b, c): PASS
+
+=== INSERT Statement ===
+  Multi-row INSERT: PASS
+
+=== CREATE TABLE Statement ===
+  CREATE TABLE with constraints: PASS
+
+=== Lexer - String Escapes ===
+  Single escape: PASS
+  Empty string: PASS
+  Multiple escapes: PASS
+
+=== DELETE Statement ===
+  DELETE FROM WHERE: PASS
+
+=== Round-trip Test ===
+  Round-trip: 23/23 passed
+
+=== Expression - Arithmetic Precedence ===
+  a + b * c = a + (b * c): PASS
+
+=== SELECT - Basic ===
+  SELECT a, b FROM t: PASS
+
+=== Expression - Boolean Precedence ===
+  AND before OR: PASS
+  NOT before AND: PASS
+
+=== Parser Batch Throughput Performance Test ===
+  Query mix: 5 types, 500,000 total per run
+  Validation runs: 5
+  Run 1: 2075133 stmts/sec
+  Run 2: 2079413 stmts/sec
+  Run 3: 2080912 stmts/sec
+  Run 4: 2075990 stmts/sec
+  Run 5: 2077704 stmts/sec
+  Throughput (stmts/sec) [PASS/OK]:
+    Runs: [2,075,133, 2,079,413, 2,080,912, 2,075,990, 2,077,704]
+    Average: 2,077,830 >= 1,000,000 (target)
+    Min/Max: 2,075,133 / 2,080,912, StdDev: 2,130
+
+=== CREATE/DROP INDEX Statement ===
+  CREATE INDEX: PASS
+  DROP INDEX: PASS
+
+=== Lexer - Comments ===
+  Single-line: PASS
+  Block comment: PASS
+  Nested block: PASS
+
+=== Lexer - Numbers ===
+  Integer: PASS
+  Float: PASS
+  Scientific: PASS
+  Negative (unary): PASS
+
+=== Lexer - Quoted Identifiers ===
+  Spaces in ident: PASS
+  Escaped quote: PASS
+
+=== DROP TABLE Statement ===
+  DROP TABLE: PASS
+  DROP TABLE IF EXISTS: PASS
+
+=== Lexer - Tokenize SELECT ===
+  Token sequence: PASS
+  Token types: PASS
+  Span tracking: PASS
+
+============================================
+  Parser: SQL Parser - All Tests Complete
+============================================
+  Lexer:       6 correctness tests
+  Expressions: 4 correctness tests
+  SELECT:      4 correctness tests
+  DML:         3 correctness tests
+  DDL:         3 correctness tests
+  Errors:      1 correctness test (4 cases)
+  Round-trip:  1 test (29 statements)
+  Benchmarks:  6 performance tests
+============================================
+
+=== Error Handling ===
+  SELECT FROM (missing cols): PASS - Parse error: Expected expression, found FROM at line 1, column 18
+  Leftover tokens after typo: PASS - Parse error: Expected a statement, found FORM at line 1, column 20
+  Incomplete WHERE: PASS - Parse error: Expected expression, found end of input at line 1, column 26
+  Unterminated string: PASS - Parse error: Unterminated string literal starting at line 1, column 8
+
+=== Parser Simple Query Performance Test ===
+  Query: SELECT id, name FROM users WHERE active = TRUE
+  Iterations per run: 100,000
+  Validation runs: 5
+  Run 1: 850 ns/parse
+  Run 2: 849 ns/parse
+  Run 3: 847 ns/parse
+  Run 4: 846 ns/parse
+  Run 5: 846 ns/parse
+  Latency (ns/parse) [PASS/OK]:
+    Runs: [850, 849, 847, 846, 846]
+    Average: 848 <= 1,000 (target)
+    Min/Max: 846 / 850, StdDev: 1
+
+=== SELECT - GROUP BY, HAVING, ORDER BY ===
+  GROUP BY + HAVING: PASS
+  ORDER BY DESC NULLS LAST LIMIT OFFSET: PASS
+
+=== SELECT - JOINs ===
+  INNER JOIN ON: PASS
+  LEFT JOIN USING: PASS
+
+=== SELECT - Qualified Wildcard ===
+  t.* wildcard: PASS
+  u.name qualified: PASS
+  Implicit join (FROM t, u): PASS
+
+=== UPDATE Statement ===
+  UPDATE SET WHERE: PASS

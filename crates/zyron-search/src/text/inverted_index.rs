@@ -247,6 +247,60 @@ impl ScoreAccumulator {
             }
         }
     }
+
+    /// Prepares a reused accumulator for a query over the id space [0, max_doc_id]:
+    /// keeps the existing buffer when the variant still fits, clears the previous
+    /// query's touched entries, and grows the dense array only when needed. This
+    /// reuses the score buffer across queries instead of allocating and zeroing a
+    /// fresh one on every call.
+    fn prepare(&mut self, max_doc_id: u64) {
+        let want_dense = max_doc_id < DENSE_SCORE_LIMIT;
+        let compatible = matches!(
+            (&*self, want_dense),
+            (ScoreAccumulator::Dense { .. }, true) | (ScoreAccumulator::Sparse(_), false)
+        );
+        if !compatible {
+            *self = ScoreAccumulator::new(max_doc_id);
+            return;
+        }
+        self.clear_scored();
+        if let ScoreAccumulator::Dense { scores, .. } = self {
+            let needed = (max_doc_id + 1) as usize;
+            if scores.len() < needed {
+                scores.resize(needed, 0.0);
+            }
+        }
+    }
+}
+
+/// Thread-local reusable score accumulator so the dense score buffer is not
+/// reallocated and zeroed on every query. It is prepared per query for the
+/// current id space; only search() borrows it and search() does not recurse
+/// into itself, so there is no reentrancy on the borrow.
+thread_local! {
+    static SCORE_ACC: std::cell::RefCell<ScoreAccumulator> =
+        std::cell::RefCell::new(ScoreAccumulator::new(0));
+    /// Pool of reusable score accumulators for boolean sub-query evaluation.
+    /// A pool (not a single thread-local) because a boolean query needs several
+    /// accumulators at once and sub-queries recurse; each acquire takes a free
+    /// buffer or makes one and returns it on completion, so the 8MB+ dense
+    /// buffers are reused across queries instead of reallocated per sub-clause.
+    static ACC_POOL: std::cell::RefCell<Vec<ScoreAccumulator>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Takes a prepared accumulator from the thread-local pool (or makes one).
+fn acquire_acc(max_id: u64) -> ScoreAccumulator {
+    let mut acc = ACC_POOL
+        .with(|p| p.borrow_mut().pop())
+        .unwrap_or_else(|| ScoreAccumulator::new(max_id));
+    acc.prepare(max_id);
+    acc
+}
+
+/// Returns an accumulator to the thread-local pool for reuse.
+fn release_acc(acc: ScoreAccumulator) {
+    ACC_POOL.with(|p| p.borrow_mut().push(acc));
 }
 
 // ---------------------------------------------------------------------------
@@ -269,7 +323,7 @@ impl Ord for ScoredDoc {
     }
 }
 
-fn top_k_from_accumulator(acc: ScoreAccumulator, limit: usize) -> Vec<(DocId, f64)> {
+fn top_k_from_accumulator(acc: &ScoreAccumulator, limit: usize) -> Vec<(DocId, f64)> {
     match acc {
         ScoreAccumulator::Dense { scores, scored_ids } => {
             if scored_ids.is_empty() {
@@ -277,7 +331,7 @@ fn top_k_from_accumulator(acc: ScoreAccumulator, limit: usize) -> Vec<(DocId, f6
             }
             let mut heap: BinaryHeap<Reverse<ScoredDoc>> = BinaryHeap::with_capacity(limit + 1);
             let mut threshold = f64::NEG_INFINITY;
-            for idx in scored_ids {
+            for &idx in scored_ids {
                 let score = unsafe { *scores.get_unchecked(idx as usize) };
                 if heap.len() >= limit && score <= threshold {
                     continue;
@@ -303,7 +357,7 @@ fn top_k_from_accumulator(acc: ScoreAccumulator, limit: usize) -> Vec<(DocId, f6
             }
             let mut heap: BinaryHeap<Reverse<ScoredDoc>> = BinaryHeap::with_capacity(limit + 1);
             let mut threshold = f64::NEG_INFINITY;
-            for (doc_id, score) in map {
+            for (&doc_id, &score) in map {
                 if heap.len() >= limit && score <= threshold {
                     continue;
                 }
@@ -382,7 +436,6 @@ fn select_score_fn() -> ScoreFn {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn score_avx512(
     doc_ids: &[u64],
     tfs: &[u16],
@@ -396,67 +449,70 @@ unsafe fn score_avx512(
     scored_ids: &mut Vec<u32>,
 ) {
     use std::arch::x86_64::*;
-    let n = doc_ids.len();
-    let chunks = n / 8;
-    let vi = _mm512_set1_pd(idf);
-    let vk = _mm512_set1_pd(k1p1);
-    let v1 = _mm512_set1_pd(k1);
-    let vo = _mm512_set1_pd(omb);
-    let vb = _mm512_set1_pd(bdav);
-    for c in 0..chunks {
-        let b = c * 8;
-        let vt = _mm512_set_pd(
-            tfs[b + 7] as f64,
-            tfs[b + 6] as f64,
-            tfs[b + 5] as f64,
-            tfs[b + 4] as f64,
-            tfs[b + 3] as f64,
-            tfs[b + 2] as f64,
-            tfs[b + 1] as f64,
-            tfs[b] as f64,
-        );
-        let vd = _mm512_set_pd(
-            fls[b + 7] as f64,
-            fls[b + 6] as f64,
-            fls[b + 5] as f64,
-            fls[b + 4] as f64,
-            fls[b + 3] as f64,
-            fls[b + 2] as f64,
-            fls[b + 1] as f64,
-            fls[b] as f64,
-        );
-        let num = _mm512_mul_pd(vt, vk);
-        let den = _mm512_add_pd(
-            vt,
-            _mm512_mul_pd(v1, _mm512_add_pd(vo, _mm512_mul_pd(vb, vd))),
-        );
-        let sc = _mm512_mul_pd(vi, _mm512_div_pd(num, den));
-        let mut out = [0.0f64; 8];
-        _mm512_storeu_pd(out.as_mut_ptr(), sc);
-        for j in 0..8 {
-            let did = *doc_ids.get_unchecked(b + j) as usize;
+
+    // SAFETY: caller guarantees the input pointers are valid for the given length and that the required CPU feature is present
+    unsafe {
+        let n = doc_ids.len();
+        let chunks = n / 8;
+        let vi = _mm512_set1_pd(idf);
+        let vk = _mm512_set1_pd(k1p1);
+        let v1 = _mm512_set1_pd(k1);
+        let vo = _mm512_set1_pd(omb);
+        let vb = _mm512_set1_pd(bdav);
+        for c in 0..chunks {
+            let b = c * 8;
+            let vt = _mm512_set_pd(
+                tfs[b + 7] as f64,
+                tfs[b + 6] as f64,
+                tfs[b + 5] as f64,
+                tfs[b + 4] as f64,
+                tfs[b + 3] as f64,
+                tfs[b + 2] as f64,
+                tfs[b + 1] as f64,
+                tfs[b] as f64,
+            );
+            let vd = _mm512_set_pd(
+                fls[b + 7] as f64,
+                fls[b + 6] as f64,
+                fls[b + 5] as f64,
+                fls[b + 4] as f64,
+                fls[b + 3] as f64,
+                fls[b + 2] as f64,
+                fls[b + 1] as f64,
+                fls[b] as f64,
+            );
+            let num = _mm512_mul_pd(vt, vk);
+            let den = _mm512_add_pd(
+                vt,
+                _mm512_mul_pd(v1, _mm512_add_pd(vo, _mm512_mul_pd(vb, vd))),
+            );
+            let sc = _mm512_mul_pd(vi, _mm512_div_pd(num, den));
+            let mut out = [0.0f64; 8];
+            _mm512_storeu_pd(out.as_mut_ptr(), sc);
+            for j in 0..8 {
+                let did = *doc_ids.get_unchecked(b + j) as usize;
+                let slot = scores.get_unchecked_mut(did);
+                if *slot == 0.0 {
+                    scored_ids.push(did as u32);
+                }
+                *slot += *out.get_unchecked(j);
+            }
+        }
+        for i in (chunks * 8)..n {
+            let sc = idf
+                * ((tfs[i] as f64 * k1p1) / (tfs[i] as f64 + k1 * (omb + bdav * fls[i] as f64)));
+            let did = doc_ids[i] as usize;
             let slot = scores.get_unchecked_mut(did);
             if *slot == 0.0 {
                 scored_ids.push(did as u32);
             }
-            *slot += *out.get_unchecked(j);
+            *slot += sc;
         }
-    }
-    for i in (chunks * 8)..n {
-        let sc =
-            idf * ((tfs[i] as f64 * k1p1) / (tfs[i] as f64 + k1 * (omb + bdav * fls[i] as f64)));
-        let did = doc_ids[i] as usize;
-        let slot = scores.get_unchecked_mut(did);
-        if *slot == 0.0 {
-            scored_ids.push(did as u32);
-        }
-        *slot += sc;
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn score_avx2(
     doc_ids: &[u64],
     tfs: &[u16],
@@ -470,59 +526,62 @@ unsafe fn score_avx2(
     scored_ids: &mut Vec<u32>,
 ) {
     use std::arch::x86_64::*;
-    let n = doc_ids.len();
-    let chunks = n / 4;
-    let vi = _mm256_set1_pd(idf);
-    let vk = _mm256_set1_pd(k1p1);
-    let v1 = _mm256_set1_pd(k1);
-    let vo = _mm256_set1_pd(omb);
-    let vb = _mm256_set1_pd(bdav);
-    for c in 0..chunks {
-        let b = c * 4;
-        let vt = _mm256_set_pd(
-            tfs[b + 3] as f64,
-            tfs[b + 2] as f64,
-            tfs[b + 1] as f64,
-            tfs[b] as f64,
-        );
-        let vd = _mm256_set_pd(
-            fls[b + 3] as f64,
-            fls[b + 2] as f64,
-            fls[b + 1] as f64,
-            fls[b] as f64,
-        );
-        let num = _mm256_mul_pd(vt, vk);
-        let den = _mm256_add_pd(
-            vt,
-            _mm256_mul_pd(v1, _mm256_add_pd(vo, _mm256_mul_pd(vb, vd))),
-        );
-        let sc = _mm256_mul_pd(vi, _mm256_div_pd(num, den));
-        let mut out = [0.0f64; 4];
-        _mm256_storeu_pd(out.as_mut_ptr(), sc);
-        for j in 0..4 {
-            let did = *doc_ids.get_unchecked(b + j) as usize;
+
+    // SAFETY: caller guarantees the input pointers are valid for the given length and that the required CPU feature is present
+    unsafe {
+        let n = doc_ids.len();
+        let chunks = n / 4;
+        let vi = _mm256_set1_pd(idf);
+        let vk = _mm256_set1_pd(k1p1);
+        let v1 = _mm256_set1_pd(k1);
+        let vo = _mm256_set1_pd(omb);
+        let vb = _mm256_set1_pd(bdav);
+        for c in 0..chunks {
+            let b = c * 4;
+            let vt = _mm256_set_pd(
+                tfs[b + 3] as f64,
+                tfs[b + 2] as f64,
+                tfs[b + 1] as f64,
+                tfs[b] as f64,
+            );
+            let vd = _mm256_set_pd(
+                fls[b + 3] as f64,
+                fls[b + 2] as f64,
+                fls[b + 1] as f64,
+                fls[b] as f64,
+            );
+            let num = _mm256_mul_pd(vt, vk);
+            let den = _mm256_add_pd(
+                vt,
+                _mm256_mul_pd(v1, _mm256_add_pd(vo, _mm256_mul_pd(vb, vd))),
+            );
+            let sc = _mm256_mul_pd(vi, _mm256_div_pd(num, den));
+            let mut out = [0.0f64; 4];
+            _mm256_storeu_pd(out.as_mut_ptr(), sc);
+            for j in 0..4 {
+                let did = *doc_ids.get_unchecked(b + j) as usize;
+                let slot = scores.get_unchecked_mut(did);
+                if *slot == 0.0 {
+                    scored_ids.push(did as u32);
+                }
+                *slot += *out.get_unchecked(j);
+            }
+        }
+        for i in (chunks * 4)..n {
+            let sc = idf
+                * ((tfs[i] as f64 * k1p1) / (tfs[i] as f64 + k1 * (omb + bdav * fls[i] as f64)));
+            let did = doc_ids[i] as usize;
             let slot = scores.get_unchecked_mut(did);
             if *slot == 0.0 {
                 scored_ids.push(did as u32);
             }
-            *slot += *out.get_unchecked(j);
+            *slot += sc;
         }
-    }
-    for i in (chunks * 4)..n {
-        let sc =
-            idf * ((tfs[i] as f64 * k1p1) / (tfs[i] as f64 + k1 * (omb + bdav * fls[i] as f64)));
-        let did = doc_ids[i] as usize;
-        let slot = scores.get_unchecked_mut(did);
-        if *slot == 0.0 {
-            scored_ids.push(did as u32);
-        }
-        *slot += sc;
     }
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn score_neon(
     doc_ids: &[u64],
     tfs: &[u16],
@@ -536,48 +595,51 @@ unsafe fn score_neon(
     scored_ids: &mut Vec<u32>,
 ) {
     use std::arch::aarch64::*;
-    let n = doc_ids.len();
-    let chunks = n / 2;
-    let vi = vdupq_n_f64(idf);
-    let vk = vdupq_n_f64(k1p1);
-    let v1 = vdupq_n_f64(k1);
-    let vo = vdupq_n_f64(omb);
-    let vb = vdupq_n_f64(bdav);
-    for c in 0..chunks {
-        let b = c * 2;
-        let ta = [tfs[b] as f64, tfs[b + 1] as f64];
-        let da = [fls[b] as f64, fls[b + 1] as f64];
-        let vt = vld1q_f64(ta.as_ptr());
-        let vd = vld1q_f64(da.as_ptr());
-        let num = vmulq_f64(vt, vk);
-        let den = vaddq_f64(vt, vmulq_f64(v1, vaddq_f64(vo, vmulq_f64(vb, vd))));
-        let sc = vmulq_f64(vi, vdivq_f64(num, den));
-        let mut out = [0.0f64; 2];
-        vst1q_f64(out.as_mut_ptr(), sc);
-        for j in 0..2 {
-            let did = *doc_ids.get_unchecked(b + j) as usize;
+
+    // SAFETY: caller guarantees the input pointers are valid for the given length and that the required CPU feature is present
+    unsafe {
+        let n = doc_ids.len();
+        let chunks = n / 2;
+        let vi = vdupq_n_f64(idf);
+        let vk = vdupq_n_f64(k1p1);
+        let v1 = vdupq_n_f64(k1);
+        let vo = vdupq_n_f64(omb);
+        let vb = vdupq_n_f64(bdav);
+        for c in 0..chunks {
+            let b = c * 2;
+            let ta = [tfs[b] as f64, tfs[b + 1] as f64];
+            let da = [fls[b] as f64, fls[b + 1] as f64];
+            let vt = vld1q_f64(ta.as_ptr());
+            let vd = vld1q_f64(da.as_ptr());
+            let num = vmulq_f64(vt, vk);
+            let den = vaddq_f64(vt, vmulq_f64(v1, vaddq_f64(vo, vmulq_f64(vb, vd))));
+            let sc = vmulq_f64(vi, vdivq_f64(num, den));
+            let mut out = [0.0f64; 2];
+            vst1q_f64(out.as_mut_ptr(), sc);
+            for j in 0..2 {
+                let did = *doc_ids.get_unchecked(b + j) as usize;
+                let slot = scores.get_unchecked_mut(did);
+                if *slot == 0.0 {
+                    scored_ids.push(did as u32);
+                }
+                *slot += *out.get_unchecked(j);
+            }
+        }
+        if n % 2 != 0 {
+            let i = n - 1;
+            let sc = idf
+                * ((tfs[i] as f64 * k1p1) / (tfs[i] as f64 + k1 * (omb + bdav * fls[i] as f64)));
+            let did = doc_ids[i] as usize;
             let slot = scores.get_unchecked_mut(did);
             if *slot == 0.0 {
                 scored_ids.push(did as u32);
             }
-            *slot += *out.get_unchecked(j);
+            *slot += sc;
         }
-    }
-    if n % 2 != 0 {
-        let i = n - 1;
-        let sc =
-            idf * ((tfs[i] as f64 * k1p1) / (tfs[i] as f64 + k1 * (omb + bdav * fls[i] as f64)));
-        let did = doc_ids[i] as usize;
-        let slot = scores.get_unchecked_mut(did);
-        if *slot == 0.0 {
-            scored_ids.push(did as u32);
-        }
-        *slot += sc;
     }
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn score_generic(
     doc_ids: &[u64],
     tfs: &[u16],
@@ -590,15 +652,18 @@ unsafe fn score_generic(
     scores: &mut [f64],
     scored_ids: &mut Vec<u32>,
 ) {
-    for i in 0..doc_ids.len() {
-        let sc =
-            idf * ((tfs[i] as f64 * k1p1) / (tfs[i] as f64 + k1 * (omb + bdav * fls[i] as f64)));
-        let did = doc_ids[i] as usize;
-        let slot = scores.get_unchecked_mut(did);
-        if *slot == 0.0 {
-            scored_ids.push(did as u32);
+    // SAFETY: caller guarantees the input pointers are valid for the given length and that the required CPU feature is present
+    unsafe {
+        for i in 0..doc_ids.len() {
+            let sc = idf
+                * ((tfs[i] as f64 * k1p1) / (tfs[i] as f64 + k1 * (omb + bdav * fls[i] as f64)));
+            let did = doc_ids[i] as usize;
+            let slot = scores.get_unchecked_mut(did);
+            if *slot == 0.0 {
+                scored_ids.push(did as u32);
+            }
+            *slot += sc;
         }
-        *slot += sc;
     }
 }
 
@@ -878,9 +943,12 @@ impl InvertedIndex {
         limit: usize,
     ) -> Result<Vec<(DocId, f64)>> {
         let max_id = self.max_doc_id.load(Ordering::Relaxed);
-        let mut acc = ScoreAccumulator::new(max_id);
-        self.score_query(query, analyzer, scorer, &mut acc)?;
-        Ok(top_k_from_accumulator(acc, limit))
+        SCORE_ACC.with(|cell| {
+            let mut acc = cell.borrow_mut();
+            acc.prepare(max_id);
+            self.score_query(query, analyzer, scorer, &mut acc)?;
+            Ok(top_k_from_accumulator(&acc, limit))
+        })
     }
 
     fn score_query(
@@ -1072,13 +1140,14 @@ impl InvertedIndex {
         let blen = ((max_id + 64) / 64) as usize + 1;
         let mut excluded = vec![0u64; blen];
         for sub in must_not {
-            let mut sa = ScoreAccumulator::new(max_id);
+            let mut sa = acquire_acc(max_id);
             self.score_query(sub, analyzer, scorer, &mut sa)?;
-            if let ScoreAccumulator::Dense { scored_ids, .. } = sa {
-                for &idx in &scored_ids {
+            if let ScoreAccumulator::Dense { scored_ids, .. } = &sa {
+                for &idx in scored_ids {
                     excluded[idx as usize / 64] |= 1u64 << (idx as usize % 64);
                 }
             }
+            release_acc(sa);
         }
         let is_excl = |d: DocId| -> bool {
             let i = d as usize;
@@ -1164,14 +1233,14 @@ impl InvertedIndex {
             } else {
                 // Fallback: complex sub-queries. Use original per-sub-query approach.
                 drop(postings);
-                let mut combined = ScoreAccumulator::new(max_id);
+                let mut combined = acquire_acc(max_id);
                 let mut hits: Vec<u8> = vec![0u8; (max_id + 1) as usize];
                 let must_len = must.len() as u8;
                 for sub in must {
-                    let mut sa = ScoreAccumulator::new(max_id);
+                    let mut sa = acquire_acc(max_id);
                     self.score_query(sub, analyzer, scorer, &mut sa)?;
-                    if let ScoreAccumulator::Dense { scores, scored_ids } = sa {
-                        for &idx in &scored_ids {
+                    if let ScoreAccumulator::Dense { scores, scored_ids } = &sa {
+                        for &idx in scored_ids {
                             if is_excl(idx as DocId) {
                                 continue;
                             }
@@ -1179,6 +1248,7 @@ impl InvertedIndex {
                             combined.add(idx as DocId, scores[idx as usize]);
                         }
                     }
+                    release_acc(sa);
                 }
                 if let ScoreAccumulator::Dense { scores, scored_ids } = &combined {
                     for &idx in scored_ids {
@@ -1187,6 +1257,7 @@ impl InvertedIndex {
                         }
                     }
                 }
+                release_acc(combined);
             }
         }
 
@@ -1230,10 +1301,10 @@ impl InvertedIndex {
             } else {
                 // Fallback: complex should clauses or no must.
                 for sub in should {
-                    let mut sa = ScoreAccumulator::new(max_id);
+                    let mut sa = acquire_acc(max_id);
                     self.score_query(sub, analyzer, scorer, &mut sa)?;
-                    if let ScoreAccumulator::Dense { scores, scored_ids } = sa {
-                        for &idx in &scored_ids {
+                    if let ScoreAccumulator::Dense { scores, scored_ids } = &sa {
+                        for &idx in scored_ids {
                             if is_excl(idx as DocId) {
                                 continue;
                             }
@@ -1247,6 +1318,7 @@ impl InvertedIndex {
                             }
                         }
                     }
+                    release_acc(sa);
                 }
             }
         }
@@ -2303,7 +2375,7 @@ mod tests {
         acc.add(5, 1.0);
         acc.add(10, 2.0);
         acc.add(5, 0.5);
-        let r = top_k_from_accumulator(acc, 10);
+        let r = top_k_from_accumulator(&acc, 10);
         assert_eq!(r.len(), 2);
     }
     #[test]

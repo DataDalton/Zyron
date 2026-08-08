@@ -48,6 +48,6 @@ pub use tuple::{
 };
 pub use txn::{
     GcStats, IntentLockTable, IsolationLevel, LockTable, MvccGc, RetentionClock, Savepoint,
-    Snapshot, Transaction, TransactionManager, TransactionStatus, TxnStatus, TxnStatusMap,
-    WaitForGraph,
+    SavepointRollback, Snapshot, Transaction, TransactionManager, TransactionStatus, TxnStatus,
+    TxnStatusMap, TxnUndoLog, UndoEntry, WaitForGraph,
 };

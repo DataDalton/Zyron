@@ -427,6 +427,69 @@ pub fn vacuum_index_cleanup(
     }
 }
 
+/// Rebuilds one B+tree index's entries from a page's live rows during REINDEX.
+/// `live` carries each live tuple's (slot, row image) read from the heap, in the
+/// same table-column order the insert path produces. The composite key (the
+/// indexed value followed by the row's tuple id) is encoded exactly as
+/// `maintain_btree_insert` builds it, so the rebuilt tree is identical to one
+/// populated incrementally. Returns the number of entries inserted.
+pub fn rebuild_btree_index_from_rows(
+    table_entry: &zyron_catalog::TableEntry,
+    page_id: zyron_common::page::PageId,
+    live: &[(u16, Vec<u8>)],
+    col_id: zyron_catalog::ColumnId,
+    btree: &Arc<zyron_storage::BTreeIndex>,
+) -> usize {
+    if live.is_empty() {
+        return 0;
+    }
+    let Some(col_pos) = table_entry.columns.iter().position(|c| c.id == col_id) else {
+        return 0;
+    };
+    let col_type = table_entry.columns[col_pos].type_id;
+
+    // Decode the live rows into a batch with every table column in order, so a
+    // column position indexes both the table and the batch.
+    let logical: Vec<LogicalColumn> = table_entry
+        .columns
+        .iter()
+        .map(|c| LogicalColumn {
+            table_idx: Some(0),
+            column_id: c.id,
+            name: c.name.clone(),
+            type_id: c.type_id,
+            nullable: c.nullable,
+            ts_precision: c.ts_precision,
+        })
+        .collect();
+    let col_ids: Vec<zyron_catalog::ColumnId> = table_entry.columns.iter().map(|c| c.id).collect();
+    let column_to_builder = build_column_to_builder_map(&table_entry.columns, &col_ids);
+    let mut builders = create_builders(&logical, live.len());
+    for (_slot, row_data) in live {
+        decode_tuple_into_builders(
+            row_data,
+            &table_entry.columns,
+            &column_to_builder,
+            &mut builders,
+        );
+    }
+    let batch = finalize_builders(builders);
+
+    let mut inserted = 0usize;
+    let mut scratch: Vec<u8> = Vec::with_capacity(24);
+    for (row_idx, (slot, _)) in live.iter().enumerate() {
+        scratch.clear();
+        if encode_btree_key_into(&batch, row_idx, col_pos, col_type, &mut scratch) {
+            let tid = TupleId::new(zyron_common::page::PageId::new(0, page_id.page_num), *slot);
+            append_index_tid_suffix(&mut scratch, tid.page_id.page_num, tid.slot_id);
+            if btree.insert_sync(&scratch, tid).is_ok() {
+                inserted += 1;
+            }
+        }
+    }
+    inserted
+}
+
 /// Extracts text content from a DataBatch row for FTS indexing into a reusable buffer.
 /// Concatenates all text-type columns (Varchar, Text, Char) for the given row
 /// into the buffer, separated by spaces. The caller should call buf.clear() between rows.
@@ -1111,6 +1174,8 @@ impl Operator for InsertOperator {
             }
             self.finished = true;
 
+            self.ctx.ensure_writable("INSERT")?;
+
             let table_entry = self.ctx.get_table_entry(self.table_id)?;
             let heap_file = self.ctx.get_heap_file(self.table_id).await?;
             let mut total_inserted: i64 = 0;
@@ -1388,6 +1453,19 @@ impl Operator for InsertOperator {
 
                 total_inserted += tuples.len() as i64;
 
+                // Record a reverse-insert per row so ROLLBACK TO SAVEPOINT
+                // self-deletes these rows. Gated on an open savepoint, so the
+                // common path records nothing.
+                if self.ctx.recording_undo() {
+                    for tid in &tuple_ids {
+                        self.ctx.record_insert_undo(
+                            table_entry.heap_file_id,
+                            table_entry.fsm_file_id,
+                            *tid,
+                        );
+                    }
+                }
+
                 // Maintain FTS indexes: add each inserted document.
                 let fts_indexes: &[(zyron_catalog::IndexId, Arc<zyron_search::InvertedIndex>)] =
                     fts_resolved.as_slice();
@@ -1564,6 +1642,8 @@ impl Operator for DeleteOperator {
             }
             self.finished = true;
 
+            self.ctx.ensure_writable("DELETE")?;
+
             let heap_file = self.ctx.get_heap_file(self.table_id).await?;
             let mut total_deleted: i64 = 0;
             let txn_id = self.ctx.txn_id;
@@ -1707,6 +1787,17 @@ impl Operator for DeleteOperator {
 
                 total_deleted += deleted as i64;
 
+                // Record a reverse-delete per row so ROLLBACK TO SAVEPOINT
+                // clears the xmax stamp and restores the row. Gated on an open
+                // savepoint. Only the rows actually stamped are reversible.
+                if self.ctx.recording_undo() {
+                    let te = self.ctx.get_table_entry(self.table_id)?;
+                    for tid in &tuple_ids {
+                        self.ctx
+                            .record_delete_undo(te.heap_file_id, te.fsm_file_id, *tid);
+                    }
+                }
+
                 // Maintain FTS indexes: remove deleted documents.
                 let fts_indexes = self.ctx.fts_indexes_for_table(self.table_id.0);
                 if !fts_indexes.is_empty() {
@@ -1846,10 +1937,23 @@ impl Operator for UpdateOperator {
             }
             self.finished = true;
 
+            self.ctx.ensure_writable("UPDATE")?;
+
             let table_entry = self.ctx.get_table_entry(self.table_id)?;
             let heap_file = self.ctx.get_heap_file(self.table_id).await?;
             let mut total_updated: i64 = 0;
             let txn_id = self.ctx.txn_id;
+
+            // FTS and vector indexes have no MVCC visibility recheck, so their
+            // maintenance is deferred into these buffers and applied only after
+            // the whole statement's batch loop completes. A mid-statement error
+            // returns early and drops the buffers, leaving no orphaned entries.
+            // Deletes are applied before inserts so a reused heap slot's new
+            // document is not clobbered by a queued delete of the old one.
+            let mut deferred_fts_deletes: Vec<u64> = Vec::new();
+            let mut deferred_fts_inserts: Vec<(u64, String)> = Vec::new();
+            let mut deferred_vec_deletes: Vec<u64> = Vec::new();
+            let mut deferred_vec_inserts: Vec<(u32, u64, Vec<f32>)> = Vec::new();
 
             loop {
                 self.ctx.check_cancelled()?;
@@ -2113,6 +2217,20 @@ impl Operator for UpdateOperator {
                     gm.invalidate_for_table(self.table_id.0);
                 }
 
+                // Record reverse-delete for each old image so ROLLBACK TO
+                // SAVEPOINT restores it (an UPDATE is delete-old then
+                // insert-new). Gated on an open savepoint. Recorded before the
+                // reverse-insert below so the log reverses insert-then-delete.
+                if self.ctx.recording_undo() {
+                    for tid in &tuple_ids {
+                        self.ctx.record_delete_undo(
+                            table_entry.heap_file_id,
+                            table_entry.fsm_file_id,
+                            *tid,
+                        );
+                    }
+                }
+
                 // Stamp deleted pages with WAL LSN for checkpoint ordering.
                 // Duplicate page_ids are harmless: set_dirty_lsn uses CAS from 0.
                 for tid in &tuple_ids {
@@ -2132,6 +2250,18 @@ impl Operator for UpdateOperator {
                 let new_tuple_ids = heap_file.insert_batch(&new_tuples).await?;
                 #[cfg(feature = "profile")]
                 drop(_heap_span);
+
+                // Record reverse-insert for each new image so ROLLBACK TO
+                // SAVEPOINT self-deletes it. Gated on an open savepoint.
+                if self.ctx.recording_undo() {
+                    for tid in &new_tuple_ids {
+                        self.ctx.record_insert_undo(
+                            table_entry.heap_file_id,
+                            table_entry.fsm_file_id,
+                            *tid,
+                        );
+                    }
+                }
 
                 // Stamp inserted pages with WAL LSN for checkpoint ordering.
                 for tid in &new_tuple_ids {
@@ -2162,24 +2292,17 @@ impl Operator for UpdateOperator {
                     );
                 }
 
-                // Maintain FTS indexes: delete old docs, add new docs.
+                // Queue FTS maintenance: old doc deletes and new doc inserts are
+                // buffered and applied after the statement succeeds.
                 let fts_indexes = self.ctx.fts_indexes_for_table(self.table_id.0);
                 if !fts_indexes.is_empty() {
-                    let analyzer = zyron_search::SimpleAnalyzer;
-                    let mut fts_buf = zyron_search::AnalysisBuffer::new();
-                    // Delete old documents
                     for tid in &tuple_ids {
                         if let Ok(doc_id) =
                             zyron_search::encode_doc_id(tid.page_id.page_num, tid.slot_id)
                         {
-                            for (idx_id, fts_idx) in &fts_indexes {
-                                if let Err(e) = fts_idx.delete_document(doc_id) {
-                                    eprintln!("FTS index {} update-delete failed: {e}", idx_id.0);
-                                }
-                            }
+                            deferred_fts_deletes.push(doc_id);
                         }
                     }
-                    // Add new documents
                     let mut text_buf = String::with_capacity(256);
                     for (row_idx, tid) in new_tuple_ids.iter().enumerate() {
                         let doc_id =
@@ -2191,43 +2314,21 @@ impl Operator for UpdateOperator {
                             &table_entry.columns,
                             &mut text_buf,
                         );
-                        for (idx_id, fts_idx) in &fts_indexes {
-                            if let Err(e) = fts_idx.add_document_with_buf(
-                                doc_id,
-                                &text_buf,
-                                &analyzer,
-                                &mut fts_buf,
-                            ) {
-                                eprintln!("FTS index {} update-insert failed: {e}", idx_id.0);
-                            }
-                        }
+                        deferred_fts_inserts.push((doc_id, text_buf.clone()));
                     }
                 }
 
-                // Maintain vector indexes: delete old vectors, insert new vectors.
+                // Queue vector maintenance: old vector deletes and new vector
+                // inserts are buffered per index and applied after success.
                 let vec_index_ids = self.ctx.vector_indexes_for_table(self.table_id.0);
                 if !vec_index_ids.is_empty() {
-                    // Delete old vectors
                     for tid in &tuple_ids {
                         if let Ok(vec_id) =
                             zyron_search::encode_doc_id(tid.page_id.page_num, tid.slot_id)
                         {
-                            for &idx_id in &vec_index_ids {
-                                if let Some(vec_idx) = self.ctx.get_vector_index(idx_id) {
-                                    if let Err(e) = zyron_search::vector::VectorSearch::delete(
-                                        vec_idx.as_ref(),
-                                        vec_id,
-                                    ) {
-                                        eprintln!(
-                                            "vector index {} update-delete failed: {e}",
-                                            idx_id
-                                        );
-                                    }
-                                }
-                            }
+                            deferred_vec_deletes.push(vec_id);
                         }
                     }
-                    // Insert new vectors, routing each index to its own column.
                     for (row_idx, tid) in new_tuple_ids.iter().enumerate() {
                         let vec_id =
                             zyron_search::encode_doc_id(tid.page_id.page_num, tid.slot_id)?;
@@ -2242,14 +2343,8 @@ impl Operator for UpdateOperator {
                                 &table_entry.columns,
                                 col_id,
                             ) {
-                                let vec_data = bytes_to_f32_slice(vec_bytes);
-                                if let Err(e) = zyron_search::vector::VectorSearch::insert(
-                                    vec_idx.as_ref(),
-                                    vec_id,
-                                    vec_data,
-                                ) {
-                                    eprintln!("vector index {} update-insert failed: {e}", idx_id);
-                                }
+                                let vec_data = bytes_to_f32_slice(vec_bytes).to_vec();
+                                deferred_vec_inserts.push((idx_id, vec_id, vec_data));
                             }
                         }
                     }
@@ -2288,6 +2383,57 @@ impl Operator for UpdateOperator {
                     &table_entry.columns,
                 )
                 .await?;
+            }
+
+            // The statement succeeded, so apply the buffered FTS and vector
+            // index maintenance now. Deletes run before inserts so a reused
+            // heap slot's new entry survives a queued delete of the old one.
+            let fts_indexes = self.ctx.fts_indexes_for_table(self.table_id.0);
+            if !fts_indexes.is_empty() {
+                for &doc_id in &deferred_fts_deletes {
+                    for (idx_id, fts_idx) in &fts_indexes {
+                        if let Err(e) = fts_idx.delete_document(doc_id) {
+                            eprintln!("FTS index {} update-delete failed: {e}", idx_id.0);
+                        }
+                    }
+                }
+                let analyzer = zyron_search::SimpleAnalyzer;
+                let mut fts_buf = zyron_search::AnalysisBuffer::new();
+                for (doc_id, text) in &deferred_fts_inserts {
+                    for (idx_id, fts_idx) in &fts_indexes {
+                        if let Err(e) =
+                            fts_idx.add_document_with_buf(*doc_id, text, &analyzer, &mut fts_buf)
+                        {
+                            eprintln!("FTS index {} update-insert failed: {e}", idx_id.0);
+                        }
+                    }
+                }
+            }
+
+            let vec_index_ids = self.ctx.vector_indexes_for_table(self.table_id.0);
+            if !vec_index_ids.is_empty() {
+                for &vec_id in &deferred_vec_deletes {
+                    for &idx_id in &vec_index_ids {
+                        if let Some(vec_idx) = self.ctx.get_vector_index(idx_id) {
+                            if let Err(e) =
+                                zyron_search::vector::VectorSearch::delete(vec_idx.as_ref(), vec_id)
+                            {
+                                eprintln!("vector index {idx_id} update-delete failed: {e}");
+                            }
+                        }
+                    }
+                }
+                for (idx_id, vec_id, vec_data) in &deferred_vec_inserts {
+                    if let Some(vec_idx) = self.ctx.get_vector_index(*idx_id) {
+                        if let Err(e) = zyron_search::vector::VectorSearch::insert(
+                            vec_idx.as_ref(),
+                            *vec_id,
+                            vec_data,
+                        ) {
+                            eprintln!("vector index {idx_id} update-insert failed: {e}");
+                        }
+                    }
+                }
             }
 
             Ok(Some(ExecutionBatch::new(count_batch(total_updated))))
