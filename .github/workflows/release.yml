@@ -181,7 +181,7 @@ jobs:
           else
             cp "$bindir/zyrondb-server" "$bindir/zyrondb-cli" "$bindir/zyrondb-ctl" "dist/$stem/"
           fi
-          cp README.md LICENSE "dist/$stem/"
+          cp README.md LICENSE.md "dist/$stem/"
           cp version-output.txt "dist/$stem/VERSION.txt"
 
           cd dist
@@ -321,7 +321,11 @@ jobs:
 
           ---
 
-          ZyronDB is a product of Zyron LLC. See LICENSE for terms.
+          Copyright (c) 2026 Zyron LLC. All rights reserved. ZyronDB is
+          proprietary software. Personal use is free, commercial use requires a
+          license. See
+          [LICENSE](https://github.com/DataDalton/Zyron/blob/main/LICENSE.md)
+          for the full terms.
           EOF
           cat notes.md
 
