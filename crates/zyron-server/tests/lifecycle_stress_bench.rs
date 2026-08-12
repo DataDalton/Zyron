@@ -33,23 +33,15 @@ impl DiskLayout {
 
 async fn open_catalog(layout: &DiskLayout) -> Arc<Catalog> {
     let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir: layout.wal_dir.clone(),
-            segment_size: 4 * 1024 * 1024,
-            fsync_enabled: true,
-            ring_buffer_capacity: 1 * 1024 * 1024,
-        })
+        WalWriter::new(zyron_bench_harness::wal_config(layout.wal_dir.clone()))
         .unwrap(),
     );
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir: layout.data_dir.clone(),
-            fsync_enabled: true,
-        })
+        DiskManager::new(zyron_bench_harness::disk_config(layout.data_dir.clone()))
         .await
         .unwrap(),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 256 }));
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let storage = Arc::new(HeapCatalogStorage::new(disk, pool).unwrap());
     let cache = Arc::new(CatalogCache::new(4096, 256));
     Arc::new(Catalog::new(storage, cache, wal).await.unwrap())

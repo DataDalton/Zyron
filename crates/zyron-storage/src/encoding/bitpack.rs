@@ -137,6 +137,63 @@ impl Encoding for BitPackEncoding {
         Ok(out)
     }
 
+    /// Every residual is the same width, so row i sits at bit offset
+    /// `i * bit_width` and a range starts there rather than at the segment
+    /// start. Reading one row costs one unpack whatever the segment holds
+    fn decode_range(
+        &self,
+        encoded: &[u8],
+        row_count: usize,
+        value_size: usize,
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<u8>> {
+        let (start, end) = crate::encoding::clamp_range(row_count, start, end);
+        if start == end {
+            return Ok(Vec::new());
+        }
+        if encoded.len() < 13 {
+            return Err(ZyronError::DecodingFailed(
+                "bitpack header too short".to_string(),
+            ));
+        }
+        let bitWidth = encoded[0];
+        if bitWidth == 0 || bitWidth > 64 {
+            return Err(ZyronError::DecodingFailed(format!(
+                "invalid bit width: {}",
+                bitWidth
+            )));
+        }
+        let storedValueSize =
+            u32::from_le_bytes([encoded[1], encoded[2], encoded[3], encoded[4]]) as usize;
+        if storedValueSize != value_size {
+            return Err(ZyronError::DecodingFailed(format!(
+                "bitpack value_size mismatch: stored {}, expected {}",
+                storedValueSize, value_size
+            )));
+        }
+        let baseValue = u64::from_le_bytes([
+            encoded[5],
+            encoded[6],
+            encoded[7],
+            encoded[8],
+            encoded[9],
+            encoded[10],
+            encoded[11],
+            encoded[12],
+        ]);
+        let packed = &encoded[13..];
+        let taken = end - start;
+        let mut out = vec![0u8; taken * value_size];
+        let mut bitOffset: u64 = start as u64 * bitWidth as u64;
+        for i in 0..taken {
+            let residual = unpack_value(packed, bitOffset, bitWidth);
+            write_value_from_u64(&mut out, i, value_size, residual + baseValue);
+            bitOffset += bitWidth as u64;
+        }
+        Ok(out)
+    }
+
     fn eval_predicate(
         &self,
         encoded: &[u8],

@@ -142,6 +142,13 @@ impl ColumnBuilder {
         self.data.push_scalar(scalar);
     }
 
+    /// Appends a value the caller is done with, moving a text or binary
+    /// cell's allocation into the column rather than copying it.
+    pub fn push_owned(&mut self, scalar: ScalarValue) {
+        self.nulls.push(scalar.is_null());
+        self.data.push_scalar_owned(scalar);
+    }
+
     pub fn push_null(&mut self) {
         self.nulls.push(true);
         self.data.push_scalar(&ScalarValue::Null);
@@ -359,7 +366,7 @@ fn tuple_decodes_within_bounds(data: &[u8], columns: &[ColumnEntry]) -> bool {
 }
 
 /// Decodes a fixed-size value from raw bytes into a ScalarValue.
-pub(crate) fn decode_fixed_scalar(type_id: TypeId, bytes: &[u8]) -> ScalarValue {
+pub fn decode_fixed_scalar(type_id: TypeId, bytes: &[u8]) -> ScalarValue {
     match type_id {
         TypeId::Null => ScalarValue::Null,
         TypeId::Boolean => ScalarValue::Boolean(bytes[0] != 0),
@@ -393,18 +400,15 @@ pub(crate) fn decode_fixed_scalar(type_id: TypeId, bytes: &[u8]) -> ScalarValue 
 }
 
 /// Decodes a variable-length value from raw bytes into a ScalarValue.
-pub(crate) fn decode_varlen_scalar(type_id: TypeId, bytes: &[u8]) -> ScalarValue {
+pub fn decode_varlen_scalar(type_id: TypeId, bytes: &[u8]) -> ScalarValue {
     match type_id {
         TypeId::Char | TypeId::Varchar | TypeId::Text | TypeId::Json | TypeId::Jsonb => {
             ScalarValue::Utf8(String::from_utf8_lossy(bytes).into_owned())
         }
-        TypeId::Binary
-        | TypeId::Varbinary
-        | TypeId::Bytea
-        | TypeId::Array
-        | TypeId::Composite
-        | TypeId::Vector => ScalarValue::Binary(bytes.to_vec()),
-        _ => ScalarValue::Null,
+        // Every other variable-length type (geometry, matrix, range, the
+        // sketch family, and future additions) is byte-backed. A type list
+        // here would silently turn unlisted values into NULL
+        _ => ScalarValue::Binary(bytes.to_vec()),
     }
 }
 
@@ -438,7 +442,7 @@ pub fn encode_row(batch: &DataBatch, row_idx: usize, columns: &[ColumnEntry]) ->
         } else if is_null {
             buf.extend_from_slice(&0u32.to_le_bytes());
         } else {
-            encode_varlen_scalar(&mut buf, col.type_id, &column.data.get_scalar(row_idx));
+            encode_varlen_scalar(&mut buf, &column.data.get_scalar(row_idx));
         }
     }
 
@@ -506,25 +510,19 @@ fn encode_fixed_scalar(buf: &mut Vec<u8>, type_id: TypeId, scalar: &ScalarValue)
 }
 
 /// Encodes a variable-length scalar value with 4-byte LE length prefix.
-fn encode_varlen_scalar(buf: &mut Vec<u8>, type_id: TypeId, scalar: &ScalarValue) {
-    match (type_id, scalar) {
-        (
-            TypeId::Char | TypeId::Varchar | TypeId::Text | TypeId::Json | TypeId::Jsonb,
-            ScalarValue::Utf8(s),
-        ) => {
+fn encode_varlen_scalar(buf: &mut Vec<u8>, scalar: &ScalarValue) {
+    // Encode by the scalar's representation, not by a type list. Every
+    // variable-length column materializes as Utf8 or Binary, and a type
+    // enumeration here silently wrote empty cells for unlisted types
+    // (geometry, matrix, range, the sketch family), losing the payload on
+    // every heap insert
+    match scalar {
+        ScalarValue::Utf8(s) => {
             let bytes = s.as_bytes();
             buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(bytes);
         }
-        (
-            TypeId::Binary
-            | TypeId::Varbinary
-            | TypeId::Bytea
-            | TypeId::Array
-            | TypeId::Composite
-            | TypeId::Vector,
-            ScalarValue::Binary(b),
-        ) => {
+        ScalarValue::Binary(b) => {
             buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
             buf.extend_from_slice(b);
         }
@@ -563,6 +561,7 @@ mod row_filter_tests {
             max_length: None,
             ts_precision: None,
             tz_offset_secs: None,
+            element_type: None,
         }
     }
 

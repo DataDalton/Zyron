@@ -20,11 +20,12 @@ use zyron_common::page::{PAGE_SIZE, PageHeader, PageId};
 use zyron_common::{Result, ZyronError};
 
 const ZYIDX_MAGIC: [u8; 8] = *b"ZYIDX\0\0\0";
-const ZYIDX_FORMAT_VERSION: u32 = 9;
+const ZYIDX_FORMAT_VERSION: u32 = 10;
 const ZYIDX_HEADER_SIZE: usize = 32;
 
 const SLOT_ARRAY_START: usize = PageHeader::SIZE + LeafPageHeader::SIZE;
 const SLOT_SIZE: usize = 4;
+const VALUE_WIDTH: usize = zyron_common::RowLocator::ENCODED_LEN;
 
 pub fn write_checkpoint_from_store(
     path: &Path,
@@ -108,7 +109,7 @@ pub fn write_checkpoint_from_store(
 
     let suffix_len = kl - prefix_len;
     let n = total_entries as usize;
-    let data_size = prefix_len + n * suffix_len + n * 6;
+    let data_size = prefix_len + n * suffix_len + n * VALUE_WIDTH;
     let total_size = ZYIDX_HEADER_SIZE + data_size;
 
     let mut buf = vec![0u8; total_size];
@@ -147,8 +148,8 @@ pub fn write_checkpoint_from_store(
     let mut vp = unsafe { bp.add(values_start) };
 
     // Extract suffixes and values from leaf pages.
-    // On-disk leaf entry format: key_len(2) + key + page_num(u32) + slot_id(u16).
-    // Checkpoint value format: page_num(u32) + slot_id(u16) = 6 bytes per entry.
+    // On-disk leaf entry format: key_len(2) + key + locator payload.
+    // Checkpoint value format: the raw locator payload per entry.
     for &(pn, ns) in &leaf_pages {
         let pd = store.get(pn).unwrap();
         let pp = pd.as_ptr();
@@ -160,9 +161,9 @@ pub fn write_checkpoint_from_store(
                 std::ptr::copy_nonoverlapping(pp.add(entry_off + 2 + prefix_len), sk, suffix_len);
                 sk = sk.add(suffix_len);
                 let pid_offset = entry_off + 2 + kl;
-                // Copy page_num(4) + slot_id(2) = 6 bytes directly.
-                std::ptr::copy_nonoverlapping(pp.add(pid_offset), vp, 6);
-                vp = vp.add(6);
+                // Copy the raw locator payload directly.
+                std::ptr::copy_nonoverlapping(pp.add(pid_offset), vp, VALUE_WIDTH);
+                vp = vp.add(VALUE_WIDTH);
             }
         }
     }
@@ -279,7 +280,7 @@ pub fn load_checkpoint_into_store(
     let kl = key_len as usize;
     let suffix_len = kl - prefix_len;
     let n = entry_count as usize;
-    let data_size = prefix_len + n * suffix_len + n * 6;
+    let data_size = prefix_len + n * suffix_len + n * VALUE_WIDTH;
     let expected_size = ZYIDX_HEADER_SIZE + data_size;
     if buf.len() < expected_size {
         return Err(ZyronError::RecoveryFailed(
@@ -315,7 +316,7 @@ pub fn load_checkpoint_into_store(
     let suffixes_start = prefix_start + prefix_len;
     let values_start = suffixes_start + n * suffix_len;
 
-    let eds = 2 + kl + 6; // entry data size per entry: key_len(2) + key + page_num(4) + slot_id(2)
+    let eds = 2 + kl + VALUE_WIDTH; // entry data size per entry: key_len(2) + key + locator payload
     let max_entries_per_page = (PAGE_SIZE - SLOT_ARRAY_START) / (eds + SLOT_SIZE);
     let num_leaves = n.div_ceil(max_entries_per_page);
     let data_end_full = PAGE_SIZE - max_entries_per_page * eds;
@@ -399,14 +400,14 @@ pub fn load_checkpoint_into_store(
         }
 
         // Reconstruct entries from columnar checkpoint data into page layout.
-        // Checkpoint stores values as page_num(u32) + slot_id(u16) = 6 bytes per entry.
+        // Checkpoint stores the raw locator payload per entry.
         // Specialized for common key sizes to emit direct mov instructions
         // instead of memcpy calls from copy_nonoverlapping with runtime sizes.
         let tmpl_ptr = entry_tmpl.as_ptr();
         let tmpl_fixed = 2 + prefix_len;
         let mut entry_base = PAGE_SIZE - eds;
         let mut s_off = suffixes_start + ei * suffix_len;
-        let mut v_off = values_start + ei * 6;
+        let mut v_off = values_start + ei * VALUE_WIDTH;
 
         match (tmpl_fixed, suffix_len) {
             // u64 keys with no common prefix: direct u16 + u64 writes.
@@ -417,16 +418,16 @@ pub fn load_checkpoint_into_store(
                         (pp.add(entry_base) as *mut u16).write_unaligned(kl_le);
                         let suf = (src.add(s_off) as *const u64).read_unaligned();
                         (pp.add(entry_base + 2) as *mut u64).write_unaligned(suf);
-                        // Copy page_num(4) + slot_id(2) = 6 bytes directly.
+                        // Copy the raw locator payload directly.
                         std::ptr::copy_nonoverlapping(
                             src.add(v_off),
                             pp.add(entry_base + pid_in_entry),
-                            6,
+                            VALUE_WIDTH,
                         );
                     }
                     entry_base -= eds;
                     s_off += 8;
-                    v_off += 6;
+                    v_off += VALUE_WIDTH;
                 }
             }
             // u32 keys with no common prefix: direct u16 + u32 writes.
@@ -440,12 +441,12 @@ pub fn load_checkpoint_into_store(
                         std::ptr::copy_nonoverlapping(
                             src.add(v_off),
                             pp.add(entry_base + pid_in_entry),
-                            6,
+                            VALUE_WIDTH,
                         );
                     }
                     entry_base -= eds;
                     s_off += 4;
-                    v_off += 6;
+                    v_off += VALUE_WIDTH;
                 }
             }
             // Generic fallback for other key sizes.
@@ -461,12 +462,12 @@ pub fn load_checkpoint_into_store(
                         std::ptr::copy_nonoverlapping(
                             src.add(v_off),
                             pp.add(entry_base + pid_in_entry),
-                            6,
+                            VALUE_WIDTH,
                         );
                     }
                     entry_base -= eds;
                     s_off += suffix_len;
-                    v_off += 6;
+                    v_off += VALUE_WIDTH;
                 }
             }
         }
@@ -623,8 +624,8 @@ impl CheckpointTrigger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tuple::TupleId;
     use tempfile::tempdir;
+    use zyron_common::RowLocator;
 
     #[test]
     fn test_checkpoint_round_trip() {
@@ -636,7 +637,10 @@ mod tests {
         for i in 0..100u64 {
             leaf.insert(
                 bytes::Bytes::copy_from_slice(&i.to_be_bytes()),
-                TupleId::new(PageId::new(0, i % 10), (i % 5) as u16),
+                RowLocator::Heap {
+                    page: PageId::new(0, i % 10),
+                    slot: (i % 5) as u16,
+                },
             )
             .unwrap();
         }
@@ -650,9 +654,13 @@ mod tests {
         for i in 0..100u64 {
             let f = BTreeLeafPage::get_in_slice(ls.get(lr).unwrap(), &i.to_be_bytes());
             assert!(f.is_some(), "Key {} missing", i);
-            let t = f.unwrap();
-            assert_eq!(t.page_id.page_num, i % 10);
-            assert_eq!(t.slot_id, (i % 5) as u16);
+            assert_eq!(
+                f,
+                Some(RowLocator::Heap {
+                    page: PageId::new(0, i % 10),
+                    slot: (i % 5) as u16,
+                })
+            );
         }
     }
 
@@ -666,7 +674,10 @@ mod tests {
         for i in 0..10u64 {
             leaf.insert(
                 bytes::Bytes::copy_from_slice(&i.to_be_bytes()),
-                TupleId::new(PageId::new(0, 0), 0),
+                RowLocator::Heap {
+                    page: PageId::new(0, 0),
+                    slot: 0,
+                },
             )
             .unwrap();
         }
@@ -730,7 +741,10 @@ mod tests {
             let n = 1_000_000u64;
             for i in 0..n {
                 let key = i.to_be_bytes();
-                let tid = crate::tuple::TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
+                let tid = RowLocator::Heap {
+                    page: PageId::new(0, i % 1000),
+                    slot: (i % 100) as u16,
+                };
                 btree.insert_exclusive(&key, tid).unwrap();
             }
 
@@ -745,8 +759,10 @@ mod tests {
             let mut missing_count = 0;
             for i in 0..n {
                 let key = i.to_be_bytes();
-                let expected =
-                    crate::tuple::TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
+                let expected = RowLocator::Heap {
+                    page: PageId::new(0, i % 1000),
+                    slot: (i % 100) as u16,
+                };
                 let found = loaded.search_sync(&key);
                 if found != Some(expected) {
                     missing_count += 1;

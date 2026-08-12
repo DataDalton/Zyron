@@ -55,44 +55,44 @@ impl Operator for LimitOperator {
                     let skip = remaining_to_skip as usize;
                     self.rows_skipped = self.offset;
                     let sliced_batch = exec_batch.batch.slice(skip, batch_rows as usize - skip);
-                    let sliced_ids = exec_batch.tuple_ids.map(|ids| ids[skip..].to_vec());
+                    let sliced_locs = exec_batch.locators.map(|locs| locs[skip..].to_vec());
 
                     let mut result_batch = sliced_batch;
-                    let mut result_ids = sliced_ids;
+                    let mut result_locs = sliced_locs;
 
                     // Apply limit to the sliced batch.
                     if let Some(limit) = self.limit {
                         let remaining_limit = limit.saturating_sub(self.rows_emitted) as usize;
                         if result_batch.num_rows > remaining_limit {
                             result_batch = result_batch.slice(0, remaining_limit);
-                            result_ids = result_ids.map(|ids| ids[..remaining_limit].to_vec());
+                            result_locs = result_locs.map(|locs| locs[..remaining_limit].to_vec());
                         }
                     }
 
                     self.rows_emitted += result_batch.num_rows as u64;
-                    return match result_ids {
-                        Some(ids) => Ok(Some(ExecutionBatch::with_tuple_ids(result_batch, ids))),
-                        None => Ok(Some(ExecutionBatch::new(result_batch))),
-                    };
+                    return Ok(Some(ExecutionBatch {
+                        batch: result_batch,
+                        locators: result_locs,
+                    }));
                 }
 
                 // Apply limit.
                 let mut result_batch = exec_batch.batch;
-                let mut result_ids = exec_batch.tuple_ids;
+                let mut result_locs = exec_batch.locators;
 
                 if let Some(limit) = self.limit {
                     let remaining_limit = limit.saturating_sub(self.rows_emitted) as usize;
                     if result_batch.num_rows > remaining_limit {
                         result_batch = result_batch.slice(0, remaining_limit);
-                        result_ids = result_ids.map(|ids| ids[..remaining_limit].to_vec());
+                        result_locs = result_locs.map(|locs| locs[..remaining_limit].to_vec());
                     }
                 }
 
                 self.rows_emitted += result_batch.num_rows as u64;
-                return match result_ids {
-                    Some(ids) => Ok(Some(ExecutionBatch::with_tuple_ids(result_batch, ids))),
-                    None => Ok(Some(ExecutionBatch::new(result_batch))),
-                };
+                return Ok(Some(ExecutionBatch {
+                    batch: result_batch,
+                    locators: result_locs,
+                }));
             }
         })
     }

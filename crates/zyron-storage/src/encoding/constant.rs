@@ -3,7 +3,7 @@
 //! Predicate evaluation compares against the single stored value,
 //! producing an all-ones or all-zeros bitmask in O(1).
 
-use crate::encoding::{Encoding, EncodingType, Predicate, slice_rows, varlen_pack};
+use crate::encoding::{Encoding, EncodingType, Predicate, range_admits, slice_rows, varlen_pack};
 use zyron_common::{Result, ZyronError};
 
 pub struct ConstantEncoding;
@@ -82,6 +82,20 @@ impl Encoding for ConstantEncoding {
         Ok(out)
     }
 
+    /// Every row is the same value, so a range is the value repeated the
+    /// number of times the range asks for and the segment size never enters
+    fn decode_range(
+        &self,
+        encoded: &[u8],
+        row_count: usize,
+        value_size: usize,
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<u8>> {
+        let (start, end) = crate::encoding::clamp_range(row_count, start, end);
+        self.decode(encoded, end - start, value_size)
+    }
+
     fn eval_predicate(
         &self,
         encoded: &[u8],
@@ -111,17 +125,7 @@ impl Encoding for ConstantEncoding {
 
         let matches = match predicate {
             Predicate::Equality(target) => value == *target,
-            Predicate::Range { low, high } => {
-                let above_low = match low {
-                    Some(lo) => value >= *lo,
-                    None => true,
-                };
-                let below_high = match high {
-                    Some(hi) => value <= *hi,
-                    None => true,
-                };
-                above_low && below_high
-            }
+            Predicate::Range { low, high } => range_admits(value, stored_size, *low, *high),
             Predicate::In(values) => values.contains(&value),
         };
 

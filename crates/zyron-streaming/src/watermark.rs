@@ -271,12 +271,14 @@ impl WatermarkGenerator {
     /// Observes an event time and returns the, possibly advanced, watermark.
     /// The watermark is monotonic. It never decreases.
     pub fn observe(&self, event_time_us: i64) -> i64 {
-        let prev_max = self.max_event_time.fetch_max(event_time_us, Ordering::AcqRel);
+        let prev_max = self
+            .max_event_time
+            .fetch_max(event_time_us, Ordering::AcqRel);
         let new_max = prev_max.max(event_time_us);
         let candidate = match self.strategy {
-            WatermarkStrategy::BoundedOutOfOrderness { allowed_lateness_us } => {
-                new_max.saturating_sub(allowed_lateness_us)
-            }
+            WatermarkStrategy::BoundedOutOfOrderness {
+                allowed_lateness_us,
+            } => new_max.saturating_sub(allowed_lateness_us),
             WatermarkStrategy::Punctual => new_max,
         };
         // Monotonic advance via fetch_max.

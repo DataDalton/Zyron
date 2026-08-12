@@ -1,4 +1,4 @@
-﻿#![allow(non_snake_case, unused_assignments)]
+#![allow(non_snake_case, unused_assignments)]
 
 //! Transaction Benchmark Suite
 //!
@@ -21,11 +21,12 @@ use std::time::Instant;
 use tempfile::tempdir;
 
 use zyron_buffer::{BufferPool, BufferPoolConfig};
+use zyron_common::RowLocator;
 use zyron_common::page::PageId;
 use zyron_storage::{
     BTreeIndex, BufferedBTreeIndex, DiskManager, DiskManagerConfig, HeapFile, IsolationLevel,
-    LockTable, MvccGc, Snapshot, Transaction, TransactionManager, TransactionStatus, Tuple,
-    TupleHeader, TupleId,
+    LockMode, LockTable, MvccGc, Snapshot, Transaction, TransactionManager, TransactionStatus,
+    Tuple, TupleHeader, TupleId,
 };
 use zyron_wal::{LogRecordType, WalReader, WalWriter, WalWriterConfig};
 
@@ -51,12 +52,7 @@ static BENCHMARK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn create_txn_manager() -> (Arc<TransactionManager>, Arc<WalWriter>, tempfile::TempDir) {
     let dir = tempdir().unwrap();
-    let config = WalWriterConfig {
-        wal_dir: dir.path().to_path_buf(),
-        segment_size: zyron_wal::segment::LogSegment::DEFAULT_SIZE,
-        fsync_enabled: false,
-        ring_buffer_capacity: 1024 * 1024,
-    };
+    let config = zyron_bench_harness::wal_config(dir.path().to_path_buf());
     let writer = Arc::new(WalWriter::new(config).unwrap());
     let mgr = Arc::new(TransactionManager::new(Arc::clone(&writer)));
     (mgr, writer, dir)
@@ -138,12 +134,14 @@ fn test_write_write_conflict() {
     // Txn A: BEGIN, lock the row (UPDATE)
     let mut txn_a = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
     mgr.lock_table()
-        .lock_row(txn_a.txn_id, table_id, rid)
+        .lock_row(txn_a.txn_id, table_id, rid.locator(), LockMode::Exclusive)
         .unwrap();
 
     // Txn B: BEGIN, attempt to lock same row -> conflict
     let mut txn_b = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
-    let result = mgr.lock_table().lock_row(txn_b.txn_id, table_id, rid);
+    let result =
+        mgr.lock_table()
+            .lock_row(txn_b.txn_id, table_id, rid.locator(), LockMode::Exclusive);
     assert!(result.is_err(), "Txn B must get TransactionConflict");
     match result.unwrap_err() {
         zyron_common::ZyronError::TransactionConflict { txn_id, .. } => {
@@ -156,7 +154,9 @@ fn test_write_write_conflict() {
     mgr.commit_blocking(&mut txn_a).unwrap();
 
     // B retries -> succeeds
-    let result = mgr.lock_table().lock_row(txn_b.txn_id, table_id, rid);
+    let result =
+        mgr.lock_table()
+            .lock_row(txn_b.txn_id, table_id, rid.locator(), LockMode::Exclusive);
     assert!(result.is_ok(), "Txn B must succeed after Txn A committed");
 
     // B commits
@@ -532,12 +532,7 @@ fn test_wal_transaction_integration() {
     zyron_bench_harness::init("transaction");
     let dir = tempdir().unwrap();
     let wal_dir = dir.path().to_path_buf();
-    let config = WalWriterConfig {
-        wal_dir: wal_dir.clone(),
-        segment_size: zyron_wal::segment::LogSegment::DEFAULT_SIZE,
-        fsync_enabled: false,
-        ring_buffer_capacity: 1024 * 1024,
-    };
+    let config = zyron_bench_harness::wal_config(wal_dir.clone());
     let writer = Arc::new(WalWriter::new(config).unwrap());
     let mgr = TransactionManager::new(Arc::clone(&writer));
 
@@ -808,8 +803,16 @@ fn test_optimistic_read_under_contention() {
     // readers scan (real reader/writer leaf contention) without ever inserting
     // a duplicate (the B+Tree rejects duplicate keys with DuplicateKey).
     {
-        let mut items: Vec<([u8; 8], TupleId)> = (0..KEYS)
-            .map(|k| ((2 * k).to_be_bytes(), TupleId::new(PageId::new(1, k), 0)))
+        let mut items: Vec<([u8; 8], RowLocator)> = (0..KEYS)
+            .map(|k| {
+                (
+                    (2 * k).to_be_bytes(),
+                    RowLocator::Heap {
+                        page: PageId::new(1, k),
+                        slot: 0,
+                    },
+                )
+            })
             .collect();
         index.insert_many(&mut items).unwrap();
     }
@@ -824,11 +827,17 @@ fn test_optimistic_read_under_contention() {
         let mut n = 0u64;
         let mut writes = 0u64;
         while !stop_w.load(std::sync::atomic::Ordering::Relaxed) {
-            let mut batch: Vec<([u8; 8], TupleId)> = (0..64)
+            let mut batch: Vec<([u8; 8], RowLocator)> = (0..64)
                 .map(|_| {
                     let key = 2 * n + 1;
                     n += 1;
-                    (key.to_be_bytes(), TupleId::new(PageId::new(1, key), 0))
+                    (
+                        key.to_be_bytes(),
+                        RowLocator::Heap {
+                            page: PageId::new(1, key),
+                            slot: 0,
+                        },
+                    )
                 })
                 .collect();
             idx_w.insert_many(&mut batch).unwrap();
@@ -1093,7 +1102,7 @@ fn test_intent_lock_conflict() {
     // Verify consistent lock ordering: row lock + intent lock both acquired
     let rid = TupleId::new(PageId::new(0, 1), 0);
     mgr.lock_table()
-        .lock_row(txn_b.txn_id, table_id, rid)
+        .lock_row(txn_b.txn_id, table_id, rid.locator(), LockMode::Exclusive)
         .unwrap();
 
     // Both intent lock and row lock held by B
@@ -1102,7 +1111,7 @@ fn test_intent_lock_conflict() {
         Some(txn_b.txn_id)
     );
     assert_eq!(
-        mgr.lock_table().is_locked_by(table_id, rid),
+        mgr.lock_table().is_locked_by(table_id, rid.locator()),
         Some(txn_b.txn_id)
     );
 
@@ -1110,7 +1119,11 @@ fn test_intent_lock_conflict() {
 
     // After commit, all locks released
     assert!(mgr.intent_locks().is_locked_by(table_id, key).is_none());
-    assert!(mgr.lock_table().is_locked_by(table_id, rid).is_none());
+    assert!(
+        mgr.lock_table()
+            .is_locked_by(table_id, rid.locator())
+            .is_none()
+    );
 
     tprintln!("  Intent lock conflict: PASS");
     tprintln!("    Intent lock acquired by first txn: verified");
@@ -1311,7 +1324,9 @@ fn test_transaction_microbenchmarks() {
         let start = Instant::now();
         for i in 0..OPS {
             let rid = TupleId::new(PageId::new(0, i as u64), 0);
-            lock_table.lock_row(1, 0, rid).unwrap();
+            lock_table
+                .lock_row(1, 0, rid.locator(), LockMode::Exclusive)
+                .unwrap();
         }
         let duration = start.elapsed();
         let ns_per_op = duration.as_nanos() as f64 / OPS as f64;

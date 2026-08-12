@@ -15,7 +15,9 @@ use zyron_common::TypeId;
 use zyron_parser::ast::{BinaryOperator, JoinType, LiteralValue};
 use zyron_planner::binder::{BoundExpr, ColumnRef};
 use zyron_planner::cost::{CostModel, EncodingCostParameters, PlanCost};
-use zyron_planner::explain::{ActualMetrics, ExplainFormat, ExplainNode, ExplainOptions};
+use zyron_planner::explain::{
+    ActualMetrics, ExplainFormat, ExplainNode, ExplainOptions, NodeMetrics,
+};
 use zyron_planner::logical::LogicalPlan;
 use zyron_planner::optimizer::cardinality::CardinalityEstimator;
 use zyron_planner::optimizer::rules::encoding_pushdown::{self, EncodingHint};
@@ -1168,11 +1170,22 @@ fn test_v6_explain_analyze() {
 
     // Merge actual metrics (simulating EXPLAIN ANALYZE)
     let mut analyzed = root;
-    let metrics = vec![
-        (982, 3.2, 5),       // Filter: 982 actual rows, 3.2ms
-        (100000, 15.7, 100), // SeqScan: 100000 actual rows, 15.7ms
-    ];
-    analyzed.merge_metrics_flat(&metrics);
+    let metrics = NodeMetrics {
+        name: analyzed.operator_name.clone(),
+        rows: 982,
+        elapsed_ms: 3.2,
+        batches: 5,
+        aux: [0; 4],
+        children: vec![NodeMetrics {
+            name: analyzed.children[0].operator_name.clone(),
+            rows: 100_000,
+            elapsed_ms: 15.7,
+            batches: 100,
+            aux: [0; 4],
+            children: Vec::new(),
+        }],
+    };
+    analyzed.merge_metrics(&metrics);
 
     let analyze_opts = ExplainOptions {
         analyze: true,
@@ -1227,6 +1240,7 @@ fn test_v6_explain_analyze() {
             rows: 500_000,
             elapsed_ms: 100.0,
             batches: 50,
+            aux: [0; 4],
         }),
         children: Vec::new(),
     };
@@ -1680,6 +1694,7 @@ fn test_perf_explain_analyze_overhead() {
             rows: 1_000_000,
             elapsed_ms: 150.0,
             batches: 1000,
+            aux: [0; 4],
         });
 
         let start_analyze = Instant::now();

@@ -1,4 +1,4 @@
-//! Parser coverage for Phase 17 data-lifecycle SQL.
+//! Parser coverage for the data-lifecycle SQL surface.
 
 use zyron_parser::ast::*;
 use zyron_parser::parse;

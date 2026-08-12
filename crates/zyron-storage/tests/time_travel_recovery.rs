@@ -26,12 +26,7 @@ fn commit_lsn_dating_survives_crash_for_checkpointed_and_redo_tail_txns() {
 
     // --- Live operation before the crash ---
     let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir: wal_dir.clone(),
-            segment_size: 16 * 1024 * 1024,
-            fsync_enabled: false,
-            ring_buffer_capacity: 1024 * 1024,
-        })
+        WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
         .expect("wal"),
     );
     let txns = Arc::new(TransactionManager::new(Arc::clone(&wal)));

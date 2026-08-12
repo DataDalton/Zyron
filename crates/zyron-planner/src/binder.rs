@@ -1046,6 +1046,35 @@ pub struct BoundSelect {
     pub set_ops: Vec<BoundSetOp>,
     pub ctes: Vec<BoundCte>,
     pub output_schema: Vec<BoundColumnDef>,
+    pub row_lock: Option<BoundRowLock>,
+}
+
+/// Row lock request bound from SELECT ... FOR UPDATE/SHARE. Carried on
+/// BoundSelect and lowered by the logical builder into LogicalPlan::LockRows
+/// directly above the locked table's row-producing subtree
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoundRowLock {
+    pub table_id: TableId,
+    pub mode: RowLockMode,
+    pub wait: RowLockWait,
+}
+
+/// Lock strength. FOR UPDATE and FOR NO KEY UPDATE lock exclusively,
+/// FOR SHARE and FOR KEY SHARE lock shared. Collapsing the four SQL
+/// strengths onto two real modes is strictly conservative, a request
+/// never locks weaker than SQL asked for
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowLockMode {
+    Shared,
+    Exclusive,
+}
+
+/// Behavior when a requested row is already locked
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowLockWait {
+    Wait,
+    Nowait,
+    SkipLocked,
 }
 
 #[derive(Debug, Clone)]
@@ -2639,6 +2668,82 @@ impl<'a> Binder<'a> {
                 });
             }
 
+            // Bind FOR UPDATE/SHARE. Row locking pins concrete base rows, so
+            // it requires exactly one base table and rejects query shapes
+            // whose output rows no longer map to storage rows. Aggregation
+            // is rejected by the logical builder where it is discovered
+            let row_lock = if let Some(fc) = &stmt.for_clause {
+                if !set_ops.is_empty() {
+                    return Err(ZyronError::PlanError(
+                        "FOR UPDATE/SHARE is not allowed with UNION, INTERSECT or EXCEPT"
+                            .to_string(),
+                    ));
+                }
+                if stmt.distinct {
+                    return Err(ZyronError::PlanError(
+                        "FOR UPDATE/SHARE is not allowed with DISTINCT".to_string(),
+                    ));
+                }
+                if !group_by.is_empty() || having.is_some() {
+                    return Err(ZyronError::PlanError(
+                        "FOR UPDATE/SHARE is not allowed with GROUP BY or HAVING".to_string(),
+                    ));
+                }
+                let (table_id, table_idx) = match from.as_slice() {
+                    [
+                        BoundFromItem::BaseTable {
+                            table_id,
+                            table_idx,
+                            as_of,
+                            ..
+                        },
+                    ] => {
+                        if as_of.is_some() {
+                            return Err(ZyronError::PlanError(
+                                "FOR UPDATE/SHARE cannot lock a time-travel read".to_string(),
+                            ));
+                        }
+                        (*table_id, *table_idx)
+                    }
+                    _ => {
+                        return Err(ZyronError::PlanError(
+                            "FOR UPDATE/SHARE requires a single base table, lock each \
+                             table with its own SELECT FOR UPDATE"
+                                .to_string(),
+                        ));
+                    }
+                };
+                for name in &fc.tables {
+                    let matches_base = ctx.tables.get(table_idx).is_some_and(|t| {
+                        t.alias.eq_ignore_ascii_case(name)
+                            || t.entry
+                                .as_ref()
+                                .is_some_and(|e| e.name.eq_ignore_ascii_case(name))
+                    });
+                    if !matches_base {
+                        return Err(ZyronError::PlanError(format!(
+                            "FOR UPDATE OF '{name}' does not name the query's base table"
+                        )));
+                    }
+                }
+                let mode = match fc.lock_type {
+                    ForLockType::Update | ForLockType::NoKeyUpdate => RowLockMode::Exclusive,
+                    ForLockType::Share | ForLockType::KeyShare => RowLockMode::Shared,
+                };
+                let wait = match fc.wait {
+                    ForWait::Wait => RowLockWait::Wait,
+                    ForWait::Nowait => RowLockWait::Nowait,
+                    ForWait::SkipLocked => RowLockWait::SkipLocked,
+                };
+                Some(BoundRowLock {
+                    table_id,
+                    mode,
+                    wait,
+                })
+            } else {
+                None
+            };
+
             Ok(BoundSelect {
                 projections,
                 from,
@@ -2652,6 +2757,7 @@ impl<'a> Binder<'a> {
                 set_ops,
                 ctes: bound_ctes,
                 output_schema,
+                row_lock,
             })
         }) // end Box::pin
     }
@@ -3604,7 +3710,17 @@ impl<'a> Binder<'a> {
                         // then bind the result. Nested calls of the same
                         // function (in arguments) are fine; only unbounded
                         // recursion is rejected, via a depth bound.
-                        const MAX_FUNCTION_INLINE_DEPTH: usize = 16;
+                        //
+                        // The bound has to be reached before the stack is.
+                        // Inlining re-enters the whole expression binder per
+                        // level, and one of those frames is large enough that
+                        // sixteen of them overflow a default thread stack in
+                        // an unoptimized build, so the guard would fire only
+                        // after the thing it exists to prevent. Four levels of
+                        // the same function nested inside one another is far
+                        // past any real query and leaves the stack margin
+                        // intact
+                        const MAX_FUNCTION_INLINE_DEPTH: usize = 4;
                         let key = (func.name.clone(), func.param_names.len());
                         let depth = self.function_stack.iter().filter(|k| **k == key).count();
                         if depth >= MAX_FUNCTION_INLINE_DEPTH {
@@ -4120,6 +4236,45 @@ impl<'a> Binder<'a> {
     /// evaluation schema (table columns in order, table_idx 0) without the plan
     /// carrying it. A stored predicate that no longer parses fails closed: the
     /// statement errors rather than skip an unverifiable constraint.
+    /// Binds each named column's DEFAULT expression, or a typed NULL literal
+    /// when the column declares none. Used by the write paths that fill a
+    /// column without a bound statement to read the default from.
+    pub async fn bind_column_defaults(
+        &mut self,
+        entry: &TableEntry,
+        columns: &[ColumnId],
+    ) -> Result<Vec<(ColumnId, BoundExpr)>> {
+        let empty_ctx = BindContext::new();
+        let mut out = Vec::with_capacity(columns.len());
+        for cid in columns {
+            let Some(col) = entry.columns.iter().find(|c| c.id == *cid) else {
+                continue;
+            };
+            let bound = match &col.default_expr {
+                None => BoundExpr::Literal {
+                    value: zyron_parser::ast::LiteralValue::Null,
+                    type_id: col.type_id,
+                },
+                Some(sql) => {
+                    let expr_ast = zyron_parser::parse_expr(sql).map_err(|e| {
+                        ZyronError::PlanError(format!(
+                            "failed to parse DEFAULT expression for column '{}': {e}",
+                            col.name
+                        ))
+                    })?;
+                    self.bind_expr(&empty_ctx, &expr_ast).await.map_err(|e| {
+                        ZyronError::PlanError(format!(
+                            "failed to bind DEFAULT expression for column '{}': {e}",
+                            col.name
+                        ))
+                    })?
+                }
+            };
+            out.push((*cid, bound));
+        }
+        Ok(out)
+    }
+
     pub async fn bind_check_constraints(&mut self, entry: &TableEntry) -> Result<Vec<BoundExpr>> {
         let has_check = entry.constraints.iter().any(|c| {
             c.constraint_type == zyron_catalog::ConstraintType::Check && c.check_expr.is_some()
@@ -4976,6 +5131,7 @@ impl<'a> Binder<'a> {
                     max_length: None,
                     ts_precision: None,
                     tz_offset_secs: None,
+                    element_type: None,
                 })
                 .collect(),
             _ => Vec::new(),
@@ -5250,10 +5406,13 @@ impl<'a> Binder<'a> {
     }
 
     /// Validates and binds a CREATE STREAMING JOB statement.
-    /// Rules: single-table FROM, no joins, no subqueries, no LATERAL,
-    /// projection arity and types must match the target column layout, Zyron
-    /// source tables must have CDC enabled, UPSERT write mode is not yet
-    /// supported by the runner and is rejected here.
+    ///
+    /// Rules: the FROM is one base table, or a two-table JOIN driving the
+    /// interval or temporal join pipeline; no subqueries and no LATERAL;
+    /// projection arity and types must match the target column layout; a
+    /// Zyron source table must have CDC enabled; UPSERT requires a Zyron
+    /// table target with a declared primary key, which is what the sink
+    /// looks existing rows up by.
     async fn bind_create_streaming_job(
         &mut self,
         stmt: &CreateStreamingJobStatement,
@@ -5532,6 +5691,7 @@ impl<'a> Binder<'a> {
                         max_length: None,
                         ts_precision: None,
                         tz_offset_secs: None,
+                        element_type: None,
                     })
                     .collect();
                 if matches!(&target_kind, BoundStreamingSinkKind::ExternalInline { .. })
@@ -6865,9 +7025,8 @@ fn infer_function_type(name: &str, arg_types: &[TypeId]) -> Result<TypeId> {
             arg_types.first().copied().unwrap_or(TypeId::Float64)
         }
         "length" | "char_length" | "character_length" | "octet_length" => TypeId::Int64,
-        "lower" | "upper" | "trim" | "ltrim" | "rtrim" | "substring" | "replace" | "concat" => {
-            TypeId::Varchar
-        }
+        "lower" | "upper" | "trim" | "ltrim" | "rtrim" | "substring" | "substr" | "replace"
+        | "concat" => TypeId::Varchar,
         "now" | "current_timestamp" => TypeId::TimestampTz,
         "hlc_now" => TypeId::Hlc,
         // Sequence functions return the 64-bit sequence value.
@@ -8368,19 +8527,41 @@ mod tests {
 
     #[tokio::test]
     async fn test_bind_select_with_in_branch_string_literal() {
-        let (catalog, _cache, db_id, _schema_id, _orders_id, _vip_id) =
+        let (catalog, _cache, db_id, _schema_id, orders_id, _vip_id) =
             build_streaming_test_catalog(true).await;
-        // IN BRANCH on a TableRef is not directly parsed (parser scopes IN BRANCH
-        // to expression position via Expr::TemporalRef), but the BoundAsOfTarget
-        // variant exists so the executor's branch error path is reachable. Verify
-        // construction directly here
-        let target = BoundAsOfTarget::Branch("main".to_string());
-        match target {
-            BoundAsOfTarget::Branch(name) => assert_eq!(name, "main"),
-            _ => panic!("wrong variant"),
+        // The branch qualifier reads on either side of an alias, and both
+        // spellings must reach the same bound target
+        for sql in [
+            "SELECT id FROM orders IN BRANCH 'work'",
+            "SELECT o.id FROM orders AS o IN BRANCH 'work'",
+            "SELECT o.id FROM orders IN BRANCH 'work' AS o",
+        ] {
+            let stmt = zyron_parser::parse(sql)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap();
+            let resolver = catalog.resolver(db_id, vec!["binder_test".to_string()]);
+            let mut binder = Binder::new(resolver, &catalog);
+            let bound = binder.bind(stmt).await.unwrap();
+            let bound_select = match bound {
+                BoundStatement::Select(s) => s,
+                other => panic!("expected Select for {sql}, got {:?}", other),
+            };
+            match bound_select.from.first().expect("at least one from item") {
+                BoundFromItem::BaseTable {
+                    table_id, as_of, ..
+                } => {
+                    assert_eq!(*table_id, orders_id);
+                    assert_eq!(
+                        as_of.as_ref(),
+                        Some(&BoundAsOfTarget::Branch("work".to_string())),
+                        "{sql}"
+                    );
+                }
+                other => panic!("expected BaseTable for {sql}, got {:?}", other),
+            }
         }
-        let _ = catalog;
-        let _ = db_id;
     }
 
     #[test]

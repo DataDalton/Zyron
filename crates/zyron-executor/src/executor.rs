@@ -204,6 +204,110 @@ fn build_operator_tree(
                 Ok(br.with_metrics("HybridScan", analyze, vec![]))
             }
 
+            PhysicalPlan::LakeScan {
+                table_id,
+                columns,
+                predicate,
+                lowered,
+                as_of,
+                ..
+            } => {
+                // Manifest pruning is final before the first batch, but a
+                // file the manifest kept can still be dropped once its
+                // zone maps are read, so the operator is handed its own
+                // metrics and republishes as that happens
+                let metrics = analyze.then(|| OperatorMetrics::with_children("LakeScan", vec![]));
+                let op = crate::operator::lake_scan::LakeScanOperator::new(
+                    ctx.clone(),
+                    table_id,
+                    columns,
+                    predicate,
+                    lowered,
+                    as_of,
+                )?
+                .with_metrics(metrics.clone());
+                match metrics {
+                    Some(m) => Ok(BuildResult {
+                        op: Box::new(MetricsOperator::new(Box::new(op), m.clone())),
+                        metrics: Some(m),
+                    }),
+                    None => Ok(BuildResult::new(Box::new(op))),
+                }
+            }
+
+            PhysicalPlan::ForeignScan {
+                table_id,
+                columns,
+                residual,
+                request,
+                ..
+            } => {
+                // The counters are filled by the round trip rather than
+                // known at build time, so the operator is handed its own
+                // metrics instead of only being wrapped in them
+                let metrics =
+                    analyze.then(|| OperatorMetrics::with_children("ForeignScan", vec![]));
+                let op = crate::operator::foreign_scan::ForeignScanOperator::new(
+                    ctx.clone(),
+                    table_id,
+                    columns,
+                    residual,
+                    request,
+                )?
+                .with_metrics(metrics.clone());
+                match metrics {
+                    Some(m) => Ok(BuildResult {
+                        op: Box::new(MetricsOperator::new(Box::new(op), m.clone())),
+                        metrics: Some(m),
+                    }),
+                    None => Ok(BuildResult::new(Box::new(op))),
+                }
+            }
+
+            PhysicalPlan::LakeDelete {
+                table_id,
+                predicate,
+                sql,
+                ..
+            } => {
+                let op = crate::operator::lake_scan::LakeDeleteOperator::new(
+                    ctx.clone(),
+                    table_id,
+                    predicate,
+                    sql,
+                );
+                let br = BuildResult::new(Box::new(op));
+                Ok(br.with_metrics("LakeDelete", analyze, vec![]))
+            }
+
+            PhysicalPlan::LakeUpdate {
+                table_id,
+                assignments,
+                check_constraints,
+                predicate,
+                sql,
+                child,
+                ..
+            } => {
+                let input_schema = child.output_schema();
+                let child_br = build_operator_tree(*child, ctx).await?;
+                let child_m = collect_metrics(&[&child_br.metrics]);
+                let check_constraints =
+                    crate::subquery::materialize_vec(check_constraints, ctx).await?;
+                let op = crate::operator::lake_scan::LakeUpdateOperator::new(
+                    child_br.op,
+                    ctx.clone(),
+                    table_id,
+                    assignments,
+                    check_constraints,
+                    predicate,
+                    sql,
+                    input_schema,
+                );
+                let br = BuildResult::new(Box::new(op));
+                Ok(br.with_metrics("LakeUpdate", analyze, child_m))
+            }
+
             PhysicalPlan::ColumnarMetadataAggregate {
                 table_id,
                 specs,
@@ -261,6 +365,36 @@ fn build_operator_tree(
                     return Ok(br.with_metrics("SeqScan", analyze, vec![]));
                 }
                 let btree = ctx.get_index(index_id);
+                // A segment-bearing table without a live tree cannot use the
+                // heap-only sequential fallback, folded rows would drop.
+                // Union both stores with the full predicate instead
+                if btree.is_none()
+                    && let Ok(te) = ctx.catalog.get_table_by_id(table_id)
+                    && !te.columnar.segments.is_empty()
+                {
+                    let combined = match remaining_predicate {
+                        Some(rest) => combine_with_and(predicate, rest),
+                        None => predicate,
+                    };
+                    let columnar = ColumnScanOperator::new(
+                        ctx.clone(),
+                        table_id,
+                        columns.clone(),
+                        Some(combined.clone()),
+                    )?;
+                    let heap = SeqScanOperator::new(
+                        ctx.clone(),
+                        table_id,
+                        columns,
+                        Some(combined),
+                        false,
+                        None,
+                    )
+                    .await?;
+                    let op = HybridScanOperator::new(columnar, heap);
+                    let br = BuildResult::new(Box::new(op));
+                    return Ok(br.with_metrics("HybridScan", analyze, vec![]));
+                }
                 let op = IndexScanOperator::new(
                     ctx.clone(),
                     table_id,
@@ -282,6 +416,7 @@ fn build_operator_tree(
                 columns,
                 match_expr,
                 remaining_predicate,
+                as_of,
                 ..
             } => {
                 let output_schema = columns.clone();
@@ -291,6 +426,7 @@ fn build_operator_tree(
                     index_id,
                     columns,
                     match_expr,
+                    as_of,
                 )
                 .await?;
                 let mut br = BuildResult::new(Box::new(op));
@@ -315,6 +451,7 @@ fn build_operator_tree(
                 query_vector,
                 k,
                 remaining_predicate,
+                as_of,
                 ..
             } => {
                 let output_schema = columns.clone();
@@ -327,6 +464,7 @@ fn build_operator_tree(
                     query_vector,
                     k,
                     ef_search,
+                    as_of,
                 )
                 .await?;
                 let mut br = BuildResult::new(Box::new(op));
@@ -349,6 +487,7 @@ fn build_operator_tree(
                 columns,
                 kind,
                 remaining_predicate,
+                as_of,
                 ..
             } => {
                 let output_schema = columns.clone();
@@ -358,6 +497,7 @@ fn build_operator_tree(
                     index_id,
                     columns,
                     kind,
+                    as_of,
                 )
                 .await?;
                 let mut br = BuildResult::new(Box::new(op));
@@ -863,6 +1003,30 @@ fn build_operator_tree(
                 Ok(br.with_metrics("HashDistinct", analyze, child_m))
             }
 
+            PhysicalPlan::LockRows {
+                table_id,
+                mode,
+                wait,
+                cap,
+                child,
+                ..
+            } => {
+                // the subtree is built through the locator-tracking scan path
+                // so every emitted row carries a storage locator to lock
+                let child_br = build_scan_with_tuple_ids(*child, ctx).await?;
+                let child_m = collect_metrics(&[&child_br.metrics]);
+                let br =
+                    BuildResult::new(Box::new(crate::operator::lock_rows::LockRowsOperator::new(
+                        child_br.op,
+                        ctx.clone(),
+                        table_id,
+                        mode,
+                        wait,
+                        cap,
+                    )));
+                Ok(br.with_metrics("LockRows", analyze, child_m))
+            }
+
             PhysicalPlan::SetOp {
                 op,
                 all,
@@ -952,25 +1116,52 @@ fn build_operator_tree(
                 let input_schema = child.output_schema();
                 let child_br = build_scan_with_tuple_ids(*child, ctx).await?;
                 let child_m = collect_metrics(&[&child_br.metrics]);
-                // Fold uncorrelated subqueries in SET values and CHECK predicates.
-                let mut materialized_assignments = Vec::with_capacity(assignments.len());
-                for a in assignments {
-                    materialized_assignments.push(zyron_planner::binder::BoundAssignment {
-                        column_id: a.column_id,
-                        value: crate::subquery::materialize_one(a.value, ctx).await?,
-                    });
-                }
-                let assignments = materialized_assignments;
+                // A SET value with a correlated subquery, the shape a
+                // desugared MERGE produces, must run per row against the
+                // updated row's values. Materializing it here would execute
+                // the inner plan standalone and fail on the outer reference,
+                // so those assignments go through per batch correlated
+                // evaluation inside the operator instead.
+                let any_correlated = assignments
+                    .iter()
+                    .any(|a| crate::correlated::expr_has_correlated_subquery(&a.value));
+                let mut correlated_values = None;
+                let assignments = if any_correlated {
+                    correlated_values = Some(
+                        crate::correlated::prepare_correlated_values(
+                            assignments.iter().map(|a| a.value.clone()).collect(),
+                            input_schema.clone(),
+                            ctx.params.clone(),
+                            ctx,
+                        )
+                        .await?,
+                    );
+                    assignments
+                } else {
+                    // Fold uncorrelated subqueries in SET values to constants.
+                    let mut materialized = Vec::with_capacity(assignments.len());
+                    for a in assignments {
+                        materialized.push(zyron_planner::binder::BoundAssignment {
+                            column_id: a.column_id,
+                            value: crate::subquery::materialize_one(a.value, ctx).await?,
+                        });
+                    }
+                    materialized
+                };
                 let check_constraints =
                     crate::subquery::materialize_vec(check_constraints, ctx).await?;
-                let br = BuildResult::new(Box::new(UpdateOperator::new(
+                let mut op = UpdateOperator::new(
                     child_br.op,
                     ctx.clone(),
                     table_id,
                     assignments,
                     input_schema,
                     check_constraints,
-                )));
+                );
+                if let Some(cv) = correlated_values {
+                    op = op.with_correlated_values(cv);
+                }
+                let br = BuildResult::new(Box::new(op));
                 Ok(br.with_metrics("Update", analyze, child_m))
             }
 
@@ -1210,6 +1401,37 @@ fn build_scan_with_tuple_ids(
                 } else {
                     ctx.get_index(index_id)
                 };
+                // A segment-bearing table cannot use the heap-only fallback,
+                // folded rows would escape the DML. Union both stores with
+                // locator tracking, branch overlays applied by the columnar
+                // scan through the context
+                if btree.is_none()
+                    && let Ok(te) = ctx.catalog.get_table_by_id(table_id)
+                    && !te.columnar.segments.is_empty()
+                {
+                    let combined = match remaining_predicate {
+                        Some(rest) => combine_with_and(predicate, rest),
+                        None => predicate,
+                    };
+                    let columnar = ColumnScanOperator::new_for_dml(
+                        ctx.clone(),
+                        table_id,
+                        columns.clone(),
+                        Some(combined.clone()),
+                    )?;
+                    let heap = SeqScanOperator::new(
+                        ctx.clone(),
+                        table_id,
+                        columns,
+                        Some(combined),
+                        true,
+                        None,
+                    )
+                    .await?;
+                    let op = HybridScanOperator::new(columnar, heap);
+                    let br = BuildResult::new(Box::new(op) as Box<dyn Operator>);
+                    return Ok(br.with_metrics("HybridScan", analyze, vec![]));
+                }
                 let op = IndexScanOperator::new(
                     ctx.clone(),
                     table_id,
@@ -1232,6 +1454,27 @@ fn build_scan_with_tuple_ids(
                 let params = ctx.params.clone();
                 let child_br = build_scan_with_tuple_ids(*child, ctx).await?;
                 let child_m = collect_metrics(&[&child_br.metrics]);
+                // Mirror the read path subquery handling so DML predicates
+                // like the EXISTS a desugared MERGE emits work here too. The
+                // correlated filter slices row locators with its mask, so
+                // UPDATE and DELETE above it still see their source rows.
+                if crate::correlated::expr_has_correlated_subquery(&predicate) {
+                    let op = crate::correlated::build_correlated_filter(
+                        child_br.op,
+                        predicate,
+                        input_schema,
+                        params,
+                        ctx,
+                    )
+                    .await?;
+                    let br = BuildResult::new(Box::new(op));
+                    return Ok(br.with_metrics("CorrelatedFilter", analyze, child_m));
+                }
+                let predicate = if crate::subquery::contains_subquery(&predicate) {
+                    crate::subquery::materialize_expr(predicate, ctx).await?
+                } else {
+                    predicate
+                };
                 let br = BuildResult::new(Box::new(FilterOperator::with_params(
                     child_br.op,
                     predicate,
@@ -1251,6 +1494,34 @@ fn build_scan_with_tuple_ids(
                 let child_m = collect_metrics(&[&child_br.metrics]);
                 let br = BuildResult::new(Box::new(LimitOperator::new(child_br.op, limit, offset)));
                 Ok(br.with_metrics("Limit", analyze, child_m))
+            }
+
+            PhysicalPlan::Sort {
+                order_by,
+                child,
+                limit,
+                ..
+            } => {
+                // FOR UPDATE with ORDER BY routes the sort through this path,
+                // locator tracking carries each row's storage identity through
+                // the sort permutation so the locking operator above can
+                // address it
+                let input_schema = child.output_schema();
+                let child_br = build_scan_with_tuple_ids(*child, ctx).await?;
+                let child_m = collect_metrics(&[&child_br.metrics]);
+                let mut materialized_order = Vec::with_capacity(order_by.len());
+                for o in order_by {
+                    materialized_order.push(zyron_planner::binder::BoundOrderBy {
+                        expr: crate::subquery::materialize_one(o.expr, ctx).await?,
+                        asc: o.asc,
+                        nulls_first: o.nulls_first,
+                    });
+                }
+                let br = BuildResult::new(Box::new(
+                    SortOperator::new(child_br.op, materialized_order, input_schema, limit)
+                        .with_locator_tracking(),
+                ));
+                Ok(br.with_metrics("Sort", analyze, child_m))
             }
 
             PhysicalPlan::HybridScan {

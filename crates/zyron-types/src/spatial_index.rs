@@ -1622,8 +1622,9 @@ const SPATIAL_FILE_MAGIC: [u8; 4] = *b"ZRTR";
 
 /// Snapshot file format version. Bumped on any binary-layout change so the
 /// loader can refuse to read incompatible files (and rebuild from the base
-/// table instead).
-const SNAPSHOT_FORMAT_VERSION: u8 = 1;
+/// table instead). Version 2: entry data ids are registry ordinals, not
+/// heap page and slot.
+const SNAPSHOT_FORMAT_VERSION: u8 = 2;
 
 /// Node kind tag in the serialized stream.
 const NODE_TAG_LEAF: u8 = 0;

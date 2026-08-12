@@ -24,6 +24,7 @@ use std::time::Instant;
 use tempfile::tempdir;
 
 use zyron_buffer::{BufferPool, BufferPoolConfig};
+use zyron_common::RowLocator;
 use zyron_common::page::PageId;
 use zyron_storage::{
     BTreeIndex, BufferedBTreeIndex, CheckpointConfig, CheckpointTrigger, DiskManager,
@@ -72,12 +73,7 @@ async fn test_wal_write_replay_10k_records() {
         tprintln!("\n--- Run {}/{} ---", run + 1, VALIDATION_RUNS);
 
         let dir = tempdir().unwrap();
-        let config = WalWriterConfig {
-            wal_dir: dir.path().to_path_buf(),
-            segment_size: 1024 * 1024,
-            fsync_enabled: false,
-            ring_buffer_capacity: 1024 * 1024, // 1MB
-        };
+        let config = zyron_bench_harness::wal_config(dir.path().to_path_buf());
 
         let mut written_lsns: Vec<Lsn> = Vec::with_capacity(RECORD_COUNT);
 
@@ -224,12 +220,7 @@ async fn test_wal_segment_rotation() {
     zyron_bench_harness::init("storage");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
-    let config = WalWriterConfig {
-        wal_dir: dir.path().to_path_buf(),
-        segment_size: 64 * 1024,
-        fsync_enabled: false,
-        ring_buffer_capacity: 1024 * 1024, // 1MB
-    };
+    let config = zyron_bench_harness::wal_config(dir.path().to_path_buf());
 
     let writer = WalWriter::new(config).unwrap();
     let initial_segment = writer.current_segment_id().unwrap();
@@ -271,9 +262,7 @@ async fn test_buffer_pool_eviction() {
     const NUM_FRAMES: usize = 100;
     const NUM_PAGES: usize = 500;
 
-    let pool = BufferPool::new(BufferPoolConfig {
-        num_frames: NUM_FRAMES,
-    });
+    let pool = BufferPool::new(zyron_bench_harness::buffer_pool_config());
 
     let mut dirty_evictions = 0;
 
@@ -318,9 +307,7 @@ async fn test_buffer_pool_pin_prevents_eviction() {
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     const NUM_FRAMES: usize = 10;
 
-    let pool = BufferPool::new(BufferPoolConfig {
-        num_frames: NUM_FRAMES,
-    });
+    let pool = BufferPool::new(zyron_bench_harness::buffer_pool_config());
 
     let mut pinned_pages = Vec::new();
     for i in 0..NUM_FRAMES {
@@ -366,9 +353,7 @@ async fn test_buffer_pool_cache_hit_rate() {
     for run in 0..VALIDATION_RUNS {
         tprintln!("\n--- Run {}/{} ---", run + 1, VALIDATION_RUNS);
 
-        let pool = BufferPool::new(BufferPoolConfig {
-            num_frames: NUM_FRAMES,
-        });
+        let pool = BufferPool::new(zyron_bench_harness::buffer_pool_config());
 
         // Initial load
         for i in 0..NUM_PAGES {
@@ -462,10 +447,7 @@ async fn test_heap_file_100k_tuples() {
         tprintln!("\n--- Run {}/{} ---", run + 1, VALIDATION_RUNS);
 
         let dir = tempdir().unwrap();
-        let config = DiskManagerConfig {
-            data_dir: dir.path().to_path_buf(),
-            fsync_enabled: false,
-        };
+        let config = zyron_bench_harness::disk_config(dir.path().to_path_buf());
         let disk = Arc::new(DiskManager::new(config).await.unwrap());
         let pool = Arc::new(BufferPool::auto_sized());
         let heap = HeapFile::with_defaults(disk, pool).unwrap();
@@ -589,10 +571,7 @@ async fn test_heap_file_delete_and_scan() {
     const DELETE_COUNT: usize = 1_000;
 
     let dir = tempdir().unwrap();
-    let config = DiskManagerConfig {
-        data_dir: dir.path().to_path_buf(),
-        fsync_enabled: false,
-    };
+    let config = zyron_bench_harness::disk_config(dir.path().to_path_buf());
     let disk = Arc::new(DiskManager::new(config).await.unwrap());
     let pool = Arc::new(BufferPool::auto_sized());
     let heap = HeapFile::with_defaults(disk, pool).unwrap();
@@ -656,10 +635,7 @@ async fn test_heap_file_space_reuse() {
     const REINSERT_TARGET_OPS_SEC: f64 = 1_000_000.0;
 
     let dir = tempdir().unwrap();
-    let config = DiskManagerConfig {
-        data_dir: dir.path().to_path_buf(),
-        fsync_enabled: false,
-    };
+    let config = zyron_bench_harness::disk_config(dir.path().to_path_buf());
     let disk = Arc::new(DiskManager::new(config).await.unwrap());
     let pool = Arc::new(BufferPool::auto_sized());
     let heap = HeapFile::with_defaults(disk, pool).unwrap();
@@ -1044,18 +1020,10 @@ async fn test_wal_heap_recovery() {
     // Phase 1: Write tuples with WAL logging
     let wal_size_bytes: usize;
     {
-        let wal_config = WalWriterConfig {
-            wal_dir: wal_dir.clone(),
-            segment_size: 16 * 1024 * 1024,
-            fsync_enabled: true,
-            ring_buffer_capacity: 1024 * 1024, // 1MB
-        };
+        let wal_config = zyron_bench_harness::wal_config(wal_dir.clone());
         let writer = Arc::new(WalWriter::new(wal_config).unwrap());
 
-        let disk_config = DiskManagerConfig {
-            data_dir: heap_dir.clone(),
-            fsync_enabled: true,
-        };
+        let disk_config = zyron_bench_harness::disk_config(heap_dir.clone());
         let disk = Arc::new(DiskManager::new(disk_config).await.unwrap());
         let pool = Arc::new(BufferPool::auto_sized());
         let heap = HeapFile::with_defaults(disk, pool).unwrap();
@@ -1163,12 +1131,7 @@ async fn test_wal_recovery_with_uncommitted() {
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
 
-    let config = WalWriterConfig {
-        wal_dir: dir.path().to_path_buf(),
-        segment_size: 16 * 1024 * 1024,
-        fsync_enabled: true,
-        ring_buffer_capacity: 1024 * 1024, // 1MB
-    };
+    let config = zyron_bench_harness::wal_config(dir.path().to_path_buf());
 
     {
         let writer = WalWriter::new(config.clone()).unwrap();
@@ -1243,12 +1206,7 @@ async fn test_wal_checksum_integrity() {
     tprintln!("\n=== WAL Checksum Integrity Test ===");
 
     let dir = tempdir().unwrap();
-    let config = WalWriterConfig {
-        wal_dir: dir.path().to_path_buf(),
-        segment_size: 1024 * 1024,
-        fsync_enabled: false,
-        ring_buffer_capacity: 1024 * 1024,
-    };
+    let config = zyron_bench_harness::wal_config(dir.path().to_path_buf());
 
     // Write a set of records through the full pipeline
     let record_count = 100;
@@ -1437,7 +1395,10 @@ async fn test_checkpoint_round_trip_1m() {
         // Insert 1M keys using exclusive access for maximum speed
         for i in 0..KEY_COUNT as u64 {
             let key = i.to_be_bytes();
-            let tid = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
+            let tid = RowLocator::Heap {
+                page: PageId::new(0, i % 1000),
+                slot: (i % 100) as u16,
+            };
             btree.insert_exclusive(&key, tid).unwrap();
         }
 
@@ -1464,7 +1425,10 @@ async fn test_checkpoint_round_trip_1m() {
         // Verify every key round-trips
         for i in 0..KEY_COUNT as u64 {
             let key = i.to_be_bytes();
-            let expected = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
+            let expected = RowLocator::Heap {
+                page: PageId::new(0, i % 1000),
+                slot: (i % 100) as u16,
+            };
             let found = loaded.search_sync(&key);
             assert_eq!(
                 found,
@@ -1571,7 +1535,10 @@ async fn test_checkpoint_corrupt_fallback() {
 
     for i in 0..KEY_COUNT as u64 {
         let key = i.to_be_bytes();
-        let tid = TupleId::new(PageId::new(0, i % 100), (i % 50) as u16);
+        let tid = RowLocator::Heap {
+            page: PageId::new(0, i % 100),
+            slot: (i % 50) as u16,
+        };
         btree.insert_exclusive(&key, tid).unwrap();
     }
     btree.force_checkpoint(1000).unwrap();
@@ -1657,17 +1624,15 @@ async fn test_recovery_with_checkpoint() {
 
             for i in 0..PRE_CHECKPOINT_KEYS as u64 {
                 let key = i.to_be_bytes();
-                let tid = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
+                let tid = RowLocator::Heap {
+                    page: PageId::new(0, i % 1000),
+                    slot: (i % 100) as u16,
+                };
                 btree.insert_exclusive(&key, tid).unwrap();
             }
 
             // Write WAL records for the pre-checkpoint keys (simulating normal operation)
-            let wal_config = WalWriterConfig {
-                wal_dir: wal_dir.clone(),
-                segment_size: 16 * 1024 * 1024,
-                fsync_enabled: false,
-                ring_buffer_capacity: 1024 * 1024,
-            };
+            let wal_config = zyron_bench_harness::wal_config(wal_dir.clone());
             let writer = Arc::new(WalWriter::new(wal_config).unwrap());
 
             // Write a checkpoint marker at the current WAL position
@@ -1693,7 +1658,10 @@ async fn test_recovery_with_checkpoint() {
             // Insert the post-checkpoint keys into the btree as well
             for i in PRE_CHECKPOINT_KEYS..(PRE_CHECKPOINT_KEYS + POST_CHECKPOINT_KEYS) {
                 let key = (i as u64).to_be_bytes();
-                let tid = TupleId::new(PageId::new(0, (i % 1000) as u64), (i as u64 % 100) as u16);
+                let tid = RowLocator::Heap {
+                    page: PageId::new(0, (i % 1000) as u64),
+                    slot: (i as u64 % 100) as u16,
+                };
                 btree.insert_exclusive(&key, tid).unwrap();
             }
 
@@ -1726,7 +1694,10 @@ async fn test_recovery_with_checkpoint() {
                 if let Some(key_str) = payload_str.strip_prefix("key:") {
                     if let Ok(i) = key_str.parse::<u64>() {
                         let key = i.to_be_bytes();
-                        let tid = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
+                        let tid = RowLocator::Heap {
+                            page: PageId::new(0, i % 1000),
+                            slot: (i % 100) as u16,
+                        };
                         // Only insert if not already present from checkpoint
                         if recovered.search_sync(&key).is_none() {
                             recovered.insert_exclusive(&key, tid).unwrap();
@@ -1807,12 +1778,7 @@ async fn test_recovery_without_checkpoint() {
 
     // Phase 1: Insert keys with WAL logging, no checkpoint
     {
-        let wal_config = WalWriterConfig {
-            wal_dir: wal_dir.clone(),
-            segment_size: 16 * 1024 * 1024,
-            fsync_enabled: false,
-            ring_buffer_capacity: 1024 * 1024,
-        };
+        let wal_config = zyron_bench_harness::wal_config(wal_dir.clone());
         let writer = Arc::new(WalWriter::new(wal_config).unwrap());
 
         for i in 0..KEY_COUNT {
@@ -1845,7 +1811,10 @@ async fn test_recovery_without_checkpoint() {
             if let Some(key_str) = payload_str.strip_prefix("key:") {
                 if let Ok(i) = key_str.parse::<u64>() {
                     let key = i.to_be_bytes();
-                    let tid = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
+                    let tid = RowLocator::Heap {
+                        page: PageId::new(0, i % 1000),
+                        slot: (i % 100) as u16,
+                    };
                     recovered.insert_exclusive(&key, tid).unwrap();
                     replayed += 1;
                 }
@@ -1903,12 +1872,7 @@ async fn test_wal_segment_cleanup() {
         std::fs::create_dir_all(&wal_dir).unwrap();
 
         // Small segments to force rotation (64KB per segment)
-        let wal_config = WalWriterConfig {
-            wal_dir: wal_dir.clone(),
-            segment_size: 64 * 1024,
-            fsync_enabled: false,
-            ring_buffer_capacity: 256 * 1024,
-        };
+        let wal_config = zyron_bench_harness::wal_config(wal_dir.clone());
         let writer = Arc::new(WalWriter::new(wal_config).unwrap());
 
         // Write enough data to create 5+ segments (each ~64KB, write ~500KB total)
@@ -2155,7 +2119,10 @@ async fn test_graceful_shutdown_checkpoint() {
 
             for i in 0..KEY_COUNT as u64 {
                 let key = i.to_be_bytes();
-                let tid = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
+                let tid = RowLocator::Heap {
+                    page: PageId::new(0, i % 1000),
+                    slot: (i % 100) as u16,
+                };
                 btree.insert_exclusive(&key, tid).unwrap();
             }
 
@@ -2188,7 +2155,10 @@ async fn test_graceful_shutdown_checkpoint() {
         let sample_step = KEY_COUNT / 10_000;
         for i in (0..KEY_COUNT as u64).step_by(sample_step) {
             let key = i.to_be_bytes();
-            let expected = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
+            let expected = RowLocator::Heap {
+                page: PageId::new(0, i % 1000),
+                slot: (i % 100) as u16,
+            };
             let found = loaded.search_sync(&key);
             assert_eq!(
                 found,
@@ -2276,7 +2246,10 @@ async fn test_checkpoint_scale_10m() {
 
         for i in 0..KEY_COUNT as u64 {
             let key = i.to_be_bytes();
-            let tid = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
+            let tid = RowLocator::Heap {
+                page: PageId::new(0, i % 1000),
+                slot: (i % 100) as u16,
+            };
             btree.insert_exclusive(&key, tid).unwrap();
         }
         let build_duration = build_start.elapsed();
@@ -2320,12 +2293,7 @@ async fn test_checkpoint_scale_10m() {
         drop(_loaded);
 
         // Write 100 post-checkpoint keys with WAL
-        let wal_config = WalWriterConfig {
-            wal_dir: wal_dir.clone(),
-            segment_size: 16 * 1024 * 1024,
-            fsync_enabled: false,
-            ring_buffer_capacity: 1024 * 1024,
-        };
+        let wal_config = zyron_bench_harness::wal_config(wal_dir.clone());
         let writer = Arc::new(WalWriter::new(wal_config).unwrap());
 
         for i in KEY_COUNT..(KEY_COUNT + POST_KEYS) {
@@ -2338,7 +2306,10 @@ async fn test_checkpoint_scale_10m() {
             writer.log_commit(txn_id, insert_lsn).unwrap();
 
             let key = (i as u64).to_be_bytes();
-            let tid = TupleId::new(PageId::new(0, (i % 1000) as u64), (i as u64 % 100) as u16);
+            let tid = RowLocator::Heap {
+                page: PageId::new(0, (i % 1000) as u64),
+                slot: (i as u64 % 100) as u16,
+            };
             btree.insert_exclusive(&key, tid).unwrap();
         }
         writer.flush().unwrap();
@@ -2359,7 +2330,10 @@ async fn test_checkpoint_scale_10m() {
                 if let Some(key_str) = payload_str.strip_prefix("key:") {
                     if let Ok(i) = key_str.parse::<u64>() {
                         let key = i.to_be_bytes();
-                        let tid = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
+                        let tid = RowLocator::Heap {
+                            page: PageId::new(0, i % 1000),
+                            slot: (i % 100) as u16,
+                        };
                         if recovered.search_sync(&key).is_none() {
                             recovered.insert_exclusive(&key, tid).unwrap();
                         }
@@ -2576,21 +2550,13 @@ async fn test_checkpoint_integration() {
     std::fs::create_dir_all(&wal_dir).unwrap();
 
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir: dir.path().to_path_buf(),
-            fsync_enabled: false,
-        })
+        DiskManager::new(zyron_bench_harness::disk_config(dir.path().to_path_buf()))
         .await
         .unwrap(),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 4096 }));
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir: wal_dir.clone(),
-            segment_size: 32 * 1024 * 1024, // 32MB segments
-            fsync_enabled: false,
-            ring_buffer_capacity: 8 * 1024 * 1024, // 8MB ring buffer
-        })
+        WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
         .unwrap(),
     );
 
@@ -2837,20 +2803,12 @@ async fn test_checkpoint_integration() {
     tprintln!("  Phase 5: Concurrent writes during checkpoint...");
 
     let wal2 = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir: dir.path().join("wal2"),
-            segment_size: 32 * 1024 * 1024,
-            fsync_enabled: false,
-            ring_buffer_capacity: 8 * 1024 * 1024,
-        })
+        WalWriter::new(zyron_bench_harness::wal_config(dir.path().join("wal2")))
         .unwrap(),
     );
-    let pool2 = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 4096 }));
+    let pool2 = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let disk2 = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir: dir.path().join("data2"),
-            fsync_enabled: false,
-        })
+        DiskManager::new(zyron_bench_harness::disk_config(dir.path().join("data2")))
         .await
         .unwrap(),
     );
@@ -3055,26 +3013,18 @@ async fn test_checkpoint_scheduler_integration() {
     std::fs::create_dir_all(&wal_dir).unwrap();
 
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir: dir.path().to_path_buf(),
-            fsync_enabled: false,
-        })
+        DiskManager::new(zyron_bench_harness::disk_config(dir.path().to_path_buf()))
         .await
         .unwrap(),
     );
 
     // Small segments (256KB) so WAL segment trigger fires quickly
     let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir: wal_dir.clone(),
-            segment_size: 256 * 1024,
-            fsync_enabled: false,
-            ring_buffer_capacity: 4 * 1024 * 1024,
-        })
+        WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
         .unwrap(),
     );
 
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 4096 }));
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
 
     let disk_for_write = Arc::clone(&disk);
     let write_fn: WriteFn =

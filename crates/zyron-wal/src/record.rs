@@ -122,6 +122,12 @@ pub enum LogRecordType {
     ColumnarPatch = 54,
     /// Columnar supersede (delete of a columnar-resident row). Payload: table_id(8) + file_id(8) + sys_rowid(8) + supersede_xid(8).
     ColumnarSupersede = 55,
+    /// Revokes a columnar value patch on ROLLBACK TO SAVEPOINT. Payload: table_id(8) + file_id(8) + sys_rowid(8) + column_id(4) + patch_xid(8).
+    ColumnarPatchRevoke = 56,
+    /// Revokes a columnar supersede on ROLLBACK TO SAVEPOINT. Payload: table_id(8) + file_id(8) + sys_rowid(8) + supersede_xid(8).
+    ColumnarSupersedeRevoke = 57,
+    /// Discards a branch's columnar overlay on DROP BRANCH or after MERGE BRANCH. Payload: table_id(8) + branch_id(8).
+    ColumnarBranchClear = 58,
     /// Version log append. Payload: table_id(4) + version_id(8) + commit_timestamp(8) + operation_type(1) + row_count_delta(4) = 25 bytes.
     VersionAppend = 60,
     /// Branch creation. Payload: branch_id(8) + parent_branch_id(8) + base_version_id(8) + name_len(2) + name bytes.
@@ -152,6 +158,9 @@ impl TryFrom<u8> for LogRecordType {
             53 => Ok(LogRecordType::MergeEnd),
             54 => Ok(LogRecordType::ColumnarPatch),
             55 => Ok(LogRecordType::ColumnarSupersede),
+            56 => Ok(LogRecordType::ColumnarPatchRevoke),
+            57 => Ok(LogRecordType::ColumnarSupersedeRevoke),
+            58 => Ok(LogRecordType::ColumnarBranchClear),
             60 => Ok(LogRecordType::VersionAppend),
             61 => Ok(LogRecordType::BranchCreate),
             62 => Ok(LogRecordType::BranchMerge),

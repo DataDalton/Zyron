@@ -553,7 +553,18 @@ pub fn parameterize_subquery(
         parameterized,
     ))?;
     let optimized = Optimizer::new(&ctx.catalog).optimize(logical)?;
-    let template = zyron_planner::physical::builder::build_physical_plan(optimized, &ctx.catalog)?;
+    // Costing a foreign scan in a re-planned subquery needs the same
+    // peer facts the outer plan used. The guard spans the build and
+    // nothing else, because a lock held across an await would pin the
+    // registry for the length of the query
+    let template = {
+        let peerGuard = ctx.peers.as_ref().map(|p| p.read());
+        zyron_planner::physical::builder::build_physical_plan(
+            optimized,
+            &ctx.catalog,
+            peerGuard.as_deref().map(|p| &**p),
+        )?
+    };
     Ok((template, order))
 }
 
@@ -785,16 +796,16 @@ impl Operator for CorrelatedFilterOperator {
                 if filtered.num_rows == 0 {
                     continue;
                 }
-                let filtered_ids = exec_batch.tuple_ids.map(|ids| {
+                let filtered_locs = exec_batch.locators.map(|locs| {
                     mask.iter()
                         .enumerate()
-                        .filter_map(|(i, &keep)| if keep { Some(ids[i]) } else { None })
+                        .filter_map(|(i, &keep)| if keep { Some(locs[i]) } else { None })
                         .collect::<Vec<_>>()
                 });
-                return match filtered_ids {
-                    Some(ids) => Ok(Some(ExecutionBatch::with_tuple_ids(filtered, ids))),
-                    None => Ok(Some(ExecutionBatch::new(filtered))),
-                };
+                return Ok(Some(ExecutionBatch {
+                    batch: filtered,
+                    locators: filtered_locs,
+                }));
             }
         })
     }
@@ -893,6 +904,64 @@ pub async fn build_correlated_project(
         base_params,
         ctx: Arc::clone(ctx),
     })
+}
+
+/// Value expressions containing correlated subqueries, prepared once and
+/// evaluated per batch. UPDATE uses this for SET values whose subqueries
+/// reference the updated table, the shape a desugared MERGE produces.
+pub struct CorrelatedValues {
+    expressions: Vec<BoundExpr>,
+    subs: Vec<CorrelatedSub>,
+    input_schema: Vec<LogicalColumn>,
+    base_params: Vec<ScalarValue>,
+}
+
+/// Prepares value expressions for repeated per batch evaluation. Correlated
+/// subqueries become parameterized templates built once, uncorrelated ones
+/// fold to constants.
+pub async fn prepare_correlated_values(
+    expressions: Vec<BoundExpr>,
+    input_schema: Vec<LogicalColumn>,
+    base_params: Vec<ScalarValue>,
+    ctx: &Arc<ExecutionContext>,
+) -> Result<CorrelatedValues> {
+    let input_set: HashSet<usize> = input_schema.iter().filter_map(|c| c.table_idx).collect();
+    let mut prep = Prep {
+        ctx,
+        input_set: &input_set,
+        base_len: base_params.len(),
+        subs: Vec::new(),
+    };
+    let mut rewritten = Vec::with_capacity(expressions.len());
+    for e in expressions {
+        let r = rewrite_expr(e, &mut prep)?;
+        rewritten.push(fold_uncorrelated(r, ctx).await?);
+    }
+    Ok(CorrelatedValues {
+        expressions: rewritten,
+        subs: prep.subs,
+        input_schema,
+        base_params,
+    })
+}
+
+impl CorrelatedValues {
+    /// One result column per prepared expression, aligned with the batch rows
+    pub async fn eval(
+        &self,
+        ctx: &Arc<ExecutionContext>,
+        batch: &DataBatch,
+    ) -> Result<Vec<Column>> {
+        eval_rows(
+            ctx,
+            &self.expressions,
+            &self.subs,
+            batch,
+            &self.input_schema,
+            &self.base_params,
+        )
+        .await
+    }
 }
 
 /// Folds any uncorrelated subquery left in a rewritten expression to a constant.

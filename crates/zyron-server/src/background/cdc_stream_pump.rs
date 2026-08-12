@@ -55,9 +55,6 @@ pub async fn run_pump_once(server: &Arc<ServerState>) -> u64 {
         if !stream.active {
             continue;
         }
-        let Some(feed) = registry.get_feed(stream.table_id) else {
-            continue;
-        };
         // A soft-dropped or missing table is skipped: nothing to decode against.
         let table = match server.catalog.get_table_by_id(TableId(stream.table_id)) {
             Ok(t) => t,
@@ -68,16 +65,48 @@ pub async fn run_pump_once(server: &Arc<ServerState>) -> u64 {
         let slots = Arc::clone(slots);
         let sink = build_sink(&stream);
 
-        let result = tokio::task::spawn_blocking(move || {
-            zyron_cdc::drive_stream_once(
-                &stream,
-                feed.as_ref(),
-                slots.as_ref(),
-                sink.as_ref(),
-                |rec| Ok(decode_change(rec, &table_name, &columns)),
-            )
-        })
-        .await;
+        // A lake table has no change file. Its transaction log is the change
+        // record, so the records are derived from the log and driven through
+        // the same batching, sink and slot-advance path
+        let result = if table.lake.is_lake() {
+            let paths = zyron_lake::LakePaths::new(server.disk_manager.data_dir(), table.id.0);
+            let Some(log) = zyron_lake::TransactionLog::lookup_shared(&paths) else {
+                continue;
+            };
+            let table = Arc::clone(&table);
+            tokio::task::spawn_blocking(move || {
+                let start_version = slots.get_slot(&stream.slot_name)?.confirmed_lsn;
+                let changes = zyron_wire::lake_changes::lake_change_records(
+                    &log,
+                    &table,
+                    start_version + 1,
+                    u64::MAX,
+                )?;
+                zyron_cdc::drive_stream_changes(
+                    &stream,
+                    changes,
+                    start_version,
+                    slots.as_ref(),
+                    sink.as_ref(),
+                    |rec| Ok(decode_change(rec, &table_name, &columns)),
+                )
+            })
+            .await
+        } else {
+            let Some(feed) = registry.get_feed(stream.table_id) else {
+                continue;
+            };
+            tokio::task::spawn_blocking(move || {
+                zyron_cdc::drive_stream_once(
+                    &stream,
+                    feed.as_ref(),
+                    slots.as_ref(),
+                    sink.as_ref(),
+                    |rec| Ok(decode_change(rec, &table_name, &columns)),
+                )
+            })
+            .await
+        };
 
         match result {
             Ok(Ok(n)) => total += n,
@@ -166,6 +195,7 @@ mod tests {
             max_length,
             ts_precision: None,
             tz_offset_secs: None,
+            element_type: None,
         }
     }
 

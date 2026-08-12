@@ -493,13 +493,13 @@ impl FrontendMessage {
                 Ok(FrontendMessage::CopyFail { message })
             }
 
-            SUBSCRIBE_MSG_TYPE => {
-                Ok(FrontendMessage::Subscribe(SubscribeMessage::decode(payload)?))
-            }
+            SUBSCRIBE_MSG_TYPE => Ok(FrontendMessage::Subscribe(SubscribeMessage::decode(
+                payload,
+            )?)),
 
-            FLOW_CONTROL_MSG_TYPE => Ok(FrontendMessage::FlowControl(
-                FlowControlMessage::decode(payload)?,
-            )),
+            FLOW_CONTROL_MSG_TYPE => Ok(FrontendMessage::FlowControl(FlowControlMessage::decode(
+                payload,
+            )?)),
 
             SUBSCRIPTION_ACK_MSG_TYPE => Ok(FrontendMessage::SubscriptionAck(
                 SubscriptionAckMessage::decode(payload)?,
@@ -523,9 +523,9 @@ impl FrontendMessage {
         payload: &mut BytesMut,
     ) -> Result<Self, ProtocolError> {
         match msg_type {
-            FLOW_CONTROL_MSG_TYPE => Ok(FrontendMessage::FlowControl(
-                FlowControlMessage::decode(payload)?,
-            )),
+            FLOW_CONTROL_MSG_TYPE => Ok(FrontendMessage::FlowControl(FlowControlMessage::decode(
+                payload,
+            )?)),
             SUBSCRIPTION_ACK_MSG_TYPE => Ok(FrontendMessage::SubscriptionAck(
                 SubscriptionAckMessage::decode(payload)?,
             )),

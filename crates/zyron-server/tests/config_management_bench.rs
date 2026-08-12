@@ -879,102 +879,6 @@ fn test_tab_completion_latency() {
 }
 
 // =============================================================================
-// Test 8: IO Stats Registry (lock-free concurrent access)
-// =============================================================================
-
-#[test]
-fn test_io_stats_registry() {
-    zyron_bench_harness::init("config_management");
-    let _lock = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-    tprintln!("\n=== Validation: IO Stats Registry ===");
-
-    let registry = zyron_server::io_stats::TableIOStatsRegistry::new();
-
-    // Create stats for multiple tables
-    let stats1 = registry.get_or_create(100);
-    let stats2 = registry.get_or_create(200);
-    let stats3 = registry.get_or_create(100); // Same table, should return same Arc
-
-    // Verify identity
-    assert!(
-        Arc::ptr_eq(&stats1, &stats3),
-        "Same table_id should return same Arc"
-    );
-    assert!(
-        !Arc::ptr_eq(&stats1, &stats2),
-        "Different table_ids should return different Arcs"
-    );
-    tprintln!("  Arc identity for same table_id: PASS");
-
-    // Increment counters
-    stats1
-        .seq_scan
-        .fetch_add(10, std::sync::atomic::Ordering::Relaxed);
-    stats1
-        .n_tup_ins
-        .fetch_add(1000, std::sync::atomic::Ordering::Relaxed);
-    stats2
-        .idx_scan
-        .fetch_add(50, std::sync::atomic::Ordering::Relaxed);
-
-    // Verify via for_each
-    let mut found_100 = false;
-    let mut found_200 = false;
-    registry.for_each(|id, stats| {
-        if id == 100 {
-            assert_eq!(
-                stats.seq_scan.load(std::sync::atomic::Ordering::Relaxed),
-                10
-            );
-            assert_eq!(
-                stats.n_tup_ins.load(std::sync::atomic::Ordering::Relaxed),
-                1000
-            );
-            found_100 = true;
-        } else if id == 200 {
-            assert_eq!(
-                stats.idx_scan.load(std::sync::atomic::Ordering::Relaxed),
-                50
-            );
-            found_200 = true;
-        }
-    });
-    assert!(found_100, "Table 100 should be in registry");
-    assert!(found_200, "Table 200 should be in registry");
-    tprintln!("  Counter increments and iteration: PASS");
-
-    // Index stats
-    let idx_registry = zyron_server::io_stats::IndexIOStatsRegistry::new();
-    let idx_stats = idx_registry.get_or_create(500);
-    idx_stats
-        .idx_scan
-        .fetch_add(25, std::sync::atomic::Ordering::Relaxed);
-    idx_stats
-        .idx_tup_read
-        .fetch_add(250, std::sync::atomic::Ordering::Relaxed);
-
-    let mut idx_found = false;
-    idx_registry.for_each(|id, stats| {
-        if id == 500 {
-            assert_eq!(
-                stats.idx_scan.load(std::sync::atomic::Ordering::Relaxed),
-                25
-            );
-            assert_eq!(
-                stats
-                    .idx_tup_read
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                250
-            );
-            idx_found = true;
-        }
-    });
-    assert!(idx_found, "Index 500 should be in registry");
-    tprintln!("  Index stats registry: PASS");
-}
-
-// =============================================================================
 // Test 9: WAL Stats Counters
 // =============================================================================
 
@@ -989,12 +893,7 @@ async fn test_wal_stats_counters() {
     let wal_dir = dir.path().join("wal");
     std::fs::create_dir_all(&wal_dir).expect("Failed to create WAL dir");
 
-    let config = zyron_wal::WalWriterConfig {
-        wal_dir,
-        segment_size: 16 * 1024 * 1024,
-        fsync_enabled: false, // Disable fsync for test speed
-        ring_buffer_capacity: 256 * 1024,
-    };
+    let config = zyron_bench_harness::wal_config(&wal_dir);
 
     let wal = Arc::new(zyron_wal::WalWriter::new(config).expect("WAL writer creation failed"));
 

@@ -195,20 +195,6 @@ impl Iterator for JoinStoreIter<'_> {
 // gather_build_column: type-safe column gathering for all StreamColumnData types
 // ---------------------------------------------------------------------------
 
-/// Gathers a single column value from each build-side source (one row per source).
-/// Each &StreamColumnData contains one or more rows. Takes row 0 from each.
-fn gather_build_column(sources: &[&StreamColumnData]) -> StreamColumnData {
-    if sources.is_empty() {
-        return StreamColumnData::Int64(Vec::new());
-    }
-    let mut col = sources[0].empty_like_with_capacity(sources.len());
-    for src in sources {
-        let scalar = src.get_scalar(0);
-        col.push_scalar(&scalar);
-    }
-    col
-}
-
 // ---------------------------------------------------------------------------
 // StreamStreamJoin
 // ---------------------------------------------------------------------------

@@ -5,9 +5,11 @@ pub mod context;
 pub mod correlated;
 pub mod executor;
 pub mod expr;
+pub mod lake_stats;
 pub mod operator;
 pub mod sequence;
 pub mod subquery;
+pub mod table_convert;
 pub mod trigger;
 pub mod types_bridge;
 

@@ -1,6 +1,6 @@
 //! Column data classification and PII auto-detection.
 //!
-//! Wraps the Phase 8 lock-free `ClassificationStore`. `SET CLASSIFICATION`
+//! Wraps the lock-free `ClassificationStore`. `SET CLASSIFICATION`
 //! drives `apply_column_classification`. Auto-detection uses deterministic
 //! rule-based pattern checks (no regex engine, no ML): email shape, digit-run
 //! lengths for SSN and credit card, phone shapes.

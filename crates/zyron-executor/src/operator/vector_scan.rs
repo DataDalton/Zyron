@@ -9,16 +9,16 @@ use std::sync::Arc;
 
 use zyron_catalog::IndexId;
 use zyron_common::Result;
+use zyron_common::RowLocator;
 use zyron_common::ZyronError;
-use zyron_common::page::{PAGE_SIZE, PageId};
 use zyron_planner::logical::LogicalColumn;
-use zyron_search::decode_doc_id;
-use zyron_storage::{HeapPage, TupleId};
+use zyron_storage::HeapPage;
 
 use crate::batch::{
     build_column_to_builder_map, create_builders, decode_tuple_into_builders, finalize_builders,
 };
 use crate::context::ExecutionContext;
+use crate::operator::doc_fetch::DocRowFetcher;
 use crate::operator::{ExecutionBatch, Operator, OperatorResult};
 
 /// Operator that executes a vector similarity search against a vector index,
@@ -29,9 +29,17 @@ pub struct VectorScanOperator {
     output_columns: Vec<LogicalColumn>,
     /// Pre-computed (vector_id, distance) results from the vector index.
     results: Vec<(u64, f32)>,
+    /// Resolved locators plus pre-fetched columnar hits, result-aligned.
+    fetcher: DocRowFetcher,
     /// Current position in the results vector.
     cursor: usize,
     finished: bool,
+    /// When set, heap hits are dated by commit LSN at this version instead of
+    /// being resolved against the live snapshot
+    heap_version: Option<u64>,
+    /// Table and index IO counters. The search ran to completion before any
+    /// row was fetched, so the entries it examined were recorded then
+    io_stats: crate::operator::IndexScanStats,
 }
 
 impl VectorScanOperator {
@@ -45,6 +53,7 @@ impl VectorScanOperator {
         query_vector: Vec<f32>,
         k: usize,
         ef_search: u16,
+        as_of: Option<zyron_planner::logical::AsOfTarget>,
     ) -> Result<Self> {
         // Privilege check: require VectorSearch on the table
         ctx.check_search_privilege(zyron_auth::PrivilegeType::VectorSearch, table_id.0)?;
@@ -63,13 +72,26 @@ impl VectorScanOperator {
 
         let _table_entry = ctx.get_table_entry(table_id)?;
 
+        let docs: Vec<u64> = results.iter().map(|r| r.0).collect();
+        let fetcher =
+            DocRowFetcher::prepare(&ctx, table_id, &columns, &docs, as_of.as_ref()).await?;
+        let io_stats = crate::operator::IndexScanStats::open(
+            &ctx,
+            table_id.0,
+            index_id.0,
+            results.len(),
+        );
+
         Ok(Self {
             ctx,
             table_id,
             output_columns: columns,
             results,
+            fetcher,
             cursor: 0,
             finished: false,
+            heap_version: crate::operator::doc_fetch::heap_as_of_version(as_of.as_ref()),
+            io_stats,
         })
     }
 }
@@ -91,42 +113,73 @@ impl Operator for VectorScanOperator {
             let column_to_builder = build_column_to_builder_map(&table_entry.columns, &output_ids);
             let mut distances: Vec<f32> = Vec::with_capacity(batch_size);
             let mut row_count = 0usize;
+            // Heap pages fetched to resolve this batch's hits, folded into
+            // the table counters once when the batch is done
+            let mut pages_read = 0u64;
 
             while row_count < batch_size && self.cursor < self.results.len() {
-                let (vec_id, distance) = self.results[self.cursor];
+                let (_vec_id, distance) = self.results[self.cursor];
+                let locator = self.fetcher.locators[self.cursor];
                 self.cursor += 1;
 
-                // Convert VectorId back to TupleId (same encoding as DocId)
-                let (page_num, slot_id) = decode_doc_id(vec_id);
-
-                let page_id = PageId::new(table_entry.heap_file_id, page_num);
-                let tid = TupleId::new(page_id, slot_id);
-
-                // Read heap page and extract tuple
-                let page_data: [u8; PAGE_SIZE] = self.ctx.disk_manager.read_page(page_id).await?;
-                let page = HeapPage::from_bytes(page_data);
-
-                let slot = zyron_storage::SlotId(tid.slot_id);
-                let Some(tuple) = page.get_tuple(slot) else {
-                    continue;
-                };
-
-                if tuple.is_deleted() {
-                    continue;
+                match locator {
+                    // dead document, deleted after the index entry was scored
+                    None => continue,
+                    Some(RowLocator::Heap { page, slot }) => {
+                        // pool-first read: a committed row can live in a
+                        // dirty buffer frame long before any flush
+                        let data = crate::operator::scan::read_page_through_pool(
+                            &self.ctx.buffer_pool,
+                            &self.ctx.disk_manager,
+                            page,
+                        )
+                        .await?;
+                        pages_read += 1;
+                        let Some(view) =
+                            HeapPage::get_tuple_view_from_slice(&data, zyron_storage::SlotId(slot))
+                        else {
+                            continue;
+                        };
+                        if !crate::operator::doc_fetch::heap_row_visible(
+                            &self.ctx,
+                            self.heap_version,
+                            view.header.xmin as u64,
+                            view.header.xmax as u64,
+                        ) {
+                            continue;
+                        }
+                        decode_tuple_into_builders(
+                            view.data,
+                            &table_entry.columns,
+                            &column_to_builder,
+                            &mut builders,
+                        );
+                    }
+                    Some(RowLocator::Columnar { file_id, sys_rowid }) => {
+                        let Some(vals) = self.fetcher.columnar_row(file_id, sys_rowid) else {
+                            continue;
+                        };
+                        for (b, v) in builders.iter_mut().zip(vals.iter()) {
+                            b.push(v);
+                        }
+                    }
+                    Some(RowLocator::Lake { file_id, ordinal }) => {
+                        let Some(vals) = self.fetcher.lake_row(file_id, ordinal) else {
+                            continue;
+                        };
+                        for (b, v) in builders.iter_mut().zip(vals.iter()) {
+                            b.push(v);
+                        }
+                    }
                 }
-                if !tuple.header().is_visible_to(&self.ctx.snapshot) {
-                    continue;
-                }
-
-                decode_tuple_into_builders(
-                    tuple.data(),
-                    &table_entry.columns,
-                    &column_to_builder,
-                    &mut builders,
-                );
                 distances.push(distance);
                 row_count += 1;
             }
+
+            self.io_stats.record_batch(
+                row_count as u64,
+                pages_read * zyron_common::page::PAGE_SIZE as u64,
+            );
 
             if row_count == 0 {
                 self.finished = true;

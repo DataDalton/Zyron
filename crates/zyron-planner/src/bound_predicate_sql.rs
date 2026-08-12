@@ -1,19 +1,22 @@
-//! Renders a bound publication predicate back to SQL text for catalog storage.
+//! Renders a bound predicate back to SQL text.
 //!
-//! A CREATE/ALTER PUBLICATION WHERE clause is bound against the member tables
-//! and arrives as a BoundExpr. The catalog persists the predicate as a SQL
-//! string so the streaming read path can re-parse and bind it per table. This
-//! renders the bound expression to SQL, resolving each ColumnRef to its column
-//! name via the member table schema. The resolver covers the predicate grammar
-//! valid in a publication WHERE filter: literals, column refs, operators,
-//! IN/BETWEEN/LIKE/IS NULL, CAST, CASE, and scalar functions. Forms that cannot
-//! appear in a row filter (subqueries, window functions, aggregates) yield None
-//! so the caller rejects the statement rather than persisting a predicate that
-//! does not round-trip.
+//! Two callers need the same thing for different reasons. A CREATE/ALTER
+//! PUBLICATION WHERE clause is bound against its member tables and persisted
+//! as SQL, so the streaming read path can re-parse and bind it per table. A
+//! foreign scan pushes its filter to a peer, and the peer is another database
+//! that accepts SQL, so the predicate has to arrive as text.
+//!
+//! Each ColumnRef resolves to its column name through the table schema. The
+//! resolver covers the grammar valid in a row filter: literals, column refs,
+//! operators, IN/BETWEEN/LIKE/IS NULL, CAST, and scalar functions. Forms with
+//! no faithful text rendering (subqueries, window functions, aggregates,
+//! parameters) yield None, so a caller either rejects the statement or keeps
+//! the predicate as a residual it evaluates itself. Approximating one would
+//! change the answer, which is the one thing neither caller can accept.
 
+use crate::binder::BoundExpr;
 use zyron_catalog::ColumnEntry;
 use zyron_parser::ast::{BinaryOperator as B, LiteralValue as L, UnaryOperator as U};
-use zyron_planner::binder::BoundExpr;
 
 /// Renders a bound predicate to SQL, resolving column refs against `columns`.
 /// Returns None for a form that cannot be re-parsed as a row filter.

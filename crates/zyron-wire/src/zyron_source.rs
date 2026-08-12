@@ -57,12 +57,74 @@ pub enum OnSchemaChange {
     Widen,
 }
 
-/// Chunking strategy for the parallel initial snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Places chunk boundaries at the quantiles of a key sample.
+///
+/// Split out from the query that produces the sample because this is where the
+/// balancing actually happens: given the same keys it must always cut the same
+/// way, and that is only checkable if it can be called without a peer.
+///
+/// Returns None when the sample is too small to place every cut, leaving the
+/// caller on equal-width ranges. Boundaries are deduplicated, so a key repeated
+/// across neighbouring quantiles yields fewer, larger chunks rather than empty
+/// ones that would cost a round trip to copy nothing.
+fn chunks_from_sample(
+    mut keys: Vec<i64>,
+    workers: usize,
+    min_pk: i64,
+    max_pk: i64,
+) -> Option<Vec<(i64, i64)>> {
+    if workers <= 1 || keys.len() < workers {
+        return None;
+    }
+    keys.sort_unstable();
+
+    let mut bounds: Vec<i64> = Vec::with_capacity(workers);
+    for w in 1..workers {
+        let idx = (keys.len() * w / workers).min(keys.len() - 1);
+        let cut = keys[idx];
+        // Strictly increasing and past the low bound, so every chunk holds at
+        // least one key value
+        if bounds.last().is_none_or(|&last| cut > last) && cut > min_pk {
+            bounds.push(cut);
+        }
+    }
+
+    let mut chunks = Vec::with_capacity(bounds.len() + 1);
+    let mut start = min_pk;
+    for cut in bounds {
+        chunks.push((start, cut));
+        start = cut;
+    }
+    chunks.push((start, max_pk + 1));
+    Some(chunks)
+}
+
+/// How the parallel initial snapshot divides the table between workers.
+///
+/// Both split the primary key space; they differ in where the cuts go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SnapshotChunkStrategy {
+    /// Equal-width key ranges. One bounds query and no further reads, so it
+    /// costs nothing to plan. Chunks hold equal key SPANS, which are equal
+    /// row counts only when keys are evenly distributed, so gaps from deletes
+    /// or a clustered key leave some workers with far more rows than others
+    #[default]
     PkRange,
+    /// Equal row counts. Samples the key column and cuts at the sample's
+    /// quantiles, so a skewed or gappy key still divides into chunks that
+    /// take about the same time. Costs one extra sampling query, which is
+    /// worth it whenever the snapshot itself is large enough to parallelize
     RowCount,
 }
+
+/// Rows to aim for when sampling keys to place row-count chunk boundaries.
+/// Boundaries only have to balance work, so a sample this size is plenty and
+/// keeps the planning query far cheaper than the snapshot it plans.
+const SNAPSHOT_SAMPLE_TARGET: u64 = 20_000;
+
+/// Below this many rows a snapshot is not worth sampling to balance: the
+/// sampling query would cost a meaningful fraction of the copy itself.
+const SNAPSHOT_SAMPLE_MIN_ROWS: u64 = 100_000;
 
 /// Build-time configuration for the source client.
 pub struct ZyronSourceConfig {
@@ -306,20 +368,35 @@ impl ZyronSourceClient {
     {
         let start = std::time::Instant::now();
         let snapshot_lsn = self.fetch_current_lsn().await?;
-        let (min_pk, max_pk) = self.fetch_pk_bounds().await?;
-        let chunks = self.compute_chunks(min_pk, max_pk);
+        let (min_pk, max_pk, row_count) = self.fetch_pk_bounds().await?;
+        let chunks = self.plan_chunks(min_pk, max_pk, row_count).await;
+
+        // Chunks cover disjoint key ranges, so they can be copied at the same
+        // time. Concurrency is capped at the configured worker count, which is
+        // also what the pool was sized for, so this never asks for more
+        // connections than the peer agreed to serve
+        let cancelled = || shutdown.load(Ordering::Acquire);
+        use futures::StreamExt as _;
+        // Built eagerly into a Vec so the stream holds plain futures rather
+        // than a closure the borrow checker has to generalize over lifetimes.
+        // Futures are lazy, so nothing runs until buffer_unordered polls them
+        let pending: Vec<_> = chunks
+            .iter()
+            .map(|chunk| self.copy_chunk(chunk, on_batch))
+            .collect();
+        let mut copies = futures::stream::iter(pending).buffer_unordered(self.snapshot_workers);
 
         let mut rows_total: u64 = 0;
         let mut bytes_total: u64 = 0;
-        for chunk in &chunks {
-            if shutdown.load(Ordering::Acquire) {
-                break;
-            }
-            let (rows, bytes) = self.copy_chunk(chunk, on_batch).await?;
+        while let Some(result) = copies.next().await {
+            let (rows, bytes) = result?;
             rows_total += rows;
             bytes_total += bytes;
+            if cancelled() {
+                break;
+            }
         }
-        let _ = self.snapshot_workers; // hint: workers count used by chunk fan-out
+        drop(copies);
         Ok(SnapshotResult {
             rows_copied: rows_total,
             bytes_copied: bytes_total,
@@ -328,7 +405,12 @@ impl ZyronSourceClient {
         })
     }
 
-    async fn fetch_pk_bounds(&self) -> Result<(i64, i64)> {
+    /// The key range to divide and how many rows fall in it.
+    ///
+    /// One query for all three, because the row count only exists to decide
+    /// whether balancing the chunks is worth a sampling pass and a second
+    /// round trip to learn that would defeat the point.
+    async fn fetch_pk_bounds(&self) -> Result<(i64, i64, u64)> {
         let mut conn = self
             .pool
             .acquire_role(HostRole::Unknown)
@@ -336,12 +418,12 @@ impl ZyronSourceClient {
             .map_err(|e| ZyronError::StreamingError(format!("pool acquire: {e}")))?;
         let client = conn.client_mut();
         let sql = format!(
-            "SELECT min(_zyron_pk), max(_zyron_pk) FROM {}",
+            "SELECT min(_zyron_pk), max(_zyron_pk), count(*) FROM {}",
             self.publication
         );
         let res = match client.simple_query(&sql).await {
             Ok(r) => r,
-            Err(_) => return Ok((0, 0)),
+            Err(_) => return Ok((0, 0, 0)),
         };
         if let Some(q) = res.first() {
             if let Some(r) = q.rows.first() {
@@ -357,10 +439,76 @@ impl ZyronSourceClient {
                     .and_then(|b| std::str::from_utf8(b).ok())
                     .and_then(|s| s.parse::<i64>().ok())
                     .unwrap_or(0);
-                return Ok((min, max));
+                let count = r
+                    .get(2)
+                    .and_then(|v| v.as_ref())
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                return Ok((min, max, count));
             }
         }
-        Ok((0, 0))
+        Ok((0, 0, 0))
+    }
+
+    /// Divides the key range according to the configured strategy.
+    ///
+    /// Row-count balancing is an optimization on top of range splitting, so
+    /// every way it can decline, too few rows to be worth it, a peer that
+    /// cannot sample, a sample too small to cut, falls back to equal-width
+    /// ranges rather than failing. A snapshot must not fail over the way its
+    /// work was divided.
+    async fn plan_chunks(&self, min_pk: i64, max_pk: i64, row_count: u64) -> Vec<(i64, i64)> {
+        if self.snapshot_chunk_strategy == SnapshotChunkStrategy::RowCount
+            && self.snapshot_workers > 1
+            && row_count >= SNAPSHOT_SAMPLE_MIN_ROWS
+        {
+            if let Some(chunks) = self.sample_chunks(min_pk, max_pk, row_count).await {
+                return chunks;
+            }
+        }
+        self.compute_chunks(min_pk, max_pk)
+    }
+
+    /// Cuts the key range at the quantiles of a key sample, so each chunk
+    /// holds about the same number of rows however the keys are distributed.
+    ///
+    /// Returns None when the peer cannot sample or the sample is too small to
+    /// place every boundary, leaving the caller on the range split.
+    async fn sample_chunks(
+        &self,
+        min_pk: i64,
+        max_pk: i64,
+        row_count: u64,
+    ) -> Option<Vec<(i64, i64)>> {
+        // Sampling percentage that lands near the target sample size. Clamped
+        // so a huge table still samples something and a small one does not ask
+        // for more than all of it
+        let percent = ((SNAPSHOT_SAMPLE_TARGET as f64 / row_count as f64) * 100.0).clamp(0.01, 100.0);
+        let sql = format!(
+            "SELECT _zyron_pk FROM {} TABLESAMPLE BERNOULLI({:.4})",
+            self.publication, percent
+        );
+
+        let mut conn = self.pool.acquire_role(HostRole::Unknown).await.ok()?;
+        let res = conn.client_mut().simple_query(&sql).await.ok()?;
+
+        let mut keys: Vec<i64> = Vec::with_capacity(SNAPSHOT_SAMPLE_TARGET as usize);
+        for q in &res {
+            for row in &q.rows {
+                if let Some(k) = row
+                    .first()
+                    .and_then(|v| v.as_ref())
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
+                    keys.push(k);
+                }
+            }
+        }
+        // Fewer sampled keys than cuts to place means the quantiles would be
+        // noise, and noisy boundaries balance worse than even ranges
+        chunks_from_sample(keys, self.snapshot_workers, min_pk, max_pk)
     }
 
     fn compute_chunks(&self, min_pk: i64, max_pk: i64) -> Vec<(i64, i64)> {
@@ -820,6 +968,191 @@ mod tests {
             snapshot_workers: 4,
             snapshot_chunk_strategy: SnapshotChunkStrategy::PkRange,
         })
+    }
+
+    fn make_source_with(workers: usize, strategy: SnapshotChunkStrategy) -> ZyronSourceClient {
+        ZyronSourceClient::new(ZyronSourceConfig {
+            pool: make_pool(),
+            publication: "pub_a".into(),
+            consumer_id: "c1".into(),
+            mode: ZyronSourceMode::Pull {
+                poll_interval: Duration::from_millis(10),
+                batch_size: 8,
+            },
+            schema_pin: None,
+            on_schema_change: OnSchemaChange::Refresh,
+            checkpoint_interval_batches: 2,
+            subscription_id: 1,
+            catalog: None,
+            snapshot_workers: workers,
+            snapshot_chunk_strategy: strategy,
+        })
+    }
+
+    /// The point of row-count chunking: a key distribution that defeats
+    /// equal-width ranges still divides into chunks holding about the same
+    /// number of rows.
+    ///
+    /// The keys here are what a real table looks like after deletes or with a
+    /// clustered id: 90% of rows packed into 10% of the key space. Equal
+    /// ranges give one worker almost everything, which is the imbalance this
+    /// feature exists to remove.
+    #[test]
+    fn test_row_count_balances_a_skewed_key_distribution() {
+        let mut keys: Vec<i64> = (0..9_000).map(|i| i % 1_000).collect();
+        keys.extend((0..1_000).map(|i| 10_000 + i * 990));
+        let max = *keys.iter().max().expect("keys");
+
+        let workers = 8;
+        let chunks =
+            chunks_from_sample(keys.clone(), workers, 0, max).expect("sample places boundaries");
+
+        // Rows per chunk, counted from the same keys the boundaries came from
+        let counts: Vec<usize> = chunks
+            .iter()
+            .map(|&(lo, hi)| keys.iter().filter(|&&k| k >= lo && k < hi).count())
+            .collect();
+        let total: usize = counts.iter().sum();
+        assert_eq!(total, keys.len(), "every key lands in exactly one chunk");
+
+        let ideal = keys.len() as f64 / chunks.len() as f64;
+        let worst = *counts.iter().max().expect("counts") as f64;
+        assert!(
+            worst <= ideal * 2.0,
+            "no chunk should hold more than twice its share: {counts:?} vs ideal {ideal:.0}"
+        );
+
+        // The same input must always cut the same way, or two runs of one
+        // snapshot would divide the table differently
+        assert_eq!(
+            chunks,
+            chunks_from_sample(keys.clone(), workers, 0, max).expect("stable"),
+            "boundary placement is deterministic"
+        );
+
+        // Equal-width ranges over the same keys are what this improves on
+        let src = make_source_with(workers, SnapshotChunkStrategy::PkRange);
+        let ranged = src.compute_chunks(0, max);
+        let rangedWorst = ranged
+            .iter()
+            .map(|&(lo, hi)| keys.iter().filter(|&&k| k >= lo && k < hi).count())
+            .max()
+            .expect("counts");
+        assert!(
+            worst < rangedWorst as f64,
+            "sampling should beat equal ranges on a skewed key: {worst} vs {rangedWorst}"
+        );
+    }
+
+    /// Boundaries tile the range exactly, and a key value repeated across
+    /// neighbouring quantiles collapses instead of producing a chunk that
+    /// would copy nothing
+    #[test]
+    fn test_sampled_chunks_tile_and_never_produce_an_empty_range() {
+        let cases: Vec<(Vec<i64>, usize)> = vec![
+            ((0..1_000).collect(), 4),
+            // Every key identical: all cuts collapse to a single chunk
+            (vec![7; 500], 8),
+            // Two distinct values across eight workers
+            ((0..500).map(|i| if i < 250 { 1 } else { 2 }).collect(), 8),
+            // Exactly as many keys as workers, the smallest sample that cuts
+            ((0..6).collect(), 6),
+            (vec![-40, -30, -20, -10, 0, 10, 20, 30], 4),
+        ];
+
+        for (keys, workers) in cases {
+            let min = *keys.iter().min().expect("keys");
+            let max = *keys.iter().max().expect("keys");
+            let chunks =
+                chunks_from_sample(keys.clone(), workers, min, max).expect("places boundaries");
+
+            assert_eq!(chunks[0].0, min, "first chunk starts at the low bound");
+            assert_eq!(
+                chunks.last().expect("chunk").1,
+                max + 1,
+                "last chunk ends one past the high bound"
+            );
+            for pair in chunks.windows(2) {
+                assert_eq!(pair[0].1, pair[1].0, "gap or overlap in {chunks:?}");
+            }
+            for &(lo, hi) in &chunks {
+                assert!(lo < hi, "empty chunk in {chunks:?}");
+            }
+            let covered: usize = chunks
+                .iter()
+                .map(|&(lo, hi)| keys.iter().filter(|&&k| k >= lo && k < hi).count())
+                .sum();
+            assert_eq!(covered, keys.len(), "every key is copied exactly once");
+        }
+    }
+
+    /// A sample too small to place the cuts declines, so the caller stays on
+    /// equal ranges rather than cutting on noise
+    #[test]
+    fn test_a_sample_smaller_than_the_worker_count_declines() {
+        assert!(chunks_from_sample(vec![1, 2, 3], 8, 0, 100).is_none());
+        assert!(chunks_from_sample(Vec::new(), 4, 0, 100).is_none());
+        // One worker has nothing to divide
+        assert!(chunks_from_sample((0..100).collect(), 1, 0, 100).is_none());
+    }
+
+    /// Chunks tile the key range with no gap and no overlap, whichever way
+    /// the cuts were chosen. A gap loses rows and an overlap copies them
+    /// twice, and the snapshot has no later pass that would notice either
+    #[test]
+    fn test_chunks_tile_the_key_range_exactly() {
+        let src = make_source_with(4, SnapshotChunkStrategy::PkRange);
+        for (min, max) in [(0i64, 999i64), (1, 1), (-500, 500), (10, 11)] {
+            let chunks = src.compute_chunks(min, max);
+            assert!(!chunks.is_empty(), "range {min}..={max} produced no chunk");
+            assert_eq!(chunks[0].0, min, "first chunk starts at the low bound");
+            assert_eq!(
+                chunks.last().expect("chunk").1,
+                max + 1,
+                "last chunk is exclusive of one past the high bound"
+            );
+            for pair in chunks.windows(2) {
+                assert_eq!(
+                    pair[0].1, pair[1].0,
+                    "range {min}..={max} left a gap or an overlap: {chunks:?}"
+                );
+            }
+            for &(lo, hi) in &chunks {
+                assert!(lo < hi, "range {min}..={max} produced an empty chunk");
+            }
+        }
+    }
+
+    /// Row-count balancing is an optimization, so every reason it cannot run
+    /// leaves the caller on equal-width ranges rather than failing. A peer
+    /// that cannot be reached to sample is the case this covers
+    #[tokio::test]
+    async fn test_row_count_falls_back_to_ranges_when_it_cannot_sample() {
+        let src = make_source_with(4, SnapshotChunkStrategy::RowCount);
+        // The pool points at a port nothing listens on, so sampling fails
+        let planned = src.plan_chunks(0, 999, 1_000_000).await;
+        assert_eq!(
+            planned,
+            src.compute_chunks(0, 999),
+            "an unsampleable peer still gets a divided snapshot"
+        );
+    }
+
+    /// A table too small to be worth a sampling round trip is not sampled,
+    /// and a single worker has nothing to balance
+    #[tokio::test]
+    async fn test_row_count_does_not_sample_when_it_would_not_pay() {
+        let small = make_source_with(4, SnapshotChunkStrategy::RowCount);
+        assert_eq!(
+            small.plan_chunks(0, 999, SNAPSHOT_SAMPLE_MIN_ROWS - 1).await,
+            small.compute_chunks(0, 999),
+            "a small table skips the sampling query"
+        );
+
+        let single = make_source_with(1, SnapshotChunkStrategy::RowCount);
+        let chunks = single.plan_chunks(0, 999, 10_000_000).await;
+        assert_eq!(chunks, single.compute_chunks(0, 999));
+        assert_eq!(chunks.len(), 1, "one worker copies the range in one chunk");
     }
 
     #[test]

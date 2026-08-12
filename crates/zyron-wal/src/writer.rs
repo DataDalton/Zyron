@@ -381,6 +381,9 @@ impl WalWriter {
             // an OnceLock so the append() hot path reads it with a single
             // atomic Acquire load and calls std::thread::unpark directly.
             flush_thread_waker.set(std::thread::current()).ok();
+            // A writer that fills the ring before its statement commits
+            // finds this thread parked, so it needs a way to wake it
+            ring_buffer.register_drain_thread();
 
             // Flush-thread-private scratch buffers. The flush thread is the sole
             // flusher, so these need no synchronization: `batch_buffer` stages
@@ -1558,6 +1561,42 @@ impl WalWriter {
             payload,
         )
     }
+
+    /// Logs the revoke of a columnar value patch on ROLLBACK TO SAVEPOINT.
+    #[inline]
+    pub fn log_columnar_patch_revoke(&self, payload: &[u8]) -> Result<Lsn> {
+        self.append(
+            0,
+            Lsn::INVALID,
+            LogRecordType::ColumnarPatchRevoke,
+            0,
+            payload,
+        )
+    }
+
+    /// Logs the revoke of a columnar supersede on ROLLBACK TO SAVEPOINT.
+    #[inline]
+    pub fn log_columnar_supersede_revoke(&self, payload: &[u8]) -> Result<Lsn> {
+        self.append(
+            0,
+            Lsn::INVALID,
+            LogRecordType::ColumnarSupersedeRevoke,
+            0,
+            payload,
+        )
+    }
+
+    /// Logs the discard of a branch's columnar overlay.
+    #[inline]
+    pub fn log_columnar_branch_clear(&self, payload: &[u8]) -> Result<Lsn> {
+        self.append(
+            0,
+            Lsn::INVALID,
+            LogRecordType::ColumnarBranchClear,
+            0,
+            payload,
+        )
+    }
 }
 
 impl Drop for WalWriter {
@@ -1695,6 +1734,50 @@ mod tests {
             "20K sequential wait_for_flush took {:?}, regression suspected",
             elapsed
         );
+    }
+
+    /// A statement large enough to fill the ring before it commits used
+    /// to hang: the writer spun on `spin_loop` waiting for space while the
+    /// thread that frees it was parked, so it held the core the drain
+    /// needed and neither made progress. Backpressure has to be a wait,
+    /// not a livelock.
+    #[test]
+    fn test_a_writer_that_fills_the_ring_makes_progress() {
+        let dir = tempdir().unwrap();
+        // Small enough that the burst below wraps it many times over
+        let capacity = 64 * 1024;
+        let writer = WalWriter::new(WalWriterConfig {
+            wal_dir: dir.path().to_path_buf(),
+            segment_size: LogSegment::DEFAULT_SIZE,
+            fsync_enabled: false,
+            ring_buffer_capacity: capacity,
+        })
+        .unwrap();
+
+        // One uninterrupted burst with no durability wait anywhere in it,
+        // which is what a large multi-row statement looks like to the WAL
+        let payload = [b'x'; 512];
+        let records = (capacity / payload.len()) * 20;
+        let start = std::time::Instant::now();
+        let mut prev = Lsn::INVALID;
+        let mut last = Lsn::INVALID;
+        for _ in 0..records {
+            last = writer.log_insert(1, prev, &payload).unwrap();
+            prev = last;
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "{} records through a {} byte ring took {:?}, which is a stall rather than backpressure",
+            records,
+            capacity,
+            elapsed
+        );
+
+        // And every one of them is durable, so nothing was dropped to make
+        // room
+        writer.wait_for_flush(last).unwrap();
+        assert!(writer.flushed_lsn() >= last);
     }
 
     #[test]

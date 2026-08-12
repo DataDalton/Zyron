@@ -11,7 +11,7 @@ use zyron_common::{Result, ZyronError};
 use zyron_planner::logical::LogicalColumn;
 
 use crate::batch::{ColumnBuilder, DataBatch, decode_tuple_into_builders};
-use crate::column::{Column, ColumnData, NullBitmap};
+use crate::column::{Column, ColumnData};
 use crate::context::ExecutionContext;
 use crate::operator::scan::read_page_through_pool;
 use crate::operator::{ExecutionBatch, Operator, OperatorResult};

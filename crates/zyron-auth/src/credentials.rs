@@ -153,25 +153,15 @@ pub fn md5_password_credential(user: &str, password: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// PBKDF2-HMAC-SHA-256 single block derivation.
-fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
+/// PBKDF2-HMAC-SHA-256, the SCRAM salted password derivation.
+///
+/// The one implementation in the build. A server verifying SCRAM and a client
+/// answering it have to derive the identical key or every Zyron-to-Zyron
+/// connection fails authentication, and three separate copies of a primitive
+/// that must agree byte for byte is a drift waiting to happen.
+pub fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
     let mut result = [0u8; 32];
-    let mut mac = Hmac::<Sha256>::new_from_slice(password).expect("HMAC accepts any key length");
-    mac.update(salt);
-    mac.update(&1u32.to_be_bytes());
-    let u1 = mac.finalize().into_bytes();
-    result.copy_from_slice(&u1);
-    let mut prev = u1;
-    for _ in 1..iterations {
-        let mut mac =
-            Hmac::<Sha256>::new_from_slice(password).expect("HMAC accepts any key length");
-        mac.update(&prev);
-        let ui = mac.finalize().into_bytes();
-        for j in 0..32 {
-            result[j] ^= ui[j];
-        }
-        prev = ui;
-    }
+    pbkdf2::pbkdf2_hmac::<Sha256>(password, salt, iterations, &mut result);
     result
 }
 
@@ -314,7 +304,6 @@ pub struct JwtClaims {
 /// JWT credential that can encode and decode tokens using HMAC signing
 /// Pre-computes the HMAC key schedule on construction to avoid per-call overhead
 pub struct JwtCredential {
-    secret: Vec<u8>,
     algorithm: JwtAlgorithm,
     issuer: Option<String>,
     max_age_secs: u64,
@@ -383,7 +372,6 @@ impl JwtCredential {
         let header_b64 = base64url_encode(header_json.as_bytes());
 
         Ok(Self {
-            secret,
             algorithm,
             issuer: None,
             max_age_secs: 3600,
@@ -526,21 +514,48 @@ impl JwtCredential {
         };
         match self.algorithm {
             JwtAlgorithm::Hs256 => {
-                let mut mac = self.hmac256.as_ref().unwrap().clone();
+                let mut mac = self
+                    .hmac256
+                    .as_ref()
+                    .ok_or_else(|| {
+                        ZyronError::AuthenticationFailed(
+                            "JWT credential declares HS256 but carries no HS256 key"
+                                .to_string(),
+                        )
+                    })?
+                    .clone();
                 mac.update(input);
                 let arr = mac.finalize().into_bytes();
                 buf.bytes[..32].copy_from_slice(&arr);
                 buf.len = 32;
             }
             JwtAlgorithm::Hs384 => {
-                let mut mac = self.hmac384.as_ref().unwrap().clone();
+                let mut mac = self
+                    .hmac384
+                    .as_ref()
+                    .ok_or_else(|| {
+                        ZyronError::AuthenticationFailed(
+                            "JWT credential declares HS384 but carries no HS384 key"
+                                .to_string(),
+                        )
+                    })?
+                    .clone();
                 mac.update(input);
                 let arr = mac.finalize().into_bytes();
                 buf.bytes[..48].copy_from_slice(&arr);
                 buf.len = 48;
             }
             JwtAlgorithm::Hs512 => {
-                let mut mac = self.hmac512.as_ref().unwrap().clone();
+                let mut mac = self
+                    .hmac512
+                    .as_ref()
+                    .ok_or_else(|| {
+                        ZyronError::AuthenticationFailed(
+                            "JWT credential declares HS512 but carries no HS512 key"
+                                .to_string(),
+                        )
+                    })?
+                    .clone();
                 mac.update(input);
                 let arr = mac.finalize().into_bytes();
                 buf.bytes[..64].copy_from_slice(&arr);

@@ -130,7 +130,7 @@ pub fn decode_row(data: &[u8], types: &[TypeId]) -> Result<Vec<StreamValue>> {
     Ok(out)
 }
 
-fn decode_fixed(ty: TypeId, bytes: &[u8]) -> Result<StreamValue> {
+pub(crate) fn decode_fixed(ty: TypeId, bytes: &[u8]) -> Result<StreamValue> {
     Ok(match ty {
         TypeId::Null => StreamValue::Null,
         TypeId::Boolean => StreamValue::Bool(bytes[0] != 0),
@@ -171,7 +171,7 @@ fn decode_fixed(ty: TypeId, bytes: &[u8]) -> Result<StreamValue> {
     })
 }
 
-fn decode_varlen(ty: TypeId, bytes: &[u8]) -> Result<StreamValue> {
+pub(crate) fn decode_varlen(ty: TypeId, bytes: &[u8]) -> Result<StreamValue> {
     Ok(match ty {
         TypeId::Char | TypeId::Varchar | TypeId::Text | TypeId::Json | TypeId::Jsonb => {
             StreamValue::Utf8(String::from_utf8_lossy(bytes).into_owned())
@@ -277,18 +277,12 @@ fn encode_fixed(buf: &mut Vec<u8>, ty: TypeId, v: &StreamValue) -> Result<()> {
 }
 
 fn encode_varlen(ty: TypeId, v: &StreamValue) -> Result<Vec<u8>> {
-    match (ty, v) {
-        (TypeId::Char, StreamValue::Utf8(s))
-        | (TypeId::Varchar, StreamValue::Utf8(s))
-        | (TypeId::Text, StreamValue::Utf8(s))
-        | (TypeId::Json, StreamValue::Utf8(s))
-        | (TypeId::Jsonb, StreamValue::Utf8(s)) => Ok(s.as_bytes().to_vec()),
-        (TypeId::Binary, StreamValue::Binary(b))
-        | (TypeId::Varbinary, StreamValue::Binary(b))
-        | (TypeId::Bytea, StreamValue::Binary(b))
-        | (TypeId::Array, StreamValue::Binary(b))
-        | (TypeId::Composite, StreamValue::Binary(b))
-        | (TypeId::Vector, StreamValue::Binary(b)) => Ok(b.clone()),
+    // Encode by the value's representation. Every variable-length type is
+    // string or byte backed, a type enumeration here rejected unlisted
+    // byte-backed types (geometry, matrix, range, the sketch family)
+    match v {
+        StreamValue::Utf8(s) => Ok(s.as_bytes().to_vec()),
+        StreamValue::Binary(b) => Ok(b.clone()),
         _ => Err(ZyronError::StreamingError(format!(
             "cannot encode {v:?} as varlen {ty:?}"
         ))),

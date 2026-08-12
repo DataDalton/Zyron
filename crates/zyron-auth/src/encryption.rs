@@ -1384,14 +1384,14 @@ mod aes_ni {
         h_be: __m128i,
     ) -> __m128i {
         unsafe {
-            let mut block = _mm_setzero_si128();
-            if block_len == 16 {
-                block = _mm_loadu_si128(block_ptr as *const __m128i);
+            let block = if block_len == 16 {
+                _mm_loadu_si128(block_ptr as *const __m128i)
             } else {
+                // A short trailing block is zero padded to a full lane
                 let mut buf = [0u8; 16];
                 core::ptr::copy_nonoverlapping(block_ptr, buf.as_mut_ptr(), block_len);
-                block = _mm_loadu_si128(buf.as_ptr() as *const __m128i);
-            }
+                _mm_loadu_si128(buf.as_ptr() as *const __m128i)
+            };
             let swapped = _mm_shuffle_epi8(block, bswap);
             ghash_mul(_mm_xor_si128(state, swapped), h_be)
         }

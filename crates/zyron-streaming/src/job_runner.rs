@@ -50,6 +50,20 @@ impl RunnerSink {
             RunnerSink::Remote(adapter) => adapter.write_batch(records).await,
         }
     }
+
+    /// Writes anything the sink is still holding.
+    ///
+    /// A remote sink coalesces small batches into larger transactions, so it
+    /// can be holding rows that `write_batch` accepted but has not sent. The
+    /// runner calls this wherever the stream goes quiet or stops, which is
+    /// what bounds how long a row can wait. The local sinks write through and
+    /// have nothing to drain.
+    pub(crate) async fn flush(&self) -> Result<()> {
+        match self {
+            RunnerSink::Append(_) | RunnerSink::Upsert(_) => Ok(()),
+            RunnerSink::Remote(adapter) => adapter.flush().await,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -330,6 +344,9 @@ fn run_loop(
 
     loop {
         if stop_flag.load(Ordering::Acquire) {
+            // Anything staged for coalescing is written before the runner
+            // goes away, so a stop never strands a partial batch
+            let _ = rt.block_on(async { sink.flush().await });
             break;
         }
 
@@ -355,6 +372,9 @@ fn run_loop(
             }
         };
         if records.is_empty() {
+            // The source has nothing more right now, so anything the sink is
+            // still coalescing has no later batch to join and goes out now
+            let _ = rt.block_on(async { sink.flush().await });
             std::thread::sleep(Duration::from_millis(RUNNER_IDLE_MS));
             continue;
         }
@@ -508,6 +528,7 @@ impl StreamJobManager {
         heap_for_target: Arc<zyron_storage::HeapFile>,
         cdc_registry: Arc<zyron_cdc::CdfRegistry>,
         txn_manager: Arc<zyron_storage::txn::TransactionManager>,
+        wal: Arc<zyron_wal::WalWriter>,
         security_manager: Arc<zyron_auth::SecurityManager>,
     ) -> Result<()> {
         // Build source and sink. Branch on the write mode so UPSERT jobs are
@@ -523,6 +544,7 @@ impl StreamJobManager {
                     Arc::clone(&catalog),
                     heap_for_target,
                     txn_manager,
+                    wal,
                     Arc::clone(&ctx_arc),
                     security_manager,
                 )?;
@@ -771,11 +793,17 @@ fn run_external_loop(
                     break;
                 }
                 if rows.is_empty() {
+                    // The source has nothing more right now, so anything the sink is
+                    // still coalescing has no later batch to join and goes out now
+                    let _ = rt.block_on(async { sink.flush().await });
                     std::thread::sleep(Duration::from_millis(RUNNER_IDLE_MS));
                 }
             }
             ExternalMode::Watch => {
                 if rows.is_empty() {
+                    // The source has nothing more right now, so anything the sink is
+                    // still coalescing has no later batch to join and goes out now
+                    let _ = rt.block_on(async { sink.flush().await });
                     std::thread::sleep(Duration::from_millis(RUNNER_IDLE_MS));
                 }
             }
@@ -1061,6 +1089,7 @@ fn run_external_to_zyron_loop(
 
     loop {
         if stop_flag.load(Ordering::Acquire) {
+            let _ = rt.block_on(async { sink.flush().await });
             break;
         }
         let current_status = catalog.get_streaming_job_by_id(entry.id).map(|j| j.status);
@@ -1131,11 +1160,17 @@ fn run_external_to_zyron_loop(
                     break;
                 }
                 if rows.is_empty() {
+                    // The source has nothing more right now, so anything the sink is
+                    // still coalescing has no later batch to join and goes out now
+                    let _ = rt.block_on(async { sink.flush().await });
                     std::thread::sleep(Duration::from_millis(RUNNER_IDLE_MS));
                 }
             }
             ExternalMode::Watch => {
                 if rows.is_empty() {
+                    // The source has nothing more right now, so anything the sink is
+                    // still coalescing has no later batch to join and goes out now
+                    let _ = rt.block_on(async { sink.flush().await });
                     std::thread::sleep(Duration::from_millis(RUNNER_IDLE_MS));
                 }
             }
@@ -1201,6 +1236,9 @@ fn run_zyron_to_external_loop(
             }
         };
         if records.is_empty() {
+            // The source has nothing more right now, so anything the sink is
+            // still coalescing has no later batch to join and goes out now
+            let _ = rt.block_on(async { sink.flush().await });
             std::thread::sleep(Duration::from_millis(RUNNER_IDLE_MS));
             continue;
         }

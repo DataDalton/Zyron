@@ -4,7 +4,7 @@
 // Outputs P(y=1 | x) in [0,1]
 
 use crate::ml::f64Kernels::{axpy, dot, log1pExp, sigmoid};
-use crate::ml::{Hyperparameters, ModelConfig, ModelData, ModelMetrics, ModelType, TrainedModel, TrainingData};
+use crate::ml::{ModelConfig, ModelData, ModelMetrics, ModelType, TrainedModel, TrainingData};
 use crate::numeric::{KahanSum, columnStandardize};
 use zyron_common::Xoshiro256pp;
 use zyron_common::error::{Result, ZyronError};

@@ -47,7 +47,7 @@ pub use tuple::{
     VersionedTupleHeader, VersionedTupleView,
 };
 pub use txn::{
-    GcStats, IntentLockTable, IsolationLevel, LockTable, MvccGc, RetentionClock, Savepoint,
-    SavepointRollback, Snapshot, Transaction, TransactionManager, TransactionStatus, TxnStatus,
-    TxnStatusMap, TxnUndoLog, UndoEntry, WaitForGraph,
+    GcStats, IntentLockTable, IsolationLevel, LockMode, LockTable, MvccGc, RetentionClock,
+    Savepoint, SavepointRollback, Snapshot, Transaction, TransactionManager, TransactionStatus,
+    TxnStatus, TxnStatusMap, TxnUndoLog, UndoEntry, WaitForGraph,
 };

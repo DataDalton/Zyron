@@ -1,4 +1,4 @@
-//! Data lifecycle management for ZyronDB (Phase 17).
+//! Data lifecycle management for ZyronDB.
 //!
 //! Retention/TTL, tiered storage, archival, soft delete, legal hold,
 //! GDPR erasure, data classification, compliance auditing, recycle bin,

@@ -80,7 +80,7 @@ impl PlannerMaterializationExecutor {
         let feature_cols: Vec<String> = group.features.iter().map(|f| f.name.clone()).collect();
 
         self.runtime.block_on(async move {
-            let plan = zyron_planner::plan(&catalog, database_id, search_path, stmt)
+            let plan = zyron_planner::plan(&catalog, database_id, search_path, stmt, None)
                 .await
                 .map_err(|e| format!("plan: {}", e))?;
             let schema = plan.output_schema();

@@ -68,20 +68,13 @@ async fn test_fold_path_throughput() {
         let columnar_dir = data_dir.join("columnar");
 
         let disk = Arc::new(
-            DiskManager::new(DiskManagerConfig {
-                data_dir: data_dir.clone(),
-                fsync_enabled: false,
-            })
+            DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
             .await
             .unwrap(),
         );
-        let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 8192 }));
+        let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
         let wal = Arc::new(
-            WalWriter::new(WalWriterConfig {
-                wal_dir: wal_dir.clone(),
-                fsync_enabled: false,
-                ..Default::default()
-            })
+            WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
             .unwrap(),
         );
 
@@ -121,10 +114,11 @@ async fn test_fold_path_throughput() {
         heap.insert_batch(&tuples).await.unwrap();
         heap.flush().await.unwrap();
 
+        // The worker the server runs. Only the trigger moves, because a
+        // fold has to happen at all for there to be anything to measure
         let cfg = CompactionWorkerConfig {
             min_rows: 0,
             columnar_dir: columnar_dir.clone(),
-            fsync_enabled: false,
             ..CompactionWorkerConfig::default()
         };
 
@@ -141,7 +135,7 @@ async fn test_fold_path_throughput() {
                     .enable_all()
                     .build()
                     .unwrap();
-                CompactionWorker::run_cycle(&rt, c, t, d, p, w, cf, None)
+                CompactionWorker::run_cycle(&rt, c, t, d, p, w, cf, None, None, None)
             });
             let elapsed = start.elapsed();
             let rps = res.0 as f64 / elapsed.as_secs_f64();

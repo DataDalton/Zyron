@@ -111,20 +111,13 @@ async fn temporal_ps_hlc_survives_fold_patch_merge() {
     let columnar_dir = data_dir.join("columnar");
 
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir: data_dir.clone(),
-            fsync_enabled: false,
-        })
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
         .await
         .unwrap(),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 4096 }));
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir: wal_dir.clone(),
-            fsync_enabled: false,
-            ..Default::default()
-        })
+        WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
         .unwrap(),
     );
 
@@ -213,7 +206,6 @@ async fn temporal_ps_hlc_survives_fold_patch_merge() {
     let cfg = CompactionWorkerConfig {
         min_rows: 4,
         columnar_dir: columnar_dir.clone(),
-        fsync_enabled: false,
         ..CompactionWorkerConfig::default()
     };
     let run = |c: &Catalog, t: &Arc<TransactionManager>| -> (u64, u64) {
@@ -223,7 +215,7 @@ async fn temporal_ps_hlc_survives_fold_patch_merge() {
                 .enable_all()
                 .build()
                 .unwrap();
-            CompactionWorker::run_cycle(&rt, cat, tx, dk, pl, wl, cf, None)
+            CompactionWorker::run_cycle(&rt, cat, tx, dk, pl, wl, cf, None, None, None)
         })
     };
 
@@ -283,9 +275,9 @@ async fn temporal_ps_hlc_survives_fold_patch_merge() {
     let rid0 = seg.sys_rowid_lo; // rowid order == insertion order here
     let new_t9: i128 = 1_775_000_000_000_000i128 * 1_000_000 + 999;
     store
-        .append_value_patch(fid, rid0, t9_col, 50, 1, &new_t9.to_le_bytes())
+        .append_value_patch(0, fid, rid0, t9_col, 50, 1, &new_t9.to_le_bytes())
         .unwrap();
-    store.append_supersede(fid, rid0 + 1, 60, 2).unwrap();
+    store.append_supersede(0, fid, rid0 + 1, 60, 2).unwrap();
     let o0 = store.row_overlay(fid, rid0).expect("value overlay");
     assert_eq!(
         i128::from_le_bytes(o0.patches[&t9_col][0].value[..16].try_into().unwrap()),
@@ -348,20 +340,13 @@ async fn encoder_selection_is_dense_on_folded_columns() {
     let columnar_dir = data_dir.join("columnar");
 
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir: data_dir.clone(),
-            fsync_enabled: false,
-        })
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
         .await
         .unwrap(),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 8192 }));
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir: wal_dir.clone(),
-            fsync_enabled: false,
-            ..Default::default()
-        })
+        WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
         .unwrap(),
     );
 
@@ -420,7 +405,6 @@ async fn encoder_selection_is_dense_on_folded_columns() {
     let cfg = CompactionWorkerConfig {
         min_rows: 4,
         columnar_dir: columnar_dir.clone(),
-        fsync_enabled: false,
         ..CompactionWorkerConfig::default()
     };
     let (rows, segs) = {
@@ -430,7 +414,7 @@ async fn encoder_selection_is_dense_on_folded_columns() {
                 .enable_all()
                 .build()
                 .unwrap();
-            CompactionWorker::run_cycle(&rt, cat, tx, dk, pl, wl, cf, None)
+            CompactionWorker::run_cycle(&rt, cat, tx, dk, pl, wl, cf, None, None, None)
         })
     };
     assert_eq!(rows, N as u64);

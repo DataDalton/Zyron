@@ -1,0 +1,101 @@
+# suite:   lake
+# run:     2026-08-12_034630_8e3f725-local
+# profile: debug
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+# NOT A BENCHMARK RESULT. This is an unoptimized build, so every
+# timing below is meaningless: an unoptimized build is not slower
+# by a constant factor, so these numbers do not even rank correctly
+# against each other. Counted quantities (rates, file and row
+# counts, PASS/FAIL on an exact bound) are valid and are the only
+# thing worth reading here. For real numbers: cargo test --release
+#
+
+=== Clustering Pass Skip-Rate Gain ===
+  skip rate after a bucket-ordered pass [PASS]: 0.8750 (bound >= 0.5000)
+  Inputs: 8 files, 32768 rows
+  Outputs: 8 files
+  Skip rate: 0.0000 -> 0.8750
+  Cluster pass:
+    Runs: [140,548us]
+    Average: 140,548us (no target set)
+  Rows rewritten:
+    Runs: [233,145 rows/s]
+    Average: 233,145 rows/s (no target set)
+
+=== Data File Scan Throughput ===
+  Rows per data file: 16384
+  Scan throughput:
+    Runs: [116,612,100 rows/s, 121,004,431 rows/s, 122,726,592 rows/s, 122,818,591 rows/s, 123,746,224 rows/s]
+    Average: 121,381,587 rows/s (no target set)
+    Min/Max: 116,612,100 rows/s / 123,746,224 rows/s, StdDev: 2,543,847 rows/s
+
+=== Transaction Log Under Concurrency ===
+  Writers: 8
+  Commits: 160
+  Retries: 104 (0.6500 per commit)
+  Commit rate:
+    Runs: [982.6815 commits/s]
+    Average: 982.6815 commits/s (no target set)
+  Retries:
+    Runs: [0.6500 per commit]
+    Average: 0.6500 per commit (no target set)
+
+=== File Pruning Effectiveness ===
+  Files in manifest: 20000
+  point predicate files pruned (fraction) [PASS]: 1.0000 (bound >= 0.9999)
+  strided predicate files pruned (fraction) [PASS]: 0.9375 (bound >= 0.9300)
+
+=== Refused Clustering Pass Is Inert ===
+  Candidate: order by bucket, on files already ordered by bucket
+  Expected: refused, since it cannot improve the skip rate
+  Gate decision [PASS]: refused, BelowThreshold { delta: 0.0, required: 0.05 }
+  Active file set [PASS]: unchanged, 4 files, log still at version 5
+
+=== Log Head and Manifest Resolution ===
+  Head read:
+    Runs: [5.1910ns, 5.1900ns, 5.1960ns, 5.2520ns, 5.1870ns]
+    Average: 5.2032ns (no target set)
+    Min/Max: 5.1870ns / 5.2520ns, StdDev: 0.0246ns
+  Latest manifest (cached):
+    Runs: [376.2000ns, 373.3000ns, 366ns, 365.7000ns, 366.1000ns]
+    Average: 369.4600ns (no target set)
+    Min/Max: 365.7000ns / 376.2000ns, StdDev: 4.4175ns
+  Prune index build (cold):
+    Runs: [65.6000us]
+    Average: 65.6000us (no target set)
+  Prune index at version (cached):
+    Runs: [380.4000ns, 360.6000ns, 360.4000ns, 361.4000ns, 365.9000ns]
+    Average: 365.7400ns (no target set)
+    Min/Max: 360.4000ns / 380.4000ns, StdDev: 7.5988ns
+
+=== Prune Index Sweep vs Exact Answer ===
+  Files in manifest: 20000
+  Prune index build:
+    Runs: [5,558us, 3,315us, 3,121us, 3,148us, 3,102us]
+    Average: 3,649us (no target set)
+    Min/Max: 3,102us / 5,558us, StdDev: 957.7689us
+  point sweep over 20000 files:
+    Runs: [185.5000us, 184.2000us, 188.8000us, 183.8000us, 183.9000us]
+    Average: 185.2400us (no target set)
+    Min/Max: 183.8000us / 188.8000us, StdDev: 1.8811us
+  range sweep over 20000 files:
+    Runs: [182us, 180.2000us, 179.9000us, 180.2000us, 182.7000us]
+    Average: 181us (no target set)
+    Min/Max: 179.9000us / 182.7000us, StdDev: 1.1296us
+  strided sweep over 20000 files:
+    Runs: [198.1000us, 183.5000us, 183.8000us, 187.2000us, 184.2000us]
+    Average: 187.3600us (no target set)
+    Min/Max: 183.5000us / 198.1000us, StdDev: 5.5305us
+
+=== Zone Map Row Rejection ===
+  zone map rows rejected (fraction) [PASS]: 1 (bound >= 1)
+  Zone map rejection:
+    Runs: [23.3000us, 17.8000us, 17us, 17us, 17.1000us]
+    Average: 18.4400us (no target set)
+    Min/Max: 17us / 23.3000us, StdDev: 2.4483us
+  Full column decode:
+    Runs: [240.7000us, 168.5000us, 158.6000us, 156.3000us, 156.6000us]
+    Average: 176.1400us (no target set)
+    Min/Max: 156.3000us / 240.7000us, StdDev: 32.5867us

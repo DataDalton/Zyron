@@ -784,6 +784,12 @@ pub async fn send_schema_update<S: AsyncWrite + Unpin>(
 pub struct CdcChangeSource {
     registry: Arc<zyron_cdc::CdfRegistry>,
     table_ids: Vec<u32>,
+    /// Resolves a member table's format and schema. A lake table keeps no
+    /// change file: its transaction log is the change record, so its
+    /// records are derived from the log instead of read from a feed
+    catalog: Arc<zyron_catalog::Catalog>,
+    /// Storage root the lake layout is anchored at
+    data_dir: std::path::PathBuf,
     high_lsn: AtomicU64,
     /// Compiled ABAC publication policies, applied as a per-row filter on the
     /// change stream. None means no policy covers this subscriber, so rows pass
@@ -792,10 +798,17 @@ pub struct CdcChangeSource {
 }
 
 impl CdcChangeSource {
-    pub fn new(registry: Arc<zyron_cdc::CdfRegistry>, table_ids: Vec<u32>) -> Self {
+    pub fn new(
+        registry: Arc<zyron_cdc::CdfRegistry>,
+        table_ids: Vec<u32>,
+        catalog: Arc<zyron_catalog::Catalog>,
+        data_dir: std::path::PathBuf,
+    ) -> Self {
         Self {
             registry,
             table_ids,
+            catalog,
+            data_dir,
             high_lsn: AtomicU64::new(0),
             filter: None,
         }
@@ -805,13 +818,50 @@ impl CdcChangeSource {
     pub fn with_filter(
         registry: Arc<zyron_cdc::CdfRegistry>,
         table_ids: Vec<u32>,
+        catalog: Arc<zyron_catalog::Catalog>,
+        data_dir: std::path::PathBuf,
         filter: Option<Arc<crate::publication_filter::PublicationRowFilter>>,
     ) -> Self {
         Self {
             registry,
             table_ids,
+            catalog,
+            data_dir,
             high_lsn: AtomicU64::new(0),
             filter,
+        }
+    }
+
+    /// The change records one member table produced after `start`.
+    ///
+    /// A lake table derives them from its transaction log, which is the
+    /// change record itself, so nothing is captured twice. Every other
+    /// table reads the change file the DML path captured into.
+    fn records_for_table(
+        &self,
+        table_id: u32,
+        start: u64,
+    ) -> Result<Vec<zyron_cdc::ChangeRecord>, ProtocolError> {
+        let entry = self
+            .catalog
+            .get_table_by_id(zyron_catalog::TableId(table_id));
+        if let Ok(table) = &entry {
+            if table.lake.is_lake() {
+                let paths = zyron_lake::LakePaths::new(&self.data_dir, table_id);
+                let Some(log) = zyron_lake::TransactionLog::lookup_shared(&paths) else {
+                    // This node does not run the lake tier, so it has no
+                    // changes to publish for the table
+                    return Ok(Vec::new());
+                };
+                return crate::lake_changes::lake_change_records(&log, table, start, u64::MAX)
+                    .map_err(|e| ProtocolError::Malformed(format!("lake change feed: {}", e)));
+            }
+        }
+        match self.registry.get_feed(table_id) {
+            Some(feed) => feed
+                .query_changes(start, u64::MAX)
+                .map_err(|e| ProtocolError::Malformed(format!("cdf query_changes: {}", e))),
+            None => Ok(Vec::new()),
         }
     }
 }
@@ -830,13 +880,10 @@ impl ChangeSource for CdcChangeSource {
         let start = after_lsn.saturating_add(1);
 
         for &tid in &self.table_ids {
-            let feed = match self.registry.get_feed(tid) {
-                Some(f) => f,
-                None => continue,
-            };
-            let recs = feed
-                .query_changes(start, u64::MAX)
-                .map_err(|e| ProtocolError::Malformed(format!("cdf query_changes: {}", e)))?;
+            let recs = self.records_for_table(tid, start)?;
+            if recs.is_empty() {
+                continue;
+            }
 
             // Map raw change records to candidate deltas, skipping schema and
             // truncate markers which carry no row image.

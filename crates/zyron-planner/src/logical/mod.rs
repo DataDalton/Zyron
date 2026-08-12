@@ -152,6 +152,21 @@ pub enum LogicalPlan {
     /// Distinct elimination.
     Distinct { child: Arc<LogicalPlan> },
 
+    /// Row locking for SELECT ... FOR UPDATE/SHARE. Sits directly above the
+    /// locked table's row-producing subtree, below Project, so every row it
+    /// sees still carries a storage locator.
+    LockRows {
+        table_id: TableId,
+        mode: crate::binder::RowLockMode,
+        wait: crate::binder::RowLockWait,
+        /// LIMIT plus OFFSET when both are literal. The nodes between this
+        /// one and the Limit preserve row count, so locking stops once this
+        /// many rows are emitted. Keeps FOR UPDATE SKIP LOCKED LIMIT n
+        /// locking exactly n rows instead of a whole batch
+        cap: Option<u64>,
+        child: Arc<LogicalPlan>,
+    },
+
     /// Set operations (UNION, INTERSECT, EXCEPT).
     SetOp {
         op: SetOpType,
@@ -350,6 +365,7 @@ impl LogicalPlan {
             LogicalPlan::Sort { child, .. } => child.output_schema(),
             LogicalPlan::Limit { child, .. } => child.output_schema(),
             LogicalPlan::Distinct { child } => child.output_schema(),
+            LogicalPlan::LockRows { child, .. } => child.output_schema(),
             LogicalPlan::SetOp { left, .. } => left.output_schema(),
             LogicalPlan::Insert { .. } => Vec::new(),
             LogicalPlan::Values { schema, .. } => schema.clone(),
@@ -373,6 +389,7 @@ impl LogicalPlan {
             | LogicalPlan::Sort { child, .. }
             | LogicalPlan::Limit { child, .. }
             | LogicalPlan::Distinct { child }
+            | LogicalPlan::LockRows { child, .. }
             | LogicalPlan::Insert { source: child, .. }
             | LogicalPlan::Update { child, .. }
             | LogicalPlan::Delete { child, .. } => vec![child],

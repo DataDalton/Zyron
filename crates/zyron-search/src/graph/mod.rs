@@ -13,8 +13,9 @@ pub mod storage;
 
 pub use manager::GraphManager;
 pub use query::{
-    CompiledGraphQuery, EdgeDirection, GraphPattern, GraphReturnItem, JoinCondition,
-    PatternElement, TableScanRef, compile_pattern,
+    CompiledGraphQuery, EdgeDirection, FilterOp, FilterValue, GraphFilter, GraphPattern,
+    GraphReturnItem, JoinCondition, PatternElement, TableScanRef, compile_pattern,
+    parse_where_clause,
 };
 pub use schema::{EdgeId, EdgeLabel, GraphSchema, LabelId, NodeId, NodeLabel, PropertyDef};
 pub use storage::{CompactGraph, CsrCache};

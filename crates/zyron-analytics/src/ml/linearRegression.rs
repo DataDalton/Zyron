@@ -65,11 +65,10 @@ pub fn train(config: &ModelConfig, data: &TrainingData) -> Result<TrainedModel> 
     let mut model = TrainedModel::new(String::new(), ModelType::LinearRegression);
     model.featureColumns = config.featureColumns.clone();
     model.targetColumn = config.targetColumn.clone();
-    // featureMean and featureStd are zeroed/identity so inference paths
-    // that consult them on legacy models do not double-apply the transform.
-    // Models persisted to disk before this change still have the original
-    // mean/std and the per-feature path corrects the math; freshly trained
-    // models go through the prebaked fast path below
+    // The standardization is folded into the weights here, so the model
+    // carries an identity transform and inference is one dot product. A
+    // model whose mean and std are not identity is standardized at predict
+    // time instead, and both forms give the same answer
     model.featureMean = vec![0.0; data.p];
     model.featureStd = vec![1.0; data.p];
     model.weights = bakedWeights;
@@ -196,8 +195,8 @@ pub fn predict(model: &TrainedModel, features: &[f64]) -> f64 {
     if prebaked {
         return crate::ml::f64Kernels::dot(features, &model.weights[..p]) + model.weights[p];
     }
-    // Legacy path for older serialized models that still carry the
-    // per-feature mean/std transform separately
+    // The model carries its transform separately, so it is applied per
+    // feature here rather than having been folded into the weights
     let mut s = 0.0f64;
     for j in 0..p {
         let std = model.featureStd.get(j).copied().unwrap_or(1.0);

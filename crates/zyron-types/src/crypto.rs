@@ -25,6 +25,11 @@ pub fn sha384(data: &[u8]) -> [u8; 48] {
     out
 }
 
+/// Computes BLAKE3 of the given data. Returns 32 bytes.
+pub fn blake3_hash(data: &[u8]) -> [u8; 32] {
+    *blake3::hash(data).as_bytes()
+}
+
 /// Computes SHA-512 of the given data. Returns 64 bytes.
 pub fn sha512(data: &[u8]) -> [u8; 64] {
     let mut hasher = Sha512::new();

@@ -7,7 +7,8 @@
 use crate::columnar::bloom::BloomFilter;
 use crate::columnar::constants::*;
 use crate::encoding::{
-    EncodingType, create_encoding, select_encoding, select_encoding_varlen, varlen_pack,
+    EncodingType, create_encoding, select_encoding, select_encoding_exact, select_encoding_varlen,
+    varlen_pack,
 };
 use zyron_common::types::TypeId;
 use zyron_common::{Result, ZyronError};
@@ -42,7 +43,10 @@ pub struct SegmentHeader {
     /// aggregate trust min/max/null_count/encoded_size from a header-only
     /// read without a whole-file checksum pass.
     pub header_crc: u32,
-    /// Byte offset from start of file to bloom filter (0 if absent).
+    /// Byte offset from the start of this segment to its bloom filter, 0
+    /// when the segment carries none. The segment builder cannot know where
+    /// the writer will place it in the file, so the offset is segment
+    /// relative and a reader adds the segment's file offset.
     pub bloom_filter_offset: u64,
     /// Size of bloom filter in bytes.
     pub bloom_filter_size: u32,
@@ -166,6 +170,48 @@ impl ZoneMapEntry {
     }
 }
 
+/// Whether a column segment carries a value bloom filter.
+///
+/// Auto is the cardinality heuristic: a bloom pays for itself only on a
+/// column with enough distinct values, and a dictionary-encoded segment
+/// already carries an exact lookup structure. Force overrides both, which is
+/// what a declared `bloom_filter_columns` asks for, and Suppress refuses one
+/// on a column that is never probed for equality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BloomPolicy {
+    #[default]
+    Auto,
+    Force,
+    Suppress,
+}
+
+impl BloomPolicy {
+    /// Decides whether this segment gets a bloom filter
+    pub fn builds_bloom(self, cardinality: u64, encoding: EncodingType) -> bool {
+        match self {
+            Self::Suppress => false,
+            // A forced bloom on a single-value column is still built, the
+            // caller asked for a probe that answers without opening the file
+            Self::Force => cardinality > 0,
+            Self::Auto => {
+                cardinality >= BLOOM_MIN_CARDINALITY && encoding != EncodingType::Dictionary
+            }
+        }
+    }
+}
+
+/// Build-time choices a caller can make for one column segment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SegmentOptions {
+    /// Whether the segment carries a value bloom filter
+    pub bloom: BloomPolicy,
+    /// Pick the encoding by trial encoding every row instead of a bounded
+    /// prefix. A caller holding the whole column already, like the lake
+    /// writer, pays nothing extra for a decision that cannot be wrong on an
+    /// unrepresentative prefix
+    pub exact_encoding: bool,
+}
+
 /// A fully materialized column segment ready for writing to a .zyr file.
 /// Contains the segment header, encoded data, zone maps, null bitmap,
 /// and an optional bloom filter (attached separately by the caller).
@@ -221,6 +267,96 @@ pub fn stat_slot_is_signed(type_id: TypeId) -> bool {
     )
 }
 
+/// How a column's stat slot bytes order against one another.
+///
+/// A slot holds the value's raw little endian bytes, and three different
+/// orders read those bytes: an unsigned integer is ordered by them
+/// directly, a two's complement integer needs its sign bit inverted
+/// first, and an IEEE float needs the whole word inverted when it is
+/// negative because a float is further from zero the larger its unsigned
+/// reading. Recording a float's bounds under the wrong one of these does
+/// not merely lose pruning, it loses the value: for a column holding both
+/// signs the unsigned extremes are the smallest non-negative and the most
+/// negative, and the largest value is never written down at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotOrder {
+    /// Byte order is value order
+    Unsigned,
+    /// Two's complement, so a negative sorts below every non-negative
+    TwosComplement,
+    /// IEEE 754, where the sign bit reverses the direction
+    Ieee,
+    /// A variable-length value, ordered by its bytes from the first, and
+    /// held as at most a 32-byte prefix
+    Lexicographic,
+}
+
+/// The order one column's stat slots compare in.
+pub fn slot_order(type_id: TypeId) -> SlotOrder {
+    if type_id.fixed_size().is_none() {
+        return SlotOrder::Lexicographic;
+    }
+    match type_id {
+        TypeId::Float32 | TypeId::Float64 => SlotOrder::Ieee,
+        other if stat_slot_is_signed(other) => SlotOrder::TwosComplement,
+        _ => SlotOrder::Unsigned,
+    }
+}
+
+/// Upper bound slot for a variable-length value.
+///
+/// A slot holds at most 32 bytes, and a truncated prefix sorts below the
+/// value it came from, so recording it as a maximum would be a bound the
+/// data breaks. Rounding the prefix up restores it: incrementing the last
+/// byte that can carry, and zeroing what follows, gives the smallest
+/// 32-byte string strictly above every value with that prefix. A value
+/// whose prefix is already all ones has nothing above it to round to, and
+/// the all-ones slot is itself a valid bound for anything.
+pub fn varlen_upper_slot(value: &[u8]) -> [u8; STAT_VALUE_SIZE] {
+    let mut slot = value_to_stat_slot(value);
+    if value.len() <= STAT_VALUE_SIZE {
+        return slot;
+    }
+    for i in (0..STAT_VALUE_SIZE).rev() {
+        if slot[i] != 0xFF {
+            slot[i] += 1;
+            for byte in slot[i + 1..].iter_mut() {
+                *byte = 0;
+            }
+            return slot;
+        }
+    }
+    [0xFF; STAT_VALUE_SIZE]
+}
+
+/// Compares two slots holding variable-length prefixes, first byte first
+fn compare_lexicographic(
+    a: &[u8; STAT_VALUE_SIZE],
+    b: &[u8; STAT_VALUE_SIZE],
+) -> std::cmp::Ordering {
+    a[..].cmp(&b[..])
+}
+
+/// Order-preserving key for a `width`-byte IEEE float held little endian.
+///
+/// Negative floats have their sign bit set and grow away from zero, so
+/// the whole word is inverted; non-negative floats keep their order and
+/// are lifted above every negative by setting the sign bit. This is the
+/// same total order `f64::total_cmp` defines.
+fn ieee_key(bytes: &[u8], width: usize) -> u128 {
+    let mut raw: u128 = 0;
+    for i in (0..width).rev() {
+        raw = (raw << 8) | bytes.get(i).copied().unwrap_or(0) as u128;
+    }
+    let sign = 1u128 << (8 * width - 1);
+    if raw & sign != 0 {
+        // Within the width, so the padding above it stays zero
+        !raw & ((sign << 1) - 1)
+    } else {
+        raw | sign
+    }
+}
+
 /// Compares two stat slots holding `width`-byte little-endian values.
 /// `signed` selects two's complement ordering: when the operands have
 /// different sign bits the negative one is the smaller, otherwise (same sign,
@@ -231,9 +367,15 @@ pub fn compare_stat_slots_typed(
     a: &[u8; STAT_VALUE_SIZE],
     b: &[u8; STAT_VALUE_SIZE],
     width: usize,
-    signed: bool,
+    order: SlotOrder,
 ) -> std::cmp::Ordering {
-    if signed && width > 0 {
+    if order == SlotOrder::Lexicographic {
+        return compare_lexicographic(a, b);
+    }
+    if order == SlotOrder::Ieee && (width == 4 || width == 8) {
+        return ieee_key(a, width).cmp(&ieee_key(b, width));
+    }
+    if order == SlotOrder::TwosComplement && width > 0 {
         let sign_byte = width - 1;
         let a_neg = a[sign_byte] & 0x80 != 0;
         let b_neg = b[sign_byte] & 0x80 != 0;
@@ -260,10 +402,20 @@ pub fn compare_value_to_slot(
     v: &[u8],
     slot: &[u8; STAT_VALUE_SIZE],
     width: usize,
-    signed: bool,
+    order: SlotOrder,
 ) -> std::cmp::Ordering {
     let vb = |i: usize| -> u8 { v.get(i).copied().unwrap_or(0) };
-    if signed && width > 0 {
+    if order == SlotOrder::Lexicographic {
+        // The value's own prefix against the recorded one. Comparing
+        // prefixes decides the values whenever they differ inside the
+        // first 32 bytes, and a tie there is what the bounds treat
+        // conservatively
+        return compare_lexicographic(&value_to_stat_slot(v), slot);
+    }
+    if order == SlotOrder::Ieee && (width == 4 || width == 8) {
+        return ieee_key(v, width).cmp(&ieee_key(slot, width));
+    }
+    if order == SlotOrder::TwosComplement && width > 0 {
         let sign_byte = width - 1;
         let a_neg = vb(sign_byte) & 0x80 != 0;
         let b_neg = slot[sign_byte] & 0x80 != 0;
@@ -320,20 +472,36 @@ pub fn compare_le_bytes(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
 }
 
 impl ColumnSegment {
-    /// Builds a ColumnSegment from raw column values.
+    /// Builds a ColumnSegment from raw column values, letting the segment's
+    /// own cardinality decide whether a bloom filter is worth its bytes.
     ///
     /// `column_id` - ordinal position of this column in the table schema.
     /// `type_id` - data type of the column, used for encoding selection.
     /// `value_size` - byte width of each value (fixed-size types only).
     /// `values` - row values, where None represents a null.
-    ///
-    /// The bloom filter field is left as None. The caller attaches one
-    /// separately if the cardinality warrants it.
     pub fn build(
         columnId: u32,
         typeId: TypeId,
         valueSize: usize,
         values: &[Option<&[u8]>],
+    ) -> Result<Self> {
+        Self::build_with_options(
+            columnId,
+            typeId,
+            valueSize,
+            values,
+            SegmentOptions::default(),
+        )
+    }
+
+    /// Builds a ColumnSegment with the caller choosing the bloom policy and
+    /// how the encoding is picked.
+    pub fn build_with_options(
+        columnId: u32,
+        typeId: TypeId,
+        valueSize: usize,
+        values: &[Option<&[u8]>],
+        options: SegmentOptions,
     ) -> Result<Self> {
         let rowCount = values.len();
         if rowCount == 0 {
@@ -343,7 +511,7 @@ impl ColumnSegment {
         }
 
         if valueSize == 0 {
-            return Self::build_varlen(columnId, typeId, values);
+            return Self::build_varlen(columnId, typeId, values, options);
         }
 
         // Single fused pass over values, computes:
@@ -381,7 +549,7 @@ impl ColumnSegment {
         // (incl. a pre-1970 picosecond timestamp) sorts below zero in the
         // segment min/max instead of above every positive under an unsigned
         // byte compare.
-        let statSigned = stat_slot_is_signed(typeId);
+        let statOrder = slot_order(typeId);
 
         let batchSize = ZONE_MAP_BATCH_SIZE as usize;
         let zoneCount = rowCount.div_ceil(batchSize);
@@ -443,39 +611,58 @@ impl ColumnSegment {
                     // Compare the raw value against each running bound and
                     // build the 32-byte slot only on a row that actually moves
                     // a bound, instead of materializing a slot for every row.
-                    use std::cmp::Ordering::{Greater, Less};
-                    let new_gmin = globalMin.is_none_or(|cur| {
-                        compare_value_to_slot(v, &cur, valueSize, statSigned) == Less
-                    });
-                    let new_gmax = globalMax.is_none_or(|cur| {
-                        compare_value_to_slot(v, &cur, valueSize, statSigned) == Greater
-                    });
-                    let new_zmin = zoneMin.is_none_or(|cur| {
-                        compare_value_to_slot(v, &cur, valueSize, statSigned) == Less
-                    });
-                    let new_zmax = zoneMax.is_none_or(|cur| {
-                        compare_value_to_slot(v, &cur, valueSize, statSigned) == Greater
-                    });
+                    use std::cmp::Ordering::{Equal, Greater, Less};
+                    // A variable-length value longer than a slot is held
+                    // as a prefix, and its upper bound is that prefix
+                    // rounded up, so it can exceed a recorded maximum its
+                    // prefix merely ties with
+                    let truncated = valueSize == 0 && v.len() > STAT_VALUE_SIZE;
+                    let below = |cur: &[u8; STAT_VALUE_SIZE]| {
+                        compare_value_to_slot(v, cur, valueSize, statOrder) == Less
+                    };
+                    let above = |cur: &[u8; STAT_VALUE_SIZE]| {
+                        match compare_value_to_slot(v, cur, valueSize, statOrder) {
+                            Greater => true,
+                            Equal => truncated,
+                            Less => false,
+                        }
+                    };
+                    let new_gmin = globalMin.is_none_or(|cur| below(&cur));
+                    let new_gmax = globalMax.is_none_or(|cur| above(&cur));
+                    let new_zmin = zoneMin.is_none_or(|cur| below(&cur));
+                    let new_zmax = zoneMax.is_none_or(|cur| above(&cur));
                     if new_gmin || new_gmax || new_zmin || new_zmax {
-                        let slot = value_to_stat_slot(v);
+                        let lower = value_to_stat_slot(v);
+                        let upper = if truncated {
+                            varlen_upper_slot(v)
+                        } else {
+                            lower
+                        };
                         if new_gmin {
-                            globalMin = Some(slot);
+                            globalMin = Some(lower);
                         }
                         if new_gmax {
-                            globalMax = Some(slot);
+                            globalMax = Some(upper);
                         }
                         if new_zmin {
-                            zoneMin = Some(slot);
+                            zoneMin = Some(lower);
                         }
                         if new_zmax {
-                            zoneMax = Some(slot);
+                            zoneMax = Some(upper);
                         }
                     }
 
-                    if isSorted
-                        && let Some(prev) = prevRaw
-                        && compare_le_bytes(v, prev) == std::cmp::Ordering::Less
-                    {
+                    // A variable-length column orders by its bytes from the
+                    // first, and compare_le_bytes reads fixed-width values
+                    // from the last and requires equal lengths
+                    let descends = if valueSize == 0 {
+                        prevRaw.is_some_and(|prev| *v < prev)
+                    } else {
+                        prevRaw.is_some_and(|prev| {
+                            compare_le_bytes(v, prev) == std::cmp::Ordering::Less
+                        })
+                    };
+                    if isSorted && descends {
                         isSorted = false;
                     }
                     prevRaw = Some(*v);
@@ -510,32 +697,33 @@ impl ColumnSegment {
         let minValue = globalMin.unwrap_or([0u8; STAT_VALUE_SIZE]);
         let maxValue = globalMax.unwrap_or([0u8; STAT_VALUE_SIZE]);
 
-        let encodingType = select_encoding(typeId, values);
+        let encodingType = if options.exact_encoding {
+            select_encoding_exact(typeId, values)
+        } else {
+            select_encoding(typeId, values)
+        };
         let encoder = create_encoding(encodingType);
 
         let encodedData = encoder.encode(&rawData, rowCount, valueSize)?;
         let encodedSize = encodedData.len() as u64;
 
-        // Build bloom filter when cardinality is high enough to benefit
-        // Dictionary-encoded segments already have an implicit lookup structure
-        // so bloom filters are skipped for those, this is the only remaining
-        // pass over values since the bloom filter sizing depends on the
+        // Build bloom filter when the policy asks for one, this is the only
+        // remaining pass over values since the filter sizing depends on the
         // cardinality decision computed in the fused pass above
-        let bloomFilter =
-            if cardinality >= BLOOM_MIN_CARDINALITY && encodingType != EncodingType::Dictionary {
-                let bloom_size_hint = if distinctCapped {
-                    rowCount as u64
-                } else {
-                    cardinality
-                };
-                let mut filter = BloomFilter::new(bloom_size_hint);
-                for v in values.iter().flatten() {
-                    filter.insert(v);
-                }
-                Some(filter)
+        let bloomFilter = if options.bloom.builds_bloom(cardinality, encodingType) {
+            let bloom_size_hint = if distinctCapped {
+                rowCount as u64
             } else {
-                None
+                cardinality
             };
+            let mut filter = BloomFilter::new(bloom_size_hint);
+            for v in values.iter().flatten() {
+                filter.insert(v);
+            }
+            Some(filter)
+        } else {
+            None
+        };
 
         let bloomFilterSize = bloomFilter
             .as_ref()
@@ -552,7 +740,13 @@ impl ColumnSegment {
             max_value: maxValue,
             data_checksum: zyron_common::hash32(&encodedData),
             header_crc: 0,
-            bloom_filter_offset: 0,
+            // The writer lays a segment out as header, bloom, zone maps,
+            // null bitmap, data, so the bloom starts right after the header
+            bloom_filter_offset: if bloomFilterSize > 0 {
+                SEGMENT_HEADER_SIZE as u64
+            } else {
+                0
+            },
             bloom_filter_size: bloomFilterSize,
             is_sorted: isSorted,
         };
@@ -574,7 +768,12 @@ impl ColumnSegment {
     /// shared prefix only ever widens a zone (a conservative non-skip), never
     /// a false skip. The null bitmap is authoritative, so an empty string and
     /// a null stay distinct.
-    fn build_varlen(columnId: u32, typeId: TypeId, values: &[Option<&[u8]>]) -> Result<Self> {
+    fn build_varlen(
+        columnId: u32,
+        typeId: TypeId,
+        values: &[Option<&[u8]>],
+        options: SegmentOptions,
+    ) -> Result<Self> {
         let rowCount = values.len();
         let batchSize = ZONE_MAP_BATCH_SIZE as usize;
         let zoneCount = rowCount.div_ceil(batchSize);
@@ -707,21 +906,20 @@ impl ColumnSegment {
         let encodedData = encoder.encode(&rawData, rowCount, 0)?;
         let encodedSize = encodedData.len() as u64;
 
-        let bloomFilter =
-            if cardinality >= BLOOM_MIN_CARDINALITY && encodingType != EncodingType::Dictionary {
-                let bloom_size_hint = if distinctCapped {
-                    rowCount as u64
-                } else {
-                    cardinality
-                };
-                let mut filter = BloomFilter::new(bloom_size_hint);
-                for v in values.iter().flatten() {
-                    filter.insert(v);
-                }
-                Some(filter)
+        let bloomFilter = if options.bloom.builds_bloom(cardinality, encodingType) {
+            let bloom_size_hint = if distinctCapped {
+                rowCount as u64
             } else {
-                None
+                cardinality
             };
+            let mut filter = BloomFilter::new(bloom_size_hint);
+            for v in values.iter().flatten() {
+                filter.insert(v);
+            }
+            Some(filter)
+        } else {
+            None
+        };
 
         let bloomFilterSize = bloomFilter
             .as_ref()
@@ -738,7 +936,13 @@ impl ColumnSegment {
             max_value: maxValue,
             data_checksum: zyron_common::hash32(&encodedData),
             header_crc: 0,
-            bloom_filter_offset: 0,
+            // The writer lays a segment out as header, bloom, zone maps,
+            // null bitmap, data, so the bloom starts right after the header
+            bloom_filter_offset: if bloomFilterSize > 0 {
+                SEGMENT_HEADER_SIZE as u64
+            } else {
+                0
+            },
             bloom_filter_size: bloomFilterSize,
             is_sorted: isSorted,
         };

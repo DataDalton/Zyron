@@ -77,25 +77,17 @@ async fn create_test_server(db_name: &str) -> (Arc<ServerState>, tempfile::TempD
     std::fs::create_dir_all(&wal_dir).unwrap();
 
     let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir,
-            segment_size: 16 * 1024 * 1024,
-            fsync_enabled: false,
-            ring_buffer_capacity: 4 * 1024 * 1024,
-        })
+        WalWriter::new(zyron_bench_harness::wal_config(wal_dir))
         .expect("WalWriter creation failed"),
     );
 
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir,
-            fsync_enabled: false,
-        })
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir))
         .await
         .expect("DiskManager creation failed"),
     );
 
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 1024 }));
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
 
     let storage = Arc::new(
         HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool))
@@ -122,6 +114,10 @@ async fn create_test_server(db_name: &str) -> (Arc<ServerState>, tempfile::TempD
         buffer_pool: pool,
         disk_manager: disk,
         txn_manager,
+        doc_registry: std::sync::Arc::new(zyron_common::DocRegistry::new()),
+        table_io_stats: std::sync::Arc::new(zyron_common::TableIOStatsRegistry::new()),
+        index_io_stats: std::sync::Arc::new(zyron_common::IndexIOStatsRegistry::new()),
+        columnar_maintenance: None,
         security_manager: None,
         key_store: Arc::new(zyron_auth::LocalKeyStore::new([0u8; 32])),
         config_lookup: None,
@@ -174,6 +170,10 @@ async fn create_test_server(db_name: &str) -> (Arc<ServerState>, tempfile::TempD
         feature_lineage: zyron_analytics::featureLineageRegistry(),
         model_cache: zyron_analytics::modelCache(),
         default_isolation: zyron_storage::IsolationLevel::ReadCommitted,
+        deployment_mode: zyron_common::DeploymentMode::Unified,
+        node_identity: Default::default(),
+        foreign_reader: None,
+        peers: Default::default(),
         statement_timeout: None,
         max_result_rows: None,
         balloon_params: None,

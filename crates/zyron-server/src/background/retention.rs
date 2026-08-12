@@ -332,6 +332,7 @@ impl RetentionWorker {
             zyron_catalog::DatabaseId(1),
             vec!["public".to_string()],
             stmt,
+            None,
         )
         .await
         .map_err(|e| format!("plan: {e}"))?;
@@ -386,6 +387,7 @@ impl RetentionWorker {
             zyron_catalog::DatabaseId(1),
             vec!["public".to_string()],
             stmt,
+            None,
         )
         .await
         .map_err(|e| format!("plan: {e}"))?;

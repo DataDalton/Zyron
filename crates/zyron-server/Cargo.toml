@@ -10,6 +10,7 @@ zyron-buffer = { path = "../zyron-buffer" }
 zyron-wal = { path = "../zyron-wal" }
 zyron-storage = { path = "../zyron-storage" }
 zyron-catalog = { path = "../zyron-catalog" }
+zyron-lake = { path = "../zyron-lake" }
 zyron-lifecycle = { path = "../zyron-lifecycle" }
 zyron-wire = { path = "../zyron-wire" }
 zyron-auth = { path = "../zyron-auth" }

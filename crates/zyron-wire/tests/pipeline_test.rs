@@ -31,23 +31,15 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
     std::fs::create_dir_all(&wal_dir).unwrap();
 
     let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir,
-            segment_size: 16 * 1024 * 1024,
-            fsync_enabled: false,
-            ring_buffer_capacity: 4 * 1024 * 1024,
-        })
+        WalWriter::new(zyron_bench_harness::wal_config(wal_dir))
         .expect("wal"),
     );
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir,
-            fsync_enabled: false,
-        })
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir))
         .await
         .expect("disk"),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 1024 }));
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let storage =
         Arc::new(HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).expect("storage"));
     let cache = Arc::new(CatalogCache::new(256, 64));
@@ -68,6 +60,10 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         buffer_pool: pool,
         disk_manager: disk,
         txn_manager,
+        doc_registry: std::sync::Arc::new(zyron_common::DocRegistry::new()),
+        table_io_stats: std::sync::Arc::new(zyron_common::TableIOStatsRegistry::new()),
+        index_io_stats: std::sync::Arc::new(zyron_common::IndexIOStatsRegistry::new()),
+        columnar_maintenance: None,
         security_manager: None,
         key_store: Arc::new(zyron_auth::LocalKeyStore::new([0u8; 32])),
         config_lookup: None,
@@ -120,6 +116,10 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         feature_lineage: zyron_analytics::featureLineageRegistry(),
         model_cache: zyron_analytics::modelCache(),
         default_isolation: zyron_storage::IsolationLevel::ReadCommitted,
+        deployment_mode: zyron_common::DeploymentMode::Unified,
+        node_identity: Default::default(),
+        foreign_reader: None,
+        peers: Default::default(),
         statement_timeout: None,
         max_result_rows: None,
         balloon_params: None,
@@ -189,9 +189,15 @@ async fn try_exec(
         return res.map(|_| Vec::new()).map_err(|e| format!("{e:?}"));
     }
 
-    let plan = zyron_planner::plan(&server.catalog, DatabaseId(1), vec!["public".into()], stmt)
-        .await
-        .map_err(|e| e.to_string())?;
+    let plan = zyron_planner::plan(
+        &server.catalog,
+        DatabaseId(1),
+        vec!["public".into()],
+        stmt,
+        None,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let mut txn = server
         .txn_manager
         .begin(IsolationLevel::ReadCommitted)

@@ -4,6 +4,7 @@
 use std::time::Instant;
 use tempfile::tempdir;
 
+use zyron_common::RowLocator;
 use zyron_common::page::PageId;
 use zyron_storage::{BTreeIndex, TupleId};
 
@@ -19,7 +20,10 @@ async fn profile_checkpoint_stages() {
 
     for i in 0..KEY_COUNT as u64 {
         let key = i.to_be_bytes();
-        let tid = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
+        let tid = RowLocator::Heap {
+            page: PageId::new(0, i % 1000),
+            slot: (i % 100) as u16,
+        };
         btree.insert_exclusive(&key, tid).unwrap();
     }
 

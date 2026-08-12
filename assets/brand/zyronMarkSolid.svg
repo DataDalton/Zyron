@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Zyron">
+  <title>Zyron</title>
+  <!-- kerfs closed, for sizes at or below 32px -->
+  <path fill="#0B0B0D" d="M9 10 H55 V21 L27 43 H55 V54 H9 V43 L37 21 H9 Z"/>
+</svg>

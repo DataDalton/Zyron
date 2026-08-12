@@ -25,6 +25,12 @@ fn now_micros() -> u64 {
         .unwrap_or(0)
 }
 
+/// Converts an epoch-microsecond instant to epoch seconds, the unit the
+/// maintenance timestamps in zyron_stat_tables are reported in.
+fn epoch_seconds(micros: u64) -> u64 {
+    micros / 1_000_000
+}
+
 /// Configuration for the vacuum worker.
 #[derive(Debug, Clone)]
 pub struct VacuumWorkerConfig {
@@ -80,6 +86,7 @@ impl VacuumWorker {
         buffer_pool: Arc<BufferPool>,
         _wal: Arc<WalWriter>,
         btree_indexes: Arc<scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>>,
+        table_io_stats: Arc<zyron_common::TableIOStatsRegistry>,
         config: VacuumWorkerConfig,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -101,6 +108,7 @@ impl VacuumWorker {
                     &txn_manager,
                     &disk_manager,
                     &buffer_pool,
+                    &table_io_stats,
                     &config,
                     &thread_shutdown,
                     &thread_stats,
@@ -124,6 +132,7 @@ impl VacuumWorker {
         txn_manager: &TransactionManager,
         disk_manager: &Arc<DiskManager>,
         buffer_pool: &Arc<BufferPool>,
+        table_io_stats: &zyron_common::TableIOStatsRegistry,
         config: &VacuumWorkerConfig,
         shutdown: &AtomicBool,
         stats: &VacuumStats,
@@ -216,6 +225,17 @@ impl VacuumWorker {
                     Ok((reclaimed, pages)) => {
                         total_reclaimed += reclaimed;
                         total_pages += pages;
+                        // Only a pass that reached the end of the table clears
+                        // the dead estimate. A page-capped cycle left dead rows
+                        // behind, so reporting zero would be a lie the next
+                        // cycle has to undo
+                        if config.max_pages_per_cycle == 0
+                            || pages < config.max_pages_per_cycle as u64
+                        {
+                            table_io_stats
+                                .get_or_create(table_entry.id.0)
+                                .record_vacuum(epoch_seconds(now_micros));
+                        }
                     }
                     Err(e) => {
                         debug!("Vacuum for table {} failed: {}", table_entry.name, e);

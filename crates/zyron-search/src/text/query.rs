@@ -1,4 +1,4 @@
-//! FTS query parser with Lucene-like syntax.
+﻿//! FTS query parser with Lucene-like syntax.
 //!
 //! Parses search query strings into an FtsQuery tree that the inverted
 //! index can evaluate. Supports term, phrase, boolean, fuzzy, prefix,
@@ -221,6 +221,110 @@ enum Modifier {
     Should,
 }
 
+impl FtsQuery {
+    /// Whether one document's analyzed terms satisfy this query.
+    ///
+    /// The inverted index answers the same question by intersecting postings
+    /// lists. This answers it from the document alone, which is what lets a
+    /// storage scan evaluate a match predicate on a table with no full-text
+    /// index, and on the rows a past version holds rather than the rows the
+    /// index describes now. Both routes must agree, so each clause is
+    /// resolved the way the postings walk resolves it: a plain term is run
+    /// through the analyzer and compared, phrase and proximity words are
+    /// compared as written, fuzzy allows a bounded edit distance, and prefix
+    /// and wildcard match the term text.
+    ///
+    /// `terms` are the document's terms in position order, already run
+    /// through the same analyzer.
+    pub fn matches_terms(&self, terms: &[&str], analyzer: &dyn crate::Analyzer) -> bool {
+        match self {
+            FtsQuery::Term(term) => {
+                let analyzed = analyzer.analyze(term);
+                analyzed
+                    .iter()
+                    .any(|token| terms.iter().any(|t| *t == token.term))
+            }
+            FtsQuery::Phrase(words) => phrase_at_any_position(words, terms),
+            FtsQuery::Boolean {
+                must,
+                should,
+                must_not,
+            } => {
+                if must_not.iter().any(|q| q.matches_terms(terms, analyzer)) {
+                    return false;
+                }
+                if !must.iter().all(|q| q.matches_terms(terms, analyzer)) {
+                    return false;
+                }
+                if must.is_empty() {
+                    // Without a required clause the optional ones are what
+                    // select documents rather than only ranking them
+                    return should.iter().any(|q| q.matches_terms(terms, analyzer));
+                }
+                true
+            }
+            FtsQuery::Fuzzy { term, max_edits } => terms
+                .iter()
+                .any(|t| edit_distance(t, term) <= *max_edits as u32),
+            FtsQuery::Prefix(prefix) => terms.iter().any(|t| t.starts_with(prefix.as_str())),
+            FtsQuery::Wildcard(pattern) => terms.iter().any(|t| wildcard_match(pattern, t)),
+            FtsQuery::Proximity {
+                terms: words,
+                distance,
+            } => proximity_within(words, terms, *distance),
+        }
+    }
+}
+
+/// Whether the words appear adjacent and in order anywhere in the document.
+fn phrase_at_any_position(words: &[String], terms: &[&str]) -> bool {
+    if words.is_empty() || words.len() > terms.len() {
+        return false;
+    }
+    terms
+        .windows(words.len())
+        .any(|w| w.iter().zip(words).all(|(t, q)| *t == q.as_str()))
+}
+
+/// Whether every word appears and the span holding one occurrence of each
+/// fits inside the allowed distance, matching the index proximity walk.
+fn proximity_within(words: &[String], terms: &[&str], distance: u32) -> bool {
+    if words.is_empty() {
+        return false;
+    }
+    let positions: Vec<Vec<usize>> = words
+        .iter()
+        .map(|w| {
+            terms
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| **t == w.as_str())
+                .map(|(i, _)| i)
+                .collect()
+        })
+        .collect();
+    if positions.iter().any(|p| p.is_empty()) {
+        return false;
+    }
+    // Slide over the first word's occurrences, taking the nearest occurrence
+    // of every other word to each one
+    positions[0].iter().any(|&anchor| {
+        let mut lo = anchor;
+        let mut hi = anchor;
+        for other in &positions[1..] {
+            let Some(&nearest) = other
+                .iter()
+                .min_by_key(|&&p| p.abs_diff(anchor))
+            else {
+                return false;
+            };
+            lo = lo.min(nearest);
+            hi = hi.max(nearest);
+        }
+        (hi - lo) as u32 <= distance
+    })
+}
+
 /// Computes the Levenshtein edit distance between two strings.
 /// Used for fuzzy matching in the inverted index search.
 pub fn edit_distance(a: &str, b: &str) -> u32 {
@@ -290,6 +394,61 @@ pub fn wildcard_match(pattern: &str, text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The row-wise matcher and the inverted index must select the same
+    /// documents. A query answered one way on an indexed table and the other
+    /// way on an unindexed one has to return the same rows, or the presence
+    /// of an index changes the answer instead of only the speed.
+    #[test]
+    fn test_row_wise_match_selects_the_same_documents_as_the_index() {
+        use crate::{Analyzer as _, Bm25Scorer, InvertedIndex, SimpleAnalyzer};
+
+        let documents = [
+            "the quick brown fox jumps over the lazy dog",
+            "a quick brown cat naps in the sun",
+            "slow green turtles crossing the road",
+            "the fox and the hound",
+            "quick thinking wins races",
+        ];
+        let analyzer = SimpleAnalyzer;
+        let index = InvertedIndex::new(1, 1, vec![1]);
+        for (i, text) in documents.iter().enumerate() {
+            index.add_document(i as u64, text, &analyzer).unwrap();
+        }
+
+        let queries = [
+            "fox",
+            "quick",
+            "+quick +brown",
+            "+quick -cat",
+            "\"brown fox\"",
+            "fox~1",
+            "qui*",
+            "tu?tle",
+            "missing",
+            "fox hound",
+        ];
+        for q in queries {
+            let parsed = FtsQueryParser::parse(q).unwrap();
+            let mut from_index: Vec<u64> = index
+                .search(&parsed, &analyzer, &Bm25Scorer::default(), 100)
+                .unwrap()
+                .into_iter()
+                .map(|(doc, _)| doc)
+                .collect();
+            from_index.sort_unstable();
+
+            let mut from_rows: Vec<u64> = Vec::new();
+            for (i, text) in documents.iter().enumerate() {
+                let tokens = crate::Analyzer::analyze(&analyzer, text);
+                let terms: Vec<&str> = tokens.iter().map(|t| t.term.as_str()).collect();
+                if parsed.matches_terms(&terms, &analyzer) {
+                    from_rows.push(i as u64);
+                }
+            }
+            assert_eq!(from_index, from_rows, "query {q:?} disagreed");
+        }
+    }
 
     #[test]
     fn test_parse_single_term() {

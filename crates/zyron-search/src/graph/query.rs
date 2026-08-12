@@ -5,6 +5,8 @@
 //! that the existing relational query engine can execute on the backing
 //! node and edge tables.
 
+use zyron_common::ZyronError;
+
 use super::schema::{GraphSchema, LabelId};
 
 /// Direction of an edge in a graph pattern.
@@ -99,8 +101,10 @@ pub struct GraphReturnItem {
 pub struct GraphPattern {
     /// Alternating node/edge elements forming the pattern
     pub elements: Vec<PatternElement>,
-    /// Optional WHERE clause filter (stored as raw string for now,
-    /// bound during query planning)
+    /// Optional WHERE clause over pattern variables, as written. Compiling
+    /// the pattern resolves it into `CompiledGraphQuery::filters`, so a
+    /// clause it cannot resolve fails the compile rather than travelling on
+    /// as text nothing applies
     pub where_clause: Option<String>,
     /// Columns to return
     pub return_items: Vec<GraphReturnItem>,
@@ -152,6 +156,227 @@ pub struct JoinCondition {
     pub right: (String, String),
 }
 
+/// How a filter compares a pattern property to a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterOp {
+    Eq,
+    Neq,
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+}
+
+impl FilterOp {
+    /// The operator's SQL spelling, longest first so `<=` is not read as `<`.
+    const SPELLINGS: [(&'static str, FilterOp); 7] = [
+        ("<=", FilterOp::Lte),
+        (">=", FilterOp::Gte),
+        ("<>", FilterOp::Neq),
+        ("!=", FilterOp::Neq),
+        ("=", FilterOp::Eq),
+        ("<", FilterOp::Lt),
+        (">", FilterOp::Gt),
+    ];
+
+    pub fn as_sql(&self) -> &'static str {
+        match self {
+            FilterOp::Eq => "=",
+            FilterOp::Neq => "<>",
+            FilterOp::Lt => "<",
+            FilterOp::Lte => "<=",
+            FilterOp::Gt => ">",
+            FilterOp::Gte => ">=",
+        }
+    }
+}
+
+/// A literal a filter compares against.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FilterValue {
+    Integer(i64),
+    Float(f64),
+    Text(String),
+    Boolean(bool),
+    Null,
+}
+
+/// One `variable.property <op> value` term of a pattern's WHERE clause.
+///
+/// The term is resolved rather than carried as text: a consumer applies it
+/// against the scan the variable named, the way it applies a join condition,
+/// with no second parse and no chance of a predicate being carried along and
+/// silently not applied.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphFilter {
+    /// Pattern variable, which is the alias of the scan this term filters
+    pub variable: String,
+    /// Property on that variable, which is the column name
+    pub property: String,
+    pub op: FilterOp,
+    pub value: FilterValue,
+}
+
+/// Resolves a pattern's WHERE clause against the scans the pattern produced.
+///
+/// A term naming a variable the pattern does not bind is refused: it would
+/// otherwise filter nothing and read as a narrower match than it was.
+fn resolve_filters(
+    pattern: &GraphPattern,
+    scans: &[TableScanRef],
+) -> zyron_common::Result<Vec<GraphFilter>> {
+    let Some(text) = &pattern.where_clause else {
+        return Ok(Vec::new());
+    };
+    let filters = parse_where_clause(text)?;
+    for filter in &filters {
+        if !scans.iter().any(|s| s.alias == filter.variable) {
+            let bound: Vec<&str> = scans.iter().map(|s| s.alias.as_str()).collect();
+            return Err(ZyronError::PlanError(format!(
+                "graph WHERE names variable \"{}\", which the pattern does not bind. Bound: {}",
+                filter.variable,
+                bound.join(", ")
+            )));
+        }
+    }
+    Ok(filters)
+}
+
+/// Parses a pattern's WHERE text into terms over pattern variables.
+///
+/// Accepts `variable.property <op> literal` terms joined by AND, which is
+/// what a pattern filter is: the joins are already expressed as join
+/// conditions, so a term here always names one variable's property. Anything
+/// else is refused by name, because a filter that parsed to nothing would
+/// return the unfiltered pattern and look like it had matched more.
+pub fn parse_where_clause(text: &str) -> zyron_common::Result<Vec<GraphFilter>> {
+    let mut out = Vec::new();
+    for term in split_conjuncts(text) {
+        let term = term.trim();
+        if term.is_empty() {
+            continue;
+        }
+        out.push(parse_filter_term(term)?);
+    }
+    if out.is_empty() {
+        return Err(ZyronError::PlanError(format!(
+            "graph WHERE clause \"{}\" has no conditions",
+            text.trim()
+        )));
+    }
+    Ok(out)
+}
+
+/// Splits on AND at the top level, leaving AND inside a quoted literal alone.
+fn split_conjuncts(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut in_quote = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\'' {
+            in_quote = !in_quote;
+            i += 1;
+            continue;
+        }
+        if !in_quote
+            && (c == b'a' || c == b'A')
+            && text[i..].len() >= 3
+            && text[i..i + 3].eq_ignore_ascii_case("and")
+            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+            && (i + 3 == bytes.len() || bytes[i + 3].is_ascii_whitespace())
+        {
+            parts.push(&text[start..i]);
+            i += 3;
+            start = i;
+            continue;
+        }
+        i += 1;
+    }
+    parts.push(&text[start..]);
+    parts
+}
+
+fn parse_filter_term(term: &str) -> zyron_common::Result<GraphFilter> {
+    let refuse = |reason: &str| {
+        ZyronError::PlanError(format!(
+            "graph WHERE term \"{}\" {}. A term is variable.property compared to a literal, terms joined by AND",
+            term, reason
+        ))
+    };
+    // Longest spelling first, and the operator is found outside quotes so a
+    // value containing one is not mistaken for the comparison
+    let mut split: Option<(usize, usize, FilterOp)> = None;
+    let bytes = term.as_bytes();
+    let mut i = 0usize;
+    let mut in_quote = false;
+    'scan: while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            in_quote = !in_quote;
+            i += 1;
+            continue;
+        }
+        if !in_quote {
+            for (spelling, op) in FilterOp::SPELLINGS {
+                if term[i..].starts_with(spelling) {
+                    split = Some((i, i + spelling.len(), op));
+                    break 'scan;
+                }
+            }
+        }
+        i += 1;
+    }
+    let Some((lhs_end, rhs_start, op)) = split else {
+        return Err(refuse("has no comparison operator"));
+    };
+
+    let lhs = term[..lhs_end].trim();
+    let Some((variable, property)) = lhs.split_once('.') else {
+        return Err(refuse("does not name variable.property on its left"));
+    };
+    let variable = variable.trim();
+    let property = property.trim();
+    if variable.is_empty() || property.is_empty() || property.contains('.') {
+        return Err(refuse("does not name variable.property on its left"));
+    }
+
+    let rhs = term[rhs_start..].trim();
+    let value = parse_filter_value(rhs).ok_or_else(|| refuse("compares against no literal"))?;
+    Ok(GraphFilter {
+        variable: variable.to_string(),
+        property: property.to_string(),
+        op,
+        value,
+    })
+}
+
+fn parse_filter_value(text: &str) -> Option<FilterValue> {
+    if text.len() >= 2 && text.starts_with('\'') && text.ends_with('\'') {
+        // Two quotes are one literal quote, the SQL escape
+        return Some(FilterValue::Text(text[1..text.len() - 1].replace("''", "'")));
+    }
+    if text.eq_ignore_ascii_case("null") {
+        return Some(FilterValue::Null);
+    }
+    if text.eq_ignore_ascii_case("true") {
+        return Some(FilterValue::Boolean(true));
+    }
+    if text.eq_ignore_ascii_case("false") {
+        return Some(FilterValue::Boolean(false));
+    }
+    if let Ok(v) = text.parse::<i64>() {
+        return Some(FilterValue::Integer(v));
+    }
+    if let Ok(v) = text.parse::<f64>() {
+        if v.is_finite() {
+            return Some(FilterValue::Float(v));
+        }
+    }
+    None
+}
+
 /// A compiled graph query expressed as relational operations on backing tables.
 /// The existing relational query engine executes this.
 #[derive(Debug, Clone)]
@@ -160,8 +385,9 @@ pub struct CompiledGraphQuery {
     pub table_scans: Vec<TableScanRef>,
     /// Join conditions linking edges to nodes
     pub join_conditions: Vec<JoinCondition>,
-    /// Optional WHERE filter predicate (raw SQL string)
-    pub filter_predicate: Option<String>,
+    /// WHERE terms, resolved to the scan alias each one filters. Empty when
+    /// the pattern carries no filter
+    pub filters: Vec<GraphFilter>,
     /// Projected return items
     pub return_items: Vec<GraphReturnItem>,
     /// Whether this uses LEFT JOIN (OPTIONAL MATCH)
@@ -366,10 +592,11 @@ fn compile_fixed_hops(
         label_filter: end_label_filter,
     });
 
+    let filters = resolve_filters(pattern, &scans)?;
     Ok(CompiledGraphQuery {
         table_scans: scans,
         join_conditions: joins,
-        filter_predicate: pattern.where_clause.clone(),
+        filters,
         return_items: pattern.return_items.clone(),
         optional: pattern.optional,
     })
@@ -481,10 +708,11 @@ fn compile_multi_edge(
     // Rebuild joins with the corrected ones
     let all_joins = joins.into_iter().chain(final_joins.into_iter()).collect();
 
+    let filters = resolve_filters(pattern, &scans)?;
     Ok(CompiledGraphQuery {
         table_scans: scans,
         join_conditions: all_joins,
-        filter_predicate: pattern.where_clause.clone(),
+        filters,
         return_items: pattern.return_items.clone(),
         optional: pattern.optional,
     })
@@ -588,6 +816,112 @@ mod tests {
         assert_eq!(queries[1].table_scans.len(), 5);
         // 3-hop: start + edge + mid + edge + mid + edge + end = 7 scans
         assert_eq!(queries[2].table_scans.len(), 7);
+    }
+
+    /// A pattern's WHERE clause is resolved to terms bound to the scan each
+    /// one filters. Carrying it as text would let a consumer drop it and
+    /// return the unfiltered pattern, which reads as a wider match rather
+    /// than as a failure.
+    #[test]
+    fn test_a_where_clause_resolves_to_terms_bound_to_the_scans() {
+        let schema = test_schema();
+        let mut pattern = GraphPattern::new(vec![
+            PatternElement::node(Some("a".to_string()), Some("Person".to_string())),
+            PatternElement::edge(None, Some("KNOWS".to_string()), EdgeDirection::Outgoing),
+            PatternElement::node(Some("b".to_string()), Some("Person".to_string())),
+        ]);
+        pattern.where_clause =
+            Some("a.name = 'Ada' AND b.age >= 21 AND a.active <> false".to_string());
+
+        let queries = compile_pattern(&pattern, &schema).expect("compile");
+        assert_eq!(
+            queries[0].filters,
+            vec![
+                GraphFilter {
+                    variable: "a".to_string(),
+                    property: "name".to_string(),
+                    op: FilterOp::Eq,
+                    value: FilterValue::Text("Ada".to_string()),
+                },
+                GraphFilter {
+                    variable: "b".to_string(),
+                    property: "age".to_string(),
+                    op: FilterOp::Gte,
+                    value: FilterValue::Integer(21),
+                },
+                GraphFilter {
+                    variable: "a".to_string(),
+                    property: "active".to_string(),
+                    op: FilterOp::Neq,
+                    value: FilterValue::Boolean(false),
+                },
+            ]
+        );
+
+        // No clause is no terms, not an error
+        let mut plain = pattern.clone();
+        plain.where_clause = None;
+        assert!(
+            compile_pattern(&plain, &schema).expect("compile")[0]
+                .filters
+                .is_empty()
+        );
+    }
+
+    /// A clause the compiler cannot resolve fails the compile. Accepting it
+    /// and filtering nothing would answer a different question than asked.
+    #[test]
+    fn test_a_where_clause_that_cannot_be_resolved_fails_the_compile() {
+        let schema = test_schema();
+        let mut pattern = GraphPattern::new(vec![
+            PatternElement::node(Some("a".to_string()), Some("Person".to_string())),
+            PatternElement::edge(None, Some("KNOWS".to_string()), EdgeDirection::Outgoing),
+            PatternElement::node(Some("b".to_string()), Some("Person".to_string())),
+        ]);
+        for (clause, expected) in [
+            // Names a variable the pattern does not bind
+            ("z.name = 'Ada'", "does not bind"),
+            // Not a comparison at all
+            ("a.name", "no comparison operator"),
+            // Compares two properties, which is a join the pattern expresses
+            ("a.name = b.name", "compares against no literal"),
+            // No property on the left
+            ("name = 'Ada'", "variable.property"),
+            ("", "no conditions"),
+        ] {
+            pattern.where_clause = Some(clause.to_string());
+            let err = compile_pattern(&pattern, &schema)
+                .expect_err(&format!("clause {clause:?} must be refused"));
+            assert!(
+                err.to_string().contains(expected),
+                "clause {clause:?} reported {err}"
+            );
+        }
+    }
+
+    /// The AND split and the operator scan both run outside quotes, so a
+    /// literal containing either is one value rather than two terms.
+    #[test]
+    fn test_a_literal_containing_and_or_an_operator_stays_one_value() {
+        let filters = parse_where_clause("a.label = 'sales and marketing'").expect("parse");
+        assert_eq!(filters.len(), 1);
+        assert_eq!(
+            filters[0].value,
+            FilterValue::Text("sales and marketing".to_string())
+        );
+
+        let filters = parse_where_clause("a.expr = 'x >= y'").expect("parse");
+        assert_eq!(filters[0].op, FilterOp::Eq);
+        assert_eq!(filters[0].value, FilterValue::Text("x >= y".to_string()));
+
+        // Two quotes are one quote
+        let filters = parse_where_clause("a.name = 'O''Hara'").expect("parse");
+        assert_eq!(filters[0].value, FilterValue::Text("O'Hara".to_string()));
+
+        // A word merely containing "and" does not split the clause
+        let filters = parse_where_clause("a.brand = 'x' AND a.hand = 2").expect("parse");
+        assert_eq!(filters.len(), 2);
+        assert_eq!(filters[1].property, "hand");
     }
 
     #[test]

@@ -121,6 +121,33 @@ impl Encoding for FsstEncoding {
         Ok(out)
     }
 
+    /// A variable-length column skips to a row through its offsets, which
+    /// are per-row compressed lengths, so reaching row i costs unpacking i
+    /// bit fields and expands no symbols. Only the requested rows are
+    /// decompressed.
+    ///
+    /// A fixed-width column takes the decode-and-take default: its rows are
+    /// padded to one width after decompression, so the saving is the same
+    /// walk with an extra copy, and the default already does the copy
+    fn decode_range(
+        &self,
+        encoded: &[u8],
+        row_count: usize,
+        value_size: usize,
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<u8>> {
+        let (start, end) = crate::encoding::clamp_range(row_count, start, end);
+        if start == end {
+            return Ok(Vec::new());
+        }
+        if value_size == 0 && encoded.len() >= 14 {
+            return decode_fsst_varlen_range(encoded, row_count, start, end);
+        }
+        let decoded = self.decode(encoded, row_count, value_size)?;
+        crate::encoding::slice_decoded(&decoded, row_count, value_size, start, end)
+    }
+
     fn decode(&self, encoded: &[u8], row_count: usize, value_size: usize) -> Result<Vec<u8>> {
         if row_count == 0 {
             return Ok(Vec::new());
@@ -412,6 +439,22 @@ fn extract_strings(data: &[u8], row_count: usize, value_size: usize) -> Result<V
 /// decompressed to its full original bytes and the result is returned as the
 /// canonical variable-length buffer so the columnar read path is uniform.
 fn decode_fsst_varlen(encoded: &[u8], row_count: usize) -> Result<Vec<u8>> {
+    decode_fsst_varlen_range(encoded, row_count, 0, row_count)
+}
+
+/// Decompresses rows `start..end` only.
+///
+/// The packed array holds each row's compressed length, so the byte where a
+/// row begins is the sum of the lengths before it. That sum is bit
+/// unpacking and nothing else, which means skipping to a row costs the
+/// offsets and never the symbol expansion, and only the requested rows are
+/// decompressed
+fn decode_fsst_varlen_range(
+    encoded: &[u8],
+    row_count: usize,
+    start: usize,
+    end: usize,
+) -> Result<Vec<u8>> {
     let symbol_count =
         u32::from_le_bytes([encoded[8], encoded[9], encoded[10], encoded[11]]) as usize;
     let offset_bits = encoded[12];
@@ -450,9 +493,10 @@ fn decode_fsst_varlen(encoded: &[u8], row_count: usize) -> Result<Vec<u8>> {
         (1u64 << offset_bits) - 1
     };
 
-    let mut rows: Vec<Vec<u8>> = Vec::with_capacity(row_count);
+    let (start, end) = crate::encoding::clamp_range(row_count, start, end);
+    let mut rows: Vec<Vec<u8>> = Vec::with_capacity(end - start);
     let mut cursor = 0usize;
-    for i in 0..row_count {
+    for i in 0..end {
         let bit_off = i as u64 * offset_bits as u64;
         let byte_idx = (bit_off >> 3) as usize;
         let bit_idx = (bit_off & 7) as u32;
@@ -465,19 +509,25 @@ fn decode_fsst_varlen(encoded: &[u8], row_count: usize) -> Result<Vec<u8>> {
             b[..avail].copy_from_slice(&packed[byte_idx..byte_idx + avail]);
             ((u64::from_le_bytes(b) >> bit_idx) & mask) as usize
         };
-        let end = cursor + row_len;
-        if end > compressed.len() {
+        let row_end = cursor + row_len;
+        if row_end > compressed.len() {
             return Err(ZyronError::DecodingFailed(
                 "FSST varlen compressed data out of bounds".to_string(),
             ));
         }
+        // Rows before the range only advance the cursor. Their symbols are
+        // never expanded, which is the work this skips
+        if i < start {
+            cursor = row_end;
+            continue;
+        }
         let mut out = Vec::with_capacity(row_len);
         let mut j = cursor;
-        while j < end {
+        while j < row_end {
             let byte = compressed[j];
             j += 1;
             if byte == ESCAPE_BYTE {
-                if j >= end {
+                if j >= row_end {
                     return Err(ZyronError::DecodingFailed(
                         "FSST varlen escape at row end".to_string(),
                     ));
@@ -496,7 +546,7 @@ fn decode_fsst_varlen(encoded: &[u8], row_count: usize) -> Result<Vec<u8>> {
             }
         }
         rows.push(out);
-        cursor = end;
+        cursor = row_end;
     }
     let refs: Vec<Option<&[u8]>> = rows.iter().map(|r| Some(r.as_slice())).collect();
     Ok(varlen_pack(&refs))

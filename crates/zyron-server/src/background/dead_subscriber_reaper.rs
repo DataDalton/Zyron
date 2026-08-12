@@ -142,6 +142,7 @@ mod tests {
     async fn reaper_logs_on_persistence_failure() {
         use parking_lot::Mutex as PlMutex;
         use std::sync::Arc;
+        let _tracing_guard = crate::test_sync::TRACING_TESTS.lock();
         use std::sync::atomic::{AtomicBool, Ordering};
         use tracing_subscriber::fmt::MakeWriter;
         use zyron_buffer::{BufferPool, BufferPoolConfig};
@@ -345,12 +346,8 @@ mod tests {
             .unwrap();
         let metrics = zyron_common::LabeledMetrics::new();
 
-        let reaped = run_reaper_once(
-            &catalog,
-            std::time::Duration::from_secs(60),
-            Some(&metrics),
-        )
-        .await;
+        let reaped =
+            run_reaper_once(&catalog, std::time::Duration::from_secs(60), Some(&metrics)).await;
         assert_eq!(reaped, 1, "idle subscription must be reaped");
         assert_eq!(metrics.subscriptionReapSecondsCount(), 1);
 
@@ -364,12 +361,8 @@ mod tests {
 
         // A second pass with no remaining Active subs records another
         // observation but transitions nothing.
-        let reaped2 = run_reaper_once(
-            &catalog,
-            std::time::Duration::from_secs(60),
-            Some(&metrics),
-        )
-        .await;
+        let reaped2 =
+            run_reaper_once(&catalog, std::time::Duration::from_secs(60), Some(&metrics)).await;
         assert_eq!(reaped2, 0);
         assert_eq!(metrics.subscriptionReapSecondsCount(), 2);
 
@@ -407,7 +400,10 @@ mod tests {
         let b = h2.await.unwrap();
         // Exactly one pass observes the work; the loser CAS-fails and returns 0.
         assert_eq!(a + b, 50, "{} + {} != 50", a, b);
-        assert!(a == 0 || b == 0, "one pass must early-return on CAS failure");
+        assert!(
+            a == 0 || b == 0,
+            "one pass must early-return on CAS failure"
+        );
 
         // Each reaped subscription produces exactly one success counter
         // increment, total 50, no double-reap.

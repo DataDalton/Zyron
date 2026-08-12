@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Zyron">
+  <title>Zyron</title>
+  <!-- transpose with the stripes closed up, the reduction for 24px and below -->
+  <g fill="#0B0B0D">
+    <path d="M8 8 H53.88 L18.88 43 H8 Z"/>
+    <path d="M21 45.12 L56 10.12 V56 H21 Z"/>
+  </g>
+</svg>

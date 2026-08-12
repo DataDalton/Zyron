@@ -253,6 +253,21 @@ impl EncodingPushdown {
                         child: Arc::new(new_child),
                     })
             }
+            LogicalPlan::LockRows {
+                table_id,
+                mode,
+                wait,
+                cap,
+                child,
+            } => self
+                .transform(child)
+                .map(|new_child| LogicalPlan::LockRows {
+                    table_id: *table_id,
+                    mode: *mode,
+                    wait: *wait,
+                    cap: *cap,
+                    child: Arc::new(new_child),
+                }),
             LogicalPlan::Aggregate {
                 group_by,
                 aggregates,

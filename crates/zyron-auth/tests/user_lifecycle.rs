@@ -9,14 +9,11 @@ use zyron_storage::{DiskManager, DiskManagerConfig};
 
 async fn make_storage(dir: &std::path::Path) -> Arc<HeapAuthStorage> {
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir: dir.to_path_buf(),
-            fsync_enabled: false,
-        })
+        DiskManager::new(zyron_bench_harness::disk_config(dir.to_path_buf()))
         .await
         .expect("disk"),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 256 }));
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     Arc::new(HeapAuthStorage::new(disk, pool).expect("auth storage"))
 }
 

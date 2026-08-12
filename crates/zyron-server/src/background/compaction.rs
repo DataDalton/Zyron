@@ -23,8 +23,8 @@ use zyron_catalog::{Catalog, TableEntry};
 use zyron_common::page::PAGE_SIZE;
 use zyron_common::types::TypeId;
 use zyron_storage::columnar::{
-    ColumnDescriptor, CompactionConfig, CompactionInput, SYS_COL_ROWID, SYS_COL_SUPERSEDE,
-    SYS_COL_XMIN, run_compaction_cycle,
+    BloomPolicy, ColumnDescriptor, CompactionConfig, CompactionInput, SYS_COL_ROWID,
+    SYS_COL_SUPERSEDE, SYS_COL_XMIN, run_compaction_cycle,
 };
 use zyron_storage::txn::TransactionManager;
 use zyron_storage::{DiskManager, HeapFile, HeapFileConfig, HeapPage, TupleHeader};
@@ -215,6 +215,8 @@ impl CompactionWorker {
         wal: Arc<WalWriter>,
         metrics: Option<Arc<MetricsRegistry>>,
         config: CompactionWorkerConfig,
+        doc_registry: Arc<zyron_common::DocRegistry>,
+        btree_indexes: Arc<scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>>,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let waker = Arc::new(OnceLock::new());
@@ -243,6 +245,8 @@ impl CompactionWorker {
                     &config,
                     &thread_shutdown,
                     &thread_stats,
+                    &doc_registry,
+                    &btree_indexes,
                 );
             })
             .expect("failed to spawn compaction worker thread");
@@ -268,6 +272,8 @@ impl CompactionWorker {
         config: &CompactionWorkerConfig,
         shutdown: &AtomicBool,
         stats: &CompactionStats,
+        doc_registry: &Arc<zyron_common::DocRegistry>,
+        btree_indexes: &Arc<scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>>,
     ) {
         let interval = Duration::from_secs(config.interval_secs.max(1));
 
@@ -301,6 +307,8 @@ impl CompactionWorker {
                 wal,
                 config,
                 Some(shutdown),
+                Some(doc_registry),
+                Some(btree_indexes),
             );
 
             stats.cycles_completed.fetch_add(1, Ordering::Relaxed);
@@ -332,6 +340,8 @@ impl CompactionWorker {
         wal: &Arc<WalWriter>,
         config: &CompactionWorkerConfig,
         shutdown: Option<&AtomicBool>,
+        doc_registry: Option<&Arc<zyron_common::DocRegistry>>,
+        btree_indexes: Option<&Arc<scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>>>,
     ) -> (u64, u64) {
         let active_txns = txn_manager.active_txn_ids();
         let oldest_active = if active_txns.is_empty() {
@@ -357,6 +367,8 @@ impl CompactionWorker {
                 buffer_pool,
                 wal,
                 config,
+                doc_registry,
+                btree_indexes,
             ) {
                 Ok(Some(rows)) => {
                     total_rows += rows;
@@ -411,6 +423,93 @@ impl CompactionWorker {
         (total_rows, total_segments)
     }
 
+    /// Runs one columnar merge pass over a single table, the columnar analog
+    /// of a heap vacuum: fully-settled segments fold their reclaimable
+    /// patches into a fresh base, rows deleted at or below the retention
+    /// floor drop out, and the patch log compacts. Used by the manual VACUUM
+    /// path; the background loop runs the same merge every cycle.
+    pub fn vacuum_table_columnar(
+        rt: &tokio::runtime::Runtime,
+        catalog: &Catalog,
+        txn_manager: &TransactionManager,
+        wal: &Arc<WalWriter>,
+        config: &CompactionWorkerConfig,
+        table_id: zyron_catalog::TableId,
+    ) -> std::result::Result<(), String> {
+        let te = catalog
+            .get_table_by_id(table_id)
+            .map_err(|e| format!("table reload: {}", e))?;
+        if te.columnar.segments.is_empty() {
+            return Ok(());
+        }
+        let active = txn_manager.active_txn_ids();
+        let oldest_active = if active.is_empty() {
+            txn_manager.next_txn_id()
+        } else {
+            active[0]
+        };
+        let now_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        let floor = zyron_executor::operator::modify::effective_retention_floor(
+            te.as_ref(),
+            txn_manager.status_map(),
+            txn_manager.retention_clock(),
+            now_micros,
+        );
+        Self::merge_table(
+            rt,
+            catalog,
+            table_id,
+            oldest_active,
+            floor,
+            txn_manager.status_map(),
+            wal,
+            config,
+        )
+    }
+
+    /// Folds one table's eligible heap tail into the columnar tier, the
+    /// per-table form of the background fold. Used by the manual OPTIMIZE
+    /// path. Returns the number of rows folded, 0 when nothing was eligible.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fold_table_once(
+        rt: &tokio::runtime::Runtime,
+        catalog: &Catalog,
+        txn_manager: &TransactionManager,
+        disk_manager: &Arc<DiskManager>,
+        buffer_pool: &Arc<BufferPool>,
+        wal: &Arc<WalWriter>,
+        config: &CompactionWorkerConfig,
+        table_id: zyron_catalog::TableId,
+        doc_registry: Option<&Arc<zyron_common::DocRegistry>>,
+        btree_indexes: Option<&Arc<scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>>>,
+    ) -> std::result::Result<u64, String> {
+        let te = catalog
+            .get_table_by_id(table_id)
+            .map_err(|e| format!("table reload: {}", e))?;
+        let active = txn_manager.active_txn_ids();
+        let oldest_active = if active.is_empty() {
+            txn_manager.next_txn_id()
+        } else {
+            active[0]
+        };
+        Ok(Self::compact_table(
+            rt,
+            catalog,
+            te.as_ref(),
+            oldest_active,
+            disk_manager,
+            buffer_pool,
+            wal,
+            config,
+            doc_registry,
+            btree_indexes,
+        )?
+        .unwrap_or(0))
+    }
+
     /// Rewrites each fully-settled segment of one table: drops rows with a
     /// committed supersede, folds the newest committed value patch into the
     /// base, preserves sys_rowid, swaps the registry, deletes the old .zyr,
@@ -461,7 +560,13 @@ impl CompactionWorker {
             // instead of scanning the whole store (rows_with_overlay) and then
             // re-locking per row.
             let seg_overlay = store.file_overlay(seg.file_id);
-            if seg_overlay.is_empty() {
+            // Rows any branch has shadowed must survive the physical drop,
+            // their base values back the branch view the same way a COW
+            // copied heap page backs a branch after main line vacuum
+            let branch_rows = store.branch_rows_for_file(seg.file_id);
+            let branch_touched: std::collections::HashSet<u64> =
+                branch_rows.iter().map(|(_, rid, _)| *rid).collect();
+            if seg_overlay.is_empty() && branch_rows.is_empty() {
                 continue;
             }
             // Settled check: every overlay xid for this file < oldest_active.
@@ -491,7 +596,8 @@ impl CompactionWorker {
             }
 
             let dec = |col: u32, vs: usize| -> std::result::Result<(Vec<u8>, Vec<u8>), String> {
-                Self::decode_seg_column(&reader, col, row_count, vs)
+                reader
+                    .decode_column(col, row_count, vs)
                     .map_err(|e| format!("decode column {}: {}", col, e))
             };
             let (rowid_b, _) = dec(zyron_storage::columnar::SYS_COL_ROWID, 8)?;
@@ -542,13 +648,14 @@ impl CompactionWorker {
                 // Dead: deleted at or before the floor, so no retained version
                 // sees it alive. Reclaimable subsumes the settled check (commit
                 // LSN <= floor implies committed below the active horizon).
-                let dead = ov
-                    .map(|o| {
-                        o.supersedes
-                            .iter()
-                            .any(|x| *x < oldest_active && reclaimable(*x))
-                    })
-                    .unwrap_or(false);
+                let dead = !branch_touched.contains(&rid)
+                    && ov
+                        .map(|o| {
+                            o.supersedes
+                                .iter()
+                                .any(|x| *x < oldest_active && reclaimable(*x))
+                        })
+                        .unwrap_or(false);
                 if dead {
                     dropped += 1;
                     continue;
@@ -651,6 +758,7 @@ impl CompactionWorker {
                     type_id: c.type_id,
                     value_size: phys.fixed_size().unwrap_or(0),
                     is_primary_key: false,
+                    bloom_policy: BloomPolicy::Auto,
                 });
                 column_data.push(std::mem::take(&mut col_vals[ci]));
             }
@@ -659,6 +767,7 @@ impl CompactionWorker {
                 type_id: TypeId::UInt64,
                 value_size: 8,
                 is_primary_key: true,
+                bloom_policy: BloomPolicy::Auto,
             });
             column_data.push(
                 keep_rowid
@@ -671,6 +780,7 @@ impl CompactionWorker {
                 type_id: TypeId::UInt64,
                 value_size: 8,
                 is_primary_key: false,
+                bloom_policy: BloomPolicy::Auto,
             });
             column_data.push(
                 keep_xmin
@@ -683,6 +793,7 @@ impl CompactionWorker {
                 type_id: TypeId::UInt64,
                 value_size: 8,
                 is_primary_key: false,
+                bloom_policy: BloomPolicy::Auto,
             });
             // Carry within-window deletes forward as sys_supersede so AS OF
             // before the delete still sees the row; live rows write 0.
@@ -725,6 +836,10 @@ impl CompactionWorker {
                 table_id: table_id.0 as u64,
                 xmin_lo,
                 xmin_hi,
+                // A merge rewrites survivors of files that were already
+                // laid out, so it keeps their order rather than imposing
+                // a new one. Re-clustering is a fold decision
+                cluster_keys: Vec::new(),
             };
             let cc = CompactionConfig {
                 columnar_dir: columnar_dir.clone(),
@@ -734,6 +849,7 @@ impl CompactionWorker {
                 max_encoding_threads: config.max_encoding_threads,
                 oltp_p99_threshold_us: config.oltp_p99_threshold_us,
                 check_interval_ms: config.interval_secs * 1000,
+                exact_encoding: true,
             };
             let result =
                 run_compaction_cycle(&cc, input).map_err(|e| format!("merge write: {}", e))?;
@@ -762,6 +878,9 @@ impl CompactionWorker {
                 sys_rowid_hi: keep_hi,
                 sys_xmin_lo: xmin_lo,
                 sys_xmin_hi: xmin_hi,
+                // A merge keeps the survivors in the order the input had,
+                // so it keeps the spec that order was chosen under
+                cluster_spec_id: seg.cluster_spec_id,
             });
             entry.columnar.next_file_id = new_file_id + 1;
             entry.columnar.low_water = oldest_active;
@@ -783,50 +902,41 @@ impl CompactionWorker {
                 let hwm = store.max_persisted_lsn();
                 for (rid, col_id, patch_xid, value) in &migrate {
                     store
-                        .append_value_patch(new_file_id, *rid, *col_id, *patch_xid, hwm, value)
+                        .append_value_patch(0, new_file_id, *rid, *col_id, *patch_xid, hwm, value)
                         .map_err(|e| format!("patch migrate: {}", e))?;
+                }
+            }
+            // Relocate branch overlay rows to the new file id. drop_file
+            // removed them with the old file's entries, re-appending under
+            // the new id preserves each branch's exact shadowed state, the
+            // explicit entries rebuild the row without a main line copy
+            if !branch_rows.is_empty() {
+                let hwm = store.max_persisted_lsn();
+                for (branch, rid, row) in &branch_rows {
+                    for sxid in &row.supersedes {
+                        store
+                            .append_supersede(*branch, new_file_id, *rid, *sxid, hwm)
+                            .map_err(|e| format!("branch supersede migrate: {}", e))?;
+                    }
+                    for (col, chain) in &row.patches {
+                        for p in chain {
+                            store
+                                .append_value_patch(
+                                    *branch,
+                                    new_file_id,
+                                    *rid,
+                                    *col,
+                                    p.patch_xid,
+                                    hwm,
+                                    &p.value,
+                                )
+                                .map_err(|e| format!("branch patch migrate: {}", e))?;
+                        }
+                    }
                 }
             }
         }
         Ok(())
-    }
-
-    /// Parses a raw .zyr segment's header regions and decodes the column.
-    fn decode_seg_column(
-        reader: &zyron_storage::columnar::ZyrFileReader,
-        column_id: u32,
-        row_count: usize,
-        value_size: usize,
-    ) -> zyron_common::Result<(Vec<u8>, Vec<u8>)> {
-        use zyron_storage::columnar::{
-            SEGMENT_HEADER_SIZE, SegmentHeader, ZONE_MAP_BATCH_SIZE, ZONE_MAP_ENTRY_SIZE,
-        };
-        let raw = reader.read_segment_raw(column_id)?;
-        let mut hb = [0u8; SEGMENT_HEADER_SIZE];
-        hb.copy_from_slice(&raw[..SEGMENT_HEADER_SIZE]);
-        let h = SegmentHeader::from_bytes(&hb)?;
-        let bloom = h.bloom_filter_size as usize;
-        let zones = row_count.div_ceil(ZONE_MAP_BATCH_SIZE as usize);
-        let zm = zones * ZONE_MAP_ENTRY_SIZE;
-        let nb = if h.null_count > 0 {
-            row_count.div_ceil(8)
-        } else {
-            0
-        };
-        let start = SEGMENT_HEADER_SIZE + bloom + zm + nb;
-        let end = start + h.encoded_size as usize;
-        let null_bitmap = raw[SEGMENT_HEADER_SIZE + bloom + zm..start].to_vec();
-        let enc = &raw[start..end];
-        let crc = zyron_common::hash32(enc);
-        if crc != h.data_checksum {
-            return Err(zyron_common::ZyronError::InvalidZyrFile(format!(
-                "merge segment payload checksum mismatch: stored 0x{:08x}, computed 0x{:08x}",
-                h.data_checksum, crc
-            )));
-        }
-        let decoded = zyron_storage::encoding::create_encoding(h.encoding_type)
-            .decode(enc, row_count, value_size)?;
-        Ok((decoded, null_bitmap))
     }
 
     /// Folds one table. Returns Ok(Some(rows)) when a segment was written and
@@ -841,6 +951,8 @@ impl CompactionWorker {
         buffer_pool: &Arc<BufferPool>,
         wal: &Arc<WalWriter>,
         config: &CompactionWorkerConfig,
+        doc_registry: Option<&Arc<zyron_common::DocRegistry>>,
+        btree_indexes: Option<&Arc<scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>>>,
     ) -> std::result::Result<Option<u64>, String> {
         // Columns ordered by ordinal. The heap payload is laid out in this
         // exact order, so materialization must walk it identically.
@@ -1037,8 +1149,9 @@ impl CompactionWorker {
         let xmin_hi = sys_xmin.iter().copied().max().unwrap_or(0);
 
         // Descriptors: user columns then the three system columns. sys_rowid
-        // is the primary key, assigned monotonically below, so the file is
-        // already rowid ordered and the encoder skips the sort permutation.
+        // is the primary key, minted below in stored order, so the file is
+        // rowid ordered whatever the user columns are clustered by and the
+        // encoder skips the sort permutation.
         let mut descriptors: Vec<ColumnDescriptor> = Vec::with_capacity(num_cols + 3);
         for col in columns.iter() {
             let phys = col.physical_type_id();
@@ -1047,6 +1160,7 @@ impl CompactionWorker {
                 type_id: col.type_id,
                 value_size: phys.fixed_size().unwrap_or(0),
                 is_primary_key: false,
+                bloom_policy: BloomPolicy::Auto,
             });
         }
         descriptors.push(ColumnDescriptor {
@@ -1054,32 +1168,91 @@ impl CompactionWorker {
             type_id: TypeId::UInt64,
             value_size: 8,
             is_primary_key: true,
+            bloom_policy: BloomPolicy::Auto,
         });
         descriptors.push(ColumnDescriptor {
             column_id: SYS_COL_XMIN,
             type_id: TypeId::UInt64,
             value_size: 8,
             is_primary_key: false,
+            bloom_policy: BloomPolicy::Auto,
         });
         descriptors.push(ColumnDescriptor {
             column_id: SYS_COL_SUPERSEDE,
             type_id: TypeId::UInt64,
             value_size: 8,
             is_primary_key: false,
+            bloom_policy: BloomPolicy::Auto,
         });
+
+        // Row order. The table's declared cluster keys decide it, and a
+        // key naming a column this fold did not materialize is skipped, so
+        // a schema change between the proposal and the fold costs ordering
+        // quality rather than the fold.
+        let fold_keys = entry.cluster.fold_keys();
+        let key_positions: Vec<(TypeId, usize)> = fold_keys
+            .iter()
+            .filter_map(|key| {
+                columns
+                    .iter()
+                    .position(|c| c.id.0 as u32 == key.column_id)
+                    .map(|idx| (columns[idx].type_id, idx))
+            })
+            .collect();
+        let user_views: Vec<Vec<Option<&[u8]>>> = (0..num_cols).map(|i| arenas[i].view()).collect();
+        let cluster_spec_id = if key_positions.is_empty() {
+            0
+        } else {
+            entry.cluster.spec_id
+        };
+        let order: Option<Vec<u32>> = if key_positions.is_empty() {
+            None
+        } else {
+            let key_views: Vec<(TypeId, &[Option<&[u8]>])> = key_positions
+                .iter()
+                .map(|(type_id, idx)| (*type_id, user_views[*idx].as_slice()))
+                .collect();
+            Some(zyron_storage::columnar::cluster_order(
+                &key_views,
+                zyron_storage::columnar::cluster_curve(&fold_keys),
+                row_count,
+            ))
+        };
 
         // sys_rowid / sys_xmin: one contiguous 8-byte-per-row blob each (one
         // allocation, not row_count tiny vecs). sys_supersede is the constant
         // 0u64 for every row, so every view entry points at one shared slice.
+        //
+        // sys_rowid is minted in STORED order, after the clustering
+        // permutation rather than before it. The fold owns this identity and
+        // nothing outside has recorded it yet, so assigning it here leaves
+        // the file both clustered on the user keys and ascending by rowid.
+        // Minting before and then permuting would scatter rowid through the
+        // file and cost the patch path its per-zone rowid pruning.
         const ZERO8: [u8; 8] = [0u8; 8];
         let mut sys_rowid_blob: Vec<u8> = Vec::with_capacity(row_count * 8);
         for i in 0..row_count {
             sys_rowid_blob.extend_from_slice(&(base_rowid + i as u64).to_le_bytes());
         }
         let mut sys_xmin_blob: Vec<u8> = Vec::with_capacity(row_count * 8);
-        for x in &sys_xmin {
-            sys_xmin_blob.extend_from_slice(&x.to_le_bytes());
+        match &order {
+            Some(order) => {
+                for &r in order {
+                    sys_xmin_blob.extend_from_slice(&sys_xmin[r as usize].to_le_bytes());
+                }
+            }
+            None => {
+                for x in &sys_xmin {
+                    sys_xmin_blob.extend_from_slice(&x.to_le_bytes());
+                }
+            }
         }
+        // The sidecar's row order is kept in step with the file's, so a
+        // reader that pairs them by index gets the row it asked for
+        let folded_rids = match &order {
+            Some(order) => order.iter().map(|&r| folded_rids[r as usize]).collect(),
+            None => folded_rids,
+        };
 
         // Per-column view provider, invoked inside each column's own encode
         // worker so view materialization is parallel across columns. User
@@ -1087,7 +1260,12 @@ impl CompactionWorker {
         // blobs (supersede is the single shared zero slice).
         let column_view = |i: usize| -> Vec<Option<&[u8]>> {
             if i < num_cols {
-                arenas[i].view()
+                // The sys columns below are already built in stored order,
+                // so only the user columns take the permutation here
+                match &order {
+                    Some(order) => order.iter().map(|&r| user_views[i][r as usize]).collect(),
+                    None => user_views[i].clone(),
+                }
             } else if i == num_cols {
                 (0..row_count)
                     .map(|r| Some(&sys_rowid_blob[r * 8..r * 8 + 8]))
@@ -1109,17 +1287,21 @@ impl CompactionWorker {
             max_encoding_threads: config.max_encoding_threads,
             oltp_p99_threshold_us: config.oltp_p99_threshold_us,
             check_interval_ms: config.interval_secs * 1000,
+            exact_encoding: true,
         };
 
         // Step 1: write the .zyr durable (temp + fsync + atomic rename).
-        // sys_rowid is the PK at descriptor index num_cols; it is already
-        // ascending so encode_and_write does no row reordering.
+        // The rows are already in their final order, so encode_and_write
+        // does no reordering. sys_rowid is ascending in that order whatever
+        // the user columns are clustered by, which is what the header says
         let result = zyron_storage::columnar::encode_and_write(
             &cc,
             &descriptors,
             row_count,
             column_view,
-            Some(num_cols),
+            zyron_storage::columnar::FileOrdering::Ascending {
+                column_id: descriptors[num_cols].column_id,
+            },
             table.id.0 as u64,
             xmin_lo,
             xmin_hi,
@@ -1196,6 +1378,57 @@ impl CompactionWorker {
         // that window with no durability change.
         Self::delete_folded_rows(rt, buffer_pool, disk_manager, &folded_rids)?;
 
+        // Re-point each folded row's document at its columnar identity so
+        // FTS, vector and spatial results keep resolving after the heap
+        // slots are gone. Position i in folded_rids holds sys_rowid
+        // base_rowid + i by construction. A row with no live document
+        // repoints nothing.
+        if let Some(reg) = doc_registry {
+            for (i, (page_id, slot, _xmin)) in folded_rids.iter().enumerate() {
+                let _ = reg.repoint(
+                    table.id.0,
+                    zyron_common::RowLocator::Heap {
+                        page: *page_id,
+                        slot: *slot,
+                    },
+                    zyron_common::RowLocator::Columnar {
+                        file_id,
+                        sys_rowid: base_rowid + i as u64,
+                    },
+                );
+            }
+        }
+
+        // Re-key each folded row's B+tree entries onto its columnar locator
+        // so index scans keep serving the rows. The indexed columns' cell
+        // arenas are still alive here, aligned with folded_rids by position
+        if let Some(reg_map) = btree_indexes {
+            let index_snap = catalog.index_snapshot(table.id);
+            if !index_snap.btree.is_empty() {
+                let indexed_cells: Vec<(
+                    zyron_catalog::ColumnId,
+                    zyron_common::TypeId,
+                    Vec<Option<&[u8]>>,
+                )> = index_snap
+                    .btree
+                    .iter()
+                    .filter_map(|(_, col_id, _)| {
+                        columns.iter().position(|c| c.id == *col_id).map(|pos| {
+                            (*col_id, columns[pos].physical_type_id(), arenas[pos].view())
+                        })
+                    })
+                    .collect();
+                zyron_executor::operator::modify::fold_rekey_btree_entries(
+                    &folded_rids,
+                    &indexed_cells,
+                    file_id,
+                    base_rowid,
+                    &index_snap.btree,
+                    reg_map,
+                );
+            }
+        }
+
         // Register the segment now that its rows no longer exist in the heap.
         entry.columnar.segments.push(ColumnarSegmentEntry {
             file_id,
@@ -1205,6 +1438,7 @@ impl CompactionWorker {
             sys_rowid_hi: next_rowid.saturating_sub(1),
             sys_xmin_lo: xmin_lo,
             sys_xmin_hi: xmin_hi,
+            cluster_spec_id,
         });
         entry.columnar.next_rowid = next_rowid;
         entry.columnar.next_file_id = file_id + 1;

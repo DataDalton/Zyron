@@ -83,20 +83,13 @@ async fn setup_catalog(
     std::fs::create_dir_all(&wal_dir).unwrap();
 
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir,
-            fsync_enabled: false,
-        })
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir))
         .await
         .unwrap(),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 4096 }));
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir,
-            fsync_enabled: false,
-            ..Default::default()
-        })
+        WalWriter::new(zyron_bench_harness::wal_config(wal_dir))
         .unwrap(),
     );
 
@@ -417,20 +410,13 @@ async fn test_ddl_persistence() {
     std::fs::create_dir_all(&wal_dir).unwrap();
 
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir: data_dir.clone(),
-            fsync_enabled: false,
-        })
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
         .await
         .unwrap(),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 4096 }));
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir: wal_dir.clone(),
-            fsync_enabled: false,
-            ..Default::default()
-        })
+        WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
         .unwrap(),
     );
 
@@ -819,6 +805,8 @@ async fn test_constraints() {
     let composite_constraints = vec![TableConstraint {
         name: None,
         kind: TableConstraintKind::PrimaryKey(vec!["a".to_string(), "b".to_string()]),
+        enforced: true,
+        on_violation: zyron_parser::ast::ViolationAction::Fail,
     }];
     let cpk_table_id = catalog
         .create_table(
@@ -1025,20 +1013,13 @@ async fn test_statistics() {
     std::fs::create_dir_all(&wal_dir).unwrap();
 
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir,
-            fsync_enabled: false,
-        })
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir))
         .await
         .unwrap(),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 8192 }));
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir,
-            fsync_enabled: false,
-            ..Default::default()
-        })
+        WalWriter::new(zyron_bench_harness::wal_config(wal_dir))
         .unwrap(),
     );
 
@@ -1183,24 +1164,17 @@ async fn test_recovery() {
     std::fs::create_dir_all(&wal_dir).unwrap();
 
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir: data_dir.clone(),
-            fsync_enabled: false,
-        })
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
         .await
         .unwrap(),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 4096 }));
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
 
     // Phase 1: Create catalog objects and "crash" (close WAL without checkpoint)
     let table_id;
     {
         let wal = Arc::new(
-            WalWriter::new(WalWriterConfig {
-                wal_dir: wal_dir.clone(),
-                fsync_enabled: false,
-                ..Default::default()
-            })
+            WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
             .unwrap(),
         );
 
@@ -1252,11 +1226,7 @@ async fn test_recovery() {
     // Phase 2: "Recover" - create fresh catalog from same storage
     {
         let wal = Arc::new(
-            WalWriter::new(WalWriterConfig {
-                wal_dir: wal_dir.clone(),
-                fsync_enabled: false,
-                ..Default::default()
-            })
+            WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
             .unwrap(),
         );
 
@@ -1533,20 +1503,13 @@ async fn test_bench_analyze() {
     std::fs::create_dir_all(&wal_dir).unwrap();
 
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir,
-            fsync_enabled: false,
-        })
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir))
         .await
         .unwrap(),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 16384 }));
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir,
-            fsync_enabled: false,
-            ..Default::default()
-        })
+        WalWriter::new(zyron_bench_harness::wal_config(wal_dir))
         .unwrap(),
     );
 
@@ -1736,23 +1699,16 @@ async fn test_bench_recovery() {
     std::fs::create_dir_all(&wal_dir).unwrap();
 
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir: data_dir.clone(),
-            fsync_enabled: false,
-        })
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
         .await
         .unwrap(),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 4096 }));
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
 
     // Create catalog objects that will be recovered
     {
         let wal = Arc::new(
-            WalWriter::new(WalWriterConfig {
-                wal_dir: wal_dir.clone(),
-                fsync_enabled: false,
-                ..Default::default()
-            })
+            WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
             .unwrap(),
         );
 
@@ -1799,11 +1755,7 @@ async fn test_bench_recovery() {
         let start = Instant::now();
 
         let wal = Arc::new(
-            WalWriter::new(WalWriterConfig {
-                wal_dir: wal_dir.clone(),
-                fsync_enabled: false,
-                ..Default::default()
-            })
+            WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
             .unwrap(),
         );
 

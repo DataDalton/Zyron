@@ -22,7 +22,7 @@ use durability::DurabilityQueue;
 pub use gc::{GcStats, MvccGc};
 pub use intent_lock::IntentLockTable;
 pub use isolation::IsolationLevel;
-pub use lock_table::LockTable;
+pub use lock_table::{LockMode, LockTable};
 pub use proc_array::ProcArray;
 pub use retention_clock::RetentionClock;
 pub use snapshot::Snapshot;
@@ -316,13 +316,17 @@ impl TransactionManager {
     /// Creates a new transaction manager.
     pub fn new(wal: Arc<WalWriter>) -> Self {
         let durability = Self::register_durability(&wal);
+        // the lock table owns the wait-for graph its blocking acquisitions
+        // feed, the manager shares it so commit/abort clear a txn's edges
+        let lock_table = Arc::new(LockTable::new());
+        let wait_for_graph = Arc::clone(lock_table.wait_graph());
         Self {
             next_txn_id: AtomicU64::new(1),
             proc_array: Arc::new(ProcArray::new()),
             wal,
-            lock_table: Arc::new(LockTable::new()),
+            lock_table,
             intent_locks: Arc::new(IntentLockTable::new()),
-            wait_for_graph: Arc::new(WaitForGraph::new()),
+            wait_for_graph,
             status_map: Arc::new(TxnStatusMap::new()),
             retention_clock: Arc::new(RetentionClock::new()),
             durability,
@@ -333,13 +337,15 @@ impl TransactionManager {
     /// Used for recovery to resume from the last known txn_id.
     pub fn with_start_txn_id(wal: Arc<WalWriter>, start_txn_id: u64) -> Self {
         let durability = Self::register_durability(&wal);
+        let lock_table = Arc::new(LockTable::new());
+        let wait_for_graph = Arc::clone(lock_table.wait_graph());
         Self {
             next_txn_id: AtomicU64::new(start_txn_id),
             proc_array: Arc::new(ProcArray::new()),
             wal,
-            lock_table: Arc::new(LockTable::new()),
+            lock_table,
             intent_locks: Arc::new(IntentLockTable::new()),
-            wait_for_graph: Arc::new(WaitForGraph::new()),
+            wait_for_graph,
             status_map: Arc::new(TxnStatusMap::new()),
             retention_clock: Arc::new(RetentionClock::new()),
             durability,
@@ -601,8 +607,10 @@ impl TransactionManager {
         Snapshot::new(txn.txn_id, active_ids, Arc::clone(&self.status_map))
     }
 
-    /// Returns a reference to the row-level lock table.
-    pub fn lock_table(&self) -> &LockTable {
+    /// Returns the shared row-level lock table. The executor takes row locks
+    /// through this for SELECT FOR UPDATE/SHARE and the DML write paths; the
+    /// locks are released by this transaction's commit/abort.
+    pub fn lock_table(&self) -> &Arc<LockTable> {
         &self.lock_table
     }
 
@@ -726,16 +734,21 @@ mod tests {
     fn dropped_active_transaction_releases_locks() {
         let (mgr, _dir) = create_test_manager();
         let rid = crate::tuple::TupleId::new(zyron_common::page::PageId::new(0, 1), 0);
+        let loc = rid.locator();
         let txn_id = {
             let txn = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
-            mgr.lock_table().lock_row(txn.txn_id, 7, rid).unwrap();
+            mgr.lock_table()
+                .lock_row(txn.txn_id, 7, loc, LockMode::Exclusive)
+                .unwrap();
             assert_eq!(mgr.lock_table().current_count(txn.txn_id), 1);
             txn.txn_id
         };
         assert_eq!(mgr.lock_table().current_count(txn_id), 0);
 
         let txn2 = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
-        mgr.lock_table().lock_row(txn2.txn_id, 7, rid).unwrap();
+        mgr.lock_table()
+            .lock_row(txn2.txn_id, 7, loc, LockMode::Exclusive)
+            .unwrap();
         assert_eq!(mgr.lock_table().current_count(txn2.txn_id), 1);
     }
 

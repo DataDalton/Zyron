@@ -433,6 +433,19 @@ pub fn write_vector_text(bytes: &[u8], buf: &mut BytesMut) {
     buf.put_u8(b']');
 }
 
+/// Writes an array value in the braced form it is written in, `{1,2,NULL}`.
+/// A value that does not parse as an array falls back to its plain text form
+/// rather than being dropped.
+pub fn write_array_text(scalar: &ScalarValue, buf: &mut BytesMut) {
+    if let ScalarValue::Binary(bytes) = scalar
+        && let Some(view) = zyron_common::ArrayView::parse(bytes)
+    {
+        buf.extend_from_slice(view.render_text().as_bytes());
+        return;
+    }
+    scalar_write_text(scalar, buf);
+}
+
 /// Writes a vector value in binary format: u16 dimension count followed by
 /// big-endian f32 values (matching pgvector binary format). Partial trailing
 /// bytes are ignored.

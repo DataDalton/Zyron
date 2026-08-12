@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Zyron">
+  <title>Zyron</title>
+  <!-- Z cut into its three strokes by two kerfs parallel to the diagonal -->
+  <g fill="#0B0B0D">
+    <path d="M9 10 H55 V21 H9 Z"/>
+    <path d="M52.5 23 H34.5 L11.5 41 H29.5 Z"/>
+    <path d="M9 43 H55 V54 H9 Z"/>
+  </g>
+</svg>

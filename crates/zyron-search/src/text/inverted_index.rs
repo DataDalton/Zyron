@@ -19,22 +19,16 @@ use super::analyzer::{AnalysisBuffer, Analyzer};
 use super::query::{FtsQuery, edit_distance, wildcard_match};
 use super::scoring::RelevanceScorer;
 
+/// Dense per-table ordinal allocated by the shared DocRegistry. Carries no
+/// storage identity, the registry maps it to the row's current RowLocator,
+/// so a document survives its row folding from the heap to a columnar
+/// segment. Ordinals only grow and are never reused.
 pub type DocId = u64;
-const MAX_DOC_PAGE_ID: u64 = 0xFFFF_FFFF_FFFF;
 const DENSE_SCORE_LIMIT: u64 = 4_000_000;
 
-pub fn encode_doc_id(page_id: u64, slot_id: u16) -> Result<DocId> {
-    if page_id > MAX_DOC_PAGE_ID {
-        return Err(ZyronError::Internal(
-            "page_id exceeds 48-bit DocId limit".into(),
-        ));
-    }
-    Ok((page_id << 16) | (slot_id as u64))
-}
-
-pub fn decode_doc_id(doc_id: DocId) -> (u64, u16) {
-    (doc_id >> 16, (doc_id & 0xFFFF) as u16)
-}
+/// Tombstone in the dense field-norms table for an ordinal with no live
+/// document (deleted, or never indexed by this index)
+const NORM_ABSENT: u32 = u32::MAX;
 
 #[derive(Debug, Clone)]
 pub struct TermInfo {
@@ -92,14 +86,6 @@ impl PostingsList {
         &self.positions[start..end]
     }
 
-    fn push(&mut self, doc_id: DocId, tf: u16, fl: u32, positions: &[u32]) {
-        self.doc_ids.push(doc_id);
-        self.term_freqs.push(tf);
-        self.field_lengths.push(fl);
-        self.position_offsets.push(self.positions.len() as u32);
-        self.positions.extend_from_slice(positions);
-    }
-
     /// Start a new document entry without collecting positions into an intermediate Vec.
     /// Call push_position() for each position, then move to the next term group.
     #[inline]
@@ -113,38 +99,6 @@ impl PostingsList {
     #[inline]
     fn push_position(&mut self, pos: u32) {
         self.positions.push(pos);
-    }
-
-    fn insert_sorted(&mut self, idx: usize, doc_id: DocId, tf: u16, fl: u32, positions: &[u32]) {
-        self.doc_ids.insert(idx, doc_id);
-        self.term_freqs.insert(idx, tf);
-        self.field_lengths.insert(idx, fl);
-        let pos_start = self.positions.len() as u32;
-        self.position_offsets.insert(idx, pos_start);
-        self.positions.extend_from_slice(positions);
-    }
-
-    fn replace(&mut self, idx: usize, tf: u16, fl: u32, positions: &[u32]) {
-        self.term_freqs[idx] = tf;
-        self.field_lengths[idx] = fl;
-        let old_start = self.position_offsets[idx] as usize;
-        let old_end = if idx + 1 < self.position_offsets.len() {
-            self.position_offsets[idx + 1] as usize
-        } else {
-            self.positions.len()
-        };
-        let old_len = old_end - old_start;
-        let new_len = positions.len();
-        if old_len == new_len {
-            self.positions[old_start..old_end].copy_from_slice(positions);
-        } else {
-            self.positions
-                .splice(old_start..old_end, positions.iter().copied());
-            let diff = new_len as i64 - old_len as i64;
-            for off in &mut self.position_offsets[idx + 1..] {
-                *off = (*off as i64 + diff) as u32;
-            }
-        }
     }
 
     fn remove(&mut self, idx: usize) {
@@ -775,7 +729,9 @@ fn intersect_sorted_ids(a: &[u64], b: &[u64]) -> Vec<u64> {
 
 pub struct InvertedIndex {
     postings: RwLock<HashMap<String, PostingsList>>,
-    field_norms: RwLock<HashMap<DocId, u32>>,
+    /// Dense per-ordinal field lengths, NORM_ABSENT marks a dead slot.
+    /// Ordinals are dense per table so this stays compact
+    field_norms: RwLock<Vec<u32>>,
     doc_count: AtomicU64,
     total_doc_length: AtomicU64,
     max_doc_id: AtomicU64,
@@ -788,7 +744,7 @@ impl InvertedIndex {
     pub fn new(index_id: u32, table_id: u32, column_ids: Vec<u16>) -> Self {
         Self {
             postings: RwLock::new(HashMap::new()),
-            field_norms: RwLock::new(HashMap::new()),
+            field_norms: RwLock::new(Vec::new()),
             doc_count: AtomicU64::new(0),
             total_doc_length: AtomicU64::new(0),
             max_doc_id: AtomicU64::new(0),
@@ -874,12 +830,18 @@ impl InvertedIndex {
 
         {
             let mut norms = self.field_norms.write();
-            if let Some(old) = norms.insert(doc_id, doc_length) {
+            let i = doc_id as usize;
+            if i >= norms.len() {
+                norms.resize(i + 1, NORM_ABSENT);
+            }
+            let old = norms[i];
+            if old != NORM_ABSENT {
                 self.total_doc_length
                     .fetch_sub(old as u64, Ordering::Relaxed);
             } else {
                 self.doc_count.fetch_add(1, Ordering::Relaxed);
             }
+            norms[i] = doc_length;
         }
         self.total_doc_length
             .fetch_add(doc_length as u64, Ordering::Relaxed);
@@ -902,10 +864,13 @@ impl InvertedIndex {
     pub fn delete_document(&self, doc_id: DocId) -> Result<()> {
         {
             let mut norms = self.field_norms.write();
-            if let Some(old) = norms.remove(&doc_id) {
+            if let Some(slot) = norms.get_mut(doc_id as usize)
+                && *slot != NORM_ABSENT
+            {
                 self.doc_count.fetch_sub(1, Ordering::Relaxed);
                 self.total_doc_length
-                    .fetch_sub(old as u64, Ordering::Relaxed);
+                    .fetch_sub(*slot as u64, Ordering::Relaxed);
+                *slot = NORM_ABSENT;
             }
         }
         // Scan all terms for this doc_id via binary search (cold path).
@@ -1022,7 +987,10 @@ impl InvertedIndex {
             .unwrap_or(0)
     }
     pub fn field_length(&self, doc_id: DocId) -> u32 {
-        self.field_norms.read().get(&doc_id).copied().unwrap_or(0)
+        match self.field_norms.read().get(doc_id as usize) {
+            Some(&n) if n != NORM_ABSENT => n,
+            _ => 0,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1459,7 +1427,8 @@ impl InvertedIndex {
         terms.sort_by(|a, b| a.0.cmp(b.0));
         let n = self.field_norms.read();
         f.write_all(b"ZFTS").map_err(ZyronError::Io)?;
-        f.write_all(&4u32.to_le_bytes()).map_err(ZyronError::Io)?;
+        // version 5: same layout as 4, doc ids are registry ordinals
+        f.write_all(&5u32.to_le_bytes()).map_err(ZyronError::Io)?;
         f.write_all(&(terms.len() as u32).to_le_bytes())
             .map_err(ZyronError::Io)?;
         f.write_all(&(self.doc_count() as u32).to_le_bytes())
@@ -1502,16 +1471,18 @@ impl InvertedIndex {
         f.write_all(&term_dict_buf).map_err(ZyronError::Io)?;
         f.write_all(&pbuf).map_err(ZyronError::Io)?;
 
-        // Version 4: delta-encoded field norms. Sort by doc_id, then write
-        // VByte(delta_doc_id) + VByte(field_length) for each entry.
-        // Sequential doc_ids produce delta=1 (1 byte each). Field lengths
-        // ~20-40 encode in 1 byte. Total: ~2 bytes/doc vs 12 bytes/doc raw.
-        let mut sorted_norms: Vec<(DocId, u32)> = n.iter().map(|(&d, &fl)| (d, fl)).collect();
-        sorted_norms.sort_unstable_by_key(|&(d, _)| d);
+        // Delta-encoded field norms, VByte(delta_doc_id) + VByte(field_length)
+        // per live entry. The dense table is already ordinal-ordered, dead
+        // slots are skipped. Sequential ordinals produce delta=1 (1 byte each)
         let mut norm_buf = Vec::new();
-        encode_vbyte(sorted_norms.len() as u64, &mut norm_buf);
+        let live_count = n.iter().filter(|&&fl| fl != NORM_ABSENT).count();
+        encode_vbyte(live_count as u64, &mut norm_buf);
         let mut prev_did = 0u64;
-        for &(did, fl) in &sorted_norms {
+        for (did, &fl) in n.iter().enumerate() {
+            if fl == NORM_ABSENT {
+                continue;
+            }
+            let did = did as u64;
             encode_vbyte(did - prev_did, &mut norm_buf);
             prev_did = did;
             encode_vbyte(fl as u64, &mut norm_buf);
@@ -1545,18 +1516,25 @@ impl InvertedIndex {
         let mut b4 = [0u8; 4];
         f.read_exact(&mut b4).map_err(ZyronError::Io)?;
         let ver = u32::from_le_bytes(b4);
+        if ver != 5 {
+            // pre-ordinal snapshots address rows by heap page and slot,
+            // their doc ids are meaningless under the registry
+            return Err(err(format!(
+                "unsupported snapshot version {ver}, reindex required"
+            )));
+        }
         f.read_exact(&mut b4).map_err(ZyronError::Io)?;
         let tc = u32::from_le_bytes(b4);
         f.read_exact(&mut b4).map_err(ZyronError::Io)?;
 
         let mut tes: Vec<(String, u32, u64, u32)> = Vec::new();
 
-        if ver >= 4 {
-            // Version 4: front-coded term dictionary.
-            f.read_exact(&mut b4).map_err(ZyronError::Io)?;
-            let dict_len = u32::from_le_bytes(b4) as usize;
-            let mut dict_buf = vec![0u8; dict_len];
-            f.read_exact(&mut dict_buf).map_err(ZyronError::Io)?;
+        // front-coded term dictionary
+        f.read_exact(&mut b4).map_err(ZyronError::Io)?;
+        let dict_len = u32::from_le_bytes(b4) as usize;
+        let mut dict_buf = vec![0u8; dict_len];
+        f.read_exact(&mut dict_buf).map_err(ZyronError::Io)?;
+        {
             let mut off = 0usize;
             let mut prev_term = String::new();
             for _ in 0..tc {
@@ -1580,24 +1558,6 @@ impl InvertedIndex {
                 let plen = u32::from_le_bytes(dict_buf[off..off + 4].try_into().unwrap());
                 off += 4;
                 prev_term = term.clone();
-                tes.push((term, df, poff, plen));
-            }
-        } else {
-            // Version 2-3: raw term dictionary.
-            for _ in 0..tc {
-                let mut b2 = [0u8; 2];
-                f.read_exact(&mut b2).map_err(ZyronError::Io)?;
-                let tl = u16::from_le_bytes(b2) as usize;
-                let mut tb = vec![0u8; tl];
-                f.read_exact(&mut tb).map_err(ZyronError::Io)?;
-                let term = String::from_utf8(tb).map_err(|e| err(format!("utf8: {e}")))?;
-                f.read_exact(&mut b4).map_err(ZyronError::Io)?;
-                let df = u32::from_le_bytes(b4);
-                let mut b8 = [0u8; 8];
-                f.read_exact(&mut b8).map_err(ZyronError::Io)?;
-                let poff = u64::from_le_bytes(b8);
-                f.read_exact(&mut b4).map_err(ZyronError::Io)?;
-                let plen = u32::from_le_bytes(b4);
                 tes.push((term, df, poff, plen));
             }
         }
@@ -1633,8 +1593,8 @@ impl InvertedIndex {
 
         let mut tl = 0u64;
         let nc;
-        if ver >= 4 {
-            // Version 4: delta-encoded field norms via VByte.
+        {
+            // delta-encoded field norms via VByte, into the dense table
             let mut rest = Vec::new();
             f.read_to_end(&mut rest).map_err(ZyronError::Io)?;
             let mut off = 0usize;
@@ -1645,27 +1605,14 @@ impl InvertedIndex {
                 let delta = decode_vbyte(&rest, &mut off)?;
                 prev += delta;
                 let fl = decode_vbyte(&rest, &mut off)? as u32;
-                norms.insert(prev, fl);
+                let i = prev as usize;
+                if i >= norms.len() {
+                    norms.resize(i + 1, NORM_ABSENT);
+                }
+                norms[i] = fl;
                 tl += fl as u64;
                 if prev > max_did {
                     max_did = prev;
-                }
-            }
-        } else {
-            // Version 2-3: raw field norms.
-            f.read_exact(&mut b4).map_err(ZyronError::Io)?;
-            nc = u32::from_le_bytes(b4);
-            let mut norms = idx.field_norms.write();
-            for _ in 0..nc {
-                let mut b8 = [0u8; 8];
-                f.read_exact(&mut b8).map_err(ZyronError::Io)?;
-                let did = u64::from_le_bytes(b8);
-                f.read_exact(&mut b4).map_err(ZyronError::Io)?;
-                let fl = u32::from_le_bytes(b4);
-                norms.insert(did, fl);
-                tl += fl as u64;
-                if did > max_did {
-                    max_did = did;
                 }
             }
         }
@@ -1673,12 +1620,14 @@ impl InvertedIndex {
         idx.doc_count.store(nc as u64, Ordering::Relaxed);
         idx.total_doc_length.store(tl, Ordering::Relaxed);
         idx.max_doc_id.store(max_did, Ordering::Relaxed);
-        if ver >= 3 {
+        {
             let norms = idx.field_norms.read();
             let mut postings = idx.postings.write();
             for list in postings.values_mut() {
                 for i in 0..list.len() {
-                    if let Some(&len) = norms.get(&list.doc_ids[i]) {
+                    if let Some(&len) = norms.get(list.doc_ids[i] as usize)
+                        && len != NORM_ABSENT
+                    {
                         list.field_lengths[i] = len;
                     }
                 }
@@ -1946,87 +1895,6 @@ pub fn decode_postings(data: &[u8], ver: u32) -> Result<PostingsList> {
     Ok(list)
 }
 
-/// Encode doc_id delta with tf=1 signal. First byte layout:
-/// bit 7 = continuation, bit 0 = tf1 flag (1), bits 1-6 = 6 data bits.
-fn encode_vbyte_tf1(mut v: u64, buf: &mut Vec<u8>) {
-    let data_bits = (v & 0x3F) as u8;
-    v >>= 6;
-    if v == 0 {
-        buf.push((data_bits << 1) | 0x01);
-    } else {
-        buf.push((data_bits << 1) | 0x01 | 0x80);
-        loop {
-            let b = (v & 0x7F) as u8;
-            v >>= 7;
-            if v == 0 {
-                buf.push(b);
-                return;
-            }
-            buf.push(b | 0x80);
-        }
-    }
-}
-
-/// Encode doc_id delta with tf>1 signal. First byte layout:
-/// bit 7 = continuation, bit 0 = tf1 flag (0), bits 1-6 = 6 data bits.
-fn encode_vbyte_tfn(mut v: u64, buf: &mut Vec<u8>) {
-    let data_bits = (v & 0x3F) as u8;
-    v >>= 6;
-    if v == 0 {
-        buf.push(data_bits << 1);
-    } else {
-        buf.push((data_bits << 1) | 0x80);
-        loop {
-            let b = (v & 0x7F) as u8;
-            v >>= 7;
-            if v == 0 {
-                buf.push(b);
-                return;
-            }
-            buf.push(b | 0x80);
-        }
-    }
-}
-
-/// Decode doc_id delta and tf=1 flag. First byte: bit 0 = tf1, bits 1-6 = data.
-fn decode_vbyte_with_flag(data: &[u8], off: &mut usize) -> Result<(u64, bool)> {
-    if *off >= data.len() {
-        return Err(ZyronError::FtsIndexCorrupted {
-            index: "postings".into(),
-            reason: "eof".into(),
-        });
-    }
-    let first = data[*off];
-    *off += 1;
-    let is_tf1 = (first & 0x01) != 0;
-    let mut v = ((first >> 1) & 0x3F) as u64;
-    if first & 0x80 == 0 {
-        return Ok((v, is_tf1));
-    }
-    let mut s = 6u32;
-    loop {
-        if *off >= data.len() {
-            return Err(ZyronError::FtsIndexCorrupted {
-                index: "postings".into(),
-                reason: "eof".into(),
-            });
-        }
-        let b = data[*off];
-        *off += 1;
-        v |= ((b & 0x7F) as u64) << s;
-        if b & 0x80 == 0 {
-            return Ok((v, is_tf1));
-        }
-        s += 7;
-        if s > 63 {
-            return Err(ZyronError::FtsIndexCorrupted {
-                index: "postings".into(),
-                reason: "overflow".into(),
-            });
-        }
-    }
-}
-
 fn encode_vbyte(mut v: u64, buf: &mut Vec<u8>) {
     loop {
         let b = (v & 0x7F) as u8;
@@ -2254,12 +2122,22 @@ mod tests {
             assert_eq!(decode_vbyte(&buf, &mut off).unwrap(), v);
         }
     }
+    /// Builds a fixture entry the way the indexer does, through begin_doc
+    /// and push_position, so these round trips cover the construction the
+    /// production path actually performs
+    fn pushDoc(list: &mut PostingsList, doc_id: DocId, tf: u16, fl: u32, positions: &[u32]) {
+        list.begin_doc(doc_id, tf, fl);
+        for &pos in positions {
+            list.push_position(pos);
+        }
+    }
+
     #[test]
     fn test_postings_roundtrip() {
         let mut list = PostingsList::new();
-        list.push(10, 3, 50, &[0, 5, 12]);
-        list.push(25, 1, 30, &[7]);
-        list.push(100, 2, 80, &[3, 9]);
+        pushDoc(&mut list, 10, 3, 50, &[0, 5, 12]);
+        pushDoc(&mut list, 25, 1, 30, &[7]);
+        pushDoc(&mut list, 100, 2, 80, &[3, 9]);
         let enc = encode_postings(&list);
         let dec = decode_postings(&enc, 4).unwrap();
         assert_eq!(dec.len(), 3);
@@ -2317,12 +2195,18 @@ mod tests {
         assert!(r.iter().any(|x| x.0 == 1));
     }
     #[test]
-    fn test_doc_id_encoding() {
-        let id = encode_doc_id(1000, 42).unwrap();
-        let (p, sl) = decode_doc_id(id);
-        assert_eq!(p, 1000);
-        assert_eq!(sl, 42);
-        assert!(encode_doc_id(MAX_DOC_PAGE_ID + 1, 0).is_err());
+    fn test_deleted_doc_frees_norm_slot_without_reuse() {
+        let i = ix();
+        i.add_document(0, "alpha beta", &a()).unwrap();
+        i.add_document(1, "gamma delta epsilon", &a()).unwrap();
+        assert_eq!(i.field_length(1), 3);
+        i.delete_document(1).unwrap();
+        assert_eq!(i.field_length(1), 0, "tombstoned slot reads as absent");
+        assert_eq!(i.doc_count(), 1);
+        // a later ordinal indexes cleanly past the tombstone
+        i.add_document(2, "zeta", &a()).unwrap();
+        assert_eq!(i.field_length(2), 1);
+        assert_eq!(i.doc_count(), 2);
     }
     #[test]
     fn test_deletion_cleanup() {
@@ -2381,9 +2265,9 @@ mod tests {
     #[test]
     fn test_soa_positions() {
         let mut list = PostingsList::new();
-        list.push(1, 2, 10, &[0, 3]);
-        list.push(2, 1, 5, &[7]);
-        list.push(3, 3, 15, &[1, 4, 9]);
+        pushDoc(&mut list, 1, 2, 10, &[0, 3]);
+        pushDoc(&mut list, 2, 1, 5, &[7]);
+        pushDoc(&mut list, 3, 3, 15, &[1, 4, 9]);
         assert_eq!(list.len(), 3);
         assert_eq!(list.positions_for(0), &[0, 3]);
         assert_eq!(list.positions_for(1), &[7]);

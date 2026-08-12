@@ -1118,9 +1118,431 @@ fn evaluate_function(
             let b = evaluate(&args[1], batch, schema, params)?;
             eval_nullif(&a, &b)
         }
+        "char_length" | "character_length" => {
+            let col = evaluate(&args[0], batch, schema, params)?;
+            eval_char_length(&col)
+        }
+        "octet_length" => {
+            let col = evaluate(&args[0], batch, schema, params)?;
+            eval_octet_length(&col)
+        }
+        "ceil" | "ceiling" => {
+            let col = evaluate(&args[0], batch, schema, params)?;
+            eval_float_unary(&col, f64::ceil, f32::ceil)
+        }
+        "floor" => {
+            let col = evaluate(&args[0], batch, schema, params)?;
+            eval_float_unary(&col, f64::floor, f32::floor)
+        }
+        // round and trunc accept an optional per row digit count, positive
+        // digits keep fractional places, negative digits zero places left of
+        // the decimal point, integer inputs pass through except negative
+        // digits which round the integer itself
+        "round" => eval_round_trunc(args, batch, schema, params, true),
+        "trunc" | "truncate" => eval_round_trunc(args, batch, schema, params, false),
+        "trim" => eval_trim(args, batch, schema, params, TrimSide::Both),
+        "ltrim" => eval_trim(args, batch, schema, params, TrimSide::Leading),
+        "rtrim" => eval_trim(args, batch, schema, params, TrimSide::Trailing),
+        "substring" | "substr" => eval_substring(args, batch, schema, params),
+        "replace" => {
+            if args.len() != 3 {
+                return Err(ZyronError::ExecutionError(
+                    "replace(string, from, to) takes exactly 3 arguments".to_string(),
+                ));
+            }
+            let s = evaluate(&args[0], batch, schema, params)?;
+            let from = evaluate(&args[1], batch, schema, params)?;
+            let to = evaluate(&args[2], batch, schema, params)?;
+            eval_replace(&s, &from, &to)
+        }
+        "concat" => eval_concat(args, batch, schema, params),
+        "greatest" => eval_greatest_least(args, batch, schema, params, true),
+        "least" => eval_greatest_least(args, batch, schema, params, false),
+        // current_date is days since the Unix epoch, current_time is
+        // microseconds since UTC midnight, both broadcast per row so they
+        // compose like literals
+        "current_date" => {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let days = secs.div_euclid(86_400) as i32;
+            let n = batch.num_rows.max(1);
+            Ok(Column::new(ColumnData::Int32(vec![days; n]), TypeId::Date))
+        }
+        "current_time" => {
+            let micros = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as i64)
+                .unwrap_or(0);
+            let of_day = micros.rem_euclid(86_400_000_000);
+            let n = batch.num_rows.max(1);
+            Ok(Column::new(
+                ColumnData::Int64(vec![of_day; n]),
+                TypeId::Time,
+            ))
+        }
+        "array" => eval_array(args, batch, schema, params),
+        "array_subscript" => eval_array_subscript(args, batch, schema, params),
+        // Search predicates evaluated row by row. The planner routes these to
+        // an index operator when one covers the table and the read is of the
+        // current state; otherwise the storage scan evaluates them here, so
+        // an unindexed table and a time-travel read answer the same question
+        "match_against" => eval_match_against(args, batch, schema, params),
+        "vector_distance_cosine" | "vector_distance_l2" | "vector_distance_dot" => {
+            eval_vector_distance(name, args, batch, schema, params)
+        }
         n if name_matches_ml(n) => eval_ml_scalar(n, args, batch, schema, params),
         _ => crate::types_bridge::evaluate_types_function(name, args, batch, schema, params),
     }
+}
+
+/// `ARRAY[a, b, c]`.
+///
+/// Every element is evaluated as a column, so an array can be built from
+/// per-row values and not only from literals, then one encoded array is
+/// assembled per row. Elements share a type: the first one that is not null
+/// sets it and the rest are cast to it, which is what makes the encoding
+/// addressable by index.
+fn eval_array(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    let rows = batch.num_rows.max(1);
+    if args.is_empty() {
+        let empty = zyron_common::array_value::encode(TypeId::Null, &[]);
+        return Ok(Column::new(
+            ColumnData::Binary(vec![empty; rows]),
+            TypeId::Array,
+        ));
+    }
+
+    let mut columns: Vec<Column> = args
+        .iter()
+        .map(|a| evaluate(a, batch, schema, params))
+        .collect::<Result<Vec<_>>>()?;
+
+    // The element type is the first one carrying values. An all-null array
+    // has no type to take, and stays untyped
+    let element_type = columns
+        .iter()
+        .map(|c| c.type_id)
+        .find(|t| *t != TypeId::Null)
+        .unwrap_or(TypeId::Null);
+    for column in &mut columns {
+        if column.type_id != element_type && column.type_id != TypeId::Null {
+            *column = crate::compute::cast_column(column, element_type)?;
+        }
+    }
+
+    let width = element_type.fixed_size().unwrap_or(0);
+    let mut out = Vec::with_capacity(rows);
+    let mut payloads: Vec<Option<Vec<u8>>> = Vec::with_capacity(columns.len());
+    for row in 0..rows {
+        payloads.clear();
+        for column in &columns {
+            let scalar = if row < column.len() {
+                column.get_scalar(row)
+            } else {
+                ScalarValue::Null
+            };
+            payloads.push(match scalar {
+                ScalarValue::Null => None,
+                other => Some(crate::batch::encode_scalar_value(
+                    element_type,
+                    &other,
+                    width,
+                )),
+            });
+        }
+        let borrowed: Vec<Option<&[u8]>> =
+            payloads.iter().map(|p| p.as_deref()).collect();
+        out.push(zyron_common::array_value::encode(element_type, &borrowed));
+    }
+    Ok(Column::new(ColumnData::Binary(out), TypeId::Array))
+}
+
+/// `array[index]`, one-based the way SQL subscripts are.
+///
+/// An index outside the array reads as NULL rather than failing, matching how
+/// a missing element reads everywhere else.
+fn eval_array_subscript(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    if args.len() != 2 {
+        return Err(ZyronError::ExecutionError(
+            "array subscript takes an array and an index".to_string(),
+        ));
+    }
+    let arrays = evaluate(&args[0], batch, schema, params)?;
+    let indexes = evaluate(&args[1], batch, schema, params)?;
+    let rows = batch.num_rows.max(1);
+
+    // The element type comes from the encoded value rather than the plan, so
+    // a column whose element type was not known at bind time still decodes
+    let element_type = (0..rows.min(arrays.len()))
+        .find_map(|row| match arrays.get_scalar(row) {
+            ScalarValue::Binary(bytes) => {
+                zyron_common::ArrayView::parse(&bytes).map(|v| v.element_type())
+            }
+            _ => None,
+        })
+        .unwrap_or(TypeId::Null);
+
+    let mut data = ColumnData::with_capacity(element_type, rows);
+    let mut nulls = crate::column::NullBitmap::empty();
+    for row in 0..rows {
+        let scalar = subscript_one(&arrays, &indexes, row, element_type);
+        nulls.push(scalar.is_null());
+        data.push_scalar(&scalar);
+    }
+    Ok(Column::with_nulls(data, nulls, element_type))
+}
+
+/// Reads one row's subscripted element, or NULL when the array, the index or
+/// the position does not resolve.
+fn subscript_one(
+    arrays: &Column,
+    indexes: &Column,
+    row: usize,
+    element_type: TypeId,
+) -> ScalarValue {
+    if row >= arrays.len() || arrays.nulls.is_null(row) {
+        return ScalarValue::Null;
+    }
+    let ScalarValue::Binary(bytes) = arrays.get_scalar(row) else {
+        return ScalarValue::Null;
+    };
+    let Some(view) = zyron_common::ArrayView::parse(&bytes) else {
+        return ScalarValue::Null;
+    };
+    let index_row = if row < indexes.len() { row } else { 0 };
+    let one_based = match indexes.get_scalar(index_row) {
+        ScalarValue::Int8(v) => v as i64,
+        ScalarValue::Int16(v) => v as i64,
+        ScalarValue::Int32(v) => v as i64,
+        ScalarValue::Int64(v) => v,
+        ScalarValue::UInt8(v) => v as i64,
+        ScalarValue::UInt16(v) => v as i64,
+        ScalarValue::UInt32(v) => v as i64,
+        ScalarValue::UInt64(v) => v as i64,
+        _ => return ScalarValue::Null,
+    };
+    if one_based < 1 {
+        return ScalarValue::Null;
+    }
+    match view.get((one_based - 1) as usize) {
+        Some(Some(payload)) => {
+            if element_type.fixed_size().unwrap_or(0) > 0 {
+                crate::batch::decode_fixed_scalar(element_type, payload)
+            } else {
+                crate::batch::decode_varlen_scalar(element_type, payload)
+            }
+        }
+        _ => ScalarValue::Null,
+    }
+}
+
+/// Row-wise `MATCH (cols) AGAINST ('query')`.
+///
+/// Returns 1.0 for a matching row and 0.0 otherwise. The indexed path returns
+/// a BM25 score, which needs corpus statistics a single row does not carry, so
+/// this reports membership rather than inventing a rank. Row membership is
+/// identical either way, which is what a predicate depends on.
+fn eval_match_against(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    let Some((query_arg, column_args)) = args.split_last() else {
+        return Err(ZyronError::ExecutionError(
+            "match_against takes at least one column and a query".to_string(),
+        ));
+    };
+    let query_column = evaluate(query_arg, batch, schema, params)?;
+    let query_text = match query_column.get_scalar(0) {
+        ScalarValue::Utf8(s) => s,
+        other => {
+            return Err(ZyronError::ExecutionError(format!(
+                "match_against expects a string query, got {other:?}"
+            )));
+        }
+    };
+    let query = zyron_search::FtsQueryParser::parse(&query_text)?;
+    let analyzer = zyron_search::SimpleAnalyzer;
+
+    let text_columns: Vec<Column> = column_args
+        .iter()
+        .map(|a| evaluate(a, batch, schema, params))
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut scores = Vec::with_capacity(batch.num_rows);
+    let mut document = String::with_capacity(256);
+    for row in 0..batch.num_rows {
+        // One document per row, the matched columns joined the way the index
+        // concatenates them at write time
+        document.clear();
+        for col in &text_columns {
+            if col.nulls.is_null(row) {
+                continue;
+            }
+            if let ColumnData::Utf8(values) = &col.data
+                && let Some(s) = values.get(row)
+            {
+                if !document.is_empty() {
+                    document.push(' ');
+                }
+                document.push_str(s);
+            }
+        }
+        let tokens = zyron_search::Analyzer::analyze(&analyzer, &document);
+        let terms: Vec<&str> = tokens.iter().map(|t| t.term.as_str()).collect();
+        scores.push(if query.matches_terms(&terms, &analyzer) {
+            1.0
+        } else {
+            0.0
+        });
+    }
+    Ok(Column::new(ColumnData::Float64(scores), TypeId::Float64))
+}
+
+/// Row-wise vector distance between a vector column and a query vector.
+/// Same metrics the vector index scores with, so a scan and an index search
+/// order rows identically.
+fn eval_vector_distance(
+    name: &str,
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    if args.len() != 2 {
+        return Err(ZyronError::ExecutionError(format!(
+            "{name} takes exactly two vectors"
+        )));
+    }
+    let left = vector_side(&args[0], batch, schema, params)?;
+    let right = vector_side(&args[1], batch, schema, params)?;
+    let mut out = Vec::with_capacity(batch.num_rows);
+    let mut lhs: Vec<f32> = Vec::new();
+    let mut rhs: Vec<f32> = Vec::new();
+    for row in 0..batch.num_rows {
+        let (Some(a), Some(b)) = (left.at(row, &mut lhs), right.at(row, &mut rhs)) else {
+            out.push(f64::NAN);
+            continue;
+        };
+        if a.len() != b.len() {
+            return Err(ZyronError::ExecutionError(format!(
+                "{name} needs equal dimensions, got {} and {}",
+                a.len(),
+                b.len()
+            )));
+        }
+        let d = match name {
+            "vector_distance_cosine" => {
+                let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+                let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let nb: f32 = b.iter().map(|y| y * y).sum::<f32>().sqrt();
+                if na == 0.0 || nb == 0.0 {
+                    1.0
+                } else {
+                    1.0 - (dot / (na * nb)) as f64
+                }
+            }
+            "vector_distance_l2" => a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| ((x - y) as f64).powi(2))
+                .sum::<f64>()
+                .sqrt(),
+            // Dot product is a similarity, negated so a smaller value is a
+            // nearer row exactly as the other two metrics read
+            _ => -(a.iter().zip(b).map(|(x, y)| (x * y) as f64).sum::<f64>()),
+        };
+        out.push(d);
+    }
+    Ok(Column::new(ColumnData::Float64(out), TypeId::Float64))
+}
+
+/// One side of a distance call: either the same vector for every row, which
+/// is how a query vector is written, or one vector per row read out of a
+/// vector column's raw f32 bytes.
+enum VectorSide {
+    Constant(Vec<f32>),
+    PerRow(Column),
+}
+
+impl VectorSide {
+    /// The vector for one row. Per-row values are decoded into `scratch`, so
+    /// the loop over rows allocates once rather than per row.
+    fn at<'a>(&'a self, row: usize, scratch: &'a mut Vec<f32>) -> Option<&'a [f32]> {
+        match self {
+            VectorSide::Constant(v) => Some(v.as_slice()),
+            VectorSide::PerRow(col) => {
+                if col.nulls.is_null(row) {
+                    return None;
+                }
+                let ColumnData::Binary(blobs) = &col.data else {
+                    return None;
+                };
+                let bytes = blobs.get(row)?;
+                if bytes.is_empty() || bytes.len() % 4 != 0 {
+                    return None;
+                }
+                scratch.clear();
+                scratch.extend(
+                    bytes
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+                );
+                Some(scratch.as_slice())
+            }
+        }
+    }
+}
+
+/// Reads one argument of a distance call. An array constructor of numeric
+/// literals is the query vector and folds to a constant; anything else is
+/// evaluated as a column.
+fn vector_side(
+    arg: &BoundExpr,
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<VectorSide> {
+    let inner = match arg {
+        BoundExpr::Nested(e) => e.as_ref(),
+        other => other,
+    };
+    if let BoundExpr::Function { name, args, .. } = inner
+        && name == "array"
+        && !args.is_empty()
+    {
+        let mut values = Vec::with_capacity(args.len());
+        for a in args {
+            let column = evaluate(a, batch, schema, params)?;
+            let v = match column.get_scalar(0) {
+                ScalarValue::Float32(f) => f as f64,
+                ScalarValue::Float64(f) => f,
+                ScalarValue::Int32(i) => i as f64,
+                ScalarValue::Int64(i) => i as f64,
+                other => {
+                    return Err(ZyronError::ExecutionError(format!(
+                        "a query vector takes numeric elements, got {other:?}"
+                    )));
+                }
+            };
+            values.push(v as f32);
+        }
+        return Ok(VectorSide::Constant(values));
+    }
+    Ok(VectorSide::PerRow(evaluate(arg, batch, schema, params)?))
 }
 
 fn name_matches_ml(name: &str) -> bool {
@@ -1563,7 +1985,13 @@ fn eval_length(col: &Column) -> Result<Column> {
     let result: Vec<i64> = strings
         .iter()
         .enumerate()
-        .map(|(i, s)| if col.is_null(i) { 0 } else { s.len() as i64 })
+        .map(|(i, s)| {
+            if col.is_null(i) {
+                0
+            } else {
+                s.chars().count() as i64
+            }
+        })
         .collect();
     Ok(Column::with_nulls(
         ColumnData::Int64(result),
@@ -1648,5 +2076,921 @@ fn values_equal_at(a: &ColumnData, a_idx: usize, b: &ColumnData, b_idx: usize) -
         (ColumnData::Binary(va), ColumnData::Binary(vb)) => va[a_idx] == vb[b_idx],
         (ColumnData::FixedBinary16(va), ColumnData::FixedBinary16(vb)) => va[a_idx] == vb[b_idx],
         _ => a.get_scalar(a_idx) == b.get_scalar(b_idx),
+    }
+}
+
+/// Typed less-than for two values at given indices, same variant on both
+/// sides, NaN orders greater than every number so folds are total
+#[inline]
+fn values_less_at(a: &ColumnData, a_idx: usize, b: &ColumnData, b_idx: usize) -> bool {
+    match (a, b) {
+        (ColumnData::Boolean(va), ColumnData::Boolean(vb)) => va[a_idx] < vb[b_idx],
+        (ColumnData::Int8(va), ColumnData::Int8(vb)) => va[a_idx] < vb[b_idx],
+        (ColumnData::Int16(va), ColumnData::Int16(vb)) => va[a_idx] < vb[b_idx],
+        (ColumnData::Int32(va), ColumnData::Int32(vb)) => va[a_idx] < vb[b_idx],
+        (ColumnData::Int64(va), ColumnData::Int64(vb)) => va[a_idx] < vb[b_idx],
+        (ColumnData::Int128(va), ColumnData::Int128(vb)) => va[a_idx] < vb[b_idx],
+        (ColumnData::UInt8(va), ColumnData::UInt8(vb)) => va[a_idx] < vb[b_idx],
+        (ColumnData::UInt16(va), ColumnData::UInt16(vb)) => va[a_idx] < vb[b_idx],
+        (ColumnData::UInt32(va), ColumnData::UInt32(vb)) => va[a_idx] < vb[b_idx],
+        (ColumnData::UInt64(va), ColumnData::UInt64(vb)) => va[a_idx] < vb[b_idx],
+        (ColumnData::Float32(va), ColumnData::Float32(vb)) => {
+            match va[a_idx].partial_cmp(&vb[b_idx]) {
+                Some(o) => o == std::cmp::Ordering::Less,
+                None => !va[a_idx].is_nan() && vb[b_idx].is_nan(),
+            }
+        }
+        (ColumnData::Float64(va), ColumnData::Float64(vb)) => {
+            match va[a_idx].partial_cmp(&vb[b_idx]) {
+                Some(o) => o == std::cmp::Ordering::Less,
+                None => !va[a_idx].is_nan() && vb[b_idx].is_nan(),
+            }
+        }
+        (ColumnData::Utf8(va), ColumnData::Utf8(vb)) => va[a_idx] < vb[b_idx],
+        (ColumnData::Binary(va), ColumnData::Binary(vb)) => va[a_idx] < vb[b_idx],
+        (ColumnData::FixedBinary16(va), ColumnData::FixedBinary16(vb)) => va[a_idx] < vb[b_idx],
+        _ => false,
+    }
+}
+
+fn utf8_or_err(col: &Column, fname: &str) -> Result<()> {
+    match &col.data {
+        ColumnData::Utf8(_) => Ok(()),
+        _ => Err(ZyronError::ExecutionError(format!(
+            "{fname}() requires a string argument"
+        ))),
+    }
+}
+
+fn eval_char_length(col: &Column) -> Result<Column> {
+    utf8_or_err(col, "char_length")?;
+    let strings = match &col.data {
+        ColumnData::Utf8(v) => v,
+        _ => unreachable!(),
+    };
+    let result: Vec<i64> = strings
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            if col.is_null(i) {
+                0
+            } else {
+                s.chars().count() as i64
+            }
+        })
+        .collect();
+    Ok(Column::with_nulls(
+        ColumnData::Int64(result),
+        col.nulls.clone(),
+        TypeId::Int64,
+    ))
+}
+
+fn eval_octet_length(col: &Column) -> Result<Column> {
+    let result: Vec<i64> = match &col.data {
+        ColumnData::Utf8(v) => v
+            .iter()
+            .enumerate()
+            .map(|(i, s)| if col.is_null(i) { 0 } else { s.len() as i64 })
+            .collect(),
+        ColumnData::Binary(v) => v
+            .iter()
+            .enumerate()
+            .map(|(i, b)| if col.is_null(i) { 0 } else { b.len() as i64 })
+            .collect(),
+        _ => {
+            return Err(ZyronError::ExecutionError(
+                "octet_length() requires a string or binary argument".to_string(),
+            ));
+        }
+    };
+    Ok(Column::with_nulls(
+        ColumnData::Int64(result),
+        col.nulls.clone(),
+        TypeId::Int64,
+    ))
+}
+
+/// ceil and floor, integers pass through, floats apply the op per lane
+fn eval_float_unary(col: &Column, op64: fn(f64) -> f64, op32: fn(f32) -> f32) -> Result<Column> {
+    match &col.data {
+        ColumnData::Float64(v) => Ok(Column::with_nulls(
+            ColumnData::Float64(v.iter().map(|&x| op64(x)).collect()),
+            col.nulls.clone(),
+            col.type_id,
+        )),
+        ColumnData::Float32(v) => Ok(Column::with_nulls(
+            ColumnData::Float32(v.iter().map(|&x| op32(x)).collect()),
+            col.nulls.clone(),
+            col.type_id,
+        )),
+        ColumnData::Int8(_)
+        | ColumnData::Int16(_)
+        | ColumnData::Int32(_)
+        | ColumnData::Int64(_)
+        | ColumnData::Int128(_)
+        | ColumnData::UInt8(_)
+        | ColumnData::UInt16(_)
+        | ColumnData::UInt32(_)
+        | ColumnData::UInt64(_) => Ok(col.clone()),
+        _ => Err(ZyronError::ExecutionError(
+            "ceil/floor requires a numeric argument".to_string(),
+        )),
+    }
+}
+
+/// Per row digit count for round and trunc, None marks a NULL digit row
+fn digits_at(col: &Column, i: usize) -> Result<Option<i32>> {
+    if col.is_null(i) {
+        return Ok(None);
+    }
+    let d = match col.data.get_scalar(i) {
+        ScalarValue::Int8(v) => v as i64,
+        ScalarValue::Int16(v) => v as i64,
+        ScalarValue::Int32(v) => v as i64,
+        ScalarValue::Int64(v) => v,
+        ScalarValue::Int128(v) => v.clamp(i32::MIN as i128, i32::MAX as i128) as i64,
+        other => {
+            return Err(ZyronError::ExecutionError(format!(
+                "round/trunc digit count must be an integer, got {other:?}"
+            )));
+        }
+    };
+    Ok(Some(d.clamp(-400, 400) as i32))
+}
+
+/// Rounds or truncates one i128 to a multiple of 10^(-d) for d < 0,
+/// half away from zero when rounding
+fn int_round_trunc(v: i128, d: i32, round: bool) -> i128 {
+    if d >= 0 {
+        return v;
+    }
+    if d <= -39 {
+        return 0;
+    }
+    let p = 10i128.pow((-d) as u32);
+    if round {
+        let half = p / 2;
+        let adj = if v >= 0 {
+            v.saturating_add(half)
+        } else {
+            v.saturating_sub(half)
+        };
+        (adj / p) * p
+    } else {
+        (v / p) * p
+    }
+}
+
+fn float_round_trunc(v: f64, d: i32, round: bool) -> f64 {
+    if d == 0 {
+        return if round { v.round() } else { v.trunc() };
+    }
+    let scale = 10f64.powi(d.clamp(-308, 308));
+    let scaled = v * scale;
+    if !scaled.is_finite() {
+        return v;
+    }
+    let r = if round {
+        scaled.round()
+    } else {
+        scaled.trunc()
+    };
+    r / scale
+}
+
+fn eval_round_trunc(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+    round: bool,
+) -> Result<Column> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(ZyronError::ExecutionError(
+            "round/trunc takes 1 or 2 arguments".to_string(),
+        ));
+    }
+    let col = evaluate(&args[0], batch, schema, params)?;
+    let dcol = if args.len() == 2 {
+        Some(evaluate(&args[1], batch, schema, params)?)
+    } else {
+        None
+    };
+    let n = col.len();
+    let digit = |i: usize| -> Result<Option<i32>> {
+        match &dcol {
+            Some(d) => digits_at(d, i),
+            None => Ok(Some(0)),
+        }
+    };
+
+    macro_rules! int_lanes {
+        ($v:expr, $variant:ident, $ty:ty) => {{
+            let mut out: Vec<$ty> = Vec::with_capacity(n);
+            let mut nulls = NullBitmap::none(n);
+            for (i, &x) in $v.iter().enumerate() {
+                match digit(i)? {
+                    Some(d) if !col.is_null(i) => {
+                        out.push(int_round_trunc(x as i128, d, round) as $ty)
+                    }
+                    _ => {
+                        out.push(0 as $ty);
+                        nulls.set_null(i);
+                    }
+                }
+            }
+            for i in 0..n {
+                if col.is_null(i) {
+                    nulls.set_null(i);
+                }
+            }
+            Ok(Column::with_nulls(
+                ColumnData::$variant(out),
+                nulls,
+                col.type_id,
+            ))
+        }};
+    }
+
+    match &col.data {
+        ColumnData::Float64(v) => {
+            let mut out: Vec<f64> = Vec::with_capacity(n);
+            let mut nulls = NullBitmap::none(n);
+            for (i, &x) in v.iter().enumerate() {
+                match digit(i)? {
+                    Some(d) if !col.is_null(i) => out.push(float_round_trunc(x, d, round)),
+                    _ => {
+                        out.push(0.0);
+                        nulls.set_null(i);
+                    }
+                }
+            }
+            for i in 0..n {
+                if col.is_null(i) {
+                    nulls.set_null(i);
+                }
+            }
+            Ok(Column::with_nulls(
+                ColumnData::Float64(out),
+                nulls,
+                col.type_id,
+            ))
+        }
+        ColumnData::Float32(v) => {
+            let mut out: Vec<f32> = Vec::with_capacity(n);
+            let mut nulls = NullBitmap::none(n);
+            for (i, &x) in v.iter().enumerate() {
+                match digit(i)? {
+                    Some(d) if !col.is_null(i) => {
+                        out.push(float_round_trunc(x as f64, d, round) as f32)
+                    }
+                    _ => {
+                        out.push(0.0);
+                        nulls.set_null(i);
+                    }
+                }
+            }
+            for i in 0..n {
+                if col.is_null(i) {
+                    nulls.set_null(i);
+                }
+            }
+            Ok(Column::with_nulls(
+                ColumnData::Float32(out),
+                nulls,
+                col.type_id,
+            ))
+        }
+        ColumnData::Int8(v) => int_lanes!(v, Int8, i8),
+        ColumnData::Int16(v) => int_lanes!(v, Int16, i16),
+        ColumnData::Int32(v) => int_lanes!(v, Int32, i32),
+        ColumnData::Int64(v) => int_lanes!(v, Int64, i64),
+        ColumnData::Int128(v) => int_lanes!(v, Int128, i128),
+        _ => Err(ZyronError::ExecutionError(
+            "round/trunc requires a numeric argument".to_string(),
+        )),
+    }
+}
+
+enum TrimSide {
+    Both,
+    Leading,
+    Trailing,
+}
+
+fn eval_trim(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+    side: TrimSide,
+) -> Result<Column> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(ZyronError::ExecutionError(
+            "trim takes 1 or 2 arguments".to_string(),
+        ));
+    }
+    let col = evaluate(&args[0], batch, schema, params)?;
+    utf8_or_err(&col, "trim")?;
+    let charset = if args.len() == 2 {
+        let c = evaluate(&args[1], batch, schema, params)?;
+        utf8_or_err(&c, "trim")?;
+        Some(c)
+    } else {
+        None
+    };
+    let strings = match &col.data {
+        ColumnData::Utf8(v) => v,
+        _ => unreachable!(),
+    };
+    let n = col.len();
+    let mut out: Vec<String> = Vec::with_capacity(n);
+    let mut nulls = NullBitmap::none(n);
+    for (i, s) in strings.iter().enumerate() {
+        if col.is_null(i) {
+            out.push(String::new());
+            nulls.set_null(i);
+            continue;
+        }
+        // SQL trim strips spaces by default, an explicit charset strips any
+        // of its characters
+        let trimmed = match &charset {
+            None => match side {
+                TrimSide::Both => s.trim_matches(' '),
+                TrimSide::Leading => s.trim_start_matches(' '),
+                TrimSide::Trailing => s.trim_end_matches(' '),
+            },
+            Some(c) => {
+                if c.is_null(i) {
+                    out.push(String::new());
+                    nulls.set_null(i);
+                    continue;
+                }
+                let set: Vec<char> = match &c.data {
+                    ColumnData::Utf8(v) => v[i].chars().collect(),
+                    _ => unreachable!(),
+                };
+                let pred = |ch: char| set.contains(&ch);
+                match side {
+                    TrimSide::Both => s.trim_matches(pred),
+                    TrimSide::Leading => s.trim_start_matches(pred),
+                    TrimSide::Trailing => s.trim_end_matches(pred),
+                }
+            }
+        };
+        out.push(trimmed.to_string());
+    }
+    Ok(Column::with_nulls(
+        ColumnData::Utf8(out),
+        nulls,
+        TypeId::Text,
+    ))
+}
+
+/// One based character addressed substring with SQL overlap semantics, a
+/// start below 1 shortens the window instead of erroring
+fn substring_chars(s: &str, start: i64, len: Option<i64>) -> Result<String> {
+    if let Some(l) = len {
+        if l < 0 {
+            return Err(ZyronError::ExecutionError(
+                "negative substring length not allowed".to_string(),
+            ));
+        }
+    }
+    let end_excl = match len {
+        Some(l) => start.saturating_add(l),
+        None => i64::MAX,
+    };
+    let begin = start.max(1);
+    if end_excl <= begin {
+        return Ok(String::new());
+    }
+    let skip = (begin - 1) as usize;
+    let take = (end_excl - begin) as usize;
+    Ok(s.chars().skip(skip).take(take).collect())
+}
+
+fn eval_substring(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(ZyronError::ExecutionError(
+            "substring(string, start [, length]) takes 2 or 3 arguments".to_string(),
+        ));
+    }
+    let col = evaluate(&args[0], batch, schema, params)?;
+    utf8_or_err(&col, "substring")?;
+    let start_col = evaluate(&args[1], batch, schema, params)?;
+    let len_col = if args.len() == 3 {
+        Some(evaluate(&args[2], batch, schema, params)?)
+    } else {
+        None
+    };
+    let int_at = |c: &Column, i: usize, what: &str| -> Result<Option<i64>> {
+        if c.is_null(i) {
+            return Ok(None);
+        }
+        match c.data.get_scalar(i) {
+            ScalarValue::Int8(v) => Ok(Some(v as i64)),
+            ScalarValue::Int16(v) => Ok(Some(v as i64)),
+            ScalarValue::Int32(v) => Ok(Some(v as i64)),
+            ScalarValue::Int64(v) => Ok(Some(v)),
+            ScalarValue::Int128(v) => Ok(Some(v.clamp(i64::MIN as i128, i64::MAX as i128) as i64)),
+            other => Err(ZyronError::ExecutionError(format!(
+                "substring {what} must be an integer, got {other:?}"
+            ))),
+        }
+    };
+    let strings = match &col.data {
+        ColumnData::Utf8(v) => v,
+        _ => unreachable!(),
+    };
+    let n = col.len();
+    let mut out: Vec<String> = Vec::with_capacity(n);
+    let mut nulls = NullBitmap::none(n);
+    for (i, s) in strings.iter().enumerate() {
+        if col.is_null(i) {
+            out.push(String::new());
+            nulls.set_null(i);
+            continue;
+        }
+        let start = match int_at(&start_col, i, "start")? {
+            Some(v) => v,
+            None => {
+                out.push(String::new());
+                nulls.set_null(i);
+                continue;
+            }
+        };
+        let len = match &len_col {
+            Some(lc) => match int_at(lc, i, "length")? {
+                Some(v) => Some(v),
+                None => {
+                    out.push(String::new());
+                    nulls.set_null(i);
+                    continue;
+                }
+            },
+            None => None,
+        };
+        out.push(substring_chars(s, start, len)?);
+    }
+    Ok(Column::with_nulls(
+        ColumnData::Utf8(out),
+        nulls,
+        TypeId::Text,
+    ))
+}
+
+fn eval_replace(s: &Column, from: &Column, to: &Column) -> Result<Column> {
+    utf8_or_err(s, "replace")?;
+    utf8_or_err(from, "replace")?;
+    utf8_or_err(to, "replace")?;
+    let (sv, fv, tv) = match (&s.data, &from.data, &to.data) {
+        (ColumnData::Utf8(a), ColumnData::Utf8(b), ColumnData::Utf8(c)) => (a, b, c),
+        _ => unreachable!(),
+    };
+    let n = s.len();
+    let mut out: Vec<String> = Vec::with_capacity(n);
+    let mut nulls = NullBitmap::none(n);
+    for i in 0..n {
+        if s.is_null(i) || from.is_null(i) || to.is_null(i) {
+            out.push(String::new());
+            nulls.set_null(i);
+            continue;
+        }
+        // an empty search string returns the input unchanged
+        if fv[i].is_empty() {
+            out.push(sv[i].clone());
+        } else {
+            out.push(sv[i].replace(&fv[i], &tv[i]));
+        }
+    }
+    Ok(Column::with_nulls(
+        ColumnData::Utf8(out),
+        nulls,
+        TypeId::Text,
+    ))
+}
+
+/// Variadic concat, NULL arguments contribute nothing and the result is
+/// never NULL, non string arguments cast to text
+fn eval_concat(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    let n = batch.num_rows.max(1);
+    let mut cols: Vec<Column> = Vec::with_capacity(args.len());
+    for a in args {
+        let c = evaluate(a, batch, schema, params)?;
+        let c = match &c.data {
+            ColumnData::Utf8(_) => c,
+            _ => crate::compute::cast_column(&c, TypeId::Varchar)?,
+        };
+        cols.push(c);
+    }
+    let mut out: Vec<String> = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut s = String::new();
+        for c in &cols {
+            if i < c.len() && !c.is_null(i) {
+                if let ColumnData::Utf8(v) = &c.data {
+                    s.push_str(&v[i]);
+                }
+            }
+        }
+        out.push(s);
+    }
+    Ok(Column::new(ColumnData::Utf8(out), TypeId::Text))
+}
+
+/// Row wise maximum or minimum across the arguments, NULLs are ignored and
+/// the result is NULL only when every argument is NULL
+fn eval_greatest_least(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+    greatest: bool,
+) -> Result<Column> {
+    if args.is_empty() {
+        return Err(ZyronError::ExecutionError(
+            "greatest/least requires at least 1 argument".to_string(),
+        ));
+    }
+    let first = evaluate(&args[0], batch, schema, params)?;
+    let target = first.type_id;
+    let ts_precision = first.ts_precision;
+    let mut cols: Vec<Column> = Vec::with_capacity(args.len());
+    for (idx, a) in args.iter().enumerate() {
+        let c = if idx == 0 {
+            first.clone()
+        } else {
+            evaluate(a, batch, schema, params)?
+        };
+        let c = if c.type_id == target {
+            c
+        } else {
+            crate::compute::cast_column(&c, target)?
+        };
+        cols.push(c);
+    }
+    let n = cols.iter().map(|c| c.len()).max().unwrap_or(0);
+    let mut data = ColumnData::with_capacity(target, n);
+    let mut nulls = NullBitmap::none(n);
+    for i in 0..n {
+        // best holds the winning argument index for this row
+        let mut best: Option<usize> = None;
+        for (k, c) in cols.iter().enumerate() {
+            if i >= c.len() || c.is_null(i) {
+                continue;
+            }
+            match best {
+                None => best = Some(k),
+                Some(b) => {
+                    let winner_loses = if greatest {
+                        values_less_at(&cols[b].data, i, &c.data, i)
+                    } else {
+                        values_less_at(&c.data, i, &cols[b].data, i)
+                    };
+                    if winner_loses {
+                        best = Some(k);
+                    }
+                }
+            }
+        }
+        match best {
+            Some(k) => data.push_from(&cols[k].data, i),
+            None => {
+                data.push_default();
+                nulls.set_null(i);
+            }
+        }
+    }
+    Ok(Column::with_nulls_ts(data, nulls, target, ts_precision))
+}
+
+#[cfg(test)]
+mod scalar_fn_tests {
+    use super::*;
+
+    fn lit_int(v: i64) -> BoundExpr {
+        BoundExpr::Literal {
+            value: LiteralValue::Integer(v),
+            type_id: TypeId::Int64,
+        }
+    }
+    fn lit_float(v: f64) -> BoundExpr {
+        BoundExpr::Literal {
+            value: LiteralValue::Float(v),
+            type_id: TypeId::Float64,
+        }
+    }
+    fn lit_str(s: &str) -> BoundExpr {
+        BoundExpr::Literal {
+            value: LiteralValue::String(s.to_string()),
+            type_id: TypeId::Text,
+        }
+    }
+    fn lit_null(t: TypeId) -> BoundExpr {
+        BoundExpr::Literal {
+            value: LiteralValue::Null,
+            type_id: t,
+        }
+    }
+    fn one_row_batch() -> DataBatch {
+        DataBatch::new(vec![Column::new(ColumnData::Int64(vec![0]), TypeId::Int64)])
+    }
+    fn call(name: &str, args: &[BoundExpr]) -> Result<Column> {
+        evaluate_function(name, args, &one_row_batch(), &[], &[])
+    }
+    fn f64_at0(c: &Column) -> f64 {
+        match c.data.get_scalar(0) {
+            ScalarValue::Float64(v) => v,
+            other => panic!("expected Float64, got {other:?}"),
+        }
+    }
+    fn i64_at0(c: &Column) -> i64 {
+        match c.data.get_scalar(0) {
+            ScalarValue::Int64(v) => v,
+            other => panic!("expected Int64, got {other:?}"),
+        }
+    }
+    fn str_at0(c: &Column) -> String {
+        match c.data.get_scalar(0) {
+            ScalarValue::Utf8(v) => v,
+            other => panic!("expected Utf8, got {other:?}"),
+        }
+    }
+
+    /// Row-wise vector distance over a vector column and a query vector.
+    /// A vector column holds raw little-endian f32 bytes, and the query side
+    /// arrives as an array constructor, so both shapes have to read.
+    #[test]
+    fn vector_distance_reads_a_vector_column_against_a_query_vector() {
+        fn vector_bytes(v: &[f32]) -> Vec<u8> {
+            v.iter().flat_map(|f| f.to_le_bytes()).collect()
+        }
+        let batch = DataBatch::new(vec![Column::new(
+            ColumnData::Binary(vec![
+                vector_bytes(&[1.0, 0.0, 0.0]),
+                vector_bytes(&[0.0, 1.0, 0.0]),
+                vector_bytes(&[0.9, 0.1, 0.0]),
+            ]),
+            TypeId::Vector,
+        )]);
+        let schema = vec![LogicalColumn {
+            table_idx: Some(0),
+            column_id: zyron_catalog::ColumnId(1),
+            name: "embedding".to_string(),
+            type_id: TypeId::Vector,
+            nullable: false,
+            ts_precision: None,
+        }];
+        let column_ref = BoundExpr::ColumnRef(zyron_planner::binder::ColumnRef {
+            table_idx: 0,
+            column_id: zyron_catalog::ColumnId(1),
+            type_id: TypeId::Vector,
+            nullable: false,
+            ts_precision: None,
+        });
+        let query = BoundExpr::Function {
+            name: "array".to_string(),
+            args: vec![lit_float(1.0), lit_float(0.0), lit_float(0.0)],
+            return_type: TypeId::Array,
+            distinct: false,
+        };
+
+        let cosine = evaluate_function(
+            "vector_distance_cosine",
+            &[column_ref.clone(), query.clone()],
+            &batch,
+            &schema,
+            &[],
+        )
+        .unwrap();
+        let ColumnData::Float64(values) = &cosine.data else {
+            panic!("expected a float column");
+        };
+        assert!(values[0].abs() < 1e-6, "a row equal to the query is at zero");
+        assert!(
+            (values[1] - 1.0).abs() < 1e-6,
+            "an orthogonal row is at one"
+        );
+        assert!(
+            values[2] > 0.0 && values[2] < 0.01,
+            "a nearly parallel row is close, got {}",
+            values[2]
+        );
+
+        let l2 = evaluate_function(
+            "vector_distance_l2",
+            &[column_ref, query],
+            &batch,
+            &schema,
+            &[],
+        )
+        .unwrap();
+        let ColumnData::Float64(values) = &l2.data else {
+            panic!("expected a float column");
+        };
+        assert!(values[0].abs() < 1e-6);
+        assert!((values[1] - std::f64::consts::SQRT_2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn round_floats_half_away_from_zero() {
+        assert_eq!(f64_at0(&call("round", &[lit_float(2.5)]).unwrap()), 3.0);
+        assert_eq!(f64_at0(&call("round", &[lit_float(-2.5)]).unwrap()), -3.0);
+        assert_eq!(f64_at0(&call("round", &[lit_float(2.4)]).unwrap()), 2.0);
+        let two_digits = call("round", &[lit_float(3.14159), lit_int(2)]).unwrap();
+        assert!((f64_at0(&two_digits) - 3.14).abs() < 1e-12);
+        let neg_digits = call("round", &[lit_float(1234.5), lit_int(-2)]).unwrap();
+        assert_eq!(f64_at0(&neg_digits), 1200.0);
+    }
+
+    #[test]
+    fn round_integers_pass_through_and_negative_digits_round_the_integer() {
+        assert_eq!(i64_at0(&call("round", &[lit_int(42)]).unwrap()), 42);
+        assert_eq!(
+            i64_at0(&call("round", &[lit_int(1250), lit_int(-2)]).unwrap()),
+            1300
+        );
+        assert_eq!(
+            i64_at0(&call("round", &[lit_int(-1250), lit_int(-2)]).unwrap()),
+            -1300
+        );
+        assert_eq!(
+            i64_at0(&call("trunc", &[lit_int(1299), lit_int(-2)]).unwrap()),
+            1200
+        );
+    }
+
+    #[test]
+    fn trunc_moves_toward_zero() {
+        assert_eq!(f64_at0(&call("trunc", &[lit_float(2.9)]).unwrap()), 2.0);
+        assert_eq!(f64_at0(&call("trunc", &[lit_float(-2.9)]).unwrap()), -2.0);
+        assert_eq!(f64_at0(&call("truncate", &[lit_float(5.5)]).unwrap()), 5.0);
+    }
+
+    #[test]
+    fn round_null_input_and_null_digits_are_null() {
+        let c = call("round", &[lit_null(TypeId::Float64)]).unwrap();
+        assert!(c.is_null(0));
+        let c = call("round", &[lit_float(1.5), lit_null(TypeId::Int64)]).unwrap();
+        assert!(c.is_null(0));
+    }
+
+    #[test]
+    fn ceil_and_floor() {
+        assert_eq!(f64_at0(&call("ceil", &[lit_float(2.1)]).unwrap()), 3.0);
+        assert_eq!(f64_at0(&call("ceiling", &[lit_float(-2.1)]).unwrap()), -2.0);
+        assert_eq!(f64_at0(&call("floor", &[lit_float(2.9)]).unwrap()), 2.0);
+        assert_eq!(f64_at0(&call("floor", &[lit_float(-2.1)]).unwrap()), -3.0);
+        assert_eq!(i64_at0(&call("ceil", &[lit_int(7)]).unwrap()), 7);
+    }
+
+    #[test]
+    fn trim_strips_spaces_only_by_default() {
+        assert_eq!(str_at0(&call("trim", &[lit_str("  x  ")]).unwrap()), "x");
+        assert_eq!(str_at0(&call("ltrim", &[lit_str("  x  ")]).unwrap()), "x  ");
+        assert_eq!(str_at0(&call("rtrim", &[lit_str("  x  ")]).unwrap()), "  x");
+        assert_eq!(
+            str_at0(&call("trim", &[lit_str("\tx\t")]).unwrap()),
+            "\tx\t"
+        );
+    }
+
+    #[test]
+    fn trim_with_explicit_charset() {
+        assert_eq!(
+            str_at0(&call("trim", &[lit_str("xxaxx"), lit_str("x")]).unwrap()),
+            "a"
+        );
+        assert_eq!(
+            str_at0(&call("ltrim", &[lit_str("xyay"), lit_str("xy")]).unwrap()),
+            "ay"
+        );
+    }
+
+    #[test]
+    fn substring_is_one_based_with_overlap_semantics() {
+        assert_eq!(
+            str_at0(&call("substring", &[lit_str("hello"), lit_int(2)]).unwrap()),
+            "ello"
+        );
+        assert_eq!(
+            str_at0(&call("substring", &[lit_str("hello"), lit_int(2), lit_int(2)]).unwrap()),
+            "el"
+        );
+        assert_eq!(
+            str_at0(&call("substring", &[lit_str("hello"), lit_int(0), lit_int(3)]).unwrap()),
+            "he"
+        );
+        assert_eq!(
+            str_at0(&call("substring", &[lit_str("hello"), lit_int(-2), lit_int(4)]).unwrap()),
+            "h"
+        );
+        assert_eq!(
+            str_at0(&call("substr", &[lit_str("h\u{e9}llo"), lit_int(2), lit_int(2)]).unwrap()),
+            "\u{e9}l"
+        );
+        assert!(call("substring", &[lit_str("x"), lit_int(1), lit_int(-1)]).is_err());
+    }
+
+    #[test]
+    fn replace_all_occurrences_and_empty_search_is_identity() {
+        assert_eq!(
+            str_at0(&call("replace", &[lit_str("aaa"), lit_str("a"), lit_str("b")]).unwrap()),
+            "bbb"
+        );
+        assert_eq!(
+            str_at0(&call("replace", &[lit_str("abc"), lit_str(""), lit_str("x")]).unwrap()),
+            "abc"
+        );
+        let c = call(
+            "replace",
+            &[lit_str("abc"), lit_null(TypeId::Text), lit_str("x")],
+        )
+        .unwrap();
+        assert!(c.is_null(0));
+    }
+
+    #[test]
+    fn concat_skips_nulls_and_casts_non_strings() {
+        assert_eq!(
+            str_at0(
+                &call(
+                    "concat",
+                    &[lit_str("a"), lit_null(TypeId::Text), lit_str("b")]
+                )
+                .unwrap()
+            ),
+            "ab"
+        );
+        assert_eq!(
+            str_at0(&call("concat", &[lit_int(1), lit_str("x")]).unwrap()),
+            "1x"
+        );
+    }
+
+    #[test]
+    fn greatest_and_least_ignore_nulls() {
+        assert_eq!(
+            i64_at0(&call("greatest", &[lit_int(1), lit_int(3), lit_int(2)]).unwrap()),
+            3
+        );
+        assert_eq!(
+            i64_at0(&call("least", &[lit_null(TypeId::Int64), lit_int(5), lit_int(3)]).unwrap()),
+            3
+        );
+        let c = call(
+            "greatest",
+            &[lit_null(TypeId::Int64), lit_null(TypeId::Int64)],
+        )
+        .unwrap();
+        assert!(c.is_null(0));
+        assert_eq!(
+            str_at0(&call("greatest", &[lit_str("apple"), lit_str("pear")]).unwrap()),
+            "pear"
+        );
+    }
+
+    #[test]
+    fn length_family_counts_chars_and_octets() {
+        assert_eq!(
+            i64_at0(&call("length", &[lit_str("h\u{e9}llo")]).unwrap()),
+            5
+        );
+        assert_eq!(
+            i64_at0(&call("char_length", &[lit_str("h\u{e9}llo")]).unwrap()),
+            5
+        );
+        assert_eq!(
+            i64_at0(&call("octet_length", &[lit_str("h\u{e9}llo")]).unwrap()),
+            6
+        );
+    }
+
+    #[test]
+    fn current_date_and_time_produce_sane_values() {
+        let d = call("current_date", &[]).unwrap();
+        assert_eq!(d.type_id, TypeId::Date);
+        match d.data.get_scalar(0) {
+            ScalarValue::Int32(days) => assert!(days > 20_000),
+            other => panic!("expected Int32 days, got {other:?}"),
+        }
+        let t = call("current_time", &[]).unwrap();
+        assert_eq!(t.type_id, TypeId::Time);
+        match t.data.get_scalar(0) {
+            ScalarValue::Int64(us) => assert!((0..86_400_000_000).contains(&us)),
+            other => panic!("expected Int64 micros, got {other:?}"),
+        }
     }
 }

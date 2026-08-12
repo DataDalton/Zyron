@@ -175,6 +175,7 @@ impl ZyronConfig {
                         self.storage.buffer_pool_size = v;
                     }
                 }
+                "deployment_mode" => self.storage.deployment_mode = value.into(),
                 _ => {}
             },
             "wal" => match key {
@@ -378,6 +379,15 @@ impl ZyronConfig {
                 Err(_) => tracing::warn!("ZYRON_BUFFER_POOL_SIZE='{}' is not valid, ignoring", val),
             }
         }
+        if let Ok(val) = std::env::var("ZYRON_DEPLOYMENT_MODE") {
+            match zyron_common::DeploymentMode::parse(&val) {
+                Some(mode) => self.storage.deployment_mode = mode.as_str().into(),
+                None => tracing::warn!(
+                    "ZYRON_DEPLOYMENT_MODE='{}' is not 'db', 'lake' or 'unified', ignoring",
+                    val
+                ),
+            }
+        }
         if let Ok(val) = std::env::var("ZYRON_METRICS_ENABLED") {
             if let Ok(v) = val.parse() {
                 self.metrics.enabled = v;
@@ -449,6 +459,12 @@ impl ZyronConfig {
         }
         if self.storage.buffer_pool_size == 0 {
             return Err(ZyronError::Internal("buffer_pool_size cannot be 0".into()));
+        }
+        if zyron_common::DeploymentMode::parse(&self.storage.deployment_mode).is_none() {
+            return Err(ZyronError::Internal(format!(
+                "Invalid storage.deployment_mode '{}', expected 'db', 'lake' or 'unified'",
+                self.storage.deployment_mode
+            )));
         }
         if self.wal.segment_size == 0 {
             return Err(ZyronError::Internal("WAL segment_size cannot be 0".into()));
@@ -529,6 +545,13 @@ impl ZyronConfig {
         Ok(())
     }
 
+    /// Returns the typed deployment mode. Validation restricts the source
+    /// string at load, so an unrecognized value here falls back to the
+    /// engine default rather than failing a running server.
+    pub fn deployment_mode(&self) -> zyron_common::DeploymentMode {
+        zyron_common::DeploymentMode::parse(&self.storage.deployment_mode).unwrap_or_default()
+    }
+
     /// Converts the server section to the common ServerConfig.
     pub fn to_server_config(&self) -> zyron_common::ServerConfig {
         zyron_common::ServerConfig {
@@ -597,6 +620,7 @@ impl ZyronConfig {
             "storage.data_dir" => Some(self.storage.data_dir.display().to_string()),
             "storage.page_size" => Some(self.storage.page_size.to_string()),
             "storage.buffer_pool_size" => Some(self.storage.buffer_pool_size.to_string()),
+            "storage.deployment_mode" => Some(self.storage.deployment_mode.clone()),
             // WAL
             "wal.wal_dir" => Some(self.wal_dir().display().to_string()),
             "wal.segment_size" => Some(self.wal.segment_size.to_string()),
@@ -711,6 +735,11 @@ impl ZyronConfig {
                 "storage.buffer_pool_size".into(),
                 self.storage.buffer_pool_size.to_string(),
                 "Buffer pool size in bytes".into(),
+            ),
+            (
+                "storage.deployment_mode".into(),
+                self.storage.deployment_mode.clone(),
+                "Storage tiers this node runs (db, lake or unified)".into(),
             ),
             (
                 "wal.wal_dir".into(),
@@ -910,6 +939,11 @@ pub struct StorageSection {
     /// Buffer pool size in bytes. Accepts human-readable strings via parse_size.
     #[serde(deserialize_with = "deserialize_size")]
     pub buffer_pool_size: usize,
+    /// Storage tiers this node runs: "db" for heap tables only, "lake" for
+    /// ZyronLake tables only, "unified" for both with heap as the default.
+    /// Picks the format CREATE TABLE uses without a USING clause, refuses DDL
+    /// naming the other format, and gates lake startup recovery and workers.
+    pub deployment_mode: String,
 }
 
 impl Default for StorageSection {
@@ -918,6 +952,7 @@ impl Default for StorageSection {
             data_dir: PathBuf::from("./data"),
             page_size: 16384,
             buffer_pool_size: 128 * 1024 * 1024, // 128 MB
+            deployment_mode: "unified".into(),
         }
     }
 }
@@ -1496,6 +1531,46 @@ wal_bytes_threshold = 33554432
         config.logging.output = "file".into();
         config.logging.file_path = Some(PathBuf::from("/var/log/zyron.log"));
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_deployment_mode_reads_from_toml_and_rejects_unknown_names() {
+        // Unset means unified, which runs both formats with heap as the
+        // default so an existing deployment keeps its behavior
+        let config = ZyronConfig::default();
+        assert_eq!(config.storage.deployment_mode, "unified");
+        assert_eq!(
+            config.deployment_mode(),
+            zyron_common::DeploymentMode::Unified
+        );
+        assert!(config.validate().is_ok());
+
+        let config: ZyronConfig = toml::from_str(
+            r#"
+[storage]
+deployment_mode = "lake"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.deployment_mode(), zyron_common::DeploymentMode::Lake);
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            config
+                .get_config_value("storage.deployment_mode")
+                .as_deref(),
+            Some("lake")
+        );
+
+        let mut config = ZyronConfig::default();
+        config.storage.deployment_mode = "hybrid".into();
+        let err = config.validate().expect_err("unknown mode must be refused");
+        assert!(err.to_string().contains("storage.deployment_mode"));
+        assert!(err.to_string().contains("'db', 'lake' or 'unified'"));
+
+        // Runtime override path, the one zyrondb.auto.conf goes through
+        let mut config = ZyronConfig::default();
+        config.set_config_value("storage", "deployment_mode", "db");
+        assert_eq!(config.deployment_mode(), zyron_common::DeploymentMode::Db);
     }
 
     #[test]

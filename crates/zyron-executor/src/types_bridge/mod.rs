@@ -263,7 +263,7 @@ pub fn evaluate_types_function(
             zyron_types::probabilistic::cms_estimate(sketch, value).unwrap_or(0) as i64
         }),
 
-        // ---------- Phase 15: checksums ----------
+        // ---------- checksums ----------
         "xxhash32" => one_bytes_to_int32(&evaluated_args, |b| {
             zyron_types::checksum::xxhash32(b) as i32
         }),
@@ -280,7 +280,7 @@ pub fn evaluate_types_function(
             zyron_types::checksum::city_hash64(b) as i64
         }),
 
-        // ---------- Phase 15: natural sort ----------
+        // ---------- natural sort ----------
         "version_compare" => two_string_to_int(&evaluated_args, |a, b| {
             zyron_types::natural_sort::version_compare(a, b)
         }),
@@ -315,7 +315,7 @@ pub fn evaluate_types_function(
             zyron_types::natural_sort::natural_sort_key(s).into_bytes()
         }),
 
-        // ---------- Phase 15: file detection ----------
+        // ---------- file detection ----------
         "detect_mime_type" => one_bytes_to_string(&evaluated_args, |b| {
             zyron_types::file_detect::detect_mime_type(b).to_string()
         }),
@@ -327,7 +327,7 @@ pub fn evaluate_types_function(
             zyron_types::file_detect::file_extension(s).to_string()
         }),
 
-        // ---------- Phase 15: document processing ----------
+        // ---------- document processing ----------
         "markdown_to_html" => one_string_to_string(&evaluated_args, |s| {
             zyron_types::document::markdown_to_html(s)
         }),
@@ -365,7 +365,7 @@ pub fn evaluate_types_function(
             )
         }),
 
-        // ---------- Phase 15: barcode/QR ----------
+        // ---------- barcode/QR ----------
         "qr_encode" => one_string_to_bytes(&evaluated_args, |s| {
             zyron_types::barcode::qr_encode(s, zyron_types::barcode::QrErrorCorrection::M)
                 .unwrap_or_default()
@@ -385,12 +385,46 @@ pub fn evaluate_types_function(
                 .unwrap_or_default()
         }),
 
-        _ => Err(ZyronError::ExecutionError(format!(
-            "unknown function: {}",
-            name
-        ))),
+        other => dispatch_extended(other, &evaluated_args, num_rows).unwrap_or_else(|| {
+            Err(ZyronError::ExecutionError(format!(
+                "unknown function: {}",
+                name
+            )))
+        }),
     }
 }
+
+/// Chains the per family dispatch modules, first Some wins. Array typed
+/// results are encoded as JSON text bytes inside Binary cells, opaque
+/// domain values (money, quantity, range, sketches) use their module's
+/// byte serialization
+fn dispatch_extended(name: &str, args: &[Column], num_rows: usize) -> Option<Result<Column>> {
+    bitfield_crypto::dispatch(name, args, num_rows)
+        .or_else(|| color_fingerprint::dispatch(name, args, num_rows))
+        .or_else(|| idgen_identifier::dispatch(name, args, num_rows))
+        .or_else(|| network_url::dispatch(name, args, num_rows))
+        .or_else(|| money_quantity::dispatch(name, args, num_rows))
+        .or_else(|| cron_range_time::dispatch(name, args, num_rows))
+        .or_else(|| regex_strings::dispatch(name, args, num_rows))
+        .or_else(|| state_rate_tree::dispatch(name, args, num_rows))
+        .or_else(|| prob_statistics::dispatch(name, args, num_rows))
+        .or_else(|| matrix_geo::dispatch(name, args, num_rows))
+        .or_else(|| financial_ts::dispatch(name, args, num_rows))
+        .or_else(|| misc_domains::dispatch(name, args, num_rows))
+}
+
+mod bitfield_crypto;
+mod color_fingerprint;
+mod cron_range_time;
+mod financial_ts;
+mod idgen_identifier;
+mod matrix_geo;
+mod misc_domains;
+mod money_quantity;
+mod network_url;
+mod prob_statistics;
+mod regex_strings;
+mod state_rate_tree;
 
 fn one_string_to_bytes<F: Fn(&str) -> Vec<u8>>(args: &[Column], f: F) -> Result<Column> {
     arg_count_check(args, 1)?;

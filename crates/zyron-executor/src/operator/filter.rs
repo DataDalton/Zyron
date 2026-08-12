@@ -78,18 +78,19 @@ impl Operator for FilterOperator {
                     continue;
                 }
 
-                // Filter tuple_ids in parallel with the boolean mask.
-                let filtered_ids = exec_batch.tuple_ids.map(|ids| {
+                // Slice the locators with the same boolean mask, works for
+                // heap and columnar rows alike.
+                let filtered_locs = exec_batch.locators.map(|locs| {
                     mask.iter()
                         .enumerate()
-                        .filter_map(|(i, &keep)| if keep { Some(ids[i]) } else { None })
+                        .filter_map(|(i, &keep)| if keep { Some(locs[i]) } else { None })
                         .collect::<Vec<_>>()
                 });
 
-                return match filtered_ids {
-                    Some(ids) => Ok(Some(ExecutionBatch::with_tuple_ids(filtered, ids))),
-                    None => Ok(Some(ExecutionBatch::new(filtered))),
-                };
+                return Ok(Some(ExecutionBatch {
+                    batch: filtered,
+                    locators: filtered_locs,
+                }));
             }
         })
     }

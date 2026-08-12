@@ -21,8 +21,20 @@ use tracing::{info, warn};
 
 use zyron_catalog::schema::ColumnarSegmentEntry;
 use zyron_catalog::{Catalog, TableId};
-use zyron_common::page::{PageId, PAGE_SIZE};
-use zyron_storage::columnar::ColumnarPatchManager;
+use zyron_common::page::{PAGE_SIZE, PageId};
+use zyron_storage::columnar::{
+    ColumnarBranchClearPayload, ColumnarPatchManager, ColumnarPatchRevokePayload,
+    ColumnarSupersedePayload, ColumnarValuePatchPayload,
+};
+
+/// WAL patch record kinds collected for replay into the patch store
+enum PatchKind {
+    Value,
+    Supersede,
+    RevokeValue,
+    RevokeSupersede,
+    BranchClear,
+}
 use zyron_storage::{DiskManager, HeapPage};
 use zyron_wal::reader::WalReader;
 use zyron_wal::record::LogRecordType;
@@ -101,7 +113,7 @@ pub async fn reconcile_columnar(
     let mut ends: Vec<EndRec> = Vec::new();
     let mut end_paths: HashSet<String> = HashSet::new();
     // (is_supersede, wal_lsn, payload)
-    let mut patch_payloads: Vec<(bool, u64, Vec<u8>)> = Vec::new();
+    let mut patch_payloads: Vec<(PatchKind, u64, Vec<u8>)> = Vec::new();
     // (table_id, old_file_id) merged away by a committed MergeEnd. A stale
     // CompactionEnd for one of these must not resurrect the old segment.
     let mut merged_away: HashSet<(u64, u64)> = HashSet::new();
@@ -124,10 +136,19 @@ pub async fn reconcile_columnar(
                 }
             }
             LogRecordType::ColumnarPatch => {
-                patch_payloads.push((false, rec.lsn.0, rec.payload.to_vec()));
+                patch_payloads.push((PatchKind::Value, rec.lsn.0, rec.payload.to_vec()));
             }
             LogRecordType::ColumnarSupersede => {
-                patch_payloads.push((true, rec.lsn.0, rec.payload.to_vec()));
+                patch_payloads.push((PatchKind::Supersede, rec.lsn.0, rec.payload.to_vec()));
+            }
+            LogRecordType::ColumnarPatchRevoke => {
+                patch_payloads.push((PatchKind::RevokeValue, rec.lsn.0, rec.payload.to_vec()));
+            }
+            LogRecordType::ColumnarSupersedeRevoke => {
+                patch_payloads.push((PatchKind::RevokeSupersede, rec.lsn.0, rec.payload.to_vec()));
+            }
+            LogRecordType::ColumnarBranchClear => {
+                patch_payloads.push((PatchKind::BranchClear, rec.lsn.0, rec.payload.to_vec()));
             }
             LogRecordType::MergeBegin => {
                 if rec.payload.len() >= 8 {
@@ -149,10 +170,8 @@ pub async fn reconcile_columnar(
                     merged_away.insert((tid, old_fid));
                     let plen = rd_u32(&rec.payload, 24) as usize;
                     if 28 + plen <= rec.payload.len() {
-                        let path = String::from_utf8_lossy(
-                            &rec.payload[28..28 + plen],
-                        )
-                        .into_owned();
+                        let path =
+                            String::from_utf8_lossy(&rec.payload[28..28 + plen]).into_owned();
                         merge_end_paths.insert(path);
                     }
                 }
@@ -188,6 +207,11 @@ pub async fn reconcile_columnar(
                 sys_rowid_hi: e.next_rowid.saturating_sub(1),
                 sys_xmin_lo: e.xmin_lo,
                 sys_xmin_hi: e.xmin_hi,
+                // Recovery re-registers a file the fold already wrote. The
+                // spec it was written under is not in the WAL record, and
+                // reading it back out of the file would be guesswork, so it
+                // registers as unclustered and the next pass picks it up
+                cluster_spec_id: 0,
             });
             entry.columnar.next_rowid = entry.columnar.next_rowid.max(e.next_rowid);
             entry.columnar.next_file_id = entry.columnar.next_file_id.max(e.file_id + 1);
@@ -205,9 +229,9 @@ pub async fn reconcile_columnar(
         // (heap pages written, registry persisted), so there is nothing to
         // redo.
         let rid_path = std::path::Path::new(&e.rid_path);
-        if let Ok(rids) = crate::background::compaction::CompactionWorker::read_rid_sidecar(
-            rid_path,
-        ) {
+        if let Ok(rids) =
+            crate::background::compaction::CompactionWorker::read_rid_sidecar(rid_path)
+        {
             let mut pages: HashMap<(u32, u64), [u8; PAGE_SIZE]> = HashMap::new();
             let mut dirty: HashSet<(u32, u64)> = HashSet::new();
             for (pid, slot, folded_xmin) in &rids {
@@ -226,10 +250,8 @@ pub async fn reconcile_columnar(
                 if so + 4 > PAGE_SIZE {
                     continue;
                 }
-                let toff =
-                    u16::from_le_bytes([page[so], page[so + 1]]) as usize;
-                let slen =
-                    u16::from_le_bytes([page[so + 2], page[so + 3]]) as usize;
+                let toff = u16::from_le_bytes([page[so], page[so + 1]]) as usize;
+                let slen = u16::from_le_bytes([page[so + 2], page[so + 3]]) as usize;
                 // Zero only when the slot still holds the folded tuple. A
                 // zeroed (slen==0) or reused slot (different xmin) is left
                 // intact so a redo never destroys an unrelated row.
@@ -298,42 +320,89 @@ pub async fn reconcile_columnar(
     // patch-file fsync, which leaves lsn > high-water.
     if !patch_payloads.is_empty() {
         let mgr = ColumnarPatchManager::global(columnar_dir);
-        for (is_supersede, wal_lsn, p) in &patch_payloads {
-            if *is_supersede {
-                if p.len() < 32 {
-                    continue;
-                }
-                let table_id = rd_u64(p, 0);
-                let file_id = rd_u64(p, 8);
-                let rowid = rd_u64(p, 16);
-                let xid = rd_u64(p, 24);
-                if let Ok(store) = mgr.store(table_id) {
-                    if *wal_lsn <= store.max_persisted_lsn() {
+        for (kind, wal_lsn, p) in &patch_payloads {
+            match kind {
+                PatchKind::Supersede => {
+                    let Some(d) = ColumnarSupersedePayload::decode(p) else {
                         continue;
+                    };
+                    if let Ok(store) = mgr.store(d.table_id) {
+                        if *wal_lsn <= store.max_persisted_lsn() {
+                            continue;
+                        }
+                        let _ = store.append_supersede(
+                            d.branch,
+                            d.file_id,
+                            d.sys_rowid,
+                            d.xid,
+                            *wal_lsn,
+                        );
                     }
-                    let _ = store.append_supersede(file_id, rowid, xid, *wal_lsn);
                 }
-            } else {
-                if p.len() < 32 {
-                    continue;
-                }
-                let table_id = rd_u64(p, 0);
-                let file_id = rd_u64(p, 8);
-                let rowid = rd_u64(p, 16);
-                let col_id = rd_u32(p, 24);
-                let xid = rd_u64(p, 28);
-                let vlen = rd_u32(p, 36) as usize;
-                if 40 + vlen > p.len() {
-                    continue;
-                }
-                let val = &p[40..40 + vlen];
-                if let Ok(store) = mgr.store(table_id) {
-                    if *wal_lsn <= store.max_persisted_lsn() {
+                PatchKind::Value => {
+                    let Some((d, val)) = ColumnarValuePatchPayload::decode(p) else {
                         continue;
+                    };
+                    if let Ok(store) = mgr.store(d.table_id) {
+                        if *wal_lsn <= store.max_persisted_lsn() {
+                            continue;
+                        }
+                        let _ = store.append_value_patch(
+                            d.branch,
+                            d.file_id,
+                            d.sys_rowid,
+                            d.column_id,
+                            d.xid,
+                            *wal_lsn,
+                            val,
+                        );
                     }
-                    let _ = store.append_value_patch(
-                        file_id, rowid, col_id, xid, *wal_lsn, val,
-                    );
+                }
+                PatchKind::RevokeSupersede => {
+                    let Some(d) = ColumnarSupersedePayload::decode(p) else {
+                        continue;
+                    };
+                    if let Ok(store) = mgr.store(d.table_id) {
+                        if *wal_lsn <= store.max_persisted_lsn() {
+                            continue;
+                        }
+                        let _ = store.revoke_supersede(
+                            d.branch,
+                            d.file_id,
+                            d.sys_rowid,
+                            d.xid,
+                            *wal_lsn,
+                        );
+                    }
+                }
+                PatchKind::BranchClear => {
+                    let Some(d) = ColumnarBranchClearPayload::decode(p) else {
+                        continue;
+                    };
+                    if let Ok(store) = mgr.store(d.table_id) {
+                        if *wal_lsn <= store.max_persisted_lsn() {
+                            continue;
+                        }
+                        let _ = store.clear_branch(d.branch, *wal_lsn);
+                    }
+                }
+                PatchKind::RevokeValue => {
+                    let Some(d) = ColumnarPatchRevokePayload::decode(p) else {
+                        continue;
+                    };
+                    if let Ok(store) = mgr.store(d.table_id) {
+                        if *wal_lsn <= store.max_persisted_lsn() {
+                            continue;
+                        }
+                        let _ = store.revoke_value_patch(
+                            d.branch,
+                            d.file_id,
+                            d.sys_rowid,
+                            d.column_id,
+                            d.xid,
+                            *wal_lsn,
+                        );
+                    }
                 }
             }
         }

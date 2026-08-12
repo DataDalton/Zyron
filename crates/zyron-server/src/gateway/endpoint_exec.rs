@@ -146,6 +146,11 @@ pub struct EndpointExecutor {
     pub wal: Arc<WalWriter>,
     pub txn_manager: Arc<TransactionManager>,
     pub security_manager: Option<Arc<SecurityManager>>,
+    /// Reads tables that live on a peer, the same client the wire path uses
+    pub foreign_reader: Option<Arc<dyn zyron_executor::operator::foreign_scan::ForeignReader>>,
+    /// This node's view of the mesh, read per request so an endpoint plan is
+    /// costed against the peers declared at the time it runs
+    pub peers: Arc<parking_lot::RwLock<Arc<zyron_common::PeerRegistry>>>,
     worker: Arc<PlanExecWorker>,
 }
 
@@ -157,6 +162,8 @@ impl EndpointExecutor {
         wal: Arc<WalWriter>,
         txn_manager: Arc<TransactionManager>,
         security_manager: Option<Arc<SecurityManager>>,
+        foreign_reader: Option<Arc<dyn zyron_executor::operator::foreign_scan::ForeignReader>>,
+        peers: Arc<parking_lot::RwLock<Arc<zyron_common::PeerRegistry>>>,
     ) -> Self {
         Self {
             catalog,
@@ -165,6 +172,8 @@ impl EndpointExecutor {
             wal,
             txn_manager,
             security_manager,
+            foreign_reader,
+            peers,
             worker: global_plan_exec_worker(),
         }
     }
@@ -220,6 +229,11 @@ impl EndpointExecutor {
         let disk_manager = Arc::clone(&self.disk_manager);
         let txn_manager = Arc::clone(&self.txn_manager);
         let security_manager = self.security_manager.clone();
+        // An endpoint is a query path like any other, so it reaches peers
+        // and is costed against the same mesh view the wire path uses
+        let foreign_reader = self.foreign_reader.clone();
+        let peers = Arc::clone(&self.peers);
+        let peerFacts = Arc::clone(&self.peers.read());
 
         enum PlanExec {
             Ok(
@@ -238,13 +252,16 @@ impl EndpointExecutor {
                 // expected to be schema-qualified. No default search_path is
                 // injected; unqualified names will fail with a clear error.
                 let search_path: Vec<String> = Vec::new();
-                let plan = match zyron_planner::plan(&catalog, db_id, search_path, stmt).await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        let _ = tx.send(PlanExec::BindError(e.to_string()));
-                        return;
-                    }
-                };
+                let plan =
+                    match zyron_planner::plan(&catalog, db_id, search_path, stmt, Some(&peerFacts))
+                        .await
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            let _ = tx.send(PlanExec::BindError(e.to_string()));
+                            return;
+                        }
+                    };
                 let output_schema = plan.output_schema();
                 let txn = match txn_manager.begin(IsolationLevel::ReadCommitted) {
                     Ok(t) => t,
@@ -271,6 +288,8 @@ impl EndpointExecutor {
                 if let Some(sm) = security_manager {
                     ctx.set_security_manager(sm);
                 }
+                ctx.foreign_reader = foreign_reader;
+                ctx.peers = Some(peers);
                 let ctx_arc = Arc::new(ctx);
                 match execute(plan, &ctx_arc).await {
                     Ok(b) => {

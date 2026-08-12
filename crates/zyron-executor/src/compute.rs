@@ -1,4 +1,4 @@
-//! Vectorized compute kernels for column operations.
+﻿//! Vectorized compute kernels for column operations.
 //!
 //! Provides filter, comparison, arithmetic, boolean logic, sorting,
 //! and hashing operations on typed column vectors. All hot-path kernels
@@ -805,6 +805,12 @@ pub fn scale_us_to_ps(col: &Column, ps_precision: Option<u8>) -> Result<Column> 
 }
 
 pub fn cast_column(col: &Column, target: TypeId) -> Result<Column> {
+    // An array and a vector are both byte-backed, so a per-scalar cast cannot
+    // tell them apart. These conversions read the source column's type as
+    // well as the target and are resolved before that point
+    if let Some(converted) = cast_array_column(col, target)? {
+        return Ok(converted);
+    }
     let len = col.len();
     let mut data = ColumnData::with_capacity(target, len);
     let mut nulls = NullBitmap::none(len);
@@ -821,6 +827,102 @@ pub fn cast_column(col: &Column, target: TypeId) -> Result<Column> {
     }
 
     Ok(Column::with_nulls(data, nulls, target))
+}
+
+/// Conversions between the array encoding and the shapes it converts to.
+/// Returns None when neither side is an array, leaving the generic
+/// per-scalar cast to answer.
+fn cast_array_column(col: &Column, target: TypeId) -> Result<Option<Column>> {
+    let from_array = col.type_id == TypeId::Array;
+    let from_vector = col.type_id == TypeId::Vector;
+    if !from_array && !(from_vector && target == TypeId::Array) {
+        return Ok(None);
+    }
+    if from_array && target == TypeId::Array {
+        return Ok(Some(col.clone()));
+    }
+
+    let len = col.len();
+    let mut nulls = NullBitmap::none(len);
+    let text_target = matches!(target, TypeId::Text | TypeId::Varchar | TypeId::Char);
+    let mut data = ColumnData::with_capacity(target, len);
+
+    for row in 0..len {
+        if col.is_null(row) {
+            nulls.set_null(row);
+            data.push_default();
+            continue;
+        }
+        let ScalarValue::Binary(bytes) = col.data.get_scalar(row) else {
+            nulls.set_null(row);
+            data.push_default();
+            continue;
+        };
+
+        // A vector holds packed f32 with no header, so converting it to an
+        // array is a re-encode rather than a reinterpretation
+        if from_vector {
+            let payloads: Vec<Option<&[u8]>> =
+                bytes.chunks_exact(4).map(|c| Some(c)).collect();
+            let encoded = zyron_common::array_value::encode(TypeId::Float32, &payloads);
+            data.push_scalar(&ScalarValue::Binary(encoded));
+            continue;
+        }
+
+        let Some(view) = zyron_common::ArrayView::parse(&bytes) else {
+            return Err(ZyronError::ExecutionError(
+                "value is not a well-formed array".to_string(),
+            ));
+        };
+        if text_target {
+            data.push_scalar(&ScalarValue::Utf8(view.render_text()));
+            continue;
+        }
+        if target == TypeId::Vector {
+            data.push_scalar(&ScalarValue::Binary(array_to_vector_bytes(&view)?));
+            continue;
+        }
+        if matches!(target, TypeId::Binary | TypeId::Bytea | TypeId::Varbinary) {
+            data.push_scalar(&ScalarValue::Binary(bytes));
+            continue;
+        }
+        return Err(ZyronError::ExecutionError(format!(
+            "cannot cast an array to {}",
+            target
+        )));
+    }
+    Ok(Some(Column::with_nulls(data, nulls, target)))
+}
+
+/// Packs an array's elements as the little-endian f32 sequence a vector
+/// column stores. Every element has to be a number and present, because a
+/// vector has no null slot and a distance over a missing one is undefined.
+fn array_to_vector_bytes(view: &zyron_common::ArrayView<'_>) -> Result<Vec<u8>> {
+    let element_type = view.element_type();
+    let width = element_type.fixed_size().unwrap_or(0);
+    let mut out = Vec::with_capacity(view.len() * 4);
+    for (i, element) in view.iter().enumerate() {
+        let Some(payload) = element else {
+            return Err(ZyronError::ExecutionError(format!(
+                "a vector takes no null element, position {} is null",
+                i + 1
+            )));
+        };
+        let scalar = if width > 0 {
+            crate::batch::decode_fixed_scalar(element_type, payload)
+        } else {
+            crate::batch::decode_varlen_scalar(element_type, payload)
+        };
+        let Some(value) = scalar.to_f64() else {
+            return Err(ZyronError::ExecutionError(format!(
+                "a vector takes numeric elements, position {} is {}",
+                i + 1,
+                element_type
+            )));
+        };
+        out.extend_from_slice(&(value as f32).to_le_bytes());
+    }
+    Ok(out)
 }
 
 /// Casts a single scalar value to the target type.

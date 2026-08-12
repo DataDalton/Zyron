@@ -5,10 +5,10 @@ use super::constants::MAX_KEY_SIZE;
 use super::page::{BTreeInternalPage, BTreeLeafPage};
 use super::store::InMemoryPageStore;
 use super::types::{DeleteResult, LeafPageHeader, compare_keys};
-use crate::tuple::TupleId;
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use zyron_common::RowLocator;
 use zyron_common::page::PageId;
 use zyron_common::{Result, ZyronError};
 
@@ -210,7 +210,7 @@ impl BTreeIndex {
     /// Pure lock-free path: traverses via version-stamped reads, retrying
     /// on torn reads. No global lock acquisition.
     #[inline]
-    pub fn search_sync(&self, key: &[u8]) -> Option<TupleId> {
+    pub fn search_sync(&self, key: &[u8]) -> Option<RowLocator> {
         loop {
             match self.search_optimistic(&self.pages, key) {
                 Ok(result) => return result,
@@ -224,7 +224,7 @@ impl BTreeIndex {
     /// run its own retry loop and count retries, e.g. a contention benchmark,
     /// without adding a counter to the production search_sync hot path.
     #[inline]
-    pub fn search_attempt(&self, key: &[u8]) -> std::result::Result<Option<TupleId>, ()> {
+    pub fn search_attempt(&self, key: &[u8]) -> std::result::Result<Option<RowLocator>, ()> {
         self.search_optimistic(&self.pages, key)
     }
 
@@ -242,7 +242,7 @@ impl BTreeIndex {
         &self,
         pages: &InMemoryPageStore,
         key: &[u8],
-    ) -> std::result::Result<Option<TupleId>, ()> {
+    ) -> std::result::Result<Option<RowLocator>, ()> {
         let height = self.height.load(Ordering::Acquire);
         let mut current = self.root_page_num.load(Ordering::Acquire);
 
@@ -300,7 +300,7 @@ impl BTreeIndex {
     /// into a local copy, CAS-writes back. Retries on version conflict.
     /// Acquires a per-leaf split latch only when an actual split is needed.
     #[inline]
-    pub fn insert_sync(&self, key: &[u8], tuple_id: TupleId) -> Result<()> {
+    pub fn insert_sync(&self, key: &[u8], locator: RowLocator) -> Result<()> {
         if key.len() > MAX_KEY_SIZE {
             return Err(ZyronError::KeyTooLarge {
                 size: key.len(),
@@ -313,7 +313,7 @@ impl BTreeIndex {
         // a few iterations because the CAS protocol guarantees forward
         // progress, one of the contending writers always wins per round.
         loop {
-            match self.insert_optimistic(&self.pages, key, tuple_id) {
+            match self.insert_optimistic(&self.pages, key, locator) {
                 Ok(()) => return Ok(()),
                 Err(ZyronError::NodeFull) => break,
                 Err(ZyronError::VersionConflict) => {
@@ -327,7 +327,7 @@ impl BTreeIndex {
         // Split path holds the per-leaf split latch, allocates a new page
         // via the lock-free counter, writes both halves via the version
         // protocol, and CAS-updates the parent to install the split key.
-        self.insert_with_split_sync(Bytes::copy_from_slice(key), tuple_id)
+        self.insert_with_split_sync(Bytes::copy_from_slice(key), locator)
     }
 
     /// Batched key insertion. Sorts the input by key, then locks each
@@ -338,7 +338,7 @@ impl BTreeIndex {
     /// For the seed workload (a 100-row INSERT VALUES batch) this collapses
     /// ~100 leaf round trips into ~1-2, which dominates the heap+WAL work.
     /// Items are passed `&mut` so the in-place sort is allocation-free.
-    pub fn insert_many<K: AsRef<[u8]>>(&self, items: &mut [(K, TupleId)]) -> Result<()> {
+    pub fn insert_many<K: AsRef<[u8]>>(&self, items: &mut [(K, RowLocator)]) -> Result<()> {
         if items.is_empty() {
             return Ok(());
         }
@@ -371,7 +371,7 @@ impl BTreeIndex {
             // This mirrors insert_optimistic; CAS interlocks with lock_for_write
             // splits via the same even/odd version, so the two stay correct.
             let mut applied = 0usize;
-            let mut need_split = false;
+            let need_split: bool;
             loop {
                 let (data, version) = match self.pages.try_read_versioned(leaf_pn) {
                     Some(Ok(dv)) => dv,
@@ -495,7 +495,7 @@ impl BTreeIndex {
         &self,
         pages: &InMemoryPageStore,
         key: &[u8],
-        tuple_id: TupleId,
+        locator: RowLocator,
     ) -> Result<()> {
         let height = self.height.load(Ordering::Acquire);
         let mut current = self.root_page_num.load(Ordering::Acquire);
@@ -519,7 +519,7 @@ impl BTreeIndex {
         };
 
         // Insert into the local copy.
-        BTreeLeafPage::insert_in_slice(&mut leaf_data, key, tuple_id)?;
+        BTreeLeafPage::insert_in_slice(&mut leaf_data, key, locator)?;
 
         // CAS-write back. Fails if the version changed since our read.
         if pages.try_versioned_write(current, &leaf_data, version) {
@@ -533,7 +533,7 @@ impl BTreeIndex {
     /// Use when caller has &mut BTreeIndex for maximum performance.
     /// Fully inlined fast path for minimal overhead.
     #[inline(always)]
-    pub fn insert_exclusive(&mut self, key: &[u8], tuple_id: TupleId) -> Result<()> {
+    pub fn insert_exclusive(&mut self, key: &[u8], locator: RowLocator) -> Result<()> {
         if key.len() > MAX_KEY_SIZE {
             return Err(ZyronError::KeyTooLarge {
                 size: key.len(),
@@ -570,7 +570,7 @@ impl BTreeIndex {
 
         // Try insert in leaf (fast path - most common)
         if let Some(data) = pages.get_mut(current) {
-            match BTreeLeafPage::insert_in_slice(data, key, tuple_id) {
+            match BTreeLeafPage::insert_in_slice(data, key, locator) {
                 Ok(()) => return Ok(()),
                 Err(ZyronError::NodeFull) => {
                     // Fall through to split path
@@ -582,14 +582,14 @@ impl BTreeIndex {
         }
 
         // Split handling (rare path)
-        self.insert_with_split_exclusive(Bytes::copy_from_slice(key), tuple_id, &path[..path_len])
+        self.insert_with_split_exclusive(Bytes::copy_from_slice(key), locator, &path[..path_len])
     }
 
     /// Insert with split using exclusive access (no locking).
     fn insert_with_split_exclusive(
         &mut self,
         key: Bytes,
-        tuple_id: TupleId,
+        locator: RowLocator,
         path: &[u32],
     ) -> Result<()> {
         let leaf_page_num = path[path.len() - 1];
@@ -613,9 +613,9 @@ impl BTreeIndex {
 
         // Insert into appropriate leaf
         if key.as_ref() < split_key.as_ref() {
-            leaf.insert(key, tuple_id)?;
+            leaf.insert(key, locator)?;
         } else {
-            right_leaf.insert(key, tuple_id)?;
+            right_leaf.insert(key, locator)?;
         }
 
         // Make the split atomic against a propagation error. Write the new
@@ -726,7 +726,7 @@ impl BTreeIndex {
 
     /// Searches with exclusive access (no locking).
     #[inline]
-    pub fn search_exclusive(&mut self, key: &[u8]) -> Option<TupleId> {
+    pub fn search_exclusive(&mut self, key: &[u8]) -> Option<RowLocator> {
         let pages = &mut self.pages;
         let height = *self.height.get_mut();
         let root = *self.root_page_num.get_mut();
@@ -823,7 +823,7 @@ impl BTreeIndex {
     ///      reachable. Concurrent readers may now route to either half.
     ///   2. Write the shrunk left-half into the guard, which becomes
     ///      visible when the guard drops.
-    fn insert_with_split_sync(&self, key: Bytes, tuple_id: TupleId) -> Result<()> {
+    fn insert_with_split_sync(&self, key: Bytes, locator: RowLocator) -> Result<()> {
         let mut sibling: Option<(u32, PageId)> = None;
 
         loop {
@@ -852,7 +852,7 @@ impl BTreeIndex {
             // The leaf may have gained room (a concurrent delete) since it
             // last read full. Publish a plain in-slice insert via CAS and
             // skip the structural split.
-            match leaf.insert(key.clone(), tuple_id) {
+            match leaf.insert(key.clone(), locator) {
                 Ok(()) => {
                     if self
                         .pages
@@ -878,9 +878,9 @@ impl BTreeIndex {
             // of midpoint splits.
             let (split_key, mut right_leaf) = leaf.split_for_key(Some(key.as_ref()), sibling_id);
             if key.as_ref() < split_key.as_ref() {
-                leaf.insert(key.clone(), tuple_id)?;
+                leaf.insert(key.clone(), locator)?;
             } else {
-                right_leaf.insert(key.clone(), tuple_id)?;
+                right_leaf.insert(key.clone(), locator)?;
             }
 
             // Write the right-half off-lock. Not reachable from the parent
@@ -1330,7 +1330,7 @@ impl BTreeIndex {
         &self,
         start_key: Option<&[u8]>,
         end_key: Option<&[u8]>,
-    ) -> Vec<(Bytes, TupleId)> {
+    ) -> Vec<(Bytes, RowLocator)> {
         let mut results = Vec::with_capacity(1024);
         let start_leaf_num = match start_key {
             Some(key) => self.find_leaf_in_pages(&self.pages, key),
@@ -1401,12 +1401,11 @@ impl BTreeIndex {
                 }
 
                 let to = eo + 2 + kl;
-                let pnv = u32::from_le_bytes([data[to], data[to + 1], data[to + 2], data[to + 3]]);
-                let sid = u16::from_le_bytes([data[to + 4], data[to + 5]]);
-                results.push((
-                    Bytes::copy_from_slice(ek),
-                    TupleId::new(PageId::new(0, pnv as u64), sid),
-                ));
+                // a corrupt payload tag is skipped rather than fabricated
+                let Some(loc) = RowLocator::read_payload(&data[to..]) else {
+                    continue;
+                };
+                results.push((Bytes::copy_from_slice(ek), loc));
                 last_emitted = Some(Bytes::copy_from_slice(ek));
             }
 
@@ -1435,7 +1434,7 @@ impl BTreeIndex {
     /// consistent snapshot of that leaf even with concurrent splits.
     pub fn range_scan_for_each<F>(&self, start_key: Option<&[u8]>, end_key: Option<&[u8]>, mut f: F)
     where
-        F: FnMut(&[u8], TupleId) -> bool,
+        F: FnMut(&[u8], RowLocator) -> bool,
     {
         let start_leaf_num = match start_key {
             Some(key) => self.find_leaf_in_pages(&self.pages, key),
@@ -1505,10 +1504,12 @@ impl BTreeIndex {
                 }
 
                 let to = eo + 2 + kl;
-                let pnv = u32::from_le_bytes([data[to], data[to + 1], data[to + 2], data[to + 3]]);
-                let sid = u16::from_le_bytes([data[to + 4], data[to + 5]]);
                 last_emitted = Some(Bytes::copy_from_slice(ek));
-                if !f(ek, TupleId::new(PageId::new(0, pnv as u64), sid)) {
+                // a corrupt payload tag is skipped rather than fabricated
+                let Some(loc) = RowLocator::read_payload(&data[to..]) else {
+                    continue;
+                };
+                if !f(ek, loc) {
                     return;
                 }
             }
@@ -1568,13 +1569,13 @@ impl BTreeIndex {
     // =========================================================================
 
     /// Searches for a key. Async wrapper around sync operation.
-    pub async fn search(&self, key: &[u8]) -> Result<Option<TupleId>> {
+    pub async fn search(&self, key: &[u8]) -> Result<Option<RowLocator>> {
         Ok(self.search_sync(key))
     }
 
     /// Inserts a key-value pair. Uses lock-free path since we have &mut self.
-    pub async fn insert(&mut self, key: Bytes, tuple_id: TupleId) -> Result<()> {
-        self.insert_exclusive(key.as_ref(), tuple_id)
+    pub async fn insert(&mut self, key: Bytes, locator: RowLocator) -> Result<()> {
+        self.insert_exclusive(key.as_ref(), locator)
     }
 
     /// Deletes a key. Async wrapper around sync operation.
@@ -1587,12 +1588,12 @@ impl BTreeIndex {
         &self,
         start_key: Option<&[u8]>,
         end_key: Option<&[u8]>,
-    ) -> Result<Vec<(Bytes, TupleId)>> {
+    ) -> Result<Vec<(Bytes, RowLocator)>> {
         Ok(self.range_scan_sync(start_key, end_key))
     }
 
     /// Scan all entries. Async wrapper around sync operation.
-    pub async fn scan_all(&self) -> Result<Vec<(Bytes, TupleId)>> {
+    pub async fn scan_all(&self) -> Result<Vec<(Bytes, RowLocator)>> {
         Ok(self.range_scan_sync(None, None))
     }
 
@@ -1688,16 +1689,16 @@ impl BTreeIndex {
     }
 
     /// Batch insert multiple entries.
-    pub async fn insert_batch(&mut self, entries: Vec<(Bytes, TupleId)>) -> Result<usize> {
+    pub async fn insert_batch(&mut self, entries: Vec<(Bytes, RowLocator)>) -> Result<usize> {
         let mut inserted = 0;
-        for (key, tuple_id) in entries {
+        for (key, locator) in entries {
             if key.len() > MAX_KEY_SIZE {
                 return Err(ZyronError::KeyTooLarge {
                     size: key.len(),
                     max: MAX_KEY_SIZE,
                 });
             }
-            self.insert_sync(key.as_ref(), tuple_id)?;
+            self.insert_sync(key.as_ref(), locator)?;
             inserted += 1;
         }
         Ok(inserted)
@@ -1722,7 +1723,10 @@ mod tests {
         let mut btree = BTreeIndex::create(0, ckpt_dir).await.unwrap();
         for i in 0..10_000u64 {
             let key = i.to_be_bytes();
-            let tid = TupleId::new(PageId::new(0, 0), 0);
+            let tid = RowLocator::Heap {
+                page: PageId::new(0, 0),
+                slot: 0,
+            };
             btree.insert_exclusive(&key, tid).unwrap();
         }
         assert!(btree.search_exclusive(&500u64.to_be_bytes()).is_some());
@@ -1742,7 +1746,10 @@ mod tests {
         let n = 200_000u64;
         for i in 0..n {
             let key = i.to_be_bytes();
-            let tid = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
+            let tid = RowLocator::Heap {
+                page: PageId::new(0, i % 1000),
+                slot: (i % 100) as u16,
+            };
             btree.insert_exclusive(&key, tid).unwrap();
         }
         assert!(btree.height() > 1, "expected a multi-level tree");
@@ -1763,7 +1770,10 @@ mod tests {
             if i % 3 == 0 {
                 assert_eq!(found, None, "key {} should be deleted", i);
             } else {
-                let expected = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
+                let expected = RowLocator::Heap {
+                    page: PageId::new(0, i % 1000),
+                    slot: (i % 100) as u16,
+                };
                 assert_eq!(found, Some(expected), "survivor {} lost", i);
             }
         }
@@ -1792,7 +1802,13 @@ mod tests {
         let n = 5_000u64;
         for i in 0..n {
             btree
-                .insert_exclusive(&i.to_be_bytes(), TupleId::new(PageId::new(0, 0), 0))
+                .insert_exclusive(
+                    &i.to_be_bytes(),
+                    RowLocator::Heap {
+                        page: PageId::new(0, 0),
+                        slot: 0,
+                    },
+                )
                 .unwrap();
         }
         for i in 0..n {
@@ -1806,11 +1822,20 @@ mod tests {
 
         // Reinserting after full deletion still works.
         btree
-            .insert_exclusive(&42u64.to_be_bytes(), TupleId::new(PageId::new(0, 7), 3))
+            .insert_exclusive(
+                &42u64.to_be_bytes(),
+                RowLocator::Heap {
+                    page: PageId::new(0, 7),
+                    slot: 3,
+                },
+            )
             .unwrap();
         assert_eq!(
             btree.search_exclusive(&42u64.to_be_bytes()),
-            Some(TupleId::new(PageId::new(0, 7), 3))
+            Some(RowLocator::Heap {
+                page: PageId::new(0, 7),
+                slot: 3
+            })
         );
     }
 
@@ -1833,7 +1858,13 @@ mod tests {
         // Seed via the concurrent insert path.
         for i in 0..n {
             btree
-                .insert_sync(&i.to_be_bytes(), TupleId::new(PageId::new(0, i % 500), 0))
+                .insert_sync(
+                    &i.to_be_bytes(),
+                    RowLocator::Heap {
+                        page: PageId::new(0, i % 500),
+                        slot: 0,
+                    },
+                )
                 .unwrap();
         }
 
@@ -1887,7 +1918,10 @@ mod tests {
         let n = 1_000_000u64;
         for i in 0..n {
             let key = i.to_be_bytes();
-            let tid = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
+            let tid = RowLocator::Heap {
+                page: PageId::new(0, i % 1000),
+                slot: (i % 100) as u16,
+            };
             btree.insert_exclusive(&key, tid).unwrap();
         }
         eprintln!("Tree height: {}", btree.height());
@@ -1895,7 +1929,10 @@ mod tests {
         let mut first_missing = None;
         for i in 0..n {
             let key = i.to_be_bytes();
-            let expected = TupleId::new(PageId::new(0, i % 1000), (i % 100) as u16);
+            let expected = RowLocator::Heap {
+                page: PageId::new(0, i % 1000),
+                slot: (i % 100) as u16,
+            };
             let found = btree.search_exclusive(&key);
             if found != Some(expected) {
                 missing += 1;

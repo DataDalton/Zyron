@@ -364,6 +364,7 @@ mod tests {
     };
     use super::*;
     use bytes::Bytes;
+    use zyron_common::RowLocator;
     use zyron_common::ZyronError;
     use zyron_common::page::{PAGE_SIZE, PageId};
 
@@ -405,17 +406,24 @@ mod tests {
     fn test_leaf_entry_roundtrip() {
         let entry = LeafEntry {
             key: Bytes::from_static(b"test_key"),
-            tuple_id: TupleId::new(PageId::new(1, 42), 5),
+            locator: RowLocator::Heap {
+                page: PageId::new(1, 42),
+                slot: 5,
+            },
         };
 
         let bytes = entry.to_bytes();
         let (recovered, consumed) = LeafEntry::from_bytes(&bytes).unwrap();
 
         assert_eq!(recovered.key, entry.key);
-        // file_id is not stored on disk, reconstructed as 0
-        assert_eq!(recovered.tuple_id.page_id.file_id, 0);
-        assert_eq!(recovered.tuple_id.page_id.page_num, 42);
-        assert_eq!(recovered.tuple_id.slot_id, 5);
+        // heap file_id is not stored on disk, reconstructed as 0
+        assert_eq!(
+            recovered.locator,
+            RowLocator::Heap {
+                page: PageId::new(0, 42),
+                slot: 5,
+            }
+        );
         assert_eq!(consumed, bytes.len());
     }
 
@@ -450,13 +458,19 @@ mod tests {
         let mut page = BTreeLeafPage::new(PageId::new(0, 0));
 
         let key = Bytes::from_static(b"hello");
-        let tuple_id = TupleId::new(PageId::new(1, 10), 5);
+        let tuple_id = RowLocator::Heap {
+            page: PageId::new(1, 10),
+            slot: 5,
+        };
 
         page.insert(key.clone(), tuple_id).unwrap();
 
         assert_eq!(page.num_entries(), 1);
         // file_id is not stored per entry, reads back as 0
-        let expected = TupleId::new(PageId::new(0, 10), 5);
+        let expected = RowLocator::Heap {
+            page: PageId::new(0, 10),
+            slot: 5,
+        };
         assert_eq!(page.get(&key), Some(expected));
     }
 
@@ -467,17 +481,26 @@ mod tests {
         // Insert in random order
         page.insert(
             Bytes::from_static(b"charlie"),
-            TupleId::new(PageId::new(0, 0), 3),
+            RowLocator::Heap {
+                page: PageId::new(0, 0),
+                slot: 3,
+            },
         )
         .unwrap();
         page.insert(
             Bytes::from_static(b"alpha"),
-            TupleId::new(PageId::new(0, 0), 1),
+            RowLocator::Heap {
+                page: PageId::new(0, 0),
+                slot: 1,
+            },
         )
         .unwrap();
         page.insert(
             Bytes::from_static(b"bravo"),
-            TupleId::new(PageId::new(0, 0), 2),
+            RowLocator::Heap {
+                page: PageId::new(0, 0),
+                slot: 2,
+            },
         )
         .unwrap();
 
@@ -496,13 +519,19 @@ mod tests {
 
         page.insert(
             Bytes::from_static(b"key"),
-            TupleId::new(PageId::new(0, 0), 1),
+            RowLocator::Heap {
+                page: PageId::new(0, 0),
+                slot: 1,
+            },
         )
         .unwrap();
 
         let result = page.insert(
             Bytes::from_static(b"key"),
-            TupleId::new(PageId::new(0, 0), 2),
+            RowLocator::Heap {
+                page: PageId::new(0, 0),
+                slot: 2,
+            },
         );
         assert!(matches!(result, Err(ZyronError::DuplicateKey)));
     }
@@ -513,12 +542,18 @@ mod tests {
 
         page.insert(
             Bytes::from_static(b"key1"),
-            TupleId::new(PageId::new(0, 0), 1),
+            RowLocator::Heap {
+                page: PageId::new(0, 0),
+                slot: 1,
+            },
         )
         .unwrap();
         page.insert(
             Bytes::from_static(b"key2"),
-            TupleId::new(PageId::new(0, 0), 2),
+            RowLocator::Heap {
+                page: PageId::new(0, 0),
+                slot: 2,
+            },
         )
         .unwrap();
 
@@ -542,7 +577,10 @@ mod tests {
         // Insert a single small entry
         page.insert(
             Bytes::from_static(b"key"),
-            TupleId::new(PageId::new(0, 0), 1),
+            RowLocator::Heap {
+                page: PageId::new(0, 0),
+                slot: 1,
+            },
         )
         .unwrap();
 
@@ -556,15 +594,33 @@ mod tests {
         let mut right = BTreeLeafPage::new(PageId::new(0, 1));
 
         // Set up left page with one entry
-        left.insert(Bytes::from_static(b"a"), TupleId::new(PageId::new(0, 0), 1))
-            .unwrap();
+        left.insert(
+            Bytes::from_static(b"a"),
+            RowLocator::Heap {
+                page: PageId::new(0, 0),
+                slot: 1,
+            },
+        )
+        .unwrap();
 
         // Set up right page with multiple entries
         right
-            .insert(Bytes::from_static(b"b"), TupleId::new(PageId::new(0, 0), 2))
+            .insert(
+                Bytes::from_static(b"b"),
+                RowLocator::Heap {
+                    page: PageId::new(0, 0),
+                    slot: 2,
+                },
+            )
             .unwrap();
         right
-            .insert(Bytes::from_static(b"c"), TupleId::new(PageId::new(0, 0), 3))
+            .insert(
+                Bytes::from_static(b"c"),
+                RowLocator::Heap {
+                    page: PageId::new(0, 0),
+                    slot: 3,
+                },
+            )
             .unwrap();
 
         // Borrow from right
@@ -583,10 +639,22 @@ mod tests {
         let mut left = BTreeLeafPage::new(PageId::new(0, 0));
         let mut right = BTreeLeafPage::new(PageId::new(0, 1));
 
-        left.insert(Bytes::from_static(b"a"), TupleId::new(PageId::new(0, 0), 1))
-            .unwrap();
+        left.insert(
+            Bytes::from_static(b"a"),
+            RowLocator::Heap {
+                page: PageId::new(0, 0),
+                slot: 1,
+            },
+        )
+        .unwrap();
         right
-            .insert(Bytes::from_static(b"b"), TupleId::new(PageId::new(0, 0), 2))
+            .insert(
+                Bytes::from_static(b"b"),
+                RowLocator::Heap {
+                    page: PageId::new(0, 0),
+                    slot: 2,
+                },
+            )
             .unwrap();
 
         // Link pages
@@ -646,7 +714,13 @@ mod tests {
         // Insert many entries
         for i in 0..100 {
             let key = Bytes::from(format!("key_{:03}", i));
-            let _ = page.insert(key, TupleId::new(PageId::new(0, 0), i as u16));
+            let _ = page.insert(
+                key,
+                RowLocator::Heap {
+                    page: PageId::new(0, 0),
+                    slot: i as u16,
+                },
+            );
         }
 
         let entries_before = page.num_entries();
@@ -672,7 +746,10 @@ mod tests {
         let mut page = BTreeLeafPage::new(PageId::new(0, 0));
         page.insert(
             Bytes::from_static(b"test"),
-            TupleId::new(PageId::new(1, 2), 3),
+            RowLocator::Heap {
+                page: PageId::new(1, 2),
+                slot: 3,
+            },
         )
         .unwrap();
 
@@ -683,7 +760,10 @@ mod tests {
         // file_id is not stored per entry, reads back as 0
         assert_eq!(
             recovered.get(b"test"),
-            Some(TupleId::new(PageId::new(0, 2), 3))
+            Some(RowLocator::Heap {
+                page: PageId::new(0, 2),
+                slot: 3
+            })
         );
     }
 
@@ -765,11 +845,14 @@ mod tests {
     fn test_leaf_entry_size_on_disk() {
         let entry = LeafEntry {
             key: Bytes::from_static(b"hello"),
-            tuple_id: TupleId::new(PageId::new(0, 0), 0),
+            locator: RowLocator::Heap {
+                page: PageId::new(0, 0),
+                slot: 0,
+            },
         };
 
-        // 2 (key_len) + 5 (key) + 4 (page_num) + 2 (slot_id) = 13
-        assert_eq!(entry.size_on_disk(), 13);
+        // 2 (key_len) + 5 (key) + 17 (locator payload) = 24
+        assert_eq!(entry.size_on_disk(), 2 + 5 + RowLocator::ENCODED_LEN);
     }
 
     #[test]

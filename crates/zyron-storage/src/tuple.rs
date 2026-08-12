@@ -54,6 +54,27 @@ impl TupleId {
     pub fn is_valid(&self) -> bool {
         self.page_id.file_id != u32::MAX
     }
+
+    /// Storage agnostic locator for this heap row
+    #[inline]
+    pub fn locator(self) -> zyron_common::RowLocator {
+        zyron_common::RowLocator::Heap {
+            page: self.page_id,
+            slot: self.slot_id,
+        }
+    }
+
+    /// Recovers the heap tuple id from a locator, None for non heap rows
+    #[inline]
+    pub fn from_locator(loc: zyron_common::RowLocator) -> Option<TupleId> {
+        match loc {
+            zyron_common::RowLocator::Heap { page, slot } => Some(TupleId {
+                page_id: page,
+                slot_id: slot,
+            }),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for TupleId {

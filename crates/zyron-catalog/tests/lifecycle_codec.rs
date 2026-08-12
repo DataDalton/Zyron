@@ -1,8 +1,8 @@
-//! Round-trip codec tests for Phase 17 catalog entries.
+//! Round-trip codec tests for the data lifecycle catalog entries.
 
 use zyron_catalog::schema::{
-    ColumnarRegistry, ColumnarSegmentEntry, ComplianceLogEntry, LegalHoldEntry, LifecycleConfig,
-    RetentionJobEntry, RetentionPolicyEntry,
+    ColumnarRegistry, ColumnarSegmentEntry, ComplianceLogEntry, LakeConfig, LegalHoldEntry,
+    LifecycleConfig, RetentionJobEntry, RetentionPolicyEntry,
 };
 use zyron_catalog::{SchemaId, TableEntry, TableId};
 
@@ -48,6 +48,9 @@ fn table_entry_lifecycle_roundtrip() {
         dropped_at: None,
         expectations: Vec::new(),
         time_travel_retention_secs: 0,
+        lake: Default::default(),
+        cluster: Default::default(),
+        foreign: Default::default(),
     };
     let bytes = entry.to_bytes();
     let decoded = TableEntry::from_bytes(&bytes).expect("decode");
@@ -57,9 +60,9 @@ fn table_entry_lifecycle_roundtrip() {
 
 #[test]
 fn table_entry_backward_compatible_without_lifecycle() {
-    // Build a pre-Phase-17 byte image: a full entry then truncate the
-    // lifecycle suffix by re-encoding an entry whose lifecycle is default and
-    // confirming a short buffer still decodes with defaults.
+    // A byte image with no lifecycle section: re-encode an entry whose
+    // lifecycle is default and confirm a short buffer still decodes with
+    // defaults.
     let entry = TableEntry {
         id: TableId(1),
         schema_id: SchemaId(1),
@@ -80,6 +83,9 @@ fn table_entry_backward_compatible_without_lifecycle() {
         dropped_at: None,
         expectations: Vec::new(),
         time_travel_retention_secs: 0,
+        lake: Default::default(),
+        cluster: Default::default(),
+        foreign: Default::default(),
     };
     let decoded = TableEntry::from_bytes(&entry.to_bytes()).expect("decode");
     assert_eq!(decoded.lifecycle, LifecycleConfig::default());
@@ -97,6 +103,7 @@ fn table_entry_columnar_registry_roundtrip() {
                 sys_rowid_hi: 1_048_575,
                 sys_xmin_lo: 100,
                 sys_xmin_hi: 9_500,
+                cluster_spec_id: 1,
             },
             ColumnarSegmentEntry {
                 file_id: 2,
@@ -106,6 +113,7 @@ fn table_entry_columnar_registry_roundtrip() {
                 sys_rowid_hi: 1_548_575,
                 sys_xmin_lo: 9_600,
                 sys_xmin_hi: 12_000,
+                cluster_spec_id: 1,
             },
         ],
         next_rowid: 1_548_576,
@@ -132,6 +140,9 @@ fn table_entry_columnar_registry_roundtrip() {
         dropped_at: None,
         expectations: Vec::new(),
         time_travel_retention_secs: 0,
+        lake: Default::default(),
+        cluster: Default::default(),
+        foreign: Default::default(),
     };
     let decoded = TableEntry::from_bytes(&entry.to_bytes()).expect("decode");
     assert_eq!(decoded.columnar, columnar);
@@ -144,6 +155,151 @@ fn table_entry_columnar_registry_roundtrip() {
             next_file_id: 0,
             low_water: 0,
         }
+    );
+}
+
+#[test]
+fn table_entry_lake_tail_roundtrip() {
+    let mut entry = TableEntry {
+        id: TableId(9),
+        schema_id: SchemaId(1),
+        name: "lake_t".into(),
+        heap_file_id: 0,
+        fsm_file_id: 0,
+        columns: vec![],
+        constraints: vec![],
+        created_at: 1,
+        versioning_enabled: false,
+        scd_type: None,
+        system_versioned: false,
+        history_table_id: None,
+        cdf_enabled: false,
+        cdf_retention_days: 0,
+        lifecycle: LifecycleConfig::default(),
+        columnar: ColumnarRegistry::default(),
+        dropped_at: None,
+        expectations: Vec::new(),
+        time_travel_retention_secs: 0,
+        lake: LakeConfig::lake(),
+        cluster: Default::default(),
+        foreign: Default::default(),
+    };
+    let decoded = TableEntry::from_bytes(&entry.to_bytes()).expect("decode");
+    assert!(decoded.lake.is_lake());
+
+    entry.lake = LakeConfig::default();
+    let heap = TableEntry::from_bytes(&entry.to_bytes()).expect("decode heap");
+    assert!(!heap.lake.is_lake());
+
+    // Bytes written before a tail section existed decode to that section's
+    // default. Each cut is measured rather than counted by hand, so adding a
+    // later tail section does not silently move the earlier cuts and turn
+    // this into a test of nothing
+    let full = entry.to_bytes();
+    // foreign: two u32-prefixed strings, both empty on a local table
+    let foreign_len = 4 + 4;
+    // cluster: mode, schedule, spec id, key count, no keys
+    let cluster_len = 1 + 1 + 4 + 2;
+    // lake: format, retained-history flag, then the leader it follows as two
+    // u32-prefixed strings, both empty on a table that follows nobody
+    let lake_len = 1 + 1 + 4 + 4;
+
+    let pre_foreign = TableEntry::from_bytes(&full[..full.len() - foreign_len])
+        .expect("decode pre-foreign bytes");
+    assert!(
+        !pre_foreign.foreign.is_foreign(),
+        "a table written before federation existed is local, which is what it meant"
+    );
+    assert_eq!(pre_foreign.cluster.spec_id, entry.cluster.spec_id);
+
+    let pre_cluster = TableEntry::from_bytes(&full[..full.len() - foreign_len - cluster_len])
+        .expect("decode pre-clustering bytes");
+    assert!(pre_cluster.cluster.keys.is_empty());
+    assert_eq!(pre_cluster.cluster.spec_id, 0);
+    assert!(!pre_cluster.foreign.is_foreign());
+
+    let pre_lake =
+        TableEntry::from_bytes(&full[..full.len() - foreign_len - cluster_len - lake_len])
+            .expect("decode pre-lake bytes");
+    assert!(!pre_lake.lake.is_lake());
+}
+
+/// The clustering policy is what the fold tier reads to lay out a heap
+/// table's segments, so it has to survive a catalog round trip exactly
+#[test]
+fn table_entry_cluster_tail_roundtrip() {
+    let mut entry = TableEntry {
+        id: TableId(11),
+        schema_id: SchemaId(1),
+        name: "events".into(),
+        heap_file_id: 0,
+        fsm_file_id: 0,
+        columns: vec![],
+        constraints: vec![],
+        created_at: 1,
+        versioning_enabled: false,
+        scd_type: None,
+        system_versioned: false,
+        history_table_id: None,
+        cdf_enabled: false,
+        cdf_retention_days: 0,
+        lifecycle: LifecycleConfig::default(),
+        columnar: ColumnarRegistry::default(),
+        dropped_at: None,
+        expectations: Vec::new(),
+        time_travel_retention_secs: 0,
+        lake: LakeConfig::default(),
+        cluster: Default::default(),
+        foreign: Default::default(),
+    };
+    entry.cluster.mode = zyron_common::ClusterMode::Hybrid.to_u8();
+    entry.cluster.schedule = zyron_common::ClusteringSchedule::Continuous.to_u8();
+    entry.cluster.set_keys(&[
+        zyron_common::ClusterKey {
+            column_id: 3,
+            strategy: zyron_common::ClusterStrategy::BitInterleave,
+            param: 0,
+        },
+        zyron_common::ClusterKey {
+            column_id: 7,
+            strategy: zyron_common::ClusterStrategy::SpaceFilling,
+            param: 5,
+        },
+    ]);
+
+    let decoded = TableEntry::from_bytes(&entry.to_bytes()).expect("decode");
+    assert_eq!(decoded.cluster, entry.cluster);
+    assert_eq!(decoded.cluster.mode(), zyron_common::ClusterMode::Hybrid);
+    assert_eq!(
+        decoded.cluster.schedule(),
+        zyron_common::ClusteringSchedule::Continuous
+    );
+    let keys = decoded.cluster.fold_keys();
+    assert_eq!(keys.len(), 2);
+    assert_eq!(
+        keys[0].strategy,
+        zyron_common::ClusterStrategy::BitInterleave
+    );
+    assert_eq!(
+        keys[1].strategy,
+        zyron_common::ClusterStrategy::SpaceFilling
+    );
+    assert_eq!(keys[1].param, 5);
+
+    // Declaring keys advances the spec, so a segment written before the
+    // change is distinguishable from one written after it
+    let before = decoded.cluster.spec_id;
+    let mut again = decoded.clone();
+    again.cluster.set_keys(&[]);
+    assert!(again.cluster.spec_id > before);
+    assert!(again.cluster.fold_keys().is_empty());
+
+    // An unknown strategy byte costs ordering quality, not the fold
+    let mut corrupt = entry.clone();
+    corrupt.cluster.keys[0].strategy = 200;
+    assert_eq!(
+        corrupt.cluster.fold_keys()[0].strategy,
+        zyron_common::ClusterStrategy::RangePartition
     );
 }
 
@@ -222,4 +378,48 @@ fn compliance_log_hash_chain() {
     let mut tampered = e2.clone();
     tampered.detail = "forget user (changed)".into();
     assert_ne!(tampered.compute_hash(), tampered.entry_hash);
+}
+
+#[test]
+fn constraint_entry_enforced_tail_roundtrip() {
+    use zyron_catalog::schema::{ConstraintEntry, ConstraintType, ReferentialAction};
+    use zyron_catalog::{ColumnId, TableId};
+
+    let entry = ConstraintEntry {
+        name: "uq_a".into(),
+        constraint_type: ConstraintType::Unique,
+        columns: vec![ColumnId(1)],
+        ref_table_id: None,
+        ref_columns: vec![],
+        check_expr: None,
+        on_delete: ReferentialAction::NoAction,
+        on_update: ReferentialAction::NoAction,
+        enforced: false,
+        on_violation: zyron_catalog::schema::ConstraintViolationAction::Quarantine,
+        quarantine_table_id: Some(77),
+    };
+    let bytes = entry.to_bytes();
+    let mut off = 0usize;
+    let decoded = ConstraintEntry::from_bytes(&bytes, &mut off).expect("decode");
+    assert!(!decoded.enforced, "the mode survives the round trip");
+    assert_eq!(
+        decoded.on_violation,
+        zyron_catalog::schema::ConstraintViolationAction::Quarantine
+    );
+    assert_eq!(decoded.quarantine_table_id, Some(77));
+    assert_eq!(off, bytes.len(), "the tail byte is consumed");
+
+    // Bytes written before the modes existed decode as enforced and Fail,
+    // which is what they meant. The tail here is enforced, on_violation, the
+    // quarantine presence byte and the table id
+    let truncated = &bytes[..bytes.len() - 7];
+    let mut off = 0usize;
+    let decoded = ConstraintEntry::from_bytes(truncated, &mut off).expect("decode");
+    assert!(decoded.enforced);
+    assert_eq!(
+        decoded.on_violation,
+        zyron_catalog::schema::ConstraintViolationAction::Fail
+    );
+    assert!(decoded.quarantine_table_id.is_none());
+    let _ = TableId(1);
 }

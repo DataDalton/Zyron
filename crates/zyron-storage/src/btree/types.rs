@@ -1,7 +1,7 @@
 //! Common types for B+Tree implementations.
 
-use crate::tuple::TupleId;
 use bytes::{Bytes, BytesMut};
+use zyron_common::RowLocator;
 use zyron_common::page::{PAGE_SIZE, PageHeader, PageId};
 use zyron_common::zerocopy::{AsBytes, FromBytes};
 
@@ -90,7 +90,7 @@ pub enum DeleteResult {
 /// |      Free Space        |
 /// +------------------------+ data_end
 /// | Entry Data             |
-/// | (key_len:2+key+pn4+s2) |  <- grows backward from PAGE_SIZE
+/// | (key_len:2+key+loc17) |  <- grows backward from PAGE_SIZE
 /// +------------------------+ PAGE_SIZE
 /// ```
 #[derive(Debug, Clone, Copy)]
@@ -225,59 +225,50 @@ impl Default for InternalPageHeader {
 /// Layout (on-disk):
 /// - key_len: 2 bytes
 /// - key: variable
-/// - page_num: 4 bytes (u32, file_id is implicit from the B+tree index)
-/// - slot_id: 2 bytes
+/// - locator payload: RowLocator::ENCODED_LEN bytes (tag + two u64 words LE,
+///   heap file_id is implicit from the B+tree index)
 #[derive(Debug, Clone)]
 pub struct LeafEntry {
     /// The key bytes.
     pub key: Bytes,
-    /// The tuple ID this key points to.
-    pub tuple_id: TupleId,
+    /// The row this key points to.
+    pub locator: RowLocator,
 }
 
 impl LeafEntry {
     /// Size of this entry on disk.
     pub fn size_on_disk(&self) -> usize {
-        2 + self.key.len() + 6 // key_len + key + page_num(4) + slot_id(2)
+        2 + self.key.len() + RowLocator::ENCODED_LEN
     }
 
-    /// Serializes the entry to bytes.
-    /// Stores only page_num (u32) + slot_id (u16). file_id is reconstructed
-    /// from the B+tree index context on read.
+    /// Serializes the entry to bytes. Heap locators store no file_id, it is
+    /// reconstructed from the B+tree index context on read.
     pub fn to_bytes(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(self.size_on_disk());
         buf.extend_from_slice(&(self.key.len() as u16).to_le_bytes());
         buf.extend_from_slice(&self.key);
-        buf.extend_from_slice(&(self.tuple_id.page_id.page_num as u32).to_le_bytes());
-        buf.extend_from_slice(&self.tuple_id.slot_id.to_le_bytes());
+        let mut payload = [0u8; RowLocator::ENCODED_LEN];
+        self.locator.write_payload(&mut payload);
+        buf.extend_from_slice(&payload);
         buf.freeze()
     }
 
     /// Deserializes an entry from bytes. Returns (entry, bytes_consumed).
-    /// Reconstructs PageId with file_id=0. Callers that need the correct
+    /// Heap locators decode with file_id=0. Callers that need the correct
     /// file_id must set it from context after deserialization.
     pub fn from_bytes(buf: &[u8]) -> Option<(Self, usize)> {
-        if buf.len() < 8 {
+        if buf.len() < 2 {
             return None;
         }
 
         let key_len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
-        if buf.len() < 2 + key_len + 6 {
+        if buf.len() < 2 + key_len + RowLocator::ENCODED_LEN {
             return None;
         }
 
         let key = Bytes::copy_from_slice(&buf[2..2 + key_len]);
-        let page_num = u32::from_le_bytes([
-            buf[2 + key_len],
-            buf[3 + key_len],
-            buf[4 + key_len],
-            buf[5 + key_len],
-        ]);
-        let slot_id = u16::from_le_bytes([buf[6 + key_len], buf[7 + key_len]]);
-
-        let page_id = PageId::new(0, page_num as u64);
-        let tuple_id = TupleId::new(page_id, slot_id);
-        Some((Self { key, tuple_id }, 2 + key_len + 6))
+        let locator = RowLocator::read_payload(&buf[2 + key_len..])?;
+        Some((Self { key, locator }, 2 + key_len + RowLocator::ENCODED_LEN))
     }
 }
 
@@ -342,43 +333,35 @@ impl InternalEntry {
 #[derive(Debug, Clone, Copy)]
 pub struct LeafEntryView<'a> {
     pub key: &'a [u8],
-    pub tuple_id: TupleId,
+    pub locator: RowLocator,
 }
 
 impl<'a> LeafEntryView<'a> {
     /// Parses a leaf entry view from a byte slice without copying the key.
     pub fn from_bytes(buf: &'a [u8]) -> Option<(Self, usize)> {
-        if buf.len() < 8 {
+        if buf.len() < 2 {
             return None;
         }
         let key_len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
-        let total = 2 + key_len + 6;
+        let total = 2 + key_len + RowLocator::ENCODED_LEN;
         if buf.len() < total {
             return None;
         }
         let key = &buf[2..2 + key_len];
-        let page_num = u32::from_le_bytes([
-            buf[2 + key_len],
-            buf[3 + key_len],
-            buf[4 + key_len],
-            buf[5 + key_len],
-        ]);
-        let slot_id = u16::from_le_bytes([buf[6 + key_len], buf[7 + key_len]]);
-        let page_id = PageId::new(0, page_num as u64);
-        let tuple_id = TupleId::new(page_id, slot_id);
-        Some((Self { key, tuple_id }, total))
+        let locator = RowLocator::read_payload(&buf[2 + key_len..])?;
+        Some((Self { key, locator }, total))
     }
 
     /// Size of this entry on disk.
     pub fn size_on_disk(&self) -> usize {
-        2 + self.key.len() + 6
+        2 + self.key.len() + RowLocator::ENCODED_LEN
     }
 
     /// Converts to an owned LeafEntry by copying the key.
     pub fn to_owned(&self) -> LeafEntry {
         LeafEntry {
             key: Bytes::copy_from_slice(self.key),
-            tuple_id: self.tuple_id,
+            locator: self.locator,
         }
     }
 
@@ -390,9 +373,9 @@ impl<'a> LeafEntryView<'a> {
         buf[offset..offset + 2].copy_from_slice(&(kl as u16).to_le_bytes());
         buf[offset + 2..offset + 2 + kl].copy_from_slice(self.key);
         let vo = offset + 2 + kl;
-        buf[vo..vo + 4].copy_from_slice(&(self.tuple_id.page_id.page_num as u32).to_le_bytes());
-        buf[vo + 4..vo + 6].copy_from_slice(&self.tuple_id.slot_id.to_le_bytes());
-        2 + kl + 6
+        self.locator
+            .write_payload(&mut buf[vo..vo + RowLocator::ENCODED_LEN]);
+        2 + kl + RowLocator::ENCODED_LEN
     }
 }
 
@@ -405,9 +388,9 @@ impl LeafEntry {
         buf[offset..offset + 2].copy_from_slice(&(kl as u16).to_le_bytes());
         buf[offset + 2..offset + 2 + kl].copy_from_slice(&self.key);
         let vo = offset + 2 + kl;
-        buf[vo..vo + 4].copy_from_slice(&(self.tuple_id.page_id.page_num as u32).to_le_bytes());
-        buf[vo + 4..vo + 6].copy_from_slice(&self.tuple_id.slot_id.to_le_bytes());
-        2 + kl + 6
+        self.locator
+            .write_payload(&mut buf[vo..vo + RowLocator::ENCODED_LEN]);
+        2 + kl + RowLocator::ENCODED_LEN
     }
 }
 
@@ -607,14 +590,45 @@ mod tests {
     fn test_leaf_entry_roundtrip() {
         let entry = LeafEntry {
             key: Bytes::from(vec![1, 2, 3, 4]),
-            tuple_id: TupleId::new(PageId::new(0, 10), 5),
+            locator: RowLocator::Heap {
+                page: PageId::new(0, 10),
+                slot: 5,
+            },
         };
 
         let bytes = entry.to_bytes();
         let (restored, _size) = LeafEntry::from_bytes(&bytes).unwrap();
         assert_eq!(restored.key, entry.key);
-        assert_eq!(restored.tuple_id.page_id.page_num, 10);
-        assert_eq!(restored.tuple_id.slot_id, 5);
+        assert_eq!(
+            restored.locator,
+            RowLocator::Heap {
+                page: PageId::new(0, 10),
+                slot: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn test_leaf_entry_roundtrip_columnar() {
+        let entry = LeafEntry {
+            key: Bytes::from(vec![9, 9, 9]),
+            locator: RowLocator::Columnar {
+                file_id: 204,
+                sys_rowid: 4096,
+            },
+        };
+
+        let bytes = entry.to_bytes();
+        let (restored, size) = LeafEntry::from_bytes(&bytes).unwrap();
+        assert_eq!(size, 2 + 3 + RowLocator::ENCODED_LEN);
+        assert_eq!(restored.key, entry.key);
+        assert_eq!(
+            restored.locator,
+            RowLocator::Columnar {
+                file_id: 204,
+                sys_rowid: 4096,
+            }
+        );
     }
 
     #[test]

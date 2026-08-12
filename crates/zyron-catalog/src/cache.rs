@@ -996,6 +996,7 @@ mod tests {
                 max_length: None,
                 ts_precision: None,
                 tz_offset_secs: None,
+                element_type: None,
             }],
             constraints: vec![],
             created_at: 0,
@@ -1010,6 +1011,9 @@ mod tests {
             dropped_at: None,
             expectations: Vec::new(),
             time_travel_retention_secs: 0,
+            lake: Default::default(),
+            cluster: Default::default(),
+            foreign: Default::default(),
         }
     }
 

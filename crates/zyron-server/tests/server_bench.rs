@@ -86,25 +86,17 @@ async fn create_test_state(
     std::fs::create_dir_all(&wal_dir).unwrap();
 
     let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir,
-            segment_size: 16 * 1024 * 1024,
-            fsync_enabled: false,
-            ring_buffer_capacity: 4 * 1024 * 1024,
-        })
+        WalWriter::new(zyron_bench_harness::wal_config(wal_dir))
         .expect("WalWriter creation failed"),
     );
 
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir,
-            fsync_enabled: false,
-        })
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir))
         .await
         .expect("DiskManager creation failed"),
     );
 
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 4096 }));
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
 
     let dm_for_bg = Arc::clone(&disk);
     let write_fn: WriteFn =
@@ -196,6 +188,10 @@ async fn create_test_state(
         buffer_pool: Arc::clone(&pool),
         disk_manager: Arc::clone(&disk),
         txn_manager,
+        doc_registry: std::sync::Arc::new(zyron_common::DocRegistry::new()),
+        table_io_stats: std::sync::Arc::new(zyron_common::TableIOStatsRegistry::new()),
+        index_io_stats: std::sync::Arc::new(zyron_common::IndexIOStatsRegistry::new()),
+        columnar_maintenance: None,
         security_manager: {
             let auth_storage: Arc<dyn zyron_auth::storage::AuthStorage> = Arc::new(
                 zyron_auth::HeapAuthStorage::new(Arc::clone(&disk), Arc::clone(&pool))
@@ -290,6 +286,10 @@ async fn create_test_state(
         feature_lineage: zyron_analytics::featureLineageRegistry(),
         model_cache: zyron_analytics::modelCache(),
         default_isolation: zyron_storage::IsolationLevel::ReadCommitted,
+        deployment_mode: zyron_common::DeploymentMode::Unified,
+        node_identity: Default::default(),
+        foreign_reader: None,
+        peers: Default::default(),
         statement_timeout: None,
         max_result_rows: None,
         balloon_params: None,
@@ -453,23 +453,15 @@ fn test_01_server_startup() {
             let wal_dir = tmp.path().join("wal");
 
             let wal = Arc::new(
-                WalWriter::new(WalWriterConfig {
-                    wal_dir,
-                    segment_size: 16 * 1024 * 1024,
-                    fsync_enabled: false,
-                    ring_buffer_capacity: 4 * 1024 * 1024,
-                })
+                WalWriter::new(zyron_bench_harness::wal_config(wal_dir))
                 .unwrap(),
             );
             let disk = Arc::new(
-                DiskManager::new(DiskManagerConfig {
-                    data_dir,
-                    fsync_enabled: false,
-                })
+                DiskManager::new(zyron_bench_harness::disk_config(data_dir))
                 .await
                 .unwrap(),
             );
-            let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 4096 }));
+            let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
             let storage =
                 Arc::new(HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap());
             let cache = Arc::new(CatalogCache::new(256, 64));
@@ -746,12 +738,7 @@ fn test_05_transaction_isolation() {
 
     let tmp = tempfile::TempDir::new().unwrap();
     let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir: tmp.path().to_path_buf(),
-            segment_size: 16 * 1024 * 1024,
-            fsync_enabled: false,
-            ring_buffer_capacity: 1024 * 1024,
-        })
+        WalWriter::new(zyron_bench_harness::wal_config(tmp.path().to_path_buf()))
         .unwrap(),
     );
 
@@ -1001,12 +988,7 @@ fn test_08_crash_recovery() {
         std::fs::create_dir_all(&wal_dir).unwrap();
 
         {
-            let wal = WalWriter::new(WalWriterConfig {
-                wal_dir: wal_dir.clone(),
-                segment_size: 16 * 1024 * 1024,
-                fsync_enabled: false,
-                ring_buffer_capacity: 1024 * 1024,
-            })
+            let wal = WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
             .unwrap();
 
             // Write ~1MB of WAL
@@ -1042,12 +1024,7 @@ fn test_08_crash_recovery() {
         std::fs::create_dir_all(&wal_dir2).unwrap();
 
         {
-            let _wal = WalWriter::new(WalWriterConfig {
-                wal_dir: wal_dir2.clone(),
-                segment_size: 16 * 1024 * 1024,
-                fsync_enabled: false,
-                ring_buffer_capacity: 1024 * 1024,
-            })
+            let _wal = WalWriter::new(zyron_bench_harness::wal_config(wal_dir2.clone()))
             .unwrap();
             // Empty WAL (simulates restart after clean shutdown with checkpoint)
         }
@@ -1140,12 +1117,7 @@ fn test_09_adaptive_checkpoint() {
 
     // Test WAL bytes tracking via LSN difference
     let tmp = tempfile::TempDir::new().unwrap();
-    let wal = WalWriter::new(WalWriterConfig {
-        wal_dir: tmp.path().to_path_buf(),
-        segment_size: 16 * 1024 * 1024,
-        fsync_enabled: false,
-        ring_buffer_capacity: 1024 * 1024,
-    })
+    let wal = WalWriter::new(zyron_bench_harness::wal_config(tmp.path().to_path_buf()))
     .unwrap();
 
     let base_lsn = wal.next_lsn().0;

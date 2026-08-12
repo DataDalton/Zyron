@@ -5,7 +5,7 @@
 //! and receive notifications asynchronously.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use tokio::sync::broadcast;
 
@@ -37,7 +37,7 @@ impl NotificationChannels {
     /// Subscribes to a named channel. Returns a receiver that will get
     /// all future notifications sent to this channel.
     pub fn listen(&self, channel: &str) -> broadcast::Receiver<Notification> {
-        let mut channels = self.channels.lock().unwrap();
+        let mut channels = self.channels.lock();
         let sender = channels
             .entry(channel.to_string())
             .or_insert_with(|| broadcast::channel(256).0);
@@ -46,7 +46,7 @@ impl NotificationChannels {
 
     /// Removes a subscription channel if no receivers remain.
     pub fn unlisten(&self, channel: &str) {
-        let mut channels = self.channels.lock().unwrap();
+        let mut channels = self.channels.lock();
         if let Some(sender) = channels.get(channel) {
             if sender.receiver_count() == 0 {
                 channels.remove(channel);
@@ -58,7 +58,7 @@ impl NotificationChannels {
     /// Returns the number of receivers that received the message.
     /// Returns 0 if no listeners exist for the channel.
     pub fn notify(&self, channel: &str, payload: &str, sender_pid: i32) -> usize {
-        let channels = self.channels.lock().unwrap();
+        let channels = self.channels.lock();
         if let Some(sender) = channels.get(channel) {
             sender
                 .send(Notification {

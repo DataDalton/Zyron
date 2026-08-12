@@ -9,6 +9,22 @@ use crate::logical::{JoinCondition, LogicalPlan};
 use zyron_catalog::{Catalog, ColumnStats, TableStats};
 use zyron_parser::ast::JoinType;
 
+/// One network round trip to a peer, in the same units as a page read.
+/// Reaching another node costs about as much as reading a hundred local
+/// pages, which is what makes a foreign scan worth pushing work into rather
+/// than issuing twice.
+const FOREIGN_ROUND_TRIP_COST: f64 = 100.0;
+
+/// The floor on how much of its own table a peer reads under a pushed
+/// predicate. No filter eliminates every file, and a factor of zero would
+/// make an arbitrarily selective foreign scan look free.
+const MIN_REMOTE_WORK: f64 = 0.01;
+
+/// Bytes a column contributes to a returned row, averaged over types. Used
+/// only to make a narrow projection cost less than a wide one, so the exact
+/// figure matters less than the ratio between projections.
+const AVG_COLUMN_BYTES: f64 = 16.0;
+
 // ---------------------------------------------------------------------------
 // Plan cost
 // ---------------------------------------------------------------------------
@@ -342,6 +358,67 @@ impl CostModel {
         }
     }
 
+    /// Estimates the cost of reading a table on a peer.
+    ///
+    /// Two things dominate and neither is local IO: the round trip, which is
+    /// paid once whatever the query asks for, and the bytes coming back,
+    /// which the pushed projection and predicate are what reduce. So the
+    /// estimate is a fixed latency term plus a transfer term over the rows
+    /// the remote is expected to return.
+    ///
+    /// The peer's mode decides how much a pushed predicate is worth, which
+    /// is the whole reason the mode is tracked. A `lake` peer prunes files
+    /// with it and never reads what it skips, so a selective filter cuts the
+    /// remote's own work roughly in proportion. A `db` peer walks an index:
+    /// a selective filter is cheap there too, but a broad one degrades to a
+    /// heap scan on the far side, so the saving flattens out as selectivity
+    /// rises. An unknown mode is costed as `db`, the more pessimistic of the
+    /// two, because guessing the cheaper one would let a plan commit to a
+    /// pushdown the peer cannot honor.
+    pub fn cost_foreign_scan(
+        &self,
+        mode: Option<zyron_common::DeploymentMode>,
+        stats: &TableStats,
+        selectivity: f64,
+        projected_columns: usize,
+        pushed: bool,
+    ) -> PlanCost {
+        let selectivity = selectivity.clamp(0.0, 1.0);
+        let rows = (stats.row_count as f64 * selectivity).max(1.0);
+
+        // What the remote saves by applying the filter itself, rather than
+        // returning rows for this node to discard. Absent a pushed
+        // predicate it saves nothing and reads everything
+        let remote_factor = if !pushed {
+            1.0
+        } else {
+            match mode {
+                // File pruning: skipped files are never opened, so the
+                // remote's work tracks selectivity closely
+                Some(zyron_common::DeploymentMode::Lake) => selectivity.max(MIN_REMOTE_WORK),
+                // An index walk saves most of the work when the filter is
+                // narrow and little when it is broad, so the curve flattens
+                // toward a full scan rather than following selectivity down
+                _ => selectivity.sqrt().max(MIN_REMOTE_WORK),
+            }
+        };
+
+        // The peer pays for its own read, and this node waits on it, so the
+        // remote's work is part of this plan's cost rather than free
+        let remote_io = stats.page_count as f64 * self.seq_page_cost * remote_factor;
+
+        // Only the projected columns cross the wire, which is why a narrow
+        // projection against a wide table is worth pushing
+        let width = projected_columns.max(1) as f64 * AVG_COLUMN_BYTES;
+        let transfer = rows * width * self.network_cost_per_byte;
+
+        PlanCost {
+            io_cost: FOREIGN_ROUND_TRIP_COST + remote_io + transfer,
+            cpu_cost: rows * self.cpu_tuple_cost,
+            row_count: rows,
+        }
+    }
+
     /// Estimates the cost of an index scan.
     pub fn cost_index_scan(&self, stats: &TableStats, selectivity: f64) -> PlanCost {
         let rows = (stats.row_count as f64 * selectivity).max(1.0);
@@ -555,6 +632,15 @@ impl CostModel {
                     io_cost: child_cost.io_cost,
                     cpu_cost: child_cost.cpu_cost + child_cost.row_count * self.cpu_operator_cost,
                     row_count: child_cost.row_count * 0.8, // Assume 20% duplicates
+                }
+            }
+            LogicalPlan::LockRows { child, .. } => {
+                let child_cost = self.estimate_plan_cost(child, catalog);
+                // one lock table insert per emitted row
+                PlanCost {
+                    io_cost: child_cost.io_cost,
+                    cpu_cost: child_cost.cpu_cost + child_cost.row_count * self.cpu_operator_cost,
+                    row_count: child_cost.row_count,
                 }
             }
             LogicalPlan::SetOp { left, right, .. } => {

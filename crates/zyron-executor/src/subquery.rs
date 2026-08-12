@@ -300,7 +300,18 @@ async fn run_first_column(
         zyron_planner::logical::builder::build_logical_plan(&BoundStatement::Select(plan))?;
     let optimizer = Optimizer::new(&ctx.catalog);
     let optimized = optimizer.optimize(logical)?;
-    let physical = zyron_planner::physical::builder::build_physical_plan(optimized, &ctx.catalog)?;
+    // Costing a foreign scan in a re-planned subquery needs the same
+    // peer facts the outer plan used. The guard spans the build and
+    // nothing else, because a lock held across an await would pin the
+    // registry for the length of the query
+    let physical = {
+        let peerGuard = ctx.peers.as_ref().map(|p| p.read());
+        zyron_planner::physical::builder::build_physical_plan(
+            optimized,
+            &ctx.catalog,
+            peerGuard.as_deref().map(|p| &**p),
+        )?
+    };
     let batches = crate::executor::execute(physical, ctx).await?;
 
     let mut values = Vec::new();
@@ -322,7 +333,18 @@ async fn subquery_has_rows(plan: BoundSelect, ctx: &Arc<ExecutionContext>) -> Re
         zyron_planner::logical::builder::build_logical_plan(&BoundStatement::Select(plan))?;
     let optimizer = Optimizer::new(&ctx.catalog);
     let optimized = optimizer.optimize(logical)?;
-    let physical = zyron_planner::physical::builder::build_physical_plan(optimized, &ctx.catalog)?;
+    // Costing a foreign scan in a re-planned subquery needs the same
+    // peer facts the outer plan used. The guard spans the build and
+    // nothing else, because a lock held across an await would pin the
+    // registry for the length of the query
+    let physical = {
+        let peerGuard = ctx.peers.as_ref().map(|p| p.read());
+        zyron_planner::physical::builder::build_physical_plan(
+            optimized,
+            &ctx.catalog,
+            peerGuard.as_deref().map(|p| &**p),
+        )?
+    };
     let batches = crate::executor::execute(physical, ctx).await?;
     Ok(batches.iter().any(|b| b.num_rows > 0))
 }

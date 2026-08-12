@@ -26,10 +26,10 @@ use zyron_common::types::TypeId;
 use zyron_storage::columnar::compaction::run_compaction_cycle;
 use zyron_storage::columnar::sorted::{MergeScanIterator, binary_search_sorted_column};
 use zyron_storage::columnar::{
-    BLOOM_MIN_CARDINALITY, BloomFilter, ColumnDescriptor, ColumnSegment, CompactionConfig,
-    CompactionInput, SEGMENT_HEADER_SIZE, STAT_VALUE_SIZE, SegmentCache, SegmentCacheKey,
-    SegmentHeader, SortOrder, SortedSegmentEntry, SortedSegmentIndex, ZONE_MAP_BATCH_SIZE,
-    ZONE_MAP_ENTRY_SIZE, ZYR_FORMAT_VERSION, ZoneMapEntry, ZyrFileReader,
+    BLOOM_MIN_CARDINALITY, BloomFilter, BloomPolicy, ColumnDescriptor, ColumnSegment,
+    CompactionConfig, CompactionInput, SEGMENT_HEADER_SIZE, STAT_VALUE_SIZE, SegmentCache,
+    SegmentCacheKey, SegmentHeader, SortOrder, SortedSegmentEntry, SortedSegmentIndex,
+    ZONE_MAP_BATCH_SIZE, ZONE_MAP_ENTRY_SIZE, ZYR_FORMAT_VERSION, ZoneMapEntry, ZyrFileReader,
 };
 use zyron_storage::encoding::{EncodingType, create_encoding, select_encoding};
 
@@ -81,30 +81,35 @@ fn test_column_segment_format() {
             type_id: TypeId::Int32,
             value_size: 4,
             is_primary_key: true,
+            bloom_policy: BloomPolicy::Auto,
         },
         ColumnDescriptor {
             column_id: 1,
             type_id: TypeId::Float64,
             value_size: 8,
             is_primary_key: false,
+            bloom_policy: BloomPolicy::Auto,
         },
         ColumnDescriptor {
             column_id: 2,
             type_id: TypeId::Int32,
             value_size: 4,
             is_primary_key: false,
+            bloom_policy: BloomPolicy::Auto,
         },
         ColumnDescriptor {
             column_id: 3,
             type_id: TypeId::Boolean,
             value_size: 1,
             is_primary_key: false,
+            bloom_policy: BloomPolicy::Auto,
         },
         ColumnDescriptor {
             column_id: 4,
             type_id: TypeId::Int32,
             value_size: 4,
             is_primary_key: false,
+            bloom_policy: BloomPolicy::Auto,
         },
     ];
 
@@ -117,15 +122,7 @@ fn test_column_segment_format() {
         columnData[4].push(Some(777u32.to_le_bytes().to_vec()));
     }
 
-    let config = CompactionConfig {
-        columnar_dir: dir.path().to_path_buf(),
-        min_rows: 1,
-        max_rows_per_file: 1_000_000,
-        fsync_enabled: false,
-        max_encoding_threads: 1,
-        oltp_p99_threshold_us: 10_000,
-        check_interval_ms: 1000,
-    };
+    let config = zyron_bench_harness::compaction_config(dir.path().to_path_buf());
 
     let input = CompactionInput {
         columns: columns.clone(),
@@ -133,6 +130,7 @@ fn test_column_segment_format() {
         table_id: 1,
         xmin_lo: 100,
         xmin_hi: 500,
+        cluster_keys: Vec::new(),
     };
 
     let result = run_compaction_cycle(&config, input).expect("compaction failed");
@@ -252,30 +250,25 @@ fn test_compaction_pipeline() {
             type_id: TypeId::Int32,
             value_size: 4,
             is_primary_key: true,
+            bloom_policy: BloomPolicy::Auto,
         },
         ColumnDescriptor {
             column_id: 1,
             type_id: TypeId::Int64,
             value_size: 8,
             is_primary_key: false,
+            bloom_policy: BloomPolicy::Auto,
         },
         ColumnDescriptor {
             column_id: 2,
             type_id: TypeId::Int32,
             value_size: 4,
             is_primary_key: false,
+            bloom_policy: BloomPolicy::Auto,
         },
     ];
 
-    let config = CompactionConfig {
-        columnar_dir: dir.path().to_path_buf(),
-        min_rows: 1,
-        max_rows_per_file: 1_000_000,
-        fsync_enabled: false,
-        max_encoding_threads: 1,
-        oltp_p99_threshold_us: 10_000,
-        check_interval_ms: 1000,
-    };
+    let config = zyron_bench_harness::compaction_config(dir.path().to_path_buf());
 
     // First compaction: 100K rows
     let mut compactionResults = Vec::with_capacity(VALIDATION_RUNS);
@@ -283,10 +276,7 @@ fn test_compaction_pipeline() {
 
     for run in 0..VALIDATION_RUNS {
         let runDir = tempdir().expect("failed to create run dir");
-        let runConfig = CompactionConfig {
-            columnar_dir: runDir.path().to_path_buf(),
-            ..config.clone()
-        };
+        let runConfig = zyron_bench_harness::compaction_config(runDir.path().to_path_buf());
 
         let mut columnData: Vec<Vec<Option<Vec<u8>>>> = vec![Vec::with_capacity(ROW_COUNT); 3];
         for i in 0..ROW_COUNT {
@@ -301,6 +291,7 @@ fn test_compaction_pipeline() {
             table_id: 42,
             xmin_lo: 1,
             xmin_hi: 100_000,
+            cluster_keys: Vec::new(),
         };
 
         let start = Instant::now();
@@ -351,6 +342,7 @@ fn test_compaction_pipeline() {
             table_id: 43,
             xmin_lo: 100_001,
             xmin_hi: 150_000,
+            cluster_keys: Vec::new(),
         };
 
         let result = run_compaction_cycle(&config, input).expect("incremental compaction failed");
@@ -503,12 +495,14 @@ fn test_htap_hybrid_scan() {
             type_id: TypeId::Int32,
             value_size: 4,
             is_primary_key: true,
+            bloom_policy: BloomPolicy::Auto,
         },
         ColumnDescriptor {
             column_id: 1,
             type_id: TypeId::Int64,
             value_size: 8,
             is_primary_key: false,
+            bloom_policy: BloomPolicy::Auto,
         },
     ];
 
@@ -519,15 +513,7 @@ fn test_htap_hybrid_scan() {
         columnData[1].push(Some(((i as i64) * 100).to_le_bytes().to_vec()));
     }
 
-    let config = CompactionConfig {
-        columnar_dir: dir.path().to_path_buf(),
-        min_rows: 1,
-        max_rows_per_file: 1_000_000,
-        fsync_enabled: false,
-        max_encoding_threads: 1,
-        oltp_p99_threshold_us: 10_000,
-        check_interval_ms: 1000,
-    };
+    let config = zyron_bench_harness::compaction_config(dir.path().to_path_buf());
 
     let input = CompactionInput {
         columns: columns.clone(),
@@ -535,6 +521,7 @@ fn test_htap_hybrid_scan() {
         table_id: 1,
         xmin_lo: 1,
         xmin_hi: 50_000,
+        cluster_keys: Vec::new(),
     };
 
     let compResult = run_compaction_cycle(&config, input).expect("compaction failed");
@@ -720,21 +707,14 @@ fn test_txn_aware_pruning() {
         type_id: TypeId::Int32,
         value_size: 4,
         is_primary_key: true,
+        bloom_policy: BloomPolicy::Auto,
     }];
 
     let mut filePaths = Vec::new();
     let mut fileHeaders = Vec::new();
 
     for (idx, (xminLo, xminHi)) in xminRanges.iter().enumerate() {
-        let config = CompactionConfig {
-            columnar_dir: dir.path().to_path_buf(),
-            min_rows: 1,
-            max_rows_per_file: 1_000_000,
-            fsync_enabled: false,
-            max_encoding_threads: 1,
-            oltp_p99_threshold_us: 10_000,
-            check_interval_ms: 1000,
-        };
+        let config = zyron_bench_harness::compaction_config(dir.path().to_path_buf());
 
         let mut columnData: Vec<Vec<Option<Vec<u8>>>> = vec![Vec::with_capacity(1000); 1];
         for i in 0..1000 {
@@ -747,6 +727,7 @@ fn test_txn_aware_pruning() {
             table_id: 100 + idx as u64,
             xmin_lo: *xminLo,
             xmin_hi: *xminHi,
+            cluster_keys: Vec::new(),
         };
 
         let result = run_compaction_cycle(&config, input).expect("compaction failed");
@@ -1221,12 +1202,14 @@ fn test_sorted_segment() {
             type_id: TypeId::Int32,
             value_size: 4,
             is_primary_key: true,
+            bloom_policy: BloomPolicy::Auto,
         },
         ColumnDescriptor {
             column_id: 1,
             type_id: TypeId::Int64,
             value_size: 8,
             is_primary_key: false,
+            bloom_policy: BloomPolicy::Auto,
         },
     ];
 
@@ -1235,15 +1218,7 @@ fn test_sorted_segment() {
 
     for fileIdx in 0..3 {
         let dir = tempdir().expect("failed to create temp dir");
-        let config = CompactionConfig {
-            columnar_dir: dir.path().to_path_buf(),
-            min_rows: 1,
-            max_rows_per_file: 1_000_000,
-            fsync_enabled: false,
-            max_encoding_threads: 1,
-            oltp_p99_threshold_us: 10_000,
-            check_interval_ms: 1000,
-        };
+        let config = zyron_bench_harness::compaction_config(dir.path().to_path_buf());
 
         let baseKey = fileIdx * ROWS_PER_FILE;
         let mut columnData: Vec<Vec<Option<Vec<u8>>>> = vec![Vec::with_capacity(ROWS_PER_FILE); 2];
@@ -1259,6 +1234,7 @@ fn test_sorted_segment() {
             table_id: 200 + fileIdx as u64,
             xmin_lo: 1,
             xmin_hi: 1000,
+            cluster_keys: Vec::new(),
         };
 
         let result = run_compaction_cycle(&config, input).expect("compaction failed");
@@ -1461,48 +1437,56 @@ fn test_parallel_column_encoding() {
             type_id: TypeId::Int32,
             value_size: 4,
             is_primary_key: true,
+            bloom_policy: BloomPolicy::Auto,
         },
         ColumnDescriptor {
             column_id: 1,
             type_id: TypeId::Int64,
             value_size: 8,
             is_primary_key: false,
+            bloom_policy: BloomPolicy::Auto,
         },
         ColumnDescriptor {
             column_id: 2,
             type_id: TypeId::Float64,
             value_size: 8,
             is_primary_key: false,
+            bloom_policy: BloomPolicy::Auto,
         },
         ColumnDescriptor {
             column_id: 3,
             type_id: TypeId::Int32,
             value_size: 4,
             is_primary_key: false,
+            bloom_policy: BloomPolicy::Auto,
         },
         ColumnDescriptor {
             column_id: 4,
             type_id: TypeId::Boolean,
             value_size: 1,
             is_primary_key: false,
+            bloom_policy: BloomPolicy::Auto,
         },
         ColumnDescriptor {
             column_id: 5,
             type_id: TypeId::Int32,
             value_size: 4,
             is_primary_key: false,
+            bloom_policy: BloomPolicy::Auto,
         },
         ColumnDescriptor {
             column_id: 6,
             type_id: TypeId::Int32,
             value_size: 4,
             is_primary_key: false,
+            bloom_policy: BloomPolicy::Auto,
         },
         ColumnDescriptor {
             column_id: 7,
             type_id: TypeId::Int64,
             value_size: 8,
             is_primary_key: false,
+            bloom_policy: BloomPolicy::Auto,
         },
     ];
 
@@ -1531,19 +1515,22 @@ fn test_parallel_column_encoding() {
         columnData
     };
 
+    // This test's subject is the encoding thread count, so it sweeps it
+    // rather than taking the shipping value: one thread, the four the
+    // server ships, and eight. Every other field stays production, and
+    // the production arm is what says whether four is the right choice
+    let sweep_config = |dir: &std::path::Path, threads: usize| {
+        let mut config = zyron_bench_harness::compaction_config(dir);
+        config.max_encoding_threads = threads;
+        config
+    };
+    const SHIPPED_ENCODING_THREADS: usize = 4;
+
     // Sequential compaction (1 thread)
     let mut seqTimes = Vec::with_capacity(VALIDATION_RUNS);
     for run in 0..VALIDATION_RUNS {
         let dir = tempdir().expect("failed to create temp dir");
-        let config = CompactionConfig {
-            columnar_dir: dir.path().to_path_buf(),
-            min_rows: 1,
-            max_rows_per_file: 1_000_000,
-            fsync_enabled: false,
-            max_encoding_threads: 1,
-            oltp_p99_threshold_us: 10_000,
-            check_interval_ms: 1000,
-        };
+        let config = sweep_config(dir.path(), 1);
 
         let input = CompactionInput {
             columns: columns.clone(),
@@ -1551,6 +1538,7 @@ fn test_parallel_column_encoding() {
             table_id: 300,
             xmin_lo: 1,
             xmin_hi: 100_000,
+            cluster_keys: Vec::new(),
         };
 
         let start = Instant::now();
@@ -1573,19 +1561,31 @@ fn test_parallel_column_encoding() {
         }
     }
 
+    // The thread count the server ships, which is the arm the other two
+    // exist to be judged against
+    let mut shippedTimes = Vec::with_capacity(VALIDATION_RUNS);
+    for _ in 0..VALIDATION_RUNS {
+        let dir = tempdir().expect("failed to create temp dir");
+        let config = sweep_config(dir.path(), SHIPPED_ENCODING_THREADS);
+        let input = CompactionInput {
+            columns: columns.clone(),
+            column_data: buildColumnData(),
+            table_id: 302,
+            xmin_lo: 1,
+            xmin_hi: 100_000,
+            cluster_keys: Vec::new(),
+        };
+        let start = Instant::now();
+        let result = run_compaction_cycle(&config, input).expect("shipped compaction failed");
+        shippedTimes.push(start.elapsed().as_secs_f64());
+        assert_eq!(result.row_count, ROW_COUNT as u64);
+    }
+
     // Parallel compaction (8 threads)
     let mut parTimes = Vec::with_capacity(VALIDATION_RUNS);
     for run in 0..VALIDATION_RUNS {
         let dir = tempdir().expect("failed to create temp dir");
-        let config = CompactionConfig {
-            columnar_dir: dir.path().to_path_buf(),
-            min_rows: 1,
-            max_rows_per_file: 1_000_000,
-            fsync_enabled: false,
-            max_encoding_threads: 8,
-            oltp_p99_threshold_us: 10_000,
-            check_interval_ms: 1000,
-        };
+        let config = sweep_config(dir.path(), 8);
 
         let input = CompactionInput {
             columns: columns.clone(),
@@ -1593,6 +1593,7 @@ fn test_parallel_column_encoding() {
             table_id: 301,
             xmin_lo: 1,
             xmin_hi: 100_000,
+            cluster_keys: Vec::new(),
         };
 
         let start = Instant::now();
@@ -1618,15 +1619,7 @@ fn test_parallel_column_encoding() {
     // Correctness: verify parallel output via hash comparison
     {
         let dir = tempdir().expect("failed to create temp dir");
-        let parConfig = CompactionConfig {
-            columnar_dir: dir.path().to_path_buf(),
-            min_rows: 1,
-            max_rows_per_file: 1_000_000,
-            fsync_enabled: false,
-            max_encoding_threads: 8,
-            oltp_p99_threshold_us: 10_000,
-            check_interval_ms: 1000,
-        };
+        let parConfig = zyron_bench_harness::compaction_config(dir.path().to_path_buf());
 
         // Use deterministic data (no random column) for hash comparison
         let mut colData: Vec<Vec<Option<Vec<u8>>>> = vec![Vec::with_capacity(ROW_COUNT); COL_COUNT];
@@ -1647,6 +1640,7 @@ fn test_parallel_column_encoding() {
             table_id: 302,
             xmin_lo: 1,
             xmin_hi: 100_000,
+            cluster_keys: Vec::new(),
         };
 
         let result = run_compaction_cycle(&parConfig, input).expect("hash-check compaction failed");
@@ -1678,9 +1672,12 @@ fn test_parallel_column_encoding() {
         .map(|(s, p)| s / p)
         .collect();
 
+    let avgShipped = shippedTimes.iter().sum::<f64>() / shippedTimes.len() as f64;
     tprintln!(
-        "  Avg sequential: {:.3}s, avg parallel: {:.3}s",
+        "  Avg sequential: {:.3}s, avg at the shipped {} threads: {:.3}s, avg parallel: {:.3}s",
         avgSeq,
+        SHIPPED_ENCODING_THREADS,
+        avgShipped,
         avgPar
     );
 
@@ -1688,6 +1685,22 @@ fn test_parallel_column_encoding() {
         "Parallel Column Encoding",
         "Parallel speedup (x)",
         speedups.clone(),
+        COMPACTION_PARALLEL_SPEEDUP_TARGET,
+        true,
+    );
+
+    // What the sweep is for: the shipped thread count has to be the one
+    // worth shipping, so its speedup over one thread is recorded beside
+    // the others rather than left to be inferred
+    let shippedSpeedups: Vec<f64> = seqTimes
+        .iter()
+        .zip(shippedTimes.iter())
+        .map(|(s, p)| s / p)
+        .collect();
+    validate_metric(
+        "Parallel Column Encoding",
+        "Shipped thread count speedup (x)",
+        shippedSpeedups,
         COMPACTION_PARALLEL_SPEEDUP_TARGET,
         true,
     );
@@ -1742,12 +1755,14 @@ fn test_metadata_aggregate_vs_scan() {
             type_id: TypeId::Int32,
             value_size: 4,
             is_primary_key: true,
+            bloom_policy: BloomPolicy::Auto,
         },
         ColumnDescriptor {
             column_id: 1,
             type_id: TypeId::Int64,
             value_size: 8,
             is_primary_key: false,
+            bloom_policy: BloomPolicy::Auto,
         },
     ];
     let mut colData: Vec<Vec<Option<Vec<u8>>>> = vec![Vec::with_capacity(ROW_COUNT); 2];
@@ -1755,21 +1770,14 @@ fn test_metadata_aggregate_vs_scan() {
         colData[0].push(Some((i as u32).to_le_bytes().to_vec()));
         colData[1].push(Some(((i as i64) * 100).to_le_bytes().to_vec()));
     }
-    let cfg = CompactionConfig {
-        columnar_dir: dir.path().to_path_buf(),
-        min_rows: 0,
-        max_rows_per_file: ROW_COUNT as u64 + 1,
-        fsync_enabled: false,
-        max_encoding_threads: 4,
-        oltp_p99_threshold_us: 1_000,
-        check_interval_ms: 5_000,
-    };
+    let cfg = zyron_bench_harness::compaction_config(dir.path().to_path_buf());
     let input = CompactionInput {
         columns: columns.clone(),
         column_data: colData,
         table_id: 7,
         xmin_lo: 1,
         xmin_hi: ROW_COUNT as u64,
+        cluster_keys: Vec::new(),
     };
     let result = run_compaction_cycle(&cfg, input).expect("compaction");
     let expected_max: i64 = (ROW_COUNT as i64 - 1) * 100;

@@ -9,13 +9,17 @@ pub mod analytics_table_fn;
 pub mod branch_write;
 pub mod column_scan;
 pub mod distinct;
+pub mod doc_fetch;
 pub mod filter;
 pub mod fk;
+pub mod foreign_scan;
 pub mod fts_scan;
 pub mod gapfill;
 pub mod graph_scan;
 pub mod join;
+pub mod lake_scan;
 pub mod limit;
+pub mod lock_rows;
 pub mod modify;
 pub mod project;
 pub mod scan;
@@ -31,7 +35,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use zyron_common::Result;
+use zyron_common::{Result, RowLocator};
 use zyron_storage::TupleId;
 
 use crate::batch::{ColumnBuilder, DataBatch};
@@ -117,46 +121,55 @@ pub(crate) fn apply_column_security(
 pub type OperatorResult<'a> =
     Pin<Box<dyn Future<Output = Result<Option<ExecutionBatch>>> + Send + 'a>>;
 
-/// A batch of rows produced by an operator, optionally carrying tuple IDs
-/// for DML operators that need to identify specific rows in heap storage.
+/// A batch of rows produced by an operator, optionally carrying one storage
+/// locator per row so DML operators can address the source rows regardless
+/// of which store holds them.
 pub struct ExecutionBatch {
     /// Columnar batch containing the row data.
     pub batch: DataBatch,
-    /// Optional tuple IDs for each row, used by UPDATE and DELETE operators
-    /// to locate the source tuples in heap pages.
-    pub tuple_ids: Option<Vec<TupleId>>,
-    /// Optional (columnar_file_id, sys_rowid) per row for rows served from a
-    /// .zyr segment. UPDATE and DELETE route these to the columnar patch log
-    /// instead of the heap. Aligned 1:1 with batch rows when present.
-    pub columnar_locators: Option<Vec<(u64, u64)>>,
+    /// Per row storage locator, aligned 1:1 with batch rows when present.
+    /// Pass through operators (filter, limit) slice this vector with the
+    /// same mask they apply to the batch, without caring which store the
+    /// rows live in.
+    pub locators: Option<Vec<RowLocator>>,
 }
 
 impl ExecutionBatch {
-    /// Creates a new ExecutionBatch without tuple IDs.
+    /// Creates a new ExecutionBatch without locators.
     pub fn new(batch: DataBatch) -> Self {
         Self {
             batch,
-            tuple_ids: None,
-            columnar_locators: None,
+            locators: None,
         }
     }
 
-    /// Creates a new ExecutionBatch with associated tuple IDs.
+    /// Creates a batch with one locator per row.
+    pub fn with_locators(batch: DataBatch, locators: Vec<RowLocator>) -> Self {
+        Self {
+            batch,
+            locators: Some(locators),
+        }
+    }
+
+    /// Creates a batch of heap resident rows from their tuple ids.
     pub fn with_tuple_ids(batch: DataBatch, tuple_ids: Vec<TupleId>) -> Self {
+        let locators = tuple_ids.into_iter().map(TupleId::locator).collect();
         Self {
             batch,
-            tuple_ids: Some(tuple_ids),
-            columnar_locators: None,
+            locators: Some(locators),
         }
     }
 
-    /// Creates a batch whose rows are columnar-resident, each carrying its
-    /// (file_id, sys_rowid) locator for the DML patch path.
-    pub fn with_columnar_locators(batch: DataBatch, locators: Vec<(u64, u64)>) -> Self {
+    /// Creates a batch of columnar resident rows from (file_id, sys_rowid)
+    /// pairs for the DML patch path.
+    pub fn with_columnar_locators(batch: DataBatch, pairs: Vec<(u64, u64)>) -> Self {
+        let locators = pairs
+            .into_iter()
+            .map(|(file_id, sys_rowid)| RowLocator::Columnar { file_id, sys_rowid })
+            .collect();
         Self {
             batch,
-            tuple_ids: None,
-            columnar_locators: Some(locators),
+            locators: Some(locators),
         }
     }
 
@@ -164,6 +177,67 @@ impl ExecutionBatch {
     pub fn num_rows(&self) -> usize {
         self.batch.num_rows
     }
+
+    /// Heap tuple ids when the batch carries locators and every row is heap
+    /// resident. An empty locator vector counts as heap so zero row batches
+    /// take the heap no-op path.
+    pub fn heap_ids(&self) -> Option<Vec<TupleId>> {
+        let locs = self.locators.as_ref()?;
+        let mut out = Vec::with_capacity(locs.len());
+        for l in locs {
+            out.push(TupleId::from_locator(*l)?);
+        }
+        Some(out)
+    }
+
+    /// Columnar (file_id, sys_rowid) pairs when the batch carries locators
+    /// and every row is columnar resident. Empty means not columnar.
+    pub fn columnar_pairs(&self) -> Option<Vec<(u64, u64)>> {
+        let locs = self.locators.as_ref()?;
+        if locs.is_empty() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(locs.len());
+        for l in locs {
+            out.push(l.columnar_pair()?);
+        }
+        Some(out)
+    }
+
+    /// Classifies the batch by the storage tier of its locators. None when
+    /// the batch carries no locators or mixes tiers, which no DML producer
+    /// emits: the index scan breaks batches on a kind change, the hybrid
+    /// scan drains one tier before the other, and the FK gather returns one
+    /// batch per tier. An empty locator vector counts as Heap so zero row
+    /// batches take the heap no-op path
+    pub fn tier(&self) -> Option<BatchTier> {
+        let locs = self.locators.as_ref()?;
+        let mut tier: Option<BatchTier> = None;
+        for l in locs {
+            let t = match l {
+                RowLocator::Heap { .. } => BatchTier::Heap,
+                RowLocator::Columnar { .. } => BatchTier::Columnar,
+                RowLocator::Lake { .. } => BatchTier::Lake,
+            };
+            match tier {
+                None => tier = Some(t),
+                Some(prev) if prev != t => return None,
+                Some(_) => {}
+            }
+        }
+        Some(tier.unwrap_or(BatchTier::Heap))
+    }
+}
+
+/// Storage tier a locator-bearing batch addresses. DML batches are tier
+/// homogeneous by construction, so the tier is a batch-level property and
+/// the DML operators dispatch on it exhaustively: a new RowLocator variant
+/// fails to compile until every dispatch site handles it
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchTier {
+    Heap,
+    Columnar,
+    Lake,
 }
 
 /// Pull-based operator trait for the volcano execution model.
@@ -177,6 +251,65 @@ impl ExecutionBatch {
 pub trait Operator: Send {
     /// Returns the next batch of rows, or None if the operator is exhausted.
     fn next(&mut self) -> OperatorResult<'_>;
+}
+
+// ---------------------------------------------------------------------------
+// IndexScanStats - IO counters shared by every index-driven scan
+// ---------------------------------------------------------------------------
+
+/// The table and index IO counters for one scan driven by an index.
+///
+/// Every index-driven scan has the same accounting shape: the index search
+/// runs to completion before any row is fetched, so the entries it examined
+/// are known up front, and the fetch loop then resolves locators to rows by
+/// reading pages. Four operators do this (B+tree, fulltext, vector and
+/// spatial) and writing the six lines four times is how two copies of a
+/// rule drift apart, so it is written once here.
+///
+/// Both counters are resolved when the scan is built and held for its
+/// lifetime, which keeps the registry lookup off the batch path.
+pub(crate) struct IndexScanStats {
+    table: Option<Arc<zyron_common::TableIOStats>>,
+    index: Option<Arc<zyron_common::IndexIOStats>>,
+}
+
+impl IndexScanStats {
+    /// Records one index scan being initiated on the table and the index,
+    /// plus the index entries the search examined.
+    ///
+    /// `entries_examined` is what the search produced before visibility or
+    /// any remaining predicate is applied, so the gap between it and the
+    /// rows eventually fetched is entries that pointed at a row this
+    /// snapshot could not see.
+    pub(crate) fn open(
+        ctx: &ExecutionContext,
+        table_id: u32,
+        index_id: u32,
+        entries_examined: usize,
+    ) -> Self {
+        let table = ctx.table_io_stats_for(table_id);
+        if let Some(stats) = &table {
+            stats.record_idx_scan();
+        }
+        let index = ctx.index_io_stats_for(index_id);
+        if let Some(stats) = &index {
+            stats.record_scan();
+            stats.record_batch(entries_examined as u64, 0);
+        }
+        Self { table, index }
+    }
+
+    /// Records one batch of fetched rows and the bytes of table data read
+    /// to fetch them. Called once per batch, never once per row.
+    #[inline]
+    pub(crate) fn record_batch(&self, rows: u64, bytes: u64) {
+        if let Some(stats) = &self.table {
+            stats.record_idx_batch(rows, bytes);
+        }
+        if let Some(stats) = &self.index {
+            stats.record_batch(0, rows);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -196,9 +329,33 @@ pub struct OperatorMetrics {
     pub elapsed_ns: AtomicU64,
     /// Number of times next() was called.
     pub batches: AtomicU64,
+    /// Operator-specific counters. Fixed width and inline, so filling one
+    /// is a relaxed add with no allocation and no trait change, and what
+    /// each slot means is resolved at render time by the operator's name
+    pub aux: [AtomicU64; AUX_SLOTS],
     /// Metrics from child operators (forms a tree for display).
     pub children: Vec<Arc<OperatorMetrics>>,
 }
+
+/// Auxiliary counter slots per operator.
+pub const AUX_SLOTS: usize = 4;
+
+/// Data files a scan's manifest listed.
+pub const AUX_FILES_CONSIDERED: usize = 0;
+/// Data files statistics excluded before any byte was read.
+pub const AUX_FILES_PRUNED: usize = 1;
+/// Bytes those files held in total.
+pub const AUX_BYTES_CONSIDERED: usize = 2;
+/// Bytes the pruned files held, the IO the predicate saved.
+pub const AUX_BYTES_PRUNED: usize = 3;
+
+/// Rows a peer returned for a foreign scan. Shares slot 0 with the file
+/// count because no operator reports both, and the labels an operator's
+/// name selects are what give a slot its meaning.
+pub const AUX_ROWS_FETCHED: usize = 0;
+/// Milliseconds the round trip to the peer took, the part of a foreign
+/// scan's cost that no local tuning changes.
+pub const AUX_REMOTE_MS: usize = 1;
 
 impl OperatorMetrics {
     pub fn new(name: &str) -> Arc<Self> {
@@ -207,8 +364,28 @@ impl OperatorMetrics {
             rows_produced: AtomicU64::new(0),
             elapsed_ns: AtomicU64::new(0),
             batches: AtomicU64::new(0),
+            aux: Default::default(),
             children: Vec::new(),
         })
+    }
+
+    /// Sets one auxiliary counter. Used for a quantity the operator knows
+    /// outright rather than accumulates, such as how many files a scan's
+    /// statistics excluded before it opened any of them
+    #[inline]
+    pub fn set_aux(&self, slot: usize, value: u64) {
+        if let Some(counter) = self.aux.get(slot) {
+            counter.store(value, Ordering::Relaxed);
+        }
+    }
+
+    /// Reads one auxiliary counter.
+    #[inline]
+    pub fn aux(&self, slot: usize) -> u64 {
+        self.aux
+            .get(slot)
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     pub fn with_children(name: &str, children: Vec<Arc<OperatorMetrics>>) -> Arc<Self> {
@@ -217,6 +394,7 @@ impl OperatorMetrics {
             rows_produced: AtomicU64::new(0),
             elapsed_ns: AtomicU64::new(0),
             batches: AtomicU64::new(0),
+            aux: Default::default(),
             children,
         })
     }

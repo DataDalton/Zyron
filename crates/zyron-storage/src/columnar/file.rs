@@ -27,10 +27,12 @@
 //!     magic repeat: "ZYRCOL\0\0"
 //!     file_checksum: u32
 
+use super::bloom::BloomFilter;
 use super::constants::{
     FILE_HEADER_METADATA_SIZE, FILE_HEADER_SIZE, FOOTER_SIZE, SEGMENT_HEADER_SIZE,
     SEGMENT_INDEX_ENTRY_SIZE, ZYR_FORMAT_VERSION, ZYR_MAGIC,
 };
+use super::segment::{SegmentHeader, ZoneMapEntry};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -443,6 +445,78 @@ pub struct ZyrFileReader {
     fileSize: u64,
 }
 
+/// Where each part of one raw segment buffer starts and ends.
+///
+/// The layout is header, bloom, zone maps, null bitmap, encoded payload,
+/// padding. Every reader that wants one part has to skip the ones before
+/// it, so the arithmetic lives here once rather than being repeated and
+/// drifting between the paths that decode a column, evaluate a predicate
+/// on it, and read it back through the scan's single-open batch reader
+pub struct SegmentRegions {
+    pub header: SegmentHeader,
+    pub null_bitmap: std::ops::Range<usize>,
+    pub encoded: std::ops::Range<usize>,
+}
+
+impl SegmentRegions {
+    /// The encoded payload, checked against the checksum the writer
+    /// recorded over exactly these bytes.
+    ///
+    /// Granular integrity: the bytes are already in memory and are exactly
+    /// the ones about to be decoded, so this costs no extra IO, and the
+    /// header self-verified its own checksum when it was parsed
+    pub fn verified_payload<'a>(&self, raw: &'a [u8], column_id: u32) -> Result<&'a [u8]> {
+        let enc = &raw[self.encoded.clone()];
+        let crc = zyron_common::hash32(enc);
+        if crc != self.header.data_checksum {
+            return Err(ZyronError::InvalidZyrFile(format!(
+                "segment payload checksum mismatch for column {}: stored 0x{:08x}, computed 0x{:08x}",
+                column_id, self.header.data_checksum, crc
+            )));
+        }
+        Ok(enc)
+    }
+}
+
+/// Splits one raw segment buffer into its parts. `column_id` names the
+/// column in error messages only
+pub fn segment_regions(raw: &[u8], column_id: u32, row_count: usize) -> Result<SegmentRegions> {
+    use super::constants::{ZONE_MAP_BATCH_SIZE, ZONE_MAP_ENTRY_SIZE};
+    if raw.len() < SEGMENT_HEADER_SIZE {
+        return Err(ZyronError::InvalidZyrFile(format!(
+            "segment for column {} is {} bytes, shorter than its header",
+            column_id,
+            raw.len()
+        )));
+    }
+    let mut header_bytes = [0u8; SEGMENT_HEADER_SIZE];
+    header_bytes.copy_from_slice(&raw[..SEGMENT_HEADER_SIZE]);
+    let header = SegmentHeader::from_bytes(&header_bytes)?;
+    let zones = row_count.div_ceil(ZONE_MAP_BATCH_SIZE as usize);
+    let null_start =
+        SEGMENT_HEADER_SIZE + header.bloom_filter_size as usize + zones * ZONE_MAP_ENTRY_SIZE;
+    let encoded_start = null_start
+        + if header.null_count > 0 {
+            row_count.div_ceil(8)
+        } else {
+            0
+        };
+    let encoded_end = encoded_start + header.encoded_size as usize;
+    if raw.len() < encoded_end {
+        return Err(ZyronError::InvalidZyrFile(format!(
+            "segment for column {} truncated: {} bytes, need {}",
+            column_id,
+            raw.len(),
+            encoded_end
+        )));
+    }
+    Ok(SegmentRegions {
+        header,
+        null_bitmap: null_start..encoded_start,
+        encoded: encoded_start..encoded_end,
+    })
+}
+
 impl ZyrFileReader {
     /// Opens a .zyr file with granular integrity validation and no
     /// whole-file pass: the file header is checked by its own
@@ -585,6 +659,27 @@ impl ZyrFileReader {
         self.segmentIndex.len()
     }
 
+    /// Whether this file holds a segment for one column.
+    ///
+    /// Answered from the segment index the open already read, so a column
+    /// the file predates is detected without touching the filesystem
+    pub fn has_segment(&self, column_id: u32) -> bool {
+        self.segmentIndex.iter().any(|e| e.columnId == column_id)
+    }
+
+    /// Bytes on disk of one column's segment, header through padding.
+    ///
+    /// Answered from the segment index the open already read, so a scan can
+    /// report what a column cost it without a second pass over the file. Zero
+    /// for a column this file predates, which is also what reading it costs.
+    pub fn segment_bytes(&self, column_id: u32) -> u64 {
+        self.segmentIndex
+            .iter()
+            .find(|e| e.columnId == column_id)
+            .map(|e| e.size)
+            .unwrap_or(0)
+    }
+
     /// Reads the raw segment bytes for the given column_id. Returns the full
     /// page-aligned segment data (header + bloom + zone maps + encoded data +
     /// padding).
@@ -623,6 +718,166 @@ impl ZyrFileReader {
         Ok(buf)
     }
 
+    /// Reads and fully decodes one column segment, returning the decoded
+    /// value bytes and the null bitmap (empty when the segment has no nulls).
+    /// Verifies the encoded payload checksum before decoding. value_size is
+    /// the fixed cell width, 0 for varlen columns
+    pub fn decode_column(
+        &self,
+        column_id: u32,
+        row_count: usize,
+        value_size: usize,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let raw = self.read_segment_raw(column_id)?;
+        let regions = segment_regions(&raw, column_id, row_count)?;
+        let null_bitmap = raw[regions.null_bitmap.clone()].to_vec();
+        let enc = regions.verified_payload(&raw, column_id)?;
+        let decoded = crate::encoding::create_encoding(regions.header.encoding_type)
+            .decode(enc, row_count, value_size)?;
+        Ok((decoded, null_bitmap))
+    }
+
+    /// Reads and decodes rows `start..end` of one column segment.
+    ///
+    /// A point read wants a few rows out of a segment holding millions.
+    /// Decoding the whole segment to reach them makes the cost of one row
+    /// the cost of the column, which is what an index is supposed to
+    /// remove. Encodings that can address a row without replaying the ones
+    /// before it pay for the range alone, and the rest fall back to the
+    /// decode they would have done anyway.
+    ///
+    /// The segment payload is still read from disk in full, because it is
+    /// one contiguous region and a partial read would cost a second seek
+    /// for no gain at these sizes. What this removes is the decode
+    pub fn decode_column_range(
+        &self,
+        column_id: u32,
+        row_count: usize,
+        value_size: usize,
+        start: usize,
+        end: usize,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let raw = self.read_segment_raw(column_id)?;
+        let regions = segment_regions(&raw, column_id, row_count)?;
+        let (start, end) = crate::encoding::clamp_range(row_count, start, end);
+        let null_bitmap = raw[regions.null_bitmap.clone()].to_vec();
+        let enc = regions.verified_payload(&raw, column_id)?;
+        let decoded = crate::encoding::create_encoding(regions.header.encoding_type)
+            .decode_range(enc, row_count, value_size, start, end)?;
+        Ok((decoded, null_bitmap))
+    }
+
+    /// Reads one column's header and zone maps without touching its
+    /// payload, in a single file open.
+    ///
+    /// A zone covers ZONE_MAP_BATCH_SIZE rows and holds their bounds, and
+    /// a segment's own bounds are the union of its zones, so a segment can
+    /// admit a range that no zone holds. Rejecting it there costs the
+    /// header and the zone region, which is bounded by the row count
+    /// rather than by the data. Bounds are raw little endian value bytes
+    /// in a 32-byte slot, compared with `compare_value_to_slot` under the
+    /// column's own signedness.
+    ///
+    /// The two are returned together because the zone region's offset
+    /// depends on the header's bloom size, so reading one already pays for
+    /// the other.
+    pub fn read_segment_metadata(
+        &self,
+        column_id: u32,
+        row_count: usize,
+    ) -> Result<(SegmentHeader, Vec<ZoneMapEntry>)> {
+        use super::constants::{ZONE_MAP_BATCH_SIZE, ZONE_MAP_ENTRY_SIZE};
+        let entry = self
+            .segmentIndex
+            .iter()
+            .find(|e| e.columnId == column_id)
+            .ok_or_else(|| {
+                ZyronError::InvalidZyrFile(format!("no segment found for column_id {}", column_id))
+            })?;
+        let mut file = File::open(&self.path).map_err(|e| {
+            ZyronError::IoError(format!(
+                "failed to reopen .zyr file {}: {}",
+                self.path.display(),
+                e
+            ))
+        })?;
+        file.seek(SeekFrom::Start(entry.offset))
+            .map_err(|e| ZyronError::IoError(format!("failed to seek to segment header: {}", e)))?;
+        let mut header_bytes = [0u8; SEGMENT_HEADER_SIZE];
+        file.read_exact(&mut header_bytes)
+            .map_err(|e| ZyronError::IoError(format!("failed to read segment header: {}", e)))?;
+        let header = SegmentHeader::from_bytes(&header_bytes)?;
+
+        let zones = row_count.div_ceil(ZONE_MAP_BATCH_SIZE as usize);
+        let region = zones * ZONE_MAP_ENTRY_SIZE;
+        let start = (SEGMENT_HEADER_SIZE + header.bloom_filter_size as usize) as u64;
+        if start + region as u64 > entry.size {
+            return Err(ZyronError::InvalidZyrFile(format!(
+                "zone maps for column {} run past their segment: need {} bytes of {}",
+                column_id,
+                start + region as u64,
+                entry.size
+            )));
+        }
+        // The header sits at the segment start and the bloom follows it, so
+        // the zone region begins wherever the bloom ends
+        if header.bloom_filter_size > 0 {
+            file.seek(SeekFrom::Start(entry.offset + start))
+                .map_err(|e| {
+                    ZyronError::IoError(format!(
+                        "failed to seek to zone maps for column {}: {}",
+                        column_id, e
+                    ))
+                })?;
+        }
+        let mut buf = vec![0u8; region];
+        file.read_exact(&mut buf).map_err(|e| {
+            ZyronError::IoError(format!(
+                "failed to read zone maps for column {}: {}",
+                column_id, e
+            ))
+        })?;
+        let mut out = Vec::with_capacity(zones);
+        for z in 0..zones {
+            let slice: [u8; ZONE_MAP_ENTRY_SIZE] = buf
+                [z * ZONE_MAP_ENTRY_SIZE..(z + 1) * ZONE_MAP_ENTRY_SIZE]
+                .try_into()
+                .map_err(|_| {
+                    ZyronError::InvalidZyrFile("failed to slice zone map entry".into())
+                })?;
+            out.push(ZoneMapEntry::from_bytes(&slice));
+        }
+        Ok((header, out))
+    }
+
+    /// Evaluates a predicate against one column without decoding it,
+    /// returning a packed bitmask of ceil(row_count / 8) bytes.
+    ///
+    /// Dictionary, run length and constant encodings answer from their
+    /// compact form, so a column whose decoded size is orders of magnitude
+    /// larger than its encoded size costs only the encoded size here. An
+    /// encoding with no such shortcut falls back to the trait's default,
+    /// which decodes, and the caller is no worse off than if it had
+    /// decoded itself
+    pub fn eval_column_predicate(
+        &self,
+        column_id: u32,
+        row_count: usize,
+        value_size: usize,
+        predicate: &crate::encoding::Predicate<'_>,
+    ) -> Result<Vec<u8>> {
+        let raw = self.read_segment_raw(column_id)?;
+        let regions = segment_regions(&raw, column_id, row_count)?;
+        let enc = regions.verified_payload(&raw, column_id)?;
+        crate::encoding::create_encoding(regions.header.encoding_type).eval_predicate(
+            enc,
+            row_count,
+            value_size,
+            predicate,
+        )
+    }
+
+
     /// Reads only the SEGMENT_HEADER_SIZE-byte header for a column, without
     /// pulling the encoded data. This is the metadata-only path used by
     /// aggregate pushdown (MIN/MAX/COUNT answered from the header), so a
@@ -649,6 +904,67 @@ impl ZyrFileReader {
         file.read_exact(&mut buf)
             .map_err(|e| ZyronError::IoError(format!("failed to read segment header: {}", e)))?;
         Ok(buf)
+    }
+
+    /// Reads and parses one column's segment header, without its data.
+    ///
+    /// This is the metadata-only path an aggregate takes when MIN, MAX or
+    /// COUNT is answerable from the header alone, so `SELECT MAX(c)` over
+    /// a clean segment costs one small read instead of decoding every row
+    pub fn read_segment_header(&self, column_id: u32) -> Result<SegmentHeader> {
+        let bytes = self.read_segment_header_bytes(column_id)?;
+        SegmentHeader::from_bytes(&bytes)
+    }
+
+    /// Reads a column's value bloom filter without touching its data.
+    ///
+    /// Returns None when the segment carries no bloom, which is the answer
+    /// for a low-cardinality or dictionary-encoded column. The bloom offset
+    /// in the header is segment relative, so the read lands at the segment's
+    /// file offset plus that value.
+    pub fn read_bloom(&self, columnId: u32) -> Result<Option<BloomFilter>> {
+        let entry = self
+            .segmentIndex
+            .iter()
+            .find(|e| e.columnId == columnId)
+            .ok_or_else(|| {
+                ZyronError::InvalidZyrFile(format!("no segment found for column_id {}", columnId))
+            })?;
+        let headerBytes = self.read_segment_header_bytes(columnId)?;
+        let header = super::segment::SegmentHeader::from_bytes(&headerBytes)?;
+        if header.bloom_filter_size == 0 {
+            return Ok(None);
+        }
+        let end = header.bloom_filter_offset + header.bloom_filter_size as u64;
+        if end > entry.size {
+            return Err(ZyronError::InvalidZyrFile(format!(
+                "bloom filter for column {} runs past its segment: needs {} bytes of {}",
+                columnId, end, entry.size
+            )));
+        }
+
+        let mut file = File::open(&self.path).map_err(|e| {
+            ZyronError::IoError(format!(
+                "failed to reopen .zyr file {}: {}",
+                self.path.display(),
+                e
+            ))
+        })?;
+        file.seek(SeekFrom::Start(entry.offset + header.bloom_filter_offset))
+            .map_err(|e| {
+                ZyronError::IoError(format!(
+                    "failed to seek to bloom filter for column {}: {}",
+                    columnId, e
+                ))
+            })?;
+        let mut buf = vec![0u8; header.bloom_filter_size as usize];
+        file.read_exact(&mut buf).map_err(|e| {
+            ZyronError::IoError(format!(
+                "failed to read bloom filter for column {}: {}",
+                columnId, e
+            ))
+        })?;
+        BloomFilter::from_bytes(&buf).map(Some)
     }
 
     /// Reads several column segments with a single file open, invoking `f`
@@ -700,6 +1016,20 @@ impl ZyrFileReader {
     /// Returns the file-level row count from the header.
     pub fn row_count(&self) -> u64 {
         self.header.row_count
+    }
+
+    /// What the file's rows are ordered by, if anything.
+    ///
+    /// `Asc` means `primary_key_column_id` is genuinely sorted and can be
+    /// binary searched. A file laid out by a multi-dimensional curve
+    /// reports `None`, because no single column is sorted in it
+    pub fn sort_order(&self) -> SortOrder {
+        self.header.sort_order
+    }
+
+    /// The column `sort_order` refers to, meaningless when that is `None`.
+    pub fn primary_key_column_id(&self) -> u32 {
+        self.header.primary_key_column_id
     }
 }
 

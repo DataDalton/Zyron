@@ -19,6 +19,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 BENCH = ROOT / "benchmarks"
+CHARTS = BENCH / "charts"
 README = ROOT / "README.md"
 
 # (suite, test group, metric key, short label, divisor)  -- value shown = average / divisor
@@ -130,6 +131,21 @@ EXTRA = [
         1,
         " us",
     ),
+    ("lake", "lake_scan", "Scan throughput", "Lake", "Scan throughput", 1e6, 0, "M rows/sec"),
+    ("lake", "lake_index", "Point probe through the index", "Lake", "Point probe through index", 1, 0, " us"),
+    ("lake", "lake_skipping", "zone map rows rejected (fraction)", "Lake", "Zone-map row rejection", 0.01, 0, "%"),
+]
+
+# Cross-format workloads to chart (heap vs lake wall-clock ratios).
+# (group, key, short label) - values pulled from tests[group][key]["ratio"]["value"].
+CROSS_READS = [
+    ("point_lookup_narrow", "Point lookup, narrow projection", "Point lookup"),
+    ("bulk_delete", "Bulk delete", "Bulk delete"),
+    ("range_scan", "Range scan, selective", "Selective scan"),
+    ("aggregate", "Aggregate over one column", "Aggregate"),
+    ("point_update", "Point update", "Point update"),
+    ("join", "Join", "Join"),
+    ("range_scan", "Range scan, wide", "Wide scan"),
 ]
 
 
@@ -146,6 +162,83 @@ def latest_json(suite: str):
 
 def metric(doc, group, key):
     return doc["tests"][group][key]["average"]
+
+
+def _svg_escape(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def write_grouped_bar_svg(path, title, x_labels, series, y_max, y_unit, value_fmt="{:,.0f}"):
+    """Write a self-contained dark-themed SVG grouped bar chart. Mermaid's
+    xychart-beta can't render side-by-side grouped bars, so this bypasses it.
+    Each x-label gets one bar per series, colored per series.
+
+    `series` is a list of (name, color_hex, values); all values lists must be
+    the same length as x_labels.
+    """
+    n_groups = len(x_labels)
+    n_series = len(series)
+    # Layout constants (in SVG user units).
+    W, H = 960, 460
+    m_left, m_right, m_top, m_bot = 70, 30, 60, 110
+    plot_w = W - m_left - m_right
+    plot_h = H - m_top - m_bot
+    group_w = plot_w / n_groups
+    bar_w = min(48, (group_w - 30) / n_series)
+    bar_gap = 4  # gap between bars within a group
+    inner_w = bar_w * n_series + bar_gap * (n_series - 1)
+    # Colors (self-contained dark theme so it reads on both GitHub themes).
+    bg = "#0d1117"
+    grid = "#30363d"
+    axis = "#8b949e"
+    text = "#e6edf3"
+
+    lines = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="100%" font-family="ui-sans-serif, system-ui, sans-serif">',
+        f'  <rect width="{W}" height="{H}" fill="{bg}" rx="6"/>',
+        f'  <text x="{W/2}" y="30" text-anchor="middle" fill="{text}" font-size="16" font-weight="600">{_svg_escape(title)}</text>',
+    ]
+
+    # Y-axis: 5 tick marks 0..y_max.
+    for i in range(6):
+        y_val = y_max * i / 5
+        y_px = m_top + plot_h - (plot_h * i / 5)
+        lines.append(f'  <line x1="{m_left}" y1="{y_px:.1f}" x2="{W-m_right}" y2="{y_px:.1f}" stroke="{grid}" stroke-width="1"/>')
+        lines.append(f'  <text x="{m_left-8}" y="{y_px+4:.1f}" text-anchor="end" fill="{axis}" font-size="11">{y_val:,.0f}</text>')
+    # Y-axis unit label.
+    lines.append(f'  <text x="{m_left-8}" y="{m_top-8}" text-anchor="end" fill="{axis}" font-size="11">{_svg_escape(y_unit)}</text>')
+
+    # Bars + group labels.
+    for gi, label in enumerate(x_labels):
+        group_x = m_left + gi * group_w
+        group_center = group_x + group_w / 2
+        inner_start = group_center - inner_w / 2
+        for si, (_, color, vals) in enumerate(series):
+            v = vals[gi]
+            bar_h = plot_h * (v / y_max) if y_max else 0
+            bx = inner_start + si * (bar_w + bar_gap)
+            by = m_top + plot_h - bar_h
+            lines.append(f'  <rect x="{bx:.1f}" y="{by:.1f}" width="{bar_w:.1f}" height="{bar_h:.1f}" fill="{color}" rx="2"/>')
+            # Value label above the bar.
+            lines.append(f'  <text x="{bx + bar_w/2:.1f}" y="{by - 4:.1f}" text-anchor="middle" fill="{text}" font-size="10">{value_fmt.format(v)}</text>')
+        # Group label below x-axis.
+        lines.append(f'  <text x="{group_center:.1f}" y="{H - m_bot + 20}" text-anchor="middle" fill="{text}" font-size="12">{_svg_escape(label)}</text>')
+
+    # Legend row at the bottom (only if there's more than one series to distinguish).
+    if n_series > 1:
+        legend_y = H - 40
+        sw_size = 14
+        entries = [(name, color) for name, color, _ in series]
+        total_legend_w = sum(sw_size + 6 + 8 * len(name) + 24 for name, _ in entries) - 24
+        lx = (W - total_legend_w) / 2
+        for name, color in entries:
+            lines.append(f'  <rect x="{lx:.1f}" y="{legend_y - sw_size + 2:.1f}" width="{sw_size}" height="{sw_size}" fill="{color}" rx="3"/>')
+            lines.append(f'  <text x="{lx + sw_size + 6:.1f}" y="{legend_y:.1f}" fill="{text}" font-size="13">{_svg_escape(name)}</text>')
+            lx += sw_size + 6 + 8 * len(name) + 24
+
+    lines.append("</svg>")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def bar_block(title, axis_label, labels, values, top):
@@ -207,6 +300,27 @@ def main():
     dc_serial = metric(doc("transaction"), "Concurrent Txns", f"durable_commit_c{dc_levels[0]}_txn_per_sec")
     dc_amplification = dc_peak / dc_serial
 
+    # Cross-format: heap vs lake ratios per workload. Read-shape ratios go in
+    # the chart; the write losses and bytes-read wins go in the supplementary
+    # table so the tradeoff is stated honestly rather than hidden.
+    cf = doc("cross_format")
+
+    def cf_ratio(group, key):
+        return cf["tests"][group][key]["ratio"]["value"]
+
+    def cf_us(group, key, fmt):
+        # fmt is "heap" or "lake"; both are wall-clock microseconds.
+        return cf["tests"][group][key][fmt]["average"]
+
+    cf_labels = [label for _, _, label in CROSS_READS]
+    cf_heap_us = [cf_us(g, k, "heap") for g, k, _ in CROSS_READS]
+    cf_lake_us = [cf_us(g, k, "lake") for g, k, _ in CROSS_READS]
+    cf_top = int(max(cf_heap_us + cf_lake_us) * 1.15)
+    cf_bytes_reduction = 1.0 / cf_ratio("point_lookup_narrow", "Bytes read")
+    cf_bulk_load = cf_ratio("bulk_load", "Bulk load to queryable")
+    cf_trickle_load = cf_ratio("trickle_load", "Trickle load to queryable")
+    cf_point_indexed = cf_ratio("point_lookup_index", "Point lookup with an index")
+
     # End-to-end: a client talking to a running server over the wire.
     e2e = doc("end_to_end")
     cold = metric(e2e, "Startup", "cold boot latency (ms)")
@@ -256,19 +370,60 @@ def main():
     out.append("### End-to-end\n")
     out.append("What a client sees from a running server over the wire protocol, from cold start to shutdown:\n")
     out.append(e2e_table)
-    out.append(
-        bar_block(
-            "OLTP throughput vs. concurrent clients (thousand tps, higher is better)",
-            "K tps",
-            tps_labels,
-            tps_vals,
-            tps_top,
-        )
+    def svg_chart(name, title, labels, values, top, unit, color="#1f6feb", fmt="{:.1f}"):
+        path = CHARTS / f"{name}.svg"
+        write_grouped_bar_svg(path, title, labels, [("", color, values)], top, unit, value_fmt=fmt)
+        rel = path.relative_to(ROOT).as_posix()
+        out.append(f"![{title}]({rel})\n")
+
+    svg_chart(
+        "oltp_throughput",
+        "OLTP throughput vs. concurrent clients (thousand tps, higher is better)",
+        tps_labels,
+        tps_vals,
+        tps_top,
+        "K tps",
     )
     out.append("### Engine internals\n")
     out.append("Raw subsystem throughput and hot-path latency under microbenchmark:\n")
-    out.append(bar_block("Throughput (million ops/sec, higher is better)", "M ops/sec", tp_labels, tp_vals, tp_top))
-    out.append(bar_block("Hot-path latency (nanoseconds, lower is better)", "ns/op", lat_labels, lat_vals, lat_top))
+    svg_chart(
+        "engine_throughput",
+        "Throughput (million ops/sec, higher is better)",
+        tp_labels,
+        tp_vals,
+        tp_top,
+        "M ops/sec",
+    )
+    svg_chart(
+        "hot_path_latency",
+        "Hot-path latency (nanoseconds, lower is better)",
+        lat_labels,
+        lat_vals,
+        lat_top,
+        "ns/op",
+    )
+    out.append("### Row heap vs ZyronLake\n")
+    out.append(
+        "Same workload, same rows, run against both formats. Blue = Row heap, purple = "
+        "ZyronLake; the shorter bar wins on wall-clock. Write-heavy trade-offs where the "
+        "Row heap wins (bulk load, trickle load, indexed point lookup) are in the table "
+        "below so the picture is honest, not cherry-picked.\n"
+    )
+    svg_top = int(max(cf_heap_us + cf_lake_us) * 1.15)
+    svg_path = CHARTS / "cross_format.svg"
+    write_grouped_bar_svg(
+        svg_path,
+        "Cross-format wall-clock (microseconds, lower is better)",
+        cf_labels,
+        [
+            ("Row heap", "#1f6feb", cf_heap_us),
+            ("ZyronLake", "#a371f7", cf_lake_us),
+        ],
+        svg_top,
+        "us",
+    )
+    svg_rel = svg_path.relative_to(ROOT).as_posix()
+    out.append(f"![Cross-format wall-clock, Row heap vs ZyronLake]({svg_rel})\n")
 
     extra_rows = []
     for suite, group, key, sub, mlabel, div, dec, suffix in EXTRA:
@@ -278,6 +433,10 @@ def main():
     extra_rows.append(
         f"| Transactions | Group-commit amplification (c={dc_levels[0]} to c={dc_levels[-1]}) | ~{dc_amplification:.1f}x |"
     )
+    extra_rows.append(f"| Cross-format | Point-lookup bytes read, heap vs lake | ~{cf_bytes_reduction:.0f}x less I/O for lake |")
+    extra_rows.append(f"| Cross-format | Point lookup with a heap B+tree index, lake vs heap | ~{cf_point_indexed:.1f}x (heap wins indexed points) |")
+    extra_rows.append(f"| Cross-format | Bulk load to queryable, lake vs heap | ~{cf_bulk_load:.1f}x (heap wins large batches) |")
+    extra_rows.append(f"| Cross-format | Trickle load to queryable, lake vs heap | ~{cf_trickle_load:.1f}x (heap wins tiny commits) |")
     extra_table = (
         "A few more numbers not shown in the charts above:\n\n"
         "| Subsystem | Metric | Result |\n"
@@ -288,8 +447,9 @@ def main():
     suite_count = sum(1 for p in BENCH.iterdir() if p.is_dir())
     out.append(
         f"{suite_count} benchmark suites cover storage, executor, optimizer, encoding, wire, "
-        "search, analytics, CDC, versioning, transactions, temporal, columnar, types, "
-        "lifecycle, gateway, Zyron-to-Zyron, and end-to-end. Each run writes a timestamped "
+        "search, analytics, CDC, versioning, transactions, temporal, columnar, lake, "
+        "cross-format, types, lifecycle, gateway, Zyron-to-Zyron, and end-to-end. Each run "
+        "writes a timestamped "
         "JSON/TXT pair under `benchmarks/<suite>/`.\n"
     )
 

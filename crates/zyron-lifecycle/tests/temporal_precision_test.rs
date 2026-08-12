@@ -46,20 +46,13 @@ async fn build_engine() -> Engine {
     std::fs::create_dir_all(&wal_dir).unwrap();
 
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir,
-            fsync_enabled: false,
-        })
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir))
         .await
         .unwrap(),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 8192 }));
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir,
-            fsync_enabled: false,
-            ..Default::default()
-        })
+        WalWriter::new(zyron_bench_harness::wal_config(wal_dir))
         .unwrap(),
     );
     let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
@@ -109,7 +102,7 @@ async fn query(
 ) -> zyron_common::Result<Vec<zyron_executor::batch::DataBatch>> {
     let stmt = zyron_parser::parse(sql)?.into_iter().next().unwrap();
     let plan =
-        zyron_planner::plan(&e.catalog, DatabaseId(1), vec![SCHEMA.to_string()], stmt).await?;
+        zyron_planner::plan(&e.catalog, DatabaseId(1), vec![SCHEMA.to_string()], stmt, None).await?;
     let mut txn = e.txn.begin(IsolationLevel::ReadCommitted)?;
     let snapshot = txn.snapshot.clone();
     let txn_id = txn.txn_id as u32;

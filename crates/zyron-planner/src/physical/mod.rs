@@ -8,7 +8,7 @@ pub mod builder;
 
 use crate::binder::{BoundAssignment, BoundExpr, BoundOrderBy};
 use crate::cost::PlanCost;
-use crate::logical::{AggregateExpr, LogicalColumn};
+use crate::logical::{AggregateExpr, AsOfTarget, LogicalColumn};
 use std::sync::Arc;
 use zyron_catalog::{ColumnId, IndexEntry, IndexId, TableId};
 use zyron_parser::ast::{JoinType, SetOpType};
@@ -64,6 +64,69 @@ pub enum PhysicalPlan {
         /// columnar and heap scans to commit-LSN version visibility so a query
         /// as of a past version sees folded rows too.
         as_of: Option<super::logical::AsOfTarget>,
+        cost: PlanCost,
+    },
+
+    /// Scan of a lake table, driven by its transaction log manifest. A
+    /// lake table has no heap rows and no MVCC system columns, visibility
+    /// is the manifest at the resolved log version, so no other scan node
+    /// can serve it. Chosen whenever the catalog marks the table lake.
+    LakeScan {
+        table_id: TableId,
+        columns: Vec<LogicalColumn>,
+        predicate: Option<BoundExpr>,
+        /// The predicate lowered to the lake IR, present only when it has an
+        /// exact equivalent. The operator prunes files with it, and its
+        /// absence is why a scan reads every file, so EXPLAIN reports it.
+        lowered: Option<zyron_lake::LakePredicate>,
+        /// Time-travel target resolved by the operator against the log,
+        /// version directly and timestamp through commit timestamps.
+        as_of: Option<super::logical::AsOfTarget>,
+        cost: PlanCost,
+    },
+
+    /// Scan of a table that lives on a peer. The projection, the filter and
+    /// the row cap travel to the remote inside `request`, because a
+    /// federated scan that fetched everything and filtered here would pay
+    /// the network for work the peer could have skipped.
+    ///
+    /// `residual` is the part of the predicate with no faithful SQL
+    /// rendering, evaluated locally on the rows that come back. A conjunct
+    /// is in exactly one of the two places, so no row is filtered twice and
+    /// none is missed.
+    ForeignScan {
+        table_id: TableId,
+        columns: Vec<LogicalColumn>,
+        residual: Option<BoundExpr>,
+        request: zyron_common::ForeignRequest,
+        cost: PlanCost,
+    },
+
+    /// Predicate delete on a lake table. The predicate is recorded in the
+    /// table's log rather than applied row by row: files it fully covers
+    /// are dropped whole with no data IO, files it may match carry it
+    /// until a later optimize rewrites them. None deletes every row.
+    LakeDelete {
+        table_id: TableId,
+        predicate: Option<zyron_lake::LakePredicate>,
+        /// The predicate's SQL text, recorded in the manifest
+        sql: String,
+        cost: PlanCost,
+    },
+
+    /// Update of a lake table: the matching rows are read through the
+    /// child scan, the assignments produce their new images, and one
+    /// commit removes the old rows and adds the new ones. The child
+    /// projects every column so the new image is complete.
+    LakeUpdate {
+        table_id: TableId,
+        assignments: Vec<crate::binder::BoundAssignment>,
+        check_constraints: Vec<BoundExpr>,
+        /// Lowered form of the child's predicate, what removes the old
+        /// rows. None updates every row.
+        predicate: Option<zyron_lake::LakePredicate>,
+        sql: String,
+        child: Box<PhysicalPlan>,
         cost: PlanCost,
     },
 
@@ -208,6 +271,19 @@ pub enum PhysicalPlan {
         cost: PlanCost,
     },
 
+    /// Row locking for SELECT ... FOR UPDATE/SHARE. The executor builds its
+    /// child through the locator-tracking scan path so every row carries a
+    /// storage locator to lock.
+    LockRows {
+        table_id: TableId,
+        mode: crate::binder::RowLockMode,
+        wait: crate::binder::RowLockWait,
+        /// literal LIMIT plus OFFSET, locking stops after this many rows
+        cap: Option<u64>,
+        child: Box<PhysicalPlan>,
+        cost: PlanCost,
+    },
+
     /// Set operation (UNION, INTERSECT, EXCEPT).
     SetOp {
         op: SetOpType,
@@ -307,6 +383,9 @@ pub enum PhysicalPlan {
         match_expr: BoundExpr,
         /// Additional predicates to apply after FTS scoring.
         remaining_predicate: Option<BoundExpr>,
+        /// Time travel qualifier. A hit resolves to a row in the store the
+        /// row lives in, and this is the version that fetch reads at.
+        as_of: Option<AsOfTarget>,
         cost: PlanCost,
     },
 
@@ -319,6 +398,8 @@ pub enum PhysicalPlan {
         metric: u8,
         k: usize,
         remaining_predicate: Option<BoundExpr>,
+        /// Time travel qualifier, see FulltextScan
+        as_of: Option<AsOfTarget>,
         cost: PlanCost,
     },
 
@@ -330,6 +411,8 @@ pub enum PhysicalPlan {
         columns: Vec<LogicalColumn>,
         kind: SpatialScanKind,
         remaining_predicate: Option<BoundExpr>,
+        /// Time travel qualifier, see FulltextScan
+        as_of: Option<AsOfTarget>,
         cost: PlanCost,
     },
 
@@ -408,6 +491,10 @@ impl PhysicalPlan {
         match self {
             PhysicalPlan::SeqScan { cost, .. }
             | PhysicalPlan::HybridScan { cost, .. }
+            | PhysicalPlan::LakeScan { cost, .. }
+            | PhysicalPlan::ForeignScan { cost, .. }
+            | PhysicalPlan::LakeDelete { cost, .. }
+            | PhysicalPlan::LakeUpdate { cost, .. }
             | PhysicalPlan::ColumnarMetadataAggregate { cost, .. }
             | PhysicalPlan::IndexScan { cost, .. }
             | PhysicalPlan::Filter { cost, .. }
@@ -421,6 +508,7 @@ impl PhysicalPlan {
             | PhysicalPlan::Sort { cost, .. }
             | PhysicalPlan::Limit { cost, .. }
             | PhysicalPlan::HashDistinct { cost, .. }
+            | PhysicalPlan::LockRows { cost, .. }
             | PhysicalPlan::SetOp { cost, .. }
             | PhysicalPlan::Insert { cost, .. }
             | PhysicalPlan::Values { cost, .. }
@@ -446,6 +534,8 @@ impl PhysicalPlan {
         match self {
             PhysicalPlan::SeqScan { columns, .. }
             | PhysicalPlan::HybridScan { columns, .. }
+            | PhysicalPlan::LakeScan { columns, .. }
+            | PhysicalPlan::ForeignScan { columns, .. }
             | PhysicalPlan::IndexScan { columns, .. }
             | PhysicalPlan::ParallelSeqScan { columns, .. } => columns.clone(),
             PhysicalPlan::ColumnarMetadataAggregate { schema, .. } => schema.clone(),
@@ -527,6 +617,7 @@ impl PhysicalPlan {
             PhysicalPlan::Sort { child, .. }
             | PhysicalPlan::Limit { child, .. }
             | PhysicalPlan::HashDistinct { child, .. }
+            | PhysicalPlan::LockRows { child, .. }
             | PhysicalPlan::Gather { child, .. }
             | PhysicalPlan::Repartition { child, .. }
             | PhysicalPlan::GapFill { child, .. }
@@ -534,7 +625,9 @@ impl PhysicalPlan {
             PhysicalPlan::SetOp { left, .. } => left.output_schema(),
             PhysicalPlan::Insert { .. }
             | PhysicalPlan::Update { .. }
-            | PhysicalPlan::Delete { .. } => Vec::new(),
+            | PhysicalPlan::Delete { .. }
+            | PhysicalPlan::LakeDelete { .. }
+            | PhysicalPlan::LakeUpdate { .. } => Vec::new(),
             PhysicalPlan::Values { schema, .. } => schema.clone(),
             PhysicalPlan::FulltextScan { columns, .. }
             | PhysicalPlan::VectorScan { columns, .. }
@@ -578,6 +671,9 @@ impl PhysicalPlan {
         let children_cost = match self {
             PhysicalPlan::SeqScan { .. }
             | PhysicalPlan::HybridScan { .. }
+            | PhysicalPlan::LakeScan { .. }
+            | PhysicalPlan::ForeignScan { .. }
+            | PhysicalPlan::LakeDelete { .. }
             | PhysicalPlan::ColumnarMetadataAggregate { .. }
             | PhysicalPlan::IndexScan { .. }
             | PhysicalPlan::Values { .. }
@@ -594,9 +690,11 @@ impl PhysicalPlan {
             | PhysicalPlan::Sort { child, .. }
             | PhysicalPlan::Limit { child, .. }
             | PhysicalPlan::HashDistinct { child, .. }
+            | PhysicalPlan::LockRows { child, .. }
             | PhysicalPlan::Insert { source: child, .. }
             | PhysicalPlan::Update { child, .. }
             | PhysicalPlan::Delete { child, .. }
+            | PhysicalPlan::LakeUpdate { child, .. }
             | PhysicalPlan::Gather { child, .. }
             | PhysicalPlan::Repartition { child, .. }
             | PhysicalPlan::Broadcast { child, .. }

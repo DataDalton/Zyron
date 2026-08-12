@@ -20,7 +20,7 @@ pub mod source_io;
 pub use cdc_ingest::{CdcIngestConfig, CdcIngestManager, CdcIngestSource, OnConflict};
 pub use cdc_stream::{
     CdcOutputStream, CdcSink, CdcSinkConfig, CdcStreamManager, OutputFormat, build_sink,
-    drive_stream_once,
+    drive_stream_changes, drive_stream_once,
 };
 pub use change_feed::{CdfRegistry, ChangeDataFeed, ChangeRecord, ChangeType};
 pub use decoder::{

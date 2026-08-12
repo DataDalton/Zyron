@@ -60,8 +60,8 @@ pub use column_security::{MaskingPolicy, MaskingPolicyStore};
 pub use context::SecurityContext;
 pub use credentials::{
     ApiKeyCredential, JwtAlgorithm, JwtClaims, JwtCredential, PasswordCredential, ScramSecret,
-    TotpCredential, md5_password_credential, parse_scram_secret, scram_sha256_secret,
-    scram_sha256_secret_with_salt,
+    TotpCredential, md5_password_credential, parse_scram_secret, pbkdf2_sha256,
+    scram_sha256_secret, scram_sha256_secret_with_salt,
 };
 pub use encryption::{
     ColumnEncryption, EncryptionAlgorithm, EncryptionStore, KeyStore, LocalKeyStore,

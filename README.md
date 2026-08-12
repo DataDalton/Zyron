@@ -14,7 +14,7 @@ ZyronDB is a hybrid transactional/analytical database. It implements its own wri
 
 Fresh writes land in an MVCC row heap tuned for OLTP. A background thread compacts committed rows into a custom column format (`.zyr`) with per-column encoding, and analytical queries run directly on the encoded data with predicate pushdown and late materialization. The same SQL, the same connection, both workloads.
 
-> **Status:** active development. The single-node engine is feature-complete through data lifecycle management and benchmarked end to end. Next up is the ZyronLake table format and distribution: multi-region, Raft consensus, and sharding.
+> **Status:** active development. The single-node engine is feature-complete through data lifecycle management, and the ZyronLake table format runs beside it with cross-format federation. Next up is distribution: Raft consensus, multi-region, and sharding.
 
 ## Table of Contents
 
@@ -37,6 +37,8 @@ Fresh writes land in an MVCC row heap tuned for OLTP. A background thread compac
 ## Highlights
 
 - **One engine, both workloads.** Row heap for transactional writes, `.zyr` columnar format for analytical scans, with automatic background compaction between them.
+- **Mesh, not monolith.** A Zyron node can host a database, a ZyronLake, both, or neither (embedded in an app). Nodes peer over the wire and a single `SELECT` reaches across the mesh, joining a local heap table to a remote publication or a shared lake with no external gateway or middleware in front.
+- **Shared-storage table format.** ZyronLake stores immutable `.zyr` files against an append-only transaction log versioned per commit, with `File::create_new` as the optimistic-concurrency primitive and periodic manifest checkpoints so readers open one file instead of replaying history. Branches, time travel, secondary indexes, Z-order clustering, constraint enforcement, and change feed all live in the format.
 - **Lock-free hot paths.** LSN assignment, the WAL ring buffer, MVCC visibility checks, the buffer pool, and the B+ tree avoid mutexes on the query and write path entirely. Locks exist only on single-owner background threads.
 - **Full durability, no per-page fsync tax.** Every commit fsyncs the WAL through group commit before acknowledging the client. Dirty heap and index pages are written by a background writer and then fsynced at explicit durability barriers, so an acknowledged transaction survives a power loss without paying a per-page fsync on the OLTP hot path.
 - **Query-on-encoded.** Dictionary, RLE, bit-pack, and FastLanes columns are filtered without being decoded; only rows that survive predicates are materialized.
@@ -79,7 +81,7 @@ flowchart TB
 
     subgraph STORAGE [Storage Engine]
         direction LR
-        ST[zyron-storage<br/>heap · B+tree · .zyr · MVCC] ~~~ BUF[zyron-buffer<br/>clock-sweep pool] ~~~ WAL[zyron-wal<br/>ring buffer · group commit]
+        ST[zyron-storage<br/>heap · B+tree · .zyr · MVCC] ~~~ LK[zyron-lake<br/>versioned .zyr · log · manifest] ~~~ BUF[zyron-buffer<br/>clock-sweep pool] ~~~ WAL[zyron-wal<br/>ring buffer · group commit]
     end
 
     COM[zyron-common · errors · pages · hashing · PRNG]
@@ -94,6 +96,7 @@ flowchart TB
 | B+ tree index | Resident in RAM, persisted via WAL + checkpoint | Point lookups, range scans |
 | Row heap (OLTP) | Buffer pool with clock-sweep eviction | Recent and transactional rows |
 | Columnar (`.zyr`) | Disk, hot segments cached in the buffer pool | Encoded analytical scans |
+| ZyronLake (`.zyr` + log) | Object store or shared filesystem, versioned per commit, manifest-checkpointed | Analytical tables on shared storage; branches, time travel, cross-engine reads |
 | Write-ahead log | Append-only, group commit, fsync on commit | Durability and crash recovery |
 
 ## Capabilities
@@ -173,6 +176,38 @@ flowchart TB
 - Tamper-evident audit chain
 
 </td></tr>
+<tr><td valign="top" width="50%">
+
+**ZyronLake table format**
+
+- Immutable `.zyr` data files against an append-only transaction log, one numbered version file per commit
+- `File::create_new` as the optimistic-concurrency primitive; periodic manifest checkpoints collapse the log
+- Copy-on-write branches with merge
+- Time travel to any committed version
+- Secondary indexes (also versioned as lake artifacts, safe against staleness)
+- Bloom filters, zone maps, and a struct-of-arrays prune index (94-100% file skip rates in practice)
+- Z-order and Hilbert space-filling-curve clustering with background maintenance
+- Unique and foreign-key constraint enforcement with a clustered fast path
+- Change feed between two versions
+- `OPTIMIZE`, `VACUUM`, `FOLLOW`, `REPAIR` operations
+- Runs on local disk, shared filesystem, or object storage
+
+</td><td valign="top" width="50%">
+
+**Federation & mesh**
+
+- Zyron nodes peer over the wire and address each other's data directly
+- One node can host a database, a ZyronLake, both, or run embedded in an application
+- Publications and subscriptions between instances with exactly-once wire-level push
+- Foreign scans across the mesh: a single query can join local heap tables to remote publications or to a shared lake
+- HybridScan bridges row heap and `.zyr` segments (local or remote) in one operator
+- Cross-format federation: heap and lake tables are first-class in the same SQL, no separate query layer
+- Dynamic REST / WebSocket / SSE endpoints (`CREATE ENDPOINT`) surface SQL directly to browsers and apps
+- OAuth 2.0, AWS IAM STS, Kubernetes SA tokens, Vault / AWS Secrets Manager / GCP Secret Manager / Azure Key Vault for remote credentials
+- Connection routing over host lists with role hints, DNS SRV, health checks, and automatic failover
+- mTLS with SPKI pinning and labeled Prometheus families per subscriber, publication, and TLS direction
+
+</td></tr>
 </table>
 
 ## Performance
@@ -200,36 +235,21 @@ What a client sees from a running server over the wire protocol, from cold start
 | Analytical query (median) | 1.30 ms |
 | Graceful shutdown | 53 ms |
 
-```mermaid
-%%{init: {'theme':'base','themeVariables':{'xyChart':{'backgroundColor':'transparent','titleColor':'#e6edf3','xAxisLabelColor':'#e6edf3','xAxisTitleColor':'#e6edf3','xAxisTickColor':'#1f6feb','xAxisLineColor':'#1f6feb','yAxisLabelColor':'#e6edf3','yAxisTitleColor':'#e6edf3','yAxisTickColor':'#1f6feb','yAxisLineColor':'#1f6feb','plotColorPalette':'#1f6feb'}},'xyChart':{'width':750,'height':360}}}%%
-xychart-beta
-    title "OLTP throughput vs. concurrent clients (thousand tps, higher is better)"
-    x-axis ["1 client", "4 clients", "16 clients", "64 clients", "256 clients"]
-    y-axis "K tps" 0 --> 74
-    bar [12.0, 33.4, 65.1, 60.5, 55.2]
-```
+![OLTP throughput vs. concurrent clients (thousand tps, higher is better)](benchmarks/charts/oltp_throughput.svg)
 
 ### Engine internals
 
 Raw subsystem throughput and hot-path latency under microbenchmark:
 
-```mermaid
-%%{init: {'theme':'base','themeVariables':{'xyChart':{'backgroundColor':'transparent','titleColor':'#e6edf3','xAxisLabelColor':'#e6edf3','xAxisTitleColor':'#e6edf3','xAxisTickColor':'#1f6feb','xAxisLineColor':'#1f6feb','yAxisLabelColor':'#e6edf3','yAxisTitleColor':'#e6edf3','yAxisTickColor':'#1f6feb','yAxisLineColor':'#1f6feb','plotColorPalette':'#1f6feb'}},'xyChart':{'width':1350,'height':360}}}%%
-xychart-beta
-    title "Throughput (million ops/sec, higher is better)"
-    x-axis ["B+tree insert", "B+tree delete", "Hash join build", "SCD-2 merge", "COPY FROM", "Row serialize", "SQL parse", "TTL purge", "Archive"]
-    y-axis "M ops/sec" 0 --> 142
-    bar [40.0, 22.7, 124.2, 45.9, 24.5, 17.7, 2.1, 9.8, 48.8]
-```
+![Throughput (million ops/sec, higher is better)](benchmarks/charts/engine_throughput.svg)
 
-```mermaid
-%%{init: {'theme':'base','themeVariables':{'xyChart':{'backgroundColor':'transparent','titleColor':'#e6edf3','xAxisLabelColor':'#e6edf3','xAxisTitleColor':'#e6edf3','xAxisTickColor':'#1f6feb','xAxisLineColor':'#1f6feb','yAxisLabelColor':'#e6edf3','yAxisTitleColor':'#e6edf3','yAxisTickColor':'#1f6feb','yAxisLineColor':'#1f6feb','plotColorPalette':'#1f6feb'}},'xyChart':{'width':1200,'height':360}}}%%
-xychart-beta
-    title "Hot-path latency (nanoseconds, lower is better)"
-    x-axis ["MVCC visible", "Version lookup", "B+tree lookup", "Branch resolve", "Row lock", "Legal-hold check", "Bloom probe", "Selectivity est"]
-    y-axis "ns/op" 0 --> 114
-    bar [1.7, 13.5, 21.4, 54.3, 97.0, 7.7, 6.9, 99.8]
-```
+![Hot-path latency (nanoseconds, lower is better)](benchmarks/charts/hot_path_latency.svg)
+
+### Row heap vs ZyronLake
+
+Same workload, same rows, run against both formats. Blue = Row heap, purple = ZyronLake; the shorter bar wins on wall-clock. Write-heavy trade-offs where the Row heap wins (bulk load, trickle load, indexed point lookup) are in the table below so the picture is honest, not cherry-picked.
+
+![Cross-format wall-clock, Row heap vs ZyronLake](benchmarks/charts/cross_format.svg)
 
 A few more numbers not shown in the charts above:
 
@@ -244,10 +264,17 @@ A few more numbers not shown in the charts above:
 | Versioning | Time-travel scan overhead | ~20% |
 | Wire | QUIC PostgreSQL handshake | ~5 us |
 | Transactions | Durable commit floor (device write) | ~80.7 us |
+| Lake | Scan throughput | ~154M rows/sec |
+| Lake | Point probe through index | ~199 us |
+| Lake | Zone-map row rejection | ~100% |
 | Transactions | Durable group-commit peak | ~703K txn/sec |
 | Transactions | Group-commit amplification (c=1 to c=512) | ~70.9x |
+| Cross-format | Point-lookup bytes read, heap vs lake | ~89x less I/O for lake |
+| Cross-format | Point lookup with a heap B+tree index, lake vs heap | ~2.0x (heap wins indexed points) |
+| Cross-format | Bulk load to queryable, lake vs heap | ~10.8x (heap wins large batches) |
+| Cross-format | Trickle load to queryable, lake vs heap | ~32.1x (heap wins tiny commits) |
 
-29 benchmark suites cover storage, executor, optimizer, encoding, wire, search, analytics, CDC, versioning, transactions, temporal, columnar, types, lifecycle, gateway, Zyron-to-Zyron, and end-to-end. Each run writes a timestamped JSON/TXT pair under `benchmarks/<suite>/`.
+32 benchmark suites cover storage, executor, optimizer, encoding, wire, search, analytics, CDC, versioning, transactions, temporal, columnar, lake, cross-format, types, lifecycle, gateway, Zyron-to-Zyron, and end-to-end. Each run writes a timestamped JSON/TXT pair under `benchmarks/<suite>/`.
 <!-- BENCH:END -->
 
 ## Getting Started
@@ -359,7 +386,8 @@ Each area ships with an optimization review and a validation checkpoint with har
 | Data operations | Versioning & time travel, CDC, pipelines/triggers/UDFs, streaming, server integration | ✅ Complete |
 | Native features | Full-text search, vector & graph search, native data types, utility operations | ✅ Complete |
 | Analytics & lifecycle | Analytics engine, feature store & ML, data lifecycle management | ✅ Complete |
-| Enterprise & distribution | ZyronLake table format, Raft consensus, sharding, key management, observability, migration & connectors | 🔨 In progress |
+| ZyronLake table format | Immutable versioned `.zyr` on a transaction log; branches, time travel, secondary indexes, clustering, constraint enforcement, change feed, cross-format federation | ✅ Complete |
+| Distribution | Raft consensus, sharding, multi-region, key management, observability, migration & connectors | 🔨 In progress |
 | Innovation & serverless | Serverless compute/storage split, innovative query features, client SDKs | ⏳ Planned |
 
 ## Development

@@ -61,6 +61,9 @@ fn ms_to_civil(ms: i64) -> (i32, u32, u32) {
     civil_from_days(days)
 }
 
+/// The inverse of `ms_to_civil`. Production converts one way, so this exists
+/// for the round trip that proves the pair agree
+#[cfg(test)]
 fn civil_to_ms(y: i32, m: u32, d: u32) -> i64 {
     days_from_civil(y, m, d) * MS_PER_DAY
 }

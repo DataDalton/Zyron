@@ -176,6 +176,27 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
         };
     }
 
+    // FOR UPDATE/SHARE -> LockRows, above Sort so the locked set is the
+    // final row set, below Project because projection drops row locators.
+    // The binder rejected multi-table, DISTINCT, GROUP BY and set-op shapes,
+    // aggregation hiding in the projection list is only discoverable here
+    if let Some(lock) = &select.row_lock {
+        if aggregate_pushed {
+            return Err(ZyronError::PlanError(
+                "FOR UPDATE/SHARE is not allowed with aggregate functions".to_string(),
+            ));
+        }
+        let cap = extract_u64_literal(&select.limit)
+            .map(|l| l + extract_u64_literal(&select.offset).unwrap_or(0));
+        plan = LogicalPlan::LockRows {
+            table_id: lock.table_id,
+            mode: lock.mode,
+            wait: lock.wait,
+            cap,
+            child: Arc::new(plan),
+        };
+    }
+
     // 6. SELECT -> Project
     //
     // When an aggregate is in scope, the projection list still references

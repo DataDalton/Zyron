@@ -43,18 +43,6 @@ fn html_escape_attr(s: &str, out: &mut String) {
 // Block-level Markdown parser
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum BlockKind {
-    Heading(u8),
-    Paragraph,
-    BlockQuote,
-    UnorderedList,
-    OrderedList(u32),
-    CodeFence(String),
-    ThematicBreak,
-    Table,
-}
-
 /// CommonMark subset plus GFM extensions: tables, task lists, strikethrough,
 /// autolinks. Returns rendered HTML
 pub fn markdown_to_html(md: &str) -> String {

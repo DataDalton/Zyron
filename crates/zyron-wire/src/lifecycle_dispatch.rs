@@ -1,4 +1,4 @@
-//! Phase 17 data lifecycle DDL handlers: TTL, table options, legal hold,
+//! Data lifecycle DDL handlers: TTL, table options, legal hold,
 //! FORGET/EXPORT USER, tier move, column classification, soft-delete restore,
 //! retention jobs, and undrop. Every handler is privilege-gated and writes a
 //! tamper-evident compliance log entry.
@@ -244,6 +244,7 @@ async fn run_sql(
         zyron_catalog::DatabaseId(1),
         vec!["public".to_string()],
         stmt,
+        Some(&server.peer_facts()),
     )
     .await
     .map_err(ProtocolError::Database)?;

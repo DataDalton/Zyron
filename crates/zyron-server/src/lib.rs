@@ -13,10 +13,18 @@ pub mod feature_persistence;
 pub mod gateway;
 pub mod health;
 pub mod hooks;
-pub mod io_stats;
+pub mod lake_recovery;
 pub mod metrics;
 pub mod session;
 pub mod signal;
+
+#[cfg(test)]
+pub(crate) mod test_sync {
+    /// Serializes tests that install a scoped tracing subscriber. Concurrent
+    /// scoped dispatchers race the global max-level hint and the callsite
+    /// interest cache, dropping events emitted under the other dispatcher
+    pub(crate) static TRACING_TESTS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+}
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -34,6 +42,11 @@ use zyron_storage::txn::TransactionManager;
 use zyron_storage::{DiskManager, DiskManagerConfig};
 use zyron_wal::{RecoveryManager, WalWriter, WalWriterConfig};
 use zyron_wire::connection::ServerState;
+
+/// Database a foreign scan connects to on a peer. Peers serve federation
+/// through the same wire protocol and the same default database a client
+/// uses, so there is no separate federation endpoint to configure.
+const DEFAULT_PEER_DATABASE: &str = "zyron";
 
 use crate::background::BackgroundWorkers;
 use crate::background::checkpoint::CheckpointWorkerConfig;
@@ -593,6 +606,20 @@ impl Server {
         let branch_mgr_arc = Arc::new(branch_mgr);
         let notif_arc = Arc::new(zyron_wire::notifications::NotificationChannels::new());
 
+        // Document registry: load the persisted DocId -> RowLocator map the
+        // search indexes address rows through. A missing or corrupt snapshot
+        // starts empty, matching the index managers' missing-file behavior.
+        let doc_registry_arc = {
+            let path = data_dir.join("doc_registry.zydoc");
+            let loaded = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| zyron_common::DocRegistry::decode(&bytes));
+            match loaded {
+                Some(r) => Arc::new(r),
+                None => Arc::new(zyron_common::DocRegistry::new()),
+            }
+        };
+
         // Full-text search manager: load persisted FTS indexes from catalog.
         let fts_mgr_arc = {
             let fts_dir = data_dir.join("fts");
@@ -735,10 +762,14 @@ impl Server {
 
                     if let Err(e) = rebuild_spatial_index_from_table(
                         &mgr,
+                        &doc_registry_arc,
                         idx.id.0,
                         dims,
                         &buffer_pool,
                         &disk_manager,
+                        &catalog,
+                        &wal,
+                        &txn_manager,
                         idx.as_ref(),
                         table.as_ref(),
                     )
@@ -770,6 +801,70 @@ impl Server {
         .await
         {
             tracing::error!("columnar recovery reconcile failed: {}", e);
+        }
+
+        // Lake log recovery, gated on the deployment mode so a db node pays
+        // no startup IO and holds no lake state
+        let deployment_mode = self.config.deployment_mode();
+
+        // Node identity and peer membership, both node-local. Established
+        // before lake recovery rather than after, because recovery opens
+        // logs and every log captures the node it writes as when it opens.
+        // Establishing it later would leave every recovered log writing as
+        // no node, which turns the single-writer rule off for exactly the
+        // datasets that were already in use
+        let node_identity = zyron_common::NodeIdentity::load_or_create(
+            data_dir,
+            &self.config.server.host,
+            deployment_mode,
+        )?;
+        let peers = Arc::new(parking_lot::RwLock::new(Arc::new(
+            zyron_common::PeerRegistry::load(data_dir)?,
+        )));
+        // Reaching a peer is a node capability, built once and shared by
+        // every execution context. It resolves names through the registry
+        // above rather than holding a copy, so a peer declared after startup
+        // is one a foreign scan can reach without a restart.
+        //
+        // Absent outside a Tokio runtime, which is the harness case: a node
+        // assembled without one holds no client, and a foreign scan there
+        // says so instead of returning no rows
+        let foreign_reader: Option<Arc<dyn zyron_executor::operator::foreign_scan::ForeignReader>> =
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => Some(Arc::new(
+                    zyron_wire::foreign_reader::PeerForeignReader::new(
+                        Arc::clone(&peers),
+                        node_identity.name.clone(),
+                        // The peer identifies the caller by this node's name
+                        // and serves it from the same database a client
+                        // reaches, because federating is reading as a client
+                        DEFAULT_PEER_DATABASE.to_string(),
+                        handle,
+                    ),
+                )),
+                Err(_) => None,
+            };
+        zyron_lake::set_local_node(node_identity.node_id);
+        tracing::info!(
+            node_id = node_identity.node_id,
+            name = %node_identity.name,
+            mode = node_identity.mode.as_str(),
+            peers = peers.read().peers().len(),
+            "node identity established"
+        );
+        {
+            let clog = ClogCommitStatus {
+                status_map: Arc::clone(txn_manager.status_map()),
+            };
+            let report =
+                crate::lake_recovery::recover_lake_logs(deployment_mode, &catalog, data_dir, &clog);
+            if report.recovered > 0 || report.failed > 0 {
+                tracing::info!(
+                    recovered = report.recovered,
+                    failed = report.failed,
+                    "lake transaction logs opened"
+                );
+            }
         }
 
         // 11. Start background workers
@@ -816,6 +911,25 @@ impl Server {
         // from the live indexes rather than a private copy.
         let btree_indexes: Arc<scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>> =
             Arc::new(scc::HashMap::new());
+        // One registry per server, shared by every connection's execution
+        // context, the maintenance workers and the stat views, so a counter
+        // written by a scan is the same counter the view reads
+        let table_io_stats_arc: Arc<zyron_common::TableIOStatsRegistry> =
+            Arc::new(zyron_common::TableIOStatsRegistry::new());
+        let index_io_stats_arc: Arc<zyron_common::IndexIOStatsRegistry> =
+            Arc::new(zyron_common::IndexIOStatsRegistry::new());
+        // Manual VACUUM and OPTIMIZE reach the compaction machinery through
+        // the wire's ColumnarMaintenance seam, installed on ServerState below
+        let columnar_maintenance_impl = Arc::new(ServerColumnarMaintenance {
+            catalog: Arc::clone(&catalog),
+            txn_manager: Arc::clone(&txn_manager),
+            disk_manager: Arc::clone(&disk_manager),
+            buffer_pool: Arc::clone(&buffer_pool),
+            wal: Arc::clone(&wal),
+            config: compaction_config.clone(),
+            doc_registry: Arc::clone(&doc_registry_arc),
+            btree_indexes: Arc::clone(&btree_indexes),
+        });
         let mut background = BackgroundWorkers::start(
             Arc::clone(&catalog),
             Arc::clone(&wal),
@@ -835,6 +949,8 @@ impl Server {
             Some(Arc::clone(&cdc_registry_arc)),
             Some(Arc::clone(&stream_mgr_arc)),
             Arc::clone(&btree_indexes),
+            Arc::clone(&doc_registry_arc),
+            Arc::clone(&table_io_stats_arc),
         );
 
         // Attach the QuotaGossip worker with the default no-op transport.
@@ -842,6 +958,33 @@ impl Server {
         // BackgroundWorkers::attach_quota_gossip with their peer transport
         let server_quota_registry = Arc::new(zyron_types::scheduling::QuotaRegistry::new());
         background.attach_quota_gossip_default(Arc::clone(&server_quota_registry));
+
+        // Adaptive Clustering maintenance, gated on the deployment mode so a
+        // db node starts no thread for it. It finishes or unwinds any pass a
+        // crash left behind before starting a new one
+        // The follower keeps replicas caught up with their leaders, and
+        // reads the same registry the wire layer writes, so a peer declared
+        // by DDL is one it can reach on its next tick rather than after a
+        // restart
+        background.attach_lake_follower(
+            deployment_mode,
+            Arc::clone(&catalog),
+            Arc::clone(&peers),
+            crate::background::lake_follower::LakeFollowerConfig {
+                interval_secs: crate::background::lake_follower::DEFAULT_INTERVAL_SECS,
+                batch: crate::background::lake_follower::DEFAULT_BATCH,
+                data_dir: data_dir.to_path_buf(),
+                user: node_identity.name.clone(),
+                database: "zyron".to_string(),
+            },
+        );
+
+        background.attach_lake_clustering(
+            deployment_mode,
+            Arc::clone(&catalog),
+            Some(Arc::clone(&self.health_state.metrics.labeled)),
+            crate::background::lake_clustering::LakeClusteringConfig::new(data_dir.clone()),
+        );
 
         // Extract background worker stats for ServerState
         let ckpt_stats = background.checkpoint_stats();
@@ -929,6 +1072,10 @@ impl Server {
             buffer_pool: Arc::clone(&buffer_pool),
             disk_manager: Arc::clone(&disk_manager),
             txn_manager: Arc::clone(&txn_manager),
+            doc_registry: Arc::clone(&doc_registry_arc),
+            table_io_stats: Arc::clone(&table_io_stats_arc),
+            index_io_stats: Arc::clone(&index_io_stats_arc),
+            columnar_maintenance: Some(columnar_maintenance_impl),
             security_manager: Some(Arc::clone(&security_manager_arc)),
             key_store: {
                 // Derive a stable master key from the data-dir path. Survives
@@ -1116,6 +1263,10 @@ impl Server {
             feature_lineage: zyron_analytics::featureLineageRegistry(),
             model_cache: zyron_analytics::modelCache(),
             default_isolation,
+            deployment_mode,
+            node_identity,
+            foreign_reader,
+            peers,
             statement_timeout,
             max_result_rows,
             balloon_params,
@@ -1176,6 +1327,8 @@ impl Server {
                 Arc::clone(&wal),
                 Arc::clone(&txn_manager),
                 Some(Arc::clone(&security_manager_arc)),
+                server_state.foreign_reader.clone(),
+                Arc::clone(&server_state.peers),
             ));
             self.health_state.set_endpoint_executor(endpoint_executor);
         }
@@ -1402,6 +1555,15 @@ impl Server {
         cdc_ingest_handle.thread().unpark();
         if cdc_ingest_handle.join().is_err() {
             warn!("cdc ingest worker thread panicked during shutdown");
+        }
+
+        // Persist the document registry before the index snapshots so the
+        // DocIds inside them stay resolvable after restart.
+        {
+            let path = self.config.storage.data_dir.join("doc_registry.zydoc");
+            if let Err(e) = std::fs::write(&path, doc_registry_arc.encode()) {
+                error!("doc registry persistence failed during shutdown: {e}");
+            }
         }
 
         // Persist FTS indexes to disk before stopping workers.
@@ -1963,17 +2125,95 @@ fn parse_spatial_params(params: Option<&[u8]>) -> (u8, u32) {
     }
 }
 
+/// Server-side implementation of the wire's columnar maintenance seam.
+/// Adapts the transaction status map to the lake log's commit oracle,
+/// consulted while opening a table's log so version files whose enclosing
+/// transaction never committed are discarded
+struct ClogCommitStatus {
+    status_map: Arc<zyron_storage::txn::TxnStatusMap>,
+}
+
+impl zyron_lake::CommitStatus for ClogCommitStatus {
+    fn is_committed(&self, db_txn_id: u64) -> bool {
+        self.status_map.is_committed(db_txn_id)
+    }
+}
+
+/// Each call builds a private current-thread runtime because the merge and
+/// fold paths take &Runtime; callers invoke through spawn_blocking so async
+/// executor threads never block on segment IO.
+struct ServerColumnarMaintenance {
+    catalog: Arc<zyron_catalog::Catalog>,
+    txn_manager: Arc<zyron_storage::txn::TransactionManager>,
+    disk_manager: Arc<zyron_storage::DiskManager>,
+    buffer_pool: Arc<BufferPool>,
+    wal: Arc<zyron_wal::WalWriter>,
+    config: crate::background::compaction::CompactionWorkerConfig,
+    doc_registry: Arc<zyron_common::DocRegistry>,
+    btree_indexes: Arc<scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>>,
+}
+
+impl ServerColumnarMaintenance {
+    fn private_runtime(&self) -> std::result::Result<tokio::runtime::Runtime, String> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("maintenance runtime: {}", e))
+    }
+}
+
+impl zyron_wire::connection::ColumnarMaintenance for ServerColumnarMaintenance {
+    fn vacuum_table(&self, table_id: zyron_catalog::TableId) -> std::result::Result<(), String> {
+        let rt = self.private_runtime()?;
+        crate::background::compaction::CompactionWorker::vacuum_table_columnar(
+            &rt,
+            &self.catalog,
+            &self.txn_manager,
+            &self.wal,
+            &self.config,
+            table_id,
+        )
+    }
+
+    fn fold_table(&self, table_id: zyron_catalog::TableId) -> std::result::Result<u64, String> {
+        let rt = self.private_runtime()?;
+        // A manual OPTIMIZE folds whatever tail is eligible, so the
+        // background batching threshold does not apply
+        let config = crate::background::compaction::CompactionWorkerConfig {
+            min_rows: 1,
+            ..self.config.clone()
+        };
+        crate::background::compaction::CompactionWorker::fold_table_once(
+            &rt,
+            &self.catalog,
+            &self.txn_manager,
+            &self.disk_manager,
+            &self.buffer_pool,
+            &self.wal,
+            &config,
+            table_id,
+            Some(&self.doc_registry),
+            Some(&self.btree_indexes),
+        )
+    }
+}
+
 /// Rebuilds a spatial index by scanning the base table's heap file, decoding
 /// the geometry column of every live tuple, and inserting (mbr, rowid) pairs
 /// into the live R-tree. Used when no snapshot file exists or when the saved
 /// snapshot failed to load. Visibility filtering is deferred to query time,
 /// this pass simply repopulates the tree with every reachable geometry.
-async fn rebuild_spatial_index_from_table(
+#[allow(clippy::too_many_arguments)]
+pub async fn rebuild_spatial_index_from_table(
     mgr: &zyron_types::spatial_index::SpatialIndexManager,
+    doc_registry: &Arc<zyron_common::DocRegistry>,
     index_id: u32,
     dims: u8,
     buffer_pool: &Arc<BufferPool>,
     disk: &Arc<DiskManager>,
+    catalog: &Arc<zyron_catalog::Catalog>,
+    wal: &Arc<zyron_wal::WalWriter>,
+    txn_manager: &Arc<zyron_storage::txn::TransactionManager>,
     idx: &zyron_catalog::schema::IndexEntry,
     table: &zyron_catalog::schema::TableEntry,
 ) -> zyron_common::Result<()> {
@@ -2015,14 +2255,81 @@ async fn rebuild_spatial_index_from_table(
             return;
         };
         let mbr = zyron_types::spatial_index::mbr_from_geometry(&geom, dims);
-        let rowid = match zyron_search::encode_doc_id(tid.page_id.page_num, tid.slot_id) {
-            Ok(r) => r,
-            Err(_) => return,
-        };
+        // reuse the row's live document ordinal, allocate one for a row the
+        // registry has never seen (indexed before the registry existed)
+        let rowid = doc_registry
+            .doc_for(table.id.0, tid.locator())
+            .unwrap_or_else(|| doc_registry.allocate(table.id.0, tid.locator()));
         if mgr.insert_mbr(index_id, mbr, rowid).is_ok() {
             count += 1;
         }
     });
+
+    // Folded rows live in columnar segments the heap scan cannot see. Drain
+    // a locator-emitting columnar scan (patch overlay and MVCC applied by
+    // the operator) and index each geometry under its columnar locator so
+    // the rebuild covers both tiers
+    if !table.columnar.segments.is_empty() {
+        let mut txn = txn_manager.begin(zyron_storage::txn::IsolationLevel::ReadCommitted)?;
+        let scan_res: zyron_common::Result<()> = async {
+            let ctx = Arc::new(zyron_executor::context::ExecutionContext::new(
+                Arc::clone(catalog),
+                Arc::clone(wal),
+                Arc::clone(buffer_pool),
+                Arc::clone(disk),
+                txn.txn_id as u32,
+                txn.snapshot.clone(),
+            ));
+            let logical: Vec<zyron_planner::logical::LogicalColumn> = table
+                .columns
+                .iter()
+                .map(|c| zyron_planner::logical::LogicalColumn {
+                    table_idx: Some(0),
+                    column_id: c.id,
+                    name: c.name.clone(),
+                    type_id: c.type_id,
+                    nullable: c.nullable,
+                    ts_precision: c.ts_precision,
+                })
+                .collect();
+            use zyron_executor::operator::Operator;
+            let mut op = zyron_executor::operator::column_scan::ColumnScanOperator::new_for_dml(
+                Arc::clone(&ctx),
+                table.id,
+                logical,
+                None,
+            )?;
+            while let Some(eb) = op.next().await? {
+                let Some(locs) = eb.locators.as_ref() else {
+                    continue;
+                };
+                for (row, loc) in locs.iter().enumerate() {
+                    let Some(geom_bytes) = zyron_executor::operator::modify::extract_column_bytes(
+                        &eb.batch,
+                        row,
+                        &table.columns,
+                        col_id,
+                    ) else {
+                        continue;
+                    };
+                    let Ok(geom) = zyron_types::geospatial::decode_wkb(geom_bytes) else {
+                        continue;
+                    };
+                    let mbr = zyron_types::spatial_index::mbr_from_geometry(&geom, dims);
+                    let rowid = doc_registry
+                        .doc_for(table.id.0, *loc)
+                        .unwrap_or_else(|| doc_registry.allocate(table.id.0, *loc));
+                    if mgr.insert_mbr(index_id, mbr, rowid).is_ok() {
+                        count += 1;
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+        let _ = txn_manager.abort(&mut txn);
+        scan_res?;
+    }
 
     info!(
         target: "zyron::recovery",

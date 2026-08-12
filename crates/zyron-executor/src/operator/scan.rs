@@ -21,7 +21,7 @@ use zyron_planner::logical::LogicalColumn;
 use zyron_storage::{BTreeIndex, DiskManager, HeapPage, TupleId};
 
 use crate::batch::{
-    BATCH_SIZE, ColumnBuilder, DataBatch, build_column_to_builder_map, create_builders,
+    DataBatch, build_column_to_builder_map, create_builders,
     decode_tuple_into_builders, finalize_builders,
 };
 use crate::column::ScalarValue;
@@ -123,6 +123,9 @@ pub struct SeqScanOperator {
     /// range is scanned. Used by the branch-aware index scan to read the insert
     /// delta after draining the main index.
     append_only: bool,
+    /// This table's IO counters, resolved once at construction. Updated once
+    /// per batch with the rows produced and the page bytes read to produce them.
+    io_stats: Option<Arc<zyron_common::TableIOStats>>,
 }
 
 impl SeqScanOperator {
@@ -146,6 +149,10 @@ impl SeqScanOperator {
         let column_to_builder = build_column_to_builder_map(&table_entry.columns, &output_ids);
         let (branch_append_file_id, num_append_pages) =
             branch_append_range(&ctx, branch_id, table_entry.heap_file_id);
+        let io_stats = ctx.table_io_stats_for(table_id.0);
+        if let Some(stats) = &io_stats {
+            stats.record_seq_scan();
+        }
 
         Ok(Self {
             ctx,
@@ -164,6 +171,7 @@ impl SeqScanOperator {
             num_append_pages,
             in_append_phase: false,
             append_only: false,
+            io_stats,
         })
     }
 
@@ -229,6 +237,11 @@ impl Operator for SeqScanOperator {
                 Vec::new()
             };
             let mut row_count: usize = 0;
+            // Pages fetched for this batch, accumulated locally and folded into
+            // the table counters once when the batch is done. A page revisited
+            // because a previous batch filled mid-page counts again, which is
+            // what happened: it was fetched again.
+            let mut pages_read: u64 = 0;
 
             while row_count < batch_size {
                 // The main range resolves each page through the branch override
@@ -258,6 +271,7 @@ impl Operator for SeqScanOperator {
                 let page_data: [u8; PAGE_SIZE] =
                     read_page_through_pool(&self.ctx.buffer_pool, &self.ctx.disk_manager, page_id)
                         .await?;
+                pages_read += 1;
 
                 // Empty page fast path, avoid HeapPage box allocation when
                 // the page has zero slots (freshly allocated, never written)
@@ -328,6 +342,10 @@ impl Operator for SeqScanOperator {
                     self.page_cursor += 1;
                     self.slot_cursor = 0;
                 }
+            }
+
+            if let Some(stats) = &self.io_stats {
+                stats.record_seq_batch(row_count as u64, pages_read * PAGE_SIZE as u64);
             }
 
             if row_count == 0 {
@@ -408,6 +426,11 @@ impl ParallelSeqScanOperator {
     ) -> Result<Self> {
         let table_entry = ctx.get_table_entry(table_id)?;
         let num_pages = ctx.get_heap_file(table_id).await?.num_pages_cached() as u64;
+        // One scan, however many workers divide it. Each worker's scanner folds
+        // in its own row and byte totals.
+        if let Some(stats) = ctx.table_io_stats_for(table_id.0) {
+            stats.record_seq_scan();
+        }
 
         let num_workers = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -511,6 +534,11 @@ pub(crate) struct PageRangeScanner<'a> {
     // Without this, slots after the break would be skipped because page_cursor
     // already advanced.
     slot_cursor: u16,
+    /// This table's IO counters. Each worker holds its own Arc to the same
+    /// entry and folds its batch totals in, so the table's counters are the sum
+    /// across workers. Scan initiation is recorded by the owning operator, once
+    /// for the whole parallel scan rather than once per worker.
+    io_stats: Option<Arc<zyron_common::TableIOStats>>,
 }
 
 impl<'a> PageRangeScanner<'a> {
@@ -526,6 +554,7 @@ impl<'a> PageRangeScanner<'a> {
             output_columns.iter().map(|c| c.column_id).collect();
         let column_to_builder = build_column_to_builder_map(&table_entry.columns, &output_ids);
         let count_only = output_columns.is_empty() && predicate.is_none();
+        let io_stats = ctx.table_io_stats_for(table_entry.id.0);
         Self {
             ctx,
             table_entry,
@@ -536,6 +565,7 @@ impl<'a> PageRangeScanner<'a> {
             page_cursor: start_page,
             end_page,
             slot_cursor: 0,
+            io_stats,
         }
     }
 
@@ -548,6 +578,9 @@ impl<'a> PageRangeScanner<'a> {
 
             let mut builders = create_builders(self.output_columns, batch_size);
             let mut row_count = 0usize;
+            // Pages fetched for this batch, folded into the table counters once
+            // when the batch is done rather than once per page.
+            let mut pages_read: u64 = 0;
 
             while row_count < batch_size && self.page_cursor < self.end_page {
                 let page_id = self.ctx.resolve_branch_page(
@@ -558,6 +591,7 @@ impl<'a> PageRangeScanner<'a> {
                 let page_data: [u8; PAGE_SIZE] =
                     read_page_through_pool(&self.ctx.buffer_pool, &self.ctx.disk_manager, page_id)
                         .await?;
+                pages_read += 1;
 
                 let header = HeapPage::heap_header_from_slice(&page_data);
                 if header.slot_count == 0 {
@@ -607,6 +641,10 @@ impl<'a> PageRangeScanner<'a> {
                     self.page_cursor += 1;
                     self.slot_cursor = 0;
                 }
+            }
+
+            if let Some(stats) = &self.io_stats {
+                stats.record_seq_batch(row_count as u64, pages_read * PAGE_SIZE as u64);
             }
 
             if row_count == 0 {
@@ -1034,16 +1072,6 @@ fn coerce_text_to_key_bytes(text: &str, ty: TypeId) -> Option<Vec<u8>> {
     }
 }
 
-/// Extracts literal bytes from a `BoundExpr::Literal`. Kept for callers
-/// that already have a literal in hand and do not need parameter lookup.
-fn extract_literal_bytes(expr: &BoundExpr) -> Option<Vec<u8>> {
-    if let BoundExpr::Literal { value, .. } = expr {
-        literal_to_key_bytes(value)
-    } else {
-        None
-    }
-}
-
 /// Picks the later (larger) of two optional start keys.
 fn pick_later_key(a: Option<Vec<u8>>, b: Option<Vec<u8>>) -> Option<Vec<u8>> {
     match (a, b) {
@@ -1117,15 +1145,24 @@ struct IndexScanState {
     column_to_builder: Vec<Option<u16>>,
     remaining_predicate: Option<BoundExpr>,
     track_tuple_ids: bool,
-    /// Pre-collected TupleIds from the B+ tree range scan.
-    tuple_ids: Vec<TupleId>,
-    /// Current position in the tuple_ids vector.
+    /// Pre-collected row locators from the B+ tree range scan, heap entries
+    /// re-stamped with the table's heap file id.
+    locators: Vec<zyron_common::RowLocator>,
+    /// Pre-fetched values for columnar-resident entries, batched per segment.
+    /// None when every entry is heap resident.
+    columnar: Option<crate::operator::doc_fetch::DocRowFetcher>,
+    /// Current position in the locators vector.
     cursor: usize,
     /// Active branch for this scan. Main index tids are resolved through this
     /// branch's override chain so rows the branch deleted or modified (their
     /// cow page slot is tombstoned) drop out on fetch.
     branch_id: Option<u64>,
     finished: bool,
+    /// Table and index IO counters, updated per batch with the rows fetched
+    /// and the page bytes read to fetch them. The scan count and the entries
+    /// the range scan examined are recorded when it is built, because the
+    /// range scan runs to completion there.
+    io_stats: crate::operator::IndexScanStats,
 }
 
 impl IndexScanOperator {
@@ -1168,11 +1205,11 @@ impl IndexScanOperator {
             let table_entry = ctx.get_table_entry(table_id)?;
             let heap_file_id = table_entry.heap_file_id;
 
-            // Index keys are composite: indexed value followed by a tuple-id
+            // Index keys are composite: indexed value followed by a locator
             // suffix so duplicate values coexist. Pad the value bounds to span
             // the whole suffix range: the lower bound gets all-zero suffix bytes,
             // the upper bound all-ones, so a value's every entry is included.
-            let suffix_len = crate::operator::modify::INDEX_TID_SUFFIX_LEN;
+            let suffix_len = crate::operator::modify::INDEX_LOCATOR_SUFFIX_LEN;
             let start_key = bounds.start_key.as_ref().map(|k| {
                 let mut v = k.clone();
                 v.extend(std::iter::repeat(0u8).take(suffix_len));
@@ -1184,17 +1221,41 @@ impl IndexScanOperator {
                 v
             });
 
-            let mut tuple_ids = Vec::new();
+            let mut locators: Vec<zyron_common::RowLocator> = Vec::new();
+            let mut has_columnar = false;
             btree_index.range_scan_for_each(
                 start_key.as_deref(),
                 end_key.as_deref(),
-                |_key, tid| {
-                    let corrected_tid =
-                        TupleId::new(PageId::new(heap_file_id, tid.page_id.page_num), tid.slot_id);
-                    tuple_ids.push(corrected_tid);
+                |_key, loc| {
+                    match loc {
+                        // heap entries store no file id, re-stamp the table's
+                        zyron_common::RowLocator::Heap { page, slot } => {
+                            locators.push(zyron_common::RowLocator::Heap {
+                                page: PageId::new(heap_file_id, page.page_num),
+                                slot,
+                            });
+                        }
+                        other => {
+                            has_columnar = true;
+                            locators.push(other);
+                        }
+                    }
                     true
                 },
             );
+
+            // Columnar-resident entries are pre-fetched in one batched pass
+            // through the columnar scan machinery, visibility included
+            let columnar = if has_columnar {
+                Some(
+                    crate::operator::doc_fetch::DocRowFetcher::prepare_columnar_only(
+                        &ctx, table_id, &columns, &locators, None,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
 
             let output_ids: Vec<zyron_catalog::ColumnId> =
                 columns.iter().map(|c| c.column_id).collect();
@@ -1230,6 +1291,15 @@ impl IndexScanOperator {
                 None
             };
 
+            // The range scan already ran to completion above, so the number
+            // of entries it examined is known here and recorded once
+            let io_stats = crate::operator::IndexScanStats::open(
+                &ctx,
+                table_id.0,
+                index_entry.id.0,
+                locators.len(),
+            );
+
             return Ok(Self {
                 index_state: Some(IndexScanState {
                     ctx,
@@ -1238,10 +1308,12 @@ impl IndexScanOperator {
                     column_to_builder,
                     remaining_predicate: effective_remaining,
                     track_tuple_ids,
-                    tuple_ids,
+                    locators,
+                    columnar,
                     cursor: 0,
                     branch_id,
                     finished: false,
+                    io_stats,
                 }),
                 fallback: None,
                 append_delta,
@@ -1314,77 +1386,126 @@ impl IndexScanState {
 
         let batch_size = self.ctx.batch_size;
         let mut builders = create_builders(&self.output_columns, batch_size);
-        let mut result_tuple_ids: Vec<TupleId> = if self.track_tuple_ids {
+        let mut result_locators: Vec<zyron_common::RowLocator> = if self.track_tuple_ids {
             Vec::with_capacity(batch_size)
         } else {
             Vec::new()
         };
         let mut row_count: usize = 0;
 
-        // Fetch tuples from the heap using pre-collected TupleIds.
-        // Read directly from the buffer pool frame's data via the read
-        // lock, avoids the 16KB stack copy + Box allocation that
+        // Fetch rows using the pre-collected locators. Heap entries read
+        // directly from the buffer pool frame's data via the read lock,
+        // avoiding the 16KB stack copy + Box allocation that
         // read_page_through_pool would do per call. Concurrent atomic
-        // inserts coordinate via the slot's AtomicU32 commit so our
-        // read sees either uncommitted (length=0, skip) or committed
-        // bytes consistently
-        while row_count < batch_size && self.cursor < self.tuple_ids.len() {
-            let tid = self.tuple_ids[self.cursor];
-            self.cursor += 1;
-            // Resolve to the branch-local page when the branch copied it; the
-            // slot id is preserved by the page copy.
-            let phys_page = self.ctx.resolve_branch_page(self.branch_id, tid.page_id);
-
-            let frame_present = self.ctx.buffer_pool.fetch_page(phys_page).is_some();
-            if !frame_present {
-                let disk_data = self.ctx.disk_manager.read_page(phys_page).await?;
-                let (_, evicted) = self.ctx.buffer_pool.load_page(phys_page, &disk_data)?;
-                if let Some(ev) = evicted {
-                    self.ctx
-                        .disk_manager
-                        .write_page(ev.page_id, &ev.data)
-                        .await?;
+        // inserts coordinate via the slot's AtomicU32 commit so our read
+        // sees either uncommitted (length=0, skip) or committed bytes
+        // consistently. Columnar entries were pre-fetched in one batched
+        // pass with visibility applied
+        // DML consumers route a batch to the heap or the columnar mutation
+        // path as a whole, so tracked batches stay homogeneous per storage
+        // kind, a kind change closes the batch and the next call continues
+        let mut batch_kind: Option<u8> = None;
+        // Heap pages fetched to resolve this batch's locators, folded into the
+        // table counters once when the batch is done.
+        let mut pages_read: u64 = 0;
+        while row_count < batch_size && self.cursor < self.locators.len() {
+            let loc = self.locators[self.cursor];
+            if self.track_tuple_ids {
+                let kind = match loc {
+                    zyron_common::RowLocator::Heap { .. } => 0u8,
+                    zyron_common::RowLocator::Columnar { .. } => 1,
+                    zyron_common::RowLocator::Lake { .. } => 2,
+                };
+                match batch_kind {
+                    None => batch_kind = Some(kind),
+                    Some(k) if k != kind => break,
+                    _ => {}
                 }
-                // load_page pinned, frame_present path's fetch_page also
-                // pinned, in both cases we have one extra pin to balance
             }
+            self.cursor += 1;
 
-            let frame = self
-                .ctx
-                .buffer_pool
-                .fetch_page(phys_page)
-                .expect("just pinned this page");
-            self.ctx.buffer_pool.unpin_page(phys_page, false);
+            let visible = match loc {
+                zyron_common::RowLocator::Heap { page, slot } => {
+                    // Resolve to the branch-local page when the branch copied
+                    // it; the slot id is preserved by the page copy.
+                    let phys_page = self.ctx.resolve_branch_page(self.branch_id, page);
+                    pages_read += 1;
 
-            let visible = {
-                let guard = frame.read_data();
-                let slot_id = zyron_storage::SlotId(tid.slot_id);
-                match HeapPage::get_tuple_view_from_slice(&**guard, slot_id) {
-                    None => false,
-                    Some(view) => {
-                        if view.is_deleted() || !view.header.is_visible_to(&self.ctx.snapshot) {
-                            false
-                        } else {
-                            decode_tuple_into_builders(
-                                view.data,
-                                &self.table_entry.columns,
-                                &self.column_to_builder,
-                                &mut builders,
-                            );
+                    let frame_present = self.ctx.buffer_pool.fetch_page(phys_page).is_some();
+                    if !frame_present {
+                        let disk_data = self.ctx.disk_manager.read_page(phys_page).await?;
+                        let (_, evicted) = self.ctx.buffer_pool.load_page(phys_page, &disk_data)?;
+                        if let Some(ev) = evicted {
+                            self.ctx
+                                .disk_manager
+                                .write_page(ev.page_id, &ev.data)
+                                .await?;
+                        }
+                        // load_page pinned, frame_present path's fetch_page also
+                        // pinned, in both cases we have one extra pin to balance
+                    }
+
+                    let frame = self
+                        .ctx
+                        .buffer_pool
+                        .fetch_page(phys_page)
+                        .expect("just pinned this page");
+                    self.ctx.buffer_pool.unpin_page(phys_page, false);
+
+                    let visible = {
+                        let guard = frame.read_data();
+                        let slot_id = zyron_storage::SlotId(slot);
+                        match HeapPage::get_tuple_view_from_slice(&**guard, slot_id) {
+                            None => false,
+                            Some(view) => {
+                                if view.is_deleted()
+                                    || !view.header.is_visible_to(&self.ctx.snapshot)
+                                {
+                                    false
+                                } else {
+                                    decode_tuple_into_builders(
+                                        view.data,
+                                        &self.table_entry.columns,
+                                        &self.column_to_builder,
+                                        &mut builders,
+                                    );
+                                    true
+                                }
+                            }
+                        }
+                    };
+                    self.ctx.buffer_pool.unpin_page(phys_page, false);
+                    visible
+                }
+                zyron_common::RowLocator::Columnar { file_id, sys_rowid } => {
+                    match self
+                        .columnar
+                        .as_ref()
+                        .and_then(|f| f.columnar_row(file_id, sys_rowid))
+                    {
+                        Some(vals) => {
+                            for (b, v) in builders.iter_mut().zip(vals.iter()) {
+                                b.push(v);
+                            }
                             true
                         }
+                        // superseded, invisible to this snapshot, or reclaimed
+                        None => false,
                     }
                 }
+                zyron_common::RowLocator::Lake { .. } => false,
             };
-            self.ctx.buffer_pool.unpin_page(phys_page, false);
 
             if visible {
                 if self.track_tuple_ids {
-                    result_tuple_ids.push(tid);
+                    result_locators.push(loc);
                 }
                 row_count += 1;
             }
         }
+
+        self.io_stats
+            .record_batch(row_count as u64, pages_read * PAGE_SIZE as u64);
 
         if row_count == 0 {
             return Ok(None);
@@ -1399,28 +1520,23 @@ impl IndexScanState {
             let filtered = batch.filter(&mask);
 
             if self.track_tuple_ids {
-                let filtered_ids: Vec<TupleId> = mask
+                let filtered_ids: Vec<zyron_common::RowLocator> = mask
                     .iter()
                     .enumerate()
-                    .filter_map(|(i, &keep)| {
-                        if keep {
-                            Some(result_tuple_ids[i])
-                        } else {
-                            None
-                        }
-                    })
+                    .filter_map(
+                        |(i, &keep)| {
+                            if keep { Some(result_locators[i]) } else { None }
+                        },
+                    )
                     .collect();
-                return Ok(Some(ExecutionBatch::with_tuple_ids(filtered, filtered_ids)));
+                return Ok(Some(ExecutionBatch::with_locators(filtered, filtered_ids)));
             }
 
             return Ok(Some(ExecutionBatch::new(filtered)));
         }
 
         if self.track_tuple_ids {
-            Ok(Some(ExecutionBatch::with_tuple_ids(
-                batch,
-                result_tuple_ids,
-            )))
+            Ok(Some(ExecutionBatch::with_locators(batch, result_locators)))
         } else {
             Ok(Some(ExecutionBatch::new(batch)))
         }

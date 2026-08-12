@@ -557,6 +557,22 @@ impl ColumnData {
     }
 
     /// Appends a scalar value. Pushes a zero/empty default if the type does not match.
+    /// Appends a value this buffer owns outright.
+    ///
+    /// Only the variable-length variants are handled here, because they are
+    /// the only ones where owning saves anything: a text or binary cell moves
+    /// its allocation into the column instead of being copied into a fresh
+    /// one. Everything else is a fixed-width copy either way and falls
+    /// through, so this stays a short list beside `push_scalar` rather than a
+    /// second full codec that could drift from it.
+    pub fn push_scalar_owned(&mut self, scalar: ScalarValue) {
+        match (self, scalar) {
+            (ColumnData::Utf8(v), ScalarValue::Utf8(s)) => v.push(s),
+            (ColumnData::Binary(v), ScalarValue::Binary(s)) => v.push(s),
+            (this, other) => this.push_scalar(&other),
+        }
+    }
+
     pub fn push_scalar(&mut self, scalar: &ScalarValue) {
         match (self, scalar) {
             (ColumnData::Boolean(v), ScalarValue::Boolean(s)) => v.push(*s),

@@ -9,7 +9,6 @@ use crate::binder::BoundExpr;
 use crate::logical::LogicalPlan;
 use crate::optimizer::OptimizationRule;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::Mutex;
 use zyron_catalog::{Catalog, ColumnId, TableId};
 
@@ -73,6 +72,7 @@ impl IndexAdvisor {
             | LogicalPlan::Sort { child, .. }
             | LogicalPlan::Limit { child, .. }
             | LogicalPlan::Distinct { child, .. }
+            | LogicalPlan::LockRows { child, .. }
             | LogicalPlan::Aggregate { child, .. }
             | LogicalPlan::Insert { source: child, .. }
             | LogicalPlan::Update { child, .. }
@@ -217,6 +217,7 @@ impl OptimizationRule for IndexAdvisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_index_advisor_new() {

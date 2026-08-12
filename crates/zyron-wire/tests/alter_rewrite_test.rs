@@ -32,23 +32,15 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
     std::fs::create_dir_all(&wal_dir).unwrap();
 
     let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir,
-            segment_size: 16 * 1024 * 1024,
-            fsync_enabled: false,
-            ring_buffer_capacity: 4 * 1024 * 1024,
-        })
+        WalWriter::new(zyron_bench_harness::wal_config(wal_dir))
         .expect("wal"),
     );
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir,
-            fsync_enabled: false,
-        })
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir))
         .await
         .expect("disk"),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 1024 }));
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let storage =
         Arc::new(HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).expect("storage"));
     let cache = Arc::new(CatalogCache::new(256, 64));
@@ -69,6 +61,10 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         buffer_pool: pool,
         disk_manager: disk,
         txn_manager,
+        doc_registry: std::sync::Arc::new(zyron_common::DocRegistry::new()),
+        table_io_stats: std::sync::Arc::new(zyron_common::TableIOStatsRegistry::new()),
+        index_io_stats: std::sync::Arc::new(zyron_common::IndexIOStatsRegistry::new()),
+        columnar_maintenance: None,
         security_manager: None,
         key_store: Arc::new(zyron_auth::LocalKeyStore::new([0u8; 32])),
         config_lookup: None,
@@ -121,6 +117,10 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
         feature_lineage: zyron_analytics::featureLineageRegistry(),
         model_cache: zyron_analytics::modelCache(),
         default_isolation: zyron_storage::IsolationLevel::ReadCommitted,
+        deployment_mode: zyron_common::DeploymentMode::Unified,
+        node_identity: Default::default(),
+        foreign_reader: None,
+        peers: Default::default(),
         statement_timeout: None,
         max_result_rows: None,
         balloon_params: None,
@@ -165,9 +165,15 @@ async fn exec(
         return Vec::new();
     }
 
-    let plan = zyron_planner::plan(&server.catalog, DatabaseId(1), vec!["public".into()], stmt)
-        .await
-        .expect("plan");
+    let plan = zyron_planner::plan(
+        &server.catalog,
+        DatabaseId(1),
+        vec!["public".into()],
+        stmt,
+        None,
+    )
+    .await
+    .expect("plan");
     let mut txn = server
         .txn_manager
         .begin(IsolationLevel::ReadCommitted)
@@ -222,9 +228,15 @@ async fn try_exec(
         return res.map(|_| Vec::new()).map_err(|e| format!("{e:?}"));
     }
 
-    let plan = zyron_planner::plan(&server.catalog, DatabaseId(1), vec!["public".into()], stmt)
-        .await
-        .map_err(|e| e.to_string())?;
+    let plan = zyron_planner::plan(
+        &server.catalog,
+        DatabaseId(1),
+        vec!["public".into()],
+        stmt,
+        None,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let mut txn = server
         .txn_manager
         .begin(IsolationLevel::ReadCommitted)
@@ -364,8 +376,14 @@ async fn drop_column_removes_it_and_keeps_others() {
         .into_iter()
         .next()
         .unwrap();
-    let planned =
-        zyron_planner::plan(&server.catalog, DatabaseId(1), vec!["public".into()], stmt).await;
+    let planned = zyron_planner::plan(
+        &server.catalog,
+        DatabaseId(1),
+        vec!["public".into()],
+        stmt,
+        None,
+    )
+    .await;
     assert!(planned.is_err(), "dropped column should no longer resolve");
 }
 
@@ -834,9 +852,15 @@ async fn exec_in_txn(
         .into_iter()
         .next()
         .expect("one statement");
-    let plan = zyron_planner::plan(&server.catalog, DatabaseId(1), vec!["public".into()], stmt)
-        .await
-        .map_err(|e| e.to_string())?;
+    let plan = zyron_planner::plan(
+        &server.catalog,
+        DatabaseId(1),
+        vec!["public".into()],
+        stmt,
+        None,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let mut ctx = ExecutionContext::new(
         server.catalog.clone(),
         server.wal.clone(),
@@ -1183,6 +1207,219 @@ async fn fk_delete_set_null_clears_child_key() {
             ScalarValue::Int32(11) => assert_eq!(*pid, ScalarValue::Int32(2)),
             other => panic!("unexpected child cid {other:?}"),
         }
+    }
+}
+
+/// A parent update that moves several keys at once sends each child after the
+/// key it referenced. Rewriting them all to one key, or refusing the statement
+/// because more than one key moved, both lose the reference the child had.
+#[tokio::test]
+async fn fk_update_cascade_follows_every_key_a_multi_row_update_moves() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    setup_parent_child(&server, &mut session, " ON UPDATE CASCADE").await;
+    exec(&server, &mut session, "INSERT INTO parent VALUES (3, 'c')").await;
+    exec(
+        &server,
+        &mut session,
+        "INSERT INTO child VALUES (10, 1), (11, 1), (12, 2), (13, 3)",
+    )
+    .await;
+
+    // One statement moves two distinct keys: 1 to 101 and 2 to 102
+    exec(
+        &server,
+        &mut session,
+        "UPDATE parent SET id = id + 100 WHERE id < 3",
+    )
+    .await;
+
+    let rows = exec(&server, &mut session, "SELECT cid, pid FROM child").await;
+    assert_eq!(total_rows(&rows), 4, "no child was dropped");
+    let mut pairs: Vec<(i32, i32)> = column_values(&rows, 0)
+        .iter()
+        .zip(column_values(&rows, 1).iter())
+        .map(|(cid, pid)| match (cid, pid) {
+            (ScalarValue::Int32(c), ScalarValue::Int32(p)) => (*c, *p),
+            other => panic!("unexpected child row {other:?}"),
+        })
+        .collect();
+    pairs.sort_unstable();
+    assert_eq!(
+        pairs,
+        vec![(10, 101), (11, 101), (12, 102), (13, 3)],
+        "each child followed its own parent key, and the untouched one stayed"
+    );
+
+    // The children still resolve, so the rewrite landed on real parent keys
+    let joined = exec(
+        &server,
+        &mut session,
+        "SELECT c.cid FROM child c INNER JOIN parent p ON c.pid = p.id",
+    )
+    .await;
+    assert_eq!(total_rows(&joined), 4);
+}
+
+/// SET DEFAULT writes the child column's declared default, and a default that
+/// names no parent key is refused rather than written, because a SET DEFAULT
+/// leaving a dangling reference is the violation it was meant to repair.
+#[tokio::test]
+async fn fk_set_default_writes_the_declared_default_and_refuses_a_dangling_one() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec(
+        &server,
+        &mut session,
+        "CREATE TABLE parent (id INT PRIMARY KEY, label TEXT)",
+    )
+    .await;
+    exec(
+        &server,
+        &mut session,
+        "CREATE TABLE child (cid INT, pid INT DEFAULT 2 REFERENCES parent(id) \
+         ON DELETE SET DEFAULT ON UPDATE SET DEFAULT)",
+    )
+    .await;
+    exec(
+        &server,
+        &mut session,
+        "INSERT INTO parent VALUES (1, 'a'), (2, 'b')",
+    )
+    .await;
+    exec(
+        &server,
+        &mut session,
+        "INSERT INTO child VALUES (10, 1), (11, 2)",
+    )
+    .await;
+
+    // Deleting parent 1 sends its child to the default, 2
+    exec(&server, &mut session, "DELETE FROM parent WHERE id = 1").await;
+    let rows = exec(&server, &mut session, "SELECT cid, pid FROM child").await;
+    assert_eq!(total_rows(&rows), 2, "children are kept, not deleted");
+    for pid in column_values(&rows, 1) {
+        assert_eq!(pid, ScalarValue::Int32(2), "both children took the default");
+    }
+
+    // Moving the only remaining parent key leaves the default naming nothing,
+    // so the statement is refused rather than writing a dangling reference
+    let err = exec_err(&server, &mut session, "UPDATE parent SET id = 9 WHERE id = 2").await;
+    assert!(err.contains("foreign key"), "{err}");
+    let rows = exec(&server, &mut session, "SELECT id FROM parent").await;
+    assert_eq!(column_values(&rows, 0), vec![ScalarValue::Int32(2)]);
+}
+
+/// A column with no DEFAULT means SET DEFAULT writes null, which the child's
+/// own NOT NULL then rejects rather than storing.
+#[tokio::test]
+async fn fk_set_default_with_no_declared_default_is_null_and_respects_not_null() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec(
+        &server,
+        &mut session,
+        "CREATE TABLE parent (id INT PRIMARY KEY)",
+    )
+    .await;
+    exec(
+        &server,
+        &mut session,
+        "CREATE TABLE child (cid INT, pid INT REFERENCES parent(id) ON DELETE SET DEFAULT)",
+    )
+    .await;
+    exec(&server, &mut session, "INSERT INTO parent VALUES (1)").await;
+    exec(&server, &mut session, "INSERT INTO child VALUES (10, 1)").await;
+
+    exec(&server, &mut session, "DELETE FROM parent WHERE id = 1").await;
+    let rows = exec(&server, &mut session, "SELECT cid, pid FROM child").await;
+    assert_eq!(total_rows(&rows), 1);
+    assert!(
+        column_values(&rows, 1)[0].is_null(),
+        "no declared default means the column takes null"
+    );
+
+    // The same shape under NOT NULL blocks the delete instead
+    exec(
+        &server,
+        &mut session,
+        "CREATE TABLE p2 (id INT PRIMARY KEY)",
+    )
+    .await;
+    exec(
+        &server,
+        &mut session,
+        "CREATE TABLE c2 (cid INT, pid INT NOT NULL REFERENCES p2(id) ON DELETE SET DEFAULT)",
+    )
+    .await;
+    exec(&server, &mut session, "INSERT INTO p2 VALUES (1)").await;
+    exec(&server, &mut session, "INSERT INTO c2 VALUES (10, 1)").await;
+    let err = exec_err(&server, &mut session, "DELETE FROM p2 WHERE id = 1").await;
+    assert!(!err.is_empty(), "a null into a NOT NULL column must abort");
+    let rows = exec(&server, &mut session, "SELECT cid FROM c2").await;
+    assert_eq!(total_rows(&rows), 1, "the child survived the refused delete");
+}
+
+/// NOT NULL is stored on the column, reported by the catalog views and sent
+/// on the wire, so a write that puts a null there has to be refused. Every
+/// path that builds a full-width row image is covered: an explicit null, an
+/// omitted column falling back to null, and an update clearing the column.
+#[tokio::test]
+async fn not_null_is_enforced_on_every_write_path() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec(
+        &server,
+        &mut session,
+        "CREATE TABLE nn (id INT, label TEXT NOT NULL, note TEXT)",
+    )
+    .await;
+    exec(&server, &mut session, "INSERT INTO nn VALUES (1, 'a', NULL)").await;
+
+    let err = exec_err(&server, &mut session, "INSERT INTO nn VALUES (2, NULL, 'x')").await;
+    assert!(err.contains("label") && err.contains("NOT NULL"), "{err}");
+
+    // An omitted column with no default falls back to null, which is the same
+    // violation reached by a different route
+    let err = exec_err(&server, &mut session, "INSERT INTO nn (id, note) VALUES (3, 'x')").await;
+    assert!(err.contains("label") && err.contains("NOT NULL"), "{err}");
+
+    let err = exec_err(&server, &mut session, "UPDATE nn SET label = NULL").await;
+    assert!(err.contains("label") && err.contains("NOT NULL"), "{err}");
+
+    // The nullable column takes a null on both paths
+    exec(&server, &mut session, "UPDATE nn SET note = NULL").await;
+    let rows = exec(&server, &mut session, "SELECT id, label FROM nn").await;
+    assert_eq!(total_rows(&rows), 1, "no refused write left a row behind");
+    assert_eq!(column_values(&rows, 0), vec![ScalarValue::Int32(1)]);
+
+    // ALTER TABLE SET NOT NULL takes effect on later writes
+    exec(
+        &server,
+        &mut session,
+        "UPDATE nn SET note = 'filled'",
+    )
+    .await;
+    exec(
+        &server,
+        &mut session,
+        "ALTER TABLE nn ALTER COLUMN note SET NOT NULL",
+    )
+    .await;
+    let err = exec_err(&server, &mut session, "UPDATE nn SET note = NULL").await;
+    assert!(err.contains("note") && err.contains("NOT NULL"), "{err}");
+}
+
+/// The message a statement fails with, for the cases where the refusal is the
+/// behavior under test.
+async fn exec_err(
+    server: &Arc<ServerState>,
+    session: &mut Option<Session>,
+    sql: &str,
+) -> String {
+    match try_exec(server, session, sql).await {
+        Ok(_) => panic!("expected {sql} to fail"),
+        Err(e) => e,
     }
 }
 

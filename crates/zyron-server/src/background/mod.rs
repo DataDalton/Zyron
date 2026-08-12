@@ -15,6 +15,8 @@ pub mod dlq_ttl;
 pub mod feature_materialization;
 pub mod feature_materialization_impl;
 pub mod host_health;
+pub mod lake_clustering;
+pub mod lake_follower;
 pub mod mv_refresh;
 pub mod publication_retention;
 pub mod quota_gossip;
@@ -73,6 +75,8 @@ pub struct BackgroundWorkers {
     feature_materialization: FeatureMaterializationWorker,
     stream_monitor: StreamMonitor,
     quota_gossip: Option<QuotaGossipWorker>,
+    lake_clustering: Option<self::lake_clustering::LakeClusteringWorker>,
+    lake_follower: Option<self::lake_follower::LakeFollowerWorker>,
 }
 
 impl BackgroundWorkers {
@@ -96,6 +100,8 @@ impl BackgroundWorkers {
         cdc_registry: Option<Arc<zyron_cdc::CdfRegistry>>,
         stream_job_manager: Option<Arc<parking_lot::Mutex<zyron_streaming::job::StreamJobManager>>>,
         btree_indexes: Arc<scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>>,
+        doc_registry: Arc<zyron_common::DocRegistry>,
+        table_io_stats: Arc<zyron_common::TableIOStatsRegistry>,
     ) -> Self {
         info!("Starting background workers");
 
@@ -161,6 +167,8 @@ impl BackgroundWorkers {
             wal.clone(),
             metrics,
             compaction_config,
+            doc_registry,
+            Arc::clone(&btree_indexes),
         );
         let vacuum = VacuumWorker::start(
             catalog,
@@ -169,6 +177,7 @@ impl BackgroundWorkers {
             buffer_pool,
             wal,
             btree_indexes,
+            table_io_stats,
             vacuum_config,
         );
 
@@ -207,7 +216,50 @@ impl BackgroundWorkers {
             feature_materialization,
             stream_monitor,
             quota_gossip: None,
+            lake_clustering: None,
+            lake_follower: None,
         }
+    }
+
+    /// Attaches the lake follower. Returns without starting a thread off
+    /// the lake tier, where there are no lake tables to follow
+    pub fn attach_lake_follower(
+        &mut self,
+        mode: zyron_common::DeploymentMode,
+        catalog: Arc<Catalog>,
+        peers: Arc<parking_lot::RwLock<Arc<zyron_common::PeerRegistry>>>,
+        config: self::lake_follower::LakeFollowerConfig,
+    ) {
+        if self.lake_follower.is_none() {
+            self.lake_follower =
+                self::lake_follower::LakeFollowerWorker::start(mode, catalog, peers, config);
+        }
+    }
+
+    /// Returns the follower's counters, None off the lake tier
+    pub fn lake_follower_stats(&self) -> Option<Arc<self::lake_follower::LakeFollowerStats>> {
+        self.lake_follower.as_ref().map(|w| Arc::clone(w.stats()))
+    }
+
+    /// Attaches the Adaptive Clustering worker. Returns without starting a
+    /// thread on a node that does not run the lake tier, so a db node pays
+    /// nothing for a tier it does not host
+    pub fn attach_lake_clustering(
+        &mut self,
+        mode: zyron_common::DeploymentMode,
+        catalog: Arc<Catalog>,
+        metrics: Option<Arc<zyron_common::LabeledMetrics>>,
+        config: self::lake_clustering::LakeClusteringConfig,
+    ) {
+        if self.lake_clustering.is_none() {
+            self.lake_clustering =
+                self::lake_clustering::LakeClusteringWorker::start(mode, catalog, metrics, config);
+        }
+    }
+
+    /// Returns the clustering worker's counters, None off the lake tier
+    pub fn lake_clustering_stats(&self) -> Option<Arc<self::lake_clustering::LakeClusteringStats>> {
+        self.lake_clustering.as_ref().map(|w| Arc::clone(w.stats()))
     }
 
     /// Returns the feature materialization worker stats Arc
@@ -287,6 +339,12 @@ impl BackgroundWorkers {
         }
 
         // Stop workers in reverse dependency order
+        if let Some(ref mut follower) = self.lake_follower {
+            follower.shutdown();
+        }
+        if let Some(ref mut clustering) = self.lake_clustering {
+            clustering.shutdown();
+        }
         if let Some(ref mut gossip) = self.quota_gossip {
             gossip.shutdown();
         }

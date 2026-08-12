@@ -288,6 +288,23 @@ pub enum Keyword {
     Columnar,
     Heap,
 
+    // Lakehouse format and clustering
+    Zyronlake,
+    Cluster,
+    Clustering,
+    Auto,
+    Force,
+    Incremental,
+    Peer,
+    Server,
+    Address,
+    Follow,
+    Unfollow,
+    Continuous,
+    Ondemand,
+    Zorder,
+    Enforced,
+
     // TTL / data retention
     Ttl,
     Days,
@@ -298,7 +315,7 @@ pub enum Keyword {
     Retain,
     Expire,
 
-    // Phase 17 data lifecycle
+    // Data lifecycle
     Legal,
     Forget,
     Tier,
@@ -1007,6 +1024,23 @@ pub fn lookup_keyword(word: &str) -> Option<Keyword> {
         "COLUMNAR" => Some(Keyword::Columnar),
         "HEAP" => Some(Keyword::Heap),
 
+        // Lakehouse format and clustering
+        "ZYRONLAKE" => Some(Keyword::Zyronlake),
+        "CLUSTER" => Some(Keyword::Cluster),
+        "CLUSTERING" => Some(Keyword::Clustering),
+        "PEER" => Some(Keyword::Peer),
+        "SERVER" => Some(Keyword::Server),
+        "FOLLOW" => Some(Keyword::Follow),
+        "UNFOLLOW" => Some(Keyword::Unfollow),
+        "ADDRESS" => Some(Keyword::Address),
+        "AUTO" => Some(Keyword::Auto),
+        "FORCE" => Some(Keyword::Force),
+        "INCREMENTAL" => Some(Keyword::Incremental),
+        "CONTINUOUS" => Some(Keyword::Continuous),
+        "ONDEMAND" => Some(Keyword::Ondemand),
+        "ZORDER" => Some(Keyword::Zorder),
+        "ENFORCED" => Some(Keyword::Enforced),
+
         // TTL / data retention
         "TTL" => Some(Keyword::Ttl),
         "DAYS" => Some(Keyword::Days),
@@ -1017,7 +1051,7 @@ pub fn lookup_keyword(word: &str) -> Option<Keyword> {
         "RETAIN" => Some(Keyword::Retain),
         "EXPIRE" => Some(Keyword::Expire),
 
-        // Phase 17 data lifecycle
+        // Data lifecycle
         "LEGAL" => Some(Keyword::Legal),
         "FORGET" => Some(Keyword::Forget),
         "TIER" => Some(Keyword::Tier),

@@ -1949,6 +1949,9 @@ impl Catalog {
                             check_expr: None,
                             on_delete: ReferentialAction::NoAction,
                             on_update: ReferentialAction::NoAction,
+                            enforced: true,
+                            on_violation: ConstraintViolationAction::Fail,
+                            quarantine_table_id: None,
                         });
                     }
                     ColumnConstraint::Unique => {
@@ -1961,6 +1964,9 @@ impl Catalog {
                             check_expr: None,
                             on_delete: ReferentialAction::NoAction,
                             on_update: ReferentialAction::NoAction,
+                            enforced: true,
+                            on_violation: ConstraintViolationAction::Fail,
+                            quarantine_table_id: None,
                         });
                     }
                     ColumnConstraint::NotNull => {
@@ -1973,6 +1979,9 @@ impl Catalog {
                             check_expr: None,
                             on_delete: ReferentialAction::NoAction,
                             on_update: ReferentialAction::NoAction,
+                            enforced: true,
+                            on_violation: ConstraintViolationAction::Fail,
+                            quarantine_table_id: None,
                         });
                     }
                     ColumnConstraint::Check(expr) => {
@@ -1985,6 +1994,9 @@ impl Catalog {
                             check_expr: Some(zyron_parser::expr_to_sql(expr)),
                             on_delete: ReferentialAction::NoAction,
                             on_update: ReferentialAction::NoAction,
+                            enforced: true,
+                            on_violation: ConstraintViolationAction::Fail,
+                            quarantine_table_id: None,
                         });
                     }
                     ColumnConstraint::References {
@@ -2015,6 +2027,9 @@ impl Catalog {
                             check_expr: None,
                             on_delete: map_ref_action(*on_delete),
                             on_update: map_ref_action(*on_update),
+                            enforced: true,
+                            on_violation: ConstraintViolationAction::Fail,
+                            quarantine_table_id: None,
                         });
                     }
                     ColumnConstraint::Default(_) => {
@@ -2044,8 +2059,96 @@ impl Catalog {
             dropped_at: None,
             expectations: Vec::new(),
             time_travel_retention_secs: 0,
+            lake: Default::default(),
+            cluster: Default::default(),
+            foreign: Default::default(),
         };
 
+        self.log_ddl(DDL_CREATE_TABLE, &entry.to_bytes())?;
+        self.storage.store_table(&entry).await?;
+        self.cache.put_table(entry);
+        Ok(table_id)
+    }
+
+    /// Registers a table whose rows live on a peer.
+    ///
+    /// No heap file and no free-space map are allocated, because there is
+    /// nothing local to store: file id zero is the reserved "no file" value,
+    /// so any path that tried to open storage for this table fails visibly
+    /// rather than creating an empty heap nobody writes to.
+    ///
+    /// Constraints are not accepted. A declared constraint that nothing
+    /// enforces is a lie, and enforcement belongs to the node that owns the
+    /// rows.
+    pub async fn create_foreign_table(
+        &self,
+        schema_id: SchemaId,
+        name: &str,
+        column_defs: &[ColumnDef],
+        peer: &str,
+        remote_table: &str,
+    ) -> Result<TableId> {
+        if schema_id == SYSTEM_SCHEMA_ID {
+            return Err(ZyronError::PermissionDenied(format!(
+                "schema `{}` is reserved for Zyron internals and cannot hold user tables",
+                SYSTEM_SCHEMA_NAME
+            )));
+        }
+        if self.cache.get_table_by_name(schema_id, name).is_some() {
+            return Err(ZyronError::TableAlreadyExists(name.to_string()));
+        }
+        if column_defs.is_empty() {
+            return Err(ZyronError::Internal(format!(
+                "foreign table `{}` declares no column",
+                name
+            )));
+        }
+        if column_defs.len() > u16::MAX as usize {
+            return Err(ZyronError::Internal(format!(
+                "table has {} columns, max is {}",
+                column_defs.len(),
+                u16::MAX
+            )));
+        }
+        let mut seen_names = HashSet::with_capacity(column_defs.len());
+        for def in column_defs {
+            if !seen_names.insert(&def.name) {
+                return Err(ZyronError::Internal(format!(
+                    "duplicate column name: {}",
+                    def.name
+                )));
+            }
+        }
+
+        let table_id = TableId(self.oid_allocator.next());
+        let columns = convert_column_defs(table_id, column_defs)?;
+        let entry = TableEntry {
+            id: table_id,
+            schema_id,
+            name: name.to_string(),
+            heap_file_id: 0,
+            fsm_file_id: 0,
+            columns,
+            constraints: Vec::new(),
+            created_at: current_timestamp(),
+            versioning_enabled: false,
+            scd_type: None,
+            system_versioned: false,
+            history_table_id: None,
+            cdf_enabled: false,
+            cdf_retention_days: 0,
+            lifecycle: Default::default(),
+            columnar: Default::default(),
+            dropped_at: None,
+            expectations: Vec::new(),
+            time_travel_retention_secs: 0,
+            lake: Default::default(),
+            cluster: Default::default(),
+            foreign: crate::schema::ForeignConfig {
+                peer: peer.to_string(),
+                table: remote_table.to_string(),
+            },
+        };
         self.log_ddl(DDL_CREATE_TABLE, &entry.to_bytes())?;
         self.storage.store_table(&entry).await?;
         self.cache.put_table(entry);
@@ -2923,6 +3026,7 @@ impl Catalog {
                     max_length: None,
                     ts_precision: *ts_precision,
                     tz_offset_secs: None,
+                    element_type: None,
                 },
             )
             .collect();
@@ -2947,6 +3051,9 @@ impl Catalog {
             dropped_at: None,
             expectations: Vec::new(),
             time_travel_retention_secs: 0,
+            lake: Default::default(),
+            cluster: Default::default(),
+            foreign: Default::default(),
         };
         self.log_ddl(DDL_CREATE_TABLE, &entry.to_bytes())?;
         self.storage.store_table(&entry).await?;
@@ -4402,6 +4509,20 @@ impl Catalog {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Invalidates every cached physical plan.
+    ///
+    /// `log_ddl` bumps the version because the catalog changed. State that
+    /// lives outside the catalog can change what a plan should be without
+    /// writing a catalog record: a clustering commit changes the layout a
+    /// scan costs, and a background pass does it with no DDL at all. Those
+    /// callers bump it here, otherwise a plan cached against the old
+    /// layout keeps being reused after the layout is gone.
+    #[inline]
+    pub fn bump_schema_version(&self) {
+        self.schema_version
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
     /// Persists a mutated table entry (used by ALTER TABLE lifecycle ops).
     /// Re-logs the entry, replaces the stored tuple, and refreshes the cache.
     /// Columns and indexes are unaffected (separate system tables).
@@ -4425,7 +4546,7 @@ impl Catalog {
         self.cache.put_table(entry);
     }
 
-    // ----- Phase 17 data lifecycle accessors -----
+    // ----- Data lifecycle accessors -----
 
     pub async fn load_legal_holds(&self) -> Result<Vec<crate::schema::LegalHoldEntry>> {
         self.storage.load_legal_holds().await
@@ -4538,9 +4659,19 @@ fn convert_column_defs(table_id: TableId, defs: &[ColumnDef]) -> Result<Vec<Colu
             max_length,
             ts_precision: def.data_type.timestamp_precision(),
             tz_offset_secs: None,
+            element_type: extract_element_type(&def.data_type),
         });
     }
     Ok(entries)
+}
+
+/// The element type of an `T[]` declaration, so array values written to the
+/// column are re-encoded to the width it declares.
+fn extract_element_type(dt: &DataType) -> Option<zyron_common::TypeId> {
+    match dt {
+        DataType::Array(inner) => Some(inner.to_type_id()),
+        _ => None,
+    }
 }
 
 /// Extracts the max_length parameter from sized data types.
@@ -4578,6 +4709,9 @@ fn convert_table_constraints(
                 check_expr: None,
                 on_delete: ReferentialAction::NoAction,
                 on_update: ReferentialAction::NoAction,
+                enforced: tc.enforced,
+                on_violation: map_violation_action(tc.on_violation),
+                quarantine_table_id: None,
             },
             TableConstraintKind::Unique(col_names) => ConstraintEntry {
                 name: tc
@@ -4591,6 +4725,9 @@ fn convert_table_constraints(
                 check_expr: None,
                 on_delete: ReferentialAction::NoAction,
                 on_update: ReferentialAction::NoAction,
+                enforced: tc.enforced,
+                on_violation: map_violation_action(tc.on_violation),
+                quarantine_table_id: None,
             },
             TableConstraintKind::Check(expr) => ConstraintEntry {
                 name: tc.name.clone().unwrap_or_else(|| "ck_table".to_string()),
@@ -4601,6 +4738,9 @@ fn convert_table_constraints(
                 check_expr: Some(zyron_parser::expr_to_sql(expr)),
                 on_delete: ReferentialAction::NoAction,
                 on_update: ReferentialAction::NoAction,
+                enforced: tc.enforced,
+                on_violation: map_violation_action(tc.on_violation),
+                quarantine_table_id: None,
             },
             TableConstraintKind::ForeignKey {
                 columns: col_names,
@@ -4620,6 +4760,9 @@ fn convert_table_constraints(
                 check_expr: None,
                 on_delete: map_ref_action(*on_delete),
                 on_update: map_ref_action(*on_update),
+                enforced: tc.enforced,
+                on_violation: map_violation_action(tc.on_violation),
+                quarantine_table_id: None,
             },
         };
         result.push(entry);
@@ -4640,6 +4783,16 @@ fn map_ref_action(a: zyron_parser::ast::ReferentialAction) -> ReferentialAction 
 }
 
 /// Resolves column names to ColumnIds. Returns an error if any column name is not found.
+/// Maps the parsed violation mode onto its catalog form. Only Fail and
+/// Quarantine are constraint modes, the expectation-only actions have no
+/// meaning for a constraint and read as Fail.
+fn map_violation_action(action: zyron_parser::ast::ViolationAction) -> ConstraintViolationAction {
+    match action {
+        zyron_parser::ast::ViolationAction::Quarantine => ConstraintViolationAction::Quarantine,
+        _ => ConstraintViolationAction::Fail,
+    }
+}
+
 fn resolve_column_ids(names: &[String], columns: &[ColumnEntry]) -> Result<Vec<ColumnId>> {
     let mut ids = Vec::with_capacity(names.len());
     for name in names {
@@ -4718,6 +4871,7 @@ mod tests {
                 max_length: None,
                 ts_precision: None,
                 tz_offset_secs: None,
+                element_type: None,
             },
             ColumnEntry {
                 id: ColumnId(1),
@@ -4730,16 +4884,21 @@ mod tests {
                 max_length: None,
                 ts_precision: None,
                 tz_offset_secs: None,
+                element_type: None,
             },
         ];
         let tcs = vec![
             TableConstraint {
                 name: None,
                 kind: TableConstraintKind::PrimaryKey(vec!["a".to_string()]),
+                enforced: true,
+                on_violation: zyron_parser::ast::ViolationAction::Fail,
             },
             TableConstraint {
                 name: None,
                 kind: TableConstraintKind::Unique(vec!["a".to_string(), "b".to_string()]),
+                enforced: true,
+                on_violation: zyron_parser::ast::ViolationAction::Fail,
             },
         ];
         let result = convert_table_constraints(&tcs, &cols).unwrap();

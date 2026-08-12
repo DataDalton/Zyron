@@ -2,6 +2,11 @@
 
 use zyron_common::TypeId;
 
+// Clustering mode and schedule are persisted encodings shared with the
+// catalog and the metrics, so one definition lives in zyron-common and
+// the AST names it rather than redeclaring it
+pub use zyron_common::{ClusterMode, ClusteringSchedule};
+
 // ---------------------------------------------------------------------------
 // Top-level statement
 // ---------------------------------------------------------------------------
@@ -96,6 +101,12 @@ pub enum Statement {
     RestoreTable(Box<RestoreTableStatement>),
     /// ALTER TABLE name SET (key = value, ...)
     AlterTableOptions(Box<AlterTableOptionsStatement>),
+    /// ALTER TABLE t SET USING ZYRONLAKE | HEAP [WITH (...)]
+    AlterTableSetUsing(Box<AlterTableSetUsingStatement>),
+    /// ALTER TABLE t CLUSTER BY (...) | AUTO | (...) AUTO
+    AlterTableClusterBy(Box<AlterTableClusterByStatement>),
+    /// ALTER TABLE t SET CLUSTERING SCHEDULE = OnDemand | Incremental | Continuous
+    AlterTableClusteringSchedule(Box<AlterTableClusteringScheduleStatement>),
     /// CREATE/DROP/RELEASE LEGAL HOLD
     LegalHold(Box<LegalHoldStatement>),
     /// FORGET USER 'id' [CASCADE] [DRY RUN]
@@ -137,6 +148,16 @@ pub enum Statement {
     AlterSystemSet(Box<AlterSystemSetStatement>),
     /// ANALYZE [table_name]
     Analyze(Box<AnalyzeStatement>),
+    /// ALTER TABLE t FOLLOW <peer>.<table>, or UNFOLLOW
+    AlterTableFollow(Box<AlterTableFollowStatement>),
+    /// CREATE PEER name ADDRESS 'host:port' [MODE db|lake|unified]
+    CreatePeer(Box<CreatePeerStatement>),
+    /// DROP PEER [IF EXISTS] name
+    DropPeer(Box<DropPeerStatement>),
+    /// CREATE FOREIGN TABLE t (cols) SERVER peer [TABLE remote]
+    CreateForeignTable(Box<CreateForeignTableStatement>),
+    /// DROP FOREIGN TABLE [IF EXISTS] t
+    DropForeignTable(Box<DropForeignTableStatement>),
     /// CREATE BRANCH name [FROM name] [AT VERSION expr]
     CreateBranch(Box<CreateBranchStatement>),
     /// MERGE BRANCH name INTO name
@@ -350,6 +371,58 @@ pub struct CreateTableStatement {
     pub options: Vec<TableOption>,
     /// Optional inline `TTL <duration> ON <column> [ACTION ...]` clause.
     pub ttl: Option<TtlClause>,
+    /// Storage format from `USING ZYRONLAKE | HEAP`. None uses the
+    /// deployment mode's default format.
+    pub using: Option<TableFormat>,
+    /// Clustering layout from `CLUSTER BY ...`.
+    pub cluster_by: Option<ClusterByClause>,
+}
+
+/// Storage format named in a `USING` clause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableFormat {
+    Heap,
+    ZyronLake,
+}
+
+/// `CLUSTER BY` clause. Keys with mode Force pin the layout, AUTO with no
+/// keys hands the layout to measurement, keys plus AUTO anchor the listed
+/// keys and let measurement fill in around them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClusterByClause {
+    pub keys: Vec<ClusterKeyDef>,
+    pub mode: ClusterMode,
+}
+
+/// One clustering key, optionally pinned to a strategy by name via
+/// `<column> USING <strategy>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClusterKeyDef {
+    pub column: String,
+    pub strategy: Option<String>,
+}
+
+/// `ALTER TABLE t SET USING <format>` storage conversion.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterTableSetUsingStatement {
+    pub table: String,
+    pub format: TableFormat,
+    /// Conversion options such as drop_history.
+    pub options: Vec<TableOption>,
+}
+
+/// `ALTER TABLE t CLUSTER BY ...` layout change.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterTableClusterByStatement {
+    pub table: String,
+    pub clause: ClusterByClause,
+}
+
+/// `ALTER TABLE t SET CLUSTERING SCHEDULE = ...`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterTableClusteringScheduleStatement {
+    pub table: String,
+    pub schedule: ClusteringSchedule,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -430,6 +503,11 @@ pub struct BeginStatement {
     pub isolation: Option<TxnIsolation>,
     /// Some(true) for READ ONLY, Some(false) for READ WRITE, None for default.
     pub read_only: Option<bool>,
+    /// BEGIN ZYRONLAKE TRANSACTION: the transaction's lake writes commit
+    /// through a cross-table intent rather than the database commit record,
+    /// so several lake tables land together without paying the OLTP commit
+    /// barrier.
+    pub lake: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -648,6 +726,10 @@ pub struct SetVariableStatement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShowStatement {
     pub name: String,
+    /// Object the shown state belongs to, as in `SHOW CLUSTERING FOR t`.
+    /// None for a plain `SHOW <setting>`, which reads session or server
+    /// state that belongs to no object.
+    pub target: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1042,7 +1124,7 @@ pub struct TtlClause {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 17 data lifecycle statements
+// Data lifecycle statements
 // ---------------------------------------------------------------------------
 
 /// CREATE/DROP/RELEASE LEGAL HOLD
@@ -1298,18 +1380,87 @@ pub struct CreateBranchStatement {
     pub name: String,
     pub from_branch: Option<String>,
     pub at_version: Option<Expr>,
+    /// `ON <table>` scopes the branch to one table's log. Without it the
+    /// branch is database wide.
+    pub on_table: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MergeBranchStatement {
     pub source: String,
     pub into_target: String,
+    /// `FOR TABLE <table>` merges one table's branch rather than the
+    /// database-wide branch.
+    pub for_table: Option<String>,
+}
+
+/// `ALTER TABLE <t> FOLLOW <peer>.<table>` and `ALTER TABLE <t> UNFOLLOW`.
+///
+/// A follower replays a leader's log instead of accepting writes. Naming
+/// the leader is what turns an ordinary lake table into a replica, and
+/// UNFOLLOW leaves it as its own authority holding whatever it applied.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterTableFollowStatement {
+    pub table: String,
+    /// The peer and its table, None for UNFOLLOW
+    pub leader: Option<(String, String)>,
+}
+
+/// `CREATE PEER <name> ADDRESS '<host:port>' [MODE <mode>]`.
+///
+/// Peering is declared, never discovered. A node that joined a mesh
+/// because it saw traffic would be a node an operator did not decide to
+/// trust, so the address and the mode are both stated here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreatePeerStatement {
+    pub name: String,
+    pub address: String,
+    /// What the peer stores, as the operator understands it. Absent means
+    /// unknown until the peer is first reached
+    pub mode: Option<String>,
+    pub if_not_exists: bool,
+}
+
+/// `DROP PEER [IF EXISTS] <name>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropPeerStatement {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+/// `CREATE FOREIGN TABLE <name> (<columns>) SERVER <peer> [TABLE <remote>]`.
+///
+/// Declares the shape of a table that lives on a peer. The columns are
+/// stated rather than fetched, because a plan is built before anything is
+/// reached and a node that had to contact a peer to parse a query would
+/// stall on a peer being down.
+///
+/// SERVER names a declared peer, never an address. TABLE names the table on
+/// that peer when it differs from the local name, which it usually does not.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateForeignTableStatement {
+    pub name: String,
+    pub columns: Vec<ColumnDef>,
+    /// Peer holding the real table
+    pub server: String,
+    /// Table name on the peer, None when it matches the local name
+    pub remote_table: Option<String>,
+    pub if_not_exists: bool,
+}
+
+/// `DROP FOREIGN TABLE [IF EXISTS] <name>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropForeignTableStatement {
+    pub name: String,
+    pub if_exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropBranchStatement {
     pub name: String,
     pub if_exists: bool,
+    /// `ON <table>` drops one table's branch.
+    pub on_table: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1984,7 +2135,7 @@ pub enum AsOf {
         start: Expr,
         end: Expr,
     },
-    /// `IN BRANCH 'name'` (expression-position only at parse time)
+    /// `IN BRANCH 'name'`, as a FROM-clause qualifier or an expression postfix
     Branch(Expr),
 }
 
@@ -2658,6 +2809,15 @@ pub enum ColumnConstraint {
 pub struct TableConstraint {
     pub name: Option<String>,
     pub kind: TableConstraintKind,
+    /// What a violating row does. Fail aborts the statement, Quarantine
+    /// moves the row into the table's companion quarantine table and lets
+    /// the rest of the batch land, which is what keeps a foreign key usable
+    /// on a bulk load.
+    pub on_violation: ViolationAction,
+    /// False when the statement said NOT ENFORCED. The declaration still
+    /// reaches the catalog and the planner, the engine just does not check
+    /// it on write.
+    pub enforced: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3075,6 +3235,7 @@ mod tests {
         let begin = Statement::Begin(Box::new(BeginStatement {
             isolation: None,
             read_only: None,
+            lake: false,
         }));
         assert!(matches!(begin, Statement::Begin(_)));
 

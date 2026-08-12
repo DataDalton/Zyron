@@ -39,23 +39,15 @@ async fn build_catalog(tmp: &tempfile::TempDir) -> Arc<Catalog> {
     std::fs::create_dir_all(&data_dir).unwrap();
     std::fs::create_dir_all(&wal_dir).unwrap();
     let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir,
-            segment_size: 4 * 1024 * 1024,
-            fsync_enabled: false,
-            ring_buffer_capacity: 1 * 1024 * 1024,
-        })
+        WalWriter::new(zyron_bench_harness::wal_config(wal_dir))
         .unwrap(),
     );
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir,
-            fsync_enabled: false,
-        })
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir))
         .await
         .unwrap(),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 64 }));
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let storage = Arc::new(HeapCatalogStorage::new(disk, pool).unwrap());
     let cache = Arc::new(CatalogCache::new(64, 32));
     Arc::new(Catalog::new(storage, cache, wal).await.unwrap())

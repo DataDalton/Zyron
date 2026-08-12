@@ -5,7 +5,7 @@
 //! contiguous slice() calls. Uses radix sort for integer key types.
 //! Supports top-N via optional limit parameter.
 
-use zyron_common::Result;
+use zyron_common::{Result, RowLocator, ZyronError};
 use zyron_planner::binder::{BoundExpr, BoundOrderBy};
 use zyron_planner::logical::LogicalColumn;
 
@@ -28,6 +28,11 @@ pub struct SortOperator {
     total_rows: usize,
     output_cursor: usize,
     finished: bool,
+    /// Carry row locators through the sort permutation. Set only when the
+    /// sort feeds a row-locking operator, the normal path pays nothing
+    track_locators: bool,
+    /// Locators permuted into sorted order, sliced alongside sorted_batch
+    sorted_locators: Option<Vec<RowLocator>>,
 }
 
 impl SortOperator {
@@ -46,12 +51,23 @@ impl SortOperator {
             total_rows: 0,
             output_cursor: 0,
             finished: false,
+            track_locators: false,
+            sorted_locators: None,
         }
+    }
+
+    /// Carries row locators through the sort so a row-locking operator
+    /// above still addresses storage rows. Disables the indices-free
+    /// in-place fast path, which cannot express its permutation
+    pub fn with_locator_tracking(mut self) -> Self {
+        self.track_locators = true;
+        self
     }
 
     async fn materialize(&mut self) -> Result<()> {
         // Collect all input batches.
         let mut all_columns: Vec<Vec<Column>> = Vec::new();
+        let mut all_locators: Vec<RowLocator> = Vec::new();
         let mut total_rows = 0usize;
 
         loop {
@@ -60,6 +76,15 @@ impl SortOperator {
                     total_rows += eb.batch.num_rows;
                     if all_columns.is_empty() {
                         all_columns.resize_with(eb.batch.num_columns(), Vec::new);
+                    }
+                    if self.track_locators {
+                        let locs = eb.locators.ok_or_else(|| {
+                            ZyronError::ExecutionError(
+                                "sort under row locking received a batch without row locators"
+                                    .to_string(),
+                            )
+                        })?;
+                        all_locators.extend(locs);
                     }
                     for (i, col) in eb.batch.columns.into_iter().enumerate() {
                         all_columns[i].push(col);
@@ -84,8 +109,10 @@ impl SortOperator {
                 let key_batches = &all_columns[key_idx];
                 let has_nulls = key_batches.iter().any(|c| c.nulls.has_nulls());
 
-                if !has_nulls && num_cols == 1 {
+                if !has_nulls && num_cols == 1 && !self.track_locators {
                     // Single column: sort values in-place, no indices needed.
+                    // Skipped under locator tracking, an in-place value sort
+                    // has no permutation to apply to the locators
                     let type_id = key_batches[0].type_id;
                     let mut merged = concat_columns(key_batches);
                     compute::sort_column_inplace(&mut merged.data, self.order_by[0].asc);
@@ -132,6 +159,14 @@ impl SortOperator {
                                 let merged = concat_columns(col_batches);
                                 result_columns.push(merged.take(idx_slice));
                             }
+                        }
+                        if self.track_locators {
+                            self.sorted_locators = Some(
+                                idx_slice
+                                    .iter()
+                                    .map(|&i| all_locators[i as usize])
+                                    .collect(),
+                            );
                         }
                         self.total_rows = final_len;
                         self.sorted_batch = Some(DataBatch::new(result_columns));
@@ -193,6 +228,10 @@ impl SortOperator {
 
         // Single full take() pass: reorder all data once. Output is then
         // emitted via contiguous slice() calls which are cheap memcpy.
+        if self.track_locators {
+            self.sorted_locators =
+                Some(indices.iter().map(|&i| all_locators[i as usize]).collect());
+        }
         self.total_rows = indices.len();
         self.sorted_batch = Some(merged.take(&indices));
         Ok(())
@@ -228,9 +267,13 @@ impl Operator for SortOperator {
             const SORT_OUTPUT_CHUNK: usize = 8192;
             let chunk_size = remaining.min(SORT_OUTPUT_CHUNK);
             let batch = sorted.slice(self.output_cursor, chunk_size);
+            let locators = self
+                .sorted_locators
+                .as_ref()
+                .map(|locs| locs[self.output_cursor..self.output_cursor + chunk_size].to_vec());
             self.output_cursor += chunk_size;
 
-            Ok(Some(ExecutionBatch::new(batch)))
+            Ok(Some(ExecutionBatch { batch, locators }))
         })
     }
 }

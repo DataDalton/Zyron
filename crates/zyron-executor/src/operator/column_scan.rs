@@ -19,9 +19,8 @@ use zyron_parser::ast::{BinaryOperator, LiteralValue};
 use zyron_planner::binder::{BoundExpr, ColumnRef};
 use zyron_planner::logical::LogicalColumn;
 use zyron_storage::columnar::{
-    ColumnarPatchManager, PatchStore, RowOverlay, SEGMENT_HEADER_SIZE, SYS_COL_ROWID,
-    SYS_COL_SUPERSEDE, SYS_COL_XMIN, SegmentHeader, ZONE_MAP_BATCH_SIZE, ZONE_MAP_ENTRY_SIZE,
-    ZyrFileReader,
+    ColumnarPatchManager, PatchStore, RowOverlay, SYS_COL_ROWID, SYS_COL_SUPERSEDE, SYS_COL_XMIN,
+    ZyrFileReader, segment_regions,
 };
 use zyron_storage::encoding::{create_encoding, varlen_slice_rows};
 
@@ -64,6 +63,11 @@ pub struct ColumnScanOperator {
     as_of_version: Option<u64>,
     pending: std::collections::VecDeque<ExecutionBatch>,
     finished: bool,
+    /// This table's IO counters, resolved once at construction. Updated per
+    /// segment with the rows it yielded and the encoded bytes read to yield
+    /// them, so a segment rejected by its header or zone maps contributes rows
+    /// and bytes of zero.
+    io_stats: Option<Arc<zyron_common::TableIOStats>>,
 }
 
 impl ColumnScanOperator {
@@ -98,6 +102,14 @@ impl ColumnScanOperator {
         only_files: std::collections::HashSet<u64>,
     ) -> Result<Self> {
         Self::new_inner(ctx, table_id, columns, predicate, false, Some(only_files))
+    }
+
+    /// Restricts the scan to a set of segment file ids after construction.
+    /// The search result fetch composes this with new_for_dml so only
+    /// segments holding hits are opened while locators still emit.
+    pub fn with_file_filter(mut self, only_files: std::collections::HashSet<u64>) -> Self {
+        self.segments.retain(|(fid, _)| only_files.contains(fid));
+        self
     }
 
     fn new_inner(
@@ -146,15 +158,17 @@ impl ColumnScanOperator {
         // The patch store is process-global, keyed by the columnar directory
         // (parent of any segment path). Skipped when there are no segments.
         let patch_store = match segments.first() {
-            Some((_, p)) => {
-                let dir = std::path::Path::new(p)
-                    .parent()
-                    .map(|d| d.to_path_buf())
-                    .unwrap_or_else(|| std::path::PathBuf::from("."));
-                Some(ColumnarPatchManager::global(&dir).store(table_entry.id.0 as u64)?)
-            }
+            Some((_, p)) => Some(ColumnarPatchManager::store_for_segment(
+                table_entry.id.0 as u64,
+                std::path::Path::new(p),
+            )?),
             None => None,
         };
+
+        let io_stats = ctx.table_io_stats_for(table_id.0);
+        if let Some(stats) = &io_stats {
+            stats.record_seq_scan();
+        }
 
         Ok(Self {
             ctx,
@@ -169,6 +183,7 @@ impl ColumnScanOperator {
             as_of_version: None,
             pending: std::collections::VecDeque::new(),
             finished: false,
+            io_stats,
         })
     }
 
@@ -194,58 +209,23 @@ impl ColumnScanOperator {
         }
     }
 
-    fn decode_column(
-        reader: &ZyrFileReader,
-        column_id: u32,
-        row_count: usize,
-        value_size: usize,
-    ) -> Result<(Vec<u8>, Vec<u8>)> {
-        let raw = reader.read_segment_raw(column_id)?;
-        Self::decode_raw(&raw, row_count, value_size)
-    }
-
     /// Parses the header regions out of an already-read raw segment buffer
     /// and decodes the encoded column. Lets the scan read every needed
     /// column with one file open (see `read_segments_each`).
-    fn decode_raw(raw: &[u8], row_count: usize, value_size: usize) -> Result<(Vec<u8>, Vec<u8>)> {
-        if raw.len() < SEGMENT_HEADER_SIZE {
-            return Err(zyron_common::ZyronError::ExecutionError(
-                "columnar scan: segment shorter than header".into(),
-            ));
-        }
-        let mut hdr_buf = [0u8; SEGMENT_HEADER_SIZE];
-        hdr_buf.copy_from_slice(&raw[..SEGMENT_HEADER_SIZE]);
-        let hdr = SegmentHeader::from_bytes(&hdr_buf)?;
-
-        let bloom_len = hdr.bloom_filter_size as usize;
-        let zones = row_count.div_ceil(ZONE_MAP_BATCH_SIZE as usize);
-        let zonemap_len = zones * ZONE_MAP_ENTRY_SIZE;
-        let nullbm_len = if hdr.null_count > 0 {
-            row_count.div_ceil(8)
-        } else {
-            0
-        };
-        let enc_start = SEGMENT_HEADER_SIZE + bloom_len + zonemap_len + nullbm_len;
-        let enc_end = enc_start + hdr.encoded_size as usize;
-        if enc_end > raw.len() {
-            return Err(zyron_common::ZyronError::ExecutionError(
-                "columnar scan: encoded region exceeds segment".into(),
-            ));
-        }
-        let null_bitmap = raw[SEGMENT_HEADER_SIZE + bloom_len + zonemap_len..enc_start].to_vec();
-        // Granular integrity: CRC the encoded payload over exactly the bytes
-        // about to be decoded (already in memory, zero extra IO). The header
-        // self-verified its own header_crc in from_bytes.
-        let enc = &raw[enc_start..enc_end];
-        let crc = zyron_common::hash32(enc);
-        if crc != hdr.data_checksum {
-            return Err(zyron_common::ZyronError::InvalidZyrFile(format!(
-                "columnar segment payload checksum mismatch: stored 0x{:08x}, computed 0x{:08x}",
-                hdr.data_checksum, crc
-            )));
-        }
-        let encoder = create_encoding(hdr.encoding_type);
-        let decoded = encoder.decode(enc, row_count, value_size)?;
+    fn decode_raw(
+        column_id: u32,
+        raw: &[u8],
+        row_count: usize,
+        value_size: usize,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let regions = segment_regions(raw, column_id, row_count)?;
+        let null_bitmap = raw[regions.null_bitmap.clone()].to_vec();
+        let enc = regions.verified_payload(raw, column_id)?;
+        let decoded = create_encoding(regions.header.encoding_type).decode(
+            enc,
+            row_count,
+            value_size,
+        )?;
         Ok((decoded, null_bitmap))
     }
 
@@ -310,10 +290,11 @@ impl ColumnScanOperator {
         // A patched (dirty) segment is never pruned: a value patch could
         // move a row into range.
         if let Some(pred) = &self.predicate {
+            let branch = self.ctx.active_branch_id.unwrap_or(0);
             let dirty = self
                 .patch_store
                 .as_ref()
-                .map(|s| s.file_has_overlay(file_id))
+                .map(|s| s.file_has_overlay_on(branch, file_id))
                 .unwrap_or(false);
             if !dirty {
                 for p in &self.col_plans {
@@ -340,8 +321,7 @@ impl ColumnScanOperator {
                     if lo.is_none() && hi.is_none() {
                         continue;
                     }
-                    let hb = reader.read_segment_header_bytes(p.column_id)?;
-                    let h = SegmentHeader::from_bytes(&hb)?;
+                    let (h, zones) = reader.read_segment_metadata(p.column_id, row_count)?;
                     if h.null_count >= row_count as u64 {
                         continue;
                     }
@@ -369,6 +349,21 @@ impl ColumnScanOperator {
                         // Predicate range cannot intersect this segment.
                         return Ok(());
                     }
+                    // A segment's bounds are the union of its zones, so it
+                    // can admit a range that no zone holds. This is what an
+                    // ordering the workload asked for buys over an ascending
+                    // primary key sort: the same rows in a layout whose
+                    // zones are narrow enough to reject the whole segment.
+                    // The zone region is sized by the row count rather than
+                    // by the data, so the check costs a few kilobytes
+                    // against decoding every column.
+                    if !zones.is_empty()
+                        && !zones
+                            .iter()
+                            .any(|z| le(&z.max_value) >= lo && le(&z.min_value) <= hi)
+                    {
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -391,18 +386,23 @@ impl ColumnScanOperator {
         // projected columns, matching the index passed to the callback.
         let mut decoded: Vec<Option<(Vec<u8>, Vec<u8>)>> =
             (0..col_ids.len()).map(|_| None).collect();
+        // Encoded bytes pulled out of this segment, summed across the sys
+        // columns and the projected columns. A segment rejected above never
+        // reaches here, which is what makes skipping show up as bytes not read.
+        let mut segment_bytes: u64 = 0;
         reader.read_segments_each(&col_ids, |idx, bytes| {
             let raw = bytes.ok_or_else(|| {
                 zyron_common::ZyronError::ExecutionError(
                     "columnar scan: missing segment for column".into(),
                 )
             })?;
+            segment_bytes += raw.len() as u64;
             let value_size = if idx < 3 {
                 8
             } else {
                 self.col_plans[idx - 3].value_size
             };
-            decoded[idx] = Some(Self::decode_raw(raw, row_count, value_size)?);
+            decoded[idx] = Some(Self::decode_raw(col_ids[idx], raw, row_count, value_size)?);
             Ok(())
         })?;
         let take = |slot: &mut Option<(Vec<u8>, Vec<u8>)>| -> Result<(Vec<u8>, Vec<u8>)> {
@@ -433,9 +433,14 @@ impl ColumnScanOperator {
 
         // Snapshot this file's overlay once under a single lock, instead of
         // a per-row lock acquisition and clone.
-        let overlay_map = match &self.patch_store {
-            Some(s) if s.file_has_overlay(file_id) => Some(s.file_overlay(file_id)),
-            _ => None,
+        let overlay_map = {
+            let branch = self.ctx.active_branch_id.unwrap_or(0);
+            match &self.patch_store {
+                Some(s) if s.file_has_overlay_on(branch, file_id) => {
+                    Some(s.file_overlay_on(branch, file_id))
+                }
+                _ => None,
+            }
         };
         // Row-level predicate pre-skip: for clean rows (no overlay), an
         // unsigned fixed-int projected column whose decoded value lies
@@ -485,6 +490,9 @@ impl ColumnScanOperator {
         let mut builders = create_builders(&self.output_columns, row_count.min(BATCH_SIZE));
         let mut locators: Vec<(u64, u64)> = Vec::new();
         let mut in_batch = 0usize;
+        // Visible rows this segment yielded, counted before the predicate runs
+        // so the number means rows the scan read rather than rows it returned.
+        let mut rows_yielded: u64 = 0;
 
         for r in 0..row_count {
             let sys_rowid = read_u64(&rowid_bytes, r);
@@ -571,6 +579,7 @@ impl ColumnScanOperator {
                 locators.push((file_id, sys_rowid));
             }
             in_batch += 1;
+            rows_yielded += 1;
 
             if in_batch == BATCH_SIZE {
                 let batch = finalize_builders(std::mem::replace(
@@ -586,6 +595,9 @@ impl ColumnScanOperator {
         if in_batch > 0 {
             let batch = finalize_builders(builders);
             self.queue_batch(batch, locators)?;
+        }
+        if let Some(stats) = &self.io_stats {
+            stats.record_seq_batch(rows_yielded, segment_bytes);
         }
         Ok(())
     }
@@ -848,26 +860,23 @@ impl Operator for ColumnarMetadataAggregateOperator {
             // Columnar contribution.
             let segments = &te.columnar.segments;
             let store = match segments.first() {
-                Some(s0) => {
-                    let dir = std::path::Path::new(&s0.path)
-                        .parent()
-                        .map(|d| d.to_path_buf())
-                        .unwrap_or_else(|| std::path::PathBuf::from("."));
-                    Some(
-                        zyron_storage::columnar::ColumnarPatchManager::global(&dir)
-                            .store(self.table_id.0 as u64)?,
-                    )
-                }
+                Some(s0) => Some(
+                    zyron_storage::columnar::ColumnarPatchManager::store_for_segment(
+                        self.table_id.0 as u64,
+                        std::path::Path::new(&s0.path),
+                    )?,
+                ),
                 None => None,
             };
             // Per-segment: a clean segment is answered from its header with
             // no decode; only segments that actually carry overlay entries
             // are resolved by a scan. One UPDATE no longer disables the
             // metadata fast path for the whole table.
+            let branch = self.ctx.active_branch_id.unwrap_or(0);
             let mut dirty: std::collections::HashSet<u64> = std::collections::HashSet::new();
             if let Some(s) = &store {
                 for seg in segments {
-                    if s.file_has_overlay(seg.file_id) {
+                    if s.file_has_overlay_on(branch, seg.file_id) {
                         dirty.insert(seg.file_id);
                     }
                 }
@@ -894,8 +903,7 @@ impl Operator for ColumnarMetadataAggregateOperator {
                             (MetaAggKind::CountStar, Acc::Count(c)) => *c += rc,
                             (MetaAggKind::CountCol, Acc::Count(c)) => {
                                 if let Some(cid) = spec.column_id {
-                                    let hb = reader.read_segment_header_bytes(cid.0 as u32)?;
-                                    let h = SegmentHeader::from_bytes(&hb)?;
+                                    let h = reader.read_segment_header(cid.0 as u32)?;
                                     *c += rc - h.null_count as i64;
                                 }
                             }
@@ -915,8 +923,7 @@ impl Operator for ColumnarMetadataAggregateOperator {
                                             "meta agg: non-fixed column".into(),
                                         )
                                     })?;
-                                    let hb = reader.read_segment_header_bytes(cid.0 as u32)?;
-                                    let h = SegmentHeader::from_bytes(&hb)?;
+                                    let h = reader.read_segment_header(cid.0 as u32)?;
                                     if h.null_count < reader.row_count() {
                                         let slot = if spec.kind == MetaAggKind::Max {
                                             &h.max_value

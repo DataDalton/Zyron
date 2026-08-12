@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use zyron_common::{Result, TypeId, ZyronError};
 
 use crate::job_runner::StreamingJoinKind;
-use crate::row_codec::{encode_row, StreamValue};
+use crate::row_codec::{StreamValue, encode_row};
 
 // -----------------------------------------------------------------------------
 // Side
@@ -183,8 +183,7 @@ impl IntervalJoinEngine {
             rows.retain(|r| {
                 if r.event_us <= cutoff {
                     if !r.matched && emit_left_nulls {
-                        let mut combined =
-                            Vec::with_capacity(r.values.len() + right_width);
+                        let mut combined = Vec::with_capacity(r.values.len() + right_width);
                         combined.extend(r.values.iter().cloned());
                         for _ in 0..right_width {
                             combined.push(StreamValue::Null);
@@ -304,18 +303,11 @@ impl IntervalJoinEngine {
 
 /// Encodes the key columns from a row as a byte string using the row codec.
 /// The deterministic byte layout makes HashMap lookups stable across sides.
-fn encode_key(
-    row: &[StreamValue],
-    ordinals: &[u16],
-    types: &[TypeId],
-) -> Result<Vec<u8>> {
+fn encode_key(row: &[StreamValue], ordinals: &[u16], types: &[TypeId]) -> Result<Vec<u8>> {
     let mut key_values = Vec::with_capacity(ordinals.len());
     for o in ordinals {
         let v = row.get(*o as usize).ok_or_else(|| {
-            ZyronError::StreamingError(format!(
-                "interval-join key ordinal {} out of range",
-                o
-            ))
+            ZyronError::StreamingError(format!("interval-join key ordinal {} out of range", o))
         })?;
         key_values.push(v.clone());
     }
@@ -329,10 +321,7 @@ fn encode_key(
 /// Builds the null-right-padded combined row for a temporal Left-outer miss.
 /// Callers pass the left row plus the combined width so the engine does not
 /// need to retain the type list at hand for this one case.
-pub fn temporal_left_null_right(
-    left_row: &[StreamValue],
-    right_width: usize,
-) -> Vec<StreamValue> {
+pub fn temporal_left_null_right(left_row: &[StreamValue], right_width: usize) -> Vec<StreamValue> {
     let mut out = Vec::with_capacity(left_row.len() + right_width);
     out.extend(left_row.iter().cloned());
     for _ in 0..right_width {
@@ -363,7 +352,11 @@ mod tests {
     }
 
     fn row3(k: i64, t: i64, v: i64) -> Vec<StreamValue> {
-        vec![StreamValue::I64(k), StreamValue::I64(t), StreamValue::I64(v)]
+        vec![
+            StreamValue::I64(k),
+            StreamValue::I64(t),
+            StreamValue::I64(v),
+        ]
     }
     fn row2(k: i64, t: i64) -> Vec<StreamValue> {
         vec![StreamValue::I64(k), StreamValue::I64(t)]
@@ -432,12 +425,20 @@ mod tests {
         // Matching pair: same (key_a, key_b), different value cols.
         e.feed_row(
             JoinSide::Left,
-            vec![StreamValue::I64(7), StreamValue::I64(9), StreamValue::I64(0)],
+            vec![
+                StreamValue::I64(7),
+                StreamValue::I64(9),
+                StreamValue::I64(0),
+            ],
         )
         .unwrap();
         e.feed_row(
             JoinSide::Right,
-            vec![StreamValue::I64(7), StreamValue::I64(9), StreamValue::I64(1_000)],
+            vec![
+                StreamValue::I64(7),
+                StreamValue::I64(9),
+                StreamValue::I64(1_000),
+            ],
         )
         .unwrap();
         let emissions = e.pop_emissions();
@@ -445,7 +446,11 @@ mod tests {
         // Non-matching second column must not emit.
         e.feed_row(
             JoinSide::Right,
-            vec![StreamValue::I64(7), StreamValue::I64(42), StreamValue::I64(2_000)],
+            vec![
+                StreamValue::I64(7),
+                StreamValue::I64(42),
+                StreamValue::I64(2_000),
+            ],
         )
         .unwrap();
         assert!(e.pop_emissions().is_empty());

@@ -5,8 +5,8 @@ use super::types::{
     DeleteResult, InternalEntry, InternalEntryView, InternalPageHeader, LeafEntry, LeafEntryView,
     LeafPageHeader, compare_keys,
 };
-use crate::tuple::TupleId;
 use bytes::Bytes;
+use zyron_common::RowLocator;
 use zyron_common::page::{PAGE_SIZE, PageHeader, PageId, PageType};
 use zyron_common::{Result, ZyronError};
 
@@ -140,8 +140,8 @@ impl BTreeLeafPage {
     /// Inserts a key-value pair into the leaf. Returns error if page is full.
     /// Uses single-pass in-place insertion for efficiency.
     #[inline]
-    pub fn insert(&mut self, key: Bytes, tuple_id: TupleId) -> Result<()> {
-        Self::insert_in_slice(&mut *self.data, &key, tuple_id)
+    pub fn insert(&mut self, key: Bytes, locator: RowLocator) -> Result<()> {
+        Self::insert_in_slice(&mut *self.data, &key, locator)
     }
 
     /// Writes entries to the page using slotted format.
@@ -179,20 +179,20 @@ impl BTreeLeafPage {
     }
 
     /// Gets the value for a key.
-    pub fn get(&self, key: &[u8]) -> Option<TupleId> {
+    pub fn get(&self, key: &[u8]) -> Option<RowLocator> {
         Self::get_in_slice(&*self.data, key)
     }
 
     /// Gets the value for a key using slotted page format
     /// Binary search directly on slot array for O(log n) lookup, no offset building needed
-    /// Returns TupleId with file_id=0. Caller sets file_id from index context
+    /// Heap locators decode with file_id=0. Caller sets file_id from index context
     ///
     /// Search loop is structured for branchless lowering, the Less/Greater
     /// arms become cmov pairs for low and high, only the rare Equal arm
     /// takes a real branch which is well-predicted on the typical
     /// either-found-once-or-not-at-all access pattern
     #[inline(always)]
-    pub fn get_in_slice(data: &[u8], key: &[u8]) -> Option<TupleId> {
+    pub fn get_in_slice(data: &[u8], key: &[u8]) -> Option<RowLocator> {
         // Parse header - read num_slots as single u16
         let header_offset = LeafPageHeader::OFFSET;
         let num_slots = u16::from_le_bytes([data[header_offset], data[header_offset + 1]]) as usize;
@@ -224,16 +224,8 @@ impl BTreeLeafPage {
 
             let cmp = compare_keys(key, entry_key);
             if cmp == std::cmp::Ordering::Equal {
-                let tuple_offset = entry_off + 2 + key_len;
-                let page_num = u32::from_le_bytes([
-                    data[tuple_offset],
-                    data[tuple_offset + 1],
-                    data[tuple_offset + 2],
-                    data[tuple_offset + 3],
-                ]);
-                let slot_id = u16::from_le_bytes([data[tuple_offset + 4], data[tuple_offset + 5]]);
-                let page_id = PageId::new(0, page_num as u64);
-                return Some(TupleId::new(page_id, slot_id));
+                let payload_offset = entry_off + 2 + key_len;
+                return RowLocator::read_payload(&data[payload_offset..]);
             }
             let is_less = cmp == std::cmp::Ordering::Less;
             high = if is_less { mid } else { high };
@@ -244,7 +236,7 @@ impl BTreeLeafPage {
 
     /// Inserts a key-value pair using slotted page format
     /// Binary search for O(log n) lookup, only shift 4-byte slots instead of full entries
-    /// Stores page_num (u32) + slot_id (u16) = 6 bytes per entry (file_id is implicit)
+    /// Stores the fixed RowLocator payload per entry (heap file_id is implicit)
     /// Returns Ok(()) on success, Err(NodeFull) if page is full, Err(DuplicateKey) if key exists
     ///
     /// Search loop is structured for branchless lowering, both low and high
@@ -253,7 +245,7 @@ impl BTreeLeafPage {
     /// duplicate-key path takes a real branch and that one is correctly
     /// predicted on the rare-Equal common case
     #[inline(always)]
-    pub fn insert_in_slice(data: &mut [u8], key: &[u8], tuple_id: TupleId) -> Result<()> {
+    pub fn insert_in_slice(data: &mut [u8], key: &[u8], locator: RowLocator) -> Result<()> {
         // Parse header
         let header_offset = LeafPageHeader::OFFSET;
         let num_slots = u16::from_le_bytes([data[header_offset], data[header_offset + 1]]) as usize;
@@ -267,8 +259,8 @@ impl BTreeLeafPage {
             raw_data_end
         };
 
-        // Entry size: key_len(2) + key + page_num(4) + slot_id(2)
-        let entry_size = 2 + key.len() + 6;
+        // Entry size: key_len(2) + key + locator payload
+        let entry_size = 2 + key.len() + RowLocator::ENCODED_LEN;
 
         // Calculate free space: between slot array end and data start
         let slot_array_end = Self::SLOT_ARRAY_START + num_slots * Self::SLOT_SIZE;
@@ -322,10 +314,7 @@ impl BTreeLeafPage {
         write_offset += 2;
         data[write_offset..write_offset + key.len()].copy_from_slice(key);
         write_offset += key.len();
-        data[write_offset..write_offset + 4]
-            .copy_from_slice(&(tuple_id.page_id.page_num as u32).to_le_bytes());
-        write_offset += 4;
-        data[write_offset..write_offset + 2].copy_from_slice(&tuple_id.slot_id.to_le_bytes());
+        locator.write_payload(&mut data[write_offset..write_offset + RowLocator::ENCODED_LEN]);
 
         // Shift slots forward to make room for new slot (only 4 bytes per slot)
         let insert_slot_offset = Self::SLOT_ARRAY_START + insert_slot_idx * Self::SLOT_SIZE;

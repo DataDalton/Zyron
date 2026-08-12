@@ -6,6 +6,7 @@
 use crate::constants::{CHECKSUM_SIZE, HEADER_SIZE, OFF_LSN, OFF_PAYLOAD_LEN, OFF_RECORD_TYPE};
 use crate::record::{LogRecordType, Lsn};
 use std::cell::UnsafeCell;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use zyron_common::profile::{self, Phase};
 
@@ -27,7 +28,15 @@ impl<T> std::ops::Deref for CachePadded<T> {
     }
 }
 
+/// Spins a writer takes before it wakes the drain. Long enough that a
+/// drain already running catches up without paying an unpark, short
+/// enough that a parked one is woken in microseconds.
+const SPIN_BEFORE_WAKING_DRAIN: u32 = 256;
+
 pub struct RingBuffer {
+    /// The draining thread, registered as it starts. A writer that fills
+    /// the ring wakes it rather than spinning against it while it sleeps.
+    drain_waker: OnceLock<std::thread::Thread>,
     /// Contiguous byte buffer.
     buffer: UnsafeCell<Box<[u8]>>,
     /// Buffer size in bytes.
@@ -106,6 +115,7 @@ impl RingBuffer {
             .into_boxed_slice();
 
         Self {
+            drain_waker: OnceLock::new(),
             buffer: UnsafeCell::new(buffer),
             buffer_size: capacity_bytes,
             buffer_mask: capacity_bytes - 1,
@@ -210,21 +220,52 @@ impl RingBuffer {
         }
     }
 
+    /// Registers the draining thread so a writer that fills the ring can
+    /// wake it. Called once by the flush thread as it starts.
+    pub fn register_drain_thread(&self) {
+        self.drain_waker.set(std::thread::current()).ok();
+    }
+
     /// Slow path: the writer has claimed space past the cached safe_write_limit.
-    /// Reload read_cursor, update the limit, and spin if the buffer is genuinely full.
+    /// Reload read_cursor, update the limit, and wait if the buffer is genuinely full.
+    ///
+    /// The drain parks between wakeups and is woken on commit, so a
+    /// statement large enough to fill the ring before it commits will find
+    /// it asleep. Spinning against a sleeping thread is a livelock, not a
+    /// wait: it holds the core the drain needs to free the space being
+    /// waited for. So the spin is bounded, and past it this wakes the
+    /// drain and yields, which turns a hang into backpressure.
     #[cold]
     #[inline(never)]
     fn wait_for_space_slow(&self, offset: u64, size: usize) {
-        loop {
-            let read = self.read_cursor.load(Ordering::Acquire);
-            let limit = read + self.buffer_size as u64;
-            // Update cached limit so other writers benefit from the fresh read.
-            self.safe_write_limit.store(limit, Ordering::Relaxed);
-            if offset + size as u64 <= limit {
+        let fits = |limit: u64| offset + size as u64 <= limit;
+        // Bounded spin first. The drain usually catches up inside this,
+        // and an unpark plus a scheduler dispatch costs far more
+        for _ in 0..SPIN_BEFORE_WAKING_DRAIN {
+            let limit = self.refresh_write_limit();
+            if fits(limit) {
                 return;
             }
             std::hint::spin_loop();
         }
+        loop {
+            if let Some(drain) = self.drain_waker.get() {
+                drain.unpark();
+            }
+            std::thread::yield_now();
+            if fits(self.refresh_write_limit()) {
+                return;
+            }
+        }
+    }
+
+    /// Rereads the consumer's cursor and republishes the limit every
+    /// writer caches, so one writer's reload serves the rest
+    #[inline]
+    fn refresh_write_limit(&self) -> u64 {
+        let limit = self.read_cursor.load(Ordering::Acquire) + self.buffer_size as u64;
+        self.safe_write_limit.store(limit, Ordering::Relaxed);
+        limit
     }
 
     /// Cold path for records that straddle the wrap boundary.

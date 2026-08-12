@@ -23,8 +23,7 @@ use zyron_planner::physical::PhysicalPlan;
 use zyron_server::background::compaction::{CompactionWorker, CompactionWorkerConfig};
 use zyron_server::columnar_recovery::reconcile_columnar;
 use zyron_storage::columnar::{
-    ColumnarPatchManager, SEGMENT_HEADER_SIZE, SYS_COL_XMIN, SegmentHeader, ZONE_MAP_BATCH_SIZE,
-    ZONE_MAP_ENTRY_SIZE, ZyrFileReader,
+    ColumnarPatchManager, SYS_COL_XMIN, ZyrFileReader, segment_regions,
 };
 use zyron_storage::encoding::create_encoding;
 use zyron_storage::txn::TransactionManager;
@@ -53,6 +52,12 @@ fn encode_row(k: i64, name: &str, v: i64) -> Vec<u8> {
     d
 }
 
+/// Decodes one column straight from its raw segment bytes.
+///
+/// The region arithmetic lives in `columnar::segment_regions`, which is
+/// what the decode path, the predicate path and the scan all read. A
+/// fourth copy here would drift from them and then assert against a
+/// layout nobody writes
 fn decode_column_raw(
     reader: &ZyrFileReader,
     column_id: u32,
@@ -60,21 +65,12 @@ fn decode_column_raw(
     value_size: usize,
 ) -> Vec<u8> {
     let raw = reader.read_segment_raw(column_id).expect("segment raw");
-    let mut hdr = [0u8; SEGMENT_HEADER_SIZE];
-    hdr.copy_from_slice(&raw[..SEGMENT_HEADER_SIZE]);
-    let h = SegmentHeader::from_bytes(&hdr).expect("seg header");
-    let bloom = h.bloom_filter_size as usize;
-    let zones = row_count.div_ceil(ZONE_MAP_BATCH_SIZE as usize);
-    let zm = zones * ZONE_MAP_ENTRY_SIZE;
-    let nb = if h.null_count > 0 {
-        row_count.div_ceil(8)
-    } else {
-        0
-    };
-    let start = SEGMENT_HEADER_SIZE + bloom + zm + nb;
-    let end = start + h.encoded_size as usize;
-    create_encoding(h.encoding_type)
-        .decode(&raw[start..end], row_count, value_size)
+    let regions = segment_regions(&raw, column_id, row_count).expect("segment regions");
+    let encoded = regions
+        .verified_payload(&raw, column_id)
+        .expect("payload checksum");
+    create_encoding(regions.header.encoding_type)
+        .decode(encoded, row_count, value_size)
         .expect("decode")
 }
 
@@ -88,20 +84,13 @@ async fn columnar_seam_fold_read_mutate_recover() {
     let columnar_dir = data_dir.join("columnar");
 
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir: data_dir.clone(),
-            fsync_enabled: false,
-        })
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
         .await
         .unwrap(),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 4096 }));
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir: wal_dir.clone(),
-            fsync_enabled: false,
-            ..Default::default()
-        })
+        WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
         .unwrap(),
     );
 
@@ -151,7 +140,6 @@ async fn columnar_seam_fold_read_mutate_recover() {
     let cfg = CompactionWorkerConfig {
         min_rows: 4,
         columnar_dir: columnar_dir.clone(),
-        fsync_enabled: false,
         ..CompactionWorkerConfig::default()
     };
     let rt_handle = tokio::runtime::Handle::current();
@@ -170,7 +158,9 @@ async fn columnar_seam_fold_read_mutate_recover() {
                 .enable_all()
                 .build()
                 .unwrap();
-            CompactionWorker::run_cycle(&rt, catalog2, txn2, disk2, pool2, wal2, cfg2, None)
+            CompactionWorker::run_cycle(
+                &rt, catalog2, txn2, disk2, pool2, wal2, cfg2, None, None, None,
+            )
         })
     };
     let _ = rt_handle;
@@ -211,8 +201,8 @@ async fn columnar_seam_fold_read_mutate_recover() {
         encoding_hints: None,
         as_of: None,
     };
-    let physical =
-        zyron_planner::physical::builder::build_physical_plan(logical, &catalog).expect("plan");
+    let physical = zyron_planner::physical::builder::build_physical_plan(logical, &catalog, None)
+        .expect("plan");
     assert!(
         matches!(physical, PhysicalPlan::HybridScan { .. }),
         "planner must pick HybridScan once segments exist, got {:?}",
@@ -278,8 +268,8 @@ async fn columnar_seam_fold_read_mutate_recover() {
         ],
         child: Arc::new(scan_for_agg),
     };
-    let agg_phys =
-        zyron_planner::physical::builder::build_physical_plan(agg, &catalog).expect("agg plan");
+    let agg_phys = zyron_planner::physical::builder::build_physical_plan(agg, &catalog, None)
+        .expect("agg plan");
     match agg_phys {
         PhysicalPlan::ColumnarMetadataAggregate { ref specs, .. } => {
             use zyron_planner::physical::MetaAggKind::*;
@@ -320,7 +310,9 @@ async fn columnar_seam_fold_read_mutate_recover() {
             .enable_all()
             .build()
             .unwrap();
-        CompactionWorker::run_cycle(&rt, &catalog, &txn, &disk, &pool, &wal, &cfg, None)
+        CompactionWorker::run_cycle(
+            &rt, &catalog, &txn, &disk, &pool, &wal, &cfg, None, None, None,
+        )
     });
     assert_eq!(rows2, 0, "folded rows were handed off out of the heap");
 
@@ -331,9 +323,9 @@ async fn columnar_seam_fold_read_mutate_recover() {
     let fid = seg.file_id;
     let rid0 = seg.sys_rowid_lo;
     store
-        .append_value_patch(fid, rid0, v_col, 50, 1, &7777i64.to_le_bytes())
+        .append_value_patch(0, fid, rid0, v_col, 50, 1, &7777i64.to_le_bytes())
         .unwrap();
-    store.append_supersede(fid, rid0 + 1, 60, 2).unwrap();
+    store.append_supersede(0, fid, rid0 + 1, 60, 2).unwrap();
     let o0 = store.row_overlay(fid, rid0).expect("value overlay");
     assert_eq!(
         i64::from_le_bytes(o0.patches[&v_col][0].value[..8].try_into().unwrap()),
@@ -350,7 +342,9 @@ async fn columnar_seam_fold_read_mutate_recover() {
             .enable_all()
             .build()
             .unwrap();
-        CompactionWorker::run_cycle(&rt, &catalog, &txn, &disk, &pool, &wal, &cfg, None)
+        CompactionWorker::run_cycle(
+            &rt, &catalog, &txn, &disk, &pool, &wal, &cfg, None, None, None,
+        )
     });
     let te = catalog.get_table_by_id(table_id).unwrap();
     assert_eq!(
@@ -442,20 +436,13 @@ async fn columnar_time_travel_version_visibility() {
     let columnar_dir = data_dir.join("columnar");
 
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir: data_dir.clone(),
-            fsync_enabled: false,
-        })
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
         .await
         .unwrap(),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 4096 }));
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir: wal_dir.clone(),
-            fsync_enabled: false,
-            ..Default::default()
-        })
+        WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
         .unwrap(),
     );
 
@@ -509,7 +496,6 @@ async fn columnar_time_travel_version_visibility() {
     let cfg = CompactionWorkerConfig {
         min_rows: 4,
         columnar_dir: columnar_dir.clone(),
-        fsync_enabled: false,
         ..CompactionWorkerConfig::default()
     };
     let (rows, _segs) = tokio::task::block_in_place(|| {
@@ -517,7 +503,9 @@ async fn columnar_time_travel_version_visibility() {
             .enable_all()
             .build()
             .unwrap();
-        CompactionWorker::run_cycle(&rt, &catalog, &txn, &disk, &pool, &wal, &cfg, None)
+        CompactionWorker::run_cycle(
+            &rt, &catalog, &txn, &disk, &pool, &wal, &cfg, None, None, None,
+        )
     });
     assert_eq!(rows, 12, "all rows folded out of the heap");
     let te = catalog.get_table_by_id(table_id).unwrap();
@@ -610,20 +598,13 @@ async fn columnar_merge_retains_within_window_history() {
     let columnar_dir = data_dir.join("columnar");
 
     let disk = Arc::new(
-        DiskManager::new(DiskManagerConfig {
-            data_dir: data_dir.clone(),
-            fsync_enabled: false,
-        })
+        DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
         .await
         .unwrap(),
     );
-    let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 4096 }));
+    let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let wal = Arc::new(
-        WalWriter::new(WalWriterConfig {
-            wal_dir: wal_dir.clone(),
-            fsync_enabled: false,
-            ..Default::default()
-        })
+        WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
         .unwrap(),
     );
     let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
@@ -663,10 +644,11 @@ async fn columnar_merge_retains_within_window_history() {
     heap.insert_batch(&tuples).await.unwrap();
     heap.flush().await.unwrap();
 
+    // Only the two triggers move, so the fold and the merge happen at all
+    // on four rows. Everything else is what the server runs
     let cfg = CompactionWorkerConfig {
         min_rows: 1,
         columnar_dir: columnar_dir.clone(),
-        fsync_enabled: false,
         merge_min_churn_ratio: 0.0,
         ..CompactionWorkerConfig::default()
     };
@@ -676,7 +658,9 @@ async fn columnar_merge_retains_within_window_history() {
             .enable_all()
             .build()
             .unwrap();
-        CompactionWorker::run_cycle(&rt, &catalog, &txn, &disk, &pool, &wal, &cfg, None)
+        CompactionWorker::run_cycle(
+            &rt, &catalog, &txn, &disk, &pool, &wal, &cfg, None, None, None,
+        )
     });
     let te = catalog.get_table_by_id(table_id).unwrap();
     assert_eq!(te.columnar.segments.len(), 1, "one folded segment");
@@ -696,10 +680,10 @@ async fn columnar_merge_retains_within_window_history() {
         .store(table_id.0 as u64)
         .unwrap();
     store
-        .append_supersede(seg.file_id, rid_lo + 1, 50, 1)
+        .append_supersede(0, seg.file_id, rid_lo + 1, 50, 1)
         .unwrap();
     store
-        .append_supersede(seg.file_id, rid_lo + 2, 40, 2)
+        .append_supersede(0, seg.file_id, rid_lo + 2, 40, 2)
         .unwrap();
 
     // Merge with the retention floor in effect.
@@ -708,7 +692,9 @@ async fn columnar_merge_retains_within_window_history() {
             .enable_all()
             .build()
             .unwrap();
-        CompactionWorker::run_cycle(&rt, &catalog, &txn, &disk, &pool, &wal, &cfg, None)
+        CompactionWorker::run_cycle(
+            &rt, &catalog, &txn, &disk, &pool, &wal, &cfg, None, None, None,
+        )
     });
 
     let te = catalog.get_table_by_id(table_id).unwrap();

@@ -570,6 +570,7 @@ mod tests {
                             max_length: None,
                             ts_precision: None,
                             tz_offset_secs: None,
+                            element_type: None,
                         },
                         ColumnEntry {
                             id: ColumnId(1),
@@ -582,6 +583,7 @@ mod tests {
                             max_length: Some(255),
                             ts_precision: None,
                             tz_offset_secs: None,
+                            element_type: None,
                         },
                     ],
                     constraints: vec![],
@@ -597,6 +599,9 @@ mod tests {
                     dropped_at: None,
                     expectations: Vec::new(),
                     time_travel_retention_secs: 0,
+                    lake: Default::default(),
+                    cluster: Default::default(),
+                    foreign: Default::default(),
                 },
                 TableEntry {
                     id: TableId(20),
@@ -618,6 +623,9 @@ mod tests {
                     dropped_at: None,
                     expectations: Vec::new(),
                     time_travel_retention_secs: 0,
+                    lake: Default::default(),
+                    cluster: Default::default(),
+                    foreign: Default::default(),
                 },
             ],
         });

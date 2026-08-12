@@ -7,7 +7,6 @@
 //! to that column. nextval produces a distinct value per row; currval, lastval,
 //! and setval broadcast one value across the batch.
 
-use std::sync::Arc;
 
 use zyron_common::{Result, TypeId, ZyronError};
 use zyron_parser::ast::LiteralValue;
