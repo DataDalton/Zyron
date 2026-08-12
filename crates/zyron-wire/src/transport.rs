@@ -7,6 +7,7 @@
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tracing::debug;
 
 /// Abstraction over TCP and QUIC byte streams.
 ///
@@ -114,50 +115,49 @@ impl WireTransport for TcpStream {
     }
 
     fn configure_post_handshake(&self) {
+        // Socket tuning is best effort. A kernel that rejects an option leaves
+        // the connection usable with weaker latency or dead-peer behavior, so
+        // failures are logged rather than propagated. They are not discarded
+        // silently: without TCP_USER_TIMEOUT, dead-peer detection falls back to
+        // keepalive alone, which is worth being able to see in a log.
+        let sock_ref = socket2::SockRef::from(self);
+
         // TCP keepalive (60s idle, 10s probe interval)
         let keepalive = socket2::TcpKeepalive::new()
             .with_time(Duration::from_secs(60))
             .with_interval(Duration::from_secs(10));
-        let sock_ref = socket2::SockRef::from(self);
-        let _ = sock_ref.set_tcp_keepalive(&keepalive);
+        if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
+            debug!("tcp keepalive not applied: {}", e);
+        }
 
         // Linux-specific TCP tuning for lower latency and faster dead-connection detection.
         #[cfg(target_os = "linux")]
         {
-            use std::os::unix::io::AsRawFd;
-            let fd = sock_ref.as_raw_fd();
-
-            // Limit time for unacknowledged data before declaring the connection dead (30s).
-            let timeout_ms: libc::c_int = 30000;
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_TCP,
-                    libc::TCP_USER_TIMEOUT,
-                    &timeout_ms as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
+            // Declare the connection dead after 30s of unacknowledged data
+            // instead of waiting out the default retransmit schedule.
+            if let Err(e) = sock_ref.set_tcp_user_timeout(Some(Duration::from_secs(30))) {
+                debug!("tcp user timeout not applied: {}", e);
             }
 
-            // Report socket as writable only when unsent data is below 16KB.
-            let _ = sock_ref.set_tcp_notsent_lowat(16384);
+            // Report the socket writable only when unsent data is below 16KB.
+            if let Err(e) = sock_ref.set_tcp_notsent_lowat(16384) {
+                debug!("tcp notsent lowat not applied: {}", e);
+            }
 
-            // Busy-poll for up to 50us to reduce network latency.
-            let _ = sock_ref.set_busy_poll(50);
+            // Busy-poll the receive path for up to 50us before sleeping. Needs
+            // net.core.busy_poll enabled, and applies to blocking receives, so
+            // its effect under the runtime's epoll-driven non-blocking sockets
+            // is limited.
+            if let Err(e) = sock_ref.set_busy_poll(50) {
+                debug!("tcp busy poll not applied: {}", e);
+            }
 
-            // Batch TCP ACKs to reduce per-packet overhead.
-            let _ = sock_ref.set_tcp_ack_frequency(2);
-
-            // Disable delayed ACKs for faster initial handshake response.
-            let quickack: libc::c_int = 1;
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_TCP,
-                    libc::TCP_QUICKACK,
-                    &quickack as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
+            // Switch to quickack mode so the first post-handshake exchange is
+            // not held for the delayed-ack timer. The kernel treats this as a
+            // one-shot, reverting to delayed acks as the connection proceeds,
+            // so holding quickack on would require re-arming after each read.
+            if let Err(e) = sock_ref.set_tcp_quickack(true) {
+                debug!("tcp quickack not applied: {}", e);
             }
         }
     }
