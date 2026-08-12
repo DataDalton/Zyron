@@ -431,4 +431,4 @@ cargo clippy --workspace -- -D warnings
 
 ## License
 
-Copyright (c) 2025 DataDalton. **All rights reserved.** Proprietary software - no part may be reproduced, distributed, modified, or used in any form without prior written permission of the copyright holder. See [LICENSE](LICENSE) for the full terms.
+Copyright (c) 2026 Zyron LLC. **All rights reserved.** ZyronDB is proprietary software. Personal use is free, commercial use requires a license. See [LICENSE](LICENSE.md) for the full terms.
