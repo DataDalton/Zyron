@@ -278,7 +278,7 @@ fn parse_args() -> Option<CliOptions> {
                 opts.database = args[i].clone();
             }
             "--version" => {
-                println!("zyrondb-cli {}", env!("CARGO_PKG_VERSION"));
+                println!("ZyronDB {} (zyrondb-cli)", env!("CARGO_PKG_VERSION"));
                 return None;
             }
             "--format" => {
@@ -346,7 +346,9 @@ fn parse_args() -> Option<CliOptions> {
 
 fn print_help() {
     println!(
-        "Usage: zyrondb-cli [OPTIONS] [CONNECTION_STRING] [COMMAND...]
+        "ZyronDB {} - interactive SQL client
+
+Usage: zyrondb-cli [OPTIONS] [CONNECTION_STRING] [COMMAND...]
 
 With no trailing COMMAND, zyrondb-cli starts the interactive REPL.
 Otherwise it dispatches the given command one-shot and exits:
@@ -378,7 +380,8 @@ Top-level commands (type `help` at the prompt for the full list):
   sql                      Enter the SQL sub-REPL, or `sql \"<stmt>\"` for one-shot
   watch [secs] <command>   Refresh any command on an interval until Ctrl-C
   source <file>            Run commands from a file
-  exit                     Quit"
+  exit                     Quit",
+        env!("CARGO_PKG_VERSION")
     );
 }
 
@@ -735,9 +738,10 @@ fn json_string(s: &str) -> String {
 /// doesn't reprint the logo every time.
 fn print_version_line(state: &CliState) {
     println!(
-        "{}  {}  ·  server {}",
-        color::bold("zyrondb-cli"),
-        color::dim(env!("CARGO_PKG_VERSION")),
+        "{} {}  {}  ·  server {}",
+        color::bold("ZyronDB"),
+        color::bold(env!("CARGO_PKG_VERSION")),
+        color::dim("zyrondb-cli"),
         state.server_version.as_deref().unwrap_or("unknown"),
     );
 }
@@ -1137,9 +1141,10 @@ fn print_welcome_banner(state: &CliState) {
     println!();
 
     let client_line = format!(
-        "{}  {}  {}  server {}",
-        color::bold("zyrondb-cli"),
-        color::dim(env!("CARGO_PKG_VERSION")),
+        "{} {}  {}  {}  server {}",
+        color::bold("ZyronDB"),
+        color::bold(env!("CARGO_PKG_VERSION")),
+        color::dim("zyrondb-cli"),
         color::dim("·"),
         state.server_version.as_deref().unwrap_or("unknown"),
     );

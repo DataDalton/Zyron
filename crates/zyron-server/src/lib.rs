@@ -96,7 +96,7 @@ pub fn parse_cli_args() -> Option<CliOptions> {
                 return None;
             }
             "--version" | "-v" => {
-                println!("zyrondb-server {}", env!("CARGO_PKG_VERSION"));
+                println!("ZyronDB {} (zyrondb-server)", env!("CARGO_PKG_VERSION"));
                 return None;
             }
             "--config" => {
@@ -159,7 +159,9 @@ pub fn parse_cli_args() -> Option<CliOptions> {
 
 fn print_usage() {
     println!(
-        "Usage: zyrondb-server [OPTIONS]
+        "ZyronDB {} - HTAP database server
+
+Usage: zyrondb-server [OPTIONS]
 
 Options:
   --config <path>       Path to zyrondb.toml config file
@@ -170,7 +172,8 @@ Options:
   --single-user         Single-connection mode for maintenance
   --skip-recovery       Skip WAL replay (emergency use only)
   --version, -v         Print version and exit
-  --help, -h            Print this help and exit"
+  --help, -h            Print this help and exit",
+        env!("CARGO_PKG_VERSION")
     );
 }
 
@@ -276,7 +279,7 @@ impl Server {
     /// Runs the server. This is the main entry point that blocks until shutdown.
     pub async fn run(self) -> zyron_common::Result<()> {
         let start_time = Instant::now();
-        info!("ZyronDB starting");
+        info!("ZyronDB {} starting", env!("CARGO_PKG_VERSION"));
 
         // 1. Create data and WAL directories
         let data_dir = &self.config.storage.data_dir;
