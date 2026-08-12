@@ -46,7 +46,10 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3", "xxh32"] }
 sysinfo = "0.38.4"
 
 # Networking
-socket2 = "0.6"
+# The "all" feature gates the platform socket options the wire layer sets.
+# set_reuse_port, set_tcp_user_timeout, set_tcp_quickack, set_tcp_notsent_lowat
+# and set_busy_poll are all behind it
+socket2 = { version = "0.6", features = ["all"] }
 
 # Wire protocol
 tokio-util = { version = "0.7", features = ["codec"] }

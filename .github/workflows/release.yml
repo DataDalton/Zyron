@@ -210,6 +210,10 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      # Build provenance attestation. id-token signs the claim, attestations
+      # records it, so a downloaded binary can be traced to this workflow run.
+      id-token: write
+      attestations: write
 
     steps:
       - name: Checkout
@@ -228,6 +232,14 @@ jobs:
           find staged -type f -name '*.sha256' -exec cat {} + > dist/SHA256SUMS.txt
           ls -la dist
           cat dist/SHA256SUMS.txt
+
+      # Signed statement that these exact archives were produced by this
+      # workflow at this commit. Verified with:
+      #   gh attestation verify <archive> --repo DataDalton/Zyron
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/*.tar.gz,dist/*.zip"
 
       - name: Write release notes
         shell: bash
@@ -255,10 +267,18 @@ jobs:
           - \`zyrondb-cli\` - interactive SQL client
           - \`zyrondb-ctl\` - backup, restore, and cluster administration
 
-          Verify a download against \`SHA256SUMS.txt\`:
+          Check a download against \`SHA256SUMS.txt\`:
 
           \`\`\`
           sha256sum -c SHA256SUMS.txt
+          \`\`\`
+
+          Each archive also carries a build provenance attestation, which
+          establishes that it was produced by this repository's release
+          workflow rather than only that the bytes are intact:
+
+          \`\`\`
+          gh attestation verify <archive> --repo DataDalton/Zyron
           \`\`\`
 
           ## Install and run
