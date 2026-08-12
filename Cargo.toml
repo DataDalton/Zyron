@@ -3,6 +3,9 @@ resolver = "2"
 members = ["crates/*", "binaries/*"]
 
 [workspace.package]
+# The ZyronDB version. Every crate and binary inherits it, so the release
+# tag, the archive names, and what --version prints all move together.
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 

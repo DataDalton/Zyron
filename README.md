@@ -28,6 +28,8 @@ Fresh writes land in an MVCC row heap tuned for OLTP. A background thread compac
     - [End-to-end](#end-to-end)
     - [Engine internals](#engine-internals)
   - [Getting Started](#getting-started)
+    - [Download](#download)
+    - [Build from source](#build-from-source)
   - [SQL Highlights](#sql-highlights)
   - [Project Layout](#project-layout)
   - [Roadmap](#roadmap)
@@ -90,7 +92,7 @@ flowchart TB
 ### Storage tiers
 
 | Tier | Backing | Purpose |
-|------|---------|---------|
+| ------ | --------- | --------- |
 | B+ tree index | Resident in RAM, persisted via WAL + checkpoint | Point lookups, range scans |
 | Row heap (OLTP) | Buffer pool with clock-sweep eviction | Recent and transactional rows |
 | Columnar (`.zyr`) | Disk, hot segments cached in the buffer pool | Encoded analytical scans |
@@ -187,7 +189,7 @@ _Release build, single machine: Intel(R) Core(TM) Ultra 7 270K Plus, 24 cores, 3
 What a client sees from a running server over the wire protocol, from cold start to shutdown:
 
 | Lifecycle / workload | Result |
-|----------------------|--------|
+| ---------------------- | -------- |
 | Cold boot to accepting queries | 40 ms |
 | First `ReadyForQuery` | 0.60 ms |
 | Schema DDL bootstrap | 7.2 ms |
@@ -234,7 +236,7 @@ xychart-beta
 A few more numbers not shown in the charts above:
 
 | Subsystem | Metric | Result |
-|-----------|--------|--------|
+| ----------- | -------- | -------- |
 | MVCC | GC sweep | ~1.8B tuples/sec |
 | Columnar | .zyr scan throughput | ~3.0 GB/sec |
 | Columnar | Compaction pipeline | ~3.4M rows/sec |
@@ -251,6 +253,23 @@ A few more numbers not shown in the charts above:
 <!-- BENCH:END -->
 
 ## Getting Started
+
+### Download
+
+Prebuilt binaries for Linux x86_64 and Windows x86_64 are attached to every
+[release](https://github.com/DataDalton/Zyron/releases). Each archive contains
+`zyrondb-server`, `zyrondb-cli`, and `zyrondb-ctl`.
+
+```bash
+tar xzf zyrondb-0.1.0-x86_64-unknown-linux-gnu.tar.gz
+cd zyrondb-0.1.0-x86_64-unknown-linux-gnu
+./zyrondb-server --version
+./zyrondb-server --data-dir ./data
+```
+
+Checksums are published as `SHA256SUMS.txt` on the release page.
+
+### Build from source
 
 **Prerequisites.** The Rust nightly toolchain pinned in `rust-toolchain.toml` (`rustup` selects it automatically) and a C toolchain for the TLS dependency.
 
@@ -353,7 +372,7 @@ scripts/              tooling, including the benchmark chart generator
 Each area ships with an optimization review and a validation checkpoint with hard performance budgets before the next begins.
 
 | Area | Scope | State |
-|------|-------|-------|
+| ------ | ------- | ------- |
 | Storage foundation | WAL, buffer pool, heap, B+ tree, MVCC, encoding engine, parser, catalog, planner, executor, wire, server | ✅ Complete |
 | Security & optimization | Authentication, RBAC/ABAC, row/column security, cost model, configuration | ✅ Complete |
 | Data operations | Versioning & time travel, CDC, pipelines/triggers/UDFs, streaming, server integration | ✅ Complete |

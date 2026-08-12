@@ -57,7 +57,7 @@ enum Subcommand {
 
 fn printHelp() {
     println!(
-        "zyrondb-ctl {} - ZyronDB cluster management tool
+        "ZyronDB {} - cluster management tool
 
 Usage: zyrondb-ctl [global-flags] <subcommand> [subcommand-flags]
 
@@ -99,7 +99,7 @@ fn parseArgs() -> Option<(GlobalFlags, Subcommand)> {
                 return None;
             }
             "--version" | "-V" => {
-                println!("zyrondb-ctl {}", VERSION);
+                println!("ZyronDB {} (zyrondb-ctl)", VERSION);
                 return None;
             }
             "--host" => {

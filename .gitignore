@@ -1,7 +1,9 @@
 # Rust build artifacts
 /target/
 **/*.rs.bk
-Cargo.lock
+
+# Cargo.lock is tracked. This workspace ships binaries, so release builds
+# resolve to the exact dependency versions recorded here.
 
 # IDE and editor files
 .idea/

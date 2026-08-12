@@ -1,0 +1,318 @@
+name: Release
+
+# Publishes a ZyronDB release whenever the workspace version changes on main.
+#
+# The version in Cargo.toml is the only input. Bump [workspace.package].version,
+# merge to main, and this builds the binaries, creates the v<version> tag, and
+# publishes the release. Commits that leave the version alone do nothing.
+#
+# workflow_dispatch builds the same artifacts without publishing, so the matrix
+# can be exercised on demand. Set publish=true there to release the current
+# version by hand.
+
+on:
+  push:
+    branches: [main]
+    # The workflow file itself is a trigger path so that a fix to a failed
+    # release run re-runs it. Once the version's tag exists the check job
+    # no-ops, so later edits here do not republish.
+    paths:
+      - "Cargo.toml"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a release. Leave false to build artifacts only."
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # Overrides .cargo/config.toml, which sets target-cpu=native for local
+  # benchmarking. Native codegen emits whatever instructions the build runner
+  # supports, which the download target may not have, so a released binary
+  # pins an explicit baseline instead. x86-64-v2 covers SSE4.2 and POPCNT,
+  # present on every x86_64 part since 2009.
+  #
+  # AVX2, FMA, AES, VAES and PCLMULQDQ paths are selected at runtime by
+  # is_x86_feature_detected!, so this baseline does not disable them.
+  #
+  # strip=debuginfo drops DWARF but keeps symbol names, so a panic in a
+  # released build still produces a readable backtrace.
+  RUSTFLAGS: "-C target-cpu=x86-64-v2 -C strip=debuginfo"
+
+jobs:
+  check:
+    name: Resolve version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      publish: ${{ steps.resolve.outputs.publish }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Reads [workspace.package].version. Every crate and binary inherits it,
+      # so this one value drives the tag, the archive names, and what the
+      # binaries print for --version.
+      - name: Resolve version and release decision
+        id: resolve
+        shell: bash
+        run: |
+          version=$(awk '
+            /^\[workspace\.package\]/ { inSection = 1; next }
+            /^\[/                     { inSection = 0 }
+            inSection && /^version[[:space:]]*=/ {
+              if (match($0, /"[^"]*"/)) {
+                print substr($0, RSTART + 1, RLENGTH - 2)
+                exit
+              }
+            }
+          ' Cargo.toml)
+
+          if [ -z "$version" ]; then
+            echo "No version found under [workspace.package] in Cargo.toml"
+            exit 1
+          fi
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            publish="${{ inputs.publish }}"
+          elif git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null 2>&1; then
+            echo "Tag v$version already exists. Bump the version in Cargo.toml to release."
+            publish=false
+          else
+            publish=true
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "ZyronDB $version, publish=$publish"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: check
+    if: needs.check.outputs.publish == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+            archive: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Invoking a rustup proxy in a directory holding rust-toolchain.toml
+      # installs the pinned toolchain along with its listed components and
+      # targets, so no explicit toolchain argument is needed here.
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          cargo --version
+          rustc --version
+          rustup target add ${{ matrix.target }}
+
+      # boring-sys and aws-lc-sys compile BoringSSL and AWS-LC from source.
+      # Both need cmake, which is present on the hosted images. The Windows
+      # assembly build additionally needs nasm, which is not.
+      - name: Install NASM (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nasm --no-progress -y
+          Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\NASM"
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          cache-on-failure: true
+
+      - name: Build binaries
+        shell: bash
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} \
+            --bin zyrondb-server \
+            --bin zyrondb-cli \
+            --bin zyrondb-ctl
+
+      # Confirms the binaries run on the runner and print the product name and
+      # version. The captured output ships in the archive as VERSION.txt.
+      - name: Verify version output
+        shell: bash
+        run: |
+          bindir="target/${{ matrix.target }}/release"
+          suffix=""
+          if [ "${{ runner.os }}" = "Windows" ]; then suffix=".exe"; fi
+          {
+            "$bindir/zyrondb-server$suffix" --version
+            "$bindir/zyrondb-cli$suffix" --version
+            "$bindir/zyrondb-ctl$suffix" --version
+          } | tee version-output.txt
+          if ! grep -q "ZyronDB ${{ needs.check.outputs.version }}" version-output.txt; then
+            echo "Binaries do not report ZyronDB ${{ needs.check.outputs.version }}"
+            exit 1
+          fi
+
+      - name: Package archive
+        shell: bash
+        run: |
+          stem="zyrondb-${{ needs.check.outputs.version }}-${{ matrix.target }}"
+          bindir="target/${{ matrix.target }}/release"
+          mkdir -p "dist/$stem"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "$bindir/zyrondb-server.exe" "$bindir/zyrondb-cli.exe" "$bindir/zyrondb-ctl.exe" "dist/$stem/"
+          else
+            cp "$bindir/zyrondb-server" "$bindir/zyrondb-cli" "$bindir/zyrondb-ctl" "dist/$stem/"
+          fi
+          cp README.md LICENSE "dist/$stem/"
+          cp version-output.txt "dist/$stem/VERSION.txt"
+
+          cd dist
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a -tzip "$stem.zip" "$stem" > /dev/null
+          else
+            tar czf "$stem.tar.gz" "$stem"
+          fi
+          rm -rf "$stem"
+          sha256sum "$stem".* > "$stem.sha256"
+          ls -la
+          cat "$stem.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zyrondb-${{ needs.check.outputs.version }}-${{ matrix.target }}
+          path: dist/*
+          retention-days: 14
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [check, build]
+    if: needs.check.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: staged
+
+      - name: Collect release files
+        shell: bash
+        run: |
+          mkdir -p dist
+          find staged -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} dist/ \;
+          find staged -type f -name '*.sha256' -exec cat {} + > dist/SHA256SUMS.txt
+          ls -la dist
+          cat dist/SHA256SUMS.txt
+
+      - name: Write release notes
+        shell: bash
+        run: |
+          version="${{ needs.check.outputs.version }}"
+          cat > notes.md <<EOF
+          # ZyronDB $version
+
+          ZyronDB is a database engine that handles transactional and analytical
+          workloads in a single system.
+
+          This is an early release. ZyronDB is under active development and is not
+          yet recommended for production data.
+
+          ## Downloads
+
+          | Platform | File |
+          | --- | --- |
+          | Linux x86_64 | \`zyrondb-$version-x86_64-unknown-linux-gnu.tar.gz\` |
+          | Windows x86_64 | \`zyrondb-$version-x86_64-pc-windows-msvc.zip\` |
+
+          Each archive contains three ZyronDB binaries:
+
+          - \`zyrondb-server\` - the ZyronDB database server
+          - \`zyrondb-cli\` - interactive SQL client
+          - \`zyrondb-ctl\` - backup, restore, and cluster administration
+
+          Verify a download against \`SHA256SUMS.txt\`:
+
+          \`\`\`
+          sha256sum -c SHA256SUMS.txt
+          \`\`\`
+
+          ## Install and run
+
+          Linux:
+
+          \`\`\`
+          tar xzf zyrondb-$version-x86_64-unknown-linux-gnu.tar.gz
+          cd zyrondb-$version-x86_64-unknown-linux-gnu
+          ./zyrondb-server --version
+          ./zyrondb-server --data-dir ./data
+          \`\`\`
+
+          Windows:
+
+          \`\`\`
+          zyrondb-server.exe --version
+          zyrondb-server.exe --data-dir .\\data
+          \`\`\`
+
+          Then connect from a second terminal:
+
+          \`\`\`
+          zyrondb-cli
+          \`\`\`
+
+          \`zyrondb-server --version\` prints:
+
+          \`\`\`
+          ZyronDB $version (zyrondb-server)
+          \`\`\`
+
+          ZyronDB listens on port 5432 by default.
+
+          ## Requirements
+
+          x86_64 with SSE4.2. Binaries are built to the x86-64-v2 baseline. AVX2,
+          FMA, and AES acceleration are selected at runtime when the CPU supports
+          them.
+
+          ---
+
+          ZyronDB is a product of Zyron LLC. See LICENSE for terms.
+          EOF
+          cat notes.md
+
+      # gh creates the tag at the released commit, so the tag is an output of
+      # the release rather than the trigger for it.
+      - name: Create tag and GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ needs.check.outputs.version }}" \
+            --target "$GITHUB_SHA" \
+            --title "ZyronDB ${{ needs.check.outputs.version }}" \
+            --notes-file notes.md \
+            dist/*
