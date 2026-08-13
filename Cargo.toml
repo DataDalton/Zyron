@@ -5,7 +5,7 @@ members = ["crates/*", "binaries/*"]
 [workspace.package]
 # The Zyron version. Every crate and binary inherits it, so the release
 # tag, the archive names, and what --version prints all move together.
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.94"
 
