@@ -131,6 +131,51 @@ async fn read_visible_tuple(
 /// from the heap and from any columnar segments. Used as the existence-check
 /// fallback when no usable index exists and as the match source for
 /// parent-side enforcement.
+/// Adds the keys of rows a branch appended to a table, from the branch's own
+/// append file.
+///
+/// Separate from the main walk so its locals do not enlarge the foreign key
+/// check's future, which the cascade paths already nest under an update
+/// operator.
+#[allow(clippy::too_many_arguments)]
+async fn collect_append_keys(
+    ctx: &Arc<ExecutionContext>,
+    table: &TableEntry,
+    positions: &[usize],
+    types: &[TypeId],
+    append_file_id: u32,
+    append_pages: u64,
+    keys: &mut HashSet<Vec<u8>>,
+) -> Result<()> {
+    for page_num in 0..append_pages {
+        ctx.check_cancelled()?;
+        let page_data = read_page_through_pool(
+            &ctx.buffer_pool,
+            &ctx.disk_manager,
+            PageId::new(append_file_id, page_num),
+        )
+        .await?;
+        let header = HeapPage::heap_header_from_slice(&page_data);
+        if header.slot_count == 0 {
+            continue;
+        }
+        let page = HeapPage::from_bytes(page_data);
+        for slot in 0..header.slot_count {
+            let Some(view) = page.get_tuple_view(zyron_storage::SlotId(slot)) else {
+                continue;
+            };
+            if view.is_deleted() || !view.header.is_visible_to(&ctx.snapshot) {
+                continue;
+            }
+            let batch = decode_tuple_to_batch(view.data, table);
+            if let Some(key) = encode_composite_key(&batch, 0, positions, types) {
+                keys.insert(key);
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn collect_visible_keys(
     ctx: &Arc<ExecutionContext>,
     table: &TableEntry,
@@ -140,9 +185,25 @@ async fn collect_visible_keys(
     let mut keys = HashSet::new();
     let heap = ctx.get_heap_file(table.id).await?;
     let num_pages = heap.num_pages_cached() as u32;
+    // Under a branch the parent's keys are its main rows as the branch sees
+    // them, plus the rows the branch appended. Reading main alone would
+    // refuse a reference to a parent the branch itself added, and admit one
+    // to a parent the branch deleted
+    let branch = ctx.active_branch_id;
+    let (append_file_id, append_pages) = match (branch, ctx.branch_catalog.as_ref()) {
+        (Some(bid), Some(cat)) => {
+            let files = cat.branch_files_for(bid, table.heap_file_id);
+            (
+                Some(files.append_file_id),
+                cat.append_page_count(bid, table.heap_file_id),
+            )
+        }
+        _ => (None, 0),
+    };
     for page_num in 0..num_pages {
         ctx.check_cancelled()?;
-        let page_id = PageId::new(table.heap_file_id, page_num as u64);
+        let page_id =
+            ctx.resolve_branch_page(branch, PageId::new(table.heap_file_id, page_num as u64));
         let page_data =
             read_page_through_pool(&ctx.buffer_pool, &ctx.disk_manager, page_id).await?;
         let header = HeapPage::heap_header_from_slice(&page_data);
@@ -162,6 +223,23 @@ async fn collect_visible_keys(
                 keys.insert(key);
             }
         }
+    }
+
+    // The branch's own appended rows, which live in its append file and so
+    // are in no main page above. Boxed because this runs inside the foreign
+    // key check, which the cascade paths nest under an update operator, and
+    // an inlined frame here is what exhausts the stack in a debug build
+    if let Some(file_id) = append_file_id {
+        Box::pin(collect_append_keys(
+            ctx,
+            table,
+            positions,
+            types,
+            file_id,
+            append_pages,
+            &mut keys,
+        ))
+        .await?;
     }
 
     // Folded rows live in columnar segments the heap walk cannot see. Drain
@@ -524,8 +602,13 @@ pub async fn check_child_fks(
             continue;
         }
 
-        // Single-column FK whose parent column is indexed takes the probe path.
-        let single_idx = if con.ref_columns.len() == 1 {
+        // Single-column FK whose parent column is indexed takes the probe
+        // path. Not under a branch: the shared index carries neither the
+        // rows the branch appended nor the ones it deleted, so the probe
+        // would answer for the main line. The key-set path below reads the
+        // branch's view instead, which costs a scan on a branch write and
+        // nothing on the main line
+        let single_idx = if con.ref_columns.len() == 1 && ctx.active_branch_id.is_none() {
             leading_btree_for_column(ctx, parent.id.0, con.ref_columns[0])
         } else {
             None

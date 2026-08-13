@@ -1,6 +1,10 @@
 <div align="center">
 
-# Zyron
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/brand/zyronBannerCobalt.svg">
+  <source media="(prefers-color-scheme: light)" srcset="assets/brand/zyronBannerLightCobalt.svg">
+  <img src="assets/brand/zyronBannerCobalt.svg" alt="Zyron" width="640">
+</picture>
 
 **An HTAP database engine in Rust - row store for transactions, custom columnar format for analytics, one engine.**
 
@@ -18,23 +22,22 @@ Fresh writes land in an MVCC row heap tuned for OLTP. A background thread compac
 
 ## Table of Contents
 
-- [Zyron](#zyron)
-  - [Table of Contents](#table-of-contents)
-  - [Highlights](#highlights)
-  - [Architecture](#architecture)
-    - [Storage tiers](#storage-tiers)
-  - [Capabilities](#capabilities)
-  - [Performance](#performance)
-    - [End-to-end](#end-to-end)
-    - [Engine internals](#engine-internals)
-  - [Getting Started](#getting-started)
-    - [Download](#download)
-    - [Build from source](#build-from-source)
-  - [SQL Highlights](#sql-highlights)
-  - [Project Layout](#project-layout)
-  - [Roadmap](#roadmap)
-  - [Development](#development)
-  - [License](#license)
+- [Highlights](#highlights)
+- [Architecture](#architecture)
+  - [Storage tiers](#storage-tiers)
+- [Capabilities](#capabilities)
+- [Performance](#performance)
+  - [End-to-end](#end-to-end)
+  - [Engine internals](#engine-internals)
+  - [Row heap vs ZyronLake](#row-heap-vs-zyronlake)
+- [Getting Started](#getting-started)
+  - [Download](#download)
+  - [Build from source](#build-from-source)
+- [SQL Highlights](#sql-highlights)
+- [Project Layout](#project-layout)
+- [Roadmap](#roadmap)
+- [Development](#development)
+- [License](#license)
 
 ## Highlights
 

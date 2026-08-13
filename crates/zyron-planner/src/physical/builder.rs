@@ -1099,9 +1099,9 @@ impl<'a> PhysicalPlanner<'a> {
         // Lake routing gate. A lake table's rows live in its transaction
         // log, and past the search operators above no heap, columnar or
         // index node can see them, so the lake scan is the access path.
-        // Every time-travel qualifier resolves inside the operator: a
-        // version or timestamp against the log, a branch by opening that
-        // head instead of main's
+        // Every time-travel qualifier resolves inside the operator. A
+        // version or timestamp resolves against the log, a branch by
+        // opening that head instead of main's
         if let Ok(te) = self.catalog.get_table_by_id(table_id) {
             if te.lake.is_lake() {
                 let cost = match &table_stats {

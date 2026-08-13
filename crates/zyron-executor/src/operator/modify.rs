@@ -408,7 +408,15 @@ pub(crate) async fn check_unique_constraints(
             for cand in candidates {
                 let live = match cand {
                     zyron_common::RowLocator::Heap { page, slot } => {
-                        let page_id = zyron_common::page::PageId::new(heap_file_id, page.page_num);
+                        // Read through the active branch. A row this branch
+                        // deleted is tombstoned in the branch's copy of the
+                        // page while the main page still shows it live, and
+                        // reading main would refuse an insert of a value the
+                        // branch no longer holds. A no-op on the main line
+                        let page_id = ctx.resolve_branch_page(
+                            ctx.active_branch_id,
+                            zyron_common::page::PageId::new(heap_file_id, page.page_num),
+                        );
                         let data = crate::operator::scan::read_page_through_pool(
                             &ctx.buffer_pool,
                             &ctx.disk_manager,
@@ -446,9 +454,150 @@ pub(crate) async fn check_unique_constraints(
                     return Err(unique_violation(table_entry, col_pos));
                 }
             }
+
+            // The shared index does not carry rows this branch appended,
+            // because their locators name the branch's own file. Those rows
+            // are as real as any other to a branch reader, so a uniqueness
+            // check that skipped them would let one branch hold the value
+            // twice. Bounded by what the branch itself wrote
+            if branch_append_holds_value(
+                ctx,
+                table_entry,
+                col_pos,
+                col_type,
+                &scratch[..value_len],
+            )
+            .await?
+            {
+                return Err(unique_violation(table_entry, col_pos));
+            }
         }
     }
     Ok(())
+}
+
+/// Runs the insert path for one batch of a branch write.
+///
+/// A branch write lands in the branch's append file rather than the main
+/// heap, and everything a main insert enforces is enforced here too. The
+/// reads these checks make resolve through the branch, so the foreign key
+/// probe and the uniqueness probe both see the branch's view rather than
+/// the main line's.
+///
+/// Kept out of the insert operator's own future deliberately. That future
+/// is already large, and the branch merge nests it under the DDL dispatch
+/// and a scan, where inlining these locals is what exhausts the stack in an
+/// unoptimized build.
+///
+/// No shared-index maintenance happens here. The shared index drops a heap
+/// locator's file id and the index scan re-stamps the table's heap file
+/// onto it, so an entry for a row in the branch's append file would resolve
+/// to a main page. A branch index scan reads the append range as a
+/// predicate-filtered delta instead, which is what makes these rows
+/// findable without putting them in an index the main line shares.
+#[allow(clippy::too_many_arguments)]
+async fn insert_branch_batch(
+    ctx: &Arc<ExecutionContext>,
+    table_id: zyron_catalog::TableId,
+    table_entry: &zyron_catalog::TableEntry,
+    index_snap: &zyron_catalog::TableIndexSnapshot,
+    branch_id: u64,
+    heap_file_id: u32,
+    txn_id: u32,
+    mut batch: DataBatch,
+) -> zyron_common::Result<i64> {
+    crate::trigger::fire_row_triggers(
+        ctx,
+        table_id,
+        zyron_catalog::TriggerEntry::TIMING_BEFORE,
+        zyron_catalog::TriggerEntry::EVENT_INSERT,
+        &batch,
+        &table_entry.columns,
+    )
+    .await?;
+
+    let fk_violations = crate::operator::fk::check_child_fks(ctx, table_entry, &batch).await?;
+    if !fk_violations.is_empty() {
+        batch = divert_quarantined(ctx, &batch, &fk_violations, txn_id).await?;
+        if batch.num_rows == 0 {
+            return Ok(0);
+        }
+    }
+
+    check_unique_constraints(ctx, table_entry, &batch, index_snap, &[]).await?;
+
+    let tuples = batch_to_tuples(&batch, &table_entry.columns, txn_id);
+    let ids =
+        crate::operator::branch_write::branch_insert(ctx, branch_id, heap_file_id, &tuples).await?;
+
+    crate::trigger::fire_row_triggers(
+        ctx,
+        table_id,
+        zyron_catalog::TriggerEntry::TIMING_AFTER,
+        zyron_catalog::TriggerEntry::EVENT_INSERT,
+        &batch,
+        &table_entry.columns,
+    )
+    .await?;
+
+    Ok(ids.len() as i64)
+}
+
+/// True when a row the active branch appended already carries this indexed
+/// value.
+///
+/// Reads only the branch's append range, which holds what this branch
+/// inserted and nothing else, so the cost is the branch's own write volume
+/// rather than the table's size. Returns false immediately on the main line.
+async fn branch_append_holds_value(
+    ctx: &Arc<ExecutionContext>,
+    table_entry: &zyron_catalog::TableEntry,
+    col_pos: usize,
+    col_type: TypeId,
+    value: &[u8],
+) -> zyron_common::Result<bool> {
+    let (Some(branch_id), Some(catalog)) = (ctx.active_branch_id, ctx.branch_catalog.as_ref())
+    else {
+        return Ok(false);
+    };
+    let files = catalog.branch_files_for(branch_id, table_entry.heap_file_id);
+    let pages = catalog.append_page_count(branch_id, table_entry.heap_file_id);
+    let mut scratch: Vec<u8> = Vec::with_capacity(48);
+    for page_num in 0..pages {
+        ctx.check_cancelled()?;
+        let page_id = zyron_common::page::PageId::new(files.append_file_id, page_num);
+        let data = crate::operator::scan::read_page_through_pool(
+            &ctx.buffer_pool,
+            &ctx.disk_manager,
+            page_id,
+        )
+        .await?;
+        let header = zyron_storage::HeapPage::heap_header_from_slice(&data);
+        for slot in 0..header.slot_count {
+            let Some(view) = zyron_storage::HeapPage::get_tuple_view_from_slice(
+                &data,
+                zyron_storage::SlotId(slot),
+            ) else {
+                continue;
+            };
+            if view.is_deleted()
+                || !ctx
+                    .snapshot
+                    .is_live_latest(view.header.xmin as u64, view.header.xmax as u64)
+            {
+                continue;
+            }
+            let row = crate::operator::fk::decode_tuple_to_batch(view.data, table_entry);
+            scratch.clear();
+            if !encode_btree_key_into(&row, 0, col_pos, col_type, &mut scratch) {
+                continue;
+            }
+            if scratch == value {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Adds B+tree index entries for a batch of newly stored rows. Each entry's key
@@ -1774,19 +1923,24 @@ impl Operator for InsertOperator {
                     )
                 })?;
 
-                // Branch writes go to the branch append overlay and stay
-                // isolated from the main line. Index, CDC, and trigger
-                // maintenance for branches arrives in a later stage.
+                // A branch write lands in the branch's append file rather
+                // than the main heap, and everything a main insert enforces
+                // is enforced here too. The rows are the branch's, so the
+                // reads these checks make resolve through the branch: the
+                // foreign key probe and the uniqueness probe both read the
+                // branch's view of the parent and of the table
                 if let Some(bid) = self.ctx.active_branch_id {
-                    let tuples = batch_to_tuples(&exec_batch.batch, &table_entry.columns, txn_id);
-                    let ids = crate::operator::branch_write::branch_insert(
+                    total_inserted += Box::pin(insert_branch_batch(
                         &self.ctx,
+                        self.table_id,
+                        &table_entry,
+                        &index_snap,
                         bid,
                         heap_file.heap_file_id(),
-                        &tuples,
-                    )
+                        txn_id,
+                        exec_batch.batch,
+                    ))
                     .await?;
-                    total_inserted += ids.len() as i64;
                     continue;
                 }
 

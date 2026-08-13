@@ -213,6 +213,110 @@ fn total_rows(batches: &[DataBatch]) -> usize {
     batches.iter().map(|b| b.num_rows).sum()
 }
 
+/// Runs one statement and returns the message it failed with, for the cases
+/// where the refusal is the behavior under test.
+async fn exec_err(h: &mut Harness, sql: &str) -> String {
+    let stmt = zyron_parser::parse(sql)
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("one statement");
+    let plan = match zyron_planner::plan(
+        &h.server.catalog,
+        DatabaseId(1),
+        vec!["public".into()],
+        stmt,
+        None,
+    )
+    .await
+    {
+        Ok(plan) => plan,
+        Err(e) => return e.to_string(),
+    };
+    let mut txn = h
+        .server
+        .txn_manager
+        .begin(IsolationLevel::ReadCommitted)
+        .expect("begin");
+    let snapshot = txn.snapshot.clone();
+    let txn_id = txn.txn_id as u32;
+    let mut ctx = ExecutionContext::new(
+        h.server.catalog.clone(),
+        h.server.wal.clone(),
+        h.server.buffer_pool.clone(),
+        h.server.disk_manager.clone(),
+        txn_id,
+        snapshot,
+    );
+    ctx.heap_files = Some(Arc::clone(&h.server.heap_files));
+    ctx.btree_indexes = Some(Arc::clone(&h.server.btree_indexes));
+    if let Some(mgr) = &h.server.branch_manager {
+        ctx.branch_catalog = Some(Arc::clone(mgr) as Arc<dyn zyron_common::BranchCatalog>);
+        if let Some(name) = &h.active_branch {
+            ctx.active_branch_id = mgr.get_branch_by_name(name).ok().map(|e| e.id.0);
+        }
+    }
+    let ctx = Arc::new(ctx);
+    let result = zyron_executor::execute(plan, &ctx).await;
+    let _ = h.server.txn_manager.abort(&mut txn);
+    match result {
+        Ok(_) => panic!("expected {sql} to fail"),
+        Err(e) => e.to_string(),
+    }
+}
+
+/// A branch write enforces what a main write enforces. These used to be
+/// skipped outright, so a branch could hold a row no main insert would have
+/// accepted, and the divergence only surfaced at merge.
+#[tokio::test]
+async fn branch_writes_enforce_the_constraints_a_main_write_enforces() {
+    let mut h = create_harness().await;
+    exec(&mut h, "CREATE TABLE p (k INT NOT NULL)").await;
+    // Heap uniqueness is enforced through a unique index, so that is what
+    // declares it here
+    exec(&mut h, "CREATE UNIQUE INDEX p_k_ux ON p (k)").await;
+    exec(
+        &mut h,
+        "CREATE TABLE c (id INT NOT NULL, k INT, FOREIGN KEY (k) REFERENCES p(k))",
+    )
+    .await;
+    exec(&mut h, "INSERT INTO p VALUES (1), (2)").await;
+
+    exec(&mut h, "CREATE BRANCH dev").await;
+    exec(&mut h, "USE BRANCH dev").await;
+
+    // A key only the branch holds still collides with itself. The shared
+    // index does not carry branch rows, so this is the check that reads the
+    // branch's own append range
+    exec(&mut h, "INSERT INTO p VALUES (7)").await;
+    let err = exec_err(&mut h, "INSERT INTO p VALUES (7)").await;
+    assert!(err.contains("nique"), "branch duplicate must be refused: {err}");
+
+    // A key main holds also collides, through the shared index
+    let err = exec_err(&mut h, "INSERT INTO p VALUES (1)").await;
+    assert!(err.contains("nique"), "main duplicate must be refused: {err}");
+
+    // A foreign key with no parent is refused on the branch too
+    let err = exec_err(&mut h, "INSERT INTO c VALUES (10, 99)").await;
+    assert!(err.contains("foreign key"), "{err}");
+
+    // A parent the branch itself added satisfies the reference
+    exec(&mut h, "INSERT INTO c VALUES (11, 7)").await;
+
+    // NOT NULL holds on the branch as everywhere else
+    let err = exec_err(&mut h, "INSERT INTO c VALUES (12, NULL), (NULL, 1)").await;
+    assert!(err.contains("NOT NULL"), "{err}");
+
+    let rows = exec(&mut h, "SELECT id FROM c").await;
+    assert_eq!(total_rows(&rows), 1, "only the accepted row landed");
+
+    // Main never saw any of it
+    h.active_branch = None;
+    let rows = exec(&mut h, "SELECT k FROM p").await;
+    assert_eq!(total_rows(&rows), 2, "main keeps its two rows");
+    assert_eq!(total_rows(&exec(&mut h, "SELECT id FROM c").await), 0);
+}
+
 /// Collects (id, v) integer pairs from a two-column result, sorted by id.
 fn id_v_pairs(batches: &[DataBatch]) -> Vec<(i32, i32)> {
     let mut out = Vec::new();

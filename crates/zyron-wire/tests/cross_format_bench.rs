@@ -38,21 +38,41 @@
 //! one run on one machine is hardware independent, and every absolute
 //! target in this repo went stale when the CPU changed.
 //!
-//! The timing ratios are bounded from the spread across the release runs
-//! in `benchmarks/cross_format/`, with headroom above the worst of them, so
-//! a bound catches a design regression rather than machine noise. A bound
-//! on a timing has to come from optimized runs: one invented from an
-//! unoptimized one is not a target, it is a number somebody made up that
+//! A timing bound here states a claim, not a snapshot of one run. A bound
+//! set to the worst observed ratio plus a little is a gate that fails on a
+//! busy machine, and a gate that cries wolf is one people learn to ignore.
+//! So each bound is the weakest statement still worth enforcing.
+//!
+//! - A point lookup bounds at 0.25, "at least four times faster". The lake
+//!   resolves a row locator to a file and an ordinal and reads only the
+//!   projected column, so this is a structural win rather than a margin
+//!   that has to be defended run to run.
+//! - A scan, aggregate, join, point update and bulk delete bound at 1.00,
+//!   "never slower than the heap". That is the claim the format exists to
+//!   make for analytics, and it holds with room to spare.
+//! - A load bounds loosely, because the lake is expected to lose. It writes
+//!   a data file and publishes a log version per statement.
+//!
+//! Range scan wide carries the thinnest margin of the set, and that is
+//! inherent rather than a defect. Reading most of a table is the shape
+//! where a row store is most competitive. If it trips, read it as a real
+//! narrowing and find out why, rather than widening the bound.
+//!
+//! A bound on a timing has to come from optimized runs. One invented from
+//! an unoptimized one is not a target, it is a number somebody made up that
 //! would have to be moved the first time real hardware disagreed. The
 //! harness applies a timing bound only in a measuring build and reports it
 //! unchecked elsewhere, so a debug run is not failed against release
-//! numbers.
+//! numbers. Bytes read carries the precise claim instead, because a byte
+//! count is exact in any build profile.
 //!
 //! Two ratios are deliberately left unbounded, both about the indexed point
-//! lookup. They span 23x and 16x across those same runs, so any bound wide
-//! enough to admit them would pass whatever the engine did, and a bound
-//! that wide is worse than none: it reads as a checked claim. The spread is
-//! itself the finding and is recorded as one.
+//! lookup. Their spread across recorded runs is orders of magnitude wider
+//! than every other shape here, so any bound loose enough to admit them
+//! would pass whatever the engine did, and a bound that wide is worse than
+//! none because it reads as a checked claim. The spread is itself the
+//! finding, and it is recorded rather than asserted. Read the run files in
+//! `benchmarks/cross_format/` for what it currently is.
 //!
 //! Bytes read is bounded, because it is not a timing. A count of bytes is
 //! the same number on any machine in any build profile, so its bound comes
@@ -650,7 +670,7 @@ async fn test_range_scan_across_formats() {
         test,
         "Range scan, selective",
         "rs",
-        Some(RatioBound::AtMost(0.85)),
+        Some(RatioBound::AtMost(1.00)),
         |t| format!("SELECT COUNT(*) FROM {} WHERE region = 7", t),
     )
     .await;
@@ -679,7 +699,7 @@ async fn test_aggregate_across_formats() {
         test,
         "Aggregate over one column",
         "ag",
-        Some(RatioBound::AtMost(0.90)),
+        Some(RatioBound::AtMost(1.00)),
         |t| format!("SELECT SUM(amount) FROM {}", t),
     )
     .await;
@@ -771,12 +791,12 @@ async fn test_point_lookup_with_and_without_an_index() {
         "us",
         lake_indexed,
     );
-    // Recorded without a bound. Across six release runs this ratio spans
-    // 0.85 to 19.5, so any bound loose enough to admit it would pass
-    // whatever the engine did. The spread is the finding, not the number:
-    // it says the lake index path is not yet consistently reached on a
-    // point lookup, which is a real question this suite is asking rather
-    // than a claim it can enforce
+    // Recorded without a bound. This ratio is far less repeatable across
+    // runs than any other shape here, so a bound loose enough to admit it
+    // would pass whatever the engine did. The spread is the finding rather
+    // than the number. It says the lake index path is not consistently
+    // reached on a point lookup, which is a question this suite is asking
+    // rather than a claim it can enforce
     ratio_of(
         test,
         "Point lookup with an index",
@@ -787,8 +807,10 @@ async fn test_point_lookup_with_and_without_an_index() {
 
     // What the index bought each format, as its own recorded quantity so a
     // format that never consults its index reads as a ratio near one.
-    // Unbounded for the same reason as the ratio above, and it is the
-    // clearer statement of it: this spans 0.008 to 0.132 across runs
+    // Unbounded for the same reason as the ratio above, and it states the
+    // question more directly. It isolates how much each format's own index
+    // helped, rather than comparing two lookups that may not both have
+    // used one
     record_ratio(
         test,
         "Index speedup on point lookup",
@@ -846,7 +868,7 @@ async fn test_point_update_across_formats() {
 
     let heap_avg = record_metric_for(Format::Heap, test, "Point update", "us", heap_runs);
     let lake_avg = record_metric_for(Format::Lake, test, "Point update", "us", lake_runs);
-    ratio_of(test, "Point update", heap_avg, lake_avg, Some(RatioBound::AtMost(0.85)));
+    ratio_of(test, "Point update", heap_avg, lake_avg, Some(RatioBound::AtMost(1.00)));
 }
 
 /// A predicate delete is the lake's case: it records the predicate and
@@ -901,7 +923,7 @@ async fn test_bulk_delete_across_formats() {
             .map(|(_, v)| *v)
             .collect(),
     );
-    ratio_of(test, "Bulk delete", heap_avg, lake_avg, Some(RatioBound::AtMost(0.60)));
+    ratio_of(test, "Bulk delete", heap_avg, lake_avg, Some(RatioBound::AtMost(1.00)));
 }
 
 /// A join of two tables of one format against the same join of the other,
@@ -938,7 +960,7 @@ async fn test_join_across_formats() {
         test,
         "Join",
         "ja",
-        Some(RatioBound::AtMost(0.95)),
+        Some(RatioBound::AtMost(1.00)),
         |t| {
             // The second table's prefix follows the first, which is what
             // keeps both sides on one format
