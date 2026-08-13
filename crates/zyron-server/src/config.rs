@@ -1567,7 +1567,7 @@ deployment_mode = "lake"
         assert!(err.to_string().contains("storage.deployment_mode"));
         assert!(err.to_string().contains("'db', 'lake' or 'unified'"));
 
-        // Runtime override path, the one zyrondb.auto.conf goes through
+        // Runtime override path, the one zyron.auto.conf goes through
         let mut config = ZyronConfig::default();
         config.set_config_value("storage", "deployment_mode", "db");
         assert_eq!(config.deployment_mode(), zyron_common::DeploymentMode::Db);
