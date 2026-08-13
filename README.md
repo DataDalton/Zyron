@@ -288,8 +288,8 @@ Prebuilt binaries for Linux x86_64 and Windows x86_64 are attached to every
 `zyron-server`, `zyron-cli`, and `zyron-ctl`.
 
 ```bash
-tar xzf zyron-0.1.0-x86_64-unknown-linux-gnu.tar.gz
-cd zyron-0.1.0-x86_64-unknown-linux-gnu
+tar xzf zyron-<version>-x86_64-unknown-linux-gnu.tar.gz
+cd zyron-<version>-x86_64-unknown-linux-gnu
 ./zyron-server --version
 ./zyron-server --data-dir ./data
 ```

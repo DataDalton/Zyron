@@ -38,10 +38,21 @@
 //! one run on one machine is hardware independent, and every absolute
 //! target in this repo went stale when the CPU changed.
 //!
-//! The timing ratios are recorded and not yet bounded. A bound on a timing
-//! has to come from an optimized run, and one invented from an unoptimized
-//! one is not a target, it is a number somebody made up that would have to
-//! be moved the first time real hardware disagreed.
+//! The timing ratios are bounded from the spread across the release runs
+//! in `benchmarks/cross_format/`, with headroom above the worst of them, so
+//! a bound catches a design regression rather than machine noise. A bound
+//! on a timing has to come from optimized runs: one invented from an
+//! unoptimized one is not a target, it is a number somebody made up that
+//! would have to be moved the first time real hardware disagreed. The
+//! harness applies a timing bound only in a measuring build and reports it
+//! unchecked elsewhere, so a debug run is not failed against release
+//! numbers.
+//!
+//! Two ratios are deliberately left unbounded, both about the indexed point
+//! lookup. They span 23x and 16x across those same runs, so any bound wide
+//! enough to admit them would pass whatever the engine did, and a bound
+//! that wide is worse than none: it reads as a checked claim. The spread is
+//! itself the finding and is recorded as one.
 //!
 //! Bytes read is bounded, because it is not a timing. A count of bytes is
 //! the same number on any machine in any build profile, so its bound comes
@@ -58,7 +69,8 @@
 use std::sync::Arc;
 
 use zyron_bench_harness::{
-    Format, Instant, VALIDATION_RUNS, init, measuring, record_metric_for, record_ratio, tprintln,
+    Format, Instant, RatioBound, VALIDATION_RUNS, assert_ratio, init, measuring,
+    record_metric_for, record_ratio, tprintln,
 };
 use zyron_executor::column::ScalarValue;
 use zyron_wire::connection::ServerState;
@@ -274,6 +286,7 @@ async fn compare(
     test: &str,
     metric: &str,
     base: &str,
+    bound: Option<RatioBound>,
     shape: impl Fn(&str) -> String,
 ) {
     let heap_sql = shape(&HEAP.table(base));
@@ -301,7 +314,7 @@ async fn compare(
 
     let heap_avg = record_metric_for(Format::Heap, test, metric, "us", heap_runs);
     let lake_avg = record_metric_for(Format::Lake, test, metric, "us", lake_runs);
-    ratio_of(test, metric, heap_avg, lake_avg);
+    ratio_of(test, metric, heap_avg, lake_avg, bound);
 
     compare_bytes_read(server, test, &heap_sql, &lake_sql).await;
 }
@@ -417,14 +430,46 @@ async fn time_query(
 }
 
 /// Records lake over heap, which reads as "how many times the lake costs
-/// what the heap does". Below one the lake is ahead
-fn ratio_of(test: &str, metric: &str, heap_avg: f64, lake_avg: f64) {
-    let value = record_ratio(
-        test,
-        metric,
-        (Format::Lake, lake_avg),
-        (Format::Heap, heap_avg),
-    );
+/// what the heap does". Below one the lake is ahead.
+///
+/// `bound` is the regression gate. It is set from the spread across the
+/// release runs in `benchmarks/cross_format/`, with headroom above the
+/// worst of them, so it catches a design regression rather than machine
+/// noise. A shape whose ratio is not stable across those runs carries None
+/// and is recorded without a claim, because a bound loose enough to admit
+/// an unstable measurement would pass no matter what the engine did.
+///
+/// A timing bound is profile dependent, so the harness applies it only in a
+/// measuring build and reports it unchecked elsewhere rather than failing a
+/// debug run against release numbers.
+fn ratio_of(test: &str, metric: &str, heap_avg: f64, lake_avg: f64, bound: Option<RatioBound>) {
+    let value = match bound {
+        Some(bound) => {
+            let admits = assert_ratio(
+                test,
+                metric,
+                (Format::Lake, lake_avg),
+                (Format::Heap, heap_avg),
+                bound,
+            );
+            assert!(
+                admits,
+                "{} {} ratio {} is outside its bound, from lake {} and heap {}",
+                test,
+                metric,
+                lake_avg / heap_avg,
+                lake_avg,
+                heap_avg
+            );
+            Some(lake_avg / heap_avg)
+        }
+        None => record_ratio(
+            test,
+            metric,
+            (Format::Lake, lake_avg),
+            (Format::Heap, heap_avg),
+        ),
+    };
     // A ratio that could not be taken means one side measured nothing,
     // which is a broken benchmark and not a result
     assert!(
@@ -469,6 +514,7 @@ async fn load_both(
     // Some when this load is itself the measurement, None when it is only
     // setting up the table a later workload reads
     metric: Option<&str>,
+    bound: Option<RatioBound>,
 ) {
     HEAP.create(server, session, base).await;
     LAKE.create(server, session, base).await;
@@ -477,7 +523,7 @@ async fn load_both(
     if let Some(metric) = metric {
         let heap_avg = record_metric_for(Format::Heap, test, metric, "us", vec![heap_us]);
         let lake_avg = record_metric_for(Format::Lake, test, metric, "us", vec![lake_us]);
-        ratio_of(test, metric, heap_avg, lake_avg);
+        ratio_of(test, metric, heap_avg, lake_avg, bound);
     }
 }
 
@@ -485,6 +531,7 @@ async fn setup(
     test: &str,
     base: &str,
     metric: Option<&str>,
+    bound: Option<RatioBound>,
 ) -> (Arc<ServerState>, tempfile::TempDir, Vec<Row>) {
     init("cross_format");
     let (server, _schema, tmp) = create_test_server().await;
@@ -499,6 +546,7 @@ async fn setup(
         &data,
         BULK_ROWS_PER_STATEMENT,
         metric,
+        bound,
     )
     .await;
     (server, tmp, data)
@@ -514,7 +562,7 @@ async fn setup(
 async fn test_bulk_load_to_queryable_across_formats() {
     let test = "bulk_load";
     let _section = section("Bulk Load To Queryable");
-    let (_server, _tmp, _data) = setup(test, "load", Some("Bulk load to queryable")).await;
+    let (_server, _tmp, _data) = setup(test, "load", Some("Bulk load to queryable"), Some(RatioBound::AtMost(14.0))).await;
 }
 
 /// The same rows in statements two orders of magnitude smaller. This is
@@ -544,6 +592,7 @@ async fn test_trickle_load_to_queryable_across_formats() {
         &data,
         TRICKLE_ROWS_PER_STATEMENT,
         Some("Trickle load to queryable"),
+        Some(RatioBound::AtMost(40.0)),
     )
     .await;
 }
@@ -556,13 +605,14 @@ async fn test_trickle_load_to_queryable_across_formats() {
 async fn test_point_lookup_narrow_projection_across_formats() {
     let test = "point_lookup_narrow";
     let _section = section("Point Lookup, Narrow Projection");
-    let (server, _tmp, data) = setup(test, "pt", None).await;
+    let (server, _tmp, data) = setup(test, "pt", None, None).await;
     let probe = data[data.len() / 3].id;
     compare(
         &server,
         test,
         "Point lookup, narrow projection",
         "pt",
+        Some(RatioBound::AtMost(0.25)),
         |t| format!("SELECT amount FROM {} WHERE id = {}", t, probe),
     )
     .await;
@@ -574,13 +624,14 @@ async fn test_point_lookup_narrow_projection_across_formats() {
 async fn test_point_lookup_full_row_across_formats() {
     let test = "point_lookup_full";
     let _section = section("Point Lookup, Full Row");
-    let (server, _tmp, data) = setup(test, "pf", None).await;
+    let (server, _tmp, data) = setup(test, "pf", None, None).await;
     let probe = data[data.len() / 2].id;
     compare(
         &server,
         test,
         "Point lookup, full row",
         "pf",
+        Some(RatioBound::AtMost(0.25)),
         |t| format!("SELECT id, region, amount, label FROM {} WHERE id = {}", t, probe),
     )
     .await;
@@ -590,7 +641,7 @@ async fn test_point_lookup_full_row_across_formats() {
 async fn test_range_scan_across_formats() {
     let test = "range_scan";
     let _section = section("Range Scan");
-    let (server, _tmp, _data) = setup(test, "rs", None).await;
+    let (server, _tmp, _data) = setup(test, "rs", None, None).await;
 
     // Selective: one region of sixty four, which is what file pruning and
     // zone maps are for
@@ -599,6 +650,7 @@ async fn test_range_scan_across_formats() {
         test,
         "Range scan, selective",
         "rs",
+        Some(RatioBound::AtMost(0.85)),
         |t| format!("SELECT COUNT(*) FROM {} WHERE region = 7", t),
     )
     .await;
@@ -610,6 +662,7 @@ async fn test_range_scan_across_formats() {
         test,
         "Range scan, wide",
         "rs",
+        Some(RatioBound::AtMost(1.00)),
         |t| format!("SELECT COUNT(*) FROM {} WHERE amount >= 0", t),
     )
     .await;
@@ -620,12 +673,13 @@ async fn test_range_scan_across_formats() {
 async fn test_aggregate_across_formats() {
     let test = "aggregate";
     let _section = section("Aggregate");
-    let (server, _tmp, _data) = setup(test, "ag", None).await;
+    let (server, _tmp, _data) = setup(test, "ag", None, None).await;
     compare(
         &server,
         test,
         "Aggregate over one column",
         "ag",
+        Some(RatioBound::AtMost(0.90)),
         |t| format!("SELECT SUM(amount) FROM {}", t),
     )
     .await;
@@ -643,7 +697,7 @@ async fn test_aggregate_across_formats() {
 async fn test_point_lookup_with_and_without_an_index() {
     let test = "point_lookup_index";
     let _section = section("Point Lookup, With And Without An Index");
-    let (server, _tmp, data) = setup(test, "pli", None).await;
+    let (server, _tmp, data) = setup(test, "pli", None, None).await;
     let mut session = new_session();
     let probe = data[data.len() / 3].id;
 
@@ -684,6 +738,7 @@ async fn test_point_lookup_with_and_without_an_index() {
         "Point lookup without an index",
         heap_bare_avg,
         lake_bare_avg,
+        Some(RatioBound::AtMost(0.25)),
     );
 
     for target in [HEAP, LAKE] {
@@ -716,15 +771,24 @@ async fn test_point_lookup_with_and_without_an_index() {
         "us",
         lake_indexed,
     );
+    // Recorded without a bound. Across six release runs this ratio spans
+    // 0.85 to 19.5, so any bound loose enough to admit it would pass
+    // whatever the engine did. The spread is the finding, not the number:
+    // it says the lake index path is not yet consistently reached on a
+    // point lookup, which is a real question this suite is asking rather
+    // than a claim it can enforce
     ratio_of(
         test,
         "Point lookup with an index",
         heap_indexed_avg,
         lake_indexed_avg,
+        None,
     );
 
     // What the index bought each format, as its own recorded quantity so a
-    // format that never consults its index reads as a ratio near one
+    // format that never consults its index reads as a ratio near one.
+    // Unbounded for the same reason as the ratio above, and it is the
+    // clearer statement of it: this spans 0.008 to 0.132 across runs
     record_ratio(
         test,
         "Index speedup on point lookup",
@@ -739,7 +803,7 @@ async fn test_point_lookup_with_and_without_an_index() {
 async fn test_point_update_across_formats() {
     let test = "point_update";
     let _section = section("Point Update");
-    let (server, _tmp, data) = setup(test, "pu", None).await;
+    let (server, _tmp, data) = setup(test, "pu", None, None).await;
     let probe = data[data.len() / 4].id;
 
     let mut heap_runs = Vec::with_capacity(reps());
@@ -782,7 +846,7 @@ async fn test_point_update_across_formats() {
 
     let heap_avg = record_metric_for(Format::Heap, test, "Point update", "us", heap_runs);
     let lake_avg = record_metric_for(Format::Lake, test, "Point update", "us", lake_runs);
-    ratio_of(test, "Point update", heap_avg, lake_avg);
+    ratio_of(test, "Point update", heap_avg, lake_avg, Some(RatioBound::AtMost(0.85)));
 }
 
 /// A predicate delete is the lake's case: it records the predicate and
@@ -791,7 +855,7 @@ async fn test_point_update_across_formats() {
 async fn test_bulk_delete_across_formats() {
     let test = "bulk_delete";
     let _section = section("Bulk Delete");
-    let (server, _tmp, _data) = setup(test, "bd", None).await;
+    let (server, _tmp, _data) = setup(test, "bd", None, None).await;
 
     let mut runs = Vec::new();
     for target in [HEAP, LAKE] {
@@ -837,7 +901,7 @@ async fn test_bulk_delete_across_formats() {
             .map(|(_, v)| *v)
             .collect(),
     );
-    ratio_of(test, "Bulk delete", heap_avg, lake_avg);
+    ratio_of(test, "Bulk delete", heap_avg, lake_avg, Some(RatioBound::AtMost(0.60)));
 }
 
 /// A join of two tables of one format against the same join of the other,
@@ -864,6 +928,7 @@ async fn test_join_across_formats() {
             &data,
             BULK_ROWS_PER_STATEMENT,
             None,
+            None,
         )
         .await;
     }
@@ -873,6 +938,7 @@ async fn test_join_across_formats() {
         test,
         "Join",
         "ja",
+        Some(RatioBound::AtMost(0.95)),
         |t| {
             // The second table's prefix follows the first, which is what
             // keeps both sides on one format

@@ -1,9 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Zyron">
-  <title>Zyron</title>
-  <circle cx="32" cy="32" r="31" fill="#0B0B0D"/>
-  <g fill="#FFFFFF">
-    <path d="M15 17 H49 V25.5 H15 Z"/>
-    <path d="M46.08 27.5 H31.08 L17.92 36.5 H32.92 Z"/>
-    <path d="M15 38.5 H49 V47 H15 Z"/>
-  </g>
-</svg>
