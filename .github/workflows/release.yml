@@ -326,6 +326,8 @@ jobs:
           license.
 
           See [LICENSE](https://github.com/DataDalton/Zyron/blob/main/LICENSE.md) for the full terms.
+
+          Zyron LLC · Licensing inquiries: [licensing@zyrondb.com](mailto:licensing@zyrondb.com)
           EOF
           cat notes.md
 
