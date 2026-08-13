@@ -1,7 +1,7 @@
 //! Quota gossip background worker.
 //!
 //! Periodically snapshots the local QuotaRegistry and emits the entries to a
-//! configurable transport, so peer ZyronDB instances can converge their
+//! configurable transport, so peer Zyron instances can converge their
 //! per-key quota usage via the monotone-max merge in
 //! `zyron_types::scheduling::QuotaRegistry::merge_remote`.
 //!

@@ -106,6 +106,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrayref"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb"
+
+[[package]]
+name = "arrayvec"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+
+[[package]]
 name = "arrow"
 version = "55.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -995,6 +1007,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 
 [[package]]
+name = "blake3"
+version = "1.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76ae7bad254120e9e4c63bafc385310756f90c484eac0e36b8317cf09cb92a77"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq",
+ "cpufeatures 0.3.0",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1341,6 +1367,12 @@ dependencies = [
  "once_cell",
  "tiny-keccak",
 ]
+
+[[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "core-foundation"
@@ -7036,6 +7068,7 @@ dependencies = [
  "mimalloc",
  "p256 0.13.2",
  "parking_lot",
+ "pbkdf2",
  "rand 0.10.0",
  "regex",
  "reqwest",
@@ -7060,6 +7093,12 @@ dependencies = [
 [[package]]
 name = "zyron-bench-harness"
 version = "0.1.0"
+dependencies = [
+ "zyron-buffer",
+ "zyron-common",
+ "zyron-storage",
+ "zyron-wal",
+]
 
 [[package]]
 name = "zyron-buffer"
@@ -7119,14 +7158,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "zyron-cli"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "ctrlc",
+ "rustyline",
+ "tokio",
+ "zyron-common",
+ "zyron-parser",
+ "zyron-wire",
+]
+
+[[package]]
 name = "zyron-common"
 version = "0.1.0"
 dependencies = [
  "scc",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "zyron-bench-harness",
+]
+
+[[package]]
+name = "zyron-ctl"
+version = "0.1.0"
+dependencies = [
+ "zyron-common",
+ "zyron-server",
 ]
 
 [[package]]
@@ -7139,18 +7200,33 @@ dependencies = [
  "scc",
  "serde_json",
  "tokio",
+ "tracing",
  "zyron-analytics",
  "zyron-auth",
  "zyron-bench-harness",
  "zyron-buffer",
  "zyron-catalog",
  "zyron-common",
+ "zyron-lake",
  "zyron-parser",
  "zyron-planner",
  "zyron-search",
  "zyron-storage",
  "zyron-types",
  "zyron-wal",
+]
+
+[[package]]
+name = "zyron-lake"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "scc",
+ "tempfile",
+ "tracing",
+ "zyron-bench-harness",
+ "zyron-common",
+ "zyron-storage",
 ]
 
 [[package]]
@@ -7216,6 +7292,7 @@ dependencies = [
  "zyron-buffer",
  "zyron-catalog",
  "zyron-common",
+ "zyron-lake",
  "zyron-lifecycle",
  "zyron-parser",
  "zyron-storage",
@@ -7261,6 +7338,7 @@ dependencies = [
  "zyron-cdc",
  "zyron-common",
  "zyron-executor",
+ "zyron-lake",
  "zyron-lifecycle",
  "zyron-parser",
  "zyron-pipeline",
@@ -7272,6 +7350,14 @@ dependencies = [
  "zyron-versioning",
  "zyron-wal",
  "zyron-wire",
+]
+
+[[package]]
+name = "zyron-server-bin"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "zyron-server",
 ]
 
 [[package]]
@@ -7325,12 +7411,14 @@ dependencies = [
  "zyron-cdc",
  "zyron-common",
  "zyron-storage",
+ "zyron-wal",
 ]
 
 [[package]]
 name = "zyron-types"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "crc32fast",
  "crossbeam",
  "parking_lot",
@@ -7415,6 +7503,7 @@ dependencies = [
  "zyron-cdc",
  "zyron-common",
  "zyron-executor",
+ "zyron-lake",
  "zyron-lifecycle",
  "zyron-parser",
  "zyron-pipeline",
@@ -7425,33 +7514,4 @@ dependencies = [
  "zyron-types",
  "zyron-versioning",
  "zyron-wal",
-]
-
-[[package]]
-name = "zyrondb-cli"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "ctrlc",
- "rustyline",
- "tokio",
- "zyron-common",
- "zyron-parser",
- "zyron-wire",
-]
-
-[[package]]
-name = "zyrondb-ctl"
-version = "0.1.0"
-dependencies = [
- "zyron-common",
- "zyron-server",
-]
-
-[[package]]
-name = "zyrondb-server"
-version = "0.1.0"
-dependencies = [
- "tokio",
- "zyron-server",
 ]

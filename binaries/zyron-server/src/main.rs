@@ -1,4 +1,4 @@
-//! ZyronDB server entry point.
+//! Zyron server entry point.
 
 #[tokio::main]
 async fn main() {

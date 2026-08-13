@@ -1,4 +1,4 @@
-//! Native data types and operations for ZyronDB.
+//! Native data types and operations for Zyron.
 //!
 //! This crate provides domain-specific functions and type operations.
 //! All functions accept primitive Rust types and return primitives.

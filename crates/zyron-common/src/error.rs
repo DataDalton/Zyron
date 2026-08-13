@@ -1,11 +1,11 @@
-//! Error types for ZyronDB.
+//! Error types for Zyron.
 
 use thiserror::Error;
 
 /// Result type alias using ZyronError.
 pub type Result<T> = std::result::Result<T, ZyronError>;
 
-/// Errors that can occur in ZyronDB operations.
+/// Errors that can occur in Zyron operations.
 #[derive(Debug, Error)]
 pub enum ZyronError {
     // I/O errors

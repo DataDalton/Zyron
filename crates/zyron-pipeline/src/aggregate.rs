@@ -1,4 +1,4 @@
-//! User-defined aggregate framework for ZyronDB.
+//! User-defined aggregate framework for Zyron.
 //!
 //! Provides a registry of user-defined aggregates (UDAs). Each aggregate
 //! is defined by a state transition function (sfunc), an optional final

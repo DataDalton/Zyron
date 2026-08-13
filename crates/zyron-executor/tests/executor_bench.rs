@@ -2,7 +2,7 @@
 
 //! Query Executor Benchmark Suite
 //!
-//! Integration tests for ZyronDB executor components:
+//! Integration tests for Zyron executor components:
 //! - Sequential scan throughput
 //! - Filter predicate evaluation
 //! - Hash join correctness and performance

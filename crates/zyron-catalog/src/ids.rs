@@ -1,4 +1,4 @@
-//! Catalog identifier types for ZyronDB.
+//! Catalog identifier types for Zyron.
 //!
 //! Provides strongly-typed wrappers for all catalog object identifiers,
 //! preventing accidental mixing of database IDs with table IDs, etc.

@@ -2,7 +2,7 @@
 
 //! Native Data Types Benchmark Suite
 //!
-//! Integration tests for ZyronDB native data types and operations:
+//! Integration tests for Zyron native data types and operations:
 //! - Time series: TIME_BUCKET, gap fill (LOCF/INTERPOLATE), LTTB downsampling
 //! - Geospatial: ST_Distance, ST_DWithin, ST_Contains, brute-force KNN
 //! - Financial: NPV, IRR, PMT, depreciation

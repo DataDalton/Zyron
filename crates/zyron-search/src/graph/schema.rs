@@ -1,4 +1,4 @@
-//! Graph schema definitions for ZyronDB's property graph model.
+//! Graph schema definitions for Zyron's property graph model.
 //!
 //! Defines node labels, edge labels, and property definitions that
 //! describe the structure of a graph stored in relational backing tables.

@@ -1,4 +1,4 @@
-//! Full-text search engine for ZyronDB.
+//! Full-text search engine for Zyron.
 //!
 //! Provides text analysis, inverted indexing, BM25 relevance scoring,
 //! query parsing, result highlighting, autocomplete, and synonym expansion.

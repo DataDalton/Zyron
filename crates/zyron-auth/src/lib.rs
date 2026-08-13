@@ -1,4 +1,4 @@
-//! Authentication, authorization, and access control for ZyronDB.
+//! Authentication, authorization, and access control for Zyron.
 //!
 //! Provides a comprehensive security subsystem with three-state privileges
 //! (GRANT/DENY/unset), temporal access control, data classification labels,

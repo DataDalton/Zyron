@@ -1,6 +1,6 @@
-//! TOML configuration loading for ZyronDB.
+//! TOML configuration loading for Zyron.
 //!
-//! Reads a zyrondb.toml file, applies environment variable overrides,
+//! Reads a zyron.toml file, applies environment variable overrides,
 //! validates settings, and maps sections to the existing ServerConfig
 //! and StorageConfig structs.
 
@@ -8,7 +8,7 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use zyron_common::{Result, ZyronError};
 
-/// Top-level server configuration loaded from zyrondb.toml.
+/// Top-level server configuration loaded from zyron.toml.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ZyronConfig {
@@ -60,14 +60,14 @@ impl ZyronConfig {
 
     /// Loads configuration with the following priority:
     /// 1. Defaults
-    /// 2. Explicit path or ./zyrondb.toml
-    /// 3. zyrondb.auto.conf (persistent ALTER SYSTEM overrides)
+    /// 2. Explicit path or ./zyron.toml
+    /// 3. zyron.auto.conf (persistent ALTER SYSTEM overrides)
     /// 4. ZYRON_* environment variables
     pub fn load_with_overrides(path: Option<&Path>) -> Result<Self> {
         let mut config = if let Some(p) = path {
             Self::load(p)?
         } else {
-            let default_path = PathBuf::from("zyrondb.toml");
+            let default_path = PathBuf::from("zyron.toml");
             if default_path.exists() {
                 Self::load(&default_path)?
             } else {
@@ -82,10 +82,10 @@ impl ZyronConfig {
         Ok(config)
     }
 
-    /// Loads zyrondb.auto.conf (TOML fragment) from the data directory and merges overrides.
+    /// Loads zyron.auto.conf (TOML fragment) from the data directory and merges overrides.
     /// This file is written by ALTER SYSTEM SET commands.
     pub fn apply_auto_conf(&mut self, data_dir: &Path) -> Result<()> {
-        let auto_path = data_dir.join("zyrondb.auto.conf");
+        let auto_path = data_dir.join("zyron.auto.conf");
         if !auto_path.exists() {
             return Ok(());
         }
@@ -97,7 +97,7 @@ impl ZyronConfig {
             ))
         })?;
         let overrides: toml::Table = toml::from_str(&contents).map_err(|e| {
-            ZyronError::Internal(format!("Failed to parse zyrondb.auto.conf: {}", e))
+            ZyronError::Internal(format!("Failed to parse zyron.auto.conf: {}", e))
         })?;
         self.apply_overrides_from_table(&overrides);
         Ok(())
@@ -298,10 +298,10 @@ impl ZyronConfig {
         }
     }
 
-    /// Writes a single key-value override to zyrondb.auto.conf.
+    /// Writes a single key-value override to zyron.auto.conf.
     /// The key should be in "section.field" format (e.g. "server.port").
     pub fn write_auto_conf(data_dir: &Path, key: &str, value: &str) -> Result<()> {
-        let auto_path = data_dir.join("zyrondb.auto.conf");
+        let auto_path = data_dir.join("zyron.auto.conf");
         let mut table: toml::Table = if auto_path.exists() {
             let contents = std::fs::read_to_string(&auto_path)
                 .map_err(|e| ZyronError::Internal(format!("Failed to read auto.conf: {}", e)))?;
@@ -1394,7 +1394,7 @@ max_connections = 500
 host = "0.0.0.0"
 
 [storage]
-data_dir = "/var/lib/zyrondb"
+data_dir = "/var/lib/zyron"
 buffer_pool_size = "1GB"
 
 [wal]
@@ -1417,7 +1417,7 @@ format = "json"
         assert_eq!(config.server.port, 5433);
         assert_eq!(config.server.max_connections, 500);
         assert_eq!(config.server.host, "0.0.0.0");
-        assert_eq!(config.storage.data_dir, PathBuf::from("/var/lib/zyrondb"));
+        assert_eq!(config.storage.data_dir, PathBuf::from("/var/lib/zyron"));
         assert_eq!(config.storage.buffer_pool_size, 1024 * 1024 * 1024);
         assert_eq!(config.wal.segment_size, 32 * 1024 * 1024);
         assert_eq!(config.checkpoint.wal_bytes_threshold, 128 * 1024 * 1024);

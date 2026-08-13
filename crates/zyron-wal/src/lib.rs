@@ -1,4 +1,4 @@
-//! Write-Ahead Log (WAL) for ZyronDB.
+//! Write-Ahead Log (WAL) for Zyron.
 //!
 //! Provides durability by logging all modifications before they are applied.
 //! Supports crash recovery through log replay.

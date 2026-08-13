@@ -18,7 +18,7 @@ pub fn emit_openapi_json(endpoints: &[Arc<EndpointEntry>]) -> String {
     write_kv(&mut out, "openapi", "\"3.0.3\"", false);
     out.push(',');
     out.push_str("\"info\":{");
-    write_kv(&mut out, "title", "\"ZyronDB Endpoints\"", false);
+    write_kv(&mut out, "title", "\"Zyron Endpoints\"", false);
     out.push(',');
     write_kv(&mut out, "version", "\"1.0\"", false);
     out.push('}');
@@ -181,7 +181,7 @@ fn escape_into(out: &mut String, s: &str) {
 pub fn emit_swagger_html(endpoints: &[Arc<EndpointEntry>]) -> String {
     let mut out = String::with_capacity(2048);
     out.push_str(
-        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>ZyronDB Endpoints</title>\
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Zyron Endpoints</title>\
          <style>body{font-family:sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem}\
          .ep{border:1px solid #ddd;border-radius:6px;padding:1rem;margin-bottom:1rem}\
          .m{display:inline-block;padding:2px 6px;border-radius:4px;color:#fff;font-size:12px;\
@@ -190,7 +190,7 @@ pub fn emit_swagger_html(endpoints: &[Arc<EndpointEntry>]) -> String {
          .head{background:#0891b2}.path{font-family:monospace;font-size:14px}\
          .meta{color:#475569;font-size:12px;margin-top:4px}</style></head><body>",
     );
-    out.push_str("<h1>ZyronDB Endpoints</h1>");
+    out.push_str("<h1>Zyron Endpoints</h1>");
     out.push_str(&format!(
         "<p>{} endpoint(s) registered.</p>",
         endpoints.len()

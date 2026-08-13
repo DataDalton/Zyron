@@ -14,7 +14,7 @@
 //! Capacity
 //! --------
 //! `MAX_SLOTS = 4096`. At 64 bytes per slot the table is 256 KB, paid once
-//! at server startup. ZyronDB rejects connections above this ceiling
+//! at server startup. Zyron rejects connections above this ceiling
 //! upstream, so claim cannot legitimately fail under correct operation,
 //! a full table returns an internal error.
 //!

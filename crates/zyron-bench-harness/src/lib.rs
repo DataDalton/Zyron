@@ -1,4 +1,4 @@
-//! Shared benchmark harness for ZyronDB integration test suites.
+//! Shared benchmark harness for Zyron integration test suites.
 //!
 //! Each test file calls `init("suite_name")` once, then uses `validate_metric`,
 //! `check_performance`, and the `tprintln!` macro for output. Results are written

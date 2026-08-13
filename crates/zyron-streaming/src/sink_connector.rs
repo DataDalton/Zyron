@@ -15,7 +15,7 @@ use crate::source_connector::CdfChange;
 // ZyronRowSink
 // ---------------------------------------------------------------------------
 
-/// Sink that inserts raw CDC row bytes into a ZyronDB target table through
+/// Sink that inserts raw CDC row bytes into a Zyron target table through
 /// the transaction manager and heap file. Runs an Insert privilege check
 /// against the captured SecurityContext before opening a transaction.
 ///

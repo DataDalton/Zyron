@@ -1,5 +1,5 @@
 #![allow(non_snake_case)]
-//! Physical backup and restore for ZyronDB.
+//! Physical backup and restore for Zyron.
 //!
 //! Copies data files and WAL segments to a destination directory, records
 //! checksums in a TOML manifest, and can restore from that manifest with
@@ -40,7 +40,7 @@ pub struct BackupFileEntry {
 pub struct BackupManifest {
     /// Manifest format version. Always 1 for this implementation.
     pub version: u32,
-    /// ZyronDB server version that created the backup.
+    /// Zyron server version that created the backup.
     pub serverVersion: String,
     /// ISO 8601 timestamp when the backup was created.
     pub createdAt: String,
@@ -60,7 +60,7 @@ pub struct BackupManifest {
 // BackupManager
 // ---------------------------------------------------------------------------
 
-/// Creates physical backups of a ZyronDB data directory and WAL.
+/// Creates physical backups of a Zyron data directory and WAL.
 pub struct BackupManager;
 
 impl BackupManager {
@@ -259,7 +259,7 @@ impl BackupManager {
 // RestoreManager
 // ---------------------------------------------------------------------------
 
-/// Restores a ZyronDB backup from a manifest directory.
+/// Restores a Zyron backup from a manifest directory.
 pub struct RestoreManager;
 
 impl RestoreManager {

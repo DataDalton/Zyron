@@ -2,7 +2,7 @@
 
 //! Analytics Engine Benchmark Suite
 //!
-//! Integration tests for the ZyronDB analytics engine:
+//! Integration tests for the Zyron analytics engine:
 //! - ROLLUP/CUBE/GROUPING SETS single-pass aggregation
 //! - Period-over-period comparisons (YOY/MOM/YTD)
 //! - Cohort retention matrix construction

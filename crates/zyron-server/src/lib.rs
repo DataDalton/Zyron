@@ -1,4 +1,4 @@
-//! ZyronDB server integration.
+//! Zyron server integration.
 //!
 //! Orchestrates all subsystems into a complete database server: configuration,
 //! session management, background workers, metrics, health endpoints, and
@@ -96,7 +96,7 @@ pub fn parse_cli_args() -> Option<CliOptions> {
                 return None;
             }
             "--version" | "-v" => {
-                println!("ZyronDB {} (zyrondb-server)", env!("CARGO_PKG_VERSION"));
+                println!("Zyron {} (zyron-server)", env!("CARGO_PKG_VERSION"));
                 return None;
             }
             "--config" => {
@@ -159,12 +159,12 @@ pub fn parse_cli_args() -> Option<CliOptions> {
 
 fn print_usage() {
     println!(
-        "ZyronDB {} - HTAP database server
+        "Zyron {} - HTAP database server
 
-Usage: zyrondb-server [OPTIONS]
+Usage: zyron-server [OPTIONS]
 
 Options:
-  --config <path>       Path to zyrondb.toml config file
+  --config <path>       Path to zyron.toml config file
   --data-dir <path>     Data directory override
   --port <number>       Listen port override
   --host <addr>         Bind address override
@@ -177,7 +177,7 @@ Options:
     );
 }
 
-/// The ZyronDB server. Owns all subsystems and coordinates lifecycle.
+/// The Zyron server. Owns all subsystems and coordinates lifecycle.
 pub struct Server {
     config: ZyronConfig,
     session_mgr: Arc<SessionManager>,
@@ -279,7 +279,7 @@ impl Server {
     /// Runs the server. This is the main entry point that blocks until shutdown.
     pub async fn run(self) -> zyron_common::Result<()> {
         let start_time = Instant::now();
-        info!("ZyronDB {} starting", env!("CARGO_PKG_VERSION"));
+        info!("Zyron {} starting", env!("CARGO_PKG_VERSION"));
 
         // 1. Create data and WAL directories
         let data_dir = &self.config.storage.data_dir;
@@ -1494,7 +1494,7 @@ impl Server {
         self.health_state.mark_startup_complete();
         let startup_duration = start_time.elapsed();
         info!(
-            "ZyronDB started in {:.1}ms on {}:{}",
+            "Zyron started in {:.1}ms on {}:{}",
             startup_duration.as_secs_f64() * 1000.0,
             self.config.server.host,
             self.config.server.port,
@@ -1715,7 +1715,7 @@ impl Server {
             handle.abort();
         }
 
-        info!("ZyronDB shut down");
+        info!("Zyron shut down");
         Ok(())
     }
 }

@@ -67,7 +67,7 @@ fn test_config_load_valid_toml() {
     let before = take_util_snapshot();
 
     let dir = tempdir().expect("Failed to create temp dir");
-    let config_path = dir.path().join("zyrondb.toml");
+    let config_path = dir.path().join("zyron.toml");
 
     // Write a complete config with all 11 sections
     let toml_content = r#"
@@ -82,7 +82,7 @@ tls_enabled = false
 health_port = 9091
 
 [storage]
-data_dir = "/var/lib/zyrondb/data"
+data_dir = "/var/lib/zyron/data"
 page_size = 16384
 buffer_pool_size = "256MB"
 
@@ -686,9 +686,9 @@ fn test_admin_alter_system_auto_conf() {
     tprintln!("  Wrote 4 ALTER SYSTEM SET overrides: PASS");
 
     // Verify the file exists
-    let auto_conf_path = data_dir.join("zyrondb.auto.conf");
-    assert!(auto_conf_path.exists(), "zyrondb.auto.conf should exist");
-    tprintln!("  zyrondb.auto.conf created: PASS");
+    let auto_conf_path = data_dir.join("zyron.auto.conf");
+    assert!(auto_conf_path.exists(), "zyron.auto.conf should exist");
+    tprintln!("  zyron.auto.conf created: PASS");
 
     // Load config with auto.conf applied
     let mut config = ZyronConfig::default();

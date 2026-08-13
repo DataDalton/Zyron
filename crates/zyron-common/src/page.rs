@@ -1,4 +1,4 @@
-//! Page structures for ZyronDB storage.
+//! Page structures for Zyron storage.
 
 use serde::{Deserialize, Serialize};
 
@@ -113,7 +113,7 @@ impl std::fmt::Display for PageId {
     }
 }
 
-/// Page types in ZyronDB storage.
+/// Page types in Zyron storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum PageType {

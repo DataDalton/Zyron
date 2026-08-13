@@ -1,6 +1,6 @@
 //! PostgreSQL type OID mapping and value serialization.
 //!
-//! Maps ZyronDB TypeId values to PostgreSQL type OIDs and provides
+//! Maps Zyron TypeId values to PostgreSQL type OIDs and provides
 //! text/binary format conversion between ScalarValue and wire bytes.
 
 use bytes::{BufMut, BytesMut};
@@ -30,7 +30,7 @@ pub const PG_UUID_OID: i32 = 2950;
 pub const PG_JSON_OID: i32 = 114;
 pub const PG_JSONB_OID: i32 = 3802;
 
-/// Maps a ZyronDB TypeId to the corresponding PostgreSQL type OID.
+/// Maps a Zyron TypeId to the corresponding PostgreSQL type OID.
 pub fn type_id_to_pg_oid(type_id: TypeId) -> i32 {
     match type_id {
         TypeId::Null => 0,

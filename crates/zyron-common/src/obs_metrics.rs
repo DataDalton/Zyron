@@ -36,7 +36,7 @@ impl TlsDirection {
 const TLS_KEY_SEP: char = '\u{1}';
 
 /// Bucket boundaries for the reaper-pass histogram, in microseconds. Matches
-/// the cadence of zyrondb_query_duration_seconds so dashboards can reuse the
+/// the cadence of zyron_query_duration_seconds so dashboards can reuse the
 /// same axis.
 const REAP_BUCKETS_US: [u64; 9] = [
     1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000, 10_000_000,

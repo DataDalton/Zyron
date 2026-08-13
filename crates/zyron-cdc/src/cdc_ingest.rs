@@ -327,7 +327,7 @@ mod tests {
             source: CdcIngestSource::Kafka {
                 brokers: "localhost:9092".into(),
                 topic: "upstream_cdc".into(),
-                group_id: "zyrondb_ingest".into(),
+                group_id: "zyron_ingest".into(),
                 start_offset: None,
             },
             target_table_id: 42,

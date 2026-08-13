@@ -277,7 +277,7 @@ pub enum Keyword {
     // DO block
     Language,
 
-    // ZyronDB custom
+    // Zyron custom
     Segments,
     Status,
     Buffer,
@@ -1013,7 +1013,7 @@ pub fn lookup_keyword(word: &str) -> Option<Keyword> {
         // DO block
         "LANGUAGE" => Some(Keyword::Language),
 
-        // ZyronDB custom
+        // Zyron custom
         "SEGMENTS" => Some(Keyword::Segments),
         "STATUS" => Some(Keyword::Status),
         "BUFFER" => Some(Keyword::Buffer),

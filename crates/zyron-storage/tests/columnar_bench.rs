@@ -2,7 +2,7 @@
 
 //! Columnar Storage Benchmark Suite
 //!
-//! Integration tests for ZyronDB columnar storage:
+//! Integration tests for Zyron columnar storage:
 //! - Column segment format and ZYR file I/O
 //! - Compaction pipeline (sequential and parallel)
 //! - Segment cache hit rates

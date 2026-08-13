@@ -1,11 +1,11 @@
 [package]
-name = "zyrondb-cli"
+name = "zyron-cli"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "zyrondb-cli"
+name = "zyron-cli"
 path = "src/main.rs"
 
 [dependencies]

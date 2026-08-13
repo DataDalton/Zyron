@@ -165,43 +165,43 @@ impl MetricsRegistry {
         // Counters
         render_counter(
             &mut out,
-            "zyrondb_connections_total",
+            "zyron_connections_total",
             "Total connections accepted since server start",
             self.connections_total.load(Ordering::Relaxed),
         );
         render_counter(
             &mut out,
-            "zyrondb_queries_total",
+            "zyron_queries_total",
             "Total queries executed",
             self.queries_total.load(Ordering::Relaxed),
         );
         render_counter(
             &mut out,
-            "zyrondb_errors_total",
+            "zyron_errors_total",
             "Total query errors",
             self.errors_total.load(Ordering::Relaxed),
         );
         render_counter(
             &mut out,
-            "zyrondb_transactions_committed_total",
+            "zyron_transactions_committed_total",
             "Total committed transactions",
             self.transactions_committed.load(Ordering::Relaxed),
         );
         render_counter(
             &mut out,
-            "zyrondb_transactions_aborted_total",
+            "zyron_transactions_aborted_total",
             "Total aborted transactions",
             self.transactions_aborted.load(Ordering::Relaxed),
         );
         render_counter(
             &mut out,
-            "zyrondb_bytes_sent_total",
+            "zyron_bytes_sent_total",
             "Total bytes sent to clients",
             self.bytes_sent.load(Ordering::Relaxed),
         );
         render_counter(
             &mut out,
-            "zyrondb_bytes_received_total",
+            "zyron_bytes_received_total",
             "Total bytes received from clients",
             self.bytes_received.load(Ordering::Relaxed),
         );
@@ -209,20 +209,20 @@ impl MetricsRegistry {
         // Gauges
         render_gauge(
             &mut out,
-            "zyrondb_active_connections",
+            "zyron_active_connections",
             "Current number of active connections",
             self.session_mgr.active_count() as u64,
         );
         render_gauge(
             &mut out,
-            "zyrondb_max_connections",
+            "zyron_max_connections",
             "Maximum allowed connections",
             self.session_mgr.max_connections() as u64,
         );
 
         // Histogram
         self.query_duration.render_prometheus(
-            "zyrondb_query_duration_seconds",
+            "zyron_query_duration_seconds",
             "Query execution duration in seconds",
             &mut out,
         );
@@ -295,11 +295,11 @@ mod tests {
         registry.errors_total.fetch_add(2, Ordering::Relaxed);
 
         let output = registry.render_prometheus();
-        assert!(output.contains("zyrondb_connections_total 10"));
-        assert!(output.contains("zyrondb_queries_total 50"));
-        assert!(output.contains("zyrondb_errors_total 2"));
-        assert!(output.contains("zyrondb_active_connections 0"));
-        assert!(output.contains("zyrondb_max_connections 100"));
+        assert!(output.contains("zyron_connections_total 10"));
+        assert!(output.contains("zyron_queries_total 50"));
+        assert!(output.contains("zyron_errors_total 2"));
+        assert!(output.contains("zyron_active_connections 0"));
+        assert!(output.contains("zyron_max_connections 100"));
     }
 
     #[test]

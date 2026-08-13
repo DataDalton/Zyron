@@ -1,4 +1,4 @@
-//! Change Data Capture (CDC) for ZyronDB.
+//! Change Data Capture (CDC) for Zyron.
 //!
 //! Provides change data feeds, RETURNING with OLD/NEW, replication slots,
 //! logical decoders, outbound CDC streams, inbound CDC ingestion,

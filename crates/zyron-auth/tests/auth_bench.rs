@@ -1521,7 +1521,7 @@ fn test_jwt_correctness() {
     // Issuer mismatch.
     let jwt_iss = JwtCredential::new(secret.clone(), JwtAlgorithm::Hs256)
         .expect("create")
-        .with_issuer("zyrondb".to_string());
+        .with_issuer("zyron".to_string());
     let wrong_iss_claims = JwtClaims {
         sub: "u".to_string(),
         iss: Some("wrong".to_string()),
@@ -2133,8 +2133,8 @@ fn test_security_context_impersonation() {
 
     // Attributes.
     assert_eq!(user_ctx.get_attribute("department"), Some("engineering"));
-    user_ctx.set_attribute("project".to_string(), "zyrondb".to_string());
-    assert_eq!(user_ctx.get_attribute("project"), Some("zyrondb"));
+    user_ctx.set_attribute("project".to_string(), "zyron".to_string());
+    assert_eq!(user_ctx.get_attribute("project"), Some("zyron"));
     tprintln!("  Session attributes: verified");
 }
 
@@ -2497,8 +2497,8 @@ fn test_abac_policies() {
 
     let mut attrs = make_attributes(RoleId(10));
     assert_eq!(attrs.get("department"), Some("engineering"));
-    attrs.set("project".to_string(), "zyrondb".to_string());
-    assert_eq!(attrs.get("project"), Some("zyrondb"));
+    attrs.set("project".to_string(), "zyron".to_string());
+    assert_eq!(attrs.get("project"), Some("zyron"));
     tprintln!("  Session attributes: verified");
 }
 
@@ -3532,7 +3532,7 @@ fn test_encryption_roundtrip() {
     let key_256 = [0x42u8; 32];
 
     // AES-128-GCM round-trip
-    let plaintext = b"Hello, ZyronDB! This is sensitive data.";
+    let plaintext = b"Hello, Zyron! This is sensitive data.";
     let ciphertext =
         encrypt_value(plaintext, &key_128, EncryptionAlgorithm::Aes128Gcm, &[]).expect("encrypt");
     let decrypted =

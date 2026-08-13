@@ -1,4 +1,4 @@
-//! SQL parser for ZyronDB.
+//! SQL parser for Zyron.
 //!
 //! Recursive descent parser with Pratt expression parsing.
 //! Converts SQL text into a typed AST for query planning and execution.

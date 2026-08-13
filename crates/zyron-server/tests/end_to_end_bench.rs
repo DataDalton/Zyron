@@ -793,7 +793,7 @@ fn test_e2e_consumer_deployment() {
     zyron_bench_harness::init("end_to_end");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    tprintln!("\n=== ZyronDB End-to-End Consumer Deployment ===\n");
+    tprintln!("\n=== Zyron End-to-End Consumer Deployment ===\n");
     tprintln!(
         "  Scenario simulates: cold boot -> schema -> seed -> OLTP -> analytics -> gateway -> shutdown\n"
     );

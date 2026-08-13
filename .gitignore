@@ -23,7 +23,7 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 
-# ZyronDB runtime files
+# Zyron runtime files
 /data/
 *.db
 *.wal

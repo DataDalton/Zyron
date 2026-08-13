@@ -1300,7 +1300,7 @@ mod tests {
 
         let claims = JwtClaims {
             sub: "user99".to_string(),
-            iss: Some("zyrondb".to_string()),
+            iss: Some("zyron".to_string()),
             exp: 9999999999,
             iat: 1000000000,
             roles: Vec::new(),
@@ -1310,10 +1310,10 @@ mod tests {
         let token = cred.encode(&claims).expect("encode failed");
         let cred_with_iss = JwtCredential::new(vec![0xcd; 48], JwtAlgorithm::Hs384)
             .expect("create failed")
-            .with_issuer("zyrondb".to_string());
+            .with_issuer("zyron".to_string());
         let decoded = cred_with_iss.decode(&token).expect("decode failed");
         assert_eq!(decoded.sub, "user99");
-        assert_eq!(decoded.iss, Some("zyrondb".to_string()));
+        assert_eq!(decoded.iss, Some("zyron".to_string()));
     }
 
     #[test]
@@ -1521,7 +1521,7 @@ mod tests {
 
     #[test]
     fn test_base64url_roundtrip() {
-        let data = b"Hello, ZyronDB!";
+        let data = b"Hello, Zyron!";
         let encoded = base64url_encode(data);
         let decoded = base64url_decode(&encoded).expect("decode failed");
         assert_eq!(decoded, data);
@@ -1548,7 +1548,7 @@ mod tests {
 
         let claims = JwtClaims {
             sub: "testuser".to_string(),
-            iss: Some("zyrondb".to_string()),
+            iss: Some("zyron".to_string()),
             exp: 9999999999,
             iat: 1000000000,
             roles: vec!["admin".to_string()],

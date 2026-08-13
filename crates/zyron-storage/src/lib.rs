@@ -1,6 +1,6 @@
 #![feature(portable_simd)]
 
-//! Storage engine for ZyronDB.
+//! Storage engine for Zyron.
 //!
 //! This crate provides:
 //! - Disk manager for page-level file I/O

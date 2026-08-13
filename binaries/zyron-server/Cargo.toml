@@ -1,0 +1,16 @@
+[package]
+# The package name is suffixed because the crates/zyron-server library already
+# claims zyron-server in this workspace. The executable this produces is named
+# zyron-server, which is the name that reaches users.
+name = "zyron-server-bin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "zyron-server"
+path = "src/main.rs"
+
+[dependencies]
+zyron-server = { path = "../../crates/zyron-server" }
+tokio.workspace = true

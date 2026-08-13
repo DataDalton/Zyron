@@ -2,7 +2,7 @@
 
 //! Catalog Benchmark Suite
 //!
-//! Comprehensive integration tests for ZyronDB catalog components:
+//! Comprehensive integration tests for Zyron catalog components:
 //! - DDL persistence (create/drop database, schema, table, index)
 //! - Name resolution (search path, qualified/unqualified)
 //! - Column type roundtrip (all supported data types)

@@ -1,4 +1,4 @@
-//! Streaming and real-time processing engine for ZyronDB.
+//! Streaming and real-time processing engine for Zyron.
 //!
 //! Implements an operator DAG model with push-based micro-batch processing,
 //! barrier-based checkpointing, and zero-lock hot paths for windowed

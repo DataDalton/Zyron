@@ -1,4 +1,4 @@
-//! Data lifecycle management for ZyronDB.
+//! Data lifecycle management for Zyron.
 //!
 //! Retention/TTL, tiered storage, archival, soft delete, legal hold,
 //! GDPR erasure, data classification, compliance auditing, recycle bin,

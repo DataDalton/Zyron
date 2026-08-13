@@ -1,13 +1,13 @@
 [package]
-name = "zyrondb-server"
+name = "zyron-ctl"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "zyrondb-server"
+name = "zyron-ctl"
 path = "src/main.rs"
 
 [dependencies]
 zyron-server = { path = "../../crates/zyron-server" }
-tokio.workspace = true
+zyron-common = { path = "../../crates/zyron-common" }

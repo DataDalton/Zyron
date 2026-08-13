@@ -1,5 +1,5 @@
 //! Data versioning, time travel, SCD, temporal tables, branching, and diff
-//! for ZyronDB.
+//! for Zyron.
 
 pub mod branch;
 pub mod diff;

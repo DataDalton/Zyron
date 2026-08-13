@@ -1,10 +1,10 @@
-//! Configuration structures for ZyronDB.
+//! Configuration structures for Zyron.
 
 use crate::page::PAGE_SIZE;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Server configuration for the ZyronDB instance.
+/// Server configuration for the Zyron instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     /// Host address to bind to. Accepts IPv4 (`127.0.0.1`, `0.0.0.0`),
@@ -287,8 +287,8 @@ mod tests {
     #[test]
     fn test_storage_config_custom() {
         let config = StorageConfig {
-            data_dir: PathBuf::from("/var/lib/zyrondb"),
-            wal_dir: PathBuf::from("/var/lib/zyrondb/wal"),
+            data_dir: PathBuf::from("/var/lib/zyron"),
+            wal_dir: PathBuf::from("/var/lib/zyron/wal"),
             page_size: 8192,
             buffer_pool_pages: 16384,
             wal_segment_size: 64 * 1024 * 1024,
@@ -297,7 +297,7 @@ mod tests {
             direct_io: true,
         };
 
-        assert_eq!(config.data_dir, PathBuf::from("/var/lib/zyrondb"));
+        assert_eq!(config.data_dir, PathBuf::from("/var/lib/zyron"));
         assert_eq!(config.page_size, 8192);
         assert!(config.direct_io);
     }

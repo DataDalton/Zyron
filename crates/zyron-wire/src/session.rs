@@ -53,7 +53,7 @@ impl Session {
         security_context: Option<zyron_auth::SecurityContext>,
     ) -> Self {
         // PG wire protocol requires is_superuser parameter for client compatibility.
-        // In ZyronDB, all access control flows through the RBAC/ABAC privilege system.
+        // In Zyron, all access control flows through the RBAC/ABAC privilege system.
         // This value is for client display only and does not bypass any checks.
         let superuser_str = "on";
 
