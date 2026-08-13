@@ -1,4 +1,4 @@
-//! DML trigger management and execution for ZyronDB.
+//! DML trigger management and execution for Zyron.
 //!
 //! Provides a trigger registry that stores trigger definitions per table,
 //! sorted by priority. The TriggerManager is a registry, not an executor.

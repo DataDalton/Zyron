@@ -5685,7 +5685,7 @@ async fn handle_create_cdc_ingest(
             brokers: cdc_required(opts, "brokers")
                 .or_else(|_| cdc_required(opts, "bootstrap_servers"))?,
             topic: cdc_required(opts, "topic")?,
-            group_id: cdc_opt_str(opts, "group_id").unwrap_or_else(|| "zyrondb_ingest".to_string()),
+            group_id: cdc_opt_str(opts, "group_id").unwrap_or_else(|| "zyron_ingest".to_string()),
             start_offset: cdc_opt_str(opts, "start_offset"),
         },
         "s3" => CdcIngestSource::S3 {

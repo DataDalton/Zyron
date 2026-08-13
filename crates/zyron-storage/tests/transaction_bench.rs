@@ -2,7 +2,7 @@
 
 //! Transaction Benchmark Suite
 //!
-//! Integration tests for ZyronDB transaction components:
+//! Integration tests for Zyron transaction components:
 //! - Snapshot isolation and MVCC visibility
 //! - Write-write conflict detection
 //! - Rollback and abort handling

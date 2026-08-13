@@ -1,8 +1,8 @@
-//! Type identifiers for ZyronDB data types.
+//! Type identifiers for Zyron data types.
 
 use serde::{Deserialize, Serialize};
 
-/// Identifier for all supported data types in ZyronDB.
+/// Identifier for all supported data types in Zyron.
 ///
 /// Type IDs are stored in tuple headers and catalog metadata
 /// to identify the type of each column value.

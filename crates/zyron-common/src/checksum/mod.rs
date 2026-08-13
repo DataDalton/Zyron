@@ -1,4 +1,4 @@
-//! Central hash and checksum primitive for ZyronDB.
+//! Central hash and checksum primitive for Zyron.
 //!
 //! AES-round-based mixing across 8 parallel 128-bit lanes. Used everywhere
 //! the database needs a non-cryptographic hash:

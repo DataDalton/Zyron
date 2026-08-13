@@ -1,4 +1,4 @@
-//! Stored procedure registry and interpreter framework for ZyronDB.
+//! Stored procedure registry and interpreter framework for Zyron.
 //!
 //! Provides a registry for stored procedures with security mode support.
 //! Procedures are stored by name and resolved at call time. The registry

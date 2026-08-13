@@ -7119,6 +7119,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "zyron-cli"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "ctrlc",
+ "rustyline",
+ "tokio",
+ "zyron-common",
+ "zyron-parser",
+ "zyron-wire",
+]
+
+[[package]]
 name = "zyron-common"
 version = "0.1.0"
 dependencies = [
@@ -7127,6 +7140,14 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "zyron-bench-harness",
+]
+
+[[package]]
+name = "zyron-ctl"
+version = "0.1.0"
+dependencies = [
+ "zyron-common",
+ "zyron-server",
 ]
 
 [[package]]
@@ -7272,6 +7293,14 @@ dependencies = [
  "zyron-versioning",
  "zyron-wal",
  "zyron-wire",
+]
+
+[[package]]
+name = "zyron-server-bin"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "zyron-server",
 ]
 
 [[package]]
@@ -7425,33 +7454,4 @@ dependencies = [
  "zyron-types",
  "zyron-versioning",
  "zyron-wal",
-]
-
-[[package]]
-name = "zyrondb-cli"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "ctrlc",
- "rustyline",
- "tokio",
- "zyron-common",
- "zyron-parser",
- "zyron-wire",
-]
-
-[[package]]
-name = "zyrondb-ctl"
-version = "0.1.0"
-dependencies = [
- "zyron-common",
- "zyron-server",
-]
-
-[[package]]
-name = "zyrondb-server"
-version = "0.1.0"
-dependencies = [
- "tokio",
- "zyron-server",
 ]

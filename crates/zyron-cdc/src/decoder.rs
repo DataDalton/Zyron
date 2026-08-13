@@ -105,7 +105,7 @@ pub trait LogicalDecoder: Send + Sync {
 // ZyronCdcDecoder
 // ---------------------------------------------------------------------------
 
-/// Native binary decoder using packed binary format for ZyronDB-to-ZyronDB replication.
+/// Native binary decoder using packed binary format for Zyron-to-Zyron replication.
 pub struct ZyronCdcDecoder;
 
 fn write_kv_pairs(buf: &mut Vec<u8>, pairs: &[(String, String)]) {
@@ -334,7 +334,7 @@ impl DebeziumDecoder {
 
         serde_json::json!({
             "source": {
-                "connector": "zyrondb",
+                "connector": "zyron",
                 "name": self.server_name,
                 "db": self.database_name,
                 "table": change.table_name,
@@ -585,7 +585,7 @@ const AVRO_OCF_MAGIC: &[u8] = b"Obj\x01";
 const AVRO_CHANGE_SCHEMA: &str = r#"{
   "type": "record",
   "name": "ZyronChange",
-  "namespace": "zyrondb.cdc",
+  "namespace": "zyron.cdc",
   "fields": [
     {"name": "table_name", "type": "string"},
     {"name": "table_id", "type": "long"},
@@ -915,7 +915,7 @@ pub fn create_decoder(plugin: DecoderPlugin) -> Box<dyn LogicalDecoder> {
     match plugin {
         DecoderPlugin::ZyronCdc => Box::new(ZyronCdcDecoder),
         DecoderPlugin::Debezium => {
-            Box::new(DebeziumDecoder::new("zyrondb".into(), "default".into()))
+            Box::new(DebeziumDecoder::new("zyron".into(), "default".into()))
         }
         DecoderPlugin::Wal2Json => Box::new(Wal2JsonDecoder),
         DecoderPlugin::Avro => Box::new(AvroDecoder::new()),
@@ -1030,7 +1030,7 @@ mod tests {
         // Verify JSON structure.
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["op"], "u");
-        assert_eq!(json["source"]["connector"], "zyrondb");
+        assert_eq!(json["source"]["connector"], "zyron");
         assert_eq!(json["source"]["name"], "test_server");
         assert_eq!(json["source"]["table"], "users");
         assert!(json["before"].is_object());

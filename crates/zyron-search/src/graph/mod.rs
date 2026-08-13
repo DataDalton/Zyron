@@ -1,4 +1,4 @@
-//! Graph search module for ZyronDB's property graph model.
+//! Graph search module for Zyron's property graph model.
 //!
 //! Provides graph schema definitions, CSR storage for cache-friendly traversal,
 //! SIMD-accelerated graph algorithms (PageRank, BFS, shortest path, connected

@@ -488,7 +488,7 @@ fn test_debezium_format_validation() {
     tprintln!("\n=== Debezium Format: JSON Envelope ===");
     let before = take_util_snapshot();
 
-    let decoder = DebeziumDecoder::new("zyrondb_test".into(), "mydb".into());
+    let decoder = DebeziumDecoder::new("zyron_test".into(), "mydb".into());
 
     // INSERT
     let insert = make_decoded("users", ChangeType::Insert, 1);
@@ -497,8 +497,8 @@ fn test_debezium_format_validation() {
     assert_eq!(json["op"], "c");
     assert!(json["before"].is_null());
     assert!(json["after"].is_object());
-    assert_eq!(json["source"]["connector"], "zyrondb");
-    assert_eq!(json["source"]["name"], "zyrondb_test");
+    assert_eq!(json["source"]["connector"], "zyron");
+    assert_eq!(json["source"]["name"], "zyron_test");
     assert_eq!(json["source"]["db"], "mydb");
     assert_eq!(json["source"]["table"], "users");
     assert!(json["ts_ms"].is_number());
@@ -720,7 +720,7 @@ fn test_bench_debezium_encoding() {
     let before = take_util_snapshot();
 
     let n = 500_000u64;
-    let decoder = DebeziumDecoder::new("zyrondb".into(), "default".into());
+    let decoder = DebeziumDecoder::new("zyron".into(), "default".into());
     let changes: Vec<DecodedChange> = (0..n)
         .map(|i| make_decoded("users", ChangeType::Insert, i))
         .collect();
@@ -975,10 +975,10 @@ fn test_metrics_observability() {
     m.update_slot_lag("slot2", 2048);
 
     let output = m.render_prometheus();
-    assert!(output.contains("zyrondb_cdc_cdf_records_appended_total 1000000"));
-    assert!(output.contains("zyrondb_cdc_stream_records_sent_total 500000"));
-    assert!(output.contains("zyrondb_cdc_ingest_records_applied_total 250000"));
-    assert!(output.contains("zyrondb_cdc_slot_lag_bytes"));
+    assert!(output.contains("zyron_cdc_cdf_records_appended_total 1000000"));
+    assert!(output.contains("zyron_cdc_stream_records_sent_total 500000"));
+    assert!(output.contains("zyron_cdc_ingest_records_applied_total 250000"));
+    assert!(output.contains("zyron_cdc_slot_lag_bytes"));
     tprintln!(
         "  Prometheus output: {} bytes, all counters present",
         output.len()
@@ -1030,7 +1030,7 @@ fn test_stream_and_ingest_management() {
             source: CdcIngestSource::Kafka {
                 brokers: "localhost:9092".into(),
                 topic: "upstream_cdc".into(),
-                group_id: "zyrondb".into(),
+                group_id: "zyron".into(),
                 start_offset: None,
             },
             target_table_id: 1,

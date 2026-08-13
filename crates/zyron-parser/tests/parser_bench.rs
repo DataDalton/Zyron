@@ -2,7 +2,7 @@
 
 //! SQL Parser Benchmark Suite
 //!
-//! Comprehensive integration tests for ZyronDB parser components:
+//! Comprehensive integration tests for Zyron parser components:
 //! - Lexer tokenization (single-pass, zero-alloc keyword lookup)
 //! - Expression parsing (Pratt precedence, postfix operators)
 //! - SELECT statement parsing (joins, grouping, ordering, CTEs)

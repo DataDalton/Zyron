@@ -2,7 +2,7 @@
 
 //! Storage Foundation Benchmark Suite
 //!
-//! Integration tests for ZyronDB storage components:
+//! Integration tests for Zyron storage components:
 //! - WAL write and replay
 //! - Buffer pool eviction and caching
 //! - Heap file tuple storage
@@ -2445,7 +2445,7 @@ async fn test_storage_summary() {
     zyron_bench_harness::init("storage");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tprintln!("\n============================================================");
-    tprintln!("ZyronDB Storage Foundation Validation Complete");
+    tprintln!("Zyron Storage Foundation Validation Complete");
     tprintln!("============================================================");
     tprintln!("\nRun: cargo test -p zyron-storage --test storage_bench --release -- --nocapture");
 }

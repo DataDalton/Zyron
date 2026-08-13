@@ -1,4 +1,4 @@
-//! Query planner for ZyronDB.
+//! Query planner for Zyron.
 //!
 //! Converts parsed SQL ASTs into optimized physical execution plans.
 //! Pipeline: Parse -> Bind -> Logical Plan -> Optimize -> Physical Plan.

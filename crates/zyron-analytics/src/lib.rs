@@ -1,4 +1,4 @@
-// ZyronDB analytics engine
+// Zyron analytics engine
 // ROLLUP/CUBE/GROUPING SETS, period-over-period comparisons, cohort and
 // funnel analysis, single-pass data profiling, outlier detection,
 // correlation statistics, feature store, in-database ML, causal

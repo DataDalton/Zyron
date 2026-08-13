@@ -1,4 +1,4 @@
-//! Vector similarity search module for ZyronDB.
+//! Vector similarity search module for Zyron.
 //!
 //! Provides SIMD-accelerated distance computation, HNSW approximate nearest
 //! neighbor indexing, IVF-PQ quantized indexing for large datasets, hybrid

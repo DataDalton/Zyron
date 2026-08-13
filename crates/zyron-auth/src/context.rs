@@ -569,7 +569,7 @@ mod tests {
         assert_eq!(ctx.get_attribute("department"), Some("engineering"));
         assert_eq!(ctx.get_attribute("project"), None);
 
-        ctx.set_attribute("project".to_string(), "zyrondb".to_string());
-        assert_eq!(ctx.get_attribute("project"), Some("zyrondb"));
+        ctx.set_attribute("project".to_string(), "zyron".to_string());
+        assert_eq!(ctx.get_attribute("project"), Some("zyron"));
     }
 }

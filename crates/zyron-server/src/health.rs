@@ -727,7 +727,7 @@ mod tests {
         let (status, content_type, body) = route_request("GET /metrics HTTP/1.1\r\n\r\n", &state);
         assert_eq!(status, "200 OK");
         assert!(content_type.contains("text/plain"));
-        assert!(body.contains("zyrondb_connections_total"));
+        assert!(body.contains("zyron_connections_total"));
     }
 
     #[test]

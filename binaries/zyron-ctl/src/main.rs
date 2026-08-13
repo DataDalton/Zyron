@@ -1,5 +1,5 @@
 #![allow(non_snake_case)]
-//! ZyronDB cluster management and admin tool.
+//! Zyron cluster management and admin tool.
 //!
 //! Provides subcommands for server status, backup, restore, checkpoint,
 //! analyze, vacuum, compaction, configuration validation, and benchmarks.
@@ -57,9 +57,9 @@ enum Subcommand {
 
 fn printHelp() {
     println!(
-        "ZyronDB {} - cluster management tool
+        "Zyron {} - cluster management tool
 
-Usage: zyrondb-ctl [global-flags] <subcommand> [subcommand-flags]
+Usage: zyron-ctl [global-flags] <subcommand> [subcommand-flags]
 
 Global flags (for commands that connect to a server):
   --host <host>       Server host (default: 127.0.0.1)
@@ -99,7 +99,7 @@ fn parseArgs() -> Option<(GlobalFlags, Subcommand)> {
                 return None;
             }
             "--version" | "-V" => {
-                println!("ZyronDB {} (zyrondb-ctl)", VERSION);
+                println!("Zyron {} (zyron-ctl)", VERSION);
                 return None;
             }
             "--host" => {
@@ -280,7 +280,7 @@ fn parseArgs() -> Option<(GlobalFlags, Subcommand)> {
         "config" => {
             i += 1;
             if i >= args.len() || args[i] != "validate" {
-                eprintln!("Usage: zyrondb-ctl config validate --config <path>");
+                eprintln!("Usage: zyron-ctl config validate --config <path>");
                 process::exit(1);
             }
             i += 1;
@@ -315,7 +315,7 @@ fn parseArgs() -> Option<(GlobalFlags, Subcommand)> {
         "bench" => {
             i += 1;
             if i >= args.len() {
-                eprintln!("Usage: zyrondb-ctl bench <tpch|tpcc> --scale <N>");
+                eprintln!("Usage: zyron-ctl bench <tpch|tpcc> --scale <N>");
                 process::exit(1);
             }
             let benchType = args[i].clone();

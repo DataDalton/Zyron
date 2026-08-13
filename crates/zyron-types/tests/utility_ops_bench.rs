@@ -1,6 +1,6 @@
 //! Utility Operations Benchmark Suite
 //!
-//! Integration tests + performance benchmarks for ZyronDB native utility operations
+//! Integration tests + performance benchmarks for Zyron native utility operations
 //!   Diff/patch       JSON diff, JSON patch, text diff/patch, row diff, schema diff
 //!   Scheduling       cron, sliding-window rate limiter, quotas
 //!   Checksums        CRC32, CRC32C, xxHash32/64/128, Murmur3, City, FNV, SipHash, Adler32

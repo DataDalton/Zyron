@@ -1238,21 +1238,21 @@ fn test_10_metrics() {
         if run == 0 {
             // Validate content on first run
             assert!(
-                output.contains("zyrondb_connections_total 10"),
+                output.contains("zyron_connections_total 10"),
                 "connections counter"
             );
             assert!(
-                output.contains("zyrondb_queries_total 50"),
+                output.contains("zyron_queries_total 50"),
                 "queries counter"
             );
-            assert!(output.contains("zyrondb_errors_total 2"), "errors counter");
+            assert!(output.contains("zyron_errors_total 2"), "errors counter");
             assert!(
-                output.contains("zyrondb_active_connections 2"),
+                output.contains("zyron_active_connections 2"),
                 "active gauge"
             );
-            assert!(output.contains("zyrondb_max_connections 1000"), "max gauge");
+            assert!(output.contains("zyron_max_connections 1000"), "max gauge");
             assert!(
-                output.contains("zyrondb_query_duration_seconds"),
+                output.contains("zyron_query_duration_seconds"),
                 "histogram"
             );
             assert!(output.contains("# TYPE"), "Prometheus TYPE annotation");
@@ -1407,8 +1407,8 @@ fn test_11_health_checks() {
                 let response = String::from_utf8_lossy(&buf[..n]);
                 assert!(response.contains("200 OK"), "metrics should be 200");
                 assert!(
-                    response.contains("zyrondb_"),
-                    "metrics body should contain zyrondb_ prefix"
+                    response.contains("zyron_"),
+                    "metrics body should contain zyron_ prefix"
                 );
                 tprintln!("  /metrics: 200 OK with Prometheus format: PASS");
 

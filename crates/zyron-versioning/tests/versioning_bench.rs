@@ -2,7 +2,7 @@
 
 //! Versioning Benchmark Suite
 //!
-//! Integration tests for ZyronDB versioning components:
+//! Integration tests for Zyron versioning components:
 //! - Version log append and lookup throughput
 //! - Timestamp binary search performance
 //! - Page version map update and skip-check throughput

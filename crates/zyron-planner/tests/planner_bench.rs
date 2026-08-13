@@ -2,7 +2,7 @@
 
 //! Query Planner Benchmark Suite
 //!
-//! Comprehensive integration tests for ZyronDB query planner components:
+//! Comprehensive integration tests for Zyron query planner components:
 //! - Binding (AST to bound plan with name resolution, type checking)
 //! - Logical plan construction (relational algebra tree)
 //! - Optimizer rules (predicate pushdown, projection pushdown, constant folding, join reorder)

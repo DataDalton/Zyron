@@ -1,4 +1,4 @@
-//! Buffer pool management for ZyronDB.
+//! Buffer pool management for Zyron.
 //!
 //! This crate provides in-memory page caching with:
 //! - Fixed-size buffer pool with configurable page count

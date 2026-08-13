@@ -1,6 +1,6 @@
 name: Release
 
-# Publishes a ZyronDB release whenever the workspace version changes on main.
+# Publishes a Zyron release whenever the workspace version changes on main.
 #
 # The version in Cargo.toml is the only input. Bump [workspace.package].version,
 # merge to main, and this builds the binaries, creates the v<version> tag, and
@@ -95,7 +95,7 @@ jobs:
 
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "publish=$publish" >> "$GITHUB_OUTPUT"
-          echo "ZyronDB $version, publish=$publish"
+          echo "Zyron $version, publish=$publish"
 
   build:
     name: Build ${{ matrix.target }}
@@ -148,9 +148,9 @@ jobs:
         shell: bash
         run: |
           cargo build --release --locked --target ${{ matrix.target }} \
-            --bin zyrondb-server \
-            --bin zyrondb-cli \
-            --bin zyrondb-ctl
+            --bin zyron-server \
+            --bin zyron-cli \
+            --bin zyron-ctl
 
       # Confirms the binaries run on the runner and print the product name and
       # version. The captured output ships in the archive as VERSION.txt.
@@ -161,25 +161,25 @@ jobs:
           suffix=""
           if [ "${{ runner.os }}" = "Windows" ]; then suffix=".exe"; fi
           {
-            "$bindir/zyrondb-server$suffix" --version
-            "$bindir/zyrondb-cli$suffix" --version
-            "$bindir/zyrondb-ctl$suffix" --version
+            "$bindir/zyron-server$suffix" --version
+            "$bindir/zyron-cli$suffix" --version
+            "$bindir/zyron-ctl$suffix" --version
           } | tee version-output.txt
-          if ! grep -q "ZyronDB ${{ needs.check.outputs.version }}" version-output.txt; then
-            echo "Binaries do not report ZyronDB ${{ needs.check.outputs.version }}"
+          if ! grep -q "Zyron ${{ needs.check.outputs.version }}" version-output.txt; then
+            echo "Binaries do not report Zyron ${{ needs.check.outputs.version }}"
             exit 1
           fi
 
       - name: Package archive
         shell: bash
         run: |
-          stem="zyrondb-${{ needs.check.outputs.version }}-${{ matrix.target }}"
+          stem="zyron-${{ needs.check.outputs.version }}-${{ matrix.target }}"
           bindir="target/${{ matrix.target }}/release"
           mkdir -p "dist/$stem"
           if [ "${{ runner.os }}" = "Windows" ]; then
-            cp "$bindir/zyrondb-server.exe" "$bindir/zyrondb-cli.exe" "$bindir/zyrondb-ctl.exe" "dist/$stem/"
+            cp "$bindir/zyron-server.exe" "$bindir/zyron-cli.exe" "$bindir/zyron-ctl.exe" "dist/$stem/"
           else
-            cp "$bindir/zyrondb-server" "$bindir/zyrondb-cli" "$bindir/zyrondb-ctl" "dist/$stem/"
+            cp "$bindir/zyron-server" "$bindir/zyron-cli" "$bindir/zyron-ctl" "dist/$stem/"
           fi
           cp README.md LICENSE.md "dist/$stem/"
           cp version-output.txt "dist/$stem/VERSION.txt"
@@ -198,7 +198,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: zyrondb-${{ needs.check.outputs.version }}-${{ matrix.target }}
+          name: zyron-${{ needs.check.outputs.version }}-${{ matrix.target }}
           path: dist/*
           retention-days: 14
           if-no-files-found: error
@@ -246,26 +246,26 @@ jobs:
         run: |
           version="${{ needs.check.outputs.version }}"
           cat > notes.md <<EOF
-          # ZyronDB $version
+          # Zyron $version
 
-          ZyronDB is a database engine that handles transactional and analytical
+          Zyron is a database engine that handles transactional and analytical
           workloads in a single system.
 
-          This is an early release. ZyronDB is under active development and is not
+          This is an early release. Zyron is under active development and is not
           yet recommended for production data.
 
           ## Downloads
 
           | Platform | File |
           | --- | --- |
-          | Linux x86_64 | \`zyrondb-$version-x86_64-unknown-linux-gnu.tar.gz\` |
-          | Windows x86_64 | \`zyrondb-$version-x86_64-pc-windows-msvc.zip\` |
+          | Linux x86_64 | \`zyron-$version-x86_64-unknown-linux-gnu.tar.gz\` |
+          | Windows x86_64 | \`zyron-$version-x86_64-pc-windows-msvc.zip\` |
 
-          Each archive contains three ZyronDB binaries:
+          Each archive contains three Zyron binaries:
 
-          - \`zyrondb-server\` - the ZyronDB database server
-          - \`zyrondb-cli\` - interactive SQL client
-          - \`zyrondb-ctl\` - backup, restore, and cluster administration
+          - \`zyron-server\` - the Zyron database server
+          - \`zyron-cli\` - interactive SQL client
+          - \`zyron-ctl\` - backup, restore, and cluster administration
 
           Check a download against \`SHA256SUMS.txt\`:
 
@@ -286,32 +286,32 @@ jobs:
           Linux:
 
           \`\`\`
-          tar xzf zyrondb-$version-x86_64-unknown-linux-gnu.tar.gz
-          cd zyrondb-$version-x86_64-unknown-linux-gnu
-          ./zyrondb-server --version
-          ./zyrondb-server --data-dir ./data
+          tar xzf zyron-$version-x86_64-unknown-linux-gnu.tar.gz
+          cd zyron-$version-x86_64-unknown-linux-gnu
+          ./zyron-server --version
+          ./zyron-server --data-dir ./data
           \`\`\`
 
           Windows:
 
           \`\`\`
-          zyrondb-server.exe --version
-          zyrondb-server.exe --data-dir .\\data
+          zyron-server.exe --version
+          zyron-server.exe --data-dir .\\data
           \`\`\`
 
           Then connect from a second terminal:
 
           \`\`\`
-          zyrondb-cli
+          zyron-cli
           \`\`\`
 
-          \`zyrondb-server --version\` prints:
+          \`zyron-server --version\` prints:
 
           \`\`\`
-          ZyronDB $version (zyrondb-server)
+          Zyron $version (zyron-server)
           \`\`\`
 
-          ZyronDB listens on port 5432 by default.
+          Zyron listens on port 5432 by default.
 
           ## Requirements
 
@@ -321,11 +321,11 @@ jobs:
 
           ---
 
-          Copyright (c) 2026 Zyron LLC. All rights reserved. ZyronDB is
+          Copyright (c) 2026 Zyron LLC. All rights reserved. Zyron is
           proprietary software. Personal use is free, commercial use requires a
-          license. See
-          [LICENSE](https://github.com/DataDalton/Zyron/blob/main/LICENSE.md)
-          for the full terms.
+          license.
+
+          See [LICENSE](https://github.com/DataDalton/Zyron/blob/main/LICENSE.md) for the full terms.
           EOF
           cat notes.md
 
@@ -337,6 +337,6 @@ jobs:
         run: |
           gh release create "v${{ needs.check.outputs.version }}" \
             --target "$GITHUB_SHA" \
-            --title "ZyronDB ${{ needs.check.outputs.version }}" \
+            --title "Zyron ${{ needs.check.outputs.version }}" \
             --notes-file notes.md \
             dist/*

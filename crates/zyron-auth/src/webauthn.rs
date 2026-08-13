@@ -323,7 +323,7 @@ impl Default for RelyingPartyConfig {
     fn default() -> Self {
         Self {
             rp_id: "localhost".to_string(),
-            rp_name: "ZyronDB".to_string(),
+            rp_name: "Zyron".to_string(),
             origin: "https://localhost".to_string(),
             challenge_timeout_secs: 60,
         }

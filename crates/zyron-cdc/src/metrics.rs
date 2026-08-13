@@ -86,19 +86,19 @@ impl CdcMetrics {
         // CDF metrics
         Self::write_counter(
             &mut out,
-            "zyrondb_cdc_cdf_records_appended_total",
+            "zyron_cdc_cdf_records_appended_total",
             "Total change records written to CDF files",
             self.cdf_records_appended.load(Ordering::Relaxed),
         );
         Self::write_counter(
             &mut out,
-            "zyrondb_cdc_cdf_records_queried_total",
+            "zyron_cdc_cdf_records_queried_total",
             "Total records read via table_changes()",
             self.cdf_records_queried.load(Ordering::Relaxed),
         );
         Self::write_counter(
             &mut out,
-            "zyrondb_cdc_cdf_bytes_written_total",
+            "zyron_cdc_cdf_bytes_written_total",
             "Total bytes written to CDF files",
             self.cdf_bytes_written.load(Ordering::Relaxed),
         );
@@ -106,18 +106,18 @@ impl CdcMetrics {
         // Slot metrics
         Self::write_counter(
             &mut out,
-            "zyrondb_cdc_slot_changes_decoded_total",
+            "zyron_cdc_slot_changes_decoded_total",
             "Total changes decoded through replication slots",
             self.slot_changes_decoded.load(Ordering::Relaxed),
         );
 
         // Per-slot lag (gauge)
-        out.push_str("# HELP zyrondb_cdc_slot_lag_bytes Replication slot lag in bytes\n");
-        out.push_str("# TYPE zyrondb_cdc_slot_lag_bytes gauge\n");
+        out.push_str("# HELP zyron_cdc_slot_lag_bytes Replication slot lag in bytes\n");
+        out.push_str("# TYPE zyron_cdc_slot_lag_bytes gauge\n");
         self.slot_lag_bytes.iter_sync(|name, lag| {
             let val = lag.load(Ordering::Relaxed);
             out.push_str(&format!(
-                "zyrondb_cdc_slot_lag_bytes{{slot=\"{name}\"}} {val}\n"
+                "zyron_cdc_slot_lag_bytes{{slot=\"{name}\"}} {val}\n"
             ));
             true
         });
@@ -125,19 +125,19 @@ impl CdcMetrics {
         // Stream metrics
         Self::write_counter(
             &mut out,
-            "zyrondb_cdc_stream_records_sent_total",
+            "zyron_cdc_stream_records_sent_total",
             "Total records sent to sinks",
             self.stream_records_sent.load(Ordering::Relaxed),
         );
         Self::write_counter(
             &mut out,
-            "zyrondb_cdc_stream_send_failures_total",
+            "zyron_cdc_stream_send_failures_total",
             "Total sink write failures",
             self.stream_send_failures.load(Ordering::Relaxed),
         );
         Self::write_counter(
             &mut out,
-            "zyrondb_cdc_stream_retry_count_total",
+            "zyron_cdc_stream_retry_count_total",
             "Total retries across all streams",
             self.stream_retry_count.load(Ordering::Relaxed),
         );
@@ -145,19 +145,19 @@ impl CdcMetrics {
         // Ingest metrics
         Self::write_counter(
             &mut out,
-            "zyrondb_cdc_ingest_records_applied_total",
+            "zyron_cdc_ingest_records_applied_total",
             "Total records ingested",
             self.ingest_records_applied.load(Ordering::Relaxed),
         );
         Self::write_counter(
             &mut out,
-            "zyrondb_cdc_ingest_records_failed_total",
+            "zyron_cdc_ingest_records_failed_total",
             "Total ingest failures",
             self.ingest_records_failed.load(Ordering::Relaxed),
         );
         Self::write_counter(
             &mut out,
-            "zyrondb_cdc_ingest_dead_letter_count_total",
+            "zyron_cdc_ingest_dead_letter_count_total",
             "Total dead letter records",
             self.ingest_dead_letter_count.load(Ordering::Relaxed),
         );
@@ -165,13 +165,13 @@ impl CdcMetrics {
         // Retention metrics
         Self::write_counter(
             &mut out,
-            "zyrondb_cdc_retention_records_purged_total",
+            "zyron_cdc_retention_records_purged_total",
             "Total records purged by retention",
             self.retention_records_purged.load(Ordering::Relaxed),
         );
         Self::write_counter(
             &mut out,
-            "zyrondb_cdc_retention_bytes_reclaimed_total",
+            "zyron_cdc_retention_bytes_reclaimed_total",
             "Total bytes freed by retention",
             self.retention_bytes_reclaimed.load(Ordering::Relaxed),
         );
@@ -247,10 +247,10 @@ mod tests {
         m.update_slot_lag("test_slot", 1024);
 
         let output = m.render_prometheus();
-        assert!(output.contains("zyrondb_cdc_cdf_records_appended_total 42"));
-        assert!(output.contains("zyrondb_cdc_slot_lag_bytes{slot=\"test_slot\"} 1024"));
-        assert!(output.contains("# TYPE zyrondb_cdc_cdf_records_appended_total counter"));
-        assert!(output.contains("# TYPE zyrondb_cdc_slot_lag_bytes gauge"));
+        assert!(output.contains("zyron_cdc_cdf_records_appended_total 42"));
+        assert!(output.contains("zyron_cdc_slot_lag_bytes{slot=\"test_slot\"} 1024"));
+        assert!(output.contains("# TYPE zyron_cdc_cdf_records_appended_total counter"));
+        assert!(output.contains("# TYPE zyron_cdc_slot_lag_bytes gauge"));
     }
 
     #[test]

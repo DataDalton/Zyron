@@ -1,4 +1,4 @@
-//! PostgreSQL wire protocol v3 implementation for ZyronDB.
+//! PostgreSQL wire protocol v3 implementation for Zyron.
 //!
 //! Provides a server that speaks the PostgreSQL wire protocol over TCP
 //! and QUIC transports. Any PostgreSQL-compatible client (psql, psycopg2,
@@ -291,7 +291,7 @@ pub async fn start_server(
     }
 
     info!(
-        "ZyronDB listening on {} (TCP) with {} workers",
+        "Zyron listening on {} (TCP) with {} workers",
         addr, num_workers
     );
 

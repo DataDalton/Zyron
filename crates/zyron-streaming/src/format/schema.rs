@@ -15,7 +15,7 @@ use zyron_common::{Result, TypeId, ZyronError};
 // TypeId to Arrow
 // -----------------------------------------------------------------------------
 
-/// Maps a ZyronDB TypeId onto an Arrow DataType. Types with no direct Arrow
+/// Maps a Zyron TypeId onto an Arrow DataType. Types with no direct Arrow
 /// analogue fall back to Binary or Utf8 as appropriate. Decimal and Int128
 /// use Decimal128 with precision 38 and scale 0, a reasonable default.
 pub fn type_id_to_arrow(t: TypeId) -> ArrowDataType {
@@ -96,7 +96,7 @@ pub fn ps_to_arrow_ns(ps: i128) -> i64 {
 // Arrow to TypeId
 // -----------------------------------------------------------------------------
 
-/// Maps an Arrow DataType back to a ZyronDB TypeId. Returns an error for
+/// Maps an Arrow DataType back to a Zyron TypeId. Returns an error for
 /// Arrow types that have no direct Zyron equivalent. Used when inferring a
 /// schema from a Parquet or Arrow IPC file.
 pub fn arrow_to_type_id(dt: &ArrowDataType) -> Result<TypeId> {
@@ -166,7 +166,7 @@ pub fn arrow_to_type_id(dt: &ArrowDataType) -> Result<TypeId> {
 // Avro to TypeId
 // -----------------------------------------------------------------------------
 
-/// Maps an Avro schema node onto a ZyronDB TypeId. Handles primitives,
+/// Maps an Avro schema node onto a Zyron TypeId. Handles primitives,
 /// logical types (date, timestamps, decimal, uuid), and the [null, T] union
 /// idiom that Avro uses for nullable fields. Errors out for shapes with no
 /// direct mapping such as enums, maps, and fixed unions.

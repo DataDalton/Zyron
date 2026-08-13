@@ -1,4 +1,4 @@
-//! Catalog module for ZyronDB.
+//! Catalog module for Zyron.
 //!
 //! Manages database metadata: databases, schemas, tables, columns, indexes,
 //! constraints, and statistics. Persists catalog entries in heap file system

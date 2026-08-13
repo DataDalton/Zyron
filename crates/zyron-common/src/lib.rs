@@ -1,6 +1,6 @@
-//! ZyronDB common types, errors, and utilities.
+//! Zyron common types, errors, and utilities.
 //!
-//! This crate provides shared definitions used across all ZyronDB components.
+//! This crate provides shared definitions used across all Zyron components.
 
 pub mod checksum;
 pub mod config;

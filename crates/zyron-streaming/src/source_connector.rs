@@ -1,6 +1,6 @@
 //! Source connectors for ingesting data into streaming jobs.
 //!
-//! ZyronTableSource pulls change records directly from a ZyronDB change data
+//! ZyronTableSource pulls change records directly from a Zyron change data
 //! feed and yields CdfChange items. ZyronSourceAdapter is the trait object the
 //! runner uses to pull rows from a remote Zyron publication.
 
@@ -13,7 +13,7 @@ use zyron_common::{Result, ZyronError};
 // ZyronTableSource
 // ---------------------------------------------------------------------------
 
-/// Pulls change records directly from a ZyronDB change data feed.
+/// Pulls change records directly from a Zyron change data feed.
 /// Each call to read_batch advances the last_version watermark to the
 /// max commit_version observed. Returns a Vec of CdfChange items.
 pub struct ZyronTableSource {

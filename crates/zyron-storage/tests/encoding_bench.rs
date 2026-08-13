@@ -2,7 +2,7 @@
 
 //! Encoding Engine Benchmark Suite
 //!
-//! Integration tests for ZyronDB columnar encoding:
+//! Integration tests for Zyron columnar encoding:
 //! - FastLanes, FSST, ALP, Dictionary, RLE round-trip correctness
 //! - Encoding selection heuristics
 //! - Compressed predicate evaluation

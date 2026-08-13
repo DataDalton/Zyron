@@ -1,4 +1,4 @@
-//! Central catalog manager for ZyronDB.
+//! Central catalog manager for Zyron.
 //!
 //! Coordinates DDL operations with WAL logging, cache updates,
 //! and storage persistence. All DDL operations are crash-safe

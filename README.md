@@ -1,6 +1,6 @@
 <div align="center">
 
-# ZyronDB
+# Zyron
 
 **An HTAP database engine in Rust - row store for transactions, custom columnar format for analytics, one engine.**
 
@@ -10,7 +10,7 @@ MVCC concurrency · lock-free hot paths · time travel · branching · CDC · na
 
 ---
 
-ZyronDB is a hybrid transactional/analytical database. It implements its own write-ahead log, buffer pool, B+ tree, MVCC engine, SQL parser, cost-based optimizer, vectorized executor, columnar encoding engine, and wire protocol: no embedded SQL engine, no third-party storage layer, no ORM.
+Zyron is a hybrid transactional/analytical database. It implements its own write-ahead log, buffer pool, B+ tree, MVCC engine, SQL parser, cost-based optimizer, vectorized executor, columnar encoding engine, and wire protocol: no embedded SQL engine, no third-party storage layer, no ORM.
 
 Fresh writes land in an MVCC row heap tuned for OLTP. A background thread compacts committed rows into a custom column format (`.zyr`) with per-column encoding, and analytical queries run directly on the encoded data with predicate pushdown and late materialization. The same SQL, the same connection, both workloads.
 
@@ -18,7 +18,7 @@ Fresh writes land in an MVCC row heap tuned for OLTP. A background thread compac
 
 ## Table of Contents
 
-- [ZyronDB](#zyrondb)
+- [Zyron](#zyron)
   - [Table of Contents](#table-of-contents)
   - [Highlights](#highlights)
   - [Architecture](#architecture)
@@ -48,14 +48,14 @@ Fresh writes land in an MVCC row heap tuned for OLTP. A background thread compac
 
 ## Architecture
 
-ZyronDB is a Cargo workspace. Each crate owns one layer and depends only on the layers beneath it.
+Zyron is a Cargo workspace. Each crate owns one layer and depends only on the layers beneath it.
 
 ```mermaid
 %%{init: {'theme':'base','themeVariables':{'background':'transparent','primaryColor':'#0d1117','primaryBorderColor':'#1f6feb','primaryTextColor':'#e6edf3','secondaryColor':'#0d1117','tertiaryColor':'#0d1117','lineColor':'#58a6ff','clusterBkg':'transparent','clusterBorder':'#1f6feb','titleColor':'#e6edf3','fontFamily':'ui-sans-serif, system-ui, sans-serif'}}}%%
 flowchart TB
     subgraph CLIENTS [Clients]
         direction LR
-        C1[psql / drivers] ~~~ C2[zyrondb-cli] ~~~ C3[zyrondb-ctl]
+        C1[psql / drivers] ~~~ C2[zyron-cli] ~~~ C3[zyron-ctl]
     end
 
     subgraph PROTO [Connectivity]
@@ -258,13 +258,13 @@ A few more numbers not shown in the charts above:
 
 Prebuilt binaries for Linux x86_64 and Windows x86_64 are attached to every
 [release](https://github.com/DataDalton/Zyron/releases). Each archive contains
-`zyrondb-server`, `zyrondb-cli`, and `zyrondb-ctl`.
+`zyron-server`, `zyron-cli`, and `zyron-ctl`.
 
 ```bash
-tar xzf zyrondb-0.1.0-x86_64-unknown-linux-gnu.tar.gz
-cd zyrondb-0.1.0-x86_64-unknown-linux-gnu
-./zyrondb-server --version
-./zyrondb-server --data-dir ./data
+tar xzf zyron-0.1.0-x86_64-unknown-linux-gnu.tar.gz
+cd zyron-0.1.0-x86_64-unknown-linux-gnu
+./zyron-server --version
+./zyron-server --data-dir ./data
 ```
 
 Checksums are published as `SHA256SUMS.txt` on the release page.
@@ -279,7 +279,7 @@ cargo build --release
 
 # Run the server
 cargo zyron -- --data-dir ./data --port 5432
-#   alias for: cargo run --release --bin zyrondb-server --
+#   alias for: cargo run --release --bin zyron-server --
 
 # Connect with the bundled client
 cargo cli -- --host localhost --port 5432
@@ -288,8 +288,8 @@ cargo cli -- --host localhost --port 5432
 psql -h localhost -p 5432 -U postgres
 
 # Administer
-cargo run --release --bin zyrondb-ctl -- status
-cargo run --release --bin zyrondb-ctl -- backup --out ./backup
+cargo run --release --bin zyron-ctl -- status
+cargo run --release --bin zyron-ctl -- backup --out ./backup
 ```
 
 Server flags include `--config`, `--host`, `--log-level`, `--foreground`, `--single-user`, and `--skip-recovery`.
@@ -357,9 +357,9 @@ crates/
   zyron-bench-harness shared benchmark harness and result output
 
 binaries/
-  zyrondb-server      database server entry point
-  zyrondb-cli         psql-like interactive client
-  zyrondb-ctl         admin tool: status, backup, restore, vacuum, compact
+  zyron-server      database server entry point
+  zyron-cli         psql-like interactive client
+  zyron-ctl         admin tool: status, backup, restore, vacuum, compact
 
 benchmarks/           timestamped JSON/TXT results, one folder per suite
 scripts/              tooling, including the benchmark chart generator
@@ -403,4 +403,4 @@ cargo clippy --workspace -- -D warnings
 
 ## License
 
-Copyright (c) 2026 Zyron LLC. **All rights reserved.** ZyronDB is proprietary software. Personal use is free, commercial use requires a license. See [LICENSE](LICENSE.md) for the full terms.
+Copyright (c) 2026 Zyron LLC. **All rights reserved.** Zyron is proprietary software. Personal use is free, commercial use requires a license. See [LICENSE](LICENSE.md) for the full terms.

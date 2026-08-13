@@ -1,7 +1,7 @@
 #![allow(non_snake_case)]
 //! Minimal synchronous PostgreSQL wire protocol client.
 //!
-//! Connects to a ZyronDB server (or any PostgreSQL-compatible server) using
+//! Connects to a Zyron server (or any PostgreSQL-compatible server) using
 //! the v3 simple query protocol over a plain TCP socket.
 
 use std::io::{BufReader, BufWriter, Read, Write};

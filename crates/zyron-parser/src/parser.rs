@@ -7875,7 +7875,7 @@ fn keyword_to_ident_str(kw: Keyword) -> Option<&'static str> {
         Keyword::Checkpoint => Some("checkpoint"),
         // DO block
         Keyword::Language => Some("language"),
-        // ZyronDB custom
+        // Zyron custom
         Keyword::Segments => Some("segments"),
         Keyword::Status => Some("status"),
         Keyword::Buffer => Some("buffer"),
@@ -11483,7 +11483,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // SHOW with multi-word (ZyronDB custom)
+    // SHOW with multi-word (Zyron custom)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -11505,7 +11505,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ALTER TABLE SET STORAGE (ZyronDB custom)
+    // ALTER TABLE SET STORAGE (Zyron custom)
     // -----------------------------------------------------------------------
 
     #[test]

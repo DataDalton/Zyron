@@ -1,4 +1,4 @@
-//! ZyronDB CLI client.
+//! Zyron CLI client.
 //!
 //! A psql-like client that connects via TCP, sends SQL queries using
 //! the PostgreSQL simple query protocol, and displays formatted results.
@@ -278,7 +278,7 @@ fn parse_args() -> Option<CliOptions> {
                 opts.database = args[i].clone();
             }
             "--version" => {
-                println!("ZyronDB {} (zyrondb-cli)", env!("CARGO_PKG_VERSION"));
+                println!("Zyron {} (zyron-cli)", env!("CARGO_PKG_VERSION"));
                 return None;
             }
             "--format" => {
@@ -329,8 +329,8 @@ fn parse_args() -> Option<CliOptions> {
                     std::process::exit(1);
                 } else {
                     // Positional token: collect as part of the one-shot
-                    // command so users can run `zyrondb-cli status` or
-                    // `zyrondb-cli tables describe users` directly.
+                    // command so users can run `zyron-cli status` or
+                    // `zyron-cli tables describe users` directly.
                     trailing_tokens.push(args[i].clone());
                 }
             }
@@ -346,15 +346,15 @@ fn parse_args() -> Option<CliOptions> {
 
 fn print_help() {
     println!(
-        "ZyronDB {} - interactive SQL client
+        "Zyron {} - interactive SQL client
 
-Usage: zyrondb-cli [OPTIONS] [CONNECTION_STRING] [COMMAND...]
+Usage: zyron-cli [OPTIONS] [CONNECTION_STRING] [COMMAND...]
 
-With no trailing COMMAND, zyrondb-cli starts the interactive REPL.
+With no trailing COMMAND, zyron-cli starts the interactive REPL.
 Otherwise it dispatches the given command one-shot and exits:
-  zyrondb-cli status
-  zyrondb-cli tables describe users
-  zyrondb-cli sql \"SELECT * FROM orders LIMIT 5\"
+  zyron-cli status
+  zyron-cli tables describe users
+  zyron-cli sql \"SELECT * FROM orders LIMIT 5\"
 
 Options:
   -h, --host <addr>      Server host (default: 127.0.0.1)
@@ -425,7 +425,7 @@ fn main() {
     let mut state = CliState::new(hist, opts.clone(), server_version.clone());
 
     // One-shot execution: when the shell invocation carried a positional
-    // command (e.g. `zyrondb-cli tables list`), dispatch it and exit
+    // command (e.g. `zyron-cli tables list`), dispatch it and exit
     // without entering the REPL. The welcome banner is suppressed so
     // pipes stay clean.
     if let Some(cmd_str) = opts.one_shot_command.clone() {
@@ -663,7 +663,7 @@ fn sql_sub_repl(state: &mut CliState, stream: &mut TcpStream) {
     }
 }
 
-/// Dispatches a single command from the OS shell (`zyrondb-cli tables
+/// Dispatches a single command from the OS shell (`zyron-cli tables
 /// list`) and returns the process exit code. Suppresses the welcome
 /// banner, the prompt, the line editor; the one-shot path is strictly
 /// for scripting. Returns 0 on success, 2 on parse error, 1 on dispatch
@@ -739,9 +739,9 @@ fn json_string(s: &str) -> String {
 fn print_version_line(state: &CliState) {
     println!(
         "{} {}  {}  ·  server {}",
-        color::bold("ZyronDB"),
+        color::bold("Zyron"),
         color::bold(env!("CARGO_PKG_VERSION")),
-        color::dim("zyrondb-cli"),
+        color::dim("zyron-cli"),
         state.server_version.as_deref().unwrap_or("unknown"),
     );
 }
@@ -1142,9 +1142,9 @@ fn print_welcome_banner(state: &CliState) {
 
     let client_line = format!(
         "{} {}  {}  {}  server {}",
-        color::bold("ZyronDB"),
+        color::bold("Zyron"),
         color::bold(env!("CARGO_PKG_VERSION")),
-        color::dim("zyrondb-cli"),
+        color::dim("zyron-cli"),
         color::dim("·"),
         state.server_version.as_deref().unwrap_or("unknown"),
     );

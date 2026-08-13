@@ -1,5 +1,5 @@
 #![allow(non_snake_case)]
-//! Pipeline, trigger, UDF, and stored procedure engine for ZyronDB.
+//! Pipeline, trigger, UDF, and stored procedure engine for Zyron.
 
 pub mod aggregate;
 pub mod dependency;

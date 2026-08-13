@@ -2,7 +2,7 @@
 
 //! Full-Text Search and Vector/Graph Search Benchmark Suite
 //!
-//! Integration tests for ZyronDB FTS engine and vector/graph search:
+//! Integration tests for Zyron FTS engine and vector/graph search:
 //! - Basic search correctness and relevance ordering
 //! - Boolean search (must/must_not/should)
 //! - Phrase search with positional verification
@@ -581,9 +581,9 @@ fn test_08_field_boosting() {
     let analyzer = SimpleAnalyzer;
     let scorer = Bm25Scorer::default();
 
-    // Doc 1: "zyrondb" in title only
+    // Doc 1: "zyron" in title only
     title_idx
-        .add_document(1, "zyrondb release notes", &analyzer)
+        .add_document(1, "zyron release notes", &analyzer)
         .expect("add failed");
     body_idx
         .add_document(
@@ -593,19 +593,19 @@ fn test_08_field_boosting() {
         )
         .expect("add failed");
 
-    // Doc 2: "zyrondb" in body only
+    // Doc 2: "zyron" in body only
     title_idx
         .add_document(2, "release notes update", &analyzer)
         .expect("add failed");
     body_idx
         .add_document(
             2,
-            "zyrondb handles distributed queries efficiently",
+            "zyron handles distributed queries efficiently",
             &analyzer,
         )
         .expect("add failed");
 
-    let query = FtsQuery::Term("zyrondb".to_string());
+    let query = FtsQuery::Term("zyron".to_string());
 
     let title_results = title_idx
         .search(&query, &analyzer, &scorer, 10)
