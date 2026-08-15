@@ -23,20 +23,20 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use zyron_common::ZyronError;
 
-use crate::codec::{corrupt, Cursor};
+use crate::codec::{Cursor, corrupt};
 use crate::index::{IndexFileEntry, LakeIndexSpec};
 use crate::manifest::{
-    decode_delete_predicate, decode_index_file, decode_index_spec, decode_partition_entry,
-    encode_delete_predicate, encode_index_file, encode_index_spec, encode_partition_entry,
-    ClusterSpec, DeletePredicate, FileStats, ManifestFile, PartitionEntry,
+    ClusterSpec, DeletePredicate, FileStats, ManifestFile, PartitionEntry, decode_delete_predicate,
+    decode_index_file, decode_index_spec, decode_partition_entry, encode_delete_predicate,
+    encode_index_file, encode_index_spec, encode_partition_entry,
 };
-use crate::paths::{parse_version_file_name, LakePaths, VersionFileKind};
+use crate::paths::{LakePaths, VersionFileKind, parse_version_file_name};
 use crate::predicate::{LakePredicate, PruneDecision};
 use crate::prune_index::PruneIndex;
 use crate::schema::LakeSchema;
@@ -193,23 +193,35 @@ impl CommitInfo {
 pub enum LogEntry {
     /// New data file. `added_version` is stamped by the log at apply time
     AddFile(PartitionEntry),
-    RemoveFile { partition_id: u64 },
+    RemoveFile {
+        partition_id: u64,
+    },
     /// New predicate delete. `created_version` is stamped at apply time,
     /// and the id attaches to every live file the predicate may match
     AddDeletePredicate(DeletePredicate),
-    RemoveDeletePredicate { id: u64 },
+    RemoveDeletePredicate {
+        id: u64,
+    },
     /// Full replacement schema, its schema id must exceed the current one
     SchemaChange(LakeSchema),
     /// Full replacement cluster spec, its spec id must exceed the current
     SetClusterSpec(ClusterSpec),
-    SetProperty { key: String, value: String },
+    SetProperty {
+        key: String,
+        value: String,
+    },
     /// New secondary index declaration, its id must be unallocated
     AddIndex(LakeIndexSpec),
     /// Drops the declaration and every file that belongs to it
-    DropIndex { index_id: u32 },
+    DropIndex {
+        index_id: u32,
+    },
     /// New index file. `added_version` is stamped by the log at apply time
     AddIndexFile(IndexFileEntry),
-    RemoveIndexFile { index_id: u32, partition_id: u64 },
+    RemoveIndexFile {
+        index_id: u32,
+        partition_id: u64,
+    },
 }
 
 impl LogEntry {
@@ -277,7 +289,6 @@ impl LogEntry {
         }
         Ok(())
     }
-
 }
 
 /// Parses one entry from a positioned cursor. The schema sub-codec
@@ -378,14 +389,21 @@ impl CommitHeader {
         if bytes.len() < COMMIT_HEADER_LEN {
             return Err(corrupt(
                 ctx,
-                format!("commit header needs {} bytes, got {}", COMMIT_HEADER_LEN, bytes.len()),
+                format!(
+                    "commit header needs {} bytes, got {}",
+                    COMMIT_HEADER_LEN,
+                    bytes.len()
+                ),
             ));
         }
         if bytes[0..5] != LOG_MAGIC {
             return Err(corrupt(ctx, "bad log magic".into()));
         }
         if bytes[5] != LOG_FORMAT_VERSION {
-            return Err(corrupt(ctx, format!("unsupported log format version {}", bytes[5])));
+            return Err(corrupt(
+                ctx,
+                format!("unsupported log format version {}", bytes[5]),
+            ));
         }
         let mut check = [0u8; COMMIT_HEADER_LEN];
         check.copy_from_slice(&bytes[..COMMIT_HEADER_LEN]);
@@ -397,7 +415,10 @@ impl CommitHeader {
         if stored_crc != actual {
             return Err(corrupt(
                 ctx,
-                format!("commit header checksum mismatch, stored {:#010x} computed {:#010x}", stored_crc, actual),
+                format!(
+                    "commit header checksum mismatch, stored {:#010x} computed {:#010x}",
+                    stored_crc, actual
+                ),
             ));
         }
         let mut r = Cursor::new(&bytes[6..COMMIT_HEADER_LEN], ctx);
@@ -476,7 +497,10 @@ impl VersionFileData {
         if entry_crc != actual {
             return Err(corrupt(
                 ctx,
-                format!("entry section checksum mismatch, stored {:#010x} computed {:#010x}", entry_crc, actual),
+                format!(
+                    "entry section checksum mismatch, stored {:#010x} computed {:#010x}",
+                    entry_crc, actual
+                ),
             ));
         }
         let entries_end = if header.audit_off != 0 {
@@ -618,10 +642,7 @@ fn apply_entries(
             LogEntry::AddDeletePredicate(del) => {
                 let mut del = del.clone();
                 del.created_version = version;
-                let pos = match m
-                    .delete_predicates
-                    .binary_search_by_key(&del.id, |p| p.id)
-                {
+                let pos = match m.delete_predicates.binary_search_by_key(&del.id, |p| p.id) {
                     Ok(_) => {
                         return Err(ZyronError::Internal(format!(
                             "delete predicate {} already exists",
@@ -680,7 +701,10 @@ fn apply_entries(
                         )));
                     }
                 }
-                match m.indexes.binary_search_by_key(&spec.index_id, |s| s.index_id) {
+                match m
+                    .indexes
+                    .binary_search_by_key(&spec.index_id, |s| s.index_id)
+                {
                     Ok(_) => {
                         return Err(ZyronError::Internal(format!(
                             "index id {} is already allocated",
@@ -1202,12 +1226,15 @@ impl TransactionLog {
         };
         let mut state = None;
         apply_entries(&mut state, 1, attempt.timestamp_us, &entries)?;
-        let manifest = state.ok_or_else(|| {
-            ZyronError::Internal("table creation produced no manifest".into())
-        })?;
+        let manifest = state
+            .ok_or_else(|| ZyronError::Internal("table creation produced no manifest".into()))?;
         let bytes = encode_version_file(1, 0, &attempt, &entries, &manifest)?;
         let path = log.paths.version_file(1);
-        let mut file = match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(ZyronError::Internal(format!(
@@ -1268,7 +1295,10 @@ impl TransactionLog {
             if header.version != v {
                 return Err(corrupt(
                     &paths.version_file(v).to_string_lossy(),
-                    format!("header says version {}, file name says {}", header.version, v),
+                    format!(
+                        "header says version {}, file name says {}",
+                        header.version, v
+                    ),
                 ));
             }
             if header.db_txn_id != 0 && !status.is_committed(header.db_txn_id) {
@@ -1465,7 +1495,11 @@ impl TransactionLog {
                     e
                 ))
             })?;
-            tracing::warn!(branch, version = v, "discarded unreachable lake branch version");
+            tracing::warn!(
+                branch,
+                version = v,
+                "discarded unreachable lake branch version"
+            );
         }
 
         let log = Self {
@@ -1616,12 +1650,18 @@ impl TransactionLog {
             };
             let bytes = encode_version_file(version, base_version, &attempt, &entries, &base)?;
             let path = self.version_path(version);
-            match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
                 Ok(mut file) => {
                     file.write_all(&bytes)?;
                     file.sync_all()?;
                     drop(file);
-                    let _ = self.manifests.insert_sync(version, CachedManifest::new(manifest));
+                    let _ = self
+                        .manifests
+                        .insert_sync(version, CachedManifest::new(manifest));
                     self.evict_cache();
                     self.created_head.fetch_max(version, Ordering::AcqRel);
                     if attempt.db_txn_id == 0 {
@@ -1635,15 +1675,14 @@ impl TransactionLog {
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     self.commit_retries.fetch_add(1, Ordering::Relaxed);
                     let winner = read_racing(|| read_commit_header(&path))?;
-                    self.created_head.fetch_max(winner.version, Ordering::AcqRel);
+                    self.created_head
+                        .fetch_max(winner.version, Ordering::AcqRel);
                     if winner.db_txn_id == 0 {
                         // A standalone winner from another thread published
                         // itself, make sure the watermark caught up
                         self.advance_published();
                     }
-                    if let Some(reason) =
-                        self.check_conflict(&attempt, &entries, &winner, &path)?
-                    {
+                    if let Some(reason) = self.check_conflict(&attempt, &entries, &winner, &path)? {
                         return Err(ZyronError::ConflictError {
                             mine: attempt.operation.name().to_string(),
                             theirs: winner.operation.name().to_string(),
@@ -1697,9 +1736,7 @@ impl TransactionLog {
             return Ok(Some("schema change, restore and convert serialize".into()));
         }
         // R6 two appends never touch the same file
-        if attempt.operation == OperationKind::Append
-            && winner.operation == OperationKind::Append
-        {
+        if attempt.operation == OperationKind::Append && winner.operation == OperationKind::Append {
             return Ok(None);
         }
         // R3 removed sets, bloom first, exact entries only on a hit
@@ -1716,10 +1753,7 @@ impl TransactionLog {
             for entry in &winner_data.entries {
                 if let LogEntry::RemoveFile { partition_id } = entry {
                     if my_removed.contains(partition_id) {
-                        return Ok(Some(format!(
-                            "both removed partition {:#x}",
-                            partition_id
-                        )));
+                        return Ok(Some(format!("both removed partition {:#x}", partition_id)));
                     }
                 }
             }
@@ -1761,10 +1795,7 @@ impl TransactionLog {
                     for theirs in &winner_data.entries {
                         if let LogEntry::SetProperty { key: their_key, .. } = theirs {
                             if key == their_key {
-                                return Ok(Some(format!(
-                                    "both set property \"{}\"",
-                                    key
-                                )));
+                                return Ok(Some(format!("both set property \"{}\"", key)));
                             }
                         }
                     }
@@ -1854,7 +1885,10 @@ impl TransactionLog {
         }
         let manifest = self.manifest_at(version)?;
         let bytes = manifest.encode();
-        let tmp = self.paths.tmp_dir().join(format!("checkpoint_{}.zym", version));
+        let tmp = self
+            .paths
+            .tmp_dir()
+            .join(format!("checkpoint_{}.zym", version));
         fs::create_dir_all(self.paths.tmp_dir())?;
         {
             let mut file = fs::File::create(&tmp)?;
@@ -2012,7 +2046,9 @@ fn encode_version_file(
     base: &ManifestFile,
 ) -> Result<Vec<u8>, ZyronError> {
     if entries.len() > u32::MAX as usize {
-        return Err(ZyronError::Internal("too many entries in one commit".into()));
+        return Err(ZyronError::Internal(
+            "too many entries in one commit".into(),
+        ));
     }
     let mut files_added = 0u32;
     let mut files_removed = 0u32;
@@ -2099,7 +2135,7 @@ mod tests {
                 name: "id".into(),
                 type_id: TypeId::Int64,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
                 tz_offset_secs: None,
                 max_length: None,
                 default_expr: None,
@@ -2215,7 +2251,10 @@ mod tests {
         for v in 1..=expected_head {
             assert!(paths.version_file(v).exists(), "version {} missing", v);
         }
-        assert!(log.commit_retries() > 0, "contention must have caused retries");
+        assert!(
+            log.commit_retries() > 0,
+            "contention must have caused retries"
+        );
     }
 
     /// Losing a version race is not a conflict, so it must not spend the
@@ -2275,8 +2314,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = new_log(dir.path());
         // A second handle over the same directory simulates another writer
-        let stale = TransactionLog::open(LakePaths::new(dir.path(), 7), &AllCommitted)
-            .expect("open");
+        let stale =
+            TransactionLog::open(LakePaths::new(dir.path(), 7), &AllCommitted).expect("open");
         let mut evolved = schema();
         evolved.schema_id = 2;
         log.commit(attempt(OperationKind::SchemaChange), |_| {
@@ -2310,8 +2349,8 @@ mod tests {
         })
         .expect("append");
 
-        let stale = TransactionLog::open(LakePaths::new(dir.path(), 7), &AllCommitted)
-            .expect("open");
+        let stale =
+            TransactionLog::open(LakePaths::new(dir.path(), 7), &AllCommitted).expect("open");
         log.commit(attempt(OperationKind::Delete), |_| {
             Ok(vec![LogEntry::RemoveFile { partition_id: 0xA }])
         })
@@ -2335,8 +2374,8 @@ mod tests {
             Ok(vec![LogEntry::AddFile(data_file(0xA, 1, 100, 10))])
         })
         .expect("append");
-        let stale = TransactionLog::open(LakePaths::new(dir.path(), 7), &AllCommitted)
-            .expect("open");
+        let stale =
+            TransactionLog::open(LakePaths::new(dir.path(), 7), &AllCommitted).expect("open");
         log.commit(attempt(OperationKind::Delete), |_| {
             Ok(vec![LogEntry::RemoveFile { partition_id: 0xA }])
         })
@@ -2366,8 +2405,8 @@ mod tests {
             op: CompareOp::LtEq,
             value: LakeValue::Int(100),
         };
-        let stale = TransactionLog::open(LakePaths::new(dir.path(), 7), &AllCommitted)
-            .expect("open");
+        let stale =
+            TransactionLog::open(LakePaths::new(dir.path(), 7), &AllCommitted).expect("open");
         log.commit(attempt(OperationKind::Append), |_| {
             Ok(vec![LogEntry::AddFile(data_file(0xC, 1, 50, 5))])
         })
@@ -2383,10 +2422,10 @@ mod tests {
         assert!(err.to_string().contains("read predicate"));
 
         // The same shape with a non-matching added file goes through
-        let log2 = TransactionLog::open(LakePaths::new(dir.path(), 7), &AllCommitted)
-            .expect("open");
-        let stale2 = TransactionLog::open(LakePaths::new(dir.path(), 7), &AllCommitted)
-            .expect("open");
+        let log2 =
+            TransactionLog::open(LakePaths::new(dir.path(), 7), &AllCommitted).expect("open");
+        let stale2 =
+            TransactionLog::open(LakePaths::new(dir.path(), 7), &AllCommitted).expect("open");
         log2.commit(attempt(OperationKind::Append), |_| {
             Ok(vec![LogEntry::AddFile(data_file(0xD, 200, 300, 5))])
         })
@@ -2501,8 +2540,8 @@ mod tests {
         assert_eq!(m5.entries.len(), 4);
 
         // Versions below the floor are gone for good
-        let fresh = TransactionLog::open(LakePaths::new(dir.path(), 7), &AllCommitted)
-            .expect("reopen");
+        let fresh =
+            TransactionLog::open(LakePaths::new(dir.path(), 7), &AllCommitted).expect("reopen");
         assert_eq!(fresh.latest_version(), 5);
         assert!(fresh.manifest_at(2).is_err());
     }
@@ -2518,24 +2557,22 @@ mod tests {
             .expect("append");
             log.commit(attempt(OperationKind::Delete), |base| {
                 assert!(base.entry_for(0xA).is_some());
-                Ok(vec![
-                    LogEntry::AddDeletePredicate(DeletePredicate {
-                        id: 1,
-                        sql: "id > 50".into(),
-                        predicate: LakePredicate::Compare {
-                            column_id: 0,
-                            op: CompareOp::Gt,
-                            value: LakeValue::Int(50),
-                        },
-                        created_version: 0,
-                    }),
-                ])
+                Ok(vec![LogEntry::AddDeletePredicate(DeletePredicate {
+                    id: 1,
+                    sql: "id > 50".into(),
+                    predicate: LakePredicate::Compare {
+                        column_id: 0,
+                        op: CompareOp::Gt,
+                        value: LakeValue::Int(50),
+                    },
+                    created_version: 0,
+                })])
             })
             .expect("predicate delete");
             (*log.latest_manifest().expect("manifest")).clone()
         };
-        let log = TransactionLog::open(LakePaths::new(dir.path(), 7), &AllCommitted)
-            .expect("reopen");
+        let log =
+            TransactionLog::open(LakePaths::new(dir.path(), 7), &AllCommitted).expect("reopen");
         let after = (*log.latest_manifest().expect("manifest")).clone();
         assert_eq!(before, after);
         // The predicate attached to the file it may match
@@ -2561,8 +2598,8 @@ mod tests {
                 Ok(vec![LogEntry::AddFile(data_file(0x5, 0, 9, 1))])
             })
             .expect("commit");
-        let data = read_version_file(&LakePaths::new(dir.path(), 7).version_file(v))
-            .expect("read back");
+        let data =
+            read_version_file(&LakePaths::new(dir.path(), 7).version_file(v)).expect("read back");
         assert_eq!(data.audit, Some(audit));
         assert_eq!(data.entries.len(), 1);
     }
@@ -2598,7 +2635,7 @@ mod tests {
             name: "added".into(),
             type_id: TypeId::Text,
             nullable: true,
-            ts_precision: None,
+            fractional_digits: None,
             tz_offset_secs: None,
             max_length: None,
             default_expr: None,
@@ -2615,12 +2652,15 @@ mod tests {
                 ])
             })
             .expect("schema change");
-        let data = read_version_file(&LakePaths::new(dir.path(), 7).version_file(v))
-            .expect("read back");
+        let data =
+            read_version_file(&LakePaths::new(dir.path(), 7).version_file(v)).expect("read back");
         assert_eq!(data.entries.len(), 2);
         assert_eq!(data.entries[0], LogEntry::SchemaChange(evolved.clone()));
         let m = log.latest_manifest().expect("manifest");
         assert_eq!(m.schema, evolved);
-        assert_eq!(m.properties.get("note").map(|s| s.as_str()), Some("widened"));
+        assert_eq!(
+            m.properties.get("note").map(|s| s.as_str()),
+            Some("widened")
+        );
     }
 }

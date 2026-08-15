@@ -1,0 +1,124 @@
+# suite:   catalog
+# run:     2026-08-15_024446_2848e81-local
+# profile: debug
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+# NOT A BENCHMARK RESULT. This is an unoptimized build, so every
+# timing below is meaningless: an unoptimized build is not slower
+# by a constant factor, so these numbers do not even rank correctly
+# against each other. Counted quantities (rates, file and row
+# counts, PASS/FAIL on an exact bound) are valid and are the only
+# thing worth reading here. For real numbers: cargo test --release
+#
+
+=== Benchmark: Histogram Build Latency ===
+  Histogram build latency (ms/col) [NOT MEASURED, unoptimized build]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 (target <= 10, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Benchmark: DDL Create Latency ===
+  Create table latency (us/op) [NOT MEASURED, unoptimized build]:
+    Runs: [93, 84, 92, 82, 89]
+    Average: 88 (target <= 200, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Benchmark: Schema Resolve Latency ===
+  Resolve latency (ns/op) [NOT MEASURED, unoptimized build]:
+    Runs: [385, 384, 384, 384, 393]
+    Average: 386 (target <= 100, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Benchmark: DDL Drop Latency ===
+  Drop table latency (us/op) [NOT MEASURED, unoptimized build]:
+    Runs: [226, 261, 244, 280, 357]
+    Average: 273 (target <= 80, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Benchmark: ANALYZE Throughput ===
+  ANALYZE throughput (rows/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [2,023,784, 1,958,753, 2,046,266, 1,946,381, 1,977,391]
+    Average: 1,990,515 (target >= 8,000,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Benchmark: Table Lookup Latency ===
+  Lookup latency (ns/op) [NOT MEASURED, unoptimized build]:
+    Runs: [347, 354, 343, 345, 344]
+    Average: 347 (target <= 50, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Benchmark: Recovery Time ===
+  Recovery time (ms) [NOT MEASURED, unoptimized build]:
+    Runs: [139, 137, 137, 135, 139]
+    Average: 138 (target <= 1, not applied)
+    Re-run with --release for a number worth comparing
+
+============================================
+  Catalog - All Tests Complete
+============================================
+  DDL Persistence:    1 test (create + reload)
+  Name Resolution:    1 test (6 cases)
+  Column Types:       1 test (29 types)
+  Constraints:        1 test (5 constraint types)
+  DDL Create/Drop:    1 test (8 operations)
+  Statistics:         1 test (100K rows)
+  Crash Recovery:     1 test (3 object types)
+  Benchmarks:         8 performance tests
+============================================
+
+=== Benchmark: Cache Hit Rate ===
+  Cache hit rate [NOT MEASURED, unoptimized build]: 1 (target >= 1, not applied)
+
+=== Column Type Roundtrip ===
+  All 29 column types roundtripped: PASS
+  Default expression preserved: PASS
+
+=== DDL Create/Drop Cycle ===
+  Create table: PASS
+  Create index: PASS
+  Drop index: PASS
+  Drop table: PASS
+  Create/drop schema: PASS
+  Create/drop database: PASS
+  Duplicate database detection: PASS
+
+=== Name Resolution ===
+  Resolve 'users' -> app.users: PASS
+  Resolve 'orders' -> app.orders: PASS
+  Resolve 'catalog_test.users' -> catalog_test.users: PASS
+  Resolve 'nonexistent' -> error: PASS
+  Resolve column 'user_id': PASS
+  Resolve nonexistent column -> error: PASS
+
+=== Statistics Collection ===
+  Inserting 100000 rows...
+  Row count: 100000 (expected 100000): PASS
+  Page count: 150: PASS
+  Avg row size: 8 bytes: PASS
+  Distinct count: 100000: PASS
+  Histogram: 100 buckets, total=100000: PASS
+  MCV: 10 entries: PASS
+  Stats store/retrieve: PASS
+  ANALYZE: 53738 us for 100000 rows (1860881 rows/sec)
+
+=== DDL Persistence ===
+  Created: database=DatabaseId(10000), schema=SchemaId(10001), table=TableId(10002), idx1=IndexId(10003), idx2=IndexId(10004)
+  Database reload: PASS
+  Schema reload: PASS
+  Table reload: PASS (10 columns)
+  Column metadata: PASS
+  Index reload: PASS (2 indexes, 1 unique, 1 composite)
+
+=== Crash Recovery ===
+  Database survived crash: PASS
+  Schema survived crash: PASS
+  Table survived crash: PASS (2 columns)
+
+=== Constraint Storage ===
+  PRIMARY KEY (column-level): PASS
+  PRIMARY KEY (table-level, composite): PASS
+  UNIQUE constraint: PASS
+  NOT NULL constraint: PASS
+  DEFAULT value: PASS
+  All constraint tables listed: PASS (5 tables)

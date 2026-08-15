@@ -22,9 +22,7 @@ use zyron_parser::ast::{ColumnDef, DataType};
 use zyron_planner::physical::PhysicalPlan;
 use zyron_server::background::compaction::{CompactionWorker, CompactionWorkerConfig};
 use zyron_server::columnar_recovery::reconcile_columnar;
-use zyron_storage::columnar::{
-    ColumnarPatchManager, SYS_COL_XMIN, ZyrFileReader, segment_regions,
-};
+use zyron_storage::columnar::{ColumnarPatchManager, SYS_COL_XMIN, ZyrFileReader, segment_regions};
 use zyron_storage::encoding::create_encoding;
 use zyron_storage::txn::TransactionManager;
 use zyron_storage::{DiskManager, DiskManagerConfig, HeapFile, HeapFileConfig, Tuple};
@@ -85,14 +83,11 @@ async fn columnar_seam_fold_read_mutate_recover() {
 
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
-        .await
-        .unwrap(),
+            .await
+            .unwrap(),
     );
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
-    let wal = Arc::new(
-        WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
-        .unwrap(),
-    );
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone())).unwrap());
 
     let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
     storage.init_cache().await.unwrap();
@@ -194,7 +189,7 @@ async fn columnar_seam_fold_read_mutate_recover() {
                 name: c.name.clone(),
                 type_id: c.type_id,
                 nullable: c.nullable,
-                ts_precision: c.ts_precision,
+                fractional_digits: c.fractional_digits,
             })
             .collect(),
         alias: "metrics".into(),
@@ -219,7 +214,7 @@ async fn columnar_seam_fold_read_mutate_recover() {
             column_id: c.id,
             type_id: c.type_id,
             nullable: c.nullable,
-            ts_precision: c.ts_precision,
+            fractional_digits: c.fractional_digits,
         })
     };
     let scan_for_agg = zyron_planner::logical::LogicalPlan::Scan {
@@ -234,7 +229,7 @@ async fn columnar_seam_fold_read_mutate_recover() {
                 name: c.name.clone(),
                 type_id: c.type_id,
                 nullable: c.nullable,
-                ts_precision: c.ts_precision,
+                fractional_digits: c.fractional_digits,
             })
             .collect(),
         alias: "metrics".into(),
@@ -437,14 +432,11 @@ async fn columnar_time_travel_version_visibility() {
 
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
-        .await
-        .unwrap(),
+            .await
+            .unwrap(),
     );
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
-    let wal = Arc::new(
-        WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
-        .unwrap(),
-    );
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone())).unwrap());
 
     let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
     storage.init_cache().await.unwrap();
@@ -524,7 +516,7 @@ async fn columnar_time_travel_version_visibility() {
         name: "k".into(),
         type_id: kcol_entry.type_id,
         nullable: kcol_entry.nullable,
-        ts_precision: kcol_entry.ts_precision,
+        fractional_digits: kcol_entry.fractional_digits,
     };
 
     async fn scan_as_of(
@@ -599,14 +591,11 @@ async fn columnar_merge_retains_within_window_history() {
 
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
-        .await
-        .unwrap(),
+            .await
+            .unwrap(),
     );
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
-    let wal = Arc::new(
-        WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
-        .unwrap(),
-    );
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone())).unwrap());
     let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
     storage.init_cache().await.unwrap();
     let storage: Arc<dyn CatalogStorage> = Arc::new(storage);

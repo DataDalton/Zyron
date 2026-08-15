@@ -12,7 +12,7 @@
 
 use zyron_common::TypeId;
 use zyron_storage::columnar::{
-    ColumnSegment, SlotOrder, STAT_VALUE_SIZE, compare_stat_slots_typed, compare_value_to_slot,
+    ColumnSegment, STAT_VALUE_SIZE, SlotOrder, compare_stat_slots_typed, compare_value_to_slot,
     slot_order, varlen_upper_slot,
 };
 
@@ -25,8 +25,7 @@ fn segment_of(values: &[&[u8]]) -> ColumnSegment {
 /// pruning decision asks
 fn bounds_admit(segment: &ColumnSegment, value: &[u8]) -> bool {
     let order = slot_order(TypeId::Varchar);
-    compare_value_to_slot(value, &segment.header.min_value, 0, order)
-        != std::cmp::Ordering::Less
+    compare_value_to_slot(value, &segment.header.min_value, 0, order) != std::cmp::Ordering::Less
         && compare_value_to_slot(value, &segment.header.max_value, 0, order)
             != std::cmp::Ordering::Greater
 }

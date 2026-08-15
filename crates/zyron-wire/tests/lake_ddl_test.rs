@@ -2437,7 +2437,8 @@ async fn exec_dml_result(server: &Arc<ServerState>, sql: &str) -> Result<(), Str
     match result {
         Ok(_) => {
             server.txn_manager.commit(&mut txn).await.expect("commit");
-            let logs = zyron_lake::publish_txn(server.disk_manager.data_dir(), txn_id).expect("publish");
+            let logs =
+                zyron_lake::publish_txn(server.disk_manager.data_dir(), txn_id).expect("publish");
             zyron_wire::connection::refresh_lake_stats(server, &logs);
             Ok(())
         }
@@ -3538,7 +3539,8 @@ async fn test_queries_that_project_no_column_agree_across_formats() {
         let heap = query_values(&server, &shape.replace("{}", "np_heap")).await;
         let lake = query_values(&server, &shape.replace("{}", "np_lake")).await;
         assert_eq!(
-            heap, lake,
+            heap,
+            lake,
             "the formats disagree on {}",
             shape.replace("{}", "<table>")
         );
@@ -3556,10 +3558,12 @@ async fn test_queries_that_project_no_column_agree_across_formats() {
     }
     let heap = query_values(&server, "SELECT COUNT(*) FROM np_heap").await;
     let lake = query_values(&server, "SELECT COUNT(*) FROM np_lake").await;
-    assert_eq!(heap, lake, "the formats disagree after an unqualified delete");
+    assert_eq!(
+        heap, lake,
+        "the formats disagree after an unqualified delete"
+    );
     match heap.first().and_then(|r| r.first()) {
         Some(zyron_executor::column::ScalarValue::Int64(0)) => {}
         other => panic!("an unqualified delete must empty the table, got {other:?}"),
     }
 }
-

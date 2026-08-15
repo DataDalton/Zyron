@@ -1,0 +1,73 @@
+{
+  "id": "2026-08-15_031404_2848e81-local",
+  "date": "2026-08-15 03:14:29Z",
+  "ts": 1786763669,
+  "commit": "2848e81-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "debug",
+  "tests": {
+    "Performance": {
+      "bulk_load 100K points/sec": {
+        "average": 1131014.778205,
+        "runs": [1125193.53, 1139977.88, 1121096.34, 1123355.69, 1145450.44],
+        "target": 1500000.000000,
+        "passed": null,
+        "higher_is_better": true
+      },
+      "delete_by_data/sec": {
+        "average": 196506.602210,
+        "runs": [196345.23, 197500.43, 194994.11, 196348.31, 197344.92],
+        "target": 500000.000000,
+        "passed": null,
+        "higher_is_better": true
+      },
+      "bulk_load 1M points/sec (parallel STR)": {
+        "average": 909967.625325,
+        "runs": [909477.93, 916957.57, 913475.43, 909054.13, 900873.06],
+        "target": 2000000.000000,
+        "passed": null,
+        "higher_is_better": true
+      },
+      "dwithin 100K r=500 (us)": {
+        "average": 40.946708,
+        "runs": [40.92, 40.98, 41.02, 41.02, 40.80],
+        "target": 1500.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "insert points/sec": {
+        "average": 32207.557869,
+        "runs": [32454.32, 32486.02, 31883.21, 32311.44, 31902.80],
+        "target": 300000.000000,
+        "passed": null,
+        "higher_is_better": true
+      },
+      "KNN 100K k=10 (us)": {
+        "average": 36.741830,
+        "runs": [36.85, 37.11, 36.73, 36.61, 36.42],
+        "target": 500.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "range 100K 1% area (us)": {
+        "average": 37.125888,
+        "runs": [37.34, 37.31, 36.84, 36.99, 37.16],
+        "target": 1500.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "snapshot roundtrip 100K (ms)": {
+        "average": 77.045200,
+        "runs": [78.82, 77.98, 74.91, 75.61, 77.91],
+        "target": 1000.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    }
+  }
+}

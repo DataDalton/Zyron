@@ -891,7 +891,10 @@ mod vault_token_tests {
         assert!(token(3600, 0).is_usable());
         assert!(token(3600, 53 * 60).is_usable());
         assert!(!token(3600, 55 * 60).is_usable(), "renew before expiry");
-        assert!(!token(3600, 3600).is_usable(), "an expired lease is not usable");
+        assert!(
+            !token(3600, 3600).is_usable(),
+            "an expired lease is not usable"
+        );
         assert!(
             !token(3600, 7200).is_usable(),
             "a lease long past its end is not usable"

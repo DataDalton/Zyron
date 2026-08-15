@@ -2413,6 +2413,10 @@ pub fn expr_contains_subquery(expr: &Expr) -> bool {
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiteralValue {
     Integer(i64),
+    /// A whole number too wide for i64, which INT128 and DECIMAL columns
+    /// both accept. Kept separate so an ordinary literal stays i64 and only
+    /// the wide case pays for the wider type.
+    Int128(i128),
     Float(f64),
     String(String),
     Boolean(bool),
@@ -2547,6 +2551,10 @@ pub enum TableRef {
     /// Boxed because the inline variant pushed TableRef from 56 to 72 bytes,
     /// and TableRef is held in many AST nodes
     TableFunction(Box<TableFunctionRef>),
+    /// Inline external source in a FROM clause, the read-side twin of the
+    /// inline sink `CREATE STREAMING JOB` already accepts after INTO.
+    /// Boxed for the same reason `TableFunction` is
+    ExternalInline(Box<ExternalInlineRef>),
 }
 
 /// Table-valued function call data, extracted so `TableRef::TableFunction` can
@@ -2555,6 +2563,23 @@ pub enum TableRef {
 pub struct TableFunctionRef {
     pub name: String,
     pub args: Vec<FunctionArg>,
+    pub alias: Option<String>,
+}
+
+/// A file or cloud URI named directly in a FROM clause:
+/// `FILE '<uri>' FORMAT CSV [OPTIONS (...)] [COLUMNS (...)] [AS alias]`.
+///
+/// Only a streaming job's FROM binds one. Every other statement rejects it,
+/// because a source read on a schedule has no meaning outside a job.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExternalInlineRef {
+    pub backend: ExternalBackendKind,
+    pub uri: String,
+    pub format: ExternalFormatKind,
+    pub options: Vec<(String, String)>,
+    /// Row layout declared inline. Empty when the layout is taken from the
+    /// job's target table instead.
+    pub columns: Vec<(String, DataType)>,
     pub alias: Option<String>,
 }
 
@@ -2701,6 +2726,49 @@ impl DataType {
     pub fn timestamp_precision(&self) -> Option<u8> {
         match self {
             DataType::Timestamp(p) | DataType::TimestampTz(p) => *p,
+            _ => None,
+        }
+    }
+
+    /// Digits this declaration keeps after the decimal point, for the two
+    /// families that declare one: a TIMESTAMP(p) counts fractional seconds
+    /// and a DECIMAL(p,s) counts s.
+    ///
+    /// A `DECIMAL` written with no parameters scales to zero, which is what
+    /// SQL says it means, so the value is exact rather than left undeclared
+    /// and silently rescaled later.
+    pub fn fractional_digits(&self) -> Option<u8> {
+        match self {
+            DataType::Timestamp(p) | DataType::TimestampTz(p) => *p,
+            DataType::Decimal(_, s) | DataType::Numeric(_, s) => Some(s.unwrap_or(0)),
+            _ => None,
+        }
+    }
+
+    /// The single number a declaration bounds its values by, stored in the
+    /// catalog column's `max_length` slot.
+    ///
+    /// A string or byte string measures characters, a vector measures its
+    /// dimension count, and a decimal measures its total digits. None where
+    /// the declaration places no bound, including a bare `DECIMAL`.
+    pub fn declared_max_length(&self) -> Option<usize> {
+        match self {
+            DataType::Char(n)
+            | DataType::Varchar(n)
+            | DataType::Binary(n)
+            | DataType::Varbinary(n)
+            | DataType::Vector(n) => *n,
+            DataType::Decimal(p, _) | DataType::Numeric(p, _) => p.map(|v| v as usize),
+            _ => None,
+        }
+    }
+
+    /// The element type of a `T[]` declaration, so array values written to
+    /// the column are re-encoded to the width it declares. None for every
+    /// non-array type.
+    pub fn declared_element_type(&self) -> Option<TypeId> {
+        match self {
+            DataType::Array(inner) => Some(inner.to_type_id()),
             _ => None,
         }
     }

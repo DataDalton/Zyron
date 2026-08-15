@@ -56,7 +56,11 @@ async fn test_full_text_search_finds_rows_of_a_lake_table() {
     }
     // One row nothing else shares a term with, so a hit on it cannot come
     // from a scan that ignored the query
-    exec_dml(&server, "INSERT INTO ldocs VALUES (99, 'an entirely separate pangolin')").await;
+    exec_dml(
+        &server,
+        "INSERT INTO ldocs VALUES (99, 'an entirely separate pangolin')",
+    )
+    .await;
 
     assert_eq!(query_rows(&server, "SELECT id FROM ldocs").await, 21);
 
@@ -113,7 +117,11 @@ async fn test_a_lake_row_deleted_after_indexing_is_not_returned_by_search() {
     )
     .await;
     assert_eq!(
-        query_rows(&server, "SELECT id FROM lsd WHERE MATCH(body) AGAINST('marker')").await,
+        query_rows(
+            &server,
+            "SELECT id FROM lsd WHERE MATCH(body) AGAINST('marker')"
+        )
+        .await,
         2
     );
 
@@ -302,14 +310,22 @@ async fn test_search_and_scan_agree_on_a_lake_table_after_an_update() {
     )
     .await;
     assert_eq!(
-        query_rows(&server, "SELECT id FROM lsu WHERE MATCH(body) AGAINST('keepable')").await,
+        query_rows(
+            &server,
+            "SELECT id FROM lsu WHERE MATCH(body) AGAINST('keepable')"
+        )
+        .await,
         2
     );
 
     // An update removes the old file and writes a new one, so every locator
     // the index held for it goes stale. What must not happen is a row that
     // no longer exists coming back
-    exec_dml(&server, "UPDATE lsu SET body = 'replaced widget' WHERE id = 1").await;
+    exec_dml(
+        &server,
+        "UPDATE lsu SET body = 'replaced widget' WHERE id = 1",
+    )
+    .await;
     assert_eq!(query_rows(&server, "SELECT id FROM lsu").await, 2);
 
     let hits = first_ints(

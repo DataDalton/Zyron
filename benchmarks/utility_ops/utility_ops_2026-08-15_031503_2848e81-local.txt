@@ -1,0 +1,165 @@
+# suite:   utility_ops
+# run:     2026-08-15_031503_2848e81-local
+# profile: debug
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+# NOT A BENCHMARK RESULT. This is an unoptimized build, so every
+# timing below is meaningless: an unoptimized build is not slower
+# by a constant factor, so these numbers do not even rank correctly
+# against each other. Counted quantities (rates, file and row
+# counts, PASS/FAIL on an exact bound) are valid and are the only
+# thing worth reading here. For real numbers: cargo test --release
+#
+
+=== Checksums and Hashes ===
+  CRC32('hello world') = 0x0D4A1185 PASS
+  XXHASH64('hello world') = 0xd447b1ea40e6988b PASS
+  Family determinism (10 hashes x 3 inputs) PASS
+  Distinct-input distinct-output PASS
+  Streaming hashers match one-shot PASS
+  hash_column_xxh64 matches row-by-row PASS
+  Run 1: CRC32C 2.75 GB/sec
+  Run 2: CRC32C 2.54 GB/sec
+  Run 3: CRC32C 2.54 GB/sec
+  Run 4: CRC32C 2.25 GB/sec
+  Run 5: CRC32C 2.42 GB/sec
+  CRC32C 1 GB (GB/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [3, 3, 3, 2, 2]
+    Average: 2 (target >= 12, not applied)
+    Re-run with --release for a number worth comparing
+  Run 1: xxHash64 0.39 GB/sec
+  Run 2: xxHash64 0.39 GB/sec
+  Run 3: xxHash64 0.39 GB/sec
+  Run 4: xxHash64 0.39 GB/sec
+  Run 5: xxHash64 0.39 GB/sec
+  xxHash64 1 GB (GB/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 (target >= 16, not applied)
+    Re-run with --release for a number worth comparing
+
+=== File and Encoding Detection ===
+  DETECT_MIME_TYPE png + pdf PASS
+  DETECT_ENCODING ascii + utf-8 BOM + raw multi-byte UTF-8 PASS
+  IS_BINARY png=true, text=false PASS
+  FILE_EXTENSION mime->ext PASS
+  Run 1: DETECT_MIME_TYPE 64.8 ns
+  Run 2: DETECT_MIME_TYPE 67.0 ns
+  Run 3: DETECT_MIME_TYPE 65.3 ns
+  Run 4: DETECT_MIME_TYPE 64.6 ns
+  Run 5: DETECT_MIME_TYPE 64.9 ns
+  DETECT_MIME_TYPE (ns) [NOT MEASURED, unoptimized build]:
+    Runs: [65, 67, 65, 65, 65]
+    Average: 65 (target <= 400, not applied)
+    Re-run with --release for a number worth comparing
+
+=== JSON Diff and Patch ===
+  JSON_DIFF + JSON_PATCH round-trip on small object PASS
+  JSON_DIFF_TABLE returns relation with replace+add PASS
+  JSON_MERGE_PATCH RFC 7396 PASS
+  Run 1: diff 73.68 us/op, patch 41.82 us/op (10K ops each)
+  Run 2: diff 73.73 us/op, patch 41.91 us/op (10K ops each)
+  Run 3: diff 73.63 us/op, patch 41.60 us/op (10K ops each)
+  Run 4: diff 73.63 us/op, patch 41.65 us/op (10K ops each)
+  Run 5: diff 73.68 us/op, patch 41.98 us/op (10K ops each)
+  JSON Diff 1 KB (us) [NOT MEASURED, unoptimized build]:
+    Runs: [74, 74, 74, 74, 74]
+    Average: 74 (target <= 12, not applied)
+    Re-run with --release for a number worth comparing
+  JSON Patch 1 KB (us) [NOT MEASURED, unoptimized build]:
+    Runs: [42, 42, 42, 42, 42]
+    Average: 42 (target <= 6, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Markdown and HTML ===
+  MARKDOWN_TO_HTML('# Hello\n\nParagraph') = '<h1>Hello</h1>\n<p>Paragraph</p>' PASS
+  MARKDOWN_EXTRACT_HEADERS yields [(1, H1), (2, H2)] PASS
+  HTML_TO_TEXT strips tags PASS
+  Links, code blocks, html_to_markdown, sanitize_html PASS
+  Run 1: MARKDOWN_TO_HTML 10 KB 699.60 us
+  Run 2: MARKDOWN_TO_HTML 10 KB 695.22 us
+  Run 3: MARKDOWN_TO_HTML 10 KB 693.98 us
+  Run 4: MARKDOWN_TO_HTML 10 KB 693.38 us
+  Run 5: MARKDOWN_TO_HTML 10 KB 696.78 us
+  MARKDOWN_TO_HTML 10 KB (us) [NOT MEASURED, unoptimized build]:
+    Runs: [700, 695, 694, 693, 697]
+    Average: 696 (target <= 300, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Natural Sort, Version, IP, Path ===
+  natural_compare orders [file1, file2, file10, file20] PASS
+  natural_sort_key produces matching order PASS
+  version_compare semver ordering PASS
+  ip_compare orders v4 numerically PASS
+  path_compare component-wise natural PASS
+  custom_order_rank known + unknown PASS
+  Run 1: 301.1 ns/key
+  Run 2: 302.0 ns/key
+  Run 3: 305.4 ns/key
+  Run 4: 309.8 ns/key
+  Run 5: 310.2 ns/key
+  natural_sort_key (ns) [NOT MEASURED, unoptimized build]:
+    Runs: [301, 302, 305, 310, 310]
+    Average: 306 (target <= 200, not applied)
+    Re-run with --release for a number worth comparing
+  Sort 1M natural strings: 204 ms
+
+=== QR Code + Barcodes ===
+  QR_ENCODE+QR_DECODE round-trip on URL PASS
+  QR round-trip for L, M, Q, H ec levels PASS
+  Code128, Code39, EAN-13, EAN-8, UPC-A round-trips PASS
+  DataMatrix round-trip across 4 sizes (10x10 to 26x26) PASS
+  Run 1: QR encode 0.55 ms
+  Run 2: QR encode 0.56 ms
+  Run 3: QR encode 0.55 ms
+  Run 4: QR encode 0.56 ms
+  Run 5: QR encode 0.56 ms
+  QR encode (ms) [NOT MEASURED, unoptimized build]:
+    Runs: [1, 1, 1, 1, 1]
+    Average: 1 (target <= 3, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Rate Limiting and Quotas ===
+  RATE_LIMIT_CHECK: 10 allowed, 11th rejected PASS
+  RATE_LIMIT_CHECK recovers after window elapses PASS
+  QUOTA_CHECK + QUOTA_INCREMENT 100+200, 800 rejected PASS
+  BURST_TOKEN_BUCKET 12-token burst from 10-cap PASS
+  CRON parse, next, matches, list PASS
+  Run 1: 628.4 ns/check
+  Run 2: 658.8 ns/check
+  Run 3: 628.0 ns/check
+  Run 4: 621.1 ns/check
+  Run 5: 631.2 ns/check
+  Rate limit check (ns) [NOT MEASURED, unoptimized build]:
+    Runs: [628, 659, 628, 621, 631]
+    Average: 633 (target <= 50, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Resilience ===
+  3 failures opens, fast-fail while open PASS
+  Reset timeout -> HalfOpen, success closes PASS
+  HalfOpen failure reopens PASS
+  EMA breaker opens on sustained errors PASS
+  CircuitBreakerRegistry shares instances by name PASS
+  retry recovers after 2 transient errors PASS
+  timeout_blocking aborts overrun PASS
+  hedged returns first completion PASS
+
+=== Row Diff, Schema Diff, Change Log ===
+  ROW_DIFF emits only changed columns PASS
+  ROW_DIFF_ORDINAL fast path skips name lookup PASS
+  SCHEMA_DIFF + GENERATE_MIGRATION emits ADD/DROP/ALTER PASS
+
+=== Text Diff and Patch ===
+  TEXT_DIFF emits delete(line2)+insert(modified)+add(line4) PASS
+  TEXT_PATCH round-trip removes line2 and adds modified+line4 PASS
+  COLLAPSE_ADJACENT_NOOPS folds insert+delete pairs PASS
+  Run 1: 2.14 ms
+  Run 2: 2.03 ms
+  Run 3: 1.99 ms
+  Run 4: 2.00 ms
+  Run 5: 2.01 ms
+  Text Diff 10K lines (ms) [NOT MEASURED, unoptimized build]:
+    Runs: [2, 2, 2, 2, 2]
+    Average: 2 (target <= 50, not applied)
+    Re-run with --release for a number worth comparing

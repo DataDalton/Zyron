@@ -21,7 +21,7 @@ use zyron_common::ZyronError;
 use crate::manifest::ManifestFile;
 use crate::paths::LakePaths;
 use crate::predicate::LakePredicate;
-use crate::reader::{evaluate_row, LakeFileReader};
+use crate::reader::{LakeFileReader, evaluate_row};
 use crate::transaction_log::{LogEntry, OperationKind, TransactionLog, VersionFileData};
 
 /// Which side of a change a descriptor describes.
@@ -242,7 +242,7 @@ mod tests {
                 name: "id".into(),
                 type_id: TypeId::Int64,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
                 tz_offset_secs: None,
                 max_length: None,
                 default_expr: None,
@@ -284,8 +284,13 @@ mod tests {
     fn test_append_reports_every_row_as_an_insert() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let log = new_log(dir.path());
-        append_rows(&log, attempt(OperationKind::Append, 200), 11, &rows(&[1, 2, 3]))
-            .expect("append");
+        append_rows(
+            &log,
+            attempt(OperationKind::Append, 200),
+            11,
+            &rows(&[1, 2, 3]),
+        )
+        .expect("append");
 
         let changes = changes_between(&log, 1, 99).expect("changes");
         assert_eq!(changes.len(), 1);
@@ -304,8 +309,13 @@ mod tests {
     fn test_whole_file_delete_reports_the_rows_that_were_live() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let log = new_log(dir.path());
-        append_rows(&log, attempt(OperationKind::Append, 200), 11, &rows(&[1, 2, 3]))
-            .expect("append");
+        append_rows(
+            &log,
+            attempt(OperationKind::Append, 200),
+            11,
+            &rows(&[1, 2, 3]),
+        )
+        .expect("append");
         delete_where(
             &log,
             attempt(OperationKind::Delete, 300),
@@ -352,7 +362,10 @@ mod tests {
         let changes = changes_between(&log, 3, 3).expect("changes");
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].kind, ChangeKind::Delete);
-        assert!(changes[0].predicate.is_some(), "a partial delete records one");
+        assert!(
+            changes[0].predicate.is_some(),
+            "a partial delete records one"
+        );
         assert_eq!(
             changed_ordinals(&log, &changes[0]).expect("rows").len(),
             3,
@@ -409,8 +422,13 @@ mod tests {
     fn test_update_reports_a_delete_and_an_insert_under_one_version() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let log = new_log(dir.path());
-        append_rows(&log, attempt(OperationKind::Append, 200), 11, &rows(&[1, 2, 9]))
-            .expect("append");
+        append_rows(
+            &log,
+            attempt(OperationKind::Append, 200),
+            11,
+            &rows(&[1, 2, 9]),
+        )
+        .expect("append");
         let predicate = LakePredicate::Compare {
             column_id: 0,
             op: CompareOp::Lt,
@@ -433,7 +451,10 @@ mod tests {
             "the commit kind travels with every descriptor"
         );
         assert_eq!(
-            changes.iter().filter(|c| c.kind == ChangeKind::Insert).count(),
+            changes
+                .iter()
+                .filter(|c| c.kind == ChangeKind::Insert)
+                .count(),
             1
         );
         assert!(changes.iter().any(|c| c.kind == ChangeKind::Delete));
@@ -447,10 +468,12 @@ mod tests {
     fn test_range_is_clamped_to_the_published_head() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let log = new_log(dir.path());
-        append_rows(&log, attempt(OperationKind::Append, 200), 11, &rows(&[1]))
-            .expect("append");
+        append_rows(&log, attempt(OperationKind::Append, 200), 11, &rows(&[1])).expect("append");
 
-        assert_eq!(changes_between(&log, 0, u64::MAX).expect("changes").len(), 1);
+        assert_eq!(
+            changes_between(&log, 0, u64::MAX).expect("changes").len(),
+            1
+        );
         assert!(changes_between(&log, 5, 9).expect("changes").is_empty());
         assert!(changes_between(&log, 3, 2).expect("changes").is_empty());
     }

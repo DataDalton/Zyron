@@ -532,10 +532,13 @@ impl CompactionWorker {
         if te.columnar.segments.is_empty() {
             return Ok(());
         }
-        let columnar_dir = std::path::Path::new(&te.columnar.segments[0].path)
-            .parent()
-            .map(|d| d.to_path_buf())
-            .unwrap_or_else(|| config.columnar_dir.clone());
+        // Resolved through the tier-aware root so a table whose segments have
+        // been relocated to a colder tier still reaches its one patch log
+        let columnar_dir = zyron_storage::columnar::columnar_root_for_segment(
+            std::path::Path::new(&te.columnar.segments[0].path),
+        )
+        .map(|d| d.to_path_buf())
+        .unwrap_or_else(|| config.columnar_dir.clone());
         let patch_path = columnar_dir.join(format!("{}.zyrpatch", table_id.0));
         let store = zyron_storage::columnar::ColumnarPatchManager::global(&columnar_dir)
             .store(table_id.0 as u64)
@@ -881,6 +884,9 @@ impl CompactionWorker {
                 // A merge keeps the survivors in the order the input had,
                 // so it keeps the spec that order was chosen under
                 cluster_spec_id: seg.cluster_spec_id,
+                // A merge writes its output beside the inputs, so the
+                // survivor stays on the tier the input was on
+                storage_tier: seg.storage_tier,
             });
             entry.columnar.next_file_id = new_file_id + 1;
             entry.columnar.low_water = oldest_active;
@@ -1405,19 +1411,27 @@ impl CompactionWorker {
         if let Some(reg_map) = btree_indexes {
             let index_snap = catalog.index_snapshot(table.id);
             if !index_snap.btree.is_empty() {
-                let indexed_cells: Vec<(
+                // Every key column of every index, not just the leading one,
+                // because a re-keyed entry has to reproduce the whole key
+                let mut indexed_cells: Vec<(
                     zyron_catalog::ColumnId,
                     zyron_common::TypeId,
                     Vec<Option<&[u8]>>,
-                )> = index_snap
-                    .btree
-                    .iter()
-                    .filter_map(|(_, col_id, _)| {
-                        columns.iter().position(|c| c.id == *col_id).map(|pos| {
-                            (*col_id, columns[pos].physical_type_id(), arenas[pos].view())
-                        })
-                    })
-                    .collect();
+                )> = Vec::new();
+                for spec in &index_snap.btree {
+                    for col_id in spec.columns.iter() {
+                        if indexed_cells.iter().any(|(cid, _, _)| cid == col_id) {
+                            continue;
+                        }
+                        if let Some(pos) = columns.iter().position(|c| c.id == *col_id) {
+                            indexed_cells.push((
+                                *col_id,
+                                columns[pos].physical_type_id(),
+                                arenas[pos].view(),
+                            ));
+                        }
+                    }
+                }
                 zyron_executor::operator::modify::fold_rekey_btree_entries(
                     &folded_rids,
                     &indexed_cells,
@@ -1439,6 +1453,8 @@ impl CompactionWorker {
             sys_xmin_lo: xmin_lo,
             sys_xmin_hi: xmin_hi,
             cluster_spec_id,
+            // The fold writes into the columnar root, which is the hot tier
+            storage_tier: 0,
         });
         entry.columnar.next_rowid = next_rowid;
         entry.columnar.next_file_id = file_id + 1;

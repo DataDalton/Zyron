@@ -150,7 +150,15 @@ pub enum PhysicalPlan {
         columns: Vec<LogicalColumn>,
         predicate: BoundExpr,
         remaining_predicate: Option<BoundExpr>,
+        /// Which way the index is walked. Backward serves an ORDER BY that
+        /// runs opposite to the index's declared key direction.
         scan_direction: ScanDirection,
+        /// The ordering this scan is relied on to produce, set when a Sort
+        /// above it was removed because the index already yields that order.
+        /// The executor rebuilds the Sort if it has to fall back to a path
+        /// that does not read the index in order, so losing the index at
+        /// runtime costs speed rather than correctness.
+        ordered_by: Option<Vec<crate::binder::BoundOrderBy>>,
         cost: PlanCost,
         /// Time travel target for versioned table scans.
         as_of: Option<super::logical::AsOfTarget>,
@@ -559,7 +567,7 @@ impl PhysicalPlan {
                         name,
                         type_id: expr.type_id(),
                         nullable: expr.nullable(),
-                        ts_precision: None,
+                        fractional_digits: None,
                     }
                 })
                 .collect(),
@@ -598,7 +606,7 @@ impl PhysicalPlan {
                         name: format!("group{}", i),
                         type_id: expr.type_id(),
                         nullable: expr.nullable(),
-                        ts_precision: None,
+                        fractional_digits: None,
                     });
                 }
                 for (i, agg) in aggregates.iter().enumerate() {
@@ -609,7 +617,7 @@ impl PhysicalPlan {
                         name: agg.function_name.clone(),
                         type_id: agg.return_type,
                         nullable: true,
-                        ts_precision: None,
+                        fractional_digits: None,
                     });
                 }
                 schema
@@ -657,7 +665,7 @@ impl PhysicalPlan {
                         name,
                         type_id: expr.type_id(),
                         nullable: true,
-                        ts_precision: None,
+                        fractional_digits: None,
                     });
                 }
                 schema

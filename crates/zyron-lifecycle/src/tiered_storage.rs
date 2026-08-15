@@ -4,46 +4,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use zyron_auth::rcu::RcuMap;
-use zyron_common::{Result, ZyronError};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StorageTier {
-    Hot = 0,
-    Warm = 1,
-    Cold = 2,
-    Archive = 3,
-}
-
-impl StorageTier {
-    pub fn from_u8(v: u8) -> StorageTier {
-        match v {
-            1 => StorageTier::Warm,
-            2 => StorageTier::Cold,
-            3 => StorageTier::Archive,
-            _ => StorageTier::Hot,
-        }
-    }
-
-    pub fn parse(s: &str) -> Result<StorageTier> {
-        match s.to_ascii_lowercase().as_str() {
-            "hot" => Ok(StorageTier::Hot),
-            "warm" => Ok(StorageTier::Warm),
-            "cold" => Ok(StorageTier::Cold),
-            "archive" => Ok(StorageTier::Archive),
-            other => Err(ZyronError::Internal(format!("unknown tier: {other}"))),
-        }
-    }
-
-    /// Scan-cost multiplier the planner applies for data on this tier.
-    pub fn cost_multiplier(&self) -> f64 {
-        match self {
-            StorageTier::Hot => 1.0,
-            StorageTier::Warm => 1.5,
-            StorageTier::Cold => 4.0,
-            StorageTier::Archive => 20.0,
-        }
-    }
-}
+/// The tier model lives in zyron-common so the planner can cost a scan by
+/// the tier its segments sit on without depending on this crate. One
+/// definition, one cost table.
+pub use zyron_common::StorageTier;
 
 /// One cached cold/archive segment plus an access counter for LFU promotion.
 #[derive(Clone)]

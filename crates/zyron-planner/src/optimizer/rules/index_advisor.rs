@@ -255,7 +255,7 @@ mod tests {
                 column_id: ColumnId(5),
                 type_id: zyron_common::TypeId::Int64,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
             }),
             child: Arc::new(scan),
         };

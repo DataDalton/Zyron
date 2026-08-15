@@ -355,7 +355,9 @@ fn parse_filter_term(term: &str) -> zyron_common::Result<GraphFilter> {
 fn parse_filter_value(text: &str) -> Option<FilterValue> {
     if text.len() >= 2 && text.starts_with('\'') && text.ends_with('\'') {
         // Two quotes are one literal quote, the SQL escape
-        return Some(FilterValue::Text(text[1..text.len() - 1].replace("''", "'")));
+        return Some(FilterValue::Text(
+            text[1..text.len() - 1].replace("''", "'"),
+        ));
     }
     if text.eq_ignore_ascii_case("null") {
         return Some(FilterValue::Null);

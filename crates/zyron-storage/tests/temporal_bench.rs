@@ -237,8 +237,15 @@ fn test_full_materialization_ps_cost_versus_us() {
     );
     // Honesty: full ps materialization is ~1.5-2x a us column, never beyond
     // ~3x. This is the documented "not zero-impact in all cases" line.
+    //
+    // The bound is read off the validation above rather than recomputed here.
+    // Comparing the averages directly applied the ratio in an unoptimized
+    // build too, where the same call had just printed "not applied" and asked
+    // for a release run: the two paths do not lose the same proportion of
+    // their work to a debug build, so the ratio between them measures the
+    // profile rather than the code.
     assert!(
-        r.average >= us_avg / 3.0,
+        r.passed,
         "ps full materialization must stay within ~3x us: ps {:.0} vs us {:.0} rows/sec",
         r.average,
         us_avg

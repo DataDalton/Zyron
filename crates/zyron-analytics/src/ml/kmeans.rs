@@ -188,8 +188,7 @@ fn assignAndComputeInertia(
         let mut bestD = f64::INFINITY;
         for c in 0..k {
             let cstart = c * p;
-            let xdotc =
-                unsafe { dotFn(row.as_ptr(), centroids[cstart..cstart + p].as_ptr(), p) };
+            let xdotc = unsafe { dotFn(row.as_ptr(), centroids[cstart..cstart + p].as_ptr(), p) };
             let d = xn - 2.0 * xdotc + centroidNormSq[c];
             if d < bestD {
                 bestD = d;
@@ -343,6 +342,10 @@ mod tests {
         let near1 = (c1[0] - 3.0).abs() < 0.5 && (c1[1] - 3.0).abs() < 0.5;
         let alt0 = (c0[0] - 3.0).abs() < 0.5 && (c0[1] - 3.0).abs() < 0.5;
         let alt1 = (c1[0] + 3.0).abs() < 0.5 && (c1[1] + 3.0).abs() < 0.5;
-        assert!((near0 && near1) || (alt0 && alt1), "centroids = {:?}", model.weights);
+        assert!(
+            (near0 && near1) || (alt0 && alt1),
+            "centroids = {:?}",
+            model.weights
+        );
     }
 }

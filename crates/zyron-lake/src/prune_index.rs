@@ -283,8 +283,7 @@ impl PruneIndex {
                     // rejects the file
                     here.fill(0);
                     for value in values {
-                        complete &=
-                            self.sweep_compare(*column_id, CompareOp::NotEq, value, child);
+                        complete &= self.sweep_compare(*column_id, CompareOp::NotEq, value, child);
                         for f in 0..n {
                             here[f] |= child[f];
                         }
@@ -618,7 +617,7 @@ mod tests {
                     name: format!("c{}", i),
                     type_id: *t,
                     nullable: true,
-                    ts_precision: None,
+                    fractional_digits: None,
                     tz_offset_secs: None,
                     max_length: None,
                     default_expr: None,
@@ -837,13 +836,7 @@ mod tests {
 
     #[test]
     fn test_a_bloomed_equality_prunes_on_bounds_but_reports_itself_incomplete() {
-        let mut stats = bounded(
-            0,
-            Some(LakeValue::Int(0)),
-            Some(LakeValue::Int(99)),
-            0,
-            100,
-        );
+        let mut stats = bounded(0, Some(LakeValue::Int(0)), Some(LakeValue::Int(99)), 0, 100);
         stats.bloom = Some(vec![0u8; 16]);
         let manifest = manifest_of(
             schema(&[TypeId::Int64]),
@@ -867,7 +860,10 @@ mod tests {
 
         let predicate = cmp(0, CompareOp::Eq, LakeValue::Int(42));
         let (mask, complete) = index.cannot_match(&predicate, &mut scratch);
-        assert!(!complete, "a bloom the sweep cannot probe is not the last word");
+        assert!(
+            !complete,
+            "a bloom the sweep cannot probe is not the last word"
+        );
         assert_eq!(mask[1], 1, "bounds still reject the file out of range");
 
         // A range term over the same column carries no bloom question
@@ -908,7 +904,10 @@ mod tests {
         let predicate = cmp(0, CompareOp::GtEq, LakeValue::UInt(300));
         let expected = scalar_mask(&manifest, &predicate);
         let (mask, complete) = index.cannot_match(&predicate, &mut scratch);
-        assert!(complete, "an unsigned literal converts into the signed key exactly");
+        assert!(
+            complete,
+            "an unsigned literal converts into the signed key exactly"
+        );
         assert_eq!(mask, &expected[..]);
 
         // One that cannot be represented is left to the exact path
@@ -922,11 +921,7 @@ mod tests {
     fn test_null_and_missing_bounds_follow_the_exact_rules() {
         let entries = vec![
             // Every row null: no comparison can match
-            entry(
-                0,
-                vec![bounded(0, None, None, 100, 100)],
-                100,
-            ),
+            entry(0, vec![bounded(0, None, None, 100, 100)], 100),
             // Bounds unknown but rows present: nothing is decided
             entry(1, vec![bounded(0, None, None, 0, 100)], 100),
             entry(

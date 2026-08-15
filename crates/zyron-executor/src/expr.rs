@@ -99,19 +99,29 @@ pub fn evaluate(
         BoundExpr::Cast {
             expr: inner,
             target_type,
+            fractional_digits,
         } => {
             let col = evaluate(inner, batch, schema, params)?;
+            // A cast naming a decimal carries the scale to land on, which
+            // the generic cast has no way to know
+            if *target_type == TypeId::Decimal {
+                return crate::compute::cast_column_to_decimal(
+                    &col,
+                    fractional_digits.unwrap_or(0),
+                );
+            }
             cast_column(&col, *target_type)
         }
         BoundExpr::Case {
             operand,
             conditions,
             else_result,
-            ..
+            type_id,
         } => evaluate_case(
             operand.as_deref(),
             conditions,
             else_result.as_deref(),
+            *type_id,
             batch,
             schema,
             params,
@@ -285,6 +295,10 @@ fn evaluate_literal(value: &LiteralValue, type_id: TypeId, num_rows: usize) -> R
             ColumnData::Int64(vec![*v; num_rows]),
             TypeId::Int64,
         )),
+        LiteralValue::Int128(v) => Ok(Column::new(
+            ColumnData::Int128(vec![*v; num_rows]),
+            TypeId::Int128,
+        )),
         LiteralValue::Float(v) => Ok(Column::new(
             ColumnData::Float64(vec![*v; num_rows]),
             TypeId::Float64,
@@ -398,7 +412,7 @@ fn is_ts_col(col: &Column) -> bool {
 
 #[inline]
 fn ts_col_is_ps(col: &Column) -> bool {
-    is_ts_col(col) && col.ts_precision.unwrap_or(6) > 6
+    is_ts_col(col) && col.fractional_digits.unwrap_or(6) > 6
 }
 
 /// When exactly one operand is a picosecond (p>6) timestamp and the other a
@@ -415,9 +429,9 @@ fn normalize_ts_pair(left: &mut Column, right: &mut Column) -> Result<()> {
         return Ok(());
     }
     if lps {
-        *right = crate::compute::scale_us_to_ps(right, left.ts_precision)?;
+        *right = crate::compute::scale_us_to_ps(right, left.fractional_digits)?;
     } else {
-        *left = crate::compute::scale_us_to_ps(left, right.ts_precision)?;
+        *left = crate::compute::scale_us_to_ps(left, right.fractional_digits)?;
     }
     Ok(())
 }
@@ -471,15 +485,25 @@ fn evaluate_binary_op(
             | BinaryOperator::LtEq
             | BinaryOperator::GtEq
     ) {
-        let lt = left_col.type_id;
-        let rt = right_col.type_id;
-        if lt != rt {
-            if let Some(common) = common_numeric_type(lt, rt) {
-                if lt != common {
-                    left_col = compute::cast_column(&left_col, common)?;
-                }
-                if rt != common {
-                    right_col = compute::cast_column(&right_col, common)?;
+        // A decimal aligns by scale rather than by width. Letting the common
+        // numeric type decide would pick a float and read the scaled integer
+        // as a plain number, so `v > 10.00` would compare 1050 against 10
+        if left_col.type_id == TypeId::Decimal || right_col.type_id == TypeId::Decimal {
+            if let Some((l, r)) = compute::align_decimal_operands(&left_col, &right_col)? {
+                left_col = l;
+                right_col = r;
+            }
+        } else {
+            let lt = left_col.type_id;
+            let rt = right_col.type_id;
+            if lt != rt {
+                if let Some(common) = common_numeric_type(lt, rt) {
+                    if lt != common {
+                        left_col = compute::cast_column(&left_col, common)?;
+                    }
+                    if rt != common {
+                        right_col = compute::cast_column(&right_col, common)?;
+                    }
                 }
             }
         }
@@ -800,21 +824,30 @@ fn evaluate_between(
 // CASE expression
 // ---------------------------------------------------------------------------
 
+/// Evaluates a CASE, merging the branches into the single result type the
+/// binder computed for the whole expression.
+///
+/// Every branch is cast to that type before it is merged. Branches routinely
+/// differ in physical type even when they agree logically, as `THEN price
+/// ELSE 0` does, and merging those columns as they came would push a value
+/// of one variant into a buffer of another.
 fn evaluate_case(
     operand: Option<&BoundExpr>,
     conditions: &[BoundWhen],
     else_result: Option<&BoundExpr>,
+    result_type: TypeId,
     batch: &DataBatch,
     schema: &[LogicalColumn],
     params: &[ScalarValue],
 ) -> Result<Column> {
     let num_rows = batch.num_rows;
 
-    // Start with else branch or null.
+    // Start with else branch or null, in the type the whole CASE produces
     let mut result = if let Some(else_expr) = else_result {
-        evaluate(else_expr, batch, schema, params)?
+        let col = evaluate(else_expr, batch, schema, params)?;
+        coerce_case_branch(col, result_type)?
     } else {
-        Column::null_column(TypeId::Text, num_rows)
+        Column::null_column(result_type, num_rows)
     };
 
     let operand_col = match operand {
@@ -832,11 +865,25 @@ fn evaluate_case(
         };
 
         let then_col = evaluate(&when.result, batch, schema, params)?;
+        let mut then_col = coerce_case_branch(then_col, result.type_id)?;
+        // A decimal branch meets the running result on a common scale, the
+        // wider of the two, because the type alone does not say where the
+        // point sits and merging two scales would move it
+        if let Some((aligned_result, aligned_then)) =
+            compute::align_decimal_operands(&result, &then_col)?
+        {
+            result = aligned_result;
+            then_col = aligned_then;
+        }
         let mask = column_to_mask(&condition_bool);
 
-        // Use typed push_from to build result without ScalarValue.
+        // Use typed push_from to build result without ScalarValue. Both
+        // start empty because the loop below appends every row: seeding the
+        // bitmap at `num_rows` left it twice the data's length, and every
+        // read of it landed in the seeded half, so a CASE that produced a
+        // null reported a value instead.
         let mut new_data = ColumnData::with_capacity(result.type_id, num_rows);
-        let mut new_nulls = NullBitmap::none(num_rows);
+        let mut new_nulls = NullBitmap::empty();
 
         for i in 0..num_rows {
             if mask[i] {
@@ -852,6 +899,18 @@ fn evaluate_case(
     }
 
     Ok(result)
+}
+
+/// Puts one CASE branch into the result type, leaving it alone when it
+/// already carries the same physical layout.
+///
+/// A branch whose column already matches skips the cast, so the common case
+/// where every branch agrees costs one comparison.
+fn coerce_case_branch(col: Column, target: TypeId) -> Result<Column> {
+    if col.type_id == target {
+        return Ok(col);
+    }
+    crate::compute::cast_column(&col, target)
 }
 
 // ---------------------------------------------------------------------------
@@ -962,7 +1021,7 @@ fn evaluate_function(
                 data,
                 ts.nulls.clone(),
                 ts.type_id,
-                ts.ts_precision,
+                ts.fractional_digits,
             ))
         }
         // locf(col): last-observation-carried-forward. Replaces each NULL with
@@ -999,7 +1058,7 @@ fn evaluate_function(
                 data,
                 nulls,
                 col.type_id,
-                col.ts_precision,
+                col.fractional_digits,
             ))
         }
         // interpolate(col): linear interpolation. Each NULL between two
@@ -1093,7 +1152,7 @@ fn evaluate_function(
                 data,
                 nulls,
                 col.type_id,
-                col.ts_precision,
+                col.fractional_digits,
             ))
         }
         "abs" => {
@@ -1182,6 +1241,7 @@ fn evaluate_function(
                 TypeId::Time,
             ))
         }
+        "extract" | "date_part" => eval_extract(args, batch, schema, params),
         "array" => eval_array(args, batch, schema, params),
         "array_subscript" => eval_array_subscript(args, batch, schema, params),
         // Search predicates evaluated row by row. The planner routes these to
@@ -1257,8 +1317,7 @@ fn eval_array(
                 )),
             });
         }
-        let borrowed: Vec<Option<&[u8]>> =
-            payloads.iter().map(|p| p.as_deref()).collect();
+        let borrowed: Vec<Option<&[u8]>> = payloads.iter().map(|p| p.as_deref()).collect();
         out.push(zyron_common::array_value::encode(element_type, &borrowed));
     }
     Ok(Column::new(ColumnData::Binary(out), TypeId::Array))
@@ -2612,6 +2671,120 @@ fn eval_concat(
 
 /// Row wise maximum or minimum across the arguments, NULLs are ignored and
 /// the result is NULL only when every argument is NULL
+/// Splits a day count since the Unix epoch into its calendar year, month and
+/// day, in the proleptic Gregorian calendar.
+fn civil_from_epoch_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// `EXTRACT(field FROM source)`, also reachable as `date_part`.
+///
+/// A DATE is stored as days since the epoch and a TIMESTAMP as microseconds,
+/// so the field is read from the calendar split of whichever unit the source
+/// carries. The result is an integer, which is what every comparison and
+/// grouping the field feeds expects.
+fn eval_extract(
+    args: &[BoundExpr],
+    batch: &DataBatch,
+    schema: &[LogicalColumn],
+    params: &[ScalarValue],
+) -> Result<Column> {
+    if args.len() != 2 {
+        return Err(ZyronError::ExecutionError(format!(
+            "extract takes a field and a source, got {} argument(s)",
+            args.len()
+        )));
+    }
+    let field_col = evaluate(&args[0], batch, schema, params)?;
+    let field = match field_col.data {
+        ColumnData::Utf8(ref v) if !v.is_empty() => v[0].to_ascii_lowercase(),
+        _ => {
+            return Err(ZyronError::ExecutionError(
+                "extract needs a constant field name, like EXTRACT(YEAR FROM ts)".to_string(),
+            ));
+        }
+    };
+    let source = evaluate(&args[1], batch, schema, params)?;
+
+    // Every source reduces to microseconds since the epoch, so one split
+    // serves dates, timestamps and times alike
+    let micros_of = |i: usize| -> Option<i64> {
+        if source.is_null(i) {
+            return None;
+        }
+        match (&source.data, source.type_id) {
+            (ColumnData::Int32(v), TypeId::Date) => Some(v[i] as i64 * 86_400_000_000),
+            (ColumnData::Int64(v), _) => Some(v[i]),
+            (ColumnData::Int32(v), _) => Some(v[i] as i64),
+            (ColumnData::Int128(v), _) => Some(v[i] as i64),
+            _ => None,
+        }
+    };
+
+    let n = source.len();
+    let mut out: Vec<i64> = Vec::with_capacity(n);
+    let mut nulls = NullBitmap::empty();
+    for i in 0..n {
+        let Some(micros) = micros_of(i) else {
+            out.push(0);
+            nulls.push(true);
+            continue;
+        };
+        let days = micros.div_euclid(86_400_000_000);
+        let time_of_day = micros.rem_euclid(86_400_000_000);
+        let (year, month, day) = civil_from_epoch_days(days);
+        let value = match field.as_str() {
+            "year" => year,
+            "month" => month,
+            "day" => day,
+            "hour" => time_of_day / 3_600_000_000,
+            "minute" => time_of_day / 60_000_000 % 60,
+            "second" => time_of_day / 1_000_000 % 60,
+            "millisecond" => time_of_day / 1_000 % 60_000,
+            "microsecond" => time_of_day % 60_000_000,
+            "quarter" => (month - 1) / 3 + 1,
+            // The epoch fell on a Thursday, so day zero is weekday four
+            "dow" | "dayofweek" => (days + 4).rem_euclid(7),
+            "doy" | "dayofyear" => days - crate::expr::epoch_days_from_civil(year, 1, 1) + 1,
+            "epoch" => micros / 1_000_000,
+            "decade" => year / 10,
+            "century" => (year - 1) / 100 + 1,
+            "millennium" => (year - 1) / 1000 + 1,
+            other => {
+                return Err(ZyronError::ExecutionError(format!(
+                    "extract does not know the field '{other}'"
+                )));
+            }
+        };
+        out.push(value);
+        nulls.push(false);
+    }
+    Ok(Column::with_nulls(
+        ColumnData::Int64(out),
+        nulls,
+        TypeId::Int64,
+    ))
+}
+
+/// The inverse of `civil_from_epoch_days`, for the day-of-year field.
+pub(crate) fn epoch_days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 fn eval_greatest_least(
     args: &[BoundExpr],
     batch: &DataBatch,
@@ -2626,7 +2799,7 @@ fn eval_greatest_least(
     }
     let first = evaluate(&args[0], batch, schema, params)?;
     let target = first.type_id;
-    let ts_precision = first.ts_precision;
+    let fractional_digits = first.fractional_digits;
     let mut cols: Vec<Column> = Vec::with_capacity(args.len());
     for (idx, a) in args.iter().enumerate() {
         let c = if idx == 0 {
@@ -2673,7 +2846,12 @@ fn eval_greatest_least(
             }
         }
     }
-    Ok(Column::with_nulls_ts(data, nulls, target, ts_precision))
+    Ok(Column::with_nulls_ts(
+        data,
+        nulls,
+        target,
+        fractional_digits,
+    ))
 }
 
 #[cfg(test)]
@@ -2751,14 +2929,14 @@ mod scalar_fn_tests {
             name: "embedding".to_string(),
             type_id: TypeId::Vector,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         }];
         let column_ref = BoundExpr::ColumnRef(zyron_planner::binder::ColumnRef {
             table_idx: 0,
             column_id: zyron_catalog::ColumnId(1),
             type_id: TypeId::Vector,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         });
         let query = BoundExpr::Function {
             name: "array".to_string(),
@@ -2778,7 +2956,10 @@ mod scalar_fn_tests {
         let ColumnData::Float64(values) = &cosine.data else {
             panic!("expected a float column");
         };
-        assert!(values[0].abs() < 1e-6, "a row equal to the query is at zero");
+        assert!(
+            values[0].abs() < 1e-6,
+            "a row equal to the query is at zero"
+        );
         assert!(
             (values[1] - 1.0).abs() < 1e-6,
             "an orthogonal row is at one"

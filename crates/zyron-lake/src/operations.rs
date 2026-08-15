@@ -18,8 +18,8 @@
 //! files through the survivor mask and retires predicates that no longer
 //! attach anywhere
 
-use std::collections::hash_map::RandomState;
 use std::collections::BTreeSet;
+use std::collections::hash_map::RandomState;
 use std::fs;
 use std::hash::{BuildHasher, Hasher};
 use std::path::PathBuf;
@@ -33,7 +33,7 @@ use crate::paths::{parse_data_file_name, parse_index_file_name};
 use crate::predicate::{LakePredicate, PruneDecision};
 use crate::reader::LakeFileReader;
 use crate::transaction_log::{CommitAttempt, LogEntry, OperationKind, TransactionLog};
-use crate::writer::{write_data_file_ordered, ColumnData, WriteRequest};
+use crate::writer::{ColumnData, WriteRequest, write_data_file_ordered};
 
 /// Outcome of an append
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,7 +142,10 @@ pub fn append_rows(
         )?);
         for entry in &entries {
             if let LogEntry::AddIndexFile(file) = entry {
-                staged_paths.push(log.paths().index_file(file.index_id, file.file.partition_id));
+                staged_paths.push(
+                    log.paths()
+                        .index_file(file.index_id, file.file.partition_id),
+                );
             }
         }
         Ok(entries)
@@ -209,11 +212,7 @@ pub fn create_index(
         // Ids ascend from the highest ever allocated so a dropped index
         // never has its id reused, which keeps a stale file from being
         // mistaken for a live one
-        let index_id = base
-            .indexes
-            .last()
-            .map(|s| s.index_id + 1)
-            .unwrap_or(1);
+        let index_id = base.indexes.last().map(|s| s.index_id + 1).unwrap_or(1);
         let spec = LakeIndexSpec {
             index_id,
             name: name.to_string(),
@@ -321,7 +320,10 @@ pub fn rebuild_indexes(
             })?;
             for entry in &built {
                 if let LogEntry::AddIndexFile(file) = entry {
-                    staged.push(log.paths().index_file(spec.index_id, file.file.partition_id));
+                    staged.push(
+                        log.paths()
+                            .index_file(spec.index_id, file.file.partition_id),
+                    );
                 }
             }
             entries.extend(built);
@@ -369,7 +371,9 @@ pub fn compact_indexes_if_fragmented(
         let entries: u64 = files.iter().map(|f| f.file.row_count).sum();
         // The count a compacted index of this size would have, so the test
         // is about fragmentation rather than about how big the table is
-        let ideal = (entries as usize).div_ceil(crate::index::ENTRIES_PER_INDEX_FILE).max(1);
+        let ideal = (entries as usize)
+            .div_ceil(crate::index::ENTRIES_PER_INDEX_FILE)
+            .max(1);
         files.len() > ideal * INDEX_FRAGMENTATION_LIMIT
     });
     if !fragmented {
@@ -435,11 +439,7 @@ pub fn delete_where(
             }
         }
         if partial {
-            let next_id = base
-                .delete_predicates
-                .last()
-                .map(|p| p.id + 1)
-                .unwrap_or(1);
+            let next_id = base.delete_predicates.last().map(|p| p.id + 1).unwrap_or(1);
             entries.push(LogEntry::AddDeletePredicate(DeletePredicate {
                 id: next_id,
                 sql: sql.to_string(),
@@ -643,7 +643,10 @@ pub fn update_where(
         )?;
         for entry in &index_entries {
             if let LogEntry::AddIndexFile(file) = entry {
-                staged.push(log.paths().index_file(file.index_id, file.file.partition_id));
+                staged.push(
+                    log.paths()
+                        .index_file(file.index_id, file.file.partition_id),
+                );
             }
         }
         entries.extend(index_entries);
@@ -831,8 +834,7 @@ pub fn optimize(
         let survivor_rows = batch.first().map(|c| c.cells.len()).unwrap_or(0);
         if survivor_rows > 0 {
             let partition_id = allocate_partition_id(base);
-            let sort_keys: Vec<u32> =
-                base.cluster_spec.keys.iter().map(|k| k.column_id).collect();
+            let sort_keys: Vec<u32> = base.cluster_spec.keys.iter().map(|k| k.column_id).collect();
             let sort_strategies: Vec<ClusterStrategy> =
                 base.cluster_spec.keys.iter().map(|k| k.strategy).collect();
             let written = write_data_file_ordered(
@@ -890,7 +892,10 @@ pub fn optimize(
                         id
                     },
                 )? {
-                    staged.push(log.paths().index_file(spec.index_id, file.file.partition_id));
+                    staged.push(
+                        log.paths()
+                            .index_file(spec.index_id, file.file.partition_id),
+                    );
                     entries.push(LogEntry::AddIndexFile(file));
                 }
             }
@@ -1037,10 +1042,10 @@ pub(crate) fn allocate_partition_id(base: &ManifestFile) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::LakeSchema;
     use crate::paths::LakePaths;
     use crate::predicate::{CompareOp, LakeValue};
     use crate::schema::LakeColumn;
+    use crate::schema::LakeSchema;
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use zyron_common::TypeId;
@@ -1054,7 +1059,7 @@ mod tests {
                     name: "id".into(),
                     type_id: TypeId::Int64,
                     nullable: false,
-                    ts_precision: None,
+                    fractional_digits: None,
                     tz_offset_secs: None,
                     max_length: None,
                     default_expr: None,
@@ -1064,7 +1069,7 @@ mod tests {
                     name: "name".into(),
                     type_id: TypeId::Varchar,
                     nullable: true,
-                    ts_precision: None,
+                    fractional_digits: None,
                     tz_offset_secs: None,
                     max_length: None,
                     default_expr: None,
@@ -1126,13 +1131,8 @@ mod tests {
     fn test_append_and_concurrent_appends_never_collide() {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = Arc::new(new_log(dir.path()));
-        let out = append_rows(
-            &log,
-            attempt(),
-            7,
-            &batch(&[1, 2], &[Some("a"), Some("b")]),
-        )
-        .expect("append");
+        let out = append_rows(&log, attempt(), 7, &batch(&[1, 2], &[Some("a"), Some("b")]))
+            .expect("append");
         assert_eq!(out.rows, 2);
 
         let mut handles = Vec::new();
@@ -1140,13 +1140,8 @@ mod tests {
             let log = Arc::clone(&log);
             handles.push(std::thread::spawn(move || {
                 for i in 0..3i64 {
-                    append_rows(
-                        &log,
-                        attempt(),
-                        7,
-                        &batch(&[t * 100 + i], &[Some("x")]),
-                    )
-                    .expect("concurrent append");
+                    append_rows(&log, attempt(), 7, &batch(&[t * 100 + i], &[Some("x")]))
+                        .expect("concurrent append");
                 }
             }));
         }
@@ -1287,13 +1282,11 @@ mod tests {
     fn test_update_without_predicate_replaces_everything() {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = new_log(dir.path());
-        append_rows(&log, attempt(), 7, &batch(&[1, 2], &[Some("a"), Some("b")]))
-            .expect("append");
+        append_rows(&log, attempt(), 7, &batch(&[1, 2], &[Some("a"), Some("b")])).expect("append");
         append_rows(&log, attempt(), 7, &batch(&[3], &[Some("c")])).expect("append");
 
         let new_rows = batch(&[9, 9, 9], &[Some("z"), Some("z"), Some("z")]);
-        let out =
-            update_where(&log, attempt(), 7, None, "TRUE", &new_rows, 3).expect("update");
+        let out = update_where(&log, attempt(), 7, None, "TRUE", &new_rows, 3).expect("update");
         assert_eq!(out.files_removed, 2);
         assert!(!out.predicate_recorded);
         let m = log.latest_manifest().expect("manifest");
@@ -1315,8 +1308,11 @@ mod tests {
 
         // An orphan from a failed writer and a staging leftover
         std::fs::write(log.paths().data_file(0xDEAD), b"orphan").expect("orphan");
-        std::fs::write(log.paths().data_dir().join("p-0000000000000bad.zyr.tmp"), b"tmp")
-            .expect("tmp");
+        std::fs::write(
+            log.paths().data_dir().join("p-0000000000000bad.zyr.tmp"),
+            b"tmp",
+        )
+        .expect("tmp");
 
         // Retaining from version 1 keeps the removed file for time travel
         let removed = vacuum_data_files(&log, 1).expect("vacuum");

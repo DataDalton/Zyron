@@ -32,14 +32,11 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
     std::fs::create_dir_all(&data_dir).unwrap();
     std::fs::create_dir_all(&wal_dir).unwrap();
 
-    let wal = Arc::new(
-        WalWriter::new(zyron_bench_harness::wal_config(wal_dir))
-        .expect("wal"),
-    );
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir)).expect("wal"));
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
-        .await
-        .expect("disk"),
+            .await
+            .expect("disk"),
     );
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let storage =
@@ -214,6 +211,25 @@ async fn try_plan(
         None,
     )
     .await
+}
+
+/// Blocks until a transaction has actually parked on a row lock.
+///
+/// The waiter registers its wait-for edge only after arming the release
+/// notification, so an edge appearing means the waiter is committed to
+/// waiting and cannot miss the wakeup. Sleeping a fixed interval instead
+/// assumed the spawned task got scheduled in that window, which a loaded
+/// machine does not guarantee: the holder would then finish first, the
+/// waiter would acquire the free lock without ever blocking, and a test
+/// asserting what happens to a blocked waiter would fail on timing alone.
+async fn await_parked_waiter(server: &Arc<ServerState>) {
+    for _ in 0..2_000 {
+        if server.txn_manager.wait_for_graph().edge_count() > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    panic!("no transaction parked on the row lock within two seconds");
 }
 
 async fn try_exec_in_txn(
@@ -508,7 +524,7 @@ async fn for_update_wait_parks_until_holder_aborts() {
             rows
         })
     };
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    await_parked_waiter(&server).await;
     server.txn_manager.abort(&mut txn1).expect("abort");
 
     let rows = waiter.await.expect("join").expect("waiter succeeds");
@@ -540,7 +556,7 @@ async fn for_update_wait_conflicts_when_holder_committed_a_change() {
             rows
         })
     };
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    await_parked_waiter(&server).await;
     server.txn_manager.commit(&mut txn1).await.expect("commit");
 
     assert_conflict(waiter.await.expect("join"), "concurrently committed");

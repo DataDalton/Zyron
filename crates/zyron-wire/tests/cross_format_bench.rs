@@ -89,8 +89,8 @@
 use std::sync::Arc;
 
 use zyron_bench_harness::{
-    Format, Instant, RatioBound, VALIDATION_RUNS, assert_ratio, init, measuring,
-    record_metric_for, record_ratio, tprintln,
+    Format, Instant, RatioBound, VALIDATION_RUNS, assert_ratio, init, measuring, record_metric_for,
+    record_ratio, tprintln,
 };
 use zyron_executor::column::ScalarValue;
 use zyron_wire::connection::ServerState;
@@ -257,9 +257,7 @@ impl Target {
             .map(|chunk| {
                 let values: Vec<String> = chunk
                     .iter()
-                    .map(|r| {
-                        format!("({}, {}, {}, '{}')", r.id, r.region, r.amount, r.label)
-                    })
+                    .map(|r| format!("({}, {}, {}, '{}')", r.id, r.region, r.amount, r.label))
                     .collect();
                 format!("INSERT INTO {} VALUES {}", table, values.join(", "))
             })
@@ -348,12 +346,7 @@ async fn compare(
 /// timing only means something in an optimized run on a known baseline.
 /// It is what file pruning, zone maps and column projection actually
 /// reduce, so it says why a timing came out the way it did
-async fn compare_bytes_read(
-    server: &Arc<ServerState>,
-    test: &str,
-    heap_sql: &str,
-    lake_sql: &str,
-) {
+async fn compare_bytes_read(server: &Arc<ServerState>, test: &str, heap_sql: &str, lake_sql: &str) {
     let metric = "Bytes read";
     let heap_bytes = bytes_read_by(server, HEAP, heap_sql).await;
     let lake_bytes = bytes_read_by(server, LAKE, lake_sql).await;
@@ -582,7 +575,13 @@ async fn setup(
 async fn test_bulk_load_to_queryable_across_formats() {
     let test = "bulk_load";
     let _section = section("Bulk Load To Queryable");
-    let (_server, _tmp, _data) = setup(test, "load", Some("Bulk load to queryable"), Some(RatioBound::AtMost(14.0))).await;
+    let (_server, _tmp, _data) = setup(
+        test,
+        "load",
+        Some("Bulk load to queryable"),
+        Some(RatioBound::AtMost(14.0)),
+    )
+    .await;
 }
 
 /// The same rows in statements two orders of magnitude smaller. This is
@@ -652,7 +651,12 @@ async fn test_point_lookup_full_row_across_formats() {
         "Point lookup, full row",
         "pf",
         Some(RatioBound::AtMost(0.25)),
-        |t| format!("SELECT id, region, amount, label FROM {} WHERE id = {}", t, probe),
+        |t| {
+            format!(
+                "SELECT id, region, amount, label FROM {} WHERE id = {}",
+                t, probe
+            )
+        },
     )
     .await;
 }
@@ -814,8 +818,14 @@ async fn test_point_lookup_with_and_without_an_index() {
     record_ratio(
         test,
         "Index speedup on point lookup",
-        (Format::Lake, lake_bare_avg / lake_indexed_avg.max(f64::MIN_POSITIVE)),
-        (Format::Heap, heap_bare_avg / heap_indexed_avg.max(f64::MIN_POSITIVE)),
+        (
+            Format::Lake,
+            lake_bare_avg / lake_indexed_avg.max(f64::MIN_POSITIVE),
+        ),
+        (
+            Format::Heap,
+            heap_bare_avg / heap_indexed_avg.max(f64::MIN_POSITIVE),
+        ),
     );
 }
 
@@ -855,12 +865,20 @@ async fn test_point_update_across_formats() {
         // did less work than the other
         let heap_after = query_values(
             &server,
-            &format!("SELECT amount FROM {} WHERE id = {}", HEAP.table("pu"), probe),
+            &format!(
+                "SELECT amount FROM {} WHERE id = {}",
+                HEAP.table("pu"),
+                probe
+            ),
         )
         .await;
         let lake_after = query_values(
             &server,
-            &format!("SELECT amount FROM {} WHERE id = {}", LAKE.table("pu"), probe),
+            &format!(
+                "SELECT amount FROM {} WHERE id = {}",
+                LAKE.table("pu"),
+                probe
+            ),
         )
         .await;
         assert_same_answer("Point update", &heap_after, &lake_after);
@@ -868,7 +886,13 @@ async fn test_point_update_across_formats() {
 
     let heap_avg = record_metric_for(Format::Heap, test, "Point update", "us", heap_runs);
     let lake_avg = record_metric_for(Format::Lake, test, "Point update", "us", lake_runs);
-    ratio_of(test, "Point update", heap_avg, lake_avg, Some(RatioBound::AtMost(1.00)));
+    ratio_of(
+        test,
+        "Point update",
+        heap_avg,
+        lake_avg,
+        Some(RatioBound::AtMost(1.00)),
+    );
 }
 
 /// A predicate delete is the lake's case: it records the predicate and
@@ -923,7 +947,13 @@ async fn test_bulk_delete_across_formats() {
             .map(|(_, v)| *v)
             .collect(),
     );
-    ratio_of(test, "Bulk delete", heap_avg, lake_avg, Some(RatioBound::AtMost(1.00)));
+    ratio_of(
+        test,
+        "Bulk delete",
+        heap_avg,
+        lake_avg,
+        Some(RatioBound::AtMost(1.00)),
+    );
 }
 
 /// A join of two tables of one format against the same join of the other,

@@ -632,6 +632,12 @@ pub enum Token {
 
     /// Integer literal.
     Integer(i64),
+    /// The magnitude of a whole number literal too wide for i64.
+    ///
+    /// Unsigned because the sign is a separate token, and the largest
+    /// negative i128 has a magnitude one past the largest positive one, so
+    /// a signed token could not carry it. The parser applies the sign.
+    BigInteger(u128),
 
     /// Floating-point literal.
     Float(f64),
@@ -702,6 +708,7 @@ impl std::fmt::Display for Token {
         match self {
             Token::Keyword(kw) => write!(f, "{kw}"),
             Token::Integer(n) => write!(f, "{n}"),
+            Token::BigInteger(n) => write!(f, "{n}"),
             Token::Float(n) => write!(f, "{n}"),
             Token::String(s) => write!(f, "'{s}'"),
             Token::Ident(s) => write!(f, "{s}"),

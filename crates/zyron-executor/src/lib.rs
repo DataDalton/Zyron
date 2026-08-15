@@ -10,6 +10,7 @@ pub mod operator;
 pub mod sequence;
 pub mod subquery;
 pub mod table_convert;
+pub mod tier_move;
 pub mod trigger;
 pub mod types_bridge;
 

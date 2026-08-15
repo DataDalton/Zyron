@@ -192,7 +192,7 @@ fn slice_batch(batch: &DataBatch, offset: usize, len: usize) -> DataBatch {
             data: c.data.slice(offset, len),
             nulls: c.nulls.slice(offset, len),
             type_id: c.type_id,
-            ts_precision: c.ts_precision,
+            fractional_digits: c.fractional_digits,
         })
         .collect();
     DataBatch::new(cols)

@@ -43,7 +43,7 @@ fn col_ref(col_id: u16) -> BoundExpr {
         column_id: ColumnId(col_id),
         type_id: TypeId::Int64,
         nullable: false,
-        ts_precision: None,
+        fractional_digits: None,
     })
 }
 
@@ -256,7 +256,7 @@ fn test_cardinality_estimator_equality() {
             column_id: ColumnId(0),
             type_id: TypeId::Int64,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         })),
         op: BinaryOperator::Eq,
         right: Box::new(BoundExpr::Literal {
@@ -525,7 +525,7 @@ fn test_encoding_hint_analysis() {
             column_id: ColumnId(0),
             type_id: TypeId::Int64,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         })),
         op: BinaryOperator::Eq,
         right: Box::new(BoundExpr::Literal {
@@ -552,7 +552,7 @@ fn test_encoding_hint_analysis() {
             column_id: ColumnId(0),
             type_id: TypeId::Int64,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         })),
         op: BinaryOperator::Gt,
         right: Box::new(BoundExpr::Literal {

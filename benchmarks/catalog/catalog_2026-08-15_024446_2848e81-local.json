@@ -1,0 +1,92 @@
+{
+  "id": "2026-08-15_024446_2848e81-local",
+  "date": "2026-08-15 02:45:33Z",
+  "ts": 1786761933,
+  "commit": "2848e81-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "debug",
+  "tests": {
+    "Histogram Build": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 10.67 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 10.68 },
+      "Histogram build latency (ms/col)": {
+        "average": 0.023760,
+        "runs": [0.09, 0.01, 0.01, 0.01, 0.01],
+        "target": 10.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "DDL Create": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 10.68 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 10.83 },
+      "Create table latency (us/op)": {
+        "average": 87.842000,
+        "runs": [93.28, 83.84, 91.74, 81.58, 88.77],
+        "target": 200.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "Schema Resolve": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 10.68 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 10.83 },
+      "Resolve latency (ns/op)": {
+        "average": 386.085800,
+        "runs": [385.23, 383.94, 383.81, 384.32, 393.12],
+        "target": 100.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "DDL Drop": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 10.68 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 10.84 },
+      "Drop table latency (us/op)": {
+        "average": 273.498000,
+        "runs": [225.85, 260.58, 244.25, 279.56, 357.24],
+        "target": 80.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "ANALYZE": {
+      "util_before": { "cpu_pct": 5.0, "ram_used_gb": 10.70 },
+      "util_after": { "cpu_pct": 11.0, "ram_used_gb": 10.84 },
+      "ANALYZE throughput (rows/sec)": {
+        "average": 1990514.755636,
+        "runs": [2023783.50, 1958752.59, 2046266.08, 1946381.09, 1977390.52],
+        "target": 8000000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "Table Lookup": {
+      "util_before": { "cpu_pct": 5.0, "ram_used_gb": 10.63 },
+      "util_after": { "cpu_pct": 3.0, "ram_used_gb": 10.78 },
+      "Lookup latency (ns/op)": {
+        "average": 346.583040,
+        "runs": [346.60, 354.03, 343.21, 345.29, 343.79],
+        "target": 50.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "Recovery": {
+      "util_before": { "cpu_pct": 6.0, "ram_used_gb": 10.62 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 10.75 },
+      "Recovery time (ms)": {
+        "average": 137.578200,
+        "runs": [139.03, 136.63, 137.36, 135.45, 139.42],
+        "target": 1.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    }
+  }
+}

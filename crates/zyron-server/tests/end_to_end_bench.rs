@@ -117,15 +117,12 @@ async fn boot_server(db_name: &str) -> (E2EServer, Duration) {
     // wal.segment_size = 16MB, wal.sync_mode = "fsync", ring buffer = 16MB
     // storage.buffer_pool_size = 128MB, page_size = 16KB, num_frames = 8192
     // disk.fsync_enabled = (wal.sync_mode == "fsync") = true
-    let wal = Arc::new(
-        WalWriter::new(zyron_bench_harness::wal_config(wal_dir))
-        .expect("wal"),
-    );
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir)).expect("wal"));
 
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
-        .await
-        .expect("disk"),
+            .await
+            .expect("disk"),
     );
 
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));

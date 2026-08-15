@@ -34,14 +34,11 @@ async fn harness_with_one_lake_table() -> (Harness, LakePaths) {
     std::fs::create_dir_all(&data_dir).unwrap();
     std::fs::create_dir_all(&wal_dir).unwrap();
 
-    let wal = Arc::new(
-        WalWriter::new(zyron_bench_harness::wal_config(wal_dir))
-        .expect("wal"),
-    );
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir)).expect("wal"));
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
-        .await
-        .expect("disk"),
+            .await
+            .expect("disk"),
     );
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let storage =
@@ -86,7 +83,7 @@ async fn harness_with_one_lake_table() -> (Harness, LakePaths) {
             name: c.name.clone(),
             type_id: c.type_id,
             nullable: c.nullable,
-            ts_precision: c.ts_precision,
+            fractional_digits: c.fractional_digits,
             tz_offset_secs: c.tz_offset_secs,
             max_length: c.max_length.map(|n| n as u32),
             default_expr: c.default_expr.clone(),

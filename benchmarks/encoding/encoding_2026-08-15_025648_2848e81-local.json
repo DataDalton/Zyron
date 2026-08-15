@@ -1,0 +1,76 @@
+{
+  "id": "2026-08-15_025648_2848e81-local",
+  "date": "2026-08-15 02:57:07Z",
+  "ts": 1786762627,
+  "commit": "2848e81-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "debug",
+  "tests": {
+    "Encoding Round-Trip": {
+      "util_before": { "cpu_pct": 9.0, "ram_used_gb": 10.68 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 10.70 },
+      "FastLanes decode (int/sec)": {
+        "average": 200595666.907996,
+        "runs": [193498452.01, 189429816.25, 206996481.06, 206868018.20, 206185567.01],
+        "target": 120000000000.000000,
+        "passed": null,
+        "higher_is_better": true
+      },
+      "FSST decompress (GB/sec)": {
+        "average": 0.946490,
+        "runs": [0.94, 0.93, 0.94, 0.94, 0.97],
+        "target": 6.000000,
+        "passed": null,
+        "higher_is_better": true
+      },
+      "ALP decode (float/sec)": {
+        "average": 167705253.019058,
+        "runs": [166030217.50, 162364020.13, 166306336.27, 172622130.16, 171203561.03],
+        "target": 3000000000.000000,
+        "passed": null,
+        "higher_is_better": true
+      },
+      "Dictionary lookup (ns/val)": {
+        "average": 49.449600,
+        "runs": [49.59, 51.83, 48.68, 48.58, 48.58],
+        "target": 3.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "RLE decode (val/sec)": {
+        "average": 3406341052.367246,
+        "runs": [1345895020.19, 1443001443.00, 5076142131.98, 4166666666.67, 5000000000.00],
+        "target": 60000000000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "Encoding Selection": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 10.69 },
+      "util_after": { "cpu_pct": 5.0, "ram_used_gb": 10.69 },
+      "Encoding select (us/col)": {
+        "average": 631.463540,
+        "runs": [629.80, 632.84, 633.30, 631.80, 629.58],
+        "target": 500.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "Query-on-Compressed": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 10.70 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 10.58 },
+      "Compressed eval speedup (x)": {
+        "average": 3356.158606,
+        "runs": [3252.65, 3342.98, 3355.77, 3378.94, 3450.45],
+        "target": 3.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    }
+  }
+}

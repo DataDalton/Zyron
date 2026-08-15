@@ -277,14 +277,43 @@ impl BufferFrame {
     /// Resets the frame to empty state.
     #[inline]
     pub fn reset(&self) {
-        self.page_id.store(NO_PAGE, Ordering::Release);
         self.pin_count.store(0, Ordering::Release);
+        self.reset_keeping_pin();
+    }
+
+    /// Prepares the frame for reuse without touching the pin count.
+    ///
+    /// An evicted frame arrives already claimed by `try_claim`, and that
+    /// claim is what stops a second eviction sweep from choosing it. Clearing
+    /// the pin here would drop the claim for the window between this call and
+    /// the caller's own pin, which is long enough to lose the frame to
+    /// another sweep and end with two page ids sharing it.
+    pub fn reset_keeping_pin(&self) {
+        self.page_id.store(NO_PAGE, Ordering::Release);
         self.is_dirty.store(false, Ordering::Release);
         self.dirty_lsn.store(0, Ordering::Release);
         self.reference_bit.store(false, Ordering::Relaxed);
         // Zero out data for security
         let mut data = self.data.write();
         data.fill(0);
+    }
+
+    /// Takes exclusive ownership of an unpinned frame, moving its pin count
+    /// from 0 to 1 in one step. Returns false when the frame is pinned, which
+    /// means another thread owns it.
+    ///
+    /// Checking `pin_count() == 0` and pinning separately is not the same
+    /// thing: two eviction sweeps both observe zero and both take the frame.
+    #[inline]
+    pub fn try_claim(&self) -> bool {
+        let claimed = self
+            .pin_count
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if claimed {
+            self.reference_bit.store(true, Ordering::Relaxed);
+        }
+        claimed
     }
 }
 

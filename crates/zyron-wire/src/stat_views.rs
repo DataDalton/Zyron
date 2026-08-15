@@ -134,6 +134,7 @@ impl StatViewFilters {
 fn literal_text(lit: &zyron_parser::LiteralValue) -> Option<String> {
     match lit {
         zyron_parser::LiteralValue::Integer(n) => Some(n.to_string()),
+        zyron_parser::LiteralValue::Int128(n) => Some(n.to_string()),
         zyron_parser::LiteralValue::Float(f) => Some(f.to_string()),
         zyron_parser::LiteralValue::String(s) => Some(s.clone()),
         zyron_parser::LiteralValue::Boolean(b) => Some(b.to_string()),
@@ -1234,7 +1235,7 @@ fn build_schema_at_version(
         make_field("column_name", PG_TEXT_OID, -1),
         make_field("type_id", PG_TEXT_OID, -1),
         make_field("nullable", PG_TEXT_OID, -1),
-        make_field("ts_precision", PG_INT4_OID, 4),
+        make_field("fractional_digits", PG_INT4_OID, 4),
         make_field("max_length", PG_INT8_OID, 8),
         make_field("default_expr", PG_TEXT_OID, -1),
     ];
@@ -1253,7 +1254,7 @@ fn build_schema_at_version(
                 cell(&column.name),
                 cell(format!("{:?}", column.type_id)),
                 cell(column.nullable),
-                column.ts_precision.map(|p| p.to_string().into_bytes()),
+                column.fractional_digits.map(|p| p.to_string().into_bytes()),
                 column.max_length.map(|n| n.to_string().into_bytes()),
                 column.default_expr.as_ref().map(|e| e.clone().into_bytes()),
             ]);

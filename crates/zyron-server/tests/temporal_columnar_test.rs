@@ -4,7 +4,7 @@
 //! A `TIMESTAMP(9)` / `TIMESTAMPTZ(12)` column is physically a 16-byte i128
 //! picosecond value, and `HLC` is a 16-byte packed instant. This test proves
 //! those 16-byte values survive byte-identically through:
-//!   (a) the heap -> .zyr fold (physical width derived from ts_precision),
+//!   (a) the heap -> .zyr fold (physical width derived from fractional_digits),
 //!   (b) a value patch + supersede in the .zyrpatch overlay,
 //!   (c) the incremental merge that folds the patch into a new base segment,
 //! including the `MAX_TIMESTAMP_PS` open-interval sentinel (a live versioned
@@ -112,14 +112,11 @@ async fn temporal_ps_hlc_survives_fold_patch_merge() {
 
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
-        .await
-        .unwrap(),
+            .await
+            .unwrap(),
     );
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
-    let wal = Arc::new(
-        WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
-        .unwrap(),
-    );
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone())).unwrap());
 
     let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
     storage.init_cache().await.unwrap();
@@ -145,11 +142,11 @@ async fn temporal_ps_hlc_survives_fold_patch_merge() {
     let txn = Arc::new(TransactionManager::with_start_txn_id(Arc::clone(&wal), 100));
 
     let te = catalog.get_table_by_id(table_id).unwrap();
-    // ts_precision must be persisted on the catalog column or the fold path
+    // fractional_digits must be persisted on the catalog column or the fold path
     // can't derive the 16-byte physical width.
     let t9c = te.columns.iter().find(|c| c.name == "t9").unwrap();
     assert_eq!(
-        t9c.ts_precision,
+        t9c.fractional_digits,
         Some(9),
         "TIMESTAMP(9) precision persisted"
     );
@@ -158,7 +155,7 @@ async fn temporal_ps_hlc_survives_fold_patch_merge() {
             .iter()
             .find(|c| c.name == "t12")
             .unwrap()
-            .ts_precision,
+            .fractional_digits,
         Some(12)
     );
 
@@ -341,14 +338,11 @@ async fn encoder_selection_is_dense_on_folded_columns() {
 
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
-        .await
-        .unwrap(),
+            .await
+            .unwrap(),
     );
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
-    let wal = Arc::new(
-        WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
-        .unwrap(),
-    );
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone())).unwrap());
 
     let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
     storage.init_cache().await.unwrap();

@@ -43,14 +43,11 @@ async fn make_catalog() -> (tempfile::TempDir, Arc<Catalog>) {
 
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(data_dir))
-        .await
-        .unwrap(),
+            .await
+            .unwrap(),
     );
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
-    let wal = Arc::new(
-        WalWriter::new(zyron_bench_harness::wal_config(wal_dir))
-        .unwrap(),
-    );
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir)).unwrap());
     let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
     storage.init_cache().await.unwrap();
     let storage: Arc<dyn zyron_catalog::CatalogStorage> = Arc::new(storage);
@@ -311,8 +308,8 @@ async fn make_security_manager(with_admin_role: bool) -> Arc<SecurityManager> {
     let tmp = tempfile::tempdir().unwrap();
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(tmp.path().to_path_buf()))
-        .await
-        .unwrap(),
+            .await
+            .unwrap(),
     );
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let storage: Arc<dyn zyron_auth::storage::AuthStorage> =

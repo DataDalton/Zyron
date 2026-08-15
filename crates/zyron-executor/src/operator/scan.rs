@@ -21,8 +21,8 @@ use zyron_planner::logical::LogicalColumn;
 use zyron_storage::{BTreeIndex, DiskManager, HeapPage, TupleId};
 
 use crate::batch::{
-    DataBatch, build_column_to_builder_map, create_builders,
-    decode_tuple_into_builders, finalize_builders,
+    DataBatch, build_column_to_builder_map, create_builders, decode_tuple_into_builders,
+    finalize_builders,
 };
 use crate::column::ScalarValue;
 use crate::compute::column_to_mask;
@@ -728,6 +728,9 @@ struct ScanBounds {
 fn literal_to_key_bytes(value: &LiteralValue) -> Option<Vec<u8>> {
     match value {
         LiteralValue::Integer(v) => Some((*v as u64).to_be_bytes().to_vec()),
+        // Matches the sixteen byte key the indexer writes for a 128 bit
+        // value, sign bit flipped so negatives order below positives
+        LiteralValue::Int128(v) => Some(((*v as u128) ^ (1u128 << 127)).to_be_bytes().to_vec()),
         LiteralValue::Float(v) => {
             // IEEE 754 float-to-sortable-bytes encoding.
             let bits = v.to_bits();
@@ -1179,6 +1182,7 @@ impl IndexScanOperator {
         predicate: BoundExpr,
         remaining_predicate: Option<BoundExpr>,
         track_tuple_ids: bool,
+        descending: bool,
     ) -> Result<Self> {
         // Try B+ tree path when both index metadata and a live tree are available.
         if let (Some(index_entry), Some(btree_index)) = (&index, &btree) {
@@ -1205,21 +1209,17 @@ impl IndexScanOperator {
             let table_entry = ctx.get_table_entry(table_id)?;
             let heap_file_id = table_entry.heap_file_id;
 
-            // Index keys are composite: indexed value followed by a locator
-            // suffix so duplicate values coexist. Pad the value bounds to span
-            // the whole suffix range: the lower bound gets all-zero suffix bytes,
-            // the upper bound all-ones, so a value's every entry is included.
-            let suffix_len = crate::operator::modify::INDEX_LOCATOR_SUFFIX_LEN;
-            let start_key = bounds.start_key.as_ref().map(|k| {
-                let mut v = k.clone();
-                v.extend(std::iter::repeat(0u8).take(suffix_len));
-                v
-            });
-            let end_key = bounds.end_key.as_ref().map(|k| {
-                let mut v = k.clone();
-                v.extend(std::iter::repeat(0xFFu8).take(suffix_len));
-                v
-            });
+            // A stored key is the leading indexed value, then any further key
+            // components, then a locator suffix so duplicate values coexist.
+            // Bounds are built on the leading value alone, so the lower bound
+            // is the value itself (every entry for it sorts at or above) and
+            // the upper bound is the value's successor, which sorts above
+            // every entry for it whatever follows in the key.
+            let start_key = bounds.start_key.clone();
+            let end_key = bounds
+                .end_key
+                .as_ref()
+                .and_then(|k| crate::operator::modify::index_key_upper_bound(k));
 
             let mut locators: Vec<zyron_common::RowLocator> = Vec::new();
             let mut has_columnar = false;
@@ -1290,6 +1290,15 @@ impl IndexScanOperator {
             } else {
                 None
             };
+
+            // The B+tree yields entries in ascending key order. A descending
+            // scan reads the same entries the other way, which is what lets
+            // an ORDER BY ... DESC be answered without a sort. The list is
+            // already materialized, so this is a reversal rather than a
+            // second traversal
+            if descending {
+                locators.reverse();
+            }
 
             // The range scan already ran to completion above, so the number
             // of entries it examined is known here and recorded once

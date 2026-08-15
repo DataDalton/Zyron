@@ -92,7 +92,11 @@ fn pack_width(max: u64) -> u8 {
 /// delta-of-delta carries the running residual and the running first difference.
 #[inline]
 fn narrow_restart_entry(flags: u8) -> usize {
-    if flags & FLAG_DELTA_OF_DELTA != 0 { 16 } else { 8 }
+    if flags & FLAG_DELTA_OF_DELTA != 0 {
+        16
+    } else {
+        8
+    }
 }
 
 /// Byte offset of the packed bit array in the narrow layout, past any restart
@@ -108,7 +112,11 @@ fn narrow_packed_offset(encoded: &[u8], flags: u8, row_count: usize) -> usize {
 /// Restart entry width for the 16-byte layouts.
 #[inline]
 fn wide_restart_entry(flags: u8) -> usize {
-    if flags & FLAG_DELTA_OF_DELTA != 0 { 32 } else { 16 }
+    if flags & FLAG_DELTA_OF_DELTA != 0 {
+        32
+    } else {
+        16
+    }
 }
 
 /// Byte offset of the packed bit array in the 16-byte layout.
@@ -240,8 +248,7 @@ impl Encoding for FastLanesEncoding {
                 encoded[18],
                 encoded[19],
             ]);
-            let quotients =
-                self.decode_range(&encoded[20..], row_count, value_size, start, end)?;
+            let quotients = self.decode_range(&encoded[20..], row_count, value_size, start, end)?;
             let mut out = vec![0u8; taken * value_size];
             for i in 0..taken {
                 let q = read_u64_le(&quotients, i * value_size, value_size);
@@ -281,9 +288,7 @@ impl Encoding for FastLanesEncoding {
         }
 
         if flags & FLAG_MINIBLOCK != 0 {
-            return decode_range_miniblock(
-                encoded, row_count, value_size, start, end, base_value,
-            );
+            return decode_range_miniblock(encoded, row_count, value_size, start, end, base_value);
         }
 
         let bit_width = encoded[8];
@@ -1669,11 +1674,7 @@ fn decode_range_miniblock(
             let lo = start.max(block_start);
             let hi = end.min(block_end);
             let packed_ptr = encoded[off..off + block_bytes].as_ptr();
-            let mask: u64 = if bw >= 64 {
-                u64::MAX
-            } else {
-                (1u64 << bw) - 1
-            };
+            let mask: u64 = if bw >= 64 { u64::MAX } else { (1u64 << bw) - 1 };
             for row in lo..hi {
                 let residual = unpack_inline(
                     packed_ptr,
@@ -1880,15 +1881,17 @@ fn decode_range_wide(
             write(&mut out, 0, residual.wrapping_add(base));
         }
         while row < start {
-            residual = residual
-                .wrapping_add(unzigzag_i128(unpack_bits_128(packed, at_bit(row), bit_width))
-                    as u128);
+            residual =
+                residual.wrapping_add(
+                    unzigzag_i128(unpack_bits_128(packed, at_bit(row), bit_width)) as u128,
+                );
             row += 1;
         }
         while row < end {
-            residual = residual
-                .wrapping_add(unzigzag_i128(unpack_bits_128(packed, at_bit(row), bit_width))
-                    as u128);
+            residual =
+                residual.wrapping_add(
+                    unzigzag_i128(unpack_bits_128(packed, at_bit(row), bit_width)) as u128,
+                );
             write(&mut out, row - start, residual.wrapping_add(base));
             row += 1;
         }
@@ -2294,7 +2297,11 @@ fn encode_narrow_core(values: &[u64], row_count: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + restarts * 8 + packed_bytes);
     out.extend_from_slice(&base_value.to_le_bytes()); // [0..8]
     out.push(bit_width); // [8]
-    out.push(if restarts > 0 { flags | FLAG_RESTART } else { flags }); // [9]
+    out.push(if restarts > 0 {
+        flags | FLAG_RESTART
+    } else {
+        flags
+    }); // [9]
     out.push(shift as u8); // [10] restart spacing
     out.push(0); // [11] reserved
     for k in 1..=restarts {
@@ -3250,7 +3257,11 @@ mod tests {
 
         let with_outliers: Vec<u8> = (0..ROWS)
             .flat_map(|i| {
-                let v = if i % 97 == 0 { 1i64 << 40 } else { (i % 13) as i64 };
+                let v = if i % 97 == 0 {
+                    1i64 << 40
+                } else {
+                    (i % 13) as i64
+                };
                 v.to_le_bytes()
             })
             .collect();

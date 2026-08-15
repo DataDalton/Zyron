@@ -10,11 +10,11 @@ use std::cmp::Ordering;
 
 use zyron_common::TypeId;
 
-use crate::predicate::{compare_i128_to_value, compare_u128_to_value, LakeValue};
+use crate::predicate::{LakeValue, compare_i128_to_value, compare_u128_to_value};
 
 // Cell family classification is shared with the fold tier through the
 // ordering curves, so it is defined in zyron-common
-pub(crate) use zyron_common::curve::{cell_family, CellFamily};
+pub(crate) use zyron_common::curve::{CellFamily, cell_family};
 
 fn signed_from_cell(cell: &[u8]) -> Option<i128> {
     Some(match cell.len() {
@@ -285,10 +285,7 @@ mod tests {
         let a = (-5i32).to_le_bytes();
         let b = 3i32.to_le_bytes();
         assert_eq!(compare_cells(TypeId::Int32, &a, &b), Ordering::Less);
-        assert_eq!(
-            cell_to_value(TypeId::Int32, &a),
-            Some(LakeValue::Int(-5))
-        );
+        assert_eq!(cell_to_value(TypeId::Int32, &a), Some(LakeValue::Int(-5)));
         let ts = (-86_400_000_000i64).to_le_bytes();
         assert_eq!(
             cell_to_value(TypeId::Timestamp, &ts),

@@ -15,8 +15,8 @@ use zyron_catalog::{
     Catalog, CatalogCache, DatabaseId, HeapCatalogStorage, SYSTEM_DATABASE_ID, SchemaId,
 };
 use zyron_executor::column::ScalarValue;
-use zyron_storage::txn::TransactionManager;
 use zyron_storage::DiskManager;
+use zyron_storage::txn::TransactionManager;
 use zyron_wal::WalWriter;
 use zyron_wire::connection::ServerState;
 use zyron_wire::session::Session;
@@ -197,9 +197,61 @@ pub async fn exec_ddl(
 }
 
 pub async fn exec_dml(server: &Arc<ServerState>, sql: &str) {
-    exec_dml_result(server, sql)
+    exec_dml_result(server, sql).await.expect("execute");
+}
+
+/// Runs several DML statements inside one transaction, for a test whose
+/// subject is what a statement sees of its own transaction's earlier writes.
+/// The first failure aborts and is returned.
+pub async fn exec_dml_script(
+    server: &Arc<ServerState>,
+    statements: &[&str],
+) -> Result<(), zyron_common::ZyronError> {
+    let mut txn = server
+        .txn_manager
+        .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
+        .expect("begin");
+    let txn_id = txn.txn_id;
+    for sql in statements {
+        let stmt = zyron_parser::parse(sql)
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("one statement");
+        let plan = zyron_planner::plan(
+            &server.catalog,
+            DatabaseId(1),
+            vec!["public".into()],
+            stmt,
+            None,
+        )
         .await
-        .expect("execute");
+        .expect("plan");
+        // A fresh snapshot per statement, which is what the wire layer gives
+        // each statement of a read-committed transaction
+        let snapshot = server.txn_manager.refresh_snapshot(&txn);
+        let mut ctx = zyron_executor::context::ExecutionContext::new(
+            server.catalog.clone(),
+            server.wal.clone(),
+            server.buffer_pool.clone(),
+            server.disk_manager.clone(),
+            txn_id as u32,
+            snapshot,
+        );
+        ctx.heap_files = Some(Arc::clone(&server.heap_files));
+        ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
+        ctx.doc_registry = Some(Arc::clone(&server.doc_registry));
+        let ctx = Arc::new(ctx);
+        if let Err(e) = zyron_executor::execute(plan, &ctx).await {
+            let _ = zyron_lake::abandon_txn(server.disk_manager.data_dir(), txn_id);
+            let _ = server.txn_manager.abort(&mut txn);
+            return Err(e);
+        }
+    }
+    server.txn_manager.commit(&mut txn).await.expect("commit");
+    let logs = zyron_lake::publish_txn(server.disk_manager.data_dir(), txn_id).expect("publish");
+    zyron_wire::connection::refresh_lake_stats(server, &logs);
+    Ok(())
 }
 
 /// Runs one DML statement and returns what it produced, for a test whose
@@ -316,7 +368,6 @@ pub async fn query_rows(server: &Arc<ServerState>, sql: &str) -> usize {
     batches.iter().map(|b| b.num_rows).sum()
 }
 
-
 /// The message a query fails with, for the cases where the refusal is the
 /// behavior under test. Panics when the query succeeds, so a test cannot pass
 /// by silently getting an answer where it expected an error.
@@ -364,6 +415,60 @@ pub async fn query_error(server: &Arc<ServerState>, sql: &str) -> String {
             batches.iter().map(|b| b.num_rows).sum::<usize>()
         ),
         Err(e) => e.to_string(),
+    }
+}
+
+/// Runs a query and returns whatever it produced, for a suite that reports
+/// which of a set of queries the engine refused rather than stopping at the
+/// first one.
+pub async fn query_result(
+    server: &Arc<ServerState>,
+    sql: &str,
+) -> Result<Vec<Vec<ScalarValue>>, String> {
+    let stmt = zyron_parser::parse(sql)
+        .map_err(|e| format!("parse: {e}"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "parse produced no statement".to_string())?;
+    let plan = zyron_planner::plan(
+        &server.catalog,
+        DatabaseId(1),
+        vec!["public".into()],
+        stmt,
+        None,
+    )
+    .await
+    .map_err(|e| format!("plan: {e}"))?;
+    let mut txn = server
+        .txn_manager
+        .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
+        .expect("begin");
+    let snapshot = txn.snapshot.clone();
+    let txn_id = txn.txn_id as u32;
+    let mut ctx = zyron_executor::context::ExecutionContext::new(
+        server.catalog.clone(),
+        server.wal.clone(),
+        server.buffer_pool.clone(),
+        server.disk_manager.clone(),
+        txn_id,
+        snapshot,
+    );
+    ctx.heap_files = Some(Arc::clone(&server.heap_files));
+    ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
+    ctx.doc_registry = Some(Arc::clone(&server.doc_registry));
+    let ctx = Arc::new(ctx);
+    let result = zyron_executor::execute(plan, &ctx).await;
+    let _ = server.txn_manager.commit(&mut txn).await;
+    match result {
+        Ok(batches) => Ok(batches
+            .iter()
+            .flat_map(|b| {
+                (0..b.num_rows)
+                    .map(|r| b.columns.iter().map(|c| c.get_scalar(r)).collect())
+                    .collect::<Vec<Vec<ScalarValue>>>()
+            })
+            .collect()),
+        Err(e) => Err(format!("execute: {e}")),
     }
 }
 

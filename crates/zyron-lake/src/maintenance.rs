@@ -60,20 +60,20 @@ use std::rc::Rc;
 use zyron_common::ZyronError;
 use zyron_storage::columnar::MergeScanIterator;
 
-use crate::codec::{corrupt, Cursor};
+use crate::codec::{Cursor, corrupt};
 use crate::curve::{normalize_component, ordering_key};
-use crate::feedback::{evaluate, Decision, GateConfig, PredicateClass};
-use crate::manifest::{
-    decode_partition_entry, encode_partition_entry, ClusterSpec, ClusterStrategy, ManifestFile,
-    PartitionEntry,
-};
+use crate::feedback::{Decision, GateConfig, PredicateClass, evaluate};
 use crate::index;
+use crate::manifest::{
+    ClusterSpec, ClusterStrategy, ManifestFile, PartitionEntry, decode_partition_entry,
+    encode_partition_entry,
+};
 use crate::operations::{allocate_partition_id, allocate_unused_partition_id};
 use crate::paths::data_file_name;
 use crate::predicate::LakeValue;
 use crate::reader::{DecodedColumn, LakeFileReader};
 use crate::transaction_log::{CommitAttempt, LogEntry, OperationKind, TransactionLog};
-use crate::writer::{write_data_file_at, ColumnData, WriteRequest};
+use crate::writer::{ColumnData, WriteRequest, write_data_file_at};
 
 const CHECKPOINT_MAGIC: [u8; 8] = *b"ZYCLUSTR";
 const CHECKPOINT_FORMAT_VERSION: u32 = 1;
@@ -294,10 +294,7 @@ impl PassCheckpoint {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)?;
+        let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
         file.write_all(&header.to_bytes())?;
         file.sync_all()?;
         Ok(Self {
@@ -1426,7 +1423,7 @@ mod tests {
                     name: "a".into(),
                     type_id: TypeId::Int64,
                     nullable: false,
-                    ts_precision: None,
+                    fractional_digits: None,
                     tz_offset_secs: None,
                     max_length: None,
                     default_expr: None,
@@ -1436,7 +1433,7 @@ mod tests {
                     name: "b".into(),
                     type_id: TypeId::Int64,
                     nullable: true,
-                    ts_precision: None,
+                    fractional_digits: None,
                     tz_offset_secs: None,
                     max_length: None,
                     default_expr: None,
@@ -1856,7 +1853,7 @@ mod tests {
     #[test]
     fn test_a_pass_driven_only_by_observed_scans_improves_the_layout() {
         use crate::planner::{evidence_from_manifest, predicate_classes, propose};
-        use crate::workload::{observe_scan, WorkloadObserver};
+        use crate::workload::{WorkloadObserver, observe_scan};
 
         let dir = tempfile::tempdir().expect("tempdir");
         let log = new_log(dir.path(), 29);
@@ -1872,16 +1869,7 @@ mod tests {
         for _ in 0..20 {
             // What one scan of `a < 8` reports: every byte considered,
             // none skipped, 64 rows decoded and 8 returned
-            crate::workload::observe_for_test(
-                &observer,
-                29,
-                &below(0, 8),
-                bytes,
-                0,
-                64,
-                8,
-                epoch,
-            );
+            crate::workload::observe_for_test(&observer, 29, &below(0, 8), bytes, 0, 64, 8, epoch);
         }
         // The process-wide entry points are the ones the scan path calls
         observe_scan(29, &below(0, 8), bytes, 0, epoch);
@@ -1945,7 +1933,9 @@ mod tests {
     /// without touching the process identity every other test shares.
     #[test]
     fn test_a_second_writer_to_a_dataset_is_refused() {
-        use crate::transaction_log::{transfer_writer, writer_node, LogEntry, WRITER_NODE_PROPERTY};
+        use crate::transaction_log::{
+            LogEntry, WRITER_NODE_PROPERTY, transfer_writer, writer_node,
+        };
 
         const NODE_A: u64 = 0xAAAA_AAAA_AAAA_AAAA;
         const NODE_B: u64 = 0xBBBB_BBBB_BBBB_BBBB;
@@ -2162,8 +2152,7 @@ mod tests {
         fs::write(orphan.join("p-00000000000000ff.zyr"), b"debris").expect("debris");
 
         let outcomes =
-            resume_cluster_passes(&log, attempt(), &[], &ResumeOptions::default())
-                .expect("resume");
+            resume_cluster_passes(&log, attempt(), &[], &ResumeOptions::default()).expect("resume");
         assert!(outcomes.is_empty());
         assert!(!orphan.exists());
     }

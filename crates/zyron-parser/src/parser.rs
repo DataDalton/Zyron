@@ -130,10 +130,7 @@ impl<'a> Parser<'a> {
 
     fn advance(&mut self) -> Result<SpannedToken> {
         let next = std::mem::replace(&mut self.peek2, self.lexer.next_token()?);
-        let prev = std::mem::replace(
-            &mut self.current,
-            std::mem::replace(&mut self.peek, next),
-        );
+        let prev = std::mem::replace(&mut self.current, std::mem::replace(&mut self.peek, next));
         Ok(prev)
     }
 
@@ -709,6 +706,27 @@ impl<'a> Parser<'a> {
             return Err(self.error("Expected SELECT after '(' in FROM clause"));
         }
 
+        // Inline external source: FILE '<uri>' FORMAT CSV ...
+        //
+        // A backend keyword opens one only when a string literal follows.
+        // Every backend name is also usable as an identifier, so requiring
+        // the URI here keeps a table actually named `file` or `http`
+        // parsing as the table it is
+        if matches!(
+            self.current.token,
+            Token::Keyword(
+                Keyword::File
+                    | Keyword::S3
+                    | Keyword::Gcs
+                    | Keyword::Azure
+                    | Keyword::Http
+                    | Keyword::Zyron
+            )
+        ) && matches!(self.peek.token, Token::String(_))
+        {
+            return self.parse_external_inline_ref();
+        }
+
         let name = self.parse_ident()?;
 
         // Table-valued function call: name(args...) [AS alias]
@@ -776,8 +794,7 @@ impl<'a> Parser<'a> {
             let _ = self.consume_keyword(Keyword::Timestamptz)?;
             let expr = self.parse_expr()?;
             Some(Box::new(AsOf::Timestamp(expr)))
-        } else if self.at_keyword(Keyword::In)
-            && self.peek.token == Token::Keyword(Keyword::Branch)
+        } else if self.at_keyword(Keyword::In) && self.peek.token == Token::Keyword(Keyword::Branch)
         {
             // FROM <table> IN BRANCH 'name'
             self.advance()?; // IN
@@ -2169,7 +2186,10 @@ impl<'a> Parser<'a> {
             }
             Token::Keyword(Keyword::Double) => {
                 self.advance()?;
-                self.expect_keyword(Keyword::Precision)?;
+                // The standard spells it DOUBLE PRECISION and the word is
+                // optional in every dialect that also accepts a bare DOUBLE,
+                // so both name the same type here
+                self.consume_keyword(Keyword::Precision)?;
                 Ok(DataType::DoublePrecision)
             }
             Token::Keyword(Keyword::Float) => {
@@ -2554,6 +2574,16 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 Ok(Expr::Literal(LiteralValue::Integer(val)))
             }
+            Token::BigInteger(n) => {
+                let magnitude = *n;
+                self.advance()?;
+                let val = i128::try_from(magnitude).map_err(|_| {
+                    self.error(&format!(
+                        "Integer literal '{magnitude}' is too large for any integer type"
+                    ))
+                })?;
+                Ok(Expr::Literal(LiteralValue::Int128(val)))
+            }
             Token::Float(f) => {
                 let val = *f;
                 self.advance()?;
@@ -2596,6 +2626,37 @@ impl<'a> Parser<'a> {
                 let interval = zyron_common::parse_interval_string(&s)
                     .map_err(|e| self.error(&format!("Invalid INTERVAL '{}': {}", s, e)))?;
                 Ok(Expr::Literal(LiteralValue::Interval(interval)))
+            }
+            // DATE 'x', TIMESTAMP 'x', TIMESTAMPTZ 'x' and TIME 'x' typed
+            // literals, the standard spelling for a temporal constant and
+            // what a client emits when it wants the comparison done in the
+            // column's type rather than as text.
+            //
+            // Desugared to a cast, which is exactly what the syntax means,
+            // so the coercion is the one every other cast goes through
+            // rather than a second path that could disagree with it. The
+            // same keywords stay available as type names, because those
+            // contexts are not followed by a string literal.
+            Token::Keyword(
+                kw @ (Keyword::Date | Keyword::Timestamp | Keyword::Timestamptz | Keyword::Time),
+            ) if matches!(&self.peek.token, Token::String(_)) => {
+                let kw = *kw;
+                self.advance()?; // consume the type keyword
+                let Token::String(s) = &self.current.token else {
+                    return Err(self.error("Expected string literal after a temporal type name"));
+                };
+                let text = s.clone();
+                self.advance()?; // consume the string
+                let data_type = match kw {
+                    Keyword::Date => DataType::Date,
+                    Keyword::Time => DataType::Time,
+                    Keyword::Timestamptz => DataType::TimestampTz(None),
+                    _ => DataType::Timestamp(None),
+                };
+                Ok(Expr::Cast {
+                    expr: Box::new(Expr::Literal(LiteralValue::String(text))),
+                    data_type,
+                })
             }
             Token::Ident(_) => {
                 let name = self.parse_ident()?;
@@ -2706,6 +2767,22 @@ impl<'a> Parser<'a> {
             }
             Token::Minus => {
                 self.advance()?;
+                // A negated wide literal folds here rather than becoming a
+                // negation of a positive one, because the most negative
+                // i128 has a magnitude the positive range cannot hold
+                if let Token::BigInteger(magnitude) = self.current.token {
+                    self.advance()?;
+                    let val = if magnitude == (i128::MAX as u128) + 1 {
+                        i128::MIN
+                    } else {
+                        -i128::try_from(magnitude).map_err(|_| {
+                            self.error(&format!(
+                                "Integer literal '-{magnitude}' is too large for any integer type"
+                            ))
+                        })?
+                    };
+                    return Ok(Expr::Literal(LiteralValue::Int128(val)));
+                }
                 let expr = self.parse_expr_bp(15)?;
                 Ok(Expr::UnaryOp {
                     op: UnaryOperator::Minus,
@@ -2744,6 +2821,17 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_function_call(&mut self, name: String) -> Result<Expr> {
+        // Two functions the standard spells with keywords in their argument
+        // list rather than commas. Both desugar to the ordinary call the
+        // executor already dispatches, so the spelling is a parser concern
+        // and nothing downstream has to know about it.
+        if name.eq_ignore_ascii_case("extract") {
+            return self.parse_extract();
+        }
+        if name.eq_ignore_ascii_case("substring") {
+            return self.parse_substring();
+        }
+
         self.expect_token(&Token::LParen)?;
 
         let distinct = self.consume_keyword(Keyword::Distinct)?;
@@ -2792,6 +2880,65 @@ impl<'a> Parser<'a> {
         }
 
         Ok(func_expr)
+    }
+
+    /// `EXTRACT(field FROM source)`, desugared to `extract('field', source)`.
+    ///
+    /// The field is a bare word rather than a string in the standard
+    /// spelling, and several of the field names are keywords in their own
+    /// right, so it is read as either and lowered to a string literal.
+    fn parse_extract(&mut self) -> Result<Expr> {
+        self.expect_token(&Token::LParen)?;
+        let field = match &self.current.token {
+            Token::Ident(name) => name.clone(),
+            Token::Keyword(k) => keyword_to_ident_str(*k)
+                .map(|s| s.to_string())
+                .ok_or_else(|| self.error("Expected a field name after EXTRACT("))?,
+            Token::String(s) => s.clone(),
+            _ => return Err(self.error("Expected a field name after EXTRACT(")),
+        };
+        self.advance()?;
+        self.expect_keyword(Keyword::From)?;
+        let source = self.parse_expr()?;
+        self.expect_token(&Token::RParen)?;
+        Ok(Expr::Function {
+            name: "extract".to_string(),
+            args: vec![
+                FunctionArg::Unnamed(Expr::Literal(LiteralValue::String(field.to_lowercase()))),
+                FunctionArg::Unnamed(source),
+            ],
+            distinct: false,
+        })
+    }
+
+    /// `SUBSTRING(source FROM start [FOR length])` and the equivalent
+    /// `SUBSTRING(source, start [, length])`, both desugared to the same
+    /// positional call.
+    ///
+    /// Which spelling is in use is decided after the first argument rather
+    /// than by looking ahead, because the source can be any expression and a
+    /// lookahead would have to know where it ends.
+    fn parse_substring(&mut self) -> Result<Expr> {
+        self.expect_token(&Token::LParen)?;
+        let source = self.parse_expr()?;
+        let mut args = vec![FunctionArg::Unnamed(source)];
+        if self.consume_keyword(Keyword::From)? {
+            args.push(FunctionArg::Unnamed(self.parse_expr()?));
+            if self.consume_keyword(Keyword::For)? {
+                args.push(FunctionArg::Unnamed(self.parse_expr()?));
+            }
+        } else {
+            while self.at_token(&Token::Comma) {
+                self.advance()?;
+                args.push(FunctionArg::Unnamed(self.parse_expr()?));
+            }
+        }
+        self.expect_token(&Token::RParen)?;
+        Ok(Expr::Function {
+            name: "substring".to_string(),
+            args,
+            distinct: false,
+        })
     }
 
     fn parse_function_arg(&mut self) -> Result<FunctionArg> {
@@ -5837,9 +5984,10 @@ impl<'a> Parser<'a> {
     /// INTO <sink-expr> [WRITE MODE APPEND | UPSERT] [MODE ...]`.
     /// The inner SELECT is parsed by the shared `parse_select_body` path so
     /// it supports every grammar the binder can handle. The binder enforces
-    /// the single-table-FROM restriction. Inline file or cloud URIs in the
-    /// FROM clause are not yet wired into this grammar; named sources only.
-    /// The sink can be either a named table or an inline file or cloud URI.
+    /// the single-table-FROM restriction. Either end can be a named catalog
+    /// object or an inline file or cloud URI: the FROM clause reads one
+    /// through `parse_external_inline_ref` and the INTO clause through
+    /// `parse_streaming_sink_ref`.
     fn streaming_event_time_err(&self) -> ZyronError {
         self.error(
             "streaming temporal JOIN AS OF expression must be a column reference like o.event_time",
@@ -6129,6 +6277,58 @@ impl<'a> Parser<'a> {
             let name = self.parse_ident()?;
             Ok(StreamingSinkRef::Named(name))
         }
+    }
+
+    /// Parses an inline external source in a FROM clause:
+    /// `<BACKEND> '<uri>' FORMAT <fmt> [OPTIONS (...)] [COLUMNS (...)]
+    /// [[AS] alias]`.
+    ///
+    /// OPTIONS and COLUMNS are read in a loop so their order does not matter,
+    /// matching how CREATE EXTERNAL SOURCE reads the same two clauses. The
+    /// ZYRON backend speaks the wire protocol rather than a file format, so
+    /// FORMAT is optional there and required everywhere else.
+    fn parse_external_inline_ref(&mut self) -> Result<TableRef> {
+        let backend = self.parse_external_backend()?;
+        let uri = self.parse_string_literal()?;
+        let format = if backend == ExternalBackendKind::Zyron {
+            if self.consume_keyword(Keyword::Format)? {
+                self.parse_external_format()?
+            } else {
+                ExternalFormatKind::Json
+            }
+        } else {
+            self.expect_keyword(Keyword::Format)?;
+            self.parse_external_format()?
+        };
+
+        let mut options: Vec<(String, String)> = Vec::new();
+        let mut columns: Vec<(String, DataType)> = Vec::new();
+        loop {
+            if self.consume_keyword(Keyword::Options)? {
+                options = self.parse_kv_options()?;
+            } else if self.consume_keyword(Keyword::Columns)? {
+                columns = self.parse_external_columns_clause()?;
+            } else {
+                break;
+            }
+        }
+
+        let alias = if self.consume_keyword(Keyword::As)? {
+            Some(self.parse_ident()?)
+        } else if matches!(&self.current.token, Token::Ident(_)) && !self.is_clause_keyword() {
+            Some(self.parse_ident()?)
+        } else {
+            None
+        };
+
+        Ok(TableRef::ExternalInline(Box::new(ExternalInlineRef {
+            backend,
+            uri,
+            format,
+            options,
+            columns,
+            alias,
+        })))
     }
 
     /// Looks for a backend keyword at the current position and consumes it.
@@ -12421,7 +12621,11 @@ mod tests {
     #[test]
     fn test_an_alias_before_a_qualifier_is_decided_by_the_token_after_it() {
         let cases: [(&str, Option<&str>, bool); 8] = [
-            ("SELECT * FROM t a AS OF TIMESTAMP '2024-01-01'", Some("a"), true),
+            (
+                "SELECT * FROM t a AS OF TIMESTAMP '2024-01-01'",
+                Some("a"),
+                true,
+            ),
             ("SELECT * FROM t AS a", Some("a"), false),
             ("SELECT * FROM t a", Some("a"), false),
             ("SELECT * FROM t a IN BRANCH 'work'", Some("a"), true),

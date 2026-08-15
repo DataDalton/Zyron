@@ -238,11 +238,10 @@ async fn test_a_vector_of_the_wrong_dimension_is_refused() {
     .await
     .expect("create table");
 
-    let err =
-        common::exec_dml_result(&server, "INSERT INTO dimcheck VALUES (1, ARRAY[1.0, 2.0])")
-            .await
-            .expect_err("a two-component vector does not fit a three-component column")
-            .to_string();
+    let err = common::exec_dml_result(&server, "INSERT INTO dimcheck VALUES (1, ARRAY[1.0, 2.0])")
+        .await
+        .expect_err("a two-component vector does not fit a three-component column")
+        .to_string();
     assert!(
         err.contains("3 components") && err.contains("has 2"),
         "the error should name both lengths: {err}"
@@ -288,9 +287,12 @@ async fn test_match_under_time_travel_leaves_the_index_for_the_scan() {
 
     // The plan for a current read takes the index; the plan for a version
     // read takes the storage scan and evaluates the predicate row by row
-    let current = plan_for(&server, "SELECT id FROM tdocs WHERE MATCH(body) AGAINST('marker')")
-        .await
-        .expect("plan a current read");
+    let current = plan_for(
+        &server,
+        "SELECT id FROM tdocs WHERE MATCH(body) AGAINST('marker')",
+    )
+    .await
+    .expect("plan a current read");
     assert!(
         format!("{current:?}").contains("FulltextScan"),
         "a current read should take the index"

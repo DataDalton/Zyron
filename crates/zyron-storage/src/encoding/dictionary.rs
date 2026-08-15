@@ -744,10 +744,19 @@ mod tests {
         );
 
         // Boundaries, including the empty and the whole-column range
-        assert!(enc.decode_range(&encoded, rows, 0, 7, 7).unwrap().is_empty());
+        assert!(
+            enc.decode_range(&encoded, rows, 0, 7, 7)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(enc.decode_range(&encoded, rows, 0, 0, rows).unwrap(), full);
-        let clamped = enc.decode_range(&encoded, rows, 0, rows - 1, rows + 50).unwrap();
-        assert_eq!(varlen_slice_rows(&clamped, 1).unwrap()[0], full_rows[rows - 1]);
+        let clamped = enc
+            .decode_range(&encoded, rows, 0, rows - 1, rows + 50)
+            .unwrap();
+        assert_eq!(
+            varlen_slice_rows(&clamped, 1).unwrap()[0],
+            full_rows[rows - 1]
+        );
     }
 
     #[test]

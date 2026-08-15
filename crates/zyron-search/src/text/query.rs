@@ -1,4 +1,4 @@
-﻿//! FTS query parser with Lucene-like syntax.
+//! FTS query parser with Lucene-like syntax.
 //!
 //! Parses search query strings into an FtsQuery tree that the inverted
 //! index can evaluate. Supports term, phrase, boolean, fuzzy, prefix,
@@ -312,10 +312,7 @@ fn proximity_within(words: &[String], terms: &[&str], distance: u32) -> bool {
         let mut lo = anchor;
         let mut hi = anchor;
         for other in &positions[1..] {
-            let Some(&nearest) = other
-                .iter()
-                .min_by_key(|&&p| p.abs_diff(anchor))
-            else {
+            let Some(&nearest) = other.iter().min_by_key(|&&p| p.abs_diff(anchor)) else {
                 return false;
             };
             lo = lo.min(nearest);

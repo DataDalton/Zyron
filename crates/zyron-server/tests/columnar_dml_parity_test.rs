@@ -80,14 +80,11 @@ async fn setup() -> Env {
 
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
-        .await
-        .unwrap(),
+            .await
+            .unwrap(),
     );
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
-    let wal = Arc::new(
-        WalWriter::new(zyron_bench_harness::wal_config(wal_dir))
-        .unwrap(),
-    );
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir)).unwrap());
     let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
     storage.init_cache().await.unwrap();
     let storage: Arc<dyn CatalogStorage> = Arc::new(storage);
@@ -1536,7 +1533,7 @@ async fn reindex_rebuild_covers_folded_rows() {
             name: c.name.clone(),
             type_id: c.type_id,
             nullable: c.nullable,
-            ts_precision: c.ts_precision,
+            fractional_digits: c.fractional_digits,
         })
         .collect();
     let mut op = zyron_executor::operator::column_scan::ColumnScanOperator::new_for_dml(
@@ -1553,7 +1550,7 @@ async fn reindex_rebuild_covers_folded_rows() {
             te.as_ref(),
             &eb.batch,
             &locs,
-            tag_col,
+            &[tag_col],
             &fresh,
         );
     }

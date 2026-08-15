@@ -1,4 +1,4 @@
-﻿//! Vectorized compute kernels for column operations.
+//! Vectorized compute kernels for column operations.
 //!
 //! Provides filter, comparison, arithmetic, boolean logic, sorting,
 //! and hashing operations on typed column vectors. All hot-path kernels
@@ -99,6 +99,15 @@ pub fn compare(left: &Column, right: &Column, op: CmpOp) -> Result<Column> {
         return Err(ZyronError::ExecutionError(
             "compare: column length mismatch".to_string(),
         ));
+    }
+
+    // A decimal's stored integer is the value times ten to its scale, so it
+    // only means the same thing as the other side once both sit on one
+    // scale. Comparing the raw integer against a plain number would read
+    // 10.50 as 1050 and make every row larger than any literal. The wider
+    // scale is used so neither side loses digits.
+    if let Some((l, r)) = align_decimal_operands(left, right)? {
+        return compare(&l, &r, op);
     }
 
     // Typed fast paths: direct array comparison without ScalarValue.
@@ -263,12 +272,91 @@ pub enum ArithOp {
 
 /// Applies an arithmetic operation element-wise on two columns.
 /// Uses typed fast paths for Int64 and Float64.
+/// Arithmetic on two decimals already sharing a scale.
+///
+/// Addition and subtraction keep the scale. A product of two values at scale
+/// `s` lands at scale `2s`, and a quotient at scale zero, so each is brought
+/// back to `s`, which keeps the result in the same units as its operands
+/// rather than silently changing where the point sits.
+fn decimal_arithmetic(left: &Column, right: &Column, scale: u8, op: ArithOp) -> Result<Column> {
+    let (ColumnData::Int128(l), ColumnData::Int128(r)) = (&left.data, &right.data) else {
+        return Err(ZyronError::ExecutionError(
+            "decimal arithmetic needs two scaled operands".to_string(),
+        ));
+    };
+    let len = left.len();
+    let factor = zyron_common::decimal::scale_factor(scale)?;
+    let mut out: Vec<i128> = Vec::with_capacity(len);
+    let mut nulls = NullBitmap::none(len);
+    for i in 0..len {
+        if left.is_null(i) || right.is_null(i) {
+            nulls.set_null(i);
+            out.push(0);
+            continue;
+        }
+        let (a, b) = (l[i], r[i]);
+        let value = match op {
+            ArithOp::Add => a.checked_add(b),
+            ArithOp::Sub => a.checked_sub(b),
+            // The product carries both scales, so it is divided back down
+            ArithOp::Mul => a
+                .checked_mul(b)
+                .map(|p| zyron_common::rescale(p, scale.saturating_mul(2).min(38), scale).ok())
+                .and_then(|v| v)
+                .or_else(|| a.checked_mul(b).and_then(|p| p.checked_div(factor))),
+            // A quotient of two same-scale values has no scale, so the
+            // dividend is raised first to land the result back on this one
+            ArithOp::Div => {
+                if b == 0 {
+                    nulls.set_null(i);
+                    out.push(0);
+                    continue;
+                }
+                a.checked_mul(factor).and_then(|n| n.checked_div(b))
+            }
+            ArithOp::Mod => {
+                if b == 0 {
+                    nulls.set_null(i);
+                    out.push(0);
+                    continue;
+                }
+                a.checked_rem(b)
+            }
+        };
+        match value {
+            Some(v) => out.push(v),
+            None => {
+                return Err(ZyronError::ExecutionError(
+                    "decimal arithmetic overflowed".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(Column::with_nulls_ts(
+        ColumnData::Int128(out),
+        nulls,
+        TypeId::Decimal,
+        Some(scale),
+    ))
+}
+
 pub fn arithmetic(left: &Column, right: &Column, op: ArithOp) -> Result<Column> {
     let len = left.len();
     if len != right.len() {
         return Err(ZyronError::ExecutionError(
             "arithmetic: column length mismatch".to_string(),
         ));
+    }
+
+    // A decimal keeps its own units through arithmetic. Falling into the
+    // generic numeric path would read its scaled integer as a plain number
+    if left.type_id == TypeId::Decimal || right.type_id == TypeId::Decimal {
+        let (l, r) = match align_decimal_operands(left, right)? {
+            Some(pair) => pair,
+            None => (left.clone(), right.clone()),
+        };
+        let scale = l.fractional_digits.unwrap_or(0);
+        return decimal_arithmetic(&l, &r, scale, op);
     }
 
     // Int64 fast path.
@@ -804,12 +892,119 @@ pub fn scale_us_to_ps(col: &Column, ps_precision: Option<u8>) -> Result<Column> 
     ))
 }
 
+/// Puts two operands on one decimal scale when either is a decimal.
+///
+/// Returns None when neither side is one, which is the common case and costs
+/// two type comparisons. Returns None too when both already share a scale,
+/// so a column compared against another of its own type converts nothing.
+///
+/// The wider of the two scales wins, so the side with fewer digits is padded
+/// rather than the side with more being rounded away.
+pub fn align_decimal_operands(left: &Column, right: &Column) -> Result<Option<(Column, Column)>> {
+    let left_decimal = left.type_id == TypeId::Decimal;
+    let right_decimal = right.type_id == TypeId::Decimal;
+    if !left_decimal && !right_decimal {
+        return Ok(None);
+    }
+    let left_scale = left.fractional_digits.unwrap_or(0);
+    let right_scale = right.fractional_digits.unwrap_or(0);
+    if left_decimal && right_decimal && left_scale == right_scale {
+        return Ok(None);
+    }
+    let target = if left_decimal && right_decimal {
+        left_scale.max(right_scale)
+    } else if left_decimal {
+        left_scale
+    } else {
+        right_scale
+    };
+    Ok(Some((
+        cast_column_to_decimal(left, target)?,
+        cast_column_to_decimal(right, target)?,
+    )))
+}
+
+/// Converts a column to DECIMAL at a known scale.
+///
+/// The stored form is an i128 holding the value multiplied by ten to the
+/// scale, so this is the only conversion to a decimal that can be complete.
+/// A column already at that scale is returned unchanged, and one at another
+/// scale is moved onto this one.
+pub fn cast_column_to_decimal(col: &Column, scale: u8) -> Result<Column> {
+    let len = col.len();
+    let mut out: Vec<i128> = Vec::with_capacity(len);
+    let source_scale = if col.type_id == TypeId::Decimal {
+        Some(col.fractional_digits.unwrap_or(0))
+    } else {
+        None
+    };
+    for i in 0..len {
+        if col.is_null(i) {
+            out.push(0);
+            continue;
+        }
+        let value = match (&col.data, source_scale) {
+            // Already a decimal, so only the scale changes
+            (ColumnData::Int128(v), Some(from)) => zyron_common::rescale(v[i], from, scale)?,
+            _ => match col.data.get_scalar(i) {
+                ScalarValue::Utf8(ref s) => zyron_common::parse_decimal(s, scale)?,
+                ScalarValue::Float32(f) => {
+                    crate::operator::modify::decimal_from_float(f as f64, scale)?
+                }
+                ScalarValue::Float64(f) => crate::operator::modify::decimal_from_float(f, scale)?,
+                other => {
+                    let whole = match other {
+                        ScalarValue::Int8(v) => v as i128,
+                        ScalarValue::Int16(v) => v as i128,
+                        ScalarValue::Int32(v) => v as i128,
+                        ScalarValue::Int64(v) => v as i128,
+                        ScalarValue::Int128(v) => v,
+                        ScalarValue::UInt8(v) => v as i128,
+                        ScalarValue::UInt16(v) => v as i128,
+                        ScalarValue::UInt32(v) => v as i128,
+                        ScalarValue::UInt64(v) => v as i128,
+                        ScalarValue::Boolean(b) => i128::from(b),
+                        ref bad => {
+                            return Err(ZyronError::ExecutionError(format!(
+                                "cannot cast {bad} to DECIMAL"
+                            )));
+                        }
+                    };
+                    whole
+                        .checked_mul(zyron_common::decimal::scale_factor(scale)?)
+                        .ok_or_else(|| {
+                            ZyronError::ExecutionError(format!(
+                                "value {whole} overflows a decimal at scale {scale}"
+                            ))
+                        })?
+                }
+            },
+        };
+        out.push(value);
+    }
+    Ok(Column::with_nulls_ts(
+        ColumnData::Int128(out),
+        col.nulls.clone(),
+        TypeId::Decimal,
+        Some(scale),
+    ))
+}
+
 pub fn cast_column(col: &Column, target: TypeId) -> Result<Column> {
     // An array and a vector are both byte-backed, so a per-scalar cast cannot
     // tell them apart. These conversions read the source column's type as
     // well as the target and are resolved before that point
     if let Some(converted) = cast_array_column(col, target)? {
         return Ok(converted);
+    }
+    // A decimal's value is an integer scaled by digits the target type alone
+    // does not carry, so there is nothing here to cast onto. The column is
+    // handed back untouched for the caller that knows the scale to convert,
+    // which is the write path against a declared column and the explicit
+    // CAST that names its own precision. Casting blind would push a value of
+    // one variant into an i128 buffer and store a zero.
+    if target == TypeId::Decimal && col.type_id != TypeId::Decimal {
+        return Ok(col.clone());
     }
     let len = col.len();
     let mut data = ColumnData::with_capacity(target, len);
@@ -862,8 +1057,7 @@ fn cast_array_column(col: &Column, target: TypeId) -> Result<Option<Column>> {
         // A vector holds packed f32 with no header, so converting it to an
         // array is a re-encode rather than a reinterpretation
         if from_vector {
-            let payloads: Vec<Option<&[u8]>> =
-                bytes.chunks_exact(4).map(|c| Some(c)).collect();
+            let payloads: Vec<Option<&[u8]>> = bytes.chunks_exact(4).map(|c| Some(c)).collect();
             let encoded = zyron_common::array_value::encode(TypeId::Float32, &payloads);
             data.push_scalar(&ScalarValue::Binary(encoded));
             continue;
@@ -937,6 +1131,11 @@ pub fn cast_scalar(value: &ScalarValue, target: TypeId) -> Result<ScalarValue> {
             ScalarValue::Int16(v) => Ok(ScalarValue::Int64(*v as i64)),
             ScalarValue::Int32(v) => Ok(ScalarValue::Int64(*v as i64)),
             ScalarValue::Int64(v) => Ok(ScalarValue::Int64(*v)),
+            // Narrowing from the 128-bit width, refused when it would not fit
+            // rather than wrapping into a different number
+            ScalarValue::Int128(v) => i64::try_from(*v).map(ScalarValue::Int64).map_err(|_| {
+                ZyronError::ExecutionError(format!("value {v} is out of range for Int64"))
+            }),
             ScalarValue::UInt8(v) => Ok(ScalarValue::Int64(*v as i64)),
             ScalarValue::UInt16(v) => Ok(ScalarValue::Int64(*v as i64)),
             ScalarValue::UInt32(v) => Ok(ScalarValue::Int64(*v as i64)),
@@ -2400,7 +2599,7 @@ mod ps_tests {
             _ => panic!("expected Int128"),
         }
         assert_eq!(ps.type_id, TypeId::TimestampTz);
-        assert_eq!(ps.ts_precision, Some(9));
+        assert_eq!(ps.fractional_digits, Some(9));
         // Already-ps passes through unchanged.
         let again = scale_us_to_ps(&ps, Some(9)).unwrap();
         match (&ps.data, &again.data) {

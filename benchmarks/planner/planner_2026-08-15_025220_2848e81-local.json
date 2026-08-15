@@ -1,0 +1,68 @@
+{
+  "id": "2026-08-15_025220_2848e81-local",
+  "date": "2026-08-15 02:52:27Z",
+  "ts": 1786762347,
+  "commit": "2848e81-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "debug",
+  "tests": {
+    "Planner Performance": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 10.80 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 10.80 },
+      "Binding latency (us)": {
+        "average": 22.004400,
+        "runs": [22.68, 21.71, 22.30, 21.65, 21.69],
+        "target": 2.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Logical plan latency (us)": {
+        "average": 2.249840,
+        "runs": [2.23, 2.47, 1.80, 2.39, 2.36],
+        "target": 5.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Optimization latency (us)": {
+        "average": 45.002200,
+        "runs": [44.35, 44.90, 45.38, 45.31, 45.08],
+        "target": 25.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Physical plan latency (us)": {
+        "average": 10.699420,
+        "runs": [11.46, 11.22, 9.99, 10.22, 10.61],
+        "target": 10.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Join reorder latency (us, 5 tables)": {
+        "average": 135.203600,
+        "runs": [139.55, 133.43, 134.96, 133.79, 134.30],
+        "target": 100.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Index selection latency (us)": {
+        "average": 0.010000,
+        "runs": [0.01, 0.01, 0.01, 0.01, 0.01],
+        "target": 5.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Full pipeline latency (us)": {
+        "average": 157.610480,
+        "runs": [157.76, 157.13, 158.32, 158.08, 156.76],
+        "target": 50.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    }
+  }
+}

@@ -96,9 +96,8 @@ impl ZyronConfig {
                 e
             ))
         })?;
-        let overrides: toml::Table = toml::from_str(&contents).map_err(|e| {
-            ZyronError::Internal(format!("Failed to parse zyron.auto.conf: {}", e))
-        })?;
+        let overrides: toml::Table = toml::from_str(&contents)
+            .map_err(|e| ZyronError::Internal(format!("Failed to parse zyron.auto.conf: {}", e)))?;
         self.apply_overrides_from_table(&overrides);
         Ok(())
     }

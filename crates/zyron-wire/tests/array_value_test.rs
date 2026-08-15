@@ -42,13 +42,7 @@ async fn test_array_column_round_trips_through_storage() {
     exec_dml(&server, "INSERT INTO arr VALUES (4, NULL)").await;
 
     assert_eq!(
-        texts(
-            &query_values(
-                &server,
-                "SELECT CAST(nums AS TEXT) FROM arr ORDER BY id",
-            )
-            .await
-        ),
+        texts(&query_values(&server, "SELECT CAST(nums AS TEXT) FROM arr ORDER BY id",).await),
         vec![
             "{10,20,30}".to_string(),
             "{}".to_string(),

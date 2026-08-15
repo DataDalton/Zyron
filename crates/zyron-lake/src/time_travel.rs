@@ -16,9 +16,9 @@ use std::io::Read;
 
 use zyron_common::ZyronError;
 
-use crate::manifest::{ManifestFile, MANIFEST_MAGIC};
-use crate::paths::{parse_version_file_name, VersionFileKind};
-use crate::transaction_log::{read_commit_header, TransactionLog};
+use crate::manifest::{MANIFEST_MAGIC, ManifestFile};
+use crate::paths::{VersionFileKind, parse_version_file_name};
+use crate::transaction_log::{TransactionLog, read_commit_header};
 
 /// What an AS OF clause resolved to at the syntax layer
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,7 +128,7 @@ mod tests {
                 name: "id".into(),
                 type_id: TypeId::Int64,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
                 tz_offset_secs: None,
                 max_length: None,
                 default_expr: None,

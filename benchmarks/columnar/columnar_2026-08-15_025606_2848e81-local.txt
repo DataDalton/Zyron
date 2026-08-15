@@ -1,0 +1,164 @@
+# suite:   columnar
+# run:     2026-08-15_025606_2848e81-local
+# profile: debug
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+# NOT A BENCHMARK RESULT. This is an unoptimized build, so every
+# timing below is meaningless: an unoptimized build is not slower
+# by a constant factor, so these numbers do not even rank correctly
+# against each other. Counted quantities (rates, file and row
+# counts, PASS/FAIL on an exact bound) are valid and are the only
+# thing worth reading here. For real numbers: cargo test --release
+#
+
+=== Bloom Filter ===
+  Zero false negatives (10K probes): PASS
+  False positive rate: 0.0347 (3468/100000)
+  FP rate < 8%: PASS
+  Serialization round-trip: PASS
+  Bloom skip rate: 100.0% (99/99 files skipped)
+  Low-cardinality segment: no bloom filter (cardinality=10): PASS
+  High-cardinality segment: bloom filter present (cardinality=65): PASS
+  Bloom probe latency (ns) [NOT MEASURED, unoptimized build]:
+    Runs: [59, 58, 56, 56, 56]
+    Average: 57 (target <= 30, not applied)
+    Re-run with --release for a number worth comparing
+  Bloom skip rate (%) [NOT MEASURED, unoptimized build]: 100 (target >= 99, not applied)
+
+  Bloom filter: ALL PASS
+
+=== Column Segment Format ===
+Rows: 10000, Columns: 5
+  Compaction result: 10000 rows, 5 cols, 114808 bytes
+  File header: PASS
+  Column 0 (Int32): encoding=FastLanes, encoded_bytes=20, sorted=true
+  Column 1 (Float64): encoding=Alp, encoded_bytes=17600, sorted=true
+  Column 2 (Int32): encoding=Dictionary, encoded_bytes=6338, sorted=false
+  Column 3 (Boolean): encoding=BitPack, encoded_bytes=1263, sorted=false
+  Column 4 (Int32): encoding=Constant, encoded_bytes=8, sorted=true
+  .zyr scan throughput (GB/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [1, 1, 1, 1, 1]
+    Average: 1 (target >= 1, not applied)
+    Re-run with --release for a number worth comparing
+
+  Column segment format: ALL PASS
+
+=== Compaction Pipeline ===
+Rows: 100000
+  First compaction: 100000 rows, 393296 bytes
+  Compaction throughput (rows/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [491,575, 487,149, 492,659, 489,338, 484,070]
+    Average: 488,958 (target >= 1,000,000, not applied)
+    Re-run with --release for a number worth comparing
+  Incremental compaction: 50000 rows, 229456 bytes
+
+  Compaction pipeline: ALL PASS
+
+=== Encoded Bits/Value: Regular vs Irregular ===
+Rows: 100000
+  Regular series:   0.0016 bits/value (encoded 20 bytes)
+  Irregular series: 64.0000 bits/value (encoded 800000 bytes)
+  Regular/irregular ratio: 0.00003
+  Irregular series (bits/value) [NOT MEASURED, unoptimized build]:
+    Runs: [64, 64, 64, 64, 64]
+    Average: 64 (target <= 64, not applied)
+    Re-run with --release for a number worth comparing
+
+  Encoded bits/value: ALL PASS
+
+=== HTAP Hybrid Scan ===
+Columnar: 50000 rows, Heap: 10000 rows, Total: 60000
+  Hybrid scan correctness (60000 rows, sorted, no duplicates): PASS
+  Value correctness: PASS
+  Hybrid scan overhead (%) [NOT MEASURED, unoptimized build]:
+    Runs: [5, 2, 2, 2, 2]
+    Average: 3 (target <= 5, not applied)
+    Re-run with --release for a number worth comparing
+
+  HTAP hybrid scan: ALL PASS
+
+=== Metadata Aggregate vs Scan Aggregate ===
+Rows: 100000
+  Scan-aggregate avg: 1430900 ns, Metadata-aggregate avg: 31114 ns (50 iters)
+  Metadata vs scan speedup (x) [NOT MEASURED, unoptimized build]:
+    Runs: [46]
+    Average: 46 (target >= 1, not applied)
+    Re-run with --release for a number worth comparing
+
+  Metadata aggregate vs scan: ALL PASS
+
+=== Micro-Batch Zone Map ===
+  Zone map count: 100 (expected 100): PASS
+  Narrow range [5000,5999]: 1 matching zones, skip rate 99.0%
+  Wide range [5000,15999]: 11 matching zones, skip rate 89.0%
+  Out-of-range [200K,300K]: 0 matching zones, skip rate 100%: PASS
+  Zone map serialization round-trip: PASS
+  Narrow range batch skip rate (%) [NOT MEASURED, unoptimized build]: 99 (target >= 95, not applied)
+  Zone map overhead: 48.47% of encoded data (6400 / 13204 bytes)
+
+  Micro-batch zone map: ALL PASS
+
+=== Parallel Column Encoding ===
+Rows: 100000, Columns: 8
+  Sequential: 100000 rows, 8 cols, 1638580 bytes
+  Parallel: 100000 rows, 8 cols, 1638580 bytes
+  Parallel correctness (all columns decodable): PASS
+  Avg sequential: 0.956s, avg at the shipped 4 threads: 0.246s, avg parallel: 0.246s
+  Parallel speedup (x) [NOT MEASURED, unoptimized build]:
+    Runs: [4, 4, 4, 4, 4]
+    Average: 4 (target >= 3, not applied)
+    Re-run with --release for a number worth comparing
+  Shipped thread count speedup (x) [NOT MEASURED, unoptimized build]:
+    Runs: [4, 4, 4, 4, 4]
+    Average: 4 (target >= 3, not applied)
+    Re-run with --release for a number worth comparing
+  Sequential compaction (rows/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [104,355, 104,679, 104,215, 106,003, 103,697]
+    Average: 104,590 (target >= 1,000,000, not applied)
+    Re-run with --release for a number worth comparing
+
+  Parallel column encoding: ALL PASS
+
+=== Segment Cache ===
+  Cache insert + get (5 keys): PASS
+  Stats (hit_count=5, used=51200): PASS
+  Eviction on overflow: PASS
+  Eviction count: 1 (expected >= 1): PASS
+  Invalidate: PASS
+  Clear (used_bytes=0): PASS
+  Cache get (ns/lookup) [NOT MEASURED, unoptimized build]: 473 (target <= 100, not applied)
+
+  Segment cache: ALL PASS
+
+=== Sorted Segment ===
+Files: 3, Rows per file: 10000
+  SortedSegmentIndex: 3 files, 30000 total rows: PASS
+  find_point(5000): 1 file: PASS
+  find_point(15000): 1 file: PASS
+  find_point(99999): 0 files: PASS
+  binary_search(5000): found at index 5000: PASS
+  binary_search(99999): None: PASS
+  find_range(5000,15000): 2 files: PASS
+  Merge scan: 30000 rows in sorted order: PASS
+  Sorted PK lookup (ns) [NOT MEASURED, unoptimized build]:
+    Runs: [366, 366, 366, 365, 367]
+    Average: 366 (target <= 500, not applied)
+    Re-run with --release for a number worth comparing
+  Sorted PK range (keys/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [13,071,895, 13,200,739, 13,926,930, 13,867,061, 14,046,259]
+    Average: 13,622,577 (target >= 80,000,000, not applied)
+    Re-run with --release for a number worth comparing
+
+  Sorted segment: ALL PASS
+
+=== Transaction-Aware Pruning ===
+  Snapshot txn_id=350
+  Fully visible files: [0, 1] (expected [0, 1])
+  Partially visible: [2] (expected [2])
+  Pruned: [3, 4] (expected [3, 4])
+  Pruning correctness: PASS
+  xmin range round-trip: PASS
+  Pruning decision (ns/file) [NOT MEASURED, unoptimized build]: 4 (target <= 10, not applied)
+
+  Transaction-aware pruning: ALL PASS

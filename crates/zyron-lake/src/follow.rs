@@ -25,7 +25,7 @@ use std::path::Path;
 
 use zyron_common::ZyronError;
 
-use crate::paths::{parse_version_file_name, LakePaths, VersionFileKind};
+use crate::paths::{LakePaths, VersionFileKind, parse_version_file_name};
 use crate::transaction_log::{
     CommitAttempt, LogEntry, OperationKind, TransactionLog, VersionFileData,
 };
@@ -325,12 +325,9 @@ pub fn decode_log_rows(
         if *version != expected {
             break;
         }
-        let bytes = decode_hex(payload).ok_or_else(|| {
-            ZyronError::ManifestCorrupted {
-                path: format!("version {}", version),
-                reason: "payload is not hex, so the transfer was truncated or mangled"
-                    .to_string(),
-            }
+        let bytes = decode_hex(payload).ok_or_else(|| ZyronError::ManifestCorrupted {
+            path: format!("version {}", version),
+            reason: "payload is not hex, so the transfer was truncated or mangled".to_string(),
         })?;
         let data = VersionFileData::decode(&bytes, &format!("version {}", version))?;
         versions.push(FollowedVersion {
@@ -363,7 +360,7 @@ mod tests {
                 name: "id".into(),
                 type_id: TypeId::Int64,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
                 tz_offset_secs: None,
                 max_length: None,
                 default_expr: None,
@@ -461,9 +458,14 @@ mod tests {
         let leader_paths = LakePaths::new(dir.path(), 3);
         let mut create = attempt();
         create.operation = OperationKind::SchemaChange;
-        let leader =
-            TransactionLog::create(leader_paths.clone(), create, &schema(), None, &BTreeMap::new())
-                .expect("leader");
+        let leader = TransactionLog::create(
+            leader_paths.clone(),
+            create,
+            &schema(),
+            None,
+            &BTreeMap::new(),
+        )
+        .expect("leader");
         append_rows(&leader, attempt(), 3, &batch(&[1, 2])).expect("append");
         append_rows(&leader, attempt(), 3, &batch(&[300, 400])).expect("append");
         delete_where(
@@ -526,9 +528,14 @@ mod tests {
         let leader_paths = LakePaths::new(dir.path(), 5);
         let mut create = attempt();
         create.operation = OperationKind::SchemaChange;
-        let leader =
-            TransactionLog::create(leader_paths.clone(), create, &schema(), None, &BTreeMap::new())
-                .expect("leader");
+        let leader = TransactionLog::create(
+            leader_paths.clone(),
+            create,
+            &schema(),
+            None,
+            &BTreeMap::new(),
+        )
+        .expect("leader");
         for id in 0..4i64 {
             append_rows(&leader, attempt(), 5, &batch(&[id])).expect("append");
         }
@@ -572,9 +579,14 @@ mod tests {
         let leader_paths = LakePaths::new(dir.path(), 9);
         let mut create = attempt();
         create.operation = OperationKind::SchemaChange;
-        let leader =
-            TransactionLog::create(leader_paths.clone(), create, &schema(), None, &BTreeMap::new())
-                .expect("leader");
+        let leader = TransactionLog::create(
+            leader_paths.clone(),
+            create,
+            &schema(),
+            None,
+            &BTreeMap::new(),
+        )
+        .expect("leader");
         leader.set_writer_identity(LEADER);
         append_rows(&leader, attempt(), 9, &batch(&[1, 2])).expect("leader claims and writes");
         append_rows(&leader, attempt(), 9, &batch(&[3, 4])).expect("leader writes again");
@@ -632,9 +644,14 @@ mod tests {
         let leader_paths = LakePaths::new(dir.path(), 7);
         let mut create = attempt();
         create.operation = OperationKind::SchemaChange;
-        let leader =
-            TransactionLog::create(leader_paths.clone(), create, &schema(), None, &BTreeMap::new())
-                .expect("leader");
+        let leader = TransactionLog::create(
+            leader_paths.clone(),
+            create,
+            &schema(),
+            None,
+            &BTreeMap::new(),
+        )
+        .expect("leader");
         let many: Vec<i64> = (0..2000).collect();
         append_rows(&leader, attempt(), 7, &batch(&many)).expect("append");
 

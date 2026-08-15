@@ -7,13 +7,13 @@
 use std::collections::BTreeMap;
 
 use zyron_common::TypeId;
-use zyron_lake::{
-    append_rows, covers_table, delete_where, group_by_partition, optimize, probe_equal,
-    update_where, vacuum_data_files, ColumnData, CommitAttempt, CompareOp, LakeFileReader,
-    LakePaths, LakePredicate, LakeSchema, LakeValue, OperationKind, TransactionLog,
-};
 use zyron_lake::operations::{create_index, drop_index, rebuild_indexes};
 use zyron_lake::schema::LakeColumn;
+use zyron_lake::{
+    ColumnData, CommitAttempt, CompareOp, LakeFileReader, LakePaths, LakePredicate, LakeSchema,
+    LakeValue, OperationKind, TransactionLog, append_rows, covers_table, delete_where,
+    group_by_partition, optimize, probe_equal, update_where, vacuum_data_files,
+};
 
 const TABLE_ID: u32 = 42;
 
@@ -26,7 +26,7 @@ fn schema() -> LakeSchema {
                 name: "id".into(),
                 type_id: TypeId::Int64,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
                 tz_offset_secs: None,
                 max_length: None,
                 default_expr: None,
@@ -36,7 +36,7 @@ fn schema() -> LakeSchema {
                 name: "email".into(),
                 type_id: TypeId::Varchar,
                 nullable: true,
-                ts_precision: None,
+                fractional_digits: None,
                 tz_offset_secs: None,
                 max_length: None,
                 default_expr: None,
@@ -131,8 +131,7 @@ fn probe_rows(log: &TransactionLog, email: &[u8]) -> Vec<(i64, String)> {
         covers_table(&manifest, spec.index_id),
         "index does not cover the table, a probe would answer short"
     );
-    let (addresses, _) =
-        probe_equal(log.paths(), &manifest, spec, &[Some(email)]).expect("probe");
+    let (addresses, _) = probe_equal(log.paths(), &manifest, spec, &[Some(email)]).expect("probe");
 
     let mut out = Vec::new();
     for (partition_id, ordinals) in group_by_partition(&addresses) {
@@ -167,15 +166,8 @@ fn probe_rows(log: &TransactionLog, email: &[u8]) -> Vec<(i64, String)> {
 }
 
 fn create_email_index(log: &TransactionLog) {
-    create_index(
-        log,
-        attempt(300),
-        TABLE_ID as u64,
-        "ix_email",
-        &[1],
-        false,
-    )
-    .expect("create index");
+    create_index(log, attempt(300), TABLE_ID as u64, "ix_email", &[1], false)
+        .expect("create index");
 }
 
 #[test]
@@ -186,8 +178,13 @@ fn test_a_probe_returns_exactly_what_a_scan_would() {
         .into_iter()
         .enumerate()
     {
-        append_rows(&log, attempt(200 + n as i64), TABLE_ID as u64, &rows(&chunk))
-            .expect("append");
+        append_rows(
+            &log,
+            attempt(200 + n as i64),
+            TABLE_ID as u64,
+            &rows(&chunk),
+        )
+        .expect("append");
     }
     create_email_index(&log);
 
@@ -196,7 +193,8 @@ fn test_a_probe_returns_exactly_what_a_scan_would() {
         assert_eq!(
             probe_rows(&log, &email_of(id)),
             vec![(id, format!("user{}@example.com", id))],
-            "probing user{}", id
+            "probing user{}",
+            id
         );
     }
     // A key the table does not hold resolves to nothing
@@ -379,21 +377,18 @@ fn test_a_past_version_reads_the_index_that_version_had() {
     let old = log.manifest_at(at_two_rows).expect("old manifest");
     let spec = old.index_by_name("ix_email").expect("index");
     assert!(covers_table(&old, spec.index_id));
-    let (found, _) =
-        probe_equal(log.paths(), &old, spec, &[Some(&email_of(3))]).expect("probe");
+    let (found, _) = probe_equal(log.paths(), &old, spec, &[Some(&email_of(3))]).expect("probe");
     assert!(
         found.is_empty(),
         "row 3 did not exist at version {}",
         at_two_rows
     );
-    let (found, _) =
-        probe_equal(log.paths(), &old, spec, &[Some(&email_of(1))]).expect("probe");
+    let (found, _) = probe_equal(log.paths(), &old, spec, &[Some(&email_of(1))]).expect("probe");
     assert_eq!(found.len(), 1, "row 1 did exist");
 
     let new = log.manifest_at(at_four_rows).expect("new manifest");
     let spec = new.index_by_name("ix_email").expect("index");
-    let (found, _) =
-        probe_equal(log.paths(), &new, spec, &[Some(&email_of(3))]).expect("probe");
+    let (found, _) = probe_equal(log.paths(), &new, spec, &[Some(&email_of(3))]).expect("probe");
     assert_eq!(found.len(), 1, "row 3 exists at the newer version");
 }
 
@@ -427,16 +422,17 @@ fn test_probe_statistics_prove_the_index_pruned_rather_than_scanned() {
     let log = new_log(dir.path());
     // Several appends, so the index holds several files and a probe has to
     // choose between them
-    for (n, chunk) in [
-        vec![1i64, 2, 3],
-        vec![100, 101, 102],
-        vec![200, 201, 202],
-    ]
-    .into_iter()
-    .enumerate()
+    for (n, chunk) in [vec![1i64, 2, 3], vec![100, 101, 102], vec![200, 201, 202]]
+        .into_iter()
+        .enumerate()
     {
-        append_rows(&log, attempt(200 + n as i64), TABLE_ID as u64, &rows(&chunk))
-            .expect("append");
+        append_rows(
+            &log,
+            attempt(200 + n as i64),
+            TABLE_ID as u64,
+            &rows(&chunk),
+        )
+        .expect("append");
     }
     create_email_index(&log);
     // One more append after the build, so the index has a second file
@@ -499,7 +495,10 @@ fn test_a_large_index_splits_into_range_disjoint_files_and_a_probe_opens_one() {
         .iter()
         .filter_map(|f| {
             let stats = f.file.stats_for(0)?;
-            Some((text(stats.bounds.min.as_ref()?), text(stats.bounds.max.as_ref()?)))
+            Some((
+                text(stats.bounds.min.as_ref()?),
+                text(stats.bounds.max.as_ref()?),
+            ))
         })
         .collect();
     bounds.sort();
@@ -517,7 +516,8 @@ fn test_a_large_index_splits_into_range_disjoint_files_and_a_probe_opens_one() {
         probe_equal(log.paths(), &manifest, spec, &[Some(&email_of(12_345))]).expect("probe");
     assert_eq!(addresses.len(), 1);
     assert_eq!(
-        stats.files_opened, 1,
+        stats.files_opened,
+        1,
         "opened {} of {} index files for one key",
         stats.files_opened,
         files.len()
@@ -539,8 +539,7 @@ fn test_a_range_probe_returns_exactly_the_rows_in_the_range() {
     let ids: Vec<i64> = (0..600).collect();
     append_rows(&log, attempt(200), TABLE_ID as u64, &rows(&ids)).expect("append");
     // Index the integer key so the range has a numeric order to bound
-    create_index(&log, attempt(300), TABLE_ID as u64, "ix_id", &[0], false)
-        .expect("create index");
+    create_index(&log, attempt(300), TABLE_ID as u64, "ix_id", &[0], false).expect("create index");
 
     let manifest = log.latest_manifest().expect("manifest");
     let spec = manifest.index_by_name("ix_id").expect("index");
@@ -572,14 +571,9 @@ fn test_a_range_probe_returns_exactly_the_rows_in_the_range() {
     assert_eq!(exclusive.len(), 8);
 
     // An open upper side runs to the end of the index
-    let (open, _) = zyron_lake::probe_range(
-        log.paths(),
-        &manifest,
-        spec,
-        Some(&bound(590, true)),
-        None,
-    )
-    .expect("range probe");
+    let (open, _) =
+        zyron_lake::probe_range(log.paths(), &manifest, spec, Some(&bound(590, true)), None)
+            .expect("range probe");
     assert_eq!(open.len(), 10);
 
     // A range past every stored key selects nothing and opens no file
@@ -605,8 +599,13 @@ fn test_fragmented_index_runs_are_compacted_back_into_disjoint_ranges() {
     // Many small writes, each appending its own index file over an
     // overlapping key range, which is what stops the manifest pruning
     for i in 1..40i64 {
-        append_rows(&log, attempt(300 + i), TABLE_ID as u64, &rows(&[i * 7 % 97]))
-            .expect("append");
+        append_rows(
+            &log,
+            attempt(300 + i),
+            TABLE_ID as u64,
+            &rows(&[i * 7 % 97]),
+        )
+        .expect("append");
     }
     let before = log.latest_manifest().expect("manifest").index_files.len();
     assert!(before > 8, "the runs did not accumulate, got {}", before);
@@ -652,7 +651,10 @@ fn test_dropping_an_index_frees_its_files_and_stops_maintaining_it() {
     let log = new_log(dir.path());
     append_rows(&log, attempt(200), TABLE_ID as u64, &rows(&[1, 2, 3])).expect("append");
     create_email_index(&log);
-    assert_eq!(log.latest_manifest().expect("manifest").index_files.len(), 1);
+    assert_eq!(
+        log.latest_manifest().expect("manifest").index_files.len(),
+        1
+    );
 
     drop_index(
         &log,

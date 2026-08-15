@@ -472,6 +472,10 @@ async fn handle_alter_table(
     )?;
 
     let mut entry = (*table).clone();
+    // Index work follows the catalog update, so a failure to write the
+    // constraint leaves no tree behind it
+    let mut provision_indexes_after = false;
+    let mut drop_index_after: Option<String> = None;
 
     match &stmt.operation {
         Op::RenameTable { new_name } => {
@@ -526,6 +530,10 @@ async fn handle_alter_table(
             // Reject the constraint if any current row already violates it.
             validate_constraint_against_existing(&stmt.name, tc, server, schema_id).await?;
             entry.constraints.push(ce);
+            // Validating the existing rows settles the past. Ongoing
+            // enforcement needs the index, which is provisioned once the
+            // catalog carries the constraint
+            provision_indexes_after = true;
         }
         Op::DropConstraint { name, if_exists } => {
             let before = entry.constraints.len();
@@ -535,6 +543,7 @@ async fn handle_alter_table(
                     "constraint \"{name}\" does not exist"
                 ))));
             }
+            drop_index_after = Some(name.clone());
         }
         Op::AlterColumnSetNotNull { column } => {
             // SET NOT NULL does not change the tuple layout, so no heap rewrite
@@ -573,11 +582,19 @@ async fn handle_alter_table(
         }
     }
 
+    let table_id = entry.id;
     server
         .catalog
         .update_table(entry)
         .await
         .map_err(ProtocolError::Database)?;
+
+    if provision_indexes_after {
+        provision_constraint_indexes(server, schema_id, &stmt.name).await?;
+    }
+    if let Some(name) = drop_index_after {
+        drop_constraint_index(server, table_id, &name).await;
+    }
 
     Ok(DdlResult::Tag("ALTER TABLE".to_string()))
 }
@@ -598,7 +615,7 @@ async fn ensure_quarantine_table(
     let mut cols: Vec<(String, zyron_common::TypeId, bool, Option<u8>)> = table
         .columns
         .iter()
-        .map(|c| (c.name.clone(), c.type_id, true, c.ts_precision))
+        .map(|c| (c.name.clone(), c.type_id, true, c.fractional_digits))
         .collect();
     cols.push((
         "_expectation".to_string(),
@@ -820,7 +837,7 @@ async fn rewrite_table_columns(
             }
             let nullable = def.nullable.unwrap_or(true);
             let type_id = def.data_type.to_type_id();
-            let ts_precision = def.data_type.timestamp_precision();
+            let fractional_digits = def.data_type.timestamp_precision();
 
             // Resolve the backfill value once. A volatile default (now()) is
             // evaluated a single time for the rewrite, matching the semantics
@@ -839,7 +856,7 @@ async fn rewrite_table_columns(
             };
 
             for b in new_batches.iter_mut() {
-                let col = build_constant_column(type_id, ts_precision, &fill, b.num_rows);
+                let col = build_constant_column(type_id, fractional_digits, &fill, b.num_rows);
                 b.columns.push(col);
             }
 
@@ -858,7 +875,7 @@ async fn rewrite_table_columns(
                 nullable,
                 default_expr: def.default.as_ref().map(zyron_parser::expr_to_sql),
                 max_length: alter_extract_max_length(&def.data_type),
-                ts_precision,
+                fractional_digits,
                 tz_offset_secs: None,
                 element_type: None,
             });
@@ -927,7 +944,7 @@ async fn rewrite_table_columns(
             let col = &mut new_columns[pos];
             col.type_id = target;
             col.max_length = alter_extract_max_length(data_type);
-            col.ts_precision = data_type.timestamp_precision();
+            col.fractional_digits = data_type.timestamp_precision();
         }
         _ => {
             return Err(ProtocolError::Database(ZyronError::Internal(
@@ -1167,15 +1184,11 @@ async fn rewrite_table_columns(
 /// Extracts the max_length parameter from a sized data type, mirroring the
 /// catalog's create-table conversion so rewritten columns keep their width.
 fn alter_extract_max_length(dt: &zyron_parser::ast::DataType) -> Option<usize> {
-    use zyron_parser::ast::DataType;
-    match dt {
-        DataType::Char(n)
-        | DataType::Varchar(n)
-        | DataType::Binary(n)
-        | DataType::Varbinary(n)
-        | DataType::Vector(n) => *n,
-        _ => None,
-    }
+    // Same slot CREATE TABLE fills, so a column added by ALTER carries the
+    // same declared bound. Reading it here from a local copy of the rule is
+    // what let DECIMAL(p,s) reach this path with its precision dropped, and
+    // an unbounded decimal stores a value the declaration says cannot exist
+    dt.declared_max_length()
 }
 
 /// Decodes a spatial index parameter blob into (dims, srid). Layout is
@@ -1197,7 +1210,7 @@ fn decode_spatial_params(params: &Option<Vec<u8>>) -> (u8, u32) {
 /// picoseconds to match the physical buffer.
 fn build_constant_column(
     logical_type: zyron_common::TypeId,
-    ts_precision: Option<u8>,
+    fractional_digits: Option<u8>,
     fill: &zyron_executor::column::ScalarValue,
     n: usize,
 ) -> zyron_executor::column::Column {
@@ -1205,9 +1218,9 @@ fn build_constant_column(
     use zyron_executor::batch::ColumnBuilder;
     use zyron_executor::column::ScalarValue;
 
-    let phys = TypeId::timestamp_physical_type_id(logical_type, ts_precision);
+    let phys = TypeId::timestamp_physical_type_id(logical_type, fractional_digits);
     let mut builder = if phys != logical_type {
-        ColumnBuilder::new_ts(logical_type, phys, ts_precision, n)
+        ColumnBuilder::new_ts(logical_type, phys, fractional_digits, n)
     } else {
         ColumnBuilder::new(logical_type, n)
     };
@@ -1867,6 +1880,12 @@ async fn handle_create_table(
                     return Err(e);
                 }
             }
+            // A declared PRIMARY KEY or UNIQUE needs the index that enforces
+            // it, or the constraint is recorded and never checked
+            if let Err(e) = provision_constraint_indexes(server, schema_id, &stmt.name).await {
+                let _ = server.catalog.drop_table(schema_id, &stmt.name).await;
+                return Err(e);
+            }
             fire_event(
                 server,
                 zyron_pipeline::event_handler::EventType::TableCreated,
@@ -1980,6 +1999,158 @@ async fn apply_constraint_quarantine(
     Ok(())
 }
 
+/// Creates the unique B+tree index that backs each enforced PRIMARY KEY and
+/// UNIQUE constraint on a heap table.
+///
+/// Heap uniqueness is enforced by probing unique indexes, so a declared
+/// constraint with no index behind it is a constraint nothing checks. The
+/// index carries the constraint's own name, which is what lets DROP
+/// CONSTRAINT take it away again.
+///
+/// A lake table needs none of this. `enforce_lake_unique` reads the declared
+/// constraints directly and prunes on the manifest's per-file bounds, so an
+/// index there would be a second mechanism answering the same question.
+///
+/// An existing index over exactly the constraint's columns already answers
+/// for it and is left alone, so declaring a constraint over an indexed key
+/// does not build a second copy of the same tree.
+async fn provision_constraint_indexes(
+    server: &Arc<ServerState>,
+    schema_id: zyron_catalog::SchemaId,
+    table_name: &str,
+) -> Result<(), ProtocolError> {
+    use zyron_catalog::schema::ConstraintType;
+
+    let table = server
+        .catalog
+        .get_table(schema_id, table_name)
+        .map_err(ProtocolError::Database)?;
+    if table.lake.is_lake() {
+        return Ok(());
+    }
+
+    let existing = server.catalog.get_indexes_for_table(table.id);
+    for constraint in &table.constraints {
+        if !matches!(
+            constraint.constraint_type,
+            ConstraintType::PrimaryKey | ConstraintType::Unique
+        ) {
+            continue;
+        }
+        // NOT ENFORCED keeps the declaration for the planner and asks the
+        // write path to skip it, so it gets no index either
+        if !constraint.enforced || constraint.columns.is_empty() {
+            continue;
+        }
+        let covered = existing.iter().any(|idx| {
+            idx.unique
+                && idx.index_type == zyron_catalog::IndexType::BTree
+                && idx.columns.len() == constraint.columns.len()
+                && idx
+                    .columns
+                    .iter()
+                    .zip(constraint.columns.iter())
+                    .all(|(ic, cc)| ic.column_id == *cc)
+        });
+        if covered {
+            continue;
+        }
+        let mut column_names = Vec::with_capacity(constraint.columns.len());
+        for col_id in &constraint.columns {
+            let Some(col) = table.columns.iter().find(|c| c.id == *col_id) else {
+                return Err(ProtocolError::Database(ZyronError::ColumnNotFound(
+                    format!(
+                        "constraint \"{}\" names a column table \"{}\" does not have",
+                        constraint.name, table_name
+                    ),
+                )));
+            };
+            column_names.push(col.name.clone());
+        }
+        create_backing_btree(server, schema_id, &table, &constraint.name, &column_names).await?;
+    }
+    Ok(())
+}
+
+/// Creates a unique B+tree index and fills it from the rows the table already
+/// holds, so a constraint added to a populated table starts enforcing against
+/// every existing row rather than only later ones.
+async fn create_backing_btree(
+    server: &Arc<ServerState>,
+    schema_id: zyron_catalog::SchemaId,
+    table: &Arc<zyron_catalog::schema::TableEntry>,
+    index_name: &str,
+    column_names: &[String],
+) -> Result<(), ProtocolError> {
+    let index_id = server
+        .catalog
+        .create_index(
+            table.id,
+            schema_id,
+            index_name,
+            column_names,
+            true,
+            zyron_catalog::IndexType::BTree,
+        )
+        .await
+        .map_err(ProtocolError::Database)?;
+
+    let entry = server
+        .catalog
+        .get_indexes_for_table(table.id)
+        .into_iter()
+        .find(|e| e.id == index_id)
+        .ok_or_else(|| {
+            ProtocolError::Database(ZyronError::Internal(format!(
+                "index backing constraint \"{index_name}\" not found in catalog after creation"
+            )))
+        })?;
+
+    let checkpoint_dir = server.data_dir.join("indexes");
+    let _ = std::fs::create_dir_all(&checkpoint_dir);
+    let btree = Arc::new(
+        zyron_storage::BTreeIndex::create(entry.index_file_id, checkpoint_dir)
+            .await
+            .map_err(ProtocolError::Database)?,
+    );
+
+    let key_columns: Vec<zyron_catalog::ColumnId> =
+        entry.columns.iter().map(|c| c.column_id).collect();
+    let rows = crate::index_build::collect_live_rows(server, table)
+        .await
+        .map_err(ProtocolError::Database)?;
+    crate::index_build::fill_btree_from_live_rows(table, &rows, &key_columns, &btree);
+
+    let _ = server.btree_indexes.insert_async(index_id.0, btree).await;
+    Ok(())
+}
+
+/// Drops the index backing a constraint, if the constraint had one. Called
+/// when DROP CONSTRAINT removes the declaration, so the tree does not outlive
+/// the rule it enforces.
+async fn drop_constraint_index(
+    server: &Arc<ServerState>,
+    table_id: zyron_catalog::TableId,
+    constraint_name: &str,
+) {
+    let Some(entry) = server
+        .catalog
+        .get_indexes_for_table(table_id)
+        .into_iter()
+        .find(|e| e.name == constraint_name)
+    else {
+        return;
+    };
+    if server
+        .catalog
+        .drop_index(table_id, constraint_name)
+        .await
+        .is_ok()
+    {
+        let _ = server.btree_indexes.remove_async(&entry.id.0).await;
+    }
+}
+
 /// `ALTER TABLE t SET USING ZYRONLAKE | HEAP [WITH (drop_history = true)]`.
 ///
 /// Converts in place, atomically from a reader's view: every row moves into
@@ -2056,7 +2227,7 @@ async fn handle_set_using(
                 name: c.name.clone(),
                 type_id: c.type_id,
                 nullable: c.nullable,
-                ts_precision: c.ts_precision,
+                fractional_digits: c.fractional_digits,
                 tz_offset_secs: c.tz_offset_secs,
                 max_length: c.max_length.map(|n| n as u32),
                 default_expr: c.default_expr.clone(),
@@ -2266,7 +2437,7 @@ async fn apply_create_table_lake(
             name: c.name.clone(),
             type_id: c.type_id,
             nullable: c.nullable,
-            ts_precision: c.ts_precision,
+            fractional_digits: c.fractional_digits,
             tz_offset_secs: c.tz_offset_secs,
             max_length: c.max_length.map(|n| n as u32),
             default_expr: c.default_expr.clone(),
@@ -3529,11 +3700,13 @@ async fn handle_create_index(
         schema_id.0,
     )?;
 
-    let mut column_names: Vec<String> = Vec::with_capacity(stmt.columns.len());
+    // Each key column carries its declared sort direction. `asc: None` is
+    // the unwritten default, which is ascending
+    let mut key_columns: Vec<(String, bool)> = Vec::with_capacity(stmt.columns.len());
     for c in &stmt.columns {
         match &c.expr {
             zyron_parser::ast::Expr::Identifier(name) => {
-                column_names.push(name.clone());
+                key_columns.push((name.clone(), c.asc == Some(false)));
             }
             other => {
                 return Err(ProtocolError::Database(ZyronError::PlanError(format!(
@@ -3543,16 +3716,29 @@ async fn handle_create_index(
             }
         }
     }
+    // A key column's stored bytes run in one direction for the whole key, so
+    // an index can be declared entirely ascending or entirely descending but
+    // not both. A uniform declaration is served either way by walking the
+    // index forward or backward, which is why both spellings are accepted.
+    // Mixed directions would have to be flattened to one of them, and an
+    // index that silently sorts differently from its own declaration is worse
+    // than one the statement refuses to create
+    if key_columns.iter().any(|(_, d)| *d) && key_columns.iter().any(|(_, d)| !*d) {
+        return Err(ProtocolError::Database(ZyronError::PlanError(format!(
+            "index '{}' mixes ASC and DESC key columns, which one index cannot store, declare every column in the same direction or build one index per ordering",
+            stmt.name
+        ))));
+    }
+    let column_names: Vec<String> = key_columns.iter().map(|(n, _)| n.clone()).collect();
 
     match server
         .catalog
-        .create_index(
+        .create_btree_index(
             table.id,
             schema_id,
             &stmt.name,
-            &column_names,
+            &key_columns,
             stmt.unique,
-            zyron_catalog::IndexType::BTree,
         )
         .await
     {
@@ -3562,9 +3748,13 @@ async fn handle_create_index(
             // versioned with the data, survives the rewrites clustering and
             // compaction perform, and is readable at a past version
             if table.lake.is_lake() {
-                let result =
-                    crate::index_build::build_lake_index(server, &table, &column_names, stmt.unique)
-                        .await;
+                let result = crate::index_build::build_lake_index(
+                    server,
+                    &table,
+                    &column_names,
+                    stmt.unique,
+                )
+                .await;
                 if let Err(e) = result {
                     // The catalog entry would otherwise describe an index
                     // the table does not have
@@ -3605,16 +3795,17 @@ async fn handle_create_index(
             // Fill the tree from the rows the table already holds. Without
             // this the index is empty, and every query the planner routes
             // through it returns nothing for rows that predate it, which is a
-            // wrong answer rather than a slow one. Indexes are single column
-            // here, so the first column id is the key
-            if let Some(col) = entry.columns.first() {
+            // wrong answer rather than a slow one
+            let key_columns: Vec<zyron_catalog::ColumnId> =
+                entry.columns.iter().map(|c| c.column_id).collect();
+            if !key_columns.is_empty() {
                 let rows = crate::index_build::collect_live_rows(server, &table)
                     .await
                     .map_err(ProtocolError::Database)?;
                 let entries = crate::index_build::fill_btree_from_live_rows(
                     &table,
                     &rows,
-                    col.column_id,
+                    &key_columns,
                     &btree,
                 );
                 if entries > 0 {
@@ -5676,7 +5867,7 @@ async fn handle_create_materialized_view(
             } else {
                 c.name.clone()
             };
-            (col_name, c.type_id, c.nullable, c.ts_precision)
+            (col_name, c.type_id, c.nullable, c.fractional_digits)
         })
         .collect();
     if columns.is_empty() {
@@ -5961,7 +6152,7 @@ async fn plan_select_columns(
             } else {
                 c.name.clone()
             };
-            (name, c.type_id, c.nullable, c.ts_precision)
+            (name, c.type_id, c.nullable, c.fractional_digits)
         })
         .collect())
 }
@@ -11081,7 +11272,7 @@ fn columns_to_specs(
             zyron_streaming::format::ColumnSpec::with_precision(
                 c.name.clone(),
                 c.type_id,
-                c.ts_precision,
+                c.fractional_digits,
             )
         })
         .collect()

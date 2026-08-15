@@ -527,7 +527,11 @@ impl HybridSearch {
             }
         } else {
             for (slot, &docId) in vecSims.iter_mut().zip(docIds.iter()) {
-                *slot = if vecMap.contains_key(&docId) { 1.0 } else { 0.0 };
+                *slot = if vecMap.contains_key(&docId) {
+                    1.0
+                } else {
+                    0.0
+                };
             }
         }
 
@@ -655,9 +659,7 @@ mod tests {
         // Lengths either side of a 4, 8 and 16 lane boundary, so the tail
         // handling is exercised rather than assumed
         for len in [1usize, 3, 4, 7, 8, 15, 16, 17, 31, 33, 100] {
-            let data: Vec<f32> = (0..len)
-                .map(|i| ((i * 37 % 71) as f32) - 20.0)
-                .collect();
+            let data: Vec<f32> = (0..len).map(|i| ((i * 37 % 71) as f32) - 20.0).collect();
             let (lo, hi) = unsafe { minMax(data.as_ptr(), len) };
             let expectedLo = data.iter().copied().fold(f32::INFINITY, f32::min);
             let expectedHi = data.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -709,8 +711,7 @@ mod tests {
             k: usize,
         ) -> Vec<(u64, f64)> {
             use std::collections::{HashMap, HashSet};
-            let ftsMap: HashMap<u64, f32> =
-                fts.iter().map(|&(id, s)| (id, s as f32)).collect();
+            let ftsMap: HashMap<u64, f32> = fts.iter().map(|&(id, s)| (id, s as f32)).collect();
             let vecMap: HashMap<u64, f32> = vectors.iter().copied().collect();
             let mut ids: HashSet<u64> = HashSet::new();
             ids.extend(ftsMap.keys());
@@ -750,9 +751,7 @@ mod tests {
                     (id, (alpha * v + (1.0 - alpha) * f) as f64)
                 })
                 .collect();
-            out.sort_unstable_by(|a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            out.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             out.truncate(k);
             out
         }
@@ -769,11 +768,20 @@ mod tests {
                 (100..110).map(|i| (i, i as f32 * 0.01)).collect(),
             ),
             // Every FTS score equal, which makes the range degenerate
-            ((0..12).map(|i| (i, 7.0)).collect(), (5..15).map(|i| (i, 2.0)).collect()),
+            (
+                (0..12).map(|i| (i, 7.0)).collect(),
+                (5..15).map(|i| (i, 2.0)).collect(),
+            ),
             // Every FTS score zero, the other degenerate direction
-            ((0..12).map(|i| (i, 0.0)).collect(), (5..15).map(|i| (i, 2.0)).collect()),
+            (
+                (0..12).map(|i| (i, 0.0)).collect(),
+                (5..15).map(|i| (i, 2.0)).collect(),
+            ),
             // Every distance zero, so every vector hit is exact
-            ((0..8).map(|i| (i, i as f64)).collect(), (4..12).map(|i| (i, 0.0)).collect()),
+            (
+                (0..8).map(|i| (i, i as f64)).collect(),
+                (4..12).map(|i| (i, 0.0)).collect(),
+            ),
             // One side empty
             ((0..6).map(|i| (i, i as f64)).collect(), Vec::new()),
             (Vec::new(), (0..6).map(|i| (i, i as f32)).collect()),
@@ -790,8 +798,7 @@ mod tests {
                 let got = HybridSearch::linear_combination(fts, vectors, alpha, KEEP_ALL);
                 let want = reference(fts, vectors, alpha, KEEP_ALL);
                 assert_eq!(got.len(), want.len(), "case {index} alpha {alpha}");
-                let gotScores: std::collections::HashMap<u64, f64> =
-                    got.iter().copied().collect();
+                let gotScores: std::collections::HashMap<u64, f64> = got.iter().copied().collect();
                 for (id, wantScore) in want {
                     let gotScore = gotScores
                         .get(&id)

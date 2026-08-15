@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use zyron_common::{Result, ZyronError};
 
 use super::distance::{
-    distWithFn, euclideanSmall4, resolveDistFn, vectorAddInplace,
-    vectorScaleInplace, vectorSubtract, vectorSubtractInplace,
+    distWithFn, euclideanSmall4, resolveDistFn, vectorAddInplace, vectorScaleInplace,
+    vectorSubtract, vectorSubtractInplace,
 };
 use super::memory::{try_alloc_default, try_alloc_filled, try_alloc_vec, validate_file_size};
 use super::profile::DataProfile;

@@ -2,11 +2,9 @@
 // Random forest, bagged decision trees with feature subsampling
 // Parallel training with std::thread::scope, no rayon dep
 
-use crate::ml::decisionTree::{
-    TreeBuildConfig, detectNumClasses, predictTree, trainTree,
-};
+use crate::ml::decisionTree::{TreeBuildConfig, detectNumClasses, predictTree, trainTree};
 use crate::ml::{
-    ModelConfig, ModelData, ModelMetrics, ModelType, TrainedModel, TreeNode, TrainingData,
+    ModelConfig, ModelData, ModelMetrics, ModelType, TrainedModel, TrainingData, TreeNode,
 };
 use zyron_common::Xoshiro256pp;
 use zyron_common::error::{Result, ZyronError};
@@ -26,7 +24,10 @@ pub fn train(config: &ModelConfig, data: &TrainingData) -> Result<TrainedModel> 
     };
 
     let nTrees = config.hyperparameters.getUsizeOr("n_trees", 50).max(1);
-    let bootstrapFrac = config.hyperparameters.getF64Or("bootstrap_frac", 1.0).clamp(0.1, 1.0);
+    let bootstrapFrac = config
+        .hyperparameters
+        .getF64Or("bootstrap_frac", 1.0)
+        .clamp(0.1, 1.0);
     let seed = config.hyperparameters.getU64Or("seed", 42);
 
     let mut treeConfigs = Vec::with_capacity(nTrees);
@@ -71,7 +72,7 @@ pub fn train(config: &ModelConfig, data: &TrainingData) -> Result<TrainedModel> 
                 Err(_) => {
                     return Err(ZyronError::ExecutionError(
                         "tree training thread panicked".to_string(),
-                    ))
+                    ));
                 }
             }
         }
@@ -88,14 +89,15 @@ pub fn train(config: &ModelConfig, data: &TrainingData) -> Result<TrainedModel> 
     } else {
         Vec::new()
     };
-    model.data = ModelData::Forest { trees: trees.clone() };
+    model.data = ModelData::Forest {
+        trees: trees.clone(),
+    };
     model.hyperparameters = config.hyperparameters.clone();
     model.trainingRows = data.n as u64;
     if regression {
         model.metrics = computeRegressionMetrics(&trees, data).intoMap();
     } else {
-        model.metrics =
-            computeClassificationMetrics(&trees, data, nClasses.unwrap_or(2)).intoMap();
+        model.metrics = computeClassificationMetrics(&trees, data, nClasses.unwrap_or(2)).intoMap();
     }
     Ok(model)
 }
@@ -178,7 +180,11 @@ fn computeRegressionMetrics(trees: &[Vec<TreeNode>], data: &TrainingData) -> Mod
     let mut m = ModelMetrics::default();
     m.rmse = Some((ssRes / n as f64).sqrt());
     m.mae = Some(absSum / n as f64);
-    m.rSquared = Some(if ssTot > 0.0 { 1.0 - ssRes / ssTot } else { 0.0 });
+    m.rSquared = Some(if ssTot > 0.0 {
+        1.0 - ssRes / ssTot
+    } else {
+        0.0
+    });
     m
 }
 
@@ -221,7 +227,11 @@ fn computeClassificationMetrics(
         let r = if rd > 0.0 { tp as f64 / rd } else { 0.0 };
         m.precision = Some(p);
         m.recall = Some(r);
-        m.f1Score = Some(if p + r > 0.0 { 2.0 * p * r / (p + r) } else { 0.0 });
+        m.f1Score = Some(if p + r > 0.0 {
+            2.0 * p * r / (p + r)
+        } else {
+            0.0
+        });
     }
     m
 }

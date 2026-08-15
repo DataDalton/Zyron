@@ -1,4 +1,4 @@
-﻿//! Cross-table atomic commit.
+//! Cross-table atomic commit.
 //!
 //! Each table's log commits atomically on its own. Two tables committed by
 //! one statement are not atomic together unless something outside both logs
@@ -319,12 +319,7 @@ fn allocate_seq(data_dir: &Path) -> Result<u64, ZyronError> {
         }
         // Racing callers converge on the same floor, then each takes its own
         // sequence from the counter below
-        let _ = NEXT_SEQ.compare_exchange(
-            0,
-            highest + 1,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        let _ = NEXT_SEQ.compare_exchange(0, highest + 1, Ordering::AcqRel, Ordering::Acquire);
         next = NEXT_SEQ.load(Ordering::Acquire);
     }
     Ok(NEXT_SEQ.fetch_add(1, Ordering::AcqRel).max(next))
@@ -431,7 +426,7 @@ mod tests {
                 name: "id".into(),
                 type_id: TypeId::Int64,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
                 tz_offset_secs: None,
                 max_length: None,
                 default_expr: None,

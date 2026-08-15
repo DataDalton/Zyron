@@ -724,6 +724,7 @@ fn expr_to_sql(expr: &Expr) -> String {
         Expr::QualifiedIdentifier { table, column } => format!("{}.{}", table, column),
         Expr::Literal(lit) => match lit {
             LiteralValue::Integer(n) => n.to_string(),
+            LiteralValue::Int128(n) => n.to_string(),
             LiteralValue::Float(f) => format!("{}", f),
             LiteralValue::String(s) => format!("'{}'", s.replace('\'', "''")),
             LiteralValue::Boolean(true) => "TRUE".to_string(),
@@ -1003,6 +1004,10 @@ fn table_ref_to_sql(tr: &TableRef) -> String {
                 format!("{}(...)", tf.name)
             }
         }
+        TableRef::ExternalInline(r) => match &r.alias {
+            Some(a) => format!("'{}' AS {}", r.uri, a),
+            None => format!("'{}'", r.uri),
+        },
     }
 }
 

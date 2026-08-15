@@ -2436,6 +2436,62 @@ impl Catalog {
         Ok(index_id)
     }
 
+    /// Creates a B+tree index recording a sort direction per key column.
+    ///
+    /// Only a B+tree has an order to record. Every other index kind is
+    /// unordered, so `create_index` covers those and this covers the one
+    /// that can answer an ORDER BY without a sort.
+    pub async fn create_btree_index(
+        &self,
+        table_id: TableId,
+        schema_id: SchemaId,
+        name: &str,
+        columns: &[(String, bool)],
+        unique: bool,
+    ) -> Result<IndexId> {
+        let existing = self.cache.get_indexes_for_table(table_id);
+        for idx in &existing {
+            if idx.name == name {
+                return Err(ZyronError::IndexAlreadyExists(name.to_string()));
+            }
+        }
+
+        let table = self.get_table_by_id(table_id)?;
+        let index_id = IndexId(self.oid_allocator.next());
+        let index_file_id = self.storage.next_index_file_id();
+
+        let mut resolved = Vec::with_capacity(columns.len());
+        for (ordinal, (col_name, descending)) in columns.iter().enumerate() {
+            let col = table
+                .columns
+                .iter()
+                .find(|c| c.name == *col_name)
+                .ok_or_else(|| ZyronError::ColumnNotFound(col_name.clone()))?;
+            resolved.push(IndexColumnEntry {
+                column_id: col.id,
+                ordinal: ordinal as u16,
+                descending: *descending,
+            });
+        }
+
+        let entry = IndexEntry {
+            id: index_id,
+            table_id,
+            schema_id,
+            name: name.to_string(),
+            columns: resolved,
+            unique,
+            index_file_id,
+            index_type: IndexType::BTree,
+            parameters: None,
+        };
+
+        self.log_ddl(DDL_CREATE_INDEX, &entry.to_bytes())?;
+        self.storage.store_index(&entry).await?;
+        self.cache.put_index(entry);
+        Ok(index_id)
+    }
+
     /// Like create_index, but also stores the opaque parameters blob on the
     /// index entry. Used by spatial and vector indexes that persist tuning
     /// options (dims, srid, HNSW config, etc.) so startup recovery can
@@ -3015,7 +3071,7 @@ impl Catalog {
             .iter()
             .enumerate()
             .map(
-                |(i, (col_name, type_id, nullable, ts_precision))| ColumnEntry {
+                |(i, (col_name, type_id, nullable, fractional_digits))| ColumnEntry {
                     id: ColumnId(i as u16),
                     table_id,
                     name: col_name.clone(),
@@ -3024,7 +3080,7 @@ impl Catalog {
                     nullable: *nullable,
                     default_expr: None,
                     max_length: None,
-                    ts_precision: *ts_precision,
+                    fractional_digits: *fractional_digits,
                     tz_offset_secs: None,
                     element_type: None,
                 },
@@ -4657,7 +4713,7 @@ fn convert_column_defs(table_id: TableId, defs: &[ColumnDef]) -> Result<Vec<Colu
             nullable,
             default_expr,
             max_length,
-            ts_precision: def.data_type.timestamp_precision(),
+            fractional_digits: def.data_type.fractional_digits(),
             tz_offset_secs: None,
             element_type: extract_element_type(&def.data_type),
         });
@@ -4667,23 +4723,20 @@ fn convert_column_defs(table_id: TableId, defs: &[ColumnDef]) -> Result<Vec<Colu
 
 /// The element type of an `T[]` declaration, so array values written to the
 /// column are re-encoded to the width it declares.
+#[inline]
 fn extract_element_type(dt: &DataType) -> Option<zyron_common::TypeId> {
-    match dt {
-        DataType::Array(inner) => Some(inner.to_type_id()),
-        _ => None,
-    }
+    dt.declared_element_type()
 }
 
-/// Extracts the max_length parameter from sized data types.
+/// Extracts the declared size of a sized type.
+///
+/// Character and binary types measure a length, a vector measures its
+/// dimension count, and a decimal measures its total digits. All three are
+/// the one number the declaration bounds the value by, so they share the
+/// slot and each write path reads it under its own type.
+#[inline]
 fn extract_max_length(dt: &DataType) -> Option<usize> {
-    match dt {
-        DataType::Char(n)
-        | DataType::Varchar(n)
-        | DataType::Binary(n)
-        | DataType::Varbinary(n)
-        | DataType::Vector(n) => *n,
-        _ => None,
-    }
+    dt.declared_max_length()
 }
 
 /// Converts parser TableConstraints to catalog ConstraintEntries. Foreign-key
@@ -4869,7 +4922,7 @@ mod tests {
                 nullable: false,
                 default_expr: None,
                 max_length: None,
-                ts_precision: None,
+                fractional_digits: None,
                 tz_offset_secs: None,
                 element_type: None,
             },
@@ -4882,7 +4935,7 @@ mod tests {
                 nullable: false,
                 default_expr: None,
                 max_length: None,
-                ts_precision: None,
+                fractional_digits: None,
                 tz_offset_secs: None,
                 element_type: None,
             },

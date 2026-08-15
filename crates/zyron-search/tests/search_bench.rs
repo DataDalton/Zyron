@@ -1806,10 +1806,8 @@ fn runClusteredScale(n: usize, numClusters: usize, stdDev: f32, seed: u64) {
     zyron_bench_harness::init("search");
     // Building an HNSW graph over this many vectors without optimization runs
     // for hours to produce a timing that would be discarded
-    if zyron_bench_harness::skip_expensive(
-        "Clustered Scale",
-        &format!("a {n} vector index build"),
-    ) {
+    if zyron_bench_harness::skip_expensive("Clustered Scale", &format!("a {n} vector index build"))
+    {
         return;
     }
     let _guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1912,10 +1910,7 @@ fn test_clustered_scale_1m() {
 
 fn runUniformScale(n: usize, seed: u64) {
     zyron_bench_harness::init("search");
-    if zyron_bench_harness::skip_expensive(
-        "Uniform Scale",
-        &format!("a {n} vector index build"),
-    ) {
+    if zyron_bench_harness::skip_expensive("Uniform Scale", &format!("a {n} vector index build")) {
         return;
     }
     let _guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());

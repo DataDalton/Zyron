@@ -25,10 +25,10 @@ use zyron_common::ZyronError;
 use zyron_storage::columnar::might_contain_serialized;
 
 use crate::cells::value_to_cell;
-use crate::codec::{corrupt, Cursor};
+use crate::codec::{Cursor, corrupt};
 use crate::index::{IndexFileEntry, LakeIndexSpec};
 use crate::predicate::{
-    decode_value, encode_value, ColumnBounds, LakePredicate, LakeValue, PruneDecision, StatsSource,
+    ColumnBounds, LakePredicate, LakeValue, PruneDecision, StatsSource, decode_value, encode_value,
 };
 use crate::schema::LakeSchema;
 
@@ -520,7 +520,10 @@ impl ManifestFile {
         if bytes.len() < HEADER_LEN + FOOTER_LEN {
             return Err(corrupt(
                 ctx,
-                format!("manifest of {} bytes is shorter than header plus footer", bytes.len()),
+                format!(
+                    "manifest of {} bytes is shorter than header plus footer",
+                    bytes.len()
+                ),
             ));
         }
         if bytes[..4] != MANIFEST_MAGIC {
@@ -537,7 +540,10 @@ impl ManifestFile {
         if stored_crc != actual_crc {
             return Err(corrupt(
                 ctx,
-                format!("manifest checksum mismatch, stored {:#010x} computed {:#010x}", stored_crc, actual_crc),
+                format!(
+                    "manifest checksum mismatch, stored {:#010x} computed {:#010x}",
+                    stored_crc, actual_crc
+                ),
             ));
         }
 
@@ -551,7 +557,10 @@ impl ManifestFile {
         }
         let flags = h.u16()?;
         if flags != 0 {
-            return Err(corrupt(ctx, format!("unknown manifest flags {:#06x}", flags)));
+            return Err(corrupt(
+                ctx,
+                format!("unknown manifest flags {:#06x}", flags),
+            ));
         }
         let header_schema_id = h.u64()?;
         let snapshot_id = h.u64()?;
@@ -569,12 +578,13 @@ impl ManifestFile {
             || offsets[7] != footer_start
             || offsets.windows(2).any(|w| w[0] > w[1])
         {
-            return Err(corrupt(ctx, format!("inconsistent section offsets {:?}", offsets)));
+            return Err(corrupt(
+                ctx,
+                format!("inconsistent section offsets {:?}", offsets),
+            ));
         }
 
-        let section = |i: usize| -> &[u8] {
-            &bytes[offsets[i] as usize..offsets[i + 1] as usize]
-        };
+        let section = |i: usize| -> &[u8] { &bytes[offsets[i] as usize..offsets[i + 1] as usize] };
 
         let (schema, schema_used) = LakeSchema::decode(section(0), ctx)?;
         if schema_used != section(0).len() {
@@ -593,7 +603,10 @@ impl ManifestFile {
         let mut sc = Cursor::new(section(1), ctx);
         let cluster_spec = ClusterSpec::decode(&mut sc)?;
         if sc.remaining() != 0 {
-            return Err(corrupt(ctx, "cluster spec section has trailing bytes".into()));
+            return Err(corrupt(
+                ctx,
+                "cluster spec section has trailing bytes".into(),
+            ));
         }
         if cluster_spec.spec_id != header_spec_id {
             return Err(corrupt(
@@ -613,7 +626,10 @@ impl ManifestFile {
             entries.push(decode_partition_entry(&mut fr)?);
         }
         if fr.remaining() != 0 {
-            return Err(corrupt(ctx, "file manifest section has trailing bytes".into()));
+            return Err(corrupt(
+                ctx,
+                "file manifest section has trailing bytes".into(),
+            ));
         }
 
         let mut dr = Cursor::new(section(3), ctx);
@@ -624,7 +640,10 @@ impl ManifestFile {
             delete_predicates.push(decode_delete_predicate(&mut dr)?);
         }
         if dr.remaining() != 0 {
-            return Err(corrupt(ctx, "delete predicate section has trailing bytes".into()));
+            return Err(corrupt(
+                ctx,
+                "delete predicate section has trailing bytes".into(),
+            ));
         }
 
         let mut pr = Cursor::new(section(4), ctx);
@@ -678,7 +697,9 @@ impl ManifestFile {
             indexes,
             index_files,
         };
-        manifest.validate().map_err(|e| corrupt(ctx, e.to_string()))?;
+        manifest
+            .validate()
+            .map_err(|e| corrupt(ctx, e.to_string()))?;
         Ok(manifest)
     }
 }
@@ -901,7 +922,7 @@ mod tests {
                     name: "id".into(),
                     type_id: TypeId::Int64,
                     nullable: false,
-                    ts_precision: None,
+                    fractional_digits: None,
                     tz_offset_secs: None,
                     max_length: None,
                     default_expr: None,
@@ -911,7 +932,7 @@ mod tests {
                     name: "name".into(),
                     type_id: TypeId::Text,
                     nullable: true,
-                    ts_precision: None,
+                    fractional_digits: None,
                     tz_offset_secs: None,
                     max_length: None,
                     default_expr: None,
@@ -921,7 +942,13 @@ mod tests {
         .expect("valid schema")
     }
 
-    fn stats(column_id: u32, min: i64, max: i64, null_count: u64, row_count: u64) -> ColumnStatsEntry {
+    fn stats(
+        column_id: u32,
+        min: i64,
+        max: i64,
+        null_count: u64,
+        row_count: u64,
+    ) -> ColumnStatsEntry {
         ColumnStatsEntry {
             ndv: Some(row_count.saturating_sub(null_count)),
             column_id,
@@ -1094,7 +1121,10 @@ mod tests {
         assert_eq!(m.entry_for(0x20).map(|e| e.row_count), Some(200));
         assert_eq!(m.entry_for(0x15), None);
         let e = m.entry_for(0x20).expect("exists");
-        assert_eq!(e.stats_for(1).and_then(|s| s.bloom.as_deref()), Some(&[0xDE, 0xAD, 0xBE, 0xEF][..]));
+        assert_eq!(
+            e.stats_for(1).and_then(|s| s.bloom.as_deref()),
+            Some(&[0xDE, 0xAD, 0xBE, 0xEF][..])
+        );
         assert_eq!(e.stats_for(7), None);
         assert_eq!(m.predicate_by_id(9).map(|p| p.created_version), Some(41));
         assert_eq!(m.predicate_by_id(8), None);

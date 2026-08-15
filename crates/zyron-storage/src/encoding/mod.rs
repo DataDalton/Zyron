@@ -316,8 +316,9 @@ pub fn range_admits(
     high: Option<&[u8]>,
 ) -> bool {
     low.is_none_or(|lo| compare_cell_bytes(cell, lo, value_size) != std::cmp::Ordering::Less)
-        && high
-            .is_none_or(|hi| compare_cell_bytes(cell, hi, value_size) != std::cmp::Ordering::Greater)
+        && high.is_none_or(|hi| {
+            compare_cell_bytes(cell, hi, value_size) != std::cmp::Ordering::Greater
+        })
 }
 
 /// Evaluates a predicate on raw (decoded) column data, producing a packed bitmask.
@@ -654,7 +655,11 @@ mod tests {
             .collect();
         let with_outliers: Vec<u8> = (0..rows)
             .flat_map(|i| {
-                let v = if i % 97 == 0 { 1i64 << 40 } else { (i % 13) as i64 };
+                let v = if i % 97 == 0 {
+                    1i64 << 40
+                } else {
+                    (i % 13) as i64
+                };
                 v.to_le_bytes()
             })
             .collect();

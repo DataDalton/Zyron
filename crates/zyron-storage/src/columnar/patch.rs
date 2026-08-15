@@ -1069,11 +1069,17 @@ impl ColumnarPatchManager {
     }
 
     /// Resolves the patch store for a table from any of its segment paths.
-    /// The parent directory of a .zyr segment is the columnar dir shared by
-    /// scans, DML, maintenance and recovery, so every caller converges on the
-    /// same manager and store
+    /// The columnar root of a .zyr segment is the directory shared by scans,
+    /// DML, maintenance and recovery, so every caller converges on the same
+    /// manager and store.
+    ///
+    /// The root is resolved through `columnar_root_for_segment` rather than
+    /// taken as the segment's parent, because a segment relocated to a colder
+    /// tier lives one level down. Reading the parent directly would give a
+    /// table two patch stores once any of its segments moved, and a patch
+    /// written through one would be invisible to a scan resolving the other
     pub fn store_for_segment(table_id: u64, segment_path: &Path) -> Result<Arc<PatchStore>> {
-        let dir = segment_path.parent().ok_or_else(|| {
+        let dir = crate::columnar::columnar_root_for_segment(segment_path).ok_or_else(|| {
             ZyronError::Internal(format!(
                 "segment path {} has no parent directory",
                 segment_path.display()

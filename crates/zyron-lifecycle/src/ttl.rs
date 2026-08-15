@@ -49,13 +49,13 @@ pub enum TtlMode {
 pub fn ttl_mode(entry: &TableEntry) -> TtlMode {
     let lc = &entry.lifecycle;
     let action = TtlAction::from_u8(lc.ttl_action);
-    if lc.retention_column_id != 0 {
+    if zyron_catalog::schema::LifecycleConfig::column_is_set(lc.retention_column_id) {
         return TtlMode::PerRow {
             column_id: lc.retention_column_id,
             action,
         };
     }
-    if lc.ttl_column_id != 0 && lc.ttl_seconds > 0 {
+    if zyron_catalog::schema::LifecycleConfig::column_is_set(lc.ttl_column_id) && lc.ttl_seconds > 0 {
         return TtlMode::Interval {
             column_id: lc.ttl_column_id,
             ttl_seconds: lc.ttl_seconds,

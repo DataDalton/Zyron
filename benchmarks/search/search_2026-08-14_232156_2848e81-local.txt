@@ -1,0 +1,32 @@
+# suite:   search
+# run:     2026-08-14_232156_2848e81-local
+# profile: debug
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+# NOT A BENCHMARK RESULT. This is an unoptimized build, so every
+# timing below is meaningless: an unoptimized build is not slower
+# by a constant factor, so these numbers do not even rank correctly
+# against each other. Counted quantities (rates, file and row
+# counts, PASS/FAIL on an exact bound) are valid and are the only
+# thing worth reading here. For real numbers: cargo test --release
+#
+
+=== Test 10: Performance (1M documents) ===
+
+--- Indexing Throughput ---
+  [SimpleAnalyzer]
+  Run 1: 31,103 docs/sec (32.1512435s)
+  Run 2: 31,155 docs/sec (32.0970908s)
+  Run 3: 31,566 docs/sec (31.6797376s)
+  Run 4: 36,997 docs/sec (27.0295738s)
+  Run 5: 33,634 docs/sec (29.7319456s)
+
+  SimpleAnalyzer index stats: 1000000 documents, avg_dl=44.0
+  Indexing throughput SimpleAnalyzer (docs/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [31,103, 31,155, 31,566, 36,997, 33,634]
+    Average: 32,891 (target >= 300,000, not applied)
+    Re-run with --release for a number worth comparing
+
+  [StandardAnalyzer]
+  Run 1: 18,946 docs/sec (52.7802722s)

@@ -179,9 +179,13 @@ impl RetentionWorker {
             };
             let lc = &table.lifecycle;
             // Resolve the comparison column and cutoff.
-            let (col_id, cutoff) = if lc.retention_column_id != 0 {
+            let (col_id, cutoff) = if zyron_catalog::schema::LifecycleConfig::column_is_set(
+                lc.retention_column_id,
+            ) {
                 (lc.retention_column_id, now_us)
-            } else if lc.ttl_column_id != 0 && lc.ttl_seconds > 0 {
+            } else if zyron_catalog::schema::LifecycleConfig::column_is_set(lc.ttl_column_id)
+                && lc.ttl_seconds > 0
+            {
                 (
                     lc.ttl_column_id,
                     now_us - lc.ttl_seconds.saturating_mul(1_000_000),

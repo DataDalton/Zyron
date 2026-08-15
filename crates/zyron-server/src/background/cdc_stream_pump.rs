@@ -158,9 +158,9 @@ fn decode_row_pairs(row_data: &[u8], columns: &[ColumnEntry]) -> Vec<(String, St
     let mut builders: Vec<ColumnBuilder> = columns
         .iter()
         .map(|c| {
-            let phys = TypeId::timestamp_physical_type_id(c.type_id, c.ts_precision);
-            if phys != c.type_id {
-                ColumnBuilder::new_ts(c.type_id, phys, c.ts_precision, 1)
+            let phys = TypeId::timestamp_physical_type_id(c.type_id, c.fractional_digits);
+            if phys != c.type_id || c.fractional_digits.is_some() {
+                ColumnBuilder::new_ts(c.type_id, phys, c.fractional_digits, 1)
             } else {
                 ColumnBuilder::new(c.type_id, 1)
             }
@@ -193,7 +193,7 @@ mod tests {
             nullable: true,
             default_expr: None,
             max_length,
-            ts_precision: None,
+            fractional_digits: None,
             tz_offset_secs: None,
             element_type: None,
         }

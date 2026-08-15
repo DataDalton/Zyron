@@ -18,14 +18,12 @@ async fn setup() -> (
     let dir = tempfile::tempdir().unwrap();
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(dir.path().join("data")))
-        .await
-        .unwrap(),
+            .await
+            .unwrap(),
     );
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
-    let wal = Arc::new(
-        WalWriter::new(zyron_bench_harness::wal_config(dir.path().join("wal")))
-        .unwrap(),
-    );
+    let wal =
+        Arc::new(WalWriter::new(zyron_bench_harness::wal_config(dir.path().join("wal"))).unwrap());
     std::fs::create_dir_all(dir.path().join("wal")).unwrap();
     let txnm = Arc::new(TransactionManager::new(wal));
     (disk, pool, txnm, dir)

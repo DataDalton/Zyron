@@ -35,14 +35,11 @@ async fn create_harness() -> Harness {
     std::fs::create_dir_all(&data_dir).unwrap();
     std::fs::create_dir_all(&wal_dir).unwrap();
 
-    let wal = Arc::new(
-        WalWriter::new(zyron_bench_harness::wal_config(wal_dir))
-        .expect("wal"),
-    );
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir)).expect("wal"));
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(data_dir))
-        .await
-        .expect("disk"),
+            .await
+            .expect("disk"),
     );
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let storage =
@@ -290,11 +287,17 @@ async fn branch_writes_enforce_the_constraints_a_main_write_enforces() {
     // branch's own append range
     exec(&mut h, "INSERT INTO p VALUES (7)").await;
     let err = exec_err(&mut h, "INSERT INTO p VALUES (7)").await;
-    assert!(err.contains("nique"), "branch duplicate must be refused: {err}");
+    assert!(
+        err.contains("nique"),
+        "branch duplicate must be refused: {err}"
+    );
 
     // A key main holds also collides, through the shared index
     let err = exec_err(&mut h, "INSERT INTO p VALUES (1)").await;
-    assert!(err.contains("nique"), "main duplicate must be refused: {err}");
+    assert!(
+        err.contains("nique"),
+        "main duplicate must be refused: {err}"
+    );
 
     // A foreign key with no parent is refused on the branch too
     let err = exec_err(&mut h, "INSERT INTO c VALUES (10, 99)").await;

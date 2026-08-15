@@ -31,14 +31,11 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
     std::fs::create_dir_all(&data_dir).unwrap();
     std::fs::create_dir_all(&wal_dir).unwrap();
 
-    let wal = Arc::new(
-        WalWriter::new(zyron_bench_harness::wal_config(wal_dir))
-        .expect("wal"),
-    );
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir)).expect("wal"));
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(data_dir))
-        .await
-        .expect("disk"),
+            .await
+            .expect("disk"),
     );
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let storage =
@@ -1304,7 +1301,12 @@ async fn fk_set_default_writes_the_declared_default_and_refuses_a_dangling_one()
 
     // Moving the only remaining parent key leaves the default naming nothing,
     // so the statement is refused rather than writing a dangling reference
-    let err = exec_err(&server, &mut session, "UPDATE parent SET id = 9 WHERE id = 2").await;
+    let err = exec_err(
+        &server,
+        &mut session,
+        "UPDATE parent SET id = 9 WHERE id = 2",
+    )
+    .await;
     assert!(err.contains("foreign key"), "{err}");
     let rows = exec(&server, &mut session, "SELECT id FROM parent").await;
     assert_eq!(column_values(&rows, 0), vec![ScalarValue::Int32(2)]);
@@ -1357,7 +1359,11 @@ async fn fk_set_default_with_no_declared_default_is_null_and_respects_not_null()
     let err = exec_err(&server, &mut session, "DELETE FROM p2 WHERE id = 1").await;
     assert!(!err.is_empty(), "a null into a NOT NULL column must abort");
     let rows = exec(&server, &mut session, "SELECT cid FROM c2").await;
-    assert_eq!(total_rows(&rows), 1, "the child survived the refused delete");
+    assert_eq!(
+        total_rows(&rows),
+        1,
+        "the child survived the refused delete"
+    );
 }
 
 /// NOT NULL is stored on the column, reported by the catalog views and sent
@@ -1374,14 +1380,29 @@ async fn not_null_is_enforced_on_every_write_path() {
         "CREATE TABLE nn (id INT, label TEXT NOT NULL, note TEXT)",
     )
     .await;
-    exec(&server, &mut session, "INSERT INTO nn VALUES (1, 'a', NULL)").await;
+    exec(
+        &server,
+        &mut session,
+        "INSERT INTO nn VALUES (1, 'a', NULL)",
+    )
+    .await;
 
-    let err = exec_err(&server, &mut session, "INSERT INTO nn VALUES (2, NULL, 'x')").await;
+    let err = exec_err(
+        &server,
+        &mut session,
+        "INSERT INTO nn VALUES (2, NULL, 'x')",
+    )
+    .await;
     assert!(err.contains("label") && err.contains("NOT NULL"), "{err}");
 
     // An omitted column with no default falls back to null, which is the same
     // violation reached by a different route
-    let err = exec_err(&server, &mut session, "INSERT INTO nn (id, note) VALUES (3, 'x')").await;
+    let err = exec_err(
+        &server,
+        &mut session,
+        "INSERT INTO nn (id, note) VALUES (3, 'x')",
+    )
+    .await;
     assert!(err.contains("label") && err.contains("NOT NULL"), "{err}");
 
     let err = exec_err(&server, &mut session, "UPDATE nn SET label = NULL").await;
@@ -1394,12 +1415,7 @@ async fn not_null_is_enforced_on_every_write_path() {
     assert_eq!(column_values(&rows, 0), vec![ScalarValue::Int32(1)]);
 
     // ALTER TABLE SET NOT NULL takes effect on later writes
-    exec(
-        &server,
-        &mut session,
-        "UPDATE nn SET note = 'filled'",
-    )
-    .await;
+    exec(&server, &mut session, "UPDATE nn SET note = 'filled'").await;
     exec(
         &server,
         &mut session,
@@ -1412,11 +1428,7 @@ async fn not_null_is_enforced_on_every_write_path() {
 
 /// The message a statement fails with, for the cases where the refusal is the
 /// behavior under test.
-async fn exec_err(
-    server: &Arc<ServerState>,
-    session: &mut Option<Session>,
-    sql: &str,
-) -> String {
+async fn exec_err(server: &Arc<ServerState>, session: &mut Option<Session>, sql: &str) -> String {
     match try_exec(server, session, sql).await {
         Ok(_) => panic!("expected {sql} to fail"),
         Err(e) => e,

@@ -15,11 +15,11 @@
 
 use std::collections::BTreeSet;
 
-use zyron_storage::columnar::{
-    BloomPolicy, ColumnDescriptor, CompactionConfig, CompactionInput, ZyrFileReader,
-    ZONE_MAP_BATCH_SIZE, run_compaction_cycle,
-};
 use zyron_common::{ClusterKey, ClusterStrategy, TypeId};
+use zyron_storage::columnar::{
+    BloomPolicy, ColumnDescriptor, CompactionConfig, CompactionInput, ZONE_MAP_BATCH_SIZE,
+    ZyrFileReader, run_compaction_cycle,
+};
 
 const ROWS: usize = 4_096;
 const REGIONS: i64 = 4;
@@ -196,7 +196,9 @@ fn test_fold_with_adaptive_ordering_prunes_more_zones_than_single_pk_sort() {
     clustered_sorted.sort_unstable();
     assert_eq!(pk_sorted, clustered_sorted, "every row survived the fold");
 
-    let pk_ids: BTreeSet<i64> = column_values(&by_pk.file_path, COL_ID).into_iter().collect();
+    let pk_ids: BTreeSet<i64> = column_values(&by_pk.file_path, COL_ID)
+        .into_iter()
+        .collect();
     let clustered_ids: BTreeSet<i64> = column_values(&by_region.file_path, COL_ID)
         .into_iter()
         .collect();

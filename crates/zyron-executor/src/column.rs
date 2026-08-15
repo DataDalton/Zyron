@@ -863,7 +863,7 @@ pub struct Column {
     /// including p<=6 timestamps (i64 microseconds). Carried with the value so
     /// cross-precision compare, casts, and presentation know a physical i128
     /// is logically a ps timestamp, not a plain Int128.
-    pub ts_precision: Option<u8>,
+    pub fractional_digits: Option<u8>,
 }
 
 impl Column {
@@ -874,18 +874,18 @@ impl Column {
             data,
             nulls: NullBitmap::none(len),
             type_id,
-            ts_precision: None,
+            fractional_digits: None,
         }
     }
 
     /// Creates a timestamp column carrying its fractional-second precision.
-    pub fn new_ts(data: ColumnData, type_id: TypeId, ts_precision: Option<u8>) -> Self {
+    pub fn new_ts(data: ColumnData, type_id: TypeId, fractional_digits: Option<u8>) -> Self {
         let len = data.len();
         Self {
             data,
             nulls: NullBitmap::none(len),
             type_id,
-            ts_precision,
+            fractional_digits,
         }
     }
 
@@ -896,7 +896,7 @@ impl Column {
             data,
             nulls,
             type_id,
-            ts_precision: None,
+            fractional_digits: None,
         }
     }
 
@@ -905,14 +905,14 @@ impl Column {
         data: ColumnData,
         nulls: NullBitmap,
         type_id: TypeId,
-        ts_precision: Option<u8>,
+        fractional_digits: Option<u8>,
     ) -> Self {
         debug_assert_eq!(data.len(), nulls.len());
         Self {
             data,
             nulls,
             type_id,
-            ts_precision,
+            fractional_digits,
         }
     }
 
@@ -922,7 +922,7 @@ impl Column {
             data: ColumnData::null_fill(type_id, len),
             nulls: NullBitmap::all_null(len),
             type_id,
-            ts_precision: None,
+            fractional_digits: None,
         }
     }
 
@@ -960,7 +960,7 @@ impl Column {
             data: self.data.filter(mask),
             nulls: self.nulls.filter(mask),
             type_id: self.type_id,
-            ts_precision: self.ts_precision,
+            fractional_digits: self.fractional_digits,
         }
     }
 
@@ -970,7 +970,7 @@ impl Column {
             data: self.data.take(indices),
             nulls: self.nulls.take(indices),
             type_id: self.type_id,
-            ts_precision: self.ts_precision,
+            fractional_digits: self.fractional_digits,
         }
     }
 
@@ -980,7 +980,7 @@ impl Column {
             data: self.data.slice(offset, len),
             nulls: self.nulls.slice(offset, len),
             type_id: self.type_id,
-            ts_precision: self.ts_precision,
+            fractional_digits: self.fractional_digits,
         }
     }
 

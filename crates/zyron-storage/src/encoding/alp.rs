@@ -237,8 +237,7 @@ impl Encoding for AlpEncoding {
 
         // Build output
         let exceptionEntrySize = 4 + value_size; // row_index + original_value
-        let totalSize =
-            28 + restarts * 8 + packedBytes + exceptions.len() * exceptionEntrySize;
+        let totalSize = 28 + restarts * 8 + packedBytes + exceptions.len() * exceptionEntrySize;
         let mut out = Vec::with_capacity(totalSize);
 
         let mut flags: u8 = if useDelta { FLAG_DELTA } else { 0x00 };

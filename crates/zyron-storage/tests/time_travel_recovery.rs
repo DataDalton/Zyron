@@ -25,10 +25,8 @@ fn commit_lsn_dating_survives_crash_for_checkpointed_and_redo_tail_txns() {
     std::fs::create_dir_all(&data_dir).unwrap();
 
     // --- Live operation before the crash ---
-    let wal = Arc::new(
-        WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
-        .expect("wal"),
-    );
+    let wal =
+        Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone())).expect("wal"));
     let txns = Arc::new(TransactionManager::new(Arc::clone(&wal)));
     let status = txns.status_map();
     // A retained version exists, so transactions are dated by commit LSN.

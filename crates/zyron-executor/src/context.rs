@@ -819,10 +819,14 @@ impl ExecutionContext {
         snap.spatial.iter().map(|(id, col)| (id.0, *col)).collect()
     }
 
-    /// Returns (index_id, indexed column_id) for B+Tree indexes on the
-    /// table. Lock-free read from the catalog index snapshot.
+    /// Returns (index_id, leading key column_id) for B+Tree indexes on the
+    /// table. Lock-free read from the catalog index snapshot. Index selection
+    /// matches on the leading column, so that is what this reports.
     pub fn btree_indexes_for_table(&self, table_id: u32) -> Vec<(u32, zyron_catalog::ColumnId)> {
         let snap = self.index_snapshot_for_table(table_id);
-        snap.btree.iter().map(|(id, col, _)| (id.0, *col)).collect()
+        snap.btree
+            .iter()
+            .map(|spec| (spec.id.0, spec.leading()))
+            .collect()
     }
 }

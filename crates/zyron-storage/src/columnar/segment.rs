@@ -620,12 +620,12 @@ impl ColumnSegment {
                     let below = |cur: &[u8; STAT_VALUE_SIZE]| {
                         compare_value_to_slot(v, cur, valueSize, statOrder) == Less
                     };
-                    let above = |cur: &[u8; STAT_VALUE_SIZE]| {
-                        match compare_value_to_slot(v, cur, valueSize, statOrder) {
-                            Greater => true,
-                            Equal => truncated,
-                            Less => false,
-                        }
+                    let above = |cur: &[u8; STAT_VALUE_SIZE]| match compare_value_to_slot(
+                        v, cur, valueSize, statOrder,
+                    ) {
+                        Greater => true,
+                        Equal => truncated,
+                        Less => false,
                     };
                     let new_gmin = globalMin.is_none_or(|cur| below(&cur));
                     let new_gmax = globalMax.is_none_or(|cur| above(&cur));

@@ -1,0 +1,69 @@
+{
+  "id": "2026-08-15_031255_2848e81-local",
+  "date": "2026-08-15 03:13:19Z",
+  "ts": 1786763599,
+  "commit": "2848e81-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "debug",
+  "tests": {
+    "Arrow IPC Write": {
+      "rows/sec at batch=10000": {
+        "average": 6572132.345475,
+        "runs": [6307496.78, 6614740.95, 6642973.39, 6624381.03, 6671069.57],
+        "target": 1000000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "Avro Write": {
+      "rows/sec at batch=10000": {
+        "average": 353382.035460,
+        "runs": [353960.50, 355018.07, 353836.01, 351146.28, 352949.32],
+        "target": 300000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "CSV Write": {
+      "rows/sec at batch=10000": {
+        "average": 701229.220118,
+        "runs": [691940.01, 702099.28, 691993.15, 708588.16, 711525.50],
+        "target": 2000000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "JSON Write": {
+      "rows/sec at batch=10000": {
+        "average": 220586.472789,
+        "runs": [218984.51, 220041.76, 219842.36, 222199.85, 221863.89],
+        "target": 1000000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "JSONL Write": {
+      "rows/sec at batch=10000": {
+        "average": 194064.674525,
+        "runs": [193851.38, 194277.52, 193897.99, 194391.95, 193904.53],
+        "target": 1500000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "Parquet Write": {
+      "rows/sec at batch=10000": {
+        "average": 236233.749865,
+        "runs": [236822.77, 235885.27, 236095.73, 236026.86, 236338.12],
+        "target": 500000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    }
+  }
+}

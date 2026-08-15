@@ -79,7 +79,7 @@ pub async fn read_heap_rows(
                 name: c.name.clone(),
                 type_id: c.type_id,
                 nullable: c.nullable,
-                ts_precision: c.ts_precision,
+                fractional_digits: c.fractional_digits,
             })
             .collect();
         let mut op = crate::operator::column_scan::ColumnScanOperator::new_for_dml(
@@ -144,7 +144,7 @@ pub fn cells_to_batches(
             name: c.name.clone(),
             type_id: c.type_id,
             nullable: c.nullable,
-            ts_precision: c.ts_precision,
+            fractional_digits: c.fractional_digits,
         })
         .collect();
 

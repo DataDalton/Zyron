@@ -17,8 +17,8 @@ use zyron_common::ZyronError;
 
 use crate::branch::list_branches;
 use crate::paths::{
-    parse_data_file_name, parse_index_file_name, parse_version_file_name, LakePaths,
-    VersionFileKind,
+    LakePaths, VersionFileKind, parse_data_file_name, parse_index_file_name,
+    parse_version_file_name,
 };
 use crate::reader::LakeFileReader;
 use crate::transaction_log::{CommitAttempt, LogEntry, TransactionLog, VersionFileData};
@@ -43,7 +43,10 @@ pub enum Problem {
         file_rows: u64,
     },
     /// A file carries a delete predicate id the manifest does not define
-    DanglingDeletePredicate { partition_id: u64, predicate_id: u64 },
+    DanglingDeletePredicate {
+        partition_id: u64,
+        predicate_id: u64,
+    },
 }
 
 impl Problem {
@@ -114,17 +117,17 @@ pub fn validate(log: &TransactionLog, deep: bool) -> Result<ValidationReport, Zy
         report.checkpoints_checked += 1;
         let path = paths.checkpoint_file(version);
         let bytes = fs::read(&path)?;
-        let checkpoint = match crate::manifest::ManifestFile::decode(&bytes, &path.to_string_lossy())
-        {
-            Ok(m) => m,
-            Err(e) => {
-                report.problems.push(Problem::UnreadableCheckpoint {
-                    version,
-                    reason: e.to_string(),
-                });
-                continue;
-            }
-        };
+        let checkpoint =
+            match crate::manifest::ManifestFile::decode(&bytes, &path.to_string_lossy()) {
+                Ok(m) => m,
+                Err(e) => {
+                    report.problems.push(Problem::UnreadableCheckpoint {
+                        version,
+                        reason: e.to_string(),
+                    });
+                    continue;
+                }
+            };
         if deep && version <= head {
             let replayed = log.manifest_at(version)?;
             let a: Vec<u64> = checkpoint.entries.iter().map(|e| e.partition_id).collect();
@@ -265,11 +268,11 @@ pub fn repair(
             report.files_removed = missing;
             report.version = Some(version);
         } else {
-            report
-                .unrepaired
-                .extend(missing.into_iter().map(|partition_id| {
-                    Problem::MissingDataFile { partition_id }
-                }));
+            report.unrepaired.extend(
+                missing
+                    .into_iter()
+                    .map(|partition_id| Problem::MissingDataFile { partition_id }),
+            );
         }
     }
 
@@ -315,8 +318,11 @@ pub fn cleanup_orphans(
     let floor = retain_from_version.clamp(1, head.max(1));
 
     let floor_manifest = log.manifest_at(floor)?;
-    let mut reachable: BTreeSet<u64> =
-        floor_manifest.entries.iter().map(|e| e.partition_id).collect();
+    let mut reachable: BTreeSet<u64> = floor_manifest
+        .entries
+        .iter()
+        .map(|e| e.partition_id)
+        .collect();
     let mut reachable_index: BTreeSet<(u32, u64)> = floor_manifest
         .index_files
         .iter()
@@ -458,7 +464,7 @@ mod tests {
                 name: "id".into(),
                 type_id: TypeId::Int64,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
                 tz_offset_secs: None,
                 max_length: None,
                 default_expr: None,
@@ -500,11 +506,7 @@ mod tests {
         let mut out: Vec<u64> = fs::read_dir(paths.data_dir())
             .expect("data dir")
             .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                e.file_name()
-                    .to_str()
-                    .and_then(parse_data_file_name)
-            })
+            .filter_map(|e| e.file_name().to_str().and_then(parse_data_file_name))
             .collect();
         out.sort_unstable();
         out
@@ -514,10 +516,20 @@ mod tests {
     fn test_validate_reports_a_healthy_table() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let log = new_log(dir.path());
-        append_rows(&log, attempt(OperationKind::Append, 200), 17, &rows(&[1, 2, 3]))
-            .expect("append");
-        append_rows(&log, attempt(OperationKind::Append, 300), 17, &rows(&[4, 5]))
-            .expect("append");
+        append_rows(
+            &log,
+            attempt(OperationKind::Append, 200),
+            17,
+            &rows(&[1, 2, 3]),
+        )
+        .expect("append");
+        append_rows(
+            &log,
+            attempt(OperationKind::Append, 300),
+            17,
+            &rows(&[4, 5]),
+        )
+        .expect("append");
 
         let report = validate(&log, true).expect("validate");
         assert!(report.is_healthy(), "{:?}", report.problems);
@@ -530,10 +542,20 @@ mod tests {
     fn test_a_missing_data_file_is_reported_and_only_dropped_when_asked() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let log = new_log(dir.path());
-        append_rows(&log, attempt(OperationKind::Append, 200), 17, &rows(&[1, 2, 3]))
-            .expect("append");
-        append_rows(&log, attempt(OperationKind::Append, 300), 17, &rows(&[4, 5]))
-            .expect("append");
+        append_rows(
+            &log,
+            attempt(OperationKind::Append, 200),
+            17,
+            &rows(&[1, 2, 3]),
+        )
+        .expect("append");
+        append_rows(
+            &log,
+            attempt(OperationKind::Append, 300),
+            17,
+            &rows(&[4, 5]),
+        )
+        .expect("append");
 
         let victim = log.latest_manifest().expect("manifest").entries[0].partition_id;
         fs::remove_file(log.paths().data_file(victim)).expect("remove data file");
@@ -581,8 +603,13 @@ mod tests {
     fn test_a_corrupt_checkpoint_is_reported_and_deleted() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let log = new_log(dir.path());
-        append_rows(&log, attempt(OperationKind::Append, 200), 17, &rows(&[1, 2]))
-            .expect("append");
+        append_rows(
+            &log,
+            attempt(OperationKind::Append, 200),
+            17,
+            &rows(&[1, 2]),
+        )
+        .expect("append");
         log.checkpoint(2).expect("checkpoint");
 
         let path = log.paths().checkpoint_file(2);
@@ -613,10 +640,20 @@ mod tests {
     fn test_cleanup_orphans_respects_the_retention_floor() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let log = new_log(dir.path());
-        append_rows(&log, attempt(OperationKind::Append, 200), 17, &rows(&[1, 2, 3]))
-            .expect("append");
-        append_rows(&log, attempt(OperationKind::Append, 300), 17, &rows(&[40, 50]))
-            .expect("append");
+        append_rows(
+            &log,
+            attempt(OperationKind::Append, 200),
+            17,
+            &rows(&[1, 2, 3]),
+        )
+        .expect("append");
+        append_rows(
+            &log,
+            attempt(OperationKind::Append, 300),
+            17,
+            &rows(&[40, 50]),
+        )
+        .expect("append");
         // Drops the first file whole, leaving it on disk but out of the manifest
         delete_where(
             &log,
@@ -649,19 +686,26 @@ mod tests {
     fn test_cleanup_orphans_keeps_what_a_branch_references() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let log = new_log(dir.path());
-        append_rows(&log, attempt(OperationKind::Append, 200), 17, &rows(&[1]))
-            .expect("append");
+        append_rows(&log, attempt(OperationKind::Append, 200), 17, &rows(&[1])).expect("append");
         crate::branch::create_branch(&log, "work", None, 250).expect("branch");
 
         let branch = crate::branch::open_branch(log.paths(), "work").expect("open");
-        append_rows(&branch, attempt(OperationKind::Append, 300), 17, &rows(&[9]))
-            .expect("branch append");
+        append_rows(
+            &branch,
+            attempt(OperationKind::Append, 300),
+            17,
+            &rows(&[9]),
+        )
+        .expect("branch append");
         assert_eq!(data_files(log.paths()).len(), 2);
 
         // The branch's file is not in main's manifest at any version, and it
         // must survive a cleanup that only main's head would justify
         let report = cleanup_orphans(&log, log.latest_version()).expect("cleanup");
-        assert!(report.removed.is_empty(), "a branch's file is not an orphan");
+        assert!(
+            report.removed.is_empty(),
+            "a branch's file is not an orphan"
+        );
         assert_eq!(data_files(log.paths()).len(), 2);
 
         // Once the branch is gone so is its claim
@@ -675,8 +719,7 @@ mod tests {
     fn test_staged_files_are_counted_never_deleted() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let log = new_log(dir.path());
-        append_rows(&log, attempt(OperationKind::Append, 200), 17, &rows(&[1]))
-            .expect("append");
+        append_rows(&log, attempt(OperationKind::Append, 200), 17, &rows(&[1])).expect("append");
         let staged = log.paths().data_dir().join("p-00000000000000ff.zyr.tmp");
         fs::write(&staged, b"half written").expect("stage");
 

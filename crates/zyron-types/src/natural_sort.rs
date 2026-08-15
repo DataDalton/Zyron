@@ -169,8 +169,14 @@ fn natural_compare_inner(a: &str, b: &str, fold_case: bool) -> Ordering {
             let bj = bi + bb[bi..].iter().take_while(|c| c.is_ascii_digit()).count();
             let a_run = &ab[ai..aj];
             let b_run = &bb[bi..bj];
-            let a_strip = a_run.iter().position(|c| *c != b'0').unwrap_or(a_run.len() - 1);
-            let b_strip = b_run.iter().position(|c| *c != b'0').unwrap_or(b_run.len() - 1);
+            let a_strip = a_run
+                .iter()
+                .position(|c| *c != b'0')
+                .unwrap_or(a_run.len() - 1);
+            let b_strip = b_run
+                .iter()
+                .position(|c| *c != b'0')
+                .unwrap_or(b_run.len() - 1);
             let a_digits = &a_run[a_strip..];
             let b_digits = &b_run[b_strip..];
             match a_digits.len().cmp(&b_digits.len()) {
@@ -196,8 +202,16 @@ fn natural_compare_inner(a: &str, b: &str, fold_case: bool) -> Ordering {
         } else if b_digit {
             return Ordering::Greater;
         } else {
-            let x = if fold_case { ab[ai].to_ascii_lowercase() } else { ab[ai] };
-            let y = if fold_case { bb[bi].to_ascii_lowercase() } else { bb[bi] };
+            let x = if fold_case {
+                ab[ai].to_ascii_lowercase()
+            } else {
+                ab[ai]
+            };
+            let y = if fold_case {
+                bb[bi].to_ascii_lowercase()
+            } else {
+                bb[bi]
+            };
             match x.cmp(&y) {
                 Ordering::Equal => {}
                 other => return other,
@@ -494,8 +508,10 @@ mod tests {
     #[test]
     fn custom_order_known_values() {
         let order = ["urgent", "high", "medium", "low"];
-        assert!(custom_order_rank("urgent", &order, UnknownPosition::Last)
-            < custom_order_rank("high", &order, UnknownPosition::Last));
+        assert!(
+            custom_order_rank("urgent", &order, UnknownPosition::Last)
+                < custom_order_rank("high", &order, UnknownPosition::Last)
+        );
         assert_eq!(
             custom_order_rank("nope", &order, UnknownPosition::Last),
             i32::MAX

@@ -147,11 +147,7 @@ impl FunnelAnalyser {
             let users = step_users[s];
             let prev = if s == 0 { users } else { step_users[s - 1] };
             let prev_f = prev.max(1) as f64;
-            let conversion = if s == 0 {
-                1.0
-            } else {
-                users as f64 / prev_f
-            };
+            let conversion = if s == 0 { 1.0 } else { users as f64 / prev_f };
             let drop_off = if s == 0 { 0.0 } else { 1.0 - conversion };
             let avg_time = if self.next_time_n[s] > 0 {
                 Some(self.next_time_sum[s] as f64 / self.next_time_n[s] as f64)

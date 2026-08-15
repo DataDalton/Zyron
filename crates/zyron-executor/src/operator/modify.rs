@@ -103,6 +103,125 @@ pub(crate) fn encode_btree_key_into(
     true
 }
 
+/// Terminator closing a variable-length component that another component
+/// follows. `0x00` inside the value is escaped to `0x00 0xFF`, which sorts
+/// above this terminator, so a value that is a prefix of another still
+/// orders below it and byte order keeps matching value order.
+const VARLEN_COMPONENT_TERMINATOR: [u8; 2] = [0x00, 0x00];
+
+/// True when a batch column stores variable-length values, so a key
+/// component built from it needs delimiting when another component follows.
+#[inline]
+fn column_is_varlen(batch: &DataBatch, col_pos: usize) -> bool {
+    matches!(
+        batch.columns.get(col_pos).map(|c| &c.data),
+        Some(ColumnData::Utf8(_)) | Some(ColumnData::Binary(_))
+    )
+}
+
+/// Delimits the variable-length component occupying `buf[start..]`, escaping
+/// any `0x00` it contains and appending the terminator.
+///
+/// A value holding no `0x00` byte, which is every ordinary string, appends
+/// the two terminator bytes and rewrites nothing.
+fn close_varlen_component(buf: &mut Vec<u8>, start: usize) {
+    if buf[start..].contains(&0x00) {
+        let raw: Vec<u8> = buf[start..].to_vec();
+        buf.truncate(start);
+        for &b in &raw {
+            if b == 0x00 {
+                buf.extend_from_slice(&[0x00, 0xFF]);
+            } else {
+                buf.push(b);
+            }
+        }
+    }
+    buf.extend_from_slice(&VARLEN_COMPONENT_TERMINATOR);
+}
+
+/// Builds the full key of a B+tree index, concatenating every key column in
+/// key order.
+///
+/// Returns false when any component is null, which leaves the row out of the
+/// index entirely. That is what makes a unique constraint over a nullable
+/// column behave as SQL requires: rows with a null in the key never conflict
+/// with each other.
+///
+/// A single-column index produces exactly the bytes `encode_btree_key_into`
+/// produces on its own, so the common key shape is unchanged.
+pub(crate) fn encode_btree_index_key_into(
+    batch: &DataBatch,
+    row_idx: usize,
+    key_cols: &[(usize, TypeId)],
+    buf: &mut Vec<u8>,
+) -> bool {
+    buf.clear();
+    let last = key_cols.len().saturating_sub(1);
+    let mut component = Vec::new();
+    for (i, &(col_pos, type_id)) in key_cols.iter().enumerate() {
+        // encode_btree_key_into clears the buffer it writes, so the first
+        // component writes straight into the key and later ones stage
+        // through a buffer that is reused across the whole key
+        let start = buf.len();
+        if i == 0 {
+            if !encode_btree_key_into(batch, row_idx, col_pos, type_id, buf) {
+                return false;
+            }
+        } else {
+            if !encode_btree_key_into(batch, row_idx, col_pos, type_id, &mut component) {
+                return false;
+            }
+            buf.extend_from_slice(&component);
+        }
+        // The final component runs to the locator suffix, so its extent is
+        // known from the key length and it needs no delimiter
+        if i != last && column_is_varlen(batch, col_pos) {
+            close_varlen_component(buf, start);
+        }
+    }
+    true
+}
+
+/// Inclusive upper bound covering every index entry whose key starts with
+/// `prefix`, for a range scan that knows a leading part of the key.
+///
+/// Returns the prefix's successor, incrementing its last byte below 0xFF and
+/// dropping the rest. No stored key can equal that successor, because every
+/// stored key carries a locator suffix and so runs past the prefix, and any
+/// key starting with the successor sorts above it. So an inclusive bound
+/// here behaves as an exclusive bound on the prefix.
+///
+/// None when the prefix is all 0xFF and has no successor, which asks the
+/// caller to leave the scan open at the top. Padding the bound with a fixed
+/// number of 0xFF bytes instead would cut a composite key short, because the
+/// components after the prefix make the stored key longer than the pad.
+pub(crate) fn index_key_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let last = prefix.iter().rposition(|&b| b != 0xFF)?;
+    let mut bound = prefix[..=last].to_vec();
+    bound[last] += 1;
+    Some(bound)
+}
+
+/// Resolves an index's key columns to their positions in the table's column
+/// list, paired with each column's type. Returns None when the index names a
+/// column the table does not have, which leaves that index untouched rather
+/// than half-maintained under a shifted key.
+pub(crate) fn index_key_columns(
+    table_entry: &zyron_catalog::TableEntry,
+    columns: &[zyron_catalog::ColumnId],
+) -> Option<Vec<(usize, TypeId)>> {
+    let mut resolved = Vec::with_capacity(columns.len());
+    for col_id in columns {
+        let pos = table_entry.columns.iter().position(|c| c.id == *col_id)?;
+        resolved.push((pos, table_entry.columns[pos].type_id));
+    }
+    if resolved.is_empty() {
+        None
+    } else {
+        Some(resolved)
+    }
+}
+
 /// Length of the locator suffix appended to every B+tree index key. Distinct
 /// rows that share an indexed value get distinct, ordered composite keys
 /// (value bytes followed by the row locator's order-preserving encoding), so
@@ -208,6 +327,47 @@ pub fn encode_btree_key_from_cell(phys: TypeId, cell: &[u8], buf: &mut Vec<u8>) 
     true
 }
 
+/// Builds an index's full key for one folded row from the raw cell bytes the
+/// fold captured, applying the same component delimiting the batch path uses
+/// so a re-keyed entry matches the key the insert path would have written.
+///
+/// Returns false when any key column is missing from `indexed_cells` or is
+/// null in this row, which leaves the row out of that index exactly as the
+/// batch path does.
+fn encode_btree_index_key_from_cells(
+    key_columns: &[zyron_catalog::ColumnId],
+    indexed_cells: &[(zyron_catalog::ColumnId, TypeId, Vec<Option<&[u8]>>)],
+    row: usize,
+    buf: &mut Vec<u8>,
+) -> bool {
+    buf.clear();
+    let last = key_columns.len().saturating_sub(1);
+    let mut component = Vec::new();
+    for (i, col_id) in key_columns.iter().enumerate() {
+        let Some((_, phys, cells)) = indexed_cells.iter().find(|(cid, _, _)| cid == col_id) else {
+            return false;
+        };
+        let Some(Some(cell)) = cells.get(row) else {
+            return false;
+        };
+        let start = buf.len();
+        if i == 0 {
+            if !encode_btree_key_from_cell(*phys, cell, buf) {
+                return false;
+            }
+        } else {
+            if !encode_btree_key_from_cell(*phys, cell, &mut component) {
+                return false;
+            }
+            buf.extend_from_slice(&component);
+        }
+        if i != last && phys.fixed_size().is_none() {
+            close_varlen_component(buf, start);
+        }
+    }
+    true
+}
+
 /// Re-keys every B+tree entry for rows a fold moved from the heap into a
 /// columnar segment: the heap-suffixed key is deleted and the columnar
 /// suffixed twin inserted, so index scans keep serving the rows after their
@@ -219,25 +379,20 @@ pub fn fold_rekey_btree_entries(
     indexed_cells: &[(zyron_catalog::ColumnId, TypeId, Vec<Option<&[u8]>>)],
     file_id: u64,
     base_rowid: u64,
-    btree: &[(zyron_catalog::IndexId, zyron_catalog::ColumnId, bool)],
+    btree: &[zyron_catalog::BTreeIndexSpec],
     registry: &scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>,
 ) {
     if folded.is_empty() || btree.is_empty() {
         return;
     }
     let mut scratch: Vec<u8> = Vec::with_capacity(48);
-    for (idx_id, col_id, _unique) in btree {
+    for spec in btree {
+        let idx_id = spec.id;
         let Some(tree) = registry.read_sync(&idx_id.0, |_, v| Arc::clone(v)) else {
             continue;
         };
-        let Some((_, phys, cells)) = indexed_cells.iter().find(|(cid, _, _)| cid == col_id) else {
-            continue;
-        };
         for (i, (page_id, slot, _xmin)) in folded.iter().enumerate() {
-            let Some(cell) = cells[i] else {
-                continue;
-            };
-            if !encode_btree_key_from_cell(*phys, cell, &mut scratch) {
+            if !encode_btree_index_key_from_cells(&spec.columns, indexed_cells, i, &mut scratch) {
                 continue;
             }
             let value_len = scratch.len();
@@ -259,26 +414,31 @@ pub fn fold_rekey_btree_entries(
     }
 }
 
-/// True when the columnar row's current visible value for the indexed column
-/// still encodes to `value_key`. Old-value index entries survive an update
-/// (the locator does not change), so they must never prove a conflict
+/// True when the columnar row's current visible values for the index's key
+/// columns still encode to `value_key`. Old-value index entries survive an
+/// update (the locator does not change), so they must never prove a conflict
 async fn columnar_row_currently_holds_value(
     ctx: &Arc<ExecutionContext>,
     te: &zyron_catalog::TableEntry,
-    col_pos: usize,
+    key_cols: &[(usize, TypeId)],
     file_id: u64,
     sys_rowid: u64,
     value_key: &[u8],
 ) -> zyron_common::Result<bool> {
-    let c = &te.columns[col_pos];
-    let logical = vec![LogicalColumn {
-        table_idx: Some(0),
-        column_id: c.id,
-        name: c.name.clone(),
-        type_id: c.type_id,
-        nullable: c.nullable,
-        ts_precision: c.ts_precision,
-    }];
+    let logical: Vec<LogicalColumn> = key_cols
+        .iter()
+        .map(|&(col_pos, _)| {
+            let c = &te.columns[col_pos];
+            LogicalColumn {
+                table_idx: Some(0),
+                column_id: c.id,
+                name: c.name.clone(),
+                type_id: c.type_id,
+                nullable: c.nullable,
+                fractional_digits: c.fractional_digits,
+            }
+        })
+        .collect();
     let loc = [zyron_common::RowLocator::Columnar { file_id, sys_rowid }];
     let fetcher = crate::operator::doc_fetch::DocRowFetcher::prepare_columnar_only(
         ctx, te.id, &logical, &loc, None,
@@ -287,16 +447,32 @@ async fn columnar_row_currently_holds_value(
     let Some(vals) = fetcher.columnar_row(file_id, sys_rowid) else {
         return Ok(false);
     };
+    if vals.len() < logical.len() {
+        return Ok(false);
+    }
     let mut builders = create_builders(&logical, 1);
-    builders[0].push(&vals[0]);
+    for (i, builder) in builders.iter_mut().enumerate() {
+        builder.push(&vals[i]);
+    }
     let row = finalize_builders(builders);
-    let mut buf = Vec::with_capacity(24);
-    Ok(encode_btree_key_into(&row, 0, 0, c.type_id, &mut buf) && buf == value_key)
+    // The fetched row carries the key columns alone, in key order, so the
+    // key is rebuilt over positions 0..n rather than the table's positions
+    let fetched_cols: Vec<(usize, TypeId)> = key_cols
+        .iter()
+        .enumerate()
+        .map(|(i, &(_, type_id))| (i, type_id))
+        .collect();
+    let mut buf = Vec::with_capacity(32);
+    Ok(encode_btree_index_key_into(&row, 0, &fetched_cols, &mut buf) && buf == value_key)
 }
 
 /// Latest-committed liveness of a columnar row for constraint probes: the
-/// folded base version is committed by construction, so the row is dead only
-/// when a committed supersede exists on the branch this statement writes
+/// folded base version is committed by construction, so the row is dead once
+/// a supersede on the branch this statement writes has committed.
+///
+/// A supersede this transaction wrote counts too. It is not committed yet but
+/// is certain to the statement asking, so the key it freed is reusable in the
+/// same transaction, matching the heap probe.
 pub(crate) fn columnar_row_live_latest(
     ctx: &ExecutionContext,
     te: &zyron_catalog::TableEntry,
@@ -312,17 +488,32 @@ pub(crate) fn columnar_row_live_latest(
         return Ok(true);
     };
     let status = ctx.snapshot.status_map();
-    Ok(!overlay.supersedes.iter().any(|&x| status.is_committed(x)))
+    let self_txn = ctx.txn_id as u64;
+    Ok(!overlay
+        .supersedes
+        .iter()
+        .any(|&x| x == self_txn || status.is_committed(x)))
 }
 
-/// Builds a unique-constraint violation error for a table column.
+/// Builds a unique-constraint violation error naming every key column, so a
+/// multi-column constraint reports the key that collided rather than one
+/// column of it.
 fn unique_violation(
     table_entry: &zyron_catalog::TableEntry,
-    col_pos: usize,
+    key_cols: &[(usize, TypeId)],
 ) -> zyron_common::ZyronError {
+    let names: Vec<&str> = key_cols
+        .iter()
+        .map(|&(col_pos, _)| table_entry.columns[col_pos].name.as_str())
+        .collect();
     zyron_common::ZyronError::UniqueViolation(format!(
-        "duplicate key value violates unique constraint on \"{}\".\"{}\"",
-        table_entry.name, table_entry.columns[col_pos].name
+        "duplicate key value violates unique constraint on \"{}\".({})",
+        table_entry.name,
+        names
+            .iter()
+            .map(|n| format!("\"{n}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
     ))
 }
 
@@ -343,7 +534,7 @@ pub(crate) async fn check_unique_constraints(
     if index_snap.btree.is_empty() {
         return Ok(());
     }
-    let has_unique = index_snap.btree.iter().any(|(_, _, u)| *u);
+    let has_unique = index_snap.btree.iter().any(|spec| spec.unique);
     if !has_unique {
         return Ok(());
     }
@@ -355,22 +546,21 @@ pub(crate) async fn check_unique_constraints(
         .collect();
     let heap_file_id = table_entry.heap_file_id;
     let mut scratch: Vec<u8> = Vec::with_capacity(24);
-    for (idx_id, col_id, unique) in &index_snap.btree {
-        if !*unique {
+    for spec in &index_snap.btree {
+        if !spec.unique {
             continue;
         }
-        let Some(btree) = ctx.get_index(*idx_id) else {
+        let Some(btree) = ctx.get_index(spec.id) else {
             continue;
         };
-        let Some(col_pos) = table_entry.columns.iter().position(|c| c.id == *col_id) else {
+        let Some(key_cols) = index_key_columns(table_entry, &spec.columns) else {
             continue;
         };
-        let col_type = table_entry.columns[col_pos].type_id;
+        let idx_id = spec.id;
         let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         for row_idx in 0..batch.num_rows {
-            scratch.clear();
-            if !encode_btree_key_into(batch, row_idx, col_pos, col_type, &mut scratch) {
-                continue; // null is unconstrained
+            if !encode_btree_index_key_into(batch, row_idx, &key_cols, &mut scratch) {
+                continue; // a null in the key is unconstrained
             }
             // Serialize concurrent inserters of the same value: take a key lock
             // (namespaced by index id) held until commit/abort. A concurrent
@@ -383,21 +573,20 @@ pub(crate) async fn check_unique_constraints(
                 locks.lock_key(ctx.txn_id as u64, table_entry.id.0, &lock_key)?;
             }
             if !seen.insert(scratch.clone()) {
-                return Err(unique_violation(table_entry, col_pos));
+                return Err(unique_violation(table_entry, &key_cols));
             }
-            // Collect index candidates for this value, excluding the rows being
+            // Collect index candidates for this key, excluding the rows being
             // updated, then confirm each points at a LIVE committed row (an
             // MVCC-deleted row's stale entry is not a conflict).
-            let mut lo = scratch.clone();
-            lo.extend_from_slice(&[0u8; INDEX_LOCATOR_SUFFIX_LEN]);
-            let mut hi = scratch.clone();
-            hi.extend_from_slice(&[0xFFu8; INDEX_LOCATOR_SUFFIX_LEN]);
+            let lo = scratch.clone();
+            let hi = index_key_upper_bound(&scratch);
             let value_len = scratch.len();
             let mut candidates: Vec<zyron_common::RowLocator> = Vec::new();
-            btree.range_scan_for_each(Some(&lo), Some(&hi), |k, existing| {
-                // A composite key is value||locator_suffix. For a variable
-                // length value, the range can also catch a longer value sharing
-                // this prefix, so require an exact value match (length + bytes)
+            btree.range_scan_for_each(Some(&lo), hi.as_deref(), |k, existing| {
+                // A stored key is index_key||locator_suffix. For a variable
+                // length final component, the range can also catch a longer
+                // value sharing this prefix, so require an exact key match
+                // (length + bytes)
                 let exact_value = k.len() == value_len + INDEX_LOCATOR_SUFFIX_LEN
                     && k[..value_len] == scratch[..];
                 if exact_value && !exclude.contains(&existing) {
@@ -427,9 +616,11 @@ pub(crate) async fn check_unique_constraints(
                             &data,
                             zyron_storage::SlotId(slot),
                         ) {
-                            Some(view) => ctx
-                                .snapshot
-                                .is_live_latest(view.header.xmin as u64, view.header.xmax as u64),
+                            Some(view) => ctx.snapshot.is_live_latest(
+                                view.header.xmin as u64,
+                                view.header.xmax as u64,
+                                ctx.txn_id as u64,
+                            ),
                             None => false,
                         }
                     }
@@ -441,7 +632,7 @@ pub(crate) async fn check_unique_constraints(
                             && columnar_row_currently_holds_value(
                                 ctx,
                                 table_entry,
-                                col_pos,
+                                &key_cols,
                                 file_id,
                                 sys_rowid,
                                 &scratch[..value_len],
@@ -451,7 +642,7 @@ pub(crate) async fn check_unique_constraints(
                     zyron_common::RowLocator::Lake { .. } => false,
                 };
                 if live {
-                    return Err(unique_violation(table_entry, col_pos));
+                    return Err(unique_violation(table_entry, &key_cols));
                 }
             }
 
@@ -460,16 +651,9 @@ pub(crate) async fn check_unique_constraints(
             // are as real as any other to a branch reader, so a uniqueness
             // check that skipped them would let one branch hold the value
             // twice. Bounded by what the branch itself wrote
-            if branch_append_holds_value(
-                ctx,
-                table_entry,
-                col_pos,
-                col_type,
-                &scratch[..value_len],
-            )
-            .await?
+            if branch_append_holds_value(ctx, table_entry, &key_cols, &scratch[..value_len]).await?
             {
-                return Err(unique_violation(table_entry, col_pos));
+                return Err(unique_violation(table_entry, &key_cols));
             }
         }
     }
@@ -552,8 +736,7 @@ async fn insert_branch_batch(
 async fn branch_append_holds_value(
     ctx: &Arc<ExecutionContext>,
     table_entry: &zyron_catalog::TableEntry,
-    col_pos: usize,
-    col_type: TypeId,
+    key_cols: &[(usize, TypeId)],
     value: &[u8],
 ) -> zyron_common::Result<bool> {
     let (Some(branch_id), Some(catalog)) = (ctx.active_branch_id, ctx.branch_catalog.as_ref())
@@ -581,15 +764,16 @@ async fn branch_append_holds_value(
                 continue;
             };
             if view.is_deleted()
-                || !ctx
-                    .snapshot
-                    .is_live_latest(view.header.xmin as u64, view.header.xmax as u64)
+                || !ctx.snapshot.is_live_latest(
+                    view.header.xmin as u64,
+                    view.header.xmax as u64,
+                    ctx.txn_id as u64,
+                )
             {
                 continue;
             }
             let row = crate::operator::fk::decode_tuple_to_batch(view.data, table_entry);
-            scratch.clear();
-            if !encode_btree_key_into(&row, 0, col_pos, col_type, &mut scratch) {
+            if !encode_btree_index_key_into(&row, 0, key_cols, &mut scratch) {
                 continue;
             }
             if scratch == value {
@@ -623,19 +807,17 @@ pub(crate) fn maintain_btree_insert(
     let mut key_spans: Vec<(usize, usize, zyron_common::RowLocator)> =
         Vec::with_capacity(locators.len());
     let mut scratch: Vec<u8> = Vec::with_capacity(48);
-    for (idx_id, col_id, _unique) in &index_snap.btree {
-        let Some(btree) = ctx.get_index(*idx_id) else {
+    for spec in &index_snap.btree {
+        let Some(btree) = ctx.get_index(spec.id) else {
             continue;
         };
-        let Some(col_pos) = table_entry.columns.iter().position(|c| c.id == *col_id) else {
+        let Some(key_cols) = index_key_columns(table_entry, &spec.columns) else {
             continue;
         };
-        let col_type = table_entry.columns[col_pos].type_id;
         key_bytes.clear();
         key_spans.clear();
         for (row_idx, loc) in locators.iter().enumerate() {
-            scratch.clear();
-            if encode_btree_key_into(batch, row_idx, col_pos, col_type, &mut scratch) {
+            if encode_btree_index_key_into(batch, row_idx, &key_cols, &mut scratch) {
                 let normalized = btree_normalize_locator(*loc);
                 normalized.append_key_suffix(&mut scratch);
                 let off = key_bytes.len();
@@ -701,7 +883,7 @@ pub fn vacuum_index_cleanup(
     table_entry: &zyron_catalog::TableEntry,
     page_id: zyron_common::page::PageId,
     dead: &[(u16, Vec<u8>)],
-    btree: &[(zyron_catalog::IndexId, zyron_catalog::ColumnId, bool)],
+    btree: &[zyron_catalog::BTreeIndexSpec],
     registry: &scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>,
 ) {
     if dead.is_empty() || btree.is_empty() {
@@ -718,7 +900,7 @@ pub fn vacuum_index_cleanup(
             name: c.name.clone(),
             type_id: c.type_id,
             nullable: c.nullable,
-            ts_precision: c.ts_precision,
+            fractional_digits: c.fractional_digits,
         })
         .collect();
     let col_ids: Vec<zyron_catalog::ColumnId> = table_entry.columns.iter().map(|c| c.id).collect();
@@ -735,17 +917,15 @@ pub fn vacuum_index_cleanup(
     let batch = finalize_builders(builders);
 
     let mut scratch: Vec<u8> = Vec::with_capacity(24);
-    for (idx_id, col_id, _unique) in btree {
-        let Some(tree) = registry.read_sync(&idx_id.0, |_, v| Arc::clone(v)) else {
+    for spec in btree {
+        let Some(tree) = registry.read_sync(&spec.id.0, |_, v| Arc::clone(v)) else {
             continue;
         };
-        let Some(col_pos) = table_entry.columns.iter().position(|c| c.id == *col_id) else {
+        let Some(key_cols) = index_key_columns(table_entry, &spec.columns) else {
             continue;
         };
-        let col_type = table_entry.columns[col_pos].type_id;
         for (row_idx, (slot, _)) in dead.iter().enumerate() {
-            scratch.clear();
-            if encode_btree_key_into(&batch, row_idx, col_pos, col_type, &mut scratch) {
+            if encode_btree_index_key_into(&batch, row_idx, &key_cols, &mut scratch) {
                 btree_heap_locator(page_id.page_num, *slot).append_key_suffix(&mut scratch);
                 tree.delete_sync(&scratch);
             }
@@ -763,16 +943,15 @@ pub fn rebuild_btree_index_from_rows(
     table_entry: &zyron_catalog::TableEntry,
     page_id: zyron_common::page::PageId,
     live: &[(u16, Vec<u8>)],
-    col_id: zyron_catalog::ColumnId,
+    key_columns: &[zyron_catalog::ColumnId],
     btree: &Arc<zyron_storage::BTreeIndex>,
 ) -> usize {
     if live.is_empty() {
         return 0;
     }
-    let Some(col_pos) = table_entry.columns.iter().position(|c| c.id == col_id) else {
+    let Some(key_cols) = index_key_columns(table_entry, key_columns) else {
         return 0;
     };
-    let col_type = table_entry.columns[col_pos].type_id;
 
     // Decode the live rows into a batch with every table column in order, so a
     // column position indexes both the table and the batch.
@@ -785,7 +964,7 @@ pub fn rebuild_btree_index_from_rows(
             name: c.name.clone(),
             type_id: c.type_id,
             nullable: c.nullable,
-            ts_precision: c.ts_precision,
+            fractional_digits: c.fractional_digits,
         })
         .collect();
     let col_ids: Vec<zyron_catalog::ColumnId> = table_entry.columns.iter().map(|c| c.id).collect();
@@ -804,8 +983,7 @@ pub fn rebuild_btree_index_from_rows(
     let mut inserted = 0usize;
     let mut scratch: Vec<u8> = Vec::with_capacity(24);
     for (row_idx, (slot, _)) in live.iter().enumerate() {
-        scratch.clear();
-        if encode_btree_key_into(&batch, row_idx, col_pos, col_type, &mut scratch) {
+        if encode_btree_index_key_into(&batch, row_idx, &key_cols, &mut scratch) {
             let loc = btree_heap_locator(page_id.page_num, *slot);
             loc.append_key_suffix(&mut scratch);
             if btree.insert_sync(&scratch, loc).is_ok() {
@@ -824,18 +1002,16 @@ pub fn rebuild_btree_index_from_batch(
     table_entry: &zyron_catalog::TableEntry,
     batch: &DataBatch,
     locators: &[zyron_common::RowLocator],
-    col_id: zyron_catalog::ColumnId,
+    key_columns: &[zyron_catalog::ColumnId],
     btree: &Arc<zyron_storage::BTreeIndex>,
 ) -> usize {
-    let Some(col_pos) = table_entry.columns.iter().position(|c| c.id == col_id) else {
+    let Some(key_cols) = index_key_columns(table_entry, key_columns) else {
         return 0;
     };
-    let col_type = table_entry.columns[col_pos].type_id;
     let mut inserted = 0usize;
     let mut scratch: Vec<u8> = Vec::with_capacity(48);
     for (row_idx, loc) in locators.iter().enumerate() {
-        scratch.clear();
-        if encode_btree_key_into(batch, row_idx, col_pos, col_type, &mut scratch) {
+        if encode_btree_index_key_into(batch, row_idx, &key_cols, &mut scratch) {
             let normalized = btree_normalize_locator(*loc);
             normalized.append_key_suffix(&mut scratch);
             if btree.insert_sync(&scratch, normalized).is_ok() {
@@ -1055,7 +1231,7 @@ impl Operator for ValuesOperator {
                     ColumnData::with_capacity(
                         zyron_common::types::TypeId::timestamp_physical_type_id(
                             c.type_id,
-                            c.ts_precision,
+                            c.fractional_digits,
                         ),
                         num_rows,
                     )
@@ -1141,15 +1317,31 @@ impl Operator for ValuesOperator {
                         }
                         _ => None,
                     };
+                    // A fast-path literal never arrives pre-scaled, so the
+                    // flag defaults to false and only the evaluated path
+                    // reports otherwise
+                    let mut source_is_decimal = false;
                     let scalar = if let Some(s) = fast {
                         s
                     } else {
                         let col = evaluate(expr, &row_eval_ctx, &self.schema, &self.params)?;
-                        let col = if col.len() > 0 && col.type_id != target && !col.is_null(0) {
+                        // A decimal target is left to the scaling step below.
+                        // The generic cast has no scale to cast onto, so it
+                        // would hand an i128 buffer a value of another
+                        // variant and store a zero
+                        let col = if col.len() > 0
+                            && col.type_id != target
+                            && target != TypeId::Decimal
+                            && !col.is_null(0)
+                        {
                             crate::compute::cast_column(&col, target)?
                         } else {
                             col
                         };
+                        // Whether the value already sits on a decimal scale
+                        // is a property of the column it came from, and the
+                        // scalar alone no longer says
+                        source_is_decimal = col.type_id == TypeId::Decimal;
                         if col.len() > 0 {
                             col.get_scalar(0)
                         } else {
@@ -1160,7 +1352,7 @@ impl Operator for ValuesOperator {
                     // TIMESTAMP(p>6) columns store i128 picoseconds. A
                     // timestamp literal evaluates to i64 microseconds, scale
                     // it up exactly into the i128 buffer.
-                    let scalar = if entry.ts_precision.unwrap_or(6) > 6
+                    let scalar = if entry.fractional_digits.unwrap_or(6) > 6
                         && matches!(target, TypeId::Timestamp | TypeId::TimestampTz)
                     {
                         match scalar {
@@ -1168,6 +1360,19 @@ impl Operator for ValuesOperator {
                             ScalarValue::Int128(ps) => ScalarValue::Int128(ps),
                             other => other,
                         }
+                    } else if target == TypeId::Decimal {
+                        // A DECIMAL column stores an i128 holding the value
+                        // times ten to its scale. Whatever the expression
+                        // produced is put on that scale here, and checked
+                        // against the declared precision, so the column holds
+                        // the number the statement wrote rather than a
+                        // reinterpretation of some other type's bytes
+                        scale_to_decimal_column(
+                            &scalar,
+                            entry.fractional_digits.unwrap_or(0),
+                            &entry.name,
+                            source_is_decimal,
+                        )?
                     } else {
                         scalar
                     };
@@ -1181,7 +1386,7 @@ impl Operator for ValuesOperator {
                 .zip(col_nulls)
                 .zip(self.schema.iter())
                 .map(|((data, nulls), lc)| {
-                    Column::with_nulls_ts(data, nulls, lc.type_id, lc.ts_precision)
+                    Column::with_nulls_ts(data, nulls, lc.type_id, lc.fractional_digits)
                 })
                 .collect();
 
@@ -1349,7 +1554,7 @@ fn evaluate_expectations(
             name: c.name.clone(),
             type_id: c.type_id,
             nullable: c.nullable,
-            ts_precision: c.ts_precision,
+            fractional_digits: c.fractional_digits,
         })
         .collect();
 
@@ -1439,10 +1644,6 @@ fn evaluate_expectations(
     })
 }
 
-/// Evaluates each CHECK predicate over a table-column-order batch and rejects
-/// the statement if any row makes a predicate false. A predicate that is NULL
-/// (unknown) passes, matching SQL semantics. The predicates were bound against
-/// the table at table_idx 0, so the schema is rebuilt at that index here.
 /// Rejects a vector whose length is not the column's declared dimension.
 ///
 /// A vector column's dimension is what the index is built for and what every
@@ -1485,6 +1686,142 @@ pub(crate) fn enforce_vector_dimensions(
                 )));
             }
         }
+    }
+    Ok(())
+}
+
+/// Rejects a value longer than the length its column declares.
+///
+/// `VARCHAR(n)`, `CHAR(n)`, `BINARY(n)` and `VARBINARY(n)` record their limit
+/// in the catalog and report it over the wire, so a write that ignored it
+/// would store a value the schema says cannot exist and hand the next reader
+/// a row wider than the type it asked for. Text lengths count characters, as
+/// SQL defines them, and binary lengths count bytes.
+///
+/// The declaration is a limit, not a target: a shorter value is stored as
+/// written, and `CHAR(n)` is not padded out to its width here.
+pub(crate) fn enforce_declared_lengths(
+    batch: &DataBatch,
+    table_columns: &[zyron_catalog::ColumnEntry],
+) -> zyron_common::Result<()> {
+    use zyron_common::TypeId;
+    if batch.num_rows == 0 {
+        return Ok(());
+    }
+    for (idx, column) in table_columns.iter().enumerate() {
+        // A decimal's declared size is its digit count, which is checked
+        // against the scaled value rather than against a byte length
+        if column.type_id == TypeId::Decimal {
+            let precision = column.max_length.and_then(|p| u8::try_from(p).ok());
+            if precision.is_none() {
+                continue;
+            }
+            let scale = column.fractional_digits.unwrap_or(0);
+            let Some(data) = batch.columns.get(idx) else {
+                continue;
+            };
+            for row in 0..batch.num_rows.min(data.len()) {
+                if data.is_null(row) {
+                    continue;
+                }
+                if let crate::column::ScalarValue::Int128(v) = data.get_scalar(row) {
+                    zyron_common::check_precision(v, precision, scale)?;
+                }
+            }
+            continue;
+        }
+        // Vector reuses max_length for its dimension count, which
+        // enforce_vector_dimensions reads with its own rule
+        let counts_characters = match column.type_id {
+            TypeId::Varchar | TypeId::Char => true,
+            TypeId::Binary | TypeId::Varbinary => false,
+            _ => continue,
+        };
+        let Some(limit) = column.max_length.filter(|n| *n > 0) else {
+            continue;
+        };
+        let Some(data) = batch.columns.get(idx) else {
+            continue;
+        };
+        for row in 0..batch.num_rows.min(data.len()) {
+            if data.is_null(row) {
+                continue;
+            }
+            let length = match data.get_scalar(row) {
+                crate::column::ScalarValue::Utf8(s) if counts_characters => s.chars().count(),
+                crate::column::ScalarValue::Binary(b) if !counts_characters => b.len(),
+                _ => continue,
+            };
+            if length > limit {
+                let unit = if counts_characters {
+                    "characters"
+                } else {
+                    "bytes"
+                };
+                return Err(zyron_common::ZyronError::CheckViolation(format!(
+                    "value too long for column \"{}\", which holds at most {} {}, row {} has {}",
+                    column.name, limit, unit, row, length
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Puts every DECIMAL column of a batch on the scale its column declares.
+///
+/// A decimal is stored as an i128 holding the value times ten to the scale,
+/// and the expression that produced the value knows nothing about that. A
+/// literal arrives as a float or text, and an integer arrives with no
+/// fractional digits at all. Left alone, the column buffer takes a scalar of the wrong
+/// variant and `push_scalar` writes a zero, which is how a declared decimal
+/// column came to discard everything written to it.
+///
+/// Runs on the full-width row image every write path builds, so INSERT with
+/// inline values, INSERT from a SELECT and UPDATE all converge here rather
+/// than each carrying their own conversion.
+///
+/// A column already holding i128 values is left untouched, so a row read from
+/// a decimal column and written back costs one type check.
+pub(crate) fn normalize_decimal_columns(
+    batch: &mut DataBatch,
+    table_columns: &[zyron_catalog::ColumnEntry],
+) -> zyron_common::Result<()> {
+    if batch.num_rows == 0 {
+        return Ok(());
+    }
+    for (idx, column) in table_columns.iter().enumerate() {
+        if column.type_id != TypeId::Decimal {
+            continue;
+        }
+        let Some(data) = batch.columns.get_mut(idx) else {
+            continue;
+        };
+        // A column already typed decimal carries values on its own scale.
+        // An i128 buffer that is not typed decimal holds whole numbers, so
+        // it still has to be scaled
+        if data.type_id == TypeId::Decimal {
+            continue;
+        }
+        let scale = column.fractional_digits.unwrap_or(0);
+        let rows = batch.num_rows.min(data.len());
+        let mut scaled: Vec<i128> = Vec::with_capacity(rows);
+        for row in 0..rows {
+            if data.is_null(row) {
+                scaled.push(0);
+                continue;
+            }
+            match scale_to_decimal_column(&data.get_scalar(row), scale, &column.name, false)? {
+                crate::column::ScalarValue::Int128(v) => scaled.push(v),
+                _ => scaled.push(0),
+            }
+        }
+        *data = Column::with_nulls_ts(
+            ColumnData::Int128(scaled),
+            data.nulls.clone(),
+            TypeId::Decimal,
+            Some(scale),
+        );
     }
     Ok(())
 }
@@ -1550,6 +1887,87 @@ pub(crate) fn normalize_array_elements(
     Ok(())
 }
 
+/// Puts a value on a DECIMAL column's declared scale.
+///
+/// The scalar reaching here is whatever the expression produced: a literal
+/// still carries the digits it was written with, an integer carries none, and
+/// a value read from another decimal column carries that column's scale. Each
+/// is converted by its own rule rather than by reinterpreting its bytes,
+/// which is what made a decimal column read back as zero.
+///
+/// Text and integers convert exactly. A float cannot, so it rounds at the
+/// target scale, and that is the only path here that loses anything.
+///
+/// The declared precision is checked separately, beside the other declared
+/// size limits, because that is where the catalog entry carrying it is in
+/// scope.
+pub(crate) fn scale_to_decimal_column(
+    scalar: &ScalarValue,
+    scale: u8,
+    column_name: &str,
+    // True when the value came from a decimal already on this scale, which
+    // is the only case where its i128 is a scaled value rather than a whole
+    // number. A wide integer literal is an i128 too, and multiplying it is
+    // exactly what the column's scale means
+    already_scaled: bool,
+) -> zyron_common::Result<ScalarValue> {
+    let scaled = match scalar {
+        ScalarValue::Null => return Ok(ScalarValue::Null),
+        // Already on some decimal scale. Nothing records which, so a value
+        // arriving as a bare i128 is taken to be on this column's scale,
+        // which is what a read from a same-scale column produces
+        ScalarValue::Int128(v) if already_scaled => *v,
+        ScalarValue::Int128(v) => decimal_from_integer(*v, scale)?,
+        ScalarValue::Int8(v) => decimal_from_integer(*v as i128, scale)?,
+        ScalarValue::Int16(v) => decimal_from_integer(*v as i128, scale)?,
+        ScalarValue::Int32(v) => decimal_from_integer(*v as i128, scale)?,
+        ScalarValue::Int64(v) => decimal_from_integer(*v as i128, scale)?,
+        ScalarValue::UInt8(v) => decimal_from_integer(*v as i128, scale)?,
+        ScalarValue::UInt16(v) => decimal_from_integer(*v as i128, scale)?,
+        ScalarValue::UInt32(v) => decimal_from_integer(*v as i128, scale)?,
+        ScalarValue::UInt64(v) => decimal_from_integer(*v as i128, scale)?,
+        ScalarValue::Utf8(s) => zyron_common::parse_decimal(s, scale)?,
+        // A decimal literal reaches here as the f64 the lexer read it into.
+        // Rendering that f64 gives back the shortest decimal string that
+        // round-trips to it, which for a literal anyone wrote is the digits
+        // they wrote, so parsing that text recovers the value exactly.
+        // Going straight through the float would land `1.005` on the binary
+        // value just below it and round the wrong way.
+        ScalarValue::Float32(v) => decimal_from_float(*v as f64, scale)?,
+        ScalarValue::Float64(v) => decimal_from_float(*v, scale)?,
+        ScalarValue::Boolean(b) => decimal_from_integer(i128::from(*b), scale)?,
+        other => {
+            return Err(zyron_common::ZyronError::ExecutionError(format!(
+                "cannot store {other} in DECIMAL column \"{column_name}\""
+            )));
+        }
+    };
+    Ok(ScalarValue::Int128(scaled))
+}
+
+/// Puts a float on a decimal scale by way of its shortest round-tripping
+/// decimal rendering, so a literal keeps the digits it was written with.
+///
+/// A value that is not finite has no decimal form and is refused there.
+pub(crate) fn decimal_from_float(value: f64, scale: u8) -> zyron_common::Result<i128> {
+    if !value.is_finite() {
+        return Err(zyron_common::ZyronError::ExecutionError(format!(
+            "cannot store {value} in a decimal column"
+        )));
+    }
+    zyron_common::parse_decimal(&format!("{value}"), scale)
+}
+
+/// Puts a whole number on a decimal scale, exactly.
+fn decimal_from_integer(value: i128, scale: u8) -> zyron_common::Result<i128> {
+    let factor = zyron_common::decimal::scale_factor(scale)?;
+    value.checked_mul(factor).ok_or_else(|| {
+        zyron_common::ZyronError::ExecutionError(format!(
+            "value {value} overflows a decimal at scale {scale}"
+        ))
+    })
+}
+
 /// Rejects a null in a column declared NOT NULL.
 ///
 /// A declared constraint that does nothing is a lie, and NOT NULL is the one
@@ -1582,6 +2000,14 @@ pub(crate) fn enforce_not_null(
     Ok(())
 }
 
+/// Evaluates each CHECK predicate over a table-column-order batch and rejects
+/// the statement if any row makes a predicate false. A predicate that is NULL
+/// (unknown) passes, matching SQL semantics. The predicates were bound against
+/// the table at table_idx 0, so the schema is rebuilt at that index here.
+///
+/// The declarations a column carries in its own right run first, because a
+/// row that violates the type it was declared with should be named by that
+/// rule rather than by whichever CHECK happens to trip on it.
 pub(crate) fn enforce_check_constraints(
     checks: &[zyron_planner::binder::BoundExpr],
     batch: &DataBatch,
@@ -1590,6 +2016,7 @@ pub(crate) fn enforce_check_constraints(
 ) -> zyron_common::Result<()> {
     enforce_not_null(batch, table_columns)?;
     enforce_vector_dimensions(batch, table_columns)?;
+    enforce_declared_lengths(batch, table_columns)?;
     if checks.is_empty() || batch.num_rows == 0 {
         return Ok(());
     }
@@ -1601,7 +2028,7 @@ pub(crate) fn enforce_check_constraints(
             name: c.name.clone(),
             type_id: c.type_id,
             nullable: c.nullable,
-            ts_precision: c.ts_precision,
+            fractional_digits: c.fractional_digits,
         })
         .collect();
     for expr in checks {
@@ -1865,6 +2292,7 @@ impl Operator for InsertOperator {
                 // Arrays take the element width their column declares before
                 // any check reads the row, so a CHECK sees the stored image
                 normalize_array_elements(&mut exec_batch.batch, &table_entry.columns)?;
+                normalize_decimal_columns(&mut exec_batch.batch, &table_entry.columns)?;
 
                 // Enforce CHECK constraints on the full-width row image before
                 // any write so a violation aborts the statement with no effect.
@@ -2311,10 +2739,7 @@ pub(crate) fn enforce_lake_unique(
         if !index.unique {
             continue;
         }
-        if specs
-            .iter()
-            .any(|s| s.column_ids == index.column_ids)
-        {
+        if specs.iter().any(|s| s.column_ids == index.column_ids) {
             continue;
         }
         specs.push(zyron_lake::UniqueSpec {
@@ -2326,13 +2751,8 @@ pub(crate) fn enforce_lake_unique(
         return Ok(());
     }
     for spec in &specs {
-        let (outcome, _) = zyron_lake::check_unique_replacing(
-            log.paths(),
-            &manifest,
-            spec,
-            columns,
-            superseded,
-        )?;
+        let (outcome, _) =
+            zyron_lake::check_unique_replacing(log.paths(), &manifest, spec, columns, superseded)?;
         match outcome {
             zyron_lake::UniqueOutcome::Ok => {}
             zyron_lake::UniqueOutcome::DuplicateInBatch {
@@ -2415,7 +2835,12 @@ fn append_lake_batches(
         audit: None,
     };
     let out = zyron_lake::append_rows(&log, attempt, table_entry.id.0 as u64, &columns)?;
-    zyron_lake::register_txn_pending(ctx.disk_manager.data_dir(), ctx.lake_txn_id(), root, out.version);
+    zyron_lake::register_txn_pending(
+        ctx.disk_manager.data_dir(),
+        ctx.lake_txn_id(),
+        root,
+        out.version,
+    );
     Ok(Some(out))
 }
 
@@ -3244,6 +3669,7 @@ impl Operator for UpdateOperator {
 
                     let mut updated_batch = DataBatch::new(updated_columns);
                     normalize_array_elements(&mut updated_batch, &table_entry.columns)?;
+                    normalize_decimal_columns(&mut updated_batch, &table_entry.columns)?;
                     enforce_check_constraints(
                         &self.check_constraints,
                         &updated_batch,
@@ -3569,6 +3995,7 @@ impl Operator for UpdateOperator {
 
                 let mut updated_batch = DataBatch::new(updated_columns);
                 normalize_array_elements(&mut updated_batch, &table_entry.columns)?;
+                normalize_decimal_columns(&mut updated_batch, &table_entry.columns)?;
 
                 // Enforce CHECK constraints on the updated row image before any
                 // write so a violating update aborts with no effect.

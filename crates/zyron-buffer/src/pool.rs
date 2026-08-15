@@ -314,18 +314,27 @@ impl BufferPool {
     /// A dirty victim is flushed to disk through the evict-writer hook before its
     /// frame is reused. When no hook is installed the dirty victim is returned as
     /// an EvictedPage for the caller to write.
+    /// Returns a frame owned exclusively by this caller, already pinned once.
+    ///
+    /// Both paths hand back a claimed frame so the caller never has to
+    /// re-acquire it: a free-list frame is pinned here, and an evicted one is
+    /// claimed inside the sweep. Handing back an unpinned frame left a window
+    /// in which a second sweep could take it.
     fn allocate_frame(&self) -> Result<(FrameId, Option<EvictedPage>)> {
-        // Try free list first (lock-free pop)
+        // Try free list first (lock-free pop). A frame on the free list is
+        // owned by whoever pops it, so the pin cannot fail
         if let Some(frame_id) = self.free_list.pop() {
+            self.frames[frame_id.0 as usize].pin();
             return Ok((frame_id, None));
         }
 
-        // Try to evict. The closure reads pin_count with Acquire so a concurrent
-        // pin (also Acquire) happens-before this eviction decision and a page a
-        // thread is pinning is never chosen.
+        // Claim the victim in the same step that finds it unpinned, so a
+        // concurrent sweep cannot choose the same frame. The compare-exchange
+        // is Acquire on success, so a concurrent pin (also Acquire) orders
+        // before this decision and a page a thread is pinning is never taken
         let victim_id = self
             .replacer
-            .evict(|fid| self.frames[fid.0 as usize].pin_count() == 0);
+            .evict(|fid| self.frames[fid.0 as usize].try_claim());
 
         if let Some(victim_id) = victim_id {
             let frame = &self.frames[victim_id.0 as usize];
@@ -387,14 +396,12 @@ impl BufferPool {
         // Allocate a frame
         let (frame_id, evicted) = self.allocate_frame()?;
 
-        // Set up the frame
+        // Set up the frame. allocate_frame hands it back already pinned once,
+        // and that pin is what keeps a concurrent eviction sweep off it, so
+        // the reset must not clear it
         let frame = &self.frames[frame_id.0 as usize];
-        frame.reset();
+        frame.reset_keeping_pin();
         frame.set_page_id(Some(page_id));
-        // New frame: pin() returns 0 since reset() clears pin_count.
-        // Frame is not in evictable set (free_list frames never were,
-        // evicted frames were removed by evict()).
-        frame.pin();
 
         // Publish the mapping atomically. A concurrent new_page for the same id
         // can race here, insert_if_absent resolves both to a single winner.
@@ -1177,6 +1184,82 @@ mod tests {
         assert!(evicted.is_none()); // No eviction when page already exists
         assert_eq!(frame.page_id(), Some(page_id));
         assert_eq!(pool.page_count(), 1);
+    }
+
+    /// Concurrent allocations under an empty free list land on distinct
+    /// frames.
+    ///
+    /// The clock replacer hands back a victim without marking it taken, so
+    /// two sweeps running at once can choose the same frame. Both callers
+    /// then reset it, install their own page id, and publish a mapping to
+    /// it: two page ids alias one frame, and a read of one returns the
+    /// other's bytes.
+    ///
+    /// The free list is drained first, because that is the only state in
+    /// which allocation reaches the replacer at all.
+    #[test]
+    fn test_concurrent_eviction_never_hands_one_frame_to_two_pages() {
+        use std::sync::Arc;
+
+        const FRAMES: usize = 8;
+        const THREADS: usize = 16;
+
+        for round in 0..200u64 {
+            let pool = Arc::new(create_test_pool(FRAMES));
+
+            // Fill every frame, then unpin so all of them are evictable and
+            // the free list is empty
+            for f in 0..FRAMES as u64 {
+                let seed = PageId::new(3, 10_000 + round * 1000 + f);
+                pool.new_page(seed).expect("seed page");
+                // Dirty, so evicting one copies its 16 KB out before the
+                // caller can pin it. That copy is the window in which a
+                // second sweep can choose the same victim
+                pool.unpin_page(seed, true);
+            }
+            assert_eq!(pool.free_count(), 0, "round {round}: free list drained");
+
+            let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+            let mut handles = Vec::new();
+            for t in 0..THREADS as u64 {
+                let pool = Arc::clone(&pool);
+                let barrier = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    let page_id = PageId::new(4, round * 100 + t);
+                    barrier.wait();
+                    let frame = pool.new_page(page_id).map(|(f, _)| f.frame_id());
+                    (page_id, frame.ok())
+                }));
+            }
+            let got: Vec<(PageId, Option<FrameId>)> =
+                handles.into_iter().map(|h| h.join().expect("thread")).collect();
+
+            // Two live page ids may never share a frame
+            let mut by_frame: std::collections::HashMap<u32, Vec<PageId>> =
+                std::collections::HashMap::new();
+            for (page_id, frame) in &got {
+                if let Some(f) = frame {
+                    by_frame.entry(f.0).or_default().push(*page_id);
+                }
+            }
+            for (frame, pages) in &by_frame {
+                assert_eq!(
+                    pages.len(),
+                    1,
+                    "round {round}: frame {frame} handed to {pages:?}"
+                );
+            }
+            // And the table agrees with what each caller was given
+            for (page_id, frame) in &got {
+                if let Some(f) = frame {
+                    assert_eq!(
+                        pool.page_table.get(*page_id),
+                        Some(*f),
+                        "round {round}: {page_id:?} maps elsewhere"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

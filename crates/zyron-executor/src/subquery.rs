@@ -188,7 +188,12 @@ pub fn materialize_expr<'a>(
                 pattern: Box::new(materialize_expr(*pattern, ctx).await?),
                 negated,
             }),
-            BoundExpr::Cast { expr, target_type } => Ok(BoundExpr::Cast {
+            BoundExpr::Cast {
+                expr,
+                target_type,
+                fractional_digits,
+            } => Ok(BoundExpr::Cast {
+                fractional_digits,
                 expr: Box::new(materialize_expr(*expr, ctx).await?),
                 target_type,
             }),
@@ -432,22 +437,26 @@ fn scalar_to_bound_expr(s: &ScalarValue, type_id: TypeId) -> Result<BoundExpr> {
         // Values whose magnitude or representation exceeds an i64 literal are
         // carried as their exact text and cast back to the column type. The
         // cast path parses decimal text for 128-bit/unsigned and hex for binary.
-        ScalarValue::Int128(v) => cast_text_to(v.to_string(), TypeId::Int128),
-        ScalarValue::UInt64(v) => cast_text_to(v.to_string(), TypeId::UInt64),
-        ScalarValue::Binary(b) => cast_text_to(encode_hex(b), TypeId::Bytea),
-        ScalarValue::FixedBinary16(b) => cast_text_to(encode_hex(b), TypeId::Uuid),
+        ScalarValue::Int128(v) => cast_text_to(v.to_string(), TypeId::Int128, None),
+        ScalarValue::UInt64(v) => cast_text_to(v.to_string(), TypeId::UInt64, None),
+        ScalarValue::Binary(b) => cast_text_to(encode_hex(b), TypeId::Bytea, None),
+        ScalarValue::FixedBinary16(b) => cast_text_to(encode_hex(b), TypeId::Uuid, None),
     })
 }
 
 /// Builds a `Cast` of a string literal to the target type so a value with no
 /// direct literal carrier round-trips through the cast path at evaluation time.
-fn cast_text_to(text: String, target: TypeId) -> BoundExpr {
+///
+/// `scale` carries the digits a decimal target keeps, taken from the column
+/// the value came from, so a folded decimal lands back on its own scale.
+fn cast_text_to(text: String, target: TypeId, scale: Option<u8>) -> BoundExpr {
     BoundExpr::Cast {
         expr: Box::new(BoundExpr::Literal {
             value: LiteralValue::String(text),
             type_id: TypeId::Text,
         }),
         target_type: target,
+        fractional_digits: scale,
     }
 }
 

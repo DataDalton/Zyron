@@ -50,22 +50,22 @@ fn bench_schema() -> Vec<ColumnSpec> {
         ColumnSpec {
             name: "id".to_string(),
             type_id: TypeId::Int64,
-            ts_precision: None,
+            fractional_digits: None,
         },
         ColumnSpec {
             name: "name".to_string(),
             type_id: TypeId::Varchar,
-            ts_precision: None,
+            fractional_digits: None,
         },
         ColumnSpec {
             name: "active".to_string(),
             type_id: TypeId::Boolean,
-            ts_precision: None,
+            fractional_digits: None,
         },
         ColumnSpec {
             name: "score".to_string(),
             type_id: TypeId::Float64,
-            ts_precision: None,
+            fractional_digits: None,
         },
     ]
 }

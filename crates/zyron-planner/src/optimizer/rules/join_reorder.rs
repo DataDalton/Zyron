@@ -250,7 +250,25 @@ fn dp_join_order(
 
     let total_mask = table_size - 1;
     if dp[total_mask].is_some() {
-        reconstruct_plan(total_mask, &dp, &relations, &predicates)
+        let mut used = vec![false; predicates.len()];
+        let plan = reconstruct_plan(total_mask, &dp, &relations, &predicates, &mut used);
+        // A predicate no join claimed reads one input alone, or reads across
+        // a pair this ordering never joins directly. It still has to run, so
+        // it sits above the tree rather than being dropped
+        let leftover: Vec<BoundExpr> = predicates
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !used[*i])
+            .map(|(_, p)| p.clone())
+            .collect();
+        if leftover.is_empty() {
+            plan
+        } else {
+            LogicalPlan::Filter {
+                predicate: super::predicate_pushdown::combine_conjuncts(leftover),
+                child: Arc::new(plan),
+            }
+        }
     } else {
         build_left_deep(relations, predicates)
     }
@@ -263,8 +281,14 @@ fn reconstruct_plan(
     dp: &[Option<DpEntry>],
     relations: &[LogicalPlan],
     predicates: &[BoundExpr],
+    used: &mut [bool],
 ) -> LogicalPlan {
-    let entry = dp[mask].as_ref().unwrap();
+    let Some(entry) = dp[mask].as_ref() else {
+        // Every mask reached here was filled by the enumeration above, so
+        // this cannot happen. Rebuilding the relations left-deep keeps a
+        // wrong plan from becoming a panic if that ever stops holding
+        return build_left_deep(relations.to_vec(), predicates.to_vec());
+    };
 
     // Base case: single relation (left_mask == 0 means this is a leaf)
     if entry.left_mask == 0 {
@@ -272,13 +296,14 @@ fn reconstruct_plan(
         return relations[bit].clone();
     }
 
-    let left = reconstruct_plan(entry.left_mask, dp, relations, predicates);
-    let right = reconstruct_plan(entry.right_mask, dp, relations, predicates);
+    let left = reconstruct_plan(entry.left_mask, dp, relations, predicates, used);
+    let right = reconstruct_plan(entry.right_mask, dp, relations, predicates, used);
 
     let condition = find_join_predicate(
         predicates,
-        entry.left_mask as u32,
-        entry.right_mask as u32,
+        used,
+        entry.left_mask,
+        entry.right_mask,
         relations,
     );
 
@@ -349,18 +374,67 @@ fn greedy_join_order(
 }
 
 /// Finds a join predicate that references columns from both subsets.
+/// The table indices a set of relations produces, as a bitmask join can be
+/// tested against.
+///
+/// Uses the same walk predicate pushdown uses, so a derived table is
+/// reported by the index its enclosing query addresses it by rather than by
+/// the scans inside it, and the two rules cannot disagree about which side a
+/// column belongs to.
+fn tables_of(mask: usize, relations: &[LogicalPlan]) -> Vec<usize> {
+    let mut out = Vec::new();
+    for (i, relation) in relations.iter().enumerate() {
+        if mask & (1usize << i) != 0 {
+            out.extend(super::predicate_pushdown::collect_table_indices(relation));
+        }
+    }
+    out
+}
+
+/// Takes the predicates that belong on this join, marking them used.
+///
+/// A predicate belongs here when every column it reads is available from the
+/// two sides and at least one column comes from each, which is what makes it
+/// a join condition rather than a filter on one input. Anything else is left
+/// for another level or for the caller to apply above the tree.
+///
+/// Each predicate is claimed once. Handing the same one to every level, as a
+/// first-available choice does, both repeats work and silently drops every
+/// other predicate, so a three table join would return a cross product.
 fn find_join_predicate(
     predicates: &[BoundExpr],
-    _left_mask: u32,
-    _right_mask: u32,
-    _relations: &[LogicalPlan],
+    used: &mut [bool],
+    left_mask: usize,
+    right_mask: usize,
+    relations: &[LogicalPlan],
 ) -> JoinCondition {
-    // Simplified: use the first available predicate.
-    // Full implementation would match predicates to relation subsets.
-    if let Some(pred) = predicates.first() {
-        JoinCondition::On(pred.clone())
-    } else {
+    let left_tables = tables_of(left_mask, relations);
+    let right_tables = tables_of(right_mask, relations);
+
+    let mut chosen: Vec<BoundExpr> = Vec::new();
+    for (i, predicate) in predicates.iter().enumerate() {
+        if used[i] {
+            continue;
+        }
+        let refs = super::predicate_pushdown::collect_column_refs(predicate);
+        if refs.is_empty() {
+            continue;
+        }
+        let touches_left = refs.iter().any(|r| left_tables.contains(&r.table_idx));
+        let touches_right = refs.iter().any(|r| right_tables.contains(&r.table_idx));
+        let fully_covered = refs
+            .iter()
+            .all(|r| left_tables.contains(&r.table_idx) || right_tables.contains(&r.table_idx));
+        if touches_left && touches_right && fully_covered {
+            used[i] = true;
+            chosen.push(predicate.clone());
+        }
+    }
+
+    if chosen.is_empty() {
         JoinCondition::Cross
+    } else {
+        JoinCondition::On(super::predicate_pushdown::combine_conjuncts(chosen))
     }
 }
 

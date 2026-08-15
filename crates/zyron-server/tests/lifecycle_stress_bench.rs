@@ -32,14 +32,12 @@ impl DiskLayout {
 }
 
 async fn open_catalog(layout: &DiskLayout) -> Arc<Catalog> {
-    let wal = Arc::new(
-        WalWriter::new(zyron_bench_harness::wal_config(layout.wal_dir.clone()))
-        .unwrap(),
-    );
+    let wal =
+        Arc::new(WalWriter::new(zyron_bench_harness::wal_config(layout.wal_dir.clone())).unwrap());
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(layout.data_dir.clone()))
-        .await
-        .unwrap(),
+            .await
+            .unwrap(),
     );
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let storage = Arc::new(HeapCatalogStorage::new(disk, pool).unwrap());

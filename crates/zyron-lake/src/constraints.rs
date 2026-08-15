@@ -57,9 +57,15 @@ pub struct UniqueCheckStats {
 pub enum UniqueOutcome {
     Ok,
     /// Two rows of the incoming batch carry the same key
-    DuplicateInBatch { first_row: usize, second_row: usize },
+    DuplicateInBatch {
+        first_row: usize,
+        second_row: usize,
+    },
     /// An incoming row's key already exists in a data file
-    DuplicateWithStored { row: usize, partition_id: u64 },
+    DuplicateWithStored {
+        row: usize,
+        partition_id: u64,
+    },
 }
 
 /// A contiguous key buffer: one allocation for the whole batch rather than
@@ -101,7 +107,15 @@ fn build_keys<'a>(
     manifest: &ManifestFile,
     spec: &UniqueSpec,
     batch: &'a [ColumnData],
-) -> Result<Option<(KeySet, zyron_common::TypeId, Option<&'a [u8]>, Option<&'a [u8]>)>, ZyronError> {
+) -> Result<
+    Option<(
+        KeySet,
+        zyron_common::TypeId,
+        Option<&'a [u8]>,
+        Option<&'a [u8]>,
+    )>,
+    ZyronError,
+> {
     if spec.column_ids.is_empty() {
         return Err(ZyronError::Internal(format!(
             "constraint \"{}\" names no columns",
@@ -295,9 +309,9 @@ pub fn check_unique_replacing(
             continue;
         }
 
-        if let Some(outcome) =
-            scan_file(paths, manifest, entry, spec, leading, &keys, superseded, &mut stats)?
-        {
+        if let Some(outcome) = scan_file(
+            paths, manifest, entry, spec, leading, &keys, superseded, &mut stats,
+        )? {
             return Ok((outcome, stats));
         }
     }
@@ -448,8 +462,16 @@ fn scan_file(
     stats: &mut UniqueCheckStats,
 ) -> Result<Option<UniqueOutcome>, ZyronError> {
     let candidates: Vec<&[u8]> = keys.index.keys().map(|k| leading_cell(k)).collect();
-    let Some(probe) =
-        open_probe(paths, manifest, entry, spec, leading, &candidates, superseded, stats)?
+    let Some(probe) = open_probe(
+        paths,
+        manifest,
+        entry,
+        spec,
+        leading,
+        &candidates,
+        superseded,
+        stats,
+    )?
     else {
         return Ok(None);
     };
@@ -503,7 +525,9 @@ pub enum ForeignKeyOutcome {
     /// All of them, not just the first: a constraint that quarantines has to
     /// divert each rejected row, and two rows sharing one absent key are two
     /// rejected rows.
-    Missing { rows: Vec<usize> },
+    Missing {
+        rows: Vec<usize>,
+    },
 }
 
 /// Checks that every non-NULL key in `values` exists in a lake parent.
@@ -567,7 +591,15 @@ pub fn check_foreign_key(
         {
             continue;
         }
-        mark_present(paths, manifest, entry, &spec, leading, &mut missing, &mut stats)?;
+        mark_present(
+            paths,
+            manifest,
+            entry,
+            &spec,
+            leading,
+            &mut missing,
+            &mut stats,
+        )?;
     }
 
     if missing.is_empty() {
@@ -596,8 +628,16 @@ fn mark_present(
     stats: &mut UniqueCheckStats,
 ) -> Result<(), ZyronError> {
     let candidates: Vec<&[u8]> = missing.keys().map(|k| leading_cell(k)).collect();
-    let Some(probe) =
-        open_probe(paths, manifest, entry, spec, leading, &candidates, None, stats)?
+    let Some(probe) = open_probe(
+        paths,
+        manifest,
+        entry,
+        spec,
+        leading,
+        &candidates,
+        None,
+        stats,
+    )?
     else {
         return Ok(());
     };
@@ -684,7 +724,7 @@ mod tests {
                     name: "id".into(),
                     type_id: TypeId::Int64,
                     nullable: false,
-                    ts_precision: None,
+                    fractional_digits: None,
                     tz_offset_secs: None,
                     max_length: None,
                     default_expr: None,
@@ -694,7 +734,7 @@ mod tests {
                     name: "tag".into(),
                     type_id: TypeId::Varchar,
                     nullable: true,
-                    ts_precision: None,
+                    fractional_digits: None,
                     tz_offset_secs: None,
                     max_length: None,
                     default_expr: None,
@@ -780,7 +820,7 @@ mod tests {
         }
     }
 
-#[test]
+    #[test]
     fn test_foreign_key_finds_referenced_keys_and_names_the_first_missing_row() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let log = new_log(dir.path());
@@ -836,8 +876,7 @@ mod tests {
             column_id: 0,
             cells: vec![None, Some(1i64.to_le_bytes().to_vec())],
         }];
-        let (outcome, _) =
-            check_foreign_key(log.paths(), &manifest, &[0], &values).expect("check");
+        let (outcome, _) = check_foreign_key(log.paths(), &manifest, &[0], &values).expect("check");
         assert_eq!(outcome, ForeignKeyOutcome::Ok);
     }
 
@@ -936,10 +975,7 @@ mod tests {
         // A key inside one file's range opens that file only
         let (outcome, stats) =
             check_unique(log.paths(), &manifest, &pk(), &ids_only(&[21])).expect("check");
-        assert!(matches!(
-            outcome,
-            UniqueOutcome::DuplicateWithStored { .. }
-        ));
+        assert!(matches!(outcome, UniqueOutcome::DuplicateWithStored { .. }));
         // The scan stops at the collision, so files_considered depends on
         // where the manifest's ordering put that file. What matters is that
         // bounds admitted exactly one and only that one was read
@@ -1048,23 +1084,14 @@ mod tests {
         // 3 survived the delete and still collides
         let (outcome, _) =
             check_unique(log.paths(), &manifest, &pk(), &ids_only(&[3])).expect("check");
-        assert!(matches!(
-            outcome,
-            UniqueOutcome::DuplicateWithStored { .. }
-        ));
+        assert!(matches!(outcome, UniqueOutcome::DuplicateWithStored { .. }));
     }
 
     #[test]
     fn test_a_null_key_component_never_conflicts() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let log = new_log(dir.path());
-        append_rows(
-            &log,
-            attempt(200),
-            31,
-            &batch(&[1, 2], &[None, Some("b")]),
-        )
-        .expect("append");
+        append_rows(&log, attempt(200), 31, &batch(&[1, 2], &[None, Some("b")])).expect("append");
         let manifest = log.latest_manifest().expect("manifest");
 
         let spec = UniqueSpec {
@@ -1082,17 +1109,9 @@ mod tests {
         assert_eq!(outcome, UniqueOutcome::Ok);
 
         // A real value still collides
-        let (outcome, _) = check_unique(
-            log.paths(),
-            &manifest,
-            &spec,
-            &batch(&[9], &[Some("b")]),
-        )
-        .expect("check");
-        assert!(matches!(
-            outcome,
-            UniqueOutcome::DuplicateWithStored { .. }
-        ));
+        let (outcome, _) =
+            check_unique(log.paths(), &manifest, &spec, &batch(&[9], &[Some("b")])).expect("check");
+        assert!(matches!(outcome, UniqueOutcome::DuplicateWithStored { .. }));
     }
 
     #[test]
@@ -1108,16 +1127,11 @@ mod tests {
         };
         // Same leading value, different trailing value
         let (outcome, _) =
-            check_unique(log.paths(), &manifest, &spec, &batch(&[1], &[Some("a")]))
-                .expect("check");
+            check_unique(log.paths(), &manifest, &spec, &batch(&[1], &[Some("a")])).expect("check");
         assert_eq!(outcome, UniqueOutcome::Ok);
         // The exact pair collides
-        let (outcome, _) =
-            check_unique(log.paths(), &manifest, &spec, &batch(&[1], &[Some("ab")]))
-                .expect("check");
-        assert!(matches!(
-            outcome,
-            UniqueOutcome::DuplicateWithStored { .. }
-        ));
+        let (outcome, _) = check_unique(log.paths(), &manifest, &spec, &batch(&[1], &[Some("ab")]))
+            .expect("check");
+        assert!(matches!(outcome, UniqueOutcome::DuplicateWithStored { .. }));
     }
 }

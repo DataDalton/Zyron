@@ -29,7 +29,7 @@ pub fn soft_delete_config(entry: &TableEntry) -> Option<SoftDeleteConfig> {
 }
 
 fn column_name_by_id(entry: &TableEntry, col_id: u32) -> Option<String> {
-    if col_id == 0 {
+    if !LifecycleConfig::column_is_set(col_id) {
         return None;
     }
     entry

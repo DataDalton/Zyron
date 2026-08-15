@@ -19,8 +19,8 @@
 //! Entry points take `Copy` arguments only and are called once per planned
 //! scan and once per finished scan, never per row.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::predicate::{CompareOp, LakePredicate};
@@ -347,12 +347,8 @@ impl WorkloadObserver {
             } else {
                 pack(epoch, weight)
             };
-            match counter.compare_exchange_weak(
-                current,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => return,
                 Err(seen) => current = seen,
             }
@@ -454,12 +450,10 @@ impl WorkloadObserver {
                 return Some(cell);
             }
             if seen == 0 {
-                match cell.key.compare_exchange(
-                    0,
-                    key,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
+                match cell
+                    .key
+                    .compare_exchange(0, key, Ordering::Relaxed, Ordering::Relaxed)
+                {
                     Ok(_) => return Some(cell),
                     // Another thread claimed it first, it may be for this
                     // key or for another
@@ -625,5 +619,78 @@ mod tests {
         assert_eq!(epoch_of(EPOCH_SECONDS - 1), 0);
         assert_eq!(epoch_of(EPOCH_SECONDS), 1);
         assert_eq!(epoch_of(EPOCH_SECONDS * 3 + 7), 3);
+    }
+
+    /// Concurrent observers of one term converge on a single cell.
+    ///
+    /// The cell array is open addressed with linear probing, the same shape
+    /// that let the buffer pool's page table put one key in two slots. Here
+    /// the claim publishes the key in one compare-exchange rather than
+    /// reserving first, and a loser whose slot went to its own key keeps that
+    /// cell instead of probing on, so one term stays one cell. This pins that
+    /// down against a future two-step claim.
+    #[test]
+    fn test_concurrent_observers_of_one_term_share_one_cell() {
+        use std::sync::Arc;
+
+        for round in 0..100u32 {
+            let observer = Arc::new(WorkloadObserver::new());
+            let barrier = Arc::new(std::sync::Barrier::new(8));
+            let mut handles = Vec::new();
+            for _ in 0..8 {
+                let observer = Arc::clone(&observer);
+                let barrier = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    observer.observe(1, round, 0, 1);
+                }));
+            }
+            for h in handles {
+                h.join().expect("observer thread");
+            }
+
+            let stats = observer.stats();
+            assert_eq!(
+                stats.occupied, 1,
+                "round {round}: one term must occupy one cell"
+            );
+            assert_eq!(stats.dropped, 0, "round {round}: nothing was dropped");
+            let terms = observer.terms_for(1, 0);
+            assert_eq!(terms.len(), 1, "round {round}: one term reported once");
+            assert_eq!(terms[0].0, round);
+        }
+    }
+
+    /// Distinct terms observed at once each get their own cell, so probing
+    /// under contention neither merges them nor loses one.
+    #[test]
+    fn test_concurrent_observers_of_distinct_terms_keep_them_apart() {
+        use std::sync::Arc;
+
+        let observer = Arc::new(WorkloadObserver::new());
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for t in 0..8u32 {
+            let observer = Arc::clone(&observer);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..50 {
+                    observer.observe(1, t, 0, 1);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("observer thread");
+        }
+
+        let mut terms = observer.terms_for(1, 0);
+        terms.sort_by_key(|(t, _)| *t);
+        assert_eq!(terms.len(), 8, "every term kept its own cell");
+        for (i, (term, score)) in terms.iter().enumerate() {
+            assert_eq!(*term, i as u32);
+            assert!(*score > 0.0, "term {term} recorded no weight");
+        }
+        assert_eq!(observer.stats().dropped, 0);
     }
 }

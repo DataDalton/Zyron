@@ -426,7 +426,12 @@ fn rewrite_expr(expr: BoundExpr, prep: &mut Prep) -> Result<BoundExpr> {
             pattern: Box::new(rewrite_expr(*pattern, prep)?),
             negated,
         }),
-        BoundExpr::Cast { expr, target_type } => Ok(BoundExpr::Cast {
+        BoundExpr::Cast {
+            expr,
+            target_type,
+            fractional_digits,
+        } => Ok(BoundExpr::Cast {
+            fractional_digits,
             expr: Box::new(rewrite_expr(*expr, prep)?),
             target_type,
         }),

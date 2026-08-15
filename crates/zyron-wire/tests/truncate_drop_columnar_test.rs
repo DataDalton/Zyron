@@ -35,14 +35,11 @@ async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::TempDir)
     std::fs::create_dir_all(&data_dir).unwrap();
     std::fs::create_dir_all(&wal_dir).unwrap();
 
-    let wal = Arc::new(
-        WalWriter::new(zyron_bench_harness::wal_config(wal_dir))
-        .expect("wal"),
-    );
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir)).expect("wal"));
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(data_dir))
-        .await
-        .expect("disk"),
+            .await
+            .expect("disk"),
     );
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let storage =
@@ -316,6 +313,7 @@ async fn manufacture_segment(
         sys_xmin_lo: 1,
         sys_xmin_hi: 1,
         cluster_spec_id: 0,
+        storage_tier: 0,
     });
     entry.columnar.next_rowid = rows.len() as u64;
     entry.columnar.next_file_id = 2;

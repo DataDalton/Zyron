@@ -1,0 +1,250 @@
+# suite:   versioning
+# run:     2026-08-15_031531_2848e81-local
+# profile: debug
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+# NOT A BENCHMARK RESULT. This is an unoptimized build, so every
+# timing below is meaningless: an unoptimized build is not slower
+# by a constant factor, so these numbers do not even rank correctly
+# against each other. Counted quantities (rates, file and row
+# counts, PASS/FAIL on an exact bound) are valid and are the only
+# thing worth reading here. For real numbers: cargo test --release
+#
+=== Branch Create Overhead ===
+  Run 1: 14.13us per branch (14.13ms)
+  Run 2: 13.81us per branch (13.81ms)
+  Run 3: 13.87us per branch (13.87ms)
+  Run 4: 13.93us per branch (13.93ms)
+  Run 5: 13.97us per branch (13.97ms)
+  us_per_branch [NOT MEASURED, unoptimized build]:
+    Runs: [14, 14, 14, 14, 14]
+    Average: 14 (target <= 10, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Time Travel Validation ===
+  Version resolution: correct at all 3 versions
+  Timestamp resolution: correct interpolation
+  Tuple visibility: correct at all version boundaries
+  Page pruning: correctly skips future pages
+  PASS
+
+=== Page Version Map Update ===
+  Run 1: 80,270,351 ops/sec (12.46ms)
+  Run 2: 80,199,536 ops/sec (12.47ms)
+  Run 3: 80,207,256 ops/sec (12.47ms)
+  Run 4: 80,524,375 ops/sec (12.42ms)
+  Run 5: 80,468,002 ops/sec (12.43ms)
+  update_ops_per_sec [NOT MEASURED, unoptimized build]:
+    Runs: [80,270,351, 80,199,536, 80,207,256, 80,524,375, 80,468,002]
+    Average: 80,333,904 (target >= 10,000,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Page Version Map Skip Check ===
+  Run 1: 142,235,371 ops/sec (7.03ms)
+  Run 2: 142,924,522 ops/sec (7.00ms)
+  Run 3: 143,059,470 ops/sec (6.99ms)
+  Run 4: 142,840,818 ops/sec (7.00ms)
+  Run 5: 142,730,724 ops/sec (7.01ms)
+  skip_check_ops_per_sec [NOT MEASURED, unoptimized build]:
+    Runs: [142,235,371, 142,924,522, 143,059,470, 142,840,818, 142,730,724]
+    Average: 142,758,181 (target >= 50,000,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Branch Merge (10K changes) ===
+  Run 1: 16.82ms (10000 pages merged)
+  Run 2: 16.70ms (10000 pages merged)
+  Run 3: 16.71ms (10000 pages merged)
+  Run 4: 16.64ms (10000 pages merged)
+  Run 5: 16.79ms (10000 pages merged)
+  ms_per_merge [NOT MEASURED, unoptimized build]:
+    Runs: [17, 17, 17, 17, 17]
+    Average: 17 (target <= 200, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Diff Adjacent Versions ===
+  Run 1: 6.69ms (+100000 -100000 ~800000)
+  Run 2: 6.56ms (+100000 -100000 ~800000)
+  Run 3: 6.61ms (+100000 -100000 ~800000)
+  Run 4: 6.58ms (+100000 -100000 ~800000)
+  Run 5: 6.60ms (+100000 -100000 ~800000)
+  ms_per_diff [NOT MEASURED, unoptimized build]:
+    Runs: [7, 7, 7, 7, 7]
+    Average: 7 (target <= 100, not applied)
+    Re-run with --release for a number worth comparing
+
+=== SCD Type 2 Merge Throughput (100K rows) ===
+  Run 1: 15,959,399 rows/sec (6.27ms)
+  Run 2: 15,931,431 rows/sec (6.28ms)
+  Run 3: 15,953,798 rows/sec (6.27ms)
+  Run 4: 15,970,869 rows/sec (6.26ms)
+  Run 5: 15,987,721 rows/sec (6.25ms)
+  rows_per_sec [NOT MEASURED, unoptimized build]:
+    Runs: [15,959,399, 15,931,431, 15,953,798, 15,970,869, 15,987,721]
+    Average: 15,960,644 (target >= 150,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Time Travel Query Overhead (1M rows) ===
+  Run 1: baseline=5.09ms, versioned=4.81ms, overhead=0.0%
+  Run 2: baseline=4.55ms, versioned=4.60ms, overhead=1.2%
+  Run 3: baseline=4.83ms, versioned=4.56ms, overhead=0.0%
+  Run 4: baseline=4.78ms, versioned=4.65ms, overhead=0.0%
+  Run 5: baseline=4.45ms, versioned=5.08ms, overhead=14.0%
+  overhead_percent [NOT MEASURED, unoptimized build]:
+    Runs: [0, 1, 0, 0, 14]
+    Average: 3 (target <= 30, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Timestamp Resolution (Planning Target: <=500us) ===
+  Run 1: 0.154us per resolution (15.37ms total)
+  Run 2: 0.153us per resolution (15.27ms total)
+  Run 3: 0.152us per resolution (15.16ms total)
+  Run 4: 0.151us per resolution (15.14ms total)
+  Run 5: 0.154us per resolution (15.40ms total)
+  us_per_resolution [NOT MEASURED, unoptimized build]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 (target <= 500, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Version Log Append (Planning Target: >=3M/sec) ===
+  Run 1: 1,856,600 ops/sec (538.62ms)
+  Run 2: 1,890,852 ops/sec (528.86ms)
+  Run 3: 1,310,640 ops/sec (762.99ms)
+  Run 4: 1,244,037 ops/sec (803.83ms)
+  Run 5: 1,222,164 ops/sec (818.22ms)
+  batch_ops_per_sec [NOT MEASURED, unoptimized build]:
+    Runs: [1,856,600, 1,890,852, 1,310,640, 1,244,037, 1,222,164]
+    Average: 1,504,858 (target >= 3,000,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Version Overhead Per Tuple ===
+  Run 1: 4.95ns per tuple (49.50ms)
+  Run 2: 4.95ns per tuple (49.51ms)
+  Run 3: 4.92ns per tuple (49.16ms)
+  Run 4: 5.06ns per tuple (50.64ms)
+  Run 5: 4.91ns per tuple (49.08ms)
+  ns_per_check [NOT MEASURED, unoptimized build]:
+    Runs: [5, 5, 5, 5, 5]
+    Average: 5 (target <= 5, not applied)
+    Re-run with --release for a number worth comparing
+
+=== SCD Type 2 Action Generation ===
+  Run 1: 83.00ns per action (83.00ms)
+  Run 2: 84.21ns per action (84.21ms)
+  Run 3: 82.79ns per action (82.79ms)
+  Run 4: 83.17ns per action (83.17ms)
+  Run 5: 82.63ns per action (82.63ms)
+  ns_per_action [NOT MEASURED, unoptimized build]:
+    Runs: [83, 84, 83, 83, 83]
+    Average: 83 (target <= 100, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Surrogate Key Generation ===
+  Run 1: 95,679,405 ops/sec (104.52ms)
+  Run 2: 96,182,608 ops/sec (103.97ms)
+  Run 3: 95,326,522 ops/sec (104.90ms)
+  Run 4: 96,137,392 ops/sec (104.02ms)
+  Run 5: 96,009,831 ops/sec (104.16ms)
+  keys_per_sec [NOT MEASURED, unoptimized build]:
+    Runs: [95,679,405, 96,182,608, 95,326,522, 96,137,392, 96,009,831]
+    Average: 95,867,152 (target >= 50,000,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Branch Lifecycle Validation ===
+  Created main + dev branches
+  Dev: 5 page overrides via copy-on-write
+  Main: pages unchanged during dev modifications
+  Unmodified page resolution: falls through to parent
+  Merge: 5 pages merged, 0 conflicts
+  Delete: branch removed, duplicate name rejected
+  PASS
+
+=== Diff Validation ===
+  Tuple classification: Added, Removed, Unchanged all correct
+  Full scenario: 150 removed, 300 added across update/delete/insert
+  DiffStats formatting: correct
+  Page range pruning for diff scans: correct skip/no-skip
+  PASS
+
+=== SCD Type 2 Validation ===
+  Config parsed from table options: scd_type=2, natural_key=customer_id
+  Required columns: valid_from, valid_to, is_current
+  10 updates: each produces 1 expire + 1 insert with unique surrogate key
+  Delete: expires row with valid_to timestamp (soft delete)
+  PASS
+
+=== Restore Validation ===
+  Restore creates version 4 (non-destructive)
+  All intermediate versions (1-3) still accessible
+  Range query returns all 4 versions
+  Timestamp resolution works across full history
+  PASS
+
+=== System-Versioned Table Validation ===
+  Required columns: sys_start (TIMESTAMPTZ), sys_end (TIMESTAMPTZ)
+  INSERT defaults: sys_start=now, sys_end=MAX_TIMESTAMP
+  UPDATE: old row sys_end=now, new row sys_start=now
+  DELETE: sys_end=now (preserves history)
+  AS OF query: correct visibility at point in time
+  BETWEEN query: correct range overlap detection
+  PASS
+
+=== Branch Page Resolution ===
+  Run 1: 1042.14ns per resolve (1.04s)
+  Run 2: 1056.78ns per resolve (1.06s)
+  Run 3: 1030.15ns per resolve (1.03s)
+  Run 4: 1036.91ns per resolve (1.04s)
+  Run 5: 1028.79ns per resolve (1.03s)
+  ns_per_resolve [NOT MEASURED, unoptimized build]:
+    Runs: [1,042, 1,057, 1,030, 1,037, 1,029]
+    Average: 1,039 (target <= 50, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Version Creation Validation ===
+  Version creation: 3 versions with correct metadata
+  PASS
+
+=== Version Log Append Throughput ===
+  Run 1: 273,453 ops/sec (3.66s)
+  Run 2: 272,976 ops/sec (3.66s)
+  Run 3: 270,801 ops/sec (3.69s)
+  Run 4: 271,306 ops/sec (3.69s)
+  Run 5: 271,479 ops/sec (3.68s)
+  append_ops_per_sec [NOT MEASURED, unoptimized build]:
+    Runs: [273,453, 272,976, 270,801, 271,306, 271,479]
+    Average: 272,003 (target >= 400,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Version Log Batch Append ===
+  Run 1: 1,247,492 ops/sec (801.61ms)
+  Run 2: 1,272,932 ops/sec (785.59ms)
+  Run 3: 1,247,292 ops/sec (801.74ms)
+  Run 4: 1,255,835 ops/sec (796.28ms)
+  Run 5: 1,243,450 ops/sec (804.21ms)
+  batch_append_ops_per_sec [NOT MEASURED, unoptimized build]:
+    Runs: [1,247,492, 1,272,932, 1,247,292, 1,255,835, 1,243,450]
+    Average: 1,253,400 (target >= 5,000,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Version Log Lookup By ID ===
+  Run 1: 47.26ns per lookup (47.26ms)
+  Run 2: 51.88ns per lookup (51.88ms)
+  Run 3: 47.52ns per lookup (47.52ms)
+  Run 4: 48.35ns per lookup (48.35ms)
+  Run 5: 49.29ns per lookup (49.29ms)
+  ns_per_lookup [NOT MEASURED, unoptimized build]:
+    Runs: [47, 52, 48, 48, 49]
+    Average: 49 (target <= 20, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Version Log Timestamp Search ===
+  Run 1: 177.72ns per search (17.77ms)
+  Run 2: 169.16ns per search (16.92ms)
+  Run 3: 172.44ns per search (17.24ms)
+  Run 4: 173.91ns per search (17.39ms)
+  Run 5: 168.88ns per search (16.89ms)
+  ns_per_search [NOT MEASURED, unoptimized build]:
+    Runs: [178, 169, 172, 174, 169]
+    Average: 172 (target <= 500, not applied)
+    Re-run with --release for a number worth comparing
+

@@ -3206,7 +3206,10 @@ impl<T: WireTransport> Connection<T> {
                             // touched
                             let published = match self.lake_txn.take() {
                                 Some(lake_txn) => lake_txn.commit(),
-                                None => zyron_lake::publish_txn(self.server.disk_manager.data_dir(), txn_id),
+                                None => zyron_lake::publish_txn(
+                                    self.server.disk_manager.data_dir(),
+                                    txn_id,
+                                ),
                             };
                             match published {
                                 Ok(logs) => refresh_lake_stats(&self.server, &logs),
@@ -3919,8 +3922,7 @@ impl<T: WireTransport> Connection<T> {
             // so they rebuild through a commit rather than by refilling a
             // tree from heap pages the table does not have
             if table.lake.is_lake() {
-                if let Err(e) =
-                    crate::index_build::rebuild_lake_indexes(&self.server, table).await
+                if let Err(e) = crate::index_build::rebuild_lake_indexes(&self.server, table).await
                 {
                     let fields = crate::messages::backend::ErrorFields {
                         severity: "ERROR".into(),
@@ -3960,11 +3962,13 @@ impl<T: WireTransport> Connection<T> {
             };
 
             for idx in &btree_indexes {
-                // The catalog stores the index column id list; B+tree indexes
-                // are single-column here, so the first column id is the key.
-                let Some(col_id) = idx.columns.first().map(|c| c.column_id) else {
+                // The catalog stores the index column id list in key order,
+                // and the rebuilt key spans all of them
+                let key_columns: Vec<zyron_catalog::ColumnId> =
+                    idx.columns.iter().map(|c| c.column_id).collect();
+                if key_columns.is_empty() {
                     continue;
-                };
+                }
 
                 // Replace the old index with a fresh empty tree and drop its
                 // stale on-disk checkpoint so recovery does not reload old keys.
@@ -3988,7 +3992,7 @@ impl<T: WireTransport> Connection<T> {
                 let index_entries = crate::index_build::fill_btree_from_live_rows(
                     table.as_ref(),
                     &live_rows,
-                    col_id,
+                    &key_columns,
                     &fresh,
                 );
                 let previous_total = total_entries;
@@ -4629,6 +4633,19 @@ impl<T: WireTransport> Connection<T> {
         let array_cols: Vec<bool> = (0..num_cols)
             .map(|i| i < schema.len() && schema[i].type_id == zyron_common::TypeId::Array)
             .collect();
+        // A DECIMAL is stored as an i128 holding the value times ten to its
+        // scale, so rendering it as a plain integer would move the decimal
+        // point. The scale comes off the column, which is the only place it
+        // is recorded
+        let decimal_scales: Vec<Option<u8>> = (0..num_cols)
+            .map(|i| {
+                if i < schema.len() && schema[i].type_id == zyron_common::TypeId::Decimal {
+                    Some(schema[i].fractional_digits.unwrap_or(0))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         let max_rows = self.server.max_result_rows;
         for batch in batches {
@@ -4686,6 +4703,17 @@ impl<T: WireTransport> Connection<T> {
                         }
                     } else if array_cols[col_idx] {
                         types::write_array_text(&scalar, &mut buf);
+                    } else if let Some(scale) = decimal_scales[col_idx] {
+                        match scalar {
+                            ScalarValue::Int128(v) => {
+                                buf.extend_from_slice(
+                                    zyron_common::format_decimal(v, scale).as_bytes(),
+                                );
+                            }
+                            ref other => {
+                                types::scalar_write_text(other, &mut buf);
+                            }
+                        }
                     } else if col_formats[col_idx] == 1 {
                         types::scalar_write_binary(&scalar, &mut buf);
                     } else {
@@ -5676,6 +5704,7 @@ fn expr_to_string(expr: &zyron_parser::Expr) -> String {
     match expr {
         zyron_parser::Expr::Literal(lit) => match lit {
             zyron_parser::LiteralValue::Integer(n) => n.to_string(),
+            zyron_parser::LiteralValue::Int128(n) => n.to_string(),
             zyron_parser::LiteralValue::Float(f) => f.to_string(),
             zyron_parser::LiteralValue::String(s) => s.clone(),
             zyron_parser::LiteralValue::Boolean(b) => if *b { "on" } else { "off" }.into(),

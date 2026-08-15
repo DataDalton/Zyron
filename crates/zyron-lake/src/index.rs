@@ -42,7 +42,7 @@ use crate::paths::LakePaths;
 use crate::predicate::{LakeValue, PruneDecision};
 use crate::reader::{LakeFileReader, ZoneVerdict};
 use crate::schema::{LakeColumn, LakeSchema};
-use crate::writer::{write_data_file, ColumnData, WriteRequest};
+use crate::writer::{ColumnData, WriteRequest, write_data_file};
 
 /// A declared index on a lake table.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,7 +131,7 @@ pub fn index_schema(table: &LakeSchema, spec: &LakeIndexSpec) -> Result<LakeSche
             // A key column is nullable inside the index whatever the table
             // says, because an index entry is written for every row
             nullable: true,
-            ts_precision: source.ts_precision,
+            fractional_digits: source.fractional_digits,
             tz_offset_secs: source.tz_offset_secs,
             max_length: source.max_length,
             default_expr: None,
@@ -147,7 +147,7 @@ pub fn index_schema(table: &LakeSchema, spec: &LakeIndexSpec) -> Result<LakeSche
             name: name.into(),
             type_id: zyron_common::TypeId::Int64,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
             tz_offset_secs: None,
             max_length: None,
             default_expr: None,
@@ -278,7 +278,9 @@ pub fn write_index_files(
         .map(|c| c.physical_type_id())
         .collect();
     let mut order: Vec<usize> = (0..rows).collect();
-    order.sort_by(|&a, &b| sort_key_of(&batch.keys, &physical, a).cmp(&sort_key_of(&batch.keys, &physical, b)));
+    order.sort_by(|&a, &b| {
+        sort_key_of(&batch.keys, &physical, a).cmp(&sort_key_of(&batch.keys, &physical, b))
+    });
 
     // Split on sort-key run boundaries rather than at a fixed count. The
     // sort key is truncated for strings and wide integers, so entries
@@ -352,7 +354,10 @@ fn sort_key_of(
         .map(|(column, physical)| match &column[row] {
             // Nulls sort last, matching the writer
             None => (true, 0),
-            Some(cell) => (false, zyron_common::curve::normalize_component(*physical, cell)),
+            Some(cell) => (
+                false,
+                zyron_common::curve::normalize_component(*physical, cell),
+            ),
         })
         .collect()
 }
@@ -552,7 +557,8 @@ pub fn probe_equal(
         }
         stats.files_admitted += 1;
 
-        let reader = LakeFileReader::open_path(&paths.index_file(spec.index_id, file.file.partition_id))?;
+        let reader =
+            LakeFileReader::open_path(&paths.index_file(spec.index_id, file.file.partition_id))?;
         stats.files_opened += 1;
         let rows = reader.row_count();
         if rows == 0 {
@@ -586,8 +592,7 @@ pub fn probe_equal(
             )?);
         }
         let base = spec.column_ids.len();
-        let partitions =
-            reader.read_column_range(&schema.columns[base], range.start, range.end)?;
+        let partitions = reader.read_column_range(&schema.columns[base], range.start, range.end)?;
         let ordinals =
             reader.read_column_range(&schema.columns[base + 1], range.start, range.end)?;
 
@@ -596,7 +601,8 @@ pub fn probe_equal(
             if !matches_key(&key_columns, row, key, physical) {
                 continue;
             }
-            let (Some(partition), Some(ordinal)) = (partitions.cell(row), ordinals.cell(row)) else {
+            let (Some(partition), Some(ordinal)) = (partitions.cell(row), ordinals.cell(row))
+            else {
                 continue;
             };
             let address = RowAddress {

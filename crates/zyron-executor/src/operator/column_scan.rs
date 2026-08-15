@@ -221,11 +221,8 @@ impl ColumnScanOperator {
         let regions = segment_regions(raw, column_id, row_count)?;
         let null_bitmap = raw[regions.null_bitmap.clone()].to_vec();
         let enc = regions.verified_payload(raw, column_id)?;
-        let decoded = create_encoding(regions.header.encoding_type).decode(
-            enc,
-            row_count,
-            value_size,
-        )?;
+        let decoded =
+            create_encoding(regions.header.encoding_type).decode(enc, row_count, value_size)?;
         Ok((decoded, null_bitmap))
     }
 
@@ -826,7 +823,7 @@ impl Operator for ColumnarMetadataAggregateOperator {
                         name: ce.name.clone(),
                         type_id: ce.type_id,
                         nullable: ce.nullable,
-                        ts_precision: ce.ts_precision,
+                        fractional_digits: ce.fractional_digits,
                     });
                 }
             }
@@ -838,7 +835,7 @@ impl Operator for ColumnarMetadataAggregateOperator {
                         name: ce.name.clone(),
                         type_id: ce.type_id,
                         nullable: ce.nullable,
-                        ts_precision: ce.ts_precision,
+                        fractional_digits: ce.fractional_digits,
                     });
                 }
             }

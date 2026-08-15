@@ -19,10 +19,10 @@ use zyron_common::TypeId;
 use zyron_lake::manifest::{ClusterSpec, ColumnStatsEntry, PartitionEntry};
 use zyron_lake::predicate::ColumnBounds;
 use zyron_lake::{
-    current_epoch, evaluate, observe_scan, observe_scan_result, skip_rate, with_sweep,
-    CommitAttempt, ColumnData, CompareOp, GateConfig, LakeColumn, LakePaths, LakePredicate,
+    ColumnData, CommitAttempt, CompareOp, GateConfig, LakeColumn, LakePaths, LakePredicate,
     LakeSchema, LakeValue, LogEntry, ManifestFile, OperationKind, PredicateClass, PruneDecision,
-    PruneIndex, StoredFilter, TransactionLog, WriteRequest,
+    PruneIndex, StoredFilter, TransactionLog, WriteRequest, current_epoch, evaluate, observe_scan,
+    observe_scan_result, skip_rate, with_sweep,
 };
 
 thread_local! {
@@ -90,7 +90,7 @@ fn schema(types: &[(&str, TypeId)]) -> LakeSchema {
                 name: (*name).into(),
                 type_id: *type_id,
                 nullable: true,
-                ts_precision: None,
+                fractional_digits: None,
                 tz_offset_secs: None,
                 max_length: None,
                 default_expr: None,
@@ -290,7 +290,10 @@ fn test_prune_index_survivor_mask_matches_scalar_reference() {
     // above would pass on a sweep that never rejects anything
     let selective = cmp(0, CompareOp::Lt, 1_000);
     let kept = manifest.files_matching(&selective).count();
-    assert_eq!(kept, 10, "a narrow range must reach ten of a hundred thousand files");
+    assert_eq!(
+        kept, 10,
+        "a narrow range must reach ten of a hundred thousand files"
+    );
 }
 
 /// Deciding which files to skip reads the manifest and nothing else, so
@@ -341,7 +344,11 @@ fn test_pruning_touches_no_data_file() {
         .files_matching(&predicate)
         .map(|e| e.partition_id)
         .collect();
-    assert_eq!(expected, vec![0], "only the first file holds ids below 1000");
+    assert_eq!(
+        expected,
+        vec![0],
+        "only the first file holds ids below 1000"
+    );
 
     // Every data file goes, so any read of one is now an error rather
     // than a slower path that still returns the right answer
@@ -361,7 +368,11 @@ fn test_pruning_touches_no_data_file() {
 
     with_sweep(&index, &predicate, |mask, complete| {
         assert!(complete);
-        assert_eq!(mask, &[0, 1, 1, 1][..], "the sweep read no data file either");
+        assert_eq!(
+            mask,
+            &[0, 1, 1, 1][..],
+            "the sweep read no data file either"
+        );
     });
 }
 
@@ -375,7 +386,9 @@ fn test_written_file_carries_its_own_statistics_with_no_analyze() {
     let paths = LakePaths::new(dir.path(), 12);
     let schema = schema(&[("id", TypeId::Int64), ("label", TypeId::Varchar)]);
 
-    let ids: Vec<Option<Vec<u8>>> = (0..500i64).map(|r| Some((r % 50).to_le_bytes().to_vec())).collect();
+    let ids: Vec<Option<Vec<u8>>> = (0..500i64)
+        .map(|r| Some((r % 50).to_le_bytes().to_vec()))
+        .collect();
     let labels: Vec<Option<Vec<u8>>> = (0..500i64)
         .map(|r| {
             if r % 10 == 0 {
@@ -423,14 +436,21 @@ fn test_written_file_carries_its_own_statistics_with_no_analyze() {
     assert_within_a_few_percent(id_stats.ndv, 50, "id");
 
     let label_stats = entry.stats_for(1).expect("label statistics");
-    assert_eq!(label_stats.bounds.min, Some(LakeValue::Str("label-0000".into())));
-    assert_eq!(label_stats.bounds.max, Some(LakeValue::Str("label-0024".into())));
+    assert_eq!(
+        label_stats.bounds.min,
+        Some(LakeValue::Str("label-0000".into()))
+    );
+    assert_eq!(
+        label_stats.bounds.max,
+        Some(LakeValue::Str("label-0024".into()))
+    );
     assert_eq!(label_stats.bounds.null_count, 50);
     assert_within_a_few_percent(label_stats.ndv, 25, "label");
 }
 
 fn assert_within_a_few_percent(estimate: Option<u64>, truth: u64, column: &str) {
-    let estimate = estimate.unwrap_or_else(|| panic!("column {} carries no distinct count", column));
+    let estimate =
+        estimate.unwrap_or_else(|| panic!("column {} carries no distinct count", column));
     let error = (estimate as f64 - truth as f64).abs() / truth as f64;
     assert!(
         error <= 0.05,
@@ -503,7 +523,9 @@ fn test_point_lookup_reads_only_projected_columns() {
         state ^= state << 17;
         state
     };
-    let ids: Vec<Option<Vec<u8>>> = (0..ROWS as i64).map(|r| Some(r.to_le_bytes().to_vec())).collect();
+    let ids: Vec<Option<Vec<u8>>> = (0..ROWS as i64)
+        .map(|r| Some(r.to_le_bytes().to_vec()))
+        .collect();
     let blobs: Vec<Option<Vec<u8>>> = (0..ROWS)
         .map(|_| {
             let mut cell = Vec::with_capacity(BLOB_LEN);
@@ -819,8 +841,7 @@ fn test_zero_allocation_in_feedback_gate() {
     let probe = cmp(0, CompareOp::Lt, 100_000);
 
     let _ = skip_rate(&manifest.entries, &manifest.schema, &probe);
-    let (rate, allocs, bytes) =
-        measure(|| skip_rate(&manifest.entries, &manifest.schema, &probe));
+    let (rate, allocs, bytes) = measure(|| skip_rate(&manifest.entries, &manifest.schema, &probe));
     assert!(
         rate > 0.0 && rate < 1.0,
         "the probe has to prune something and keep something, got {}",

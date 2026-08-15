@@ -76,8 +76,7 @@ impl OnlineMoments {
         let deltaN2 = deltaN * deltaN;
         let term1 = delta * deltaN * n1;
         self.mean += deltaN;
-        self.m4 += term1 * deltaN2 * (n * n - 3.0 * n + 3.0)
-            + 6.0 * deltaN2 * self.m2
+        self.m4 += term1 * deltaN2 * (n * n - 3.0 * n + 3.0) + 6.0 * deltaN2 * self.m2
             - 4.0 * deltaN * self.m3;
         self.m3 += term1 * deltaN * (n - 2.0) - 3.0 * deltaN * self.m2;
         self.m2 += term1;
@@ -181,13 +180,7 @@ impl OnlineQuantile {
             n: 0,
             q: [0.0; 5],
             np: [1.0, 2.0, 3.0, 4.0, 5.0],
-            nDesired: [
-                1.0,
-                1.0 + 2.0 * p,
-                1.0 + 4.0 * p,
-                3.0 + 2.0 * p,
-                5.0,
-            ],
+            nDesired: [1.0, 1.0 + 2.0 * p, 1.0 + 4.0 * p, 3.0 + 2.0 * p, 5.0],
             initialized: false,
         }
     }
@@ -200,7 +193,8 @@ impl OnlineQuantile {
         if (self.n as usize) <= 5 {
             self.q[(self.n as usize) - 1] = x;
             if self.n == 5 {
-                self.q.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                self.q
+                    .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 self.initialized = true;
             }
             return;
@@ -254,8 +248,7 @@ impl OnlineQuantile {
         let npp = self.np[i + 1];
         let npm = self.np[i - 1];
         qi + d / (npp - npm)
-            * ((np - npm + d) * (qip - qi) / (npp - np)
-                + (npp - np - d) * (qi - qim) / (np - npm))
+            * ((np - npm + d) * (qip - qi) / (npp - np) + (npp - np - d) * (qi - qim) / (np - npm))
     }
 
     fn linear(&self, i: usize, d: f64) -> f64 {
@@ -472,7 +465,9 @@ where
     }
     estimates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let lo = ((alpha / 2.0) * bSamples as f64).floor() as usize;
-    let hi = (((1.0 - alpha / 2.0) * bSamples as f64) - 1.0).ceil().max(0.0) as usize;
+    let hi = (((1.0 - alpha / 2.0) * bSamples as f64) - 1.0)
+        .ceil()
+        .max(0.0) as usize;
     let lo = lo.min(bSamples - 1);
     let hi = hi.min(bSamples - 1);
     Some((estimator(values), estimates[lo], estimates[hi]))

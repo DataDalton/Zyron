@@ -1,0 +1,301 @@
+# suite:   pipeline
+# run:     2026-08-15_025025_2848e81-local
+# profile: debug
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+# NOT A BENCHMARK RESULT. This is an unoptimized build, so every
+# timing below is meaningless: an unoptimized build is not slower
+# by a constant factor, so these numbers do not even rank correctly
+# against each other. Counted quantities (rates, file and row
+# counts, PASS/FAIL on an exact bound) are valid and are the only
+# thing worth reading here. For real numbers: cargo test --release
+#
+
+=== AFTER Trigger ===
+  AFTER INSERT|UPDATE|DELETE on orders
+  INSERT context: new row only
+  UPDATE context: old + new rows
+  PASS
+
+=== BEFORE Trigger ===
+  BEFORE INSERT: set_updated(1000), reject_neg(500, WHEN new.total<0)
+  Priority order: reject_neg fires first
+  PASS
+
+=== Benchmark: BEFORE Trigger Per Row ===
+  Run 1: 619.0 ns/row
+  Run 2: 674.6 ns/row
+  Run 3: 673.1 ns/row
+  Run 4: 671.3 ns/row
+  Run 5: 679.9 ns/row
+  Latency (ns/row) [NOT MEASURED, unoptimized build]:
+    Runs: [619, 675, 673, 671, 680]
+    Average: 664 (target <= 300, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Benchmark: AFTER Trigger Per Row ===
+  Run 1: 669.9 ns/row
+  Run 2: 670.1 ns/row
+  Run 3: 672.3 ns/row
+  Run 4: 672.1 ns/row
+  Run 5: 665.4 ns/row
+  Latency (ns/row) [NOT MEASURED, unoptimized build]:
+    Runs: [670, 670, 672, 672, 665]
+    Average: 670 (target <= 800, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Benchmark: Cron Parse + Match ===
+  Run 1: 0.0026 ms/parse+match
+  Run 2: 0.0026 ms/parse+match
+  Run 3: 0.0026 ms/parse+match
+  Run 4: 0.0027 ms/parse+match
+  Run 5: 0.0026 ms/parse+match
+  Jitter (ms/parse+match) [NOT MEASURED, unoptimized build]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 (target <= 20, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Benchmark: Event Dispatch Latency ===
+  Run 1: 0.118 us/dispatch
+  Run 2: 0.117 us/dispatch
+  Run 3: 0.120 us/dispatch
+  Run 4: 0.118 us/dispatch
+  Run 5: 0.222 us/dispatch
+  Latency (us/dispatch) [NOT MEASURED, unoptimized build]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 (target <= 3, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Benchmark: Full Refresh Throughput (1M rows) ===
+  Run 1: 203516770 rows/sec
+  Run 2: 202835642 rows/sec
+  Run 3: 204102459 rows/sec
+  Run 4: 203744830 rows/sec
+  Run 5: 203940123 rows/sec
+  Throughput (rows/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [203,516,770, 202,835,642, 204,102,459, 203,744,830, 203,940,123]
+    Average: 203,627,965 (target >= 1,500,000, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Benchmark: Incremental Refresh (10K rows) ===
+  Run 1: 0.048 ms
+  Run 2: 0.044 ms
+  Run 3: 0.044 ms
+  Run 4: 0.044 ms
+  Run 5: 0.044 ms
+  Latency (ms/10K rows) [NOT MEASURED, unoptimized build]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 (target <= 150, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Benchmark: Merge Refresh (10K changes) ===
+  Run 1: 0.044 ms
+  Run 2: 0.043 ms
+  Run 3: 0.043 ms
+  Run 4: 0.043 ms
+  Run 5: 0.043 ms
+  Latency (ms/10K changes) [NOT MEASURED, unoptimized build]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 (target <= 300, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Benchmark: MV Aggregate Maintenance (10K deltas) ===
+  Run 1: 0.110 ms for 10000 deltas
+  Run 2: 0.109 ms for 10000 deltas
+  Run 3: 0.109 ms for 10000 deltas
+  Run 4: 0.109 ms for 10000 deltas
+  Run 5: 0.109 ms for 10000 deltas
+  Latency (ms/10K deltas) [NOT MEASURED, unoptimized build]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 (target <= 5, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Benchmark: Pipeline Create + Trigger ===
+  Run 1: 0.010 ms/pipeline
+  Run 2: 0.010 ms/pipeline
+  Run 3: 0.010 ms/pipeline
+  Run 4: 0.010 ms/pipeline
+  Run 5: 0.010 ms/pipeline
+  Latency (ms/pipeline) [NOT MEASURED, unoptimized build]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 (target <= 100, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Benchmark: Quality Check Overhead (1M rows) ===
+  Run 1: 0.00% overhead (base=4.5ms, checked=4.5ms)
+  Run 2: 0.11% overhead (base=4.5ms, checked=4.5ms)
+  Run 3: 0.00% overhead (base=4.5ms, checked=4.5ms)
+  Run 4: 0.57% overhead (base=4.5ms, checked=4.5ms)
+  Run 5: 0.00% overhead (base=4.5ms, checked=4.5ms)
+  Overhead (%) [NOT MEASURED, unoptimized build]:
+    Runs: [0, 0, 0, 1, 0]
+    Average: 0 (target <= 5, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Benchmark: SQL UDF Inlined Call ===
+  Measures inlined expression evaluation cost (no registry lookup).
+  Inlining substitutes the function body into the expression tree at plan time.
+  Run 1: 6.46 ns/call
+  Run 2: 6.45 ns/call
+  Run 3: 6.47 ns/call
+  Run 4: 6.46 ns/call
+  Run 5: 6.46 ns/call
+  Latency (ns/call) [NOT MEASURED, unoptimized build]:
+    Runs: [6, 6, 6, 6, 6]
+    Average: 6 (target <= 8, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Benchmark: Stored Procedure Call ===
+  Run 1: 0.591 us/call
+  Run 2: 0.604 us/call
+  Run 3: 0.615 us/call
+  Run 4: 0.598 us/call
+  Run 5: 0.600 us/call
+  Latency (us/call) [NOT MEASURED, unoptimized build]:
+    Runs: [1, 1, 1, 1, 1]
+    Average: 1 (target <= 200, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Benchmark: Trigger Dispatch (No Triggers) ===
+  Run 1: 112.20 ns/check
+  Run 2: 112.68 ns/check
+  Run 3: 111.91 ns/check
+  Run 4: 112.07 ns/check
+  Run 5: 112.05 ns/check
+  Latency (ns/check) [NOT MEASURED, unoptimized build]:
+    Runs: [112, 113, 112, 112, 112]
+    Average: 112 (target <= 15, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Data Lineage ===
+  orders.total -[Aggregated]-> order_stats.sum_total -[Direct]-> gold_metrics.revenue
+  Forward/backward trace works
+  Impact analysis: changing orders.total affects 2 downstream nodes
+  PASS
+
+=== Benchmark: Watermark Resolution ===
+  Run 1: 0.820 us/lookup
+  Run 2: 0.824 us/lookup
+  Run 3: 0.821 us/lookup
+  Run 4: 0.826 us/lookup
+  Run 5: 0.822 us/lookup
+  Latency (us/lookup) [NOT MEASURED, unoptimized build]:
+    Runs: [1, 1, 1, 1, 1]
+    Average: 1 (target <= 500, not applied)
+    Re-run with --release for a number worth comparing
+
+=== Event Handler ===
+  Handler registered for TableCreated
+  Dispatch non-blocking (async channel)
+  No handlers for unregistered event types
+  PASS
+
+=== Materialized View Lifecycle ===
+  MV CRUD, staleness detection, auto-refresh trigger
+  Incremental agg: COUNT, SUM, AVG, MIN/MAX delta maintenance
+  Min boundary delete flags recompute
+  PASS
+
+=== MV Auto-Advisor ===
+  20 executions at 5ms: advisor recommends MV
+  GROUP BY detected -> incremental refresh
+  Estimated savings: 100 ms/hour
+  PASS
+
+=== Pipeline DAG and Dependencies ===
+  Circular dependency rejected: a, b, c
+  Linear chain: pa -> mid -> pb verified
+  Circular dependency correctly rejected
+  Diamond DAG accepted, topological order correct
+  RESTRICT prevents drop with dependents
+  CASCADE returns dependent objects to drop
+  PASS
+
+=== Pipeline Full Refresh ===
+  Pipeline with FULL mode created
+  Full executor returns no watermark (complete rebuild)
+  PASS
+
+=== Pipeline Incremental Refresh ===
+  First run without watermark: full scan fallback
+  Watermark advanced after first run
+  Second run with watermark: delta only
+  PASS
+
+=== Hot-Swap Rust UDF ===
+  Rust UDF hot-swapped v1 -> v2 atomically
+  SQL UDF hot-swap correctly rejected
+  PASS
+
+=== Pipeline Merge Refresh ===
+  Merge executor: key-match insert/update/delete
+  Watermark preserved through merge
+  PASS
+
+=== Pipeline Scheduling ===
+  Schedule: 0 * * * * (every hour at :00)
+  Cron: */5 9-17 * * 1-5 (every 5min, business hours, weekdays)
+  Pause/resume toggles active state
+  Scheduler thread starts and stops cleanly
+  PASS
+
+=== Pipeline SLA Monitoring ===
+  Within SLA (3s/30s): no breach
+  Exceeded duration (8s > 5s): breach with reason
+  PASS
+
+=== Quality Checks and Abort Logic ===
+  NOT_NULL, RANGE(0-150), UNIQUE checks
+  All pass -> pipeline proceeds
+  Fatal+Abort -> pipeline rolls back
+  Warn+Continue -> pipeline completes with warnings
+  PASS
+
+=== Quality Drift Detection ===
+  PSI = 0.8789, severity = Critical
+  Shifted distribution detected (PSI > 0.10)
+  Stable distribution: no false positive
+  PASS
+
+=== Quality Quarantine Mode ===
+  10/1000 rows quarantined (1.0% failure rate)
+  Quarantine mode does not abort pipeline
+  PASS
+
+=== Trigger Recursion Depth Limit ===
+  MAX_TRIGGER_DEPTH = 16
+  PASS
+
+=== SQL UDF Lifecycle ===
+  discount_price(DECIMAL, DECIMAL) -> DECIMAL IMMUTABLE
+  Resolved by name + param types
+  isImmutableSql = true (inlinable at plan time)
+  DROP removes from registry
+  PASS
+
+=== Stored Procedure ===
+  batch_process(batch_size INT) SECURITY INVOKER
+  admin_cleanup() SECURITY DEFINER
+  PASS
+
+=== Trigger Priority Order ===
+  Priorities: high(100), med(1000), low(3000)
+  Fire order verified: high, med, low
+  PASS
+
+=== Trigger Trace ===
+  SET trigger_trace = on
+  Trace captures name, table, timing, event, duration, result
+  PASS
+
+=== UDF Overloading and Inlining ===
+  calc(FLOAT64, FLOAT64) IMMUTABLE -> inlinable
+  calc(INT32) VOLATILE -> not inlinable
+  Overload resolution by param types
+  PASS
+
+=== User-Defined Aggregate ===
+  geometric_mean: sfunc + finalfunc + combinefunc
+  combinefunc enables parallel aggregation
+  PASS

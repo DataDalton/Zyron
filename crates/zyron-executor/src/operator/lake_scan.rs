@@ -143,10 +143,7 @@ fn surviving_span(keep: &[u8], row_count: usize) -> (usize, usize) {
     let Some(first_byte) = first else {
         return (0, 0);
     };
-    let last_byte = keep
-        .iter()
-        .rposition(|b| *b != 0)
-        .unwrap_or(first_byte);
+    let last_byte = keep.iter().rposition(|b| *b != 0).unwrap_or(first_byte);
     let start = first_byte * 8 + keep[first_byte].trailing_zeros() as usize;
     let end = (last_byte * 8 + (8 - keep[last_byte].leading_zeros() as usize)).min(row_count);
     (start.min(row_count), end.max(start.min(row_count)))
@@ -225,7 +222,11 @@ fn index_is_worth_probing(
 /// equality terms do
 fn range_terms(
     predicate: &zyron_lake::LakePredicate,
-    out: &mut Vec<(u32, Option<zyron_lake::RangeBound>, Option<zyron_lake::RangeBound>)>,
+    out: &mut Vec<(
+        u32,
+        Option<zyron_lake::RangeBound>,
+        Option<zyron_lake::RangeBound>,
+    )>,
 ) {
     use zyron_lake::CompareOp;
     match predicate {
@@ -1020,7 +1021,11 @@ impl Operator for LakeUpdateOperator {
                 || !indexes.spatial.is_empty();
             // AFTER UPDATE fires on the committed images too, so they are
             // kept when the table has triggers as well
-            let has_triggers = !self.ctx.catalog.triggers_for_table(self.table_id).is_empty();
+            let has_triggers = !self
+                .ctx
+                .catalog
+                .triggers_for_table(self.table_id)
+                .is_empty();
             let keep_images = needs_search_maintenance || has_triggers;
             let mut images: Vec<crate::batch::DataBatch> = Vec::new();
             while let Some(batch) = self.child.next().await? {
@@ -1158,7 +1163,12 @@ impl Operator for LakeUpdateOperator {
                 &columns,
                 matched,
             )?;
-            zyron_lake::register_txn_pending(self.ctx.disk_manager.data_dir(), self.ctx.lake_txn_id(), root, outcome.version);
+            zyron_lake::register_txn_pending(
+                self.ctx.disk_manager.data_dir(),
+                self.ctx.lake_txn_id(),
+                root,
+                outcome.version,
+            );
             self.ctx.mark_wrote_wal();
             // The rows only have addresses once the commit assigned them,
             // so the search indexes take the new images here rather than
@@ -1256,7 +1266,12 @@ impl Operator for LakeDeleteOperator {
                 None => zyron_lake::delete_all(&log, attempt)?,
             };
             if let Some(version) = outcome.version {
-                zyron_lake::register_txn_pending(self.ctx.disk_manager.data_dir(), self.ctx.lake_txn_id(), root, version);
+                zyron_lake::register_txn_pending(
+                    self.ctx.disk_manager.data_dir(),
+                    self.ctx.lake_txn_id(),
+                    root,
+                    version,
+                );
                 self.ctx.mark_wrote_wal();
             }
             Ok(Some(ExecutionBatch::new(

@@ -11,7 +11,7 @@ use crate::heap::constants::{DATA_START, HEAP_HEADER_OFFSET, TUPLE_HEADER_SIZE, 
 use crate::heap::page::{HeapPage, SlotId};
 use crate::tuple::{Tuple, TupleHeader, TupleId, TupleView};
 use std::sync::Arc;
-use zyron_buffer::{BufferPool};
+use zyron_buffer::BufferPool;
 use zyron_common::page::{PAGE_SIZE, PageId};
 use zyron_common::{Result, ZyronError};
 
@@ -139,7 +139,6 @@ impl AtomicHintSlots {
         }
         None
     }
-
 }
 
 /// HeapFile manages tuple storage with buffer pool caching.
@@ -992,7 +991,6 @@ impl HeapFile {
             Err(other) => Ok(other),
         }
     }
-
 }
 
 /// Guard that holds pinned pages during zero-copy scan iteration.

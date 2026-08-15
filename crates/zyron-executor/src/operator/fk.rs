@@ -1,4 +1,4 @@
-﻿//! Foreign-key referential integrity enforcement for DML operators.
+//! Foreign-key referential integrity enforcement for DML operators.
 //!
 //! Child-side: INSERT and UPDATE verify that each non-null foreign-key value
 //! has a matching live row in the referenced parent table (MATCH SIMPLE, so a
@@ -14,9 +14,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use zyron_catalog::{
-    ColumnId, ConstraintEntry, ConstraintType, ReferentialAction, TableEntry,
-};
+use zyron_catalog::{ColumnId, ConstraintEntry, ConstraintType, ReferentialAction, TableEntry};
 use zyron_common::page::PageId;
 use zyron_common::{Result, TypeId, ZyronError};
 use zyron_parser::ast::LiteralValue;
@@ -82,9 +80,9 @@ pub(crate) fn decode_tuple_to_batch(data: &[u8], table: &TableEntry) -> DataBatc
         .columns
         .iter()
         .map(|c| {
-            let phys = TypeId::timestamp_physical_type_id(c.type_id, c.ts_precision);
-            if phys != c.type_id {
-                ColumnBuilder::new_ts(c.type_id, phys, c.ts_precision, 1)
+            let phys = TypeId::timestamp_physical_type_id(c.type_id, c.fractional_digits);
+            if phys != c.type_id || c.fractional_digits.is_some() {
+                ColumnBuilder::new_ts(c.type_id, phys, c.fractional_digits, 1)
             } else {
                 ColumnBuilder::new(c.type_id, 1)
             }
@@ -96,6 +94,12 @@ pub(crate) fn decode_tuple_to_batch(data: &[u8], table: &TableEntry) -> DataBatc
 
 /// Returns the B+tree index id whose leading column is `col_id` for the table,
 /// or None. Used to take the O(1) probe path for single-column keys.
+///
+/// An index over more stores the further components between the value and
+/// the locator suffix, so the probe reads them as part of the key. A
+/// leading-column range still brackets every entry for the value, and the
+/// probe re-reads each candidate row to confirm the key, so the extra
+/// components cost candidates rather than correctness.
 fn leading_btree_for_column(
     ctx: &ExecutionContext,
     table_id: u32,
@@ -104,8 +108,8 @@ fn leading_btree_for_column(
     let snap = ctx.index_snapshot_for_table(table_id);
     snap.btree
         .iter()
-        .find(|(_, c, _)| *c == col_id)
-        .map(|(id, _, _)| id.0)
+        .find(|spec| spec.leading() == col_id)
+        .map(|spec| spec.id.0)
 }
 
 /// Reads the heap tuple at `tid` and returns its decoded single-row batch when
@@ -255,7 +259,7 @@ async fn collect_visible_keys(
                 name: c.name.clone(),
                 type_id: c.type_id,
                 nullable: c.nullable,
-                ts_precision: c.ts_precision,
+                fractional_digits: c.fractional_digits,
             })
             .collect();
         let mut op = crate::operator::column_scan::ColumnScanOperator::new_for_dml(
@@ -289,17 +293,14 @@ async fn parent_key_exists(
 ) -> Result<bool> {
     if let (Some(idx_id), Some(raw)) = (single_col_index, single_col_raw) {
         if let Some(btree) = ctx.get_index(zyron_catalog::IndexId(idx_id)) {
-            // Index keys are composite (value followed by a locator suffix),
+            // A stored key is the indexed value followed by a locator suffix,
             // so probe the whole key range for this value and collect the
             // candidates; multiple rows may share the value.
-            let suffix = crate::operator::modify::INDEX_LOCATOR_SUFFIX_LEN;
-            let mut lo = raw.to_vec();
-            lo.extend(std::iter::repeat(0u8).take(suffix));
-            let mut hi = raw.to_vec();
-            hi.extend(std::iter::repeat(0xFFu8).take(suffix));
+            let lo = raw.to_vec();
+            let hi = crate::operator::modify::index_key_upper_bound(raw);
             let mut heap_candidates: Vec<TupleId> = Vec::new();
             let mut columnar_candidates: Vec<zyron_common::RowLocator> = Vec::new();
-            btree.range_scan_for_each(Some(&lo), Some(&hi), |_k, loc| {
+            btree.range_scan_for_each(Some(&lo), hi.as_deref(), |_k, loc| {
                 match loc {
                     // stored heap locators are normalized to file id 0,
                     // resolve to the parent heap file before reading
@@ -340,7 +341,7 @@ async fn parent_key_exists(
                         name: c.name.clone(),
                         type_id: c.type_id,
                         nullable: c.nullable,
-                        ts_precision: c.ts_precision,
+                        fractional_digits: c.fractional_digits,
                     })
                     .collect();
                 let fetcher = crate::operator::doc_fetch::DocRowFetcher::prepare_columnar_only(
@@ -363,9 +364,9 @@ async fn parent_key_exists(
                         .iter()
                         .map(|c| {
                             let phys =
-                                TypeId::timestamp_physical_type_id(c.type_id, c.ts_precision);
-                            if phys != c.type_id {
-                                ColumnBuilder::new_ts(c.type_id, phys, c.ts_precision, 1)
+                                TypeId::timestamp_physical_type_id(c.type_id, c.fractional_digits);
+                            if phys != c.type_id || c.fractional_digits.is_some() {
+                                ColumnBuilder::new_ts(c.type_id, phys, c.fractional_digits, 1)
                             } else {
                                 ColumnBuilder::new(c.type_id, 1)
                             }
@@ -688,7 +689,7 @@ fn logical_schema(table: &TableEntry) -> Vec<LogicalColumn> {
             name: c.name.clone(),
             type_id: c.type_id,
             nullable: c.nullable,
-            ts_precision: c.ts_precision,
+            fractional_digits: c.fractional_digits,
         })
         .collect()
 }

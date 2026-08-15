@@ -65,14 +65,11 @@ async fn setup() -> Env {
 
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
-        .await
-        .unwrap(),
+            .await
+            .unwrap(),
     );
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
-    let wal = Arc::new(
-        WalWriter::new(zyron_bench_harness::wal_config(wal_dir))
-        .unwrap(),
-    );
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir)).unwrap());
     let storage = Arc::new(HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap());
     let cache = Arc::new(CatalogCache::new(64, 16));
     let catalog = Arc::new(
@@ -121,6 +118,8 @@ async fn setup() -> Env {
             sys_xmin_hi: 0,
             // No clustering policy is declared here, which is what zero means
             cluster_spec_id: 0,
+            // Hot, the tier the fold writes into
+            storage_tier: 0,
         });
     catalog.update_table(te).await.unwrap();
 

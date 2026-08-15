@@ -294,9 +294,7 @@ impl Encoding for RleEncoding {
 
             let matches = match predicate {
                 Predicate::Equality(target) => value == *target,
-                Predicate::Range { low, high } => {
-                    range_admits(value, storedValueSize, *low, *high)
-                }
+                Predicate::Range { low, high } => range_admits(value, storedValueSize, *low, *high),
                 Predicate::In(values) => values.contains(&value),
             };
 

@@ -57,16 +57,16 @@ pub struct ColumnSpec {
     /// the column is i128 picoseconds and Arrow export downcasts ps->ns (the
     /// one sanctioned lossy narrowing). None / p<=6 is the i64 microsecond
     /// path and is byte-identical to before this field existed.
-    pub ts_precision: Option<u8>,
+    pub fractional_digits: Option<u8>,
 }
 
 impl ColumnSpec {
-    /// Non-temporal / default-precision column spec (ts_precision = None).
+    /// Non-temporal / default-precision column spec (fractional_digits = None).
     pub fn new(name: impl Into<String>, type_id: TypeId) -> Self {
         Self {
             name: name.into(),
             type_id,
-            ts_precision: None,
+            fractional_digits: None,
         }
     }
 
@@ -74,12 +74,12 @@ impl ColumnSpec {
     pub fn with_precision(
         name: impl Into<String>,
         type_id: TypeId,
-        ts_precision: Option<u8>,
+        fractional_digits: Option<u8>,
     ) -> Self {
         Self {
             name: name.into(),
             type_id,
-            ts_precision,
+            fractional_digits,
         }
     }
 }

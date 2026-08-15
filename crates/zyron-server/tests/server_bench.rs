@@ -87,13 +87,13 @@ async fn create_test_state(
 
     let wal = Arc::new(
         WalWriter::new(zyron_bench_harness::wal_config(wal_dir))
-        .expect("WalWriter creation failed"),
+            .expect("WalWriter creation failed"),
     );
 
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(data_dir))
-        .await
-        .expect("DiskManager creation failed"),
+            .await
+            .expect("DiskManager creation failed"),
     );
 
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
@@ -452,14 +452,11 @@ fn test_01_server_startup() {
             let data_dir = tmp.path().join("data");
             let wal_dir = tmp.path().join("wal");
 
-            let wal = Arc::new(
-                WalWriter::new(zyron_bench_harness::wal_config(wal_dir))
-                .unwrap(),
-            );
+            let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir)).unwrap());
             let disk = Arc::new(
                 DiskManager::new(zyron_bench_harness::disk_config(data_dir))
-                .await
-                .unwrap(),
+                    .await
+                    .unwrap(),
             );
             let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
             let storage =
@@ -738,8 +735,7 @@ fn test_05_transaction_isolation() {
 
     let tmp = tempfile::TempDir::new().unwrap();
     let wal = Arc::new(
-        WalWriter::new(zyron_bench_harness::wal_config(tmp.path().to_path_buf()))
-        .unwrap(),
+        WalWriter::new(zyron_bench_harness::wal_config(tmp.path().to_path_buf())).unwrap(),
     );
 
     let txn_mgr = TransactionManager::new(Arc::clone(&wal));
@@ -988,8 +984,7 @@ fn test_08_crash_recovery() {
         std::fs::create_dir_all(&wal_dir).unwrap();
 
         {
-            let wal = WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
-            .unwrap();
+            let wal = WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone())).unwrap();
 
             // Write ~1MB of WAL
             let record_data = vec![0u8; 200];
@@ -1024,8 +1019,7 @@ fn test_08_crash_recovery() {
         std::fs::create_dir_all(&wal_dir2).unwrap();
 
         {
-            let _wal = WalWriter::new(zyron_bench_harness::wal_config(wal_dir2.clone()))
-            .unwrap();
+            let _wal = WalWriter::new(zyron_bench_harness::wal_config(wal_dir2.clone())).unwrap();
             // Empty WAL (simulates restart after clean shutdown with checkpoint)
         }
 
@@ -1117,8 +1111,7 @@ fn test_09_adaptive_checkpoint() {
 
     // Test WAL bytes tracking via LSN difference
     let tmp = tempfile::TempDir::new().unwrap();
-    let wal = WalWriter::new(zyron_bench_harness::wal_config(tmp.path().to_path_buf()))
-    .unwrap();
+    let wal = WalWriter::new(zyron_bench_harness::wal_config(tmp.path().to_path_buf())).unwrap();
 
     let base_lsn = wal.next_lsn().0;
 
@@ -1213,20 +1206,14 @@ fn test_10_metrics() {
                 output.contains("zyron_connections_total 10"),
                 "connections counter"
             );
-            assert!(
-                output.contains("zyron_queries_total 50"),
-                "queries counter"
-            );
+            assert!(output.contains("zyron_queries_total 50"), "queries counter");
             assert!(output.contains("zyron_errors_total 2"), "errors counter");
             assert!(
                 output.contains("zyron_active_connections 2"),
                 "active gauge"
             );
             assert!(output.contains("zyron_max_connections 1000"), "max gauge");
-            assert!(
-                output.contains("zyron_query_duration_seconds"),
-                "histogram"
-            );
+            assert!(output.contains("zyron_query_duration_seconds"), "histogram");
             assert!(output.contains("# TYPE"), "Prometheus TYPE annotation");
             assert!(output.contains("# HELP"), "Prometheus HELP annotation");
             tprintln!("  Prometheus format validation: PASS");

@@ -1,0 +1,171 @@
+# suite:   cross_format
+# run:     2026-08-15_031629_2848e81-local
+# profile: debug
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+# NOT A BENCHMARK RESULT. This is an unoptimized build, so every
+# timing below is meaningless: an unoptimized build is not slower
+# by a constant factor, so these numbers do not even rank correctly
+# against each other. Counted quantities (rates, file and row
+# counts, PASS/FAIL on an exact bound) are valid and are the only
+# thing worth reading here. For real numbers: cargo test --release
+#
+
+=== Aggregate ===
+  Rows on each format: 2000
+  Aggregate over one column [heap]:
+    Runs: [587.1000us]
+    Average: 587.1000us (no target set)
+  Aggregate over one column [lake]:
+    Runs: [506.9000us]
+    Average: 506.9000us (no target set)
+  Aggregate over one column [lake / heap]: 0.863 (bound <= 1, not applied in an unoptimized build)
+  Bytes read [heap]:
+    Runs: [131,072 bytes]
+    Average: 131,072 bytes (no target set)
+  Bytes read [lake]:
+    Runs: [16,384 bytes]
+    Average: 16,384 bytes (no target set)
+  Bytes read [lake / heap] [PASS]: 0.125 (bound <= 1)
+
+=== Point Lookup, Full Row ===
+  Rows on each format: 2000
+  Point lookup, full row [heap]:
+    Runs: [1,837us]
+    Average: 1,837us (no target set)
+  Point lookup, full row [lake]:
+    Runs: [1,215us]
+    Average: 1,215us (no target set)
+  Point lookup, full row [lake / heap]: 0.662 (bound <= 0.2500, not applied in an unoptimized build)
+  Bytes read [heap]:
+    Runs: [131,072 bytes]
+    Average: 131,072 bytes (no target set)
+  Bytes read [lake]:
+    Runs: [98,304 bytes]
+    Average: 98,304 bytes (no target set)
+  Bytes read [lake / heap] [PASS]: 0.750 (bound <= 1)
+
+=== Bulk Load To Queryable ===
+  Rows on each format: 2000
+  Bulk load to queryable [heap]:
+    Runs: [11,894us]
+    Average: 11,894us (no target set)
+  Bulk load to queryable [lake]:
+    Runs: [1,305,488us]
+    Average: 1,305,488us (no target set)
+  Bulk load to queryable [lake / heap]: 109.763 (bound <= 14, not applied in an unoptimized build)
+
+=== Point Lookup, Narrow Projection ===
+  Rows on each format: 2000
+  Point lookup, narrow projection [heap]:
+    Runs: [1,249us]
+    Average: 1,249us (no target set)
+  Point lookup, narrow projection [lake]:
+    Runs: [730.5000us]
+    Average: 730.5000us (no target set)
+  Point lookup, narrow projection [lake / heap]: 0.585 (bound <= 0.2500, not applied in an unoptimized build)
+  Bytes read [heap]:
+    Runs: [131,072 bytes]
+    Average: 131,072 bytes (no target set)
+  Bytes read [lake]:
+    Runs: [49,152 bytes]
+    Average: 49,152 bytes (no target set)
+  Bytes read [lake / heap] [PASS]: 0.375 (bound <= 1)
+
+=== Bulk Delete ===
+  Rows on each format: 2000
+  Bulk delete [heap]:
+    Runs: [2,193us]
+    Average: 2,193us (no target set)
+  Bulk delete [lake]:
+    Runs: [2,014us]
+    Average: 2,014us (no target set)
+  Bulk delete [lake / heap]: 0.918 (bound <= 1, not applied in an unoptimized build)
+
+=== Join ===
+  Rows on each format: 2000
+  Join [heap]:
+    Runs: [2,072us]
+    Average: 2,072us (no target set)
+  Join [lake]:
+    Runs: [1,872us]
+    Average: 1,872us (no target set)
+  Join [lake / heap]: 0.903 (bound <= 1, not applied in an unoptimized build)
+  Bytes read [heap]:
+    Runs: [262,144 bytes]
+    Average: 262,144 bytes (no target set)
+  Bytes read [lake]:
+    Runs: [65,536 bytes]
+    Average: 65,536 bytes (no target set)
+  Bytes read [lake / heap] [PASS]: 0.250 (bound <= 1)
+  mixed join us [heap joined to lake, no counterpart to compare]: 1670
+
+=== Point Lookup, With And Without An Index ===
+  Rows on each format: 2000
+  Point lookup without an index [heap]:
+    Runs: [1,186us]
+    Average: 1,186us (no target set)
+  Point lookup without an index [lake]:
+    Runs: [781.5000us]
+    Average: 781.5000us (no target set)
+  Point lookup without an index [lake / heap]: 0.659 (bound <= 0.2500, not applied in an unoptimized build)
+  Point lookup with an index [heap]:
+    Runs: [984.4000us]
+    Average: 984.4000us (no target set)
+  Point lookup with an index [lake]:
+    Runs: [885.9000us]
+    Average: 885.9000us (no target set)
+  Point lookup with an index [lake / heap]: 0.900 (no bound set, not applied in an unoptimized build)
+  Index speedup on point lookup [lake / heap]: 0.732 (no bound set, not applied in an unoptimized build)
+
+=== Point Update ===
+  Rows on each format: 2000
+  Point update [heap]:
+    Runs: [2,389us]
+    Average: 2,389us (no target set)
+  Point update [lake]:
+    Runs: [5,658us]
+    Average: 5,658us (no target set)
+  Point update [lake / heap]: 2.368 (bound <= 1, not applied in an unoptimized build)
+
+=== Range Scan ===
+  Rows on each format: 2000
+  Range scan, selective [heap]:
+    Runs: [967.4000us]
+    Average: 967.4000us (no target set)
+  Range scan, selective [lake]:
+    Runs: [847.9000us]
+    Average: 847.9000us (no target set)
+  Range scan, selective [lake / heap]: 0.876 (bound <= 1, not applied in an unoptimized build)
+  Bytes read [heap]:
+    Runs: [131,072 bytes]
+    Average: 131,072 bytes (no target set)
+  Bytes read [lake]:
+    Runs: [32,768 bytes]
+    Average: 32,768 bytes (no target set)
+  Bytes read [lake / heap] [PASS]: 0.250 (bound <= 1)
+  Range scan, wide [heap]:
+    Runs: [982.8000us]
+    Average: 982.8000us (no target set)
+  Range scan, wide [lake]:
+    Runs: [890.2000us]
+    Average: 890.2000us (no target set)
+  Range scan, wide [lake / heap]: 0.906 (bound <= 1, not applied in an unoptimized build)
+  Bytes read [heap]:
+    Runs: [131,072 bytes]
+    Average: 131,072 bytes (no target set)
+  Bytes read [lake]:
+    Runs: [32,768 bytes]
+    Average: 32,768 bytes (no target set)
+  Bytes read [lake / heap] [PASS]: 0.250 (bound <= 1)
+
+=== Trickle Load To Queryable ===
+trickle_load: 1000 rows on both formats, 100 per statement
+  Trickle load to queryable [heap]:
+    Runs: [9,413us]
+    Average: 9,413us (no target set)
+  Trickle load to queryable [lake]:
+    Runs: [705,063us]
+    Average: 705,063us (no target set)
+  Trickle load to queryable [lake / heap]: 74.903 (bound <= 40, not applied in an unoptimized build)

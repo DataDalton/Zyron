@@ -44,7 +44,7 @@ impl FormatWriter for ArrowIpcWriter {
             .map(|c| {
                 Field::new(
                     &c.name,
-                    timestamp_arrow_type(c.type_id, c.ts_precision),
+                    timestamp_arrow_type(c.type_id, c.fractional_digits),
                     true,
                 )
             })

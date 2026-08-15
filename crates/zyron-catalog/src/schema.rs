@@ -99,9 +99,16 @@ pub struct ColumnEntry {
     pub nullable: bool,
     pub default_expr: Option<String>,
     pub max_length: Option<usize>,
-    /// TIMESTAMP(p) fractional-second precision 0..=12. None means the default
-    /// 6 (microseconds). p>6 routes the column to the i128 picosecond path.
-    pub ts_precision: Option<u8>,
+    /// Digits kept after the decimal point, for the two types that declare
+    /// one. A TIMESTAMP(p) counts fractional seconds, 0..=12, where None
+    /// means the default 6 (microseconds) and p>6 routes the column to the
+    /// i128 picosecond path. A DECIMAL(p,s) counts s, the digits its scaled
+    /// i128 holds below the point, where None means 0.
+    ///
+    /// One field because it is one property. A column declares at most one of
+    /// those types, so the two readings never contend, and every consumer
+    /// dispatches on `type_id` before interpreting it.
+    pub fractional_digits: Option<u8>,
     /// Original timezone offset in seconds for a single-zone TIMESTAMPTZ
     /// column, reattached on display/export. None == unknown (display UTC).
     pub tz_offset_secs: Option<i32>,
@@ -118,7 +125,7 @@ impl ColumnEntry {
     /// This is the single key the executor/storage layer uses for byte
     /// layout, so encode and decode stay consistent.
     pub fn physical_type_id(&self) -> TypeId {
-        TypeId::timestamp_physical_type_id(self.type_id, self.ts_precision)
+        TypeId::timestamp_physical_type_id(self.type_id, self.fractional_digits)
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -132,7 +139,7 @@ impl ColumnEntry {
         write_option_string(&mut buf, &self.default_expr);
         write_option_usize(&mut buf, &self.max_length);
         // 0 = None, 1..=13 = Some(0..=12).
-        write_u8(&mut buf, self.ts_precision.map(|p| p + 1).unwrap_or(0));
+        write_u8(&mut buf, self.fractional_digits.map(|p| p + 1).unwrap_or(0));
         match self.tz_offset_secs {
             Some(secs) => {
                 write_u8(&mut buf, 1);
@@ -156,12 +163,12 @@ impl ColumnEntry {
         let nullable = read_bool(data, &mut off)?;
         let default_expr = read_option_string(data, &mut off)?;
         let max_length = read_option_usize(data, &mut off)?;
-        let ts_precision = match read_u8(data, &mut off)? {
+        let fractional_digits = match read_u8(data, &mut off)? {
             0 => None,
             n if n <= 13 => Some(n - 1),
             n => {
                 return Err(zyron_common::ZyronError::CatalogCorrupted(format!(
-                    "invalid ts_precision byte {n} (expected 0..=13)"
+                    "invalid fractional_digits byte {n} (expected 0..=13)"
                 )));
             }
         };
@@ -191,7 +198,7 @@ impl ColumnEntry {
             nullable,
             default_expr,
             max_length,
-            ts_precision,
+            fractional_digits,
             tz_offset_secs,
             element_type,
         })
@@ -797,24 +804,34 @@ impl LakeConfig {
     }
 }
 
+/// Marks a lifecycle column id as unset.
+///
+/// Zero cannot serve here: it is the id of a table's first column, so a
+/// policy declared on that column would read back as no policy at all and
+/// the rows it governs would never expire.
+pub const NO_LIFECYCLE_COLUMN: u32 = u32::MAX;
+
 /// Per-table data lifecycle configuration. All fields default to off so a
 /// table with no lifecycle policy is governed by none of them.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleConfig {
     /// Soft delete enabled on this table.
     pub soft_delete_enabled: bool,
-    /// Column id of the boolean is_deleted marker (0 = unset).
+    /// Column id of the boolean is_deleted marker, NO_LIFECYCLE_COLUMN when
+    /// unset.
     pub soft_delete_is_deleted_col_id: u32,
-    /// Column id of the deleted_at timestamp (0 = unset).
+    /// Column id of the deleted_at timestamp, NO_LIFECYCLE_COLUMN when unset.
     pub soft_delete_deleted_at_col_id: u32,
-    /// Column id used for TTL expiry comparison (0 = unset).
+    /// Column id used for TTL expiry comparison, NO_LIFECYCLE_COLUMN when
+    /// unset.
     pub ttl_column_id: u32,
     /// TTL interval in seconds (0 = no TTL).
     pub ttl_seconds: i64,
     /// TTL action: 0 Delete, 1 Archive, 2 Anonymize.
     pub ttl_action: u8,
-    /// Per-row retention column id (0 = unset). When set, expiry is
-    /// `retention_column < now()` instead of `ttl_column + ttl_seconds`.
+    /// Per-row retention column id, NO_LIFECYCLE_COLUMN when unset. When
+    /// set, expiry is `retention_column < now()` instead of
+    /// `ttl_column + ttl_seconds`.
     pub retention_column_id: u32,
     /// Current storage tier: 0 Hot, 1 Warm, 2 Cold, 3 Archive.
     pub storage_tier: u8,
@@ -841,7 +858,40 @@ pub struct LifecycleConfig {
     pub immutable: bool,
 }
 
+impl Default for LifecycleConfig {
+    /// Every policy off. The four column-id fields hold NO_LIFECYCLE_COLUMN
+    /// rather than zero, which is a real column id.
+    fn default() -> Self {
+        Self {
+            soft_delete_enabled: false,
+            soft_delete_is_deleted_col_id: NO_LIFECYCLE_COLUMN,
+            soft_delete_deleted_at_col_id: NO_LIFECYCLE_COLUMN,
+            ttl_column_id: NO_LIFECYCLE_COLUMN,
+            ttl_seconds: 0,
+            ttl_action: 0,
+            retention_column_id: NO_LIFECYCLE_COLUMN,
+            storage_tier: 0,
+            cold_after_seconds: 0,
+            archive_after_seconds: 0,
+            archive_destination: String::new(),
+            archive_on_purge: false,
+            purge_grace_seconds: 0,
+            retention_lock_until: 0,
+            recycle_window_seconds: 0,
+            data_key_id: 0,
+            residency_region: String::new(),
+            immutable: false,
+        }
+    }
+}
+
 impl LifecycleConfig {
+    /// True when `col_id` names a real column rather than the unset marker.
+    #[inline]
+    pub fn column_is_set(col_id: u32) -> bool {
+        col_id != NO_LIFECYCLE_COLUMN
+    }
+
     fn write_into(&self, buf: &mut Vec<u8>) {
         buf.push(if self.soft_delete_enabled { 1 } else { 0 });
         write_u32(buf, self.soft_delete_is_deleted_col_id);
@@ -912,6 +962,12 @@ pub struct ColumnarSegmentEntry {
     /// older id is one a later pass has not reached yet. Zero for a
     /// segment folded with no clustering policy declared.
     pub cluster_spec_id: u32,
+    /// Storage tier holding this file: 0 Hot, 1 Warm, 2 Cold, 3 Archive.
+    /// `path` always names where the file actually is, so a read needs
+    /// nothing from this field. The planner reads it to cost a scan that
+    /// touches the segment, and ALTER TABLE MOVE reads it to report what a
+    /// relocation would change.
+    pub storage_tier: u8,
 }
 
 /// Per-table columnar tier registry. Durable so it survives WAL truncation.
@@ -942,6 +998,7 @@ impl ColumnarRegistry {
             write_u64(buf, seg.sys_xmin_lo);
             write_u64(buf, seg.sys_xmin_hi);
             write_u32(buf, seg.cluster_spec_id);
+            buf.push(seg.storage_tier);
         }
         write_u64(buf, self.next_rowid);
         write_u64(buf, self.next_file_id);
@@ -965,6 +1022,7 @@ impl ColumnarRegistry {
             seg.sys_xmin_lo = read_u64(data, off)?;
             seg.sys_xmin_hi = read_u64(data, off)?;
             seg.cluster_spec_id = read_u32(data, off)?;
+            seg.storage_tier = read_u8(data, off)?;
             r.segments.push(seg);
         }
         r.next_rowid = read_u64(data, off)?;
@@ -3703,7 +3761,7 @@ mod tests {
             nullable: false,
             default_expr: None,
             max_length: None,
-            ts_precision: None,
+            fractional_digits: None,
             tz_offset_secs: None,
             element_type: None,
         };
@@ -3727,7 +3785,7 @@ mod tests {
             nullable: true,
             default_expr: Some("'unknown'".to_string()),
             max_length: Some(255),
-            ts_precision: None,
+            fractional_digits: None,
             tz_offset_secs: None,
             element_type: None,
         };
@@ -3756,12 +3814,12 @@ mod tests {
                 nullable: true,
                 default_expr: None,
                 max_length: None,
-                ts_precision: p,
+                fractional_digits: p,
                 tz_offset_secs: off,
                 element_type: None,
             };
             let decoded = ColumnEntry::from_bytes(&entry.to_bytes()).unwrap();
-            assert_eq!(decoded.ts_precision, p, "precision {p:?}");
+            assert_eq!(decoded.fractional_digits, p, "precision {p:?}");
             assert_eq!(decoded.tz_offset_secs, off, "offset {off:?}");
         }
     }
@@ -3784,7 +3842,7 @@ mod tests {
                     nullable: false,
                     default_expr: None,
                     max_length: None,
-                    ts_precision: None,
+                    fractional_digits: None,
                     tz_offset_secs: None,
                     element_type: None,
                 },
@@ -3797,7 +3855,7 @@ mod tests {
                     nullable: true,
                     default_expr: None,
                     max_length: Some(100),
-                    ts_precision: None,
+                    fractional_digits: None,
                     tz_offset_secs: None,
                     element_type: None,
                 },

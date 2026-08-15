@@ -16,7 +16,7 @@ use zyron_common::ZyronError;
 use crate::manifest::PartitionEntry;
 use crate::schema::LakeSchema;
 use crate::transaction_log::{
-    read_commit_header, CommitInfo, LogEntry, OperationKind, TransactionLog, VersionFileData,
+    CommitInfo, LogEntry, OperationKind, TransactionLog, VersionFileData, read_commit_header,
 };
 
 /// One row of a table's version history.
@@ -295,7 +295,7 @@ mod tests {
                 name: "id".into(),
                 type_id: TypeId::Int64,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
                 tz_offset_secs: None,
                 max_length: None,
                 default_expr: None,
@@ -332,10 +332,20 @@ mod tests {
             &BTreeMap::new(),
         )
         .expect("create");
-        append_rows(&log, attempt(OperationKind::Append, 2_000), 9, &rows(&[1, 2, 3]))
-            .expect("append one");
-        append_rows(&log, attempt(OperationKind::Append, 3_000), 9, &rows(&[10, 11]))
-            .expect("append two");
+        append_rows(
+            &log,
+            attempt(OperationKind::Append, 2_000),
+            9,
+            &rows(&[1, 2, 3]),
+        )
+        .expect("append one");
+        append_rows(
+            &log,
+            attempt(OperationKind::Append, 3_000),
+            9,
+            &rows(&[10, 11]),
+        )
+        .expect("append two");
         delete_where(
             &log,
             attempt(OperationKind::Delete, 4_000),

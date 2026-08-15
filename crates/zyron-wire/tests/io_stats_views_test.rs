@@ -197,7 +197,12 @@ async fn test_stat_indexes_counts_index_scans_and_the_rows_they_fetched() {
     .await
     .expect("create index");
 
-    let before = view_row(&server, "zyron_stat_indexes", "index_name", "indexed_id_idx");
+    let before = view_row(
+        &server,
+        "zyron_stat_indexes",
+        "index_name",
+        "indexed_id_idx",
+    );
     assert_eq!(before.text("table_name"), "indexed");
     assert_eq!(before.text("index_type"), "btree");
     assert_eq!(before.u64("idx_scan"), 0);
@@ -206,7 +211,12 @@ async fn test_stat_indexes_counts_index_scans_and_the_rows_they_fetched() {
     assert_eq!(matched, 1);
 
     let table_row = view_row(&server, "zyron_stat_tables", "table_name", "indexed");
-    let index_row = view_row(&server, "zyron_stat_indexes", "index_name", "indexed_id_idx");
+    let index_row = view_row(
+        &server,
+        "zyron_stat_indexes",
+        "index_name",
+        "indexed_id_idx",
+    );
 
     // The planner is free to answer this with a sequential scan, and either
     // choice must be reported honestly. What must never happen is the query
@@ -221,7 +231,10 @@ async fn test_stat_indexes_counts_index_scans_and_the_rows_they_fetched() {
             index_row.u64("idx_tup_read") >= index_row.u64("idx_tup_fetch"),
             "entries examined cannot be fewer than the rows they resolved to"
         );
-        assert_eq!(table_row.u64("idx_tup_fetch"), index_row.u64("idx_tup_fetch"));
+        assert_eq!(
+            table_row.u64("idx_tup_fetch"),
+            index_row.u64("idx_tup_fetch")
+        );
     } else {
         assert!(
             table_row.u64("seq_scan") > 0,
@@ -336,7 +349,10 @@ async fn test_every_index_type_records_the_scans_it_serves() {
         "SELECT id FROM docs WHERE MATCH(body) AGAINST('quick')",
     )
     .await;
-    assert!(hits > 0, "the search matched nothing, so it scanned nothing");
+    assert!(
+        hits > 0,
+        "the search matched nothing, so it scanned nothing"
+    );
 
     let after = view_row(&server, "zyron_stat_indexes", "index_name", "docs_body_fts");
     assert_eq!(
@@ -395,9 +411,11 @@ async fn test_dropping_a_table_discards_its_counters() {
     // A table id is reusable, so leaving the counters behind would credit a
     // future table with a dropped table's history
     assert_eq!(
-        server.table_io_stats.get_or_create(dropped_id).n_tup_ins.load(
-            std::sync::atomic::Ordering::Relaxed
-        ),
+        server
+            .table_io_stats
+            .get_or_create(dropped_id)
+            .n_tup_ins
+            .load(std::sync::atomic::Ordering::Relaxed),
         0,
         "the dropped table's counters were discarded with it"
     );

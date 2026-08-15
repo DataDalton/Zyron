@@ -822,7 +822,7 @@ mod tests {
                 column_id: ColumnId(0),
                 type_id: TypeId::Int64,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
             })),
             op: BinaryOperator::Eq,
             right: Box::new(BoundExpr::Literal {

@@ -350,10 +350,7 @@ fn is_table_separator(line: &str) -> bool {
     }
     cells.iter().all(|c| {
         let s = c.trim();
-        !s.is_empty()
-            && s.chars()
-                .all(|ch| ch == '-' || ch == ':' || ch == ' ')
-            && s.contains('-')
+        !s.is_empty() && s.chars().all(|ch| ch == '-' || ch == ':' || ch == ' ') && s.contains('-')
     })
 }
 
@@ -559,7 +556,10 @@ fn render_inlines(text: &str, out: &mut String) {
 }
 
 fn find_byte(bytes: &[u8], start: usize, target: u8) -> Option<usize> {
-    bytes[start..].iter().position(|b| *b == target).map(|p| p + start)
+    bytes[start..]
+        .iter()
+        .position(|b| *b == target)
+        .map(|p| p + start)
 }
 
 fn find_double(bytes: &[u8], start: usize, target: u8) -> Option<usize> {
@@ -582,7 +582,9 @@ fn parse_link(bytes: &[u8], at: usize) -> Option<(String, String, usize)> {
         return None;
     }
     let close_url = find_byte(bytes, close_text + 2, b')')?;
-    let text = std::str::from_utf8(&bytes[at + 1..close_text]).ok()?.to_string();
+    let text = std::str::from_utf8(&bytes[at + 1..close_text])
+        .ok()?
+        .to_string();
     let url = std::str::from_utf8(&bytes[close_text + 2..close_url])
         .ok()?
         .to_string();
@@ -1026,7 +1028,10 @@ mod tests {
     #[test]
     fn extract_headers() {
         let h = markdown_extract_headers("# H1\n## H2\n### H3");
-        assert_eq!(h, vec![(1, "H1".into()), (2, "H2".into()), (3, "H3".into())]);
+        assert_eq!(
+            h,
+            vec![(1, "H1".into()), (2, "H2".into()), (3, "H3".into())]
+        );
     }
 
     #[test]

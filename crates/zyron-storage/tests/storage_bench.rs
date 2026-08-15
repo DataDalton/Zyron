@@ -220,7 +220,13 @@ async fn test_wal_segment_rotation() {
     zyron_bench_harness::init("storage");
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
-    let config = zyron_bench_harness::wal_config(dir.path().to_path_buf());
+    // Rotation is this test's subject, so the segment size is sized for it
+    // and every other field stays as the server ships it. The 200 KB written
+    // below spans several 64 KB segments and none of one shipping segment
+    let config = WalWriterConfig {
+        segment_size: 64 * 1024,
+        ..zyron_bench_harness::wal_config(dir.path().to_path_buf())
+    };
 
     let writer = WalWriter::new(config).unwrap();
     let initial_segment = writer.current_segment_id().unwrap();
@@ -262,7 +268,12 @@ async fn test_buffer_pool_eviction() {
     const NUM_FRAMES: usize = 100;
     const NUM_PAGES: usize = 500;
 
-    let pool = BufferPool::new(zyron_bench_harness::buffer_pool_config());
+    // Eviction under pressure is this test's subject, so the frame count is
+    // sized for it. Reaching the shipping pool's capacity would take a
+    // working set larger than any test should build
+    let pool = BufferPool::new(BufferPoolConfig {
+        num_frames: NUM_FRAMES,
+    });
 
     let mut dirty_evictions = 0;
 
@@ -307,7 +318,12 @@ async fn test_buffer_pool_pin_prevents_eviction() {
     let _bench_guard = BENCHMARK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     const NUM_FRAMES: usize = 10;
 
-    let pool = BufferPool::new(zyron_bench_harness::buffer_pool_config());
+    // A pool with every frame pinned is this test's subject, so the frame
+    // count is sized for it. Pinning the shipping pool's every frame would
+    // take a working set larger than any test should build
+    let pool = BufferPool::new(BufferPoolConfig {
+        num_frames: NUM_FRAMES,
+    });
 
     let mut pinned_pages = Vec::new();
     for i in 0..NUM_FRAMES {
@@ -1871,8 +1887,13 @@ async fn test_wal_segment_cleanup() {
         let wal_dir = dir.path().join("wal");
         std::fs::create_dir_all(&wal_dir).unwrap();
 
-        // Small segments to force rotation (64KB per segment)
-        let wal_config = zyron_bench_harness::wal_config(wal_dir.clone());
+        // Cleanup across many segments is this test's subject, so the segment
+        // size is sized for it and every other field stays as the server ships
+        // it. The ~500 KB written below spans 5+ of these 64 KB segments
+        let wal_config = WalWriterConfig {
+            segment_size: 64 * 1024,
+            ..zyron_bench_harness::wal_config(wal_dir.clone())
+        };
         let writer = Arc::new(WalWriter::new(wal_config).unwrap());
 
         // Write enough data to create 5+ segments (each ~64KB, write ~500KB total)
@@ -2551,14 +2572,11 @@ async fn test_checkpoint_integration() {
 
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(dir.path().to_path_buf()))
-        .await
-        .unwrap(),
+            .await
+            .unwrap(),
     );
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
-    let wal = Arc::new(
-        WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
-        .unwrap(),
-    );
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone())).unwrap());
 
     // Set up background writer with real disk writes
     let disk_for_writer = Arc::clone(&disk);
@@ -2802,15 +2820,13 @@ async fn test_checkpoint_integration() {
     // -------------------------------------------------------------------------
     tprintln!("  Phase 5: Concurrent writes during checkpoint...");
 
-    let wal2 = Arc::new(
-        WalWriter::new(zyron_bench_harness::wal_config(dir.path().join("wal2")))
-        .unwrap(),
-    );
+    let wal2 =
+        Arc::new(WalWriter::new(zyron_bench_harness::wal_config(dir.path().join("wal2"))).unwrap());
     let pool2 = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let disk2 = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(dir.path().join("data2")))
-        .await
-        .unwrap(),
+            .await
+            .unwrap(),
     );
     let disk2_for_writer = Arc::clone(&disk2);
     let write_fn2: WriteFn =
@@ -3014,13 +3030,18 @@ async fn test_checkpoint_scheduler_integration() {
 
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(dir.path().to_path_buf()))
-        .await
-        .unwrap(),
+            .await
+            .unwrap(),
     );
 
-    // Small segments (256KB) so WAL segment trigger fires quickly
+    // The WAL segment trigger firing is this test's subject, so the segment
+    // size is sized for it and every other field stays as the server ships
+    // it. The ~2 MB Phase 2 writes rotates several of these 256 KB segments
     let wal = Arc::new(
-        WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
+        WalWriter::new(WalWriterConfig {
+            segment_size: 256 * 1024,
+            ..zyron_bench_harness::wal_config(wal_dir.clone())
+        })
         .unwrap(),
     );
 

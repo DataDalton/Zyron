@@ -50,7 +50,10 @@ pub(crate) fn heap_row_visible(
     xmax: u64,
 ) -> bool {
     match heap_version {
-        Some(v) => ctx.snapshot.status_map().is_visible_at_version(xmin, xmax, v),
+        Some(v) => ctx
+            .snapshot
+            .status_map()
+            .is_visible_at_version(xmin, xmax, v),
         None => ctx.snapshot.is_visible(xmin, xmax),
     }
 }

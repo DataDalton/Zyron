@@ -84,14 +84,11 @@ async fn setup_catalog(
 
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(data_dir))
-        .await
-        .unwrap(),
+            .await
+            .unwrap(),
     );
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
-    let wal = Arc::new(
-        WalWriter::new(zyron_bench_harness::wal_config(wal_dir))
-        .unwrap(),
-    );
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir)).unwrap());
 
     let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
     storage.init_cache().await.unwrap();
@@ -411,14 +408,11 @@ async fn test_ddl_persistence() {
 
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
-        .await
-        .unwrap(),
+            .await
+            .unwrap(),
     );
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
-    let wal = Arc::new(
-        WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
-        .unwrap(),
-    );
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone())).unwrap());
 
     // Phase 1: Create objects
     let db_id;
@@ -678,7 +672,9 @@ async fn test_column_types() {
         ("c_uint128", TypeId::UInt128, true, None),
         ("c_real", TypeId::Float32, true, None),
         ("c_double", TypeId::Float64, true, None),
-        ("c_decimal", TypeId::Decimal, true, None),
+        // A decimal's declared size is its precision, which the write path
+        // reads to refuse a value with more digits than the column allows
+        ("c_decimal", TypeId::Decimal, true, Some(18)),
         ("c_char", TypeId::Char, true, Some(10)),
         ("c_varchar", TypeId::Varchar, true, Some(255)),
         ("c_text", TypeId::Text, true, None),
@@ -1014,14 +1010,11 @@ async fn test_statistics() {
 
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(data_dir))
-        .await
-        .unwrap(),
+            .await
+            .unwrap(),
     );
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
-    let wal = Arc::new(
-        WalWriter::new(zyron_bench_harness::wal_config(wal_dir))
-        .unwrap(),
-    );
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir)).unwrap());
 
     let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
     storage.init_cache().await.unwrap();
@@ -1165,18 +1158,16 @@ async fn test_recovery() {
 
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
-        .await
-        .unwrap(),
+            .await
+            .unwrap(),
     );
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
 
     // Phase 1: Create catalog objects and "crash" (close WAL without checkpoint)
     let table_id;
     {
-        let wal = Arc::new(
-            WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
-            .unwrap(),
-        );
+        let wal =
+            Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone())).unwrap());
 
         let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
         storage.init_cache().await.unwrap();
@@ -1225,10 +1216,8 @@ async fn test_recovery() {
 
     // Phase 2: "Recover" - create fresh catalog from same storage
     {
-        let wal = Arc::new(
-            WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
-            .unwrap(),
-        );
+        let wal =
+            Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone())).unwrap());
 
         let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
         storage.init_cache().await.unwrap();
@@ -1504,14 +1493,11 @@ async fn test_bench_analyze() {
 
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(data_dir))
-        .await
-        .unwrap(),
+            .await
+            .unwrap(),
     );
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
-    let wal = Arc::new(
-        WalWriter::new(zyron_bench_harness::wal_config(wal_dir))
-        .unwrap(),
-    );
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir)).unwrap());
 
     let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
     storage.init_cache().await.unwrap();
@@ -1700,17 +1686,15 @@ async fn test_bench_recovery() {
 
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
-        .await
-        .unwrap(),
+            .await
+            .unwrap(),
     );
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
 
     // Create catalog objects that will be recovered
     {
-        let wal = Arc::new(
-            WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
-            .unwrap(),
-        );
+        let wal =
+            Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone())).unwrap());
 
         let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
         storage.init_cache().await.unwrap();
@@ -1754,10 +1738,8 @@ async fn test_bench_recovery() {
     for _ in 0..VALIDATION_RUNS {
         let start = Instant::now();
 
-        let wal = Arc::new(
-            WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
-            .unwrap(),
-        );
+        let wal =
+            Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone())).unwrap());
 
         let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
         storage.init_cache().await.unwrap();

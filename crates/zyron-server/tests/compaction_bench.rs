@@ -69,14 +69,12 @@ async fn test_fold_path_throughput() {
 
         let disk = Arc::new(
             DiskManager::new(zyron_bench_harness::disk_config(data_dir.clone()))
-            .await
-            .unwrap(),
+                .await
+                .unwrap(),
         );
         let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
-        let wal = Arc::new(
-            WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone()))
-            .unwrap(),
-        );
+        let wal =
+            Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir.clone())).unwrap());
 
         let storage = HeapCatalogStorage::new(Arc::clone(&disk), Arc::clone(&pool)).unwrap();
         storage.init_cache().await.unwrap();

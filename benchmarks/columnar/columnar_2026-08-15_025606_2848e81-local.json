@@ -1,0 +1,124 @@
+{
+  "id": "2026-08-15_025606_2848e81-local",
+  "date": "2026-08-15 02:56:48Z",
+  "ts": 1786762608,
+  "commit": "2848e81-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "debug",
+  "tests": {
+    "Bloom Filter": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 10.68 },
+      "util_after": { "cpu_pct": 12.0, "ram_used_gb": 10.90 },
+      "Bloom probe latency (ns)": {
+        "average": 57.074000,
+        "runs": [58.59, 58.01, 56.20, 56.25, 56.31],
+        "target": 30.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "Column Segment Format": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 10.70 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 10.73 },
+      ".zyr scan throughput (GB/sec)": {
+        "average": 1.315061,
+        "runs": [1.29, 1.31, 1.32, 1.33, 1.33],
+        "target": 1.400000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "Compaction Pipeline": {
+      "util_before": { "cpu_pct": 4.0, "ram_used_gb": 10.73 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 10.74 },
+      "Compaction throughput (rows/sec)": {
+        "average": 488958.071246,
+        "runs": [491574.90, 487149.48, 492658.65, 489337.58, 484069.75],
+        "target": 1000000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "Encoded Density": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 10.73 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 10.73 },
+      "Irregular series (bits/value)": {
+        "average": 64.000000,
+        "runs": [64.00, 64.00, 64.00, 64.00, 64.00],
+        "target": 64.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "HTAP Hybrid Scan": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 10.71 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 10.67 },
+      "Hybrid scan overhead (%)": {
+        "average": 2.670301,
+        "runs": [5.31, 2.07, 2.14, 2.19, 1.64],
+        "target": 5.000000,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "Metadata Aggregate": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 10.70 },
+      "util_after": { "cpu_pct": 4.0, "ram_used_gb": 10.68 },
+      "Metadata vs scan speedup (x)": {
+        "average": 45.988944,
+        "runs": [45.99],
+        "target": 1.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "Parallel Column Encoding": {
+      "util_before": { "cpu_pct": 5.0, "ram_used_gb": 10.69 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 10.71 },
+      "Parallel speedup (x)": {
+        "average": 3.892771,
+        "runs": [4.12, 4.01, 3.81, 3.63, 3.89],
+        "target": 3.000000,
+        "passed": null,
+        "higher_is_better": true
+      },
+      "Shipped thread count speedup (x)": {
+        "average": 3.897871,
+        "runs": [3.77, 4.12, 3.94, 3.80, 3.86],
+        "target": 3.000000,
+        "passed": null,
+        "higher_is_better": true
+      },
+      "Sequential compaction (rows/sec)": {
+        "average": 104589.749685,
+        "runs": [104355.39, 104678.64, 104214.94, 106002.85, 103696.93],
+        "target": 1000000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    },
+    "Sorted Segment": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 10.73 },
+      "util_after": { "cpu_pct": 6.0, "ram_used_gb": 10.68 },
+      "Sorted PK lookup (ns)": {
+        "average": 365.925200,
+        "runs": [365.57, 365.66, 366.23, 365.32, 366.84],
+        "target": 500.000000,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Sorted PK range (keys/sec)": {
+        "average": 13622576.965431,
+        "runs": [13071895.42, 13200739.24, 13926930.04, 13867061.11, 14046259.01],
+        "target": 80000000.000000,
+        "passed": null,
+        "higher_is_better": true
+      }
+    }
+  }
+}

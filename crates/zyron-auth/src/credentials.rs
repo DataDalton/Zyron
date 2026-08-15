@@ -519,8 +519,7 @@ impl JwtCredential {
                     .as_ref()
                     .ok_or_else(|| {
                         ZyronError::AuthenticationFailed(
-                            "JWT credential declares HS256 but carries no HS256 key"
-                                .to_string(),
+                            "JWT credential declares HS256 but carries no HS256 key".to_string(),
                         )
                     })?
                     .clone();
@@ -535,8 +534,7 @@ impl JwtCredential {
                     .as_ref()
                     .ok_or_else(|| {
                         ZyronError::AuthenticationFailed(
-                            "JWT credential declares HS384 but carries no HS384 key"
-                                .to_string(),
+                            "JWT credential declares HS384 but carries no HS384 key".to_string(),
                         )
                     })?
                     .clone();
@@ -551,8 +549,7 @@ impl JwtCredential {
                     .as_ref()
                     .ok_or_else(|| {
                         ZyronError::AuthenticationFailed(
-                            "JWT credential declares HS512 but carries no HS512 key"
-                                .to_string(),
+                            "JWT credential declares HS512 but carries no HS512 key".to_string(),
                         )
                     })?
                     .clone();

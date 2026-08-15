@@ -401,7 +401,7 @@ async fn collect_columnar_rows(
             name: c.name.clone(),
             type_id: c.type_id,
             nullable: c.nullable,
-            ts_precision: c.ts_precision,
+            fractional_digits: c.fractional_digits,
         })
         .collect();
 
@@ -429,26 +429,35 @@ async fn collect_columnar_rows(
     scanned
 }
 
-/// Fills a B+tree with one index key per live row.
+/// Fills a B+tree with one index key per live row, keyed on every column of
+/// the index in key order.
 ///
-/// Returns the number of entries inserted. A row whose indexed column is
-/// absent from the table contributes nothing, which is what the underlying
-/// rebuild helpers already decide.
+/// Returns the number of entries inserted. A row whose key columns are absent
+/// from the table contributes nothing, which is what the underlying rebuild
+/// helpers already decide.
 pub fn fill_btree_from_live_rows(
     table: &TableEntry,
     rows: &LiveRows,
-    col_id: zyron_catalog::ColumnId,
+    key_columns: &[zyron_catalog::ColumnId],
     btree: &Arc<zyron_storage::BTreeIndex>,
 ) -> u64 {
     let mut inserted: u64 = 0;
     for (page_id, live) in &rows.heap {
         inserted += zyron_executor::operator::modify::rebuild_btree_index_from_rows(
-            table, *page_id, live, col_id, btree,
+            table,
+            *page_id,
+            live,
+            key_columns,
+            btree,
         ) as u64;
     }
     for (batch, locs) in &rows.columnar {
         inserted += zyron_executor::operator::modify::rebuild_btree_index_from_batch(
-            table, batch, locs, col_id, btree,
+            table,
+            batch,
+            locs,
+            key_columns,
+            btree,
         ) as u64;
     }
     inserted

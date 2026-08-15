@@ -158,7 +158,11 @@ pub fn branch_info(paths: &LakePaths, name: &str) -> Result<BranchInfo, ZyronErr
     let path = marker_path(paths, name);
     let bytes = fs::read(&path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => ZyronError::BranchNotFound(name.to_string()),
-        _ => ZyronError::IoError(format!("cannot read branch marker {}: {}", path.display(), e)),
+        _ => ZyronError::IoError(format!(
+            "cannot read branch marker {}: {}",
+            path.display(),
+            e
+        )),
     })?;
     let (base_version, created_us) = decode_marker(&bytes, &path.to_string_lossy())?;
     let head_version = head_on_disk(paths, name, base_version)?;
@@ -450,14 +454,13 @@ fn schema_property_diff(base: &ManifestFile, theirs: &ManifestFile) -> BTreeMap<
     out
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transaction_log::OperationKind;
     use crate::operations::{append_rows, delete_where};
     use crate::predicate::{CompareOp, LakePredicate, LakeValue};
     use crate::schema::{LakeColumn, LakeSchema};
+    use crate::transaction_log::OperationKind;
     use crate::writer::ColumnData;
     use zyron_common::TypeId;
 
@@ -469,7 +472,7 @@ mod tests {
                 name: "id".into(),
                 type_id: TypeId::Int64,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
                 tz_offset_secs: None,
                 max_length: None,
                 default_expr: None,
@@ -515,8 +518,13 @@ mod tests {
     fn test_creating_a_branch_copies_no_data() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let log = new_log(dir.path());
-        append_rows(&log, attempt(OperationKind::Append, 200), 13, &rows(&[1, 2, 3]))
-            .expect("append");
+        append_rows(
+            &log,
+            attempt(OperationKind::Append, 200),
+            13,
+            &rows(&[1, 2, 3]),
+        )
+        .expect("append");
 
         let data_before: Vec<_> = fs::read_dir(log.paths().data_dir())
             .expect("data dir")
@@ -549,13 +557,23 @@ mod tests {
     fn test_branch_writes_stay_off_main_until_merged() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let log = new_log(dir.path());
-        append_rows(&log, attempt(OperationKind::Append, 200), 13, &rows(&[1, 2]))
-            .expect("append");
+        append_rows(
+            &log,
+            attempt(OperationKind::Append, 200),
+            13,
+            &rows(&[1, 2]),
+        )
+        .expect("append");
         create_branch(&log, "work", None, 300).expect("create branch");
 
         let branch = open_branch(log.paths(), "work").expect("open");
-        append_rows(&branch, attempt(OperationKind::Append, 400), 13, &rows(&[7, 8, 9]))
-            .expect("branch append");
+        append_rows(
+            &branch,
+            attempt(OperationKind::Append, 400),
+            13,
+            &rows(&[7, 8, 9]),
+        )
+        .expect("branch append");
         assert_eq!(branch.latest_version(), 3);
         assert_eq!(live_rows(&branch.latest_manifest().expect("manifest")), 5);
 
@@ -565,8 +583,8 @@ mod tests {
         assert!(!log.paths().version_file(3).exists());
         assert!(log.paths().branch_version_file("work", 3).exists());
 
-        let outcome = merge_branch(&log, "work", attempt(OperationKind::Merge, 500))
-            .expect("merge");
+        let outcome =
+            merge_branch(&log, "work", attempt(OperationKind::Merge, 500)).expect("merge");
         assert_eq!(outcome.files_added, 1);
         assert_eq!(outcome.files_removed, 0);
         assert_eq!(outcome.version, Some(3));
@@ -610,9 +628,12 @@ mod tests {
         // Main still sees every row until the merge lands
         assert_eq!(live_rows(&log.latest_manifest().expect("manifest")), 5);
 
-        let outcome = merge_branch(&log, "prune", attempt(OperationKind::Merge, 500))
-            .expect("merge");
-        assert_eq!(outcome.predicates_added, 1, "the recorded predicate carries over");
+        let outcome =
+            merge_branch(&log, "prune", attempt(OperationKind::Merge, 500)).expect("merge");
+        assert_eq!(
+            outcome.predicates_added, 1,
+            "the recorded predicate carries over"
+        );
         let merged = log.latest_manifest().expect("manifest");
         assert_eq!(merged.delete_predicates.len(), 1);
         assert_eq!(
@@ -626,8 +647,13 @@ mod tests {
     fn test_merge_branch_conflicting_file_is_reported_not_silently_resolved() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let log = new_log(dir.path());
-        append_rows(&log, attempt(OperationKind::Append, 200), 13, &rows(&[1, 2, 3]))
-            .expect("append");
+        append_rows(
+            &log,
+            attempt(OperationKind::Append, 200),
+            13,
+            &rows(&[1, 2, 3]),
+        )
+        .expect("append");
         create_branch(&log, "diverge", None, 300).expect("create branch");
 
         // Both sides replace the same base file with their own rewrite
@@ -670,12 +696,11 @@ mod tests {
     fn test_a_branch_with_no_writes_merges_to_nothing() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let log = new_log(dir.path());
-        append_rows(&log, attempt(OperationKind::Append, 200), 13, &rows(&[1]))
-            .expect("append");
+        append_rows(&log, attempt(OperationKind::Append, 200), 13, &rows(&[1])).expect("append");
         create_branch(&log, "idle", None, 300).expect("create branch");
 
-        let outcome = merge_branch(&log, "idle", attempt(OperationKind::Merge, 400))
-            .expect("merge");
+        let outcome =
+            merge_branch(&log, "idle", attempt(OperationKind::Merge, 400)).expect("merge");
         assert_eq!(outcome.version, None);
         assert_eq!(log.latest_version(), 2, "nothing was committed");
     }
@@ -684,10 +709,20 @@ mod tests {
     fn test_branch_from_a_past_version_sees_that_version() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let log = new_log(dir.path());
-        append_rows(&log, attempt(OperationKind::Append, 200), 13, &rows(&[1, 2]))
-            .expect("append one");
-        append_rows(&log, attempt(OperationKind::Append, 300), 13, &rows(&[3, 4, 5]))
-            .expect("append two");
+        append_rows(
+            &log,
+            attempt(OperationKind::Append, 200),
+            13,
+            &rows(&[1, 2]),
+        )
+        .expect("append one");
+        append_rows(
+            &log,
+            attempt(OperationKind::Append, 300),
+            13,
+            &rows(&[3, 4, 5]),
+        )
+        .expect("append two");
 
         create_branch(&log, "old", Some(2), 400).expect("create branch");
         let branch = open_branch(log.paths(), "old").expect("open");

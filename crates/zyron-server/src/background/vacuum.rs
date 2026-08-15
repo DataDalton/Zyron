@@ -330,7 +330,7 @@ impl VacuumWorker {
         buffer_pool: &Arc<BufferPool>,
         status_map: &zyron_storage::TxnStatusMap,
         retention_floor: u64,
-        btree: &[(zyron_catalog::IndexId, zyron_catalog::ColumnId, bool)],
+        btree: &[zyron_catalog::BTreeIndexSpec],
         btree_indexes: &scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>,
     ) -> std::result::Result<(u64, u64), String> {
         let heap_file = HeapFile::new(
@@ -459,7 +459,7 @@ pub fn vacuum_table_immediate(
     buffer_pool: &Arc<BufferPool>,
     status_map: &zyron_storage::TxnStatusMap,
     retention_floor: u64,
-    btree: &[(zyron_catalog::IndexId, zyron_catalog::ColumnId, bool)],
+    btree: &[zyron_catalog::BTreeIndexSpec],
     btree_indexes: &scc::HashMap<u32, Arc<zyron_storage::BTreeIndex>>,
 ) -> std::result::Result<(u64, u64), String> {
     VacuumWorker::vacuum_table(

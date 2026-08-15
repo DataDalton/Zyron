@@ -14,13 +14,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use zyron_common::curve::normalize_component;
 use zyron_common::{TypeId, ZyronError};
 use zyron_storage::columnar::{
-    compare_value_to_slot, slot_order, SlotOrder, SortOrder, ZoneMapEntry, ZyrFileReader,
-    STAT_VALUE_SIZE, ZONE_MAP_BATCH_SIZE,
+    STAT_VALUE_SIZE, SlotOrder, SortOrder, ZONE_MAP_BATCH_SIZE, ZoneMapEntry, ZyrFileReader,
+    compare_value_to_slot, slot_order,
 };
 use zyron_storage::encoding::Predicate;
 
 use crate::cells::{compare_cell_to_value, compare_cells};
-use crate::encoded_filter::{rows_matching, ColumnEvidence, StoredFilter};
+use crate::encoded_filter::{ColumnEvidence, StoredFilter, rows_matching};
 use crate::manifest::{ManifestFile, PartitionEntry};
 use crate::paths::LakePaths;
 use crate::predicate::{CompareOp, LakePredicate, LakeValue};
@@ -526,11 +526,7 @@ pub fn evaluate_row(
                     None => unknown = true,
                 }
             }
-            if unknown {
-                None
-            } else {
-                Some(false)
-            }
+            if unknown { None } else { Some(false) }
         }
         LakePredicate::And(children) => {
             let mut unknown = false;
@@ -541,11 +537,7 @@ pub fn evaluate_row(
                     Some(true) => {}
                 }
             }
-            if unknown {
-                None
-            } else {
-                Some(true)
-            }
+            if unknown { None } else { Some(true) }
         }
         LakePredicate::Or(children) => {
             let mut unknown = false;
@@ -556,11 +548,7 @@ pub fn evaluate_row(
                     Some(false) => {}
                 }
             }
-            if unknown {
-                None
-            } else {
-                Some(false)
-            }
+            if unknown { None } else { Some(false) }
         }
         LakePredicate::Not(inner) => evaluate_row(inner, columns, row).map(|b| !b),
     }
@@ -583,9 +571,9 @@ fn column_physical(columns: &[DecodedColumn], column_id: u32) -> Option<TypeId> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::DeletePredicate;
-    use crate::writer::{write_data_file, ColumnData, WriteRequest};
     use crate::LakeValue;
+    use crate::manifest::DeletePredicate;
+    use crate::writer::{ColumnData, WriteRequest, write_data_file};
     use std::collections::BTreeMap;
 
     fn schema() -> LakeSchema {
@@ -597,7 +585,7 @@ mod tests {
                     name: "id".into(),
                     type_id: TypeId::Int64,
                     nullable: false,
-                    ts_precision: None,
+                    fractional_digits: None,
                     tz_offset_secs: None,
                     max_length: None,
                     default_expr: None,
@@ -607,7 +595,7 @@ mod tests {
                     name: "name".into(),
                     type_id: TypeId::Varchar,
                     nullable: true,
-                    ts_precision: None,
+                    fractional_digits: None,
                     tz_offset_secs: None,
                     max_length: None,
                     default_expr: None,
@@ -806,7 +794,7 @@ mod tests {
             name: "added".into(),
             type_id: TypeId::Float64,
             nullable: true,
-            ts_precision: None,
+            fractional_digits: None,
             tz_offset_secs: None,
             max_length: None,
             default_expr: None,

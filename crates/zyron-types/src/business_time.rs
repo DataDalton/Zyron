@@ -252,9 +252,9 @@ pub fn parse_natural_date(text: &str, reference_date: i32) -> Result<i32> {
             )));
         };
 
-        let count: i32 = count_str.parse().map_err(|_| {
-            ZyronError::ExecutionError(format!("Invalid count: {}", count_str))
-        })?;
+        let count: i32 = count_str
+            .parse()
+            .map_err(|_| ZyronError::ExecutionError(format!("Invalid count: {}", count_str)))?;
         let count = count * direction;
 
         let unit_singular = unit_str.trim_end_matches('s');

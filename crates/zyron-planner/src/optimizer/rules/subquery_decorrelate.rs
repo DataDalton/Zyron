@@ -192,7 +192,7 @@ fn try_decorrelate_in_subquery(predicate: &BoundExpr, child: &LogicalPlan) -> Op
                     column_id: subquery_schema[0].column_id,
                     type_id: subquery_schema[0].type_id,
                     nullable: subquery_schema[0].nullable,
-                    ts_precision: subquery_schema[0].ts_precision,
+                    fractional_digits: subquery_schema[0].fractional_digits,
                 })),
                 type_id: TypeId::Boolean,
             };

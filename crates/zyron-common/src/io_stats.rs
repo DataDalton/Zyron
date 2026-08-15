@@ -429,7 +429,10 @@ mod tests {
         registry.get_or_create(5).record_inserts(9);
         registry.remove(5);
 
-        assert_eq!(registry.get_or_create(5).n_tup_ins.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            registry.get_or_create(5).n_tup_ins.load(Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]

@@ -328,6 +328,8 @@ fn build_operator_tree(
                 predicate,
                 remaining_predicate,
                 as_of,
+                scan_direction,
+                ordered_by,
                 ..
             } => {
                 // Fold any uncorrelated subquery in the index bound or the
@@ -365,6 +367,38 @@ fn build_operator_tree(
                     return Ok(br.with_metrics("SeqScan", analyze, vec![]));
                 }
                 let btree = ctx.get_index(index_id);
+                // This scan replaced a Sort, so its output order is what the
+                // query returns. Two runtime conditions the planner cannot
+                // see make the index unable to supply that order: no live
+                // tree, and an active branch whose inserted rows the index
+                // does not cover and which are appended after it. Either one
+                // rebuilds the Sort over an ordinary scan, so losing the
+                // index costs speed rather than row order
+                if let Some(order_by) = ordered_by.clone()
+                    && (btree.is_none() || ctx.active_branch_id.is_some())
+                {
+                    let combined = match remaining_predicate {
+                        Some(rest) => Some(combine_with_and(predicate, rest)),
+                        None => None,
+                    };
+                    let child = SeqScanOperator::new(
+                        ctx.clone(),
+                        table_id,
+                        columns.clone(),
+                        combined,
+                        false,
+                        None,
+                    )
+                    .await?;
+                    let op = crate::operator::sort::SortOperator::new(
+                        Box::new(child),
+                        order_by,
+                        columns,
+                        None,
+                    );
+                    let br = BuildResult::new(Box::new(op));
+                    return Ok(br.with_metrics("Sort", analyze, vec![]));
+                }
                 // A segment-bearing table without a live tree cannot use the
                 // heap-only sequential fallback, folded rows would drop.
                 // Union both stores with the full predicate instead
@@ -404,6 +438,7 @@ fn build_operator_tree(
                     predicate,
                     remaining_predicate,
                     false,
+                    scan_direction == zyron_planner::physical::ScanDirection::Backward,
                 )
                 .await?;
                 let br = BuildResult::new(Box::new(op));
@@ -1303,7 +1338,7 @@ fn build_aggregate_schema(
             name: format!("group{}", i),
             type_id: expr.type_id(),
             nullable: expr.nullable(),
-            ts_precision: expr.ts_precision(),
+            fractional_digits: expr.fractional_digits(),
         });
     }
     for (i, agg) in aggregates.iter().enumerate() {
@@ -1315,7 +1350,7 @@ fn build_aggregate_schema(
             type_id: agg.return_type,
             nullable: true,
             // Aggregate-result precision finalized in B5.
-            ts_precision: None,
+            fractional_digits: None,
         });
     }
     schema
@@ -1441,6 +1476,8 @@ fn build_scan_with_tuple_ids(
                     predicate,
                     remaining_predicate,
                     true,
+                    // The DML path addresses rows, it does not order them
+                    false,
                 )
                 .await?;
                 let br = BuildResult::new(Box::new(op) as Box<dyn Operator>);
@@ -1640,14 +1677,14 @@ fn build_system_time_predicate(
         column_id: sys_start.id,
         type_id: sys_start.type_id,
         nullable: sys_start.nullable,
-        ts_precision: sys_start.ts_precision,
+        fractional_digits: sys_start.fractional_digits,
     });
     let sys_end_ref = BoundExpr::ColumnRef(ColumnRef {
         table_idx,
         column_id: sys_end.id,
         type_id: sys_end.type_id,
         nullable: sys_end.nullable,
-        ts_precision: sys_end.ts_precision,
+        fractional_digits: sys_end.fractional_digits,
     });
 
     // sys_start <= ts

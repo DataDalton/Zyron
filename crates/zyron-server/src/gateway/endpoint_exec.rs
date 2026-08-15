@@ -320,7 +320,7 @@ impl EndpointExecutor {
         // -----------------------------------------------------------------------------
         let schema: Vec<ColumnSpec> = output_schema
             .iter()
-            .map(|c| ColumnSpec::with_precision(c.name.clone(), c.type_id, c.ts_precision))
+            .map(|c| ColumnSpec::with_precision(c.name.clone(), c.type_id, c.fractional_digits))
             .collect();
         let rows = collect_rows(&batches, schema.len());
 

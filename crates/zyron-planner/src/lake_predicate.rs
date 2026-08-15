@@ -60,10 +60,10 @@ pub fn lower_predicate(expr: &BoundExpr, columns: &[ColumnEntry]) -> Option<Lake
             list,
             negated,
         } => {
-            let (col, ts_precision) = resolve_column(expr, columns)?;
+            let (col, fractional_digits) = resolve_column(expr, columns)?;
             let mut values = Vec::with_capacity(list.len());
             for item in list {
-                values.push(literal_to_value(item, col, ts_precision)?);
+                values.push(literal_to_value(item, col, fractional_digits)?);
             }
             let base = LakePredicate::In {
                 column_id: col.id,
@@ -77,9 +77,9 @@ pub fn lower_predicate(expr: &BoundExpr, columns: &[ColumnEntry]) -> Option<Lake
             high,
             negated,
         } => {
-            let (col, ts_precision) = resolve_column(expr, columns)?;
-            let low = literal_to_value(low, col, ts_precision)?;
-            let high = literal_to_value(high, col, ts_precision)?;
+            let (col, fractional_digits) = resolve_column(expr, columns)?;
+            let low = literal_to_value(low, col, fractional_digits)?;
+            let high = literal_to_value(high, col, fractional_digits)?;
             let base = LakePredicate::And(vec![
                 LakePredicate::Compare {
                     column_id: col.id,
@@ -106,14 +106,14 @@ fn lower_comparison(
     columns: &[ColumnEntry],
 ) -> Option<LakePredicate> {
     // The column may sit on either side, the operator flips with it
-    let (col, ts_precision, literal, op) = match resolve_column(left, columns) {
+    let (col, fractional_digits, literal, op) = match resolve_column(left, columns) {
         Some((col, p)) => (col, p, right, op),
         None => {
             let (col, p) = resolve_column(right, columns)?;
             (col, p, left, flip(op))
         }
     };
-    let value = literal_to_value(literal, col, ts_precision)?;
+    let value = literal_to_value(literal, col, fractional_digits)?;
     Some(LakePredicate::Compare {
         column_id: col.id,
         op: compare_op(op)?,
@@ -242,7 +242,7 @@ fn resolve_column(
                     id: entry.id.0 as u32,
                     type_id: entry.type_id,
                 },
-                entry.ts_precision,
+                entry.fractional_digits,
             ))
         }
         _ => None,
@@ -255,10 +255,10 @@ fn resolve_column(
 fn literal_to_value(
     expr: &BoundExpr,
     col: LakeColumnRef,
-    ts_precision: Option<u8>,
+    fractional_digits: Option<u8>,
 ) -> Option<LakeValue> {
     let value = match expr {
-        BoundExpr::Nested(inner) => return literal_to_value(inner, col, ts_precision),
+        BoundExpr::Nested(inner) => return literal_to_value(inner, col, fractional_digits),
         BoundExpr::Literal { value, .. } => value,
         _ => return None,
     };
@@ -297,13 +297,15 @@ fn literal_to_value(
         },
         // Timestamps are i64 microseconds. A p>6 column stores i128
         // picoseconds, a different domain, so it does not lower here
-        TypeId::Timestamp | TypeId::TimestampTz if ts_precision.unwrap_or(6) <= 6 => match value {
-            LiteralValue::Integer(v) => Some(LakeValue::Int(*v)),
-            LiteralValue::String(s) => zyron_common::parse_timestamp_micros(s)
-                .ok()
-                .map(LakeValue::Int),
-            _ => None,
-        },
+        TypeId::Timestamp | TypeId::TimestampTz if fractional_digits.unwrap_or(6) <= 6 => {
+            match value {
+                LiteralValue::Integer(v) => Some(LakeValue::Int(*v)),
+                LiteralValue::String(s) => zyron_common::parse_timestamp_micros(s)
+                    .ok()
+                    .map(LakeValue::Int),
+                _ => None,
+            }
+        }
         // Byte order equals collation order for these string types
         TypeId::Varchar | TypeId::Text => match value {
             LiteralValue::String(s) => Some(LakeValue::Str(s.clone())),
@@ -333,7 +335,7 @@ mod tests {
             nullable: true,
             default_expr: None,
             max_length: None,
-            ts_precision: None,
+            fractional_digits: None,
             tz_offset_secs: None,
             element_type: None,
         }
@@ -354,7 +356,7 @@ mod tests {
             column_id: ColumnId(id),
             type_id,
             nullable: true,
-            ts_precision: None,
+            fractional_digits: None,
         })
     }
 

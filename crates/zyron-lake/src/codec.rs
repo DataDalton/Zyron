@@ -92,7 +92,12 @@ impl<'a> Cursor<'a> {
 
     /// Guards a count field against a corrupt value driving a huge
     /// preallocation, each counted record needs at least `min_size` bytes
-    pub(crate) fn check_count(&self, count: usize, min_size: usize, what: &str) -> Result<(), ZyronError> {
+    pub(crate) fn check_count(
+        &self,
+        count: usize,
+        min_size: usize,
+        what: &str,
+    ) -> Result<(), ZyronError> {
         if count > self.remaining() / min_size.max(1) + 1 {
             return Err(self.corrupt(format!("{} count {} exceeds section size", what, count)));
         }

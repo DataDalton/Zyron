@@ -104,6 +104,7 @@ fn table_entry_columnar_registry_roundtrip() {
                 sys_xmin_lo: 100,
                 sys_xmin_hi: 9_500,
                 cluster_spec_id: 1,
+                storage_tier: 0,
             },
             ColumnarSegmentEntry {
                 file_id: 2,
@@ -114,6 +115,9 @@ fn table_entry_columnar_registry_roundtrip() {
                 sys_xmin_lo: 9_600,
                 sys_xmin_hi: 12_000,
                 cluster_spec_id: 1,
+                // A relocated segment has to survive the round trip too, or
+                // a restart would read every cold file back as hot
+                storage_tier: 2,
             },
         ],
         next_rowid: 1_548_576,

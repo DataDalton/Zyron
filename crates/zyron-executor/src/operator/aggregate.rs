@@ -412,7 +412,7 @@ fn uda_column(column_id: u16, type_id: TypeId) -> LogicalColumn {
         name: String::new(),
         type_id,
         nullable: true,
-        ts_precision: None,
+        fractional_digits: None,
     }
 }
 
@@ -1598,7 +1598,7 @@ mod tests {
             column_id: ColumnId(column_id),
             type_id,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         })
     }
 
@@ -1630,7 +1630,7 @@ mod tests {
                 name: "k".into(),
                 type_id: TypeId::Int64,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
             },
             LogicalColumn {
                 table_idx: Some(0),
@@ -1638,7 +1638,7 @@ mod tests {
                 name: "v".into(),
                 type_id: TypeId::Int64,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
             },
         ]
     }
@@ -1655,7 +1655,7 @@ mod tests {
                 name: format!("g{i}"),
                 type_id: TypeId::Int64,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
             });
         }
         for (i, agg) in aggregates.iter().enumerate() {
@@ -1665,7 +1665,7 @@ mod tests {
                 name: agg.function_name.clone(),
                 type_id: agg.return_type,
                 nullable: true,
-                ts_precision: None,
+                fractional_digits: None,
             });
         }
         schema

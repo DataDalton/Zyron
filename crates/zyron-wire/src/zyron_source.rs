@@ -484,7 +484,8 @@ impl ZyronSourceClient {
         // Sampling percentage that lands near the target sample size. Clamped
         // so a huge table still samples something and a small one does not ask
         // for more than all of it
-        let percent = ((SNAPSHOT_SAMPLE_TARGET as f64 / row_count as f64) * 100.0).clamp(0.01, 100.0);
+        let percent =
+            ((SNAPSHOT_SAMPLE_TARGET as f64 / row_count as f64) * 100.0).clamp(0.01, 100.0);
         let sql = format!(
             "SELECT _zyron_pk FROM {} TABLESAMPLE BERNOULLI({:.4})",
             self.publication, percent
@@ -1144,7 +1145,9 @@ mod tests {
     async fn test_row_count_does_not_sample_when_it_would_not_pay() {
         let small = make_source_with(4, SnapshotChunkStrategy::RowCount);
         assert_eq!(
-            small.plan_chunks(0, 999, SNAPSHOT_SAMPLE_MIN_ROWS - 1).await,
+            small
+                .plan_chunks(0, 999, SNAPSHOT_SAMPLE_MIN_ROWS - 1)
+                .await,
             small.compute_chunks(0, 999),
             "a small table skips the sampling query"
         );

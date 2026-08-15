@@ -11,8 +11,8 @@
 //! over a folded column are answered straight out of these bytes, so a
 //! wrong order is a wrong answer.
 
-use zyron_storage::columnar::{ColumnSegment, STAT_VALUE_SIZE};
 use zyron_common::TypeId;
+use zyron_storage::columnar::{ColumnSegment, STAT_VALUE_SIZE};
 
 fn cells(values: &[f64]) -> Vec<[u8; 8]> {
     values.iter().map(|v| v.to_le_bytes()).collect()
@@ -27,8 +27,7 @@ fn slot_f64(slot: &[u8; STAT_VALUE_SIZE]) -> f64 {
 fn bounds_of(values: &[f64]) -> (f64, f64) {
     let raw = cells(values);
     let refs: Vec<Option<&[u8]>> = raw.iter().map(|c| Some(&c[..])).collect();
-    let segment =
-        ColumnSegment::build(0, TypeId::Float64, 8, &refs).expect("segment builds");
+    let segment = ColumnSegment::build(0, TypeId::Float64, 8, &refs).expect("segment builds");
     (
         slot_f64(&segment.header.min_value),
         slot_f64(&segment.header.max_value),
@@ -72,8 +71,7 @@ fn test_a_float_zone_records_its_value_bounds() {
 
     let raw = cells(&values);
     let refs: Vec<Option<&[u8]>> = raw.iter().map(|c| Some(&c[..])).collect();
-    let segment =
-        ColumnSegment::build(0, TypeId::Float64, 8, &refs).expect("segment builds");
+    let segment = ColumnSegment::build(0, TypeId::Float64, 8, &refs).expect("segment builds");
     assert_eq!(segment.zone_maps.len(), 2);
 
     let expected_min = values.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -85,7 +83,10 @@ fn test_a_float_zone_records_its_value_bounds() {
     for (z, zone) in segment.zone_maps.iter().enumerate() {
         let start = z * 1_024;
         let end = ((z + 1) * 1_024).min(values.len());
-        let zone_min = values[start..end].iter().cloned().fold(f64::INFINITY, f64::min);
+        let zone_min = values[start..end]
+            .iter()
+            .cloned()
+            .fold(f64::INFINITY, f64::min);
         let zone_max = values[start..end]
             .iter()
             .cloned()

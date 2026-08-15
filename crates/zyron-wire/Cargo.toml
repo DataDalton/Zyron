@@ -62,3 +62,4 @@ tokio-util.workspace = true
 futures.workspace = true
 rcgen.workspace = true
 zyron-bench-harness = { path = "../zyron-bench-harness" }
+zyron-tpc = { path = "../zyron-tpc" }

@@ -104,10 +104,16 @@ impl DocRegistry {
 
     /// Removes a row's document identity on DELETE, returning the DocId the
     /// caller must delete from each index. The ordinal is never reused.
+    ///
+    /// The forward write lock is taken before the reverse map is touched, so
+    /// the removal is one step against a concurrent `allocate` for the same
+    /// row. Reading the reverse map first let an allocate return the ordinal
+    /// this call was in the middle of retiring, handing the caller a DocId
+    /// whose forward slot had already been cleared.
     pub fn take(&self, table_id: u32, locator: RowLocator) -> Option<u64> {
         let t = self.tables.read_sync(&table_id, |_, t| Arc::clone(t))?;
-        let (_, ordinal) = t.reverse.remove_sync(&locator)?;
         let mut fwd = t.forward.write().expect("doc registry forward lock");
+        let (_, ordinal) = t.reverse.remove_sync(&locator)?;
         if let Some(slot) = fwd.get_mut(ordinal as usize) {
             *slot = None;
         }
@@ -118,18 +124,40 @@ impl DocRegistry {
     /// DocId. Called by the fold when a heap row moves into a columnar
     /// segment, this is what keeps search indexes valid across folding.
     /// Returns false when the old locator had no live document.
+    ///
+    /// The whole re-point runs under the forward write lock, which is the
+    /// lock `allocate` holds while it re-checks the reverse map. Publishing
+    /// the new locator after releasing it let an `allocate` for that same
+    /// locator slip in between and the row came away with two ordinals. The
+    /// fold writes columnar locators here while an index build allocates for
+    /// the rows it scans, which is where the two meet.
+    ///
+    /// Holding the lock is not enough on its own: when the allocate runs
+    /// first, `new` already carries a document, and moving `old`'s onto it
+    /// would still make two. The invariant is one locator, one document, so
+    /// the destination's existing document wins and the old ordinal is
+    /// retired. A search then returns the row once, and postings left behind
+    /// under the retired ordinal resolve to a dead slot exactly as they do
+    /// after a delete.
     pub fn repoint(&self, table_id: u32, old: RowLocator, new: RowLocator) -> bool {
         let Some(t) = self.tables.read_sync(&table_id, |_, t| Arc::clone(t)) else {
             return false;
         };
+        let mut fwd = t.forward.write().expect("doc registry forward lock");
         let Some((_, ordinal)) = t.reverse.remove_sync(&old) else {
             return false;
         };
-        let mut fwd = t.forward.write().expect("doc registry forward lock");
+        if t.reverse.read_sync(&new, |_, v| *v).is_some() {
+            // The destination is already identified. Retire the old ordinal
+            // rather than pointing a second one at the same row
+            if let Some(slot) = fwd.get_mut(ordinal as usize) {
+                *slot = None;
+            }
+            return true;
+        }
         if let Some(slot) = fwd.get_mut(ordinal as usize) {
             *slot = Some(new);
         }
-        drop(fwd);
         let _ = t.reverse.insert_sync(new, ordinal);
         true
     }
@@ -383,5 +411,169 @@ mod tests {
         let mut bytes = r.encode();
         bytes.truncate(bytes.len() - 3);
         assert!(DocRegistry::decode(&bytes).is_none());
+    }
+
+    /// How many forward slots currently point at `locator`. One row has one
+    /// document, so this is 1 for a live row and 0 for a retired one.
+    fn documents_for(r: &DocRegistry, table_id: u32, locator: RowLocator) -> usize {
+        (0..r.ordinal_count(table_id))
+            .filter(|d| r.locator(table_id, *d) == Some(locator))
+            .count()
+    }
+
+    /// A fold re-pointing a row and an index build allocating for that same
+    /// row must not leave it with two documents.
+    ///
+    /// `repoint` used to publish the new locator after releasing the forward
+    /// lock. An `allocate` for that locator could land in the gap, take a
+    /// fresh ordinal, and leave two forward slots pointing at one row: the
+    /// row comes back twice from a search, and the loser is unreachable
+    /// through the reverse map so no later `take` can free it. The fold
+    /// writes columnar locators while an index build allocates for the rows
+    /// it scans, which is where the two meet in production.
+    #[test]
+    fn concurrent_repoint_and_allocate_leave_one_document_per_row() {
+        use std::sync::Arc;
+
+        for round in 0..300u64 {
+            let r = Arc::new(DocRegistry::new());
+            let old = heap(round, 1);
+            let new = RowLocator::Columnar {
+                file_id: 9,
+                sys_rowid: round,
+            };
+            let doc = r.allocate(1, old);
+
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let repointer = {
+                let (r, barrier) = (Arc::clone(&r), Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    r.repoint(1, old, new)
+                })
+            };
+            let allocator = {
+                let (r, barrier) = (Arc::clone(&r), Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    r.allocate(1, new)
+                })
+            };
+            let repointed = repointer.join().expect("repoint thread");
+            let allocated = allocator.join().expect("allocate thread");
+
+            assert!(repointed, "the old locator had a live document");
+            assert_eq!(
+                documents_for(&r, 1, new),
+                1,
+                "round {round}: one row, one document"
+            );
+            assert_eq!(
+                documents_for(&r, 1, old),
+                0,
+                "round {round}: the old locator is vacated"
+            );
+            // Whichever order the two ran in, the reverse map and the forward
+            // array agree, and the allocator was handed the live ordinal
+            assert_eq!(r.doc_for(1, new), Some(allocated), "round {round}");
+            assert_eq!(r.locator(1, allocated), Some(new), "round {round}");
+            // When the re-point won it carried the original document across.
+            // When the allocate won, the row was already identified and the
+            // original was retired instead of doubling up
+            if allocated != doc {
+                assert_eq!(
+                    r.locator(1, doc),
+                    None,
+                    "round {round}: the superseded document is retired"
+                );
+            }
+        }
+    }
+
+    /// Concurrent allocates for one row hand back one ordinal, and for
+    /// distinct rows hand back distinct ones.
+    #[test]
+    fn concurrent_allocate_is_one_document_per_row() {
+        use std::sync::Arc;
+
+        for round in 0..200u64 {
+            let r = Arc::new(DocRegistry::new());
+            let shared = heap(round, 0);
+            let barrier = Arc::new(std::sync::Barrier::new(8));
+            let mut handles = Vec::new();
+            for t in 0..8u16 {
+                let (r, barrier) = (Arc::clone(&r), Arc::clone(&barrier));
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    // Half contend on one row, half take rows of their own
+                    let loc = if t % 2 == 0 { shared } else { heap(round, t) };
+                    (loc, r.allocate(1, loc))
+                }));
+            }
+            let got: Vec<(RowLocator, u64)> =
+                handles.into_iter().map(|h| h.join().expect("thread")).collect();
+
+            for (loc, doc) in &got {
+                assert_eq!(r.locator(1, *doc), Some(*loc), "round {round}");
+                assert_eq!(documents_for(&r, 1, *loc), 1, "round {round}");
+            }
+            let shared_docs: Vec<u64> = got
+                .iter()
+                .filter(|(l, _)| *l == shared)
+                .map(|(_, d)| *d)
+                .collect();
+            assert!(
+                shared_docs.windows(2).all(|w| w[0] == w[1]),
+                "round {round}: one row cannot have two documents: {shared_docs:?}"
+            );
+        }
+    }
+
+    /// A delete racing an allocate for the same row never hands the caller a
+    /// document whose forward slot has already been cleared.
+    #[test]
+    fn concurrent_take_and_allocate_stay_consistent() {
+        use std::sync::Arc;
+
+        for round in 0..300u64 {
+            let r = Arc::new(DocRegistry::new());
+            let loc = heap(round, 3);
+            r.allocate(1, loc);
+
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let taker = {
+                let (r, barrier) = (Arc::clone(&r), Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    r.take(1, loc)
+                })
+            };
+            let allocator = {
+                let (r, barrier) = (Arc::clone(&r), Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    r.allocate(1, loc)
+                })
+            };
+            let taken = taker.join().expect("take thread");
+            let allocated = allocator.join().expect("allocate thread");
+
+            assert!(taken.is_some(), "round {round}: the row had a document");
+            // The allocate either ran first and got the doc the take then
+            // retired, or ran after and minted a fresh one. Either way the
+            // document it was handed has to describe the row it asked about
+            match r.locator(1, allocated) {
+                Some(l) => assert_eq!(l, loc, "round {round}"),
+                None => assert_eq!(
+                    Some(allocated),
+                    taken,
+                    "round {round}: only the retired document may be empty"
+                ),
+            }
+            assert!(
+                documents_for(&r, 1, loc) <= 1,
+                "round {round}: a row never holds two documents"
+            );
+        }
     }
 }

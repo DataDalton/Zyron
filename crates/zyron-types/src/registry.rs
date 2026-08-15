@@ -368,7 +368,6 @@ pub fn infer_types_scalar_return_type(name: &str, arg_types: &[TypeId]) -> Optio
         // CREATE CIRCUIT BREAKER and enforced by the session layer, they
         // hold no state reachable from expression context so they are not
         // scalar functions
-
         _ => None,
     }
     .or_else(|| {

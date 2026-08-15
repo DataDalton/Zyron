@@ -31,8 +31,8 @@ use crate::feedback::PredicateClass;
 use crate::manifest::{ClusterKey, ClusterStrategy, ManifestFile};
 use crate::predicate::{CompareOp, LakePredicate, LakeValue};
 use crate::workload::{
-    column_term, WorkloadObserver, TERM_BYTES_CONSIDERED, TERM_BYTES_SKIPPED, TERM_EQUALITY,
-    TERM_RANGE, TERM_ROWS_MATCHED, TERM_ROWS_SCANNED,
+    TERM_BYTES_CONSIDERED, TERM_BYTES_SKIPPED, TERM_EQUALITY, TERM_RANGE, TERM_ROWS_MATCHED,
+    TERM_ROWS_SCANNED, WorkloadObserver, column_term,
 };
 
 /// Cardinality at or below which interleaving is the cheap right answer.
@@ -115,11 +115,7 @@ pub fn choose_strategy(evidence: &ColumnEvidence) -> Option<ClusterStrategy> {
 /// Everything after them is ordered by measured weight, heaviest first, so
 /// the column the workload filters on most becomes the leading free key.
 /// A column no query touches is not proposed at all.
-pub fn propose(
-    evidence: &[ColumnEvidence],
-    anchors: &[u32],
-    max_keys: usize,
-) -> Vec<ClusterKey> {
+pub fn propose(evidence: &[ColumnEvidence], anchors: &[u32], max_keys: usize) -> Vec<ClusterKey> {
     let mut keys: Vec<ClusterKey> = Vec::with_capacity(max_keys.min(evidence.len()));
 
     for anchor in anchors {
@@ -287,11 +283,7 @@ pub fn measured_skip_rate(
     column_id: u32,
     now: u16,
 ) -> Option<f64> {
-    let considered = observer.score(
-        table_id,
-        column_term(column_id, TERM_BYTES_CONSIDERED),
-        now,
-    );
+    let considered = observer.score(table_id, column_term(column_id, TERM_BYTES_CONSIDERED), now);
     if considered <= 0.0 {
         return None;
     }
@@ -345,8 +337,8 @@ pub fn predicate_classes(
         let measured = measured_skip_rate(observer, table_id, column.column_id, now);
         // With no finished scan to learn from, the probe splits the range,
         // which is the least assuming placement available
-        let selectivity = measured_selectivity(observer, table_id, column.column_id, now)
-            .unwrap_or(0.5);
+        let selectivity =
+            measured_selectivity(observer, table_id, column.column_id, now).unwrap_or(0.5);
         let Some(value) = probe_value(manifest, column.column_id, selectivity) else {
             continue;
         };
@@ -388,7 +380,10 @@ fn probe_value(manifest: &ManifestFile, column_id: u32, quantile: f64) -> Option
         };
         if let Some(min) = stats.bounds.min.as_ref() {
             bounds.push(min);
-            if low.map(|l| min.compare(l) == Some(std::cmp::Ordering::Less)).unwrap_or(true) {
+            if low
+                .map(|l| min.compare(l) == Some(std::cmp::Ordering::Less))
+                .unwrap_or(true)
+            {
                 low = Some(min);
             }
         }
@@ -420,9 +415,7 @@ fn probe_value(manifest: &ManifestFile, column_id: u32, quantile: f64) -> Option
 /// None for anything without arithmetic, which falls back to the bounds
 fn interpolate(low: &LakeValue, high: &LakeValue, q: f64) -> Option<LakeValue> {
     Some(match (low, high) {
-        (LakeValue::Int(a), LakeValue::Int(b)) => {
-            LakeValue::Int(a + ((b - a) as f64 * q) as i64)
-        }
+        (LakeValue::Int(a), LakeValue::Int(b)) => LakeValue::Int(a + ((b - a) as f64 * q) as i64),
         (LakeValue::UInt(a), LakeValue::UInt(b)) => {
             LakeValue::UInt(a + ((b - a) as f64 * q) as u64)
         }

@@ -42,6 +42,19 @@ pub async fn bind_table_check_constraints(
     binder.bind_check_constraints(entry).await
 }
 
+/// Binds one predicate against a table (at a canonical table_idx of 0), so a
+/// maintenance command carrying a WHERE clause evaluates it through the same
+/// expression machinery a query would.
+pub async fn bind_table_predicate(
+    catalog: &Catalog,
+    entry: &TableEntry,
+    expr: &zyron_parser::ast::Expr,
+) -> Result<binder::BoundExpr> {
+    let resolver = catalog.resolver(DatabaseId(1), vec!["public".to_string()]);
+    let mut binder = Binder::new(resolver, catalog);
+    binder.bind_table_predicate(entry, expr).await
+}
+
 /// Binds the DEFAULT expression of each named column, so an
 /// executor-internal write path with no bound statement can fill a column
 /// the way INSERT does. A column with no default yields a NULL literal of

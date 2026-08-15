@@ -1,0 +1,196 @@
+# suite:   planner
+# run:     2026-08-15_025220_2848e81-local
+# profile: debug
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+# NOT A BENCHMARK RESULT. This is an unoptimized build, so every
+# timing below is meaningless: an unoptimized build is not slower
+# by a constant factor, so these numbers do not even rank correctly
+# against each other. Counted quantities (rates, file and row
+# counts, PASS/FAIL on an exact bound) are valid and are the only
+# thing worth reading here. For real numbers: cargo test --release
+#
+
+=== Logical Plan Structure ===
+  Planning: SELECT * FROM users WHERE age > 21 ORDER BY name LIMIT 10
+  Top-level operator: Limit
+  Child of Limit: Sort
+  Child of Sort: Filter
+    Contains Filter: true
+    Contains Scan: true
+  Planning: SELECT * FROM a JOIN b ON a.id = b.a_id
+  Contains Join: true
+  Logical plan structure test: PASS
+
+=== Complex Queries (TPC-H style) ===
+  TPC-H Q1 (aggregation + filter):
+    Top operator: Project
+    Total cost: 22169.90
+    Contains aggregate: true
+  TPC-H Q3 (3-way join):
+    Top operator: Limit
+    Total cost: 45642.48
+    Contains join: true
+  Complex query test: PASS
+
+=== Binding ===
+  Binding: SELECT id, name FROM users WHERE age > 21
+    Projections: 2 (expected 2)
+    Table resolved to OID TableId(10001)
+    WHERE type: Boolean (expected Boolean)
+  Binding: SELECT nonexistent FROM users (expect error)
+    Error: Column not found: nonexistent
+  Binding: SELECT id FROM nonexistent (expect error)
+    Error: Table not found: nonexistent
+  Binding test: PASS
+
+=== Spatial Predicate -> SpatialScan ===
+  SQL: SELECT id FROM events WHERE st_dwithin(location, st_make_point(-74.0, 40.7), 5000.0)
+  Physical plan top: Project
+  SpatialScan present in physical plan: PASS
+
+=== Index Selection ===
+  Planning: SELECT * FROM orders WHERE status = 'pending' (low selectivity, expect IndexScan)
+  Physical operator: IndexScan
+  Cost: 401.50
+  Uses IndexScan: true
+  Planning: SELECT * FROM orders WHERE status != 'pending' (high selectivity, expect SeqScan)
+  Physical operator: Gather
+  Cost: 1851.67
+  Uses SeqScan: true
+  Index selection test: PASS
+
+=== Planner Performance Benchmarks ===
+Validation runs: 5
+
+--- Run 1/5 ---
+  Binding: 22.68 us/op
+  Logical plan: 2.23 us/op (pure, excl. binding)
+  Optimization: 44.35 us/op (pure, excl. logical)
+  Physical plan: 11.46 us/op (pure, excl. optimization)
+  Join reorder (5 tables): 139.55 us/op
+  Index selection: 0.01 us/op (pure, excl. optimization)
+  Full pipeline: 157.76 us/op
+
+--- Run 2/5 ---
+  Binding: 21.71 us/op
+  Logical plan: 2.47 us/op (pure, excl. binding)
+  Optimization: 44.90 us/op (pure, excl. logical)
+  Physical plan: 11.22 us/op (pure, excl. optimization)
+  Join reorder (5 tables): 133.43 us/op
+  Index selection: 0.01 us/op (pure, excl. optimization)
+  Full pipeline: 157.13 us/op
+
+--- Run 3/5 ---
+  Binding: 22.30 us/op
+  Logical plan: 1.80 us/op (pure, excl. binding)
+  Optimization: 45.38 us/op (pure, excl. logical)
+  Physical plan: 9.99 us/op (pure, excl. optimization)
+  Join reorder (5 tables): 134.96 us/op
+  Index selection: 0.01 us/op (pure, excl. optimization)
+  Full pipeline: 158.32 us/op
+
+--- Run 4/5 ---
+  Binding: 21.65 us/op
+  Logical plan: 2.39 us/op (pure, excl. binding)
+  Optimization: 45.31 us/op (pure, excl. logical)
+  Physical plan: 10.22 us/op (pure, excl. optimization)
+  Join reorder (5 tables): 133.79 us/op
+  Index selection: 0.01 us/op (pure, excl. optimization)
+  Full pipeline: 158.08 us/op
+
+--- Run 5/5 ---
+  Binding: 21.69 us/op
+  Logical plan: 2.36 us/op (pure, excl. binding)
+  Optimization: 45.08 us/op (pure, excl. logical)
+  Physical plan: 10.61 us/op (pure, excl. optimization)
+  Join reorder (5 tables): 134.30 us/op
+  Index selection: 0.01 us/op (pure, excl. optimization)
+  Full pipeline: 156.76 us/op
+
+=== Planner Performance Results ===
+  Binding latency (us) [NOT MEASURED, unoptimized build]:
+    Runs: [23, 22, 22, 22, 22]
+    Average: 22 (target <= 2, not applied)
+    Re-run with --release for a number worth comparing
+  Logical plan latency (us) [NOT MEASURED, unoptimized build]:
+    Runs: [2, 2, 2, 2, 2]
+    Average: 2 (target <= 5, not applied)
+    Re-run with --release for a number worth comparing
+  Optimization latency (us) [NOT MEASURED, unoptimized build]:
+    Runs: [44, 45, 45, 45, 45]
+    Average: 45 (target <= 25, not applied)
+    Re-run with --release for a number worth comparing
+  Physical plan latency (us) [NOT MEASURED, unoptimized build]:
+    Runs: [11, 11, 10, 10, 11]
+    Average: 11 (target <= 10, not applied)
+    Re-run with --release for a number worth comparing
+  Join reorder latency (us, 5 tables) [NOT MEASURED, unoptimized build]:
+    Runs: [140, 133, 135, 134, 134]
+    Average: 135 (target <= 100, not applied)
+    Re-run with --release for a number worth comparing
+  Index selection latency (us) [NOT MEASURED, unoptimized build]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 (target <= 5, not applied)
+    Re-run with --release for a number worth comparing
+  Full pipeline latency (us) [NOT MEASURED, unoptimized build]:
+    Runs: [158, 157, 158, 158, 157]
+    Average: 158 (target <= 50, not applied)
+    Re-run with --release for a number worth comparing
+
+--- Plan Cache Simulation ---
+  Plan cache hit rate [NOT MEASURED, unoptimized build]: 1 (target >= 1, not applied)
+
+--- Cardinality Estimation Accuracy ---
+  Cardinality estimation error factor [NOT MEASURED, unoptimized build]: 1 (target <= 2, not applied)
+
+=== All Planner Performance Tests: PASS ===
+
+=== Cost Estimation ===
+  Full scan cost (1K rows): 10.10
+  Full scan cost (1M rows): 1851.67
+  Cost ratio: 183.3x
+  SeqScan cost (1K): io=10.00, cpu=10.00, rows=1000
+  SeqScan cost (1M): io=10000.00, cpu=10000.00, rows=1000000
+  IndexScan cost (1M, 1%%): io=400.00, cpu=150.00, rows=10000
+  Cost estimation test: PASS
+
+============================================
+  Planner Benchmark Suite - All Tests Complete
+============================================
+  Cores: 24
+  OS: windows/x86_64
+  Run ID: 2026-08-15_025220_2848e81-local
+  Output:  benchmarks/planner/planner_2026-08-15_025220_2848e81-local.json
+  Log:     benchmarks/planner/planner_2026-08-15_025220_2848e81-local.txt
+  Binding:     1 correctness test
+  Logical:     1 correctness test
+  Predicate:   1 correctness test
+  Projection:  1 correctness test
+  Join Order:  1 correctness test
+  Index Sel:   1 correctness test
+  Cost Model:  1 correctness test
+  Complex:     1 correctness test (TPC-H Q1, Q3)
+  Benchmarks:  1 performance test (9 metrics)
+============================================
+
+=== Predicate Pushdown ===
+  Planning: SELECT * FROM a JOIN b ON a.id = b.id WHERE a.x > 10 AND b.y < 5
+  Filter nodes in optimized plan: 2
+  Top-level operator: Join
+  Predicate pushdown test: PASS
+
+=== Projection Pushdown ===
+  Planning: SELECT col1, col2 FROM wide_table
+  Scan column counts: [2]
+  Narrowest scan reads 2 columns (originally 20)
+  Projection pushed down to scan level
+  Projection pushdown test: PASS
+
+=== Join Ordering ===
+  Planning: SELECT * FROM large JOIN medium ON large.id = medium.id JOIN small ON medium.id = small.id
+  Top-level operator: Join
+  Physical plan top: HashJoin
+  Physical plan cost: 5886.56
+  Join ordering test: PASS

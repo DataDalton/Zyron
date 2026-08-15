@@ -106,7 +106,7 @@ pub struct ColumnBuilder {
     type_id: TypeId,
     /// Fractional-second precision carried onto the finished Column so a
     /// physical i128 is known to be a logical ps timestamp.
-    ts_precision: Option<u8>,
+    fractional_digits: Option<u8>,
 }
 
 impl ColumnBuilder {
@@ -115,24 +115,24 @@ impl ColumnBuilder {
             data: ColumnData::with_capacity(type_id, capacity),
             nulls: NullBitmap::empty(),
             type_id,
-            ts_precision: None,
+            fractional_digits: None,
         }
     }
 
     /// Builder for a timestamp column: the physical buffer is sized for
     /// `physical_type` (Int128 when p>6) while the finished Column reports the
-    /// `logical_type` and carries `ts_precision`.
+    /// `logical_type` and carries `fractional_digits`.
     pub fn new_ts(
         logical_type: TypeId,
         physical_type: TypeId,
-        ts_precision: Option<u8>,
+        fractional_digits: Option<u8>,
         capacity: usize,
     ) -> Self {
         Self {
             data: ColumnData::with_capacity(physical_type, capacity),
             nulls: NullBitmap::empty(),
             type_id: logical_type,
-            ts_precision,
+            fractional_digits,
         }
     }
 
@@ -155,7 +155,7 @@ impl ColumnBuilder {
     }
 
     pub fn finish(self) -> Column {
-        Column::with_nulls_ts(self.data, self.nulls, self.type_id, self.ts_precision)
+        Column::with_nulls_ts(self.data, self.nulls, self.type_id, self.fractional_digits)
     }
 }
 
@@ -166,9 +166,9 @@ pub fn create_builders(columns: &[LogicalColumn], capacity: usize) -> Vec<Column
     columns
         .iter()
         .map(|col| {
-            let phys = TypeId::timestamp_physical_type_id(col.type_id, col.ts_precision);
-            if phys != col.type_id {
-                ColumnBuilder::new_ts(col.type_id, phys, col.ts_precision, capacity)
+            let phys = TypeId::timestamp_physical_type_id(col.type_id, col.fractional_digits);
+            if phys != col.type_id || col.fractional_digits.is_some() {
+                ColumnBuilder::new_ts(col.type_id, phys, col.fractional_digits, capacity)
             } else {
                 ColumnBuilder::new(col.type_id, capacity)
             }
@@ -559,7 +559,7 @@ mod row_filter_tests {
             nullable: false,
             default_expr: None,
             max_length: None,
-            ts_precision: None,
+            fractional_digits: None,
             tz_offset_secs: None,
             element_type: None,
         }
@@ -572,7 +572,7 @@ mod row_filter_tests {
             name: name.to_string(),
             type_id,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         }
     }
 
@@ -611,7 +611,7 @@ mod row_filter_tests {
                 column_id: ColumnId(1),
                 type_id: TypeId::Text,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
             })),
             op: BinaryOperator::Eq,
             right: Box::new(BoundExpr::Literal {
@@ -656,7 +656,7 @@ mod row_filter_tests {
                 column_id: ColumnId(1),
                 type_id: TypeId::Text,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
             })),
             op: BinaryOperator::Eq,
             right: Box::new(BoundExpr::Literal {

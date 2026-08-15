@@ -22,10 +22,10 @@ use std::fs;
 
 use zyron_common::ZyronError;
 
+use crate::manifest::ClusterSpec;
 use crate::operations::append_rows;
 use crate::paths::LakePaths;
 use crate::schema::LakeSchema;
-use crate::manifest::ClusterSpec;
 use crate::transaction_log::{CommitAttempt, OperationKind, TransactionLog};
 use crate::writer::ColumnData;
 
@@ -163,7 +163,7 @@ mod tests {
                     name: "id".into(),
                     type_id: TypeId::Int64,
                     nullable: false,
-                    ts_precision: None,
+                    fractional_digits: None,
                     tz_offset_secs: None,
                     max_length: None,
                     default_expr: None,
@@ -173,7 +173,7 @@ mod tests {
                     name: "tag".into(),
                     type_id: TypeId::Varchar,
                     nullable: true,
-                    ts_precision: None,
+                    fractional_digits: None,
                     tz_offset_secs: None,
                     max_length: None,
                     default_expr: None,
@@ -238,7 +238,12 @@ mod tests {
         .expect("load");
         assert_eq!(log.latest_version(), 1, "nothing to append");
         assert!(log.latest_manifest().expect("manifest").entries.is_empty());
-        assert!(read_all_rows(&paths, &log).expect("read").iter().all(|c| c.cells.is_empty()));
+        assert!(
+            read_all_rows(&paths, &log)
+                .expect("read")
+                .iter()
+                .all(|c| c.cells.is_empty())
+        );
     }
 
     #[test]

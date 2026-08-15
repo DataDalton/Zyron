@@ -33,11 +33,13 @@
 //! inversion, which is the safe direction: the exact filter removes it,
 //! and SQL says a null satisfies no comparison anyway.
 
-use zyron_common::curve::{cell_family, CellFamily};
+use zyron_common::curve::{CellFamily, cell_family};
 use zyron_common::{TypeId, ZyronError};
 
-use zyron_storage::columnar::{compare_stat_slots_typed, compare_value_to_slot, slot_order, SlotOrder};
-use zyron_storage::columnar::{ZoneMapEntry, STAT_VALUE_SIZE, ZONE_MAP_BATCH_SIZE};
+use zyron_storage::columnar::{STAT_VALUE_SIZE, ZONE_MAP_BATCH_SIZE, ZoneMapEntry};
+use zyron_storage::columnar::{
+    SlotOrder, compare_stat_slots_typed, compare_value_to_slot, slot_order,
+};
 use zyron_storage::encoding::Predicate;
 
 use crate::cells::value_to_cell;
@@ -347,9 +349,17 @@ fn lower_compare(
 fn equality_cells(shape: &ColumnShape, value: &LakeValue) -> Option<Vec<Vec<u8>>> {
     let cell = value_to_cell(shape.physical, shape.value_size, value)?;
     let mut cells = vec![cell.as_slice().to_vec()];
-    if shape.float && let LakeValue::Float(v) = value && *v == 0.0 {
-        let other = if v.is_sign_negative() { 0.0f64 } else { -0.0f64 };
-        if let Some(cell) = value_to_cell(shape.physical, shape.value_size, &LakeValue::Float(other))
+    if shape.float
+        && let LakeValue::Float(v) = value
+        && *v == 0.0
+    {
+        let other = if v.is_sign_negative() {
+            0.0f64
+        } else {
+            -0.0f64
+        };
+        if let Some(cell) =
+            value_to_cell(shape.physical, shape.value_size, &LakeValue::Float(other))
         {
             let bytes = cell.as_slice().to_vec();
             if !cells.contains(&bytes) {
@@ -871,7 +881,7 @@ mod tests {
                     name: format!("c{}", i),
                     type_id: *t,
                     nullable: true,
-                    ts_precision: None,
+                    fractional_digits: None,
                     tz_offset_secs: None,
                     max_length: None,
                     default_expr: None,
@@ -902,20 +912,17 @@ mod tests {
     #[test]
     fn test_a_signed_range_spanning_zero_becomes_two_stored_ranges() {
         let s = schema(&[TypeId::Int32]);
-        let filter = StoredFilter::lower(&cmp(0, CompareOp::LtEq, LakeValue::Int(5)), &s)
-            .expect("lowers");
+        let filter =
+            StoredFilter::lower(&cmp(0, CompareOp::LtEq, LakeValue::Int(5)), &s).expect("lowers");
         let leaf = leaf_of(&filter);
         assert_eq!(leaf.pushdown.len(), 2, "negatives and non-negatives split");
 
         for v in [-2_000_000_000i32, -1, 0, 5, 6, 2_000_000_000] {
             let cell = v.to_le_bytes();
             let admitted = leaf.pushdown.iter().any(|p| match p {
-                OwnedPredicate::Range { low, high } => zyron_storage::encoding::range_admits(
-                    &cell,
-                    4,
-                    low.as_deref(),
-                    high.as_deref(),
-                ),
+                OwnedPredicate::Range { low, high } => {
+                    zyron_storage::encoding::range_admits(&cell, 4, low.as_deref(), high.as_deref())
+                }
                 OwnedPredicate::AnyOf(_) => false,
             });
             assert_eq!(admitted, v <= 5, "value {} lowered wrong", v);
@@ -925,19 +932,16 @@ mod tests {
     #[test]
     fn test_an_unsigned_range_stays_one_stored_range() {
         let s = schema(&[TypeId::UInt32]);
-        let filter = StoredFilter::lower(&cmp(0, CompareOp::Gt, LakeValue::UInt(100)), &s)
-            .expect("lowers");
+        let filter =
+            StoredFilter::lower(&cmp(0, CompareOp::Gt, LakeValue::UInt(100)), &s).expect("lowers");
         let leaf = leaf_of(&filter);
         assert_eq!(leaf.pushdown.len(), 1);
         for v in [0u32, 100, 101, u32::MAX] {
             let cell = v.to_le_bytes();
             let admitted = match &leaf.pushdown[0] {
-                OwnedPredicate::Range { low, high } => zyron_storage::encoding::range_admits(
-                    &cell,
-                    4,
-                    low.as_deref(),
-                    high.as_deref(),
-                ),
+                OwnedPredicate::Range { low, high } => {
+                    zyron_storage::encoding::range_admits(&cell, 4, low.as_deref(), high.as_deref())
+                }
                 OwnedPredicate::AnyOf(_) => false,
             };
             assert_eq!(admitted, v > 100, "value {} lowered wrong", v);
@@ -988,8 +992,8 @@ mod tests {
     #[test]
     fn test_a_negated_equality_keeps_what_the_constant_does_not_pin() {
         let s = schema(&[TypeId::Int32]);
-        let filter = StoredFilter::lower(&cmp(0, CompareOp::NotEq, LakeValue::Int(50)), &s)
-            .expect("lowers");
+        let filter =
+            StoredFilter::lower(&cmp(0, CompareOp::NotEq, LakeValue::Int(50)), &s).expect("lowers");
         let leaf = leaf_of(&filter);
         assert!(leaf.invert, "the mask is the equality mask inverted");
         assert_eq!(leaf.pushdown.len(), 1);
@@ -1062,8 +1066,8 @@ mod tests {
     #[test]
     fn test_negation_is_pushed_down_to_the_leaves() {
         let s = schema(&[TypeId::Int64]);
-        let direct = StoredFilter::lower(&cmp(0, CompareOp::GtEq, LakeValue::Int(10)), &s)
-            .expect("lowers");
+        let direct =
+            StoredFilter::lower(&cmp(0, CompareOp::GtEq, LakeValue::Int(10)), &s).expect("lowers");
         let negated = StoredFilter::lower(
             &LakePredicate::Not(Box::new(cmp(0, CompareOp::Lt, LakeValue::Int(10)))),
             &s,
@@ -1108,8 +1112,8 @@ mod tests {
         assert!(!zone_admits(leaf, &zone(-100, 49)));
 
         // A negative bound still sorts below a positive one
-        let below = StoredFilter::lower(&cmp(0, CompareOp::Lt, LakeValue::Int(-5)), &s)
-            .expect("lowers");
+        let below =
+            StoredFilter::lower(&cmp(0, CompareOp::Lt, LakeValue::Int(-5)), &s).expect("lowers");
         let below = leaf_of(&below);
         assert!(zone_admits(below, &zone(-100, -50)));
         assert!(!zone_admits(below, &zone(0, 100)));
@@ -1222,8 +1226,8 @@ mod tests {
         assert!(zone_admits(below, &zone(-2.0, 5.0)));
 
         // Equality is pushed, and zero admits both of its spellings
-        let zero = StoredFilter::lower(&cmp(0, CompareOp::Eq, LakeValue::Float(0.0)), &s)
-            .expect("lowers");
+        let zero =
+            StoredFilter::lower(&cmp(0, CompareOp::Eq, LakeValue::Float(0.0)), &s).expect("lowers");
         let zero = leaf_of(&zero);
         match &zero.pushdown[0] {
             OwnedPredicate::AnyOf(values) => assert_eq!(
@@ -1237,8 +1241,8 @@ mod tests {
         assert!(!zone_admits(zero, &zone(1.0, 2.0)));
 
         // A non-zero constant carries one spelling
-        let one = StoredFilter::lower(&cmp(0, CompareOp::Eq, LakeValue::Float(1.5)), &s)
-            .expect("lowers");
+        let one =
+            StoredFilter::lower(&cmp(0, CompareOp::Eq, LakeValue::Float(1.5)), &s).expect("lowers");
         match &leaf_of(&one).pushdown[0] {
             OwnedPredicate::AnyOf(values) => assert_eq!(values.len(), 1),
             other => panic!("expected an equality set, got {:?}", other),

@@ -7188,6 +7188,7 @@ version = "0.1.0"
 dependencies = [
  "zyron-common",
  "zyron-server",
+ "zyron-tpc",
 ]
 
 [[package]]
@@ -7415,6 +7416,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "zyron-tpc"
+version = "0.1.0"
+
+[[package]]
 name = "zyron-types"
 version = "0.1.0"
 dependencies = [
@@ -7511,6 +7516,7 @@ dependencies = [
  "zyron-search",
  "zyron-storage",
  "zyron-streaming",
+ "zyron-tpc",
  "zyron-types",
  "zyron-versioning",
  "zyron-wal",

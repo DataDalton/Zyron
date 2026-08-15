@@ -1,0 +1,60 @@
+# suite:   lifecycle
+# run:     2026-08-15_024933_2848e81-local
+# profile: debug
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+# NOT A BENCHMARK RESULT. This is an unoptimized build, so every
+# timing below is meaningless: an unoptimized build is not slower
+# by a constant factor, so these numbers do not even rank correctly
+# against each other. Counted quantities (rates, file and row
+# counts, PASS/FAIL on an exact bound) are valid and are the only
+# thing worth reading here. For real numbers: cargo test --release
+#
+
+=== Partition-Scoped TTL ===
+
+=== Row-Level TTL ===
+
+=== Archive + Restore ===
+
+=== Soft Delete ===
+
+=== FORGET USER (cross-table) ===
+
+=== Soft-Delete Purge ===
+
+=== Tiered Storage ===
+
+=== Performance (5-run average) ===
+
+=== Legal Hold ===
+
+=== Compliance Report ===
+  SOX retention validation + PII detection: PASS
+  Legal hold blocks DELETE/UPDATE/TTL, release restores: PASS
+  Soft-delete purge after grace window: PASS
+  Soft delete + visibility modifiers + HARD: PASS
+  Row-level TTL delete + retention boundary: PASS
+  FORGET USER cross-table erasure + PII detect: PASS
+  Partition-scoped TTL (predicate drop): PASS
+  Tiered storage transparent query + cost model: PASS
+  Archive write + delete + restore round-trip: PASS
+  latency (ns/op) [NOT MEASURED, unoptimized build]:
+    Runs: [27, 28, 27, 27, 28]
+    Average: 28 (target <= 50, not applied)
+    Re-run with --release for a number worth comparing
+  latency (s) [NOT MEASURED, unoptimized build]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 (target <= 5, not applied)
+    Re-run with --release for a number worth comparing
+  throughput (rows/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [1,083,090, 1,075,911, 1,086,951, 1,063,407, 1,072,042]
+    Average: 1,076,280 (target >= 500,000, not applied)
+    Re-run with --release for a number worth comparing
+  throughput (rows/sec) [NOT MEASURED, unoptimized build]:
+    Runs: [20,193,249, 19,653,122, 20,723,241, 21,544,295, 21,571,715]
+    Average: 20,737,125 (target >= 500,000, not applied)
+    Re-run with --release for a number worth comparing
+
+  Performance suite complete.

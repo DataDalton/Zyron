@@ -71,12 +71,12 @@ pub fn type_id_to_arrow(t: TypeId) -> ArrowDataType {
 /// Arrow has no picosecond unit - this is the one sanctioned lossy export
 /// (ps -> ns truncates the low 3 digits; see ps_to_arrow_ns and the format
 /// spec). Non-timestamp types defer to type_id_to_arrow.
-pub fn timestamp_arrow_type(t: TypeId, ts_precision: Option<u8>) -> ArrowDataType {
+pub fn timestamp_arrow_type(t: TypeId, fractional_digits: Option<u8>) -> ArrowDataType {
     match t {
-        TypeId::Timestamp if ts_precision.unwrap_or(6) > 6 => {
+        TypeId::Timestamp if fractional_digits.unwrap_or(6) > 6 => {
             ArrowDataType::Timestamp(TimeUnit::Nanosecond, None)
         }
-        TypeId::TimestampTz if ts_precision.unwrap_or(6) > 6 => {
+        TypeId::TimestampTz if fractional_digits.unwrap_or(6) > 6 => {
             ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
         }
         _ => type_id_to_arrow(t),

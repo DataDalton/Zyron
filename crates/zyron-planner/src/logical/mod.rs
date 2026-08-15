@@ -43,13 +43,14 @@ pub struct LogicalColumn {
     pub column_id: ColumnId,
     pub name: String,
     /// Logical type. For a TIMESTAMP(p)/TIMESTAMPTZ(p) column this stays the
-    /// logical timestamp type; ts_precision records p so the executor can
+    /// logical timestamp type; fractional_digits records p so the executor can
     /// pick the i128 picosecond physical buffer for p>6 while keeping the
     /// logical identity for compare/cast/presentation.
     pub type_id: TypeId,
     pub nullable: bool,
-    /// Fractional-second precision for timestamp columns (None otherwise).
-    pub ts_precision: Option<u8>,
+    /// Digits after the decimal point: fractional seconds for a TIMESTAMP(p),
+    /// scale for a DECIMAL(p,s), None for every other type.
+    pub fractional_digits: Option<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -300,7 +301,7 @@ impl LogicalPlan {
                         name,
                         type_id: expr.type_id(),
                         nullable: expr.nullable(),
-                        ts_precision: expr.ts_precision(),
+                        fractional_digits: expr.fractional_digits(),
                     }
                 })
                 .collect(),
@@ -327,7 +328,7 @@ impl LogicalPlan {
                         name: col.name.clone(),
                         type_id: col.type_id,
                         nullable: col.nullable || force_nullable,
-                        ts_precision: col.ts_precision,
+                        fractional_digits: col.fractional_digits,
                     });
                 }
                 schema
@@ -345,7 +346,7 @@ impl LogicalPlan {
                         name: format!("group{}", i),
                         type_id: expr.type_id(),
                         nullable: expr.nullable(),
-                        ts_precision: expr.ts_precision(),
+                        fractional_digits: expr.fractional_digits(),
                     });
                 }
                 for (i, agg) in aggregates.iter().enumerate() {
@@ -357,7 +358,7 @@ impl LogicalPlan {
                         type_id: agg.return_type,
                         nullable: true,
                         // Aggregate-result precision finalized in B5.
-                        ts_precision: None,
+                        fractional_digits: None,
                     });
                 }
                 schema
@@ -420,7 +421,7 @@ mod tests {
                     name: "id".to_string(),
                     type_id: TypeId::Int64,
                     nullable: false,
-                    ts_precision: None,
+                    fractional_digits: None,
                 },
                 LogicalColumn {
                     table_idx: Some(0),
@@ -428,7 +429,7 @@ mod tests {
                     name: "name".to_string(),
                     type_id: TypeId::Varchar,
                     nullable: true,
-                    ts_precision: None,
+                    fractional_digits: None,
                 },
             ],
             alias: "users".to_string(),
@@ -452,7 +453,7 @@ mod tests {
                 name: "id".to_string(),
                 type_id: TypeId::Int64,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
             }],
             alias: "t".to_string(),
             encoding_hints: None,
@@ -481,7 +482,7 @@ mod tests {
                 name: "a".to_string(),
                 type_id: TypeId::Int64,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
             }],
             alias: "l".to_string(),
             encoding_hints: None,
@@ -496,7 +497,7 @@ mod tests {
                 name: "b".to_string(),
                 type_id: TypeId::Int64,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
             }],
             alias: "r".to_string(),
             encoding_hints: None,

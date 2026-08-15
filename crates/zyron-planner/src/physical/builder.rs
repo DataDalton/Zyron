@@ -238,7 +238,7 @@ impl<'a> PhysicalPlanner<'a> {
                         name: col.name.clone(),
                         type_id: col.type_id,
                         nullable: col.nullable || force_nullable,
-                        ts_precision: col.ts_precision,
+                        fractional_digits: col.fractional_digits,
                     })
                     .collect();
                 let cost = PlanCost {
@@ -264,6 +264,12 @@ impl<'a> PhysicalPlanner<'a> {
                 child,
             } => self.plan_aggregate(group_by, aggregates, Arc::unwrap_or_clone(child)),
             LogicalPlan::Sort { order_by, child } => {
+                // An index whose key order already matches the requested one
+                // answers the ORDER BY by being read in order, so the sort
+                // is removed rather than run over rows that arrive sorted
+                if let Some(scan) = self.try_plan_ordered_index_scan(&order_by, child.as_ref())? {
+                    return Ok(scan);
+                }
                 let child_plan = self.plan(Arc::unwrap_or_clone(child))?;
                 let child_cost = *child_plan.cost();
                 let sort_cost = self.cost_model.cost_sort(&child_cost);
@@ -533,6 +539,136 @@ impl<'a> PhysicalPlanner<'a> {
         }
     }
 
+    /// Answers an ORDER BY by reading a B+tree index in key order instead of
+    /// sorting, when the index provably yields exactly the requested order.
+    ///
+    /// Returns the scan that replaces the whole `Sort -> [Filter] -> Scan`
+    /// subtree, or None to leave the sort in place. Every condition below is
+    /// a correctness precondition, not a heuristic:
+    ///
+    /// - The ORDER BY terms are plain columns of the scanned table, matching
+    ///   a leading run of the index's key columns in order.
+    /// - Those columns are NOT NULL. A row with a null in any key component
+    ///   is left out of the index entirely, so an index scan over a nullable
+    ///   key column would drop rows rather than reorder them.
+    /// - Those columns are fixed width. A variable-length component runs into
+    ///   the key's row-locator suffix, so byte order does not provably equal
+    ///   value order and the rows would come back subtly misordered.
+    /// - Every term runs the same way, so one walk direction serves them all.
+    ///   Forward for ascending, backward for descending.
+    /// - The table is heap format with no folded columnar segments, and there
+    ///   is no time-travel target. A lake table's index is a lake artifact
+    ///   rather than a B+tree, and the other two are the conditions that keep
+    ///   the predicate-driven index path off those tables.
+    fn try_plan_ordered_index_scan(
+        &self,
+        order_by: &[crate::binder::BoundOrderBy],
+        child: &LogicalPlan,
+    ) -> Result<Option<PhysicalPlan>> {
+        if order_by.is_empty() {
+            return Ok(None);
+        }
+        // A Filter between the sort and the scan becomes the scan's residual
+        // predicate. Anything else in between is left alone
+        let mut node = child;
+        let mut residual: Option<BoundExpr> = None;
+        if let LogicalPlan::Filter { predicate, child } = node {
+            residual = Some(predicate.clone());
+            node = child.as_ref();
+        }
+        let LogicalPlan::Scan {
+            table_id,
+            columns,
+            as_of,
+            ..
+        } = node
+        else {
+            return Ok(None);
+        };
+        if as_of.is_some() {
+            return Ok(None);
+        }
+        let Ok(te) = self.catalog.get_table_by_id(*table_id) else {
+            return Ok(None);
+        };
+        // A lake table's index is a lake artifact committed into its own
+        // transaction log, not a B+tree over heap addresses, so the catalog
+        // entry describing it cannot be walked by an index scan
+        if te.lake.is_lake() || !te.columnar.segments.is_empty() {
+            return Ok(None);
+        }
+
+        // Every term must be a plain column of this table, and they must all
+        // run the same way
+        let ascending = order_by[0].asc;
+        let mut wanted: Vec<zyron_catalog::ColumnId> = Vec::with_capacity(order_by.len());
+        for term in order_by {
+            if term.asc != ascending {
+                return Ok(None);
+            }
+            let BoundExpr::ColumnRef(col) = &term.expr else {
+                return Ok(None);
+            };
+            wanted.push(col.column_id);
+        }
+
+        for index in self.catalog.get_indexes_for_table(*table_id) {
+            if index.index_type != zyron_catalog::IndexType::BTree
+                || index.columns.len() < wanted.len()
+            {
+                continue;
+            }
+            let mut usable = true;
+            for (position, want) in wanted.iter().enumerate() {
+                let key = &index.columns[position];
+                if key.column_id != *want {
+                    usable = false;
+                    break;
+                }
+                let Some(col) = te.columns.iter().find(|c| c.id == *want) else {
+                    usable = false;
+                    break;
+                };
+                if col.nullable || col.physical_type_id().fixed_size().is_none() {
+                    usable = false;
+                    break;
+                }
+            }
+            if !usable {
+                continue;
+            }
+
+            let table_stats = self.catalog.get_stats(*table_id);
+            let cost = match &table_stats {
+                Some(s) => self.cost_model.cost_seq_scan(&s.0),
+                None => PlanCost::zero(),
+            };
+            return Ok(Some(PhysicalPlan::IndexScan {
+                table_id: *table_id,
+                index_id: index.id,
+                index: Arc::clone(&index),
+                columns: columns.clone(),
+                // No bound is derived from the ordering, the whole index is
+                // walked. A residual predicate still filters the rows it
+                // yields, and filtering preserves their order
+                predicate: BoundExpr::Literal {
+                    value: zyron_parser::ast::LiteralValue::Boolean(true),
+                    type_id: TypeId::Boolean,
+                },
+                remaining_predicate: residual,
+                scan_direction: if ascending {
+                    ScanDirection::Forward
+                } else {
+                    ScanDirection::Backward
+                },
+                ordered_by: Some(order_by.to_vec()),
+                cost,
+                as_of: None,
+            }));
+        }
+        Ok(None)
+    }
+
     /// Recognizes a KNN-shaped plan directly under a LIMIT and, when matched,
     /// produces the scan with k threaded in. Two shapes are handled: a vector
     /// distance predicate (`Limit -> [Filter] -> Scan`) becomes a VectorScan
@@ -788,7 +924,7 @@ impl<'a> PhysicalPlanner<'a> {
                 name: c.name.clone(),
                 type_id: c.type_id,
                 nullable: c.nullable,
-                ts_precision: c.ts_precision,
+                fractional_digits: c.fractional_digits,
             })
             .collect();
         let cost = *child.cost();
@@ -1174,6 +1310,9 @@ impl<'a> PhysicalPlanner<'a> {
                         predicate: index_pred,
                         remaining_predicate: remaining,
                         scan_direction: ScanDirection::Forward,
+                        // A predicate-driven index scan is not relied on for
+                        // ordering, the Sort above it (if any) still runs
+                        ordered_by: None,
                         cost,
                         as_of: as_of.clone(),
                     });
@@ -1201,6 +1340,18 @@ impl<'a> PhysicalPlanner<'a> {
                 cost = PlanCost {
                     io_cost: cost.io_cost * keep,
                     cpu_cost: cost.cpu_cost * keep,
+                    row_count: cost.row_count,
+                };
+            }
+            // Segments relocated to a colder tier are read from slower
+            // storage, so the IO half of the scan is weighted by the tier
+            // each segment sits on in proportion to the rows it holds. A
+            // table entirely on hot storage weighs 1.0 and costs as before
+            let tier_weight = columnar_tier_io_weight(&te.columnar.segments);
+            if tier_weight != 1.0 {
+                cost = PlanCost {
+                    io_cost: cost.io_cost * tier_weight,
+                    cpu_cost: cost.cpu_cost,
                     row_count: cost.row_count,
                 };
             }
@@ -1253,6 +1404,9 @@ impl<'a> PhysicalPlanner<'a> {
                                 predicate: index_pred,
                                 remaining_predicate: remaining,
                                 scan_direction: ScanDirection::Forward,
+                        // A predicate-driven index scan is not relied on for
+                        // ordering, the Sort above it (if any) still runs
+                        ordered_by: None,
                                 cost,
                                 as_of: as_of.clone(),
                             });
@@ -1615,7 +1769,7 @@ impl<'a> PhysicalPlanner<'a> {
                         name: s.name.clone(),
                         type_id: s.return_type,
                         nullable: true,
-                        ts_precision: None,
+                        fractional_digits: None,
                     })
                     .collect();
                 return Ok(PhysicalPlan::ColumnarMetadataAggregate {
@@ -2016,9 +2170,7 @@ fn extract_constant_geometry(expr: &BoundExpr) -> Option<zyron_types::geospatial
             }
             // SRID only labels the coordinate system, it does not move the
             // coordinates, so the box is the inner geometry's
-            "st_setsrid" | "st_set_srid" if !args.is_empty() => {
-                extract_constant_geometry(&args[0])
-            }
+            "st_setsrid" | "st_set_srid" if !args.is_empty() => extract_constant_geometry(&args[0]),
             _ => None,
         },
         _ => None,
@@ -2344,7 +2496,7 @@ fn rewrite_window_refs(
                 type_id: *type_id,
                 nullable: true,
                 // Window-output precision finalized in B5.
-                ts_precision: None,
+                fractional_digits: None,
             })
         }
         BE::ColumnRef(_) | BE::Literal { .. } | BE::Parameter { .. } => expr.clone(),
@@ -2449,9 +2601,11 @@ fn rewrite_window_refs(
         BE::Cast {
             expr: inner,
             target_type,
+            fractional_digits,
         } => BE::Cast {
             expr: Box::new(rewrite_window_refs(inner, collected, names, None)),
             target_type: *target_type,
+            fractional_digits: *fractional_digits,
         },
         BE::Case {
             operand,
@@ -2486,11 +2640,61 @@ fn rewrite_window_refs(
     }
 }
 
+/// Row-weighted read-cost multiplier for a table's columnar segments.
+///
+/// Each segment contributes its tier's multiplier in proportion to the rows
+/// it holds, so relocating a tenth of a table to cold storage raises the
+/// scan's IO cost by a tenth of the cold penalty rather than all of it. A
+/// table whose segments are all hot returns exactly 1.0, which leaves its
+/// cost arithmetic untouched.
+fn columnar_tier_io_weight(segments: &[zyron_catalog::schema::ColumnarSegmentEntry]) -> f64 {
+    let mut rows: u64 = 0;
+    let mut weighted = 0.0f64;
+    for seg in segments {
+        let n = seg.row_count.max(1);
+        rows += n;
+        weighted += n as f64 * zyron_common::StorageTier::from_u8(seg.storage_tier).cost_multiplier();
+    }
+    if rows == 0 {
+        return 1.0;
+    }
+    weighted / rows as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::binder::ColumnRef;
     use zyron_catalog::ColumnId;
+
+    fn segment_on_tier(row_count: u64, storage_tier: u8) -> zyron_catalog::schema::ColumnarSegmentEntry {
+        zyron_catalog::schema::ColumnarSegmentEntry {
+            row_count,
+            storage_tier,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_an_all_hot_table_carries_no_tier_penalty() {
+        let segs = vec![segment_on_tier(1000, 0), segment_on_tier(500, 0)];
+        assert_eq!(columnar_tier_io_weight(&segs), 1.0);
+        assert_eq!(columnar_tier_io_weight(&[]), 1.0);
+    }
+
+    /// The penalty follows the share of rows that moved, so one cold segment
+    /// among many does not cost the whole scan the cold multiplier.
+    #[test]
+    fn test_the_tier_penalty_is_weighted_by_rows() {
+        let cold = zyron_common::StorageTier::Cold.cost_multiplier();
+        let half = vec![segment_on_tier(100, 0), segment_on_tier(100, 2)];
+        assert!((columnar_tier_io_weight(&half) - (1.0 + cold) / 2.0).abs() < 1e-9);
+
+        let mostly_hot = vec![segment_on_tier(900, 0), segment_on_tier(100, 2)];
+        let mostly_cold = vec![segment_on_tier(100, 0), segment_on_tier(900, 2)];
+        assert!(columnar_tier_io_weight(&mostly_hot) < columnar_tier_io_weight(&mostly_cold));
+        assert!(columnar_tier_io_weight(&mostly_hot) > 1.0);
+    }
 
     fn geom_literal(wkt: &str) -> BoundExpr {
         BoundExpr::Literal {
@@ -2577,11 +2781,14 @@ mod tests {
             column_id: ColumnId(0),
             type_id: TypeId::Geometry,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         });
         assert_eq!(extract_envelope_from_expr(&column), None);
         assert_eq!(extract_envelope_from_expr(&geom_literal("not wkt")), None);
-        assert_eq!(extract_point_from_expr(&geom_literal("POLYGON((0 0, 1 0, 1 1, 0 0))")), None);
+        assert_eq!(
+            extract_point_from_expr(&geom_literal("POLYGON((0 0, 1 0, 1 1, 0 0))")),
+            None
+        );
     }
 
     #[test]
@@ -2591,14 +2798,14 @@ mod tests {
             column_id: ColumnId(0),
             type_id: TypeId::Int64,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         });
         let right_col = BoundExpr::ColumnRef(ColumnRef {
             table_idx: 1,
             column_id: ColumnId(0),
             type_id: TypeId::Int64,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         });
         let eq = BoundExpr::BinaryOp {
             left: Box::new(left_col.clone()),
@@ -2622,14 +2829,14 @@ mod tests {
             column_id: ColumnId(0),
             type_id: TypeId::Int64,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         });
         let right_col = BoundExpr::ColumnRef(ColumnRef {
             table_idx: 1,
             column_id: ColumnId(0),
             type_id: TypeId::Int64,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         });
         let eq = BoundExpr::BinaryOp {
             left: Box::new(left_col.clone()),
@@ -2669,7 +2876,7 @@ mod tests {
                 column_id: ColumnId(0),
                 type_id: TypeId::Int64,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
             })),
             op: BinaryOperator::Gt,
             right: Box::new(BoundExpr::Literal {

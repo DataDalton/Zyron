@@ -42,7 +42,9 @@ fn bitmap_bytes(count: usize) -> usize {
 pub fn encode(element_type: TypeId, elements: &[Option<&[u8]>]) -> Vec<u8> {
     let count = elements.len();
     let bitmap_len = bitmap_bytes(count);
-    let fixed = element_type.fixed_size().filter(|w| *w > 0 && *w <= u16::MAX as usize);
+    let fixed = element_type
+        .fixed_size()
+        .filter(|w| *w > 0 && *w <= u16::MAX as usize);
 
     let payload_len: usize = elements.iter().flatten().map(|b| b.len()).sum();
     let body_len = match fixed {
@@ -238,7 +240,11 @@ fn render_element(element_type: TypeId, bytes: &[u8], out: &mut String) {
         let raw = i128::from_le_bytes(buf);
         // Sign-extend from the element's own width
         let shift = 128 - (n * 8) as u32;
-        if shift == 0 { raw } else { (raw << shift) >> shift }
+        if shift == 0 {
+            raw
+        } else {
+            (raw << shift) >> shift
+        }
     };
     let uint = |n: usize| -> u128 {
         let mut buf = [0u8; 16];
@@ -247,7 +253,11 @@ fn render_element(element_type: TypeId, bytes: &[u8], out: &mut String) {
         u128::from_le_bytes(buf)
     };
     match element_type {
-        TypeId::Boolean => out.push_str(if bytes.first() == Some(&0) { "false" } else { "true" }),
+        TypeId::Boolean => out.push_str(if bytes.first() == Some(&0) {
+            "false"
+        } else {
+            "true"
+        }),
         TypeId::Int8 => {
             let _ = write!(out, "{}", int(1));
         }
@@ -369,10 +379,7 @@ mod tests {
         let one = 1i32.to_le_bytes();
         let two = 2i32.to_le_bytes();
         let ints = encode(TypeId::Int32, &[Some(&one), None, Some(&two)]);
-        assert_eq!(
-            ArrayView::parse(&ints).unwrap().render_text(),
-            "{1,NULL,2}"
-        );
+        assert_eq!(ArrayView::parse(&ints).unwrap().render_text(), "{1,NULL,2}");
 
         let floats = encode(
             TypeId::Float64,
@@ -401,7 +408,9 @@ mod tests {
         );
 
         assert_eq!(
-            ArrayView::parse(&encode(TypeId::Int32, &[])).unwrap().render_text(),
+            ArrayView::parse(&encode(TypeId::Int32, &[]))
+                .unwrap()
+                .render_text(),
             "{}"
         );
     }

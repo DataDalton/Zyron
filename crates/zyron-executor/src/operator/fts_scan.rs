@@ -78,12 +78,8 @@ impl FulltextScanOperator {
         let docs: Vec<u64> = results.iter().map(|r| r.0).collect();
         let fetcher =
             DocRowFetcher::prepare(&ctx, table_id, &columns, &docs, as_of.as_ref()).await?;
-        let io_stats = crate::operator::IndexScanStats::open(
-            &ctx,
-            table_id.0,
-            index_id.0,
-            results.len(),
-        );
+        let io_stats =
+            crate::operator::IndexScanStats::open(&ctx, table_id.0, index_id.0, results.len());
 
         Ok(Self {
             ctx,

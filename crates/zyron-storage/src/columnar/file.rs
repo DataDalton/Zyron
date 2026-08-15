@@ -842,9 +842,7 @@ impl ZyrFileReader {
             let slice: [u8; ZONE_MAP_ENTRY_SIZE] = buf
                 [z * ZONE_MAP_ENTRY_SIZE..(z + 1) * ZONE_MAP_ENTRY_SIZE]
                 .try_into()
-                .map_err(|_| {
-                    ZyronError::InvalidZyrFile("failed to slice zone map entry".into())
-                })?;
+                .map_err(|_| ZyronError::InvalidZyrFile("failed to slice zone map entry".into()))?;
             out.push(ZoneMapEntry::from_bytes(&slice));
         }
         Ok((header, out))
@@ -869,14 +867,9 @@ impl ZyrFileReader {
         let raw = self.read_segment_raw(column_id)?;
         let regions = segment_regions(&raw, column_id, row_count)?;
         let enc = regions.verified_payload(&raw, column_id)?;
-        crate::encoding::create_encoding(regions.header.encoding_type).eval_predicate(
-            enc,
-            row_count,
-            value_size,
-            predicate,
-        )
+        crate::encoding::create_encoding(regions.header.encoding_type)
+            .eval_predicate(enc, row_count, value_size, predicate)
     }
-
 
     /// Reads only the SEGMENT_HEADER_SIZE-byte header for a column, without
     /// pulling the encoded data. This is the metadata-only path used by

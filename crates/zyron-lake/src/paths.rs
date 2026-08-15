@@ -96,14 +96,20 @@ impl LakePaths {
 
     /// One committed version: `<version:020>.zyl` under the log dir
     pub fn version_file(&self, version: u64) -> PathBuf {
-        self.log_dir()
-            .join(format!("{:0width$}.zyl", version, width = VERSION_NAME_WIDTH))
+        self.log_dir().join(format!(
+            "{:0width$}.zyl",
+            version,
+            width = VERSION_NAME_WIDTH
+        ))
     }
 
     /// One manifest checkpoint: `<version:020>.zym` under the log dir
     pub fn checkpoint_file(&self, version: u64) -> PathBuf {
-        self.log_dir()
-            .join(format!("{:0width$}.zym", version, width = VERSION_NAME_WIDTH))
+        self.log_dir().join(format!(
+            "{:0width$}.zym",
+            version,
+            width = VERSION_NAME_WIDTH
+        ))
     }
 
     /// A branch's log directory under the main log
@@ -113,8 +119,11 @@ impl LakePaths {
 
     /// One committed version on a branch head
     pub fn branch_version_file(&self, branch: &str, version: u64) -> PathBuf {
-        self.branch_dir(branch)
-            .join(format!("{:0width$}.zyl", version, width = VERSION_NAME_WIDTH))
+        self.branch_dir(branch).join(format!(
+            "{:0width$}.zyl",
+            version,
+            width = VERSION_NAME_WIDTH
+        ))
     }
 
     /// Hint file holding a branch's newest published version. A branch has
@@ -326,7 +335,10 @@ mod tests {
     #[test]
     fn test_parse_data_file_name() {
         assert_eq!(parse_data_file_name("p-000000000000002a.zyr"), Some(0x2a));
-        assert_eq!(parse_data_file_name("p-ffffffffffffffff.zyr"), Some(u64::MAX));
+        assert_eq!(
+            parse_data_file_name("p-ffffffffffffffff.zyr"),
+            Some(u64::MAX)
+        );
         assert_eq!(parse_data_file_name("p-2a.zyr"), None);
         assert_eq!(parse_data_file_name("p-000000000000002a.zyr.tmp"), None);
         assert_eq!(parse_data_file_name("00000000000000000041.zyl"), None);
@@ -344,7 +356,10 @@ mod tests {
         assert_eq!(parse_data_file_name(&name), None);
         assert_eq!(parse_index_file_name("p-000000000000002a.zyr"), None);
         assert_eq!(parse_index_file_name("x-3-2a.zyr"), None);
-        assert_eq!(parse_index_file_name("x-0000000g-000000000000002a.zyr"), None);
+        assert_eq!(
+            parse_index_file_name("x-0000000g-000000000000002a.zyr"),
+            None
+        );
     }
 
     #[test]
@@ -357,7 +372,7 @@ mod tests {
                 .map(|n| n.to_string_lossy().into_owned())
                 .into_iter()
                 .next()
-                    .and_then(|n| parse_version_file_name(&n));
+                .and_then(|n| parse_version_file_name(&n));
             assert_eq!(name, Some((v, VersionFileKind::Version)));
         }
     }

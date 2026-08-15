@@ -13,8 +13,8 @@
 mod common;
 
 use common::{
-    create_test_server, create_test_server_with_pool_frames, exec_ddl, exec_dml,
-    exec_dml_result, new_session, query_rows, query_values,
+    create_test_server, create_test_server_with_pool_frames, exec_ddl, exec_dml, exec_dml_result,
+    new_session, query_rows, query_values,
 };
 use zyron_executor::column::ScalarValue;
 
@@ -85,7 +85,10 @@ async fn test_create_index_on_a_populated_table_covers_the_rows_that_predate_it(
         );
     }
     exec_dml(&server, "INSERT INTO t VALUES (100, 1000)").await;
-    assert_eq!(query_rows(&server, "SELECT v FROM t WHERE id = 100").await, 1);
+    assert_eq!(
+        query_rows(&server, "SELECT v FROM t WHERE id = 100").await,
+        1
+    );
     assert_eq!(query_rows(&server, "SELECT v FROM t").await, 31);
 }
 
@@ -127,7 +130,11 @@ async fn test_create_index_covers_rows_on_pages_the_buffer_pool_does_not_hold() 
     // Probe across the whole key range, so a page dropped anywhere shows up
     for id in [0, 1, 137, 299, 300, 451, 598, 599] {
         assert_eq!(
-            query_rows(&server, &format!("SELECT payload FROM wide WHERE id = {id}")).await,
+            query_rows(
+                &server,
+                &format!("SELECT payload FROM wide WHERE id = {id}")
+            )
+            .await,
             1,
             "id {id} is missing from the index, so its page was skipped"
         );
@@ -232,7 +239,10 @@ async fn test_create_index_on_a_lake_table_covers_every_row_and_keeps_covering_t
     // still on disk, because the fetch filters through the delete
     // predicate exactly as a scan does
     exec_dml(&server, "DELETE FROM lt WHERE id = 11").await;
-    assert_eq!(query_rows(&server, "SELECT v FROM lt WHERE id = 11").await, 0);
+    assert_eq!(
+        query_rows(&server, "SELECT v FROM lt WHERE id = 11").await,
+        0
+    );
     assert_eq!(query_rows(&server, "SELECT v FROM lt").await, 41);
 
     // An update rewrites the row into a new file, and the index follows it
@@ -267,14 +277,19 @@ async fn test_a_range_predicate_on_an_indexed_lake_column_returns_the_same_rows(
     }
 
     // The answers before the index exists are the answers it must not change
-    let before_closed = query_rows(&server, "SELECT id FROM lrange WHERE v >= 950 AND v <= 970").await;
+    let before_closed =
+        query_rows(&server, "SELECT id FROM lrange WHERE v >= 950 AND v <= 970").await;
     let before_open = query_rows(&server, "SELECT id FROM lrange WHERE v > 990").await;
     assert_eq!(before_closed, 21);
     assert_eq!(before_open, 10);
 
-    exec_ddl(&server, &mut session, "CREATE INDEX lrange_v_ix ON lrange (v)")
-        .await
-        .expect("create index");
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE INDEX lrange_v_ix ON lrange (v)",
+    )
+    .await
+    .expect("create index");
 
     assert_eq!(
         query_rows(&server, "SELECT id FROM lrange WHERE v >= 950 AND v <= 970").await,
@@ -292,7 +307,10 @@ async fn test_a_range_predicate_on_an_indexed_lake_column_returns_the_same_rows(
         19
     );
     // A range past every stored value selects nothing
-    assert_eq!(query_rows(&server, "SELECT id FROM lrange WHERE v > 5000").await, 0);
+    assert_eq!(
+        query_rows(&server, "SELECT id FROM lrange WHERE v > 5000").await,
+        0
+    );
     assert_eq!(query_rows(&server, "SELECT id FROM lrange").await, 100);
 }
 
@@ -343,7 +361,11 @@ async fn test_a_lake_update_enforces_uniqueness_without_colliding_with_itself() 
     )
     .await
     .expect("create lake");
-    exec_dml(&server, "INSERT INTO luu VALUES (1, 100), (2, 200), (3, 300)").await;
+    exec_dml(
+        &server,
+        "INSERT INTO luu VALUES (1, 100), (2, 200), (3, 300)",
+    )
+    .await;
     exec_ddl(
         &server,
         &mut session,
@@ -355,7 +377,10 @@ async fn test_a_lake_update_enforces_uniqueness_without_colliding_with_itself() 
     // Rewriting a row without touching its key must not collide with the
     // copy it is replacing
     exec_dml(&server, "UPDATE luu SET id = 11 WHERE code = 100").await;
-    assert_eq!(query_rows(&server, "SELECT id FROM luu WHERE code = 100").await, 1);
+    assert_eq!(
+        query_rows(&server, "SELECT id FROM luu WHERE code = 100").await,
+        1
+    );
     assert_eq!(query_rows(&server, "SELECT id FROM luu").await, 3);
 
     // Moving a row onto a key a surviving row holds must still be refused
@@ -364,12 +389,18 @@ async fn test_a_lake_update_enforces_uniqueness_without_colliding_with_itself() 
         err.is_err(),
         "an update produced a duplicate under a unique index"
     );
-    assert_eq!(query_rows(&server, "SELECT id FROM luu WHERE code = 200").await, 1);
+    assert_eq!(
+        query_rows(&server, "SELECT id FROM luu WHERE code = 200").await,
+        1
+    );
     assert_eq!(query_rows(&server, "SELECT id FROM luu").await, 3);
 
     // Moving a row onto a free key still works
     exec_dml(&server, "UPDATE luu SET code = 400 WHERE code = 300").await;
-    assert_eq!(query_rows(&server, "SELECT id FROM luu WHERE code = 400").await, 1);
+    assert_eq!(
+        query_rows(&server, "SELECT id FROM luu WHERE code = 400").await,
+        1
+    );
     assert_eq!(query_rows(&server, "SELECT id FROM luu").await, 3);
 }
 
@@ -445,7 +476,10 @@ async fn test_dropping_a_lake_index_leaves_every_row_readable() {
     exec_ddl(&server, &mut session, "CREATE INDEX ld_id_idx ON ld (id)")
         .await
         .expect("create index");
-    assert_eq!(query_rows(&server, "SELECT v FROM ld WHERE id = 9").await, 1);
+    assert_eq!(
+        query_rows(&server, "SELECT v FROM ld WHERE id = 9").await,
+        1
+    );
 
     exec_ddl(&server, &mut session, "DROP INDEX ld_id_idx")
         .await
@@ -489,10 +523,7 @@ async fn test_reindex_rebuilds_a_lake_index_and_it_still_answers() {
 
     // REINDEX is a utility statement handled on the connection, so the
     // rebuild it routes to is called directly here
-    let table = server
-        .catalog
-        .get_table(_schema, "lr")
-        .expect("table");
+    let table = server.catalog.get_table(_schema, "lr").expect("table");
     zyron_wire::index_build::rebuild_lake_indexes(&server, &table)
         .await
         .expect("rebuild");

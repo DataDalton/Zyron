@@ -914,9 +914,7 @@ impl LogicalDecoder for AvroDecoder {
 pub fn create_decoder(plugin: DecoderPlugin) -> Box<dyn LogicalDecoder> {
     match plugin {
         DecoderPlugin::ZyronCdc => Box::new(ZyronCdcDecoder),
-        DecoderPlugin::Debezium => {
-            Box::new(DebeziumDecoder::new("zyron".into(), "default".into()))
-        }
+        DecoderPlugin::Debezium => Box::new(DebeziumDecoder::new("zyron".into(), "default".into())),
         DecoderPlugin::Wal2Json => Box::new(Wal2JsonDecoder),
         DecoderPlugin::Avro => Box::new(AvroDecoder::new()),
     }

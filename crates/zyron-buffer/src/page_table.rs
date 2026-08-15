@@ -107,7 +107,12 @@ impl PageTable {
                 let frame_id = self.hash_values[idx].load(Ordering::Acquire);
                 return Some(FrameId(frame_id));
             }
-            // Skip tombstones and continue probing
+            // Tombstones and in-progress reservations are probed past rather
+            // than waited on. This is the pool's hottest path, and a lookup
+            // racing an insert that has not published its key yet is entitled
+            // to report the page absent: the insert has not taken effect. A
+            // published entry further along is still found, because probing
+            // stops only at an empty slot and one key occupies one slot
             idx = (idx + 1) & self.hash_mask;
         }
         None
@@ -148,7 +153,15 @@ impl PageTable {
         let mut idx = self.hash_index(key);
 
         for _ in 0..self.hash_keys.len() {
-            let stored_key = self.hash_keys[idx].load(Ordering::Acquire);
+            // A reserved slot has to be resolved before this slot is judged.
+            // The reservation may be about to publish this very key, and
+            // probing past it would let both inserters take a slot for the
+            // same key, each getting Inserted, leaving one page id mapped to
+            // two frames and two copies of the page in the pool.
+            //
+            // The wait is bounded by two stores in the reserving thread, with
+            // no I/O and no lock in between.
+            let stored_key = self.await_slot_resolution(idx);
             if stored_key == key {
                 // Another inserter already owns this key
                 let existing = self.hash_values[idx].load(Ordering::Acquire);
@@ -184,12 +197,30 @@ impl PageTable {
         InsertOutcome::TableFull
     }
 
+    /// Reads a slot's key, waiting out an in-progress reservation so the
+    /// caller never judges a slot whose key is about to change.
+    ///
+    /// Returns the resolved key, which is never `INPROGRESS_KEY`.
+    #[inline]
+    fn await_slot_resolution(&self, idx: usize) -> u64 {
+        loop {
+            let stored_key = self.hash_keys[idx].load(Ordering::Acquire);
+            if stored_key != INPROGRESS_KEY {
+                return stored_key;
+            }
+            std::hint::spin_loop();
+        }
+    }
+
     fn insert_to_hash(&self, page_id: PageId, frame_id: FrameId) -> bool {
         let key = page_id.as_u64();
         let mut idx = self.hash_index(key);
 
         for _ in 0..self.hash_keys.len() {
-            let stored_key = self.hash_keys[idx].load(Ordering::Acquire);
+            // Same reason insert_if_absent_hash waits: a reservation about to
+            // publish this key must not be probed past, or the key lands in
+            // two slots
+            let stored_key = self.await_slot_resolution(idx);
             if stored_key == EMPTY_KEY || stored_key == TOMBSTONE_KEY {
                 // Empty or tombstone slot - insert here
                 self.hash_values[idx].store(frame_id.0, Ordering::Release);
@@ -224,7 +255,10 @@ impl PageTable {
         let mut idx = self.hash_index(key);
 
         for _ in 0..self.hash_keys.len() {
-            let stored_key = self.hash_keys[idx].load(Ordering::Acquire);
+            // A reservation resolves to either this key or another one, and
+            // skipping it would report the entry absent while it is being
+            // published, leaving the mapping in place after a remove
+            let stored_key = self.await_slot_resolution(idx);
             if stored_key == EMPTY_KEY {
                 return None;
             }
@@ -392,5 +426,63 @@ mod tests {
         table.insert(page_id, FrameId(2));
         assert_eq!(table.get(page_id), Some(FrameId(2)));
         assert_eq!(table.len(), 1);
+    }
+
+    /// Concurrent inserts of one hash-path key produce exactly one winner.
+    ///
+    /// An inserter reserves its slot with an in-progress marker before
+    /// publishing the real key. A second inserter that probed past that
+    /// marker took the next free slot, so both got `Inserted` and the key
+    /// occupied two slots: one page id mapped to two buffer frames, which is
+    /// two copies of the page and a lost write when one of them is flushed.
+    ///
+    /// Only the hash path is affected. The direct path is a single
+    /// compare-exchange with no reservation window, and is included here so a
+    /// regression on either side is caught.
+    #[test]
+    fn test_concurrent_insert_if_absent_yields_one_winner() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+
+        // Enough rounds and threads that the reservation window is hit. The
+        // defect this guards reproduced in roughly one run in thirteen with a
+        // single round, so the rounds are what make the test decisive
+        for round in 0..400u64 {
+            for page_id in [PageId::new(0, 5), PageId::new(7, 100_000 + round)] {
+                let table = Arc::new(PageTable::new(64));
+                let barrier = Arc::new(std::sync::Barrier::new(8));
+                let inserted = Arc::new(AtomicUsize::new(0));
+                let mut handles = Vec::new();
+
+                for t in 0..8u32 {
+                    let table = Arc::clone(&table);
+                    let barrier = Arc::clone(&barrier);
+                    let inserted = Arc::clone(&inserted);
+                    handles.push(std::thread::spawn(move || {
+                        barrier.wait();
+                        match table.insert_if_absent(page_id, FrameId(t)) {
+                            InsertOutcome::Inserted => {
+                                inserted.fetch_add(1, O::Relaxed);
+                                FrameId(t)
+                            }
+                            InsertOutcome::Existing(winner) => winner,
+                            InsertOutcome::TableFull => panic!("table has room for one key"),
+                        }
+                    }));
+                }
+                let seen: Vec<FrameId> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+                assert_eq!(
+                    inserted.load(O::Relaxed),
+                    1,
+                    "exactly one inserter may win {page_id:?}"
+                );
+                assert_eq!(table.len(), 1, "one key occupies one slot");
+                let winner = table.get(page_id).expect("the winner is readable");
+                for got in seen {
+                    assert_eq!(got, winner, "every caller resolves to the winning frame");
+                }
+            }
+        }
     }
 }

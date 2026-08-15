@@ -71,7 +71,7 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
                 name: "".to_string(),
                 type_id: TypeId::Null,
                 nullable: true,
-                ts_precision: None,
+                fractional_digits: None,
             }],
         }
     } else {
@@ -283,7 +283,7 @@ fn build_from_item(item: &BoundFromItem) -> Result<LogicalPlan> {
                     name: c.name.clone(),
                     type_id: c.type_id,
                     nullable: c.nullable,
-                    ts_precision: c.ts_precision,
+                    fractional_digits: c.fractional_digits,
                 })
                 .collect();
             let as_of_target = match as_of {
@@ -435,7 +435,7 @@ fn relabel_derived(inner: LogicalPlan, table_idx: usize) -> LogicalPlan {
                         column_id: c.column_id,
                         type_id: c.type_id,
                         nullable: c.nullable,
-                        ts_precision: c.ts_precision,
+                        fractional_digits: c.fractional_digits,
                     })
                 })
                 .collect();
@@ -545,7 +545,7 @@ fn rewrite_post_aggregate(
             column_id: ColumnId(i as u16),
             type_id: g.type_id(),
             nullable: g.nullable(),
-            ts_precision: g.ts_precision(),
+            fractional_digits: g.fractional_digits(),
         });
         return;
     }
@@ -585,7 +585,7 @@ fn rewrite_post_aggregate(
                 nullable: true,
                 // Aggregate-result precision (e.g. MIN/MAX over TIMESTAMP(p))
                 // is finalized in B5; default precision until then.
-                ts_precision: None,
+                fractional_digits: None,
             });
         }
         BoundExpr::BinaryOp { left, right, .. } => {
@@ -718,7 +718,7 @@ fn rewrite_group_keys(expr: &mut BoundExpr, group_by: &[BoundExpr]) {
             column_id: ColumnId(i as u16),
             type_id: g.type_id(),
             nullable: g.nullable(),
-            ts_precision: g.ts_precision(),
+            fractional_digits: g.fractional_digits(),
         });
         return;
     }
@@ -1030,7 +1030,7 @@ fn build_insert_plan(insert: &BoundInsert) -> Result<LogicalPlan> {
                     name: c.name.clone(),
                     type_id: c.type_id,
                     nullable: c.nullable,
-                    ts_precision: c.ts_precision,
+                    fractional_digits: c.fractional_digits,
                 });
             }
             LogicalPlan::Values {
@@ -1066,7 +1066,7 @@ fn build_update_plan(update: &BoundUpdate) -> Result<LogicalPlan> {
             name: c.name.clone(),
             type_id: c.type_id,
             nullable: c.nullable,
-            ts_precision: c.ts_precision,
+            fractional_digits: c.fractional_digits,
         })
         .collect();
 
@@ -1108,7 +1108,7 @@ fn build_delete_plan(delete: &BoundDelete) -> Result<LogicalPlan> {
             name: c.name.clone(),
             type_id: c.type_id,
             nullable: c.nullable,
-            ts_precision: c.ts_precision,
+            fractional_digits: c.fractional_digits,
         })
         .collect();
 
@@ -1257,7 +1257,7 @@ mod tests {
             column_id: ColumnId(0),
             type_id: TypeId::Int64,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         })];
         let mut having = BoundExpr::BinaryOp {
             left: Box::new(count_star()),

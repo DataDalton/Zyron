@@ -47,9 +47,10 @@ impl LakeValue {
             (Float(a), Float(b)) => Some(a.total_cmp(b)),
             (Str(a), Str(b)) => Some(a.as_bytes().cmp(b.as_bytes())),
             (Bytes(a), Bytes(b)) => Some(a.cmp(b)),
-            (Int(_) | Int128(_) | UInt(_) | UInt128(_), Int(_) | Int128(_) | UInt(_) | UInt128(_)) => {
-                Some(compare_integers(self.as_num(), other.as_num()))
-            }
+            (
+                Int(_) | Int128(_) | UInt(_) | UInt128(_),
+                Int(_) | Int128(_) | UInt(_) | UInt128(_),
+            ) => Some(compare_integers(self.as_num(), other.as_num())),
             _ => None,
         }
     }
@@ -760,8 +761,12 @@ fn decode_node(r: &mut Cursor<'_>, depth: usize) -> Result<LakePredicate, ZyronE
                 value,
             }
         }
-        2 => LakePredicate::IsNull { column_id: r.u32()? },
-        3 => LakePredicate::IsNotNull { column_id: r.u32()? },
+        2 => LakePredicate::IsNull {
+            column_id: r.u32()?,
+        },
+        3 => LakePredicate::IsNotNull {
+            column_id: r.u32()?,
+        },
         4 => {
             let column_id = r.u32()?;
             let count = r.u32()? as usize;
@@ -826,25 +831,58 @@ mod tests {
         // in the comparison and key paths must order them below zero
         let stats = MapStats(HashMap::from([(0, int_bounds(-5000, -100, 0, 10))]));
 
-        assert_eq!(cmp(0, CompareOp::Gt, 0).prune(&stats), PruneDecision::CannotMatch);
-        assert_eq!(cmp(0, CompareOp::Lt, 0).prune(&stats), PruneDecision::FullyCovers);
-        assert_eq!(cmp(0, CompareOp::Lt, -200).prune(&stats), PruneDecision::MayMatch);
-        assert_eq!(cmp(0, CompareOp::GtEq, -5000).prune(&stats), PruneDecision::FullyCovers);
-        assert_eq!(cmp(0, CompareOp::Lt, -5000).prune(&stats), PruneDecision::CannotMatch);
-        assert_eq!(cmp(0, CompareOp::LtEq, -5000).prune(&stats), PruneDecision::MayMatch);
+        assert_eq!(
+            cmp(0, CompareOp::Gt, 0).prune(&stats),
+            PruneDecision::CannotMatch
+        );
+        assert_eq!(
+            cmp(0, CompareOp::Lt, 0).prune(&stats),
+            PruneDecision::FullyCovers
+        );
+        assert_eq!(
+            cmp(0, CompareOp::Lt, -200).prune(&stats),
+            PruneDecision::MayMatch
+        );
+        assert_eq!(
+            cmp(0, CompareOp::GtEq, -5000).prune(&stats),
+            PruneDecision::FullyCovers
+        );
+        assert_eq!(
+            cmp(0, CompareOp::Lt, -5000).prune(&stats),
+            PruneDecision::CannotMatch
+        );
+        assert_eq!(
+            cmp(0, CompareOp::LtEq, -5000).prune(&stats),
+            PruneDecision::MayMatch
+        );
     }
 
     #[test]
     fn test_equality_and_membership_pruning() {
         let stats = MapStats(HashMap::from([(0, int_bounds(10, 20, 0, 100))]));
 
-        assert_eq!(cmp(0, CompareOp::Eq, 5).prune(&stats), PruneDecision::CannotMatch);
-        assert_eq!(cmp(0, CompareOp::Eq, 15).prune(&stats), PruneDecision::MayMatch);
+        assert_eq!(
+            cmp(0, CompareOp::Eq, 5).prune(&stats),
+            PruneDecision::CannotMatch
+        );
+        assert_eq!(
+            cmp(0, CompareOp::Eq, 15).prune(&stats),
+            PruneDecision::MayMatch
+        );
 
         let single = MapStats(HashMap::from([(0, int_bounds(7, 7, 0, 3))]));
-        assert_eq!(cmp(0, CompareOp::Eq, 7).prune(&single), PruneDecision::FullyCovers);
-        assert_eq!(cmp(0, CompareOp::NotEq, 7).prune(&single), PruneDecision::CannotMatch);
-        assert_eq!(cmp(0, CompareOp::NotEq, 9).prune(&single), PruneDecision::FullyCovers);
+        assert_eq!(
+            cmp(0, CompareOp::Eq, 7).prune(&single),
+            PruneDecision::FullyCovers
+        );
+        assert_eq!(
+            cmp(0, CompareOp::NotEq, 7).prune(&single),
+            PruneDecision::CannotMatch
+        );
+        assert_eq!(
+            cmp(0, CompareOp::NotEq, 9).prune(&single),
+            PruneDecision::FullyCovers
+        );
 
         let none_in = LakePredicate::In {
             column_id: 0,
@@ -867,8 +905,14 @@ mod tests {
     fn test_nulls_block_full_coverage_but_not_exclusion() {
         // 3 of 10 rows null. Exclusion still holds, coverage cannot
         let stats = MapStats(HashMap::from([(0, int_bounds(10, 20, 3, 10))]));
-        assert_eq!(cmp(0, CompareOp::Lt, 5).prune(&stats), PruneDecision::CannotMatch);
-        assert_eq!(cmp(0, CompareOp::Lt, 100).prune(&stats), PruneDecision::MayMatch);
+        assert_eq!(
+            cmp(0, CompareOp::Lt, 5).prune(&stats),
+            PruneDecision::CannotMatch
+        );
+        assert_eq!(
+            cmp(0, CompareOp::Lt, 100).prune(&stats),
+            PruneDecision::MayMatch
+        );
 
         let all_null = MapStats(HashMap::from([(
             0,
@@ -879,7 +923,10 @@ mod tests {
                 row_count: 10,
             },
         )]));
-        assert_eq!(cmp(0, CompareOp::Eq, 1).prune(&all_null), PruneDecision::CannotMatch);
+        assert_eq!(
+            cmp(0, CompareOp::Eq, 1).prune(&all_null),
+            PruneDecision::CannotMatch
+        );
         assert_eq!(
             LakePredicate::IsNull { column_id: 0 }.prune(&all_null),
             PruneDecision::FullyCovers
@@ -891,7 +938,10 @@ mod tests {
 
         // Missing statistics never decide anything
         let empty = MapStats(HashMap::new());
-        assert_eq!(cmp(9, CompareOp::Eq, 1).prune(&empty), PruneDecision::MayMatch);
+        assert_eq!(
+            cmp(9, CompareOp::Eq, 1).prune(&empty),
+            PruneDecision::MayMatch
+        );
         assert_eq!(
             LakePredicate::IsNull { column_id: 9 }.prune(&empty),
             PruneDecision::MayMatch
@@ -905,16 +955,11 @@ mod tests {
             (1, int_bounds(-50, -30, 0, 100)),
         ]));
 
-        let and = LakePredicate::And(vec![
-            cmp(0, CompareOp::GtEq, 10),
-            cmp(1, CompareOp::Lt, 0),
-        ]);
+        let and = LakePredicate::And(vec![cmp(0, CompareOp::GtEq, 10), cmp(1, CompareOp::Lt, 0)]);
         assert_eq!(and.prune(&stats), PruneDecision::FullyCovers);
 
-        let and_dead = LakePredicate::And(vec![
-            cmp(0, CompareOp::GtEq, 10),
-            cmp(1, CompareOp::Gt, 0),
-        ]);
+        let and_dead =
+            LakePredicate::And(vec![cmp(0, CompareOp::GtEq, 10), cmp(1, CompareOp::Gt, 0)]);
         assert_eq!(and_dead.prune(&stats), PruneDecision::CannotMatch);
 
         let or = LakePredicate::Or(vec![cmp(0, CompareOp::Lt, 0), cmp(1, CompareOp::Lt, 0)]);
@@ -995,7 +1040,12 @@ mod tests {
         for w in strs.windows(2) {
             let a = LakeValue::Str(w[0].into()).stats_key().expect("key");
             let b = LakeValue::Str(w[1].into()).stats_key().expect("key");
-            assert!(a <= b, "string keys must order {:?} before {:?}", w[0], w[1]);
+            assert!(
+                a <= b,
+                "string keys must order {:?} before {:?}",
+                w[0],
+                w[1]
+            );
         }
         let big = [0u128, 1 << 64, u128::MAX];
         for w in big.windows(2) {

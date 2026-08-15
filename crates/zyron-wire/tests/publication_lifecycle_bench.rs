@@ -24,14 +24,11 @@ async fn build_catalog(tmp: &tempfile::TempDir) -> Arc<Catalog> {
     let wal_dir = tmp.path().join("wal");
     std::fs::create_dir_all(&data_dir).unwrap();
     std::fs::create_dir_all(&wal_dir).unwrap();
-    let wal = Arc::new(
-        WalWriter::new(zyron_bench_harness::wal_config(wal_dir))
-        .unwrap(),
-    );
+    let wal = Arc::new(WalWriter::new(zyron_bench_harness::wal_config(wal_dir)).unwrap());
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(data_dir))
-        .await
-        .unwrap(),
+            .await
+            .unwrap(),
     );
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let storage = Arc::new(HeapCatalogStorage::new(disk, pool).unwrap());
@@ -44,8 +41,8 @@ async fn build_security_manager(tmp: &tempfile::TempDir) -> SecurityManager {
     std::fs::create_dir_all(&data_dir).unwrap();
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(data_dir))
-        .await
-        .unwrap(),
+            .await
+            .unwrap(),
     );
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
     let storage = Arc::new(HeapAuthStorage::new(disk, pool).unwrap());

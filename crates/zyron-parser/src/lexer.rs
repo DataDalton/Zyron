@@ -338,14 +338,20 @@ impl<'a> Lexer<'a> {
         }
 
         let text = &self.input[start..self.pos];
-        let value: i64 = text.parse().map_err(|_| {
+        let span = Span::new(start, self.pos - start);
+        // A literal wider than i64 is still a whole number an INT128 or a
+        // DECIMAL column holds, so it takes the wider token rather than
+        // being refused for not fitting a type it was never destined for
+        if let Ok(value) = text.parse::<i64>() {
+            return Ok(SpannedToken::new(Token::Integer(value), span));
+        }
+        let value: u128 = text.parse().map_err(|_| {
             ZyronError::ParseError(format!(
-                "Integer literal '{}' overflows i64 at line {}, column {}",
+                "Integer literal '{}' is too large for any integer type at line {}, column {}",
                 text, self.line, start_col
             ))
         })?;
-        let span = Span::new(start, self.pos - start);
-        Ok(SpannedToken::new(Token::Integer(value), span))
+        Ok(SpannedToken::new(Token::BigInteger(value), span))
     }
 
     fn scan_string(&mut self) -> Result<SpannedToken> {

@@ -755,7 +755,7 @@ mod tests {
                 name: "a".into(),
                 type_id: zyron_common::TypeId::Int32,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
             },
             LogicalColumn {
                 table_idx: None,
@@ -763,7 +763,7 @@ mod tests {
                 name: "b".into(),
                 type_id: zyron_common::TypeId::Text,
                 nullable: true,
-                ts_precision: None,
+                fractional_digits: None,
             },
         ];
 
@@ -787,7 +787,7 @@ mod tests {
                 name: "a".into(),
                 type_id: zyron_common::TypeId::Int32,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
             },
             LogicalColumn {
                 table_idx: None,
@@ -795,7 +795,7 @@ mod tests {
                 name: "b".into(),
                 type_id: zyron_common::TypeId::Text,
                 nullable: false,
-                ts_precision: None,
+                fractional_digits: None,
             },
         ];
 
@@ -816,7 +816,7 @@ mod tests {
             name: "a".into(),
             type_id: zyron_common::TypeId::Int32,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         }];
 
         let mut handler = CopyInHandler::new(columns, CopyFormat::Text);
@@ -832,7 +832,7 @@ mod tests {
             name: "a".into(),
             type_id: zyron_common::TypeId::Int32,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         }];
 
         let mut handler = CopyInHandler::new(columns, CopyFormat::Text);

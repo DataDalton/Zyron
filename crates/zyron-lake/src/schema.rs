@@ -23,7 +23,7 @@ pub struct LakeColumn {
     pub nullable: bool,
     /// TIMESTAMP(p) fractional-second precision 0..=12. None means the
     /// default 6. p>6 stores i128 picoseconds
-    pub ts_precision: Option<u8>,
+    pub fractional_digits: Option<u8>,
     /// Original timezone offset in seconds for a single-zone TIMESTAMPTZ
     /// column, reattached on display. None means unknown, display UTC
     pub tz_offset_secs: Option<i32>,
@@ -38,7 +38,7 @@ impl LakeColumn {
     /// Physical storage TypeId. TIMESTAMP(p)/TIMESTAMPTZ(p) with p>6
     /// stores i128 picoseconds, everything else is its logical type
     pub fn physical_type_id(&self) -> TypeId {
-        TypeId::timestamp_physical_type_id(self.type_id, self.ts_precision)
+        TypeId::timestamp_physical_type_id(self.type_id, self.fractional_digits)
     }
 }
 
@@ -58,7 +58,8 @@ const META_TS_PRECISION: u8 = 1 << 0;
 const META_TZ_OFFSET: u8 = 1 << 1;
 const META_MAX_LENGTH: u8 = 1 << 2;
 const META_DEFAULT_EXPR: u8 = 1 << 3;
-const META_KNOWN_MASK: u8 = META_TS_PRECISION | META_TZ_OFFSET | META_MAX_LENGTH | META_DEFAULT_EXPR;
+const META_KNOWN_MASK: u8 =
+    META_TS_PRECISION | META_TZ_OFFSET | META_MAX_LENGTH | META_DEFAULT_EXPR;
 
 impl LakeSchema {
     /// Builds a validated schema. `next_column_id` is derived as one past
@@ -109,7 +110,7 @@ impl LakeSchema {
                     )));
                 }
             }
-            if let Some(p) = col.ts_precision {
+            if let Some(p) = col.fractional_digits {
                 if p > 12 {
                     return Err(ZyronError::Internal(format!(
                         "lake schema column \"{}\" timestamp precision {} exceeds 12",
@@ -172,7 +173,7 @@ impl LakeSchema {
 
             let mut flags = 0u8;
             let mut meta_len = 1usize;
-            if col.ts_precision.is_some() {
+            if col.fractional_digits.is_some() {
                 flags |= META_TS_PRECISION;
                 meta_len += 1;
             }
@@ -190,7 +191,7 @@ impl LakeSchema {
             }
             buf.extend_from_slice(&(meta_len as u32).to_le_bytes());
             buf.push(flags);
-            if let Some(p) = col.ts_precision {
+            if let Some(p) = col.fractional_digits {
                 buf.push(p);
             }
             if let Some(secs) = col.tz_offset_secs {
@@ -217,7 +218,10 @@ impl LakeSchema {
         // Each column record is at least 13 bytes, bounds the count against
         // the buffer so a corrupt count cannot drive a huge preallocation
         if count > bytes.len() / 13 {
-            return Err(r.corrupt(format!("schema column count {} exceeds section size", count)));
+            return Err(r.corrupt(format!(
+                "schema column count {} exceeds section size",
+                count
+            )));
         }
         let mut columns = Vec::with_capacity(count);
         for _ in 0..count {
@@ -261,7 +265,7 @@ impl LakeSchema {
                     name, flags
                 )));
             }
-            let ts_precision = if flags & META_TS_PRECISION != 0 {
+            let fractional_digits = if flags & META_TS_PRECISION != 0 {
                 Some(r.u8()?)
             } else {
                 None
@@ -293,7 +297,7 @@ impl LakeSchema {
                 name,
                 type_id,
                 nullable,
-                ts_precision,
+                fractional_digits,
                 tz_offset_secs,
                 max_length,
                 default_expr,
@@ -304,10 +308,12 @@ impl LakeSchema {
             next_column_id,
             columns,
         };
-        schema.validate().map_err(|e| ZyronError::ManifestCorrupted {
-            path: ctx.to_string(),
-            reason: e.to_string(),
-        })?;
+        schema
+            .validate()
+            .map_err(|e| ZyronError::ManifestCorrupted {
+                path: ctx.to_string(),
+                reason: e.to_string(),
+            })?;
         Ok((schema, r.pos()))
     }
 }
@@ -322,7 +328,7 @@ mod tests {
             name: name.to_string(),
             type_id,
             nullable: true,
-            ts_precision: None,
+            fractional_digits: None,
             tz_offset_secs: None,
             max_length: None,
             default_expr: None,
@@ -338,7 +344,7 @@ mod tests {
                     name: "id".into(),
                     type_id: TypeId::Int64,
                     nullable: false,
-                    ts_precision: None,
+                    fractional_digits: None,
                     tz_offset_secs: None,
                     max_length: None,
                     default_expr: None,
@@ -348,7 +354,7 @@ mod tests {
                     name: "name".into(),
                     type_id: TypeId::Varchar,
                     nullable: true,
-                    ts_precision: None,
+                    fractional_digits: None,
                     tz_offset_secs: None,
                     max_length: Some(255),
                     default_expr: Some("'anonymous'".into()),
@@ -358,7 +364,7 @@ mod tests {
                     name: "created".into(),
                     type_id: TypeId::TimestampTz,
                     nullable: false,
-                    ts_precision: Some(9),
+                    fractional_digits: Some(9),
                     tz_offset_secs: Some(-18000),
                     max_length: None,
                     default_expr: None,
@@ -417,7 +423,10 @@ mod tests {
     #[test]
     fn test_lookups_by_id_name_and_ordinal() {
         let schema = sample();
-        assert_eq!(schema.column_by_id(2).map(|c| c.name.as_str()), Some("created"));
+        assert_eq!(
+            schema.column_by_id(2).map(|c| c.name.as_str()),
+            Some("created")
+        );
         assert_eq!(schema.column_by_name("name").map(|c| c.id), Some(1));
         assert_eq!(schema.ordinal_of_id(1), Some(1));
         assert_eq!(schema.column_by_id(99), None);

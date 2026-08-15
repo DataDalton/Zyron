@@ -5,7 +5,9 @@
 // Optional ridge regularization (lambda)
 
 use crate::ml::f64Kernels::{addInPlace, axpy, dot, scaleInPlace};
-use crate::ml::{Hyperparameters, ModelConfig, ModelData, ModelMetrics, ModelType, TrainedModel, TrainingData};
+use crate::ml::{
+    Hyperparameters, ModelConfig, ModelData, ModelMetrics, ModelType, TrainedModel, TrainingData,
+};
 use crate::numeric::{KahanSum, choleskySolve, columnStandardize};
 use zyron_common::Xoshiro256pp;
 use zyron_common::error::{Result, ZyronError};
@@ -119,13 +121,7 @@ fn trainClosedForm(xs: &[f64], ys: &[f64], n: usize, p: usize, lambda: f64) -> R
     Ok(b)
 }
 
-fn trainSgd(
-    xs: &[f64],
-    ys: &[f64],
-    n: usize,
-    p: usize,
-    hp: &Hyperparameters,
-) -> Result<Vec<f64>> {
+fn trainSgd(xs: &[f64], ys: &[f64], n: usize, p: usize, hp: &Hyperparameters) -> Result<Vec<f64>> {
     let lr = hp.getF64Or("learning_rate", 0.01);
     let lambda = hp.getF64Or("lambda", 0.0);
     let epochs = hp.getUsizeOr("max_epochs", 200);
@@ -190,8 +186,8 @@ pub fn predict(model: &TrainedModel, features: &[f64]) -> f64 {
     // Fast path for freshly-trained models with baked-in transform:
     // mean is all zeros, std is all ones, so prediction is one dot
     // product plus a bias. Detect via featureStd values
-    let prebaked = model.featureStd.iter().all(|s| *s == 1.0)
-        && model.featureMean.iter().all(|m| *m == 0.0);
+    let prebaked =
+        model.featureStd.iter().all(|s| *s == 1.0) && model.featureMean.iter().all(|m| *m == 0.0);
     if prebaked {
         return crate::ml::f64Kernels::dot(features, &model.weights[..p]) + model.weights[p];
     }
@@ -211,17 +207,10 @@ pub fn predictBatch(model: &TrainedModel, xs: &[f64], n: usize, out: &mut [f64])
     let p = model.featureColumns.len();
     debug_assert_eq!(xs.len(), n * p);
     debug_assert_eq!(out.len(), n);
-    let prebaked = model.featureStd.iter().all(|s| *s == 1.0)
-        && model.featureMean.iter().all(|m| *m == 0.0);
+    let prebaked =
+        model.featureStd.iter().all(|s| *s == 1.0) && model.featureMean.iter().all(|m| *m == 0.0);
     if prebaked {
-        crate::ml::f64Kernels::rowMajorMatvec(
-            xs,
-            &model.weights[..p],
-            model.weights[p],
-            n,
-            p,
-            out,
-        );
+        crate::ml::f64Kernels::rowMajorMatvec(xs, &model.weights[..p], model.weights[p], n, p, out);
         return;
     }
     for i in 0..n {
@@ -271,7 +260,13 @@ fn computeRegressionMetrics(model: &TrainedModel, xs: &[f64], ys: &[f64]) -> Mod
 mod tests {
     use super::*;
 
-    fn buildLinearData(n: usize, slope: f64, intercept: f64, noise: f64, seed: u64) -> (Vec<f64>, Vec<f64>) {
+    fn buildLinearData(
+        n: usize,
+        slope: f64,
+        intercept: f64,
+        noise: f64,
+        seed: u64,
+    ) -> (Vec<f64>, Vec<f64>) {
         let mut rng = Xoshiro256pp::fromSeed(seed);
         let mut xs = Vec::with_capacity(n);
         let mut ys = Vec::with_capacity(n);

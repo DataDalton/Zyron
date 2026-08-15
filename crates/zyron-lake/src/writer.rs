@@ -17,12 +17,12 @@ use zyron_storage::columnar::{
     BloomPolicy, ColumnSegment, SegmentOptions, SortOrder, ZyrFileHeader, ZyrFileWriter,
 };
 
-use crate::cells::{cell_family, cell_to_value, compare_cells, CellFamily};
-use crate::hll::DistinctSketch;
+use crate::cells::{CellFamily, cell_family, cell_to_value, compare_cells};
 use crate::curve::{normalize_component, ordering_key};
+use crate::hll::DistinctSketch;
 use crate::manifest::ClusterStrategy;
 use crate::manifest::{ColumnStatsEntry, PartitionEntry};
-use crate::paths::{data_file_name, index_file_name, LakePaths};
+use crate::paths::{LakePaths, data_file_name, index_file_name};
 use crate::predicate::ColumnBounds;
 use crate::schema::LakeSchema;
 
@@ -219,9 +219,7 @@ pub fn write_data_file_at(
             .columns
             .iter()
             .find(|c| c.column_id == col.id)
-            .ok_or_else(|| {
-                ZyronError::Internal(format!("column \"{}\" has no data", col.name))
-            })?;
+            .ok_or_else(|| ZyronError::Internal(format!("column \"{}\" has no data", col.name)))?;
         let physical = col.physical_type_id();
         let value_size = physical.fixed_size().unwrap_or(0);
 
@@ -378,7 +376,7 @@ mod tests {
             name: name.into(),
             type_id,
             nullable: true,
-            ts_precision: None,
+            fractional_digits: None,
             tz_offset_secs: None,
             max_length: None,
             default_expr: None,
@@ -389,7 +387,7 @@ mod tests {
         values.iter().map(|v| Some(v.to_vec())).collect()
     }
 
-#[test]
+    #[test]
     fn test_a_declared_curve_changes_the_file_layout() {
         use crate::curve::{normalize_component, ordering_key};
         use crate::manifest::ClusterStrategy;
@@ -399,10 +397,7 @@ mod tests {
         let paths = LakePaths::new(dir.path(), 61);
         let schema = LakeSchema::new(
             1,
-            vec![
-                column(0, "x", TypeId::Int64),
-                column(1, "y", TypeId::Int64),
-            ],
+            vec![column(0, "x", TypeId::Int64), column(1, "y", TypeId::Int64)],
         )
         .expect("schema");
 

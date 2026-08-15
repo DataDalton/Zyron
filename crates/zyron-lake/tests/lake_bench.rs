@@ -35,10 +35,10 @@ use zyron_common::TypeId;
 use zyron_lake::manifest::{ClusterSpec, ColumnStatsEntry, PartitionEntry};
 use zyron_lake::predicate::ColumnBounds;
 use zyron_lake::{
-    ClusterKey, ClusterPassOptions, ClusterStrategy, ColumnData, CommitAttempt,
-    CompareOp, Decision, GateConfig, LakeColumn, LakePaths, LakePredicate, LakeSchema, LakeValue,
-    LogEntry, ManifestFile, OperationKind, PredicateClass, PruneDecision, PruneIndex,
-    TransactionLog, WriteRequest, skip_rate, with_sweep,
+    ClusterKey, ClusterPassOptions, ClusterStrategy, ColumnData, CommitAttempt, CompareOp,
+    Decision, GateConfig, LakeColumn, LakePaths, LakePredicate, LakeSchema, LakeValue, LogEntry,
+    ManifestFile, OperationKind, PredicateClass, PruneDecision, PruneIndex, TransactionLog,
+    WriteRequest, skip_rate, with_sweep,
 };
 
 /// Repetitions of a timed measurement, matching every other suite here.
@@ -96,7 +96,7 @@ fn schema(types: &[(&str, TypeId)]) -> LakeSchema {
                 name: (*name).into(),
                 type_id: *type_id,
                 nullable: true,
-                ts_precision: None,
+                fractional_digits: None,
                 tz_offset_secs: None,
                 max_length: None,
                 default_expr: None,
@@ -310,14 +310,23 @@ fn test_prune_index_sweep_agrees_with_the_exact_answer_and_reports_its_cost() {
         // anything is measured, and so the comparison runs on a warm cache
         // exactly as the timed ones do
         with_sweep(&index, predicate, |mask, complete| {
-            assert_eq!(mask.len(), total, "{}: sweep covered the whole file set", label);
+            assert_eq!(
+                mask.len(),
+                total,
+                "{}: sweep covered the whole file set",
+                label
+            );
             // The sweep is sound but not complete: a one is a proof the
             // file can be skipped, a zero is the absence of proof. Where
             // it reports itself short of exact, the manifest decides, so
             // the sweep may only ever be a subset of the exact answer
             for (i, (got, want)) in mask.iter().zip(expected.iter()).enumerate() {
                 if complete {
-                    assert_eq!(got, want, "{}: file {} disagreed with the exact answer", label, i);
+                    assert_eq!(
+                        got, want,
+                        "{}: file {} disagreed with the exact answer",
+                        label, i
+                    );
                 } else {
                     assert!(
                         *got == 0 || *want == 1,
@@ -430,8 +439,7 @@ fn test_zone_maps_reject_rows_the_file_bounds_admit() {
     // A value a zone does hold must survive, or the rejection above proves
     // nothing: a filter that rejects everything is not a filter
     let present = cmp(0, CompareOp::Eq, 10_005);
-    let present_filter =
-        zyron_lake::StoredFilter::lower(&present, &schema).expect("lowers");
+    let present_filter = zyron_lake::StoredFilter::lower(&present, &schema).expect("lowers");
     let present_mask = reader
         .rows_matching(&present_filter)
         .expect("evaluate")
@@ -536,7 +544,11 @@ const CONSTRAINT_FILES: usize = 8;
 /// Clustered writes each file ascending by the key, which is the layout a
 /// declared primary key bootstraps to. Unclustered writes arrival order,
 /// which is what a table with no declared ordering gets
-fn key_table(dir: &std::path::Path, table_id: u32, clustered: bool) -> (TransactionLog, LakeSchema) {
+fn key_table(
+    dir: &std::path::Path,
+    table_id: u32,
+    clustered: bool,
+) -> (TransactionLog, LakeSchema) {
     let paths = LakePaths::new(dir, table_id);
     let schema = schema(&[("id", TypeId::Int64), ("payload", TypeId::Int64)]);
     let spec = clustered.then(|| ClusterSpec {
@@ -597,7 +609,10 @@ fn id_batch(ids: &[i64]) -> Vec<ColumnData> {
         },
         ColumnData {
             column_id: 1,
-            cells: ids.iter().map(|_| Some(0i64.to_le_bytes().to_vec())).collect(),
+            cells: ids
+                .iter()
+                .map(|_| Some(0i64.to_le_bytes().to_vec()))
+                .collect(),
         },
     ]
 }
@@ -717,8 +732,7 @@ fn test_secondary_index_probe_against_the_scan_it_replaces() {
     let needle = (CONSTRAINT_ROWS_PER_FILE as i64) / 2;
     let cell = needle.to_le_bytes();
     let (addresses, stats) =
-        zyron_lake::probe_equal(log.paths(), &manifest, spec, &[Some(&cell[..])])
-            .expect("probe");
+        zyron_lake::probe_equal(log.paths(), &manifest, spec, &[Some(&cell[..])]).expect("probe");
     assert!(!addresses.is_empty(), "the probed value is stored");
     tprintln!(
         "  Probe: index files opened {} of {}, entries examined {}, rows addressed {}",
@@ -749,7 +763,12 @@ fn test_secondary_index_probe_against_the_scan_it_replaces() {
         });
         probe_runs.push(us);
     }
-    record_metric("lake_index", "Point probe through the index", "us", probe_runs);
+    record_metric(
+        "lake_index",
+        "Point probe through the index",
+        "us",
+        probe_runs,
+    );
 
     // The same answer without the index: every file the bounds admit is
     // opened and its column read
@@ -759,8 +778,8 @@ fn test_secondary_index_probe_against_the_scan_it_replaces() {
         let (found, us) = micros(|| {
             let mut hits = 0usize;
             for entry in &manifest.entries {
-                let reader =
-                    zyron_lake::LakeFileReader::open(log.paths(), entry.partition_id).expect("open");
+                let reader = zyron_lake::LakeFileReader::open(log.paths(), entry.partition_id)
+                    .expect("open");
                 let column = reader.read_column(payload_column).expect("decode");
                 for row in 0..reader.row_count() {
                     if column.cell_equals(row, &cell) {
@@ -809,7 +828,12 @@ fn test_secondary_index_probe_against_the_scan_it_replaces() {
         });
         range_runs.push(us);
     }
-    record_metric("lake_index", "Range probe through the index", "us", range_runs);
+    record_metric(
+        "lake_index",
+        "Range probe through the index",
+        "us",
+        range_runs,
+    );
 }
 
 // =============================================================================
@@ -859,9 +883,7 @@ fn test_concurrent_commits_serialize_and_report_their_retries() {
                                 delete_predicate_ids: Vec::new(),
                             })])
                         })
-                        .unwrap_or_else(|e| {
-                            panic!("writer {} commit {} failed: {e}", writer, n)
-                        });
+                        .unwrap_or_else(|e| panic!("writer {} commit {} failed: {e}", writer, n));
                     }
                 });
             }
@@ -903,7 +925,11 @@ fn test_concurrent_commits_serialize_and_report_their_retries() {
     );
     tprintln!("  Writers: {}", WRITERS);
     tprintln!("  Commits: {}", commits);
-    tprintln!("  Retries: {} ({:.4} per commit)", retries, retries as f64 / commits as f64);
+    tprintln!(
+        "  Retries: {} ({:.4} per commit)",
+        retries,
+        retries as f64 / commits as f64
+    );
     record_metric(
         "lake_log",
         "Commit rate",
@@ -1012,7 +1038,12 @@ fn test_log_head_and_manifest_resolution_cost() {
         assert_eq!(files, APPENDS * PRUNE_READS);
         prune_runs.push(us * 1_000.0 / PRUNE_READS as f64);
     }
-    record_metric("lake_log", "Prune index at version (cached)", "ns", prune_runs);
+    record_metric(
+        "lake_log",
+        "Prune index at version (cached)",
+        "ns",
+        prune_runs,
+    );
 }
 
 // =============================================================================
@@ -1121,7 +1152,10 @@ fn test_a_clustering_pass_raises_the_measured_skip_rate() {
         "a layout that turns a zero skip rate into a positive one must be accepted, got {:?}",
         outcome.decision
     );
-    assert!(outcome.version.is_some(), "an accepted pass commits a version");
+    assert!(
+        outcome.version.is_some(),
+        "an accepted pass commits a version"
+    );
     assert_eq!(outcome.inputs, FILES);
     assert!(outcome.outputs > 0);
 

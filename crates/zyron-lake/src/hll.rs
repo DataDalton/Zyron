@@ -123,7 +123,10 @@ mod tests {
         for count in [100u64, 200, 250] {
             let estimate = sketch_of(count).estimate();
             let error = (estimate as f64 - count as f64).abs() / count as f64;
-            assert!(error < 0.05, "estimate {estimate} for {count} is off by {error}");
+            assert!(
+                error < 0.05,
+                "estimate {estimate} for {count} is off by {error}"
+            );
             assert!(
                 estimate <= 256,
                 "{count} distinct values must not read as more than low cardinality"

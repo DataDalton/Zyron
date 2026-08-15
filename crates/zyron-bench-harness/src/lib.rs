@@ -12,8 +12,7 @@ pub use std::time::Instant;
 
 pub mod production;
 pub use production::{
-    buffer_pool_config, compaction_config, create_dirs, data_and_wal_dirs, disk_config,
-    wal_config,
+    buffer_pool_config, compaction_config, create_dirs, data_and_wal_dirs, disk_config, wal_config,
 };
 
 // =============================================================================
@@ -369,7 +368,16 @@ fn validate_metric_inner(
         // Recorded like any other run. Every run writes, and the run file's
         // profile field is what tells a reader this one was not measured.
         // The target is carried but no verdict is, because none was reached
-        write_benchmark_record(test, name, format, average, runs, Some(target), None, higher_is_better);
+        write_benchmark_record(
+            test,
+            name,
+            format,
+            average,
+            runs,
+            Some(target),
+            None,
+            higher_is_better,
+        );
         return ValidationResult {
             passed: true,
             regression_detected: false,
@@ -472,7 +480,22 @@ fn check_performance_inner(
             if higher_is_better { ">=" } else { "<=" },
             format_with_commas(target)
         );
-        let _ = test;
+        // Recorded like any other run, matching validate_metric. Returning
+        // without recording left a suite that reaches the harness only
+        // through this function with no metrics at all, so nothing ever
+        // triggered the run file and it produced a .txt with no .json beside
+        // it. The target is carried but no verdict is, because none was
+        // reached
+        write_benchmark_record(
+            test,
+            metric_name,
+            format,
+            value,
+            vec![value],
+            Some(target),
+            None,
+            higher_is_better,
+        );
         return true;
     }
     let passed = if higher_is_better {
@@ -551,8 +574,7 @@ pub fn record_metric_for(
     if runs.len() > 1 {
         let min = runs.iter().cloned().fold(f64::INFINITY, f64::min);
         let max = runs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let variance =
-            runs.iter().map(|r| (r - average).powi(2)).sum::<f64>() / runs.len() as f64;
+        let variance = runs.iter().map(|r| (r - average).powi(2)).sum::<f64>() / runs.len() as f64;
         tprintln!(
             "    Min/Max: {} / {}, StdDev: {}",
             u(min),
@@ -593,8 +615,7 @@ pub fn record_metric(test: &str, name: &str, unit: &str, runs: Vec<f64>) -> f64 
     if runs.len() > 1 {
         let min = runs.iter().cloned().fold(f64::INFINITY, f64::min);
         let max = runs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let variance =
-            runs.iter().map(|r| (r - average).powi(2)).sum::<f64>() / runs.len() as f64;
+        let variance = runs.iter().map(|r| (r - average).powi(2)).sum::<f64>() / runs.len() as f64;
         tprintln!(
             "    Min/Max: {} / {}, StdDev: {}",
             u(min),
@@ -612,12 +633,7 @@ pub fn record_metric(test: &str, name: &str, unit: &str, runs: Vec<f64>) -> f64 
 /// retry count. Optimization does not change any of them, so the bound
 /// applies in every build profile and the assertion is worth running on
 /// every test pass rather than only on a baselined one
-pub fn assert_exact_metric(
-    test: &str,
-    name: &str,
-    value: f64,
-    bound: RatioBound,
-) -> bool {
+pub fn assert_exact_metric(test: &str, name: &str, value: f64, bound: RatioBound) -> bool {
     let admits = bound.admits(value);
     tprintln!(
         "  {} [{}]: {} (bound {} {})",
@@ -683,7 +699,14 @@ pub fn assert_exact_ratio(
     denominator: (Format, f64),
     bound: RatioBound,
 ) -> bool {
-    assert_ratio_with(test, metric, numerator, denominator, bound, Exactness::Exact)
+    assert_ratio_with(
+        test,
+        metric,
+        numerator,
+        denominator,
+        bound,
+        Exactness::Exact,
+    )
 }
 
 fn assert_ratio_with(
@@ -1452,7 +1475,11 @@ fn raw_log_file() -> &'static Mutex<std::fs::File> {
         let hw = platform_hw();
         let _ = writeln!(f, "# suite:   {}", name);
         let _ = writeln!(f, "# run:     {}", run_id());
-        let _ = writeln!(f, "# profile: {}", if measuring() { "release" } else { "debug" });
+        let _ = writeln!(
+            f,
+            "# profile: {}",
+            if measuring() { "release" } else { "debug" }
+        );
         let _ = writeln!(f, "# cpu:     {}", hw.cpu);
         let _ = writeln!(f, "# cores:   {}", logical_cores());
         if !measuring() {
@@ -1635,10 +1662,7 @@ mod tests {
             1,
             "one metric name, not one per format"
         );
-        assert!(
-            duplicate_keys(&json).is_empty(),
-            "duplicate keys in {json}"
-        );
+        assert!(duplicate_keys(&json).is_empty(), "duplicate keys in {json}");
     }
 
     #[test]
@@ -1647,7 +1671,10 @@ mod tests {
         let json = build_run_json(&metrics, &[], &[]);
         assert!(json.contains("\"rows per second\": {"), "{json}");
         assert!(json.contains("\"average\": 120000.000000"), "{json}");
-        assert!(!json.contains("\"heap\""), "no format dimension was asked for");
+        assert!(
+            !json.contains("\"heap\""),
+            "no format dimension was asked for"
+        );
         assert!(!json.contains("\"ratio\""), "{json}");
         assert!(duplicate_keys(&json).is_empty(), "duplicate keys in {json}");
     }

@@ -4,8 +4,8 @@
 //! to a tokio broadcast sender. Connections subscribe by calling listen()
 //! and receive notifications asynchronously.
 
-use std::collections::HashMap;
 use parking_lot::Mutex;
+use std::collections::HashMap;
 
 use tokio::sync::broadcast;
 

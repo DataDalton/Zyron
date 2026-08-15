@@ -212,6 +212,10 @@ pub async fn reconcile_columnar(
                 // reading it back out of the file would be guesswork, so it
                 // registers as unclustered and the next pass picks it up
                 cluster_spec_id: 0,
+                // Recovery reads the file where it found it, and the fold
+                // writes into the columnar root, so a re-registered segment
+                // is hot
+                storage_tier: 0,
             });
             entry.columnar.next_rowid = entry.columnar.next_rowid.max(e.next_rowid);
             entry.columnar.next_file_id = entry.columnar.next_file_id.max(e.file_id + 1);

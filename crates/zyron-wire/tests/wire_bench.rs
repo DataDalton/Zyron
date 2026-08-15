@@ -78,13 +78,13 @@ async fn create_test_server(db_name: &str) -> (Arc<ServerState>, tempfile::TempD
 
     let wal = Arc::new(
         WalWriter::new(zyron_bench_harness::wal_config(wal_dir))
-        .expect("WalWriter creation failed"),
+            .expect("WalWriter creation failed"),
     );
 
     let disk = Arc::new(
         DiskManager::new(zyron_bench_harness::disk_config(data_dir))
-        .await
-        .expect("DiskManager creation failed"),
+            .await
+            .expect("DiskManager creation failed"),
     );
 
     let pool = Arc::new(BufferPool::new(zyron_bench_harness::buffer_pool_config()));
@@ -518,7 +518,7 @@ fn make_column(type_id: TypeId, values: Vec<ScalarValue>) -> Column {
         data,
         nulls,
         type_id,
-        ts_precision: None,
+        fractional_digits: None,
     }
 }
 
@@ -531,7 +531,7 @@ fn make_test_columns() -> Vec<LogicalColumn> {
             name: "id".to_string(),
             type_id: TypeId::Int32,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         },
         LogicalColumn {
             table_idx: None,
@@ -539,7 +539,7 @@ fn make_test_columns() -> Vec<LogicalColumn> {
             name: "name".to_string(),
             type_id: TypeId::Text,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         },
     ]
 }
@@ -1045,7 +1045,7 @@ fn test_wire_copy_protocol() {
             name: "id".into(),
             type_id: TypeId::Int32,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         },
         LogicalColumn {
             table_idx: None,
@@ -1053,7 +1053,7 @@ fn test_wire_copy_protocol() {
             name: "name".into(),
             type_id: TypeId::Text,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         },
     ];
 
@@ -1580,7 +1580,7 @@ fn test_wire_copy_from_throughput() {
             name: "id".into(),
             type_id: TypeId::Int32,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         },
         LogicalColumn {
             table_idx: None,
@@ -1588,7 +1588,7 @@ fn test_wire_copy_from_throughput() {
             name: "name".into(),
             type_id: TypeId::Text,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         },
         LogicalColumn {
             table_idx: None,
@@ -1596,7 +1596,7 @@ fn test_wire_copy_from_throughput() {
             name: "value".into(),
             type_id: TypeId::Float64,
             nullable: true,
-            ts_precision: None,
+            fractional_digits: None,
         },
     ];
 
@@ -1673,7 +1673,7 @@ fn test_wire_copy_to_throughput() {
             name: "id".into(),
             type_id: TypeId::Int32,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         },
         LogicalColumn {
             table_idx: None,
@@ -1681,7 +1681,7 @@ fn test_wire_copy_to_throughput() {
             name: "name".into(),
             type_id: TypeId::Text,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         },
     ];
 

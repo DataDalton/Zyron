@@ -1669,7 +1669,7 @@ mod parallel_join_tests {
             name: name.to_string(),
             type_id: TypeId::Int64,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         }
     }
 
@@ -1679,7 +1679,7 @@ mod parallel_join_tests {
             column_id: ColumnId(col),
             type_id: TypeId::Int64,
             nullable: false,
-            ts_precision: None,
+            fractional_digits: None,
         })
     }
 
