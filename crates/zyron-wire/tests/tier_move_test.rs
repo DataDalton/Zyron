@@ -26,11 +26,11 @@ use zyron_catalog::{
 use zyron_common::TypeId;
 use zyron_executor::batch::DataBatch;
 use zyron_executor::context::ExecutionContext;
+use zyron_storage::DiskManager;
 use zyron_storage::columnar::{
     BloomPolicy, ColumnDescriptor, SYS_COL_ROWID, SYS_COL_SUPERSEDE, SYS_COL_XMIN, encode_and_write,
 };
 use zyron_storage::txn::{IsolationLevel, TransactionManager};
-use zyron_storage::DiskManager;
 use zyron_wal::WalWriter;
 use zyron_wire::connection::ServerState;
 use zyron_wire::session::Session;
@@ -354,13 +354,7 @@ fn segment_state(
         .columnar
         .segments
         .iter()
-        .map(|s| {
-            (
-                s.file_id,
-                std::path::PathBuf::from(&s.path),
-                s.storage_tier,
-            )
-        })
+        .map(|s| (s.file_id, std::path::PathBuf::from(&s.path), s.storage_tier))
         .collect()
 }
 
@@ -405,7 +399,9 @@ async fn test_a_fully_covered_segment_relocates_and_still_reads() {
         "the file is where the catalog says it is"
     );
     assert!(
-        moved[0].1.starts_with(server.data_dir.join("columnar").join("tiers").join("cold")),
+        moved[0]
+            .1
+            .starts_with(server.data_dir.join("columnar").join("tiers").join("cold")),
         "relocated into the tier directory: {:?}",
         moved[0].1
     );
@@ -582,12 +578,7 @@ async fn test_the_partition_form_moves_by_equality() {
 async fn test_cold_after_relocates_aged_segments_on_a_retention_run() {
     let (server, schema, _tmp) = create_test_server().await;
     let mut session = new_session();
-    exec(
-        &server,
-        &mut session,
-        "CREATE TABLE t (k BIGINT, v BIGINT)",
-    )
-    .await;
+    exec(&server, &mut session, "CREATE TABLE t (k BIGINT, v BIGINT)").await;
 
     // k stands in for the row's age in microseconds. One segment is well
     // past a one-hour threshold, the other is in the future
@@ -638,7 +629,12 @@ async fn test_cold_after_relocates_aged_segments_on_a_retention_run() {
 async fn test_a_ttl_on_the_first_column_expires_rows() {
     let (server, schema, _tmp) = create_test_server().await;
     let mut session = new_session();
-    exec(&server, &mut session, "CREATE TABLE t (ts BIGINT, v BIGINT)").await;
+    exec(
+        &server,
+        &mut session,
+        "CREATE TABLE t (ts BIGINT, v BIGINT)",
+    )
+    .await;
 
     let now_us = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -682,12 +678,7 @@ async fn test_a_ttl_on_the_first_column_expires_rows() {
 async fn test_purge_after_soft_delete_sets_the_purge_grace() {
     let (server, schema, _tmp) = create_test_server().await;
     let mut session = new_session();
-    exec(
-        &server,
-        &mut session,
-        "CREATE TABLE t (k BIGINT, v BIGINT)",
-    )
-    .await;
+    exec(&server, &mut session, "CREATE TABLE t (k BIGINT, v BIGINT)").await;
     exec(
         &server,
         &mut session,

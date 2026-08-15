@@ -656,6 +656,7 @@ mod tests {
             },
             bloom: None,
             ndv: None,
+            size_bytes: None,
         }
     }
 

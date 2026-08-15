@@ -18,7 +18,10 @@ use common::{create_test_server, exec_ddl, exec_dml, new_session, query_values};
 use zyron_executor::column::ScalarValue;
 use zyron_planner::physical::{PhysicalPlan, ScanDirection};
 
-async fn plan_of(server: &std::sync::Arc<zyron_wire::connection::ServerState>, sql: &str) -> PhysicalPlan {
+async fn plan_of(
+    server: &std::sync::Arc<zyron_wire::connection::ServerState>,
+    sql: &str,
+) -> PhysicalPlan {
     let stmt = zyron_parser::parse(sql)
         .expect("parse")
         .into_iter()
@@ -89,7 +92,11 @@ async fn indexed_table(
     )
     .await
     .expect("create");
-    exec_dml(server, "INSERT INTO t VALUES (3, 30), (1, 10), (4, 40), (2, 20)").await;
+    exec_dml(
+        server,
+        "INSERT INTO t VALUES (3, 30), (1, 10), (4, 40), (2, 20)",
+    )
+    .await;
     exec_ddl(server, session, index_sql).await.expect("index");
 }
 
@@ -191,7 +198,9 @@ async fn test_a_nullable_key_column_still_sorts() {
         "a nullable key column cannot be answered from the index"
     );
     assert_eq!(
-        query_values(&server, "SELECT k FROM n ORDER BY k").await.len(),
+        query_values(&server, "SELECT k FROM n ORDER BY k")
+            .await
+            .len(),
         3,
         "the null row is still returned"
     );
@@ -249,9 +258,13 @@ async fn test_a_mixed_direction_index_is_refused() {
     .await
     .expect("create");
 
-    let err = exec_ddl(&server, &mut session, "CREATE INDEX mx ON m (a ASC, b DESC)")
-        .await
-        .expect_err("a mixed-direction index must be refused");
+    let err = exec_ddl(
+        &server,
+        &mut session,
+        "CREATE INDEX mx ON m (a ASC, b DESC)",
+    )
+    .await
+    .expect_err("a mixed-direction index must be refused");
     let msg = format!("{err:?}");
     assert!(
         msg.contains("ASC") && msg.contains("DESC"),

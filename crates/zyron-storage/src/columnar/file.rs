@@ -34,7 +34,7 @@ use super::constants::{
 };
 use super::segment::{SegmentHeader, ZoneMapEntry};
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use zyron_common::page::PAGE_SIZE;
 use zyron_common::{Result, ZyronError};
@@ -274,6 +274,11 @@ impl ZyrFileWriter {
     /// the next PAGE_SIZE boundary. The null bitmap is empty when the column
     /// has no nulls; readers derive its length from the header null_count and
     /// the file row_count.
+    ///
+    /// Returns the padded region this column occupies, which is what a
+    /// reader pays to read the column and what a cost model comparing two
+    /// access paths has to compare. Deriving it later needs the file open,
+    /// and the writer already knows it
     pub fn write_segment(
         &mut self,
         columnId: u32,
@@ -282,7 +287,7 @@ impl ZyrFileWriter {
         zoneMapBytes: &[u8],
         nullBitmap: &[u8],
         encodedData: &[u8],
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let segmentStart = self.currentOffset;
 
         // Write segment header.
@@ -338,7 +343,7 @@ impl ZyrFileWriter {
         });
 
         self.currentOffset += paddedLen as u64;
-        Ok(())
+        Ok(paddedLen as u64)
     }
 
     /// Writes the footer (segment index + trailer), flushes, optionally fsyncs,
@@ -437,12 +442,58 @@ fn round_up_to_page(size: usize) -> usize {
 // ---------------------------------------------------------------------------
 
 /// Reads a .zyr columnar file. Validates header and footer on open.
+///
+/// The handle stays open for the reader's life and every read is
+/// positional, so reading N columns costs one file open rather than N. A
+/// point lookup reads a handful of small regions out of two files, which
+/// made the open the dominant cost of answering it.
+///
+/// Holding the handle does not pin the file. The format reclaims files
+/// underneath readers, vacuum unlinking a version's files and compaction
+/// and tier moves renaming them, and both keep working. Unix keeps the
+/// inode alive until the last handle closes, and Rust opens with
+/// `FILE_SHARE_DELETE` on Windows, which gives the same behaviour there.
+/// `test_a_reader_survives_its_file_being_deleted` pins it
 pub struct ZyrFileReader {
     path: PathBuf,
+    /// Held open so no read has to reopen the file. Reads are positional,
+    /// so this is shared rather than owned by one read at a time
+    file: File,
     header: ZyrFileHeader,
     segmentIndex: Vec<SegmentIndexEntry>,
     #[allow(dead_code)]
     fileSize: u64,
+}
+
+/// Fills `buf` from `offset`, naming the region in any error so a failure
+/// says which part of which file could not be read
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64, path: &Path, what: &str) -> Result<()> {
+    crate::disk::positional_read_exact(file, buf, offset).map_err(|e| {
+        ZyronError::IoError(format!(
+            "failed to read {} of .zyr file {} at offset {}: {}",
+            what,
+            path.display(),
+            offset,
+            e
+        ))
+    })
+}
+
+/// Reads `len` bytes at `offset` into a fresh buffer.
+///
+/// The buffer is not zeroed first. The read overwrites every byte of it or
+/// fails, so a zero fill is pure cost, and a segment is a page or more. A
+/// failed read drops the buffer without anything having looked at it
+fn read_vec_at(file: &File, len: usize, offset: u64, path: &Path, what: &str) -> Result<Vec<u8>> {
+    let mut buf: Vec<u8> = Vec::with_capacity(len);
+    // SAFETY: read_exact_at writes exactly `len` bytes into the slice or
+    // returns an error, so no element is observed before initialization
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        buf.set_len(len);
+    }
+    read_exact_at(file, &mut buf, offset, path, what)?;
+    Ok(buf)
 }
 
 /// Where each part of one raw segment buffer starts and ends.
@@ -529,16 +580,15 @@ impl ZyrFileReader {
     /// byte actually consumed.
     pub fn open(path: &Path) -> Result<Self> {
         let filePath = path.to_path_buf();
-        let mut file = BufReader::new(File::open(path).map_err(|e| {
+        let file = File::open(path).map_err(|e| {
             ZyronError::IoError(format!(
                 "failed to open .zyr file {}: {}",
                 path.display(),
                 e
             ))
-        })?);
+        })?;
 
         let fileSize = file
-            .get_ref()
             .metadata()
             .map_err(|e| {
                 ZyronError::IoError(format!(
@@ -559,17 +609,13 @@ impl ZyrFileReader {
 
         // Read file header (first PAGE_SIZE bytes).
         let mut headerBuf = [0u8; PAGE_SIZE];
-        file.read_exact(&mut headerBuf)
-            .map_err(|e| ZyronError::IoError(format!("failed to read file header: {}", e)))?;
+        read_exact_at(&file, &mut headerBuf, 0, path, "file header")?;
         let header = ZyrFileHeader::from_bytes(&headerBuf)?;
 
         // Read footer trailer: last FOOTER_SIZE bytes = segment_index_offset(8) + magic(8) + checksum(4).
         let trailerStart = fileSize - FOOTER_SIZE as u64;
-        file.seek(SeekFrom::Start(trailerStart))
-            .map_err(|e| ZyronError::IoError(format!("failed to seek to footer: {}", e)))?;
         let mut trailerBuf = [0u8; FOOTER_SIZE];
-        file.read_exact(&mut trailerBuf)
-            .map_err(|e| ZyronError::IoError(format!("failed to read footer trailer: {}", e)))?;
+        read_exact_at(&file, &mut trailerBuf, trailerStart, path, "footer trailer")?;
 
         // Parse trailer fields.
         let segmentIndexOffset = u64::from_le_bytes(trailerBuf[0..8].try_into().map_err(|_| {
@@ -605,11 +651,13 @@ impl ZyrFileReader {
         }
         let entryCount = indexRegionSize / SEGMENT_INDEX_ENTRY_SIZE;
 
-        file.seek(SeekFrom::Start(segmentIndexOffset))
-            .map_err(|e| ZyronError::IoError(format!("failed to seek to segment index: {}", e)))?;
-        let mut indexBytes = vec![0u8; indexRegionSize];
-        file.read_exact(&mut indexBytes)
-            .map_err(|e| ZyronError::IoError(format!("failed to read segment index: {}", e)))?;
+        let indexBytes = read_vec_at(
+            &file,
+            indexRegionSize,
+            segmentIndexOffset,
+            path,
+            "segment index",
+        )?;
         let computedIndexChecksum = zyron_common::hash32(&indexBytes);
         if storedFileChecksum != computedIndexChecksum {
             return Err(ZyronError::InvalidZyrFile(format!(
@@ -643,6 +691,7 @@ impl ZyrFileReader {
 
         Ok(Self {
             path: filePath,
+            file,
             header,
             segmentIndex,
             fileSize,
@@ -692,30 +741,13 @@ impl ZyrFileReader {
                 ZyronError::InvalidZyrFile(format!("no segment found for column_id {}", columnId))
             })?;
 
-        let mut file = BufReader::new(File::open(&self.path).map_err(|e| {
-            ZyronError::IoError(format!(
-                "failed to reopen .zyr file {}: {}",
-                self.path.display(),
-                e
-            ))
-        })?);
-
-        file.seek(SeekFrom::Start(entry.offset)).map_err(|e| {
-            ZyronError::IoError(format!(
-                "failed to seek to segment for column {}: {}",
-                columnId, e
-            ))
-        })?;
-
-        let mut buf = vec![0u8; entry.size as usize];
-        file.read_exact(&mut buf).map_err(|e| {
-            ZyronError::IoError(format!(
-                "failed to read segment for column {}: {}",
-                columnId, e
-            ))
-        })?;
-
-        Ok(buf)
+        read_vec_at(
+            &self.file,
+            entry.size as usize,
+            entry.offset,
+            &self.path,
+            &format!("segment for column {}", columnId),
+        )
     }
 
     /// Reads and fully decodes one column segment, returning the decoded
@@ -794,18 +826,14 @@ impl ZyrFileReader {
             .ok_or_else(|| {
                 ZyronError::InvalidZyrFile(format!("no segment found for column_id {}", column_id))
             })?;
-        let mut file = File::open(&self.path).map_err(|e| {
-            ZyronError::IoError(format!(
-                "failed to reopen .zyr file {}: {}",
-                self.path.display(),
-                e
-            ))
-        })?;
-        file.seek(SeekFrom::Start(entry.offset))
-            .map_err(|e| ZyronError::IoError(format!("failed to seek to segment header: {}", e)))?;
         let mut header_bytes = [0u8; SEGMENT_HEADER_SIZE];
-        file.read_exact(&mut header_bytes)
-            .map_err(|e| ZyronError::IoError(format!("failed to read segment header: {}", e)))?;
+        read_exact_at(
+            &self.file,
+            &mut header_bytes,
+            entry.offset,
+            &self.path,
+            "segment header",
+        )?;
         let header = SegmentHeader::from_bytes(&header_bytes)?;
 
         let zones = row_count.div_ceil(ZONE_MAP_BATCH_SIZE as usize);
@@ -821,22 +849,13 @@ impl ZyrFileReader {
         }
         // The header sits at the segment start and the bloom follows it, so
         // the zone region begins wherever the bloom ends
-        if header.bloom_filter_size > 0 {
-            file.seek(SeekFrom::Start(entry.offset + start))
-                .map_err(|e| {
-                    ZyronError::IoError(format!(
-                        "failed to seek to zone maps for column {}: {}",
-                        column_id, e
-                    ))
-                })?;
-        }
-        let mut buf = vec![0u8; region];
-        file.read_exact(&mut buf).map_err(|e| {
-            ZyronError::IoError(format!(
-                "failed to read zone maps for column {}: {}",
-                column_id, e
-            ))
-        })?;
+        let buf = read_vec_at(
+            &self.file,
+            region,
+            entry.offset + start,
+            &self.path,
+            &format!("zone maps for column {}", column_id),
+        )?;
         let mut out = Vec::with_capacity(zones);
         for z in 0..zones {
             let slice: [u8; ZONE_MAP_ENTRY_SIZE] = buf
@@ -884,18 +903,14 @@ impl ZyrFileReader {
             .ok_or_else(|| {
                 ZyronError::InvalidZyrFile(format!("no segment found for column_id {}", columnId))
             })?;
-        let mut file = File::open(&self.path).map_err(|e| {
-            ZyronError::IoError(format!(
-                "failed to reopen .zyr file {}: {}",
-                self.path.display(),
-                e
-            ))
-        })?;
-        file.seek(SeekFrom::Start(entry.offset))
-            .map_err(|e| ZyronError::IoError(format!("failed to seek to segment header: {}", e)))?;
         let mut buf = [0u8; SEGMENT_HEADER_SIZE];
-        file.read_exact(&mut buf)
-            .map_err(|e| ZyronError::IoError(format!("failed to read segment header: {}", e)))?;
+        read_exact_at(
+            &self.file,
+            &mut buf,
+            entry.offset,
+            &self.path,
+            "segment header",
+        )?;
         Ok(buf)
     }
 
@@ -936,27 +951,13 @@ impl ZyrFileReader {
             )));
         }
 
-        let mut file = File::open(&self.path).map_err(|e| {
-            ZyronError::IoError(format!(
-                "failed to reopen .zyr file {}: {}",
-                self.path.display(),
-                e
-            ))
-        })?;
-        file.seek(SeekFrom::Start(entry.offset + header.bloom_filter_offset))
-            .map_err(|e| {
-                ZyronError::IoError(format!(
-                    "failed to seek to bloom filter for column {}: {}",
-                    columnId, e
-                ))
-            })?;
-        let mut buf = vec![0u8; header.bloom_filter_size as usize];
-        file.read_exact(&mut buf).map_err(|e| {
-            ZyronError::IoError(format!(
-                "failed to read bloom filter for column {}: {}",
-                columnId, e
-            ))
-        })?;
+        let buf = read_vec_at(
+            &self.file,
+            header.bloom_filter_size as usize,
+            entry.offset + header.bloom_filter_offset,
+            &self.path,
+            &format!("bloom filter for column {}", columnId),
+        )?;
         BloomFilter::from_bytes(&buf).map(Some)
     }
 
@@ -970,34 +971,22 @@ impl ZyrFileReader {
     where
         F: FnMut(usize, Option<&[u8]>) -> Result<()>,
     {
-        let mut file = BufReader::new(File::open(&self.path).map_err(|e| {
-            ZyronError::IoError(format!(
-                "failed to reopen .zyr file {}: {}",
-                self.path.display(),
-                e
-            ))
-        })?);
         let mut buf: Vec<u8> = Vec::new();
         for (idx, &cid) in column_ids.iter().enumerate() {
             match self.segmentIndex.iter().find(|e| e.columnId == cid) {
                 Some(entry) => {
-                    file.seek(SeekFrom::Start(entry.offset)).map_err(|e| {
-                        ZyronError::IoError(format!("failed to seek to segment: {}", e))
-                    })?;
                     let need = entry.size as usize;
                     buf.clear();
                     buf.reserve(need);
-                    // SAFETY: read_exact writes exactly `need` bytes into the
-                    // slice or returns an error, so no element is observed
-                    // before initialization. Avoids the resize zero-fill on
-                    // the scan hot path.
+                    // SAFETY: positional_read_exact writes exactly `need`
+                    // bytes into the slice or returns an error, so no
+                    // element is observed before initialization. Avoids the
+                    // resize zero-fill on the scan hot path.
                     #[allow(clippy::uninit_vec)]
                     unsafe {
                         buf.set_len(need);
                     }
-                    file.read_exact(&mut buf).map_err(|e| {
-                        ZyronError::IoError(format!("failed to read segment: {}", e))
-                    })?;
+                    read_exact_at(&self.file, &mut buf, entry.offset, &self.path, "segment")?;
                     f(idx, Some(&buf))?;
                 }
                 None => f(idx, None)?,
@@ -1041,6 +1030,57 @@ mod tests {
         let mut hdr = [0u8; SEGMENT_HEADER_SIZE];
         hdr[0..4].copy_from_slice(&columnId.to_le_bytes());
         hdr
+    }
+
+    /// The reader holds its file open for its whole life, and the format
+    /// deletes files underneath readers. Vacuum unlinks the files of a
+    /// version nothing needs any more while a scan started before it may
+    /// still be reading them, so an open reader must not make the unlink
+    /// fail, and it must keep answering from the bytes it opened.
+    ///
+    /// This is what makes holding the handle safe rather than a change of
+    /// reclamation semantics, and it is platform behaviour rather than
+    /// anything this file does, which is exactly why it needs a test
+    #[test]
+    fn test_a_reader_survives_its_file_being_deleted() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let filePath = dir.path().join("reclaimed.zyr");
+
+        let header = ZyrFileHeader {
+            format_version: ZYR_FORMAT_VERSION,
+            column_count: 1,
+            row_count: 64,
+            table_id: 7,
+            xmin_range_lo: 0,
+            xmin_range_hi: 0,
+            xmax_range_lo: 0,
+            xmax_range_hi: u64::MAX,
+            primary_key_column_id: 0,
+            sort_order: SortOrder::None,
+        };
+        let data = vec![0x5Au8; 4096];
+        {
+            let mut writer = ZyrFileWriter::create(&filePath, header).expect("create writer");
+            writer
+                .write_segment(0, &make_segment_header(0), None, &[], &[], &data)
+                .expect("write segment");
+            writer.finalize(false).expect("finalize");
+        }
+
+        let reader = ZyrFileReader::open(&filePath).expect("open reader");
+        std::fs::remove_file(&filePath).expect("an open reader must not block reclamation");
+        assert!(!filePath.exists());
+
+        // The reader still answers, from metadata it already holds and from
+        // bytes it reads after the unlink
+        assert_eq!(reader.row_count(), 64);
+        let raw = reader
+            .read_segment_raw(0)
+            .expect("read segment after unlink");
+        assert_eq!(
+            &raw[SEGMENT_HEADER_SIZE..SEGMENT_HEADER_SIZE + data.len()],
+            &data[..]
+        );
     }
 
     #[test]

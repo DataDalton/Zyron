@@ -30,14 +30,27 @@ pub enum DdlResult {
 /// Returns `Some(Ok(result))` if the statement was handled,
 /// `Some(Err(e))` if handling failed, or `None` if the statement should
 /// fall through to the planner/executor path.
-pub async fn try_handle_ddl_utility(
-    stmt: &zyron_parser::Statement,
-    server: &Arc<ServerState>,
-    session: &mut Option<Session>,
-    txn: &mut Option<zyron_storage::txn::Transaction>,
-    active_branch: &mut Option<String>,
-    raw_sql: &str,
-) -> Option<Result<DdlResult, ProtocolError>> {
+///
+/// This is a plain function returning a boxed future, and each arm boxes its
+/// own, rather than the whole thing being one `async fn`. That is load
+/// bearing. As an `async fn` the match is a single state machine, and a debug
+/// build gives every arm's awaited handler future its own slot in the poll
+/// frame instead of sharing one, so a statement paid for all hundred and
+/// thirteen arms whichever one it took. That was 58 KB of stack per call, on
+/// a path every connection runs before it can do anything else. Boxing per
+/// arm constructs only the handler actually selected, at the cost of one
+/// allocation per statement, which is nothing next to the work a DDL
+/// statement then does
+pub fn try_handle_ddl_utility<'a>(
+    stmt: &'a zyron_parser::Statement,
+    server: &'a Arc<ServerState>,
+    session: &'a mut Option<Session>,
+    txn: &'a mut Option<zyron_storage::txn::Transaction>,
+    active_branch: &'a mut Option<String>,
+    raw_sql: &'a str,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Option<Result<DdlResult, ProtocolError>>> + Send + 'a>,
+> {
     use zyron_parser::Statement;
 
     match stmt {
@@ -45,31 +58,43 @@ pub async fn try_handle_ddl_utility(
         Statement::Select(_)
         | Statement::Insert(_)
         | Statement::Update(_)
-        | Statement::Delete(_) => None,
+        | Statement::Delete(_) => Box::pin(async move { None }),
 
         // MERGE requires INSERT/UPDATE/DELETE combined execution, routed through planner
-        Statement::Merge(s) => Some(handle_merge(s, server, session).await),
+        Statement::Merge(s) => {
+            Box::pin(async move { Some(handle_merge(s, server, session).await) })
+        }
 
         // Standalone VALUES query handled as DDL result with rows
-        Statement::ValuesQuery(s) => Some(handle_values_query(s, server, session).await),
+        Statement::ValuesQuery(s) => {
+            Box::pin(async move { Some(handle_values_query(s, server, session).await) })
+        }
 
         // Transaction control handled by try_handle_transaction_control
-        Statement::Begin(_) | Statement::Commit(_) | Statement::Rollback(_) => None,
+        Statement::Begin(_) | Statement::Commit(_) | Statement::Rollback(_) => {
+            Box::pin(async move { None })
+        }
 
         // SHOW CLUSTERING FOR t reads table state rather than session
         // state, so it is the one SHOW form that belongs here
         Statement::Show(s) if s.target.is_some() => {
-            Some(handle_show_clustering(s, server, session).await)
+            Box::pin(async move { Some(handle_show_clustering(s, server, session).await) })
         }
 
         // -- Node mesh --
-        Statement::AlterTableFollow(s) => Some(handle_alter_table_follow(s, server, session).await),
-        Statement::CreatePeer(s) => Some(handle_create_peer(s, server).await),
-        Statement::DropPeer(s) => Some(handle_drop_peer(s, server).await),
-        Statement::CreateForeignTable(s) => {
-            Some(handle_create_foreign_table(s, server, session).await)
+        Statement::AlterTableFollow(s) => {
+            Box::pin(async move { Some(handle_alter_table_follow(s, server, session).await) })
         }
-        Statement::DropForeignTable(s) => Some(handle_drop_foreign_table(s, server, session).await),
+        Statement::CreatePeer(s) => {
+            Box::pin(async move { Some(handle_create_peer(s, server).await) })
+        }
+        Statement::DropPeer(s) => Box::pin(async move { Some(handle_drop_peer(s, server).await) }),
+        Statement::CreateForeignTable(s) => {
+            Box::pin(async move { Some(handle_create_foreign_table(s, server, session).await) })
+        }
+        Statement::DropForeignTable(s) => {
+            Box::pin(async move { Some(handle_drop_foreign_table(s, server, session).await) })
+        }
 
         // Session commands handled by try_handle_session_command
         Statement::SetVariable(_)
@@ -77,206 +102,337 @@ pub async fn try_handle_ddl_utility(
         | Statement::AlterSystemSet(_)
         | Statement::Checkpoint(_)
         | Statement::Vacuum(_)
-        | Statement::Analyze(_) => None,
+        | Statement::Analyze(_) => Box::pin(async move { None }),
 
         // EXPLAIN handled by handle_explain_statement
-        Statement::Explain(_) => None,
+        Statement::Explain(_) => Box::pin(async move { None }),
 
         // -- Core DDL --
-        Statement::CreateTable(s) => Some(handle_create_table(s, server, session).await),
-        Statement::DropTable(s) => Some(handle_drop_table(s, server, session).await),
-        Statement::AlterTable(s) => Some(handle_alter_table(s, server, session).await),
-        Statement::Truncate(s) => Some(handle_truncate(s, server, session).await),
-        Statement::CreateIndex(s) => Some(handle_create_index(s, server, session).await),
-        Statement::DropIndex(s) => Some(handle_drop_index(s, server, session).await),
-        Statement::AlterIndex(s) => Some(handle_alter_index(s, server, session).await),
-        Statement::CreateSchema(s) => Some(handle_create_schema(s, server, session).await),
-        Statement::DropSchema(s) => Some(handle_drop_schema(s, server, session).await),
-        Statement::CreateSequence(s) => Some(handle_create_sequence(s, server, session).await),
-        Statement::DropSequence(s) => Some(handle_drop_sequence(s, server, session).await),
-        Statement::AlterSequence(s) => Some(handle_alter_sequence(s, server, session).await),
-        Statement::CreateView(s) => Some(handle_create_view(s, server, session, raw_sql).await),
-        Statement::DropView(s) => Some(handle_drop_view(s, server, session).await),
-        Statement::AlterView(s) => Some(handle_alter_view(s, server, session).await),
-        Statement::AlterTableTtl(s) => {
+        Statement::CreateTable(s) => {
+            Box::pin(async move { Some(handle_create_table(s, server, session).await) })
+        }
+        Statement::DropTable(s) => {
+            Box::pin(async move { Some(handle_drop_table(s, server, session).await) })
+        }
+        Statement::AlterTable(s) => {
+            Box::pin(async move { Some(handle_alter_table(s, server, session).await) })
+        }
+        Statement::Truncate(s) => {
+            Box::pin(async move { Some(handle_truncate(s, server, session).await) })
+        }
+        Statement::CreateIndex(s) => {
+            Box::pin(async move { Some(handle_create_index(s, server, session).await) })
+        }
+        Statement::DropIndex(s) => {
+            Box::pin(async move { Some(handle_drop_index(s, server, session).await) })
+        }
+        Statement::AlterIndex(s) => {
+            Box::pin(async move { Some(handle_alter_index(s, server, session).await) })
+        }
+        Statement::CreateSchema(s) => {
+            Box::pin(async move { Some(handle_create_schema(s, server, session).await) })
+        }
+        Statement::DropSchema(s) => {
+            Box::pin(async move { Some(handle_drop_schema(s, server, session).await) })
+        }
+        Statement::CreateSequence(s) => {
+            Box::pin(async move { Some(handle_create_sequence(s, server, session).await) })
+        }
+        Statement::DropSequence(s) => {
+            Box::pin(async move { Some(handle_drop_sequence(s, server, session).await) })
+        }
+        Statement::AlterSequence(s) => {
+            Box::pin(async move { Some(handle_alter_sequence(s, server, session).await) })
+        }
+        Statement::CreateView(s) => {
+            Box::pin(async move { Some(handle_create_view(s, server, session, raw_sql).await) })
+        }
+        Statement::DropView(s) => {
+            Box::pin(async move { Some(handle_drop_view(s, server, session).await) })
+        }
+        Statement::AlterView(s) => {
+            Box::pin(async move { Some(handle_alter_view(s, server, session).await) })
+        }
+        Statement::AlterTableTtl(s) => Box::pin(async move {
             Some(crate::lifecycle_dispatch::handle_alter_table_ttl(s, server, session).await)
-        }
-        Statement::AlterTableOptions(s) => {
+        }),
+        Statement::AlterTableOptions(s) => Box::pin(async move {
             Some(crate::lifecycle_dispatch::handle_alter_table_options(s, server, session).await)
+        }),
+        Statement::AlterTableSetUsing(s) => {
+            Box::pin(async move { Some(handle_set_using(s, server, session).await) })
         }
-        Statement::AlterTableSetUsing(s) => Some(handle_set_using(s, server, session).await),
-        Statement::AlterTableClusterBy(s) => Some(handle_cluster_by(s, server, session).await),
+        Statement::AlterTableClusterBy(s) => {
+            Box::pin(async move { Some(handle_cluster_by(s, server, session).await) })
+        }
         Statement::AlterTableClusteringSchedule(s) => {
-            Some(handle_clustering_schedule(s, server, session).await)
+            Box::pin(async move { Some(handle_clustering_schedule(s, server, session).await) })
         }
-        Statement::LegalHold(s) => {
+        Statement::LegalHold(s) => Box::pin(async move {
             Some(crate::lifecycle_dispatch::handle_legal_hold(s, server, session).await)
-        }
-        Statement::ForgetUser(s) => {
+        }),
+        Statement::ForgetUser(s) => Box::pin(async move {
             Some(crate::lifecycle_dispatch::handle_forget_user(s, server, session).await)
-        }
-        Statement::ExportUser(s) => {
+        }),
+        Statement::ExportUser(s) => Box::pin(async move {
             Some(crate::lifecycle_dispatch::handle_export_user(s, server, session).await)
-        }
-        Statement::AlterTableMove(s) => {
+        }),
+        Statement::AlterTableMove(s) => Box::pin(async move {
             Some(crate::lifecycle_dispatch::handle_alter_table_move(s, server, session).await)
-        }
-        Statement::AlterColumnClassification(s) => Some(
-            crate::lifecycle_dispatch::handle_alter_column_classification(s, server, session).await,
-        ),
-        Statement::RestoreSoftDelete(s) => {
+        }),
+        Statement::AlterColumnClassification(s) => Box::pin(async move {
+            Some(
+                crate::lifecycle_dispatch::handle_alter_column_classification(s, server, session)
+                    .await,
+            )
+        }),
+        Statement::RestoreSoftDelete(s) => Box::pin(async move {
             Some(crate::lifecycle_dispatch::handle_restore_soft_delete(s, server, session).await)
-        }
-        Statement::RunRetentionJob(s) => {
+        }),
+        Statement::RunRetentionJob(s) => Box::pin(async move {
             Some(crate::lifecycle_dispatch::handle_run_retention_job(s, server, session).await)
-        }
-        Statement::UndropTable(s) => {
+        }),
+        Statement::UndropTable(s) => Box::pin(async move {
             Some(crate::lifecycle_dispatch::handle_undrop_table(s, server, session).await)
-        }
+        }),
         // OPTIMIZE TABLE and REINDEX are handled by the session command layer
         // (connection.rs handle_optimize / handle_reindex) before this dispatch
         // runs, so these never reach here; route to None for consistency.
-        Statement::OptimizeTable(_) | Statement::Reindex(_) => None,
-        Statement::CommentOn(s) => Some(handle_comment_on(s, server, session).await),
+        Statement::OptimizeTable(_) | Statement::Reindex(_) => Box::pin(async move { None }),
+        Statement::CommentOn(s) => {
+            Box::pin(async move { Some(handle_comment_on(s, server, session).await) })
+        }
 
         // -- Materialized Views --
-        Statement::CreateMaterializedView(s) => {
+        Statement::CreateMaterializedView(s) => Box::pin(async move {
             Some(handle_create_materialized_view(s, server, session, raw_sql).await)
-        }
+        }),
         Statement::DropMaterializedView(s) => {
-            Some(handle_drop_materialized_view(s, server, session).await)
+            Box::pin(async move { Some(handle_drop_materialized_view(s, server, session).await) })
         }
         Statement::RefreshMaterializedView(s) => {
-            Some(handle_refresh_materialized_view(s, server, session).await)
+            Box::pin(
+                async move { Some(handle_refresh_materialized_view(s, server, session).await) },
+            )
         }
 
         // -- Search Indexes --
         Statement::CreateFulltextIndex(s) => {
-            Some(handle_create_fulltext_index(s, server, session).await)
+            Box::pin(async move { Some(handle_create_fulltext_index(s, server, session).await) })
         }
         Statement::CreateVectorIndex(s) => {
-            Some(handle_create_vector_index(s, server, session).await)
+            Box::pin(async move { Some(handle_create_vector_index(s, server, session).await) })
         }
         Statement::CreateSpatialIndex(s) => {
-            Some(handle_create_spatial_index(s, server, session).await)
+            Box::pin(async move { Some(handle_create_spatial_index(s, server, session).await) })
         }
 
         // -- Auth/Roles --
-        Statement::CreateUser(s) => Some(handle_create_user(s, server, session).await),
-        Statement::AlterUser(s) => Some(handle_alter_user(s, server, session).await),
-        Statement::DropUser(s) => Some(handle_drop_user(s, server, session).await),
-        Statement::CreateRole(s) => Some(handle_create_role(s, server).await),
-        Statement::AlterRole(s) => Some(handle_alter_role(s, server, session).await),
-        Statement::DropRole(s) => Some(handle_drop_role(s, server).await),
-        Statement::Grant(s) => Some(handle_grant(s, server, session).await),
-        Statement::Revoke(s) => Some(handle_revoke(s, server, session).await),
+        Statement::CreateUser(s) => {
+            Box::pin(async move { Some(handle_create_user(s, server, session).await) })
+        }
+        Statement::AlterUser(s) => {
+            Box::pin(async move { Some(handle_alter_user(s, server, session).await) })
+        }
+        Statement::DropUser(s) => {
+            Box::pin(async move { Some(handle_drop_user(s, server, session).await) })
+        }
+        Statement::CreateRole(s) => {
+            Box::pin(async move { Some(handle_create_role(s, server).await) })
+        }
+        Statement::AlterRole(s) => {
+            Box::pin(async move { Some(handle_alter_role(s, server, session).await) })
+        }
+        Statement::DropRole(s) => Box::pin(async move { Some(handle_drop_role(s, server).await) }),
+        Statement::Grant(s) => {
+            Box::pin(async move { Some(handle_grant(s, server, session).await) })
+        }
+        Statement::Revoke(s) => {
+            Box::pin(async move { Some(handle_revoke(s, server, session).await) })
+        }
 
         // -- CDC --
         Statement::CreateReplicationSlot(s) => {
-            Some(handle_create_replication_slot(s, server, session).await)
+            Box::pin(async move { Some(handle_create_replication_slot(s, server, session).await) })
         }
         Statement::DropReplicationSlot(s) => {
-            Some(handle_drop_replication_slot(s, server, session).await)
+            Box::pin(async move { Some(handle_drop_replication_slot(s, server, session).await) })
         }
-        Statement::CreateCdcStream(s) => Some(handle_create_cdc_stream(s, server, session).await),
-        Statement::DropCdcStream(s) => Some(handle_drop_cdc_stream(s, server, session).await),
-        Statement::CreateCdcIngest(s) => Some(handle_create_cdc_ingest(s, server, session).await),
-        Statement::DropCdcIngest(s) => Some(handle_drop_cdc_ingest(s, server, session).await),
+        Statement::CreateCdcStream(s) => {
+            Box::pin(async move { Some(handle_create_cdc_stream(s, server, session).await) })
+        }
+        Statement::DropCdcStream(s) => {
+            Box::pin(async move { Some(handle_drop_cdc_stream(s, server, session).await) })
+        }
+        Statement::CreateCdcIngest(s) => {
+            Box::pin(async move { Some(handle_create_cdc_ingest(s, server, session).await) })
+        }
+        Statement::DropCdcIngest(s) => {
+            Box::pin(async move { Some(handle_drop_cdc_ingest(s, server, session).await) })
+        }
 
         // -- Streaming jobs --
         Statement::CreateStreamingJob(_)
         | Statement::DropStreamingJob(_)
-        | Statement::AlterStreamingJob(_) => {
+        | Statement::AlterStreamingJob(_) => Box::pin(async move {
             Some(dispatch_streaming_statement(stmt.clone(), server, session, raw_sql).await)
-        }
+        }),
 
         // -- Versioning --
-        Statement::CreateBranch(s) => Some(handle_create_branch(s, server, session).await),
-        Statement::MergeBranch(s) => Some(handle_merge_branch(s, server, session).await),
-        Statement::DropBranch(s) => Some(handle_drop_branch(s, server, session).await),
-        Statement::UseBranch(s) => Some(handle_use_branch(s, server, active_branch).await),
-        Statement::CreateVersion(s) => Some(handle_create_version(s, server, session).await),
-        Statement::DropVersion(s) => Some(handle_drop_version(s, server, session).await),
+        Statement::CreateBranch(s) => {
+            Box::pin(async move { Some(handle_create_branch(s, server, session).await) })
+        }
+        Statement::MergeBranch(s) => {
+            Box::pin(async move { Some(handle_merge_branch(s, server, session).await) })
+        }
+        Statement::DropBranch(s) => {
+            Box::pin(async move { Some(handle_drop_branch(s, server, session).await) })
+        }
+        Statement::UseBranch(s) => {
+            Box::pin(async move { Some(handle_use_branch(s, server, active_branch).await) })
+        }
+        Statement::CreateVersion(s) => {
+            Box::pin(async move { Some(handle_create_version(s, server, session).await) })
+        }
+        Statement::DropVersion(s) => {
+            Box::pin(async move { Some(handle_drop_version(s, server, session).await) })
+        }
 
         // -- Pipeline --
         Statement::CreatePipeline(s) => {
-            Some(handle_create_pipeline(s, server, session, raw_sql).await)
+            Box::pin(async move { Some(handle_create_pipeline(s, server, session, raw_sql).await) })
         }
-        Statement::RunPipeline(s) => Some(handle_run_pipeline(s, server, session).await),
-        Statement::DropPipeline(s) => Some(handle_drop_pipeline(s, server, session).await),
+        Statement::RunPipeline(s) => {
+            Box::pin(async move { Some(handle_run_pipeline(s, server, session).await) })
+        }
+        Statement::DropPipeline(s) => {
+            Box::pin(async move { Some(handle_drop_pipeline(s, server, session).await) })
+        }
 
         // -- Feature store and ML --
-        Statement::CreateFeatureGroup(s) => Some(handle_create_feature_group(s, server).await),
-        Statement::DropFeatureGroup(s) => Some(handle_drop_feature_group(s, server).await),
-        Statement::CreateModel(s) => {
-            Some(handle_create_model(s, server, session, txn, raw_sql).await)
+        Statement::CreateFeatureGroup(s) => {
+            Box::pin(async move { Some(handle_create_feature_group(s, server).await) })
         }
-        Statement::DropModel(s) => Some(handle_drop_model(s, server).await),
+        Statement::DropFeatureGroup(s) => {
+            Box::pin(async move { Some(handle_drop_feature_group(s, server).await) })
+        }
+        Statement::CreateModel(s) => {
+            Box::pin(
+                async move { Some(handle_create_model(s, server, session, txn, raw_sql).await) },
+            )
+        }
+        Statement::DropModel(s) => {
+            Box::pin(async move { Some(handle_drop_model(s, server).await) })
+        }
 
         // -- Scheduling --
         Statement::CreateSchedule(s) => {
-            Some(handle_create_schedule(s, server, session, raw_sql).await)
+            Box::pin(async move { Some(handle_create_schedule(s, server, session, raw_sql).await) })
         }
-        Statement::DropSchedule(s) => Some(handle_drop_schedule(s, server, session).await),
-        Statement::PauseSchedule(s) => Some(handle_pause_schedule(s, server, session).await),
-        Statement::ResumeSchedule(s) => Some(handle_resume_schedule(s, server, session).await),
+        Statement::DropSchedule(s) => {
+            Box::pin(async move { Some(handle_drop_schedule(s, server, session).await) })
+        }
+        Statement::PauseSchedule(s) => {
+            Box::pin(async move { Some(handle_pause_schedule(s, server, session).await) })
+        }
+        Statement::ResumeSchedule(s) => {
+            Box::pin(async move { Some(handle_resume_schedule(s, server, session).await) })
+        }
 
         // -- Functions/Aggregates --
-        Statement::CreateFunction(s) => Some(handle_create_function(s, server, session).await),
-        Statement::DropFunction(s) => Some(handle_drop_function(s, server, session).await),
-        Statement::CreateAggregate(s) => Some(handle_create_aggregate(s, server, session).await),
-        Statement::DropAggregate(s) => Some(handle_drop_aggregate(s, server, session).await),
+        Statement::CreateFunction(s) => {
+            Box::pin(async move { Some(handle_create_function(s, server, session).await) })
+        }
+        Statement::DropFunction(s) => {
+            Box::pin(async move { Some(handle_drop_function(s, server, session).await) })
+        }
+        Statement::CreateAggregate(s) => {
+            Box::pin(async move { Some(handle_create_aggregate(s, server, session).await) })
+        }
+        Statement::DropAggregate(s) => {
+            Box::pin(async move { Some(handle_drop_aggregate(s, server, session).await) })
+        }
 
         // -- Procedures --
-        Statement::CreateProcedure(s) => Some(handle_create_procedure(s, server, session).await),
-        Statement::DropProcedure(s) => Some(handle_drop_procedure(s, server, session).await),
-        Statement::Call(s) => Some(handle_call(s, server, session).await),
+        Statement::CreateProcedure(s) => {
+            Box::pin(async move { Some(handle_create_procedure(s, server, session).await) })
+        }
+        Statement::DropProcedure(s) => {
+            Box::pin(async move { Some(handle_drop_procedure(s, server, session).await) })
+        }
+        Statement::Call(s) => Box::pin(async move { Some(handle_call(s, server, session).await) }),
 
         // -- Triggers --
-        Statement::CreateTrigger(s) => Some(handle_create_trigger(s, server, session).await),
-        Statement::DropTrigger(s) => Some(handle_drop_trigger(s, server, session).await),
+        Statement::CreateTrigger(s) => {
+            Box::pin(async move { Some(handle_create_trigger(s, server, session).await) })
+        }
+        Statement::DropTrigger(s) => {
+            Box::pin(async move { Some(handle_drop_trigger(s, server, session).await) })
+        }
 
         // -- Event Handlers --
         Statement::CreateEventHandler(s) => {
-            Some(handle_create_event_handler(s, server, session).await)
+            Box::pin(async move { Some(handle_create_event_handler(s, server, session).await) })
         }
-        Statement::DropEventHandler(s) => Some(handle_drop_event_handler(s, server, session).await),
+        Statement::DropEventHandler(s) => {
+            Box::pin(async move { Some(handle_drop_event_handler(s, server, session).await) })
+        }
 
         // -- Expectations/Features --
-        Statement::AddExpectation(s) => Some(handle_add_expectation(s, server, session).await),
-        Statement::DropExpectation(s) => Some(handle_drop_expectation(s, server, session).await),
-        Statement::EnableFeature(s) => Some(handle_enable_feature(s, server, session).await),
-        Statement::DisableFeature(s) => Some(handle_disable_feature(s, server, session).await),
+        Statement::AddExpectation(s) => {
+            Box::pin(async move { Some(handle_add_expectation(s, server, session).await) })
+        }
+        Statement::DropExpectation(s) => {
+            Box::pin(async move { Some(handle_drop_expectation(s, server, session).await) })
+        }
+        Statement::EnableFeature(s) => {
+            Box::pin(async move { Some(handle_enable_feature(s, server, session).await) })
+        }
+        Statement::DisableFeature(s) => {
+            Box::pin(async move { Some(handle_disable_feature(s, server, session).await) })
+        }
 
         // -- Transaction extensions --
-        Statement::Savepoint(s) => Some(handle_savepoint(s, txn, server)),
-        Statement::ReleaseSavepoint(s) => Some(handle_release_savepoint(s, txn)),
+        Statement::Savepoint(s) => Box::pin(async move { Some(handle_savepoint(s, txn, server)) }),
+        Statement::ReleaseSavepoint(s) => {
+            Box::pin(async move { Some(handle_release_savepoint(s, txn)) })
+        }
 
         // -- Prepared statements: handled by caller (needs statements map) --
-        Statement::Prepare(_) | Statement::Execute(_) | Statement::Deallocate(_) => None,
+        Statement::Prepare(_) | Statement::Execute(_) | Statement::Deallocate(_) => {
+            Box::pin(async move { None })
+        }
 
         // -- Cursors: handled by caller (needs cursors map) --
-        Statement::DeclareCursor(_) | Statement::FetchCursor(_) | Statement::CloseCursor(_) => None,
+        Statement::DeclareCursor(_) | Statement::FetchCursor(_) | Statement::CloseCursor(_) => {
+            Box::pin(async move { None })
+        }
 
         // -- Pub/Sub: handled by caller (needs notification_receivers) --
-        Statement::Listen(_) | Statement::Notify(_) => None,
+        Statement::Listen(_) | Statement::Notify(_) => Box::pin(async move { None }),
 
         // -- COPY: handled by caller (needs wire protocol interaction) --
-        Statement::Copy(_) => None,
+        Statement::Copy(_) => Box::pin(async move { None }),
 
         // -- Archive --
-        Statement::ArchiveTable(s) => Some(handle_archive_table(s, server, session).await),
-        Statement::RestoreTable(s) => Some(handle_restore_table(s, server, session).await),
+        Statement::ArchiveTable(s) => {
+            Box::pin(async move { Some(handle_archive_table(s, server, session).await) })
+        }
+        Statement::RestoreTable(s) => {
+            Box::pin(async move { Some(handle_restore_table(s, server, session).await) })
+        }
 
         // -- Utility --
-        Statement::DoBlock(s) => Some(handle_do_block(s, server, session).await),
+        Statement::DoBlock(s) => {
+            Box::pin(async move { Some(handle_do_block(s, server, session).await) })
+        }
 
         // -- Graph schema --
         Statement::CreateGraphSchema(stmt) => {
-            Some(handle_create_graph_schema(stmt, server, session).await)
+            Box::pin(async move { Some(handle_create_graph_schema(stmt, server, session).await) })
         }
         Statement::DropGraphSchema(stmt) => {
-            Some(handle_drop_graph_schema(stmt, server, session).await)
+            Box::pin(async move { Some(handle_drop_graph_schema(stmt, server, session).await) })
         }
 
         // -- External sources and sinks --
@@ -285,9 +441,9 @@ pub async fn try_handle_ddl_utility(
         | Statement::DropExternalSource(_)
         | Statement::DropExternalSink(_)
         | Statement::AlterExternalSource(_)
-        | Statement::AlterExternalSink(_) => {
+        | Statement::AlterExternalSink(_) => Box::pin(async move {
             Some(dispatch_external_statement(stmt.clone(), server, session).await)
-        }
+        }),
 
         // -- Zyron-to-Zyron data plane --
         Statement::CreatePublication(_)
@@ -297,13 +453,25 @@ pub async fn try_handle_ddl_utility(
         | Statement::AlterEndpoint(_)
         | Statement::AlterSecurityMap(_)
         | Statement::DropSecurityMap(_) => {
-            Some(dispatch_z2z_statement(stmt.clone(), server, session).await)
+            Box::pin(
+                async move { Some(dispatch_z2z_statement(stmt.clone(), server, session).await) },
+            )
         }
-        Statement::TagPublication(s) => Some(handle_tag_publication(s, server, session).await),
-        Statement::UntagPublication(s) => Some(handle_untag_publication(s, server, session).await),
-        Statement::DropPublication(s) => Some(handle_drop_publication(s, server, session).await),
-        Statement::DropEndpoint(s) => Some(handle_drop_endpoint(s, server, session).await),
-        Statement::CreateAbacPolicy(s) => Some(handle_create_abac_policy(s, server, session).await),
+        Statement::TagPublication(s) => {
+            Box::pin(async move { Some(handle_tag_publication(s, server, session).await) })
+        }
+        Statement::UntagPublication(s) => {
+            Box::pin(async move { Some(handle_untag_publication(s, server, session).await) })
+        }
+        Statement::DropPublication(s) => {
+            Box::pin(async move { Some(handle_drop_publication(s, server, session).await) })
+        }
+        Statement::DropEndpoint(s) => {
+            Box::pin(async move { Some(handle_drop_endpoint(s, server, session).await) })
+        }
+        Statement::CreateAbacPolicy(s) => {
+            Box::pin(async move { Some(handle_create_abac_policy(s, server, session).await) })
+        }
     }
 }
 
@@ -3733,13 +3901,7 @@ async fn handle_create_index(
 
     match server
         .catalog
-        .create_btree_index(
-            table.id,
-            schema_id,
-            &stmt.name,
-            &key_columns,
-            stmt.unique,
-        )
+        .create_btree_index(table.id, schema_id, &stmt.name, &key_columns, stmt.unique)
         .await
     {
         Ok(index_id) => {

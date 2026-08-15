@@ -448,6 +448,58 @@ fn positional_write_all(
     Ok(())
 }
 
+/// Positional `read_exact` against a shared `std::fs::File`. The read twin
+/// of `positional_write_all`, and the same properties: it does not move the
+/// file's seek cursor, so one handle serves every reader of a file and two
+/// threads reading different regions of it never contend. On Unix this is
+/// `pread` via `FileExt::read_at`, on Windows `ReadFile` with an
+/// `OVERLAPPED` offset via `FileExt::seek_read`.
+///
+/// Taking `&File` rather than `&mut File` is the point. A reader that has
+/// to seek needs exclusive access, which is what forces a caller holding
+/// one shared handle to open the file again per read
+#[cfg(unix)]
+pub(crate) fn positional_read_exact(
+    file: &std::fs::File,
+    mut buf: &mut [u8],
+    mut offset: u64,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    while !buf.is_empty() {
+        match file.read_at(buf, offset) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => {
+                buf = &mut buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn positional_read_exact(
+    file: &std::fs::File,
+    mut buf: &mut [u8],
+    mut offset: u64,
+) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match file.seek_read(buf, offset) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => {
+                buf = &mut buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

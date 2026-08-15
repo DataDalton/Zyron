@@ -55,7 +55,8 @@ pub fn ttl_mode(entry: &TableEntry) -> TtlMode {
             action,
         };
     }
-    if zyron_catalog::schema::LifecycleConfig::column_is_set(lc.ttl_column_id) && lc.ttl_seconds > 0 {
+    if zyron_catalog::schema::LifecycleConfig::column_is_set(lc.ttl_column_id) && lc.ttl_seconds > 0
+    {
         return TtlMode::Interval {
             column_id: lc.ttl_column_id,
             ttl_seconds: lc.ttl_seconds,

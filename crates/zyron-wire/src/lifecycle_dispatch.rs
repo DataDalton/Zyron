@@ -436,9 +436,7 @@ pub async fn handle_alter_table_options(
                 entry.lifecycle.soft_delete_deleted_at_col_id = id;
             }
             "cold_after" => entry.lifecycle.cold_after_seconds = parse_duration_secs(v),
-            "archive_after" => {
-                entry.lifecycle.archive_after_seconds = parse_duration_secs(v)
-            }
+            "archive_after" => entry.lifecycle.archive_after_seconds = parse_duration_secs(v),
             // The window a soft-deleted row is kept before it is physically
             // purged, which the retention worker reads from
             // purge_grace_seconds. Writing it to archive_after_seconds left
@@ -882,13 +880,12 @@ async fn run_age_tiering(
     if lc.cold_after_seconds <= 0 && lc.archive_after_seconds <= 0 {
         return Ok((0, 0));
     }
-    let age_column_id = if zyron_catalog::schema::LifecycleConfig::column_is_set(
-        lc.retention_column_id,
-    ) {
-        lc.retention_column_id
-    } else {
-        lc.ttl_column_id
-    };
+    let age_column_id =
+        if zyron_catalog::schema::LifecycleConfig::column_is_set(lc.retention_column_id) {
+            lc.retention_column_id
+        } else {
+            lc.ttl_column_id
+        };
     let Some(column) = column_name_by_id(table, age_column_id) else {
         return Ok((0, 0));
     };
@@ -905,11 +902,9 @@ async fn run_age_tiering(
         // Temporal columns store microseconds, the same domain the expiry
         // predicate below compares against
         let cutoff = now_us - after_seconds.saturating_mul(1_000_000);
-        let expr = zyron_parser::parse_expr(&format!(
-            "\"{}\" < {cutoff}",
-            column.replace('"', "\"\"")
-        ))
-        .map_err(ProtocolError::Database)?;
+        let expr =
+            zyron_parser::parse_expr(&format!("\"{}\" < {cutoff}", column.replace('"', "\"\"")))
+                .map_err(ProtocolError::Database)?;
         // Re-read the entry between passes so the archive pass sees the paths
         // the cold pass wrote rather than the ones it replaced
         let current = server
@@ -1020,12 +1015,13 @@ pub(crate) async fn relocate_covered_segments(
     let mut outcome = RelocationOutcome::default();
     for (idx, rows) in candidates {
         let old_path = std::path::PathBuf::from(&entry.columnar.segments[idx].path);
-        let root = zyron_storage::columnar::columnar_root_for_segment(&old_path).ok_or_else(|| {
-            ProtocolError::Database(ZyronError::Internal(format!(
-                "segment path {} has no columnar root",
-                old_path.display()
-            )))
-        })?;
+        let root =
+            zyron_storage::columnar::columnar_root_for_segment(&old_path).ok_or_else(|| {
+                ProtocolError::Database(ZyronError::Internal(format!(
+                    "segment path {} has no columnar root",
+                    old_path.display()
+                )))
+            })?;
         let file_name = old_path.file_name().ok_or_else(|| {
             ProtocolError::Database(ZyronError::Internal(format!(
                 "segment path {} names no file",
@@ -1267,19 +1263,19 @@ pub async fn handle_run_retention_job(
         // Expiry predicate: a per-row retention column compares directly to now;
         // a TTL column compares to a cutoff `now - ttl_seconds`. Temporal columns
         // store i64 microseconds, so the comparison is against a micro cutoff.
-        let where_sql = if zyron_catalog::schema::LifecycleConfig::column_is_set(
-            lc.retention_column_id,
-        ) {
-            column_name_by_id(table, lc.retention_column_id)
-                .map(|col| format!("\"{col}\" < {started}"))
-        } else if zyron_catalog::schema::LifecycleConfig::column_is_set(lc.ttl_column_id)
-            && lc.ttl_seconds > 0
-        {
-            let cutoff = started - lc.ttl_seconds.saturating_mul(1_000_000);
-            column_name_by_id(table, lc.ttl_column_id).map(|col| format!("\"{col}\" < {cutoff}"))
-        } else {
-            None
-        };
+        let where_sql =
+            if zyron_catalog::schema::LifecycleConfig::column_is_set(lc.retention_column_id) {
+                column_name_by_id(table, lc.retention_column_id)
+                    .map(|col| format!("\"{col}\" < {started}"))
+            } else if zyron_catalog::schema::LifecycleConfig::column_is_set(lc.ttl_column_id)
+                && lc.ttl_seconds > 0
+            {
+                let cutoff = started - lc.ttl_seconds.saturating_mul(1_000_000);
+                column_name_by_id(table, lc.ttl_column_id)
+                    .map(|col| format!("\"{col}\" < {cutoff}"))
+            } else {
+                None
+            };
         let Some(where_sql) = where_sql else {
             continue; // no retention/TTL policy on this table
         };

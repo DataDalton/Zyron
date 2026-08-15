@@ -69,8 +69,9 @@ pub use history::{
 };
 pub use index::{
     ENTRIES_PER_INDEX_FILE, IndexBatch, IndexFileEntry, IndexProbeStats, LakeIndexSpec, RangeBound,
-    RowAddress, covers_table, entries_for_file, group_by_partition, index_schema, probe_equal,
-    probe_range, value_to_index_cell, write_index_files,
+    RowAddress, covers_table, entries_for_file, group_by_partition, index_schema,
+    point_probe_read_bytes, probe_equal, probe_range, range_probe_read_bytes, scan_read_bytes,
+    value_to_index_cell, write_index_files,
 };
 pub use maintenance::{
     ClusterPassOptions, ClusterPassOutcome, DEFAULT_MAX_INPUTS, DEFAULT_ROWS_PER_FILE, PassState,

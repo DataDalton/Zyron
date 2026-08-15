@@ -247,7 +247,6 @@ fn test_full_materialization_ps_cost_versus_us() {
     assert!(
         r.passed,
         "ps full materialization must stay within ~3x us: ps {:.0} vs us {:.0} rows/sec",
-        r.average,
-        us_avg
+        r.average, us_avg
     );
 }

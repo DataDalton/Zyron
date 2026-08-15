@@ -176,45 +176,41 @@ fn equality_terms(
 /// Whether reading an index costs less than answering the predicate from
 /// the files pruning already left.
 ///
-/// Both sides are bytes, and both come from the manifest with no IO. The
-/// scan side is what a file costs to answer a predicate on: the predicate's
-/// own column has to be read out of every surviving file, and a file's
-/// per-column share is its size over its column count. The index side is
-/// the index files whose key bounds admit the probe, read whole.
+/// Both sides are bytes the manifest already knows, so the decision reads
+/// no file. What each side counts is what its plan reads and the other's
+/// does not:
 ///
-/// The comparison is what makes an index optional rather than mandatory. On
-/// a column the files are already ordered by, pruning reaches one file and
-/// the index is pure overhead. On a column they are not, pruning reaches
-/// every file and the index is the only thing that can help
+/// - the scan opens every surviving data file and reads the leading key
+///   column's whole segment out of each
+/// - the probe opens every index file its key bounds admit and reads it
+///
+/// Projected columns are on neither side because both plans read them.
+/// Two things the probe saves go uncounted: the trailing columns of a
+/// composite key, which the scan also has to read and the probe does not,
+/// and the surviving files the probe does not address, which are not known
+/// until it runs. So the comparison understates the index, and it errs
+/// toward the scan, which is the safe direction: declining an index that
+/// would have helped costs a speedup, while taking one that does not help
+/// costs the query.
+///
+/// The comparison is what makes an index optional rather than mandatory.
+/// On a column the files are already ordered by, pruning reaches one file
+/// and the index is pure overhead. On a column they are not, pruning
+/// reaches every file and the index is the only thing that can help
 fn index_is_worth_probing(
     manifest: &ManifestFile,
     spec: &zyron_lake::LakeIndexSpec,
     surviving: &[u64],
+    probe_bytes: u64,
 ) -> bool {
-    let columns = manifest.schema.columns.len().max(1) as u64;
-    let scan_bytes: u64 = surviving
-        .iter()
-        .filter_map(|id| manifest.entry_for(*id))
-        .map(|entry| entry.size_bytes / columns)
-        .sum();
-    let index_bytes: u64 = manifest
-        .index_files
-        .iter()
-        .filter(|f| f.index_id == spec.index_id)
-        .map(|f| f.file.size_bytes)
-        .sum::<u64>()
-        // Key bounds pick one file of the set, and they are disjoint, so
-        // the share one probe reads is one file's worth
-        .checked_div(
-            manifest
-                .index_files
-                .iter()
-                .filter(|f| f.index_id == spec.index_id)
-                .count()
-                .max(1) as u64,
-        )
-        .unwrap_or(0);
-    index_bytes < scan_bytes
+    // A manifest that does not carry per-column sizes cannot support this
+    // comparison, and guessing one would decide an access path on a number
+    // nobody measured
+    let Some(scan_bytes) = zyron_lake::scan_read_bytes(manifest, surviving, spec.column_ids[0])
+    else {
+        return false;
+    };
+    probe_bytes < scan_bytes
 }
 
 /// Range terms a lowered predicate asserts at its top level, as column id
@@ -266,6 +262,17 @@ fn range_terms(
     }
 }
 
+/// What a secondary index resolved for one scan
+struct IndexResolution {
+    /// Rows the probe addressed, keyed by data file and ascending within it
+    rows: std::collections::BTreeMap<u64, Vec<u64>>,
+    /// The index that produced them
+    name: String,
+    /// Index files the probe opened, so a plan can show the probe's own
+    /// cost rather than only its effect on the data files
+    files_read: usize,
+}
+
 /// Resolves a range predicate to row addresses through an index that leads
 /// with the bounded column.
 fn resolve_range_through_index(
@@ -273,14 +280,11 @@ fn resolve_range_through_index(
     manifest: &ManifestFile,
     lowered: &zyron_lake::LakePredicate,
     surviving: &[u64],
-) -> Result<(
-    Option<std::collections::BTreeMap<u64, Vec<u64>>>,
-    Option<String>,
-)> {
+) -> Result<Option<IndexResolution>> {
     let mut terms = Vec::new();
     range_terms(lowered, &mut terms);
     if terms.is_empty() {
-        return Ok((None, None));
+        return Ok(None);
     }
     for spec in &manifest.indexes {
         let leading = spec.column_ids[0];
@@ -293,17 +297,20 @@ fn resolve_range_through_index(
         if !zyron_lake::covers_table(manifest, spec.index_id) {
             continue;
         }
-        if !index_is_worth_probing(manifest, spec, surviving) {
+        let probe_bytes =
+            zyron_lake::range_probe_read_bytes(manifest, spec, low.as_ref(), high.as_ref())?;
+        if !index_is_worth_probing(manifest, spec, surviving, probe_bytes) {
             continue;
         }
-        let (addresses, _) =
+        let (addresses, stats) =
             zyron_lake::probe_range(paths, manifest, spec, low.as_ref(), high.as_ref())?;
-        return Ok((
-            Some(zyron_lake::group_by_partition(&addresses)),
-            Some(spec.name.clone()),
-        ));
+        return Ok(Some(IndexResolution {
+            rows: zyron_lake::group_by_partition(&addresses),
+            name: spec.name.clone(),
+            files_read: stats.files_opened,
+        }));
     }
-    Ok((None, None))
+    Ok(None)
 }
 
 /// Resolves a predicate to row addresses through a secondary index, when
@@ -319,17 +326,14 @@ fn resolve_through_index(
     lowered: &zyron_lake::LakePredicate,
     // Files pruning left, which is what the index has to beat
     surviving: &[u64],
-) -> Result<(
-    Option<std::collections::BTreeMap<u64, Vec<u64>>>,
-    Option<String>,
-)> {
+) -> Result<Option<IndexResolution>> {
     if manifest.indexes.is_empty() {
-        return Ok((None, None));
+        return Ok(None);
     }
     let mut terms = Vec::new();
     equality_terms(lowered, &mut terms);
     if terms.is_empty() {
-        return Ok((None, None));
+        return Ok(None);
     }
 
     // The index whose key the predicate pins furthest, so a composite
@@ -360,14 +364,16 @@ fn resolve_through_index(
             best = Some((spec, key));
         }
     }
-    if let Some((spec, _)) = &best
-        && !index_is_worth_probing(manifest, spec, surviving)
-    {
-        // Pruning already reduced the file set far enough that the index
-        // would cost more to read than it saves. Declining is the whole
-        // point of measuring: an index is a way to read less, so using one
-        // that reads more is the wrong call however available it is
-        return Ok((None, None));
+    if let Some((spec, key)) = &best {
+        let probe_bytes = zyron_lake::point_probe_read_bytes(manifest, spec, key.first())?;
+        if !index_is_worth_probing(manifest, spec, surviving, probe_bytes) {
+            // Pruning already reduced the file set far enough that the
+            // index would cost more to read than it saves. Declining is
+            // the whole point of measuring: an index is a way to read
+            // less, so using one that reads more is the wrong call however
+            // available it is
+            return Ok(None);
+        }
     }
     let Some((spec, key)) = best else {
         // No index has its whole key pinned. A range on an index's leading
@@ -387,15 +393,16 @@ fn resolve_through_index(
             Some(cell) => cells.push(Some(cell)),
             // A constant with no stored form cannot be looked up, and the
             // scan answers it exactly
-            None => return Ok((None, None)),
+            None => return Ok(None),
         }
     }
     let borrowed: Vec<Option<&[u8]>> = cells.iter().map(|c| c.as_deref()).collect();
-    let (addresses, _) = zyron_lake::probe_equal(paths, manifest, spec, &borrowed)?;
-    Ok((
-        Some(zyron_lake::group_by_partition(&addresses)),
-        Some(spec.name.clone()),
-    ))
+    let (addresses, stats) = zyron_lake::probe_equal(paths, manifest, spec, &borrowed)?;
+    Ok(Some(IndexResolution {
+        rows: zyron_lake::group_by_partition(&addresses),
+        name: spec.name.clone(),
+        files_read: stats.files_opened,
+    }))
 }
 
 /// Reads the data files of one lake table at one log version.
@@ -446,6 +453,8 @@ pub struct LakeScanOperator {
     index_rows: Option<std::collections::BTreeMap<u64, Vec<u64>>>,
     /// The index that produced them, reported by EXPLAIN
     index_name: Option<String>,
+    /// Index files the probe opened, zero when no index answered
+    index_files_read: usize,
     /// Where the counters are published, so EXPLAIN ANALYZE reports every
     /// file skipped rather than only the ones the manifest rejected
     metrics: Option<Arc<crate::operator::OperatorMetrics>>,
@@ -556,16 +565,21 @@ impl LakeScanOperator {
         // manifest already reduced, and it is consulted only when its
         // files cover every live data file, which is what makes an index
         // that is behind decline rather than answer short
-        let (index_rows, index_name) = match &lowered {
+        let resolved = match &lowered {
             Some(lowered) => resolve_through_index(&paths, &manifest, lowered, &files)?,
-            None => (None, None),
+            None => None,
         };
-        let files: Vec<u64> = match &index_rows {
-            Some(rows) => files
+        let files: Vec<u64> = match &resolved {
+            Some(index) => files
                 .into_iter()
-                .filter(|partition_id| rows.contains_key(partition_id))
+                .filter(|partition_id| index.rows.contains_key(partition_id))
                 .collect(),
             None => files,
+        };
+        let index_files_read = resolved.as_ref().map(|i| i.files_read).unwrap_or(0);
+        let (index_rows, index_name) = match resolved {
+            Some(index) => (Some(index.rows), Some(index.name)),
+            None => (None, None),
         };
         let files_pruned = manifest.entries.len() - files.len();
 
@@ -614,6 +628,7 @@ impl LakeScanOperator {
             bytes_skipped_on_read: 0,
             index_rows,
             index_name,
+            index_files_read,
             metrics: None,
             io_stats,
         })
@@ -646,6 +661,19 @@ impl LakeScanOperator {
         metrics.set_aux(
             crate::operator::AUX_BYTES_PRUNED,
             self.bytes_skipped + self.bytes_skipped_on_read,
+        );
+        // Which access path answered the predicate. Without this a plan
+        // shows only that files were pruned, and a scan that consulted an
+        // index reads the same as one whose statistics happened to be
+        // enough, which is the difference somebody diagnosing a slow point
+        // lookup is looking for
+        metrics.set_aux(
+            crate::operator::AUX_INDEX_FILES_READ,
+            self.index_files_read as u64,
+        );
+        metrics.set_aux(
+            crate::operator::AUX_INDEX_ROWS_ADDRESSED,
+            self.index_rows_addressed() as u64,
         );
     }
 

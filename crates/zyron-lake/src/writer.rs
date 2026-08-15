@@ -278,7 +278,7 @@ pub fn write_data_file_at(
             .flat_map(|z| z.to_bytes())
             .collect();
         let bloom_bytes = segment.bloom_filter.as_ref().map(|b| b.to_bytes());
-        writer.write_segment(
+        let segment_bytes = writer.write_segment(
             col.id,
             &segment.header.to_bytes(),
             bloom_bytes.as_deref(),
@@ -297,6 +297,7 @@ pub fn write_data_file_at(
             },
             bloom: bloom_bytes,
             ndv: Some(distinct.estimate()),
+            size_bytes: Some(segment_bytes),
         });
     }
     let size_bytes = writer.finalize(true)?;

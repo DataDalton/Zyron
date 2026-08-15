@@ -332,14 +332,14 @@ fn rewrite_expr(expr: BoundExpr, prep: &mut Prep) -> Result<BoundExpr> {
     match expr {
         BoundExpr::Subquery { plan, type_id } => {
             if subquery_is_correlated(&plan) {
-                extract(SubKind::Scalar, *plan, type_id, prep)
+                extract(SubKind::Scalar, plan, type_id, prep)
             } else {
                 Ok(BoundExpr::Subquery { plan, type_id })
             }
         }
         BoundExpr::Exists { plan, negated } => {
             if subquery_is_correlated(&plan) {
-                extract(SubKind::Exists { negated }, *plan, TypeId::Boolean, prep)
+                extract(SubKind::Exists { negated }, plan, TypeId::Boolean, prep)
             } else {
                 Ok(BoundExpr::Exists { plan, negated })
             }
@@ -351,7 +351,7 @@ fn rewrite_expr(expr: BoundExpr, prep: &mut Prep) -> Result<BoundExpr> {
         } => {
             if subquery_is_correlated(&plan) {
                 let probe = rewrite_expr(*expr, prep)?;
-                extract(SubKind::In { probe, negated }, *plan, TypeId::Boolean, prep)
+                extract(SubKind::In { probe, negated }, plan, TypeId::Boolean, prep)
             } else {
                 let expr = Box::new(rewrite_expr(*expr, prep)?);
                 Ok(BoundExpr::InSubquery {
@@ -488,7 +488,7 @@ fn rewrite_expr(expr: BoundExpr, prep: &mut Prep) -> Result<BoundExpr> {
 /// it, returning the parameter reference that replaces the subquery node.
 fn extract(
     kind: SubKind,
-    plan: BoundSelect,
+    plan: Box<BoundSelect>,
     slot_type: TypeId,
     prep: &mut Prep,
 ) -> Result<BoundExpr> {
@@ -515,7 +515,7 @@ fn extract(
 /// j-th maps to parameter index base_len + j + 1, which the operator fills per
 /// row before executing the template.
 pub fn parameterize_subquery(
-    plan: BoundSelect,
+    plan: Box<BoundSelect>,
     outer_set: &HashSet<usize>,
     base_len: usize,
     ctx: &Arc<ExecutionContext>,
@@ -555,7 +555,7 @@ pub fn parameterize_subquery(
     });
 
     let logical = zyron_planner::logical::builder::build_logical_plan(&BoundStatement::Select(
-        parameterized,
+        *parameterized,
     ))?;
     let optimized = Optimizer::new(&ctx.catalog).optimize(logical)?;
     // Costing a foreign scan in a re-planned subquery needs the same
@@ -1159,7 +1159,7 @@ impl Operator for LateralJoinOperator {
 #[allow(clippy::too_many_arguments)]
 pub fn build_lateral_join(
     left: Box<dyn Operator>,
-    subquery: BoundSelect,
+    subquery: Box<BoundSelect>,
     join_type: JoinType,
     condition: Option<BoundExpr>,
     left_schema: Vec<LogicalColumn>,

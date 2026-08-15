@@ -66,7 +66,7 @@ impl ExplainFormat {
 /// executor's per-operator metrics stay allocation free on the hot path;
 /// what each slot means depends on the operator and is resolved at render
 /// time by `aux_labels`
-pub const ACTUAL_AUX_SLOTS: usize = 4;
+pub const ACTUAL_AUX_SLOTS: usize = 6;
 
 /// Runtime metrics collected during EXPLAIN ANALYZE execution.
 #[derive(Debug, Clone, Default)]
@@ -105,11 +105,16 @@ pub fn aux_labels(operator_name: &str) -> [&'static str; ACTUAL_AUX_SLOTS] {
             "files_pruned",
             "bytes_considered",
             "bytes_pruned",
+            // Zero index files read means the scan answered the predicate
+            // from the data files, either because no index applied or
+            // because probing one would have read more than it saved
+            "index_files_read",
+            "index_rows_addressed",
         ],
         // A foreign scan's cost is the peer's answer, so what it reports is
         // how much came back and how long the round trip took
-        "ForeignScan" => ["rows_fetched", "remote_ms", "", ""],
-        _ => ["", "", "", ""],
+        "ForeignScan" => ["rows_fetched", "remote_ms", "", "", "", ""],
+        _ => ["", "", "", "", "", ""],
     }
 }
 
@@ -1282,7 +1287,7 @@ mod tests {
             children: Vec::new(),
         };
         let mut metrics = measured("LakeScan", 12, vec![]);
-        metrics.aux = [40, 37, 4_096_000, 3_788_800];
+        metrics.aux = [40, 37, 4_096_000, 3_788_800, 1, 6];
         assert_eq!(node.merge_metrics(&metrics), 1);
         let text = node.render(&ExplainOptions {
             analyze: true,
@@ -1291,6 +1296,10 @@ mod tests {
         assert!(text.contains("files_considered=40"), "{text}");
         assert!(text.contains("files_pruned=37"), "{text}");
         assert!(text.contains("bytes_pruned=3788800"), "{text}");
+        // Which access path answered, so a plan distinguishes a scan whose
+        // statistics were enough from one an index addressed
+        assert!(text.contains("index_files_read=1"), "{text}");
+        assert!(text.contains("index_rows_addressed=6"), "{text}");
 
         // An operator that fills no aux slot prints none of them
         let mut plain = make_simple_plan();

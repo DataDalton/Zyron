@@ -243,6 +243,7 @@ mod tests {
                     row_count: 100,
                 },
                 bloom: None,
+                size_bytes: None,
             })
             .collect();
         column_stats.sort_by_key(|s| s.column_id);

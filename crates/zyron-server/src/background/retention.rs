@@ -179,20 +179,19 @@ impl RetentionWorker {
             };
             let lc = &table.lifecycle;
             // Resolve the comparison column and cutoff.
-            let (col_id, cutoff) = if zyron_catalog::schema::LifecycleConfig::column_is_set(
-                lc.retention_column_id,
-            ) {
-                (lc.retention_column_id, now_us)
-            } else if zyron_catalog::schema::LifecycleConfig::column_is_set(lc.ttl_column_id)
-                && lc.ttl_seconds > 0
-            {
-                (
-                    lc.ttl_column_id,
-                    now_us - lc.ttl_seconds.saturating_mul(1_000_000),
-                )
-            } else {
-                continue;
-            };
+            let (col_id, cutoff) =
+                if zyron_catalog::schema::LifecycleConfig::column_is_set(lc.retention_column_id) {
+                    (lc.retention_column_id, now_us)
+                } else if zyron_catalog::schema::LifecycleConfig::column_is_set(lc.ttl_column_id)
+                    && lc.ttl_seconds > 0
+                {
+                    (
+                        lc.ttl_column_id,
+                        now_us - lc.ttl_seconds.saturating_mul(1_000_000),
+                    )
+                } else {
+                    continue;
+                };
             let col_name = match table.columns.iter().find(|c| c.id.0 as u32 == col_id) {
                 Some(c) => c.name.clone(),
                 None => continue,

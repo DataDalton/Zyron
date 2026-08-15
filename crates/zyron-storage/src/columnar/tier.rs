@@ -79,7 +79,10 @@ mod tests {
     #[test]
     fn test_tier_directories_nest_under_the_root() {
         let root = Path::new("/data/columnar");
-        assert_eq!(tier_segment_dir(root, "hot"), PathBuf::from("/data/columnar"));
+        assert_eq!(
+            tier_segment_dir(root, "hot"),
+            PathBuf::from("/data/columnar")
+        );
         assert_eq!(
             tier_segment_dir(root, "cold"),
             PathBuf::from("/data/columnar/tiers/cold")

@@ -1175,13 +1175,13 @@ fn test_v6_explain_analyze() {
         rows: 982,
         elapsed_ms: 3.2,
         batches: 5,
-        aux: [0; 4],
+        aux: [0; zyron_planner::ACTUAL_AUX_SLOTS],
         children: vec![NodeMetrics {
             name: analyzed.children[0].operator_name.clone(),
             rows: 100_000,
             elapsed_ms: 15.7,
             batches: 100,
-            aux: [0; 4],
+            aux: [0; zyron_planner::ACTUAL_AUX_SLOTS],
             children: Vec::new(),
         }],
     };
@@ -1240,7 +1240,7 @@ fn test_v6_explain_analyze() {
             rows: 500_000,
             elapsed_ms: 100.0,
             batches: 50,
-            aux: [0; 4],
+            aux: [0; zyron_planner::ACTUAL_AUX_SLOTS],
         }),
         children: Vec::new(),
     };
@@ -1694,7 +1694,7 @@ fn test_perf_explain_analyze_overhead() {
             rows: 1_000_000,
             elapsed_ms: 150.0,
             batches: 1000,
-            aux: [0; 4],
+            aux: [0; zyron_planner::ACTUAL_AUX_SLOTS],
         });
 
         let start_analyze = Instant::now();

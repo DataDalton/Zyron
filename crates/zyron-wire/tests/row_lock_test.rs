@@ -222,14 +222,29 @@ async fn try_plan(
 /// machine does not guarantee: the holder would then finish first, the
 /// waiter would acquire the free lock without ever blocking, and a test
 /// asserting what happens to a blocked waiter would fail on timing alone.
+/// The budget is generous rather than tight because it is a precondition
+/// wait, not the thing under test. A two second budget failed intermittently
+/// when the whole suite ran at once, since the spawned waiter competes for
+/// the runtime with every other test process on the machine. Waiting longer
+/// costs nothing on an idle machine, because the loop returns as soon as the
+/// edge appears, and a waiter that never parks still fails, just later
 async fn await_parked_waiter(server: &Arc<ServerState>) {
-    for _ in 0..2_000 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if server.txn_manager.wait_for_graph().edge_count() > 0 {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("no transaction parked on the row lock within thirty seconds");
+        }
+        // yield first so the spawned waiter runs without waiting on a timer,
+        // which is what makes this return promptly on an idle machine
+        tokio::task::yield_now().await;
         if server.txn_manager.wait_for_graph().edge_count() > 0 {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
-    panic!("no transaction parked on the row lock within two seconds");
 }
 
 async fn try_exec_in_txn(

@@ -53,7 +53,8 @@ const STAT_MIN: u8 = 1 << 0;
 const STAT_MAX: u8 = 1 << 1;
 const STAT_BLOOM: u8 = 1 << 2;
 const STAT_NDV: u8 = 1 << 3;
-const STAT_KNOWN_MASK: u8 = STAT_MIN | STAT_MAX | STAT_BLOOM | STAT_NDV;
+const STAT_SIZE: u8 = 1 << 4;
+const STAT_KNOWN_MASK: u8 = STAT_MIN | STAT_MAX | STAT_BLOOM | STAT_NDV | STAT_SIZE;
 
 // The strategy encoding is persisted here and in the catalog, so one
 // definition lives in zyron-common and this crate names it
@@ -128,6 +129,16 @@ pub struct ColumnStatsEntry {
     /// the estimate existed, which reads as evidence the clustering
     /// planner does not have rather than as zero distinct values
     pub ndv: Option<u64>,
+    /// Bytes this column's segment occupies in the file, padded to the
+    /// page boundary the reader seeks to.
+    ///
+    /// This is what reading the column costs, and columns of one file
+    /// differ by more than an order of magnitude, so a per file average is
+    /// not a usable stand in. A cost model comparing two access paths
+    /// needs it, and needs it without opening a file. None means the
+    /// writer did not record it, which reads as evidence a cost model does
+    /// not have rather than as a free column
+    pub size_bytes: Option<u64>,
 }
 
 /// One live data file. The spec calls this a partition entry, it is a
@@ -789,6 +800,9 @@ pub(crate) fn encode_partition_entry(entry: &PartitionEntry, buf: &mut Vec<u8>) 
         if stat.ndv.is_some() {
             flags |= STAT_NDV;
         }
+        if stat.size_bytes.is_some() {
+            flags |= STAT_SIZE;
+        }
         buf.push(flags);
         buf.extend_from_slice(&stat.bounds.null_count.to_le_bytes());
         if let Some(min) = &stat.bounds.min {
@@ -803,6 +817,9 @@ pub(crate) fn encode_partition_entry(entry: &PartitionEntry, buf: &mut Vec<u8>) 
         }
         if let Some(ndv) = stat.ndv {
             buf.extend_from_slice(&ndv.to_le_bytes());
+        }
+        if let Some(size) = stat.size_bytes {
+            buf.extend_from_slice(&size.to_le_bytes());
         }
     }
     buf.extend_from_slice(&(entry.delete_predicate_ids.len() as u16).to_le_bytes());
@@ -852,6 +869,11 @@ pub(crate) fn decode_partition_entry(fr: &mut Cursor<'_>) -> Result<PartitionEnt
         } else {
             None
         };
+        let size_bytes = if flags & STAT_SIZE != 0 {
+            Some(fr.u64()?)
+        } else {
+            None
+        };
         column_stats.push(ColumnStatsEntry {
             ndv,
             column_id,
@@ -862,6 +884,7 @@ pub(crate) fn decode_partition_entry(fr: &mut Cursor<'_>) -> Result<PartitionEnt
                 row_count,
             },
             bloom,
+            size_bytes,
         });
     }
     let ref_count = fr.u16()? as usize;
@@ -959,6 +982,7 @@ mod tests {
                 row_count,
             },
             bloom: None,
+            size_bytes: Some(16_384),
         }
     }
 
@@ -1004,6 +1028,7 @@ mod tests {
                                 row_count: 200,
                             },
                             bloom: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+                            size_bytes: Some(49_152),
                         },
                     ],
                     delete_predicate_ids: vec![9],
@@ -1056,6 +1081,7 @@ mod tests {
                         },
                         bloom: Some(vec![0x01, 0x02]),
                         ndv: Some(5),
+                        size_bytes: Some(16_384),
                     }],
                     delete_predicate_ids: Vec::new(),
                 },

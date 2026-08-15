@@ -111,6 +111,7 @@ fn int_stats(column_id: u32, min: i64, max: i64, rows: u64) -> ColumnStatsEntry 
         },
         bloom: None,
         ndv: Some(rows),
+        size_bytes: None,
     }
 }
 

@@ -2161,6 +2161,7 @@ mod tests {
                     row_count: rows,
                 },
                 bloom: None,
+                size_bytes: None,
             }],
             delete_predicate_ids: vec![],
         }

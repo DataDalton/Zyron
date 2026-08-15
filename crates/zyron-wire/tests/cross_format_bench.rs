@@ -67,12 +67,16 @@
 //! count is exact in any build profile.
 //!
 //! Two ratios are deliberately left unbounded, both about the indexed point
-//! lookup. Their spread across recorded runs is orders of magnitude wider
-//! than every other shape here, so any bound loose enough to admit them
-//! would pass whatever the engine did, and a bound that wide is worse than
-//! none because it reads as a checked claim. The spread is itself the
-//! finding, and it is recorded rather than asserted. Read the run files in
-//! `benchmarks/cross_format/` for what it currently is.
+//! lookup, and both because the two formats take different access paths on
+//! that shape rather than because either is unpredictable. The indexed
+//! column ascends with insertion, so the lake's file bounds already resolve
+//! it to one file and the lake measures the index against that and declines
+//! it, while the heap turns a full scan into a few page reads. The spread
+//! across runs is the heap's, whose indexed lookup is fast enough to be
+//! dominated by fixed cost, and a bound loose enough to admit it would pass
+//! whatever the engine did. What is enforced on that shape instead is a
+//! byte count: a declined index is never opened, so the lake reads exactly
+//! what it read before the index existed.
 //!
 //! Bytes read is bounded, because it is not a timing. A count of bytes is
 //! the same number on any machine in any build profile, so its bound comes
@@ -741,6 +745,19 @@ async fn test_point_lookup_with_and_without_an_index() {
         runs
     };
 
+    // Bytes before any index exists, which is the quantity the index has
+    // to change if it is being read at all
+    let lake_bare_bytes = bytes_read_by(
+        &server,
+        LAKE,
+        &format!(
+            "SELECT amount FROM {} WHERE id = {}",
+            LAKE.table("pli"),
+            probe
+        ),
+    )
+    .await;
+
     let heap_bare = measure(server.clone(), HEAP).await;
     let lake_bare = measure(server.clone(), LAKE).await;
     let heap_bare_avg = record_metric_for(
@@ -795,12 +812,17 @@ async fn test_point_lookup_with_and_without_an_index() {
         "us",
         lake_indexed,
     );
-    // Recorded without a bound. This ratio is far less repeatable across
-    // runs than any other shape here, so a bound loose enough to admit it
-    // would pass whatever the engine did. The spread is the finding rather
-    // than the number. It says the lake index path is not consistently
-    // reached on a point lookup, which is a question this suite is asking
-    // rather than a claim it can enforce
+    // Recorded without a bound, and the reason is not that the engine is
+    // unpredictable here. `id` ascends with insertion, so the manifest's
+    // own bounds already pick one data file and an index has nothing left
+    // to remove: the lake measures both paths and declines the index,
+    // while the heap replaces a full scan with three page reads and gains
+    // an order of magnitude. So this ratio is two different access paths
+    // by design, and its run to run spread is the heap's, whose indexed
+    // lookup is fast enough to be dominated by fixed cost. A bound over
+    // that spread would pass whatever the engine did.
+    //
+    // The claim worth enforcing on this shape is the counted one below
     ratio_of(
         test,
         "Point lookup with an index",
@@ -809,12 +831,11 @@ async fn test_point_lookup_with_and_without_an_index() {
         None,
     );
 
-    // What the index bought each format, as its own recorded quantity so a
-    // format that never consults its index reads as a ratio near one.
-    // Unbounded for the same reason as the ratio above, and it states the
-    // question more directly. It isolates how much each format's own index
-    // helped, rather than comparing two lookups that may not both have
-    // used one
+    // What the index bought each format. Near one on the lake is the
+    // correct outcome here rather than a missing feature: an index the
+    // manifest has already made redundant is measured and declined. What
+    // an index does buy the lake is measured in the lake suite, on a
+    // column bounds cannot narrow, where declining is not an option
     record_ratio(
         test,
         "Index speedup on point lookup",
@@ -826,6 +847,33 @@ async fn test_point_lookup_with_and_without_an_index() {
             Format::Heap,
             heap_bare_avg / heap_indexed_avg.max(f64::MIN_POSITIVE),
         ),
+    );
+
+    // The enforceable half, and the one that says which path ran. A
+    // declined index is not opened, so the query reads exactly the bytes
+    // it read before the index existed. This is exact in any build
+    // profile, and it fails the moment the lake starts reading an index
+    // whose files cost more than the column they replace
+    let lake_indexed_bytes = bytes_read_by(
+        &server,
+        LAKE,
+        &format!(
+            "SELECT amount FROM {} WHERE id = {}",
+            LAKE.table("pli"),
+            probe
+        ),
+    )
+    .await;
+    record_metric_for(
+        Format::Lake,
+        test,
+        "Bytes read with an index",
+        " bytes",
+        vec![lake_indexed_bytes],
+    );
+    assert_eq!(
+        lake_indexed_bytes, lake_bare_bytes,
+        "the lake read {lake_indexed_bytes} bytes with an index on a column its file bounds          already resolve, against {lake_bare_bytes} without one, so it opened index files that          cannot have removed work"
     );
 }
 

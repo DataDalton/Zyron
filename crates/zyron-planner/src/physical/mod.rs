@@ -199,7 +199,10 @@ pub enum PhysicalPlan {
     /// Left (NULL-extend); condition is the optional ON predicate.
     LateralJoin {
         left: Box<PhysicalPlan>,
-        subquery: crate::binder::BoundSelect,
+        /// Boxed because a `BoundSelect` is by far the widest thing any plan
+        /// node carries, and inlining it here would set the size of every
+        /// `PhysicalPlan` value in the planner and the executor
+        subquery: Box<crate::binder::BoundSelect>,
         subquery_table_idx: usize,
         join_type: JoinType,
         condition: Option<BoundExpr>,
@@ -724,5 +727,30 @@ impl PhysicalPlan {
             cpu_cost: own.cpu_cost + children_cost.cpu_cost,
             row_count: own.row_count,
         }
+    }
+}
+
+#[cfg(test)]
+mod plan_width {
+    use super::*;
+
+    /// Every construction, move, match arm and `Vec` element in the planner
+    /// and the executor pays this width, and the operator tree is built by
+    /// recursion, so it is also multiplied by plan depth on the stack. It was
+    /// 928 bytes while `LateralJoin` held a `BoundSelect` inline, which alone
+    /// is 704. Raising this is a real cost, so it is pinned rather than left
+    /// to drift
+    #[test]
+    fn a_physical_plan_node_stays_narrow() {
+        let width = std::mem::size_of::<PhysicalPlan>();
+        assert!(
+            width <= 384,
+            "PhysicalPlan grew to {} bytes, over the 384 byte budget.              Box the widest field of the variant that grew rather than              widening every plan node in the tree",
+            width
+        );
+        assert!(
+            std::mem::size_of::<crate::binder::BoundSelect>() > width,
+            "BoundSelect is no longer wider than a plan node, so the reason              LateralJoin boxes it should be rechecked"
+        );
     }
 }

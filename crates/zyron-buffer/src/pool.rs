@@ -1231,8 +1231,10 @@ mod tests {
                     (page_id, frame.ok())
                 }));
             }
-            let got: Vec<(PageId, Option<FrameId>)> =
-                handles.into_iter().map(|h| h.join().expect("thread")).collect();
+            let got: Vec<(PageId, Option<FrameId>)> = handles
+                .into_iter()
+                .map(|h| h.join().expect("thread"))
+                .collect();
 
             // Two live page ids may never share a frame
             let mut by_frame: std::collections::HashMap<u32, Vec<PageId>> =

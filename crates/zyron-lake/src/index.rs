@@ -35,6 +35,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use zyron_common::ZyronError;
+use zyron_storage::columnar::FILE_HEADER_SIZE;
 
 use crate::cells::compare_cells;
 use crate::manifest::{ManifestFile, PartitionEntry};
@@ -97,13 +98,15 @@ const ADDRESS_ORDINAL_OFFSET: u32 = 1;
 
 /// Entries one index file holds.
 ///
-/// This is the quantity a probe actually pays. Decoding is whole-segment,
-/// so the cost of answering one key is the size of the file that key lands
-/// in, not the size of the index. Splitting a sorted run into files of this
-/// size gives every file a disjoint key range, which lets the manifest's
-/// own min and max pruning pick exactly one before anything is opened.
+/// This is the quantity a probe actually pays. A segment's payload is one
+/// contiguous region and is read whole even when the caller wants a few
+/// rows of it, so the bytes answering one key costs are the bytes of the
+/// file that key lands in, not of the index. Splitting a sorted run into
+/// files of this size gives every file a disjoint key range, which lets
+/// the manifest's own min and max pruning pick exactly one before anything
+/// is opened.
 ///
-/// A single file holding the whole index would make a probe decode every
+/// A single file holding the whole index would make a probe read every
 /// entry in the table, which is more work than scanning the data
 pub const ENTRIES_PER_INDEX_FILE: usize = 8192;
 
@@ -486,6 +489,85 @@ pub fn covers_table(manifest: &ManifestFile, index_id: u32) -> bool {
         .all(|entry| covered.contains(&entry.partition_id))
 }
 
+/// Bytes a scan reads to answer a predicate on one column, across the data
+/// files pruning left.
+///
+/// Each file costs the header page the reader consumes before it can find
+/// any segment, plus the predicate column's whole segment. The segment is
+/// charged whole because a ranged read still reads its contiguous payload
+/// and only narrows the decode, so the byte cost of touching a column does
+/// not depend on how many of its rows the caller wants.
+///
+/// Projected columns are outside this: both access paths read them, so
+/// they cancel. Returns None when any surviving file did not record its
+/// per-column sizes, which is the answer "there is no evidence here" and
+/// not a cost of zero
+pub fn scan_read_bytes(manifest: &ManifestFile, surviving: &[u64], column_id: u32) -> Option<u64> {
+    let mut total = 0u64;
+    for partition_id in surviving {
+        let entry = manifest.entry_for(*partition_id)?;
+        let column = entry.stats_for(column_id)?.size_bytes?;
+        total = total
+            .saturating_add(column)
+            .saturating_add(FILE_HEADER_SIZE as u64);
+    }
+    Some(total)
+}
+
+/// Bytes a point probe of one index reads.
+///
+/// Only the index files whose key bounds admit the key are counted, which
+/// is the same admission `probe_equal` applies and is answered from the
+/// manifest with no IO. An admitted file is charged whole, because the
+/// probe reads its header, its leading key segment to bisect, and the
+/// address segments over the run it found, and every segment read is a
+/// whole segment.
+///
+/// A key with no comparable form admits every file, because that is what
+/// the probe would do
+pub fn point_probe_read_bytes(
+    manifest: &ManifestFile,
+    spec: &LakeIndexSpec,
+    leading: Option<&LakeValue>,
+) -> Result<u64, ZyronError> {
+    let schema = index_schema(&manifest.schema, spec)?;
+    let mut total = 0u64;
+    for file in &manifest.index_files {
+        if file.index_id != spec.index_id {
+            continue;
+        }
+        if let Some(value) = leading
+            && !admits_value(&schema, &file.file, 0, value)
+        {
+            continue;
+        }
+        total = total.saturating_add(file.file.size_bytes);
+    }
+    Ok(total)
+}
+
+/// Bytes a range probe of one index reads, over the contiguous span of
+/// index files its bounds admit
+pub fn range_probe_read_bytes(
+    manifest: &ManifestFile,
+    spec: &LakeIndexSpec,
+    low: Option<&RangeBound>,
+    high: Option<&RangeBound>,
+) -> Result<u64, ZyronError> {
+    let schema = index_schema(&manifest.schema, spec)?;
+    let mut total = 0u64;
+    for file in &manifest.index_files {
+        if file.index_id != spec.index_id {
+            continue;
+        }
+        if !admits_range(&schema, &file.file, low, high) {
+            continue;
+        }
+        total = total.saturating_add(file.file.size_bytes);
+    }
+    Ok(total)
+}
+
 /// What a probe had to read, so a caller can prove the statistics did
 /// their job rather than assume it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -694,9 +776,6 @@ pub fn probe_range(
             continue;
         }
         let key_column = reader.read_column(leading_column)?;
-        let base = spec.column_ids.len();
-        let partitions = reader.read_column(&schema.columns[base])?;
-        let ordinals = reader.read_column(&schema.columns[base + 1])?;
 
         // Two bisections bound the run. The sort key is truncated for
         // strings and wide integers, so the ends are widened by one run and
@@ -709,6 +788,17 @@ pub fn probe_range(
             Some((cell, _)) => key_column.sort_key_range_in(cell, start..rows).end,
             None => rows,
         };
+        if start >= end {
+            continue;
+        }
+
+        // The addresses are decoded over the run the bisection found, not
+        // over the file. A range selecting a few hundred rows out of a full
+        // index file would otherwise decode both address columns whole,
+        // which is the cost the bisection exists to remove
+        let base = spec.column_ids.len();
+        let partitions = reader.read_column_range(&schema.columns[base], start, end)?;
+        let ordinals = reader.read_column_range(&schema.columns[base + 1], start, end)?;
 
         for row in start..end {
             stats.entries_examined += 1;

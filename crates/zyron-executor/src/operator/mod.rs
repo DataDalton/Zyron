@@ -338,16 +338,22 @@ pub struct OperatorMetrics {
 }
 
 /// Auxiliary counter slots per operator.
-pub const AUX_SLOTS: usize = 4;
+pub const AUX_SLOTS: usize = 6;
 
-/// Data files a scan's manifest listed.
+/// Data files a scan's manifest listed
 pub const AUX_FILES_CONSIDERED: usize = 0;
-/// Data files statistics excluded before any byte was read.
+/// Data files statistics excluded before any byte was read
 pub const AUX_FILES_PRUNED: usize = 1;
-/// Bytes those files held in total.
+/// Bytes those files held in total
 pub const AUX_BYTES_CONSIDERED: usize = 2;
-/// Bytes the pruned files held, the IO the predicate saved.
+/// Bytes the pruned files held, the IO the predicate saved
 pub const AUX_BYTES_PRUNED: usize = 3;
+/// Index files a lake scan read to address its rows. Zero means it read
+/// none, which is what an unindexed column and a declined index both look
+/// like from the outside
+pub const AUX_INDEX_FILES_READ: usize = 4;
+/// Rows a secondary index addressed for a lake scan
+pub const AUX_INDEX_ROWS_ADDRESSED: usize = 5;
 
 /// Rows a peer returned for a foreign scan. Shares slot 0 with the file
 /// count because no operator reports both, and the labels an operator's

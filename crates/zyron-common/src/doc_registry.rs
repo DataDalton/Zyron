@@ -510,8 +510,10 @@ mod tests {
                     (loc, r.allocate(1, loc))
                 }));
             }
-            let got: Vec<(RowLocator, u64)> =
-                handles.into_iter().map(|h| h.join().expect("thread")).collect();
+            let got: Vec<(RowLocator, u64)> = handles
+                .into_iter()
+                .map(|h| h.join().expect("thread"))
+                .collect();
 
             for (loc, doc) in &got {
                 assert_eq!(r.locator(1, *doc), Some(*loc), "round {round}");
