@@ -182,7 +182,10 @@ const CHECKPOINT_EVERY: u64 = 64;
 /// version files older than what the table's time-travel window and the
 /// newest checkpoint still need. A table with no retention window promises
 /// no history, so only the published head has to stay reconstructable
-fn maintain_lake_log(catalog: &Catalog, log: &TransactionLog) -> Result<(), zyron_common::ZyronError> {
+fn maintain_lake_log(
+    catalog: &Catalog,
+    log: &TransactionLog,
+) -> Result<(), zyron_common::ZyronError> {
     let latest = log.latest_version();
     if latest == 0 {
         return Ok(());
@@ -539,7 +542,10 @@ mod tests {
         // history below it and keeps everything at or above readable
         log.checkpoint(6).expect("checkpoint");
         let removed = log.gc_versions(6).expect("gc");
-        assert_eq!(removed, 6, "history at and below the checkpoint is reclaimed");
+        assert_eq!(
+            removed, 6,
+            "history at and below the checkpoint is reclaimed"
+        );
         let m = log
             .manifest_at(6)
             .expect("head reconstructs from the checkpoint");

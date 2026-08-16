@@ -360,7 +360,11 @@ impl BufferFrame {
         let _ = self
             .pin_count
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
-                if c & CLAIM != 0 { Some(c - CLAIM + 1) } else { None }
+                if c & CLAIM != 0 {
+                    Some(c - CLAIM + 1)
+                } else {
+                    None
+                }
             });
     }
 

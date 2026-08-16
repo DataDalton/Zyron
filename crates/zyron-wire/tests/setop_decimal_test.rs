@@ -40,11 +40,7 @@ async fn set_operations_compare_decimal_values_not_raw_integers() {
         "10.50 and 10.500 are one value, the union holds 3.125, 7.25, 10.50"
     );
     assert_eq!(
-        query_rows(
-            &server,
-            "SELECT v FROM sd_a INTERSECT SELECT v FROM sd_b"
-        )
-        .await,
+        query_rows(&server, "SELECT v FROM sd_a INTERSECT SELECT v FROM sd_b").await,
         1,
         "the branches share exactly the value 10.5"
     );
@@ -81,11 +77,7 @@ async fn same_scale_set_operations_still_work() {
         3
     );
     assert_eq!(
-        query_rows(
-            &server,
-            "SELECT v FROM sd_c INTERSECT SELECT v FROM sd_d"
-        )
-        .await,
+        query_rows(&server, "SELECT v FROM sd_c INTERSECT SELECT v FROM sd_d").await,
         1
     );
     assert_eq!(

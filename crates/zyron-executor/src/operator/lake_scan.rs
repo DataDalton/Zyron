@@ -1374,7 +1374,11 @@ impl Operator for LakeDeleteOperator {
                 .catalog
                 .referencing_constraints(table_entry.id)
                 .is_empty()
-                || !self.ctx.catalog.triggers_for_table(self.table_id).is_empty()
+                || !self
+                    .ctx
+                    .catalog
+                    .triggers_for_table(self.table_id)
+                    .is_empty()
                 || self.ctx.cdc_hook.is_some();
             let mut old_batches: Vec<crate::batch::DataBatch> = Vec::new();
             if needs_old_rows {

@@ -111,17 +111,19 @@ impl SortOperator {
                     // tracking, a values-only sort has no permutation to
                     // apply to the locators
                     let type_id = key_batches[0].type_id;
-                    let mut sorted = match compute::radix_sort_batches_values(
-                        key_batches,
-                        self.order_by[0].asc,
-                    ) {
-                        Some(data) => Column::new(data, type_id),
-                        None => {
-                            let mut merged = concat_columns(key_batches);
-                            compute::sort_column_inplace(&mut merged.data, self.order_by[0].asc);
-                            merged
-                        }
-                    };
+                    let mut sorted =
+                        match compute::radix_sort_batches_values(key_batches, self.order_by[0].asc)
+                        {
+                            Some(data) => Column::new(data, type_id),
+                            None => {
+                                let mut merged = concat_columns(key_batches);
+                                compute::sort_column_inplace(
+                                    &mut merged.data,
+                                    self.order_by[0].asc,
+                                );
+                                merged
+                            }
+                        };
                     if let Some(limit) = self.limit {
                         let limit = limit as usize;
                         if total_rows > limit {

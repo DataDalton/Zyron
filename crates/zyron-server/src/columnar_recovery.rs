@@ -551,10 +551,7 @@ pub async fn reconcile_segment_tiers(catalog: &Catalog) {
             }
             for (_, extra) in &found[1..] {
                 match std::fs::remove_file(extra) {
-                    Ok(()) => info!(
-                        "tier reconcile: removed duplicate copy {}",
-                        extra.display()
-                    ),
+                    Ok(()) => info!("tier reconcile: removed duplicate copy {}", extra.display()),
                     Err(e) => warn!(
                         "tier reconcile: could not remove duplicate copy {}: {}",
                         extra.display(),

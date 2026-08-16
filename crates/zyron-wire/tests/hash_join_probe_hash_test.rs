@@ -39,13 +39,9 @@ fn as_i64_pairs(rows: &[Vec<ScalarValue>]) -> Vec<(i64, i64)> {
 async fn test_null_bearing_build_side_still_matches_clean_probe() {
     let (server, _schema, _tmp) = create_test_server().await;
     let mut session = common::new_session();
-    exec_ddl(
-        &server,
-        &mut session,
-        "CREATE TABLE l (a BIGINT, x BIGINT)",
-    )
-    .await
-    .expect("create l");
+    exec_ddl(&server, &mut session, "CREATE TABLE l (a BIGINT, x BIGINT)")
+        .await
+        .expect("create l");
     exec_ddl(
         &server,
         &mut session,
@@ -56,11 +52,7 @@ async fn test_null_bearing_build_side_still_matches_clean_probe() {
     exec_dml(&server, "INSERT INTO l VALUES (1, 10), (2, 20), (NULL, 30)").await;
     exec_dml(&server, "INSERT INTO r VALUES (1, 100), (2, 200)").await;
 
-    let rows = query_values(
-        &server,
-        "SELECT l.x, r.y FROM l JOIN r ON l.a = r.b",
-    )
-    .await;
+    let rows = query_values(&server, "SELECT l.x, r.y FROM l JOIN r ON l.a = r.b").await;
     assert_eq!(
         as_i64_pairs(&rows),
         vec![(10, 100), (20, 200)],
@@ -91,11 +83,7 @@ async fn test_expression_build_key_still_matches_clean_probe() {
     exec_dml(&server, "INSERT INTO l VALUES (0, 10), (1, 20)").await;
     exec_dml(&server, "INSERT INTO r VALUES (1, 100), (2, 200)").await;
 
-    let rows = query_values(
-        &server,
-        "SELECT l.x, r.y FROM l JOIN r ON l.a + 1 = r.b",
-    )
-    .await;
+    let rows = query_values(&server, "SELECT l.x, r.y FROM l JOIN r ON l.a + 1 = r.b").await;
     assert_eq!(
         as_i64_pairs(&rows),
         vec![(10, 100), (20, 200)],
@@ -109,13 +97,9 @@ async fn test_expression_build_key_still_matches_clean_probe() {
 async fn test_right_join_null_bearing_build_side_pads_only_true_misses() {
     let (server, _schema, _tmp) = create_test_server().await;
     let mut session = common::new_session();
-    exec_ddl(
-        &server,
-        &mut session,
-        "CREATE TABLE l (a BIGINT, x BIGINT)",
-    )
-    .await
-    .expect("create l");
+    exec_ddl(&server, &mut session, "CREATE TABLE l (a BIGINT, x BIGINT)")
+        .await
+        .expect("create l");
     exec_ddl(
         &server,
         &mut session,
@@ -126,11 +110,7 @@ async fn test_right_join_null_bearing_build_side_pads_only_true_misses() {
     exec_dml(&server, "INSERT INTO l VALUES (1, 10), (NULL, 30)").await;
     exec_dml(&server, "INSERT INTO r VALUES (1, 100), (7, 700)").await;
 
-    let rows = query_values(
-        &server,
-        "SELECT l.x, r.y FROM l RIGHT JOIN r ON l.a = r.b",
-    )
-    .await;
+    let rows = query_values(&server, "SELECT l.x, r.y FROM l RIGHT JOIN r ON l.a = r.b").await;
     assert_eq!(rows.len(), 2, "one match plus one true miss");
     let mut matched = 0;
     let mut padded = 0;

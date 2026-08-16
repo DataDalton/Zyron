@@ -92,7 +92,13 @@ async fn an_inline_file_source_requires_the_external_source_privilege() {
         ObjectType::Schema,
         schema.0,
     );
-    grant(&sm, role, PrivilegeType::Insert, ObjectType::Table, tgt_id.0);
+    grant(
+        &sm,
+        role,
+        PrivilegeType::Insert,
+        ObjectType::Table,
+        tgt_id.0,
+    );
     session.as_mut().expect("session").security_context = Some(security_context(role));
 
     let csv = tmp.path().join("rows.csv");
@@ -153,7 +159,10 @@ async fn an_inline_file_sink_requires_the_external_sink_privilege() {
     // registry this harness does not configure, so the catalog flag is set
     // directly, the subject here is the privilege gate alone
     {
-        let entry = server.catalog.get_table(schema, "stream_src").expect("table");
+        let entry = server
+            .catalog
+            .get_table(schema, "stream_src")
+            .expect("table");
         let mut entry = (*entry).clone();
         entry.cdf_enabled = true;
         server
@@ -176,7 +185,13 @@ async fn an_inline_file_sink_requires_the_external_sink_privilege() {
         ObjectType::Schema,
         schema.0,
     );
-    grant(&sm, role, PrivilegeType::Select, ObjectType::Table, src_id.0);
+    grant(
+        &sm,
+        role,
+        PrivilegeType::Select,
+        ObjectType::Table,
+        src_id.0,
+    );
     session.as_mut().expect("session").security_context = Some(security_context(role));
 
     let out = tmp.path().join("out.csv");

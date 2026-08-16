@@ -161,9 +161,13 @@ async fn test_outer_joins_still_owe_rows_when_one_input_is_empty() {
     let (server, _schema, _tmp) = create_test_server().await;
     setup(&server).await;
     let mut session = common::new_session();
-    exec_ddl(&server, &mut session, "CREATE TABLE nothing (k INT, nv INT)")
-        .await
-        .expect("create nothing");
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE nothing (k INT, nv INT)",
+    )
+    .await
+    .expect("create nothing");
 
     // Empty left input: RIGHT JOIN owes every right row null-padded.
     let rows = query_values(

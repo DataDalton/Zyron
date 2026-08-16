@@ -21,7 +21,11 @@ async fn test_truncate_empties_a_lake_table() {
     )
     .await
     .expect("create");
-    exec_dml(&server, "INSERT INTO lk VALUES (1, 'a'), (2, 'b'), (3, 'c')").await;
+    exec_dml(
+        &server,
+        "INSERT INTO lk VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    )
+    .await;
     assert_eq!(query_rows(&server, "SELECT id FROM lk").await, 3);
 
     exec_ddl(&server, &mut session, "TRUNCATE TABLE lk")

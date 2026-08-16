@@ -856,9 +856,7 @@ fn decode_numeric_binary(bytes: &[u8]) -> Result<ScalarValue, ProtocolError> {
         scaled = contribution
             .and_then(|c| scaled.checked_add(c))
             .ok_or_else(|| {
-                ProtocolError::Malformed(
-                    "Numeric value exceeds the 128-bit decimal range".into(),
-                )
+                ProtocolError::Malformed("Numeric value exceeds the 128-bit decimal range".into())
             })?;
     }
     if sign == NUMERIC_NEG as u16 {
@@ -870,9 +868,7 @@ fn decode_numeric_binary(bytes: &[u8]) -> Result<ScalarValue, ProtocolError> {
             Err(_) => ScalarValue::Int128(scaled),
         });
     }
-    Ok(ScalarValue::Float64(
-        scaled as f64 / 10f64.powi(dscale),
-    ))
+    Ok(ScalarValue::Float64(scaled as f64 / 10f64.powi(dscale)))
 }
 
 /// Parses a UUID string into 16 bytes. Accepts "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".

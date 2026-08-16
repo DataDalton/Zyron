@@ -707,7 +707,9 @@ impl HeapFile {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
-            .map_err(|e| ZyronError::IoError(format!("scan flush open {}: {}", path.display(), e)))?;
+            .map_err(|e| {
+                ZyronError::IoError(format!("scan flush open {}: {}", path.display(), e))
+            })?;
         let offset = page_id.page_num * (PAGE_SIZE as u64);
         std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset))
             .map_err(|e| ZyronError::IoError(format!("scan flush seek: {}", e)))?;

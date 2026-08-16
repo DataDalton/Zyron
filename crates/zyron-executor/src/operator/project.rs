@@ -170,8 +170,7 @@ impl Operator for ProjectOperator {
                     Some(col) => columns.push(col),
                     None => {
                         return Err(ZyronError::ExecutionError(
-                            "projection produced no column for one of its expressions"
-                                .to_string(),
+                            "projection produced no column for one of its expressions".to_string(),
                         ));
                     }
                 }

@@ -1985,7 +1985,14 @@ pub fn radix_sort_column_batches(
     }
     match &batches[0].data {
         ColumnData::Int64(_) => {
-            radix_extract_signed!(batches, ascending, Int64, i64, u64, 0x8000_0000_0000_0000u64)
+            radix_extract_signed!(
+                batches,
+                ascending,
+                Int64,
+                i64,
+                u64,
+                0x8000_0000_0000_0000u64
+            )
         }
         ColumnData::Int32(_) => {
             radix_extract_signed!(batches, ascending, Int32, i32, u32, 0x8000_0000u64)
@@ -2023,7 +2030,14 @@ pub fn radix_sort_batches_values(batches: &[Column], ascending: bool) -> Option<
     }
     match &batches[0].data {
         ColumnData::Int64(_) => {
-            radix_values_signed!(batches, ascending, Int64, i64, u64, 0x8000_0000_0000_0000u64)
+            radix_values_signed!(
+                batches,
+                ascending,
+                Int64,
+                i64,
+                u64,
+                0x8000_0000_0000_0000u64
+            )
         }
         ColumnData::Int32(_) => {
             radix_values_signed!(batches, ascending, Int32, i32, u32, 0x8000_0000u64)
@@ -2179,7 +2193,7 @@ pub fn sort_indices(
         let asc = ascending[0];
         match &columns[0].data {
             ColumnData::Int64(v) => {
-                return radix_sort_signed!(v, asc, u64, 0x8000_0000_0000_0000u64)
+                return radix_sort_signed!(v, asc, u64, 0x8000_0000_0000_0000u64);
             }
             ColumnData::Int32(v) => return radix_sort_signed!(v, asc, u32, 0x8000_0000u64),
             ColumnData::Int16(v) => return radix_sort_signed!(v, asc, u16, 0x8000u64),
@@ -2811,7 +2825,9 @@ mod radix_sort_tests {
 
     /// Deterministic 64-bit generator so every run sorts the same data
     fn lcg(state: &mut u64) -> u64 {
-        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *state
     }
 
@@ -2870,7 +2886,9 @@ mod radix_sort_tests {
 
         // Values differing only in bytes 0 and 2, byte 1 constant across
         // all keys, exercises the intermediate constant-byte pass skip
-        let vals: Vec<i64> = (0..600).map(|i| ((i * 37) % 251) * 0x1_0000 + (i % 13)).collect();
+        let vals: Vec<i64> = (0..600)
+            .map(|i| ((i * 37) % 251) * 0x1_0000 + (i % 13))
+            .collect();
         let batches = vec![Column::new(ColumnData::Int64(vals.clone()), TypeId::Int64)];
         let mut expect = vals.clone();
         expect.sort_unstable();
@@ -2898,7 +2916,10 @@ mod radix_sort_tests {
         with_null.nulls.set_null(5);
         assert!(radix_sort_batches_values(&[with_null], true).is_none());
 
-        let floats = vec![Column::new(ColumnData::Float64(vec![0.0; 600]), TypeId::Float64)];
+        let floats = vec![Column::new(
+            ColumnData::Float64(vec![0.0; 600]),
+            TypeId::Float64,
+        )];
         assert!(radix_sort_batches_values(&floats, true).is_none());
     }
 
@@ -2910,7 +2931,9 @@ mod radix_sort_tests {
         let mut batches: Vec<Column> = Vec::new();
         let mut concat: Vec<i64> = Vec::new();
         for len in lens {
-            let vals: Vec<i64> = (0..len).map(|_| (lcg(&mut state) % 50) as i64 - 25).collect();
+            let vals: Vec<i64> = (0..len)
+                .map(|_| (lcg(&mut state) % 50) as i64 - 25)
+                .collect();
             concat.extend_from_slice(&vals);
             batches.push(Column::new(ColumnData::Int64(vals), TypeId::Int64));
         }

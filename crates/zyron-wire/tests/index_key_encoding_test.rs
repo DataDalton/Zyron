@@ -101,7 +101,10 @@ async fn test_signed_bigint_order_by_reads_index_in_value_order() {
 
     let desc = "SELECT k FROM t ORDER BY k DESC";
     let plan = plan_of(&server, desc).await;
-    assert!(uses_index_scan(&plan), "DESC should read the index backward");
+    assert!(
+        uses_index_scan(&plan),
+        "DESC should read the index backward"
+    );
     assert_eq!(as_i64(&query_values(&server, desc).await), vec![5, 1, -3]);
 }
 
@@ -132,7 +135,10 @@ async fn test_signed_bigint_range_predicates_via_index() {
             "SELECT k FROM t WHERE k > -5 ORDER BY k",
             vec![-4, -1, 0, 2, 5],
         ),
-        ("SELECT k FROM t WHERE k >= -1 ORDER BY k", vec![-1, 0, 2, 5]),
+        (
+            "SELECT k FROM t WHERE k >= -1 ORDER BY k",
+            vec![-1, 0, 2, 5],
+        ),
         ("SELECT k FROM t WHERE k <= 0 ORDER BY k", vec![-4, -1, 0]),
         (
             "SELECT k FROM t WHERE k > -2 AND k < 3 ORDER BY k",
@@ -239,11 +245,14 @@ async fn test_boolean_index_scan_returns_rows() {
     assert_eq!(rows.len(), 3, "index scan dropped rows");
     let flags: Vec<i64> = as_i64(&rows);
     assert_eq!(flags[0], 2, "false rows order first");
-    assert_eq!({
-        let mut rest = flags[1..].to_vec();
-        rest.sort();
-        rest
-    }, vec![1, 3]);
+    assert_eq!(
+        {
+            let mut rest = flags[1..].to_vec();
+            rest.sort();
+            rest
+        },
+        vec![1, 3]
+    );
 }
 
 /// INTERVAL has no order-preserving fixed encoding, so indexing one is

@@ -1207,7 +1207,10 @@ async fn rewrite_table_columns(
     use zyron_parser::ast::AlterTableOperation as Op;
 
     let table_id = old_table.id;
-    debug_assert!(!old_table.lake.is_lake(), "lake tables never reach the heap rewrite");
+    debug_assert!(
+        !old_table.lake.is_lake(),
+        "lake tables never reach the heap rewrite"
+    );
 
     // Read every current row under the old schema. INCLUDING DELETED keeps
     // soft-deleted tombstones so the rewrite does not silently drop them.

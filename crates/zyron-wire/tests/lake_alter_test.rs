@@ -33,7 +33,11 @@ async fn test_lake_add_column_serves_null_for_old_rows() {
 
     // Old rows read back whole, with NULL in the added column
     let rows = query_values(&server, "SELECT id, name, v FROM lk ORDER BY id").await;
-    assert_eq!(rows.len(), 2, "both existing rows survive the schema change");
+    assert_eq!(
+        rows.len(),
+        2,
+        "both existing rows survive the schema change"
+    );
     assert_eq!(rows[0][2], ScalarValue::Null);
     assert_eq!(rows[1][2], ScalarValue::Null);
 

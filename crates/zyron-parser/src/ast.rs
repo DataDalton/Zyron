@@ -2421,7 +2421,10 @@ pub enum LiteralValue {
     /// exactly, carried as unscaled digits and a scale so every digit the
     /// statement wrote survives to the row. Narrow fixed-point literals stay
     /// Float, keeping their long-standing float typing.
-    Decimal { digits: i128, scale: u8 },
+    Decimal {
+        digits: i128,
+        scale: u8,
+    },
     Float(f64),
     String(String),
     Boolean(bool),

@@ -14,8 +14,7 @@ mod common;
 use common::{create_test_server, exec_ddl, exec_dml, new_session, query_values};
 use zyron_executor::column::ScalarValue;
 
-async fn setup(
-) -> (
+async fn setup() -> (
     std::sync::Arc<zyron_wire::connection::ServerState>,
     Option<zyron_wire::session::Session>,
     tempfile::TempDir,
@@ -48,11 +47,7 @@ async fn test_cross_scale_decimal_equi_join_matches() {
     exec_dml(&server, "INSERT INTO a VALUES (10.50), (7.25)").await;
     exec_dml(&server, "INSERT INTO b VALUES (10.500), (7.251)").await;
 
-    let rows = query_values(
-        &server,
-        "SELECT a.v FROM a JOIN b ON a.v = b.w",
-    )
-    .await;
+    let rows = query_values(&server, "SELECT a.v FROM a JOIN b ON a.v = b.w").await;
     assert_eq!(
         fmt_decimals(&rows, 2),
         vec!["10.50"],
@@ -76,11 +71,7 @@ async fn test_int_decimal_equi_join_compares_values() {
     exec_dml(&server, "INSERT INTO i VALUES (10), (1050)").await;
     exec_dml(&server, "INSERT INTO d VALUES (10.50), (10.00)").await;
 
-    let rows = query_values(
-        &server,
-        "SELECT i.n FROM i JOIN d ON i.n = d.v",
-    )
-    .await;
+    let rows = query_values(&server, "SELECT i.n FROM i JOIN d ON i.n = d.v").await;
     assert_eq!(rows.len(), 1, "exactly one numeric match exists");
     assert_eq!(rows[0][0], ScalarValue::Int64(10));
 }
@@ -101,18 +92,22 @@ async fn test_cross_scale_decimal_join_partitioned_path() {
         let values: Vec<String> = (0..1000)
             .map(|i| format!("({}.25)", chunk * 1000 + i))
             .collect();
-        exec_dml(&server, &format!("INSERT INTO pa VALUES {}", values.join(","))).await;
+        exec_dml(
+            &server,
+            &format!("INSERT INTO pa VALUES {}", values.join(",")),
+        )
+        .await;
         let values: Vec<String> = (0..1000)
             .map(|i| format!("({}.250)", chunk * 1000 + i))
             .collect();
-        exec_dml(&server, &format!("INSERT INTO pb VALUES {}", values.join(","))).await;
+        exec_dml(
+            &server,
+            &format!("INSERT INTO pb VALUES {}", values.join(",")),
+        )
+        .await;
     }
 
-    let rows = query_values(
-        &server,
-        "SELECT COUNT(*) FROM pa JOIN pb ON pa.v = pb.w",
-    )
-    .await;
+    let rows = query_values(&server, "SELECT COUNT(*) FROM pa JOIN pb ON pa.v = pb.w").await;
     assert_eq!(
         rows[0][0],
         ScalarValue::Int64(5000),
@@ -204,21 +199,13 @@ async fn test_having_compares_aggregated_decimals_as_values() {
     )
     .await;
 
-    let rows = query_values(
-        &server,
-        "SELECT g FROM d GROUP BY g HAVING SUM(v) > 100",
-    )
-    .await;
+    let rows = query_values(&server, "SELECT g FROM d GROUP BY g HAVING SUM(v) > 100").await;
     assert!(
         rows.is_empty(),
         "35.75 is not greater than 100, raw 3575 is the bug"
     );
 
-    let rows = query_values(
-        &server,
-        "SELECT g FROM d GROUP BY g HAVING SUM(v) > 30",
-    )
-    .await;
+    let rows = query_values(&server, "SELECT g FROM d GROUP BY g HAVING SUM(v) > 30").await;
     assert_eq!(rows.len(), 1, "35.75 is greater than 30");
 }
 
@@ -240,11 +227,7 @@ async fn test_computed_decimal_keeps_scale_through_derived_table() {
         "SELECT s FROM (SELECT a + b AS s FROM d) t WHERE s < 2",
     )
     .await;
-    assert_eq!(
-        rows.len(),
-        1,
-        "1.3125 is less than 2, its raw 13125 is not"
-    );
+    assert_eq!(rows.len(), 1, "1.3125 is less than 2, its raw 13125 is not");
 }
 
 /// INSERT from a SELECT across scales stores the value on the target scale.
@@ -474,9 +457,13 @@ async fn sum_overflow_is_an_error_not_a_wrap() {
 #[tokio::test]
 async fn test_wide_decimal_literals_land_exactly() {
     let (server, mut session, _tmp) = setup().await;
-    exec_ddl(&server, &mut session, "CREATE TABLE wide (v DECIMAL(38, 9))")
-        .await
-        .expect("create");
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE wide (v DECIMAL(38, 9))",
+    )
+    .await
+    .expect("create");
     exec_dml(
         &server,
         "INSERT INTO wide VALUES (123456789012345678.123456789), (-0.000000001)",

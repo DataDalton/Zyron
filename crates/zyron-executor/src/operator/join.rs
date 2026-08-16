@@ -434,7 +434,12 @@ fn merge_batches(mut batches: Vec<DataBatch>, total_rows: usize) -> Option<DataB
             data.extend_from(&batch.columns[col_idx].data);
             nulls.extend_from(&batch.columns[col_idx].nulls);
         }
-        merged_columns.push(Column::with_nulls_ts(data, nulls, type_id, fractional_digits));
+        merged_columns.push(Column::with_nulls_ts(
+            data,
+            nulls,
+            type_id,
+            fractional_digits,
+        ));
     }
     Some(DataBatch::new(merged_columns))
 }
@@ -1181,113 +1186,211 @@ impl Operator for HashJoinOperator {
             }
 
             for merged_probe in &probe_batches {
-            let total_probe_rows = merged_probe.num_rows;
-            // Determine if we can use the fused probe path: single ColumnRef
-            // integer key, no nulls, no remaining condition. This computes
-            // hashes inline and probes the hash table in one pass with
-            // group-prefetch to hide L3 latency, eliminating the separate
-            // hash buffer allocation and extra passes.
-            let use_fused = self.remaining_condition.is_none()
-                && self.probe_key_col_indices.len() == 1
-                && self.probe_key_col_indices[0].is_some();
+                let total_probe_rows = merged_probe.num_rows;
+                // Determine if we can use the fused probe path: single ColumnRef
+                // integer key, no nulls, no remaining condition. This computes
+                // hashes inline and probes the hash table in one pass with
+                // group-prefetch to hide L3 latency, eliminating the separate
+                // hash buffer allocation and extra passes.
+                let use_fused = self.remaining_condition.is_none()
+                    && self.probe_key_col_indices.len() == 1
+                    && self.probe_key_col_indices[0].is_some();
 
-            let fused_key_idx = if use_fused {
-                self.probe_key_col_indices[0]
-            } else {
-                None
-            };
+                let fused_key_idx = if use_fused {
+                    self.probe_key_col_indices[0]
+                } else {
+                    None
+                };
 
-            let fused_col_no_nulls = fused_key_idx
-                .map(|ki| !merged_probe.columns[ki].nulls.has_nulls())
-                .unwrap_or(false);
+                let fused_col_no_nulls = fused_key_idx
+                    .map(|ki| !merged_probe.columns[ki].nulls.has_nulls())
+                    .unwrap_or(false);
 
-            // Materialize probe key columns once for value comparison after the
-            // hi32 hash match across every probe path.
-            let probe_keys = self.materialize_probe_keys(merged_probe)?;
+                // Materialize probe key columns once for value comparison after the
+                // hi32 hash match across every probe path.
+                let probe_keys = self.materialize_probe_keys(merged_probe)?;
 
-            if fused_col_no_nulls {
-                let key_idx = fused_key_idx.unwrap();
-                let track_right = matches!(self.internal_join, JoinType::Right | JoinType::Full);
-                let track_build = !self.build_matched.is_empty();
+                if fused_col_no_nulls {
+                    let key_idx = fused_key_idx.unwrap();
+                    let track_right =
+                        matches!(self.internal_join, JoinType::Right | JoinType::Full);
+                    let track_build = !self.build_matched.is_empty();
 
-                let mut build_idx: Vec<u32> = Vec::with_capacity(total_probe_rows);
-                let mut probe_idx: Vec<u32> = Vec::with_capacity(total_probe_rows);
-                let mut unmatched_probe: Vec<u32> =
-                    if track_right { Vec::new() } else { Vec::new() };
+                    let mut build_idx: Vec<u32> = Vec::with_capacity(total_probe_rows);
+                    let mut probe_idx: Vec<u32> = Vec::with_capacity(total_probe_rows);
+                    let mut unmatched_probe: Vec<u32> =
+                        if track_right { Vec::new() } else { Vec::new() };
 
-                // Fused hash + probe with group-prefetch.
-                // Prefetch distance of 16 hides L3 latency for bucket lookups.
-                const PF: usize = 16;
+                    // Fused hash + probe with group-prefetch.
+                    // Prefetch distance of 16 hides L3 latency for bucket lookups.
+                    const PF: usize = 16;
 
-                macro_rules! fused_probe_prefetch {
-                    ($v:expr) => {{
-                        let n = $v.len();
-                        let mut pf_buf = [0u64; PF];
-                        let prime = PF.min(n);
-                        for i in 0..prime {
-                            pf_buf[i] = compute::hash_int($v[i] as u64);
-                            self.build_index.prefetch(pf_buf[i]);
+                    macro_rules! fused_probe_prefetch {
+                        ($v:expr) => {{
+                            let n = $v.len();
+                            let mut pf_buf = [0u64; PF];
+                            let prime = PF.min(n);
+                            for i in 0..prime {
+                                pf_buf[i] = compute::hash_int($v[i] as u64);
+                                self.build_index.prefetch(pf_buf[i]);
+                            }
+
+                            for probe_row in 0..n {
+                                let hash = pf_buf[probe_row % PF];
+
+                                let ahead = probe_row + PF;
+                                if ahead < n {
+                                    let h = compute::hash_int($v[ahead] as u64);
+                                    pf_buf[ahead % PF] = h;
+                                    self.build_index.prefetch(h);
+                                }
+
+                                let mut cursor = self.build_index.get(hash);
+                                let hash_hi32 = (hash >> 32) as u32;
+                                let mut matched = false;
+                                while cursor != u32::MAX {
+                                    let (next, stored_hi32) = self.build_entries[cursor as usize];
+                                    let build_row = cursor;
+                                    cursor = next;
+                                    if stored_hi32 != hash_hi32 {
+                                        continue;
+                                    }
+                                    if !self.keys_match(&probe_keys, build_row as usize, probe_row)
+                                    {
+                                        continue;
+                                    }
+                                    build_idx.push(build_row);
+                                    probe_idx.push(probe_row as u32);
+                                    matched = true;
+                                    if track_build {
+                                        self.build_matched[build_row as usize] = true;
+                                    }
+                                }
+                                if !matched && track_right {
+                                    unmatched_probe.push(probe_row as u32);
+                                }
+                            }
+                        }};
+                    }
+
+                    // The integer-hash probe is only valid when the build side
+                    // filled its buckets with the same integer hash. A build key
+                    // with NULLs or an expression key hashed generically, and a
+                    // probe hashing the same values differently would look up
+                    // buckets that were never filled, dropping every match
+                    let col = &merged_probe.columns[key_idx];
+                    match (&col.data, self.build_used_int_hash) {
+                        (ColumnData::Int64(v), true) => fused_probe_prefetch!(v),
+                        (ColumnData::Int32(v), true) => fused_probe_prefetch!(v),
+                        (ColumnData::Int16(v), true) => fused_probe_prefetch!(v),
+                        (ColumnData::Int8(v), true) => fused_probe_prefetch!(v),
+                        (ColumnData::UInt64(v), true) => fused_probe_prefetch!(v),
+                        (ColumnData::UInt32(v), true) => fused_probe_prefetch!(v),
+                        (ColumnData::UInt16(v), true) => fused_probe_prefetch!(v),
+                        (ColumnData::UInt8(v), true) => fused_probe_prefetch!(v),
+                        _ => {
+                            // Non-integer fused path without prefetch (strings,
+                            // decimals, and any probe whose build side hashed
+                            // generically). Hashes the materialized key column,
+                            // which carries any decimal alignment
+                            let probe_hashes = compute::hash_column_batch(
+                                &[probe_keys[0].as_ref()],
+                                total_probe_rows,
+                            );
+                            for probe_row in 0..total_probe_rows {
+                                let hash = probe_hashes[probe_row];
+                                let mut cursor = self.build_index.get(hash);
+                                let hash_hi32 = (hash >> 32) as u32;
+                                let mut matched = false;
+                                while cursor != u32::MAX {
+                                    let (next, stored_hi32) = self.build_entries[cursor as usize];
+                                    let build_row = cursor;
+                                    cursor = next;
+                                    if stored_hi32 != hash_hi32 {
+                                        continue;
+                                    }
+                                    if !self.keys_match(&probe_keys, build_row as usize, probe_row)
+                                    {
+                                        continue;
+                                    }
+                                    build_idx.push(build_row);
+                                    probe_idx.push(probe_row as u32);
+                                    matched = true;
+                                    if track_build {
+                                        self.build_matched[build_row as usize] = true;
+                                    }
+                                }
+                                if !matched && track_right {
+                                    unmatched_probe.push(probe_row as u32);
+                                }
+                            }
                         }
+                    }
 
-                        for probe_row in 0..n {
-                            let hash = pf_buf[probe_row % PF];
+                    // Accumulate matches into full-size output batches.
+                    self.append_matches(&build_idx, merged_probe, &probe_idx);
 
-                            let ahead = probe_row + PF;
-                            if ahead < n {
-                                let h = compute::hash_int($v[ahead] as u64);
-                                pf_buf[ahead % PF] = h;
-                                self.build_index.prefetch(h);
+                    // Emit unmatched probe rows for probe-outer joins. Pending
+                    // matches flush first so a row's position never depends on
+                    // which probe batch it came from.
+                    if !unmatched_probe.is_empty() {
+                        self.flush_pending_out();
+                        let swapped = self.swapped;
+                        let buf = self.output_buffer.as_mut().unwrap();
+                        for &pr in &unmatched_probe {
+                            if swapped {
+                                buf.push_left_null_right(merged_probe, pr as usize);
+                            } else {
+                                buf.push_null_left_right(merged_probe, pr as usize);
                             }
-
-                            let mut cursor = self.build_index.get(hash);
-                            let hash_hi32 = (hash >> 32) as u32;
-                            let mut matched = false;
-                            while cursor != u32::MAX {
-                                let (next, stored_hi32) = self.build_entries[cursor as usize];
-                                let build_row = cursor;
-                                cursor = next;
-                                if stored_hi32 != hash_hi32 {
-                                    continue;
-                                }
-                                if !self.keys_match(&probe_keys, build_row as usize, probe_row) {
-                                    continue;
-                                }
-                                build_idx.push(build_row);
-                                probe_idx.push(probe_row as u32);
-                                matched = true;
-                                if track_build {
-                                    self.build_matched[build_row as usize] = true;
-                                }
-                            }
-                            if !matched && track_right {
-                                unmatched_probe.push(probe_row as u32);
+                            if buf.is_full() {
+                                self.output_queue
+                                    .push(buf.flush(&self.left_types, &self.right_types));
                             }
                         }
-                    }};
-                }
+                    }
+                } else {
+                    // Generic path: hash all probe keys, then probe. The
+                    // materialized probe key columns carry any decimal
+                    // alignment, so hashing them matches the build side
+                    let key_refs: Vec<&Column> = probe_keys.iter().map(|c| c.as_ref()).collect();
+                    let probe_hashes = if self.build_used_int_hash {
+                        // Build used hash_int for single integer key. Compute
+                        // matching hashes from the single probe key column.
+                        let col = key_refs[0];
+                        let mut hashes = Vec::with_capacity(total_probe_rows);
+                        macro_rules! hash_int_col {
+                            ($v:expr) => {
+                                for val in $v.iter() {
+                                    hashes.push(compute::hash_int(*val as u64));
+                                }
+                            };
+                        }
+                        match &col.data {
+                            ColumnData::Int64(v) => hash_int_col!(v),
+                            ColumnData::Int32(v) => hash_int_col!(v),
+                            ColumnData::Int16(v) => hash_int_col!(v),
+                            ColumnData::Int8(v) => hash_int_col!(v),
+                            ColumnData::UInt64(v) => hash_int_col!(v),
+                            ColumnData::UInt32(v) => hash_int_col!(v),
+                            ColumnData::UInt16(v) => hash_int_col!(v),
+                            ColumnData::UInt8(v) => hash_int_col!(v),
+                            _ => {
+                                hashes = compute::hash_column_batch(&key_refs, total_probe_rows);
+                            }
+                        }
+                        hashes
+                    } else {
+                        compute::hash_column_batch(&key_refs, total_probe_rows)
+                    };
 
-                // The integer-hash probe is only valid when the build side
-                // filled its buckets with the same integer hash. A build key
-                // with NULLs or an expression key hashed generically, and a
-                // probe hashing the same values differently would look up
-                // buckets that were never filled, dropping every match
-                let col = &merged_probe.columns[key_idx];
-                match (&col.data, self.build_used_int_hash) {
-                    (ColumnData::Int64(v), true) => fused_probe_prefetch!(v),
-                    (ColumnData::Int32(v), true) => fused_probe_prefetch!(v),
-                    (ColumnData::Int16(v), true) => fused_probe_prefetch!(v),
-                    (ColumnData::Int8(v), true) => fused_probe_prefetch!(v),
-                    (ColumnData::UInt64(v), true) => fused_probe_prefetch!(v),
-                    (ColumnData::UInt32(v), true) => fused_probe_prefetch!(v),
-                    (ColumnData::UInt16(v), true) => fused_probe_prefetch!(v),
-                    (ColumnData::UInt8(v), true) => fused_probe_prefetch!(v),
-                    _ => {
-                        // Non-integer fused path without prefetch (strings,
-                        // decimals, and any probe whose build side hashed
-                        // generically). Hashes the materialized key column,
-                        // which carries any decimal alignment
-                        let probe_hashes =
-                            compute::hash_column_batch(&[probe_keys[0].as_ref()], total_probe_rows);
+                    if self.remaining_condition.is_some() {
+                        let swapped = self.swapped;
+                        let track_right =
+                            matches!(self.internal_join, JoinType::Right | JoinType::Full);
+                        let build_key_columns = &self.build_key_columns;
+                        let buf = self.output_buffer.as_mut().unwrap();
+                        let build = self.build_batch.as_ref().unwrap();
                         for probe_row in 0..total_probe_rows {
                             let hash = probe_hashes[probe_row];
                             let mut cursor = self.build_index.get(hash);
@@ -1300,148 +1403,68 @@ impl Operator for HashJoinOperator {
                                 if stored_hi32 != hash_hi32 {
                                     continue;
                                 }
-                                if !self.keys_match(&probe_keys, build_row as usize, probe_row) {
+                                if !keys_match_columns(
+                                    build_key_columns,
+                                    &probe_keys,
+                                    build_row as usize,
+                                    probe_row,
+                                ) {
                                     continue;
                                 }
-                                build_idx.push(build_row);
-                                probe_idx.push(probe_row as u32);
-                                matched = true;
-                                if track_build {
-                                    self.build_matched[build_row as usize] = true;
+                                // The condition schema is external left then
+                                // right, so the combined row follows that order
+                                let combined = if swapped {
+                                    combine_rows_single(
+                                        merged_probe,
+                                        probe_row,
+                                        build,
+                                        build_row as usize,
+                                    )
+                                } else {
+                                    combine_rows_single(
+                                        build,
+                                        build_row as usize,
+                                        merged_probe,
+                                        probe_row,
+                                    )
+                                };
+                                let mask = evaluate(
+                                    self.remaining_condition.as_ref().unwrap(),
+                                    &combined,
+                                    &self.input_schema,
+                                    &[],
+                                )?;
+                                if !mask.is_null(0) && mask.get_bool(0) {
+                                    matched = true;
+                                    if !self.build_matched.is_empty() {
+                                        self.build_matched[build_row as usize] = true;
+                                    }
+                                    if swapped {
+                                        buf.push_matched(
+                                            merged_probe,
+                                            probe_row,
+                                            build,
+                                            build_row as usize,
+                                        );
+                                    } else {
+                                        buf.push_matched(
+                                            build,
+                                            build_row as usize,
+                                            merged_probe,
+                                            probe_row,
+                                        );
+                                    }
+                                    if buf.is_full() {
+                                        self.output_queue
+                                            .push(buf.flush(&self.left_types, &self.right_types));
+                                    }
                                 }
                             }
                             if !matched && track_right {
-                                unmatched_probe.push(probe_row as u32);
-                            }
-                        }
-                    }
-                }
-
-                // Accumulate matches into full-size output batches.
-                self.append_matches(&build_idx, merged_probe, &probe_idx);
-
-                // Emit unmatched probe rows for probe-outer joins. Pending
-                // matches flush first so a row's position never depends on
-                // which probe batch it came from.
-                if !unmatched_probe.is_empty() {
-                    self.flush_pending_out();
-                    let swapped = self.swapped;
-                    let buf = self.output_buffer.as_mut().unwrap();
-                    for &pr in &unmatched_probe {
-                        if swapped {
-                            buf.push_left_null_right(merged_probe, pr as usize);
-                        } else {
-                            buf.push_null_left_right(merged_probe, pr as usize);
-                        }
-                        if buf.is_full() {
-                            self.output_queue
-                                .push(buf.flush(&self.left_types, &self.right_types));
-                        }
-                    }
-                }
-            } else {
-                // Generic path: hash all probe keys, then probe. The
-                // materialized probe key columns carry any decimal
-                // alignment, so hashing them matches the build side
-                let key_refs: Vec<&Column> = probe_keys.iter().map(|c| c.as_ref()).collect();
-                let probe_hashes = if self.build_used_int_hash {
-                    // Build used hash_int for single integer key. Compute
-                    // matching hashes from the single probe key column.
-                    let col = key_refs[0];
-                    let mut hashes = Vec::with_capacity(total_probe_rows);
-                    macro_rules! hash_int_col {
-                        ($v:expr) => {
-                            for val in $v.iter() {
-                                hashes.push(compute::hash_int(*val as u64));
-                            }
-                        };
-                    }
-                    match &col.data {
-                        ColumnData::Int64(v) => hash_int_col!(v),
-                        ColumnData::Int32(v) => hash_int_col!(v),
-                        ColumnData::Int16(v) => hash_int_col!(v),
-                        ColumnData::Int8(v) => hash_int_col!(v),
-                        ColumnData::UInt64(v) => hash_int_col!(v),
-                        ColumnData::UInt32(v) => hash_int_col!(v),
-                        ColumnData::UInt16(v) => hash_int_col!(v),
-                        ColumnData::UInt8(v) => hash_int_col!(v),
-                        _ => {
-                            hashes = compute::hash_column_batch(&key_refs, total_probe_rows);
-                        }
-                    }
-                    hashes
-                } else {
-                    compute::hash_column_batch(&key_refs, total_probe_rows)
-                };
-
-                if self.remaining_condition.is_some() {
-                    let swapped = self.swapped;
-                    let track_right = matches!(self.internal_join, JoinType::Right | JoinType::Full);
-                    let build_key_columns = &self.build_key_columns;
-                    let buf = self.output_buffer.as_mut().unwrap();
-                    let build = self.build_batch.as_ref().unwrap();
-                    for probe_row in 0..total_probe_rows {
-                        let hash = probe_hashes[probe_row];
-                        let mut cursor = self.build_index.get(hash);
-                        let hash_hi32 = (hash >> 32) as u32;
-                        let mut matched = false;
-                        while cursor != u32::MAX {
-                            let (next, stored_hi32) = self.build_entries[cursor as usize];
-                            let build_row = cursor;
-                            cursor = next;
-                            if stored_hi32 != hash_hi32 {
-                                continue;
-                            }
-                            if !keys_match_columns(
-                                build_key_columns,
-                                &probe_keys,
-                                build_row as usize,
-                                probe_row,
-                            ) {
-                                continue;
-                            }
-                            // The condition schema is external left then
-                            // right, so the combined row follows that order
-                            let combined = if swapped {
-                                combine_rows_single(
-                                    merged_probe,
-                                    probe_row,
-                                    build,
-                                    build_row as usize,
-                                )
-                            } else {
-                                combine_rows_single(
-                                    build,
-                                    build_row as usize,
-                                    merged_probe,
-                                    probe_row,
-                                )
-                            };
-                            let mask = evaluate(
-                                self.remaining_condition.as_ref().unwrap(),
-                                &combined,
-                                &self.input_schema,
-                                &[],
-                            )?;
-                            if !mask.is_null(0) && mask.get_bool(0) {
-                                matched = true;
-                                if !self.build_matched.is_empty() {
-                                    self.build_matched[build_row as usize] = true;
-                                }
                                 if swapped {
-                                    buf.push_matched(
-                                        merged_probe,
-                                        probe_row,
-                                        build,
-                                        build_row as usize,
-                                    );
+                                    buf.push_left_null_right(merged_probe, probe_row);
                                 } else {
-                                    buf.push_matched(
-                                        build,
-                                        build_row as usize,
-                                        merged_probe,
-                                        probe_row,
-                                    );
+                                    buf.push_null_left_right(merged_probe, probe_row);
                                 }
                                 if buf.is_full() {
                                     self.output_queue
@@ -1449,24 +1472,12 @@ impl Operator for HashJoinOperator {
                                 }
                             }
                         }
-                        if !matched && track_right {
-                            if swapped {
-                                buf.push_left_null_right(merged_probe, probe_row);
-                            } else {
-                                buf.push_null_left_right(merged_probe, probe_row);
-                            }
-                            if buf.is_full() {
-                                self.output_queue
-                                    .push(buf.flush(&self.left_types, &self.right_types));
-                            }
-                        }
+                    } else {
+                        let batches =
+                            self.probe_batch_vectorized(merged_probe, &probe_hashes, &probe_keys);
+                        self.output_queue.extend(batches);
                     }
-                } else {
-                    let batches =
-                        self.probe_batch_vectorized(merged_probe, &probe_hashes, &probe_keys);
-                    self.output_queue.extend(batches);
                 }
-            }
             }
 
             // Emit whatever matched rows are still accumulating.
@@ -1723,8 +1734,16 @@ impl ParallelHashJoinOperator {
                 if !ld && !rd {
                     return None;
                 }
-                let ls = if ld { l.fractional_digits().unwrap_or(0) } else { 0 };
-                let rs = if rd { r.fractional_digits().unwrap_or(0) } else { 0 };
+                let ls = if ld {
+                    l.fractional_digits().unwrap_or(0)
+                } else {
+                    0
+                };
+                let rs = if rd {
+                    r.fractional_digits().unwrap_or(0)
+                } else {
+                    0
+                };
                 Some(ls.max(rs))
             })
             .collect()
@@ -1855,7 +1874,12 @@ async fn merge_drained(mut op: Box<dyn Operator>) -> Result<Option<DataBatch>> {
             data.extend_from(&b.columns[c].data);
             nulls.extend_from(&b.columns[c].nulls);
         }
-        cols.push(Column::with_nulls_ts(data, nulls, type_id, fractional_digits));
+        cols.push(Column::with_nulls_ts(
+            data,
+            nulls,
+            type_id,
+            fractional_digits,
+        ));
     }
     Ok(Some(DataBatch::new(cols)))
 }

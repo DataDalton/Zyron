@@ -200,8 +200,7 @@ async fn exec(h: &mut Harness, sql: &str) -> Vec<DataBatch> {
     let ctx = Arc::new(ctx);
     let batches = zyron_executor::execute(plan, &ctx).await.expect("execute");
     h.server.txn_manager.commit(&mut txn).await.expect("commit");
-    let logs =
-        zyron_lake::publish_txn(h.server.disk_manager.data_dir(), txn_id).expect("publish");
+    let logs = zyron_lake::publish_txn(h.server.disk_manager.data_dir(), txn_id).expect("publish");
     zyron_wire::connection::refresh_lake_stats(&h.server, &logs);
     batches
 }
@@ -215,11 +214,7 @@ fn total_rows(batches: &[DataBatch]) -> usize {
 #[tokio::test]
 async fn lake_parent_fk_probe_reads_the_branch_head() {
     let mut h = create_harness().await;
-    exec(
-        &mut h,
-        "CREATE TABLE p (k BIGINT NOT NULL) USING ZYRONLAKE",
-    )
-    .await;
+    exec(&mut h, "CREATE TABLE p (k BIGINT NOT NULL) USING ZYRONLAKE").await;
     exec(
         &mut h,
         "CREATE TABLE c (id INT NOT NULL, k BIGINT, FOREIGN KEY (k) REFERENCES p(k))",

@@ -4116,8 +4116,7 @@ impl<T: WireTransport> Connection<T> {
         // files carrying retired delete predicates instead of vacuuming an
         // empty heap and reporting success
         if table.lake.is_lake() {
-            let paths =
-                zyron_lake::LakePaths::new(self.server.disk_manager.data_dir(), table.id.0);
+            let paths = zyron_lake::LakePaths::new(self.server.disk_manager.data_dir(), table.id.0);
             let outcome = match zyron_lake::TransactionLog::lookup_shared(&paths) {
                 Some(log) => {
                     let timestamp_us = std::time::SystemTime::now()

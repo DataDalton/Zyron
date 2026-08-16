@@ -117,11 +117,7 @@ impl RowStore {
                     )
                 })
                 .collect();
-            self.scales = batch
-                .columns
-                .iter()
-                .map(|c| c.fractional_digits)
-                .collect();
+            self.scales = batch.columns.iter().map(|c| c.fractional_digits).collect();
         }
     }
 
@@ -450,9 +446,7 @@ impl Operator for SetOpOperator {
                         }
                     }
                 }
-                SetOpState::Right => {
-                    align_streamed(self.right.next().await?, &self.stream_scales)
-                }
+                SetOpState::Right => align_streamed(self.right.next().await?, &self.stream_scales),
                 SetOpState::Materialized { result, cursor } => {
                     let Some(batch) = result else {
                         self.state = SetOpState::Done;

@@ -55,10 +55,7 @@ async fn run_stmt(
 }
 
 fn is_conflict(r: &Result<(), zyron_common::ZyronError>) -> bool {
-    matches!(
-        r,
-        Err(zyron_common::ZyronError::TransactionConflict { .. })
-    )
+    matches!(r, Err(zyron_common::ZyronError::TransactionConflict { .. }))
 }
 
 /// Collects the single integer column of a result as sorted values
@@ -169,7 +166,11 @@ async fn concurrent_update_then_delete_conflicts_instead_of_losing_the_delete() 
         "a delete of a concurrently updated row must conflict, got {second:?}"
     );
     let values = int_column(&server, "SELECT v FROM wc_ud WHERE id = 1").await;
-    assert_eq!(values, vec![10], "the committed update survives the conflict");
+    assert_eq!(
+        values,
+        vec![10],
+        "the committed update survives the conflict"
+    );
 }
 
 #[tokio::test]
