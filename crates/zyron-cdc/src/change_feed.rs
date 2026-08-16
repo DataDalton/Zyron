@@ -147,10 +147,17 @@ const RECORD_FRAME_SUFFIX: usize = 4; // u32 checksum
 const BINARY_FIXED_HEADER: usize = 34;
 
 impl ChangeRecord {
-    /// Serializes to packed binary format (table_id omitted, stored in file header).
-    fn serialize(&self) -> Vec<u8> {
-        let total = BINARY_FIXED_HEADER + self.row_data.len() + self.primary_key_data.len();
-        let mut buf = Vec::with_capacity(total);
+    /// Bytes this record occupies in packed binary form, so a caller can
+    /// size a buffer for many records exactly instead of growing it
+    #[inline]
+    fn serialized_len(&self) -> usize {
+        BINARY_FIXED_HEADER + self.row_data.len() + self.primary_key_data.len()
+    }
+
+    /// Appends the packed binary form to an existing buffer (table_id
+    /// omitted, stored in the file header). Writing in place lets a batch
+    /// serialize every record into one buffer with no per-record allocation.
+    fn serialize_into(&self, buf: &mut Vec<u8>) {
         buf.push(self.change_type as u8);
         buf.extend_from_slice(&self.commit_version.to_le_bytes());
         buf.extend_from_slice(&self.commit_timestamp.to_le_bytes());
@@ -162,6 +169,12 @@ impl ChangeRecord {
         buf.extend_from_slice(&self.row_data);
         buf.extend_from_slice(&(self.primary_key_data.len() as u32).to_le_bytes());
         buf.extend_from_slice(&self.primary_key_data);
+    }
+
+    /// Serializes to packed binary format (table_id omitted, stored in file header).
+    fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.serialized_len());
+        self.serialize_into(&mut buf);
         buf
     }
 
@@ -532,16 +545,27 @@ impl ChangeDataFeed {
             return Ok(());
         }
 
-        // Pre-serialize outside the lock: one contiguous buffer for all records.
-        let mut batch_buf: Vec<u8> = Vec::with_capacity(records.len() * 64);
+        // Pre-serialize outside the lock: one contiguous buffer for all
+        // records, sized exactly so appending never reallocates and copies
+        // the accumulated batch forward
+        let exact: usize = records
+            .iter()
+            .map(|r| RECORD_FRAME_PREFIX + r.serialized_len() + RECORD_FRAME_SUFFIX)
+            .sum();
+        let mut batch_buf: Vec<u8> = Vec::with_capacity(exact);
         let mut meta: Vec<(usize, u64, i64)> = Vec::with_capacity(records.len());
 
         for record in records {
             let start = batch_buf.len();
-            let data = record.serialize();
-            let checksum = cdf_hash32(&data);
-            batch_buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
-            batch_buf.extend_from_slice(&data);
+            // The length prefix is written after the body, whose size is
+            // known only once it is encoded. Each record serializes straight
+            // into the batch buffer rather than into a buffer of its own
+            batch_buf.extend_from_slice(&0u32.to_le_bytes());
+            let body_start = batch_buf.len();
+            record.serialize_into(&mut batch_buf);
+            let body_len = (batch_buf.len() - body_start) as u32;
+            batch_buf[start..body_start].copy_from_slice(&body_len.to_le_bytes());
+            let checksum = cdf_hash32(&batch_buf[body_start..]);
             batch_buf.extend_from_slice(&checksum.to_le_bytes());
             meta.push((start, record.commit_version, record.commit_timestamp));
         }
