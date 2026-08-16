@@ -2417,6 +2417,11 @@ pub enum LiteralValue {
     /// both accept. Kept separate so an ordinary literal stays i64 and only
     /// the wide case pays for the wider type.
     Int128(i128),
+    /// A fixed-point literal with more significant digits than an f64 holds
+    /// exactly, carried as unscaled digits and a scale so every digit the
+    /// statement wrote survives to the row. Narrow fixed-point literals stay
+    /// Float, keeping their long-standing float typing.
+    Decimal { digits: i128, scale: u8 },
     Float(f64),
     String(String),
     Boolean(bool),

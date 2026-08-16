@@ -178,7 +178,7 @@ async fn setup() -> Env {
                 .enable_all()
                 .build()
                 .unwrap();
-            CompactionWorker::run_cycle(&rt, c, t, d, p, w, cf, None, None, None)
+            CompactionWorker::run_cycle(&rt, c, t, d, p, w, cf, None, None, None, None)
         })
     };
     assert!(rows >= 12, "parent rows folded, got {rows}");
@@ -612,7 +612,7 @@ fn fold_all_with_btree(
             .enable_all()
             .build()
             .unwrap();
-        CompactionWorker::run_cycle(&rt, c, t, d, p, w, cf, None, Some(reg), btree).0
+        CompactionWorker::run_cycle(&rt, c, t, d, p, w, cf, None, Some(reg), btree, None).0
     })
 }
 
@@ -1943,6 +1943,7 @@ async fn streaming_upsert_replaces_and_deletes_folded_rows() {
         Arc::clone(&env.wal),
         Arc::new(parking_lot::Mutex::new(sec_ctx)),
         sm,
+        Arc::new(zyron_common::TableIOStatsRegistry::new()),
     )
     .unwrap();
 

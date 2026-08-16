@@ -144,6 +144,7 @@ mod tests {
             commit_lsn: 1,
             timestamp_us: ts,
             read_predicate: None,
+            read_version: 0,
             audit: None,
         }
     }
@@ -155,7 +156,7 @@ mod tests {
             row_count: 1,
             added_version: 0,
             cluster_spec_id: 0,
-            column_stats: vec![],
+            column_stats: std::sync::Arc::new(vec![]),
             delete_predicate_ids: vec![],
         }
     }

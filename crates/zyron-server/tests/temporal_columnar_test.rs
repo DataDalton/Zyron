@@ -212,7 +212,7 @@ async fn temporal_ps_hlc_survives_fold_patch_merge() {
                 .enable_all()
                 .build()
                 .unwrap();
-            CompactionWorker::run_cycle(&rt, cat, tx, dk, pl, wl, cf, None, None, None)
+            CompactionWorker::run_cycle(&rt, cat, tx, dk, pl, wl, cf, None, None, None, None)
         })
     };
 
@@ -408,7 +408,7 @@ async fn encoder_selection_is_dense_on_folded_columns() {
                 .enable_all()
                 .build()
                 .unwrap();
-            CompactionWorker::run_cycle(&rt, cat, tx, dk, pl, wl, cf, None, None, None)
+            CompactionWorker::run_cycle(&rt, cat, tx, dk, pl, wl, cf, None, None, None, None)
         })
     };
     assert_eq!(rows, N as u64);

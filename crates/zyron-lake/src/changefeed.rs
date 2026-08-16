@@ -21,7 +21,7 @@ use zyron_common::ZyronError;
 use crate::manifest::ManifestFile;
 use crate::paths::LakePaths;
 use crate::predicate::LakePredicate;
-use crate::reader::{LakeFileReader, evaluate_row};
+use crate::reader::LakeFileReader;
 use crate::transaction_log::{LogEntry, OperationKind, TransactionLog, VersionFileData};
 
 /// Which side of a change a descriptor describes.
@@ -178,7 +178,11 @@ pub fn changed_ordinals(
 
     let matched = match &descriptor.predicate {
         None => None,
-        Some(predicate) => Some(reader.read_predicate_columns(&base.schema, &[predicate])?),
+        Some(predicate) => {
+            let columns = reader.read_predicate_columns(&base.schema, &[predicate])?;
+            let compiled = crate::reader::CompiledPredicate::new(predicate, &columns);
+            Some((columns, compiled))
+        }
     };
 
     let mut out = Vec::new();
@@ -186,8 +190,8 @@ pub fn changed_ordinals(
         if keep[row / 8] & (1 << (row % 8)) == 0 {
             continue;
         }
-        if let (Some(columns), Some(predicate)) = (&matched, &descriptor.predicate) {
-            if evaluate_row(predicate, columns, row) != Some(true) {
+        if let Some((columns, compiled)) = &matched {
+            if compiled.evaluate(columns, row) != Some(true) {
                 continue;
             }
         }
@@ -258,6 +262,7 @@ mod tests {
             commit_lsn: 1,
             timestamp_us,
             read_predicate: None,
+            read_version: 0,
             audit: None,
         }
     }

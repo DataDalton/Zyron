@@ -559,7 +559,7 @@ fn select_columns(manifest: &ManifestFile, file_count: usize) -> Vec<u32> {
     };
     let mut present = vec![false; schema_ids.len()];
     for entry in &manifest.entries {
-        for stat in &entry.column_stats {
+        for stat in entry.column_stats.iter() {
             if let Ok(i) = schema_ids.binary_search(&stat.column_id) {
                 present[i] = true;
             }
@@ -634,7 +634,7 @@ mod tests {
             row_count,
             added_version: 1,
             cluster_spec_id: 0,
-            column_stats: stats,
+            column_stats: std::sync::Arc::new(stats),
             delete_predicate_ids: Vec::new(),
         }
     }

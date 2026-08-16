@@ -578,14 +578,20 @@ fn rewrite_post_aggregate(
                 return;
             };
             let column_idx = group_by.len() + agg_idx;
+            // A decimal aggregate keeps its argument's scale, so a HAVING
+            // or ORDER BY reading the output column compares the value
+            // rather than the raw scaled integer
+            let fractional_digits = if *return_type == zyron_common::TypeId::Decimal {
+                args.first().and_then(|a| a.fractional_digits())
+            } else {
+                None
+            };
             *expr = BoundExpr::ColumnRef(crate::binder::ColumnRef {
                 table_idx: AGGREGATE_TABLE_IDX,
                 column_id: ColumnId(column_idx as u16),
                 type_id: *return_type,
                 nullable: true,
-                // Aggregate-result precision (e.g. MIN/MAX over TIMESTAMP(p))
-                // is finalized in B5; default precision until then.
-                fractional_digits: None,
+                fractional_digits,
             });
         }
         BoundExpr::BinaryOp { left, right, .. } => {

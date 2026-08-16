@@ -494,12 +494,13 @@ fn count_matching_rows(
     }
     let keep = reader.delete_survivors(&base.schema, base, file)?;
     let columns = reader.read_predicate_columns(&base.schema, &[predicate])?;
+    let compiled = crate::reader::CompiledPredicate::new(predicate, &columns);
     let mut matched = 0u64;
     for row in 0..row_count {
         if keep[row / 8] & (1 << (row % 8)) == 0 {
             continue;
         }
-        if crate::reader::evaluate_row(predicate, &columns, row) == Some(true) {
+        if compiled.evaluate(&columns, row) == Some(true) {
             matched += 1;
         }
     }
@@ -1086,6 +1087,7 @@ mod tests {
             commit_lsn: 1,
             timestamp_us: 1_754_700_000_000_000,
             read_predicate: None,
+            read_version: 0,
             audit: None,
         }
     }

@@ -134,10 +134,10 @@ fn synthetic_manifest(files: usize) -> ManifestFile {
                 row_count: 100,
                 added_version: 1,
                 cluster_spec_id: 0,
-                column_stats: vec![
+                column_stats: std::sync::Arc::new(vec![
                     int_stats(0, lo, lo + 99, 100),
                     int_stats(1, (i % 16) as i64, (i % 16) as i64, 100),
-                ],
+                ]),
                 delete_predicate_ids: Vec::new(),
             }
         })
@@ -171,6 +171,7 @@ fn attempt(operation: OperationKind, txn: u64) -> CommitAttempt<'static> {
         commit_lsn: 1,
         timestamp_us: 1_754_700_000_000_000,
         read_predicate: None,
+        read_version: 0,
         audit: None,
     }
 }
@@ -880,7 +881,12 @@ fn test_concurrent_commits_serialize_and_report_their_retries() {
                                 row_count: 1,
                                 added_version: 0,
                                 cluster_spec_id: 0,
-                                column_stats: vec![int_stats(0, next as i64, next as i64, 1)],
+                                column_stats: std::sync::Arc::new(vec![int_stats(
+                                    0,
+                                    next as i64,
+                                    next as i64,
+                                    1,
+                                )]),
                                 delete_predicate_ids: Vec::new(),
                             })])
                         })
@@ -964,7 +970,12 @@ fn test_log_head_and_manifest_resolution_cost() {
                 row_count: 100,
                 added_version: 0,
                 cluster_spec_id: 0,
-                column_stats: vec![int_stats(0, n as i64 * 100, n as i64 * 100 + 99, 100)],
+                column_stats: std::sync::Arc::new(vec![int_stats(
+                    0,
+                    n as i64 * 100,
+                    n as i64 * 100 + 99,
+                    100,
+                )]),
                 delete_predicate_ids: Vec::new(),
             })])
         })

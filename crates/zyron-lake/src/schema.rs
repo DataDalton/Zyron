@@ -111,10 +111,17 @@ impl LakeSchema {
                 }
             }
             if let Some(p) = col.fractional_digits {
-                if p > 12 {
+                // A decimal scale reaches 38, the widest an i128 holds. The
+                // timestamp precisions stop at 12 (picoseconds)
+                let (bound, what) = if col.type_id == TypeId::Decimal {
+                    (38, "decimal scale")
+                } else {
+                    (12, "timestamp precision")
+                };
+                if p > bound {
                     return Err(ZyronError::Internal(format!(
-                        "lake schema column \"{}\" timestamp precision {} exceeds 12",
-                        col.name, p
+                        "lake schema column \"{}\" {} {} exceeds {}",
+                        col.name, what, p, bound
                     )));
                 }
             }

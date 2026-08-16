@@ -157,6 +157,7 @@ them the same, so a version out of sequence means a gap rather than a conflict"
             commit_lsn: 0,
             timestamp_us: version.timestamp_us,
             read_predicate: None,
+            read_version: 0,
             audit: None,
         };
         let entries = version.entries.clone();
@@ -376,6 +377,7 @@ mod tests {
             commit_lsn: 1,
             timestamp_us: 1_754_700_000_000_000,
             read_predicate: None,
+            read_version: 0,
             audit: None,
         }
     }

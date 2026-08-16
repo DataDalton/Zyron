@@ -13,18 +13,25 @@
 //!   crash between the WAL log and the patch-file append loses nothing. The
 //!   patch file is fsynced per append, so replay is at worst a harmless
 //!   duplicate (newest-xid-wins resolution is unaffected).
+//! - Segment tier reconcile: a relocation renames the segment file before
+//!   the registry write, so a crash between the two leaves the catalog
+//!   naming a path with no file behind it. The registration is repaired
+//!   from the tier directory that actually holds the file, and the staging
+//!   files and stale copies an interrupted move can leave are swept.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use zyron_catalog::schema::ColumnarSegmentEntry;
 use zyron_catalog::{Catalog, TableId};
+use zyron_common::StorageTier;
 use zyron_common::page::{PAGE_SIZE, PageId};
 use zyron_storage::columnar::{
     ColumnarBranchClearPayload, ColumnarPatchManager, ColumnarPatchRevokePayload,
-    ColumnarSupersedePayload, ColumnarValuePatchPayload,
+    ColumnarSupersedePayload, ColumnarValuePatchPayload, columnar_root_for_segment,
+    tier_segment_dir,
 };
 
 /// WAL patch record kinds collected for replay into the patch store
@@ -103,11 +110,13 @@ pub async fn reconcile_columnar(
     disk: &DiskManager,
     columnar_dir: &Path,
 ) -> zyron_common::Result<()> {
-    let reader = match WalReader::new(wal_dir) {
-        Ok(r) => r,
-        Err(_) => return Ok(()), // No WAL yet: nothing to reconcile.
+    // No WAL yet means no fold or patch records to replay. The tier
+    // reconcile at the end still runs, it reads only the catalog and the
+    // filesystem
+    let records = match WalReader::new(wal_dir) {
+        Ok(r) => r.scan_all_trusted(),
+        Err(_) => Vec::new(),
     };
-    let records = reader.scan_all_trusted();
 
     let mut begins: HashMap<String, u64> = HashMap::new(); // path -> table_id
     let mut ends: Vec<EndRec> = Vec::new();
@@ -412,5 +421,165 @@ pub async fn reconcile_columnar(
         }
     }
 
+    // Runs after the fold and merge reconcile so it sees the final registry
+    reconcile_segment_tiers(catalog).await;
+
     Ok(())
+}
+
+/// Points every columnar segment registration at the tier directory that
+/// actually holds its file, and sweeps the debris an interrupted relocation
+/// can leave behind.
+///
+/// A relocation renames the segment file first and persists the registry
+/// second, so a crash between the two leaves the catalog naming a path with
+/// no file behind it while the bytes sit complete in another tier directory.
+/// Segment file names are unique and a rename is atomic, so the disk state
+/// is unambiguous and the registration is repaired from it. The cross-device
+/// fallback can also strand a staging file or a duplicate copy, either of
+/// which blocks a later relocation from placing the file under that name,
+/// so both are removed. A registration whose file is found on no tier is
+/// reported and left in place: dropping it would silently discard the rows
+/// it serves, while restoring the file makes them readable again.
+pub async fn reconcile_segment_tiers(catalog: &Catalog) {
+    const TIERS: [StorageTier; 4] = [
+        StorageTier::Hot,
+        StorageTier::Warm,
+        StorageTier::Cold,
+        StorageTier::Archive,
+    ];
+    for table in catalog.list_all_tables() {
+        if table.columnar.segments.is_empty() {
+            continue;
+        }
+        // Cloned lazily on the first repair so an already-consistent table
+        // costs no registry write
+        let mut repaired: Option<zyron_catalog::schema::TableEntry> = None;
+        for (idx, seg) in table.columnar.segments.iter().enumerate() {
+            let recorded = std::path::PathBuf::from(&seg.path);
+            let Some(root) = columnar_root_for_segment(&recorded).map(Path::to_path_buf) else {
+                warn!(
+                    "tier reconcile: segment path {} of table {} has no parent directory",
+                    seg.path, table.name
+                );
+                continue;
+            };
+            let Some(file_name) = recorded.file_name().map(std::ffi::OsStr::to_os_string) else {
+                warn!(
+                    "tier reconcile: segment path {} of table {} names no file",
+                    seg.path, table.name
+                );
+                continue;
+            };
+            // A staging file is never referenced by the catalog and only
+            // blocks the next move from placing a file, so it goes first
+            for t in TIERS {
+                let staging = tier_segment_dir(&root, t.name())
+                    .join(&file_name)
+                    .with_extension("zyr.moving");
+                if staging.exists() {
+                    match std::fs::remove_file(&staging) {
+                        Ok(()) => info!(
+                            "tier reconcile: removed staging leftover {}",
+                            staging.display()
+                        ),
+                        Err(e) => warn!(
+                            "tier reconcile: could not remove staging leftover {}: {}",
+                            staging.display(),
+                            e
+                        ),
+                    }
+                }
+            }
+            if recorded.exists() {
+                // The recorded path is authoritative. A same-named file on
+                // another tier is a stale copy from an interrupted
+                // cross-device move, and under that name it would make the
+                // next relocation unable to place the file
+                for t in TIERS {
+                    let other = tier_segment_dir(&root, t.name()).join(&file_name);
+                    if other != recorded && other.is_file() {
+                        match std::fs::remove_file(&other) {
+                            Ok(()) => {
+                                info!("tier reconcile: removed stale copy {}", other.display())
+                            }
+                            Err(e) => warn!(
+                                "tier reconcile: could not remove stale copy {}: {}",
+                                other.display(),
+                                e
+                            ),
+                        }
+                    }
+                }
+                // The tier byte drives planner costing and the already-there
+                // check, so it has to agree with the directory the file is in
+                let actual = TIERS
+                    .into_iter()
+                    .find(|t| {
+                        recorded.parent() == Some(tier_segment_dir(&root, t.name()).as_path())
+                    })
+                    .unwrap_or(StorageTier::Hot);
+                if seg.storage_tier != actual as u8 {
+                    let entry = repaired.get_or_insert_with(|| table.as_ref().clone());
+                    entry.columnar.segments[idx].storage_tier = actual as u8;
+                    info!(
+                        "tier reconcile: segment {} of table {} sits on tier {}, tier byte corrected",
+                        seg.path,
+                        table.name,
+                        actual.name()
+                    );
+                }
+                continue;
+            }
+            // The recorded path is gone: the file moved and the crash hit
+            // before the registry write. Adopt the location that holds the
+            // file, hottest first so a duplicate resolves to the cheaper read
+            let mut found: Vec<(StorageTier, std::path::PathBuf)> = Vec::new();
+            for t in TIERS {
+                let candidate = tier_segment_dir(&root, t.name()).join(&file_name);
+                if candidate.is_file() {
+                    found.push((t, candidate));
+                }
+            }
+            if found.is_empty() {
+                error!(
+                    "tier reconcile: segment {} of table {} is missing from every tier directory, \
+                     its rows cannot be read until the file is restored",
+                    seg.path, table.name
+                );
+                continue;
+            }
+            for (_, extra) in &found[1..] {
+                match std::fs::remove_file(extra) {
+                    Ok(()) => info!(
+                        "tier reconcile: removed duplicate copy {}",
+                        extra.display()
+                    ),
+                    Err(e) => warn!(
+                        "tier reconcile: could not remove duplicate copy {}: {}",
+                        extra.display(),
+                        e
+                    ),
+                }
+            }
+            let (adopt_tier, adopt_path) = &found[0];
+            let entry = repaired.get_or_insert_with(|| table.as_ref().clone());
+            entry.columnar.segments[idx].path = adopt_path.to_string_lossy().into_owned();
+            entry.columnar.segments[idx].storage_tier = *adopt_tier as u8;
+            info!(
+                "tier reconcile: segment of table {} adopted at {} on tier {}",
+                table.name,
+                adopt_path.display(),
+                adopt_tier.name()
+            );
+        }
+        if let Some(entry) = repaired {
+            if let Err(e) = catalog.update_table(entry).await {
+                warn!(
+                    "tier reconcile: registry update for table {} failed: {}",
+                    table.name, e
+                );
+            }
+        }
+    }
 }

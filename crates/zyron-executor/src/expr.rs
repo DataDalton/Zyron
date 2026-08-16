@@ -299,6 +299,11 @@ fn evaluate_literal(value: &LiteralValue, type_id: TypeId, num_rows: usize) -> R
             ColumnData::Int128(vec![*v; num_rows]),
             TypeId::Int128,
         )),
+        LiteralValue::Decimal { digits, scale } => Ok(Column::new_ts(
+            ColumnData::Int128(vec![*digits; num_rows]),
+            TypeId::Decimal,
+            Some(*scale),
+        )),
         LiteralValue::Float(v) => Ok(Column::new(
             ColumnData::Float64(vec![*v; num_rows]),
             TypeId::Float64,
@@ -865,7 +870,13 @@ fn evaluate_case(
         };
 
         let then_col = evaluate(&when.result, batch, schema, params)?;
-        let mut then_col = coerce_case_branch(then_col, result.type_id)?;
+        // The branch coerces to the CASE's declared type, not the running
+        // result's physical type. When the declared type is Decimal the
+        // running result can still be an integer column (the conversion to
+        // a decimal needs a scale only a decimal branch carries), and
+        // casting this branch down to that integer would round its value.
+        // The alignment below then puts both sides on the common scale
+        let mut then_col = coerce_case_branch(then_col, result_type)?;
         // A decimal branch meets the running result on a common scale, the
         // wider of the two, because the type alone does not say where the
         // point sits and merging two scales would move it

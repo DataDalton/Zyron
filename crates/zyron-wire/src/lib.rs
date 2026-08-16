@@ -65,7 +65,11 @@ pub use crate::zyron_sink::{ZyronSinkClient, build_sink_client_from_entry};
 /// the listener also accepts IPv4 connections via IPv4-mapped IPv6 addresses.
 /// Linux defaults V6ONLY off (matches dual_stack=true), Windows defaults it
 /// on (so this option overrides explicitly via socket2)
-fn create_tcp_listener(
+///
+/// Public so tests and benchmarks bind the way the server binds. A listener
+/// created any other way inherits the platform's small default accept queue,
+/// which changes what a connection benchmark measures.
+pub fn create_tcp_listener(
     addr: SocketAddr,
     dual_stack: bool,
 ) -> std::io::Result<std::net::TcpListener> {
@@ -81,7 +85,13 @@ fn create_tcp_listener(
         socket.set_only_v6(!dual_stack)?;
     }
     socket.bind(&addr.into())?;
-    socket.listen(1024)?;
+    // The accept queue holds connections the kernel has completed but the
+    // accept loop has not taken yet. Once it is full the kernel drops further
+    // handshakes rather than refusing them, so those clients stall for a
+    // retransmit timeout instead of failing fast. Asking for the maximum lets
+    // the kernel apply its own limit, which an operator can tune, rather than
+    // a depth chosen here that no deployment can raise
+    socket.listen(i32::MAX)?;
     socket.set_nonblocking(true)?;
     Ok(std::net::TcpListener::from(socket))
 }

@@ -562,6 +562,8 @@ impl ColumnScanOperator {
                     let vs = p.value_size;
                     Some(&bytes[r * vs..(r + 1) * vs])
                 };
+                // push_owned moves a decoded text or binary allocation into
+                // the column instead of copying it a second time
                 let sv = self.resolve_value(
                     overlay,
                     p.column_id,
@@ -570,7 +572,7 @@ impl ColumnScanOperator {
                     is_null,
                     base_bytes,
                 );
-                builders[ci].push(&sv);
+                builders[ci].push_owned(sv);
             }
             if self.emit_locators {
                 locators.push((file_id, sys_rowid));

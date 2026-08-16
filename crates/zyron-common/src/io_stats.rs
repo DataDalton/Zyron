@@ -155,6 +155,15 @@ impl TableIOStats {
     /// Records a completed vacuum pass, clearing the dead-row estimate. Called
     /// after the pass commits, so a crash mid-pass leaves the estimate high
     /// rather than falsely clean.
+    /// Monotonic count of row writes against this table, for a background
+    /// worker's has-anything-changed gate. Inserts, updates and deletes all
+    /// count, the gate needs change detection rather than a breakdown
+    pub fn write_activity(&self) -> u64 {
+        self.n_tup_ins.load(Ordering::Relaxed)
+            + self.n_tup_upd.load(Ordering::Relaxed)
+            + self.n_tup_del.load(Ordering::Relaxed)
+    }
+
     pub fn record_vacuum(&self, epochSecs: u64) {
         self.n_dead_tup.store(0, Ordering::Relaxed);
         self.last_vacuum.store(epochSecs, Ordering::Relaxed);

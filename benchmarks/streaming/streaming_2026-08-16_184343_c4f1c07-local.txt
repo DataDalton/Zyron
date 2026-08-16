@@ -1,0 +1,124 @@
+# suite:   streaming
+# run:     2026-08-16_184343_c4f1c07-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Benchmark: Backpressure Monitor ===
+  Backpressure: ratio checks correct, load shedding operational
+  Total time (ms) [PASS/OK]:
+    Runs: [1, 1, 1, 1, 1]
+    Average: 1 <= 500 (target)
+    Min/Max: 1 / 1, StdDev: 0
+
+=== Benchmark: Checkpoint and Recovery ===
+  Populated state backend with 100000 entries (100 bytes each)
+  Snapshot time (s) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 5 (target)
+    Min/Max: 0 / 0, StdDev: 0
+  Restore time (s) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 10 (target)
+    Min/Max: 0 / 0, StdDev: 0
+
+=== E2E: Exactly Once Processing ===
+  Produced 3 output rows from 3 windows
+  Checkpoint: 0 state entries
+  Recovery replay: 3 rows (matches original)
+  Windows processed [PASS]: 3 >= 3 (target)
+
+=== Late Data: Drop Policy ===
+  Drop policy: 3 dropped, 2 passed, counter incremented
+  On-time records [PASS]: 2 >= 2 (target)
+
+=== Late Data: SideOutput Policy ===
+  SideOutput policy: 2 on-time passed, 2 late routed to side output
+  Side output records [PASS]: 2 >= 2 (target)
+
+=== Late Data: Update Policy ===
+  Update policy: all records returned, late count tracked
+  Records returned [PASS]: 5 >= 5 (target)
+
+=== Benchmark: Lookup Join (Cached) ===
+  Events/sec [PASS/OK]:
+    Runs: [93,771,685, 98,018,075, 101,243,267, 100,944,844, 103,461,833]
+    Average: 99,487,941 >= 5,000,000 (target)
+    Min/Max: 93,771,685 / 103,461,833, StdDev: 3,341,606
+
+=== Correctness: Lookup Join ===
+  Lookup join: enrichment, caching, and TTL expiry verified
+
+=== Operator Chain: Filter -> Project -> KeyBy ===
+  Operator 1: 0 state entries
+  Operator 2: 0 state entries
+  Operator 3: 0 state entries
+  Chain: 200 in, 150 after filter, 1 column after project, keys set
+  Output rows [PASS]: 150 >= 150 (target)
+
+=== Correctness: Operator Checkpoint and Recovery ===
+  Checkpoint/recovery: 5 windows, identical SUM values after restore
+
+=== Correctness: Session Window ===
+  Session merger: 2 sessions, ranges [0, 2.4M) and [3.6M, 5.7M) verified
+
+=== Benchmark: Session Window Throughput ===
+  Events/sec [PASS/OK]:
+    Runs: [267,658,789, 242,206,990, 268,925,642, 259,841,497, 254,362,314]
+    Average: 258,599,046 >= 2,000,000 (target)
+    Min/Max: 242,206,990 / 268,925,642, StdDev: 9,766,377
+
+=== Correctness: Sliding Window ===
+  Sliding window: 10 output rows, overlapping sums verified
+
+=== Benchmark: Sliding Window Throughput ===
+  Events/sec [PASS/OK]:
+    Runs: [42,816,651, 43,243,617, 43,226,607, 43,423,132, 43,338,635]
+    Average: 43,209,728 >= 3,000,000 (target)
+    Min/Max: 42,816,651 / 43,423,132, StdDev: 208,855
+
+=== State Backend: HeapStateBackend + DiskStateBackend ===
+  HeapState: inserted 1000 entries
+  HeapState: verified 1000 reads
+  HeapState: 100 updates, 50 deletes, count = 950
+  HeapState: snapshot/clear/restore verified
+  DiskState: inserted and verified 500 entries
+  DiskState: snapshot/clear/restore verified
+  DiskState: delete and prefix scan verified
+  Total entries verified [PASS]: 1,950 >= 1,950 (target)
+
+=== Stream Join Latency Breakdown ===
+  Left insert (no probe):  14.4M/sec (3.5ms for 50000)
+  Right probe+insert:      13.1M/sec (3.8ms for 50000)
+  Hash only:               1543.2M/sec (0.0ms for 50000)
+  Map lookup only:         387.0M/sec (0.1ms for 50000, found=50000)
+  Record clone only:       540.0M/sec (0.1ms for 50000)
+  Combined rate:           13.7M/sec
+
+=== Benchmark: Stream-Stream Join ===
+  Events/sec [PASS/OK]:
+    Runs: [13,565,944, 14,265,946, 14,188,825, 14,038,240, 13,336,890]
+    Average: 13,879,169 >= 1,000,000 (target)
+    Min/Max: 13,336,890 / 14,265,946, StdDev: 364,133
+
+=== Correctness: Stream-Stream Join ===
+  Stream-stream join: match, no-match, eviction, and re-match verified
+
+=== Correctness: Tumbling Window ===
+  10 tumbling windows verified with correct SUM values
+
+=== Benchmark: Tumbling Window Throughput ===
+  Events/sec [PASS/OK]:
+    Runs: [53,525,741, 53,969,890, 53,695,600, 53,924,490, 53,535,483]
+    Average: 53,730,241 >= 8,000,000 (target)
+    Min/Max: 53,525,741 / 53,969,890, StdDev: 187,678
+
+=== Correctness: Watermark ===
+  BoundedOutOfOrder watermark: 5 events, monotonic advance verified
+
+=== Benchmark: Watermark Propagation ===
+  Total time (ms) [PASS/OK]:
+    Runs: [2, 1, 1, 1, 1]
+    Average: 1 <= 20 (target)
+    Min/Max: 1 / 2, StdDev: 0

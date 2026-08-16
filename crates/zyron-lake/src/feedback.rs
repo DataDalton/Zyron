@@ -253,7 +253,7 @@ mod tests {
             row_count: 100,
             added_version: 1,
             cluster_spec_id: 1,
-            column_stats,
+            column_stats: std::sync::Arc::new(column_stats),
             delete_predicate_ids: Vec::new(),
         }
     }

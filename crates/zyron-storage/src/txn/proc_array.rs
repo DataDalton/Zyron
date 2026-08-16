@@ -93,6 +93,15 @@ impl ProcArray {
         self.active_count.fetch_sub(1, Ordering::Release);
     }
 
+    /// Replaces the id a claimed slot publishes. Caller must own the slot.
+    /// begin claims with a conservative placeholder id before allocating
+    /// the real one, then publishes the real id here, so a concurrent
+    /// horizon scan never finds the id space advanced past a transaction
+    /// it cannot see
+    pub fn set(&self, slot_idx: usize, txn_id: u64) {
+        self.slots[slot_idx].0.store(txn_id, Ordering::Release);
+    }
+
     /// Fills `into` with the txn_ids of all active transactions, excluding
     /// `exclude_txn_id`. The result is sorted ascending so callers can
     /// binary search. Scans every slot for a consistent snapshot. Stopping

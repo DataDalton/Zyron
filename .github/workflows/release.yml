@@ -340,3 +340,21 @@ jobs:
             --title "Zyron ${{ needs.check.outputs.version }}" \
             --notes-file notes.md \
             dist/*
+
+      # The landing site bakes the latest release version and download links
+      # in at build time, so a new release triggers a site rebuild. Skips
+      # quietly when LANDING_DEPLOY_TOKEN is absent so it never blocks a release.
+      - name: Trigger landing site rebuild
+        env:
+          LANDING_TOKEN: ${{ secrets.LANDING_DEPLOY_TOKEN }}
+        run: |
+          if [ -z "$LANDING_TOKEN" ]; then
+            echo "LANDING_DEPLOY_TOKEN is not set, skipping the landing site rebuild"
+            exit 0
+          fi
+          curl -sS --fail -X POST \
+            -H "Authorization: Bearer $LANDING_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/DataDalton/Zyron-landing/dispatches \
+            -d '{"event_type": "zyron-release"}'
+          echo "Landing site rebuild dispatched"

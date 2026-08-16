@@ -310,7 +310,7 @@ pub fn write_data_file_at(
             row_count: row_count as u64,
             added_version: 0,
             cluster_spec_id: req.cluster_spec_id,
-            column_stats,
+            column_stats: std::sync::Arc::new(column_stats),
             delete_predicate_ids: Vec::new(),
         },
         order,

@@ -37,10 +37,22 @@ pub struct ExternalTableSource {
     completed: PlMutex<HashSet<String>>,
     // Holds leftover rows for a partially drained file across calls.
     leftover: PlMutex<Vec<Vec<StreamValue>>>,
+    // The key whose remaining rows sit in the leftover buffer. It joins
+    // the delivered list only once the buffer drains, so a key is never
+    // acknowledged while rows of its object are still in flight
+    leftover_key: PlMutex<Option<String>>,
     // Becomes true when one-shot mode finishes draining the last object.
     exhausted: PlMutex<bool>,
     // For OneShot: true once the initial listing has been performed.
     listed_once: PlMutex<bool>,
+    // Keys whose rows have been fully handed to the caller since the last
+    // progress commit
+    delivered: PlMutex<Vec<String>>,
+    // Durable ingest progress, one completed key per line. Loaded into the
+    // completed set on open, appended on commit_progress, so a restarted
+    // job resumes after the last acknowledged object instead of ingesting
+    // every object again and duplicating rows on an appending target
+    progress: Option<PlMutex<std::fs::File>>,
 }
 
 impl ExternalTableSource {
@@ -65,9 +77,88 @@ impl ExternalTableSource {
             file_queue: PlMutex::new(VecDeque::new()),
             completed: PlMutex::new(HashSet::new()),
             leftover: PlMutex::new(Vec::new()),
+            leftover_key: PlMutex::new(None),
             exhausted: PlMutex::new(false),
             listed_once: PlMutex::new(false),
+            delivered: PlMutex::new(Vec::new()),
+            progress: None,
         })
+    }
+
+    /// Attaches a durable progress log. Keys already recorded there load as
+    /// completed, so a restarted job resumes after the last object it
+    /// acknowledged rather than ingesting every object again. Without a log
+    /// the completed set lives only in memory, which is the behavior a
+    /// statement-scoped COPY wants and a restarted job must not have.
+    pub fn with_progress(mut self, path: std::path::PathBuf) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                ZyronError::StreamingError(format!(
+                    "failed to create progress directory {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+        if path.exists() {
+            let data = std::fs::read_to_string(&path).map_err(|e| {
+                ZyronError::StreamingError(format!(
+                    "failed to read ingest progress {}: {e}",
+                    path.display()
+                ))
+            })?;
+            let mut completed = self.completed.lock();
+            for line in data.lines() {
+                if !line.is_empty() {
+                    completed.insert(line.to_string());
+                }
+            }
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| {
+                ZyronError::StreamingError(format!(
+                    "failed to open ingest progress {}: {e}",
+                    path.display()
+                ))
+            })?;
+        self.progress = Some(PlMutex::new(file));
+        Ok(self)
+    }
+
+    /// Records every fully delivered object in the progress log and clears
+    /// the delivered list. The runner calls this once the sink has accepted
+    /// and flushed the rows, so a key becomes durable only after its rows
+    /// are out of the pipeline: a crash before the commit re-reads the
+    /// object, never loses it. Without an attached log the list is simply
+    /// dropped.
+    pub fn commit_progress(&self) -> Result<()> {
+        use std::io::Write;
+        let keys: Vec<String> = std::mem::take(&mut *self.delivered.lock());
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let Some(progress) = &self.progress else {
+            return Ok(());
+        };
+        let mut buf = String::new();
+        for k in &keys {
+            buf.push_str(k);
+            buf.push('\n');
+        }
+        let mut file = progress.lock();
+        let result = file
+            .write_all(buf.as_bytes())
+            .and_then(|_| file.sync_data());
+        if let Err(e) = result {
+            // The keys go back so a later commit can retry them
+            self.delivered.lock().extend(keys);
+            return Err(ZyronError::StreamingError(format!(
+                "failed to record ingest progress: {e}"
+            )));
+        }
+        Ok(())
     }
 
     /// Returns true once every matching object has been drained in OneShot
@@ -91,6 +182,13 @@ impl ExternalTableSource {
             if !left.is_empty() {
                 let take = max_rows.min(left.len());
                 let out: Vec<Vec<StreamValue>> = left.drain(0..take).collect();
+                if left.is_empty() {
+                    // The buffered object has now been handed out in full,
+                    // so its key is eligible for the next progress commit
+                    if let Some(key) = self.leftover_key.lock().take() {
+                        self.delivered.lock().push(key);
+                    }
+                }
                 return Ok(out);
             }
         }
@@ -100,7 +198,16 @@ impl ExternalTableSource {
 
         let next_key = {
             let mut q = self.file_queue.lock();
-            q.pop_front()
+            let completed = self.completed.lock();
+            // A key can sit in the queue twice when a re-list raced the
+            // read that drained it, so anything already completed is
+            // dropped here rather than ingested again
+            loop {
+                match q.pop_front() {
+                    Some(k) if completed.contains(&k) => continue,
+                    other => break other,
+                }
+            }
         };
         let key = match next_key {
             Some(k) => k,
@@ -137,7 +244,7 @@ impl ExternalTableSource {
 
         {
             let mut done = self.completed.lock();
-            done.insert(key);
+            done.insert(key.clone());
         }
 
         // Update exhausted flag for OneShot when queue is empty and no
@@ -145,8 +252,12 @@ impl ExternalTableSource {
         let returned = if rows.len() > max_rows {
             let leftover: Vec<_> = rows.split_off(max_rows);
             *self.leftover.lock() = leftover;
+            // Rows of this object are still buffered, so the key waits in
+            // leftover_key and is delivered only when the buffer drains
+            *self.leftover_key.lock() = Some(key);
             rows
         } else {
+            self.delivered.lock().push(key);
             rows
         };
 
@@ -188,7 +299,10 @@ impl ExternalTableSource {
         };
 
         // Filter against the glob if present, skip directories, skip already
-        // completed keys (Watch mode deduplication).
+        // completed keys, and skip keys the queue already holds. A Watch
+        // re-list overlaps whatever the queue has not drained yet, and
+        // enqueueing those again would ingest the same object twice
+        let queued: HashSet<String> = self.file_queue.lock().iter().cloned().collect();
         let mut keys: Vec<String> = Vec::new();
         let completed = self.completed.lock();
         for e in entries {
@@ -201,7 +315,7 @@ impl ExternalTableSource {
                     continue;
                 }
             }
-            if completed.contains(&path) {
+            if completed.contains(&path) || queued.contains(&path) {
                 continue;
             }
             keys.push(path);
@@ -521,6 +635,28 @@ mod tests {
         ]
     }
 
+    // Hand-builds a source over an in-memory operator, so the URI builder
+    // is not in the picture and what a test exercises is the queue, the
+    // leftover buffer and the progress log alone
+    fn source_with(op: &Operator, mode: ExternalMode) -> ExternalTableSource {
+        ExternalTableSource {
+            operator: op.clone(),
+            prefix: "data/".into(),
+            glob: Some(Glob::new("data/*.jsonl").unwrap().compile_matcher()),
+            format: FormatKind::JsonLines,
+            column_schema: schema(),
+            mode,
+            file_queue: PlMutex::new(VecDeque::new()),
+            completed: PlMutex::new(HashSet::new()),
+            leftover: PlMutex::new(Vec::new()),
+            leftover_key: PlMutex::new(None),
+            exhausted: PlMutex::new(false),
+            listed_once: PlMutex::new(false),
+            delivered: PlMutex::new(Vec::new()),
+            progress: None,
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn external_source_jsonl_oneshot() {
         // Write 3 rows of JSONL into an in-memory operator.
@@ -531,24 +667,93 @@ mod tests {
         let buf: opendal::Buffer = opendal::Buffer::from(bytes);
         op.write("data/file.jsonl", buf).await.unwrap();
 
-        // Hand-build a source that points at the same in-memory operator by
-        // constructing the struct directly. Use a File entry so the builder
-        // would not be hit, and inject the operator through a small helper.
-        let source = ExternalTableSource {
-            operator: op.clone(),
-            prefix: "data/".into(),
-            glob: Some(Glob::new("data/*.jsonl").unwrap().compile_matcher()),
-            format: FormatKind::JsonLines,
-            column_schema: schema(),
-            mode: ExternalMode::OneShot,
-            file_queue: PlMutex::new(VecDeque::new()),
-            completed: PlMutex::new(HashSet::new()),
-            leftover: PlMutex::new(Vec::new()),
-            exhausted: PlMutex::new(false),
-            listed_once: PlMutex::new(false),
-        };
+        let source = source_with(&op, ExternalMode::OneShot);
         let batch = source.read_batch(10).unwrap();
         assert_eq!(batch.len(), 3);
         assert!(source.exhausted());
+    }
+
+    /// A restarted source with the same progress log does not ingest an
+    /// object it already acknowledged. Without the log every restart
+    /// re-listed and re-read everything, duplicating rows on an appending
+    /// target.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn acknowledged_objects_survive_a_restart() {
+        let op = Operator::new(Memory::default()).unwrap().finish();
+        let bytes = writer_for(FormatKind::JsonLines)
+            .write_rows(&rows(), &schema())
+            .unwrap();
+        op.write("data/a.jsonl", opendal::Buffer::from(bytes.clone()))
+            .await
+            .unwrap();
+        op.write("data/b.jsonl", opendal::Buffer::from(bytes))
+            .await
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let progress = tmp.path().join("job_1.progress");
+
+        let source = source_with(&op, ExternalMode::Watch)
+            .with_progress(progress.clone())
+            .unwrap();
+        let mut total = 0;
+        loop {
+            let batch = source.read_batch(10).unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            total += batch.len();
+        }
+        assert_eq!(total, 6, "both objects ingested");
+        source.commit_progress().unwrap();
+
+        // The restart: a fresh source over the same log sees both objects
+        // as completed before its first read
+        let restarted = source_with(&op, ExternalMode::Watch)
+            .with_progress(progress)
+            .unwrap();
+        assert!(
+            restarted.read_batch(10).unwrap().is_empty(),
+            "acknowledged objects are not ingested again"
+        );
+    }
+
+    /// An object whose rows were only partly handed out is not acknowledged,
+    /// so a crash mid-object re-reads it whole rather than losing its tail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_partly_delivered_object_is_not_acknowledged() {
+        let op = Operator::new(Memory::default()).unwrap().finish();
+        let bytes = writer_for(FormatKind::JsonLines)
+            .write_rows(&rows(), &schema())
+            .unwrap();
+        op.write("data/a.jsonl", opendal::Buffer::from(bytes))
+            .await
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let progress = tmp.path().join("job_2.progress");
+
+        let source = source_with(&op, ExternalMode::Watch)
+            .with_progress(progress.clone())
+            .unwrap();
+        let first = source.read_batch(2).unwrap();
+        assert_eq!(first.len(), 2, "two of three rows handed out");
+        source.commit_progress().unwrap();
+
+        let restarted = source_with(&op, ExternalMode::Watch)
+            .with_progress(progress.clone())
+            .unwrap();
+        assert_eq!(
+            restarted.read_batch(10).unwrap().len(),
+            3,
+            "the partly delivered object is re-read whole"
+        );
+        restarted.commit_progress().unwrap();
+
+        let third = source_with(&op, ExternalMode::Watch)
+            .with_progress(progress)
+            .unwrap();
+        assert!(
+            third.read_batch(10).unwrap().is_empty(),
+            "the fully delivered object is acknowledged"
+        );
     }
 }

@@ -49,6 +49,7 @@ impl StatsCollector {
         catalog: Arc<Catalog>,
         disk_manager: Arc<DiskManager>,
         buffer_pool: Arc<BufferPool>,
+        table_io_stats: Arc<zyron_common::TableIOStatsRegistry>,
         config: StatsCollectorConfig,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -65,6 +66,7 @@ impl StatsCollector {
                     &catalog,
                     &disk_manager,
                     &buffer_pool,
+                    &table_io_stats,
                     &config,
                     &thread_shutdown,
                 );
@@ -83,6 +85,7 @@ impl StatsCollector {
         catalog: &Catalog,
         disk_manager: &Arc<DiskManager>,
         buffer_pool: &Arc<BufferPool>,
+        table_io_stats: &zyron_common::TableIOStatsRegistry,
         config: &StatsCollectorConfig,
         shutdown: &AtomicBool,
     ) {
@@ -91,6 +94,13 @@ impl StatsCollector {
             .enable_all()
             .build()
             .expect("failed to build tokio runtime for stats collector");
+        // Per table, the data signature at the last successful analyze:
+        // write activity plus the columnar registry position, which moves
+        // when a fold or merge changes what the table's storage looks like
+        // without a row write. A table whose signature has not moved has
+        // identical statistics, so its scan is skipped
+        let mut analyzed_at: std::collections::HashMap<u32, (u64, u64, u64)> =
+            std::collections::HashMap::new();
 
         loop {
             thread::park_timeout(interval);
@@ -107,6 +117,17 @@ impl StatsCollector {
             for table_entry in &tables {
                 if shutdown.load(Ordering::Acquire) {
                     return;
+                }
+
+                let signature = (
+                    table_io_stats
+                        .get_or_create(table_entry.id.0)
+                        .write_activity(),
+                    table_entry.columnar.next_file_id,
+                    table_entry.columnar.next_rowid,
+                );
+                if analyzed_at.get(&table_entry.id.0).copied() == Some(signature) {
+                    continue;
                 }
 
                 let heap_file = match HeapFile::new(
@@ -135,15 +156,21 @@ impl StatsCollector {
                         );
                         catalog.put_stats(table_entry.id, table_stats, column_stats);
                         analyzed += 1;
+                        // The signature was read before the scan, so writes
+                        // landing mid-analysis reopen the gate next cycle
+                        analyzed_at.insert(table_entry.id.0, signature);
                     }
                     Err(e) => {
                         debug!(
                             "Stats analysis failed for table {}: {}",
                             table_entry.name, e
                         );
+                        analyzed_at.remove(&table_entry.id.0);
                     }
                 }
             }
+            // Dropped tables leave no gate entries behind
+            analyzed_at.retain(|id, _| tables.iter().any(|t| t.id.0 == *id));
 
             if analyzed > 0 {
                 info!("Stats collection complete: analyzed {} tables", analyzed);

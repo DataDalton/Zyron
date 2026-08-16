@@ -4111,6 +4111,69 @@ impl<T: WireTransport> Connection<T> {
             }
         };
 
+        // A lake table's rows live in immutable data files addressed by its
+        // log, the heap opened below holds nothing. OPTIMIZE rewrites the
+        // files carrying retired delete predicates instead of vacuuming an
+        // empty heap and reporting success
+        if table.lake.is_lake() {
+            let paths =
+                zyron_lake::LakePaths::new(self.server.disk_manager.data_dir(), table.id.0);
+            let outcome = match zyron_lake::TransactionLog::lookup_shared(&paths) {
+                Some(log) => {
+                    let timestamp_us = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_micros() as i64)
+                        .unwrap_or(0);
+                    let attempt = zyron_lake::CommitAttempt {
+                        operation: zyron_lake::OperationKind::Optimize,
+                        db_txn_id: 0,
+                        commit_lsn: 0,
+                        timestamp_us,
+                        read_predicate: None,
+                        read_version: 0,
+                        audit: None,
+                    };
+                    zyron_lake::optimize(&log, attempt, table.id.0 as u64)
+                }
+                None => Err(zyron_common::ZyronError::ConfigError(format!(
+                    "this node does not run the lake tier, so it cannot optimize \"{}\"",
+                    table.name
+                ))),
+            };
+            return match outcome {
+                Ok(o) => {
+                    let fields = crate::messages::backend::ErrorFields {
+                        severity: "NOTICE".into(),
+                        code: "00000".into(),
+                        message: format!(
+                            "OPTIMIZE rewrote {} files into {} ({} rows, {} predicates retired)",
+                            o.files_removed, o.files_written, o.rows_written, o.predicates_retired
+                        ),
+                        detail: None,
+                        hint: None,
+                        position: None,
+                    };
+                    let _ = self.feed(BackendMessage::NoticeResponse(fields)).await;
+                    self.feed(BackendMessage::CommandComplete {
+                        tag: "OPTIMIZE".into(),
+                    })
+                    .await
+                }
+                Err(e) => {
+                    let fields = crate::messages::backend::ErrorFields {
+                        severity: "ERROR".into(),
+                        code: "XX000".into(),
+                        message: format!("OPTIMIZE of lake table failed: {}", e),
+                        detail: None,
+                        hint: None,
+                        position: None,
+                    };
+                    let _ = self.feed(BackendMessage::ErrorResponse(fields)).await;
+                    Ok(())
+                }
+            };
+        }
+
         let heap_file = match HeapFile::new(
             Arc::clone(&self.server.disk_manager),
             Arc::clone(&self.server.buffer_pool),
@@ -4706,9 +4769,16 @@ impl<T: WireTransport> Connection<T> {
                     } else if let Some(scale) = decimal_scales[col_idx] {
                         match scalar {
                             ScalarValue::Int128(v) => {
-                                buf.extend_from_slice(
-                                    zyron_common::format_decimal(v, scale).as_bytes(),
-                                );
+                                // A binary-format column gets the numeric
+                                // wire layout at the column's scale, text
+                                // gets the decimal rendering
+                                if col_formats[col_idx] == 1 {
+                                    types::write_numeric_binary(v, scale, &mut buf);
+                                } else {
+                                    buf.extend_from_slice(
+                                        zyron_common::format_decimal(v, scale).as_bytes(),
+                                    );
+                                }
                             }
                             ref other => {
                                 types::scalar_write_text(other, &mut buf);
@@ -5705,6 +5775,9 @@ fn expr_to_string(expr: &zyron_parser::Expr) -> String {
         zyron_parser::Expr::Literal(lit) => match lit {
             zyron_parser::LiteralValue::Integer(n) => n.to_string(),
             zyron_parser::LiteralValue::Int128(n) => n.to_string(),
+            zyron_parser::LiteralValue::Decimal { digits, scale } => {
+                zyron_common::format_decimal(*digits, *scale)
+            }
             zyron_parser::LiteralValue::Float(f) => f.to_string(),
             zyron_parser::LiteralValue::String(s) => s.clone(),
             zyron_parser::LiteralValue::Boolean(b) => if *b { "on" } else { "off" }.into(),

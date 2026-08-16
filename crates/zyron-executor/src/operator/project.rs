@@ -1,17 +1,20 @@
 //! Project operator for column projection and expression evaluation.
 //!
 //! Pulls batches from a child operator, evaluates projection expressions,
-//! and outputs a new batch with the projected columns.
+//! and outputs a new batch with the projected columns. Projections that
+//! are bare column references move their column out of the owned input
+//! batch instead of deep-copying it.
 
 use std::sync::Arc;
 
+use zyron_common::{TypeId, ZyronError};
 use zyron_planner::binder::BoundExpr;
 use zyron_planner::logical::LogicalColumn;
 
 use crate::batch::DataBatch;
-use crate::column::ScalarValue;
+use crate::column::{Column, ScalarValue};
 use crate::context::ExecutionContext;
-use crate::expr::evaluate;
+use crate::expr::{evaluate, resolve_column_index};
 use crate::operator::{ExecutionBatch, Operator, OperatorResult};
 
 /// Evaluates projection expressions and outputs a new batch with only
@@ -32,6 +35,41 @@ pub struct ProjectOperator {
     /// computed once at construction so the common no-sequence path skips the
     /// per-batch clone and async pre-pass.
     has_sequence: bool,
+    /// For each projection, Some(input column index) when the expression is
+    /// a bare column reference. Those skip the evaluator, taking the input
+    /// column directly
+    bare_refs: Vec<Option<usize>>,
+    /// True at the last projection of each referenced input column, where
+    /// the column moves out of the batch. Earlier duplicate references clone
+    bare_last_use: Vec<bool>,
+}
+
+/// Identifies bare column-reference projections and marks the last use of
+/// each referenced input column. Unresolvable references stay None and
+/// fall back to the evaluator, which reports the error.
+fn bare_ref_plan(
+    expressions: &[BoundExpr],
+    input_schema: &[LogicalColumn],
+) -> (Vec<Option<usize>>, Vec<bool>) {
+    let bare_refs: Vec<Option<usize>> = expressions
+        .iter()
+        .map(|e| match e {
+            BoundExpr::ColumnRef(cr) => {
+                resolve_column_index(cr.table_idx, cr.column_id, input_schema).ok()
+            }
+            _ => None,
+        })
+        .collect();
+    let mut bare_last_use = vec![false; bare_refs.len()];
+    let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (i, bare) in bare_refs.iter().enumerate().rev() {
+        if let Some(idx) = bare {
+            if seen.insert(*idx) {
+                bare_last_use[i] = true;
+            }
+        }
+    }
+    (bare_refs, bare_last_use)
 }
 
 impl ProjectOperator {
@@ -40,15 +78,7 @@ impl ProjectOperator {
         expressions: Vec<BoundExpr>,
         input_schema: Vec<LogicalColumn>,
     ) -> Self {
-        let has_sequence = expressions.iter().any(crate::sequence::contains_sequence);
-        Self {
-            child,
-            expressions,
-            input_schema,
-            params: Vec::new(),
-            ctx: None,
-            has_sequence,
-        }
+        Self::with_params(child, expressions, input_schema, Vec::new())
     }
 
     pub fn with_params(
@@ -58,6 +88,7 @@ impl ProjectOperator {
         params: Vec<ScalarValue>,
     ) -> Self {
         let has_sequence = expressions.iter().any(crate::sequence::contains_sequence);
+        let (bare_refs, bare_last_use) = bare_ref_plan(&expressions, &input_schema);
         Self {
             child,
             expressions,
@@ -65,6 +96,8 @@ impl ProjectOperator {
             params,
             ctx: None,
             has_sequence,
+            bare_refs,
+            bare_last_use,
         }
     }
 
@@ -107,10 +140,41 @@ impl Operator for ProjectOperator {
                 }
             }
 
-            let mut columns = Vec::with_capacity(self.expressions.len());
-            for expr in &self.expressions {
-                let col = evaluate(expr, &exec_batch.batch, &self.input_schema, &self.params)?;
-                columns.push(col);
+            // Computed projections evaluate first against the intact batch,
+            // then bare references take their columns, moving each out of
+            // the batch at its last use instead of deep-copying.
+            let mut batch = exec_batch.batch;
+            let mut slots: Vec<Option<Column>> = Vec::with_capacity(self.expressions.len());
+            slots.resize_with(self.expressions.len(), || None);
+            for (i, expr) in self.expressions.iter().enumerate() {
+                if self.bare_refs[i].is_none() {
+                    slots[i] = Some(evaluate(expr, &batch, &self.input_schema, &self.params)?);
+                }
+            }
+            for (i, bare) in self.bare_refs.iter().enumerate() {
+                if let Some(idx) = bare {
+                    let col = if self.bare_last_use[i] {
+                        std::mem::replace(
+                            &mut batch.columns[*idx],
+                            Column::null_column(TypeId::Null, 0),
+                        )
+                    } else {
+                        batch.columns[*idx].clone()
+                    };
+                    slots[i] = Some(col);
+                }
+            }
+            let mut columns = Vec::with_capacity(slots.len());
+            for slot in slots {
+                match slot {
+                    Some(col) => columns.push(col),
+                    None => {
+                        return Err(ZyronError::ExecutionError(
+                            "projection produced no column for one of its expressions"
+                                .to_string(),
+                        ));
+                    }
+                }
             }
 
             let batch = DataBatch::new(columns);

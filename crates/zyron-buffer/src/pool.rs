@@ -222,6 +222,11 @@ pub struct BufferPool {
     /// When unset, the dirty victim is returned as an EvictedPage for the caller
     /// to write.
     evict_writer: OnceLock<EvictWriteFn>,
+    /// Serializes flusher-side page writes (background trickle, checkpoint
+    /// flush, full flush) so two flushers can never write one page's images
+    /// to disk in opposite order. Eviction does not take it: a claimed
+    /// victim is unreachable to every flusher through the failed pin.
+    flush_serial: parking_lot::Mutex<()>,
 }
 
 impl BufferPool {
@@ -241,6 +246,7 @@ impl BufferPool {
             free_list: TreiberFreeList::new(num_frames),
             replacer: ClockReplacer::new(num_frames),
             evict_writer: OnceLock::new(),
+            flush_serial: parking_lot::Mutex::new(()),
         }
     }
 
@@ -298,14 +304,36 @@ impl BufferPool {
     ///
     /// If the page is not in the pool, returns None.
     /// The page is pinned before being returned.
+    ///
+    /// The pin is claim-aware: an eviction claims its victim before
+    /// removing the mapping, so a lookup can hand back a frame that is
+    /// already being replaced. A pin refused by the claim retries the
+    /// lookup until the mapping disappears, and a pin that lands after the
+    /// frame changed tenants is detected by re-reading the frame's page id
+    /// under the pin and released.
     #[inline(always)]
     pub fn fetch_page(&self, page_id: PageId) -> Option<&BufferFrame> {
-        let frame_id = self.page_table.get(page_id)?;
-        let frame = &self.frames[frame_id.0 as usize];
-        frame.pin();
-        // Record access for clock algorithm (sets reference bit)
-        self.replacer.record_access(frame_id);
-        Some(frame)
+        let mut round: u32 = 0;
+        loop {
+            let frame_id = self.page_table.get(page_id)?;
+            let frame = &self.frames[frame_id.0 as usize];
+            if !frame.try_pin() {
+                // claimed mid eviction, the mapping is on its way out
+                retry_pause(&mut round);
+                #[cfg(debug_assertions)]
+                stall_diagnostic(round, "fetch_page pin refused", page_id, frame);
+                continue;
+            }
+            if frame.page_id() == Some(page_id) {
+                // Record access for clock algorithm (sets reference bit)
+                self.replacer.record_access(frame_id);
+                return Some(frame);
+            }
+            frame.unpin();
+            retry_pause(&mut round);
+            #[cfg(debug_assertions)]
+            stall_diagnostic(round, "fetch_page tenant mismatch", page_id, frame);
+        }
     }
 
     /// Allocates a frame for a new page.
@@ -321,20 +349,39 @@ impl BufferPool {
     /// claimed inside the sweep. Handing back an unpinned frame left a window
     /// in which a second sweep could take it.
     fn allocate_frame(&self) -> Result<(FrameId, Option<EvictedPage>)> {
-        // Try free list first (lock-free pop). A frame on the free list is
-        // owned by whoever pops it, so the pin cannot fail
+        // Try free list first (lock-free pop). The pop owns the frame id,
+        // but an eviction sweep may hold a transient claim on the frame
+        // while discovering it has no tenant, so ownership is taken with
+        // the same claim CAS the sweep uses. A blind pin here could land
+        // between the sweep's claim and its tenant check, and the setup's
+        // page id would then make the sweep keep the frame as a victim:
+        // two owners, one buffer
         if let Some(frame_id) = self.free_list.pop() {
-            self.frames[frame_id.0 as usize].pin();
+            let frame = &self.frames[frame_id.0 as usize];
+            let mut round: u32 = 0;
+            while !frame.try_claim() {
+                retry_pause(&mut round);
+            }
             return Ok((frame_id, None));
         }
 
         // Claim the victim in the same step that finds it unpinned, so a
         // concurrent sweep cannot choose the same frame. The compare-exchange
         // is Acquire on success, so a concurrent pin (also Acquire) orders
-        // before this decision and a page a thread is pinning is never taken
-        let victim_id = self
-            .replacer
-            .evict(|fid| self.frames[fid.0 as usize].try_claim());
+        // before this decision and a page a thread is pinning is never taken.
+        // A frame with no page belongs to the free list, claiming it here
+        // would give it two owners, so it is skipped
+        let victim_id = self.replacer.evict(|fid| {
+            let frame = &self.frames[fid.0 as usize];
+            if !frame.try_claim() {
+                return false;
+            }
+            if frame.page_id().is_none() {
+                frame.unclaim();
+                return false;
+            }
+            true
+        });
 
         if let Some(victim_id) = victim_id {
             let frame = &self.frames[victim_id.0 as usize];
@@ -385,47 +432,111 @@ impl BufferPool {
     /// evicted to make room. Caller must write evicted pages to disk.
     #[inline]
     pub fn new_page(&self, page_id: PageId) -> Result<(&BufferFrame, Option<EvictedPage>)> {
-        // Check if page already exists
-        if let Some(frame_id) = self.page_table.get(page_id) {
-            let frame = &self.frames[frame_id.0 as usize];
-            frame.pin();
-            self.replacer.record_access(frame_id);
-            return Ok((frame, None));
-        }
+        self.new_page_inner(page_id, None)
+            .map(|(frame, evicted, _)| (frame, evicted))
+    }
 
-        // Allocate a frame
-        let (frame_id, evicted) = self.allocate_frame()?;
-
-        // Set up the frame. allocate_frame hands it back already pinned once,
-        // and that pin is what keeps a concurrent eviction sweep off it, so
-        // the reset must not clear it
-        let frame = &self.frames[frame_id.0 as usize];
-        frame.reset_keeping_pin();
-        frame.set_page_id(Some(page_id));
-
-        // Publish the mapping atomically. A concurrent new_page for the same id
-        // can race here, insert_if_absent resolves both to a single winner.
-        match self.page_table.insert_if_absent(page_id, frame_id) {
-            InsertOutcome::Inserted => Ok((frame, evicted)),
-            InsertOutcome::Existing(winner_id) => {
-                // Another caller already installed a frame for this id. Release
-                // this frame and use the winner so the id maps to one frame.
+    /// Like `new_page` but reports whether the returned frame was freshly
+    /// installed for this id. A frame that already held the page carries
+    /// content as new or newer than any disk image, so `init` is copied in
+    /// only on a fresh install, and before the mapping publishes: once the
+    /// page table names this frame a concurrent fetch may pin it, and it
+    /// must never observe the zeroed frame a later copy would fill
+    fn new_page_inner(
+        &self,
+        page_id: PageId,
+        init: Option<&[u8]>,
+    ) -> Result<(&BufferFrame, Option<EvictedPage>, bool)> {
+        // A retry after a lost install race carries any dirty page an
+        // earlier allocation evicted, the caller still has to write it.
+        // After the lost frame returns to the free list the retry's
+        // allocation takes the free path, so a second eviction cannot pile
+        // a second dirty page on top of this one
+        let mut carried: Option<EvictedPage> = None;
+        let mut round: u32 = 0;
+        loop {
+            // Check if page already exists
+            if let Some(frame_id) = self.page_table.get(page_id) {
+                let frame = &self.frames[frame_id.0 as usize];
+                if !frame.try_pin() {
+                    // claimed mid eviction, the mapping is on its way out
+                    retry_pause(&mut round);
+                    #[cfg(debug_assertions)]
+                    stall_diagnostic(round, "new_page pin refused", page_id, frame);
+                    continue;
+                }
+                if frame.page_id() == Some(page_id) {
+                    self.replacer.record_access(frame_id);
+                    return Ok((frame, carried, false));
+                }
                 frame.unpin();
-                frame.set_page_id(None);
-                self.free_list.push(frame_id);
-
-                let winner = &self.frames[winner_id.0 as usize];
-                winner.pin();
-                self.replacer.record_access(winner_id);
-                Ok((winner, evicted))
+                retry_pause(&mut round);
+                #[cfg(debug_assertions)]
+                stall_diagnostic(round, "new_page tenant mismatch", page_id, frame);
+                continue;
             }
-            InsertOutcome::TableFull => {
-                // Page table is full. Release the frame instead of leaking it
-                // and surface the failure.
-                frame.unpin();
-                frame.set_page_id(None);
-                self.free_list.push(frame_id);
-                Err(ZyronError::BufferPoolFull)
+
+            // Allocate a frame
+            let (frame_id, evicted) = self.allocate_frame()?;
+            if let Some(e) = evicted {
+                if carried.is_some() {
+                    return Err(ZyronError::Internal(
+                        "a page install evicted two dirty pages, one would be lost".to_string(),
+                    ));
+                }
+                carried = Some(e);
+            }
+
+            // Set up the frame. allocate_frame hands it back claimed or
+            // pinned, and that ownership is what keeps a concurrent
+            // eviction sweep off it, so the reset must not clear it
+            let frame = &self.frames[frame_id.0 as usize];
+            frame.reset_keeping_pin();
+            if let Some(data) = init {
+                frame.copy_from(data);
+            }
+            frame.set_page_id(Some(page_id));
+            // An eviction claim converts to a normal pin only after the
+            // frame carries its new identity, so a stale reader that pins
+            // in the gap sees the changed page id and retreats. A frame
+            // from the free list already holds a plain pin
+            frame.claim_to_pin_if_claimed();
+
+            // Publish the mapping atomically. A concurrent new_page for the
+            // same id can race here, insert_if_absent resolves both to a
+            // single winner.
+            match self.page_table.insert_if_absent(page_id, frame_id) {
+                InsertOutcome::Inserted => return Ok((frame, carried, true)),
+                InsertOutcome::Existing(winner_id) => {
+                    // Another caller already installed a frame for this id.
+                    // The identity clears before the unpin, so an eviction
+                    // sweep that takes the freed frame cannot remove the
+                    // winner's mapping through a stale page id
+                    frame.set_page_id(None);
+                    frame.unpin();
+                    self.free_list.push(frame_id);
+
+                    let winner = &self.frames[winner_id.0 as usize];
+                    if winner.try_pin() {
+                        if winner.page_id() == Some(page_id) {
+                            self.replacer.record_access(winner_id);
+                            return Ok((winner, carried, false));
+                        }
+                        winner.unpin();
+                    }
+                    // the winner is already being replaced, retry from the
+                    // table lookup
+                    retry_pause(&mut round);
+                    continue;
+                }
+                InsertOutcome::TableFull => {
+                    // Page table is full. Release the frame instead of
+                    // leaking it and surface the failure.
+                    frame.set_page_id(None);
+                    frame.unpin();
+                    self.free_list.push(frame_id);
+                    return Err(ZyronError::BufferPoolFull);
+                }
             }
         }
     }
@@ -440,8 +551,13 @@ impl BufferPool {
         page_id: PageId,
         data: &[u8],
     ) -> Result<(&BufferFrame, Option<EvictedPage>)> {
-        let (frame, evicted) = self.new_page(page_id)?;
-        frame.copy_from(data);
+        // Only a freshly installed frame takes the caller's bytes, and it
+        // takes them before its mapping publishes. A frame that already
+        // held the page, whether found directly or through a lost install
+        // race, holds content as new or newer than the disk image, and
+        // copying the stale bytes over it would erase committed writes and
+        // later flush them durably
+        let (frame, evicted, _fresh) = self.new_page_inner(page_id, Some(data))?;
         Ok((frame, evicted))
     }
 
@@ -469,22 +585,55 @@ impl BufferPool {
     ///
     /// The callback receives the page data if the page is dirty.
     /// Returns true if the page was flushed.
+    ///
+    /// The dirty state is captured and cleared before the copy, so a write
+    /// landing while the flush is in flight re-marks the frame and stays
+    /// discoverable instead of being wiped clean by a post-flush clear. A
+    /// failed flush restores the state so the page is retried.
     pub fn flush_page<F>(&self, page_id: PageId, mut flush_fn: F) -> Result<bool>
     where
         F: FnMut(PageId, &[u8]) -> Result<()>,
     {
-        if let Some(frame_id) = self.page_table.get(page_id) {
-            let frame = &self.frames[frame_id.0 as usize];
-
-            if frame.is_dirty() {
-                let data = frame.read_data();
-                flush_fn(page_id, &**data)?;
-                frame.set_dirty(false);
-                return Ok(true);
-            }
+        let Some(frame_id) = self.page_table.get(page_id) else {
+            return Ok(false);
+        };
+        let frame = &self.frames[frame_id.0 as usize];
+        if !frame.try_pin() {
+            // claimed by an eviction, whose own write-through covers it
             return Ok(false);
         }
-        Ok(false)
+        if frame.page_id() != Some(page_id) {
+            frame.unpin();
+            return Ok(false);
+        }
+        let flush_order = self.flush_serial.lock();
+        if !frame.is_dirty() {
+            drop(flush_order);
+            frame.unpin();
+            return Ok(false);
+        }
+        let expected_lsn = frame.dirty_lsn();
+        frame.set_dirty(false);
+        let _ = frame.clear_dirty_lsn(expected_lsn);
+        let data: Box<[u8; PAGE_SIZE]> = {
+            let guard = frame.read_data();
+            Box::new(**guard)
+        };
+        let outcome = flush_fn(page_id, &data[..]);
+        drop(flush_order);
+        match outcome {
+            Ok(()) => {
+                frame.unpin();
+                Ok(true)
+            }
+            Err(e) => {
+                // restore so the page stays discoverable and is retried
+                frame.set_dirty(true);
+                frame.set_dirty_lsn(expected_lsn);
+                frame.unpin();
+                Err(e)
+            }
+        }
     }
 
     /// Flushes all dirty pages.
@@ -509,28 +658,46 @@ impl BufferPool {
             true // continue iteration
         });
 
+        let flush_order = self.flush_serial.lock();
         for (page_id, frame_id) in dirty_pages {
             let frame = &self.frames[frame_id.0 as usize];
-            if frame.is_dirty() {
-                let data = frame.read_data();
-                match flush_fn(page_id, &**data) {
-                    Ok(()) => {
-                        drop(data);
-                        frame.set_dirty(false);
-                        flushed += 1;
-                    }
-                    Err(e) => {
-                        // Leave the page dirty so it is retried, record the error
-                        // and keep flushing the rest.
-                        drop(data);
-                        failed += 1;
-                        if first_error.is_none() {
-                            first_error = Some(e);
-                        }
+            if !frame.try_pin() {
+                // claimed by an eviction, whose own write-through covers it
+                continue;
+            }
+            if frame.page_id() != Some(page_id) || !frame.is_dirty() {
+                frame.unpin();
+                continue;
+            }
+            // Capture and clear the dirty state before the copy: a write
+            // landing during the flush re-marks the frame instead of being
+            // wiped clean by a clear that runs after the write
+            let expected_lsn = frame.dirty_lsn();
+            frame.set_dirty(false);
+            let _ = frame.clear_dirty_lsn(expected_lsn);
+            let data: Box<[u8; PAGE_SIZE]> = {
+                let guard = frame.read_data();
+                Box::new(**guard)
+            };
+            match flush_fn(page_id, &data[..]) {
+                Ok(()) => {
+                    frame.unpin();
+                    flushed += 1;
+                }
+                Err(e) => {
+                    // Restore so the page is retried, record the error and
+                    // keep flushing the rest.
+                    frame.set_dirty(true);
+                    frame.set_dirty_lsn(expected_lsn);
+                    frame.unpin();
+                    failed += 1;
+                    if first_error.is_none() {
+                        first_error = Some(e);
                     }
                 }
             }
         }
+        drop(flush_order);
 
         match first_error {
             Some(e) => Err(ZyronError::Internal(format!(
@@ -545,24 +712,31 @@ impl BufferPool {
     ///
     /// Returns true if the page was deleted.
     /// Returns false if the page is pinned or not in the pool.
+    ///
+    /// The claim comes first: it excludes readers, eviction sweeps and a
+    /// second delete for the whole removal, so the mapping never has to be
+    /// re-inserted (the re-insert could clobber a concurrent fault-in) and
+    /// the reset can never wipe a pin a reader took in between.
     pub fn delete_page(&self, page_id: PageId) -> bool {
-        if let Some(frame_id) = self.page_table.remove(page_id) {
-            let frame = &self.frames[frame_id.0 as usize];
-
-            // Cannot delete pinned page - re-insert if pinned
-            if frame.is_pinned() {
-                self.page_table.insert(page_id, frame_id);
-                return false;
-            }
-
-            // Remove from replacer and add to free list
-            self.replacer.remove(frame_id);
-            frame.reset();
-            self.free_list.push(frame_id);
-
-            return true;
+        let Some(frame_id) = self.page_table.get(page_id) else {
+            return false;
+        };
+        let frame = &self.frames[frame_id.0 as usize];
+        if !frame.try_claim() {
+            // pinned by a reader or owned by an eviction, refuse
+            return false;
         }
-        false
+        // The frame may have changed tenants between the lookup and the
+        // claim, in which case it belongs to another page now
+        if frame.page_id() != Some(page_id) || self.page_table.get(page_id) != Some(frame_id) {
+            frame.unclaim();
+            return false;
+        }
+        self.page_table.remove(page_id);
+        self.replacer.remove(frame_id);
+        frame.reset();
+        self.free_list.push(frame_id);
+        true
     }
 
     /// Returns a read guard for page data.
@@ -604,17 +778,30 @@ impl BufferPool {
 
     /// Pins multiple pages at once for batch read operations.
     ///
-    /// Returns the number of pages successfully pinned.
-    /// Use with `batch_unpin` after processing.
+    /// Returns one flag per requested page, true where a resident frame
+    /// was pinned. A page with no frame is the caller's to load, and only
+    /// flagged pages may be unpinned afterwards, an unflagged unpin would
+    /// steal a pin another thread holds on a later fault-in.
+    /// Use with `batch_unpin` over exactly the flagged pages.
     #[inline]
-    pub fn batch_pin(&self, page_ids: &[PageId]) -> usize {
-        let mut pinned = 0;
+    pub fn batch_pin(&self, page_ids: &[PageId]) -> Vec<bool> {
+        let mut pinned = Vec::with_capacity(page_ids.len());
         for &pid in page_ids {
+            let mut got = false;
             if let Some(frame_id) = self.page_table.get(pid) {
-                self.frames[frame_id.0 as usize].pin();
-                self.replacer.record_access(frame_id);
-                pinned += 1;
+                let frame = &self.frames[frame_id.0 as usize];
+                // A frame claimed by an eviction or re-tenanted since the
+                // lookup counts as absent, the caller loads the page instead
+                if frame.try_pin() {
+                    if frame.page_id() == Some(pid) {
+                        self.replacer.record_access(frame_id);
+                        got = true;
+                    } else {
+                        frame.unpin();
+                    }
+                }
             }
+            pinned.push(got);
         }
         pinned
     }
@@ -675,17 +862,38 @@ impl BufferPool {
     /// Loads a page into a pre-reserved frame.
     ///
     /// Skips the free-list lock since the frame was already reserved.
-    /// The frame is pinned, marked dirty, and data is copied in.
-    /// Caller must call unpin_page when done.
-    pub fn load_reserved_frame(&self, frame_id: FrameId, page_id: PageId, data: &[u8; PAGE_SIZE]) {
+    /// The frame is pinned, marked dirty, and data is copied in. The
+    /// mapping publishes through insert_if_absent, a blind insert here
+    /// could silently replace a mapping a concurrent fault-in installed
+    /// and leave two frames claiming one page. Returns false when another
+    /// thread won, in which case the reserved frame returns to the free
+    /// list and the caller reads through the winner's mapping.
+    /// Caller must call unpin_page when done with an installed page.
+    pub fn load_reserved_frame(
+        &self,
+        frame_id: FrameId,
+        page_id: PageId,
+        data: &[u8; PAGE_SIZE],
+    ) -> bool {
         let frame = &self.frames[frame_id.0 as usize];
         frame.reset();
         frame.set_page_id(Some(page_id));
         frame.pin();
         frame.copy_from(data);
         frame.set_dirty(true);
-        self.page_table.insert(page_id, frame_id);
-        self.replacer.record_access(frame_id);
+        match self.page_table.insert_if_absent(page_id, frame_id) {
+            InsertOutcome::Inserted => {
+                self.replacer.record_access(frame_id);
+                true
+            }
+            InsertOutcome::Existing(_) | InsertOutcome::TableFull => {
+                frame.set_page_id(None);
+                frame.set_dirty(false);
+                frame.unpin();
+                self.free_list.push(frame_id);
+                false
+            }
+        }
     }
 
     /// Returns unused reserved frames back to the free list.
@@ -717,14 +925,20 @@ impl BufferPool {
         }
     }
 
-    /// Returns true if any unpinned frame has dirty_lsn in (0, below_lsn].
+    /// Returns true if any frame is dirty at or below the boundary.
     /// Early-exit scan, O(1) best case when the first frame matches.
+    ///
+    /// A dirty frame whose LSN was never stamped (dirtied through an
+    /// unpin with no WAL record, the FSM write path, or mid-stamp) has an
+    /// unknown age, so it counts as dirty below every boundary. Missing it
+    /// let checkpoints delete WAL segments whose redo records were the
+    /// only durable copy of such a page's committed writes.
     pub fn has_dirty_pages_below(&self, below_lsn: u64) -> bool {
         let mut found = false;
         self.page_table.for_each(|_page_id, frame_id| {
             let frame = &self.frames[frame_id.0 as usize];
             let dlsn = frame.dirty_lsn();
-            if dlsn > 0 && dlsn <= below_lsn {
+            if (dlsn > 0 && dlsn <= below_lsn) || (dlsn == 0 && frame.is_dirty()) {
                 found = true;
                 return false; // stop iteration
             }
@@ -736,12 +950,17 @@ impl BufferPool {
     /// Collects dirty frames with dirty_lsn <= below_lsn, sorted oldest-first.
     /// Skips pinned pages to avoid blocking the background writer.
     /// Returns up to `limit` entries as (page_id, frame_id, dirty_lsn).
+    ///
+    /// A dirty frame with no LSN stamp has an unknown age, so it is
+    /// collected under every boundary and sorts first, otherwise it would
+    /// stay invisible to the background writer forever.
     pub fn collect_dirty_pages(&self, below_lsn: u64, limit: usize) -> Vec<(PageId, FrameId, u64)> {
         let mut dirty = Vec::new();
         self.page_table.for_each(|page_id, frame_id| {
             let frame = &self.frames[frame_id.0 as usize];
             let dlsn = frame.dirty_lsn();
-            if dlsn > 0 && dlsn <= below_lsn && !frame.is_pinned() {
+            let eligible = (dlsn > 0 && dlsn <= below_lsn) || (dlsn == 0 && frame.is_dirty());
+            if eligible && !frame.is_pinned() {
                 dirty.push((page_id, frame_id, dlsn));
             }
             true
@@ -751,9 +970,17 @@ impl BufferPool {
         dirty
     }
 
-    /// Flushes a single dirty page by pinning, copying data, unpinning, then writing.
-    /// Clears dirty_lsn only if it still matches expected_lsn (page was not re-dirtied).
-    /// Returns true if the page was flushed, false if evicted or already clean.
+    /// Flushes a single dirty page collected by `collect_dirty_pages`.
+    /// Returns true if the page was flushed, false if evicted, re-dirtied
+    /// since collection, or already clean.
+    ///
+    /// The dirty state is captured and cleared before the copy: from that
+    /// point a landing write's CAS-from-zero LSN stamp succeeds and the
+    /// dirty flag re-arms, so the newer version stays discoverable. The
+    /// old shape held the LSN through the flush, which made the landing
+    /// write's stamp fail and the post-flush clear mark it clean. The pin
+    /// is held across the I/O so the frame cannot be evicted and reused
+    /// while its image is being written.
     pub fn flush_dirty_frame<F>(
         &self,
         page_id: PageId,
@@ -764,14 +991,34 @@ impl BufferPool {
     where
         F: FnOnce(PageId, &[u8; PAGE_SIZE]) -> Result<()>,
     {
-        // Verify the frame still holds the expected page
+        // Pin first, then verify the tenancy under the pin. Checking the
+        // page id before pinning left a window in which the frame was
+        // evicted and reused, and this writer then wrote the next tenant's
+        // bytes into the expected page's disk slot
         let frame = &self.frames[frame_id.0 as usize];
+        if !frame.try_pin() {
+            return Ok(false);
+        }
         if frame.page_id() != Some(page_id) {
+            frame.unpin();
             return Ok(false);
         }
 
-        // Pin before reading to prevent eviction
-        frame.pin();
+        let flush_order = self.flush_serial.lock();
+        if !frame.is_dirty() {
+            drop(flush_order);
+            frame.unpin();
+            return Ok(false);
+        }
+        frame.set_dirty(false);
+        if !frame.clear_dirty_lsn(expected_lsn) {
+            // Re-stamped since collection, a newer write owns the state
+            // now, restore the flag and leave it for the next cycle
+            frame.set_dirty(true);
+            drop(flush_order);
+            frame.unpin();
+            return Ok(false);
+        }
 
         // Copy data out while pinned
         let mut buf = Box::new([0u8; PAGE_SIZE]);
@@ -779,19 +1026,22 @@ impl BufferPool {
         buf.copy_from_slice(&**data);
         drop(data);
 
-        // Unpin before I/O (allows eviction of other pages during write)
-        frame.unpin();
-
         // Write to disk
-        flush_fn(page_id, &buf)?;
-
-        // Clear dirty state only if the page was not re-dirtied during flush.
-        // If dirty_lsn changed, a newer write occurred and the page needs to stay dirty.
-        if frame.clear_dirty_lsn(expected_lsn) {
-            frame.set_dirty(false);
+        let outcome = flush_fn(page_id, &buf);
+        drop(flush_order);
+        match outcome {
+            Ok(()) => {
+                frame.unpin();
+                Ok(true)
+            }
+            Err(e) => {
+                // Restore so the page stays discoverable and is retried
+                frame.set_dirty(true);
+                frame.set_dirty_lsn(expected_lsn);
+                frame.unpin();
+                Err(e)
+            }
         }
-
-        Ok(true)
     }
 
     /// Returns statistics about the buffer pool.
@@ -817,6 +1067,36 @@ impl BufferPool {
             pinned_frames: pinned_count,
             dirty_frames: dirty_count,
         }
+    }
+}
+
+/// One round of a claim-race retry: a brief spin for the first rounds while
+/// the racing owner finishes its handful of instructions, then a timeslice
+/// yield so a descheduled owner can run instead of being starved by the
+/// spinner under CPU oversubscription
+#[inline]
+fn retry_pause(round: &mut u32) {
+    *round = round.saturating_add(1);
+    if *round < 16 {
+        std::hint::spin_loop();
+    } else {
+        std::thread::yield_now();
+    }
+}
+
+/// Debug-build watchdog for the claim-retry loops: a loop this hot retrying
+/// for millions of rounds means the protocol leaked a claim or wedged a
+/// mapping, and a loud panic with the frame's state beats an silent hang
+#[cfg(debug_assertions)]
+fn stall_diagnostic(round: u32, site: &str, page_id: PageId, frame: &BufferFrame) {
+    if round == 5_000_000 {
+        panic!(
+            "{site} stalled on page {page_id}: frame {} pin_count {:#x} tenant {:?} dirty {}",
+            frame.frame_id(),
+            frame.pin_count(),
+            frame.page_id(),
+            frame.is_dirty()
+        );
     }
 }
 
@@ -896,6 +1176,202 @@ mod tests {
 
     fn create_test_pool(num_frames: usize) -> BufferPool {
         BufferPool::new(BufferPoolConfig { num_frames })
+    }
+
+    /// A page dirtied without an LSN stamp (an unpin-dirty with no WAL
+    /// record, the FSM write path) must still block WAL truncation below
+    /// any boundary and must be visible to the background flusher,
+    /// otherwise its only durable copy is the stale disk image and the
+    /// redo that would rebuild it gets deleted
+    #[test]
+    fn test_dirty_without_lsn_blocks_checkpoint_and_reaches_the_flusher() {
+        let pool = create_test_pool(4);
+        let pid = PageId::new(0, 3);
+        let (_frame, _) = pool.new_page(pid).expect("new page");
+        pool.unpin_page(pid, true);
+
+        assert!(
+            pool.has_dirty_pages_below(1),
+            "a dirty page with no LSN must block truncation below any boundary"
+        );
+        let collected = pool.collect_dirty_pages(1, 16);
+        assert!(
+            collected.iter().any(|&(p, _, _)| p == pid),
+            "the background flusher must see a dirty page with no LSN"
+        );
+    }
+
+    /// A write landing while the frame is mid-flush must leave the frame
+    /// dirty afterwards. The old shape held the dirty LSN through the
+    /// flush, so the landing write's CAS-from-zero stamp failed and the
+    /// post-flush clear marked the newer version clean and undiscoverable
+    #[test]
+    fn test_flush_dirty_frame_keeps_a_write_that_lands_during_the_flush() {
+        let pool = create_test_pool(4);
+        let pid = PageId::new(0, 5);
+        let (_frame, _) = pool.new_page(pid).expect("new page");
+        pool.unpin_page(pid, true);
+        pool.mark_dirty_with_lsn(pid, 40);
+
+        let frame_id = pool.page_table.get(pid).expect("mapped");
+        let flushed = pool
+            .flush_dirty_frame(pid, frame_id, 40, |_, _| {
+                // a foreground write lands while the flush is in flight
+                pool.mark_dirty_with_lsn(pid, 90);
+                Ok(())
+            })
+            .expect("flush");
+        assert!(flushed);
+
+        let frame = &pool.frames[frame_id.0 as usize];
+        assert!(
+            frame.is_dirty(),
+            "the write that landed during the flush was marked clean"
+        );
+        assert_eq!(
+            frame.dirty_lsn(),
+            90,
+            "the landing write's LSN stamp was swallowed by the in-flight flush"
+        );
+    }
+
+    /// Same property for flush_all, whose old shape cleared the dirty flag
+    /// after dropping the data guard, erasing a write that landed between
+    /// the copy and the clear
+    #[test]
+    fn test_flush_all_keeps_a_write_that_lands_during_the_flush() {
+        let pool = create_test_pool(4);
+        let pid = PageId::new(0, 6);
+        let (_frame, _) = pool.new_page(pid).expect("new page");
+        pool.unpin_page(pid, true);
+        pool.mark_dirty_with_lsn(pid, 40);
+
+        pool.flush_all(|p, _| {
+            if p == pid {
+                pool.mark_dirty_with_lsn(pid, 90);
+            }
+            Ok(())
+        })
+        .expect("flush all");
+
+        let frame_id = pool.page_table.get(pid).expect("mapped");
+        let frame = &pool.frames[frame_id.0 as usize];
+        assert!(
+            frame.is_dirty(),
+            "the write that landed during flush_all was marked clean"
+        );
+        assert_eq!(frame.dirty_lsn(), 90, "the landing write's LSN was lost");
+    }
+
+    /// A page's first eight bytes carry its page number as the identity
+    /// marker the aliasing hammers below validate against
+    fn marker_page(page_num: u64) -> [u8; PAGE_SIZE] {
+        let mut data = [0u8; PAGE_SIZE];
+        data[..8].copy_from_slice(&page_num.to_le_bytes());
+        data
+    }
+
+    /// A fetched frame must serve the requested page's bytes for as long
+    /// as the fetch pin is held. The pool is far smaller than the page set
+    /// so evictions run constantly, and a fetch that pins over an eviction
+    /// claim without revalidating hands back the next tenant's bytes
+    #[test]
+    fn test_fetch_never_serves_another_pages_bytes() {
+        let pool = std::sync::Arc::new(create_test_pool(4));
+        let pages: u64 = 16;
+        let violations = std::sync::atomic::AtomicU64::new(0);
+        std::thread::scope(|s| {
+            for t in 0..3 {
+                let pool = std::sync::Arc::clone(&pool);
+                s.spawn(move || {
+                    for i in 0..40_000u64 {
+                        let page_num = (i.wrapping_mul(2654435761).wrapping_add(t)) % pages;
+                        let pid = PageId::new(0, page_num);
+                        if let Ok((_, _)) = pool.load_page(pid, &marker_page(page_num)) {
+                            pool.unpin_page(pid, false);
+                        }
+                    }
+                });
+            }
+            for t in 0..3 {
+                let pool = std::sync::Arc::clone(&pool);
+                let violations = &violations;
+                s.spawn(move || {
+                    for i in 0..40_000u64 {
+                        let page_num = (i.wrapping_mul(2246822519).wrapping_add(t)) % pages;
+                        let pid = PageId::new(0, page_num);
+                        if let Some(frame) = pool.fetch_page(pid) {
+                            let guard = frame.read_data();
+                            let seen = u64::from_le_bytes(guard[..8].try_into().expect("8 bytes"));
+                            drop(guard);
+                            if seen != page_num {
+                                violations.fetch_add(1, Ordering::Relaxed);
+                            }
+                            frame.unpin();
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            violations.load(Ordering::Relaxed),
+            0,
+            "a pinned fetch served another page's bytes"
+        );
+    }
+
+    /// delete_page must not wipe a pin a concurrent reader holds, and a
+    /// reader that fetched the page must see its bytes until it unpins.
+    /// The old shape removed the mapping, reset the frame (pin count
+    /// included) and re-inserted when pinned, all as separate steps
+    #[test]
+    fn test_delete_page_never_wipes_a_readers_pin() {
+        let pool = std::sync::Arc::new(create_test_pool(4));
+        let pid = PageId::new(0, 7);
+        let violations = std::sync::atomic::AtomicU64::new(0);
+        std::thread::scope(|s| {
+            {
+                let pool = std::sync::Arc::clone(&pool);
+                s.spawn(move || {
+                    for _ in 0..60_000u64 {
+                        pool.delete_page(pid);
+                        if pool.load_page(pid, &marker_page(7)).is_ok() {
+                            pool.unpin_page(pid, false);
+                        }
+                    }
+                });
+            }
+            {
+                let pool = std::sync::Arc::clone(&pool);
+                let violations = &violations;
+                s.spawn(move || {
+                    for _ in 0..60_000u64 {
+                        if let Some(frame) = pool.fetch_page(pid) {
+                            let guard = frame.read_data();
+                            let seen = u64::from_le_bytes(guard[..8].try_into().expect("8 bytes"));
+                            drop(guard);
+                            if seen != 7 {
+                                violations.fetch_add(1, Ordering::Relaxed);
+                            }
+                            frame.unpin();
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            violations.load(Ordering::Relaxed),
+            0,
+            "delete_page let a pinned reader observe foreign or wiped bytes"
+        );
+        // No thread holds a pin here, a wiped pin would show as residue
+        if let Some(frame_id) = pool.page_table.get(pid) {
+            assert_eq!(
+                pool.frames[frame_id.0 as usize].pin_count(),
+                0,
+                "pin accounting corrupted by delete_page"
+            );
+        }
     }
 
     #[test]

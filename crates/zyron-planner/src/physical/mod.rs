@@ -109,6 +109,9 @@ pub enum PhysicalPlan {
     LakeDelete {
         table_id: TableId,
         predicate: Option<zyron_lake::LakePredicate>,
+        /// The same row-selecting predicate in bound form, so referential
+        /// enforcement can gather exactly the rows the delete removes
+        bound_predicate: Option<BoundExpr>,
         /// The predicate's SQL text, recorded in the manifest
         sql: String,
         cost: PlanCost,
@@ -570,7 +573,7 @@ impl PhysicalPlan {
                         name,
                         type_id: expr.type_id(),
                         nullable: expr.nullable(),
-                        fractional_digits: None,
+                        fractional_digits: expr.fractional_digits(),
                     }
                 })
                 .collect(),
@@ -609,18 +612,26 @@ impl PhysicalPlan {
                         name: format!("group{}", i),
                         type_id: expr.type_id(),
                         nullable: expr.nullable(),
-                        fractional_digits: None,
+                        fractional_digits: expr.fractional_digits(),
                     });
                 }
                 for (i, agg) in aggregates.iter().enumerate() {
                     let idx = group_by.len() + i;
+                    // A decimal aggregate keeps its argument's scale, so
+                    // the output column compares and renders the value
+                    // rather than the raw scaled integer
+                    let fractional_digits = if agg.return_type == zyron_common::TypeId::Decimal {
+                        agg.args.first().and_then(|a| a.fractional_digits())
+                    } else {
+                        None
+                    };
                     schema.push(LogicalColumn {
                         table_idx: Some(crate::logical::AGGREGATE_TABLE_IDX),
                         column_id: ColumnId(idx as u16),
                         name: agg.function_name.clone(),
                         type_id: agg.return_type,
                         nullable: true,
-                        fractional_digits: None,
+                        fractional_digits,
                     });
                 }
                 schema
@@ -668,7 +679,7 @@ impl PhysicalPlan {
                         name,
                         type_id: expr.type_id(),
                         nullable: true,
-                        fractional_digits: None,
+                        fractional_digits: expr.fractional_digits(),
                     });
                 }
                 schema

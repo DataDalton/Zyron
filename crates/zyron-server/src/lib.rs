@@ -794,7 +794,8 @@ impl Server {
         // Columnar crash-recovery reconcile. Runs after WAL recovery and the
         // catalog is loaded, before any worker or query touches a folded
         // table. Discards uncommitted .zyr, idempotently redoes committed
-        // folds, and replays patch records.
+        // folds, replays patch records, and re-points segment registrations
+        // at the tier directory that actually holds their file.
         if let Err(e) = crate::columnar_recovery::reconcile_columnar(
             &wal_dir,
             &catalog,
@@ -1275,6 +1276,10 @@ impl Server {
             balloon_params,
             default_auth_method,
         });
+
+        // The retention worker's age-tiering pass drives the wire
+        // relocation, which needs the server state that exists only now
+        background.attach_server_state(Arc::clone(&server_state));
 
         // Restore feature groups and trained models from on-disk snapshots
         if let Err(e) = crate::feature_persistence::restore_feature_state(&server_state) {

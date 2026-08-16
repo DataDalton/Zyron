@@ -138,7 +138,8 @@ impl ColumnEntry {
         write_bool(&mut buf, self.nullable);
         write_option_string(&mut buf, &self.default_expr);
         write_option_usize(&mut buf, &self.max_length);
-        // 0 = None, 1..=13 = Some(0..=12).
+        // 0 = None, 1..=39 = Some(0..=38). Timestamp precision uses 0..=12
+        // and a decimal scale reaches 38, the widest an i128 can hold
         write_u8(&mut buf, self.fractional_digits.map(|p| p + 1).unwrap_or(0));
         match self.tz_offset_secs {
             Some(secs) => {
@@ -165,10 +166,10 @@ impl ColumnEntry {
         let max_length = read_option_usize(data, &mut off)?;
         let fractional_digits = match read_u8(data, &mut off)? {
             0 => None,
-            n if n <= 13 => Some(n - 1),
+            n if n <= 39 => Some(n - 1),
             n => {
                 return Err(zyron_common::ZyronError::CatalogCorrupted(format!(
-                    "invalid fractional_digits byte {n} (expected 0..=13)"
+                    "invalid fractional_digits byte {n} (expected 0..=39)"
                 )));
             }
         };

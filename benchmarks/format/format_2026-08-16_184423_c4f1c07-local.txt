@@ -1,0 +1,312 @@
+# suite:   format
+# run:     2026-08-16_184423_c4f1c07-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Arrow IPC write throughput ===
+--- Run 1/5 (batch=100) ---
+
+  batch=  100: 18,431,821 rows/sec
+--- Run 2/5 (batch=100) ---
+
+  batch=  100: 20,290,561 rows/sec
+--- Run 3/5 (batch=100) ---
+
+  batch=  100: 20,623,659 rows/sec
+--- Run 4/5 (batch=100) ---
+
+  batch=  100: 20,823,789 rows/sec
+--- Run 5/5 (batch=100) ---
+
+  batch=  100: 20,920,502 rows/sec
+--- Run 1/5 (batch=1000) ---
+
+  batch= 1000: 21,811,678 rows/sec
+--- Run 2/5 (batch=1000) ---
+
+  batch= 1000: 21,021,210 rows/sec
+--- Run 3/5 (batch=1000) ---
+
+  batch= 1000: 23,226,646 rows/sec
+--- Run 4/5 (batch=1000) ---
+
+  batch= 1000: 25,775,853 rows/sec
+--- Run 5/5 (batch=1000) ---
+
+  batch= 1000: 25,452,741 rows/sec
+--- Run 1/5 (batch=10000) ---
+
+  batch=10000: 20,575,708 rows/sec
+--- Run 2/5 (batch=10000) ---
+
+  batch=10000: 20,803,645 rows/sec
+--- Run 3/5 (batch=10000) ---
+
+  batch=10000: 20,989,222 rows/sec
+--- Run 4/5 (batch=10000) ---
+
+  batch=10000: 20,896,458 rows/sec
+--- Run 5/5 (batch=10000) ---
+
+  batch=10000: 21,179,710 rows/sec
+  rows/sec at batch=10000 [PASS/OK]:
+    Runs: [20,575,708, 20,803,645, 20,989,222, 20,896,458, 21,179,710]
+    Average: 20,888,949 >= 1,000,000 (target)
+    Min/Max: 20,575,708 / 21,179,710, StdDev: 200,025
+
+=== Avro write throughput ===
+--- Run 1/5 (batch=100) ---
+
+  batch=  100: 1,527,580 rows/sec
+--- Run 2/5 (batch=100) ---
+
+  batch=  100: 1,591,115 rows/sec
+--- Run 3/5 (batch=100) ---
+
+  batch=  100: 1,591,672 rows/sec
+--- Run 4/5 (batch=100) ---
+
+  batch=  100: 1,598,210 rows/sec
+--- Run 5/5 (batch=100) ---
+
+  batch=  100: 1,596,016 rows/sec
+--- Run 1/5 (batch=1000) ---
+
+  batch= 1000: 1,806,870 rows/sec
+--- Run 2/5 (batch=1000) ---
+
+  batch= 1000: 1,810,599 rows/sec
+--- Run 3/5 (batch=1000) ---
+
+  batch= 1000: 1,812,327 rows/sec
+--- Run 4/5 (batch=1000) ---
+
+  batch= 1000: 1,814,070 rows/sec
+--- Run 5/5 (batch=1000) ---
+
+  batch= 1000: 1,741,452 rows/sec
+--- Run 1/5 (batch=10000) ---
+
+  batch=10000: 1,770,099 rows/sec
+--- Run 2/5 (batch=10000) ---
+
+  batch=10000: 1,827,773 rows/sec
+--- Run 3/5 (batch=10000) ---
+
+  batch=10000: 1,794,881 rows/sec
+--- Run 4/5 (batch=10000) ---
+
+  batch=10000: 1,830,576 rows/sec
+--- Run 5/5 (batch=10000) ---
+
+  batch=10000: 1,809,326 rows/sec
+  rows/sec at batch=10000 [PASS/OK]:
+    Runs: [1,770,099, 1,827,773, 1,794,881, 1,830,576, 1,809,326]
+    Average: 1,806,531 >= 300,000 (target)
+    Min/Max: 1,770,099 / 1,830,576, StdDev: 22,361
+
+=== CSV write throughput ===
+--- Run 1/5 (batch=100) ---
+
+  batch=  100: 6,613,713 rows/sec
+--- Run 2/5 (batch=100) ---
+
+  batch=  100: 6,736,093 rows/sec
+--- Run 3/5 (batch=100) ---
+
+  batch=  100: 6,458,113 rows/sec
+--- Run 4/5 (batch=100) ---
+
+  batch=  100: 6,715,511 rows/sec
+--- Run 5/5 (batch=100) ---
+
+  batch=  100: 6,761,828 rows/sec
+--- Run 1/5 (batch=1000) ---
+
+  batch= 1000: 6,616,120 rows/sec
+--- Run 2/5 (batch=1000) ---
+
+  batch= 1000: 6,619,229 rows/sec
+--- Run 3/5 (batch=1000) ---
+
+  batch= 1000: 6,648,936 rows/sec
+--- Run 4/5 (batch=1000) ---
+
+  batch= 1000: 6,607,900 rows/sec
+--- Run 5/5 (batch=1000) ---
+
+  batch= 1000: 6,618,747 rows/sec
+--- Run 1/5 (batch=10000) ---
+
+  batch=10000: 6,168,955 rows/sec
+--- Run 2/5 (batch=10000) ---
+
+  batch=10000: 6,288,399 rows/sec
+--- Run 3/5 (batch=10000) ---
+
+  batch=10000: 6,271,991 rows/sec
+--- Run 4/5 (batch=10000) ---
+
+  batch=10000: 6,321,552 rows/sec
+--- Run 5/5 (batch=10000) ---
+
+  batch=10000: 6,322,431 rows/sec
+  rows/sec at batch=10000 [PASS/OK]:
+    Runs: [6,168,955, 6,288,399, 6,271,991, 6,321,552, 6,322,431]
+    Average: 6,274,666 >= 2,000,000 (target)
+    Min/Max: 6,168,955 / 6,322,431, StdDev: 56,303
+
+=== JSON array write throughput ===
+--- Run 1/5 (batch=100) ---
+
+  batch=  100: 3,104,992 rows/sec (1000 batches x 100 rows)
+--- Run 2/5 (batch=100) ---
+
+  batch=  100: 3,300,025 rows/sec (1000 batches x 100 rows)
+--- Run 3/5 (batch=100) ---
+
+  batch=  100: 3,112,288 rows/sec (1000 batches x 100 rows)
+--- Run 4/5 (batch=100) ---
+
+  batch=  100: 3,141,473 rows/sec (1000 batches x 100 rows)
+--- Run 5/5 (batch=100) ---
+
+  batch=  100: 3,109,549 rows/sec (1000 batches x 100 rows)
+--- Run 1/5 (batch=1000) ---
+
+  batch= 1000: 2,118,617 rows/sec (100 batches x 1000 rows)
+--- Run 2/5 (batch=1000) ---
+
+  batch= 1000: 2,305,305 rows/sec (100 batches x 1000 rows)
+--- Run 3/5 (batch=1000) ---
+
+  batch= 1000: 2,559,921 rows/sec (100 batches x 1000 rows)
+--- Run 4/5 (batch=1000) ---
+
+  batch= 1000: 2,668,367 rows/sec (100 batches x 1000 rows)
+--- Run 5/5 (batch=1000) ---
+
+  batch= 1000: 2,830,207 rows/sec (100 batches x 1000 rows)
+--- Run 1/5 (batch=10000) ---
+
+  batch=10000: 1,688,285 rows/sec (10 batches x 10000 rows)
+--- Run 2/5 (batch=10000) ---
+
+  batch=10000: 1,912,730 rows/sec (10 batches x 10000 rows)
+--- Run 3/5 (batch=10000) ---
+
+  batch=10000: 2,047,200 rows/sec (10 batches x 10000 rows)
+--- Run 4/5 (batch=10000) ---
+
+  batch=10000: 1,950,698 rows/sec (10 batches x 10000 rows)
+--- Run 5/5 (batch=10000) ---
+
+  batch=10000: 2,032,388 rows/sec (10 batches x 10000 rows)
+  rows/sec at batch=10000 [PASS/OK]:
+    Runs: [1,688,285, 1,912,730, 2,047,200, 1,950,698, 2,032,388]
+    Average: 1,926,260 >= 1,000,000 (target)
+    Min/Max: 1,688,285 / 2,047,200, StdDev: 129,075
+
+=== JSON Lines write throughput ===
+--- Run 1/5 (batch=100) ---
+
+  batch=  100: 3,404,835 rows/sec
+--- Run 2/5 (batch=100) ---
+
+  batch=  100: 3,446,232 rows/sec
+--- Run 3/5 (batch=100) ---
+
+  batch=  100: 3,461,441 rows/sec
+--- Run 4/5 (batch=100) ---
+
+  batch=  100: 3,459,956 rows/sec
+--- Run 5/5 (batch=100) ---
+
+  batch=  100: 3,466,000 rows/sec
+--- Run 1/5 (batch=1000) ---
+
+  batch= 1000: 3,547,848 rows/sec
+--- Run 2/5 (batch=1000) ---
+
+  batch= 1000: 3,563,259 rows/sec
+--- Run 3/5 (batch=1000) ---
+
+  batch= 1000: 3,549,523 rows/sec
+--- Run 4/5 (batch=1000) ---
+
+  batch= 1000: 3,550,544 rows/sec
+--- Run 5/5 (batch=1000) ---
+
+  batch= 1000: 3,568,434 rows/sec
+--- Run 1/5 (batch=10000) ---
+
+  batch=10000: 3,497,445 rows/sec
+--- Run 2/5 (batch=10000) ---
+
+  batch=10000: 3,556,150 rows/sec
+--- Run 3/5 (batch=10000) ---
+
+  batch=10000: 3,547,005 rows/sec
+--- Run 4/5 (batch=10000) ---
+
+  batch=10000: 3,548,566 rows/sec
+--- Run 5/5 (batch=10000) ---
+
+  batch=10000: 3,539,071 rows/sec
+  rows/sec at batch=10000 [PASS/OK]:
+    Runs: [3,497,445, 3,556,150, 3,547,005, 3,548,566, 3,539,071]
+    Average: 3,537,647 >= 1,500,000 (target)
+    Min/Max: 3,497,445 / 3,556,150, StdDev: 20,820
+
+=== Parquet write throughput ===
+--- Run 1/5 (batch=100) ---
+
+  batch=  100: 2,282,219 rows/sec
+--- Run 2/5 (batch=100) ---
+
+  batch=  100: 2,611,136 rows/sec
+--- Run 3/5 (batch=100) ---
+
+  batch=  100: 2,576,656 rows/sec
+--- Run 4/5 (batch=100) ---
+
+  batch=  100: 2,612,706 rows/sec
+--- Run 5/5 (batch=100) ---
+
+  batch=  100: 2,680,462 rows/sec
+--- Run 1/5 (batch=1000) ---
+
+  batch= 1000: 9,783,491 rows/sec
+--- Run 2/5 (batch=1000) ---
+
+  batch= 1000: 9,865,533 rows/sec
+--- Run 3/5 (batch=1000) ---
+
+  batch= 1000: 10,424,920 rows/sec
+--- Run 4/5 (batch=1000) ---
+
+  batch= 1000: 6,145,337 rows/sec
+--- Run 5/5 (batch=1000) ---
+
+  batch= 1000: 9,158,516 rows/sec
+--- Run 1/5 (batch=10000) ---
+
+  batch=10000: 7,437,930 rows/sec
+--- Run 2/5 (batch=10000) ---
+
+  batch=10000: 7,901,890 rows/sec
+--- Run 3/5 (batch=10000) ---
+
+  batch=10000: 7,954,310 rows/sec
+--- Run 4/5 (batch=10000) ---
+
+  batch=10000: 9,326,705 rows/sec
+--- Run 5/5 (batch=10000) ---
+
+  batch=10000: 9,801,904 rows/sec
+  rows/sec at batch=10000 [PASS/OK]:
+    Runs: [7,437,930, 7,901,890, 7,954,310, 9,326,705, 9,801,904]
+    Average: 8,484,548 >= 500,000 (target)
+    Min/Max: 7,437,930 / 9,801,904, StdDev: 912,218

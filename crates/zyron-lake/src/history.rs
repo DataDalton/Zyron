@@ -311,6 +311,7 @@ mod tests {
             commit_lsn: 5,
             timestamp_us,
             read_predicate: None,
+            read_version: 0,
             audit: None,
         }
     }

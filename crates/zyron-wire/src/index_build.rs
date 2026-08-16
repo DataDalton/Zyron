@@ -108,6 +108,7 @@ pub async fn build_lake_index(
         commit_lsn: 0,
         timestamp_us,
         read_predicate: None,
+        read_version: 0,
         audit: None,
     };
     let name = index_name_for(table, column_names);
@@ -161,6 +162,7 @@ pub async fn drop_lake_index(
         commit_lsn: 0,
         timestamp_us,
         read_predicate: None,
+        read_version: 0,
         audit: None,
     };
     zyron_lake::operations::drop_index(&log, attempt, &name)?;
@@ -193,6 +195,7 @@ pub async fn rebuild_lake_indexes(
         commit_lsn: 0,
         timestamp_us,
         read_predicate: None,
+        read_version: 0,
         audit: None,
     };
     zyron_lake::operations::rebuild_indexes(&log, attempt, table.id.0 as u64)?;
@@ -262,7 +265,12 @@ pub async fn collect_live_rows(
         Vec::new()
     } else {
         let heap_file = open_heap_file(server, table).await?;
-        let page_ids = heap_file.scan()?.page_ids().to_vec();
+        // Every page of the heap by number, not a scan guard's pinned set.
+        // The loop below reads each page from the pool when resident and
+        // straight off disk otherwise, so it needs the full extent
+        let page_ids: Vec<PageId> = (0..heap_file.num_pages_cached() as u64)
+            .map(|n| PageId::new(heap_file.heap_file_id(), n))
+            .collect();
 
         let mut byPage: Vec<(PageId, Vec<(u16, Vec<u8>)>)> = Vec::with_capacity(page_ids.len());
         for page_id in &page_ids {

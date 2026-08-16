@@ -163,6 +163,15 @@ impl TypeId {
         self.fixed_size().is_some()
     }
 
+    /// True when a B+tree index can key on a column of this type, meaning
+    /// the key encoder produces bytes whose unsigned bytewise order matches
+    /// the value order. Interval has three independent fields and no total
+    /// byte order. UInt128 shares Int128's storage, whose sign-flip key
+    /// layout would misorder values with the top bit set
+    pub fn btree_index_encodable(&self) -> bool {
+        !matches!(self, TypeId::Null | TypeId::Interval | TypeId::UInt128)
+    }
+
     /// Physical storage type for a (logical timestamp type, precision) pair.
     /// p<=6 keeps the i64 microsecond representation. p>6 uses i128
     /// picoseconds so it rides the 128-bit columnar path. Non-timestamp

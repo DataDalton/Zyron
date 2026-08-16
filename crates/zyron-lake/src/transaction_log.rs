@@ -51,6 +51,22 @@ const BACKOFF_CAP_US: u64 = 5_000;
 const MANIFEST_CACHE_MAX: usize = 32;
 const MANIFEST_CACHE_KEEP: usize = 16;
 
+/// Test-only stall inserted between a transactional commit's pending
+/// registration and its head advance, in microseconds. Widens the gap the
+/// statement ordering closes so a test can reach the interleaving, always
+/// zero outside tests
+#[cfg(test)]
+pub(crate) static TEST_STALL_VISIBILITY_GAP_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+fn stall_visibility_gap() {
+    let us = TEST_STALL_VISIBILITY_GAP_US.load(Ordering::Relaxed);
+    if us != 0 {
+        std::thread::sleep(Duration::from_micros(us));
+    }
+}
+
 /// What a commit did, one byte in the header. Conflict rules dispatch on
 /// this before any entry is read
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -811,6 +827,12 @@ pub struct CommitAttempt<'a> {
     /// Predicate the writer's reads depended on, recorded for phantom
     /// detection under rule R4
     pub read_predicate: Option<&'a LakePredicate>,
+    /// Version the read predicate was evaluated at. When non-zero, the
+    /// commit phantom-checks the predicate against every version that
+    /// landed after this base, because those writers were never met in a
+    /// version-file collision and rule R4 alone would miss them. Zero
+    /// means the predicate carries no base pin
+    pub read_version: u64,
     pub audit: Option<&'a CommitInfo>,
 }
 
@@ -1413,15 +1435,29 @@ impl TransactionLog {
             Some(_) => version.min(self.branch_base),
             None => version,
         };
-        for dirent in fs::read_dir(self.paths.log_dir())? {
-            let dirent = dirent?;
-            let name = dirent.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if let Some((v, VersionFileKind::Checkpoint)) = parse_version_file_name(name) {
-                // Checkpoints live on main. A branch replays from the newest
-                // one at or below its fork point, then its own versions
-                if v <= ceiling && v > base {
-                    base = v;
+        // The hint names the newest checkpoint, one small read instead of a
+        // directory scan per reconstruction. It is advisory: absent, stale,
+        // above the ceiling or pointing at a removed file falls back to the
+        // scan below
+        if let Ok(text) = fs::read_to_string(self.paths.last_checkpoint_hint()) {
+            if let Ok(hinted) = text.trim().parse::<u64>() {
+                if hinted > 0 && hinted <= ceiling && self.paths.checkpoint_file(hinted).exists() {
+                    base = hinted;
+                }
+            }
+        }
+        if base == 0 {
+            for dirent in fs::read_dir(self.paths.log_dir())? {
+                let dirent = dirent?;
+                let name = dirent.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if let Some((v, VersionFileKind::Checkpoint)) = parse_version_file_name(name) {
+                    // Checkpoints live on main. A branch replays from the
+                    // newest one at or below its fork point, then its own
+                    // versions
+                    if v <= ceiling && v > base {
+                        base = v;
+                    }
                 }
             }
         }
@@ -1577,7 +1613,16 @@ impl TransactionLog {
         let mut races: u64 = 0;
         loop {
             // A pending version from another transaction is uncommitted
-            // state, building on it would tie this commit to its fate
+            // state, building on it would tie this commit to its fate.
+            // The head is read before the pending scan: registration
+            // precedes the head advance on the winner side, so a base at
+            // an unresolved transactional version is always caught here
+            let base_version = self.head_version();
+            if base_version == 0 {
+                return Err(ZyronError::Internal(
+                    "lake table log is empty, create it before committing".into(),
+                ));
+            }
             let mut foreign_pending = false;
             self.pending.iter_sync(|_, txn| {
                 if *txn != attempt.db_txn_id {
@@ -1605,13 +1650,27 @@ impl TransactionLog {
                 waits += 1;
                 continue;
             }
-            let base_version = self.head_version();
-            if base_version == 0 {
-                return Err(ZyronError::Internal(
-                    "lake table log is empty, create it before committing".into(),
-                ));
+            if self.head_version() != base_version {
+                // The head moved between the read and the pending scan,
+                // either forward past a new commit or backward past an
+                // abandon, so the base is re-derived
+                races += 1;
+                backoff(races.min(u32::MAX as u64) as u32);
+                continue;
             }
-            let base = self.manifest_at(base_version)?;
+            let base = match self.manifest_at(base_version) {
+                Ok(base) => base,
+                Err(_) if self.head_version() != base_version => {
+                    // The base was abandoned after the checks above, its
+                    // retraction rolls the head back before removing the
+                    // files, so a vanished base always shows here as a
+                    // moved head
+                    races += 1;
+                    backoff(races.min(u32::MAX as u64) as u32);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let mut entries = build(&base)?;
             if entries.is_empty() {
                 return Err(ZyronError::Internal("commit with no entries".into()));
@@ -1635,6 +1694,35 @@ impl TransactionLog {
                         reason: "one node writes a dataset and the others read it, so a second writer is refused rather than merged. Transfer ownership explicitly if the owning node is gone"
                             .to_string(),
                     });
+                }
+            }
+            // The read predicate pins the base the caller probed at. Every
+            // version that landed after that base is a writer this attempt
+            // never met in a version-file collision, so the phantom rule
+            // runs against each of them here, exactly as rule R4 runs
+            // against a collision winner. A unique probe rides this: the
+            // probed key range conflicts with any concurrent commit whose
+            // new file could hold the key
+            if let Some(predicate) = attempt.read_predicate
+                && attempt.read_version != 0
+            {
+                for v in attempt.read_version + 1..=base_version {
+                    let data = read_racing(|| read_version_file(&self.version_path(v)))?;
+                    for entry in &data.entries {
+                        if let LogEntry::AddFile(file) = entry {
+                            if predicate.prune(file) != PruneDecision::CannotMatch {
+                                return Err(ZyronError::ConflictError {
+                                    mine: attempt.operation.name().to_string(),
+                                    theirs: format!("version {}", v),
+                                    reason: format!(
+                                        "a concurrent commit added partition {:#x} matching \
+                                         the read predicate",
+                                        file.partition_id
+                                    ),
+                                });
+                            }
+                        }
+                    }
                 }
             }
             let version = base_version + 1;
@@ -1663,24 +1751,90 @@ impl TransactionLog {
                         .manifests
                         .insert_sync(version, CachedManifest::new(manifest));
                     self.evict_cache();
-                    self.created_head.fetch_max(version, Ordering::AcqRel);
                     if attempt.db_txn_id == 0 {
+                        self.created_head.fetch_max(version, Ordering::AcqRel);
                         self.advance_published();
                         self.write_latest_hint(self.latest_version());
                     } else {
+                        // Pending registration precedes the head advance.
+                        // Once the shared head includes this version,
+                        // advance_published and concurrent committers act on
+                        // it, and only the pending entry tells them its
+                        // transaction has not resolved yet
                         let _ = self.pending.insert_sync(version, attempt.db_txn_id);
+                        #[cfg(test)]
+                        stall_visibility_gap();
+                        self.created_head.fetch_max(version, Ordering::AcqRel);
                     }
                     return Ok(version);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     self.commit_retries.fetch_add(1, Ordering::Relaxed);
-                    let winner = read_racing(|| read_commit_header(&path))?;
-                    self.created_head
-                        .fetch_max(winner.version, Ordering::AcqRel);
+                    let winner = match read_racing(|| read_commit_header(&path)) {
+                        Ok(w) => w,
+                        Err(_) if !path.exists() => {
+                            // The winner abandoned before resolving, its
+                            // version number is free again and nothing
+                            // conflicts with this attempt
+                            races += 1;
+                            backoff(races.min(u32::MAX as u64) as u32);
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    };
                     if winner.db_txn_id == 0 {
-                        // A standalone winner from another thread published
-                        // itself, make sure the watermark caught up
+                        // A standalone winner is committed by construction
+                        // and can never be abandoned, so its version is
+                        // adopted directly. This is also how a version
+                        // written through another handle of the same
+                        // directory reaches this instance's head
+                        self.created_head
+                            .fetch_max(winner.version, Ordering::AcqRel);
                         self.advance_published();
+                    } else {
+                        // A transactional winner registers its version
+                        // pending before advancing the head itself, both in
+                        // this instance's memory. Adopting the version from
+                        // the file alone would make it discoverable before
+                        // that registration, and writing the head here
+                        // could re-raise a version an abandon just rolled
+                        // back, so this waits for the winner's own advance
+                        // or for the file to vanish when it abandons
+                        let mut spins: u32 = 0;
+                        loop {
+                            if self.head_version() >= winner.version
+                                || self.latest_version() >= winner.version
+                            {
+                                break;
+                            }
+                            if !path.exists() {
+                                break;
+                            }
+                            if spins >= MAX_COMMIT_ATTEMPTS {
+                                return Err(ZyronError::ConflictError {
+                                    mine: attempt.operation.name().to_string(),
+                                    theirs: winner.operation.name().to_string(),
+                                    reason: format!(
+                                        "waited {} attempts for the winning transaction's \
+                                         version {} to resolve",
+                                        MAX_COMMIT_ATTEMPTS, winner.version
+                                    ),
+                                });
+                            }
+                            backoff(spins);
+                            spins += 1;
+                        }
+                        if !path.exists()
+                            && self.head_version() < winner.version
+                            && self.latest_version() < winner.version
+                        {
+                            // The winner was abandoned before it was
+                            // adopted, so nothing conflicts with this
+                            // attempt
+                            races += 1;
+                            backoff(races.min(u32::MAX as u64) as u32);
+                            continue;
+                        }
                     }
                     if let Some(reason) = self.check_conflict(&attempt, &entries, &winner, &path)? {
                         return Err(ZyronError::ConflictError {
@@ -1697,19 +1851,6 @@ impl TransactionLog {
                         winner = winner.operation.name(),
                         "commit lost a version race, rebuilding on the winner"
                     );
-                    // The winner's version file exists, so the head must now
-                    // be past the version this attempt tried for. That is the
-                    // progress that makes retrying here sound rather than a
-                    // spin, and if it ever failed to hold the loop would be
-                    // one, so it is checked rather than assumed
-                    if self.head_version() <= base_version {
-                        return Err(ZyronError::Internal(format!(
-                            "lake log at {:?}: version {} exists but the head is still {}",
-                            self.paths().root(),
-                            version,
-                            base_version
-                        )));
-                    }
                     races += 1;
                     backoff(races.min(u32::MAX as u64) as u32);
                 }
@@ -1842,7 +1983,22 @@ impl TransactionLog {
     /// newest created version can be abandoned, later versions would have
     /// waited on it rather than build over it
     pub fn abandon(&self, version: u64) -> Result<(), ZyronError> {
-        if version != self.head_version() {
+        if self.pending.read_sync(&version, |_, _| ()).is_none() {
+            return Err(ZyronError::Internal(format!(
+                "lake version {} is not pending",
+                version
+            )));
+        }
+        // Retraction reverses registration: the head rolls back before the
+        // registration and the files go away, so a committer that saw the
+        // version through the head can still resolve it, and one that finds
+        // the files gone always observes the moved head. The exchange also
+        // claims the abandon, a concurrent second abandon fails the guard
+        if self
+            .created_head
+            .compare_exchange(version, version - 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return Err(ZyronError::Internal(format!(
                 "abandon of version {} but the head is {}",
                 version,
@@ -1857,7 +2013,6 @@ impl TransactionLog {
         }
         let _ = self.manifests.remove_sync(&version);
         fs::remove_file(self.version_path(version))?;
-        self.created_head.store(version - 1, Ordering::Release);
         Ok(())
     }
 
@@ -2151,7 +2306,7 @@ mod tests {
             row_count: rows,
             added_version: 0,
             cluster_spec_id: 0,
-            column_stats: vec![ColumnStatsEntry {
+            column_stats: std::sync::Arc::new(vec![ColumnStatsEntry {
                 ndv: Some(rows),
                 column_id: 0,
                 bounds: ColumnBounds {
@@ -2162,7 +2317,7 @@ mod tests {
                 },
                 bloom: None,
                 size_bytes: None,
-            }],
+            }]),
             delete_predicate_ids: vec![],
         }
     }
@@ -2174,6 +2329,7 @@ mod tests {
             commit_lsn: 100,
             timestamp_us: 1_754_700_000_000_000,
             read_predicate: None,
+            read_version: 0,
             audit: None,
         }
     }
@@ -2256,6 +2412,179 @@ mod tests {
             log.commit_retries() > 0,
             "contention must have caused retries"
         );
+    }
+
+    /// A transactional commit must be registered pending before its version
+    /// becomes discoverable through the shared head. In the reverse order a
+    /// concurrent standalone commit sees the head advance with no pending
+    /// entry, builds on the uncommitted manifest and publishes past it, so
+    /// every scan dirty-reads the uncommitted version and the transaction
+    /// can neither publish nor abandon it afterwards. The stall widens the
+    /// registration gap so the interleaving is reachable, and the sound
+    /// ordering must hold the invariants for every iteration regardless
+    #[test]
+    fn test_transactional_version_is_pending_before_it_is_discoverable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = Arc::new(new_log(dir.path()));
+        TEST_STALL_VISIBILITY_GAP_US.store(2_000, Ordering::Relaxed);
+        let mut expected_rows: u64 = 0;
+        for i in 0..200u64 {
+            let txn_attempt = CommitAttempt {
+                db_txn_id: 7,
+                ..attempt(OperationKind::Append)
+            };
+            let a = Arc::clone(&log);
+            let ta = thread::spawn(move || {
+                a.commit(txn_attempt, |_| {
+                    Ok(vec![LogEntry::AddFile(data_file(0x1000 + i, 0, 10, 1))])
+                })
+            });
+            let b = Arc::clone(&log);
+            let tb = thread::spawn(move || {
+                b.commit(attempt(OperationKind::Append), |_| {
+                    Ok(vec![LogEntry::AddFile(data_file(0x2000 + i, 0, 10, 1))])
+                })
+            });
+            let va = ta
+                .join()
+                .expect("transactional thread")
+                .expect("transactional append");
+            // The standalone committer must not observe the version before
+            // its registration, so publication never crosses it while it is
+            // unresolved. Resolving promptly also clears the standalone
+            // committer's bounded wait on the pending entry
+            if i % 2 == 0 {
+                log.abandon(va).unwrap_or_else(|e| {
+                    panic!(
+                        "iteration {i}: the uncommitted version {va} escaped its \
+                         transaction and cannot be abandoned: {e}"
+                    )
+                });
+            } else {
+                log.publish(va).expect("publish the transactional version");
+                expected_rows += 1;
+            }
+            tb.join()
+                .expect("standalone thread")
+                .expect("standalone append");
+            expected_rows += 1;
+            let live: u64 = log
+                .latest_manifest()
+                .expect("manifest")
+                .entries
+                .iter()
+                .map(|e| e.row_count)
+                .sum();
+            assert_eq!(
+                live, expected_rows,
+                "iteration {i}: published rows diverged, an uncommitted or \
+                 abandoned version leaked into the published prefix"
+            );
+        }
+        TEST_STALL_VISIBILITY_GAP_US.store(0, Ordering::Relaxed);
+    }
+
+    /// A commit that declares what it read pins the version it read at.
+    /// Every version committed after that base is a writer the attempt
+    /// never collided with in the version-file namespace, so the phantom
+    /// rule has to run against each of them at commit time. A unique-key
+    /// probe passes its key range this way: without the gap check, two
+    /// writers who both probed an empty range and then commit in sequence
+    /// both succeed, and the duplicate lands silently
+    #[test]
+    fn test_read_predicate_pins_the_probe_base_across_the_gap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = new_log(dir.path());
+        let probed_version = log.head_version();
+
+        // Another writer lands keys [10, 20] after the probe
+        log.commit(attempt(OperationKind::Append), |_| {
+            Ok(vec![LogEntry::AddFile(data_file(0xA1, 10, 20, 5))])
+        })
+        .expect("concurrent append");
+
+        // This attempt probed [15, 25] against the pre-append base, the
+        // concurrent file intersects the range so the commit must conflict
+        let overlapping = LakePredicate::And(vec![
+            LakePredicate::Compare {
+                column_id: 0,
+                op: CompareOp::GtEq,
+                value: LakeValue::Int(15),
+            },
+            LakePredicate::Compare {
+                column_id: 0,
+                op: CompareOp::LtEq,
+                value: LakeValue::Int(25),
+            },
+        ]);
+        let mut pinned = attempt(OperationKind::Append);
+        pinned.read_predicate = Some(&overlapping);
+        pinned.read_version = probed_version;
+        let err = log
+            .commit(pinned, |_| {
+                Ok(vec![LogEntry::AddFile(data_file(0xA2, 15, 15, 1))])
+            })
+            .expect_err("the gap write intersects the probed range");
+        assert!(
+            matches!(err, ZyronError::ConflictError { .. }),
+            "expected a conflict, got {err:?}"
+        );
+
+        // A probe whose range the gap write cannot touch commits cleanly
+        let disjoint = LakePredicate::And(vec![
+            LakePredicate::Compare {
+                column_id: 0,
+                op: CompareOp::GtEq,
+                value: LakeValue::Int(100),
+            },
+            LakePredicate::Compare {
+                column_id: 0,
+                op: CompareOp::LtEq,
+                value: LakeValue::Int(200),
+            },
+        ]);
+        let mut clean = attempt(OperationKind::Append);
+        clean.read_predicate = Some(&disjoint);
+        clean.read_version = probed_version;
+        log.commit(clean, |_| {
+            Ok(vec![LogEntry::AddFile(data_file(0xA3, 100, 100, 1))])
+        })
+        .expect("a disjoint range does not conflict");
+    }
+
+    /// The invariant every observer relies on: a transactional version that
+    /// is discoverable through the shared head is already registered
+    /// pending. The stall sits between the two steps, so if the head ever
+    /// advances first there is a wide window in which this fails
+    #[test]
+    fn test_head_advance_implies_pending_registration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = Arc::new(new_log(dir.path()));
+        TEST_STALL_VISIBILITY_GAP_US.store(5_000, Ordering::Relaxed);
+        let base = log.head_version();
+        let a = Arc::clone(&log);
+        let ta = thread::spawn(move || {
+            a.commit(
+                CommitAttempt {
+                    db_txn_id: 9,
+                    ..attempt(OperationKind::Append)
+                },
+                |_| Ok(vec![LogEntry::AddFile(data_file(0x9000, 0, 10, 1))]),
+            )
+        });
+        while log.head_version() <= base {
+            std::hint::spin_loop();
+        }
+        let v = log.head_version();
+        let registered = log.pending.read_sync(&v, |_, _| ()).is_some();
+        assert!(
+            registered,
+            "version {v} is discoverable through the head but not registered pending"
+        );
+        let va = ta.join().expect("transactional thread").expect("append");
+        assert_eq!(va, v);
+        log.abandon(va).expect("abandon");
+        TEST_STALL_VISIBILITY_GAP_US.store(0, Ordering::Relaxed);
     }
 
     /// Losing a version race is not a conflict, so it must not spend the

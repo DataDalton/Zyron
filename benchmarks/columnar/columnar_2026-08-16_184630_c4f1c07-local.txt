@@ -1,0 +1,18 @@
+# suite:   columnar
+# run:     2026-08-16_184630_c4f1c07-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Fold-path throughput (CompactionWorker::run_cycle) ===
+Rows per run: 100000, runs: 5
+  run 1: 790,713 rows/sec
+  run 2: 779,055 rows/sec
+  run 3: 780,589 rows/sec
+  run 4: 767,344 rows/sec
+  run 5: 781,678 rows/sec
+  Fold-path throughput (rows/sec) [FAIL/OK]:
+    Runs: [790,713, 779,055, 780,589, 767,344, 781,678]
+    Average: 779,876 >= 1,000,000 (target)
+    Min/Max: 767,344 / 790,713, StdDev: 7,469

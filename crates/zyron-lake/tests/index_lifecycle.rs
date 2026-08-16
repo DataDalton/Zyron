@@ -53,6 +53,7 @@ fn attempt(timestamp_us: i64) -> CommitAttempt<'static> {
         commit_lsn: 1,
         timestamp_us,
         read_predicate: None,
+        read_version: 0,
         audit: None,
     }
 }

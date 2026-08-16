@@ -311,13 +311,18 @@ impl PageTable {
 
     /// Iterates over all entries, calling the provided function for each.
     /// Returns early if the function returns false.
+    ///
+    /// Keys and values load Acquire so a published entry is observed with
+    /// its matching frame: a Relaxed pair could tear against a concurrent
+    /// publish and hand a flusher a stale or unrelated frame id, which
+    /// would write another page's bytes to this page's disk slot.
     pub fn for_each<F>(&self, mut f: F)
     where
         F: FnMut(PageId, FrameId) -> bool,
     {
         // Iterate direct path
         for (page_num, slot) in self.direct_path.iter().enumerate() {
-            let val = slot.load(Ordering::Relaxed);
+            let val = slot.load(Ordering::Acquire);
             if val != EMPTY_FRAME {
                 let page_id = PageId::new(0, page_num as u64);
                 if !f(page_id, FrameId(val)) {
@@ -328,9 +333,9 @@ impl PageTable {
 
         // Iterate hash table
         for (idx, key_slot) in self.hash_keys.iter().enumerate() {
-            let key = key_slot.load(Ordering::Relaxed);
+            let key = key_slot.load(Ordering::Acquire);
             if key != EMPTY_KEY && key != TOMBSTONE_KEY && key != INPROGRESS_KEY {
-                let frame_id = self.hash_values[idx].load(Ordering::Relaxed);
+                let frame_id = self.hash_values[idx].load(Ordering::Acquire);
                 let page_id = PageId::from_u64(key);
                 if !f(page_id, FrameId(frame_id)) {
                     return;

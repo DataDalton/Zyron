@@ -534,6 +534,29 @@ impl ColumnData {
         dispatch_column!(self, v, v[offset..offset + len].to_vec())
     }
 
+    /// Shortens the column to len rows in place, keeping the front. Frees
+    /// nothing but drops the tail values, unlike slice this copies no data.
+    pub fn truncate(&mut self, len: usize) {
+        match self {
+            ColumnData::Boolean(v) => v.truncate(len),
+            ColumnData::Int8(v) => v.truncate(len),
+            ColumnData::Int16(v) => v.truncate(len),
+            ColumnData::Int32(v) => v.truncate(len),
+            ColumnData::Int64(v) => v.truncate(len),
+            ColumnData::Int128(v) => v.truncate(len),
+            ColumnData::UInt8(v) => v.truncate(len),
+            ColumnData::UInt16(v) => v.truncate(len),
+            ColumnData::UInt32(v) => v.truncate(len),
+            ColumnData::UInt64(v) => v.truncate(len),
+            ColumnData::Float32(v) => v.truncate(len),
+            ColumnData::Float64(v) => v.truncate(len),
+            ColumnData::Utf8(v) => v.truncate(len),
+            ColumnData::Binary(v) => v.truncate(len),
+            ColumnData::FixedBinary16(v) => v.truncate(len),
+            ColumnData::Interval(v) => v.truncate(len),
+        }
+    }
+
     /// Extracts a scalar value at the given row.
     pub fn get_scalar(&self, row: usize) -> ScalarValue {
         match self {

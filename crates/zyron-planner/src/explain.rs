@@ -289,6 +289,7 @@ impl ExplainNode {
                 predicate,
                 sql,
                 cost,
+                ..
             } => Self {
                 operator_name: "LakeDelete".to_string(),
                 details: vec![

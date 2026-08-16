@@ -448,16 +448,64 @@ impl BoundExpr {
         }
     }
 
-    /// Fractional-second precision this expression carries, if it is (or
-    /// passes through) a timestamp column. None means the default 6
-    /// (microseconds) or a non-timestamp expression.
+    /// Digits after the point this expression carries: a decimal's scale or
+    /// a timestamp's fractional-second precision. None means the expression
+    /// declares neither, which for a timestamp is the default 6.
+    ///
+    /// Computed decimals derive their scale from their inputs so a plan
+    /// schema built from this expression renders and compares the value
+    /// rather than the raw scaled integer.
     pub fn fractional_digits(&self) -> Option<u8> {
         match self {
             BoundExpr::ColumnRef(cr) => cr.fractional_digits,
             BoundExpr::Nested(inner) => inner.fractional_digits(),
             BoundExpr::TemporalRef { inner, .. } => inner.fractional_digits(),
-            // CAST AS TIMESTAMP(p) precision is carried in B5 (cross-precision
-            // cast); until then a cast result reports the default precision.
+            BoundExpr::Cast {
+                fractional_digits, ..
+            } => *fractional_digits,
+            // A decimal-valued operator lands on the wider operand scale,
+            // which is where the runtime alignment puts it
+            BoundExpr::BinaryOp {
+                left,
+                right,
+                type_id,
+                ..
+            } if *type_id == TypeId::Decimal => {
+                match (left.fractional_digits(), right.fractional_digits()) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (a, b) => a.or(b),
+                }
+            }
+            BoundExpr::UnaryOp { expr, type_id, .. } if *type_id == TypeId::Decimal => {
+                expr.fractional_digits()
+            }
+            // SUM, MIN and MAX keep their argument's scale
+            BoundExpr::AggregateFunction {
+                args, return_type, ..
+            } if *return_type == TypeId::Decimal => {
+                args.first().and_then(|a| a.fractional_digits())
+            }
+            // A wide fixed-point literal carries its own scale
+            BoundExpr::Literal {
+                value: LiteralValue::Decimal { scale, .. },
+                ..
+            } => Some(*scale),
+            // A CASE unifying decimal branches lands on the widest branch
+            // scale, matching the runtime branch alignment
+            BoundExpr::Case {
+                conditions,
+                else_result,
+                type_id,
+                ..
+            } if *type_id == TypeId::Decimal => {
+                let mut widest = else_result.as_ref().and_then(|e| e.fractional_digits());
+                for when in conditions {
+                    if let Some(s) = when.result.fractional_digits() {
+                        widest = Some(widest.map_or(s, |w| w.max(s)));
+                    }
+                }
+                widest
+            }
             _ => None,
         }
     }
@@ -4632,6 +4680,16 @@ impl<'a> Binder<'a> {
     }
 
     async fn bind_insert(&mut self, stmt: &InsertStatement) -> Result<BoundInsert> {
+        // Nothing downstream reads the conflict clause yet. Accepting the
+        // statement would run a plain INSERT, so DO NOTHING would raise the
+        // unique violation it asked to suppress and DO UPDATE would insert
+        // a duplicate, both silent wrong answers
+        if stmt.on_conflict.is_some() {
+            return Err(ZyronError::PlanError(
+                "INSERT ... ON CONFLICT is not supported yet, the conflict action cannot be honored"
+                    .to_string(),
+            ));
+        }
         let (schema_name, table_name) = if let Some(dot_pos) = stmt.table.find('.') {
             (Some(&stmt.table[..dot_pos]), &stmt.table[dot_pos + 1..])
         } else {
@@ -6081,7 +6139,7 @@ impl<'a> Binder<'a> {
         if let SourceResolution::Zyron(entry) = &source_resolved {
             if !entry.cdf_enabled {
                 return Err(ZyronError::PlanError(format!(
-                    "source table '{}' does not have CDC enabled, run ALTER TABLE {} SET (cdc_enabled = true) first",
+                    "source table '{}' does not have CDC enabled, run ALTER TABLE {} ENABLE change_data_feed first",
                     entry.name, entry.name
                 )));
             }
@@ -7042,6 +7100,7 @@ fn literal_type(lit: &LiteralValue) -> TypeId {
     match lit {
         LiteralValue::Integer(_) => TypeId::Int64,
         LiteralValue::Int128(_) => TypeId::Int128,
+        LiteralValue::Decimal { .. } => TypeId::Decimal,
         LiteralValue::Float(_) => TypeId::Float64,
         LiteralValue::String(_) => TypeId::Varchar,
         LiteralValue::Boolean(_) => TypeId::Boolean,

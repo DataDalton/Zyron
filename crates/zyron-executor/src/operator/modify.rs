@@ -56,24 +56,29 @@ pub(crate) fn encode_btree_key_into(
     }
     buf.clear();
     match (&col.data, type_id) {
+        // Signed integers flip the sign bit after widening so the tree's
+        // unsigned bytewise comparison orders negatives below positives
         (ColumnData::Int8(v), _) => {
-            buf.extend_from_slice(&(v[row_idx] as i64 as u64).to_be_bytes())
+            buf.extend_from_slice(&((v[row_idx] as i64 as u64) ^ (1u64 << 63)).to_be_bytes())
         }
         (ColumnData::Int16(v), _) => {
-            buf.extend_from_slice(&(v[row_idx] as i64 as u64).to_be_bytes())
+            buf.extend_from_slice(&((v[row_idx] as i64 as u64) ^ (1u64 << 63)).to_be_bytes())
         }
         (ColumnData::Int32(v), _) => {
-            buf.extend_from_slice(&(v[row_idx] as i64 as u64).to_be_bytes())
+            buf.extend_from_slice(&((v[row_idx] as i64 as u64) ^ (1u64 << 63)).to_be_bytes())
         }
-        (ColumnData::Int64(v), _) => buf.extend_from_slice(&(v[row_idx] as u64).to_be_bytes()),
+        (ColumnData::Int64(v), _) => {
+            buf.extend_from_slice(&((v[row_idx] as u64) ^ (1u64 << 63)).to_be_bytes())
+        }
         // 16-byte order-preserving key for Int128 (incl. i128 picosecond
-        // timestamps). The explicit sign-bit flip keeps negative values
-        // (pre-1970 timestamps) ordered before positive ones, which the bare
-        // cast used for the narrower widths only achieves for non-negatives
+        // timestamps), same sign-bit flip at the wider width
         (ColumnData::Int128(v), _) => {
             let key = (v[row_idx] as u128) ^ (1u128 << 127);
             buf.extend_from_slice(&key.to_be_bytes());
         }
+        (ColumnData::Boolean(v), _) => buf.push(v[row_idx] as u8),
+        // A UUID's 16 raw bytes already compare in value order
+        (ColumnData::FixedBinary16(v), _) => buf.extend_from_slice(&v[row_idx]),
         (ColumnData::UInt8(v), _) => buf.extend_from_slice(&(v[row_idx] as u64).to_be_bytes()),
         (ColumnData::UInt16(v), _) => buf.extend_from_slice(&(v[row_idx] as u64).to_be_bytes()),
         (ColumnData::UInt32(v), _) => buf.extend_from_slice(&(v[row_idx] as u64).to_be_bytes()),
@@ -266,23 +271,38 @@ pub fn encode_btree_key_from_cell(phys: TypeId, cell: &[u8], buf: &mut Vec<u8>) 
         };
         buf.extend_from_slice(&sortable.to_be_bytes());
     };
+    // The temporal and decimal ids share an integer cell layout, and the
+    // batch path indexes them through the matching integer column data, so
+    // the cell path dispatches on the same layout
+    let phys = match phys {
+        TypeId::Date => TypeId::Int32,
+        TypeId::Time | TypeId::Timestamp | TypeId::TimestampTz => TypeId::Int64,
+        TypeId::Decimal | TypeId::Hlc => TypeId::Int128,
+        other => other,
+    };
     match phys {
+        TypeId::Boolean if cell.len() == 1 => {
+            buf.push(if cell[0] != 0 { 1 } else { 0 });
+        }
+        TypeId::Uuid if cell.len() == 16 => {
+            buf.extend_from_slice(cell);
+        }
         TypeId::Int8 if cell.len() == 1 => {
-            buf.extend_from_slice(&(cell[0] as i8 as i64 as u64).to_be_bytes());
+            buf.extend_from_slice(&((cell[0] as i8 as i64 as u64) ^ (1u64 << 63)).to_be_bytes());
         }
         TypeId::Int16 if cell.len() == 2 => {
             let v = i16::from_le_bytes([cell[0], cell[1]]);
-            buf.extend_from_slice(&(v as i64 as u64).to_be_bytes());
+            buf.extend_from_slice(&((v as i64 as u64) ^ (1u64 << 63)).to_be_bytes());
         }
         TypeId::Int32 if cell.len() == 4 => {
             let v = i32::from_le_bytes([cell[0], cell[1], cell[2], cell[3]]);
-            buf.extend_from_slice(&(v as i64 as u64).to_be_bytes());
+            buf.extend_from_slice(&((v as i64 as u64) ^ (1u64 << 63)).to_be_bytes());
         }
         TypeId::Int64 if cell.len() == 8 => {
             let Ok(b) = <[u8; 8]>::try_from(cell) else {
                 return false;
             };
-            buf.extend_from_slice(&(i64::from_le_bytes(b) as u64).to_be_bytes());
+            buf.extend_from_slice(&((i64::from_le_bytes(b) as u64) ^ (1u64 << 63)).to_be_bytes());
         }
         TypeId::Int128 if cell.len() == 16 => {
             let Ok(b) = <[u8; 16]>::try_from(cell) else {
@@ -1798,9 +1818,16 @@ pub(crate) fn normalize_decimal_columns(
             continue;
         };
         // A column already typed decimal carries values on its own scale.
-        // An i128 buffer that is not typed decimal holds whole numbers, so
-        // it still has to be scaled
+        // When that scale differs from the declaration, the values move
+        // onto the declared one, otherwise a scale-3 source written into a
+        // scale-2 column would read back ten times too large. An i128
+        // buffer that is not typed decimal holds whole numbers, so it
+        // still has to be scaled
         if data.type_id == TypeId::Decimal {
+            let declared = column.fractional_digits.unwrap_or(0);
+            if data.fractional_digits.unwrap_or(0) != declared {
+                *data = crate::compute::cast_column_to_decimal(data, declared)?;
+            }
             continue;
         }
         let scale = column.fractional_digits.unwrap_or(0);
@@ -2669,6 +2696,37 @@ impl Operator for InsertOperator {
                         outcome.partition_id,
                         &outcome.order,
                     )?;
+                    // The heap path notifies per batch under the WAL LSN it
+                    // wrote. A lake append is one commit for the whole
+                    // statement, so the feed gets one notification carrying
+                    // the log version the rows landed under
+                    if let Some(ref hook) = self.ctx.cdc_hook {
+                        let mut encoded: Vec<Vec<u8>> = Vec::new();
+                        for batch in &lake_batches {
+                            for r in 0..batch.num_rows {
+                                encoded.push(crate::batch::encode_row(
+                                    batch,
+                                    r,
+                                    &table_entry.columns,
+                                ));
+                            }
+                        }
+                        let refs: Vec<&[u8]> = encoded.iter().map(|v| v.as_slice()).collect();
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_micros() as i64;
+                        if let Err(e) = hook.on_insert(
+                            self.table_id.0,
+                            &refs,
+                            outcome.version,
+                            now,
+                            txn_id,
+                            true,
+                        ) {
+                            eprintln!("CDC insert hook failed: {e}");
+                        }
+                    }
                 }
                 // AFTER INSERT fires once the rows are committed, because a
                 // trigger body that reads the table has to see them. One
@@ -2696,13 +2754,42 @@ impl Operator for InsertOperator {
     }
 }
 
+/// The manifest at the log's created head together with that head, which
+/// includes this transaction's own pending versions and any foreign pending
+/// version a commit would wait on anyway. Retried when a concurrent abandon
+/// retracts the head between the sample and the read
+fn pending_inclusive_manifest(
+    log: &zyron_lake::TransactionLog,
+) -> zyron_common::Result<(std::sync::Arc<zyron_lake::ManifestFile>, u64)> {
+    let mut tries = 0u32;
+    loop {
+        let head = log.head_version();
+        match log.manifest_at(head) {
+            Ok(m) => return Ok((m, head)),
+            Err(e) => {
+                tries += 1;
+                if log.head_version() == head || tries >= 64 {
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
 /// Enforces every declared PRIMARY KEY and UNIQUE constraint against the
-/// incoming batch and the table's live rows.
+/// incoming batch and the table's live rows at the pending-inclusive head,
+/// so a key this transaction already appended collides with a second use.
 ///
 /// A declared constraint that does nothing is a lie, so these run by
 /// default. The cost stays off the write path because the check reads the
 /// manifest's per-file bounds and value blooms first: a monotonic key opens
 /// one file and a key outside every stored range opens none.
+///
+/// Returns the probe's read footprint, the batch's key ranges pinned to the
+/// probed head version, for the caller to carry on its commit attempt. The
+/// commit then conflicts with any concurrent commit that added a file in a
+/// probed range after the probe, which is the duplicate the probe itself
+/// could not see
 pub(crate) fn enforce_lake_unique(
     log: &zyron_lake::TransactionLog,
     table_entry: &zyron_catalog::TableEntry,
@@ -2711,7 +2798,7 @@ pub(crate) fn enforce_lake_unique(
     // collide with the copy it is rewriting. None for an insert, which
     // supersedes nothing
     superseded: Option<&zyron_lake::LakePredicate>,
-) -> zyron_common::Result<()> {
+) -> zyron_common::Result<Option<(zyron_lake::LakePredicate, u64)>> {
     let mut specs: Vec<zyron_lake::UniqueSpec> = table_entry
         .constraints
         .iter()
@@ -2730,7 +2817,7 @@ pub(crate) fn enforce_lake_unique(
             column_ids: c.columns.iter().map(|id| id.0 as u32).collect(),
         })
         .collect();
-    let manifest = log.latest_manifest()?;
+    let (manifest, probed_version) = pending_inclusive_manifest(log)?;
     // A unique index is a declaration too, and one that admits duplicates
     // is the same lie a constraint that does nothing would be. The lake's
     // own index specs carry the flag and the key columns, so they enforce
@@ -2748,8 +2835,9 @@ pub(crate) fn enforce_lake_unique(
         });
     }
     if specs.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
+    let mut footprint: Vec<zyron_lake::LakePredicate> = Vec::with_capacity(specs.len());
     for spec in &specs {
         let (outcome, _) =
             zyron_lake::check_unique_replacing(log.paths(), &manifest, spec, columns, superseded)?;
@@ -2772,8 +2860,15 @@ pub(crate) fn enforce_lake_unique(
                 )));
             }
         }
+        if let Some(range) = zyron_lake::unique_probe_range(&manifest, spec, columns)? {
+            footprint.push(range);
+        }
     }
-    Ok(())
+    Ok(match footprint.len() {
+        0 => None,
+        1 => footprint.pop().map(|p| (p, probed_version)),
+        _ => Some((zyron_lake::LakePredicate::Or(footprint), probed_version)),
+    })
 }
 
 /// Turns accumulated full-width insert batches into one lake data file
@@ -2821,7 +2916,7 @@ fn append_lake_batches(
     let head = crate::operator::lake_scan::effective_head(ctx, None);
     let log = crate::operator::lake_scan::open_lake_write_head(&paths, &table_entry.name, head)?;
     let root = log.registry_key();
-    enforce_lake_unique(&log, table_entry, &columns, None)?;
+    let probe = enforce_lake_unique(&log, table_entry, &columns, None)?;
     let timestamp_us = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
@@ -2831,7 +2926,11 @@ fn append_lake_batches(
         db_txn_id: ctx.lake_txn_id(),
         commit_lsn: 0,
         timestamp_us,
-        read_predicate: None,
+        // The probe's key ranges pinned at the probed head, so a
+        // concurrent commit that lands a probed key after the probe
+        // conflicts instead of committing a duplicate
+        read_predicate: probe.as_ref().map(|(p, _)| p),
+        read_version: probe.as_ref().map(|(_, v)| *v).unwrap_or(0),
         audit: None,
     };
     let out = zyron_lake::append_rows(&log, attempt, table_entry.id.0 as u64, &columns)?;
@@ -2980,6 +3079,118 @@ pub(crate) fn maintain_lake_search_indexes(
 // DeleteOperator
 // ---------------------------------------------------------------------------
 
+/// After exclusive row locks are acquired for an UPDATE or DELETE, verifies
+/// the latest committed state of each locked row still matches the image
+/// this statement's snapshot produced. A foreign committed xmax on a heap
+/// tuple, a pruned slot, or a committed but snapshot-invisible columnar
+/// patch or supersede means a first committer already changed the row.
+/// Re-stamping it would overwrite that transaction's xmax and leave two
+/// live versions, so the statement fails with a conflict the client can
+/// retry. Heap locators are grouped so each page is inspected once, in
+/// place under the frame's read guard when the page is resident
+async fn ensure_locked_rows_unchanged(
+    ctx: &Arc<ExecutionContext>,
+    table_id: zyron_catalog::TableId,
+    locators: &[zyron_common::RowLocator],
+) -> zyron_common::Result<()> {
+    use zyron_common::RowLocator;
+
+    let own_txn = ctx.txn_id as u64;
+    let status_map = ctx.snapshot.status_map();
+    let conflict = |loc: RowLocator| ZyronError::TransactionConflict {
+        txn_id: own_txn,
+        reason: format!(
+            "row {loc} in table {} was changed by a concurrently committed \
+             transaction, retry the transaction",
+            table_id.0
+        ),
+    };
+
+    let mut heap_pages: std::collections::HashMap<zyron_common::PageId, Vec<u16>> =
+        std::collections::HashMap::new();
+    let mut columnar_rows: Vec<(u64, u64)> = Vec::new();
+    for loc in locators {
+        match *loc {
+            RowLocator::Heap { page, slot } => heap_pages.entry(page).or_default().push(slot),
+            RowLocator::Columnar { file_id, sys_rowid } => {
+                columnar_rows.push((file_id, sys_rowid));
+            }
+            RowLocator::Lake { .. } => {}
+        }
+    }
+
+    for (page_id, slots) in &heap_pages {
+        let stale_slot = |data: &[u8]| -> Option<u16> {
+            slots.iter().copied().find(|&slot| {
+                match zyron_storage::HeapPage::get_tuple_view_from_slice(
+                    data,
+                    zyron_storage::SlotId(slot),
+                ) {
+                    // the slot was pruned or reused, the scanned image is gone
+                    None => true,
+                    Some(view) => {
+                        let xmax = view.header.xmax as u64;
+                        xmax != 0 && xmax != own_txn && status_map.is_committed(xmax)
+                    }
+                }
+            })
+        };
+        let found = match ctx.buffer_pool.fetch_page(*page_id) {
+            Some(frame) => {
+                let guard = frame.read_data();
+                let found = stale_slot(&**guard);
+                drop(guard);
+                ctx.buffer_pool.unpin_page(*page_id, false);
+                found
+            }
+            None => {
+                let data = crate::operator::scan::read_page_through_pool(
+                    &ctx.buffer_pool,
+                    &ctx.disk_manager,
+                    *page_id,
+                )
+                .await?;
+                stale_slot(&data)
+            }
+        };
+        if let Some(slot) = found {
+            return Err(conflict(RowLocator::Heap {
+                page: *page_id,
+                slot,
+            }));
+        }
+    }
+
+    if !columnar_rows.is_empty() {
+        let te = ctx.get_table_entry(table_id)?;
+        let store = columnar_patch_store(&te)?;
+        // a patch or supersede from a transaction that committed but is not
+        // visible to this snapshot is a concurrent change
+        let concurrent = |xid: u64| {
+            xid != own_txn && status_map.is_committed(xid) && !ctx.snapshot.is_visible(xid, 0)
+        };
+        for (file_id, sys_rowid) in columnar_rows {
+            let overlay = match ctx.active_branch_id {
+                Some(branch) => store.row_overlay_on(branch, file_id, sys_rowid),
+                None => store.row_overlay(file_id, sys_rowid),
+            };
+            let Some(overlay) = overlay else {
+                continue;
+            };
+            if overlay.supersedes.iter().any(|&x| concurrent(x))
+                || overlay
+                    .patches
+                    .values()
+                    .any(|chain| chain.iter().any(|p| concurrent(p.patch_xid)))
+            {
+                return Err(conflict(RowLocator::Columnar { file_id, sys_rowid }));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Pulls rows with tuple IDs from a child scan, logs deletions to WAL,
 /// deletes from the heap, and returns the row count.
 pub struct DeleteOperator {
@@ -3045,6 +3256,15 @@ impl Operator for DeleteOperator {
                             zyron_storage::LockMode::Exclusive,
                         )?;
                     }
+                }
+
+                // First committer wins: a transaction may have committed a
+                // change to these rows between this statement's snapshot and
+                // the lock acquisition above. Stamping over its xmax would
+                // silently lose the delete and keep the superseded image
+                // alive, so the statement conflicts instead
+                if let Some(locs) = exec_batch.locators.as_ref() {
+                    ensure_locked_rows_unchanged(&self.ctx, self.table_id, locs).await?;
                 }
 
                 // Exhaustive tier gate: a new RowLocator variant fails to
@@ -3235,20 +3455,6 @@ impl Operator for DeleteOperator {
                     ZyronError::Internal("DeleteOperator requires row locators from scan".into())
                 })?;
 
-                // Branch deletes copy the target page into the branch overlay
-                // and tombstone it there, leaving the main line untouched.
-                if let Some(bid) = self.ctx.active_branch_id {
-                    let deleted = crate::operator::branch_write::branch_delete(
-                        &self.ctx,
-                        bid,
-                        heap_file.heap_file_id(),
-                        &tuple_ids,
-                    )
-                    .await?;
-                    total_deleted += deleted as i64;
-                    continue;
-                }
-
                 // Apply the ON DELETE referential actions that do not need the
                 // parent's final state, before removing its rows. Restrict
                 // aborts here, cascade and set-null mutate the children first.
@@ -3286,6 +3492,42 @@ impl Operator for DeleteOperator {
                         &table_entry.columns,
                     )
                     .await?;
+                }
+
+                // Branch deletes copy the target page into the branch overlay
+                // and tombstone it there, leaving the main line untouched.
+                // The fork sits below the referential and trigger checks so a
+                // branch delete refuses exactly what a main delete refuses,
+                // with cascades and probes resolving through the branch
+                if let Some(bid) = self.ctx.active_branch_id {
+                    let deleted = crate::operator::branch_write::branch_delete(
+                        &self.ctx,
+                        bid,
+                        heap_file.heap_file_id(),
+                        &tuple_ids,
+                    )
+                    .await?;
+                    {
+                        let table_entry = self.ctx.get_table_entry(self.table_id)?;
+                        crate::operator::fk::enforce_parent_delete(
+                            &self.ctx,
+                            &table_entry,
+                            &exec_batch.batch,
+                            crate::operator::fk::FkPhase::AfterWrite,
+                        )
+                        .await?;
+                        crate::trigger::fire_row_triggers(
+                            &self.ctx,
+                            self.table_id,
+                            zyron_catalog::TriggerEntry::TIMING_AFTER,
+                            zyron_catalog::TriggerEntry::EVENT_DELETE,
+                            &exec_batch.batch,
+                            &table_entry.columns,
+                        )
+                        .await?;
+                    }
+                    total_deleted += deleted as i64;
+                    continue;
                 }
 
                 // Capture old tuples for CDC hook (batch data is from the scan).
@@ -3585,6 +3827,15 @@ impl Operator for UpdateOperator {
                     }
                 }
 
+                // First committer wins: a transaction may have committed a
+                // change to these rows between this statement's snapshot and
+                // the lock acquisition above. Re-stamping the superseded
+                // image would leave both new versions live, duplicating the
+                // row, so the statement conflicts instead
+                if let Some(locs) = exec_batch.locators.as_ref() {
+                    ensure_locked_rows_unchanged(&self.ctx, self.table_id, locs).await?;
+                }
+
                 // Exhaustive tier gate: a new RowLocator variant fails to
                 // compile here until the update path handles it
                 match exec_batch.tier() {
@@ -3646,7 +3897,16 @@ impl Operator for UpdateOperator {
                                     assignment.column_id
                                 ))
                             })?;
-                        let new_col = if new_col.type_id != ce.type_id {
+                        // A decimal assignment converts onto the column's
+                        // declared scale here, because the patch below
+                        // encodes this column directly and a float or
+                        // wrong-scale value would encode as zero
+                        let new_col = if ce.type_id == TypeId::Decimal {
+                            crate::compute::cast_column_to_decimal(
+                                &new_col,
+                                ce.fractional_digits.unwrap_or(0),
+                            )?
+                        } else if new_col.type_id != ce.type_id {
                             crate::compute::cast_column(&new_col, ce.type_id)?
                         } else {
                             new_col
@@ -4006,29 +4266,6 @@ impl Operator for UpdateOperator {
                     self.params(),
                 )?;
 
-                // Branch updates tombstone the old image in the branch overlay
-                // (copying the source page first) and append the new image to
-                // the branch, keeping the main line untouched.
-                if let Some(bid) = self.ctx.active_branch_id {
-                    let new_tuples = batch_to_tuples(&updated_batch, &table_entry.columns, txn_id);
-                    crate::operator::branch_write::branch_delete(
-                        &self.ctx,
-                        bid,
-                        heap_file.heap_file_id(),
-                        &tuple_ids,
-                    )
-                    .await?;
-                    crate::operator::branch_write::branch_insert(
-                        &self.ctx,
-                        bid,
-                        heap_file.heap_file_id(),
-                        &new_tuples,
-                    )
-                    .await?;
-                    total_updated += tuple_ids.len() as i64;
-                    continue;
-                }
-
                 // Enforce child-side foreign keys on the post-update image
                 // before any write so a violation aborts cleanly.
                 crate::operator::fk::check_child_fks(&self.ctx, &table_entry, &updated_batch)
@@ -4090,6 +4327,47 @@ impl Operator for UpdateOperator {
                     &table_entry.columns,
                 )
                 .await?;
+
+                // Branch updates tombstone the old image in the branch overlay
+                // (copying the source page first) and append the new image to
+                // the branch, keeping the main line untouched. The fork sits
+                // below the FK, unique and trigger checks so a branch update
+                // refuses exactly what a main update refuses
+                if let Some(bid) = self.ctx.active_branch_id {
+                    crate::operator::branch_write::branch_delete(
+                        &self.ctx,
+                        bid,
+                        heap_file.heap_file_id(),
+                        &tuple_ids,
+                    )
+                    .await?;
+                    crate::operator::branch_write::branch_insert(
+                        &self.ctx,
+                        bid,
+                        heap_file.heap_file_id(),
+                        &new_tuples,
+                    )
+                    .await?;
+                    crate::operator::fk::enforce_parent_update(
+                        &self.ctx,
+                        &table_entry,
+                        &exec_batch.batch,
+                        &updated_batch,
+                        crate::operator::fk::FkPhase::AfterWrite,
+                    )
+                    .await?;
+                    crate::trigger::fire_row_triggers(
+                        &self.ctx,
+                        self.table_id,
+                        zyron_catalog::TriggerEntry::TIMING_AFTER,
+                        zyron_catalog::TriggerEntry::EVENT_UPDATE,
+                        &updated_batch,
+                        &table_entry.columns,
+                    )
+                    .await?;
+                    total_updated += tuple_ids.len() as i64;
+                    continue;
+                }
 
                 // Batch WAL log deletes: one CAS + commit for all.
                 let delete_payloads: Vec<Vec<u8>> =
@@ -4484,6 +4762,30 @@ mod b6_key_tests {
                 TypeId::Binary,
                 vec![1, 2, 3],
             ),
+            (ColumnData::Boolean(vec![true]), TypeId::Boolean, vec![1]),
+            (ColumnData::Boolean(vec![false]), TypeId::Boolean, vec![0]),
+            (
+                ColumnData::FixedBinary16(vec![[7u8; 16]]),
+                TypeId::Uuid,
+                vec![7u8; 16],
+            ),
+            // The temporal and decimal logical ids ride their integer cell
+            // layouts through both encoders
+            (
+                ColumnData::Int32(vec![-31]),
+                TypeId::Date,
+                (-31i32).to_le_bytes().to_vec(),
+            ),
+            (
+                ColumnData::Int64(vec![-86_400_000_000]),
+                TypeId::Timestamp,
+                (-86_400_000_000i64).to_le_bytes().to_vec(),
+            ),
+            (
+                ColumnData::Int128(vec![-1050]),
+                TypeId::Decimal,
+                (-1050i128).to_le_bytes().to_vec(),
+            ),
         ];
         for (data, type_id, cell) in cases {
             let col = Column::new(data, type_id);
@@ -4499,6 +4801,30 @@ mod b6_key_tests {
                 "cell encoder rejected {type_id:?}"
             );
             assert_eq!(from_batch, from_cell, "key drift for {type_id:?}");
+        }
+    }
+
+    #[test]
+    fn test_i64_index_key_order_preserving_with_negatives() {
+        // Signed 64-bit keys must produce big-endian bytes whose unsigned
+        // order matches numeric order, negatives strictly below positives
+        let vals: Vec<i64> = vec![i64::MIN, -1_000_000, -3, -1, 0, 1, 5, 1_000_000, i64::MAX];
+        let col = Column::new(ColumnData::Int64(vals.clone()), TypeId::Int64);
+        let batch = DataBatch::new(vec![col]);
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        for r in 0..vals.len() {
+            let mut buf = Vec::new();
+            assert!(encode_btree_key_into(&batch, r, 0, TypeId::Int64, &mut buf));
+            assert_eq!(buf.len(), 8);
+            keys.push(buf);
+        }
+        for i in 1..keys.len() {
+            assert!(
+                keys[i - 1] < keys[i],
+                "key order broken at {i}: {:?} vs {:?}",
+                vals[i - 1],
+                vals[i]
+            );
         }
     }
 

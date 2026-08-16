@@ -99,6 +99,7 @@ async fn harness_with_one_lake_table() -> (Harness, LakePaths) {
             commit_lsn: 0,
             timestamp_us: 1,
             read_predicate: None,
+            read_version: 0,
             audit: None,
         },
         &lake_schema,

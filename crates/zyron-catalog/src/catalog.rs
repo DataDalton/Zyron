@@ -165,6 +165,9 @@ pub struct Catalog {
     /// linear. The load-compute-store sequence runs under this lock so two
     /// concurrent appends cannot read the same tail and fork the chain.
     compliance_append_lock: tokio::sync::Mutex<()>,
+    /// Per-table serialization of whole-entry read-modify-write updates,
+    /// lazily created and shared by every mutator of that table's entry.
+    table_update_locks: scc::HashMap<TableId, Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl Catalog {
@@ -205,6 +208,7 @@ impl Catalog {
             version_tags_by_name: RwLock::new(HashMap::new()),
             version_tags_by_id: RwLock::new(HashMap::new()),
             compliance_append_lock: tokio::sync::Mutex::new(()),
+            table_update_locks: scc::HashMap::new(),
         };
 
         if !catalog.storage.is_bootstrapped().await? {
@@ -4579,9 +4583,41 @@ impl Catalog {
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
+    /// The lock serializing whole-entry read-modify-write updates of one
+    /// table. A mutator that clones a TableEntry, edits it and writes it
+    /// back holds this across the re-read, the edit and the write. Without
+    /// it two concurrent mutators each write back their own clone and the
+    /// loser's change vanishes, a fold's segment registration erased by a
+    /// tier relocation being the concrete pair. The entry must be
+    /// re-fetched after the lock is acquired, a clone taken before it is
+    /// exactly the stale image the lock exists to exclude.
+    pub fn table_update_lock(&self, table_id: TableId) -> Arc<tokio::sync::Mutex<()>> {
+        if let Some(lock) = self
+            .table_update_locks
+            .read_sync(&table_id, |_, l| Arc::clone(l))
+        {
+            return lock;
+        }
+        let fresh = Arc::new(tokio::sync::Mutex::new(()));
+        match self
+            .table_update_locks
+            .insert_sync(table_id, Arc::clone(&fresh))
+        {
+            Ok(()) => fresh,
+            Err(_) => self
+                .table_update_locks
+                .read_sync(&table_id, |_, l| Arc::clone(l))
+                // entries are never removed, a lost insert means the
+                // winner's entry is present
+                .unwrap_or(fresh),
+        }
+    }
+
     /// Persists a mutated table entry (used by ALTER TABLE lifecycle ops).
     /// Re-logs the entry, replaces the stored tuple, and refreshes the cache.
     /// Columns and indexes are unaffected (separate system tables).
+    /// A caller that derived `entry` by cloning and editing the current one
+    /// runs the whole read-modify-write under `table_update_lock`.
     pub async fn update_table(&self, entry: TableEntry) -> Result<()> {
         self.log_ddl(DDL_CREATE_TABLE, &entry.to_bytes())?;
         self.storage.delete_table(entry.id).await?;

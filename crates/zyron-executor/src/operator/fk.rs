@@ -521,7 +521,11 @@ fn check_lake_parent(
     violations: &mut FkViolations,
 ) -> Result<()> {
     let paths = zyron_lake::LakePaths::new(ctx.disk_manager.data_dir(), parent.id.0);
-    let log = zyron_lake::TransactionLog::open_shared(paths, &zyron_lake::AllCommitted)?;
+    // The probe reads the session's effective head, so a parent row the
+    // branch inserted satisfies the reference and one the branch deleted
+    // no longer does
+    let head = crate::operator::lake_scan::effective_head(ctx, None);
+    let log = crate::operator::lake_scan::open_lake_head(&paths, &parent.name, head)?;
     let manifest = log.latest_manifest()?;
 
     let num_rows = batch.columns.first().map(|c| c.len()).unwrap_or(0);

@@ -6,24 +6,28 @@
   <img src="assets/brand/zyronBannerCobalt.svg" alt="Zyron" width="640">
 </picture>
 
-**An HTAP database engine in Rust - row store for transactions, custom columnar format for analytics, one engine.**
+**A unified data platform - HTAP database, shared-storage lake, and federated mesh in one runtime, reachable from any client language.**
 
-MVCC concurrency · lock-free hot paths · time travel · branching · CDC · native search · in-database ML · enterprise security
+MVCC concurrency · lock-free hot paths · shared-storage table format · full-mesh federation · time travel · branching · CDC · native search · in-database ML · enterprise security
 
 </div>
 
 ---
 
-Zyron is a hybrid transactional/analytical database. It implements its own write-ahead log, buffer pool, B+ tree, MVCC engine, SQL parser, cost-based optimizer, vectorized executor, columnar encoding engine, and wire protocol: no embedded SQL engine, no third-party storage layer, no ORM.
+Zyron runs three surfaces off one codebase: an **HTAP database** with an MVCC row heap and a custom `.zyr` columnar format; **ZyronLake**, a shared-storage table format on an append-only transaction log with branches, time travel, and secondary indexes; and a **mesh** where any node can host a database, a lake, both, or embed in an application, and nodes peer over the wire so a single query reaches across them. All three are reachable from any client language over the same wire protocol.
 
-Fresh writes land in an MVCC row heap tuned for OLTP. A background thread compacts committed rows into a custom column format (`.zyr`) with per-column encoding, and analytical queries run directly on the encoded data with predicate pushdown and late materialization. The same SQL, the same connection, both workloads.
+Under the hood, Rust throughout, with an in-repo write-ahead log, buffer pool, B+ tree, MVCC engine, SQL parser, cost-based optimizer, vectorized executor, columnar encoding engine, lake transaction log, and wire protocol: no embedded SQL engine, no third-party storage layer, no ORM.
+
+Fresh writes land in the MVCC row heap tuned for OLTP. A background thread compacts committed rows into `.zyr` segments with per-column encoding, and analytical queries run directly on the encoded data with predicate pushdown and late materialization. Heap and lake tables are first-class in the same SQL, joined by the same HybridScan operator, whether they live on the local node or across the mesh.
 
 > **Status:** active development. The single-node engine is feature-complete through data lifecycle management, and the ZyronLake table format runs beside it with cross-format federation. Next up is distribution: Raft consensus, multi-region, and sharding.
 
 ## Table of Contents
 
+- [Table of Contents](#table-of-contents)
 - [Highlights](#highlights)
 - [Architecture](#architecture)
+  - [Mesh topology](#mesh-topology)
   - [Storage tiers](#storage-tiers)
 - [Capabilities](#capabilities)
 - [Performance](#performance)
@@ -93,6 +97,12 @@ flowchart TB
 
     CLIENTS --> PROTO --> ORCH --> QUERY --> FEAT --> STORAGE --> COM
 ```
+
+### Mesh topology
+
+The diagram above is one node's internals. In a deployment, Zyron nodes peer over the wire. Each node can host a database only, a lake reader only, both, or be embedded inside an application. Any client can hit any node, and a single query reaches across the mesh. Lake-holding nodes share the same object-store backing.
+
+![Zyron mesh deployment topology: clients above, four peered nodes in the middle with dashed peer edges, and a shared object store below](assets/diagrams/mesh.svg)
 
 ### Storage tiers
 
@@ -409,8 +419,10 @@ Each area ships with an optimization review and a validation checkpoint with har
 | Native features | Full-text search, vector & graph search, native data types, utility operations | ✅ Complete |
 | Analytics & lifecycle | Analytics engine, feature store & ML, data lifecycle management | ✅ Complete |
 | ZyronLake table format | Immutable versioned `.zyr` on a transaction log; branches, time travel, secondary indexes, clustering, constraint enforcement, change feed, cross-format federation | ✅ Complete |
-| Distribution | Raft consensus, sharding, multi-region, key management, observability, migration & connectors | 🔨 In progress |
-| Innovation & serverless | Serverless compute/storage split, innovative query features, client SDKs | ⏳ Planned |
+| Enterprise & distribution | Raft consensus and replication, sharding and multi-region, secret store and KMS, high availability and DR, observability and compliance, semantic views, schema registry, data contracts, data governance, multi-tenancy and cost tracking, migration tools and ecosystem connectors, Volumes (arbitrary-file storage as catalog objects), enterprise type-system extensions | 🔨 In progress |
+| Serverless mesh and autonomous operations | Base compute mesh, user meshes with compute reservations, workload-aware scheduling, continuous self-tuning and self-healing across every node in the mesh | ⏳ Planned |
+| Wire protocols, API and drivers | ZWP native wire protocol alongside PostgreSQL wire compatibility, Zyron API (unified QUERY / POST / GET / WS surface for apps), native drivers across every supported client language, Zyron Embedded (`libzyron`) for in-process use | ⏳ Planned |
+| Application and workflow hosting | Zyron Apps (container hosting on the mesh substrate), Workflows (task orchestration, subsuming pipelines and schedules), deployment artifacts, SQL function library expansion, query engine advances | ⏳ Planned |
 
 ## Development
 

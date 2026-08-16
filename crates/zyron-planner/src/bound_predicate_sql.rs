@@ -140,6 +140,7 @@ fn literal_to_sql(value: &L) -> String {
     match value {
         L::Integer(i) => i.to_string(),
         L::Int128(i) => i.to_string(),
+        L::Decimal { digits, scale } => zyron_common::format_decimal(*digits, *scale),
         L::Float(f) => f.to_string(),
         L::String(s) => format!("'{}'", s.replace('\'', "''")),
         L::Boolean(b) => b.to_string(),

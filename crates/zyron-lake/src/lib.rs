@@ -49,7 +49,7 @@ pub use changefeed::{
 };
 pub use constraints::{
     ForeignKeyOutcome, UniqueCheckStats, UniqueOutcome, UniqueSpec, check_foreign_key,
-    check_unique, check_unique_replacing,
+    check_unique, check_unique_replacing, unique_probe_range,
 };
 pub use convert::{load_lake_from_rows, read_all_rows, reclaim_orphan_root};
 pub use crosstable::{

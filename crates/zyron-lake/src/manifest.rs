@@ -154,8 +154,13 @@ pub struct PartitionEntry {
     /// Cluster spec the file was written under, reconstructing the layout
     /// a past version saw
     pub cluster_spec_id: u32,
-    /// Sorted by column id
-    pub column_stats: Vec<ColumnStatsEntry>,
+    /// Sorted by column id. Shared rather than owned because every commit
+    /// materializes the next manifest by cloning the previous one, and the
+    /// bloom bytes in here are the bulk of an entry: sharing makes that
+    /// clone a reference count bump per file instead of a copy of every
+    /// bloom in the table. Stats are immutable once a file is written, a
+    /// rewrite produces a new file with new stats
+    pub column_stats: std::sync::Arc<Vec<ColumnStatsEntry>>,
     /// Active delete predicates the file must be filtered through, each id
     /// resolves in the manifest's delete predicate section
     pub delete_predicate_ids: Vec<u64>,
@@ -287,7 +292,7 @@ impl ManifestFile {
                     )));
                 }
             }
-            for stat in &entry.column_stats {
+            for stat in entry.column_stats.iter() {
                 if stat.bounds.null_count > entry.row_count {
                     return Err(ZyronError::Internal(format!(
                         "partition {:#x} column {} null count {} exceeds row count {}",
@@ -785,7 +790,7 @@ pub(crate) fn encode_partition_entry(entry: &PartitionEntry, buf: &mut Vec<u8>) 
     buf.extend_from_slice(&entry.added_version.to_le_bytes());
     buf.extend_from_slice(&entry.cluster_spec_id.to_le_bytes());
     buf.extend_from_slice(&(entry.column_stats.len() as u16).to_le_bytes());
-    for stat in &entry.column_stats {
+    for stat in entry.column_stats.iter() {
         buf.extend_from_slice(&stat.column_id.to_le_bytes());
         let mut flags = 0u8;
         if stat.bounds.min.is_some() {
@@ -899,7 +904,7 @@ pub(crate) fn decode_partition_entry(fr: &mut Cursor<'_>) -> Result<PartitionEnt
         row_count,
         added_version,
         cluster_spec_id,
-        column_stats,
+        column_stats: std::sync::Arc::new(column_stats),
         delete_predicate_ids,
     })
 }
@@ -1007,7 +1012,7 @@ mod tests {
                     row_count: 100,
                     added_version: 7,
                     cluster_spec_id: 1,
-                    column_stats: vec![stats(0, 1, 100, 0, 100)],
+                    column_stats: std::sync::Arc::new(vec![stats(0, 1, 100, 0, 100)]),
                     delete_predicate_ids: vec![],
                 },
                 PartitionEntry {
@@ -1016,7 +1021,7 @@ mod tests {
                     row_count: 200,
                     added_version: 40,
                     cluster_spec_id: 2,
-                    column_stats: vec![
+                    column_stats: std::sync::Arc::new(vec![
                         stats(0, 101, 300, 0, 200),
                         ColumnStatsEntry {
                             ndv: Some(188),
@@ -1030,7 +1035,7 @@ mod tests {
                             bloom: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
                             size_bytes: Some(49_152),
                         },
-                    ],
+                    ]),
                     delete_predicate_ids: vec![9],
                 },
             ],
@@ -1071,7 +1076,7 @@ mod tests {
                     row_count: 6,
                     added_version: 41,
                     cluster_spec_id: 0,
-                    column_stats: vec![ColumnStatsEntry {
+                    column_stats: std::sync::Arc::new(vec![ColumnStatsEntry {
                         column_id: 0,
                         bounds: ColumnBounds {
                             min: Some(LakeValue::Str("alice".into())),
@@ -1082,7 +1087,7 @@ mod tests {
                         bloom: Some(vec![0x01, 0x02]),
                         ndv: Some(5),
                         size_bytes: Some(16_384),
-                    }],
+                    }]),
                     delete_predicate_ids: Vec::new(),
                 },
             }],
@@ -1188,11 +1193,13 @@ mod tests {
         assert!(dangling.validate().is_err());
 
         let mut bad_nulls = sample();
-        bad_nulls.entries[0].column_stats[0].bounds.null_count = 500;
+        std::sync::Arc::make_mut(&mut bad_nulls.entries[0].column_stats)[0]
+            .bounds
+            .null_count = 500;
         assert!(bad_nulls.validate().is_err());
 
         let mut unsorted_stats = sample();
-        unsorted_stats.entries[1].column_stats.swap(0, 1);
+        std::sync::Arc::make_mut(&mut unsorted_stats.entries[1].column_stats).swap(0, 1);
         assert!(unsorted_stats.validate().is_err());
     }
 

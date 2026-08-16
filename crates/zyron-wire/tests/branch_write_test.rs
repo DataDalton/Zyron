@@ -320,6 +320,86 @@ async fn branch_writes_enforce_the_constraints_a_main_write_enforces() {
     assert_eq!(total_rows(&exec(&mut h, "SELECT id FROM c").await), 0);
 }
 
+/// A branch DELETE runs the same referential enforcement a main DELETE runs.
+/// The branch fork used to sit above the FK blocks, so a parent row with
+/// dependent children deleted cleanly on a branch and the orphan only
+/// surfaced at merge.
+#[tokio::test]
+async fn branch_delete_enforces_foreign_keys() {
+    let mut h = create_harness().await;
+    exec(&mut h, "CREATE TABLE p (k INT NOT NULL)").await;
+    exec(&mut h, "CREATE UNIQUE INDEX p_k_ux ON p (k)").await;
+    exec(
+        &mut h,
+        "CREATE TABLE c (id INT NOT NULL, k INT, FOREIGN KEY (k) REFERENCES p(k))",
+    )
+    .await;
+    exec(&mut h, "INSERT INTO p VALUES (1), (2)").await;
+    exec(&mut h, "INSERT INTO c VALUES (10, 1)").await;
+
+    exec(&mut h, "CREATE BRANCH dev").await;
+    exec(&mut h, "USE BRANCH dev").await;
+
+    // The referenced parent cannot be deleted on the branch either
+    let err = exec_err(&mut h, "DELETE FROM p WHERE k = 1").await;
+    assert!(
+        err.contains("foreign key"),
+        "branch delete of a referenced parent must be refused: {err}"
+    );
+
+    // The unreferenced parent deletes normally
+    exec(&mut h, "DELETE FROM p WHERE k = 2").await;
+    let rows = exec(&mut h, "SELECT k FROM p").await;
+    assert_eq!(total_rows(&rows), 1, "the branch dropped only row 2");
+
+    // Main keeps both rows
+    h.active_branch = None;
+    let rows = exec(&mut h, "SELECT k FROM p").await;
+    assert_eq!(total_rows(&rows), 2, "main keeps its two rows");
+}
+
+/// A branch UPDATE runs the FK and unique enforcement a main UPDATE runs.
+/// The branch fork used to sit above those blocks, so duplicate keys and
+/// orphaned children were accepted on branches.
+#[tokio::test]
+async fn branch_update_enforces_uniqueness_and_foreign_keys() {
+    let mut h = create_harness().await;
+    exec(&mut h, "CREATE TABLE p (k INT NOT NULL)").await;
+    exec(&mut h, "CREATE UNIQUE INDEX p_k_ux ON p (k)").await;
+    exec(
+        &mut h,
+        "CREATE TABLE c (id INT NOT NULL, k INT, FOREIGN KEY (k) REFERENCES p(k))",
+    )
+    .await;
+    exec(&mut h, "INSERT INTO p VALUES (1), (2)").await;
+    exec(&mut h, "INSERT INTO c VALUES (10, 1)").await;
+
+    exec(&mut h, "CREATE BRANCH dev").await;
+    exec(&mut h, "USE BRANCH dev").await;
+
+    // An update creating a duplicate key is refused on the branch
+    let err = exec_err(&mut h, "UPDATE p SET k = 2 WHERE k = 1").await;
+    assert!(
+        err.contains("nique") || err.contains("foreign key"),
+        "branch update to a duplicate key must be refused: {err}"
+    );
+
+    // An update pointing a child at a missing parent is refused
+    let err = exec_err(&mut h, "UPDATE c SET k = 99 WHERE id = 10").await;
+    assert!(
+        err.contains("foreign key"),
+        "branch update orphaning a child must be refused: {err}"
+    );
+
+    // A legal update still lands, on the branch only
+    exec(&mut h, "UPDATE c SET k = 2 WHERE id = 10").await;
+    let rows = exec(&mut h, "SELECT k FROM c WHERE k = 2").await;
+    assert_eq!(total_rows(&rows), 1, "the branch sees the new reference");
+    h.active_branch = None;
+    let rows = exec(&mut h, "SELECT k FROM c WHERE k = 1").await;
+    assert_eq!(total_rows(&rows), 1, "main keeps the old reference");
+}
+
 /// Collects (id, v) integer pairs from a two-column result, sorted by id.
 fn id_v_pairs(batches: &[DataBatch]) -> Vec<(i32, i32)> {
     let mut out = Vec::new();

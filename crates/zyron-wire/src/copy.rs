@@ -97,7 +97,22 @@ impl CopyOutHandler {
                 let scalar = column.get_scalar(row);
 
                 scalar_buf.clear();
-                if !types::scalar_write_text(&scalar, &mut scalar_buf) {
+                // A decimal's i128 is the value times ten to the column's
+                // scale, so it renders as fixed point rather than as the
+                // raw integer, which would not round-trip through COPY FROM
+                let wrote = match (&scalar, column.type_id) {
+                    (
+                        zyron_executor::column::ScalarValue::Int128(v),
+                        zyron_common::TypeId::Decimal,
+                    ) => {
+                        let scale = column.fractional_digits.unwrap_or(0);
+                        scalar_buf
+                            .extend_from_slice(zyron_common::format_decimal(*v, scale).as_bytes());
+                        true
+                    }
+                    _ => types::scalar_write_text(&scalar, &mut scalar_buf),
+                };
+                if !wrote {
                     line.extend_from_slice(&self.null_string);
                 } else if self.format == CopyFormat::Csv {
                     csv_escape(&mut line, &scalar_buf);

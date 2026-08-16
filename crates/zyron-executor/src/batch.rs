@@ -248,7 +248,7 @@ pub fn decode_tuple_into_builders(
                 let value_bytes = &data[offset..offset + fixed_size];
                 if let Some(b) = builder_idx {
                     let scalar = decode_fixed_scalar(phys_type, value_bytes);
-                    builders[b].push(&scalar);
+                    builders[b].push_owned(scalar);
                 }
                 offset += fixed_size;
             }
@@ -270,8 +270,10 @@ pub fn decode_tuple_into_builders(
             } else {
                 let value_bytes = &data[offset..offset + len];
                 if let Some(b) = builder_idx {
+                    // push_owned moves the freshly decoded text or binary
+                    // allocation into the column instead of copying it again
                     let scalar = decode_varlen_scalar(col.type_id, value_bytes);
-                    builders[b].push(&scalar);
+                    builders[b].push_owned(scalar);
                 }
                 offset += len;
             }

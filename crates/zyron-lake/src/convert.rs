@@ -57,6 +57,7 @@ pub fn load_lake_from_rows(
             commit_lsn: 0,
             timestamp_us,
             read_predicate: None,
+            read_version: 0,
             audit: None,
         },
         schema,
@@ -74,6 +75,7 @@ pub fn load_lake_from_rows(
                 commit_lsn: 0,
                 timestamp_us,
                 read_predicate: None,
+                read_version: 0,
                 audit: None,
             },
             table_id,
@@ -323,6 +325,7 @@ mod tests {
                 commit_lsn: 0,
                 timestamp_us: 2_000,
                 read_predicate: None,
+                read_version: 0,
                 audit: None,
             },
             &crate::predicate::LakePredicate::Compare {

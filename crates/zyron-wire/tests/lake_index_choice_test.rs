@@ -173,7 +173,7 @@ async fn test_reading_a_narrow_key_is_not_charged_for_a_wide_neighbour() {
 
     // Every column of a written file records what it costs to read
     let mut recorded = 0u64;
-    for stat in &entry.column_stats {
+    for stat in entry.column_stats.iter() {
         recorded += stat
             .size_bytes
             .unwrap_or_else(|| panic!("column {} recorded no size", stat.column_id));

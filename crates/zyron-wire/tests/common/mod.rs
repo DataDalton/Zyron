@@ -28,7 +28,22 @@ pub async fn create_test_server() -> (Arc<ServerState>, SchemaId, tempfile::Temp
 pub async fn create_test_server_in_mode(
     mode: zyron_common::DeploymentMode,
 ) -> (Arc<ServerState>, SchemaId, tempfile::TempDir) {
-    create_test_server_configured(mode, None).await
+    let (server, schema, _, tmp) = create_test_server_configured(mode, None, false).await;
+    (server, schema, tmp)
+}
+
+/// A server with the security manager installed, for a test whose subject is
+/// a privilege gate. Nothing is granted, the test grants exactly what its
+/// scenario names.
+pub async fn create_test_server_with_security() -> (
+    Arc<ServerState>,
+    SchemaId,
+    Arc<zyron_auth::SecurityManager>,
+    tempfile::TempDir,
+) {
+    let (server, schema, sm, tmp) =
+        create_test_server_configured(zyron_common::DeploymentMode::Unified, None, true).await;
+    (server, schema, sm.expect("security manager built"), tmp)
 }
 
 /// A server whose buffer pool is smaller than the one it ships with.
@@ -41,13 +56,22 @@ pub async fn create_test_server_in_mode(
 pub async fn create_test_server_with_pool_frames(
     frames: usize,
 ) -> (Arc<ServerState>, SchemaId, tempfile::TempDir) {
-    create_test_server_configured(zyron_common::DeploymentMode::Unified, Some(frames)).await
+    let (server, schema, _, tmp) =
+        create_test_server_configured(zyron_common::DeploymentMode::Unified, Some(frames), false)
+            .await;
+    (server, schema, tmp)
 }
 
 async fn create_test_server_configured(
     mode: zyron_common::DeploymentMode,
     pool_frames: Option<usize>,
-) -> (Arc<ServerState>, SchemaId, tempfile::TempDir) {
+    with_security: bool,
+) -> (
+    Arc<ServerState>,
+    SchemaId,
+    Option<Arc<zyron_auth::SecurityManager>>,
+    tempfile::TempDir,
+) {
     // The engine the server ships, so what is measured here is what runs.
     // Only the directories differ, because a run needs its own
     let tmp = tempfile::TempDir::new().expect("temp dir");
@@ -78,6 +102,20 @@ async fn create_test_server_configured(
         .expect("create public schema");
     let txn_manager = Arc::new(TransactionManager::new(Arc::clone(&wal)));
 
+    let security_manager = if with_security {
+        let auth_storage: Arc<dyn zyron_auth::storage::AuthStorage> = Arc::new(
+            zyron_auth::HeapAuthStorage::new(Arc::clone(&disk), Arc::clone(&pool))
+                .expect("auth storage"),
+        );
+        Some(Arc::new(
+            zyron_auth::SecurityManager::new(auth_storage)
+                .await
+                .expect("security manager"),
+        ))
+    } else {
+        None
+    };
+
     let state = Arc::new(ServerState {
         catalog,
         wal,
@@ -88,7 +126,7 @@ async fn create_test_server_configured(
         table_io_stats: std::sync::Arc::new(zyron_common::TableIOStatsRegistry::new()),
         index_io_stats: std::sync::Arc::new(zyron_common::IndexIOStatsRegistry::new()),
         columnar_maintenance: None,
-        security_manager: None,
+        security_manager: security_manager.clone(),
         key_store: Arc::new(zyron_auth::LocalKeyStore::new([0u8; 32])),
         config_lookup: None,
         config_all: None,
@@ -159,7 +197,7 @@ async fn create_test_server_configured(
         balloon_params: None,
         default_auth_method: zyron_auth::auth_rules::AuthMethod::Trust,
     });
-    (state, public_schema, tmp)
+    (state, public_schema, security_manager, tmp)
 }
 
 pub fn new_session() -> Option<Session> {

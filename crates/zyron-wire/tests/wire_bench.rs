@@ -1879,7 +1879,14 @@ fn test_wire_connection_handshake_latency() {
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
         let (server_state, _tmp) = create_test_server("testdb").await;
-        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.expect("bind failed"));
+        // Bind through the server's own listener setup rather than the plain
+        // constructor, so the accept queue here is the one production runs
+        // with. A default-bound listener has a far smaller queue, and a burst
+        // deeper than that queue stalls on handshake retransmits, so the
+        // result reports connection setup rather than what the server does
+        let std_listener = zyron_wire::create_tcp_listener("127.0.0.1:0".parse().unwrap(), false)
+            .expect("bind failed");
+        let listener = Arc::new(TcpListener::from_std(std_listener).expect("from_std"));
         let addr = listener.local_addr().unwrap();
         tprintln!("  Server listening on {}\n", addr);
 
@@ -1971,7 +1978,14 @@ fn test_wire_concurrent_connections() {
 
     rt.block_on(async {
         let (server_state, _tmp) = create_test_server("testdb").await;
-        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.expect("bind failed"));
+        // Bind through the server's own listener setup rather than the plain
+        // constructor, so the accept queue here is the one production runs
+        // with. A default-bound listener has a far smaller queue, and a burst
+        // deeper than that queue stalls on handshake retransmits, so the
+        // result reports connection setup rather than what the server does
+        let std_listener = zyron_wire::create_tcp_listener("127.0.0.1:0".parse().unwrap(), false)
+            .expect("bind failed");
+        let listener = Arc::new(TcpListener::from_std(std_listener).expect("from_std"));
         let addr = listener.local_addr().unwrap();
         tprintln!("  Server listening on {}\n", addr);
 

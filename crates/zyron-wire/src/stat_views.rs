@@ -135,6 +135,9 @@ fn literal_text(lit: &zyron_parser::LiteralValue) -> Option<String> {
     match lit {
         zyron_parser::LiteralValue::Integer(n) => Some(n.to_string()),
         zyron_parser::LiteralValue::Int128(n) => Some(n.to_string()),
+        zyron_parser::LiteralValue::Decimal { digits, scale } => {
+            Some(zyron_common::format_decimal(*digits, *scale))
+        }
         zyron_parser::LiteralValue::Float(f) => Some(f.to_string()),
         zyron_parser::LiteralValue::String(s) => Some(s.clone()),
         zyron_parser::LiteralValue::Boolean(b) => Some(b.to_string()),

@@ -794,7 +794,8 @@ impl<'a> PhysicalPlanner<'a> {
                     usable = false;
                     break;
                 };
-                if col.nullable || col.physical_type_id().fixed_size().is_none() {
+                let phys = col.physical_type_id();
+                if col.nullable || phys.fixed_size().is_none() || !phys.btree_index_encodable() {
                     usable = false;
                     break;
                 }
@@ -971,7 +972,6 @@ impl<'a> PhysicalPlanner<'a> {
             return Ok(None);
         }
         let (bound, lowered) = self.lake_dml_predicate(&te, child, "DELETE")?;
-        let _ = bound;
         let sql = lowered
             .as_ref()
             .map(|p| crate::lake_predicate::render_sql(p, &te.columns))
@@ -979,6 +979,7 @@ impl<'a> PhysicalPlanner<'a> {
         Ok(Some(PhysicalPlan::LakeDelete {
             table_id,
             predicate: lowered,
+            bound_predicate: bound,
             sql,
             cost: *child.cost(),
         }))

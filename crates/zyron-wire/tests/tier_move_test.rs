@@ -699,6 +699,74 @@ async fn test_purge_after_soft_delete_sets_the_purge_grace() {
     );
 }
 
+/// A move that fails part way keeps the registry true for what already
+/// moved. The first segment's file sits at its new path when the second
+/// segment's rename fails, so dropping the registry edits would leave the
+/// catalog naming a path with no file behind it and every read of that
+/// segment failing until a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_a_failed_move_keeps_the_registry_true_for_what_already_moved() {
+    let (server, schema, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    two_segment_table(&server, schema, &mut session).await;
+    let before = segment_state(&server, schema, "t");
+
+    // Both segments are covered by the predicate. A directory planted under
+    // the second segment's exact target name makes its rename fail after
+    // the first segment has already moved
+    let cold_dir = server.data_dir.join("columnar").join("tiers").join("cold");
+    let blocked = cold_dir.join(before[1].1.file_name().expect("file name"));
+    std::fs::create_dir_all(&blocked).expect("blocking directory");
+
+    let sql = "ALTER TABLE t MOVE WHERE k < 1000 TO TIER 'cold'";
+    let stmt = zyron_parser::parse(sql)
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("one statement");
+    let mut txn_opt: Option<zyron_storage::txn::Transaction> = None;
+    let mut active_branch: Option<String> = None;
+    let res = zyron_wire::ddl_dispatch::try_handle_ddl_utility(
+        &stmt,
+        &server,
+        &mut session,
+        &mut txn_opt,
+        &mut active_branch,
+        sql,
+    )
+    .await
+    .expect("the move statement is claimed by the DDL path");
+    res.expect_err("the blocked rename must surface as an error");
+
+    let state = segment_state(&server, schema, "t");
+    assert_eq!(
+        state[0].2, 2,
+        "the completed move is recorded despite the failure: {state:?}"
+    );
+    assert!(
+        state[0].1.starts_with(&cold_dir),
+        "the registry names the tier path: {:?}",
+        state[0].1
+    );
+    assert!(state[0].1.exists(), "the file is where the registry says");
+    assert_eq!(state[1].2, 0, "the blocked segment stays hot");
+    assert_eq!(
+        state[1].1, before[1].1,
+        "the blocked segment keeps its path"
+    );
+    assert!(state[1].1.exists());
+    assert!(
+        !blocked.with_extension("zyr.moving").exists(),
+        "the failed fallback removed its staging file"
+    );
+
+    assert_eq!(
+        query_pairs(&server, "SELECT k, v FROM t ORDER BY k").await,
+        vec![(1, 10), (2, 20), (3, 30), (500, 5000), (600, 6000)],
+        "every row reads back through the registry after the failure"
+    );
+}
+
 /// An unknown tier name is refused rather than silently creating a directory
 /// nobody configured.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

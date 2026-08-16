@@ -855,12 +855,14 @@ impl LakeScanOperator {
                 continue;
             }
             for (ci, (type_id, value_size, col)) in decoded.iter().enumerate() {
+                // push_owned moves a decoded text or binary allocation into
+                // the column instead of copying it a second time
                 let sv = match col.cell(r) {
                     None => ScalarValue::Null,
                     Some(cell) if *value_size == 0 => decode_varlen_scalar(*type_id, cell),
                     Some(cell) => decode_fixed_scalar(*type_id, cell),
                 };
-                builders[ci].push(&sv);
+                builders[ci].push_owned(sv);
             }
             if self.emit_locators {
                 locators.push(zyron_common::RowLocator::Lake {
@@ -1056,6 +1058,19 @@ impl Operator for LakeUpdateOperator {
                 .is_empty();
             let keep_images = needs_search_maintenance || has_triggers;
             let mut images: Vec<crate::batch::DataBatch> = Vec::new();
+            // Old and new images kept for the post-commit referential pass
+            // when another table references this one
+            let has_referencing = !self
+                .ctx
+                .catalog
+                .referencing_constraints(table_entry.id)
+                .is_empty();
+            let mut fk_pairs: Vec<(crate::batch::DataBatch, crate::batch::DataBatch)> = Vec::new();
+            // Old and new images kept for the CDC notification after the
+            // commit, so a feed on the table sees the replacement the same
+            // way it sees a heap update
+            let cdc_capture = self.ctx.cdc_hook.is_some();
+            let mut cdc_pairs: Vec<(crate::batch::DataBatch, crate::batch::DataBatch)> = Vec::new();
             while let Some(batch) = self.child.next().await? {
                 self.ctx.check_cancelled()?;
                 if batch.batch.num_rows == 0 {
@@ -1116,6 +1131,14 @@ impl Operator for LakeUpdateOperator {
                     &table_entry.columns,
                 )?;
 
+                // Decimals take their column's scale before the row is
+                // encoded, otherwise the encoder receives a float or a
+                // wrong-scale integer and writes zero
+                crate::operator::modify::normalize_decimal_columns(
+                    &mut image,
+                    &table_entry.columns,
+                )?;
+
                 // The image is what CHECK sees, so a violating update
                 // aborts before anything is written
                 crate::operator::modify::enforce_check_constraints(
@@ -1124,6 +1147,26 @@ impl Operator for LakeUpdateOperator {
                     &table_entry.columns,
                     &self.ctx.params,
                 )?;
+
+                // Child-side foreign keys hold on the new image before any
+                // write, so an update orphaning this row aborts cleanly
+                crate::operator::fk::check_child_fks(&self.ctx, &table_entry, &image)
+                    .await?
+                    .deny_diversion(&table_entry.name)?;
+
+                // ON UPDATE referential actions that land before the write,
+                // so moving a referenced key runs the declared action
+                if has_referencing {
+                    crate::operator::fk::enforce_parent_update(
+                        &self.ctx,
+                        &table_entry,
+                        &batch.batch,
+                        &image,
+                        crate::operator::fk::FkPhase::BeforeWrite,
+                    )
+                    .await?;
+                    fk_pairs.push((batch.batch.clone(), image.clone()));
+                }
                 for (ci, col_entry) in table_entry.columns.iter().enumerate() {
                     let value_size = col_entry.physical_type_id().fixed_size().unwrap_or(0);
                     let column = &image.columns[ci];
@@ -1140,6 +1183,9 @@ impl Operator for LakeUpdateOperator {
                     }
                 }
                 matched += image.num_rows as u64;
+                if cdc_capture {
+                    cdc_pairs.push((batch.batch.clone(), image.clone()));
+                }
                 if keep_images {
                     images.push(image);
                 }
@@ -1167,7 +1213,7 @@ impl Operator for LakeUpdateOperator {
             // replaces excluded from the stored side. A row keeping its key
             // must not collide with the copy being rewritten, and a row
             // taking a key a surviving row holds still must
-            crate::operator::modify::enforce_lake_unique(
+            let probe = crate::operator::modify::enforce_lake_unique(
                 &log,
                 &table_entry,
                 &columns,
@@ -1179,7 +1225,11 @@ impl Operator for LakeUpdateOperator {
                 db_txn_id: self.ctx.lake_txn_id(),
                 commit_lsn: 0,
                 timestamp_us,
-                read_predicate: None,
+                // The probe's key ranges pinned at the probed head, so a
+                // concurrent commit that lands a probed key after the
+                // probe conflicts instead of committing a duplicate
+                read_predicate: probe.as_ref().map(|(p, _)| p),
+                read_version: probe.as_ref().map(|(_, v)| *v).unwrap_or(0),
                 audit: None,
             };
             let outcome = zyron_lake::update_where(
@@ -1210,6 +1260,45 @@ impl Operator for LakeUpdateOperator {
                     &outcome.order,
                 )?;
             }
+            // One commit replaced the old images with the new, so the feed
+            // gets one notification pairing them under the committed version
+            if let Some(ref hook) = self.ctx.cdc_hook {
+                let mut old_encoded: Vec<Vec<u8>> = Vec::new();
+                let mut new_encoded: Vec<Vec<u8>> = Vec::new();
+                for (old, new) in &cdc_pairs {
+                    for r in 0..old.num_rows {
+                        old_encoded.push(crate::batch::encode_row(old, r, &table_entry.columns));
+                    }
+                    for r in 0..new.num_rows {
+                        new_encoded.push(crate::batch::encode_row(new, r, &table_entry.columns));
+                    }
+                }
+                let old_refs: Vec<&[u8]> = old_encoded.iter().map(|v| v.as_slice()).collect();
+                let new_refs: Vec<&[u8]> = new_encoded.iter().map(|v| v.as_slice()).collect();
+                if let Err(e) = hook.on_update(
+                    self.table_id.0,
+                    &old_refs,
+                    &new_refs,
+                    outcome.version,
+                    timestamp_us,
+                    self.ctx.txn_id,
+                    true,
+                ) {
+                    eprintln!("CDC update hook failed: {e}");
+                }
+            }
+            // ON UPDATE actions that need the moved key committed before
+            // they can re-check the children against it
+            for (old_batch, new_image) in &fk_pairs {
+                crate::operator::fk::enforce_parent_update(
+                    &self.ctx,
+                    &table_entry,
+                    old_batch,
+                    new_image,
+                    crate::operator::fk::FkPhase::AfterWrite,
+                )
+                .await?;
+            }
             // AFTER UPDATE fires once the new images are committed, because
             // a trigger body that reads the table has to see them
             for image in &images {
@@ -1238,6 +1327,9 @@ pub struct LakeDeleteOperator {
     ctx: Arc<ExecutionContext>,
     table_id: zyron_catalog::TableId,
     predicate: Option<zyron_lake::LakePredicate>,
+    /// The same row-selecting predicate in bound form, so referential
+    /// enforcement can gather exactly the rows the delete removes
+    bound_predicate: Option<BoundExpr>,
     sql: String,
     finished: bool,
 }
@@ -1247,12 +1339,14 @@ impl LakeDeleteOperator {
         ctx: Arc<ExecutionContext>,
         table_id: zyron_catalog::TableId,
         predicate: Option<zyron_lake::LakePredicate>,
+        bound_predicate: Option<BoundExpr>,
         sql: String,
     ) -> Self {
         Self {
             ctx,
             table_id,
             predicate,
+            bound_predicate,
             sql,
             finished: false,
         }
@@ -1268,6 +1362,66 @@ impl Operator for LakeDeleteOperator {
             self.finished = true;
             self.ctx.ensure_writable("DELETE")?;
             let table_entry = self.ctx.get_table_entry(self.table_id)?;
+
+            // Referential actions, DELETE triggers and the CDC notification
+            // run over the rows this delete removes, so they are gathered
+            // first when any of the three applies. The gather scan reads the
+            // same effective head the commit below writes, and the bound
+            // predicate reproduces exactly the rows the lowered predicate
+            // removes
+            let needs_old_rows = !self
+                .ctx
+                .catalog
+                .referencing_constraints(table_entry.id)
+                .is_empty()
+                || !self.ctx.catalog.triggers_for_table(self.table_id).is_empty()
+                || self.ctx.cdc_hook.is_some();
+            let mut old_batches: Vec<crate::batch::DataBatch> = Vec::new();
+            if needs_old_rows {
+                let scan_columns: Vec<LogicalColumn> = table_entry
+                    .columns
+                    .iter()
+                    .map(|c| LogicalColumn {
+                        table_idx: Some(0),
+                        column_id: c.id,
+                        name: c.name.clone(),
+                        type_id: c.type_id,
+                        nullable: c.nullable,
+                        fractional_digits: c.fractional_digits,
+                    })
+                    .collect();
+                let mut scan = LakeScanOperator::new(
+                    Arc::clone(&self.ctx),
+                    self.table_id,
+                    scan_columns,
+                    self.bound_predicate.clone(),
+                    self.predicate.clone(),
+                    None,
+                )?;
+                while let Some(b) = scan.next().await? {
+                    if b.batch.num_rows == 0 {
+                        continue;
+                    }
+                    crate::operator::fk::enforce_parent_delete(
+                        &self.ctx,
+                        &table_entry,
+                        &b.batch,
+                        crate::operator::fk::FkPhase::BeforeWrite,
+                    )
+                    .await?;
+                    crate::trigger::fire_row_triggers(
+                        &self.ctx,
+                        self.table_id,
+                        zyron_catalog::TriggerEntry::TIMING_BEFORE,
+                        zyron_catalog::TriggerEntry::EVENT_DELETE,
+                        &b.batch,
+                        &table_entry.columns,
+                    )
+                    .await?;
+                    old_batches.push(b.batch);
+                }
+            }
+
             let paths = LakePaths::new(self.ctx.disk_manager.data_dir(), table_entry.id.0);
             // The branch head, so the delete records against the files the
             // branch has rather than main's
@@ -1284,6 +1438,7 @@ impl Operator for LakeDeleteOperator {
                 commit_lsn: 0,
                 timestamp_us,
                 read_predicate: None,
+                read_version: 0,
                 audit: None,
             };
             // No predicate deletes every row, which the always-true
@@ -1301,6 +1456,47 @@ impl Operator for LakeDeleteOperator {
                     version,
                 );
                 self.ctx.mark_wrote_wal();
+                // The rows the commit removed were gathered above, so the
+                // feed sees the same images the triggers do
+                if let Some(ref hook) = self.ctx.cdc_hook {
+                    let mut encoded: Vec<Vec<u8>> = Vec::new();
+                    for old in &old_batches {
+                        for r in 0..old.num_rows {
+                            encoded.push(crate::batch::encode_row(old, r, &table_entry.columns));
+                        }
+                    }
+                    let refs: Vec<&[u8]> = encoded.iter().map(|v| v.as_slice()).collect();
+                    if let Err(e) = hook.on_delete(
+                        self.table_id.0,
+                        &refs,
+                        version,
+                        timestamp_us,
+                        self.ctx.txn_id,
+                        true,
+                    ) {
+                        eprintln!("CDC delete hook failed: {e}");
+                    }
+                }
+            }
+            // ON DELETE SET DEFAULT re-checks against the parent with these
+            // rows gone, and AFTER DELETE fires once the removal committed
+            for old in &old_batches {
+                crate::operator::fk::enforce_parent_delete(
+                    &self.ctx,
+                    &table_entry,
+                    old,
+                    crate::operator::fk::FkPhase::AfterWrite,
+                )
+                .await?;
+                crate::trigger::fire_row_triggers(
+                    &self.ctx,
+                    self.table_id,
+                    zyron_catalog::TriggerEntry::TIMING_AFTER,
+                    zyron_catalog::TriggerEntry::EVENT_DELETE,
+                    old,
+                    &table_entry.columns,
+                )
+                .await?;
             }
             Ok(Some(ExecutionBatch::new(
                 crate::operator::modify::count_batch(outcome.rows_matched as i64),

@@ -132,9 +132,17 @@ fn build_operator_tree(
         PhysicalPlan::LakeDelete {
             table_id,
             predicate,
+            bound_predicate,
             sql,
             ..
-        } => Box::pin(build_lake_delete(table_id, predicate, sql, analyze, ctx)),
+        } => Box::pin(build_lake_delete(
+            table_id,
+            predicate,
+            bound_predicate,
+            sql,
+            analyze,
+            ctx,
+        )),
 
         PhysicalPlan::LakeUpdate {
             table_id,
@@ -696,12 +704,18 @@ async fn build_foreign_scan(
 async fn build_lake_delete(
     table_id: zyron_catalog::TableId,
     predicate: Option<zyron_lake::LakePredicate>,
+    bound_predicate: Option<zyron_planner::binder::BoundExpr>,
     sql: String,
     analyze: bool,
     ctx: &Arc<ExecutionContext>,
 ) -> Result<BuildResult> {
-    let op =
-        crate::operator::lake_scan::LakeDeleteOperator::new(ctx.clone(), table_id, predicate, sql);
+    let op = crate::operator::lake_scan::LakeDeleteOperator::new(
+        ctx.clone(),
+        table_id,
+        predicate,
+        bound_predicate,
+        sql,
+    );
     let br = BuildResult::new(Box::new(op));
     Ok(br.with_metrics("LakeDelete", analyze, vec![]))
 }
@@ -1851,14 +1865,21 @@ fn build_aggregate_schema(
     }
     for (i, agg) in aggregates.iter().enumerate() {
         let idx = group_by.len() + i;
+        // A decimal aggregate keeps its argument's scale, so its output
+        // column compares and renders the value rather than the raw
+        // scaled integer
+        let fractional_digits = if agg.return_type == zyron_common::TypeId::Decimal {
+            agg.args.first().and_then(|a| a.fractional_digits())
+        } else {
+            None
+        };
         schema.push(zyron_planner::logical::LogicalColumn {
             table_idx: Some(zyron_planner::logical::AGGREGATE_TABLE_IDX),
             column_id: zyron_catalog::ColumnId(idx as u16),
             name: agg.function_name.clone(),
             type_id: agg.return_type,
             nullable: true,
-            // Aggregate-result precision finalized in B5.
-            fractional_digits: None,
+            fractional_digits,
         });
     }
     schema

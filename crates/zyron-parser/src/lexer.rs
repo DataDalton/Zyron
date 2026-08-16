@@ -287,6 +287,29 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// The exact token for a fixed-point literal too wide for f64, or None
+    /// when the f64 read is already exact enough or the digits exceed what
+    /// DECIMAL can hold. Fifteen significant digits always survive an f64
+    /// round trip, so narrower literals keep their long-standing float
+    /// token, and a literal wider than 38 total or fractional digits has no
+    /// exact decimal representation either, so it stays on the float path.
+    fn exact_decimal_token(text: &str) -> Option<Token> {
+        let (int_part, frac_part) = text.split_once('.')?;
+        if frac_part.len() > 38 {
+            return None;
+        }
+        let mut digits = String::with_capacity(int_part.len() + frac_part.len());
+        digits.push_str(int_part);
+        digits.push_str(frac_part);
+        let significant = digits.trim_start_matches('0').len();
+        if significant <= 15 {
+            return None;
+        }
+        let magnitude: u128 = digits.parse().ok()?;
+        let value = i128::try_from(magnitude).ok()?;
+        Some(Token::Decimal(value, frac_part.len() as u8))
+    }
+
     fn scan_number(&mut self) -> Result<SpannedToken> {
         let start = self.pos;
         let start_col = self.column;
@@ -310,9 +333,11 @@ impl<'a> Lexer<'a> {
             self.pos = end;
 
             // Scientific notation: e/E followed by optional +/- and digits
+            let mut has_exponent = false;
             if self.pos < self.bytes.len()
                 && (self.bytes[self.pos] == b'e' || self.bytes[self.pos] == b'E')
             {
+                has_exponent = true;
                 self.pos += 1;
                 self.column += 1;
                 if self.pos < self.bytes.len()
@@ -327,13 +352,23 @@ impl<'a> Lexer<'a> {
             }
 
             let text = &self.input[start..self.pos];
+            let span = Span::new(start, self.pos - start);
+            // A fixed-point literal with more significant digits than an
+            // f64 holds exactly keeps its digits on an i128 path. The f64
+            // read below is exact only to fifteen guaranteed significant
+            // digits, so a wider literal would silently change value
+            // between the statement and the row
+            if !has_exponent {
+                if let Some(token) = Self::exact_decimal_token(text) {
+                    return Ok(SpannedToken::new(token, span));
+                }
+            }
             let value: f64 = text.parse().map_err(|_| {
                 ZyronError::ParseError(format!(
                     "Invalid float literal '{}' at line {}, column {}",
                     text, self.line, start_col
                 ))
             })?;
-            let span = Span::new(start, self.pos - start);
             return Ok(SpannedToken::new(Token::Float(value), span));
         }
 

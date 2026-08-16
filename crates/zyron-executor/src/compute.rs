@@ -305,14 +305,21 @@ fn decimal_arithmetic(left: &Column, right: &Column, scale: u8, op: ArithOp) -> 
                 .and_then(|v| v)
                 .or_else(|| a.checked_mul(b).and_then(|p| p.checked_div(factor))),
             // A quotient of two same-scale values has no scale, so the
-            // dividend is raised first to land the result back on this one
+            // dividend is raised first to land the result back on this one.
+            // The last digit rounds half away from zero, the same rule
+            // multiplication applies, a truncating quotient would make
+            // 2.00 / 3.00 read 0.66 while 2.00 * (1.00 / 3.00) rounds
             ArithOp::Div => {
                 if b == 0 {
                     nulls.set_null(i);
                     out.push(0);
                     continue;
                 }
-                a.checked_mul(factor).and_then(|n| n.checked_div(b))
+                a.checked_mul(factor).and_then(|n| {
+                    let half = (b / 2).abs();
+                    let adjust = if (n < 0) == (b < 0) { half } else { -half };
+                    n.checked_add(adjust).and_then(|n| n.checked_div(b))
+                })
             }
             ArithOp::Mod => {
                 if b == 0 {
@@ -1006,6 +1013,12 @@ pub fn cast_column(col: &Column, target: TypeId) -> Result<Column> {
     if target == TypeId::Decimal && col.type_id != TypeId::Decimal {
         return Ok(col.clone());
     }
+    // A decimal source converts by value. Its i128 holds the value times
+    // ten to the column's scale, so handing the raw integer to the scalar
+    // cast would move the point by that factor
+    if col.type_id == TypeId::Decimal && target != TypeId::Decimal {
+        return cast_column_from_decimal(col, target);
+    }
     let len = col.len();
     let mut data = ColumnData::with_capacity(target, len);
     let mut nulls = NullBitmap::none(len);
@@ -1021,6 +1034,49 @@ pub fn cast_column(col: &Column, target: TypeId) -> Result<Column> {
         data.push_scalar(&casted);
     }
 
+    Ok(Column::with_nulls(data, nulls, target))
+}
+
+/// Casts a decimal column to another type by value. Integer targets round
+/// half away from zero, matching the rule an assignment losing digits
+/// applies. Float targets divide the scale factor out. Text targets render
+/// the fixed-point form
+fn cast_column_from_decimal(col: &Column, target: TypeId) -> Result<Column> {
+    let scale = col.fractional_digits.unwrap_or(0);
+    let len = col.len();
+    let mut data = ColumnData::with_capacity(target, len);
+    let mut nulls = NullBitmap::none(len);
+    for i in 0..len {
+        if col.is_null(i) {
+            nulls.set_null(i);
+            data.push_default();
+            continue;
+        }
+        let raw = match col.data.get_scalar(i) {
+            ScalarValue::Int128(v) => v,
+            other => {
+                // A decimal-typed column always stores i128, anything else
+                // is a buffer mismatch upstream
+                return Err(ZyronError::ExecutionError(format!(
+                    "decimal column holds a non-i128 value {other}"
+                )));
+            }
+        };
+        let casted = match target {
+            TypeId::Float32 | TypeId::Float64 => {
+                let value = raw as f64 / 10f64.powi(scale as i32);
+                cast_scalar(&ScalarValue::Float64(value), target)?
+            }
+            TypeId::Char | TypeId::Varchar | TypeId::Text => {
+                ScalarValue::Utf8(zyron_common::format_decimal(raw, scale))
+            }
+            _ => {
+                let whole = zyron_common::rescale(raw, scale, 0)?;
+                cast_scalar(&ScalarValue::Int128(whole), target)?
+            }
+        };
+        data.push_scalar(&casted);
+    }
     Ok(Column::with_nulls(data, nulls, target))
 }
 
@@ -1471,134 +1527,330 @@ macro_rules! sort_single_ord {
 }
 
 // ---------------------------------------------------------------------------
-// Radix sort (LSD, 8-bit, 4 passes for 32-bit keys, 8 passes for 64-bit)
+// Radix sort (LSD, 8-bit passes, histograms and key range gathered while
+// the key buffer is built so no pass re-reads the data just to count)
 // ---------------------------------------------------------------------------
 
-/// 8-bit LSD radix sort on (sort_key, original_index) pairs.
-/// Converts O(n log n) random-access comparison sort into O(w * n)
-/// sequential passes where w = key_bytes. For 500K i64 values this is
-/// 8 sequential passes over contiguous memory vs ~9.5M random accesses.
-fn radix_sort_pairs(pairs: &mut [(u64, u32)], scratch: &mut [(u64, u32)]) {
-    let n = pairs.len();
-    // Determine how many bytes actually vary across keys by finding
-    // the differing bits between min and max key values. For signed
-    // integers after sign-bit XOR, the high bytes are identical
-    // across all positive (or all negative) values, so only the
-    // low bytes that carry real variation are radix-sorted.
-    let (mut min_key, mut max_key) = (u64::MAX, 0u64);
-    for p in pairs.iter() {
-        min_key = min_key.min(p.0);
-        max_key = max_key.max(p.0);
-    }
-    let diff = min_key ^ max_key;
-    let needed_bytes = if diff == 0 {
-        0
-    } else {
-        (64 - diff.leading_zeros() as usize + 7) / 8
-    };
+/// Per-byte histograms plus key range, filled by the same loop that builds
+/// the key buffer. Knowing every histogram up front removes the counting
+/// read from each radix pass, and a byte whose histogram is a single bucket
+/// is constant across all keys, so its pass is the identity and is skipped.
+/// Boxed because the eight histograms are 8KB, too large for a stack local.
+struct RadixPrep {
+    counts: Box<[[u32; 256]; 8]>,
+    min_key: u64,
+    max_key: u64,
+}
 
-    let mut src = true; // true = pairs is source, false = scratch is source
-    for byte_idx in 0..needed_bytes {
-        let shift = byte_idx * 8;
-        let mut counts = [0u32; 256];
-
-        let (input, output) = if src {
-            (pairs as &[(u64, u32)], scratch as &mut [(u64, u32)])
-        } else {
-            (scratch as &[(u64, u32)], pairs as &mut [(u64, u32)])
-        };
-
-        // Count occurrences of each byte value.
-        for i in 0..n {
-            let byte = ((input[i].0 >> shift) & 0xFF) as usize;
-            counts[byte] += 1;
+impl RadixPrep {
+    fn new() -> Self {
+        Self {
+            counts: Box::new([[0u32; 256]; 8]),
+            min_key: u64::MAX,
+            max_key: 0,
         }
+    }
 
-        // Prefix sum to get starting positions.
+    /// Folds one key into the range and all eight byte histograms.
+    #[inline]
+    fn record(&mut self, key: u64) {
+        self.min_key = self.min_key.min(key);
+        self.max_key = self.max_key.max(key);
+        let c = &mut *self.counts;
+        c[0][(key & 0xFF) as usize] += 1;
+        c[1][((key >> 8) & 0xFF) as usize] += 1;
+        c[2][((key >> 16) & 0xFF) as usize] += 1;
+        c[3][((key >> 24) & 0xFF) as usize] += 1;
+        c[4][((key >> 32) & 0xFF) as usize] += 1;
+        c[5][((key >> 40) & 0xFF) as usize] += 1;
+        c[6][((key >> 48) & 0xFF) as usize] += 1;
+        c[7][((key >> 56) & 0xFF) as usize] += 1;
+    }
+
+    /// Number of low bytes that differ between the smallest and largest
+    /// key. Bytes at and above the returned index are identical across
+    /// the whole input, so no pass ever needs to sort by them.
+    fn needed_bytes(&self) -> usize {
+        let diff = self.min_key ^ self.max_key;
+        if diff == 0 {
+            0
+        } else {
+            (64 - diff.leading_zeros() as usize + 7) / 8
+        }
+    }
+
+    /// True when every one of the n keys carries the same value in this
+    /// byte position, making its counting-sort pass the identity.
+    fn byte_is_constant(&self, byte_idx: usize, n: usize) -> bool {
+        self.counts[byte_idx].iter().any(|&c| c as usize == n)
+    }
+
+    /// Exclusive prefix sum of the histogram for one byte position.
+    fn offsets(&self, byte_idx: usize) -> [u32; 256] {
         let mut offsets = [0u32; 256];
         let mut running = 0u32;
-        for i in 0..256 {
-            offsets[i] = running;
-            running += counts[i];
+        for (slot, &count) in offsets.iter_mut().zip(self.counts[byte_idx].iter()) {
+            *slot = running;
+            running += count;
         }
-
-        // Scatter into output.
-        for i in 0..n {
-            let byte = ((input[i].0 >> shift) & 0xFF) as usize;
-            let dest = offsets[byte] as usize;
-            offsets[byte] += 1;
-            output[dest] = input[i];
-        }
-
-        src = !src;
-    }
-
-    // If result ended up in scratch, copy back.
-    if !src {
-        pairs.copy_from_slice(scratch);
+        offsets
     }
 }
 
-/// Radix sort for signed integers. XORs the sign bit to convert signed
-/// order to unsigned order, radix sorts, then extracts the indices.
+/// 8-bit LSD radix sort over (key, original_index) pairs that emits its
+/// result as separate index and value vectors. The pass over the highest
+/// varying byte runs last and scatters straight into the two outputs,
+/// applying `untransform` to turn each key back into a column value, so
+/// the sort needs no copy-back pass and no separate extraction sweep.
+/// Constant bytes below the top varying one are skipped outright.
+fn radix_scatter_pairs<T, F>(
+    mut pairs: Vec<(u64, u32)>,
+    prep: &RadixPrep,
+    untransform: F,
+) -> (Vec<u32>, Vec<T>)
+where
+    T: Copy,
+    F: Fn(u64) -> T,
+{
+    let n = pairs.len();
+    let needed = prep.needed_bytes();
+    let mut indices: Vec<u32> = Vec::with_capacity(n);
+    let mut values: Vec<T> = Vec::with_capacity(n);
+
+    if needed == 0 {
+        // Every key is identical, so input order is already sorted order.
+        for &(key, idx) in pairs.iter() {
+            indices.push(idx);
+            values.push(untransform(key));
+        }
+        return (indices, values);
+    }
+
+    // Ping-pong passes over the varying bytes below the top one. The first
+    // pass scatters into reserved-but-unwritten scratch capacity, later
+    // passes alternate between the two fully written buffers.
+    let intermediate: Vec<usize> = (0..needed - 1)
+        .filter(|&b| !prep.byte_is_constant(b, n))
+        .collect();
+    let mut scratch: Vec<(u64, u32)> =
+        Vec::with_capacity(if intermediate.is_empty() { 0 } else { n });
+    let mut src_is_pairs = true;
+    for (pass, &byte_idx) in intermediate.iter().enumerate() {
+        let shift = (byte_idx * 8) as u32;
+        let mut offsets = prep.offsets(byte_idx);
+        if pass == 0 {
+            let out = scratch.spare_capacity_mut();
+            for &p in pairs.iter() {
+                let byte = ((p.0 >> shift) & 0xFF) as usize;
+                let dest = offsets[byte] as usize;
+                offsets[byte] += 1;
+                out[dest].write(p);
+            }
+            // SAFETY: the offsets are exclusive prefix sums of a histogram
+            // over exactly these n keys, so the destinations enumerate
+            // 0..n with no gap or repeat and every slot was written above.
+            // The element type is Copy, so no drop obligations exist.
+            unsafe { scratch.set_len(n) };
+            src_is_pairs = false;
+        } else {
+            let (input, output) = if src_is_pairs {
+                (pairs.as_slice(), scratch.as_mut_slice())
+            } else {
+                (scratch.as_slice(), pairs.as_mut_slice())
+            };
+            for &p in input.iter() {
+                let byte = ((p.0 >> shift) & 0xFF) as usize;
+                let dest = offsets[byte] as usize;
+                offsets[byte] += 1;
+                output[dest] = p;
+            }
+            src_is_pairs = !src_is_pairs;
+        }
+    }
+
+    // Final pass over the top varying byte writes both outputs directly.
+    let byte_idx = needed - 1;
+    let shift = (byte_idx * 8) as u32;
+    let mut offsets = prep.offsets(byte_idx);
+    let input: &[(u64, u32)] = if src_is_pairs { &pairs } else { &scratch };
+    {
+        let idx_out = indices.spare_capacity_mut();
+        let val_out = values.spare_capacity_mut();
+        for &(key, idx) in input.iter() {
+            let byte = ((key >> shift) & 0xFF) as usize;
+            let dest = offsets[byte] as usize;
+            offsets[byte] += 1;
+            idx_out[dest].write(idx);
+            val_out[dest].write(untransform(key));
+        }
+    }
+    // SAFETY: same argument as above, the scatter destinations cover 0..n
+    // exactly once, so both vectors are fully written up to n. Both element
+    // types are Copy.
+    unsafe {
+        indices.set_len(n);
+        values.set_len(n);
+    }
+    (indices, values)
+}
+
+/// Index-only variant of `radix_scatter_pairs`. The unit value output
+/// occupies no memory and its writes compile away, leaving a scatter
+/// that emits just the sorted index vector.
+fn radix_sort_pair_indices(pairs: Vec<(u64, u32)>, prep: &RadixPrep) -> Vec<u32> {
+    radix_scatter_pairs(pairs, prep, |_| ()).0
+}
+
+/// Values-only counterpart of `radix_scatter_pairs` for single-column
+/// sorts that need no permutation indices. Half the bandwidth of the
+/// pair sort, 8 bytes per element per pass instead of 16.
+fn radix_scatter_values<T, F>(mut keys: Vec<u64>, prep: &RadixPrep, untransform: F) -> Vec<T>
+where
+    T: Copy,
+    F: Fn(u64) -> T,
+{
+    let n = keys.len();
+    let needed = prep.needed_bytes();
+    let mut values: Vec<T> = Vec::with_capacity(n);
+
+    if needed == 0 {
+        for &key in keys.iter() {
+            values.push(untransform(key));
+        }
+        return values;
+    }
+
+    let intermediate: Vec<usize> = (0..needed - 1)
+        .filter(|&b| !prep.byte_is_constant(b, n))
+        .collect();
+    let mut scratch: Vec<u64> = Vec::with_capacity(if intermediate.is_empty() { 0 } else { n });
+    let mut src_is_keys = true;
+    for (pass, &byte_idx) in intermediate.iter().enumerate() {
+        let shift = (byte_idx * 8) as u32;
+        let mut offsets = prep.offsets(byte_idx);
+        if pass == 0 {
+            let out = scratch.spare_capacity_mut();
+            for &key in keys.iter() {
+                let byte = ((key >> shift) & 0xFF) as usize;
+                let dest = offsets[byte] as usize;
+                offsets[byte] += 1;
+                out[dest].write(key);
+            }
+            // SAFETY: exclusive prefix sums over these n keys enumerate
+            // destinations 0..n exactly once, so every slot was written.
+            // u64 is Copy.
+            unsafe { scratch.set_len(n) };
+            src_is_keys = false;
+        } else {
+            let (input, output) = if src_is_keys {
+                (keys.as_slice(), scratch.as_mut_slice())
+            } else {
+                (scratch.as_slice(), keys.as_mut_slice())
+            };
+            for &key in input.iter() {
+                let byte = ((key >> shift) & 0xFF) as usize;
+                let dest = offsets[byte] as usize;
+                offsets[byte] += 1;
+                output[dest] = key;
+            }
+            src_is_keys = !src_is_keys;
+        }
+    }
+
+    let byte_idx = needed - 1;
+    let shift = (byte_idx * 8) as u32;
+    let mut offsets = prep.offsets(byte_idx);
+    let input: &[u64] = if src_is_keys { &keys } else { &scratch };
+    {
+        let out = values.spare_capacity_mut();
+        for &key in input.iter() {
+            let byte = ((key >> shift) & 0xFF) as usize;
+            let dest = offsets[byte] as usize;
+            offsets[byte] += 1;
+            out[dest].write(untransform(key));
+        }
+    }
+    // SAFETY: same destination-coverage argument, all n slots written.
+    // T is Copy.
+    unsafe { values.set_len(n) };
+    values
+}
+
+/// Radix sort for signed integers, returning sorted indices. Truncates
+/// each value to its unsigned twin so the key stays within the narrow
+/// width, then XORs the narrow sign bit to convert signed order to
+/// unsigned order. Sign-extending instead would set every high bit on
+/// negatives and sort them after positives. The key range and all byte
+/// histograms are gathered in the same loop that builds the pairs.
 macro_rules! radix_sort_signed {
-    ($data:expr, $asc:expr, $sign_bit:expr) => {{
+    ($data:expr, $asc:expr, $uty:ty, $sign_bit:expr) => {{
         let n = $data.len();
         let mut pairs: Vec<(u64, u32)> = Vec::with_capacity(n);
+        let mut prep = RadixPrep::new();
         if $asc {
             for (i, &v) in $data.iter().enumerate() {
-                pairs.push(((v as u64) ^ $sign_bit, i as u32));
+                let key = (v as $uty as u64) ^ $sign_bit;
+                prep.record(key);
+                pairs.push((key, i as u32));
             }
         } else {
             for (i, &v) in $data.iter().enumerate() {
-                pairs.push((!((v as u64) ^ $sign_bit), i as u32));
+                let key = !((v as $uty as u64) ^ $sign_bit);
+                prep.record(key);
+                pairs.push((key, i as u32));
             }
         }
-        let mut scratch = vec![(0u64, 0u32); n];
-        radix_sort_pairs(&mut pairs, &mut scratch);
-        pairs.into_iter().map(|p| p.1).collect()
+        radix_sort_pair_indices(pairs, &prep)
     }};
 }
 
-/// Radix sort for unsigned integers.
+/// Radix sort for unsigned integers, returning sorted indices.
 macro_rules! radix_sort_unsigned {
     ($data:expr, $asc:expr) => {{
         let n = $data.len();
         let mut pairs: Vec<(u64, u32)> = Vec::with_capacity(n);
+        let mut prep = RadixPrep::new();
         if $asc {
             for (i, &v) in $data.iter().enumerate() {
-                pairs.push((v as u64, i as u32));
+                let key = v as u64;
+                prep.record(key);
+                pairs.push((key, i as u32));
             }
         } else {
             for (i, &v) in $data.iter().enumerate() {
-                pairs.push((!(v as u64), i as u32));
+                let key = !(v as u64);
+                prep.record(key);
+                pairs.push((key, i as u32));
             }
         }
-        let mut scratch = vec![(0u64, 0u32); n];
-        radix_sort_pairs(&mut pairs, &mut scratch);
-        pairs.into_iter().map(|p| p.1).collect()
+        radix_sort_pair_indices(pairs, &prep)
     }};
 }
 
 /// Radix sort across multiple column batches, returning both sorted indices
 /// and the sorted key column data. Builds pairs directly from unconcatenated
-/// batches (avoids concat memcpy), then extracts sorted values via reverse
-/// XOR transform (avoids random-access take/gather). Returns None for
-/// non-integer types or columns with nulls.
+/// batches (no concat memcpy) while gathering the key range and all byte
+/// histograms, then lets the final radix pass scatter untransformed values
+/// straight into the outputs. Returns None for a non-matching column type.
 macro_rules! radix_extract_signed {
-    ($batches:expr, $asc:expr, $variant:ident, $ty:ty, $sign_bit:expr) => {{
+    ($batches:expr, $asc:expr, $variant:ident, $ty:ty, $uty:ty, $sign_bit:expr) => {{
         let total: usize = $batches.iter().map(|c| c.len()).sum();
         let mut pairs: Vec<(u64, u32)> = Vec::with_capacity(total);
+        let mut prep = RadixPrep::new();
         let mut off = 0u32;
         for col in $batches {
             if let ColumnData::$variant(v) = &col.data {
                 if $asc {
                     for (i, &val) in v.iter().enumerate() {
-                        pairs.push(((val as u64) ^ $sign_bit, off + i as u32));
+                        let key = (val as $uty as u64) ^ $sign_bit;
+                        prep.record(key);
+                        pairs.push((key, off + i as u32));
                     }
                 } else {
                     for (i, &val) in v.iter().enumerate() {
-                        pairs.push((!((val as u64) ^ $sign_bit), off + i as u32));
+                        let key = !((val as $uty as u64) ^ $sign_bit);
+                        prep.record(key);
+                        pairs.push((key, off + i as u32));
                     }
                 }
                 off += v.len() as u32;
@@ -1606,21 +1858,11 @@ macro_rules! radix_extract_signed {
                 return None;
             }
         }
-        let mut scratch = vec![(0u64, 0u32); total];
-        radix_sort_pairs(&mut pairs, &mut scratch);
-        let mut indices = Vec::with_capacity(total);
-        let mut sorted: Vec<$ty> = Vec::with_capacity(total);
-        if $asc {
-            for &(key, idx) in &pairs {
-                indices.push(idx);
-                sorted.push((key ^ $sign_bit) as $ty);
-            }
+        let (indices, sorted) = if $asc {
+            radix_scatter_pairs(pairs, &prep, |k: u64| (k ^ $sign_bit) as $ty)
         } else {
-            for &(key, idx) in &pairs {
-                indices.push(idx);
-                sorted.push(((!key) ^ $sign_bit) as $ty);
-            }
-        }
+            radix_scatter_pairs(pairs, &prep, |k: u64| ((!k) ^ $sign_bit) as $ty)
+        };
         Some((indices, ColumnData::$variant(sorted)))
     }};
 }
@@ -1629,16 +1871,21 @@ macro_rules! radix_extract_unsigned {
     ($batches:expr, $asc:expr, $variant:ident, $ty:ty) => {{
         let total: usize = $batches.iter().map(|c| c.len()).sum();
         let mut pairs: Vec<(u64, u32)> = Vec::with_capacity(total);
+        let mut prep = RadixPrep::new();
         let mut off = 0u32;
         for col in $batches {
             if let ColumnData::$variant(v) = &col.data {
                 if $asc {
                     for (i, &val) in v.iter().enumerate() {
-                        pairs.push((val as u64, off + i as u32));
+                        let key = val as u64;
+                        prep.record(key);
+                        pairs.push((key, off + i as u32));
                     }
                 } else {
                     for (i, &val) in v.iter().enumerate() {
-                        pairs.push((!(val as u64), off + i as u32));
+                        let key = !(val as u64);
+                        prep.record(key);
+                        pairs.push((key, off + i as u32));
                     }
                 }
                 off += v.len() as u32;
@@ -1646,22 +1893,81 @@ macro_rules! radix_extract_unsigned {
                 return None;
             }
         }
-        let mut scratch = vec![(0u64, 0u32); total];
-        radix_sort_pairs(&mut pairs, &mut scratch);
-        let mut indices = Vec::with_capacity(total);
-        let mut sorted: Vec<$ty> = Vec::with_capacity(total);
-        if $asc {
-            for &(key, idx) in &pairs {
-                indices.push(idx);
-                sorted.push(key as $ty);
-            }
+        let (indices, sorted) = if $asc {
+            radix_scatter_pairs(pairs, &prep, |k: u64| k as $ty)
         } else {
-            for &(key, idx) in &pairs {
-                indices.push(idx);
-                sorted.push((!key) as $ty);
+            radix_scatter_pairs(pairs, &prep, |k: u64| (!k) as $ty)
+        };
+        Some((indices, ColumnData::$variant(sorted)))
+    }};
+}
+
+/// Values-only variants for single-column sorts. The key-build loop fuses
+/// what were separate concat, sign transform, range scan and per-pass
+/// counting reads into one pass over the batches.
+macro_rules! radix_values_signed {
+    ($batches:expr, $asc:expr, $variant:ident, $ty:ty, $uty:ty, $sign_bit:expr) => {{
+        let total: usize = $batches.iter().map(|c| c.len()).sum();
+        let mut keys: Vec<u64> = Vec::with_capacity(total);
+        let mut prep = RadixPrep::new();
+        for col in $batches {
+            if let ColumnData::$variant(v) = &col.data {
+                if $asc {
+                    for &val in v.iter() {
+                        let key = (val as $uty as u64) ^ $sign_bit;
+                        prep.record(key);
+                        keys.push(key);
+                    }
+                } else {
+                    for &val in v.iter() {
+                        let key = !((val as $uty as u64) ^ $sign_bit);
+                        prep.record(key);
+                        keys.push(key);
+                    }
+                }
+            } else {
+                return None;
             }
         }
-        Some((indices, ColumnData::$variant(sorted)))
+        let sorted = if $asc {
+            radix_scatter_values(keys, &prep, |k: u64| (k ^ $sign_bit) as $ty)
+        } else {
+            radix_scatter_values(keys, &prep, |k: u64| ((!k) ^ $sign_bit) as $ty)
+        };
+        Some(ColumnData::$variant(sorted))
+    }};
+}
+
+macro_rules! radix_values_unsigned {
+    ($batches:expr, $asc:expr, $variant:ident, $ty:ty) => {{
+        let total: usize = $batches.iter().map(|c| c.len()).sum();
+        let mut keys: Vec<u64> = Vec::with_capacity(total);
+        let mut prep = RadixPrep::new();
+        for col in $batches {
+            if let ColumnData::$variant(v) = &col.data {
+                if $asc {
+                    for &val in v.iter() {
+                        let key = val as u64;
+                        prep.record(key);
+                        keys.push(key);
+                    }
+                } else {
+                    for &val in v.iter() {
+                        let key = !(val as u64);
+                        prep.record(key);
+                        keys.push(key);
+                    }
+                }
+            } else {
+                return None;
+            }
+        }
+        let sorted = if $asc {
+            radix_scatter_values(keys, &prep, |k: u64| k as $ty)
+        } else {
+            radix_scatter_values(keys, &prep, |k: u64| (!k) as $ty)
+        };
+        Some(ColumnData::$variant(sorted))
     }};
 }
 
@@ -1679,13 +1985,15 @@ pub fn radix_sort_column_batches(
     }
     match &batches[0].data {
         ColumnData::Int64(_) => {
-            radix_extract_signed!(batches, ascending, Int64, i64, 0x8000_0000_0000_0000u64)
+            radix_extract_signed!(batches, ascending, Int64, i64, u64, 0x8000_0000_0000_0000u64)
         }
         ColumnData::Int32(_) => {
-            radix_extract_signed!(batches, ascending, Int32, i32, 0x8000_0000u64)
+            radix_extract_signed!(batches, ascending, Int32, i32, u32, 0x8000_0000u64)
         }
-        ColumnData::Int16(_) => radix_extract_signed!(batches, ascending, Int16, i16, 0x8000u64),
-        ColumnData::Int8(_) => radix_extract_signed!(batches, ascending, Int8, i8, 0x80u64),
+        ColumnData::Int16(_) => {
+            radix_extract_signed!(batches, ascending, Int16, i16, u16, 0x8000u64)
+        }
+        ColumnData::Int8(_) => radix_extract_signed!(batches, ascending, Int8, i8, u8, 0x80u64),
         ColumnData::UInt64(_) => radix_extract_unsigned!(batches, ascending, UInt64, u64),
         ColumnData::UInt32(_) => radix_extract_unsigned!(batches, ascending, UInt32, u32),
         ColumnData::UInt16(_) => radix_extract_unsigned!(batches, ascending, UInt16, u16),
@@ -1694,175 +2002,56 @@ pub fn radix_sort_column_batches(
     }
 }
 
-/// 8-bit LSD radix sort on plain u64 values (no index pairs).
-/// Half the bandwidth of radix_sort_pairs: 8 bytes per element vs 16.
-/// Uses the same byte-skip optimization to only sort varying bytes.
-fn radix_sort_u64_values(data: &mut [u64], scratch: &mut [u64]) {
-    let n = data.len();
-    let (mut min_key, mut max_key) = (u64::MAX, 0u64);
-    for &k in data.iter() {
-        min_key = min_key.min(k);
-        max_key = max_key.max(k);
-    }
-    let diff = min_key ^ max_key;
-    let needed_bytes = if diff == 0 {
-        0
-    } else {
-        (64 - diff.leading_zeros() as usize + 7) / 8
-    };
-
-    let mut src_is_data = true;
-    for byte_idx in 0..needed_bytes {
-        let shift = byte_idx * 8;
-        let mut counts = [0u32; 256];
-
-        let (input, output): (&[u64], &mut [u64]) = if src_is_data {
-            (data as &[u64], scratch)
-        } else {
-            (scratch as &[u64], data)
-        };
-
-        for i in 0..n {
-            counts[((input[i] >> shift) & 0xFF) as usize] += 1;
-        }
-
-        let mut offsets = [0u32; 256];
-        let mut running = 0u32;
-        for i in 0..256 {
-            offsets[i] = running;
-            running += counts[i];
-        }
-
-        for i in 0..n {
-            let byte = ((input[i] >> shift) & 0xFF) as usize;
-            let dest = offsets[byte] as usize;
-            offsets[byte] += 1;
-            output[dest] = input[i];
-        }
-
-        src_is_data = !src_is_data;
-    }
-
-    if !src_is_data {
-        data.copy_from_slice(scratch);
-    }
-}
-
-/// Radix sort for i64 slices in-place. Reinterprets as &mut [u64] which
-/// is safe because i64 and u64 have identical size, alignment, and all
-/// bit patterns are valid for both types.
-fn radix_sort_i64_inplace(data: &mut [i64], ascending: bool) {
-    let keys: &mut [u64] =
-        unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u64, data.len()) };
-    const SIGN_BIT: u64 = 0x8000_0000_0000_0000;
-    if ascending {
-        for k in keys.iter_mut() {
-            *k ^= SIGN_BIT;
-        }
-    } else {
-        for k in keys.iter_mut() {
-            *k = !(*k ^ SIGN_BIT);
-        }
-    }
-    let mut scratch = vec![0u64; keys.len()];
-    radix_sort_u64_values(keys, &mut scratch);
-    if ascending {
-        for k in keys.iter_mut() {
-            *k ^= SIGN_BIT;
-        }
-    } else {
-        for k in keys.iter_mut() {
-            *k = (!*k) ^ SIGN_BIT;
-        }
-    }
-}
-
-/// Radix sort for u64 slices in-place.
-fn radix_sort_u64_inplace(data: &mut [u64], ascending: bool) {
-    if !ascending {
-        for k in data.iter_mut() {
-            *k = !*k;
-        }
-    }
-    let mut scratch = vec![0u64; data.len()];
-    radix_sort_u64_values(data, &mut scratch);
-    if !ascending {
-        for k in data.iter_mut() {
-            *k = !*k;
-        }
-    }
-}
-
-/// Radix sort for signed integer types smaller than 64 bits.
-/// Widens to Vec<u64>, sorts, then writes back. This avoids the unsound
-/// transmute that would create a u64 slice from a smaller-typed buffer.
-macro_rules! radix_sort_signed_widened {
-    ($data:expr, $asc:expr, $sign_bit:expr) => {{
-        let n = $data.len();
-        let mut keys: Vec<u64> = if $asc {
-            $data.iter().map(|&v| (v as u64) ^ $sign_bit).collect()
-        } else {
-            $data.iter().map(|&v| !((v as u64) ^ $sign_bit)).collect()
-        };
-        let mut scratch = vec![0u64; n];
-        radix_sort_u64_values(&mut keys, &mut scratch);
-        if $asc {
-            for (i, &k) in keys.iter().enumerate() {
-                $data[i] = (k ^ $sign_bit) as _;
-            }
-        } else {
-            for (i, &k) in keys.iter().enumerate() {
-                $data[i] = ((!k) ^ $sign_bit) as _;
-            }
-        }
-    }};
-}
-
-/// Radix sort for unsigned integer types smaller than 64 bits.
-macro_rules! radix_sort_unsigned_widened {
-    ($data:expr, $asc:expr) => {{
-        let n = $data.len();
-        let mut keys: Vec<u64> = if $asc {
-            $data.iter().map(|&v| v as u64).collect()
-        } else {
-            $data.iter().map(|&v| !(v as u64)).collect()
-        };
-        let mut scratch = vec![0u64; n];
-        radix_sort_u64_values(&mut keys, &mut scratch);
-        if $asc {
-            for (i, &k) in keys.iter().enumerate() {
-                $data[i] = k as _;
-            }
-        } else {
-            for (i, &k) in keys.iter().enumerate() {
-                $data[i] = (!k) as _;
-            }
-        }
-    }};
-}
-
 /// Minimum element count for radix sort. Below this threshold,
 /// pdqsort (sort_unstable) is faster due to lower constant overhead.
 const RADIX_SORT_THRESHOLD: usize = 256;
 
-/// Sorts column data in-place. For integer types >= 256 elements, uses
-/// values-only radix sort (O(w*n) sequential, half the bandwidth of
-/// pair-based radix sort). For smaller arrays and non-integer types,
-/// falls back to sort_unstable (pdqsort).
+/// Sorts a single integer key column split across batches, producing the
+/// sorted values directly with no permutation indices. One fused loop
+/// builds the transformed key buffer while gathering the range and byte
+/// histograms, and the final radix pass writes untransformed values
+/// straight into the output. Returns None for non-integer types, columns
+/// with nulls, or inputs below the radix threshold, where the caller's
+/// concat plus comparison sort is the better path.
+pub fn radix_sort_batches_values(batches: &[Column], ascending: bool) -> Option<ColumnData> {
+    let total: usize = batches.iter().map(|c| c.len()).sum();
+    if batches.is_empty()
+        || total < RADIX_SORT_THRESHOLD
+        || batches.iter().any(|c| c.nulls.has_nulls())
+    {
+        return None;
+    }
+    match &batches[0].data {
+        ColumnData::Int64(_) => {
+            radix_values_signed!(batches, ascending, Int64, i64, u64, 0x8000_0000_0000_0000u64)
+        }
+        ColumnData::Int32(_) => {
+            radix_values_signed!(batches, ascending, Int32, i32, u32, 0x8000_0000u64)
+        }
+        ColumnData::Int16(_) => {
+            radix_values_signed!(batches, ascending, Int16, i16, u16, 0x8000u64)
+        }
+        ColumnData::Int8(_) => radix_values_signed!(batches, ascending, Int8, i8, u8, 0x80u64),
+        ColumnData::UInt64(_) => radix_values_unsigned!(batches, ascending, UInt64, u64),
+        ColumnData::UInt32(_) => radix_values_unsigned!(batches, ascending, UInt32, u32),
+        ColumnData::UInt16(_) => radix_values_unsigned!(batches, ascending, UInt16, u16),
+        ColumnData::UInt8(_) => radix_values_unsigned!(batches, ascending, UInt8, u8),
+        _ => None,
+    }
+}
+
+/// Sorts column data in-place with comparison sorts (pdqsort). This is the
+/// fallback behind `radix_sort_batches_values`, serving the non-integer
+/// types, integer inputs below the radix threshold, and any type the radix
+/// path declines.
 pub fn sort_column_inplace(data: &mut ColumnData, ascending: bool) {
     match data {
-        ColumnData::Int64(v) if v.len() >= RADIX_SORT_THRESHOLD => {
-            radix_sort_i64_inplace(v, ascending);
-        }
         ColumnData::Int64(v) => {
             if ascending {
                 v.sort_unstable();
             } else {
                 v.sort_unstable_by(|a, b| b.cmp(a));
             }
-        }
-        ColumnData::Int32(v) if v.len() >= RADIX_SORT_THRESHOLD => {
-            radix_sort_signed_widened!(v, ascending, 0x8000_0000u64);
         }
         ColumnData::Int32(v) => {
             if ascending {
@@ -1871,18 +2060,12 @@ pub fn sort_column_inplace(data: &mut ColumnData, ascending: bool) {
                 v.sort_unstable_by(|a, b| b.cmp(a));
             }
         }
-        ColumnData::Int16(v) if v.len() >= RADIX_SORT_THRESHOLD => {
-            radix_sort_signed_widened!(v, ascending, 0x8000u64);
-        }
         ColumnData::Int16(v) => {
             if ascending {
                 v.sort_unstable();
             } else {
                 v.sort_unstable_by(|a, b| b.cmp(a));
             }
-        }
-        ColumnData::Int8(v) if v.len() >= RADIX_SORT_THRESHOLD => {
-            radix_sort_signed_widened!(v, ascending, 0x80u64);
         }
         ColumnData::Int8(v) => {
             if ascending {
@@ -1891,18 +2074,12 @@ pub fn sort_column_inplace(data: &mut ColumnData, ascending: bool) {
                 v.sort_unstable_by(|a, b| b.cmp(a));
             }
         }
-        ColumnData::UInt64(v) if v.len() >= RADIX_SORT_THRESHOLD => {
-            radix_sort_u64_inplace(v, ascending);
-        }
         ColumnData::UInt64(v) => {
             if ascending {
                 v.sort_unstable();
             } else {
                 v.sort_unstable_by(|a, b| b.cmp(a));
             }
-        }
-        ColumnData::UInt32(v) if v.len() >= RADIX_SORT_THRESHOLD => {
-            radix_sort_unsigned_widened!(v, ascending);
         }
         ColumnData::UInt32(v) => {
             if ascending {
@@ -1911,18 +2088,12 @@ pub fn sort_column_inplace(data: &mut ColumnData, ascending: bool) {
                 v.sort_unstable_by(|a, b| b.cmp(a));
             }
         }
-        ColumnData::UInt16(v) if v.len() >= RADIX_SORT_THRESHOLD => {
-            radix_sort_unsigned_widened!(v, ascending);
-        }
         ColumnData::UInt16(v) => {
             if ascending {
                 v.sort_unstable();
             } else {
                 v.sort_unstable_by(|a, b| b.cmp(a));
             }
-        }
-        ColumnData::UInt8(v) if v.len() >= RADIX_SORT_THRESHOLD => {
-            radix_sort_unsigned_widened!(v, ascending);
         }
         ColumnData::UInt8(v) => {
             if ascending {
@@ -1990,32 +2161,6 @@ pub fn sort_column_inplace(data: &mut ColumnData, ascending: bool) {
     }
 }
 
-/// Radix sort on a single already-concatenated column. Returns both sorted
-/// indices and the sorted column data. Same as radix_sort_column_batches
-/// but takes contiguous data (better cache behavior during pair construction).
-pub fn radix_sort_contiguous(col: &Column, ascending: bool) -> Option<(Vec<u32>, ColumnData)> {
-    if col.nulls.has_nulls() {
-        return None;
-    }
-    // Wrap in a single-element slice to reuse the batch macros.
-    let batches = std::slice::from_ref(col);
-    match &col.data {
-        ColumnData::Int64(_) => {
-            radix_extract_signed!(batches, ascending, Int64, i64, 0x8000_0000_0000_0000u64)
-        }
-        ColumnData::Int32(_) => {
-            radix_extract_signed!(batches, ascending, Int32, i32, 0x8000_0000u64)
-        }
-        ColumnData::Int16(_) => radix_extract_signed!(batches, ascending, Int16, i16, 0x8000u64),
-        ColumnData::Int8(_) => radix_extract_signed!(batches, ascending, Int8, i8, 0x80u64),
-        ColumnData::UInt64(_) => radix_extract_unsigned!(batches, ascending, UInt64, u64),
-        ColumnData::UInt32(_) => radix_extract_unsigned!(batches, ascending, UInt32, u32),
-        ColumnData::UInt16(_) => radix_extract_unsigned!(batches, ascending, UInt16, u16),
-        ColumnData::UInt8(_) => radix_extract_unsigned!(batches, ascending, UInt8, u8),
-        _ => None,
-    }
-}
-
 /// Computes sort indices using typed comparison (no ScalarValue allocation).
 /// When no sort columns contain nulls, uses a streamlined comparison path
 /// that skips all null bitmap lookups. For single-key integer sorts, uses
@@ -2033,10 +2178,12 @@ pub fn sort_indices(
     if !any_nulls && columns.len() == 1 {
         let asc = ascending[0];
         match &columns[0].data {
-            ColumnData::Int64(v) => return radix_sort_signed!(v, asc, 0x8000_0000_0000_0000u64),
-            ColumnData::Int32(v) => return radix_sort_signed!(v, asc, 0x8000_0000u64),
-            ColumnData::Int16(v) => return radix_sort_signed!(v, asc, 0x8000u64),
-            ColumnData::Int8(v) => return radix_sort_signed!(v, asc, 0x80u64),
+            ColumnData::Int64(v) => {
+                return radix_sort_signed!(v, asc, u64, 0x8000_0000_0000_0000u64)
+            }
+            ColumnData::Int32(v) => return radix_sort_signed!(v, asc, u32, 0x8000_0000u64),
+            ColumnData::Int16(v) => return radix_sort_signed!(v, asc, u16, 0x8000u64),
+            ColumnData::Int8(v) => return radix_sort_signed!(v, asc, u8, 0x80u64),
             ColumnData::UInt64(v) => return radix_sort_unsigned!(v, asc),
             ColumnData::UInt32(v) => return radix_sort_unsigned!(v, asc),
             ColumnData::UInt16(v) => return radix_sort_unsigned!(v, asc),
@@ -2653,5 +2800,155 @@ mod ps_tests {
             ColumnData::Boolean(b) => assert!(b[0], "same instant must compare equal"),
             _ => panic!("expected Boolean"),
         }
+    }
+}
+
+#[cfg(test)]
+mod radix_sort_tests {
+    use super::*;
+    use crate::column::{Column, NullBitmap};
+    use zyron_common::TypeId;
+
+    /// Deterministic 64-bit generator so every run sorts the same data
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *state
+    }
+
+    macro_rules! check_values_sort {
+        ($variant:ident, $ty:ty, $type_id:expr, $make:expr) => {{
+            let mut state = 0x9E3779B97F4A7C15u64;
+            // Three uneven batches totalling well past the radix threshold
+            let lens = [300usize, 257, 144];
+            let mut batches: Vec<Column> = Vec::new();
+            let mut oracle: Vec<$ty> = Vec::new();
+            for len in lens {
+                let vals: Vec<$ty> = (0..len).map(|_| $make(lcg(&mut state))).collect();
+                oracle.extend_from_slice(&vals);
+                batches.push(Column::new(ColumnData::$variant(vals), $type_id));
+            }
+            for asc in [true, false] {
+                let mut expect = oracle.clone();
+                expect.sort_unstable();
+                if !asc {
+                    expect.reverse();
+                }
+                let sorted = radix_sort_batches_values(&batches, asc)
+                    .expect("radix path must accept this input");
+                match sorted {
+                    ColumnData::$variant(v) => assert_eq!(v, expect),
+                    other => panic!("wrong output variant: {:?}", other.len()),
+                }
+            }
+        }};
+    }
+
+    #[test]
+    fn values_sort_matches_a_comparison_oracle_for_every_integer_type() {
+        check_values_sort!(Int64, i64, TypeId::Int64, |r: u64| r as i64);
+        check_values_sort!(Int32, i32, TypeId::Int32, |r: u64| r as i32);
+        check_values_sort!(Int16, i16, TypeId::Int16, |r: u64| r as i16);
+        check_values_sort!(Int8, i8, TypeId::Int8, |r: u64| r as i8);
+        check_values_sort!(UInt64, u64, TypeId::UInt64, |r: u64| r);
+        check_values_sort!(UInt32, u32, TypeId::UInt32, |r: u64| r as u32);
+        check_values_sort!(UInt16, u16, TypeId::UInt16, |r: u64| r as u16);
+        check_values_sort!(UInt8, u8, TypeId::UInt8, |r: u64| r as u8);
+    }
+
+    #[test]
+    fn values_sort_handles_negatives_duplicates_and_narrow_ranges() {
+        // Mixed signs with heavy duplication, verifies the sign-bit
+        // transform and that skipped constant high bytes stay correct
+        let vals: Vec<i64> = (0..600).map(|i| ((i % 7) as i64) - 3).collect();
+        let batches = vec![Column::new(ColumnData::Int64(vals.clone()), TypeId::Int64)];
+        let mut expect = vals.clone();
+        expect.sort_unstable();
+        match radix_sort_batches_values(&batches, true).expect("radix accepts i64") {
+            ColumnData::Int64(v) => assert_eq!(v, expect),
+            _ => panic!("wrong variant"),
+        }
+
+        // Values differing only in bytes 0 and 2, byte 1 constant across
+        // all keys, exercises the intermediate constant-byte pass skip
+        let vals: Vec<i64> = (0..600).map(|i| ((i * 37) % 251) * 0x1_0000 + (i % 13)).collect();
+        let batches = vec![Column::new(ColumnData::Int64(vals.clone()), TypeId::Int64)];
+        let mut expect = vals.clone();
+        expect.sort_unstable();
+        match radix_sort_batches_values(&batches, true).expect("radix accepts i64") {
+            ColumnData::Int64(v) => assert_eq!(v, expect),
+            _ => panic!("wrong variant"),
+        }
+
+        // All keys equal, the zero-pass branch must reproduce the input
+        let vals: Vec<i64> = vec![42; 600];
+        let batches = vec![Column::new(ColumnData::Int64(vals.clone()), TypeId::Int64)];
+        match radix_sort_batches_values(&batches, false).expect("radix accepts i64") {
+            ColumnData::Int64(v) => assert_eq!(v, vals),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn values_sort_declines_small_inputs_nulls_and_non_integers() {
+        let small = vec![Column::new(ColumnData::Int64(vec![3, 1, 2]), TypeId::Int64)];
+        assert!(radix_sort_batches_values(&small, true).is_none());
+
+        let mut with_null = Column::new(ColumnData::Int64(vec![0; 600]), TypeId::Int64);
+        with_null.nulls = NullBitmap::none(600);
+        with_null.nulls.set_null(5);
+        assert!(radix_sort_batches_values(&[with_null], true).is_none());
+
+        let floats = vec![Column::new(ColumnData::Float64(vec![0.0; 600]), TypeId::Float64)];
+        assert!(radix_sort_batches_values(&floats, true).is_none());
+    }
+
+    #[test]
+    fn pair_sort_returns_matching_indices_values_and_stable_order() {
+        let mut state = 0xDEADBEEFCAFEF00Du64;
+        // Duplicate-heavy keys so stability is observable
+        let lens = [400usize, 311];
+        let mut batches: Vec<Column> = Vec::new();
+        let mut concat: Vec<i64> = Vec::new();
+        for len in lens {
+            let vals: Vec<i64> = (0..len).map(|_| (lcg(&mut state) % 50) as i64 - 25).collect();
+            concat.extend_from_slice(&vals);
+            batches.push(Column::new(ColumnData::Int64(vals), TypeId::Int64));
+        }
+        for asc in [true, false] {
+            let (indices, sorted) =
+                radix_sort_column_batches(&batches, asc).expect("radix accepts i64");
+            let sorted = match sorted {
+                ColumnData::Int64(v) => v,
+                _ => panic!("wrong variant"),
+            };
+            let mut expect = concat.clone();
+            expect.sort_unstable();
+            if !asc {
+                expect.reverse();
+            }
+            assert_eq!(sorted, expect);
+            // Indices permute the concatenated input onto the sorted values
+            assert_eq!(indices.len(), concat.len());
+            for (pos, &idx) in indices.iter().enumerate() {
+                assert_eq!(concat[idx as usize], sorted[pos]);
+            }
+            // LSD radix is stable, equal keys keep their original order
+            for w in indices.windows(2) {
+                if concat[w[0] as usize] == concat[w[1] as usize] {
+                    assert!(w[0] < w[1], "equal keys reordered: {} then {}", w[0], w[1]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sort_indices_radix_path_orders_negatives_correctly() {
+        let vals: Vec<i64> = (0..500).map(|i| 250 - i as i64).collect();
+        let col = Column::new(ColumnData::Int64(vals.clone()), TypeId::Int64);
+        let indices = sort_indices(&[&col], &[true], &[false], vals.len());
+        let ordered: Vec<i64> = indices.iter().map(|&i| vals[i as usize]).collect();
+        let mut expect = vals.clone();
+        expect.sort_unstable();
+        assert_eq!(ordered, expect);
     }
 }

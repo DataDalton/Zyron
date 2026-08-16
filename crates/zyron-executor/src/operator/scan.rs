@@ -282,7 +282,8 @@ impl Operator for SeqScanOperator {
                     continue;
                 }
 
-                let page = HeapPage::from_bytes(page_data);
+                // Tuple views borrow straight from the stack copy, no boxed
+                // HeapPage and no second 8KB move per page
                 let slot_count = header.slot_count;
                 let mut slot_idx = self.slot_cursor;
                 let mut filled_batch = false;
@@ -290,7 +291,8 @@ impl Operator for SeqScanOperator {
                 while slot_idx < slot_count {
                     let slot_id = zyron_storage::SlotId(slot_idx);
                     slot_idx += 1;
-                    let Some(tuple) = page.get_tuple_view(slot_id) else {
+                    let Some(tuple) = HeapPage::get_tuple_view_from_slice(&page_data, slot_id)
+                    else {
                         continue;
                     };
                     if tuple.is_deleted() {
@@ -600,7 +602,8 @@ impl<'a> PageRangeScanner<'a> {
                     continue;
                 }
 
-                let page = HeapPage::from_bytes(page_data);
+                // Tuple views borrow straight from the stack copy, no boxed
+                // HeapPage and no second 8KB move per page
                 let slot_count = header.slot_count;
                 let mut slot_idx = self.slot_cursor;
                 let mut filled_batch = false;
@@ -608,7 +611,8 @@ impl<'a> PageRangeScanner<'a> {
                 while slot_idx < slot_count {
                     let slot_id = zyron_storage::SlotId(slot_idx);
                     slot_idx += 1;
-                    let Some(tuple) = page.get_tuple_view(slot_id) else {
+                    let Some(tuple) = HeapPage::get_tuple_view_from_slice(&page_data, slot_id)
+                    else {
                         continue;
                     };
                     if tuple.is_deleted() {
@@ -727,10 +731,16 @@ struct ScanBounds {
 /// Returns None for types that cannot be used as index keys.
 fn literal_to_key_bytes(value: &LiteralValue) -> Option<Vec<u8>> {
     match value {
-        LiteralValue::Integer(v) => Some((*v as u64).to_be_bytes().to_vec()),
+        // Sign bit flipped to match the indexer, so negatives order below
+        // positives under the tree's unsigned bytewise comparison
+        LiteralValue::Integer(v) => Some(((*v as u64) ^ (1u64 << 63)).to_be_bytes().to_vec()),
         // Matches the sixteen byte key the indexer writes for a 128 bit
-        // value, sign bit flipped so negatives order below positives
+        // value, same sign bit flip at the wider width
         LiteralValue::Int128(v) => Some(((*v as u128) ^ (1u128 << 127)).to_be_bytes().to_vec()),
+        // A decimal index key is scaled to the column's scale, which this
+        // literal's own scale need not match, so no key is offered and the
+        // predicate is answered by the scan filter instead
+        LiteralValue::Decimal { .. } => None,
         LiteralValue::Float(v) => {
             // IEEE 754 float-to-sortable-bytes encoding.
             let bits = v.to_bits();
@@ -744,7 +754,9 @@ fn literal_to_key_bytes(value: &LiteralValue) -> Option<Vec<u8>> {
         LiteralValue::String(s) => Some(s.as_bytes().to_vec()),
         LiteralValue::Boolean(b) => Some(vec![*b as u8]),
         LiteralValue::Null => None,
-        LiteralValue::Interval(i) => Some(i.to_le_bytes().to_vec()),
+        // Interval has no order-preserving fixed encoding, so no bound is
+        // built and CREATE INDEX refuses interval key columns
+        LiteralValue::Interval(_) => None,
     }
 }
 
@@ -1004,10 +1016,11 @@ fn scalar_to_key_bytes(value: &ScalarValue, column_ty: Option<TypeId>) -> Option
     match value {
         ScalarValue::Null => None,
         ScalarValue::Boolean(b) => Some(vec![*b as u8]),
-        ScalarValue::Int8(v) => Some((*v as i64 as u64).to_be_bytes().to_vec()),
-        ScalarValue::Int16(v) => Some((*v as i64 as u64).to_be_bytes().to_vec()),
-        ScalarValue::Int32(v) => Some((*v as i64 as u64).to_be_bytes().to_vec()),
-        ScalarValue::Int64(v) => Some((*v as u64).to_be_bytes().to_vec()),
+        // Sign bit flipped to match the indexer's order-preserving layout
+        ScalarValue::Int8(v) => Some(((*v as i64 as u64) ^ (1u64 << 63)).to_be_bytes().to_vec()),
+        ScalarValue::Int16(v) => Some(((*v as i64 as u64) ^ (1u64 << 63)).to_be_bytes().to_vec()),
+        ScalarValue::Int32(v) => Some(((*v as i64 as u64) ^ (1u64 << 63)).to_be_bytes().to_vec()),
+        ScalarValue::Int64(v) => Some(((*v as u64) ^ (1u64 << 63)).to_be_bytes().to_vec()),
         ScalarValue::Int128(v) => {
             let key = (*v as u128) ^ (1u128 << 127);
             Some(key.to_be_bytes().to_vec())
@@ -1037,7 +1050,9 @@ fn scalar_to_key_bytes(value: &ScalarValue, column_ty: Option<TypeId>) -> Option
         ScalarValue::Utf8(s) => Some(s.as_bytes().to_vec()),
         ScalarValue::Binary(b) => Some(b.clone()),
         ScalarValue::FixedBinary16(b) => Some(b.to_vec()),
-        ScalarValue::Interval(i) => Some(i.to_le_bytes().to_vec()),
+        // Interval has no order-preserving fixed encoding, so no bound is
+        // built and CREATE INDEX refuses interval key columns
+        ScalarValue::Interval(_) => None,
     }
 }
 
@@ -1051,7 +1066,7 @@ fn coerce_text_to_key_bytes(text: &str, ty: TypeId) -> Option<Vec<u8>> {
             .trim()
             .parse::<i64>()
             .ok()
-            .map(|v| (v as u64).to_be_bytes().to_vec()),
+            .map(|v| ((v as u64) ^ (1u64 << 63)).to_be_bytes().to_vec()),
         TypeId::UInt8 | TypeId::UInt16 | TypeId::UInt32 | TypeId::UInt64 => text
             .trim()
             .parse::<u64>()

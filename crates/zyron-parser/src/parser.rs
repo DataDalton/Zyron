@@ -2431,10 +2431,25 @@ impl<'a> Parser<'a> {
     fn parse_optional_precision_scale(&mut self) -> Result<(Option<u8>, Option<u8>)> {
         if self.at_token(&Token::LParen) {
             self.advance()?;
-            let precision = self.parse_integer_value()? as u8;
+            // An i128 holds at most 38 decimal digits, so precision and
+            // scale are bounded here rather than truncated modulo 256 by
+            // the cast below
+            let precision_raw = self.parse_integer_value()?;
+            if !(1..=38).contains(&precision_raw) {
+                return Err(self.error(&format!(
+                    "DECIMAL precision {precision_raw} is out of range, expected 1 to 38"
+                )));
+            }
+            let precision = precision_raw as u8;
             let scale = if self.at_token(&Token::Comma) {
                 self.advance()?;
-                Some(self.parse_integer_value()? as u8)
+                let scale_raw = self.parse_integer_value()?;
+                if scale_raw < 0 || scale_raw > precision_raw {
+                    return Err(self.error(&format!(
+                        "DECIMAL scale {scale_raw} is out of range, expected 0 to the precision {precision_raw}"
+                    )));
+                }
+                Some(scale_raw as u8)
             } else {
                 None
             };
@@ -2588,6 +2603,11 @@ impl<'a> Parser<'a> {
                 let val = *f;
                 self.advance()?;
                 Ok(Expr::Literal(LiteralValue::Float(val)))
+            }
+            Token::Decimal(digits, scale) => {
+                let (digits, scale) = (*digits, *scale);
+                self.advance()?;
+                Ok(Expr::Literal(LiteralValue::Decimal { digits, scale }))
             }
             Token::String(s) => {
                 let val = s.clone();
@@ -2782,6 +2802,15 @@ impl<'a> Parser<'a> {
                         })?
                     };
                     return Ok(Expr::Literal(LiteralValue::Int128(val)));
+                }
+                // A negated wide decimal folds the same way. Its digits fit
+                // 38 places, so the negation always fits i128
+                if let Token::Decimal(digits, scale) = self.current.token {
+                    self.advance()?;
+                    return Ok(Expr::Literal(LiteralValue::Decimal {
+                        digits: -digits,
+                        scale,
+                    }));
                 }
                 let expr = self.parse_expr_bp(15)?;
                 Ok(Expr::UnaryOp {

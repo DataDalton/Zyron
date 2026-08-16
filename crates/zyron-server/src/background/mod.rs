@@ -139,6 +139,7 @@ impl BackgroundWorkers {
             catalog.clone(),
             disk_manager.clone(),
             buffer_pool.clone(),
+            table_io_stats.clone(),
             stats_config,
         );
 
@@ -169,6 +170,7 @@ impl BackgroundWorkers {
             compaction_config,
             doc_registry,
             Arc::clone(&btree_indexes),
+            table_io_stats.clone(),
         );
         let vacuum = VacuumWorker::start(
             catalog,
@@ -239,6 +241,13 @@ impl BackgroundWorkers {
     /// Returns the follower's counters, None off the lake tier
     pub fn lake_follower_stats(&self) -> Option<Arc<self::lake_follower::LakeFollowerStats>> {
         self.lake_follower.as_ref().map(|w| Arc::clone(w.stats()))
+    }
+
+    /// Hands the retention worker the server state once it exists, which
+    /// enables its age-tiering pass. The workers start before the state is
+    /// built, so this arrives late by construction
+    pub fn attach_server_state(&self, state: Arc<zyron_wire::connection::ServerState>) {
+        self.retention.install_server_state(state);
     }
 
     /// Attaches the Adaptive Clustering worker. Returns without starting a

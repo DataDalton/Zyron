@@ -731,6 +731,9 @@ fn expr_to_sql(expr: &Expr) -> String {
             LiteralValue::Boolean(false) => "FALSE".to_string(),
             LiteralValue::Null => "NULL".to_string(),
             LiteralValue::Interval(i) => format!("INTERVAL '{}'", i),
+            LiteralValue::Decimal { digits, scale } => {
+                zyron_common::format_decimal(*digits, *scale)
+            }
         },
         Expr::BinaryOp { left, op, right } => {
             let op_str = match op {

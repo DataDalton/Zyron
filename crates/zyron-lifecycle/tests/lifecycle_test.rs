@@ -6,7 +6,7 @@ use zyron_lifecycle::classification::{
 use zyron_lifecycle::compliance::{RetentionRequirement, validate_retention};
 use zyron_lifecycle::legal_hold::{CompiledHold, HoldPredicateEvaluator, LegalHoldRegistry};
 use zyron_lifecycle::scheduling::CleanupGovernor;
-use zyron_lifecycle::tiered_storage::{StorageTier, TierCache, should_rehydrate};
+use zyron_lifecycle::tiered_storage::StorageTier;
 use zyron_lifecycle::ttl::{TtlMode, is_expired};
 
 #[test]
@@ -108,17 +108,6 @@ fn tier_cost_multiplier_increases_with_coldness() {
     assert!(StorageTier::Cold.cost_multiplier() < StorageTier::Archive.cost_multiplier());
     assert_eq!(StorageTier::parse("cold").unwrap(), StorageTier::Cold);
     assert!(StorageTier::parse("frozen").is_err());
-}
-
-#[test]
-fn tier_cache_tracks_hits_and_rehydration() {
-    let c = TierCache::new(8);
-    c.put(1, 2, vec![9, 9, 9]);
-    assert_eq!(c.get(1, 2).map(|b| b.len()), Some(3));
-    assert!(c.hit_count(1, 2) >= 2);
-    assert!(should_rehydrate(c.hit_count(1, 2), 1));
-    c.invalidate(1, 2);
-    assert!(c.get(1, 2).is_none());
 }
 
 #[test]

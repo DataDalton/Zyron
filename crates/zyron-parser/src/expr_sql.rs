@@ -17,6 +17,10 @@ pub fn expr_to_sql(e: &Expr) -> String {
         Expr::Identifier(n) => n.clone(),
         Expr::QualifiedIdentifier { table, column } => format!("{table}.{column}"),
         Expr::Literal(L::Integer(i)) => i.to_string(),
+        Expr::Literal(L::Int128(i)) => i.to_string(),
+        Expr::Literal(L::Decimal { digits, scale }) => {
+            zyron_common::format_decimal(*digits, *scale)
+        }
         Expr::Literal(L::Float(f)) => f.to_string(),
         Expr::Literal(L::String(s)) => format!("'{}'", s.replace('\'', "''")),
         Expr::Literal(L::Boolean(b)) => b.to_string(),

@@ -1285,13 +1285,18 @@ async fn test_bench_planner_performance() {
     for run in 0..VALIDATION_RUNS {
         tprintln!("\n--- Run {}/{} ---", run + 1, VALIDATION_RUNS);
 
-        // Binding latency
+        // Binding latency. Parsing and resolver construction are setup,
+        // not binding: parsing inside the loop timed the parser, and a
+        // per-iteration resolver threw away its schema-id cache, so the
+        // loop paid the exact cold lookup the resolver exists to avoid.
+        // One binder binds a pre-parsed statement per iteration, each bind
+        // opening its own BindContext exactly as production does
         let iterations = 1000;
+        let parsed: Vec<_> = (0..iterations).map(|_| parse_sql(bind_sql_str)).collect();
+        let resolver = catalog.resolver(DatabaseId(1), vec!["planner_test".to_string()]);
+        let mut binder = Binder::new(resolver, &catalog);
         let start = Instant::now();
-        for _ in 0..iterations {
-            let stmt = parse_sql(bind_sql_str);
-            let resolver = catalog.resolver(DatabaseId(1), vec!["planner_test".to_string()]);
-            let mut binder = Binder::new(resolver, &catalog);
+        for stmt in parsed {
             let _ = binder.bind(stmt).await.unwrap();
         }
         let binding_us = start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64;

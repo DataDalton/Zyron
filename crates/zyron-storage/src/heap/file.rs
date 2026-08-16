@@ -628,6 +628,12 @@ impl HeapFile {
     /// Returns a guard that holds pinned pages. Use `.iter()` to iterate
     /// over tuples as borrowed `TupleView` references. Pages are automatically
     /// unpinned when the guard is dropped.
+    ///
+    /// A page the pool evicted is read back from disk and re-installed
+    /// pinned. Without that, an evicted page's rows silently vanished from
+    /// the scan, so any whole-heap read under memory pressure lost rows.
+    /// When the pool cannot take another frame, the guard carries the
+    /// page's bytes itself, so the scan is complete either way.
     pub fn scan(&self) -> Result<ScanGuard<'_>> {
         let num_pages = self.heap_page_count();
         let file_id = self.config.heap_file_id;
@@ -636,12 +642,78 @@ impl HeapFile {
             .map(|n| PageId::new(file_id, n as u64))
             .collect();
 
-        self.pool.batch_pin(&page_ids);
-
-        Ok(ScanGuard {
+        let resident = self.pool.batch_pin(&page_ids);
+        // The guard exists from here on so an error below unpins what was
+        // already pinned instead of leaking the pins
+        let mut guard = ScanGuard {
             pool: &self.pool,
-            page_ids,
-        })
+            page_ids: Vec::with_capacity(page_ids.len()),
+            owned: Vec::new(),
+        };
+        for (i, &pid) in page_ids.iter().enumerate() {
+            if resident[i] {
+                guard.page_ids.push(pid);
+                continue;
+            }
+            let data = self.read_page_from_disk_sync(pid)?;
+            match self.pool.load_page(pid, data.as_ref()) {
+                Ok((_, evicted)) => {
+                    if let Some(ev) = evicted {
+                        self.write_page_to_disk_sync(ev.page_id, ev.data.as_ref())?;
+                    }
+                    guard.page_ids.push(pid);
+                }
+                Err(ZyronError::BufferPoolFull) => guard.owned.push((pid, data)),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(guard)
+    }
+
+    /// Reads one page's bytes straight from its data file, for the scan
+    /// path that runs without an async context. A page past the file's
+    /// current end reads as zeroes, which decodes as an empty page, the
+    /// same answer the async read gives for a never-flushed page
+    fn read_page_from_disk_sync(&self, page_id: PageId) -> Result<Box<[u8; PAGE_SIZE]>> {
+        let path = self
+            .disk
+            .data_dir()
+            .join(format!("{:08}.dat", page_id.file_id));
+        let mut buf: Box<[u8; PAGE_SIZE]> = Box::new([0u8; PAGE_SIZE]);
+        let mut file = std::fs::File::open(&path)
+            .map_err(|e| ZyronError::IoError(format!("scan open {}: {}", path.display(), e)))?;
+        let offset = page_id.page_num * (PAGE_SIZE as u64);
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset))
+            .map_err(|e| ZyronError::IoError(format!("scan seek: {}", e)))?;
+        let mut read = 0usize;
+        while read < PAGE_SIZE {
+            match std::io::Read::read(&mut file, &mut buf[read..]) {
+                Ok(0) => break,
+                Ok(n) => read += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(ZyronError::IoError(format!("scan read: {}", e))),
+            }
+        }
+        Ok(buf)
+    }
+
+    /// Writes one page's bytes straight to its data file, for the scan
+    /// path's dirty evictions
+    fn write_page_to_disk_sync(&self, page_id: PageId, data: &[u8]) -> Result<()> {
+        let path = self
+            .disk
+            .data_dir()
+            .join(format!("{:08}.dat", page_id.file_id));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(|e| ZyronError::IoError(format!("scan flush open {}: {}", path.display(), e)))?;
+        let offset = page_id.page_num * (PAGE_SIZE as u64);
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset))
+            .map_err(|e| ZyronError::IoError(format!("scan flush seek: {}", e)))?;
+        std::io::Write::write_all(&mut file, data)
+            .map_err(|e| ZyronError::IoError(format!("scan flush write: {}", e)))?;
+        Ok(())
     }
 
     /// Returns the number of pages in the heap file.
@@ -999,11 +1071,15 @@ impl HeapFile {
 /// borrowing of tuple data directly from page buffers.
 pub struct ScanGuard<'a> {
     pool: &'a BufferPool,
+    /// Pages pinned in the pool for the guard's lifetime, unpinned on drop
     page_ids: Vec<PageId>,
+    /// Pages the pool had no frame for, carried as owned copies so the
+    /// scan still serves their rows
+    owned: Vec<(PageId, Box<[u8; PAGE_SIZE]>)>,
 }
 
 impl<'a> ScanGuard<'a> {
-    /// Returns the list of page IDs held by this scan guard.
+    /// Returns the list of pool-pinned page IDs held by this scan guard.
     #[inline]
     pub fn page_ids(&self) -> &[PageId] {
         &self.page_ids
@@ -1016,53 +1092,15 @@ impl<'a> ScanGuard<'a> {
     where
         F: FnMut(TupleId, TupleView<'_>),
     {
-        let max_slots = (PAGE_SIZE - DATA_START) / TUPLE_SLOT_SIZE;
         for &page_id in &self.page_ids {
             if let Some(p) = unsafe { self.pool.frame_data_ptr(page_id) } {
                 // Safety: page is pinned and frame_data_ptr returned valid pointer
                 let data = unsafe { &*p };
-                let raw_slot_count =
-                    u16::from_le_bytes([data[HEAP_HEADER_OFFSET], data[HEAP_HEADER_OFFSET + 1]])
-                        as usize;
-                // Cap slot_count to prevent out-of-bounds reads from corrupt page headers.
-                let slot_count = raw_slot_count.min(max_slots);
-
-                for i in 0..slot_count {
-                    // Safety: slot_base is within page bounds (slot_count from page header)
-                    let slot_base = DATA_START + i * TUPLE_SLOT_SIZE;
-                    let tuple_length = unsafe {
-                        u16::from_le_bytes([
-                            *data.get_unchecked(slot_base + 2),
-                            *data.get_unchecked(slot_base + 3),
-                        ])
-                    } as usize;
-
-                    if tuple_length == 0 {
-                        continue;
-                    }
-
-                    let tuple_offset = unsafe {
-                        u16::from_le_bytes([
-                            *data.get_unchecked(slot_base),
-                            *data.get_unchecked(slot_base + 1),
-                        ])
-                    } as usize;
-
-                    // Safety: tuple_offset validated by page format, header fits in page
-                    let header = unsafe {
-                        TupleHeader::from_bytes_unchecked(
-                            &data[tuple_offset..tuple_offset + TUPLE_HEADER_SIZE],
-                        )
-                    };
-                    let data_start = tuple_offset + TUPLE_HEADER_SIZE;
-                    let data_end = data_start + header.data_len as usize;
-
-                    f(
-                        TupleId::new(page_id, i as u16),
-                        TupleView::new(header, &data[data_start..data_end]),
-                    );
-                }
+                for_each_tuple_in_page(page_id, data, &mut f);
             }
+        }
+        for (page_id, data) in &self.owned {
+            for_each_tuple_in_page(*page_id, data, &mut f);
         }
     }
 
@@ -1074,50 +1112,17 @@ impl<'a> ScanGuard<'a> {
     where
         F: FnMut(TupleId, TupleView<'_>) -> bool,
     {
-        let max_slots = (PAGE_SIZE - DATA_START) / TUPLE_SLOT_SIZE;
         for &page_id in &self.page_ids {
             if let Some(p) = unsafe { self.pool.frame_data_ptr(page_id) } {
                 let data = unsafe { &*p };
-                let raw_slot_count =
-                    u16::from_le_bytes([data[HEAP_HEADER_OFFSET], data[HEAP_HEADER_OFFSET + 1]])
-                        as usize;
-                let slot_count = raw_slot_count.min(max_slots);
-
-                for i in 0..slot_count {
-                    let slot_base = DATA_START + i * TUPLE_SLOT_SIZE;
-                    let tuple_length = unsafe {
-                        u16::from_le_bytes([
-                            *data.get_unchecked(slot_base + 2),
-                            *data.get_unchecked(slot_base + 3),
-                        ])
-                    } as usize;
-
-                    if tuple_length == 0 {
-                        continue;
-                    }
-
-                    let tuple_offset = unsafe {
-                        u16::from_le_bytes([
-                            *data.get_unchecked(slot_base),
-                            *data.get_unchecked(slot_base + 1),
-                        ])
-                    } as usize;
-
-                    let header = unsafe {
-                        TupleHeader::from_bytes_unchecked(
-                            &data[tuple_offset..tuple_offset + TUPLE_HEADER_SIZE],
-                        )
-                    };
-                    let data_start = tuple_offset + TUPLE_HEADER_SIZE;
-                    let data_end = data_start + header.data_len as usize;
-
-                    if !f(
-                        TupleId::new(page_id, i as u16),
-                        TupleView::new(header, &data[data_start..data_end]),
-                    ) {
-                        return;
-                    }
+                if !try_for_each_tuple_in_page(page_id, data, &mut f) {
+                    return;
                 }
+            }
+        }
+        for (page_id, data) in &self.owned {
+            if !try_for_each_tuple_in_page(*page_id, data, &mut f) {
+                return;
             }
         }
     }
@@ -1125,32 +1130,105 @@ impl<'a> ScanGuard<'a> {
     /// Fast tuple count without constructing TupleView for each tuple.
     #[inline]
     pub fn count(&self) -> usize {
-        let max_slots = (PAGE_SIZE - DATA_START) / TUPLE_SLOT_SIZE;
         let mut total = 0;
         for &page_id in &self.page_ids {
             if let Some(p) = unsafe { self.pool.frame_data_ptr(page_id) } {
                 let data = unsafe { &*p };
-                let raw_slot_count =
-                    u16::from_le_bytes([data[HEAP_HEADER_OFFSET], data[HEAP_HEADER_OFFSET + 1]])
-                        as usize;
-                let slot_count = raw_slot_count.min(max_slots);
-
-                for i in 0..slot_count {
-                    let slot_base = DATA_START + i * TUPLE_SLOT_SIZE;
-                    let tuple_length = unsafe {
-                        u16::from_le_bytes([
-                            *data.get_unchecked(slot_base + 2),
-                            *data.get_unchecked(slot_base + 3),
-                        ])
-                    } as usize;
-                    if tuple_length != 0 {
-                        total += 1;
-                    }
-                }
+                total += count_tuples_in_page(data);
             }
+        }
+        for (_, data) in &self.owned {
+            total += count_tuples_in_page(data.as_ref());
         }
         total
     }
+}
+
+/// Applies `f` to every live tuple of one page image.
+/// Uses raw pointer access and unchecked indexing for maximum throughput
+#[inline]
+fn for_each_tuple_in_page<F>(page_id: PageId, data: &[u8; PAGE_SIZE], f: &mut F)
+where
+    F: FnMut(TupleId, TupleView<'_>),
+{
+    try_for_each_tuple_in_page(page_id, data, &mut |tid, view| {
+        f(tid, view);
+        true
+    });
+}
+
+/// Applies `f` to every live tuple of one page image until it returns
+/// false. Returns false when the callback stopped the iteration
+#[inline]
+fn try_for_each_tuple_in_page<F>(page_id: PageId, data: &[u8; PAGE_SIZE], f: &mut F) -> bool
+where
+    F: FnMut(TupleId, TupleView<'_>) -> bool,
+{
+    let max_slots = (PAGE_SIZE - DATA_START) / TUPLE_SLOT_SIZE;
+    let raw_slot_count =
+        u16::from_le_bytes([data[HEAP_HEADER_OFFSET], data[HEAP_HEADER_OFFSET + 1]]) as usize;
+    // Cap slot_count to prevent out-of-bounds reads from corrupt page headers
+    let slot_count = raw_slot_count.min(max_slots);
+
+    for i in 0..slot_count {
+        // Safety: slot_base is within page bounds (slot_count from page header)
+        let slot_base = DATA_START + i * TUPLE_SLOT_SIZE;
+        let tuple_length = unsafe {
+            u16::from_le_bytes([
+                *data.get_unchecked(slot_base + 2),
+                *data.get_unchecked(slot_base + 3),
+            ])
+        } as usize;
+
+        if tuple_length == 0 {
+            continue;
+        }
+
+        let tuple_offset = unsafe {
+            u16::from_le_bytes([
+                *data.get_unchecked(slot_base),
+                *data.get_unchecked(slot_base + 1),
+            ])
+        } as usize;
+
+        // Safety: tuple_offset validated by page format, header fits in page
+        let header = unsafe {
+            TupleHeader::from_bytes_unchecked(&data[tuple_offset..tuple_offset + TUPLE_HEADER_SIZE])
+        };
+        let data_start = tuple_offset + TUPLE_HEADER_SIZE;
+        let data_end = data_start + header.data_len as usize;
+
+        if !f(
+            TupleId::new(page_id, i as u16),
+            TupleView::new(header, &data[data_start..data_end]),
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Live tuples in one page image, from the slot directory alone
+#[inline]
+fn count_tuples_in_page(data: &[u8; PAGE_SIZE]) -> usize {
+    let max_slots = (PAGE_SIZE - DATA_START) / TUPLE_SLOT_SIZE;
+    let raw_slot_count =
+        u16::from_le_bytes([data[HEAP_HEADER_OFFSET], data[HEAP_HEADER_OFFSET + 1]]) as usize;
+    let slot_count = raw_slot_count.min(max_slots);
+    let mut total = 0;
+    for i in 0..slot_count {
+        let slot_base = DATA_START + i * TUPLE_SLOT_SIZE;
+        let tuple_length = unsafe {
+            u16::from_le_bytes([
+                *data.get_unchecked(slot_base + 2),
+                *data.get_unchecked(slot_base + 3),
+            ])
+        } as usize;
+        if tuple_length != 0 {
+            total += 1;
+        }
+    }
+    total
 }
 
 impl Drop for ScanGuard<'_> {
@@ -1184,6 +1262,45 @@ mod tests {
         let (heap, _dir) = create_test_heap().await;
         assert_eq!(heap.heap_file_id(), 0);
         assert_eq!(heap.fsm_file_id(), 1);
+    }
+
+    /// A pool smaller than the heap forces evictions, and the scan must
+    /// read the missing pages back rather than skipping their rows. This
+    /// needs no concurrency: filling the heap past the pool evicts pages,
+    /// and the very next scan used to lose their tuples.
+    #[tokio::test]
+    async fn test_scan_serves_rows_from_evicted_pages() {
+        let dir = tempdir().unwrap();
+        let config = DiskManagerConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync_enabled: false,
+        };
+        let disk = Arc::new(DiskManager::new(config).await.unwrap());
+        let pool = Arc::new(BufferPool::new(BufferPoolConfig { num_frames: 8 }));
+        let heap = HeapFile::with_defaults(disk, pool).unwrap();
+
+        // ~1.5KB tuples, a handful per 16KB page, spread over far more
+        // pages than the pool has frames
+        let mut inserted = 0usize;
+        for _ in 0..20 {
+            let tuples: Vec<Tuple> = (0..10).map(|_| Tuple::new(vec![7u8; 1500], 1)).collect();
+            heap.insert_batch(&tuples).await.unwrap();
+            inserted += 10;
+        }
+
+        let guard = heap.scan().unwrap();
+        assert_eq!(
+            guard.count(),
+            inserted,
+            "every inserted row is served, resident or evicted"
+        );
+
+        let mut seen = 0usize;
+        guard.for_each(|_, view| {
+            assert_eq!(view.data[0], 7u8);
+            seen += 1;
+        });
+        assert_eq!(seen, inserted);
     }
 
     #[tokio::test]

@@ -398,32 +398,45 @@ fn pack_value(packed: &mut [u8], bit_offset: u64, value: u64, bit_width: u8) {
     }
 }
 
-/// Unpacks a value from the given bit offset in the packed array.
+/// Unpacks a value from the given bit offset in the packed array. Every
+/// row but the last few sits over a full 8 byte window, read as one
+/// unaligned word plus a guarded spill byte. The variable-length copy
+/// only runs on the array's tail bytes
 #[inline]
 fn unpack_value(packed: &[u8], bit_offset: u64, bit_width: u8) -> u64 {
     let byteIdx = (bit_offset / 8) as usize;
     let bitIdx = (bit_offset % 8) as u32;
-
-    let mut buf = [0u8; 9];
-    let available = packed.len().saturating_sub(byteIdx).min(9);
-    buf[..available].copy_from_slice(&packed[byteIdx..byteIdx + available]);
-
-    let lo = u64::from_le_bytes([
-        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-    ]);
-    let val = lo >> bitIdx;
-
     let mask = if bit_width >= 64 {
         u64::MAX
     } else {
         (1u64 << bit_width) - 1
     };
+    let needsSpill = bitIdx + bit_width as u32 > 64;
 
-    if bitIdx + bit_width as u32 > 64 {
-        let hiBits = (buf[8] as u64) << (64 - bitIdx);
-        (val | hiBits) & mask
+    if byteIdx + 8 <= packed.len() {
+        let mut w = [0u8; 8];
+        w.copy_from_slice(&packed[byteIdx..byteIdx + 8]);
+        let val = u64::from_le_bytes(w) >> bitIdx;
+        if needsSpill {
+            let hi = *packed.get(byteIdx + 8).unwrap_or(&0) as u64;
+            (val | (hi << (64 - bitIdx))) & mask
+        } else {
+            val & mask
+        }
     } else {
-        val & mask
+        let mut buf = [0u8; 9];
+        let available = packed.len().saturating_sub(byteIdx).min(9);
+        buf[..available].copy_from_slice(&packed[byteIdx..byteIdx + available]);
+        let lo = u64::from_le_bytes([
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        ]);
+        let val = lo >> bitIdx;
+        if needsSpill {
+            let hiBits = (buf[8] as u64) << (64 - bitIdx);
+            (val | hiBits) & mask
+        } else {
+            val & mask
+        }
     }
 }
 

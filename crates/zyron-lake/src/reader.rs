@@ -452,9 +452,14 @@ impl LakeFileReader {
             predicates.push(&del.predicate);
         }
         let columns = self.read_predicate_columns(schema, &predicates)?;
+        // Compiled once per file, the row loop resolves no column ids
+        let compiled: Vec<CompiledPredicate> = predicates
+            .iter()
+            .map(|p| CompiledPredicate::new(p, &columns))
+            .collect();
         for row in 0..self.row_count {
-            for pred in &predicates {
-                if evaluate_row(pred, &columns, row) == Some(true) {
+            for pred in &compiled {
+                if pred.evaluate(&columns, row) == Some(true) {
                     keep[row / 8] &= !(1 << (row % 8));
                     break;
                 }
@@ -474,14 +479,57 @@ fn trim_mask_tail(mask: &mut [u8], row_count: usize) {
     }
 }
 
-/// Three-valued predicate evaluation over one row. None is unknown, the
-/// SQL outcome of any comparison touching NULL. Columns the slice does
-/// not carry read as NULL
-pub fn evaluate_row(
-    predicate: &LakePredicate,
-    columns: &[DecodedColumn],
-    row: usize,
-) -> Option<bool> {
+/// A predicate resolved once against a decoded column slice. Column ids
+/// became direct indices and NULL-literal comparisons collapsed to a
+/// constant, so the per-row walk searches and re-inspects nothing. A
+/// column absent from the slice keeps index None and reads as NULL,
+/// matching `evaluate_row`
+pub struct CompiledPredicate<'a> {
+    node: CompiledNode<'a>,
+}
+
+enum CompiledNode<'a> {
+    /// A comparison against a NULL literal, unknown for every row
+    Unknown,
+    Compare {
+        col: Option<usize>,
+        op: CompareOp,
+        value: &'a LakeValue,
+    },
+    IsNull {
+        col: Option<usize>,
+    },
+    IsNotNull {
+        col: Option<usize>,
+    },
+    In {
+        col: Option<usize>,
+        values: &'a [LakeValue],
+    },
+    And(Vec<CompiledNode<'a>>),
+    Or(Vec<CompiledNode<'a>>),
+    Not(Box<CompiledNode<'a>>),
+}
+
+impl<'a> CompiledPredicate<'a> {
+    /// Resolves every column reference in the predicate to its index in
+    /// `columns`. Callers that evaluate many rows compile once and reuse
+    pub fn new(predicate: &'a LakePredicate, columns: &[DecodedColumn]) -> Self {
+        Self {
+            node: compile_node(predicate, columns),
+        }
+    }
+
+    /// Three-valued evaluation of one row. None is unknown, the SQL
+    /// outcome of any comparison touching NULL. `columns` must be the
+    /// slice this predicate was compiled against
+    pub fn evaluate(&self, columns: &[DecodedColumn], row: usize) -> Option<bool> {
+        evaluate_node(&self.node, columns, row)
+    }
+}
+
+fn compile_node<'a>(predicate: &'a LakePredicate, columns: &[DecodedColumn]) -> CompiledNode<'a> {
+    let find = |id: u32| columns.iter().position(|c| c.column_id == id);
     match predicate {
         LakePredicate::Compare {
             column_id,
@@ -489,11 +537,42 @@ pub fn evaluate_row(
             value,
         } => {
             if matches!(value, LakeValue::Null) {
-                return None;
+                CompiledNode::Unknown
+            } else {
+                CompiledNode::Compare {
+                    col: find(*column_id),
+                    op: *op,
+                    value,
+                }
             }
-            let cell = column_cell(columns, *column_id, row)?;
-            let physical = column_physical(columns, *column_id)?;
-            let ord = compare_cell_to_value(physical, cell, value)?;
+        }
+        LakePredicate::IsNull { column_id } => CompiledNode::IsNull {
+            col: find(*column_id),
+        },
+        LakePredicate::IsNotNull { column_id } => CompiledNode::IsNotNull {
+            col: find(*column_id),
+        },
+        LakePredicate::In { column_id, values } => CompiledNode::In {
+            col: find(*column_id),
+            values,
+        },
+        LakePredicate::And(children) => {
+            CompiledNode::And(children.iter().map(|c| compile_node(c, columns)).collect())
+        }
+        LakePredicate::Or(children) => {
+            CompiledNode::Or(children.iter().map(|c| compile_node(c, columns)).collect())
+        }
+        LakePredicate::Not(inner) => CompiledNode::Not(Box::new(compile_node(inner, columns))),
+    }
+}
+
+fn evaluate_node(node: &CompiledNode<'_>, columns: &[DecodedColumn], row: usize) -> Option<bool> {
+    match node {
+        CompiledNode::Unknown => None,
+        CompiledNode::Compare { col, op, value } => {
+            let c = &columns[(*col)?];
+            let cell = c.cell(row)?;
+            let ord = compare_cell_to_value(c.physical, cell, value)?;
             Some(match op {
                 CompareOp::Eq => ord.is_eq(),
                 CompareOp::NotEq => ord.is_ne(),
@@ -503,24 +582,24 @@ pub fn evaluate_row(
                 CompareOp::GtEq => ord.is_ge(),
             })
         }
-        LakePredicate::IsNull { column_id } => {
-            Some(column_cell(columns, *column_id, row).is_none())
-        }
-        LakePredicate::IsNotNull { column_id } => {
-            Some(column_cell(columns, *column_id, row).is_some())
-        }
-        LakePredicate::In { column_id, values } => {
-            let Some(cell) = column_cell(columns, *column_id, row) else {
-                return None;
-            };
-            let physical = column_physical(columns, *column_id)?;
+        CompiledNode::IsNull { col } => match col {
+            Some(i) => Some(columns[*i].cell(row).is_none()),
+            None => Some(true),
+        },
+        CompiledNode::IsNotNull { col } => match col {
+            Some(i) => Some(columns[*i].cell(row).is_some()),
+            None => Some(false),
+        },
+        CompiledNode::In { col, values } => {
+            let c = &columns[(*col)?];
+            let cell = c.cell(row)?;
             let mut unknown = false;
-            for v in values {
+            for v in values.iter() {
                 if matches!(v, LakeValue::Null) {
                     unknown = true;
                     continue;
                 }
-                match compare_cell_to_value(physical, cell, v) {
+                match compare_cell_to_value(c.physical, cell, v) {
                     Some(ord) if ord.is_eq() => return Some(true),
                     Some(_) => {}
                     None => unknown = true,
@@ -528,10 +607,10 @@ pub fn evaluate_row(
             }
             if unknown { None } else { Some(false) }
         }
-        LakePredicate::And(children) => {
+        CompiledNode::And(children) => {
             let mut unknown = false;
             for child in children {
-                match evaluate_row(child, columns, row) {
+                match evaluate_node(child, columns, row) {
                     Some(false) => return Some(false),
                     None => unknown = true,
                     Some(true) => {}
@@ -539,10 +618,10 @@ pub fn evaluate_row(
             }
             if unknown { None } else { Some(true) }
         }
-        LakePredicate::Or(children) => {
+        CompiledNode::Or(children) => {
             let mut unknown = false;
             for child in children {
-                match evaluate_row(child, columns, row) {
+                match evaluate_node(child, columns, row) {
                     Some(true) => return Some(true),
                     None => unknown = true,
                     Some(false) => {}
@@ -550,22 +629,20 @@ pub fn evaluate_row(
             }
             if unknown { None } else { Some(false) }
         }
-        LakePredicate::Not(inner) => evaluate_row(inner, columns, row).map(|b| !b),
+        CompiledNode::Not(inner) => evaluate_node(inner, columns, row).map(|b| !b),
     }
 }
 
-fn column_cell<'a>(columns: &'a [DecodedColumn], column_id: u32, row: usize) -> Option<&'a [u8]> {
-    columns
-        .iter()
-        .find(|c| c.column_id == column_id)
-        .and_then(|c| c.cell(row))
-}
-
-fn column_physical(columns: &[DecodedColumn], column_id: u32) -> Option<TypeId> {
-    columns
-        .iter()
-        .find(|c| c.column_id == column_id)
-        .map(|c| c.physical)
+/// Three-valued predicate evaluation over one row. None is unknown, the
+/// SQL outcome of any comparison touching NULL. Columns the slice does
+/// not carry read as NULL. Compiles per call, a loop over many rows
+/// should compile a `CompiledPredicate` once instead
+pub fn evaluate_row(
+    predicate: &LakePredicate,
+    columns: &[DecodedColumn],
+    row: usize,
+) -> Option<bool> {
+    CompiledPredicate::new(predicate, columns).evaluate(columns, row)
 }
 
 #[cfg(test)]

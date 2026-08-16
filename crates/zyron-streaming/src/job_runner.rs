@@ -64,6 +64,14 @@ impl RunnerSink {
             RunnerSink::Remote(adapter) => adapter.flush().await,
         }
     }
+
+    /// Whether a batch `write_batch` accepted is committed when the call
+    /// returns. The local sinks write transactionally per batch, so ingest
+    /// progress can be acknowledged right after a write. The remote sink
+    /// coalesces, its acknowledgment has to wait for a flush.
+    pub(crate) fn writes_through(&self) -> bool {
+        matches!(self, RunnerSink::Append(_) | RunnerSink::Upsert(_))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -530,6 +538,7 @@ impl StreamJobManager {
         txn_manager: Arc<zyron_storage::txn::TransactionManager>,
         wal: Arc<zyron_wal::WalWriter>,
         security_manager: Arc<zyron_auth::SecurityManager>,
+        io_stats: Arc<zyron_common::TableIOStatsRegistry>,
     ) -> Result<()> {
         // Build source and sink. Branch on the write mode so UPSERT jobs are
         // driven by ZyronUpsertSink and APPEND jobs stay on ZyronRowSink.
@@ -547,6 +556,7 @@ impl StreamJobManager {
                     wal,
                     Arc::clone(&ctx_arc),
                     security_manager,
+                    io_stats,
                 )?;
                 RunnerSink::Upsert(upsert)
             }
@@ -558,6 +568,7 @@ impl StreamJobManager {
                 txn_manager,
                 Arc::clone(&ctx_arc),
                 security_manager,
+                io_stats,
             )),
         };
 
@@ -735,7 +746,16 @@ fn run_external_loop(
 
     loop {
         if stop_flag.load(Ordering::Acquire) {
-            let _ = rt.block_on(async { sink.flush().await });
+            // Best effort on the way out. An unflushed batch keeps its
+            // objects unacknowledged, so a restart re-reads them
+            if rt.block_on(async { sink.flush().await }).is_ok() {
+                if let Err(e) = source.commit_progress() {
+                    tracing::warn!(
+                        job_id = entry.id.0,
+                        "ingest progress commit on stop failed: {e}"
+                    );
+                }
+            }
             break;
         }
 
@@ -778,7 +798,17 @@ fn run_external_loop(
         match mode {
             ExternalMode::OneShot => {
                 if source.exhausted() {
-                    let _ = rt.block_on(async { sink.flush().await });
+                    // Completing with rows still coalesced in the sink would
+                    // report success for rows that never landed, so a flush
+                    // failure fails the job instead of finishing it
+                    if let Err(e) = rt.block_on(async { sink.flush().await }) {
+                        mark_failed(&rt, &catalog, entry.id, format!("sink flush error: {e}"));
+                        break;
+                    }
+                    if let Err(e) = source.commit_progress() {
+                        mark_failed(&rt, &catalog, entry.id, format!("progress error: {e}"));
+                        break;
+                    }
                     // No Completed status exists, transition to Paused to
                     // indicate the runner finished cleanly.
                     let _ = rt.block_on(async {
@@ -794,22 +824,67 @@ fn run_external_loop(
                 }
                 if rows.is_empty() {
                     // The source has nothing more right now, so anything the sink is
-                    // still coalescing has no later batch to join and goes out now
-                    let _ = rt.block_on(async { sink.flush().await });
+                    // still coalescing has no later batch to join and goes out now.
+                    // Once the flush lands, the delivered objects are acknowledged
+                    // in the ingest progress log. A failure leaves them
+                    // unacknowledged and both retry on the next idle tick
+                    match rt.block_on(async { sink.flush().await }) {
+                        Ok(()) => {
+                            if let Err(e) = source.commit_progress() {
+                                tracing::warn!(
+                                    job_id = entry.id.0,
+                                    "ingest progress commit failed: {e}"
+                                );
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            job_id = entry.id.0,
+                            "sink flush failed, ingest progress not committed: {e}"
+                        ),
+                    }
                     std::thread::sleep(Duration::from_millis(RUNNER_IDLE_MS));
                 }
             }
             ExternalMode::Watch => {
                 if rows.is_empty() {
                     // The source has nothing more right now, so anything the sink is
-                    // still coalescing has no later batch to join and goes out now
-                    let _ = rt.block_on(async { sink.flush().await });
+                    // still coalescing has no later batch to join and goes out now.
+                    // Once the flush lands, the delivered objects are acknowledged
+                    // in the ingest progress log. A failure leaves them
+                    // unacknowledged and both retry on the next idle tick
+                    match rt.block_on(async { sink.flush().await }) {
+                        Ok(()) => {
+                            if let Err(e) = source.commit_progress() {
+                                tracing::warn!(
+                                    job_id = entry.id.0,
+                                    "ingest progress commit failed: {e}"
+                                );
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            job_id = entry.id.0,
+                            "sink flush failed, ingest progress not committed: {e}"
+                        ),
+                    }
                     std::thread::sleep(Duration::from_millis(RUNNER_IDLE_MS));
                 }
             }
             ExternalMode::Scheduled => {
                 if source.exhausted() {
-                    let _ = rt.block_on(async { sink.flush().await });
+                    match rt.block_on(async { sink.flush().await }) {
+                        Ok(()) => {
+                            if let Err(e) = source.commit_progress() {
+                                tracing::warn!(
+                                    job_id = entry.id.0,
+                                    "ingest progress commit failed: {e}"
+                                );
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            job_id = entry.id.0,
+                            "sink flush failed, ingest progress not committed: {e}"
+                        ),
+                    }
                     // Wait until next scheduled tick or stop.
                     let delay = schedule
                         .as_ref()
@@ -1089,7 +1164,16 @@ fn run_external_to_zyron_loop(
 
     loop {
         if stop_flag.load(Ordering::Acquire) {
-            let _ = rt.block_on(async { sink.flush().await });
+            // Best effort on the way out. An unflushed batch keeps its
+            // objects unacknowledged, so a restart re-reads them
+            if rt.block_on(async { sink.flush().await }).is_ok() {
+                if let Err(e) = source.commit_progress() {
+                    tracing::warn!(
+                        job_id = entry.id.0,
+                        "ingest progress commit on stop failed: {e}"
+                    );
+                }
+            }
             break;
         }
         let current_status = catalog.get_streaming_job_by_id(entry.id).map(|j| j.status);
@@ -1143,11 +1227,31 @@ fn run_external_to_zyron_loop(
                     break;
                 }
             }
+            // A write-through sink has committed this batch, so the objects
+            // it drained can be acknowledged now. The coalescing sink's
+            // acknowledgment waits for its flush on the idle tick
+            if sink.writes_through() {
+                if let Err(e) = source.commit_progress() {
+                    mark_failed(&rt, &catalog, entry.id, format!("progress error: {e}"));
+                    break;
+                }
+            }
         }
 
         match mode {
             ExternalMode::OneShot => {
                 if source.exhausted() {
+                    // Completing with rows still coalesced in the sink would
+                    // report success for rows that never landed, so a flush
+                    // failure fails the job instead of finishing it
+                    if let Err(e) = rt.block_on(async { sink.flush().await }) {
+                        mark_failed(&rt, &catalog, entry.id, format!("sink flush error: {e}"));
+                        break;
+                    }
+                    if let Err(e) = source.commit_progress() {
+                        mark_failed(&rt, &catalog, entry.id, format!("progress error: {e}"));
+                        break;
+                    }
                     let _ = rt.block_on(async {
                         catalog
                             .update_streaming_job_status(
@@ -1161,21 +1265,67 @@ fn run_external_to_zyron_loop(
                 }
                 if rows.is_empty() {
                     // The source has nothing more right now, so anything the sink is
-                    // still coalescing has no later batch to join and goes out now
-                    let _ = rt.block_on(async { sink.flush().await });
+                    // still coalescing has no later batch to join and goes out now.
+                    // Once the flush lands, the delivered objects are acknowledged
+                    // in the ingest progress log. A failure leaves them
+                    // unacknowledged and both retry on the next idle tick
+                    match rt.block_on(async { sink.flush().await }) {
+                        Ok(()) => {
+                            if let Err(e) = source.commit_progress() {
+                                tracing::warn!(
+                                    job_id = entry.id.0,
+                                    "ingest progress commit failed: {e}"
+                                );
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            job_id = entry.id.0,
+                            "sink flush failed, ingest progress not committed: {e}"
+                        ),
+                    }
                     std::thread::sleep(Duration::from_millis(RUNNER_IDLE_MS));
                 }
             }
             ExternalMode::Watch => {
                 if rows.is_empty() {
                     // The source has nothing more right now, so anything the sink is
-                    // still coalescing has no later batch to join and goes out now
-                    let _ = rt.block_on(async { sink.flush().await });
+                    // still coalescing has no later batch to join and goes out now.
+                    // Once the flush lands, the delivered objects are acknowledged
+                    // in the ingest progress log. A failure leaves them
+                    // unacknowledged and both retry on the next idle tick
+                    match rt.block_on(async { sink.flush().await }) {
+                        Ok(()) => {
+                            if let Err(e) = source.commit_progress() {
+                                tracing::warn!(
+                                    job_id = entry.id.0,
+                                    "ingest progress commit failed: {e}"
+                                );
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            job_id = entry.id.0,
+                            "sink flush failed, ingest progress not committed: {e}"
+                        ),
+                    }
                     std::thread::sleep(Duration::from_millis(RUNNER_IDLE_MS));
                 }
             }
             ExternalMode::Scheduled => {
                 if source.exhausted() {
+                    match rt.block_on(async { sink.flush().await }) {
+                        Ok(()) => {
+                            if let Err(e) = source.commit_progress() {
+                                tracing::warn!(
+                                    job_id = entry.id.0,
+                                    "ingest progress commit failed: {e}"
+                                );
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            job_id = entry.id.0,
+                            "sink flush failed, ingest progress not committed: {e}"
+                        ),
+                    }
                     let delay = schedule
                         .as_ref()
                         .map(|s| s.next_delay())

@@ -133,7 +133,7 @@ async fn test_fold_path_throughput() {
                     .enable_all()
                     .build()
                     .unwrap();
-                CompactionWorker::run_cycle(&rt, c, t, d, p, w, cf, None, None, None)
+                CompactionWorker::run_cycle(&rt, c, t, d, p, w, cf, None, None, None, None)
             });
             let elapsed = start.elapsed();
             let rps = res.0 as f64 / elapsed.as_secs_f64();

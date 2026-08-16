@@ -641,6 +641,9 @@ pub enum Token {
 
     /// Floating-point literal.
     Float(f64),
+    /// A fixed-point literal wider than f64 exactness, as unscaled digits
+    /// and scale. Narrow fixed-point literals lex as Float.
+    Decimal(i128, u8),
 
     /// String literal (single-quoted).
     String(String),
@@ -710,6 +713,9 @@ impl std::fmt::Display for Token {
             Token::Integer(n) => write!(f, "{n}"),
             Token::BigInteger(n) => write!(f, "{n}"),
             Token::Float(n) => write!(f, "{n}"),
+            Token::Decimal(digits, scale) => {
+                write!(f, "{}", zyron_common::format_decimal(*digits, *scale))
+            }
             Token::String(s) => write!(f, "'{s}'"),
             Token::Ident(s) => write!(f, "{s}"),
             Token::Parameter(n) => write!(f, "${n}"),

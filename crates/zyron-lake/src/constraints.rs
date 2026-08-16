@@ -225,6 +225,54 @@ fn leading_range(
     ))
 }
 
+/// The read footprint of one spec's unique probe over this batch: the
+/// leading key column bounded to the batch's [min, max], or None when the
+/// batch carries no non-NULL leading cell. A commit passes this as its read
+/// predicate so a concurrent append whose new file admits a key in the
+/// probed range conflicts instead of landing a duplicate the probe could
+/// not see
+pub fn unique_probe_range(
+    manifest: &ManifestFile,
+    spec: &UniqueSpec,
+    batch: &[ColumnData],
+) -> Result<Option<LakePredicate>, ZyronError> {
+    if spec.column_ids.is_empty() {
+        return Ok(None);
+    }
+    let Some(leading) = batch.iter().find(|c| c.column_id == spec.column_ids[0]) else {
+        return Ok(None);
+    };
+    let leading_physical = manifest
+        .schema
+        .column_by_id(spec.column_ids[0])
+        .ok_or_else(|| {
+            ZyronError::Internal(format!(
+                "constraint \"{}\" names column {}, which is not in the schema",
+                spec.name, spec.column_ids[0]
+            ))
+        })?
+        .physical_type_id();
+    let mut min_cell: Option<&[u8]> = None;
+    let mut max_cell: Option<&[u8]> = None;
+    for cell in leading.cells.iter().flatten() {
+        let cell = cell.as_slice();
+        if min_cell
+            .map(|m| compare_cells(leading_physical, cell, m).is_lt())
+            .unwrap_or(true)
+        {
+            min_cell = Some(cell);
+        }
+        if max_cell
+            .map(|m| compare_cells(leading_physical, cell, m).is_gt())
+            .unwrap_or(true)
+        {
+            max_cell = Some(cell);
+        }
+    }
+    Ok(leading_range(spec, leading_physical, min_cell, max_cell)
+        .map(|(lower, upper)| LakePredicate::And(vec![lower, upper])))
+}
+
 /// Enforces one unique constraint over an incoming batch.
 ///
 /// Returns the first violation found and what the check had to read. A row
@@ -403,11 +451,12 @@ fn open_probe(
     // unknown outcome leaves the row in force
     if let Some(predicate) = superseded {
         let columns = reader.read_predicate_columns(&manifest.schema, &[predicate])?;
+        let compiled = crate::reader::CompiledPredicate::new(predicate, &columns);
         for row in 0..rows {
             if keep[row / 8] & (1 << (row % 8)) == 0 {
                 continue;
             }
-            if crate::reader::evaluate_row(predicate, &columns, row) == Some(true) {
+            if compiled.evaluate(&columns, row) == Some(true) {
                 keep[row / 8] &= !(1 << (row % 8));
             }
         }
@@ -751,6 +800,7 @@ mod tests {
             commit_lsn: 1,
             timestamp_us,
             read_predicate: None,
+            read_version: 0,
             audit: None,
         }
     }

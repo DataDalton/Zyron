@@ -62,6 +62,9 @@ pub struct ZyronUpsertSink {
     wal: Arc<zyron_wal::WalWriter>,
     security_ctx: Arc<PlMutex<zyron_auth::SecurityContext>>,
     security_manager: Arc<zyron_auth::SecurityManager>,
+    // The same per-table write counters DML maintains, so stat views count
+    // streamed rows and the background workers' activity gates see them
+    io_stats: Arc<zyron_common::TableIOStatsRegistry>,
     // In-memory PK to RowLocator map covering heap-resident and folded rows,
     // populated at construction time and healed on stale hits during writes
     memory_map: PlMutex<HashMap<Vec<u8>, RowLocator>>,
@@ -84,6 +87,7 @@ impl ZyronUpsertSink {
         wal: Arc<zyron_wal::WalWriter>,
         security_ctx: Arc<PlMutex<zyron_auth::SecurityContext>>,
         security_manager: Arc<zyron_auth::SecurityManager>,
+        io_stats: Arc<zyron_common::TableIOStatsRegistry>,
     ) -> Result<Self> {
         if target_pk_ordinals.is_empty() {
             return Err(ZyronError::StreamingError(
@@ -141,6 +145,7 @@ impl ZyronUpsertSink {
             wal,
             security_ctx,
             security_manager,
+            io_stats,
             memory_map: PlMutex::new(map),
         })
     }
@@ -229,6 +234,11 @@ impl ZyronUpsertSink {
             }
         };
 
+        // Row counts for the table's write counters, recorded only when the
+        // transaction commits so an aborted batch counts nothing
+        let mut applied_inserts = 0u64;
+        let mut applied_updates = 0u64;
+        let mut applied_deletes = 0u64;
         // Apply each record while holding the map mutex so reads and writes
         // to the index are sequentially consistent within this batch.
         let result: Result<()> = (|| {
@@ -248,7 +258,13 @@ impl ZyronUpsertSink {
                     zyron_cdc::ChangeType::Insert | zyron_cdc::ChangeType::UpdatePostimage => {
                         // Delete the prior row if one exists, in whichever
                         // storage tier it lives.
-                        self.delete_existing(&rt, &mut map_guard, &key, txn.txn_id, &mut rebuilt)?;
+                        let replaced = self.delete_existing(
+                            &rt,
+                            &mut map_guard,
+                            &key,
+                            txn.txn_id,
+                            &mut rebuilt,
+                        )?;
                         // Insert the new row.
                         let tuple = zyron_storage::Tuple::new(change.row_data.clone(), txn_id_u32);
                         let new_id =
@@ -258,9 +274,24 @@ impl ZyronUpsertSink {
                             ZyronError::Internal("upsert insert returned no tuple id".to_string())
                         })?;
                         map_guard.insert(key, tuple_id.locator());
+                        // A replacement leaves a superseded version behind,
+                        // which is what the update counter tracks
+                        if replaced {
+                            applied_updates += 1;
+                        } else {
+                            applied_inserts += 1;
+                        }
                     }
                     zyron_cdc::ChangeType::Delete | zyron_cdc::ChangeType::UpdatePreimage => {
-                        self.delete_existing(&rt, &mut map_guard, &key, txn.txn_id, &mut rebuilt)?;
+                        if self.delete_existing(
+                            &rt,
+                            &mut map_guard,
+                            &key,
+                            txn.txn_id,
+                            &mut rebuilt,
+                        )? {
+                            applied_deletes += 1;
+                        }
                         map_guard.remove(&key);
                     }
                     // Schema changes and truncates are structural events,
@@ -276,6 +307,16 @@ impl ZyronUpsertSink {
         match result {
             Ok(()) => {
                 self.txn_manager.commit_blocking(&mut txn)?;
+                let stats = self.io_stats.get_or_create(self.target_table_id);
+                if applied_inserts > 0 {
+                    stats.record_inserts(applied_inserts);
+                }
+                if applied_updates > 0 {
+                    stats.record_updates(applied_updates);
+                }
+                if applied_deletes > 0 {
+                    stats.record_deletes(applied_deletes);
+                }
                 Ok(())
             }
             Err(e) => {

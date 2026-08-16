@@ -129,10 +129,10 @@ fn synthetic_manifest(files: usize) -> ManifestFile {
                 row_count: 100,
                 added_version: 1,
                 cluster_spec_id: 0,
-                column_stats: vec![
+                column_stats: std::sync::Arc::new(vec![
                     int_stats(0, lo, lo + 99, 100),
                     int_stats(1, bucket, bucket, 100),
-                ],
+                ]),
                 delete_predicate_ids: Vec::new(),
             }
         })
@@ -479,7 +479,7 @@ fn test_get_latest_version_performs_no_io() {
             row_count: 64,
             added_version: 0,
             cluster_spec_id: 0,
-            column_stats: vec![int_stats(0, 0, 63, 64)],
+            column_stats: std::sync::Arc::new(vec![int_stats(0, 0, 63, 64)]),
             delete_predicate_ids: Vec::new(),
         })])
     })
@@ -783,6 +783,7 @@ fn attempt(operation: OperationKind) -> CommitAttempt<'static> {
         commit_lsn: 1,
         timestamp_us: 1_754_700_000_000_000,
         read_predicate: None,
+        read_version: 0,
         audit: None,
     }
 }

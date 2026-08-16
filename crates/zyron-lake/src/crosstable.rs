@@ -442,6 +442,7 @@ mod tests {
             commit_lsn: 1,
             timestamp_us: 1_000,
             read_predicate: None,
+            read_version: 0,
             audit: None,
         }
     }
