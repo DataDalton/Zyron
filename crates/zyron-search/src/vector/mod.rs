@@ -27,7 +27,7 @@ pub use memory::{
     estimate_ivfpq_build_peak, estimate_ivfpq_memory, try_alloc_default, try_alloc_filled,
     try_alloc_vec, validate_file_size,
 };
-pub use profile::{DataProfile, QueryTuner};
+pub use profile::DataProfile;
 pub use quantized_index::IvfPqIndex;
 pub use types::{
     DistanceMetric, HnswConfig, IvfPqConfig, VectorId, VectorIndexParams, VectorSearch, VectorValue,
