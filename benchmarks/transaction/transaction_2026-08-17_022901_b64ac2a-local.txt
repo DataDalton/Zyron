@@ -1,0 +1,146 @@
+# suite:   transaction
+# run:     2026-08-17_022901_b64ac2a-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Transaction: B+Tree Split Under Concurrency Test ===
+
+--- Run 1/5 ---
+  160000 keys with interleaved inserts in 32.7294ms (4,888,571 ops/sec), height=2
+
+--- Run 2/5 ---
+  160000 keys with interleaved inserts in 32.1968ms (4,969,438 ops/sec), height=2
+
+--- Run 3/5 ---
+  160000 keys with interleaved inserts in 32.1863ms (4,971,059 ops/sec), height=2
+
+--- Run 4/5 ---
+  160000 keys with interleaved inserts in 33.0297ms (4,844,125 ops/sec), height=2
+
+--- Run 5/5 ---
+  160000 keys with interleaved inserts in 34.9092ms (4,583,319 ops/sec), height=2
+  Split insert throughput (ops/sec) [PASS/OK]:
+    Runs: [4,888,571, 4,969,438, 4,971,059, 4,844,125, 4,583,319]
+    Average: 4,851,302 >= 4,000,000 (target)
+    Min/Max: 4,583,319 / 4,971,059, StdDev: 142,515
+
+=== Transaction: Concurrent B+Tree Latch Coupling Test ===
+Threads: 16, Keys per thread: 10000, Total: 160000
+
+--- Run 1/5 ---
+  160000 keys in 23.7345ms (6,741,242 ops/sec), height=2
+
+--- Run 2/5 ---
+  160000 keys in 25.4965ms (6,275,371 ops/sec), height=2
+
+--- Run 3/5 ---
+  160000 keys in 26.629ms (6,008,487 ops/sec), height=2
+
+--- Run 4/5 ---
+  160000 keys in 24.5818ms (6,508,881 ops/sec), height=2
+
+--- Run 5/5 ---
+  160000 keys in 23.1332ms (6,916,466 ops/sec), height=2
+  Insert throughput (ops/sec) [PASS/OK]:
+    Runs: [6,741,242, 6,275,371, 6,008,487, 6,508,881, 6,916,466]
+    Average: 6,490,089 >= 4,000,000 (target)
+    Min/Max: 6,008,487 / 6,916,466, StdDev: 323,504
+
+=== Transaction: Durable Commit Throughput vs Concurrency ===
+Every commit is a durable write-through device write; throughput
+scales as group commit batches concurrent committers per write.
+  c=  1     1000 durable txns in   103.47ms         9,665 txn/sec  (L_eff 103.5 us/write)
+  durable_commit_c1_txn_per_sec [PASS]: 9,665 >= 1 (target)
+  c= 16    16000 durable txns in   141.71ms       112,910 txn/sec  (L_eff 141.7 us/write)
+  durable_commit_c16_txn_per_sec [PASS]: 112,910 >= 1 (target)
+  c= 64    64000 durable txns in   159.55ms       401,120 txn/sec  (L_eff 159.6 us/write)
+  durable_commit_c64_txn_per_sec [PASS]: 401,120 >= 1 (target)
+  c=256   256000 durable txns in   335.70ms       762,575 txn/sec  (L_eff 335.7 us/write)
+  durable_commit_c256_txn_per_sec [PASS]: 762,575 >= 1 (target)
+  c=512   512000 durable txns in   738.47ms       693,324 txn/sec  (L_eff 738.5 us/write)
+  durable_commit_c512_txn_per_sec [PASS]: 693,324 >= 1 (target)
+  serial (c=1) 9,665 txn/sec  ->  peak 762,575 txn/sec  (78.9x from group commit)
+  peak_durable_txn_per_sec [PASS]: 762,575 >= 38,660 (target)
+
+=== Transaction: Intent Lock Conflict Test ===
+  Intent lock conflict: PASS
+    Intent lock acquired by first txn: verified
+    Conflict returned for second txn: verified
+    Lock released on commit, retry succeeds: verified
+    Consistent row + intent lock ordering: verified
+
+=== Transaction: Read Committed vs Snapshot Isolation ===
+  Isolation levels: PASS
+    SnapshotIsolation: committed data invisible to older snapshot: verified
+    ReadCommitted: refreshed snapshot sees committed data: verified
+
+=== Transaction: MVCC GC Test ===
+  MVCC GC: PASS
+    Dead tuples (xmax < oldest_active) reclaimable: verified
+    Live tuples (xmax=0) not reclaimable: verified
+    No active txns -> all deleted reclaimable: verified
+    Threshold-based page selection: verified
+    Reclaimed 5000 / 10000 dead tuples
+
+=== Transaction: B+Tree Read Under Write Contention ===
+  Writer overwrote 824064 keys during reader load
+  Reads hit: 750000 / 750000
+  Reader retries: 0 (0.000% of read attempts)
+  Max read latency: 765.00 us (advisory target: < 10 us)
+  Reader retry rate (%) [PASS]: 0 <= 5 (target)
+  Max read latency (us) [FAIL]: 765 <= 10 (target)
+
+=== Transaction: PageId u64 Addressing Test ===
+  PageId u64 addressing: PASS
+    PageId::new with u64 page_num: verified
+    as_u64 / from_u64 round-trip: verified
+    B+Tree leaf pointers store u64 page references: verified
+    Range scan packed values decode correctly: verified
+
+=== Transaction: Rollback (Abort) Test ===
+  Rollback (abort): PASS
+    Aborted txn removed from active set: verified
+    Aborted txn recorded in commit-status map: verified
+    Aborted inserts invisible without physical xmax: verified
+
+=== Transaction: Snapshot Isolation Test ===
+  Snapshot isolation: PASS
+    Uncommitted insert invisible to concurrent txn: verified
+    Committed insert invisible to txn with older snapshot: verified
+    Committed insert visible to txn with newer snapshot: verified
+
+=== Transaction: Transaction Performance Microbenchmarks ===
+  durable begin()+commit() latency floor (ns/op) [PASS/OK]:
+    Runs: [75,799, 67,258, 89,803, 81,619, 81,089]
+    Average: 79,114 <= 5,000,000 (target)
+    Min/Max: 67,258 / 89,803, StdDev: 7,429
+  is_visible() latency (ns/op) [PASS/OK]:
+    Runs: [2, 2, 2, 2, 2]
+    Average: 2 <= 15 (target)
+    Min/Max: 2 / 2, StdDev: 0
+  lock_row() latency (ns/op) [FAIL/OK]:
+    Runs: [133, 131, 130, 130, 128]
+    Average: 130 <= 80 (target)
+    Min/Max: 128 / 133, StdDev: 2
+  Snapshot::new() latency (ns/op) [PASS/OK]:
+    Runs: [31, 26, 26, 26, 26]
+    Average: 27 <= 200 (target)
+    Min/Max: 26 / 31, StdDev: 2
+  GC sweep throughput (tuples/sec) [PASS/OK]:
+    Runs: [1,643,385,374, 1,800,180,018, 1,700,969,553, 1,800,180,018, 1,794,043,775]
+    Average: 1,747,751,747 >= 500,000 (target)
+    Min/Max: 1,643,385,374 / 1,800,180,018, StdDev: 64,375,947
+
+=== Transaction: WAL Transaction Integration Test ===
+  WAL transaction integration: PASS
+    5 Begin, 3 Commit, 2 Abort records: verified
+    Committed txn WAL records: verified
+    Aborted txn WAL records: verified
+
+=== Transaction: Write-Write Conflict Test ===
+  Write-write conflict: PASS
+    First writer acquires lock: verified
+    Second writer gets TransactionConflict: verified
+    Retry after first writer commits: verified

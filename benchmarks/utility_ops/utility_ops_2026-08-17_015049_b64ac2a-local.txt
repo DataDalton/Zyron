@@ -1,0 +1,158 @@
+# suite:   utility_ops
+# run:     2026-08-17_015049_b64ac2a-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Checksums and Hashes ===
+  CRC32('hello world') = 0x0D4A1185 PASS
+  XXHASH64('hello world') = 0xd447b1ea40e6988b PASS
+  Family determinism (10 hashes x 3 inputs) PASS
+  Distinct-input distinct-output PASS
+  Streaming hashers match one-shot PASS
+  hash_column_xxh64 matches row-by-row PASS
+  Run 1: CRC32C 12.16 GB/sec
+  Run 2: CRC32C 12.20 GB/sec
+  Run 3: CRC32C 12.15 GB/sec
+  Run 4: CRC32C 12.23 GB/sec
+  Run 5: CRC32C 12.29 GB/sec
+  CRC32C 1 GB (GB/sec) [PASS/OK]:
+    Runs: [12, 12, 12, 12, 12]
+    Average: 12 >= 12 (target)
+    Min/Max: 12 / 12, StdDev: 0
+  Run 1: xxHash64 20.91 GB/sec
+  Run 2: xxHash64 18.22 GB/sec
+  Run 3: xxHash64 19.23 GB/sec
+  Run 4: xxHash64 20.92 GB/sec
+  Run 5: xxHash64 20.92 GB/sec
+  xxHash64 1 GB (GB/sec) [PASS/OK]:
+    Runs: [21, 18, 19, 21, 21]
+    Average: 20 >= 16 (target)
+    Min/Max: 18 / 21, StdDev: 1
+
+=== File and Encoding Detection ===
+  DETECT_MIME_TYPE png + pdf PASS
+  DETECT_ENCODING ascii + utf-8 BOM + raw multi-byte UTF-8 PASS
+  IS_BINARY png=true, text=false PASS
+  FILE_EXTENSION mime->ext PASS
+  Run 1: DETECT_MIME_TYPE 5.6 ns
+  Run 2: DETECT_MIME_TYPE 5.6 ns
+  Run 3: DETECT_MIME_TYPE 5.6 ns
+  Run 4: DETECT_MIME_TYPE 5.6 ns
+  Run 5: DETECT_MIME_TYPE 5.6 ns
+  DETECT_MIME_TYPE (ns) [PASS/OK]:
+    Runs: [6, 6, 6, 6, 6]
+    Average: 6 <= 400 (target)
+    Min/Max: 6 / 6, StdDev: 0
+
+=== JSON Diff and Patch ===
+  JSON_DIFF + JSON_PATCH round-trip on small object PASS
+  JSON_DIFF_TABLE returns relation with replace+add PASS
+  JSON_MERGE_PATCH RFC 7396 PASS
+  Run 1: diff 9.75 us/op, patch 4.85 us/op (10K ops each)
+  Run 2: diff 9.69 us/op, patch 4.77 us/op (10K ops each)
+  Run 3: diff 9.73 us/op, patch 4.76 us/op (10K ops each)
+  Run 4: diff 9.71 us/op, patch 4.76 us/op (10K ops each)
+  Run 5: diff 9.67 us/op, patch 4.79 us/op (10K ops each)
+  JSON Diff 1 KB (us) [PASS/OK]:
+    Runs: [10, 10, 10, 10, 10]
+    Average: 10 <= 12 (target)
+    Min/Max: 10 / 10, StdDev: 0
+  JSON Patch 1 KB (us) [PASS/OK]:
+    Runs: [5, 5, 5, 5, 5]
+    Average: 5 <= 6 (target)
+    Min/Max: 5 / 5, StdDev: 0
+
+=== Markdown and HTML ===
+  MARKDOWN_TO_HTML('# Hello\n\nParagraph') = '<h1>Hello</h1>\n<p>Paragraph</p>' PASS
+  MARKDOWN_EXTRACT_HEADERS yields [(1, H1), (2, H2)] PASS
+  HTML_TO_TEXT strips tags PASS
+  Links, code blocks, html_to_markdown, sanitize_html PASS
+  Run 1: MARKDOWN_TO_HTML 10 KB 53.22 us
+  Run 2: MARKDOWN_TO_HTML 10 KB 53.07 us
+  Run 3: MARKDOWN_TO_HTML 10 KB 53.54 us
+  Run 4: MARKDOWN_TO_HTML 10 KB 50.21 us
+  Run 5: MARKDOWN_TO_HTML 10 KB 50.20 us
+  MARKDOWN_TO_HTML 10 KB (us) [PASS/OK]:
+    Runs: [53, 53, 54, 50, 50]
+    Average: 52 <= 300 (target)
+    Min/Max: 50 / 54, StdDev: 2
+
+=== Natural Sort, Version, IP, Path ===
+  natural_compare orders [file1, file2, file10, file20] PASS
+  natural_sort_key produces matching order PASS
+  version_compare semver ordering PASS
+  ip_compare orders v4 numerically PASS
+  path_compare component-wise natural PASS
+  custom_order_rank known + unknown PASS
+  Run 1: 54.2 ns/key
+  Run 2: 53.8 ns/key
+  Run 3: 53.8 ns/key
+  Run 4: 63.0 ns/key
+  Run 5: 54.0 ns/key
+  natural_sort_key (ns) [PASS/OK]:
+    Runs: [54, 54, 54, 63, 54]
+    Average: 56 <= 200 (target)
+    Min/Max: 54 / 63, StdDev: 4
+  Sort 1M natural strings: 8 ms
+
+=== QR Code + Barcodes ===
+  QR_ENCODE+QR_DECODE round-trip on URL PASS
+  QR round-trip for L, M, Q, H ec levels PASS
+  Code128, Code39, EAN-13, EAN-8, UPC-A round-trips PASS
+  DataMatrix round-trip across 4 sizes (10x10 to 26x26) PASS
+  Run 1: QR encode 0.12 ms
+  Run 2: QR encode 0.12 ms
+  Run 3: QR encode 0.12 ms
+  Run 4: QR encode 0.12 ms
+  Run 5: QR encode 0.11 ms
+  QR encode (ms) [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 3 (target)
+    Min/Max: 0 / 0, StdDev: 0
+
+=== Rate Limiting and Quotas ===
+  RATE_LIMIT_CHECK: 10 allowed, 11th rejected PASS
+  RATE_LIMIT_CHECK recovers after window elapses PASS
+  QUOTA_CHECK + QUOTA_INCREMENT 100+200, 800 rejected PASS
+  BURST_TOKEN_BUCKET 12-token burst from 10-cap PASS
+  CRON parse, next, matches, list PASS
+  Run 1: 62.8 ns/check
+  Run 2: 62.6 ns/check
+  Run 3: 62.3 ns/check
+  Run 4: 63.1 ns/check
+  Run 5: 62.5 ns/check
+  Rate limit check (ns) [FAIL/OK]:
+    Runs: [63, 63, 62, 63, 62]
+    Average: 63 <= 50 (target)
+    Min/Max: 62 / 63, StdDev: 0
+
+=== Resilience ===
+  3 failures opens, fast-fail while open PASS
+  Reset timeout -> HalfOpen, success closes PASS
+  HalfOpen failure reopens PASS
+  EMA breaker opens on sustained errors PASS
+  CircuitBreakerRegistry shares instances by name PASS
+  retry recovers after 2 transient errors PASS
+  timeout_blocking aborts overrun PASS
+  hedged returns first completion PASS
+
+=== Row Diff, Schema Diff, Change Log ===
+  ROW_DIFF emits only changed columns PASS
+  ROW_DIFF_ORDINAL fast path skips name lookup PASS
+  SCHEMA_DIFF + GENERATE_MIGRATION emits ADD/DROP/ALTER PASS
+
+=== Text Diff and Patch ===
+  TEXT_DIFF emits delete(line2)+insert(modified)+add(line4) PASS
+  TEXT_PATCH round-trip removes line2 and adds modified+line4 PASS
+  COLLAPSE_ADJACENT_NOOPS folds insert+delete pairs PASS
+  Run 1: 0.75 ms
+  Run 2: 0.82 ms
+  Run 3: 0.80 ms
+  Run 4: 0.81 ms
+  Run 5: 0.96 ms
+  Text Diff 10K lines (ms) [PASS/OK]:
+    Runs: [1, 1, 1, 1, 1]
+    Average: 1 <= 50 (target)
+    Min/Max: 1 / 1, StdDev: 0

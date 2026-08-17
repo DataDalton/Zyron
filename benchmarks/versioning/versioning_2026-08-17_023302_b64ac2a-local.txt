@@ -1,0 +1,242 @@
+# suite:   versioning
+# run:     2026-08-17_023302_b64ac2a-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+=== Branch Create Overhead ===
+  Run 1: 2.13us per branch (2.13ms)
+  Run 2: 2.07us per branch (2.07ms)
+  Run 3: 2.08us per branch (2.08ms)
+  Run 4: 2.03us per branch (2.03ms)
+  Run 5: 2.07us per branch (2.07ms)
+  us_per_branch [PASS/OK]:
+    Runs: [2, 2, 2, 2, 2]
+    Average: 2 <= 10 (target)
+    Min/Max: 2 / 2, StdDev: 0
+
+=== Branch Page Resolution ===
+  Run 1: 54.69ns per resolve (54.69ms)
+  Run 2: 54.75ns per resolve (54.75ms)
+  Run 3: 54.70ns per resolve (54.70ms)
+  Run 4: 54.66ns per resolve (54.66ms)
+  Run 5: 54.26ns per resolve (54.26ms)
+  ns_per_resolve [FAIL/OK]:
+    Runs: [55, 55, 55, 55, 54]
+    Average: 55 <= 50 (target)
+    Min/Max: 54 / 55, StdDev: 0
+=== Page Version Map Skip Check ===
+  Run 1: 3,843,197,540 ops/sec (260.20µs)
+  Run 2: 4,302,925,990 ops/sec (232.40µs)
+  Run 3: 4,302,925,990 ops/sec (232.40µs)
+  Run 4: 4,301,075,269 ops/sec (232.50µs)
+  Run 5: 4,226,542,688 ops/sec (236.60µs)
+  skip_check_ops_per_sec [PASS/OK]:
+    Runs: [3,843,197,540, 4,302,925,990, 4,302,925,990, 4,301,075,269, 4,226,542,688]
+    Average: 4,195,333,495 >= 50,000,000 (target)
+    Min/Max: 3,843,197,540 / 4,302,925,990, StdDev: 178,497,819
+
+=== Page Version Map Update ===
+  Run 1: 570,320,520 ops/sec (1.75ms)
+  Run 2: 581,023,764 ops/sec (1.72ms)
+  Run 3: 581,801,257 ops/sec (1.72ms)
+  Run 4: 581,462,961 ops/sec (1.72ms)
+  Run 5: 562,398,065 ops/sec (1.78ms)
+  update_ops_per_sec [PASS/OK]:
+    Runs: [570,320,520, 581,023,764, 581,801,257, 581,462,961, 562,398,065]
+    Average: 575,401,313 >= 10,000,000 (target)
+    Min/Max: 562,398,065 / 581,801,257, StdDev: 7,800,176
+
+=== Branch Merge (10K changes) ===
+  Run 1: 1.63ms (10000 pages merged)
+  Run 2: 1.63ms (10000 pages merged)
+  Run 3: 1.64ms (10000 pages merged)
+  Run 4: 1.65ms (10000 pages merged)
+  Run 5: 1.81ms (10000 pages merged)
+  ms_per_merge [PASS/OK]:
+    Runs: [2, 2, 2, 2, 2]
+    Average: 2 <= 200 (target)
+    Min/Max: 2 / 2, StdDev: 0
+
+=== Diff Adjacent Versions ===
+  Run 1: 0.41ms (+100000 -100000 ~800000)
+  Run 2: 0.41ms (+100000 -100000 ~800000)
+  Run 3: 0.41ms (+100000 -100000 ~800000)
+  Run 4: 0.40ms (+100000 -100000 ~800000)
+  Run 5: 0.42ms (+100000 -100000 ~800000)
+  ms_per_diff [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 100 (target)
+    Min/Max: 0 / 0, StdDev: 0
+
+=== SCD Type 2 Merge Throughput (100K rows) ===
+  Run 1: 46,307,016 rows/sec (2.16ms)
+  Run 2: 46,904,315 rows/sec (2.13ms)
+  Run 3: 46,943,949 rows/sec (2.13ms)
+  Run 4: 46,277,014 rows/sec (2.16ms)
+  Run 5: 46,882,325 rows/sec (2.13ms)
+  rows_per_sec [PASS/OK]:
+    Runs: [46,307,016, 46,904,315, 46,943,949, 46,277,014, 46,882,325]
+    Average: 46,662,924 >= 150,000 (target)
+    Min/Max: 46,277,014 / 46,943,949, StdDev: 303,638
+
+=== Time Travel Query Overhead (1M rows) ===
+  Run 1: baseline=1.12ms, versioned=1.28ms, overhead=14.4%
+  Run 2: baseline=0.99ms, versioned=1.27ms, overhead=28.5%
+  Run 3: baseline=0.94ms, versioned=1.14ms, overhead=21.6%
+  Run 4: baseline=0.89ms, versioned=1.14ms, overhead=27.9%
+  Run 5: baseline=0.91ms, versioned=1.08ms, overhead=18.7%
+  overhead_percent [PASS/OK]:
+    Runs: [14, 29, 22, 28, 19]
+    Average: 22 <= 30 (target)
+    Min/Max: 14 / 29, StdDev: 5
+
+=== Timestamp Resolution (Planning Target: <=500us) ===
+  Run 1: 0.042us per resolution (4.23ms total)
+  Run 2: 0.042us per resolution (4.24ms total)
+  Run 3: 0.041us per resolution (4.09ms total)
+  Run 4: 0.041us per resolution (4.09ms total)
+  Run 5: 0.041us per resolution (4.10ms total)
+  us_per_resolution [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 500 (target)
+    Min/Max: 0 / 0, StdDev: 0
+
+=== Version Log Append (Planning Target: >=3M/sec) ===
+  Run 1: 6,513,792 ops/sec (153.52ms)
+  Run 2: 5,888,702 ops/sec (169.82ms)
+  Run 3: 6,464,116 ops/sec (154.70ms)
+  Run 4: 6,287,588 ops/sec (159.04ms)
+  Run 5: 6,425,393 ops/sec (155.63ms)
+  batch_ops_per_sec [PASS/OK]:
+    Runs: [6,513,792, 5,888,702, 6,464,116, 6,287,588, 6,425,393]
+    Average: 6,315,918 >= 3,000,000 (target)
+    Min/Max: 5,888,702 / 6,513,792, StdDev: 226,459
+
+=== Version Overhead Per Tuple ===
+  Run 1: 0.00ns per tuple (0.00ms)
+  Run 2: 0.00ns per tuple (0.00ms)
+  Run 3: 0.00ns per tuple (0.00ms)
+  Run 4: 0.00ns per tuple (0.00ms)
+  Run 5: 0.00ns per tuple (0.00ms)
+  ns_per_check [PASS/OK]:
+    Runs: [0, 0, 0, 0, 0]
+    Average: 0 <= 5 (target)
+    Min/Max: 0 / 0, StdDev: 0
+
+=== SCD Type 2 Action Generation ===
+  Run 1: 27.89ns per action (27.89ms)
+  Run 2: 27.83ns per action (27.83ms)
+  Run 3: 27.85ns per action (27.85ms)
+  Run 4: 27.83ns per action (27.83ms)
+  Run 5: 27.86ns per action (27.86ms)
+  ns_per_action [PASS/OK]:
+    Runs: [28, 28, 28, 28, 28]
+    Average: 28 <= 100 (target)
+    Min/Max: 28 / 28, StdDev: 0
+
+=== Surrogate Key Generation ===
+  Run 1: 161,768,845 ops/sec (61.82ms)
+  Run 2: 162,740,816 ops/sec (61.45ms)
+  Run 3: 162,894,571 ops/sec (61.39ms)
+  Run 4: 162,941,020 ops/sec (61.37ms)
+  Run 5: 161,188,150 ops/sec (62.04ms)
+  keys_per_sec [PASS/OK]:
+    Runs: [161,768,845, 162,740,816, 162,894,571, 162,941,020, 161,188,150]
+    Average: 162,306,681 >= 50,000,000 (target)
+    Min/Max: 161,188,150 / 162,941,020, StdDev: 703,826
+
+=== Branch Lifecycle Validation ===
+  Created main + dev branches
+  Dev: 5 page overrides via copy-on-write
+  Main: pages unchanged during dev modifications
+  Unmodified page resolution: falls through to parent
+  Merge: 5 pages merged, 0 conflicts
+  Delete: branch removed, duplicate name rejected
+  PASS
+
+=== Diff Validation ===
+  Tuple classification: Added, Removed, Unchanged all correct
+  Full scenario: 150 removed, 300 added across update/delete/insert
+  DiffStats formatting: correct
+  Page range pruning for diff scans: correct skip/no-skip
+  PASS
+
+=== Restore Validation ===
+  Restore creates version 4 (non-destructive)
+  All intermediate versions (1-3) still accessible
+  Range query returns all 4 versions
+  Timestamp resolution works across full history
+  PASS
+
+=== SCD Type 2 Validation ===
+  Config parsed from table options: scd_type=2, natural_key=customer_id
+  Required columns: valid_from, valid_to, is_current
+  10 updates: each produces 1 expire + 1 insert with unique surrogate key
+  Delete: expires row with valid_to timestamp (soft delete)
+  PASS
+
+=== System-Versioned Table Validation ===
+  Required columns: sys_start (TIMESTAMPTZ), sys_end (TIMESTAMPTZ)
+  INSERT defaults: sys_start=now, sys_end=MAX_TIMESTAMP
+  UPDATE: old row sys_end=now, new row sys_start=now
+  DELETE: sys_end=now (preserves history)
+  AS OF query: correct visibility at point in time
+  BETWEEN query: correct range overlap detection
+  PASS
+
+=== Time Travel Validation ===
+  Version resolution: correct at all 3 versions
+  Timestamp resolution: correct interpolation
+  Tuple visibility: correct at all version boundaries
+  Page pruning: correctly skips future pages
+  PASS
+
+=== Version Creation Validation ===
+  Version creation: 3 versions with correct metadata
+  PASS
+
+=== Version Log Append Throughput ===
+  Run 1: 712,160 ops/sec (1.40s)
+  Run 2: 703,186 ops/sec (1.42s)
+  Run 3: 717,692 ops/sec (1.39s)
+  Run 4: 713,847 ops/sec (1.40s)
+  Run 5: 712,480 ops/sec (1.40s)
+  append_ops_per_sec [PASS/OK]:
+    Runs: [712,160, 703,186, 717,692, 713,847, 712,480]
+    Average: 711,873 >= 400,000 (target)
+    Min/Max: 703,186 / 717,692, StdDev: 4,768
+
+=== Version Log Batch Append ===
+  Run 1: 6,672,383 ops/sec (149.87ms)
+  Run 2: 6,789,300 ops/sec (147.29ms)
+  Run 3: 6,663,766 ops/sec (150.07ms)
+  Run 4: 6,460,992 ops/sec (154.78ms)
+  Run 5: 6,560,324 ops/sec (152.43ms)
+  batch_append_ops_per_sec [PASS/OK]:
+    Runs: [6,672,383, 6,789,300, 6,663,766, 6,460,992, 6,560,324]
+    Average: 6,629,353 >= 5,000,000 (target)
+    Min/Max: 6,460,992 / 6,789,300, StdDev: 111,112
+
+=== Version Log Lookup By ID ===
+  Run 1: 13.50ns per lookup (13.50ms)
+  Run 2: 13.65ns per lookup (13.65ms)
+  Run 3: 13.31ns per lookup (13.31ms)
+  Run 4: 13.39ns per lookup (13.39ms)
+  Run 5: 13.56ns per lookup (13.56ms)
+  ns_per_lookup [PASS/OK]:
+    Runs: [14, 14, 13, 13, 14]
+    Average: 13 <= 20 (target)
+    Min/Max: 13 / 14, StdDev: 0
+
+=== Version Log Timestamp Search ===
+  Run 1: 44.43ns per search (4.44ms)
+  Run 2: 43.43ns per search (4.34ms)
+  Run 3: 42.93ns per search (4.29ms)
+  Run 4: 42.86ns per search (4.29ms)
+  Run 5: 42.85ns per search (4.28ms)
+  ns_per_search [PASS/OK]:
+    Runs: [44, 43, 43, 43, 43]
+    Average: 43 <= 500 (target)
+    Min/Max: 43 / 44, StdDev: 1
+

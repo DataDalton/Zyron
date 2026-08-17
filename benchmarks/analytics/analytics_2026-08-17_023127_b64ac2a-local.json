@@ -1,0 +1,177 @@
+{
+  "id": "2026-08-17_023127_b64ac2a-local",
+  "date": "2026-08-17 02:32:44Z",
+  "ts": 1786933964,
+  "commit": "b64ac2a-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "ROLLUP_1M_3cols": {
+      "Latency (ms)": {
+        "average": 54.604140,
+        "runs": [49.78, 51.23, 49.10, 55.53, 67.38],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "CUBE_1M_3cols": {
+      "Latency (ms)": {
+        "average": 102.859280,
+        "runs": [97.63, 98.56, 98.11, 98.79, 121.21],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "YOY_10M": {
+      "Latency (ms)": {
+        "average": 104.203420,
+        "runs": [103.66, 104.06, 104.26, 104.44, 104.60],
+        "target": 2000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "COHORT_RETENTION_10M": {
+      "Latency (ms)": {
+        "average": 902.837700,
+        "runs": [890.26, 947.04, 894.62, 905.84, 876.43],
+        "target": 10000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "FUNNEL_10M_5steps": {
+      "Latency (ms)": {
+        "average": 875.447800,
+        "runs": [844.53, 859.32, 918.42, 908.01, 846.96],
+        "target": 5000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "DATA_PROFILE_10M_20cols": {
+      "Latency (ms)": {
+        "average": 2523.035440,
+        "runs": [2569.96, 2512.23, 2501.74, 2532.33, 2498.91],
+        "target": 30000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "ZSCORE_10M": {
+      "Latency (ms)": {
+        "average": 35.955240,
+        "runs": [36.05, 36.42, 35.75, 35.60, 35.94],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "CORR_10M": {
+      "Latency (ms)": {
+        "average": 30.299720,
+        "runs": [30.18, 30.24, 30.20, 30.43, 30.45],
+        "target": 300.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "CORRELATION_MATRIX_20cols": {
+      "Latency (ms)": {
+        "average": 36.861180,
+        "runs": [36.99, 37.09, 36.59, 37.00, 36.64],
+        "target": 5000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "FEATURE_RETRIEVAL_1K_x_10": {
+      "Latency (ms)": {
+        "average": 0.766080,
+        "runs": [0.93, 0.77, 0.71, 0.71, 0.71],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "PIT_JOIN_1M": {
+      "Latency (ms)": {
+        "average": 3.146600,
+        "runs": [5.06, 4.32, 2.68, 2.04, 1.63],
+        "target": 5000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "LINEAR_TRAIN_100K_10": {
+      "Latency (ms)": {
+        "average": 5.666580,
+        "runs": [5.67, 5.78, 5.66, 5.71, 5.51],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "LOGISTIC_TRAIN_100K_10": {
+      "Latency (ms)": {
+        "average": 57.732960,
+        "runs": [58.20, 57.36, 56.94, 57.90, 58.27],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "TREE_TRAIN_100K": {
+      "Latency (ms)": {
+        "average": 68.363540,
+        "runs": [66.20, 68.78, 67.88, 69.76, 69.19],
+        "target": 2000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "BATCH_PREDICT_1M": {
+      "Latency (ms)": {
+        "average": 4.533460,
+        "runs": [4.32, 4.48, 4.69, 4.89, 4.28],
+        "target": 2000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "SINGLE_PREDICT": {
+      "Latency (us)": {
+        "average": 0.008428,
+        "runs": [0.01, 0.01, 0.01, 0.01, 0.01],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "ATE_100K": {
+      "Latency (ms)": {
+        "average": 11.168160,
+        "runs": [11.34, 11.26, 11.02, 11.09, 11.13],
+        "target": 5000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "FORECAST_10K": {
+      "Latency (ms)": {
+        "average": 0.089120,
+        "runs": [0.21, 0.06, 0.06, 0.05, 0.06],
+        "target": 10000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    }
+  }
+}

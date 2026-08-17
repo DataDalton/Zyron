@@ -1,9 +1,7 @@
 //! Disk manager for async page-level file I/O.
 
 use std::path::{Path, PathBuf};
-use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use zyron_common::page::{PAGE_SIZE, PageId};
 use zyron_common::{Result, ZyronError};
 
@@ -32,27 +30,37 @@ impl Default for DiskManagerConfig {
 pub struct DiskManager {
     /// Configuration.
     config: DiskManagerConfig,
-    /// Open file handles keyed by file_id.
-    /// scc::HashMap allows concurrent access to different file_ids.
-    /// Per-file Mutex serializes operations on the same file.
-    files: scc::HashMap<u32, Mutex<FileHandle>>,
-    /// Synchronous file handles for the background writer thread and
-    /// buffer-pool eviction. Lock-free reads via `scc::HashMap::read_sync`,
-    /// and writes use positional I/O (`pwrite` / `seek_write`) so multiple
-    /// threads can write to the same file at different offsets concurrently
-    /// without any lock. Previously a single global `Mutex<HashMap<File>>`
-    /// serialized ALL page writes across every file in the engine, holding
-    /// the lock through every fsync (~5ms on Windows), which capped the
-    /// engine at roughly 200 page writes per second.
-    sync_files: scc::HashMap<u32, std::sync::Arc<std::fs::File>>,
+    /// Open files keyed by file_id, one entry and one operating system
+    /// handle per file serving every caller. scc::HashMap gives lock-free
+    /// lookup, and because all page I/O is positional the entry itself
+    /// needs no lock to read or write through.
+    files: scc::HashMap<u32, std::sync::Arc<FileEntry>>,
 }
 
-/// Handle for an open data file.
-struct FileHandle {
-    /// The async file handle.
-    file: File,
-    /// Number of pages in the file.
-    num_pages: u64,
+/// An open data file.
+///
+/// Page reads and writes address the file by offset (`pread` / `pwrite`),
+/// which never touches the file cursor, so any number of threads can read
+/// and write the same file at once without coordinating. The page count
+/// and length that a lock previously guarded are atomics instead, updated
+/// with the monotonic operations their meaning already implied. Growth is
+/// `fetch_max` so a late small allocation can never shrink a file another
+/// caller already extended.
+struct FileEntry {
+    /// One handle, shared by the async callers and by the background
+    /// writer thread. Opening a path costs milliseconds on some platforms,
+    /// so it is done once when the file is first referenced.
+    file: std::sync::Arc<std::fs::File>,
+    /// Pages the file is known to hold, which bounds what `read_page`
+    /// accepts.
+    num_pages: AtomicU64,
+    /// Bytes the file has been extended to. Kept beside `num_pages` so a
+    /// grow is one compare rather than a metadata call.
+    len_bytes: AtomicU64,
+    /// Held shared by page I/O and exclusively by operations that change
+    /// the file's extent underneath it, which is truncation and deletion.
+    /// Page I/O never contends with page I/O, only with those two.
+    extent: parking_lot::RwLock<()>,
 }
 
 impl DiskManager {
@@ -63,20 +71,21 @@ impl DiskManager {
         Ok(Self {
             config,
             files: scc::HashMap::new(),
-            sync_files: scc::HashMap::new(),
         })
     }
 
-    /// Returns a shared `std::fs::File` handle for the given file_id,
-    /// lazily opening the file the first time it is referenced. Reads are
-    /// lock-free, opens settle by letting the first writer's `insert_sync`
-    /// win and subsequent racers fall through to the established entry.
-    fn sync_file(&self, file_id: u32) -> Result<std::sync::Arc<std::fs::File>> {
-        if let Some(arc) = self
-            .sync_files
-            .read_sync(&file_id, |_, f| std::sync::Arc::clone(f))
-        {
-            return Ok(arc);
+    /// Returns the entry for a file, opening it the first time it is
+    /// referenced. Lookups are lock-free. A race to open settles by letting
+    /// the first inserter win, the loser's handle closes harmlessly, so
+    /// every caller ends up on the same handle and the same counters.
+    ///
+    /// This is synchronous by design. Opening resolves a path, which is
+    /// expensive enough on some platforms to matter, and doing it once here
+    /// keeps that cost off every later read and write from either the async
+    /// callers or the background writer thread.
+    fn entry(&self, file_id: u32) -> Result<std::sync::Arc<FileEntry>> {
+        if let Some(e) = self.files.read_sync(&file_id, |_, e| e.clone()) {
+            return Ok(e);
         }
         let path = self.file_path(file_id);
         let file = std::fs::OpenOptions::new()
@@ -86,16 +95,38 @@ impl DiskManager {
             .truncate(false)
             .open(&path)
             .map_err(|e| ZyronError::IoError(format!("open {}: {}", path.display(), e)))?;
-        let arc = std::sync::Arc::new(file);
-        let _ = self
-            .sync_files
-            .insert_sync(file_id, std::sync::Arc::clone(&arc));
-        // If a concurrent caller's insert won, our `arc` is dropped harmlessly
-        // and the next read_sync returns theirs; otherwise we keep our own.
+        let len = file
+            .metadata()
+            .map_err(|e| ZyronError::IoError(format!("stat {}: {}", path.display(), e)))?
+            .len();
+        let entry = std::sync::Arc::new(FileEntry {
+            file: std::sync::Arc::new(file),
+            num_pages: AtomicU64::new(len / PAGE_SIZE as u64),
+            len_bytes: AtomicU64::new(len),
+            extent: parking_lot::RwLock::new(()),
+        });
+        let _ = self.files.insert_sync(file_id, entry.clone());
         Ok(self
-            .sync_files
-            .read_sync(&file_id, |_, f| std::sync::Arc::clone(f))
-            .unwrap_or(arc))
+            .files
+            .read_sync(&file_id, |_, e| e.clone())
+            .unwrap_or(entry))
+    }
+
+    /// Grows a file to cover `target_len`, and only ever grows. Concurrent
+    /// allocations can complete out of order, so the length each one sets
+    /// has to be the high water mark rather than its own value, otherwise a
+    /// smaller late call would truncate away another's pages.
+    fn grow_to(entry: &FileEntry, target_len: u64) -> Result<()> {
+        let previous = entry.len_bytes.fetch_max(target_len, Ordering::AcqRel);
+        if previous >= target_len {
+            return Ok(());
+        }
+        entry.file.set_len(target_len).map_err(|e| {
+            // Undo the claim so a later caller retries the extension rather
+            // than trusting a length the file does not have
+            entry.len_bytes.store(previous, Ordering::Release);
+            ZyronError::IoError(format!("extend file to {}: {}", target_len, e))
+        })
     }
 
     /// Returns the data directory path.
@@ -108,88 +139,66 @@ impl DiskManager {
         self.config.data_dir.join(format!("{:08}.dat", file_id))
     }
 
-    /// Opens or creates a data file.
-    async fn open_file(&self, file_id: u32) -> Result<()> {
-        if self.files.contains_async(&file_id).await {
-            return Ok(());
-        }
-
-        let path = self.file_path(file_id);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .await?;
-
-        let file_size = file.metadata().await?.len();
-        let num_pages = file_size / PAGE_SIZE as u64;
-
-        // insert_async returns Err if key already exists (concurrent open_file race).
-        // That is fine, the first writer wins and subsequent callers use the existing entry.
-        let _ = self
-            .files
-            .insert_async(file_id, Mutex::new(FileHandle { file, num_pages }))
-            .await;
-
-        Ok(())
-    }
-
     /// Reads a page from disk.
     pub async fn read_page(&self, page_id: PageId) -> Result<[u8; PAGE_SIZE]> {
-        self.open_file(page_id.file_id).await?;
-
-        let entry = self
-            .files
-            .get_async(&page_id.file_id)
-            .await
-            .ok_or_else(|| ZyronError::IoError(format!("file {} not open", page_id.file_id)))?;
-
-        let mut handle = entry.get().lock().await;
-
-        if page_id.page_num >= handle.num_pages {
+        let entry = self.entry(page_id.file_id)?;
+        if page_id.page_num >= entry.num_pages.load(Ordering::Acquire) {
             return Err(ZyronError::IoError(format!(
                 "page {} does not exist in file {}",
                 page_id.page_num, page_id.file_id
             )));
         }
-
         let offset = page_id.page_num * (PAGE_SIZE as u64);
-        handle.file.seek(std::io::SeekFrom::Start(offset)).await?;
-
-        let mut buffer = [0u8; PAGE_SIZE];
-        handle.file.read_exact(&mut buffer).await?;
-
-        Ok(buffer)
+        let file_id = page_id.file_id;
+        let page_num = page_id.page_num;
+        tokio::task::spawn_blocking(move || {
+            let _extent = entry.extent.read();
+            let mut buffer = [0u8; PAGE_SIZE];
+            positional_read_exact(&entry.file, &mut buffer, offset).map_err(|e| {
+                ZyronError::IoError(format!(
+                    "read page {}@{} for file {}: {}",
+                    page_num, offset, file_id, e
+                ))
+            })?;
+            Ok(buffer)
+        })
+        .await
+        .map_err(|e| ZyronError::IoError(format!("read page task: {}", e)))?
     }
 
     /// Writes a page to disk.
     pub async fn write_page(&self, page_id: PageId, data: &[u8; PAGE_SIZE]) -> Result<()> {
-        self.open_file(page_id.file_id).await?;
-
-        let entry = self
-            .files
-            .get_async(&page_id.file_id)
-            .await
-            .ok_or_else(|| ZyronError::IoError(format!("file {} not open", page_id.file_id)))?;
-
-        let mut handle = entry.get().lock().await;
-
+        let entry = self.entry(page_id.file_id)?;
         let offset = page_id.page_num * (PAGE_SIZE as u64);
-        handle.file.seek(std::io::SeekFrom::Start(offset)).await?;
-        handle.file.write_all(data).await?;
-
-        if self.config.fsync_enabled {
-            handle.file.sync_all().await?;
-        }
-
-        // Update page count if we extended the file
-        if page_id.page_num >= handle.num_pages {
-            handle.num_pages = page_id.page_num + 1;
-        }
-
-        Ok(())
+        let fsync = self.config.fsync_enabled;
+        let buf = *data;
+        let file_id = page_id.file_id;
+        let page_num = page_id.page_num;
+        let written = tokio::task::spawn_blocking(move || -> Result<()> {
+            let _extent = entry.extent.read();
+            positional_write_all(&entry.file, &buf, offset).map_err(|e| {
+                ZyronError::IoError(format!(
+                    "write page {}@{} for file {}: {}",
+                    page_num, offset, file_id, e
+                ))
+            })?;
+            if fsync {
+                entry
+                    .file
+                    .sync_all()
+                    .map_err(|e| ZyronError::IoError(format!("fsync file {}: {}", file_id, e)))?;
+            }
+            // A write past the known end extends the file, so both counters
+            // rise to cover it and never fall
+            entry.num_pages.fetch_max(page_num + 1, Ordering::AcqRel);
+            entry
+                .len_bytes
+                .fetch_max((page_num + 1) * PAGE_SIZE as u64, Ordering::AcqRel);
+            Ok(())
+        })
+        .await
+        .map_err(|e| ZyronError::IoError(format!("write page task: {}", e)))?;
+        written
     }
 
     /// Allocates a new page in the specified file and extends the underlying
@@ -200,77 +209,47 @@ impl DiskManager {
     /// guaranteed to be readable and returns a zero-filled buffer if no
     /// data has been written yet.
     pub async fn allocate_page(&self, file_id: u32) -> Result<PageId> {
-        self.open_file(file_id).await?;
-
-        let entry = self
-            .files
-            .get_async(&file_id)
-            .await
-            .ok_or_else(|| ZyronError::IoError(format!("file {} not open", file_id)))?;
-
-        let mut handle = entry.get().lock().await;
-
-        let page_num = handle.num_pages;
-        let new_num_pages = page_num + 1;
-        let new_len = new_num_pages * (PAGE_SIZE as u64);
-        handle.file.set_len(new_len).await?;
-        handle.num_pages = new_num_pages;
-
-        Ok(PageId::new(file_id, page_num))
+        Ok(self.allocate_pages_batch(file_id, 1).await?[0])
     }
 
     /// Allocates multiple pages in a single operation and extends the file to
     /// the new page count. Every returned page is physically addressable even
     /// before its first `write_page`.
+    ///
+    /// The page numbers come from one atomic add, so two callers allocating
+    /// at once take disjoint ranges without a lock between them.
     pub async fn allocate_pages_batch(&self, file_id: u32, count: u64) -> Result<Vec<PageId>> {
         if count == 0 {
             return Ok(Vec::new());
         }
+        let entry = self.entry(file_id)?;
+        let start_page = entry.num_pages.fetch_add(count, Ordering::AcqRel);
+        let target_len = (start_page + count) * (PAGE_SIZE as u64);
+        let e2 = entry.clone();
+        tokio::task::spawn_blocking(move || {
+            let _extent = e2.extent.read();
+            Self::grow_to(&e2, target_len)
+        })
+        .await
+        .map_err(|e| ZyronError::IoError(format!("allocate task: {}", e)))??;
 
-        self.open_file(file_id).await?;
-
-        let entry = self
-            .files
-            .get_async(&file_id)
-            .await
-            .ok_or_else(|| ZyronError::IoError(format!("file {} not open", file_id)))?;
-
-        let mut handle = entry.get().lock().await;
-
-        let start_page = handle.num_pages;
-        let new_num_pages = start_page + count;
-        let new_len = new_num_pages * (PAGE_SIZE as u64);
-        handle.file.set_len(new_len).await?;
-
-        let mut pages = Vec::with_capacity(count as usize);
-        for i in 0..count {
-            pages.push(PageId::new(file_id, start_page + i));
-        }
-        handle.num_pages = new_num_pages;
-
-        Ok(pages)
+        Ok((0..count)
+            .map(|i| PageId::new(file_id, start_page + i))
+            .collect())
     }
 
     /// Returns the number of pages in a file.
     pub async fn num_pages(&self, file_id: u32) -> Result<u64> {
-        self.open_file(file_id).await?;
-
-        let entry = self
-            .files
-            .get_async(&file_id)
-            .await
-            .ok_or_else(|| ZyronError::IoError(format!("file {} not open", file_id)))?;
-
-        let handle = entry.get().lock().await;
-
-        Ok(handle.num_pages)
+        Ok(self.entry(file_id)?.num_pages.load(Ordering::Acquire))
     }
 
     /// Synchronous page write for the background writer thread.
     /// Uses std::fs::File handles separate from the async path.
     /// The background writer is a dedicated OS thread that can block on I/O.
     pub fn write_page_sync(&self, page_id: PageId, data: &[u8; PAGE_SIZE]) -> Result<()> {
-        let file = self.sync_file(page_id.file_id)?;
+        let entry = self.entry(page_id.file_id)?;
+        let _extent = entry.extent.read();
+        let file = &entry.file;
         let offset = page_id.page_num * (PAGE_SIZE as u64);
         positional_write_all(&file, data, offset).map_err(|e| {
             ZyronError::IoError(format!(
@@ -292,7 +271,9 @@ impl DiskManager {
     /// than one fsync per page on platforms where fsync dominates write
     /// cost (notably Windows).
     pub fn write_page_sync_no_fsync(&self, page_id: PageId, data: &[u8; PAGE_SIZE]) -> Result<()> {
-        let file = self.sync_file(page_id.file_id)?;
+        let entry = self.entry(page_id.file_id)?;
+        let _extent = entry.extent.read();
+        let file = &entry.file;
         let offset = page_id.page_num * (PAGE_SIZE as u64);
         positional_write_all(&file, data, offset).map_err(|e| {
             ZyronError::IoError(format!(
@@ -309,27 +290,32 @@ impl DiskManager {
         if !self.config.fsync_enabled {
             return Ok(());
         }
-        let file = self.sync_file(file_id)?;
-        file.sync_all()
+        let entry = self.entry(file_id)?;
+        entry
+            .file
+            .sync_all()
             .map_err(|e| ZyronError::IoError(format!("fsync file {}: {}", file_id, e)))
     }
 
     /// Flushes all pending writes to disk.
     pub async fn flush(&self) -> Result<()> {
-        // Collect file_ids, then flush each individually.
-        let mut file_ids = Vec::new();
+        let mut entries = Vec::new();
         self.files
-            .iter_async(|&file_id, _| {
-                file_ids.push(file_id);
+            .iter_async(|&file_id, e| {
+                entries.push((file_id, e.clone()));
                 true
             })
             .await;
 
-        for file_id in file_ids {
-            if let Some(entry) = self.files.get_async(&file_id).await {
-                let handle = entry.get().lock().await;
-                handle.file.sync_all().await?;
-            }
+        for (file_id, entry) in entries {
+            tokio::task::spawn_blocking(move || {
+                entry
+                    .file
+                    .sync_all()
+                    .map_err(|e| ZyronError::IoError(format!("fsync file {}: {}", file_id, e)))
+            })
+            .await
+            .map_err(|e| ZyronError::IoError(format!("flush task: {}", e)))??;
         }
 
         Ok(())
@@ -337,39 +323,54 @@ impl DiskManager {
 
     /// Truncates a data file to zero pages, removing all stored data.
     /// The file remains on disk but is reset to empty.
+    ///
+    /// Takes the extent lock exclusively, so no read or write is addressing
+    /// the file while its length changes underneath them.
     pub async fn truncate_file(&self, file_id: u32) -> Result<()> {
-        self.open_file(file_id).await?;
-
-        let entry = self
-            .files
-            .get_async(&file_id)
-            .await
-            .ok_or_else(|| ZyronError::IoError(format!("file {} not open", file_id)))?;
-
-        let mut handle = entry.get().lock().await;
-        handle.file.set_len(0).await?;
-        if self.config.fsync_enabled {
-            handle.file.sync_all().await?;
-        }
-        handle.num_pages = 0;
-
-        Ok(())
+        let entry = self.entry(file_id)?;
+        let fsync = self.config.fsync_enabled;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let _extent = entry.extent.write();
+            entry
+                .file
+                .set_len(0)
+                .map_err(|e| ZyronError::IoError(format!("truncate file {}: {}", file_id, e)))?;
+            if fsync {
+                entry
+                    .file
+                    .sync_all()
+                    .map_err(|e| ZyronError::IoError(format!("fsync file {}: {}", file_id, e)))?;
+            }
+            entry.num_pages.store(0, Ordering::Release);
+            entry.len_bytes.store(0, Ordering::Release);
+            Ok(())
+        })
+        .await
+        .map_err(|e| ZyronError::IoError(format!("truncate task: {}", e)))?
     }
 
-    /// Closes a specific file.
-    /// Extends file to match num_pages to persist lazy-allocated pages.
+    /// Closes a specific file, first extending it to cover every page that
+    /// was allocated, so pages allocated but never written survive.
     pub async fn close_file(&self, file_id: u32) -> Result<()> {
-        if let Some((_, file_mutex)) = self.files.remove_async(&file_id).await {
-            let handle = file_mutex.into_inner();
-            let expected_size = handle.num_pages * (PAGE_SIZE as u64);
-            handle.file.set_len(expected_size).await?;
-            handle.file.sync_all().await?;
+        if let Some((_, entry)) = self.files.remove_async(&file_id).await {
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let _extent = entry.extent.write();
+                let expected = entry.num_pages.load(Ordering::Acquire) * (PAGE_SIZE as u64);
+                entry.file.set_len(expected).map_err(|e| {
+                    ZyronError::IoError(format!("extend file {} on close: {}", file_id, e))
+                })?;
+                entry
+                    .file
+                    .sync_all()
+                    .map_err(|e| ZyronError::IoError(format!("fsync file {}: {}", file_id, e)))
+            })
+            .await
+            .map_err(|e| ZyronError::IoError(format!("close task: {}", e)))??;
         }
         Ok(())
     }
 
     /// Closes all open files.
-    /// Extends files to match num_pages to persist lazy-allocated pages.
     pub async fn close_all(&self) -> Result<()> {
         let mut file_ids = Vec::new();
         self.files
@@ -380,12 +381,7 @@ impl DiskManager {
             .await;
 
         for file_id in file_ids {
-            if let Some((_, file_mutex)) = self.files.remove_async(&file_id).await {
-                let handle = file_mutex.into_inner();
-                let expected_size = handle.num_pages * (PAGE_SIZE as u64);
-                handle.file.set_len(expected_size).await?;
-                handle.file.sync_all().await?;
-            }
+            self.close_file(file_id).await?;
         }
         Ok(())
     }

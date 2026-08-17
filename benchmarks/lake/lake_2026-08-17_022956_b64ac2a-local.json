@@ -1,0 +1,211 @@
+{
+  "id": "2026-08-17_022956_b64ac2a-local",
+  "date": "2026-08-17 02:29:58Z",
+  "ts": 1786933798,
+  "commit": "b64ac2a-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "lake_clustering": {
+      "skip rate after a bucket-ordered pass": {
+        "average": 0.875000,
+        "runs": [0.88],
+        "target": 0.500000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "Cluster pass": {
+        "average": 38294.500000,
+        "runs": [38294.50],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Rows rewritten": {
+        "average": 855684.236640,
+        "runs": [855684.24],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "lake_log": {
+      "Commit rate": {
+        "average": 1047.621604,
+        "runs": [1047.62],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Retries": {
+        "average": 0.706250,
+        "runs": [0.71],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Head read": {
+        "average": 0.185400,
+        "runs": [0.18, 0.19, 0.18, 0.18, 0.19],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Latest manifest (cached)": {
+        "average": 41.520000,
+        "runs": [42.00, 41.40, 41.40, 41.40, 41.40],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Prune index build (cold)": {
+        "average": 23.900000,
+        "runs": [23.90],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Prune index at version (cached)": {
+        "average": 42.300000,
+        "runs": [43.50, 42.00, 42.00, 42.00, 42.00],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "lake_scan": {
+      "Scan throughput": {
+        "average": 1124053513.558144,
+        "runs": [1092266666.67, 1114557823.13, 1145734265.73, 1129931034.48, 1137777777.78],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "lake_pruning": {
+      "point predicate files pruned (fraction)": {
+        "average": 0.999990,
+        "runs": [1.00],
+        "target": 0.999900,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "strided predicate files pruned (fraction)": {
+        "average": 0.937500,
+        "runs": [0.94],
+        "target": 0.930000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "Prune index build": {
+        "average": 10279.420000,
+        "runs": [10180.80, 10364.10, 9218.80, 11639.20, 9994.20],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "point sweep over 100000 files": {
+        "average": 27.180000,
+        "runs": [49.30, 22.00, 21.50, 21.60, 21.50],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "range sweep over 100000 files": {
+        "average": 18.560000,
+        "runs": [29.00, 16.10, 15.90, 16.00, 15.80],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "strided sweep over 100000 files": {
+        "average": 23.800000,
+        "runs": [41.10, 19.60, 19.40, 19.40, 19.50],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "lake_index": {
+      "index files opened per point probe": {
+        "average": 1.000000,
+        "runs": [1.00],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Point probe through the index": {
+        "average": 33.780000,
+        "runs": [47.60, 33.60, 30.10, 28.70, 28.90],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Point lookup by scanning": {
+        "average": 423.520000,
+        "runs": [549.70, 397.70, 384.90, 396.50, 388.80],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Range probe through the index": {
+        "average": 74.800000,
+        "runs": [108.80, 76.30, 64.30, 66.80, 57.80],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      }
+    },
+    "lake_constraints": {
+      "Unique check, clustered": {
+        "average": 33.840000,
+        "runs": [44.30, 32.60, 31.70, 29.90, 30.70],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Unique check, unclustered": {
+        "average": 41.060000,
+        "runs": [48.10, 40.70, 38.70, 38.80, 39.00],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "rows compared per probed key (clustered)": {
+        "average": 0.062500,
+        "runs": [0.06],
+        "target": 8.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "lake_skipping": {
+      "zone map rows rejected (fraction)": {
+        "average": 1.000000,
+        "runs": [1.00],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "Zone map rejection": {
+        "average": 2.720000,
+        "runs": [3.90, 2.70, 2.60, 2.10, 2.30],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Full column decode": {
+        "average": 28.380000,
+        "runs": [41.10, 25.90, 25.20, 24.80, 24.90],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      }
+    }
+  }
+}

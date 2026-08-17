@@ -1,0 +1,131 @@
+{
+  "id": "2026-08-17_025456_b64ac2a-local",
+  "date": "2026-08-17 02:55:22Z",
+  "ts": 1786935322,
+  "commit": "b64ac2a-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Server Startup": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 13.11 },
+      "util_after": { "cpu_pct": 5.0, "ram_used_gb": 13.48 },
+      "Cold start latency (ms)": {
+        "average": 26.973180,
+        "runs": [39.99, 21.07, 24.36, 23.24, 26.21],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Warm start latency (ms)": {
+        "average": 37.560500,
+        "runs": [39.14, 38.68, 42.37, 34.20, 33.41],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Concurrent Connections": {
+      "Max connections capacity": {
+        "average": 100000.000000,
+        "runs": [100000.00],
+        "target": 100000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    },
+    "Checkpoint": {
+      "util_before": { "cpu_pct": 0.0, "ram_used_gb": 13.32 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 13.58 },
+      "Checkpoint latency (ms)": {
+        "average": 0.686940,
+        "runs": [0.75, 0.86, 0.70, 0.71, 0.42],
+        "target": 3.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Graceful Shutdown": {
+      "util_before": { "cpu_pct": 3.0, "ram_used_gb": 13.59 },
+      "util_after": { "cpu_pct": 5.0, "ram_used_gb": 13.76 },
+      "Shutdown latency (ms)": {
+        "average": 0.623460,
+        "runs": [0.77, 0.67, 0.79, 0.49, 0.40],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Crash Recovery": {
+      "util_before": { "cpu_pct": 1.0, "ram_used_gb": 13.74 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 13.68 },
+      "1MB WAL recovery latency (ms)": {
+        "average": 5.550240,
+        "runs": [5.84, 5.64, 6.38, 4.59, 5.30],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "Clean recovery latency (ms)": {
+        "average": 0.521900,
+        "runs": [0.52, 0.50, 0.61, 0.51, 0.47],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Metrics": {
+      "util_before": { "cpu_pct": 7.0, "ram_used_gb": 13.68 },
+      "util_after": { "cpu_pct": 0.0, "ram_used_gb": 13.67 },
+      "Metrics scrape latency (us)": {
+        "average": 15.660000,
+        "runs": [52.40, 8.50, 7.30, 5.10, 5.00],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Health Checks": {
+      "util_before": { "cpu_pct": 4.0, "ram_used_gb": 13.66 },
+      "util_after": { "cpu_pct": 9.0, "ram_used_gb": 13.66 },
+      "Health check latency (us)": {
+        "average": 3355.700000,
+        "runs": [526.60, 15884.10, 158.50, 110.10, 99.20],
+        "target": 100.000000,
+        "passed": false,
+        "higher_is_better": false
+      },
+      "Health endpoint round-trip (us)": {
+        "average": 3355.700000,
+        "runs": [3355.70],
+        "target": 10000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "End-to-End Wire": {
+      "util_before": { "cpu_pct": 2.0, "ram_used_gb": 13.66 },
+      "util_after": { "cpu_pct": 1.0, "ram_used_gb": 13.79 },
+      "Handshake latency (us)": {
+        "average": 364.765000,
+        "runs": [338.06, 250.59, 116.45, 814.37, 304.36],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    },
+    "Memory Baseline": {
+      "Core struct overhead (bytes)": {
+        "average": 1184.000000,
+        "runs": [1184.00],
+        "target": 10000000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    }
+  }
+}

@@ -444,27 +444,6 @@ fn merge_batches(mut batches: Vec<DataBatch>, total_rows: usize) -> Option<DataB
     Some(DataBatch::new(merged_columns))
 }
 
-/// Gathers the given rows of each column into fresh columns appended to
-/// out. Columns without nulls skip the bitmap gather entirely.
-fn gather_columns_into(cols: &[Column], idx: &[u32], n: usize, out: &mut Vec<Column>) {
-    for col in cols {
-        let mut d = ColumnData::with_capacity(col.type_id, n);
-        d.gather_from(&col.data, idx);
-        if col.nulls.has_nulls() {
-            let mut nulls = NullBitmap::empty();
-            nulls.gather_from(&col.nulls, idx);
-            out.push(Column::with_nulls_ts(
-                d,
-                nulls,
-                col.type_id,
-                col.fractional_digits,
-            ));
-        } else {
-            out.push(Column::new_ts(d, col.type_id, col.fractional_digits));
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // HashJoinOperator
 // ---------------------------------------------------------------------------

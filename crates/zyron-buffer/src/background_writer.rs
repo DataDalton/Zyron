@@ -66,6 +66,10 @@ pub struct BackgroundWriter {
     writer_thread: Option<JoinHandle<()>>,
     /// Total pages flushed (cumulative counter for stats).
     pages_flushed: Arc<AtomicU64>,
+    /// Completed flush cycles, published so a waiter can block until the
+    /// writer has actually done another pass rather than sleeping for a
+    /// guessed interval and rescanning the pool on a fixed cadence
+    cycles: Arc<(parking_lot::Mutex<u64>, parking_lot::Condvar)>,
 }
 
 impl BackgroundWriter {
@@ -93,6 +97,9 @@ impl BackgroundWriter {
         let thread_shutdown = Arc::clone(&shutdown);
         let thread_waker = Arc::clone(&writer_thread_waker);
         let thread_flushed = Arc::clone(&pages_flushed);
+        let cycles: Arc<(parking_lot::Mutex<u64>, parking_lot::Condvar)> =
+            Arc::new((parking_lot::Mutex::new(0), parking_lot::Condvar::new()));
+        let thread_cycles = Arc::clone(&cycles);
         let thread_config = config.clone();
 
         let handle = thread::Builder::new()
@@ -110,6 +117,7 @@ impl BackgroundWriter {
                     &thread_durable_error,
                     &thread_shutdown,
                     &thread_flushed,
+                    &thread_cycles,
                     &thread_config,
                 );
             })
@@ -123,6 +131,7 @@ impl BackgroundWriter {
             writer_thread_waker,
             writer_thread: Some(handle),
             pages_flushed,
+            cycles,
         }
     }
 
@@ -136,6 +145,7 @@ impl BackgroundWriter {
         durable_error: &AtomicBool,
         shutdown: &AtomicBool,
         pages_flushed: &AtomicU64,
+        cycles: &Arc<(parking_lot::Mutex<u64>, parking_lot::Condvar)>,
         config: &BackgroundWriterConfig,
     ) {
         loop {
@@ -156,7 +166,19 @@ impl BackgroundWriter {
 
             // Determine threshold: checkpoint target or unlimited trickle
             let target = target_lsn.load(Ordering::Acquire);
-            let threshold = if target == 0 { u64::MAX } else { target };
+            let checkpointing = target != 0;
+            let threshold = if checkpointing { target } else { u64::MAX };
+
+            // The per-cycle quota paces trickle mode so background flushing
+            // does not starve foreground work. A checkpoint is a bulk
+            // operation whose whole cost is how long the flush takes, and
+            // each cycle ends in an fsync per touched file, so capping the
+            // batch there only multiplies the fsyncs a checkpoint waits on
+            let limit = if checkpointing {
+                usize::MAX
+            } else {
+                config.pages_per_cycle
+            };
 
             let flushed = Self::flush_cycle(
                 pool,
@@ -166,10 +188,24 @@ impl BackgroundWriter {
                 min_dirty_lsn,
                 durable_error,
                 pages_flushed,
-                config.pages_per_cycle,
+                limit,
             );
 
-            // Sleep based on whether work was done
+            // Publish the completed cycle before sleeping, so a checkpoint
+            // waiting on the writer learns a pass finished as soon as it
+            // finishes rather than when its own next poll happens to fire
+            {
+                let mut count = cycles.0.lock();
+                *count += 1;
+                cycles.1.notify_all();
+            }
+
+            // Sleep based on whether work was done. A checkpoint that still
+            // has pages to move goes straight into the next cycle, because
+            // pausing there only adds to the wait it is being measured on
+            if checkpointing && flushed > 0 {
+                continue;
+            }
             if flushed > 0 {
                 thread::park_timeout(Duration::from_micros(config.active_sleep_us));
             } else {
@@ -279,6 +315,26 @@ impl BackgroundWriter {
     /// Returns the lowest unflushed dirty_lsn. u64::MAX means no dirty pages.
     pub fn min_dirty_lsn(&self) -> u64 {
         self.min_dirty_lsn.load(Ordering::Acquire)
+    }
+
+    /// Flush cycles completed so far. Paired with `wait_for_cycle_after` so
+    /// a caller can rescan only when the writer has actually done more work
+    pub fn cycles_completed(&self) -> u64 {
+        *self.cycles.0.lock()
+    }
+
+    /// Blocks until the writer completes a cycle numbered above `seen`, or
+    /// until `timeout` elapses, and returns the count observed on wake.
+    /// Waiting on the writer's own progress replaces sleeping for a guessed
+    /// interval, so a checkpoint neither rescans the pool needlessly nor
+    /// waits past the moment the last page became durable
+    pub fn wait_for_cycle_after(&self, seen: u64, timeout: Duration) -> u64 {
+        let mut count = self.cycles.0.lock();
+        if *count > seen {
+            return *count;
+        }
+        self.cycles.1.wait_for(&mut count, timeout);
+        *count
     }
 
     /// Returns true if a page write or fsync has failed durably since the last
