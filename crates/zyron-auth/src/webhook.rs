@@ -4,11 +4,9 @@
 //! external services (Stripe, GitHub, Slack). Uses HMAC-SHA256 with
 //! constant-time comparison to prevent timing attacks.
 
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use zyron_common::{Result, ZyronError};
 
-type HmacSha256 = Hmac<Sha256>;
+use crate::hmac_sha2::hmac_sha256;
 
 /// Supported HMAC algorithms for generic webhook verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,14 +28,10 @@ pub fn verify_hmac(
 
     match algorithm {
         HmacAlgorithm::Sha256 => {
-            let mut mac = HmacSha256::new_from_slice(secret).map_err(|e| {
-                ZyronError::WebhookVerificationFailed(format!("HMAC init failed: {}", e))
-            })?;
-            mac.update(payload);
-            match mac.verify_slice(&expected_bytes) {
-                Ok(()) => Ok(true),
-                Err(_) => Ok(false),
-            }
+            // constant_time_eq returns false on a length mismatch, matching
+            // the length check the Mac verify_slice path performed
+            let computed = hmac_sha256(secret, payload);
+            Ok(crate::balloon::constant_time_eq(&computed, &expected_bytes))
         }
     }
 }
@@ -197,11 +191,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// Computes an HMAC-SHA256 and returns the hex-encoded signature.
 /// Useful for generating test signatures.
 pub fn compute_hmac_sha256(payload: &[u8], secret: &[u8]) -> Result<String> {
-    let mut mac = HmacSha256::new_from_slice(secret)
-        .map_err(|e| ZyronError::WebhookVerificationFailed(format!("HMAC init failed: {}", e)))?;
-    mac.update(payload);
-    let result = mac.finalize();
-    Ok(hex_encode(&result.into_bytes()))
+    Ok(hex_encode(&hmac_sha256(secret, payload)))
 }
 
 #[cfg(test)]

@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use zyron_common::{Result, ZyronError};
 
 use crate::balloon::{self, BalloonParams};
+use crate::hmac_sha2::{HmacSha256Key, HmacSha384Key, HmacSha512Key};
 
 // ---------------------------------------------------------------------------
 // PasswordCredential
@@ -167,11 +168,7 @@ pub fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] 
 
 /// HMAC-SHA-256 returning a fixed 32-byte array.
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(data);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&mac.finalize().into_bytes());
-    out
+    crate::hmac_sha2::hmac_sha256(key, data)
 }
 
 // ---------------------------------------------------------------------------
@@ -301,17 +298,23 @@ pub struct JwtClaims {
     pub custom: std::collections::HashMap<String, String>,
 }
 
+/// Signing key for one algorithm, holding the padded HMAC blocks so a
+/// signature costs two hash passes and no key derivation
+enum JwtMacKey {
+    Hs256(HmacSha256Key),
+    Hs384(HmacSha384Key),
+    Hs512(HmacSha512Key),
+}
+
 /// JWT credential that can encode and decode tokens using HMAC signing
 /// Pre-computes the HMAC key schedule on construction to avoid per-call overhead
 pub struct JwtCredential {
     algorithm: JwtAlgorithm,
     issuer: Option<String>,
     max_age_secs: u64,
-    /// Pre-computed HMAC-SHA256 instance, cloned per sign() call to skip key
-    /// derivation (inner/outer pad computation)
-    hmac256: Option<Hmac<sha2::Sha256>>,
-    hmac384: Option<Hmac<sha2::Sha384>>,
-    hmac512: Option<Hmac<sha2::Sha512>>,
+    /// Padded key blocks for the declared algorithm, so the variant present
+    /// always matches `algorithm` and signing cannot fail on a missing key
+    mac_key: JwtMacKey,
     /// Pre-computed base64url-encoded header for this algorithm, the header
     /// JSON is constant per algorithm so encoding it once at construction
     /// saves one format!, one base64 alloc, and one String alloc per encode
@@ -344,29 +347,10 @@ impl JwtCredential {
                 secret.len()
             )));
         }
-        let hmac256 = if matches!(algorithm, JwtAlgorithm::Hs256) {
-            Some(
-                Hmac::<sha2::Sha256>::new_from_slice(&secret)
-                    .map_err(|e| ZyronError::InvalidCredential(format!("HMAC key error: {}", e)))?,
-            )
-        } else {
-            None
-        };
-        let hmac384 = if matches!(algorithm, JwtAlgorithm::Hs384) {
-            Some(
-                Hmac::<sha2::Sha384>::new_from_slice(&secret)
-                    .map_err(|e| ZyronError::InvalidCredential(format!("HMAC key error: {}", e)))?,
-            )
-        } else {
-            None
-        };
-        let hmac512 = if matches!(algorithm, JwtAlgorithm::Hs512) {
-            Some(
-                Hmac::<sha2::Sha512>::new_from_slice(&secret)
-                    .map_err(|e| ZyronError::InvalidCredential(format!("HMAC key error: {}", e)))?,
-            )
-        } else {
-            None
+        let mac_key = match algorithm {
+            JwtAlgorithm::Hs256 => JwtMacKey::Hs256(HmacSha256Key::new(&secret)),
+            JwtAlgorithm::Hs384 => JwtMacKey::Hs384(HmacSha384Key::new(&secret)),
+            JwtAlgorithm::Hs512 => JwtMacKey::Hs512(HmacSha512Key::new(&secret)),
         };
         let header_json = format!("{{\"alg\":\"{}\",\"typ\":\"JWT\"}}", algorithm.as_str());
         let header_b64 = base64url_encode(header_json.as_bytes());
@@ -375,9 +359,7 @@ impl JwtCredential {
             algorithm,
             issuer: None,
             max_age_secs: 3600,
-            hmac256,
-            hmac384,
-            hmac512,
+            mac_key,
             header_b64,
         })
     }
@@ -411,7 +393,7 @@ impl JwtCredential {
         base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode_string(payload_json.as_bytes(), &mut token);
 
-        let signature = self.sign(token.as_bytes())?;
+        let signature = self.sign(token.as_bytes());
         token.push('.');
         base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode_string(signature.as_slice(), &mut token);
@@ -436,7 +418,7 @@ impl JwtCredential {
         let payload_b64 = &token[first_dot + 1..last_dot];
 
         let presented_sig = base64url_decode(sig_b64)?;
-        let expected_sig = self.sign(signing_input.as_bytes())?;
+        let expected_sig = self.sign(signing_input.as_bytes());
 
         if !balloon::constant_time_eq(&presented_sig, expected_sig.as_slice()) {
             return Err(ZyronError::InvalidCredential(
@@ -504,62 +486,29 @@ impl JwtCredential {
         Ok((header, claims))
     }
 
-    /// Computes HMAC signature into a stack-allocated SignatureBuf using
-    /// the pre-computed key schedule, cloning the pre-computed HMAC avoids
-    /// re-deriving inner/outer pads per call
-    fn sign(&self, input: &[u8]) -> Result<SignatureBuf> {
+    /// Computes the HMAC signature into a stack-allocated SignatureBuf from
+    /// the padded key blocks, which costs two hash passes and no allocation
+    #[inline(always)]
+    fn sign(&self, input: &[u8]) -> SignatureBuf {
         let mut buf = SignatureBuf {
             bytes: [0u8; 64],
             len: 0,
         };
-        match self.algorithm {
-            JwtAlgorithm::Hs256 => {
-                let mut mac = self
-                    .hmac256
-                    .as_ref()
-                    .ok_or_else(|| {
-                        ZyronError::AuthenticationFailed(
-                            "JWT credential declares HS256 but carries no HS256 key".to_string(),
-                        )
-                    })?
-                    .clone();
-                mac.update(input);
-                let arr = mac.finalize().into_bytes();
-                buf.bytes[..32].copy_from_slice(&arr);
+        match &self.mac_key {
+            JwtMacKey::Hs256(key) => {
+                buf.bytes[..32].copy_from_slice(&key.sign(input));
                 buf.len = 32;
             }
-            JwtAlgorithm::Hs384 => {
-                let mut mac = self
-                    .hmac384
-                    .as_ref()
-                    .ok_or_else(|| {
-                        ZyronError::AuthenticationFailed(
-                            "JWT credential declares HS384 but carries no HS384 key".to_string(),
-                        )
-                    })?
-                    .clone();
-                mac.update(input);
-                let arr = mac.finalize().into_bytes();
-                buf.bytes[..48].copy_from_slice(&arr);
+            JwtMacKey::Hs384(key) => {
+                buf.bytes[..48].copy_from_slice(&key.sign(input));
                 buf.len = 48;
             }
-            JwtAlgorithm::Hs512 => {
-                let mut mac = self
-                    .hmac512
-                    .as_ref()
-                    .ok_or_else(|| {
-                        ZyronError::AuthenticationFailed(
-                            "JWT credential declares HS512 but carries no HS512 key".to_string(),
-                        )
-                    })?
-                    .clone();
-                mac.update(input);
-                let arr = mac.finalize().into_bytes();
-                buf.bytes[..64].copy_from_slice(&arr);
+            JwtMacKey::Hs512(key) => {
+                buf.bytes[..64].copy_from_slice(&key.sign(input));
                 buf.len = 64;
             }
         }
-        Ok(buf)
+        buf
     }
 
     // -----------------------------------------------------------------------------
@@ -1618,7 +1567,7 @@ mod tests {
         let header_b64 = base64url_encode(b"{\"alg\":\"HS256\",\"typ\":\"JWT\"}");
         let payload_b64 = base64url_encode(payload.as_bytes());
         let signing_input = format!("{}.{}", header_b64, payload_b64);
-        let sig = cred.sign(signing_input.as_bytes()).expect("sign");
+        let sig = cred.sign(signing_input.as_bytes());
         let sig_b64 = base64url_encode(sig.as_slice());
         let token = format!("{}.{}", signing_input, sig_b64);
 

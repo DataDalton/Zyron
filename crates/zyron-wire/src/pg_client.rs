@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use bytes::{Buf, BufMut, BytesMut};
-use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1308,9 +1307,7 @@ fn sha256_bytes(input: &[u8]) -> [u8; 32] {
 }
 
 fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("hmac key");
-    mac.update(msg);
-    mac.finalize().into_bytes().into()
+    zyron_auth::hmac_sha2::hmac_sha256(key, msg)
 }
 
 fn parse_scram_first(s: &str) -> Result<(String, String, u32), ProtocolError> {

@@ -396,15 +396,7 @@ impl Authenticator for ScramAuthenticator {
 
 /// HMAC-SHA-256.
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    use hmac::Mac;
-
-    let mut mac =
-        hmac::Hmac::<sha2::Sha256>::new_from_slice(key).expect("HMAC key length is valid");
-    mac.update(data);
-    let result = mac.finalize().into_bytes();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&result);
-    out
+    zyron_auth::hmac_sha2::hmac_sha256(key, data)
 }
 
 /// SHA-256 hash.

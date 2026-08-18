@@ -22,6 +22,7 @@ pub mod encryption;
 pub mod external_credentials;
 pub mod governance;
 pub mod heap_storage;
+pub mod hmac_sha2;
 pub mod ip_management;
 pub mod k8s_auth;
 pub mod masking;
