@@ -68,11 +68,72 @@ impl ExplainFormat {
 /// time by `aux_labels`
 pub const ACTUAL_AUX_SLOTS: usize = 6;
 
+/// Elapsed nanoseconds split into whole milliseconds and thousandths, the two
+/// integers the renderers print as `{}.{:03}`.
+///
+/// The digits match `{:.3}` applied to the same count as an f64 millisecond
+/// value, exactly, including where the float's representation error decides the
+/// last place. `{:.3}` rounds the true value of the float to three places with
+/// ties to even, and that value is `m * 2^e` for the integers sitting in the
+/// float's bits, so the rounding is a shift and a tie test rather than a decimal
+/// conversion. The conversion is where the float formatter spends its time.
+///
+/// The divide stays, because which side of a tie the quotient lands on is a
+/// property of the division. Scaling the integer nanosecond count instead would
+/// change printed digits at an exact half microsecond
+#[inline]
+pub fn millis_parts(ns: u64) -> (u64, u64) {
+    let thousandths = millis_thousandths(ns);
+    (thousandths / 1_000, thousandths % 1_000)
+}
+
+/// Thousandths of a millisecond, rounded the way `{:.3}` rounds.
+#[inline]
+fn millis_thousandths(ns: u64) -> u64 {
+    let value = ns as f64 / 1_000_000.0;
+    let bits = value.to_bits();
+    let biased_exponent = ((bits >> 52) & 0x7FF) as i32;
+    let fraction = bits & ((1u64 << 52) - 1);
+
+    // A subnormal carries no implicit leading one and sits at a fixed exponent
+    let (mantissa, exponent) = if biased_exponent == 0 {
+        (fraction, -1074i32)
+    } else {
+        (fraction | (1u64 << 52), biased_exponent - 1075)
+    };
+    if mantissa == 0 {
+        return 0;
+    }
+
+    // Under 2^63, so scaling by a thousand still needs only a u128 to stay exact
+    let scaled = mantissa as u128 * 1_000u128;
+
+    if exponent >= 0 {
+        // A u64 nanosecond count reaches about 1.8e13 milliseconds, far under
+        // the 2^52 needed to land here. Kept so the function is total
+        return u64::try_from(scaled << (exponent as u32).min(127)).unwrap_or(u64::MAX);
+    }
+
+    let shift = exponent.unsigned_abs();
+    if shift >= 128 {
+        return 0;
+    }
+    let quotient = scaled >> shift;
+    let remainder = scaled & ((1u128 << shift) - 1);
+    let half = 1u128 << (shift - 1);
+    let rounded = if remainder > half || (remainder == half && quotient & 1 == 1) {
+        quotient + 1
+    } else {
+        quotient
+    };
+    u64::try_from(rounded).unwrap_or(u64::MAX)
+}
+
 /// Runtime metrics collected during EXPLAIN ANALYZE execution.
 #[derive(Debug, Clone, Default)]
 pub struct ActualMetrics {
     pub rows: u64,
-    pub elapsed_ms: f64,
+    pub elapsed_ns: u64,
     pub batches: u64,
     /// Operator-specific counters, zero when the operator fills none
     pub aux: [u64; ACTUAL_AUX_SLOTS],
@@ -89,7 +150,7 @@ pub struct ActualMetrics {
 pub struct NodeMetrics {
     pub name: String,
     pub rows: u64,
-    pub elapsed_ms: f64,
+    pub elapsed_ns: u64,
     pub batches: u64,
     pub aux: [u64; ACTUAL_AUX_SLOTS],
     pub children: Vec<NodeMetrics>,
@@ -847,7 +908,7 @@ impl ExplainNode {
         }
         self.actual_metrics = Some(ActualMetrics {
             rows: metrics.rows,
-            elapsed_ms: metrics.elapsed_ms,
+            elapsed_ns: metrics.elapsed_ns,
             batches: metrics.batches,
             aux: metrics.aux,
         });
@@ -872,9 +933,26 @@ impl ExplainNode {
     // -----------------------------------------------------------------------
 
     fn to_text(&self, options: &ExplainOptions) -> String {
-        let mut output = String::new();
+        let mut output = String::with_capacity(self.render_capacity(96));
         self.write_text_node(&mut output, options, 0);
         output
+    }
+
+    /// Nodes in this subtree, so a render reserves its buffer once instead of
+    /// growing it by doubling. The doubling also made ANALYZE look more
+    /// expensive than it is, since its longer output crossed one more growth
+    /// step than the same plan rendered without it
+    fn node_count(&self) -> usize {
+        1 + self
+            .children
+            .iter()
+            .map(|child| child.node_count())
+            .sum::<usize>()
+    }
+
+    /// Buffer size to reserve for a render, at `per_node` bytes a node.
+    fn render_capacity(&self, per_node: usize) -> usize {
+        self.node_count() * per_node
     }
 
     fn write_text_node(&self, output: &mut String, options: &ExplainOptions, depth: usize) {
@@ -909,10 +987,11 @@ impl ExplainNode {
         // otherwise shows up as a multi-percent rendering overhead
         match (options.analyze, &self.actual_metrics, options.timing) {
             (true, Some(actual), true) => {
+                let (ms, frac) = millis_parts(actual.elapsed_ns);
                 let _ = writeln!(
                     output,
-                    " (actual rows={} time={:.3}ms)",
-                    actual.rows, actual.elapsed_ms
+                    " (actual rows={} time={}.{:03}ms)",
+                    actual.rows, ms, frac
                 );
             }
             (true, Some(actual), false) => {
@@ -957,7 +1036,7 @@ impl ExplainNode {
     // -----------------------------------------------------------------------
 
     fn to_json(&self, options: &ExplainOptions) -> String {
-        let mut output = String::new();
+        let mut output = String::with_capacity(self.render_capacity(256));
         self.write_json_node(&mut output, options, 0);
         let _ = writeln!(output);
         output
@@ -997,11 +1076,8 @@ impl ExplainNode {
             if let Some(actual) = &self.actual_metrics {
                 let _ = writeln!(output, "{}  \"actual_rows\": {},", pad, actual.rows);
                 if options.timing {
-                    let _ = writeln!(
-                        output,
-                        "{}  \"actual_time_ms\": {:.3},",
-                        pad, actual.elapsed_ms
-                    );
+                    let (ms, frac) = millis_parts(actual.elapsed_ns);
+                    let _ = writeln!(output, "{}  \"actual_time_ms\": {}.{:03},", pad, ms, frac);
                 }
             }
         }
@@ -1029,7 +1105,7 @@ impl ExplainNode {
     // -----------------------------------------------------------------------
 
     fn to_yaml(&self, options: &ExplainOptions) -> String {
-        let mut output = String::new();
+        let mut output = String::with_capacity(self.render_capacity(192));
         self.write_yaml_node(&mut output, options, 0);
         output
     }
@@ -1053,7 +1129,8 @@ impl ExplainNode {
             if let Some(actual) = &self.actual_metrics {
                 let _ = writeln!(output, "{}actual_rows: {}", pad, actual.rows);
                 if options.timing {
-                    let _ = writeln!(output, "{}actual_time_ms: {:.3}", pad, actual.elapsed_ms);
+                    let (ms, frac) = millis_parts(actual.elapsed_ns);
+                    let _ = writeln!(output, "{}actual_time_ms: {}.{:03}", pad, ms, frac);
                 }
                 for (label, value) in aux_labels(&self.operator_name)
                     .iter()
@@ -1084,11 +1161,9 @@ impl ExplainNode {
                     if let Some(actual) = &child.actual_metrics {
                         let _ = writeln!(output, "{}    actual_rows: {}", pad, actual.rows);
                         if options.timing {
-                            let _ = writeln!(
-                                output,
-                                "{}    actual_time_ms: {:.3}",
-                                pad, actual.elapsed_ms
-                            );
+                            let (ms, frac) = millis_parts(actual.elapsed_ns);
+                            let _ =
+                                writeln!(output, "{}    actual_time_ms: {}.{:03}", pad, ms, frac);
                         }
                     }
                 }
@@ -1110,6 +1185,43 @@ impl ExplainNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every digit the renderers print has to match what `{:.3}` printed for
+    /// the same count as an f64 millisecond value. The cases that matter are
+    /// exact half microseconds, where the answer is decided by which side of
+    /// the tie the division landed on rather than by any rounding rule
+    #[test]
+    fn millis_parts_matches_float_formatting_exactly() {
+        let check = |ns: u64| {
+            let (ms, frac) = millis_parts(ns);
+            assert_eq!(
+                format!("{}.{:03}", ms, frac),
+                format!("{:.3}", ns as f64 / 1_000_000.0),
+                "ns={ns}"
+            );
+        };
+
+        // Every nanosecond across the first two milliseconds, covering every
+        // tie and every carry in that range
+        for ns in 0u64..2_000_000 {
+            check(ns);
+        }
+        // Exact half microseconds much further out, where float spacing is
+        // coarser and ties resolve the other way
+        for k in 0u64..100_000 {
+            check(k * 1_000 + 500);
+            check(k * 1_000_000 + 500);
+        }
+        // Magnitudes up to the width of the field itself
+        for shift in 0..64 {
+            let base = 1u64 << shift;
+            for delta in [0u64, 1, 499, 500, 501, 999] {
+                check(base.saturating_add(delta));
+                check(base.saturating_sub(delta));
+            }
+        }
+        check(u64::MAX);
+    }
 
     fn make_simple_plan() -> ExplainNode {
         ExplainNode {
@@ -1177,7 +1289,7 @@ mod tests {
         let mut node = make_simple_plan();
         node.actual_metrics = Some(ActualMetrics {
             rows: 982,
-            elapsed_ms: 3.2,
+            elapsed_ns: 3_200_000,
             batches: 5,
             ..Default::default()
         });
@@ -1218,7 +1330,7 @@ mod tests {
         NodeMetrics {
             name: name.to_string(),
             rows,
-            elapsed_ms: 1.0,
+            elapsed_ns: 1_000_000,
             batches: 2,
             aux: [0; ACTUAL_AUX_SLOTS],
             children,

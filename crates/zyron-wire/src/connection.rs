@@ -5632,7 +5632,7 @@ fn collect_node_metrics(metrics: &OperatorMetrics) -> zyron_planner::NodeMetrics
     zyron_planner::NodeMetrics {
         name: metrics.name.clone(),
         rows: metrics.rows_produced.load(Ordering::Relaxed),
-        elapsed_ms: metrics.elapsed_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+        elapsed_ns: metrics.elapsed_ns.load(Ordering::Relaxed),
         batches: metrics.batches.load(Ordering::Relaxed),
         aux,
         children: metrics

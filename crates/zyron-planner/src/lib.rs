@@ -17,7 +17,7 @@ pub use binder::{BindContext, Binder, BoundStatement, BoundStreamingJob};
 pub use cost::{CostModel, PlanCost};
 pub use explain::{
     ACTUAL_AUX_SLOTS, ActualMetrics, ExplainFormat, ExplainNode, ExplainOptions, NodeMetrics,
-    aux_labels,
+    aux_labels, millis_parts,
 };
 pub use logical::LogicalPlan;
 pub use optimizer::Optimizer;

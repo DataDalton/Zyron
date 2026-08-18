@@ -405,21 +405,18 @@ impl OperatorMetrics {
         })
     }
 
-    /// Returns elapsed time in fractional milliseconds.
-    pub fn elapsed_ms(&self) -> f64 {
-        self.elapsed_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0
-    }
-
     /// Formats the metrics tree for display (EXPLAIN ANALYZE output).
     pub fn format_tree(&self, indent: usize) -> String {
         let mut out = String::new();
         let prefix = " ".repeat(indent);
+        let (ms, frac) = zyron_planner::millis_parts(self.elapsed_ns.load(Ordering::Relaxed));
         out.push_str(&format!(
-            "{}{} (rows={}, time={:.3}ms, batches={})\n",
+            "{}{} (rows={}, time={}.{:03}ms, batches={})\n",
             prefix,
             self.name,
             self.rows_produced.load(Ordering::Relaxed),
-            self.elapsed_ms(),
+            ms,
+            frac,
             self.batches.load(Ordering::Relaxed),
         ));
         for child in &self.children {
