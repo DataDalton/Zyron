@@ -42,7 +42,7 @@ enum PatchKind {
     RevokeSupersede,
     BranchClear,
 }
-use zyron_storage::{DiskManager, HeapPage};
+use zyron_storage::{DiskManager, HeapPage, TupleSlot};
 use zyron_wal::reader::WalReader;
 use zyron_wal::record::LogRecordType;
 
@@ -259,29 +259,18 @@ pub async fn reconcile_columnar(
                         pages.entry(key).or_insert(data)
                     }
                 };
-                let so = HeapPage::DATA_START + (*slot as usize) * 4;
-                if so + 4 > PAGE_SIZE {
-                    continue;
-                }
-                let toff = u16::from_le_bytes([page[so], page[so + 1]]) as usize;
-                let slen = u16::from_le_bytes([page[so + 2], page[so + 3]]) as usize;
-                // Zero only when the slot still holds the folded tuple. A
-                // zeroed (slen==0) or reused slot (different xmin) is left
+                // Empty only when the slot still holds the folded tuple. An
+                // already emptied or reused slot (different xmin) is left
                 // intact so a redo never destroys an unrelated row.
-                if slen == 0 || toff + 8 > PAGE_SIZE {
+                let Some(tuple_slot) = HeapPage::live_slot_in_slice(&page[..], *slot) else {
+                    continue;
+                };
+                if tuple_slot.header.xmin != *folded_xmin {
                     continue;
                 }
-                let slot_xmin = u32::from_le_bytes([
-                    page[toff + 4],
-                    page[toff + 5],
-                    page[toff + 6],
-                    page[toff + 7],
-                ]);
-                if slot_xmin != *folded_xmin {
-                    continue;
-                }
-                page[so + 2] = 0;
-                page[so + 3] = 0;
+                let so = HeapPage::DATA_START + (*slot as usize) * TupleSlot::SIZE;
+                page[so] = 0;
+                page[so + 1] = 0;
                 dirty.insert(key);
             }
             for ((fid, pnum), data) in &pages {

@@ -26,7 +26,7 @@ unsafe impl FromBytes for PackedLeafHeader {}
 #[repr(C, packed)]
 struct PackedInternalHeader {
     num_keys: u16,
-    free_space_offset: u16,
+    key_region_start: u16,
     level: u16,
     reserved: [u8; 10],
 }
@@ -157,15 +157,16 @@ impl Default for LeafPageHeader {
 ///
 /// Layout (16 bytes):
 /// - num_keys: 2 bytes
-/// - free_space_offset: 2 bytes
+/// - key_region_start: 2 bytes
 /// - level: 2 bytes (0 = just above leaves)
 /// - reserved: 10 bytes
 #[derive(Debug, Clone, Copy)]
 pub struct InternalPageHeader {
     /// Number of keys in this internal node.
     pub num_keys: u16,
-    /// Offset to free space (from page start).
-    pub free_space_offset: u16,
+    /// Low boundary of the long key region, which grows down from the page
+    /// end. Equal to PAGE_SIZE when every key fits inside its slot
+    pub key_region_start: u16,
     /// Level in the tree (0 = just above leaves).
     pub level: u16,
     /// Reserved for future use.
@@ -183,7 +184,7 @@ impl InternalPageHeader {
     pub fn new(level: u16) -> Self {
         Self {
             num_keys: 0,
-            free_space_offset: (PageHeader::SIZE + Self::SIZE) as u16,
+            key_region_start: PAGE_SIZE as u16,
             level,
             reserved: [0; 10],
         }
@@ -193,7 +194,7 @@ impl InternalPageHeader {
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
         let packed = PackedInternalHeader {
             num_keys: self.num_keys.to_le(),
-            free_space_offset: self.free_space_offset.to_le(),
+            key_region_start: self.key_region_start.to_le(),
             level: self.level.to_le(),
             reserved: self.reserved,
         };
@@ -207,7 +208,7 @@ impl InternalPageHeader {
         let packed = PackedInternalHeader::read_from(buf, 0);
         Self {
             num_keys: u16::from_le(packed.num_keys),
-            free_space_offset: u16::from_le(packed.free_space_offset),
+            key_region_start: u16::from_le(packed.key_region_start),
             level: u16::from_le(packed.level),
             reserved: packed.reserved,
         }
@@ -225,8 +226,9 @@ impl Default for InternalPageHeader {
 /// Layout (on-disk):
 /// - key_len: 2 bytes
 /// - key: variable
-/// - locator payload: RowLocator::ENCODED_LEN bytes (tag + two u64 words LE,
-///   heap file_id is implicit from the B+tree index)
+/// - locator payload: 7 bytes for a heap row, 17 otherwise, the width is
+///   recoverable from the leading tag byte and the heap file_id is implicit
+///   from the B+tree index
 #[derive(Debug, Clone)]
 pub struct LeafEntry {
     /// The key bytes.
@@ -238,7 +240,7 @@ pub struct LeafEntry {
 impl LeafEntry {
     /// Size of this entry on disk.
     pub fn size_on_disk(&self) -> usize {
-        2 + self.key.len() + RowLocator::ENCODED_LEN
+        2 + self.key.len() + self.locator.payload_len()
     }
 
     /// Serializes the entry to bytes. Heap locators store no file_id, it is
@@ -247,9 +249,9 @@ impl LeafEntry {
         let mut buf = BytesMut::with_capacity(self.size_on_disk());
         buf.extend_from_slice(&(self.key.len() as u16).to_le_bytes());
         buf.extend_from_slice(&self.key);
-        let mut payload = [0u8; RowLocator::ENCODED_LEN];
-        self.locator.write_payload(&mut payload);
-        buf.extend_from_slice(&payload);
+        let mut payload = [0u8; RowLocator::MAX_PAYLOAD_LEN];
+        let written = self.locator.write_payload(&mut payload);
+        buf.extend_from_slice(&payload[..written]);
         buf.freeze()
     }
 
@@ -262,22 +264,24 @@ impl LeafEntry {
         }
 
         let key_len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
-        if buf.len() < 2 + key_len + RowLocator::ENCODED_LEN {
+        let value_offset = 2 + key_len;
+        let width = RowLocator::payload_len_for_tag(*buf.get(value_offset)?);
+        if buf.len() < value_offset + width {
             return None;
         }
 
-        let key = Bytes::copy_from_slice(&buf[2..2 + key_len]);
-        let locator = RowLocator::read_payload(&buf[2 + key_len..])?;
-        Some((Self { key, locator }, 2 + key_len + RowLocator::ENCODED_LEN))
+        let key = Bytes::copy_from_slice(&buf[2..value_offset]);
+        let locator = RowLocator::read_payload(&buf[value_offset..])?;
+        Some((Self { key, locator }, value_offset + width))
     }
 }
 
 /// A key-pointer entry in an internal page.
 ///
-/// Layout (on-disk):
-/// - key_len: 2 bytes
-/// - key: variable
-/// - child_page_num: 4 bytes (u32, file_id is implicit from the B+tree index)
+/// Held in a fixed 16-byte slot: the first eight key bytes big-endian, the
+/// child page_num as u32 (file_id is implicit from the B+tree index), the key
+/// length and, for keys longer than eight bytes, the offset of the full key
+/// in the region at the page tail
 #[derive(Debug, Clone)]
 pub struct InternalEntry {
     /// The key bytes.
@@ -287,45 +291,14 @@ pub struct InternalEntry {
 }
 
 impl InternalEntry {
-    /// Size of this entry on disk.
+    /// Bytes this entry costs in a page: one slot, plus the key itself only
+    /// when it is too long to sit inside the slot
     pub fn size_on_disk(&self) -> usize {
-        2 + self.key.len() + 4 // key_len + key + page_num(4)
-    }
-
-    /// Serializes the entry to bytes.
-    /// Stores only page_num (u32). file_id is reconstructed from the
-    /// B+tree index context on read.
-    pub fn to_bytes(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(self.size_on_disk());
-        buf.extend_from_slice(&(self.key.len() as u16).to_le_bytes());
-        buf.extend_from_slice(&self.key);
-        buf.extend_from_slice(&(self.child_page_id.page_num as u32).to_le_bytes());
-        buf.freeze()
-    }
-
-    /// Deserializes an entry from bytes. Returns (entry, bytes_consumed).
-    /// Reconstructs PageId with file_id=0. Callers that need the correct
-    /// file_id must set it from context after deserialization.
-    pub fn from_bytes(buf: &[u8]) -> Option<(Self, usize)> {
-        if buf.len() < 6 {
-            return None;
+        if self.key.len() > 8 {
+            16 + self.key.len()
+        } else {
+            16
         }
-
-        let key_len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
-        if buf.len() < 2 + key_len + 4 {
-            return None;
-        }
-
-        let key = Bytes::copy_from_slice(&buf[2..2 + key_len]);
-        let page_num = u32::from_le_bytes([
-            buf[2 + key_len],
-            buf[3 + key_len],
-            buf[4 + key_len],
-            buf[5 + key_len],
-        ]);
-        let child_page_id = PageId::new(0, page_num as u64);
-
-        Some((Self { key, child_page_id }, 2 + key_len + 4))
     }
 }
 
@@ -343,18 +316,19 @@ impl<'a> LeafEntryView<'a> {
             return None;
         }
         let key_len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
-        let total = 2 + key_len + RowLocator::ENCODED_LEN;
+        let value_offset = 2 + key_len;
+        let total = value_offset + RowLocator::payload_len_for_tag(*buf.get(value_offset)?);
         if buf.len() < total {
             return None;
         }
-        let key = &buf[2..2 + key_len];
-        let locator = RowLocator::read_payload(&buf[2 + key_len..])?;
+        let key = &buf[2..value_offset];
+        let locator = RowLocator::read_payload(&buf[value_offset..])?;
         Some((Self { key, locator }, total))
     }
 
     /// Size of this entry on disk.
     pub fn size_on_disk(&self) -> usize {
-        2 + self.key.len() + RowLocator::ENCODED_LEN
+        2 + self.key.len() + self.locator.payload_len()
     }
 
     /// Converts to an owned LeafEntry by copying the key.
@@ -373,9 +347,7 @@ impl<'a> LeafEntryView<'a> {
         buf[offset..offset + 2].copy_from_slice(&(kl as u16).to_le_bytes());
         buf[offset + 2..offset + 2 + kl].copy_from_slice(self.key);
         let vo = offset + 2 + kl;
-        self.locator
-            .write_payload(&mut buf[vo..vo + RowLocator::ENCODED_LEN]);
-        2 + kl + RowLocator::ENCODED_LEN
+        2 + kl + self.locator.write_payload(&mut buf[vo..])
     }
 }
 
@@ -388,9 +360,7 @@ impl LeafEntry {
         buf[offset..offset + 2].copy_from_slice(&(kl as u16).to_le_bytes());
         buf[offset + 2..offset + 2 + kl].copy_from_slice(&self.key);
         let vo = offset + 2 + kl;
-        self.locator
-            .write_payload(&mut buf[vo..vo + RowLocator::ENCODED_LEN]);
-        2 + kl + RowLocator::ENCODED_LEN
+        2 + kl + self.locator.write_payload(&mut buf[vo..])
     }
 }
 
@@ -402,30 +372,14 @@ pub struct InternalEntryView<'a> {
 }
 
 impl<'a> InternalEntryView<'a> {
-    /// Parses an internal entry view from a byte slice without copying the key.
-    pub fn from_bytes(buf: &'a [u8]) -> Option<(Self, usize)> {
-        if buf.len() < 6 {
-            return None;
-        }
-        let key_len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
-        let total = 2 + key_len + 4;
-        if buf.len() < total {
-            return None;
-        }
-        let key = &buf[2..2 + key_len];
-        let page_num = u32::from_le_bytes([
-            buf[2 + key_len],
-            buf[3 + key_len],
-            buf[4 + key_len],
-            buf[5 + key_len],
-        ]);
-        let child_page_id = PageId::new(0, page_num as u64);
-        Some((Self { key, child_page_id }, total))
-    }
-
-    /// Size of this entry on disk.
+    /// Bytes this entry costs in a page: one slot, plus the key itself only
+    /// when it is too long to sit inside the slot
     pub fn size_on_disk(&self) -> usize {
-        2 + self.key.len() + 4
+        if self.key.len() > 8 {
+            16 + self.key.len()
+        } else {
+            16
+        }
     }
 
     /// Converts to an owned InternalEntry by copying the key.
@@ -434,18 +388,6 @@ impl<'a> InternalEntryView<'a> {
             key: Bytes::copy_from_slice(self.key),
             child_page_id: self.child_page_id,
         }
-    }
-
-    /// Writes this entry directly to a byte slice at the given offset.
-    /// Returns the number of bytes written.
-    #[inline]
-    pub fn write_to_slice(&self, buf: &mut [u8], offset: usize) -> usize {
-        let kl = self.key.len();
-        buf[offset..offset + 2].copy_from_slice(&(kl as u16).to_le_bytes());
-        buf[offset + 2..offset + 2 + kl].copy_from_slice(self.key);
-        let vo = offset + 2 + kl;
-        buf[vo..vo + 4].copy_from_slice(&(self.child_page_id.page_num as u32).to_le_bytes());
-        2 + kl + 4
     }
 }
 
@@ -523,7 +465,7 @@ mod tests {
     fn test_packed_internal_header_roundtrip() {
         let header = PackedInternalHeader {
             num_keys: 100,
-            free_space_offset: 2048,
+            key_region_start: 2048,
             level: 3,
             reserved: [0; 10],
         };
@@ -532,7 +474,7 @@ mod tests {
         assert_eq!(bytes.len(), 16);
 
         let r = PackedInternalHeader::read_from(bytes, 0);
-        let (nk, fso, lv) = (r.num_keys, r.free_space_offset, r.level);
+        let (nk, fso, lv) = (r.num_keys, r.key_region_start, r.level);
         assert_eq!(nk, 100);
         assert_eq!(fso, 2048);
         assert_eq!(lv, 3);
@@ -542,13 +484,13 @@ mod tests {
     fn test_packed_internal_header_all_bits() {
         let header = PackedInternalHeader {
             num_keys: u16::MAX,
-            free_space_offset: u16::MAX,
+            key_region_start: u16::MAX,
             level: u16::MAX,
             reserved: [0xFF; 10],
         };
 
         let r = PackedInternalHeader::read_from(header.as_bytes(), 0);
-        let (nk, fso, lv) = (r.num_keys, r.free_space_offset, r.level);
+        let (nk, fso, lv) = (r.num_keys, r.key_region_start, r.level);
         assert_eq!(nk, u16::MAX);
         assert_eq!(fso, u16::MAX);
         assert_eq!(lv, u16::MAX);
@@ -574,7 +516,7 @@ mod tests {
     fn test_internal_page_header_roundtrip() {
         let header = InternalPageHeader {
             num_keys: 20,
-            free_space_offset: 512,
+            key_region_start: 512,
             level: 2,
             reserved: [0; 10],
         };
@@ -582,7 +524,7 @@ mod tests {
         let bytes = header.to_bytes();
         let restored = InternalPageHeader::from_bytes(&bytes);
         assert_eq!(restored.num_keys, 20);
-        assert_eq!(restored.free_space_offset, 512);
+        assert_eq!(restored.key_region_start, 512);
         assert_eq!(restored.level, 2);
     }
 
@@ -620,7 +562,7 @@ mod tests {
 
         let bytes = entry.to_bytes();
         let (restored, size) = LeafEntry::from_bytes(&bytes).unwrap();
-        assert_eq!(size, 2 + 3 + RowLocator::ENCODED_LEN);
+        assert_eq!(size, 2 + 3 + RowLocator::MAX_PAYLOAD_LEN);
         assert_eq!(restored.key, entry.key);
         assert_eq!(
             restored.locator,
@@ -629,20 +571,6 @@ mod tests {
                 sys_rowid: 4096,
             }
         );
-    }
-
-    #[test]
-    fn test_internal_entry_roundtrip() {
-        let entry = InternalEntry {
-            key: Bytes::from(vec![10, 20, 30]),
-            child_page_id: PageId::new(0, 77),
-        };
-
-        let bytes = entry.to_bytes();
-        let (restored, size) = InternalEntry::from_bytes(&bytes).unwrap();
-        assert_eq!(restored.key, entry.key);
-        assert_eq!(restored.child_page_id.page_num, 77);
-        assert_eq!(size, 2 + 3 + 4); // key_len(2) + key(3) + page_num(4)
     }
 
     #[test]

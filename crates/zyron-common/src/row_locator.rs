@@ -20,12 +20,23 @@ pub enum RowLocator {
 }
 
 impl RowLocator {
-    /// Byte width of the fixed codecs below, one tag byte plus two u64 words
-    pub const ENCODED_LEN: usize = 17;
+    /// Widest payload form, one tag byte plus two u64 words. Every locator
+    /// can be written this wide, so it is also the buffer size a caller needs
+    pub const MAX_PAYLOAD_LEN: usize = 17;
+
+    /// Payload width of a heap row whose page fits 32 bits. Heap rows are
+    /// addressed by a 32-bit page number and a 16-bit slot everywhere else in
+    /// the engine, so this is the form nearly every index entry takes
+    pub const NARROW_PAYLOAD_LEN: usize = 7;
+
+    /// Byte width of the order-preserving key suffix codec. Fixed, so range
+    /// bounds can bracket one value with all-0x00 and all-0xFF suffixes
+    pub const KEY_SUFFIX_LEN: usize = 17;
 
     const TAG_HEAP: u8 = 0;
     const TAG_COLUMNAR: u8 = 1;
     const TAG_LAKE: u8 = 2;
+    const TAG_HEAP_NARROW: u8 = 3;
 
     /// The (tag, a, b) words of the fixed codec. Heap drops its file_id,
     /// callers normalize it to 0 before encoding and re-stamp from context
@@ -50,9 +61,48 @@ impl RowLocator {
         buf.extend_from_slice(&b.to_be_bytes());
     }
 
-    /// Writes the little-endian payload form, exactly ENCODED_LEN bytes
+    /// Bytes `write_payload` will produce for this locator.
     #[inline]
-    pub fn write_payload(&self, out: &mut [u8]) {
+    pub fn payload_len(&self) -> usize {
+        match *self {
+            RowLocator::Heap { page, .. } if page.page_num <= u32::MAX as u64 => {
+                Self::NARROW_PAYLOAD_LEN
+            }
+            _ => Self::MAX_PAYLOAD_LEN,
+        }
+    }
+
+    /// Bytes a payload starting with `tag` occupies.
+    #[inline]
+    pub fn payload_len_for_tag(tag: u8) -> usize {
+        if tag == Self::TAG_HEAP_NARROW {
+            Self::NARROW_PAYLOAD_LEN
+        } else {
+            Self::MAX_PAYLOAD_LEN
+        }
+    }
+
+    /// Writes the little-endian payload form and returns the bytes written.
+    /// A heap row whose page fits 32 bits takes the narrow form, everything
+    /// else takes the wide one
+    #[inline]
+    pub fn write_payload(&self, out: &mut [u8]) -> usize {
+        if let RowLocator::Heap { page, slot } = *self
+            && page.page_num <= u32::MAX as u64
+        {
+            out[0] = Self::TAG_HEAP_NARROW;
+            out[1..5].copy_from_slice(&(page.page_num as u32).to_le_bytes());
+            out[5..7].copy_from_slice(&slot.to_le_bytes());
+            return Self::NARROW_PAYLOAD_LEN;
+        }
+        self.write_payload_wide(out);
+        Self::MAX_PAYLOAD_LEN
+    }
+
+    /// Writes the wide payload form, which represents every locator. Used
+    /// where one fixed stride has to cover a whole run of entries
+    #[inline]
+    pub fn write_payload_wide(&self, out: &mut [u8]) {
         let (tag, a, b) = self.codec_words();
         out[0] = tag;
         out[1..9].copy_from_slice(&a.to_le_bytes());
@@ -64,12 +114,25 @@ impl RowLocator {
     /// an unknown tag
     #[inline]
     pub fn read_payload(buf: &[u8]) -> Option<RowLocator> {
-        if buf.len() < Self::ENCODED_LEN {
+        let tag = *buf.first()?;
+        if tag == Self::TAG_HEAP_NARROW {
+            if buf.len() < Self::NARROW_PAYLOAD_LEN {
+                return None;
+            }
+            return Some(RowLocator::Heap {
+                page: PageId::new(
+                    0,
+                    u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]) as u64,
+                ),
+                slot: u16::from_le_bytes([buf[5], buf[6]]),
+            });
+        }
+        if buf.len() < Self::MAX_PAYLOAD_LEN {
             return None;
         }
         let a = u64::from_le_bytes(buf[1..9].try_into().ok()?);
         let b = u64::from_le_bytes(buf[9..17].try_into().ok()?);
-        match buf[0] {
+        match tag {
             Self::TAG_HEAP => Some(RowLocator::Heap {
                 page: PageId::new(0, a),
                 slot: b as u16,

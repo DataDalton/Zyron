@@ -436,6 +436,17 @@ impl BufferPool {
             .map(|(frame, evicted, _)| (frame, evicted))
     }
 
+    /// Like `new_page` but reports whether this call installed the frame.
+    /// A caller that initializes a page in place must do so only on a fresh
+    /// install, because an existing frame already holds live content.
+    #[inline]
+    pub fn new_page_reporting_fresh(
+        &self,
+        page_id: PageId,
+    ) -> Result<(&BufferFrame, Option<EvictedPage>, bool)> {
+        self.new_page_inner(page_id, None)
+    }
+
     /// Like `new_page` but reports whether the returned frame was freshly
     /// installed for this id. A frame that already held the page carries
     /// content as new or newer than any disk image, so `init` is copied in

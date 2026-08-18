@@ -7,9 +7,9 @@ use crate::disk::DiskManager;
 use crate::freespace::{
     ENTRIES_PER_FSM_PAGE, FreeSpaceMap, FsmPage, category_to_min_space, space_to_category,
 };
-use crate::heap::constants::{DATA_START, HEAP_HEADER_OFFSET, TUPLE_HEADER_SIZE, TUPLE_SLOT_SIZE};
+use crate::heap::constants::{DATA_START, HEAP_HEADER_OFFSET, TUPLE_SLOT_SIZE};
 use crate::heap::page::{HeapPage, SlotId};
-use crate::tuple::{Tuple, TupleHeader, TupleId, TupleView};
+use crate::tuple::{Tuple, TupleFlags, TupleHeader, TupleId, TupleView};
 use std::sync::Arc;
 use zyron_buffer::BufferPool;
 use zyron_common::page::{PAGE_SIZE, PageId};
@@ -893,7 +893,7 @@ impl HeapFile {
         let usable_per_page = PAGE_SIZE - DATA_START;
         let total_bytes: usize = tuples
             .iter()
-            .map(|t| t.size_on_disk() + TUPLE_SLOT_SIZE)
+            .map(|t| t.data().len() + TUPLE_SLOT_SIZE)
             .sum();
         let estimated_pages = ((total_bytes + usable_per_page - 1) / usable_per_page).max(1) as u64;
 
@@ -930,9 +930,17 @@ impl HeapFile {
             };
 
             if is_fresh {
-                let mut buf = [0u8; PAGE_SIZE];
-                HeapPage::init_fresh_slice_reuse(&mut buf, page_id);
-                let (_, evicted) = self.pool.load_page(page_id, &buf)?;
+                let (frame, evicted, installed) = self.pool.new_page_reporting_fresh(page_id)?;
+                if installed {
+                    // Only the page and heap headers are written. Everything
+                    // past them is free space this page never reads, so
+                    // clearing it would cost a full page of stores for every
+                    // page allocated
+                    // SAFETY: the frame is pinned by the call above and no
+                    // other thread can reach a page installed a moment ago
+                    let raw = unsafe { &mut *frame.data_ptr_mut() };
+                    HeapPage::init_fresh_slice_reuse(raw, page_id);
+                }
                 if let Some(ev) = evicted {
                     self.disk.write_page(ev.page_id, &ev.data).await?;
                 }
@@ -1161,6 +1169,9 @@ where
 
 /// Applies `f` to every live tuple of one page image until it returns
 /// false. Returns false when the callback stopped the iteration
+///
+/// Every field this reads lives in the slot array, which is dense and walked
+/// in order, so the row data is never touched and no prefetch hint is needed
 #[inline]
 fn try_for_each_tuple_in_page<F>(page_id: PageId, data: &[u8; PAGE_SIZE], f: &mut F) -> bool
 where
@@ -1173,19 +1184,9 @@ where
     let slot_count = raw_slot_count.min(max_slots);
 
     for i in 0..slot_count {
-        // Safety: slot_base is within page bounds (slot_count from page header)
+        // Safety: slot_base spans one slot inside the page, because
+        // slot_count is capped at max_slots
         let slot_base = DATA_START + i * TUPLE_SLOT_SIZE;
-        let tuple_length = unsafe {
-            u16::from_le_bytes([
-                *data.get_unchecked(slot_base + 2),
-                *data.get_unchecked(slot_base + 3),
-            ])
-        } as usize;
-
-        if tuple_length == 0 {
-            continue;
-        }
-
         let tuple_offset = unsafe {
             u16::from_le_bytes([
                 *data.get_unchecked(slot_base),
@@ -1193,16 +1194,43 @@ where
             ])
         } as usize;
 
-        // Safety: tuple_offset validated by page format, header fits in page
+        // Offset 0 lies inside the page header, so it marks an empty slot
+        if tuple_offset == 0 {
+            continue;
+        }
+
         let header = unsafe {
-            TupleHeader::from_bytes_unchecked(&data[tuple_offset..tuple_offset + TUPLE_HEADER_SIZE])
+            TupleHeader {
+                data_len: u16::from_le_bytes([
+                    *data.get_unchecked(slot_base + 2),
+                    *data.get_unchecked(slot_base + 3),
+                ]),
+                flags: TupleFlags(u16::from_le_bytes([
+                    *data.get_unchecked(slot_base + 4),
+                    *data.get_unchecked(slot_base + 5),
+                ])),
+                xmin: u32::from_le_bytes([
+                    *data.get_unchecked(slot_base + 8),
+                    *data.get_unchecked(slot_base + 9),
+                    *data.get_unchecked(slot_base + 10),
+                    *data.get_unchecked(slot_base + 11),
+                ]),
+                xmax: u32::from_le_bytes([
+                    *data.get_unchecked(slot_base + 12),
+                    *data.get_unchecked(slot_base + 13),
+                    *data.get_unchecked(slot_base + 14),
+                    *data.get_unchecked(slot_base + 15),
+                ]),
+            }
         };
-        let data_start = tuple_offset + TUPLE_HEADER_SIZE;
-        let data_end = data_start + header.data_len as usize;
+        let data_end = tuple_offset + header.data_len as usize;
+        if data_end > PAGE_SIZE {
+            continue;
+        }
 
         if !f(
             TupleId::new(page_id, i as u16),
-            TupleView::new(header, &data[data_start..data_end]),
+            TupleView::new(header, &data[tuple_offset..data_end]),
         ) {
             return false;
         }
@@ -1220,13 +1248,13 @@ fn count_tuples_in_page(data: &[u8; PAGE_SIZE]) -> usize {
     let mut total = 0;
     for i in 0..slot_count {
         let slot_base = DATA_START + i * TUPLE_SLOT_SIZE;
-        let tuple_length = unsafe {
+        let tuple_offset = unsafe {
             u16::from_le_bytes([
-                *data.get_unchecked(slot_base + 2),
-                *data.get_unchecked(slot_base + 3),
+                *data.get_unchecked(slot_base),
+                *data.get_unchecked(slot_base + 1),
             ])
         } as usize;
-        if tuple_length != 0 {
+        if tuple_offset != 0 {
             total += 1;
         }
     }

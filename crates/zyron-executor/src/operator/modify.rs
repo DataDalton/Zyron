@@ -233,7 +233,7 @@ pub(crate) fn index_key_columns(
 /// the unique-key B+tree stores a non-unique secondary index without
 /// collisions. The encoding is fixed width, so range bounds pad with all-0x00
 /// and all-0xFF suffixes and exact-value checks work from the length alone
-pub(crate) const INDEX_LOCATOR_SUFFIX_LEN: usize = zyron_common::RowLocator::ENCODED_LEN;
+pub(crate) const INDEX_LOCATOR_SUFFIX_LEN: usize = zyron_common::RowLocator::KEY_SUFFIX_LEN;
 
 /// The btree-normalized locator of a heap row: the heap file_id is implicit
 /// from the index, so keys and payloads carry page number and slot only

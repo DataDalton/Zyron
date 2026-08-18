@@ -27,7 +27,7 @@ use zyron_storage::columnar::{
     SYS_COL_SUPERSEDE, SYS_COL_XMIN, run_compaction_cycle,
 };
 use zyron_storage::txn::TransactionManager;
-use zyron_storage::{DiskManager, HeapFile, HeapFileConfig, HeapPage, TupleHeader};
+use zyron_storage::{DiskManager, HeapFile, HeapFileConfig, HeapPage, TupleSlot};
 use zyron_wal::WalWriter;
 
 use crate::metrics::MetricsRegistry;
@@ -106,28 +106,12 @@ type FoldedRid = (zyron_common::page::PageId, u16, u32);
 /// unset. One pass over the slot, no full-page copy. `page` is any view of
 /// the page bytes (a buffer-frame guard or an owned read).
 fn slot_still_folded(page: &[u8], slot: u16, folded_xmin: u32) -> bool {
-    let so = HeapPage::DATA_START + (slot as usize) * 4;
-    if so + 4 > page.len() {
+    let Some(slot) = HeapPage::live_slot_in_slice(page, slot) else {
         return false;
-    }
-    let toff = u16::from_le_bytes([page[so], page[so + 1]]) as usize;
-    let slen = u16::from_le_bytes([page[so + 2], page[so + 3]]) as usize;
-    if slen == 0 || toff + TupleHeader::SIZE > page.len() {
-        return false;
-    }
-    let flags = u16::from_le_bytes([page[toff], page[toff + 1]]);
-    let xmin = u32::from_le_bytes([
-        page[toff + 4],
-        page[toff + 5],
-        page[toff + 6],
-        page[toff + 7],
-    ]);
-    let xmax = u32::from_le_bytes([
-        page[toff + 8],
-        page[toff + 9],
-        page[toff + 10],
-        page[toff + 11],
-    ]);
+    };
+    let flags = slot.header.flags.0;
+    let xmin = slot.header.xmin;
+    let xmax = slot.header.xmax;
     xmin == folded_xmin && flags & 0x0001 == 0 && xmax == 0
 }
 
@@ -1221,31 +1205,12 @@ impl CompactionWorker {
 
             let header = HeapPage::heap_header_from_slice(&page_data);
             for slot in 0..header.slot_count {
-                let slot_off = HeapPage::DATA_START + (slot as usize) * 4;
-                let tuple_off =
-                    u16::from_le_bytes([page_data[slot_off], page_data[slot_off + 1]]) as usize;
-                let slot_len =
-                    u16::from_le_bytes([page_data[slot_off + 2], page_data[slot_off + 3]]) as usize;
-                if slot_len == 0 {
+                let Some(tuple_slot) = HeapPage::live_slot_in_slice(&page_data, slot) else {
                     continue;
-                }
-                if tuple_off + TupleHeader::SIZE > PAGE_SIZE || slot_len < TupleHeader::SIZE {
-                    continue;
-                }
-
-                let flags = u16::from_le_bytes([page_data[tuple_off], page_data[tuple_off + 1]]);
-                let xmin = u32::from_le_bytes([
-                    page_data[tuple_off + 4],
-                    page_data[tuple_off + 5],
-                    page_data[tuple_off + 6],
-                    page_data[tuple_off + 7],
-                ]);
-                let xmax = u32::from_le_bytes([
-                    page_data[tuple_off + 8],
-                    page_data[tuple_off + 9],
-                    page_data[tuple_off + 10],
-                    page_data[tuple_off + 11],
-                ]);
+                };
+                let flags = tuple_slot.header.flags.0;
+                let xmin = tuple_slot.header.xmin;
+                let xmax = tuple_slot.header.xmax;
 
                 // Eligibility. This predicate is exactly
                 // Snapshot{txn_id = oldest_active}.is_visible(xmin, xmax) for
@@ -1262,8 +1227,8 @@ impl CompactionWorker {
                     continue;
                 }
 
-                let payload_start = tuple_off + TupleHeader::SIZE;
-                let payload_end = tuple_off + slot_len;
+                let payload_start = tuple_slot.offset as usize;
+                let payload_end = payload_start + tuple_slot.data_len();
                 if payload_end > PAGE_SIZE || payload_end <= payload_start {
                     continue;
                 }
@@ -1870,10 +1835,11 @@ impl CompactionWorker {
                         breached = Some(slot);
                         break;
                     }
-                    let slot_off = HeapPage::DATA_START + (slot as usize) * 4;
-                    // Zero the slot length to mark the tuple removed.
-                    data[slot_off + 2] = 0;
-                    data[slot_off + 3] = 0;
+                    let slot_off = HeapPage::DATA_START + (slot as usize) * TupleSlot::SIZE;
+                    // Clearing the offset empties the slot, which marks the
+                    // tuple removed
+                    data[slot_off] = 0;
+                    data[slot_off + 1] = 0;
                 }
                 // The durable image below is captured under the same guard
                 // that performed the zeroing, so it cannot miss a concurrent

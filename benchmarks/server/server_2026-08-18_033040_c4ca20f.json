@@ -1,0 +1,33 @@
+{
+  "id": "2026-08-18_033040_c4ca20f",
+  "date": "2026-08-18 03:30:44Z",
+  "ts": 1787023844,
+  "commit": "c4ca20f",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Health Checks": {
+      "util_before": { "cpu_pct": 12.0, "ram_used_gb": 13.32 },
+      "util_after": { "cpu_pct": 2.0, "ram_used_gb": 13.28 },
+      "Health check latency (us)": {
+        "average": 182.000000,
+        "runs": [482.60, 124.50, 106.50, 101.00, 95.40],
+        "target": 100.000000,
+        "passed": false,
+        "higher_is_better": false
+      },
+      "Health endpoint round-trip (us)": {
+        "average": 182.000000,
+        "runs": [182.00],
+        "target": 10000.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    }
+  }
+}

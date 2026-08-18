@@ -4055,7 +4055,7 @@ impl<T: WireTransport> Connection<T> {
     async fn handle_optimize(&mut self, table_name: &str) -> Result<(), ProtocolError> {
         use std::sync::atomic::Ordering;
         use zyron_common::page::PAGE_SIZE;
-        use zyron_storage::{HeapFile, HeapFileConfig, HeapPage, MvccGc, TupleHeader};
+        use zyron_storage::{HeapFile, HeapFileConfig, HeapPage, MvccGc, TupleSlot};
 
         if self
             .server
@@ -4237,26 +4237,16 @@ impl<T: WireTransport> Connection<T> {
             let mut modified = page_data;
             let mut reclaimed = 0u64;
             for i in 0..header.slot_count {
-                let slot_offset = HeapPage::DATA_START + (i as usize) * 4;
-                let slot_len =
-                    u16::from_le_bytes([modified[slot_offset + 2], modified[slot_offset + 3]]);
-                if slot_len == 0 {
+                let Some(slot) = HeapPage::live_slot_in_slice(&modified, i) else {
                     continue;
-                }
-                let tuple_offset =
-                    u16::from_le_bytes([modified[slot_offset], modified[slot_offset + 1]]) as usize;
-                if tuple_offset + TupleHeader::SIZE <= PAGE_SIZE {
-                    let xmax = u32::from_le_bytes([
-                        modified[tuple_offset + 8],
-                        modified[tuple_offset + 9],
-                        modified[tuple_offset + 10],
-                        modified[tuple_offset + 11],
-                    ]);
-                    if MvccGc::is_reclaimable(xmax, oldest_active) {
-                        modified[slot_offset + 2] = 0;
-                        modified[slot_offset + 3] = 0;
-                        reclaimed += 1;
-                    }
+                };
+                if MvccGc::is_reclaimable(slot.header.xmax, oldest_active) {
+                    // Clearing the offset empties the slot, the bytes are
+                    // reclaimed by the next compaction
+                    let slot_offset = HeapPage::DATA_START + (i as usize) * TupleSlot::SIZE;
+                    modified[slot_offset] = 0;
+                    modified[slot_offset + 1] = 0;
+                    reclaimed += 1;
                 }
             }
             if reclaimed > 0 {

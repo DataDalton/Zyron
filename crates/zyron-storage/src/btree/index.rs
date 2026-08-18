@@ -1115,11 +1115,14 @@ impl BTreeIndex {
             if left.num_entries() > 1 {
                 let mut leaf = BTreeLeafPage::from_bytes(*self.pages.get(leaf_pn).unwrap());
                 if let Some(new_sep) = leaf.borrow_from_left(&mut left) {
-                    self.pages.write(left_pn, left.as_bytes());
-                    self.pages.write(leaf_pn, leaf.as_bytes());
-                    // Separator left of `leaf` is entry[slot-1]; update its key.
-                    self.set_separator(parent_pn, slot - 1, new_sep);
-                    return;
+                    // Separator left of `leaf` is entry[slot-1]. It is written
+                    // first, so a key that does not fit abandons the borrow
+                    // with both leaves untouched and the merge path takes over
+                    if self.set_separator(parent_pn, slot - 1, new_sep) {
+                        self.pages.write(left_pn, left.as_bytes());
+                        self.pages.write(leaf_pn, leaf.as_bytes());
+                        return;
+                    }
                 }
             }
         }
@@ -1131,11 +1134,12 @@ impl BTreeIndex {
             if right.num_entries() > 1 {
                 let mut leaf = BTreeLeafPage::from_bytes(*self.pages.get(leaf_pn).unwrap());
                 if let Some(new_sep) = leaf.borrow_from_right(&mut right) {
-                    self.pages.write(right_pn, right.as_bytes());
-                    self.pages.write(leaf_pn, leaf.as_bytes());
-                    // Separator left of `right` is entry[slot]; update its key.
-                    self.set_separator(parent_pn, slot, new_sep);
-                    return;
+                    // Separator left of `right` is entry[slot]
+                    if self.set_separator(parent_pn, slot, new_sep) {
+                        self.pages.write(right_pn, right.as_bytes());
+                        self.pages.write(leaf_pn, leaf.as_bytes());
+                        return;
+                    }
                 }
             }
         }
@@ -1147,7 +1151,11 @@ impl BTreeIndex {
             let right_pn = Self::child_at(&parent, rs);
             let mut leaf = BTreeLeafPage::from_bytes(*self.pages.get(leaf_pn).unwrap());
             let mut right = BTreeLeafPage::from_bytes(*self.pages.get(right_pn).unwrap());
-            leaf.merge_with_right(&mut right);
+            if !leaf.merge_with_right(&mut right) {
+                // The pair does not fit in one page, leave the leaf underfull
+                // rather than dropping the sibling rows
+                return;
+            }
             self.pages.write(leaf_pn, leaf.as_bytes());
             // The separator between leaf and right is entry[slot].
             (leaf_pn, slot)
@@ -1158,7 +1166,9 @@ impl BTreeIndex {
             let left_pn = Self::child_at(&parent, ls);
             let mut left = BTreeLeafPage::from_bytes(*self.pages.get(left_pn).unwrap());
             let mut leaf = BTreeLeafPage::from_bytes(*self.pages.get(leaf_pn).unwrap());
-            left.merge_with_right(&mut leaf);
+            if !left.merge_with_right(&mut leaf) {
+                return;
+            }
             self.pages.write(left_pn, left.as_bytes());
             // The separator between left and leaf is entry[slot-1].
             (left_pn, slot - 1)
@@ -1224,13 +1234,16 @@ impl BTreeIndex {
             let left_pn = Self::child_at(&parent, ls);
             let mut left = BTreeInternalPage::from_bytes(*self.pages.get(left_pn).unwrap());
             if left.num_keys() > 1 {
-                let sep = Self::separator_key(&parent, slot - 1);
+                let Some(sep) = Self::separator_key(&parent, slot - 1) else {
+                    return;
+                };
                 let mut node = BTreeInternalPage::from_bytes(*self.pages.get(node_pn).unwrap());
                 if let Some(new_sep) = node.borrow_from_left(&mut left, sep) {
-                    self.pages.write(left_pn, left.as_bytes());
-                    self.pages.write(node_pn, node.as_bytes());
-                    self.set_separator(parent_pn, slot - 1, new_sep);
-                    return;
+                    if self.set_separator(parent_pn, slot - 1, new_sep) {
+                        self.pages.write(left_pn, left.as_bytes());
+                        self.pages.write(node_pn, node.as_bytes());
+                        return;
+                    }
                 }
             }
         }
@@ -1240,13 +1253,16 @@ impl BTreeIndex {
             let right_pn = Self::child_at(&parent, rs);
             let mut right = BTreeInternalPage::from_bytes(*self.pages.get(right_pn).unwrap());
             if right.num_keys() > 1 {
-                let sep = Self::separator_key(&parent, slot);
+                let Some(sep) = Self::separator_key(&parent, slot) else {
+                    return;
+                };
                 let mut node = BTreeInternalPage::from_bytes(*self.pages.get(node_pn).unwrap());
                 if let Some(new_sep) = node.borrow_from_right(&mut right, sep) {
-                    self.pages.write(right_pn, right.as_bytes());
-                    self.pages.write(node_pn, node.as_bytes());
-                    self.set_separator(parent_pn, slot, new_sep);
-                    return;
+                    if self.set_separator(parent_pn, slot, new_sep) {
+                        self.pages.write(right_pn, right.as_bytes());
+                        self.pages.write(node_pn, node.as_bytes());
+                        return;
+                    }
                 }
             }
         }
@@ -1255,19 +1271,27 @@ impl BTreeIndex {
         // merged node, then remove that separator from the parent.
         let removed_sep_idx = if let Some(rs) = right_slot {
             let right_pn = Self::child_at(&parent, rs);
-            let sep = Self::separator_key(&parent, slot);
+            let Some(sep) = Self::separator_key(&parent, slot) else {
+                return;
+            };
             let right = BTreeInternalPage::from_bytes(*self.pages.get(right_pn).unwrap());
             let mut node = BTreeInternalPage::from_bytes(*self.pages.get(node_pn).unwrap());
-            node.merge_with_right(&right, sep);
+            if !node.merge_with_right(&right, sep) {
+                return;
+            }
             self.pages.write(node_pn, node.as_bytes());
             slot
         } else {
             let ls = left_slot.unwrap();
             let left_pn = Self::child_at(&parent, ls);
-            let sep = Self::separator_key(&parent, slot - 1);
+            let Some(sep) = Self::separator_key(&parent, slot - 1) else {
+                return;
+            };
             let node = BTreeInternalPage::from_bytes(*self.pages.get(node_pn).unwrap());
             let mut left = BTreeInternalPage::from_bytes(*self.pages.get(left_pn).unwrap());
-            left.merge_with_right(&node, sep);
+            if !left.merge_with_right(&node, sep) {
+                return;
+            }
             self.pages.write(left_pn, left.as_bytes());
             slot - 1
         };
@@ -1276,17 +1300,22 @@ impl BTreeIndex {
     }
 
     /// Reads the separator key at entry index `idx` of an internal node.
-    fn separator_key(internal: &BTreeInternalPage, idx: usize) -> Bytes {
-        internal.entries()[idx].key.clone()
+    fn separator_key(internal: &BTreeInternalPage, idx: usize) -> Option<Bytes> {
+        internal.separator_key_at(idx)
     }
 
     /// Overwrites the separator key at entry index `idx` of the internal node
     /// at `page_num`, keeping its child pointer. Used after a borrow shifts the
     /// boundary between two children.
-    fn set_separator(&mut self, page_num: u32, idx: usize, new_key: Bytes) {
+    /// Returns false when the replacement key does not fit, leaving the
+    /// parent untouched so the caller can fall back to a merge.
+    fn set_separator(&mut self, page_num: u32, idx: usize, new_key: Bytes) -> bool {
         let mut node = BTreeInternalPage::from_bytes(*self.pages.get(page_num).unwrap());
-        node.set_separator_key(idx, new_key);
+        if !node.set_separator_key(idx, new_key) {
+            return false;
+        }
         self.pages.write(page_num, node.as_bytes());
+        true
     }
 
     /// Removes entry `idx` (separator + its right child) from an internal node.
