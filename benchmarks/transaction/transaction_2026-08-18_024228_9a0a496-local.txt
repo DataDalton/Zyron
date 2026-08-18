@@ -1,0 +1,14 @@
+# suite:   transaction
+# run:     2026-08-18_024228_9a0a496-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Transaction: B+Tree Read Under Write Contention ===
+  Writer overwrote 189376 keys during reader load
+  Reads hit: 750000 / 750000
+  Reader retries: 0 (0.000% of read attempts)
+  Max read latency: 211.90 us (advisory target: < 10 us)
+  Reader retry rate (%) [PASS]: 0 <= 5 (target)
+  Max read latency (us) [FAIL]: 212 <= 10 (target)

@@ -6,6 +6,7 @@ use super::page::{BTreeInternalPage, BTreeLeafPage};
 use super::store::InMemoryPageStore;
 use super::types::{DeleteResult, LeafPageHeader, compare_keys};
 use bytes::Bytes;
+use crossbeam::epoch;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use zyron_common::RowLocator;
@@ -165,38 +166,28 @@ impl BTreeIndex {
     // Core In-Memory Operations (Synchronous)
     // =========================================================================
 
-    /// Finds the leaf page number for a given key using lock-free
-    /// version-stamped reads. Spins on torn reads.
+    /// Finds the leaf page number for a given key by borrowing each page
+    /// along the descent under a single epoch guard.
     #[inline]
     fn find_leaf_in_pages(&self, pages: &InMemoryPageStore, key: &[u8]) -> u32 {
-        loop {
-            let height = self.height.load(Ordering::Acquire);
-            let mut current = self.root_page_num.load(Ordering::Acquire);
+        let height = self.height.load(Ordering::Acquire);
+        let mut current = self.root_page_num.load(Ordering::Acquire);
 
-            if height == 1 {
-                return current;
-            }
-
-            let mut torn = false;
-            for _ in 0..(height - 1) {
-                match pages.try_read(current) {
-                    Some(Ok(data)) => {
-                        let child_page_id = BTreeInternalPage::find_child_in_slice(&data, key);
-                        current = child_page_id.page_num as u32;
-                    }
-                    Some(Err(())) => {
-                        torn = true;
-                        break;
-                    }
-                    None => return current,
-                }
-            }
-            if torn {
-                std::hint::spin_loop();
-                continue;
-            }
+        if height == 1 {
             return current;
         }
+
+        let guard = epoch::pin();
+        for _ in 0..(height - 1) {
+            match pages.page_ref(current, &guard) {
+                Some(data) => {
+                    let child_page_id = BTreeInternalPage::find_child_in_slice(data, key);
+                    current = child_page_id.page_num as u32;
+                }
+                None => return current,
+            }
+        }
+        current
     }
 
     /// Finds the leaf page number for a given key using lock-free reads.
@@ -245,11 +236,12 @@ impl BTreeIndex {
     ) -> std::result::Result<Option<RowLocator>, ()> {
         let height = self.height.load(Ordering::Acquire);
         let mut current = self.root_page_num.load(Ordering::Acquire);
+        let guard = epoch::pin();
 
         if height > 1 {
             for _ in 0..(height - 1) {
-                let data = pages.try_read(current).ok_or(())??;
-                let child_page_id = BTreeInternalPage::find_child_in_slice(&data, key);
+                let data = pages.page_ref(current, &guard).ok_or(())?;
+                let child_page_id = BTreeInternalPage::find_child_in_slice(data, key);
                 current = child_page_id.page_num as u32;
             }
         }
@@ -261,8 +253,8 @@ impl BTreeIndex {
         // the reader. In practice we follow at most one link, the cap
         // covers transient mid-split states.
         for _ in 0..Self::MAX_HEIGHT * 4 {
-            let leaf_data = pages.try_read(current).ok_or(())??;
-            if let Some(tid) = BTreeLeafPage::get_in_slice(&leaf_data, key) {
+            let leaf_data = pages.page_ref(current, &guard).ok_or(())?;
+            if let Some(tid) = BTreeLeafPage::get_in_slice(leaf_data, key) {
                 return Ok(Some(tid));
             }
             let ns = u16::from_le_bytes([leaf_data[ho], leaf_data[ho + 1]]) as usize;
@@ -448,42 +440,32 @@ impl BTreeIndex {
     /// hold), via a single lock-free version-stamped descent. `None` bound
     /// means the leaf is the rightmost on its path and has no upper bound.
     fn find_leaf_and_bound(&self, key: &[u8]) -> (u32, Option<Vec<u8>>) {
-        loop {
-            let height = self.height.load(Ordering::Acquire);
-            let mut current = self.root_page_num.load(Ordering::Acquire);
-            if height == 1 {
-                return (current, None);
-            }
-
-            let mut bound: Option<Vec<u8>> = None;
-            let mut torn = false;
-            for _ in 0..(height - 1) {
-                match self.pages.try_read(current) {
-                    Some(Ok(data)) => {
-                        let (child, stop) = BTreeInternalPage::find_child_with_upper(&data, key);
-                        current = child;
-                        // The leaf's bound is the tightest (smallest)
-                        // separator we stopped before across the path.
-                        if let Some(s) = stop {
-                            bound = Some(match bound {
-                                Some(b) if compare_keys(&b, &s).is_le() => b,
-                                _ => s,
-                            });
-                        }
-                    }
-                    Some(Err(())) => {
-                        torn = true;
-                        break;
-                    }
-                    None => return (current, bound),
-                }
-            }
-            if torn {
-                std::hint::spin_loop();
-                continue;
-            }
-            return (current, bound);
+        let height = self.height.load(Ordering::Acquire);
+        let mut current = self.root_page_num.load(Ordering::Acquire);
+        if height == 1 {
+            return (current, None);
         }
+
+        let mut bound: Option<Vec<u8>> = None;
+        let guard = epoch::pin();
+        for _ in 0..(height - 1) {
+            match self.pages.page_ref(current, &guard) {
+                Some(data) => {
+                    let (child, stop) = BTreeInternalPage::find_child_with_upper(data, key);
+                    current = child;
+                    // The leaf's bound is the tightest (smallest) separator we
+                    // stopped before across the path.
+                    if let Some(s) = stop {
+                        bound = Some(match bound {
+                            Some(b) if compare_keys(&b, &s).is_le() => b,
+                            _ => s,
+                        });
+                    }
+                }
+                None => return (current, bound),
+            }
+        }
+        (current, bound)
     }
 
     /// Optimistic lock-free insert. Reads the leaf page via version stamp,
@@ -502,12 +484,12 @@ impl BTreeIndex {
 
         // Traverse internal nodes to find the leaf.
         if height > 1 {
+            let guard = epoch::pin();
             for _ in 0..(height - 1) {
-                let data = match pages.try_read(current) {
-                    Some(Ok(d)) => d,
-                    _ => return Err(ZyronError::VersionConflict),
+                let Some(data) = pages.page_ref(current, &guard) else {
+                    return Err(ZyronError::VersionConflict);
                 };
-                let child = BTreeInternalPage::find_child_in_slice(&data, key);
+                let child = BTreeInternalPage::find_child_in_slice(data, key);
                 current = child.page_num as u32;
             }
         }
@@ -761,46 +743,36 @@ impl BTreeIndex {
         current
     }
 
-    /// Finds the path from root to leaf using lock-free version-stamped
-    /// reads. Spins on torn reads of any page along the descent.
+    /// Finds the path from root to leaf, borrowing each page along the
+    /// descent under a single epoch guard.
     fn find_path_sync(&self, key: &[u8]) -> ([u32; Self::MAX_HEIGHT], usize) {
-        loop {
-            let height = self.height.load(Ordering::Acquire);
-            let root = self.root_page_num.load(Ordering::Acquire);
+        let height = self.height.load(Ordering::Acquire);
+        let root = self.root_page_num.load(Ordering::Acquire);
 
-            let mut path = [0u32; Self::MAX_HEIGHT];
-            let mut path_len = 0;
-            let mut current = root;
+        let mut path = [0u32; Self::MAX_HEIGHT];
+        let mut path_len = 0;
+        let mut current = root;
 
-            path[path_len] = current;
-            path_len += 1;
+        path[path_len] = current;
+        path_len += 1;
 
-            if height == 1 {
-                return (path, path_len);
-            }
-
-            let mut torn = false;
-            for _ in 0..(height - 1) {
-                match self.pages.try_read(current) {
-                    Some(Ok(data)) => {
-                        let child_page_id = BTreeInternalPage::find_child_in_slice(&data, key);
-                        current = child_page_id.page_num as u32;
-                        path[path_len] = current;
-                        path_len += 1;
-                    }
-                    Some(Err(())) => {
-                        torn = true;
-                        break;
-                    }
-                    None => return (path, path_len),
-                }
-            }
-            if torn {
-                std::hint::spin_loop();
-                continue;
-            }
+        if height == 1 {
             return (path, path_len);
         }
+
+        let guard = epoch::pin();
+        for _ in 0..(height - 1) {
+            match self.pages.page_ref(current, &guard) {
+                Some(data) => {
+                    let child_page_id = BTreeInternalPage::find_child_in_slice(data, key);
+                    current = child_page_id.page_num as u32;
+                    path[path_len] = current;
+                    path_len += 1;
+                }
+                None => return (path, path_len),
+            }
+        }
+        (path, path_len)
     }
 
     /// Insert with split handling, prepare-then-publish. The split halves are
@@ -1348,10 +1320,12 @@ impl BTreeIndex {
         let mut last_emitted: Option<Bytes> = None;
 
         while let Some(pn) = current_page_num {
-            let Some(data) = self.pages.read_stable(pn) else {
+            // Pinned per page rather than once for the whole scan, so a long
+            // scan does not hold back reclamation of retired page buffers
+            let guard = epoch::pin();
+            let Some(data) = self.pages.page_ref(pn, &guard) else {
                 break;
             };
-            let data = &data;
             let ns = u16::from_le_bytes([data[ho], data[ho + 1]]) as usize;
 
             // Binary search for start position on first page
@@ -1430,8 +1404,8 @@ impl BTreeIndex {
     }
 
     /// Range scan that calls a callback for each matching entry. Each leaf
-    /// page is materialized once via read_stable, so the callback sees a
-    /// consistent snapshot of that leaf even with concurrent splits.
+    /// page is borrowed once under its own epoch guard, so the callback sees
+    /// a consistent snapshot of that leaf even with concurrent splits.
     pub fn range_scan_for_each<F>(&self, start_key: Option<&[u8]>, end_key: Option<&[u8]>, mut f: F)
     where
         F: FnMut(&[u8], RowLocator) -> bool,
@@ -1452,10 +1426,12 @@ impl BTreeIndex {
         let mut last_emitted: Option<Bytes> = None;
 
         while let Some(pn) = current_page_num {
-            let Some(data) = self.pages.read_stable(pn) else {
+            // Pinned per page rather than once for the whole scan, so a long
+            // scan does not hold back reclamation of retired page buffers
+            let guard = epoch::pin();
+            let Some(data) = self.pages.page_ref(pn, &guard) else {
                 break;
             };
-            let data = &data;
             let ns = u16::from_le_bytes([data[ho], data[ho + 1]]) as usize;
 
             let start_slot = if first_page {
@@ -1534,34 +1510,23 @@ impl BTreeIndex {
 
     /// Find leftmost leaf page number using lock-free reads.
     fn find_leftmost_leaf_num(&self, pages: &InMemoryPageStore) -> u32 {
-        loop {
-            let height = self.height.load(Ordering::Acquire);
-            let mut current = self.root_page_num.load(Ordering::Acquire);
+        let height = self.height.load(Ordering::Acquire);
+        let mut current = self.root_page_num.load(Ordering::Acquire);
 
-            if height == 1 {
-                return current;
-            }
-
-            let mut torn = false;
-            for _ in 0..(height - 1) {
-                match pages.try_read(current) {
-                    Some(Ok(data)) => {
-                        let internal = BTreeInternalPage::from_bytes(data);
-                        current = internal.leftmost_child().page_num as u32;
-                    }
-                    Some(Err(())) => {
-                        torn = true;
-                        break;
-                    }
-                    None => return current,
-                }
-            }
-            if torn {
-                std::hint::spin_loop();
-                continue;
-            }
+        if height == 1 {
             return current;
         }
+
+        let guard = epoch::pin();
+        for _ in 0..(height - 1) {
+            match pages.page_ref(current, &guard) {
+                Some(data) => {
+                    current = BTreeInternalPage::leftmost_child_in_slice(data).page_num as u32;
+                }
+                None => return current,
+            }
+        }
+        current
     }
 
     // =========================================================================

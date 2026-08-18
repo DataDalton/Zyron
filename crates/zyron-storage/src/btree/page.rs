@@ -678,6 +678,22 @@ impl BTreeInternalPage {
     /// Uses linear search for small pages (common case), binary search for large ones.
     /// Child pointers stored as page_num (u32). Returns PageId with file_id=0.
     #[inline(always)]
+    /// Reads the leftmost child pointer straight from the page bytes, so a
+    /// descent does not have to materialize a whole BTreeInternalPage.
+    pub fn leftmost_child_in_slice(data: &[u8]) -> PageId {
+        let offset = Self::DATA_START;
+        PageId::from_u64(u64::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
+        ]))
+    }
+
     pub fn find_child_in_slice(data: &[u8], key: &[u8]) -> PageId {
         // Parse header to get num_keys
         let header_offset = InternalPageHeader::OFFSET;

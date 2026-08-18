@@ -202,31 +202,39 @@ impl InMemoryPageStore {
         start
     }
 
-    /// Wait-free read. Loads the current immutable page buffer and copies it
-    /// out. Returns None if the page has never been written (null pointer).
-    /// Never tears and never asks the caller to retry, because the buffer it
-    /// returns is immutable: a concurrent writer publishes a new buffer
-    /// rather than mutating this one. The Result is kept for call-site
-    /// compatibility; it is always Ok.
+    /// Wait-free read. Borrows the current immutable page buffer for as long
+    /// as `guard` stays pinned. Returns None if the page has never been
+    /// written. One atomic load and a null check, with no loop, no retry and
+    /// no copy, so it completes in a bounded number of steps whatever other
+    /// threads are doing.
+    ///
+    /// A writer never mutates a published buffer, it installs a new one and
+    /// retires the old through epoch reclamation, and that reclamation cannot
+    /// run while `guard` is pinned. A traversal therefore pins once and
+    /// borrows every page it visits rather than copying PAGE_SIZE bytes per
+    /// level.
     #[inline]
-    pub fn try_read(&self, page_num: u32) -> Option<Result<[u8; PAGE_SIZE], ()>> {
+    pub fn page_ref<'g>(
+        &'g self,
+        page_num: u32,
+        guard: &'g epoch::Guard,
+    ) -> Option<&'g [u8; PAGE_SIZE]> {
         let slot = self.slot_if_installed(page_num)?;
-        let guard = epoch::pin();
-        let shared = slot.page.load(Ordering::Acquire, &guard);
+        let shared = slot.page.load(Ordering::Acquire, guard);
         if shared.is_null() {
             return None;
         }
-        // SAFETY: the buffer is alive while the guard is pinned, and it is
-        // immutable once published, so this copy cannot tear.
-        let data = unsafe { *shared.deref() };
-        Some(Ok(data))
+        // SAFETY: the buffer is immutable once published, and it is retired
+        // only after a grace period that cannot elapse while `guard` is
+        // pinned, so the borrow stays valid for 'g
+        Some(unsafe { shared.deref() })
     }
 
     /// Read for the writer CAS protocol: returns the buffer plus the version
     /// token to pass to try_versioned_write. Validates the version around the
     /// copy so the (data, version) pair is consistent for a read-modify-write.
     /// Returns Err(()) if a writer is mid-publish so the calling writer
-    /// retries. Readers should use try_read, which never retries.
+    /// retries. Readers should use page_ref, which never retries.
     #[inline]
     pub fn try_read_versioned(&self, page_num: u32) -> Option<Result<([u8; PAGE_SIZE], u64), ()>> {
         let slot = self.slot_if_installed(page_num)?;
@@ -245,19 +253,6 @@ impl InMemoryPageStore {
             return Some(Err(()));
         }
         Some(Ok((data, v1)))
-    }
-
-    /// Reads the current immutable page buffer. Returns None only if the page
-    /// has never been written. Wait-free, never tears.
-    #[inline]
-    pub fn read_stable(&self, page_num: u32) -> Option<[u8; PAGE_SIZE]> {
-        let slot = self.slot_if_installed(page_num)?;
-        let guard = epoch::pin();
-        let shared = slot.page.load(Ordering::Acquire, &guard);
-        if shared.is_null() {
-            return None;
-        }
-        Some(unsafe { *shared.deref() })
     }
 
     /// CAS-publish. Succeeds only if the page version still equals
@@ -567,20 +562,22 @@ mod tests {
     }
 
     #[test]
-    fn try_read_returns_none_for_unallocated() {
+    fn page_ref_returns_none_for_unallocated() {
         let s = InMemoryPageStore::new();
-        assert!(s.try_read(0).is_none());
+        let guard = epoch::pin();
+        assert!(s.page_ref(0, &guard).is_none());
     }
 
     #[test]
-    fn try_read_returns_data_after_write() {
+    fn page_ref_returns_data_after_write() {
         let mut s = InMemoryPageStore::new();
         let p = s.allocate();
         let mut data = [0u8; PAGE_SIZE];
         data[0] = 0xAB;
         data[42] = 0xCD;
         s.write(p, &data);
-        let read = s.try_read(p).unwrap().unwrap();
+        let guard = epoch::pin();
+        let read = s.page_ref(p, &guard).unwrap();
         assert_eq!(read[0], 0xAB);
         assert_eq!(read[42], 0xCD);
     }
@@ -628,7 +625,8 @@ mod tests {
             data[7] = 0x5A;
             g.write(&data);
         }
-        let read = s.try_read(p).unwrap().unwrap();
+        let guard = epoch::pin();
+        let read = s.page_ref(p, &guard).unwrap();
         assert_eq!(read[7], 0x5A);
     }
 
@@ -654,7 +652,8 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
-        let final_data = s.try_read(p).unwrap().unwrap();
+        let guard = epoch::pin();
+        let final_data = s.page_ref(p, &guard).unwrap();
         let count =
             u32::from_le_bytes([final_data[0], final_data[1], final_data[2], final_data[3]]);
         assert_eq!(count, 4000);
