@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use zyron_common::{FX_K, IdentityBuildHasher, fx_finalize, fx_mix};
+use zyron_common::{FX_K, IdentityBuildHasher, fx_mix, mix_finalize_2round};
 
 /// One B+Tree index's key shape, as the DML hot path needs it.
 ///
@@ -82,7 +82,7 @@ fn name_key(id: u32, name: &str) -> u64 {
     for &b in name.as_bytes() {
         h = fx_mix(h, b as u64);
     }
-    fx_finalize(h)
+    mix_finalize_2round(h)
 }
 
 type NameMap<V> = scc::HashMap<u64, V, IdentityBuildHasher>;

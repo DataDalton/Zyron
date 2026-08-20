@@ -5,6 +5,7 @@
 
 pub mod binder;
 pub mod bound_predicate_sql;
+pub mod cluster_expr;
 pub mod cost;
 pub mod explain;
 pub mod lake_predicate;
@@ -21,7 +22,7 @@ pub use explain::{
 };
 pub use logical::LogicalPlan;
 pub use optimizer::Optimizer;
-pub use physical::PhysicalPlan;
+pub use physical::{ClusterFitDetail, PhysicalPlan};
 
 use std::sync::Arc;
 

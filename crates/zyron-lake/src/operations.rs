@@ -78,6 +78,9 @@ pub struct OptimizeOutcome {
     pub files_written: usize,
     pub rows_written: u64,
     pub predicates_retired: usize,
+    /// Bytes the pass read out of the files it replaced, what a caller
+    /// pacing background rewrites charges the work against
+    pub bytes_rewritten: u64,
 }
 
 /// Appends one row batch as a new data file
@@ -445,6 +448,9 @@ pub fn delete_where(
                 sql: sql.to_string(),
                 predicate: predicate.clone(),
                 created_version: 0,
+                // Rows still on disk: what the predicate matched, less the
+                // files it covered whole, which are gone already
+                pending_rows: rows_matched.saturating_sub(rows_removed),
             }));
         }
         predicate_recorded = partial;
@@ -563,6 +569,7 @@ pub fn update_where(
         match predicate {
             Some(p) => {
                 let mut partial = false;
+                let mut pending_rows = 0u64;
                 for file in &base.entries {
                     match base.prune_file(p, file) {
                         PruneDecision::FullyCovers => {
@@ -571,7 +578,14 @@ pub fn update_where(
                             });
                             files_removed += 1;
                         }
-                        PruneDecision::MayMatch => partial = true,
+                        PruneDecision::MayMatch => {
+                            partial = true;
+                            // Counted here rather than estimated later,
+                            // because this reads only the predicate's
+                            // columns while a later count would read the
+                            // file
+                            pending_rows += count_matching_rows(log, base, file, p)?;
+                        }
                         PruneDecision::CannotMatch => {}
                     }
                 }
@@ -582,6 +596,7 @@ pub fn update_where(
                         sql: sql.to_string(),
                         predicate: p.clone(),
                         created_version: 0,
+                        pending_rows,
                     }));
                     predicate_recorded = true;
                 }
@@ -751,27 +766,226 @@ pub fn delete_all(
     }
 }
 
-/// Applies attached delete predicates physically. Every file carrying a
-/// predicate is rewritten through its survivor mask, inputs are removed,
-/// survivors coalesce into one new file, and predicates that no longer
-/// attach to any live file are retired
+/// What a restore moved, for the statement to report
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreOutcome {
+    /// Version the table was rolled back to
+    pub restored_from: u64,
+    /// Version the rollback itself committed as
+    pub version: u64,
+    pub files_removed: usize,
+    pub files_added: usize,
+    pub rows_after: u64,
+}
+
+/// Rolls a table's data back to what it showed at `version`.
+///
+/// The history is not rewritten. Every version between then and now stays
+/// readable and every AS OF query against them keeps answering what it
+/// always did: the restore is one more commit on top, whose file set
+/// happens to be an older one's. That is what makes it undoable, by
+/// restoring to the version before it.
+///
+/// Nothing is copied. The files that version named are still on disk,
+/// because a version that can be read is a version whose files vacuum has
+/// been keeping, so the commit is a list of removals and additions over
+/// files that already exist.
+///
+/// The schema and the layout travel with the file set, because they have
+/// to: those files were written under that schema, and reading them under
+/// a later one would be reading columns that were not there. Their version
+/// numbers still advance rather than going backwards, since a restore is a
+/// new state of the table rather than a return to an old one.
+///
+/// Properties are left alone. They configure how the table is maintained
+/// rather than describing what it holds, and an operator who set a
+/// retention window last week did not ask for it to be rolled back with
+/// the rows
+pub fn restore_to_version(
+    log: &TransactionLog,
+    attempt: CommitAttempt<'_>,
+    version: u64,
+) -> Result<RestoreOutcome, ZyronError> {
+    let head = log.head_version();
+    if version == 0 || version > head {
+        return Err(ZyronError::Internal(format!(
+            "cannot restore to version {version}, the table has versions 1 through {head}"
+        )));
+    }
+    let target = log.manifest_at(version)?;
+    let mut attempt = attempt;
+    attempt.operation = OperationKind::Restore;
+
+    let mut files_removed = 0usize;
+    let mut files_added = 0usize;
+    let mut rows_after = 0u64;
+    let committed = log.commit(attempt, |base| {
+        let mut entries: Vec<LogEntry> = Vec::new();
+        files_removed = 0;
+        files_added = 0;
+        rows_after = target.entries.iter().map(|e| e.row_count).sum();
+
+        let wanted: BTreeSet<u64> = target.entries.iter().map(|e| e.partition_id).collect();
+        let held: BTreeSet<u64> = base.entries.iter().map(|e| e.partition_id).collect();
+        for entry in &base.entries {
+            if !wanted.contains(&entry.partition_id) {
+                entries.push(LogEntry::RemoveFile {
+                    partition_id: entry.partition_id,
+                });
+                files_removed += 1;
+            }
+        }
+
+        // The shape those files were written under. Its version advances
+        // rather than returning, because the table is arriving at a new
+        // state rather than travelling back to an old one
+        if base.schema.columns != target.schema.columns
+            || base.schema.derived != target.schema.derived
+        {
+            let mut schema = target.schema.clone();
+            schema.schema_id = base.schema.schema_id.saturating_add(1);
+            entries.push(LogEntry::SchemaChange(schema));
+        }
+        if base.cluster_spec.keys != target.cluster_spec.keys {
+            entries.push(LogEntry::SetClusterSpec(crate::manifest::ClusterSpec {
+                spec_id: base.cluster_spec.spec_id.saturating_add(1),
+                keys: target.cluster_spec.keys.clone(),
+            }));
+        }
+
+        for entry in &target.entries {
+            if !held.contains(&entry.partition_id) {
+                entries.push(LogEntry::AddFile(entry.clone()));
+                files_added += 1;
+            }
+        }
+
+        // Which rows those files show. A delete that happened after the
+        // restore point is undone by dropping its predicate, and one that
+        // was live then is put back
+        let wanted_predicates: BTreeSet<u64> =
+            target.delete_predicates.iter().map(|p| p.id).collect();
+        let held_predicates: BTreeSet<u64> = base.delete_predicates.iter().map(|p| p.id).collect();
+        for predicate in &base.delete_predicates {
+            if !wanted_predicates.contains(&predicate.id) {
+                entries.push(LogEntry::RemoveDeletePredicate { id: predicate.id });
+            }
+        }
+        for predicate in &target.delete_predicates {
+            if !held_predicates.contains(&predicate.id) {
+                entries.push(LogEntry::AddDeletePredicate(predicate.clone()));
+            }
+        }
+
+        if entries.is_empty() {
+            return Err(ZyronError::Internal(
+                "the table already holds exactly what that version held".into(),
+            ));
+        }
+        Ok(entries)
+    });
+
+    match committed {
+        Ok(v) => Ok(RestoreOutcome {
+            restored_from: version,
+            version: v,
+            files_removed,
+            files_added,
+            rows_after,
+        }),
+        // Restoring a table to the state it is already in is a statement
+        // that asked for nothing, not a failure
+        Err(ZyronError::Internal(msg)) if msg.starts_with("the table already holds") => {
+            Ok(RestoreOutcome {
+                restored_from: version,
+                version: head,
+                files_removed: 0,
+                files_added: 0,
+                rows_after: target.entries.iter().map(|e| e.row_count).sum(),
+            })
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The files one compaction rewrites.
+///
+/// Two reasons a file is in here, and they are answered together because
+/// one rewrite settles both:
+///
+/// * It carries a delete predicate. Those rows are gone logically and
+///   present physically, and rewriting the file is what retires the
+///   predicate, so every such file has to be an input or the predicate
+///   stays.
+/// * It is small. A table filled by many small writes ends up with a file
+///   per write, and every scan then pays per-file cost for rows that
+///   belong in one file.
+///
+/// Small files are taken smallest first and only while the merged output
+/// stays inside the target, so one compaction does not build a file far
+/// larger than the shape the table is aiming for. Delete-carrying files go
+/// in whatever their size, because leaving one out leaves its predicate
+/// live.
+///
+/// Fewer than `MIN_SMALL_FILES_TO_MERGE` small files are left alone:
+/// rewriting one file into one file moves the same rows into the same
+/// shape
+fn compaction_inputs(base: &ManifestFile, fallback_rows_per_file: u64) -> Vec<&PartitionEntry> {
+    let mut inputs: Vec<&PartitionEntry> = base
+        .entries
+        .iter()
+        .filter(|e| !e.delete_predicate_ids.is_empty())
+        .collect();
+    let mut rows: u64 = inputs.iter().map(|e| e.row_count).sum();
+
+    let target_rows_per_file = base.target_rows_per_file(fallback_rows_per_file);
+    let threshold = ManifestFile::small_file_threshold(target_rows_per_file);
+    let mut small: Vec<&PartitionEntry> = base
+        .entries
+        .iter()
+        .filter(|e| e.delete_predicate_ids.is_empty() && e.row_count < threshold)
+        .collect();
+    if small.len() >= crate::manifest::MIN_SMALL_FILES_TO_MERGE {
+        small.sort_by_key(|e| (e.row_count, e.partition_id));
+        for entry in small {
+            if rows.saturating_add(entry.row_count) > target_rows_per_file {
+                break;
+            }
+            rows += entry.row_count;
+            inputs.push(entry);
+        }
+    }
+    // Sorted so the rewrite reads them in manifest order, which is the
+    // order the writer's merge expects
+    inputs.sort_by_key(|e| e.partition_id);
+    inputs
+}
+
+/// Rewrites a table toward its target shape.
+///
+/// Two things are settled in one pass over one input set, because both are
+/// answered by writing the survivors of those files into one new file:
+/// delete predicates are applied physically and retired, and small files
+/// are merged. Inputs are removed, survivors coalesce into a single new
+/// file laid out by the current cluster spec, and any predicate that no
+/// longer attaches to a live file is dropped.
+///
+/// `compaction_inputs` decides what goes in
 pub fn optimize(
     log: &TransactionLog,
     attempt: CommitAttempt<'_>,
     table_id: u64,
+    fallback_rows_per_file: u64,
 ) -> Result<OptimizeOutcome, ZyronError> {
     let snapshot = log.latest_manifest()?;
-    if snapshot
-        .entries
-        .iter()
-        .all(|e| e.delete_predicate_ids.is_empty())
-    {
+    if compaction_inputs(&snapshot, fallback_rows_per_file).is_empty() {
         return Ok(OptimizeOutcome {
             version: None,
             files_removed: 0,
             files_written: 0,
             rows_written: 0,
             predicates_retired: 0,
+            bytes_rewritten: 0,
         });
     }
     let mut attempt = attempt;
@@ -781,19 +995,17 @@ pub fn optimize(
     let mut files_written = 0usize;
     let mut rows_written = 0u64;
     let mut predicates_retired = 0usize;
+    let mut bytes_rewritten = 0u64;
     let mut zero_effect = false;
     let result = log.commit(attempt, |base| {
         for path in staged.drain(..) {
             let _ = fs::remove_file(path);
         }
-        let inputs: Vec<&PartitionEntry> = base
-            .entries
-            .iter()
-            .filter(|e| !e.delete_predicate_ids.is_empty())
-            .collect();
+        let inputs = compaction_inputs(base, fallback_rows_per_file);
         files_removed = inputs.len();
         files_written = 0;
         rows_written = 0;
+        bytes_rewritten = inputs.iter().map(|f| f.size_bytes).sum();
         if inputs.is_empty() {
             zero_effect = true;
             return Err(ZyronError::Internal("nothing to optimize".into()));
@@ -928,6 +1140,7 @@ pub fn optimize(
             files_written,
             rows_written,
             predicates_retired,
+            bytes_rewritten,
         }),
         Err(_) if zero_effect => Ok(OptimizeOutcome {
             version: None,
@@ -935,6 +1148,7 @@ pub fn optimize(
             files_written: 0,
             rows_written: 0,
             predicates_retired: 0,
+            bytes_rewritten: 0,
         }),
         Err(e) => {
             for path in staged {
@@ -975,6 +1189,19 @@ pub fn vacuum_data_files(
             Err(_) => continue,
         }
     }
+    // A clone holds a version of this table, and the source has to stay
+    // able to serve it. The pins name versions rather than files, so this
+    // costs one manifest reconstruction per clone and no directory walk
+    let (pinned, pins_complete) = crate::clone::pinned_partitions(log);
+    if !pins_complete {
+        // A pin naming a version that cannot be reconstructed means the
+        // reachable set is unknown, and deleting against an unknown
+        // reachable set is how a clone loses its data. Reclaiming nothing
+        // this pass costs disk; the alternative costs a table
+        return Ok(0);
+    }
+    referenced.extend(pinned);
+
     let mut removed = 0usize;
     for dirent in fs::read_dir(log.paths().data_dir())? {
         let dirent = dirent?;
@@ -1222,7 +1449,13 @@ mod tests {
             .expect("survivors");
         assert_eq!(keep[0].count_ones(), 2);
 
-        let opt = optimize(&log, attempt(), 7).expect("optimize");
+        let opt = optimize(
+            &log,
+            attempt(),
+            7,
+            crate::maintenance::DEFAULT_ROWS_PER_FILE,
+        )
+        .expect("optimize");
         assert_eq!(opt.files_removed, 1);
         assert_eq!(opt.files_written, 1);
         assert_eq!(opt.rows_written, 2);
@@ -1234,7 +1467,13 @@ mod tests {
         assert!(m2.entries[0].delete_predicate_ids.is_empty());
 
         // A second optimize has nothing to do
-        let idle = optimize(&log, attempt(), 7).expect("idle");
+        let idle = optimize(
+            &log,
+            attempt(),
+            7,
+            crate::maintenance::DEFAULT_ROWS_PER_FILE,
+        )
+        .expect("idle");
         assert_eq!(idle.version, None);
     }
 

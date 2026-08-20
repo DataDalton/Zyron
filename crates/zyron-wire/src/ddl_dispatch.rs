@@ -418,6 +418,9 @@ pub fn try_handle_ddl_utility<'a>(
         Statement::ArchiveTable(s) => {
             Box::pin(async move { Some(handle_archive_table(s, server, session).await) })
         }
+        Statement::RestoreTableVersion(s) => {
+            Box::pin(async move { Some(handle_restore_to_version(s, server, session).await) })
+        }
         Statement::RestoreTable(s) => {
             Box::pin(async move { Some(handle_restore_table(s, server, session).await) })
         }
@@ -739,6 +742,18 @@ async fn handle_alter_table(
             let col = alter_find_column_mut(&mut entry, column)?;
             col.nullable = false;
         }
+        Op::AddDerivedColumn { .. } => {
+            // A derived column stores an expression's values so clustering
+            // and pruning can address it. Only a lake table has somewhere
+            // to put one
+            if !table.lake.is_lake() {
+                return Err(ProtocolError::Database(ZyronError::Internal(format!(
+                    "ADD DERIVED COLUMN needs a ZyronLake table, \"{}\" is a heap table",
+                    table.name
+                ))));
+            }
+            return alter_lake_table_columns(&stmt.operation, server, &table).await;
+        }
         Op::AddColumn(_) | Op::DropColumn { .. } | Op::AlterColumnSetType { .. } => {
             // A lake table's rows live in its transaction log, so a column
             // shape change is a schema-change commit there. The heap rewrite
@@ -1055,6 +1070,9 @@ async fn alter_lake_table_columns(
                     schema_id: base.schema.schema_id + 1,
                     next_column_id: new_id + 1,
                     columns,
+                    // Adding a column leaves every expression column
+                    // computing what it computed before
+                    derived: base.schema.derived.clone(),
                 };
                 schema.validate()?;
                 Ok(vec![zyron_lake::LogEntry::SchemaChange(schema)])
@@ -1137,6 +1155,15 @@ async fn alter_lake_table_columns(
                         spec.name
                     )));
                 }
+                // An expression column reading this one would have nothing
+                // to recompute from after the drop, so the dependency is
+                // refused rather than left broken
+                if let Some(derived) = base.schema.derived_depending_on(lake_id) {
+                    return Err(ZyronError::Internal(format!(
+                        "cannot drop column \"{name}\": the clustering expression \"{}\" reads it, change the clustering first",
+                        derived.sql
+                    )));
+                }
                 let columns: Vec<zyron_lake::LakeColumn> = base
                     .schema
                     .columns
@@ -1156,6 +1183,15 @@ async fn alter_lake_table_columns(
                     // later column
                     next_column_id: base.schema.next_column_id,
                     columns,
+                    // Dropping the column an expression is stored in drops
+                    // the expression with it
+                    derived: base
+                        .schema
+                        .derived
+                        .iter()
+                        .filter(|d| d.column_id != lake_id)
+                        .cloned()
+                        .collect(),
                 };
                 schema.validate()?;
                 Ok(vec![zyron_lake::LogEntry::SchemaChange(schema)])
@@ -1167,6 +1203,127 @@ async fn alter_lake_table_columns(
             for (i, c) in entry.columns.iter_mut().enumerate() {
                 c.ordinal = i as u16;
             }
+            server
+                .catalog
+                .update_table(entry)
+                .await
+                .map_err(ProtocolError::Database)?;
+        }
+        Op::AddDerivedColumn { name, expr } => {
+            if old_table.columns.iter().any(|c| c.name == *name) {
+                return Err(ProtocolError::Database(ZyronError::Internal(format!(
+                    "column \"{name}\" already exists"
+                ))));
+            }
+            // Bound through the binder a query uses, so the declared
+            // expression and the query that later matches it resolve and
+            // type identically
+            // Every proof a persisted expression needs, in the one place
+            // that runs all of them. A statement that ran three of the four
+            // would report success and leave a column every later write
+            // fails on
+            let table_arc = std::sync::Arc::new(old_table.clone());
+            let storable = zyron_executor::derived_columns::prove_storable(
+                &server.catalog,
+                &table_arc,
+                expr,
+                &format!("derived column \"{name}\""),
+            )
+            .await
+            .map_err(ProtocolError::Database)?;
+            let canonical = storable.canonical;
+            // The type comes from the expression as it reads back, because
+            // that is the one the write path evaluates
+            let result_type = storable.bound.type_id();
+            let result_digits = storable.bound.fractional_digits();
+            let mut new_id: u32 = 0;
+            log.commit(attempt, |base| {
+                if base.schema.columns.iter().any(|c| c.name == *name) {
+                    return Err(ZyronError::Internal(format!(
+                        "column \"{name}\" already exists in the lake schema"
+                    )));
+                }
+                // Rows already written hold no value for an expression
+                // declared after them, and a query filtering on the
+                // expression is answered from the stored column, so those
+                // rows would silently stop matching their own expression.
+                // Refusing is the only answer that does not lose them:
+                // filling them in means rewriting every data file, which is
+                // the same rewrite this function refuses for a column type
+                // change
+                let stored_rows: u64 = base.entries.iter().map(|e| e.row_count).sum();
+                if stored_rows > 0 {
+                    return Err(ZyronError::Internal(format!(
+                        "cannot add derived column \"{name}\" to \"{}\": it holds {stored_rows} \
+                         rows written before the expression existed, which have no value for it, \
+                         and a query filtering on the expression would drop them. Declare the \
+                         expression on a table with no rows, or create the table with \
+                         CLUSTER BY (<expression>)",
+                        old_table.name
+                    )));
+                }
+                // One column per expression, so its statistics stay in one
+                // place and two predicates cannot prune from different ones
+                if let Some(existing) = base
+                    .schema
+                    .derived
+                    .iter()
+                    .find(|d| d.canonical_hash == canonical.canonical_hash)
+                {
+                    return Err(ZyronError::Internal(format!(
+                        "expression \"{}\" is already stored by column id {}",
+                        existing.sql, existing.column_id
+                    )));
+                }
+                new_id = base.schema.next_column_id;
+                let mut columns = base.schema.columns.clone();
+                columns.push(zyron_lake::LakeColumn {
+                    id: new_id,
+                    name: name.clone(),
+                    type_id: result_type,
+                    // Rows written before the column existed hold no value
+                    // for it, and an expression over a NULL yields NULL
+                    nullable: true,
+                    fractional_digits: result_digits,
+                    tz_offset_secs: None,
+                    max_length: None,
+                    default_expr: None,
+                });
+                let mut derived = base.schema.derived.clone();
+                derived.push(zyron_lake::DerivedColumn {
+                    column_id: new_id,
+                    canonical_hash: canonical.canonical_hash,
+                    sql: canonical.sql.clone(),
+                    source_columns: canonical.source_columns.clone(),
+                });
+                let schema = zyron_lake::LakeSchema {
+                    schema_id: base.schema.schema_id + 1,
+                    next_column_id: new_id + 1,
+                    columns,
+                    derived,
+                };
+                schema.validate()?;
+                Ok(vec![zyron_lake::LogEntry::SchemaChange(schema)])
+            })
+            .map_err(ProtocolError::Database)?;
+
+            // Deliberately not added to the catalog's column list. That list
+            // is positional: the insert path walks it against the incoming
+            // batch's columns, so a column the statement never supplies would
+            // shift every column after it. A derived column is reached
+            // through its expression, which the planner rewrites onto it, and
+            // its name is reported by the derived columns view
+            let mut entry = old_table.clone();
+            entry
+                .cluster
+                .derived
+                .push(zyron_catalog::schema::DerivedColumnEntry {
+                    column_id: new_id,
+                    canonical_hash: canonical.canonical_hash,
+                    type_id: result_type as u8,
+                    fractional_digits: result_digits.unwrap_or(0xFF),
+                    sql: canonical.sql.clone(),
+                });
             server
                 .catalog
                 .update_table(entry)
@@ -2269,6 +2426,143 @@ fn map_parser_ref_action(
     }
 }
 
+/// `CREATE TABLE b CLONE OF a [AT VERSION n]`.
+///
+/// The clone starts holding the source's file set at that version, sharing
+/// the files rather than copying them, so the statement costs a walk of the
+/// manifest whatever the table weighs. Everything about its shape comes
+/// from the source: columns, their ids, the layout, the properties, the
+/// indexes and the delete predicates that were live at that version.
+///
+/// Column ids are preserved rather than renumbered. Every statistic, every
+/// cluster key and every index in the file set the clone is about to hold
+/// names its columns by id, so a clone that renumbered them would describe
+/// files it could no longer read
+async fn handle_create_table_clone(
+    stmt: &zyron_parser::ast::CreateTableStatement,
+    source: &zyron_parser::ast::CloneSource,
+    server: &Arc<ServerState>,
+    schema_id: zyron_catalog::SchemaId,
+) -> Result<DdlResult, ProtocolError> {
+    if server.catalog.get_table(schema_id, &stmt.name).is_ok() {
+        if stmt.if_not_exists {
+            return Ok(DdlResult::Tag("CREATE TABLE".to_string()));
+        }
+        return Err(ProtocolError::Database(ZyronError::TableAlreadyExists(
+            stmt.name.clone(),
+        )));
+    }
+
+    let src = server
+        .catalog
+        .get_table(schema_id, &source.table)
+        .map_err(ProtocolError::Database)?;
+    if !src.lake.is_lake() {
+        return Err(ProtocolError::Database(ZyronError::Internal(format!(
+            "\"{}\" is not a lake table. A clone shares the source's immutable data files, \
+             which is a thing only the lake format has",
+            source.table
+        ))));
+    }
+    let src_paths = zyron_lake::LakePaths::new(server.disk_manager.data_dir(), src.id.0);
+    let src_log = zyron_lake::TransactionLog::lookup_shared(&src_paths).ok_or_else(|| {
+        ProtocolError::Database(ZyronError::ConfigError(format!(
+            "this node does not run the lake tier, so it cannot clone \"{}\"",
+            source.table
+        )))
+    })?;
+
+    // The catalog entry first, because the clone's table id decides where
+    // its files are linked and what its pin on the source is called
+    let columns: Vec<(String, zyron_common::TypeId, bool, Option<u8>)> = src
+        .columns
+        .iter()
+        .map(|c| (c.name.clone(), c.type_id, c.nullable, c.fractional_digits))
+        .collect();
+    let clone_id = server
+        .catalog
+        .create_table_from_columns(schema_id, &stmt.name, &columns)
+        .await
+        .map_err(ProtocolError::Database)?;
+
+    let clone_paths = zyron_lake::LakePaths::new(server.disk_manager.data_dir(), clone_id.0);
+    let timestamp_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    let attempt = zyron_lake::CommitAttempt {
+        operation: zyron_lake::OperationKind::SchemaChange,
+        db_txn_id: 0,
+        commit_lsn: 0,
+        timestamp_us,
+        read_predicate: None,
+        read_version: 0,
+        audit: None,
+    };
+    let (log, outcome) =
+        match zyron_lake::clone_table(&src_log, clone_paths, attempt, source.at_version) {
+            Ok(pair) => pair,
+            Err(e) => {
+                // A clone without its log is unusable, so the catalog entry
+                // goes back rather than standing for a table nothing can read
+                let _ = server.catalog.drop_table(schema_id, &stmt.name).await;
+                return Err(ProtocolError::Database(e));
+            }
+        };
+    let manifest = match log.latest_manifest() {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = server.catalog.drop_table(schema_id, &stmt.name).await;
+            return Err(ProtocolError::Database(e));
+        }
+    };
+    zyron_lake::TransactionLog::register_shared(Arc::new(log));
+
+    // The source's own column ids, so every statistic and cluster key in
+    // the file set the clone now holds still resolves
+    let mut entry = server
+        .catalog
+        .get_table(schema_id, &stmt.name)
+        .map_err(ProtocolError::Database)?
+        .as_ref()
+        .clone();
+    entry.columns = src
+        .columns
+        .iter()
+        .map(|c| {
+            let mut column = c.clone();
+            column.table_id = clone_id;
+            column
+        })
+        .collect();
+    entry.lake = zyron_catalog::schema::LakeConfig::lake();
+    entry.cluster = src.cluster.clone();
+    entry.cluster.mode = manifest.clustering_mode().to_u8();
+    entry.cluster.schedule = manifest.clustering_schedule().to_u8();
+    entry.cluster.set_keys(&manifest.cluster_spec.keys);
+    entry.cluster.spec_id = manifest.cluster_spec.spec_id;
+    // The clone has been measured by nobody, whatever the source had
+    entry.cluster.active_keys.clear();
+    entry.cluster.bloom_columns = manifest.declared_bloom_columns();
+    zyron_executor::lake_stats::publish_manifest_stats(&server.catalog, &entry, &manifest);
+    server
+        .catalog
+        .update_table(entry)
+        .await
+        .map_err(ProtocolError::Database)?;
+
+    tracing::info!(
+        table = %stmt.name,
+        source = %source.table,
+        version = outcome.source_version,
+        files = outcome.files,
+        rows = outcome.rows,
+        bytes_shared = outcome.bytes_shared,
+        "cloned a lake table, sharing its files rather than copying them"
+    );
+    Ok(DdlResult::Tag("CREATE TABLE".to_string()))
+}
+
 async fn handle_create_table(
     stmt: &zyron_parser::ast::CreateTableStatement,
     server: &Arc<ServerState>,
@@ -2284,6 +2578,12 @@ async fn handle_create_table(
         zyron_auth::ObjectType::Schema,
         schema_id.0,
     )?;
+
+    // A clone takes its shape from the source rather than declaring one, so
+    // it does not go through column resolution at all
+    if let Some(source) = &stmt.clone_of {
+        return handle_create_table_clone(stmt, source, server, schema_id).await;
+    }
 
     // Storage format, resolved before the catalog entry exists so a format
     // this node does not run refuses the statement whole
@@ -2838,6 +3138,15 @@ async fn reclaim_heap_storage(
     Ok(())
 }
 
+/// Name for the column holding a clustering expression's values.
+///
+/// The id keeps it unique and stable, and the prefix keeps it out of the
+/// space a user names columns in. A user who wants a name of their own for
+/// an expression declares it with ADD DERIVED COLUMN instead
+fn derived_column_name(column_id: u32, _sql: &str) -> String {
+    format!("zyron_expr_{column_id}")
+}
+
 /// Materializes a USING ZYRONLAKE table: writes version one of its
 /// transaction log carrying the schema, cluster spec and WITH options as
 /// lake properties, then flips the catalog format flag. The table's
@@ -2848,7 +3157,7 @@ async fn apply_create_table_lake(
     schema_id: zyron_catalog::SchemaId,
     stmt: &zyron_parser::ast::CreateTableStatement,
 ) -> Result<(), ProtocolError> {
-    use zyron_parser::ast::{ClusterMode, TableOptionValue};
+    use zyron_parser::ast::{ClusterKeyTarget, ClusterMode, TableOptionValue};
 
     let table = server
         .catalog
@@ -2870,25 +3179,88 @@ async fn apply_create_table_lake(
             default_expr: c.default_expr.clone(),
         })
         .collect();
-    let lake_schema =
-        zyron_lake::LakeSchema::new(1, lake_columns).map_err(ProtocolError::Database)?;
+    // An expression key is stored in a column of its own, so the writer
+    // computes its statistics and every pruning path treats it as a
+    // column. The columns are appended to the schema here, before the log
+    // is created, so version one already describes them
+    let mut lake_columns = lake_columns;
+    let mut derived_columns: Vec<zyron_lake::DerivedColumn> = Vec::new();
+    let mut next_column_id = lake_columns.iter().map(|c| c.id).max().map_or(0, |m| m + 1);
 
     let cluster_spec = match &stmt.cluster_by {
         Some(clause) if !clause.keys.is_empty() => {
             let mut keys = Vec::with_capacity(clause.keys.len());
             for key in &clause.keys {
-                let col = lake_schema.column_by_name(&key.column).ok_or_else(|| {
-                    ProtocolError::Database(ZyronError::ParseError(format!(
-                        "CLUSTER BY column \"{}\" is not a column of {}",
-                        key.column, stmt.name
-                    )))
-                })?;
+                let column_id = match &key.target {
+                    ClusterKeyTarget::Column(name) => {
+                        lake_columns
+                            .iter()
+                            .find(|c| c.name == *name)
+                            .ok_or_else(|| {
+                                ProtocolError::Database(ZyronError::ParseError(format!(
+                                    "CLUSTER BY column \"{}\" is not a column of {}",
+                                    name, stmt.name
+                                )))
+                            })?
+                            .id
+                    }
+                    ClusterKeyTarget::Expression(expr) => {
+                        // Every proof a persisted expression needs, in the
+                        // one place that runs all of them: it canonicalizes,
+                        // its rendering reads back as the same expression,
+                        // and the evaluator can compute it. A CREATE that
+                        // skipped any of them would report success and leave
+                        // a table whose every insert fails
+                        let storable = zyron_executor::derived_columns::prove_storable(
+                            &server.catalog,
+                            &table,
+                            expr,
+                            &format!("CLUSTER BY expression on {}", stmt.name),
+                        )
+                        .await
+                        .map_err(ProtocolError::Database)?;
+                        let canonical = storable.canonical;
+                        let rebound = storable.bound;
+                        // One column per expression. A key list naming the
+                        // same expression twice orders by it once
+                        match derived_columns
+                            .iter()
+                            .find(|d| d.canonical_hash == canonical.canonical_hash)
+                        {
+                            Some(existing) => existing.column_id,
+                            None => {
+                                let id = next_column_id;
+                                next_column_id += 1;
+                                lake_columns.push(zyron_lake::LakeColumn {
+                                    id,
+                                    name: derived_column_name(id, &canonical.sql),
+                                    type_id: rebound.type_id(),
+                                    // An expression over a NULL row yields
+                                    // NULL, and no expression is required to
+                                    // produce a value for every row
+                                    nullable: true,
+                                    fractional_digits: rebound.fractional_digits(),
+                                    tz_offset_secs: None,
+                                    max_length: None,
+                                    default_expr: None,
+                                });
+                                derived_columns.push(zyron_lake::DerivedColumn {
+                                    column_id: id,
+                                    canonical_hash: canonical.canonical_hash,
+                                    sql: canonical.sql.clone(),
+                                    source_columns: canonical.source_columns.clone(),
+                                });
+                                id
+                            }
+                        }
+                    }
+                };
                 let strategy = match &key.strategy {
                     Some(name) => parse_cluster_strategy(name)?,
                     None => zyron_lake::ClusterStrategy::RangePartition,
                 };
                 keys.push(zyron_lake::ClusterKey {
-                    column_id: col.id,
+                    column_id,
                     strategy,
                     param: 0,
                 });
@@ -2897,6 +3269,10 @@ async fn apply_create_table_lake(
         }
         _ => None,
     };
+
+    let lake_schema =
+        zyron_lake::LakeSchema::with_derived(1, lake_columns, derived_columns.clone())
+            .map_err(ProtocolError::Database)?;
 
     let mut properties = std::collections::BTreeMap::new();
     for opt in &stmt.options {
@@ -2908,16 +3284,42 @@ async fn apply_create_table_lake(
         };
         properties.insert(opt.key.to_ascii_lowercase(), value);
     }
-    if let Some(clause) = &stmt.cluster_by {
-        properties.insert(
-            zyron_lake::CLUSTERING_MODE_PROPERTY.to_string(),
-            clause.mode.as_str().to_ascii_lowercase(),
-        );
-        // Under Hybrid the declared keys are anchors measurement may not
-        // reorder or drop. Force pins the whole spec and Auto pins
-        // nothing, so neither needs a separate anchor list
-        if clause.mode == ClusterMode::Hybrid {
-            let anchors: Vec<&str> = clause.keys.iter().map(|k| k.column.as_str()).collect();
+    // Clustering is on for every lake table that does not opt out. The mode
+    // comes from the CLUSTER BY clause when there is one and is Auto
+    // otherwise, and the schedule is background so a table that declared
+    // nothing still has its drift removed. Both are written at creation
+    // rather than left to a fallback, so the manifest states the policy the
+    // table is actually running under. A WITH option naming either property
+    // is the operator being explicit, so it wins
+    let cluster_mode = stmt
+        .cluster_by
+        .as_ref()
+        .map(|clause| clause.mode)
+        .unwrap_or(ClusterMode::Auto);
+    properties
+        .entry(zyron_lake::CLUSTERING_MODE_PROPERTY.to_string())
+        .or_insert_with(|| cluster_mode.as_str().to_ascii_lowercase());
+    properties
+        .entry(zyron_lake::CLUSTERING_SCHEDULE_PROPERTY.to_string())
+        .or_insert_with(|| {
+            zyron_lake::ClusteringSchedule::Continuous
+                .as_str()
+                .to_ascii_lowercase()
+        });
+    // Under Hybrid the declared keys are anchors measurement may not
+    // reorder or drop. Force pins the whole spec and Auto pins nothing, so
+    // neither needs a separate anchor list
+    if cluster_mode == ClusterMode::Hybrid {
+        if let Some(clause) = &stmt.cluster_by {
+            // An anchor is a key measurement may not reorder or drop, and it
+            // is named by column. An expression key has a generated name, so
+            // it anchors by that name rather than by the text a user wrote
+            let anchors: Vec<String> = clause
+                .keys
+                .iter()
+                .filter_map(|k| k.column_name().map(|n| n.to_string()))
+                .collect();
+            let anchors: Vec<&str> = anchors.iter().map(|s| s.as_str()).collect();
             properties.insert(
                 zyron_lake::CLUSTERING_ANCHORS_PROPERTY.to_string(),
                 anchors.join(","),
@@ -2948,14 +3350,45 @@ async fn apply_create_table_lake(
         &properties,
     )
     .map_err(ProtocolError::Database)?;
-    // The empty table's statistics, so its first plan estimates zero rows
-    // rather than falling to the planner's no-statistics defaults
     if let Ok(manifest) = log.latest_manifest() {
+        // The policy the manifest resolved, which is the properties after
+        // their defaults rather than the properties as written
+        entry.cluster.mode = manifest.clustering_mode().to_u8();
+        entry.cluster.schedule = manifest.clustering_schedule().to_u8();
+        entry.cluster.bloom_columns = manifest.declared_bloom_columns();
+        warn_redundant_blooms(&stmt.name, &manifest);
+        // The empty table's statistics, so its first plan estimates zero
+        // rows rather than falling to the planner's no-statistics defaults
         zyron_executor::lake_stats::publish_manifest_stats(&server.catalog, &entry, &manifest);
     }
     zyron_lake::TransactionLog::register_shared(Arc::new(log));
 
     entry.lake = zyron_catalog::schema::LakeConfig::lake();
+    // The declared policy, mirrored so planning reads one place. The
+    // authority is the manifest, but the planner reads the catalog and
+    // never opens a log, so a lake table whose catalog policy stayed empty
+    // planned as though it had no layout at all
+    if let Some(spec) = cluster_spec.as_ref() {
+        entry.cluster.set_keys(&spec.keys);
+    }
+    // Mirrored so the planner can match a query's expression without opening
+    // the log, and so the write path can recompute the values without
+    // reading the manifest per insert
+    entry.cluster.derived = derived_columns
+        .iter()
+        .map(|d| {
+            let column = lake_schema
+                .column_by_id(d.column_id)
+                .expect("the schema validated the derived column into existence");
+            zyron_catalog::schema::DerivedColumnEntry {
+                column_id: d.column_id,
+                canonical_hash: d.canonical_hash,
+                type_id: column.type_id as u8,
+                fractional_digits: column.fractional_digits.unwrap_or(0xFF),
+                sql: d.sql.clone(),
+            }
+        })
+        .collect();
     server
         .catalog
         .update_table(entry)
@@ -3009,13 +3442,22 @@ fn resolve_cluster_keys(
     let mut names = Vec::with_capacity(clause.keys.len());
     let mut seen = std::collections::BTreeSet::new();
     for key in &clause.keys {
+        // Only a lake table can cluster by an expression: the values are
+        // stored in a column of their own, and the fold tier has no such
+        // column to write
+        let key_name = key.column_name().ok_or_else(|| {
+            ProtocolError::Database(ZyronError::ParseError(format!(
+                "CLUSTER BY on {} may only name columns, an expression key needs a                  ZyronLake table",
+                table_name
+            )))
+        })?;
         let column = columns
             .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(&key.column))
+            .find(|c| c.name.eq_ignore_ascii_case(key_name))
             .ok_or_else(|| {
                 ProtocolError::Database(ZyronError::ParseError(format!(
                     "CLUSTER BY column \"{}\" is not a column of {}",
-                    key.column, table_name
+                    key_name, table_name
                 )))
             })?;
         let strategy = match &key.strategy {
@@ -3069,6 +3511,63 @@ async fn set_heap_cluster_policy(
     // cached plans against the old one have to go
     server.catalog.bump_schema_version();
     Ok(())
+}
+
+/// Reports every bloom filter the layout made unnecessary.
+///
+/// The writer drops them, and a request quietly not carried out is worse
+/// than one refused: an operator who declared a filter and is not seeing it
+/// help has no way to tell that from a filter that is not working
+pub(crate) fn warn_redundant_blooms(table: &str, manifest: &zyron_lake::ManifestFile) {
+    for column_id in manifest.redundant_bloom_columns() {
+        let name = manifest
+            .schema
+            .column_by_id(column_id)
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| format!("column {column_id}"));
+        tracing::warn!(
+            table = %table,
+            column = %name,
+            "bloom_filter_columns names the leading cluster key, whose file bounds already \
+             resolve it, so no filter is built for it"
+        );
+    }
+}
+
+/// Copies a lake table's clustering policy from its manifest into the
+/// catalog.
+///
+/// The manifest is the authority and the planner never opens one, so every
+/// statement that changes the layout has to leave the catalog saying the
+/// same thing. A stale mirror does not fail a query, which is what makes it
+/// worth being careful about: it makes every later plan judge itself
+/// against a layout the files do not have.
+///
+/// `declared_keys` is what the statement asked for, kept apart from what a
+/// clustering pass later accepts. A new declaration supersedes a pass's
+/// choice, so the active set starts over
+async fn mirror_lake_cluster_policy(
+    server: &Arc<ServerState>,
+    table: &zyron_catalog::schema::TableEntry,
+    log: &zyron_lake::TransactionLog,
+    declared_keys: Option<&[zyron_lake::ClusterKey]>,
+) -> Result<(), ProtocolError> {
+    let manifest = log.latest_manifest().map_err(ProtocolError::Database)?;
+    let mut entry = table.clone();
+    entry.cluster.mode = manifest.clustering_mode().to_u8();
+    entry.cluster.schedule = manifest.clustering_schedule().to_u8();
+    entry.cluster.bloom_columns = manifest.declared_bloom_columns();
+    if let Some(keys) = declared_keys {
+        entry.cluster.set_keys(keys);
+        entry.cluster.spec_id = manifest.cluster_spec.spec_id;
+        entry.cluster.active_keys.clear();
+    }
+    warn_redundant_blooms(&table.name, &manifest);
+    server
+        .catalog
+        .update_table(entry)
+        .await
+        .map_err(ProtocolError::Database)
 }
 
 /// The commit attempt clustering DDL uses. Clustering changes stand alone
@@ -3156,6 +3655,13 @@ async fn handle_cluster_by(
     })
     .map_err(ProtocolError::Database)?;
 
+    mirror_lake_cluster_policy(
+        server,
+        &table,
+        &log,
+        declared.then_some(spec.keys.as_slice()),
+    )
+    .await?;
     // A layout change invalidates cached plans that costed the old one
     server.catalog.bump_schema_version();
     Ok(DdlResult::Tag("ALTER TABLE".to_string()))
@@ -3723,6 +4229,7 @@ async fn handle_clustering_schedule(
         }])
     })
     .map_err(ProtocolError::Database)?;
+    mirror_lake_cluster_policy(server, &table, &log, None).await?;
     Ok(DdlResult::Tag("ALTER TABLE".to_string()))
 }
 
@@ -3855,7 +4362,30 @@ async fn handle_drop_table(
                 // soft drop keeps everything for UNDROP
                 if let Some(id) = lake_table_id {
                     let paths = zyron_lake::LakePaths::new(server.disk_manager.data_dir(), id);
+                    // A clone holds a claim on the table it came from. Read
+                    // it before the log goes, because the claim is recorded
+                    // in the clone's own manifest, and drop it after: a
+                    // source left carrying a pin from a table that no longer
+                    // exists would never reclaim those files again
+                    let pinned_source = zyron_lake::TransactionLog::lookup_shared(&paths)
+                        .and_then(|log| log.latest_manifest().ok())
+                        .and_then(|m| zyron_lake::clone_source(&m))
+                        .map(|(source_id, _)| source_id);
                     zyron_lake::TransactionLog::remove_shared(&paths);
+                    if let Some(source_id) = pinned_source {
+                        let source_paths =
+                            zyron_lake::LakePaths::new(server.disk_manager.data_dir(), source_id);
+                        if let Err(e) = zyron_lake::release_pin(&source_paths, id) {
+                            tracing::warn!(
+                                target: "zyron::ddl",
+                                table_id = id,
+                                source_id,
+                                error = %e,
+                                "dropped a clone but could not release its pin, the source will \
+                                 keep its files until the pin is removed by hand"
+                            );
+                        }
+                    }
                     if let Err(e) = std::fs::remove_dir_all(paths.root()) {
                         if e.kind() != std::io::ErrorKind::NotFound {
                             tracing::error!(
@@ -9149,6 +9679,99 @@ async fn handle_archive_table(
     }
 
     Ok(DdlResult::Tag(format!("ARCHIVE TABLE {count}")))
+}
+
+/// `RESTORE TABLE t TO VERSION n` and `... TO TIMESTAMP '...'`.
+///
+/// Rolls the table's data back to what it showed then by committing a new
+/// head whose file set is that version's. Nothing is copied and nothing is
+/// rewritten: the versions in between stay readable, every AS OF query
+/// against them keeps answering what it always did, and the restore itself
+/// is undone by restoring to the version before it.
+///
+/// This is a different thing from `RESTORE TABLE t FROM '<archive>'`, which
+/// reads a flat snapshot from outside the database and has no version
+/// history to move through. That statement still refuses a point in time,
+/// because there is none in an archive to name
+async fn handle_restore_to_version(
+    stmt: &zyron_parser::ast::RestoreTableVersionStatement,
+    server: &Arc<ServerState>,
+    session: &mut Option<Session>,
+) -> Result<DdlResult, ProtocolError> {
+    use zyron_parser::ast::RestoreVersionTarget;
+
+    let (schema_id, name) = resolve_qualified_name(&stmt.table, server, session)?;
+    let table = server
+        .catalog
+        .get_table(schema_id, &name)
+        .map_err(ProtocolError::Database)?;
+    check_ddl_privilege(
+        server,
+        session,
+        zyron_auth::PrivilegeType::Create,
+        zyron_auth::ObjectType::Table,
+        table.id.0,
+    )?;
+    if !table.lake.is_lake() {
+        return Err(ProtocolError::Database(ZyronError::Internal(format!(
+            "\"{name}\" is not a lake table. Rolling a table back to a version needs a version \
+             history, which is a thing only the lake format keeps"
+        ))));
+    }
+
+    let paths = zyron_lake::LakePaths::new(server.disk_manager.data_dir(), table.id.0);
+    let log = zyron_lake::TransactionLog::lookup_shared(&paths).ok_or_else(|| {
+        ProtocolError::Database(ZyronError::ConfigError(format!(
+            "this node does not run the lake tier, so it cannot restore \"{name}\""
+        )))
+    })?;
+
+    let version = match &stmt.target {
+        RestoreVersionTarget::Version(v) => *v,
+        RestoreVersionTarget::Timestamp(text) => {
+            let micros = zyron_common::parse_timestamp_micros(text).map_err(|e| {
+                ProtocolError::Database(ZyronError::ParseError(format!(
+                    "\"{text}\" is not a timestamp this engine can read: {e}"
+                )))
+            })?;
+            zyron_lake::resolve_version(&log, zyron_lake::TimeTravelSpec::Timestamp(micros))
+                .map_err(ProtocolError::Database)?
+        }
+    };
+
+    let timestamp_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    let attempt = zyron_lake::CommitAttempt {
+        operation: zyron_lake::OperationKind::Restore,
+        db_txn_id: 0,
+        commit_lsn: 0,
+        timestamp_us,
+        read_predicate: None,
+        read_version: 0,
+        audit: None,
+    };
+    let outcome =
+        zyron_lake::restore_to_version(&log, attempt, version).map_err(ProtocolError::Database)?;
+
+    // The file set changed, so every plan priced against the old one is
+    // stale, and so are the statistics the planner costs from
+    if let Ok(manifest) = log.latest_manifest() {
+        zyron_executor::lake_stats::publish_manifest_stats(&server.catalog, &table, &manifest);
+    }
+    server.catalog.bump_schema_version();
+
+    tracing::info!(
+        table = %name,
+        restored_from = outcome.restored_from,
+        version = outcome.version,
+        files_removed = outcome.files_removed,
+        files_added = outcome.files_added,
+        rows = outcome.rows_after,
+        "restored a lake table to an earlier version"
+    );
+    Ok(DdlResult::Tag("RESTORE TABLE".to_string()))
 }
 
 async fn handle_restore_table(

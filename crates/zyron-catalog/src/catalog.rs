@@ -4626,6 +4626,42 @@ impl Catalog {
         Ok(())
     }
 
+    /// Records the keys a clustering pass left a table laid out by.
+    ///
+    /// Planning reads the catalog rather than a transaction log, so a plan
+    /// is judged against whatever was last recorded here. A pass that
+    /// changed the layout without recording it would leave every later plan
+    /// claiming pruning the files cannot deliver, and one that changed
+    /// nothing must not rewrite the entry: the passes run on a timer, so a
+    /// write per tick per table would be the bulk of what the catalog does
+    ///
+    /// Returns true when the entry was rewritten
+    pub async fn set_active_cluster_keys(
+        &self,
+        table_id: TableId,
+        keys: &[zyron_common::ClusterKey],
+    ) -> Result<bool> {
+        let entry = self.get_table_by_id(table_id)?;
+        let unchanged = entry.cluster.active_keys.len() == keys.len()
+            && entry
+                .cluster
+                .active_keys
+                .iter()
+                .zip(keys.iter())
+                .all(|(have, want)| {
+                    have.column_id == want.column_id
+                        && have.strategy == want.strategy.to_u8()
+                        && have.param == want.param
+                });
+        if unchanged {
+            return Ok(false);
+        }
+        let mut entry = (*entry).clone();
+        entry.cluster.set_active_keys(keys);
+        self.update_table(entry).await?;
+        Ok(true)
+    }
+
     /// Replaces the cached table entry without WAL logging or a storage
     /// rewrite. The compaction worker uses this for the common per-fold
     /// columnar-registry update so a fold is O(1) instead of re-serializing

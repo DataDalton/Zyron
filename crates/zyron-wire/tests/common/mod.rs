@@ -645,3 +645,145 @@ pub async fn run_on_branch(
         }
     }
 }
+
+// =============================================================================
+// EXPLAIN ANALYZE
+// =============================================================================
+
+/// Plans and executes one statement the way EXPLAIN ANALYZE does, then
+/// merges the executor's counters into the plan tree.
+///
+/// A suite that wants to know what a scan actually did has to go through
+/// this rather than through `query_values`, because the counters only exist
+/// when the executor is told to wrap its operators in metrics collectors
+pub async fn analyze(
+    server: &Arc<ServerState>,
+    sql: &str,
+) -> (zyron_planner::ExplainNode, zyron_planner::NodeMetrics) {
+    let stmt = zyron_parser::parse(sql)
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("one statement");
+    let plan = zyron_planner::plan(
+        &server.catalog,
+        DatabaseId(1),
+        vec!["public".into()],
+        stmt,
+        None,
+    )
+    .await
+    .expect("plan");
+    let mut tree = zyron_planner::ExplainNode::from_physical_plan(&plan);
+
+    let mut txn = server
+        .txn_manager
+        .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
+        .expect("begin");
+    let snapshot = txn.snapshot.clone();
+    let txn_id = txn.txn_id;
+    let mut ctx = zyron_executor::context::ExecutionContext::new(
+        server.catalog.clone(),
+        server.wal.clone(),
+        server.buffer_pool.clone(),
+        server.disk_manager.clone(),
+        txn_id as u32,
+        snapshot,
+    );
+    ctx.heap_files = Some(Arc::clone(&server.heap_files));
+    ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
+    // The only thing that makes the executor wrap its operators in metrics
+    // collectors
+    ctx.analyze = true;
+    let ctx = Arc::new(ctx);
+    let (_batches, metrics) = zyron_executor::execute_analyze(plan, &ctx)
+        .await
+        .expect("analyze");
+    server.txn_manager.commit(&mut txn).await.expect("commit");
+
+    let metrics = metrics.expect("analyze mode produces metrics");
+    let node_metrics = node_metrics_of(&metrics);
+    assert!(
+        tree.merge_metrics(&node_metrics) > 0,
+        "the plan and the executor must agree on the operator names"
+    );
+    (tree, node_metrics)
+}
+
+/// One statement's plan as EXPLAIN renders it, without running it.
+///
+/// What a reader sees before committing to a query, which is where a
+/// verdict the planner reached rather than measured belongs
+pub async fn render_plan(server: &Arc<ServerState>, sql: &str) -> String {
+    let stmt = zyron_parser::parse(sql)
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("one statement");
+    let plan = zyron_planner::plan(
+        &server.catalog,
+        DatabaseId(1),
+        vec!["public".into()],
+        stmt,
+        None,
+    )
+    .await
+    .expect("plan");
+    zyron_planner::ExplainNode::from_physical_plan(&plan)
+        .render(&zyron_planner::ExplainOptions::default())
+}
+
+/// The analyzed plan as the text a person reads
+pub async fn render_analyzed(server: &Arc<ServerState>, sql: &str) -> String {
+    let (tree, _) = analyze(server, sql).await;
+    tree.render(&zyron_planner::ExplainOptions {
+        analyze: true,
+        ..Default::default()
+    })
+}
+
+/// The measured counters of the LakeScan in one statement's plan
+pub async fn analyze_lake_scan(
+    server: &Arc<ServerState>,
+    sql: &str,
+) -> zyron_planner::ActualMetrics {
+    let (tree, _) = analyze(server, sql).await;
+    find_named(&tree, "LakeScan")
+        .expect("a LakeScan node")
+        .actual_metrics
+        .clone()
+        .expect("the scan reports what it measured")
+}
+
+/// The first node in the tree with this operator name
+pub fn find_named<'a>(
+    node: &'a zyron_planner::ExplainNode,
+    name: &str,
+) -> Option<&'a zyron_planner::ExplainNode> {
+    if node.operator_name == name {
+        return Some(node);
+    }
+    node.children.iter().find_map(|c| find_named(c, name))
+}
+
+fn node_metrics_of(
+    metrics: &zyron_executor::operator::OperatorMetrics,
+) -> zyron_planner::NodeMetrics {
+    use std::sync::atomic::Ordering;
+    let mut aux = [0u64; zyron_planner::ACTUAL_AUX_SLOTS];
+    for (slot, value) in aux.iter_mut().enumerate() {
+        *value = metrics.aux(slot);
+    }
+    zyron_planner::NodeMetrics {
+        name: metrics.name.clone(),
+        rows: metrics.rows_produced.load(Ordering::Relaxed),
+        elapsed_ns: metrics.elapsed_ns.load(Ordering::Relaxed),
+        batches: metrics.batches.load(Ordering::Relaxed),
+        aux,
+        children: metrics
+            .children
+            .iter()
+            .map(|c| node_metrics_of(c))
+            .collect(),
+    }
+}

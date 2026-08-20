@@ -13,7 +13,7 @@ use zyron_wire::session::Session;
 mod common;
 use common::{
     create_test_server, create_test_server_in_mode, exec_ddl, exec_dml, new_session, query_error,
-    query_rows, query_values, run_on_branch,
+    query_rows, query_values, render_plan, run_on_branch,
 };
 
 #[tokio::test]
@@ -57,12 +57,22 @@ async fn test_create_lake_table_writes_log_and_flips_catalog() {
             .map(|s| s.as_str()),
         Some("268435456")
     );
+    // A bare key list seeds the layout and leaves measurement free to move
+    // it, and the schedule is written at creation so the manifest states the
+    // policy rather than leaning on a fallback
     assert_eq!(
         manifest
             .properties
             .get("clustering_mode")
             .map(|s| s.as_str()),
-        Some("force")
+        Some("auto")
+    );
+    assert_eq!(
+        manifest
+            .properties
+            .get("clustering_schedule")
+            .map(|s| s.as_str()),
+        Some("continuous")
     );
 }
 
@@ -2843,7 +2853,7 @@ async fn test_alter_cluster_by_commits_a_new_spec_that_later_writes_use() {
     exec_ddl(
         &server,
         &mut session,
-        "ALTER TABLE events CLUSTER BY (region USING BitInterleave, id)",
+        "ALTER TABLE events CLUSTER BY (region USING BitInterleave, id) FORCE",
     )
     .await
     .expect("alter cluster by");
@@ -2976,7 +2986,9 @@ async fn test_clustering_schedule_is_persisted_on_both_formats() {
         plain.cluster.schedule(),
         zyron_common::ClusteringSchedule::Incremental
     );
-    assert_eq!(plain.cluster.mode(), zyron_common::ClusterMode::Force);
+    // A bare key list declares the keys without pinning them, on either
+    // format
+    assert_eq!(plain.cluster.mode(), zyron_common::ClusterMode::Auto);
     let keys = plain.cluster.fold_keys();
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].column_id, 0);
@@ -3031,7 +3043,7 @@ async fn test_show_clustering_reports_without_changing_the_pinned_choice() {
         &server,
         &mut session,
         "CREATE TABLE events (id BIGINT NOT NULL, region TEXT) USING ZYRONLAKE \
-         CLUSTER BY (id USING RangePartition)",
+         CLUSTER BY (id USING RangePartition) FORCE",
     )
     .await
     .expect("create");
@@ -3052,8 +3064,10 @@ async fn test_show_clustering_reports_without_changing_the_pinned_choice() {
             .map(|r| r[1].clone())
             .unwrap_or_else(|| panic!("SHOW CLUSTERING has no {property} row"))
     };
+    // FORCE pins the declared keys, and the schedule is the creation
+    // default because the statement named no other one
     assert_eq!(value("mode"), "FORCE");
-    assert_eq!(value("schedule"), "ONDEMAND");
+    assert_eq!(value("schedule"), "CONTINUOUS");
     assert_eq!(value("keys"), "id USING RangePartition");
     assert_eq!(value("anchors"), "id");
     assert_eq!(value("spec_id"), "1");
@@ -3571,4 +3585,828 @@ async fn test_queries_that_project_no_column_agree_across_formats() {
         Some(zyron_executor::column::ScalarValue::Int64(0)) => {}
         other => panic!("an unqualified delete must empty the table, got {other:?}"),
     }
+}
+
+/// A table clustered by an expression stores that expression in a column of
+/// its own, and every write fills it. Without the stored values there are no
+/// file statistics over the expression, so a query filtering on it could
+/// never prune, which is the whole point of allowing the key
+#[tokio::test]
+async fn test_cluster_by_expression_stores_and_fills_a_derived_column() {
+    let (server, schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE events (id BIGINT NOT NULL, ts TIMESTAMP, country TEXT) \
+         USING ZYRONLAKE CLUSTER BY (date_part('year', ts))",
+    )
+    .await
+    .expect("create with an expression cluster key");
+
+    let entry = server
+        .catalog
+        .get_table(schema_id, "events")
+        .expect("entry");
+    // The expression is mirrored into the catalog so the planner can match a
+    // query against it without opening the log
+    assert_eq!(entry.cluster.derived.len(), 1, "one expression, one column");
+    let mirrored = &entry.cluster.derived[0];
+    assert!(
+        mirrored.sql.contains("date_part"),
+        "the mirror carries the expression text, got {}",
+        mirrored.sql
+    );
+    assert_ne!(mirrored.canonical_hash, 0);
+
+    let paths = LakePaths::new(server.disk_manager.data_dir(), entry.id.0);
+    let log = TransactionLog::lookup_shared(&paths).expect("shared log");
+    let manifest = log.latest_manifest().expect("manifest");
+    assert_eq!(
+        manifest.schema.derived.len(),
+        1,
+        "version one already describes the expression column"
+    );
+    let derived_id = manifest.schema.derived[0].column_id;
+    assert_eq!(
+        manifest.schema.derived[0].source_columns,
+        vec![1],
+        "the expression reads ts, which is what makes dropping ts refusable"
+    );
+    assert_eq!(
+        manifest.cluster_spec.keys.len(),
+        1,
+        "the key list orders by the column holding the expression"
+    );
+    assert_eq!(manifest.cluster_spec.keys[0].column_id, derived_id);
+    // The table declared three columns, clustering added the fourth
+    assert_eq!(manifest.schema.columns.len(), 4);
+    assert_eq!(manifest.schema.user_columns().count(), 3);
+
+    // The insert has to fill the expression column or the writer rejects the
+    // batch as short of the schema
+    exec_dml(
+        &server,
+        "INSERT INTO events VALUES \
+         (1, TIMESTAMP '2024-03-01 00:00:00', 'eu'), \
+         (2, TIMESTAMP '2026-07-04 00:00:00', 'us')",
+    )
+    .await;
+
+    let after = log.latest_manifest().expect("manifest");
+    let file = after.entries.last().expect("a data file");
+    let stats = file
+        .stats_for(derived_id)
+        .expect("the expression column carries statistics, which is what prunes");
+    assert!(
+        stats.bounds.min.is_some() && stats.bounds.max.is_some(),
+        "computed values reached the writer's statistics pass"
+    );
+    assert_ne!(
+        stats.bounds.min, stats.bounds.max,
+        "two different years must not collapse to one bound"
+    );
+
+    // The rows themselves are unchanged by the extra column
+    let rows = query_rows(&server, "SELECT id FROM events ORDER BY id").await;
+    assert_eq!(rows, 2, "the extra column did not change the row set");
+}
+
+/// An expression the engine cannot evaluate has to be refused when it is
+/// declared. Accepting it would create a table whose every insert fails
+#[tokio::test]
+async fn test_cluster_by_an_uncomputable_expression_is_refused() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    let err = exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE events (id BIGINT NOT NULL, ts TIMESTAMP) USING ZYRONLAKE \
+         CLUSTER BY (no_such_function(ts))",
+    )
+    .await
+    .expect_err("an unknown function cannot be a cluster key");
+    let text = format!("{err:?}").to_lowercase();
+    assert!(
+        text.contains("no_such_function") || text.contains("unknown function"),
+        "the refusal has to name what it could not compute, got {text}"
+    );
+
+    // A volatile expression is refused too: its value would differ between
+    // the write that stored it and the query that filters on it
+    assert!(
+        exec_ddl(
+            &server,
+            &mut session,
+            "CREATE TABLE v (id BIGINT NOT NULL, ts TIMESTAMP) USING ZYRONLAKE \
+             CLUSTER BY (date_part('year', now()))",
+        )
+        .await
+        .is_err(),
+        "a volatile expression must not become a cluster key"
+    );
+}
+
+/// Everything an expression is built from reaches a kernel that runs over
+/// a whole column, except a short list of predicates the evaluator answers
+/// a row at a time. Declaring one of those as a cluster key is legal and
+/// expensive, so the statement that declares it has to say so while the
+/// operator can still choose something else. Silence would leave the cost
+/// to be discovered from a slow insert months later
+#[tokio::test]
+async fn test_a_row_at_a_time_clustering_expression_warns_at_create() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+
+    let logs = CapturedWarnings::default();
+    let captured = {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        exec_ddl(
+            &server,
+            &mut session,
+            "CREATE TABLE neighbors (id BIGINT NOT NULL, embedding VECTOR(3)) USING ZYRONLAKE \
+             CLUSTER BY (embedding <-> ARRAY[0.0, 1.0, 0.0])",
+        )
+        .await
+        .expect("a row-at-a-time expression is expensive, not illegal");
+        logs.text()
+    };
+
+    assert!(
+        captured.contains("row at a time"),
+        "declaring a per-row expression said nothing about what it costs, log was: {captured}"
+    );
+    assert!(
+        captured.contains("vector_distance_l2"),
+        "the warning has to name the function that costs the per-row walk, log was: {captured}"
+    );
+    assert!(
+        captured.contains("neighbors"),
+        "the warning has to name the table, log was: {captured}"
+    );
+
+    // Expensive and still correct: the column is allocated and a write
+    // fills it, which is what makes the warning about cost rather than
+    // about a refusal
+    exec_dml(
+        &server,
+        "INSERT INTO neighbors VALUES (1, ARRAY[1.0, 0.0, 0.0]), (2, ARRAY[0.0, 1.0, 0.0])",
+    )
+    .await;
+    assert_eq!(query_rows(&server, "SELECT id FROM neighbors").await, 2);
+}
+
+/// A vectorized expression must not warn, or the warning stops meaning
+/// anything
+#[tokio::test]
+async fn test_a_vectorized_clustering_expression_does_not_warn() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+
+    let logs = CapturedWarnings::default();
+    let captured = {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        exec_ddl(
+            &server,
+            &mut session,
+            "CREATE TABLE hits (id BIGINT NOT NULL, ts TIMESTAMP) USING ZYRONLAKE \
+             CLUSTER BY (date_part('year', ts))",
+        )
+        .await
+        .expect("create");
+        logs.text()
+    };
+
+    assert!(
+        !captured.contains("row at a time"),
+        "a kernel-evaluated expression must not be reported as per-row, log was: {captured}"
+    );
+}
+
+/// Collects what a statement wrote to the WARN level.
+///
+/// The warning is the entire observable effect of the per-row check, so
+/// there is nothing else to assert on. Capturing it is what makes the
+/// check testable rather than a line nobody ever reads
+#[derive(Clone, Default)]
+struct CapturedWarnings(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl CapturedWarnings {
+    fn text(&self) -> String {
+        let buffer = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        String::from_utf8_lossy(&buffer).into_owned()
+    }
+}
+
+impl std::io::Write for CapturedWarnings {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedWarnings {
+    type Writer = CapturedWarnings;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// The stored text is read back on every write to recompute the column, so
+/// an expression the renderer cannot write back has to be refused where it
+/// is declared. Accepting it would create a table whose every insert fails
+#[tokio::test]
+async fn test_a_clustering_expression_that_cannot_be_read_back_is_refused() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    let err = exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE docs (id BIGINT NOT NULL, body TEXT) USING ZYRONLAKE \
+         CLUSTER BY (MATCH(body) AGAINST ('needle'))",
+    )
+    .await
+    .expect_err("a search predicate has no form the write path can read back");
+    let text = format!("{err:?}");
+    assert!(
+        text.contains("read back") || text.contains("cannot be stored"),
+        "the refusal has to say the expression could not be stored, got {text}"
+    );
+}
+
+/// A derived column added to a table that already holds rows would be null
+/// for every one of them, and a query rewritten onto it would then drop
+/// rows that match. Filling them in means rewriting every data file, which
+/// is the rewrite a lake ALTER refuses, so the statement is refused instead
+/// of quietly losing the rows
+#[tokio::test]
+async fn test_add_derived_column_on_a_table_with_rows_is_refused() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE hits (id BIGINT NOT NULL, ts TIMESTAMP) USING ZYRONLAKE",
+    )
+    .await
+    .expect("create");
+    exec_dml(
+        &server,
+        "INSERT INTO hits VALUES (1, TIMESTAMP '2013-01-01 00:00:00'), \
+         (2, TIMESTAMP '2019-01-01 00:00:00')",
+    )
+    .await;
+
+    let err = exec_ddl(
+        &server,
+        &mut session,
+        "ALTER TABLE hits ADD DERIVED COLUMN yr AS date_part('year', ts)",
+    )
+    .await
+    .expect_err("rows written before the expression have no value for it");
+    let text = format!("{err:?}");
+    assert!(
+        text.contains("2 rows") && text.contains("drop them"),
+        "the refusal has to say how many rows are at stake and what would happen to them, \
+         got {text}"
+    );
+
+    // Refused means refused: the table is untouched and its rows still
+    // answer the query they always did
+    let entry = server
+        .catalog
+        .list_all_tables()
+        .into_iter()
+        .find(|t| t.name == "hits")
+        .expect("table");
+    assert!(
+        entry.cluster.derived.is_empty(),
+        "a refused ALTER must not leave a half-registered expression behind"
+    );
+    assert_eq!(query_rows(&server, "SELECT id FROM hits").await, 2);
+}
+
+/// A derived column declared on an empty table is filled by every write
+/// after it, which is the case that needs no backfill
+#[tokio::test]
+async fn test_add_derived_column_on_an_empty_table_is_filled_by_later_writes() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE hits (id BIGINT NOT NULL, ts TIMESTAMP) USING ZYRONLAKE",
+    )
+    .await
+    .expect("create");
+    exec_ddl(
+        &server,
+        &mut session,
+        "ALTER TABLE hits ADD DERIVED COLUMN yr AS date_part('year', ts)",
+    )
+    .await
+    .expect("a derived column on an empty table needs nothing backfilled");
+
+    exec_dml(
+        &server,
+        "INSERT INTO hits VALUES (1, TIMESTAMP '2013-01-01 00:00:00'), \
+         (2, TIMESTAMP '2019-01-01 00:00:00')",
+    )
+    .await;
+
+    let entry = server
+        .catalog
+        .list_all_tables()
+        .into_iter()
+        .find(|t| t.name == "hits")
+        .expect("table");
+    assert_eq!(
+        entry.cluster.derived.len(),
+        1,
+        "the catalog mirror is what the planner matches a query against"
+    );
+    let paths = LakePaths::new(server.disk_manager.data_dir(), entry.id.0);
+    let log = TransactionLog::lookup_shared(&paths).expect("shared log");
+    let manifest = log.latest_manifest().expect("manifest");
+    let derived_id = manifest.schema.derived[0].column_id;
+    let file = manifest.entries.last().expect("a data file");
+    let stats = file
+        .stats_for(derived_id)
+        .expect("the write filled the derived column");
+    assert_eq!(stats.bounds.min, Some(zyron_lake::LakeValue::Int(2013)));
+    assert_eq!(stats.bounds.max, Some(zyron_lake::LakeValue::Int(2019)));
+
+    let rows = query_values(
+        &server,
+        "SELECT id FROM hits WHERE date_part('year', ts) = 2013 ORDER BY id",
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "the expression predicate lost a row");
+}
+
+/// An expression the evaluator cannot compute has to be refused by ALTER
+/// for the same reason CREATE refuses it
+#[tokio::test]
+async fn test_add_derived_column_refuses_an_uncomputable_expression() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE hits (id BIGINT NOT NULL, ts TIMESTAMP) USING ZYRONLAKE",
+    )
+    .await
+    .expect("create");
+    assert!(
+        exec_ddl(
+            &server,
+            &mut session,
+            "ALTER TABLE hits ADD DERIVED COLUMN bad AS no_such_function(ts)",
+        )
+        .await
+        .is_err(),
+        "a function the engine does not have must not become a derived column"
+    );
+    assert!(
+        exec_ddl(
+            &server,
+            &mut session,
+            "ALTER TABLE hits ADD DERIVED COLUMN whenever AS date_part('year', now())",
+        )
+        .await
+        .is_err(),
+        "a volatile expression must not become a derived column"
+    );
+}
+
+/// A plan says how much the table's layout does for it, before it runs.
+///
+/// The scan counters say how many files were skipped, which is the outcome.
+/// This is the reason: a predicate that reached no cluster key skips files
+/// only by luck, and the counters alone cannot tell that apart from a
+/// predicate that reached one and matched everything
+#[tokio::test]
+async fn test_explain_reports_what_the_layout_does_for_a_predicate() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE sales (region BIGINT, sku BIGINT, amount BIGINT) USING ZYRONLAKE \
+         CLUSTER BY (region, sku) FORCE",
+    )
+    .await
+    .expect("create");
+    exec_dml(
+        &server,
+        "INSERT INTO sales VALUES (1, 10, 100), (2, 20, 200)",
+    )
+    .await;
+
+    let leading = render_plan(&server, "SELECT amount FROM sales WHERE region = 1").await;
+    assert!(
+        leading.contains("cluster_fit=good (region)"),
+        "the leading key is what decides which files open, {leading}"
+    );
+
+    let secondary = render_plan(&server, "SELECT amount FROM sales WHERE sku = 10").await;
+    assert!(
+        secondary.contains("cluster_fit=fair (sku is cluster key 2)"),
+        "a later key narrows within a run rather than across the file set, {secondary}"
+    );
+
+    let missed = render_plan(&server, "SELECT region FROM sales WHERE amount = 100").await;
+    assert!(
+        missed.contains("cluster_fit=poor (fell back to amount)"),
+        "a predicate reaching no key has to say which column it reached instead, {missed}"
+    );
+
+    // Nothing to judge when the table has no layout, and saying "poor"
+    // there would read as a defect rather than as an absence
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE plainlake (a BIGINT, b BIGINT) USING ZYRONLAKE",
+    )
+    .await
+    .expect("create");
+    let unclustered = render_plan(&server, "SELECT b FROM plainlake WHERE a = 1").await;
+    assert!(
+        !unclustered.contains("cluster_fit"),
+        "a table with no cluster keys has no fit to report, {unclustered}"
+    );
+}
+
+/// An expression cluster key is stored in a column with no name a user
+/// wrote, so a verdict about it has to name the expression instead of a
+/// column number nobody can act on
+#[tokio::test]
+async fn test_explain_names_the_expression_behind_an_expression_cluster_key() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE hits (id BIGINT, ts TIMESTAMP) USING ZYRONLAKE \
+         CLUSTER BY (date_part('year', ts)) FORCE",
+    )
+    .await
+    .expect("create");
+
+    let text = render_plan(
+        &server,
+        "SELECT id FROM hits WHERE date_part('year', ts) = 2013",
+    )
+    .await;
+    assert!(
+        text.contains("cluster_fit=good (date_part("),
+        "the verdict has to name the expression the key stores, {text}"
+    );
+}
+
+/// A bloom filter on the leading cluster key is not built, because the
+/// key's own file bounds already resolve it. The plan has to say so: the
+/// operator asked for something the writer did not do, and a filter that
+/// is silently absent looks the same as one that is not helping
+#[tokio::test]
+async fn test_a_bloom_on_the_leading_cluster_key_is_reported_as_not_built() {
+    let (server, schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE sales (region BIGINT, sku BIGINT, amount BIGINT) USING ZYRONLAKE \
+         CLUSTER BY (region, sku) FORCE WITH (bloom_filter_columns = 'region,sku')",
+    )
+    .await
+    .expect("create");
+    exec_dml(
+        &server,
+        "INSERT INTO sales VALUES (1, 10, 100), (2, 20, 200)",
+    )
+    .await;
+
+    let entry = server.catalog.get_table(schema_id, "sales").expect("entry");
+    assert_eq!(
+        entry.cluster.bloom_columns.len(),
+        2,
+        "the catalog mirrors what was asked for, not what was built"
+    );
+    assert_eq!(
+        entry.cluster.redundant_bloom_columns().len(),
+        1,
+        "only the leading key is covered by the layout"
+    );
+
+    let text = render_plan(&server, "SELECT amount FROM sales WHERE sku = 10").await;
+    assert!(
+        text.contains("bloom_redundant=region"),
+        "the plan has to name the filter it did not build, {text}"
+    );
+    assert!(
+        !text.contains("bloom_redundant=sku"),
+        "a filter on a key after the leading one is built and must not be reported as \
+         dropped, {text}"
+    );
+
+    // The writer agrees with the plan: no filter exists on the leading key
+    let paths = LakePaths::new(server.disk_manager.data_dir(), entry.id.0);
+    let log = TransactionLog::lookup_shared(&paths).expect("shared log");
+    let manifest = log.latest_manifest().expect("manifest");
+    assert_eq!(manifest.bloom_columns(), vec![1], "only sku gets a filter");
+    let file = manifest.entries.last().expect("a data file");
+    assert!(
+        file.stats_for(0).map(|s| s.bloom.is_none()).unwrap_or(true),
+        "a filter was built for the column the layout already resolves"
+    );
+    assert!(
+        file.stats_for(1)
+            .map(|s| s.bloom.is_some())
+            .unwrap_or(false),
+        "the filter that was not redundant has to exist"
+    );
+}
+
+/// A table with no layout builds every filter it was asked for, and reports
+/// nothing as dropped
+#[tokio::test]
+async fn test_an_unclustered_table_builds_every_declared_bloom() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE flat (a BIGINT, b BIGINT) USING ZYRONLAKE \
+         WITH (bloom_filter_columns = 'a,b')",
+    )
+    .await
+    .expect("create");
+    exec_dml(&server, "INSERT INTO flat VALUES (1, 2)").await;
+
+    let text = render_plan(&server, "SELECT b FROM flat WHERE a = 1").await;
+    assert!(!text.contains("bloom_redundant"), "{text}");
+}
+
+/// The catalog's clustering policy has to say what the manifest says.
+///
+/// The manifest is the authority and the planner never opens one, so
+/// everything the planner decides about a layout is decided from the
+/// mirror. This went unnoticed once already: CREATE TABLE wrote the policy
+/// to the manifest and nothing to the catalog, so every lake table planned
+/// as though it had no layout at all, and nothing caught it because there
+/// was no consumer of the mirror until a cost model tried to read it. This
+/// pins the two together at the statement that fills them, so a future
+/// divergence trips here rather than in whatever joins next
+#[tokio::test]
+async fn test_the_catalog_mirror_matches_the_manifest_it_was_taken_from() {
+    let (server, schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE sales (region BIGINT, sku BIGINT, ts TIMESTAMP) USING ZYRONLAKE \
+         CLUSTER BY (region, sku) FORCE WITH (bloom_filter_columns = 'region,sku')",
+    )
+    .await
+    .expect("create");
+
+    let entry = server.catalog.get_table(schema_id, "sales").expect("entry");
+    let paths = LakePaths::new(server.disk_manager.data_dir(), entry.id.0);
+    let log = TransactionLog::lookup_shared(&paths).expect("shared log");
+    let manifest = log.latest_manifest().expect("manifest");
+
+    assert_eq!(
+        entry.cluster.mode,
+        manifest.clustering_mode().to_u8(),
+        "the mode a plan reads has to be the mode the table runs"
+    );
+    assert_eq!(
+        entry.cluster.schedule,
+        manifest.clustering_schedule().to_u8(),
+        "the schedule decides whether the layout a plan priced will survive"
+    );
+    assert_eq!(entry.cluster.spec_id, manifest.cluster_spec.spec_id);
+    assert_eq!(
+        entry.cluster.fold_keys(),
+        manifest.cluster_spec.keys,
+        "the declared keys are what a plan is judged against until a pass replaces them"
+    );
+    assert_eq!(
+        entry.cluster.bloom_columns,
+        manifest.declared_bloom_columns(),
+        "the planner reports which declared filters were not built, from this"
+    );
+    assert_eq!(
+        entry.cluster.derived.len(),
+        manifest.schema.derived.len(),
+        "an expression the planner cannot see is one it cannot rewrite a predicate onto"
+    );
+
+    // An ALTER that moves the layout has to move the mirror with it, which
+    // is the half that was missing when the mirror had no reader
+    exec_ddl(
+        &server,
+        &mut session,
+        "ALTER TABLE sales CLUSTER BY (sku) FORCE",
+    )
+    .await
+    .expect("redeclare the layout");
+    let entry = server.catalog.get_table(schema_id, "sales").expect("entry");
+    let manifest = log.latest_manifest().expect("manifest");
+    assert_eq!(entry.cluster.fold_keys(), manifest.cluster_spec.keys);
+    assert_eq!(entry.cluster.spec_id, manifest.cluster_spec.spec_id);
+    assert!(
+        entry.cluster.active_keys.is_empty(),
+        "a new declaration supersedes whatever a pass had chosen"
+    );
+}
+
+/// A numeric literal has to read back as the same kind of number.
+///
+/// The stored text is re-parsed on every write, so a literal that renders
+/// without its point comes back as an integer and binds at a different
+/// type than the one that was written. That is a wrong answer generator
+/// rather than a cosmetic defect: the stored column would hold values of
+/// one type and the query's constant would be compared at another.
+/// `prove_storable` refuses anything that does not round trip, so a CREATE
+/// succeeding here is the proof
+#[tokio::test]
+async fn test_every_numeric_literal_kind_survives_the_round_trip() {
+    let cases: &[(&str, &str)] = &[
+        ("whole", "amount + 1"),
+        ("negative_whole", "amount + -1"),
+        ("zero", "amount + 0"),
+        // The exact shape that was broken: an integral float rendered as
+        // `0` and re-parsed as an integer
+        ("integral_float", "amount * 1.0"),
+        ("zero_float", "amount * 0.0"),
+        ("fractional", "amount * 1.5"),
+        ("negative_fractional", "amount * -2.25"),
+        ("many_places", "amount * 1.0625"),
+        ("large_whole", "amount + 9007199254740993"),
+    ];
+    for (label, expr) in cases {
+        let (server, _schema_id, _tmp) = create_test_server().await;
+        let mut session = new_session();
+        exec_ddl(
+            &server,
+            &mut session,
+            &format!(
+                "CREATE TABLE t_{label} (id BIGINT NOT NULL, amount BIGINT) USING ZYRONLAKE \
+                 CLUSTER BY ({expr})"
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{label}: \"{expr}\" did not round trip: {e}"));
+
+        // And it computes, which is the other half of what the stored text
+        // has to be good for
+        exec_dml(&server, &format!("INSERT INTO t_{label} VALUES (1, 4)")).await;
+        assert_eq!(
+            query_rows(&server, &format!("SELECT id FROM t_{label}")).await,
+            1,
+            "{label}: the write path could not compute the expression it stored"
+        );
+    }
+}
+
+/// A join is evidence about both tables in it.
+///
+/// Until this was wired, measurement could not see a join at all: a table
+/// joined on a column a thousand times a minute looked exactly like a table
+/// nobody read, so the layout it was given served the filters and left the
+/// join reading everything against everything. Both sides are credited,
+/// because a join is only co-located when both are ordered by the key
+#[tokio::test]
+async fn test_a_join_credits_the_key_on_both_tables() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE orders (id BIGINT NOT NULL, customer BIGINT) USING ZYRONLAKE",
+    )
+    .await
+    .expect("create");
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE customers (cid BIGINT NOT NULL, region BIGINT) USING ZYRONLAKE",
+    )
+    .await
+    .expect("create");
+    exec_dml(&server, "INSERT INTO orders VALUES (1, 10), (2, 20)").await;
+    exec_dml(&server, "INSERT INTO customers VALUES (10, 1), (20, 2)").await;
+
+    let orders = table_id_of(&server, "orders");
+    let customers = table_id_of(&server, "customers");
+    // Column one on each side is the join key: orders.customer and
+    // customers.region are both ordinal one, and the key is orders.customer
+    // against customers.cid, which is ordinal zero
+    let before_left = join_score(orders, 1);
+    let before_right = join_score(customers, 0);
+
+    let rows = query_rows(
+        &server,
+        "SELECT orders.id FROM orders JOIN customers ON orders.customer = customers.cid",
+    )
+    .await;
+    assert_eq!(
+        rows, 2,
+        "the join has to actually answer before it is evidence"
+    );
+
+    assert!(
+        join_score(orders, 1) > before_left,
+        "the left side's key was not credited"
+    );
+    assert!(
+        join_score(customers, 0) > before_right,
+        "the right side's key was not credited, so the join can never become co-located"
+    );
+
+    // A column the join did not name is untouched, or every column on a
+    // joined table would drift toward being a cluster key
+    assert_eq!(
+        join_score(orders, 0),
+        0.0,
+        "a column no join key names must not be credited"
+    );
+}
+
+/// A join key is only evidence when it names a plain column on a lake table
+/// on both sides. Anything else would have to be attributed by guessing,
+/// and evidence nobody can trust moves a layout for a query that never ran
+#[tokio::test]
+async fn test_a_join_against_a_heap_table_credits_nothing() {
+    let (server, _schema_id, _tmp) = create_test_server().await;
+    let mut session = new_session();
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE lakeside (id BIGINT NOT NULL, k BIGINT) USING ZYRONLAKE",
+    )
+    .await
+    .expect("create");
+    exec_ddl(
+        &server,
+        &mut session,
+        "CREATE TABLE heapside (hid BIGINT NOT NULL, k BIGINT)",
+    )
+    .await
+    .expect("create");
+    exec_dml(&server, "INSERT INTO lakeside VALUES (1, 10)").await;
+    exec_dml(&server, "INSERT INTO heapside VALUES (1, 10)").await;
+
+    let lake = table_id_of(&server, "lakeside");
+    let before = join_score(lake, 1);
+    let rows = query_rows(
+        &server,
+        "SELECT lakeside.id FROM lakeside JOIN heapside ON lakeside.k = heapside.k",
+    )
+    .await;
+    assert_eq!(rows, 1);
+    assert_eq!(
+        join_score(lake, 1),
+        before,
+        "one side is not a lake table, so there is no layout on it to ask for"
+    );
+}
+
+fn table_id_of(server: &Arc<ServerState>, table: &str) -> u32 {
+    server
+        .catalog
+        .list_all_tables()
+        .into_iter()
+        .find(|t| t.name == table)
+        .expect("table")
+        .id
+        .0
+}
+
+/// How much joining this table has asked for an ordering on this column
+fn join_score(table_id: u32, column_id: u32) -> f64 {
+    zyron_lake::observer().score(
+        table_id,
+        zyron_lake::column_term(column_id, zyron_lake::TERM_JOIN_KEY),
+        zyron_lake::current_epoch(),
+    )
 }

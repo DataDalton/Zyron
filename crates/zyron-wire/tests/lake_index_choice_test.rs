@@ -15,8 +15,10 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{create_test_server, exec_ddl, exec_dml, new_session, query_values};
-use zyron_catalog::DatabaseId;
+use common::{
+    analyze_lake_scan, create_test_server, exec_ddl, exec_dml, new_session, query_values,
+    render_analyzed,
+};
 use zyron_executor::column::ScalarValue;
 use zyron_wire::connection::ServerState;
 
@@ -273,111 +275,4 @@ async fn test_explain_analyze_reports_whether_an_index_answered_a_lake_scan() {
     let text = render_analyzed(&server, "SELECT id FROM ex WHERE tag = 113").await;
     assert!(text.contains("index_files_read="), "{text}");
     assert!(text.contains("index_rows_addressed=4"), "{text}");
-}
-
-/// Runs one SELECT under EXPLAIN ANALYZE and returns the LakeScan's
-/// measured counters
-async fn analyze_lake_scan(server: &Arc<ServerState>, sql: &str) -> zyron_planner::ActualMetrics {
-    let (tree, _) = analyze(server, sql).await;
-    find_named(&tree, "LakeScan")
-        .expect("a LakeScan node")
-        .actual_metrics
-        .clone()
-        .expect("the scan reports what it measured")
-}
-
-async fn render_analyzed(server: &Arc<ServerState>, sql: &str) -> String {
-    let (tree, _) = analyze(server, sql).await;
-    tree.render(&zyron_planner::ExplainOptions {
-        analyze: true,
-        ..Default::default()
-    })
-}
-
-/// Plans and executes one statement the way EXPLAIN ANALYZE does, then
-/// merges the executor's counters into the plan tree
-async fn analyze(
-    server: &Arc<ServerState>,
-    sql: &str,
-) -> (zyron_planner::ExplainNode, zyron_planner::NodeMetrics) {
-    let stmt = zyron_parser::parse(sql)
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("one statement");
-    let plan = zyron_planner::plan(
-        &server.catalog,
-        DatabaseId(1),
-        vec!["public".into()],
-        stmt,
-        None,
-    )
-    .await
-    .expect("plan");
-    let mut tree = zyron_planner::ExplainNode::from_physical_plan(&plan);
-
-    let mut txn = server
-        .txn_manager
-        .begin(zyron_storage::txn::IsolationLevel::ReadCommitted)
-        .expect("begin");
-    let snapshot = txn.snapshot.clone();
-    let txn_id = txn.txn_id;
-    let mut ctx = zyron_executor::context::ExecutionContext::new(
-        server.catalog.clone(),
-        server.wal.clone(),
-        server.buffer_pool.clone(),
-        server.disk_manager.clone(),
-        txn_id as u32,
-        snapshot,
-    );
-    ctx.heap_files = Some(Arc::clone(&server.heap_files));
-    ctx.btree_indexes = Some(Arc::clone(&server.btree_indexes));
-    // The only thing that makes the executor wrap its operators in metrics
-    // collectors
-    ctx.analyze = true;
-    let ctx = Arc::new(ctx);
-    let (_batches, metrics) = zyron_executor::execute_analyze(plan, &ctx)
-        .await
-        .expect("analyze");
-    server.txn_manager.commit(&mut txn).await.expect("commit");
-
-    let metrics = metrics.expect("analyze mode produces metrics");
-    let node_metrics = node_metrics_of(&metrics);
-    assert!(
-        tree.merge_metrics(&node_metrics) > 0,
-        "the plan and the executor must agree on the operator names"
-    );
-    (tree, node_metrics)
-}
-
-fn node_metrics_of(
-    metrics: &zyron_executor::operator::OperatorMetrics,
-) -> zyron_planner::NodeMetrics {
-    use std::sync::atomic::Ordering;
-    let mut aux = [0u64; zyron_planner::ACTUAL_AUX_SLOTS];
-    for (slot, value) in aux.iter_mut().enumerate() {
-        *value = metrics.aux(slot);
-    }
-    zyron_planner::NodeMetrics {
-        name: metrics.name.clone(),
-        rows: metrics.rows_produced.load(Ordering::Relaxed),
-        elapsed_ns: metrics.elapsed_ns.load(Ordering::Relaxed),
-        batches: metrics.batches.load(Ordering::Relaxed),
-        aux,
-        children: metrics
-            .children
-            .iter()
-            .map(|c| node_metrics_of(c))
-            .collect(),
-    }
-}
-
-fn find_named<'a>(
-    node: &'a zyron_planner::ExplainNode,
-    name: &str,
-) -> Option<&'a zyron_planner::ExplainNode> {
-    if node.operator_name == name {
-        return Some(node);
-    }
-    node.children.iter().find_map(|c| find_named(c, name))
 }

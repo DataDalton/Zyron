@@ -77,6 +77,16 @@ pub struct ClusterSpec {
 }
 
 impl ClusterSpec {
+    /// The columns files are ordered by, in layout order.
+    ///
+    /// What a plan is judged against: files are sorted by the first of
+    /// these, then by the next within a run of equal values, so the
+    /// position of a column in this list is how much the layout does for a
+    /// predicate that names it
+    pub fn key_columns(&self) -> Vec<u32> {
+        self.keys.iter().map(|k| k.column_id).collect()
+    }
+
     /// A table with no clustering, spec zero
     pub fn none() -> Self {
         Self {
@@ -236,6 +246,13 @@ pub struct DeletePredicate {
     pub sql: String,
     pub predicate: LakePredicate,
     pub created_version: u64,
+    /// Rows this predicate deletes that are still physically present.
+    ///
+    /// Counted when the delete ran, where the rows were being examined
+    /// anyway, so nothing has to read a data file to find out how much of
+    /// the table is waiting to be rewritten. Files the predicate covered
+    /// whole were removed there and then and are not in here
+    pub pending_rows: u64,
 }
 
 /// Complete table state at one log version
@@ -383,7 +400,7 @@ impl ManifestFile {
     /// rather than failing the write, the property is advisory layout, and
     /// the writer only forces a filter the pruning path would otherwise not
     /// have
-    pub fn bloom_columns(&self) -> Vec<u32> {
+    pub fn declared_bloom_columns(&self) -> Vec<u32> {
         let Some(list) = self.properties.get("bloom_filter_columns") else {
             return Vec::new();
         };
@@ -392,9 +409,59 @@ impl ManifestFile {
             .collect()
     }
 
+    /// The one column whose bloom the layout already makes unnecessary, if
+    /// there is one.
+    ///
+    /// Only the leading key, and only under RangePartition. That strategy
+    /// gives each file a contiguous range of the key, so file bounds are
+    /// close to disjoint and an equality resolves to a file or two before
+    /// any filter is read. Nothing else in the spec qualifies:
+    ///
+    /// * A key after the leading one is only sorted within a run of equal
+    ///   leading values, so its bounds span the domain once across every
+    ///   run and a filter still removes files the bounds keep.
+    /// * BitInterleave and SpaceFilling interleave every key into one
+    ///   ordering, so no single key gets contiguous ranges.
+    /// * AntiCluster spreads a key across files on purpose, which makes its
+    ///   bounds maximally wide and a filter the only thing that prunes it
+    pub fn bloom_redundant_key(&self) -> Option<u32> {
+        let key = self.cluster_spec.keys.first()?;
+        (key.strategy == ClusterStrategy::RangePartition).then_some(key.column_id)
+    }
+
+    /// Declared bloom columns the layout already covers, so no filter is
+    /// built for them.
+    ///
+    /// Reported rather than dropped in silence: the property is something
+    /// an operator asked for, and a request quietly not carried out is
+    /// worse than one refused
+    pub fn redundant_bloom_columns(&self) -> Vec<u32> {
+        let Some(redundant) = self.bloom_redundant_key() else {
+            return Vec::new();
+        };
+        self.declared_bloom_columns()
+            .into_iter()
+            .filter(|c| *c == redundant)
+            .collect()
+    }
+
+    /// Columns the writer builds a bloom filter for.
+    ///
+    /// The declared set minus what the layout already covers. A filter on
+    /// the leading range-partitioned key costs bytes in every manifest
+    /// entry and removes files the key's own bounds removed first
+    pub fn bloom_columns(&self) -> Vec<u32> {
+        let redundant = self.bloom_redundant_key();
+        self.declared_bloom_columns()
+            .into_iter()
+            .filter(|c| Some(*c) != redundant)
+            .collect()
+    }
+
     /// How the clustering choice interacts with measurement. A table that
-    /// never declared one is Force with no keys, which is a table nobody
-    /// asked to cluster, so measurement leaves it alone
+    /// never declared one is Auto, so measurement chooses its layout and
+    /// keeps revisiting it as the workload moves. An operator who wants the
+    /// layout to stay where they put it declares Force
     pub fn clustering_mode(&self) -> ClusterMode {
         self.properties
             .get(CLUSTERING_MODE_PROPERTY)
@@ -404,10 +471,15 @@ impl ManifestFile {
                 "hybrid" => Some(ClusterMode::Hybrid),
                 _ => None,
             })
-            .unwrap_or(ClusterMode::Force)
+            .unwrap_or(ClusterMode::Auto)
     }
 
-    /// When clustering maintenance may run without being asked
+    /// When clustering maintenance may run without being asked.
+    ///
+    /// A table that never declared one is Continuous, so background passes
+    /// remove drift as it appears rather than waiting to be asked. OnDemand
+    /// is the opt out, and it means no pass starts unless OPTIMIZE asks for
+    /// one
     pub fn clustering_schedule(&self) -> ClusteringSchedule {
         self.properties
             .get(CLUSTERING_SCHEDULE_PROPERTY)
@@ -417,7 +489,7 @@ impl ManifestFile {
                 "continuous" => Some(ClusteringSchedule::Continuous),
                 _ => None,
             })
-            .unwrap_or(ClusteringSchedule::OnDemand)
+            .unwrap_or(ClusteringSchedule::Continuous)
     }
 
     /// Key column ids the operator pinned, in declaration order. A
@@ -914,6 +986,7 @@ pub(crate) fn decode_partition_entry(fr: &mut Cursor<'_>) -> Result<PartitionEnt
 pub(crate) fn encode_delete_predicate(del: &DeletePredicate, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&del.id.to_le_bytes());
     buf.extend_from_slice(&del.created_version.to_le_bytes());
+    buf.extend_from_slice(&del.pending_rows.to_le_bytes());
     buf.extend_from_slice(&(del.sql.len() as u32).to_le_bytes());
     buf.extend_from_slice(del.sql.as_bytes());
     del.predicate.encode_into(buf);
@@ -923,6 +996,7 @@ pub(crate) fn encode_delete_predicate(del: &DeletePredicate, buf: &mut Vec<u8>) 
 pub(crate) fn decode_delete_predicate(dr: &mut Cursor<'_>) -> Result<DeletePredicate, ZyronError> {
     let id = dr.u64()?;
     let created_version = dr.u64()?;
+    let pending_rows = dr.u64()?;
     let sql_len = dr.u32()? as usize;
     let sql = dr.utf8(sql_len, "delete predicate sql")?;
     let predicate = LakePredicate::decode_from(dr)?;
@@ -931,7 +1005,300 @@ pub(crate) fn decode_delete_predicate(dr: &mut Cursor<'_>) -> Result<DeletePredi
         sql,
         predicate,
         created_version,
+        pending_rows,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Auto compaction
+// ---------------------------------------------------------------------------
+
+/// Share of files that may sit below a quarter of the target before a
+/// compaction runs unasked
+pub const DEFAULT_AUTO_COMPACT_SMALL_FILE_RATIO: f64 = 0.25;
+
+/// Share of the table's rows that may be deleted and not yet rewritten
+/// before a compaction runs unasked
+pub const DEFAULT_AUTO_COMPACT_DEAD_ROW_RATIO: f64 = 0.20;
+
+pub const TARGET_ROWS_PER_FILE_PROPERTY: &str = "target_rows_per_file";
+pub const CLUSTER_REPAIR_MAX_INPUTS_PROPERTY: &str = "cluster_repair_max_inputs";
+pub const CLUSTER_REPAIR_INTERVAL_SECS_PROPERTY: &str = "cluster_repair_interval_secs";
+pub const CLUSTER_REPAIR_URGENCY_THRESHOLD_PROPERTY: &str = "cluster_repair_urgency_threshold";
+
+/// How long a table waits between repair passes when it names no interval
+/// of its own
+pub const DEFAULT_CLUSTER_REPAIR_INTERVAL_SECS: u64 = 300;
+
+/// Files needing repair before a table stops waiting for its interval.
+///
+/// Eight is the point where the layout has stopped being a layout: a
+/// predicate that should reach one or two files is reaching nine, and every
+/// query pays for it until the next pass. Waiting out a five minute clock
+/// in that state serves nobody
+pub const DEFAULT_CLUSTER_REPAIR_URGENCY_THRESHOLD: usize = 8;
+pub const AUTO_COMPACT_SMALL_FILE_RATIO_PROPERTY: &str = "auto_compact_small_file_ratio";
+pub const AUTO_COMPACT_DEAD_ROW_RATIO_PROPERTY: &str = "auto_compact_dead_row_ratio";
+
+/// Fewest small files worth merging.
+///
+/// Rewriting one file into one file moves the same rows into the same
+/// shape, so a table holding a single small file would trip the ratio on
+/// every tick and rewrite it forever
+pub const MIN_SMALL_FILES_TO_MERGE: usize = 2;
+
+/// Why a compaction ran without being asked
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionTrigger {
+    /// Too many files hold fewer rows than a quarter of the target, so
+    /// every scan pays per-file cost for rows that belong in one file
+    SmallFiles,
+    /// Too much of the table is rows a delete removed logically and no
+    /// rewrite has removed physically, so every scan reads and discards
+    /// them
+    DeadRows,
+    /// Both crossed in one check. One compaction answers both, so it runs
+    /// once
+    Both,
+}
+
+impl CompactionTrigger {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CompactionTrigger::SmallFiles => "small_files",
+            CompactionTrigger::DeadRows => "dead_rows",
+            CompactionTrigger::Both => "small_files_and_dead_rows",
+        }
+    }
+}
+
+impl std::fmt::Display for CompactionTrigger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What the manifest says about whether a compaction is due, and the
+/// numbers the answer came from.
+///
+/// The counts are reported whether or not anything tripped, because an
+/// operator asking why nothing ran needs the same figures as one asking
+/// why something did
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CompactionNeed {
+    pub trigger: Option<CompactionTrigger>,
+    pub small_files: usize,
+    pub total_files: usize,
+    /// Rows deleted logically and still on disk
+    pub pending_deleted_rows: u64,
+    pub total_rows: u64,
+}
+
+impl ManifestFile {
+    /// Identity of everything about this table that changes what a plan
+    /// should be.
+    ///
+    /// Derived rather than stored, so nothing has to remember to bump it.
+    /// A field would have to be advanced by every commit that touches the
+    /// layout, and the one that forgot would leave plans costed against a
+    /// table that no longer exists, which fails as a slow query rather
+    /// than as an error. This is a function of the state a plan is costed
+    /// against, so two manifests that would cost a plan the same way
+    /// produce the same value and nothing can drift.
+    ///
+    /// What goes into it:
+    ///
+    /// * The spec, because it decides which columns prune.
+    /// * The schema id, because adding or dropping an expression column
+    ///   changes which predicates can reach a stored value.
+    /// * Mode and schedule, because they decide whether the spec a plan
+    ///   was costed against is the one measurement will keep.
+    /// * How many files are laid out under the current spec, and how many
+    ///   rows they hold. This is why a pass that commits files under an
+    ///   unchanged spec still moves the epoch: the layout did not change
+    ///   but the data's conformance to it did, and conformance is what
+    ///   decides how many files a predicate opens.
+    ///
+    /// Persisted-safe hashing, because a caller may compare a value taken
+    /// before a restart with one taken after
+    pub fn clustering_epoch(&self) -> u64 {
+        let mut buf = Vec::with_capacity(64 + self.cluster_spec.keys.len() * 9);
+        buf.extend_from_slice(&self.cluster_spec.spec_id.to_le_bytes());
+        buf.extend_from_slice(&self.schema.schema_id.to_le_bytes());
+        for key in &self.cluster_spec.keys {
+            buf.extend_from_slice(&key.column_id.to_le_bytes());
+            buf.push(key.strategy.to_u8());
+            buf.extend_from_slice(&key.param.to_le_bytes());
+        }
+        buf.push(self.clustering_mode().to_u8());
+        buf.push(self.clustering_schedule().to_u8());
+        for id in self.clustering_anchors() {
+            buf.extend_from_slice(&id.to_le_bytes());
+        }
+        let conforming = self
+            .entries
+            .iter()
+            .filter(|e| e.cluster_spec_id == self.cluster_spec.spec_id)
+            .count() as u64;
+        buf.extend_from_slice(&conforming.to_le_bytes());
+        buf.extend_from_slice(&(self.entries.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&self.total_rows().to_le_bytes());
+        zyron_common::checksum::hash64(&buf)
+    }
+
+    /// Rows across the table's live files, before any delete predicate is
+    /// applied
+    pub fn total_rows(&self) -> u64 {
+        self.entries.iter().map(|e| e.row_count).sum()
+    }
+
+    /// Rows a delete removed logically that a rewrite has not removed
+    /// physically.
+    ///
+    /// Exact and free: every predicate recorded what it matched in the
+    /// files it did not remove whole, counted while those rows were
+    /// already being examined
+    pub fn pending_deleted_rows(&self) -> u64 {
+        self.delete_predicates
+            .iter()
+            .map(|p| p.pending_rows)
+            .sum::<u64>()
+            .min(self.total_rows())
+    }
+
+    /// A ratio property, or its default when unset or unreadable.
+    ///
+    /// An unreadable value falls back rather than failing a maintenance
+    /// tick: the property is a threshold, and refusing to maintain a table
+    /// because someone typed a word into it would be worse than
+    /// maintaining it on the shipped one. Negative and non-finite values
+    /// are the same case
+    fn ratio_property(&self, key: &str, default: f64) -> f64 {
+        self.properties
+            .get(key)
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(default)
+    }
+
+    /// A whole-number property, or its default when unset or unreadable.
+    ///
+    /// Same reasoning as `ratio_property`: an unreadable value falls back
+    /// rather than stopping maintenance on the table. A statement that sets
+    /// one is checked where it is written, so the only way to reach this
+    /// fallback is a manifest nobody wrote by hand
+    fn count_property(&self, key: &str, default: u64) -> u64 {
+        self.properties
+            .get(key)
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(default)
+    }
+
+    /// Files one repair pass may rewrite.
+    ///
+    /// A pass reads and rewrites every input, so this is what bounds how
+    /// long one pass runs and how much it writes. A table taking constant
+    /// small writes wants it high enough to keep up; one that is mostly
+    /// read wants it low so a pass never competes with queries for long
+    pub fn cluster_repair_max_inputs(&self, fallback: usize) -> usize {
+        self.count_property(CLUSTER_REPAIR_MAX_INPUTS_PROPERTY, fallback as u64)
+            .max(1) as usize
+    }
+
+    /// Seconds between repair passes on this table.
+    ///
+    /// The node's own cadence is the floor: this can make a table wait
+    /// longer between passes, never less. A table that needs attention
+    /// sooner than its interval says gets it through the urgency threshold
+    /// instead, which is the mechanism for "now" rather than "more often"
+    pub fn cluster_repair_interval_secs(&self, fallback: u64) -> u64 {
+        self.count_property(CLUSTER_REPAIR_INTERVAL_SECS_PROPERTY, fallback)
+    }
+
+    /// Files needing repair before this table stops waiting for its
+    /// interval and is passed on the next tick
+    pub fn cluster_repair_urgency_threshold(&self) -> usize {
+        self.count_property(
+            CLUSTER_REPAIR_URGENCY_THRESHOLD_PROPERTY,
+            DEFAULT_CLUSTER_REPAIR_URGENCY_THRESHOLD as u64,
+        ) as usize
+    }
+
+    pub fn auto_compact_small_file_ratio(&self) -> f64 {
+        self.ratio_property(
+            AUTO_COMPACT_SMALL_FILE_RATIO_PROPERTY,
+            DEFAULT_AUTO_COMPACT_SMALL_FILE_RATIO,
+        )
+    }
+
+    pub fn auto_compact_dead_row_ratio(&self) -> f64 {
+        self.ratio_property(
+            AUTO_COMPACT_DEAD_ROW_RATIO_PROPERTY,
+            DEFAULT_AUTO_COMPACT_DEAD_ROW_RATIO,
+        )
+    }
+
+    /// Rows one data file is aiming for.
+    ///
+    /// The table property when it names one, otherwise whatever the caller
+    /// runs as its default: a node-wide setting is the right answer for a
+    /// table that expressed no opinion, and the wrong one for a table that
+    /// did
+    pub fn target_rows_per_file(&self, fallback: u64) -> u64 {
+        self.properties
+            .get(TARGET_ROWS_PER_FILE_PROPERTY)
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(fallback)
+            .max(1)
+    }
+
+    /// Files holding fewer rows than a quarter of the target.
+    ///
+    /// A quarter rather than the target itself, because a file at
+    /// three quarters of the target is the normal result of a bulk load
+    /// and rewriting it would cost more than it saves
+    pub fn small_file_threshold(target_rows_per_file: u64) -> u64 {
+        (target_rows_per_file / 4).max(1)
+    }
+
+    /// Whether this table has drifted far enough from its target shape to
+    /// be worth rewriting, and the figures behind the answer.
+    ///
+    /// Reads the manifest and opens nothing, so a maintenance tick can ask
+    /// it for every table
+    pub fn compaction_need(&self, fallback_rows_per_file: u64) -> CompactionNeed {
+        let threshold =
+            Self::small_file_threshold(self.target_rows_per_file(fallback_rows_per_file));
+        let total_files = self.entries.len();
+        let small_files = self
+            .entries
+            .iter()
+            .filter(|e| e.row_count < threshold)
+            .count();
+        let total_rows = self.total_rows();
+        let pending_deleted_rows = self.pending_deleted_rows();
+
+        let small_tripped = small_files >= MIN_SMALL_FILES_TO_MERGE
+            && total_files > 0
+            && small_files as f64 / total_files as f64 > self.auto_compact_small_file_ratio();
+        let dead_tripped = total_rows > 0
+            && pending_deleted_rows as f64 / total_rows as f64 > self.auto_compact_dead_row_ratio();
+
+        let trigger = match (small_tripped, dead_tripped) {
+            (true, true) => Some(CompactionTrigger::Both),
+            (true, false) => Some(CompactionTrigger::SmallFiles),
+            (false, true) => Some(CompactionTrigger::DeadRows),
+            (false, false) => None,
+        };
+        CompactionNeed {
+            trigger,
+            small_files,
+            total_files,
+            pending_deleted_rows,
+            total_rows,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1048,6 +1415,7 @@ mod tests {
                     value: LakeValue::Str("deleted".into()),
                 },
                 created_version: 41,
+                pending_rows: 0,
             }],
             properties: BTreeMap::from([
                 ("target_file_size".to_string(), "268435456".to_string()),
@@ -1221,5 +1589,319 @@ mod tests {
         unknown_flags[crc_field..crc_field + 4].copy_from_slice(&crc.to_le_bytes());
         let err = ManifestFile::decode(&unknown_flags, "test.zym").expect_err("rejects");
         assert!(err.to_string().contains("flags"));
+    }
+
+    /// A bloom on the leading range-partitioned key removes files the key's
+    /// own bounds removed first, so it is bytes in every manifest entry for
+    /// nothing. Nothing else in a spec qualifies, and dropping a filter
+    /// that would have pruned is a regression rather than a saving
+    #[test]
+    fn test_only_the_leading_range_key_makes_a_bloom_redundant() {
+        let mut manifest = sample();
+        manifest
+            .properties
+            .insert("bloom_filter_columns".to_string(), "id,name".to_string());
+
+        // No layout at all, so nothing is covered
+        manifest.cluster_spec = ClusterSpec::none();
+        assert_eq!(manifest.bloom_columns(), vec![0, 1]);
+        assert!(manifest.redundant_bloom_columns().is_empty());
+
+        // Leading range key: each file holds a contiguous range of it
+        manifest.cluster_spec = ClusterSpec {
+            spec_id: 1,
+            keys: vec![
+                cluster_key(0, ClusterStrategy::RangePartition),
+                cluster_key(1, ClusterStrategy::RangePartition),
+            ],
+        };
+        assert_eq!(manifest.redundant_bloom_columns(), vec![0]);
+        assert_eq!(
+            manifest.bloom_columns(),
+            vec![1],
+            "a key after the leading one spans the domain once per run of leading values, so \
+             its filter still removes files its bounds keep"
+        );
+
+        // Z-order interleaves every key, so no single one gets contiguous
+        // ranges and every declared filter still earns its bytes
+        manifest.cluster_spec = ClusterSpec {
+            spec_id: 2,
+            keys: vec![
+                cluster_key(0, ClusterStrategy::BitInterleave),
+                cluster_key(1, ClusterStrategy::BitInterleave),
+            ],
+        };
+        assert!(manifest.redundant_bloom_columns().is_empty());
+        assert_eq!(manifest.bloom_columns(), vec![0, 1]);
+
+        // AntiCluster spreads the key on purpose, which makes its bounds
+        // maximally wide and the filter the only thing that prunes it
+        manifest.cluster_spec = ClusterSpec {
+            spec_id: 3,
+            keys: vec![cluster_key(0, ClusterStrategy::AntiCluster)],
+        };
+        assert!(manifest.redundant_bloom_columns().is_empty());
+        assert_eq!(manifest.bloom_columns(), vec![0, 1]);
+    }
+
+    /// A cluster key nobody declared a filter for is not reported as a
+    /// dropped request, because none was made
+    #[test]
+    fn test_a_cluster_key_with_no_declared_bloom_reports_nothing() {
+        let mut manifest = sample();
+        manifest
+            .properties
+            .insert("bloom_filter_columns".to_string(), "name".to_string());
+        manifest.cluster_spec = ClusterSpec {
+            spec_id: 1,
+            keys: vec![cluster_key(0, ClusterStrategy::RangePartition)],
+        };
+        assert!(manifest.redundant_bloom_columns().is_empty());
+        assert_eq!(manifest.bloom_columns(), vec![1]);
+    }
+
+    fn cluster_key(column_id: u32, strategy: ClusterStrategy) -> ClusterKey {
+        ClusterKey {
+            column_id,
+            strategy,
+            param: 0,
+        }
+    }
+
+    /// The two thresholds are independent, either one is enough, and both
+    /// together still describe one rewrite
+    #[test]
+    fn test_compaction_need_reads_both_thresholds() {
+        // Eight files of ten rows each against a target of four hundred:
+        // the small threshold is a hundred, so every file is small
+        let mut manifest = sized_manifest(&[10; 8]);
+        let need = manifest.compaction_need(400);
+        assert_eq!(need.small_files, 8);
+        assert_eq!(need.total_files, 8);
+        assert_eq!(need.trigger, Some(CompactionTrigger::SmallFiles));
+
+        // Two small files out of ten is a fifth, under the quarter default
+        let mut sizes = vec![10, 10];
+        sizes.extend(std::iter::repeat_n(200u64, 8));
+        manifest = sized_manifest(&sizes);
+        let need = manifest.compaction_need(400);
+        assert_eq!(need.small_files, 2);
+        assert_eq!(
+            need.trigger, None,
+            "a fifth of the files being small is inside the default"
+        );
+
+        // Raising the bar turns the same table into work
+        manifest
+            .properties
+            .insert(AUTO_COMPACT_SMALL_FILE_RATIO_PROPERTY.into(), "0.1".into());
+        assert_eq!(
+            manifest.compaction_need(400).trigger,
+            Some(CompactionTrigger::SmallFiles)
+        );
+    }
+
+    /// Rows a delete removed logically and no rewrite removed physically
+    /// are read and discarded by every scan, and the count is exact
+    /// because the delete counted them while it had the rows in hand
+    #[test]
+    fn test_compaction_need_reads_rows_a_delete_left_behind() {
+        // A target of a thousand puts the small threshold at 250, so
+        // five hundred row files are the shape the table is aiming for and
+        // only the delete threshold is in play
+        let mut manifest = sized_manifest(&[500, 500]);
+        assert_eq!(manifest.total_rows(), 1000);
+        assert_eq!(manifest.compaction_need(1000).trigger, None);
+
+        manifest.delete_predicates = vec![DeletePredicate {
+            id: 1,
+            sql: "x = 1".into(),
+            predicate: LakePredicate::IsNull { column_id: 0 },
+            created_version: 1,
+            pending_rows: 150,
+        }];
+        assert_eq!(manifest.pending_deleted_rows(), 150);
+        assert_eq!(
+            manifest.compaction_need(1000).trigger,
+            None,
+            "fifteen percent is inside the twenty percent default"
+        );
+
+        manifest.delete_predicates[0].pending_rows = 250;
+        let need = manifest.compaction_need(1000);
+        assert_eq!(need.trigger, Some(CompactionTrigger::DeadRows));
+        assert_eq!(need.pending_deleted_rows, 250);
+        assert_eq!(need.total_rows, 1000);
+
+        // Both at once is still one rewrite
+        let mut both = sized_manifest(&[10, 10]);
+        both.delete_predicates = manifest.delete_predicates.clone();
+        assert_eq!(
+            both.compaction_need(4000).trigger,
+            Some(CompactionTrigger::Both)
+        );
+    }
+
+    /// Rewriting one file into one file moves the same rows into the same
+    /// shape, so a table holding a single small file would otherwise trip
+    /// the ratio on every tick forever
+    #[test]
+    fn test_one_small_file_is_not_worth_a_rewrite() {
+        let manifest = sized_manifest(&[10]);
+        let need = manifest.compaction_need(400);
+        assert_eq!(need.small_files, 1);
+        assert_eq!(need.trigger, None);
+    }
+
+    /// A threshold nobody can read falls back to the shipped one rather
+    /// than stopping maintenance on the table
+    #[test]
+    fn test_an_unreadable_threshold_falls_back() {
+        let mut manifest = sized_manifest(&[10; 8]);
+        manifest
+            .properties
+            .insert(AUTO_COMPACT_SMALL_FILE_RATIO_PROPERTY.into(), "soon".into());
+        assert_eq!(
+            manifest.auto_compact_small_file_ratio(),
+            DEFAULT_AUTO_COMPACT_SMALL_FILE_RATIO
+        );
+        manifest
+            .properties
+            .insert(AUTO_COMPACT_SMALL_FILE_RATIO_PROPERTY.into(), "-1".into());
+        assert_eq!(
+            manifest.auto_compact_small_file_ratio(),
+            DEFAULT_AUTO_COMPACT_SMALL_FILE_RATIO
+        );
+        // A threshold above one can never trip, which is how a table opts
+        // out of one of the two triggers
+        manifest
+            .properties
+            .insert(AUTO_COMPACT_SMALL_FILE_RATIO_PROPERTY.into(), "2".into());
+        assert_eq!(manifest.compaction_need(400).trigger, None);
+    }
+
+    /// The table's own target wins over whatever the node runs, because a
+    /// node-wide default is the right answer only for a table that
+    /// expressed no opinion
+    #[test]
+    fn test_a_table_target_overrides_the_node_default() {
+        let mut manifest = sized_manifest(&[10; 8]);
+        assert_eq!(manifest.target_rows_per_file(400), 400);
+        manifest
+            .properties
+            .insert(TARGET_ROWS_PER_FILE_PROPERTY.into(), "20".into());
+        assert_eq!(manifest.target_rows_per_file(400), 20);
+        // A threshold of five now, so ten-row files are not small
+        assert_eq!(manifest.compaction_need(400).small_files, 0);
+    }
+
+    fn sized_manifest(row_counts: &[u64]) -> ManifestFile {
+        let mut manifest = sample();
+        manifest.delete_predicates = Vec::new();
+        manifest.entries = row_counts
+            .iter()
+            .enumerate()
+            .map(|(i, rows)| PartitionEntry {
+                partition_id: i as u64 + 1,
+                size_bytes: rows * 8,
+                row_count: *rows,
+                added_version: 1,
+                cluster_spec_id: 0,
+                column_stats: std::sync::Arc::new(Vec::new()),
+                delete_predicate_ids: Vec::new(),
+            })
+            .collect();
+        manifest
+    }
+
+    /// Everything a plan is costed against moves the epoch, and nothing
+    /// else does. A change that moved it for no reason would evict every
+    /// cached plan on the node; one that did not move it would keep
+    /// serving plans priced against a layout that is gone
+    #[test]
+    fn test_the_clustering_epoch_moves_with_what_a_plan_is_costed_against() {
+        let base = sample();
+        let baseline = base.clustering_epoch();
+        assert_eq!(
+            base.clone().clustering_epoch(),
+            baseline,
+            "the same state has to produce the same value"
+        );
+
+        // The spec, because it decides which columns prune
+        let mut changed = base.clone();
+        changed.cluster_spec = ClusterSpec {
+            spec_id: base.cluster_spec.spec_id + 1,
+            keys: base.cluster_spec.keys.clone(),
+        };
+        assert_ne!(changed.clustering_epoch(), baseline);
+
+        // The keys inside it, at the same spec id
+        let mut changed = base.clone();
+        changed.cluster_spec.keys = vec![ClusterKey {
+            column_id: 1,
+            strategy: ClusterStrategy::RangePartition,
+            param: 16,
+        }];
+        assert_ne!(changed.clustering_epoch(), baseline);
+
+        // The strategy, which decides how a key buckets
+        let mut changed = base.clone();
+        changed.cluster_spec.keys[0].strategy = ClusterStrategy::BitInterleave;
+        assert_ne!(changed.clustering_epoch(), baseline);
+
+        // The policy, because it decides whether the spec will survive
+        let mut changed = base.clone();
+        changed
+            .properties
+            .insert(CLUSTERING_MODE_PROPERTY.into(), "force".into());
+        assert_ne!(changed.clustering_epoch(), baseline);
+        let mut changed = base.clone();
+        changed
+            .properties
+            .insert(CLUSTERING_SCHEDULE_PROPERTY.into(), "ondemand".into());
+        assert_ne!(changed.clustering_epoch(), baseline);
+
+        // The schema, because adding an expression column changes which
+        // predicates can reach a stored value
+        let mut changed = base.clone();
+        changed.schema.schema_id += 1;
+        assert_ne!(changed.clustering_epoch(), baseline);
+
+        // Conformance, which is why a pass that commits files under an
+        // unchanged spec still evicts: the layout did not move but how
+        // much of the data sits under it did
+        let mut changed = base.clone();
+        for entry in &mut changed.entries {
+            entry.cluster_spec_id = changed.cluster_spec.spec_id;
+        }
+        assert_ne!(changed.clustering_epoch(), baseline);
+
+        // Rows, because a scan's cost is read off them
+        let mut changed = base.clone();
+        changed.entries[0].row_count += 1;
+        assert_ne!(changed.clustering_epoch(), baseline);
+    }
+
+    /// A property nothing costs a plan against must not evict every cached
+    /// plan on the node
+    #[test]
+    fn test_an_unrelated_property_leaves_the_clustering_epoch_alone() {
+        let base = sample();
+        let baseline = base.clustering_epoch();
+        let mut changed = base.clone();
+        changed
+            .properties
+            .insert("bloom_filter_columns".into(), "name".into());
+        assert_eq!(changed.clustering_epoch(), baseline);
+        changed
+            .properties
+            .insert(AUTO_COMPACT_DEAD_ROW_RATIO_PROPERTY.into(), "0.5".into());
+        assert_eq!(
+            changed.clustering_epoch(),
+            baseline,
+            "a maintenance threshold changes when a rewrite happens, not what a plan costs"
+        );
     }
 }

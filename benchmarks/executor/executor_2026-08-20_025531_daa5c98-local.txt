@@ -1,0 +1,224 @@
+# suite:   executor
+# run:     2026-08-20_025531_daa5c98-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== TopN Sort Test ===
+
+=== Limit/Offset Correctness Test ===
+
+=== Filter Correctness Test ===
+
+=== Projection Correctness Test ===
+
+=== Aggregate Correctness Test ===
+
+=== Filter Throughput Performance Test ===
+
+=== Expression Evaluation Test ===
+
+=== Distinct Correctness Test ===
+
+=== Hash Join Correctness Test ===
+
+=== Sort Correctness (Multi-Key) Test ===
+  GROUP BY dept with COUNT/SUM/MIN/MAX: 3 groups [PASS]
+
+=== Pipeline Integration Test (Filter -> Sort -> Limit) ===
+  LIMIT 10: 10 rows [PASS]
+  SELECT b, c FROM t: 2 columns, 3 rows [PASS]
+  id < 10: 10 rows [PASS]
+  LIMIT 10 OFFSET 100: 10 rows, first id=100 [PASS]
+Rows: 1000000
+Validation runs: 5
+  DISTINCT on 10 rows with 5 unique values: 5 rows [PASS]
+
+=== Set Operations Correctness Test ===
+  id >= 10 AND id < 20: 10 rows [PASS]
+  Multi-key sort (ASC a, DESC b): verified [PASS]
+  UNION ALL: 10 rows [PASS]
+  TopN(100) from 10K rows: correct smallest 100 [PASS]
+  a + b: [15, 35, 55, 75, 95] [PASS]
+  INNER JOIN: 3 rows [PASS]
+  UNION: 7 rows [PASS]
+  a * 2: [20, 40, 60, 80, 100] [PASS]
+  INTERSECT: 3 rows [PASS]
+  EXCEPT: 2 rows [PASS]
+  OFFSET beyond data: 0 rows [PASS]
+  a > b: all true [PASS]
+  Filter(id<500) -> Sort(val ASC) -> Limit(10): vals 500-509 [PASS]
+  IS NULL: row 2 is null [PASS]
+  LEFT JOIN: 5 rows [PASS]
+
+--- Run 1/5 ---
+  Filter: 262,964,132 rows/sec (3.8028ms), 250000 rows passed
+
+--- Run 2/5 ---
+  Filter: 260,091,552 rows/sec (3.8448ms), 250000 rows passed
+
+--- Run 3/5 ---
+  Filter: 274,679,998 rows/sec (3.6406ms), 250000 rows passed
+
+--- Run 4/5 ---
+  Filter: 275,368,305 rows/sec (3.6315ms), 250000 rows passed
+
+--- Run 5/5 ---
+  Filter: 283,599,444 rows/sec (3.5261ms), 250000 rows passed
+
+=== Filter Validation Results ===
+  Filter throughput (rows/sec) [PASS/OK]:
+    Runs: [262,964,132, 260,091,552, 274,679,998, 275,368,305, 283,599,444]
+    Average: 271,340,686 >= 60,000,000 (target)
+    Min/Max: 260,091,552 / 283,599,444, StdDev: 8,652,856
+
+=== Hash Build Performance Test ===
+Rows: 1000000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Hash Build: 114,735,477 rows/sec (8.7157ms), 1000 groups
+
+--- Run 2/5 ---
+  Hash Build: 116,939,916 rows/sec (8.5514ms), 1000 groups
+
+--- Run 3/5 ---
+  Hash Build: 119,594,336 rows/sec (8.3616ms), 1000 groups
+
+--- Run 4/5 ---
+  Hash Build: 121,416,690 rows/sec (8.2361ms), 1000 groups
+
+--- Run 5/5 ---
+  Hash Build: 115,901,715 rows/sec (8.628ms), 1000 groups
+
+=== Hash Build Validation Results ===
+  Hash build throughput (rows/sec) [PASS/OK]:
+    Runs: [114,735,477, 116,939,916, 119,594,336, 121,416,690, 115,901,715]
+    Average: 117,717,627 >= 50,000,000 (target)
+    Min/Max: 114,735,477 / 121,416,690, StdDev: 2,449,518
+
+=== Aggregate Performance Test ===
+Rows: 1000000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Aggregate: 831,324,300 rows/sec (1.2029ms)
+
+--- Run 2/5 ---
+  Aggregate: 900,900,901 rows/sec (1.11ms)
+
+--- Run 3/5 ---
+  Aggregate: 999,400,360 rows/sec (1.0006ms)
+
+--- Run 4/5 ---
+  Aggregate: 1,029,124,215 rows/sec (971.7µs)
+
+--- Run 5/5 ---
+  Aggregate: 988,826,263 rows/sec (1.0113ms)
+
+=== Aggregate Validation Results ===
+  Aggregate throughput (rows/sec) [PASS/OK]:
+    Runs: [831,324,300, 900,900,901, 999,400,360, 1,029,124,215, 988,826,263]
+    Average: 949,915,208 >= 150,000,000 (target)
+    Min/Max: 831,324,300 / 1,029,124,215, StdDev: 73,079,577
+
+=== Sort Performance Test ===
+Rows: 500000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Sort: 99,310,783 rows/sec (5.0347ms)
+
+--- Run 2/5 ---
+  Sort: 104,598,134 rows/sec (4.7802ms)
+
+--- Run 3/5 ---
+  Sort: 104,687,925 rows/sec (4.7761ms)
+
+--- Run 4/5 ---
+  Sort: 98,446,514 rows/sec (5.0789ms)
+
+--- Run 5/5 ---
+  Sort: 100,824,746 rows/sec (4.9591ms)
+
+=== Sort Validation Results ===
+  Sort throughput (rows/sec) [PASS/OK]:
+    Runs: [99,310,783, 104,598,134, 104,687,925, 98,446,514, 100,824,746]
+    Average: 101,573,621 >= 100,000,000 (target)
+    Min/Max: 98,446,514 / 104,687,925, StdDev: 2,619,413
+
+=== Limit Throughput Performance Test ===
+Rows: 1000000, Limit: 100
+Validation runs: 5
+
+--- Run 1/5 ---
+  Limit: 544,662,309,368 rows/sec (367.2µs for 200 samples)
+
+--- Run 2/5 ---
+  Limit: 537,201,181,843 rows/sec (372.3µs for 200 samples)
+
+--- Run 3/5 ---
+  Limit: 502,008,032,129 rows/sec (398.4µs for 200 samples)
+
+--- Run 4/5 ---
+  Limit: 538,358,008,075 rows/sec (371.5µs for 200 samples)
+
+--- Run 5/5 ---
+  Limit: 548,998,078,507 rows/sec (364.3µs for 200 samples)
+
+=== Limit Validation Results ===
+  Limit throughput (rows/sec) [PASS/OK]:
+    Runs: [544,662,309,368, 537,201,181,843, 502,008,032,129, 538,358,008,075, 548,998,078,507]
+    Average: 534,245,521,984 >= 200,000,000 (target)
+    Min/Max: 502,008,032,129 / 548,998,078,507, StdDev: 16,679,637,901
+
+=== Scan Throughput Performance Test ===
+Rows: 1000000, Columns: 4
+Validation runs: 5
+
+--- Run 1/5 ---
+  Scan: 1,381,597,126 rows/sec (723.8µs)
+
+--- Run 2/5 ---
+  Scan: 1,680,107,527 rows/sec (595.2µs)
+
+--- Run 3/5 ---
+  Scan: 2,180,074,123 rows/sec (458.7µs)
+
+--- Run 4/5 ---
+  Scan: 2,242,152,466 rows/sec (446µs)
+
+--- Run 5/5 ---
+  Scan: 2,002,402,883 rows/sec (499.4µs)
+
+=== Scan Validation Results ===
+  Scan throughput (rows/sec) [PASS/OK]:
+    Runs: [1,381,597,126, 1,680,107,527, 2,180,074,123, 2,242,152,466, 2,002,402,883]
+    Average: 1,897,266,825 >= 75,000,000 (target)
+    Min/Max: 1,381,597,126 / 2,242,152,466, StdDev: 323,435,639
+
+=== Hash Join Performance Test ===
+Left rows: 500000, Right rows: 50000
+Validation runs: 5
+
+--- Run 1/5 ---
+  Join: 136,222,910 rows/sec (4.0375ms), 50000 output rows
+
+--- Run 2/5 ---
+  Join: 168,991,581 rows/sec (3.2546ms), 50000 output rows
+
+--- Run 3/5 ---
+  Join: 171,697,937 rows/sec (3.2033ms), 50000 output rows
+
+--- Run 4/5 ---
+  Join: 170,780,935 rows/sec (3.2205ms), 50000 output rows
+
+--- Run 5/5 ---
+  Join: 173,512,524 rows/sec (3.1698ms), 50000 output rows
+
+=== Hash Join Validation Results ===
+  Join throughput (rows/sec) [PASS/OK]:
+    Runs: [136,222,910, 168,991,581, 171,697,937, 170,780,935, 173,512,524]
+    Average: 164,241,177 >= 100,000,000 (target)
+    Min/Max: 136,222,910 / 173,512,524, StdDev: 14,084,880

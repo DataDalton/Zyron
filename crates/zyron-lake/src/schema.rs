@@ -42,6 +42,34 @@ impl LakeColumn {
     }
 }
 
+/// A column whose values are computed from an expression rather than
+/// supplied by the writer's caller as a table column.
+///
+/// This is what lets clustering target an expression. A cluster key names
+/// a column id, pruning reads statistics by column id, and the prune index
+/// and the overlap sweep both address columns, so an expression that is to
+/// be clustered on and pruned by has to be a column. Giving it one means
+/// every one of those paths works on it unchanged, and the writer computes
+/// its bounds and bloom in the pass it already makes over the batch.
+///
+/// The hash is the identity. The planner canonicalizes an expression and
+/// hashes the canonical form, so two spellings of the same expression
+/// reach the same column and matching a query against it is a u64 compare
+/// rather than an AST walk. The SQL is what the canonical form renders
+/// back to, carried so the column can be shown and recomputed
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedColumn {
+    /// The schema column holding this expression's values
+    pub column_id: u32,
+    pub canonical_hash: u64,
+    pub sql: String,
+    /// Columns the expression reads, ascending. Recorded rather than
+    /// re-derived from the SQL so dropping a column can refuse when an
+    /// expression still depends on it, which is the case that would
+    /// otherwise leave a derived column nothing can recompute
+    pub source_columns: Vec<u32>,
+}
+
 /// A whole-table schema at one schema version
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LakeSchema {
@@ -51,6 +79,9 @@ pub struct LakeSchema {
     pub next_column_id: u32,
     /// Columns in user-visible order
     pub columns: Vec<LakeColumn>,
+    /// Columns computed from an expression, by the id of the column that
+    /// holds their values. Empty on a table nobody clusters by expression
+    pub derived: Vec<DerivedColumn>,
 }
 
 // Metadata blob presence flags
@@ -75,9 +106,75 @@ impl LakeSchema {
             schema_id,
             next_column_id,
             columns,
+            derived: Vec::new(),
         };
         schema.validate()?;
         Ok(schema)
+    }
+
+    /// Builds a validated schema carrying expression columns.
+    ///
+    /// `next_column_id` still comes from the highest id present, and a
+    /// derived entry names a column that has to be in `columns`, because
+    /// its values are stored like any other column's
+    pub fn with_derived(
+        schema_id: u64,
+        columns: Vec<LakeColumn>,
+        derived: Vec<DerivedColumn>,
+    ) -> Result<Self, ZyronError> {
+        let next_column_id = columns
+            .iter()
+            .map(|c| c.id)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        let schema = Self {
+            schema_id,
+            next_column_id,
+            columns,
+            derived,
+        };
+        schema.validate()?;
+        Ok(schema)
+    }
+
+    /// The expression a column computes, or None for a stored column
+    pub fn derived_for(&self, column_id: u32) -> Option<&DerivedColumn> {
+        self.derived.iter().find(|d| d.column_id == column_id)
+    }
+
+    /// The column holding an expression's values, matched by canonical
+    /// hash. This is how a query's expression finds the column carrying
+    /// the statistics that can prune it
+    pub fn column_by_derived_hash(&self, canonical_hash: u64) -> Option<&LakeColumn> {
+        self.derived
+            .iter()
+            .find(|d| d.canonical_hash == canonical_hash)
+            .and_then(|d| self.column_by_id(d.column_id))
+    }
+
+    /// True when a column exists to carry an expression rather than
+    /// because the table declared it. These are not part of the table's
+    /// user-visible shape
+    pub fn is_derived(&self, column_id: u32) -> bool {
+        self.derived.iter().any(|d| d.column_id == column_id)
+    }
+
+    /// The first expression column that reads this column, if any.
+    ///
+    /// Dropping a column an expression reads would leave that expression
+    /// with nothing to recompute from, so a drop consults this and refuses
+    /// rather than leaving a column whose next insert cannot fill it
+    pub fn derived_depending_on(&self, column_id: u32) -> Option<&DerivedColumn> {
+        self.derived
+            .iter()
+            .find(|d| d.source_columns.contains(&column_id))
+    }
+
+    /// Columns the table declared, in order, without the expression
+    /// columns clustering added
+    pub fn user_columns(&self) -> impl Iterator<Item = &LakeColumn> {
+        self.columns.iter().filter(|c| !self.is_derived(c.id))
     }
 
     /// Checks every invariant the codec and the writer rely on
@@ -146,6 +243,57 @@ impl LakeSchema {
                 }
             }
         }
+        for (i, derived) in self.derived.iter().enumerate() {
+            if self.column_by_id(derived.column_id).is_none() {
+                return Err(ZyronError::Internal(format!(
+                    "lake schema derived expression names column id {}, which is not in the schema",
+                    derived.column_id
+                )));
+            }
+            if derived.sql.is_empty() {
+                return Err(ZyronError::Internal(format!(
+                    "lake schema derived column id {} has an empty expression",
+                    derived.column_id
+                )));
+            }
+            if derived.sql.len() > u16::MAX as usize {
+                return Err(ZyronError::Internal(format!(
+                    "lake schema derived column id {} expression exceeds {} bytes",
+                    derived.column_id,
+                    u16::MAX
+                )));
+            }
+            for source in &derived.source_columns {
+                if *source == derived.column_id {
+                    return Err(ZyronError::Internal(format!(
+                        "lake schema derived column id {} reads itself",
+                        derived.column_id
+                    )));
+                }
+                if self.column_by_id(*source).is_none() {
+                    return Err(ZyronError::Internal(format!(
+                        "lake schema derived column id {} reads column id {}, which is not in the schema",
+                        derived.column_id, source
+                    )));
+                }
+            }
+            for other in &self.derived[i + 1..] {
+                if other.column_id == derived.column_id {
+                    return Err(ZyronError::Internal(format!(
+                        "lake schema has two expressions for column id {}",
+                        derived.column_id
+                    )));
+                }
+                // Two columns computing the same expression would split its
+                // statistics and let a query prune by whichever it matched
+                if other.canonical_hash == derived.canonical_hash {
+                    return Err(ZyronError::Internal(format!(
+                        "lake schema has two columns for expression \"{}\"",
+                        derived.sql
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -210,6 +358,19 @@ impl LakeSchema {
             if let Some(expr) = &col.default_expr {
                 buf.extend_from_slice(&(expr.len() as u16).to_le_bytes());
                 buf.extend_from_slice(expr.as_bytes());
+            }
+        }
+        // Expression columns follow the column records, so a schema that
+        // has none costs four bytes
+        buf.extend_from_slice(&(self.derived.len() as u32).to_le_bytes());
+        for derived in &self.derived {
+            buf.extend_from_slice(&derived.column_id.to_le_bytes());
+            buf.extend_from_slice(&derived.canonical_hash.to_le_bytes());
+            buf.extend_from_slice(&(derived.sql.len() as u16).to_le_bytes());
+            buf.extend_from_slice(derived.sql.as_bytes());
+            buf.extend_from_slice(&(derived.source_columns.len() as u16).to_le_bytes());
+            for source in &derived.source_columns {
+                buf.extend_from_slice(&source.to_le_bytes());
             }
         }
     }
@@ -310,10 +471,38 @@ impl LakeSchema {
                 default_expr,
             });
         }
+        let derived_count = r.u32()? as usize;
+        // A record is at least 14 bytes, so a corrupt count cannot drive a
+        // large preallocation
+        if derived_count > bytes.len() / 14 {
+            return Err(r.corrupt(format!(
+                "schema derived column count {} exceeds section size",
+                derived_count
+            )));
+        }
+        let mut derived = Vec::with_capacity(derived_count);
+        for _ in 0..derived_count {
+            let column_id = r.u32()?;
+            let canonical_hash = r.u64()?;
+            let sql_len = r.u16()? as usize;
+            let sql = r.utf8(sql_len, "derived column expression")?;
+            let source_count = r.u16()? as usize;
+            let mut source_columns = Vec::with_capacity(source_count);
+            for _ in 0..source_count {
+                source_columns.push(r.u32()?);
+            }
+            derived.push(DerivedColumn {
+                column_id,
+                canonical_hash,
+                sql,
+                source_columns,
+            });
+        }
         let schema = Self {
             schema_id,
             next_column_id,
             columns,
+            derived,
         };
         schema
             .validate()
@@ -490,5 +679,161 @@ mod tests {
         buf.extend_from_slice(&1u32.to_le_bytes());
         buf.extend_from_slice(&u32::MAX.to_le_bytes());
         assert!(LakeSchema::decode(&buf, "test").is_err());
+    }
+
+    fn derived_schema() -> LakeSchema {
+        LakeSchema::with_derived(
+            3,
+            vec![
+                plain(0, "id", TypeId::Int64),
+                plain(1, "ts", TypeId::Timestamp),
+                plain(2, "ts_day", TypeId::Timestamp),
+            ],
+            vec![DerivedColumn {
+                column_id: 2,
+                canonical_hash: 0x9E37_79B9_7F4A_7C15,
+                sql: "date_trunc('day', ts)".into(),
+                source_columns: vec![1],
+            }],
+        )
+        .expect("valid derived schema")
+    }
+
+    /// An expression column has to survive the codec intact, because the
+    /// hash is how a query finds the column carrying statistics it can
+    /// prune by, and a lost source list would let a drop break it
+    #[test]
+    fn test_roundtrip_preserves_derived_columns() {
+        let schema = derived_schema();
+        let mut buf = Vec::new();
+        schema.encode_into(&mut buf);
+        let (back, consumed) = LakeSchema::decode(&buf, "test").expect("decodes");
+        assert_eq!(consumed, buf.len());
+        assert_eq!(back, schema);
+        assert_eq!(back.derived.len(), 1);
+        assert_eq!(back.derived[0].source_columns, vec![1]);
+    }
+
+    /// A schema with no expression columns pays four bytes for the section
+    /// and still round trips
+    #[test]
+    fn test_roundtrip_without_derived_columns() {
+        let schema = sample();
+        let mut buf = Vec::new();
+        schema.encode_into(&mut buf);
+        let (back, consumed) = LakeSchema::decode(&buf, "test").expect("decodes");
+        assert_eq!(consumed, buf.len());
+        assert!(back.derived.is_empty());
+    }
+
+    #[test]
+    fn test_derived_lookups_answer_by_hash_and_by_column() {
+        let schema = derived_schema();
+        let found = schema
+            .column_by_derived_hash(0x9E37_79B9_7F4A_7C15)
+            .expect("hash finds its column");
+        assert_eq!(found.id, 2);
+        assert!(schema.column_by_derived_hash(1).is_none());
+        assert!(schema.is_derived(2));
+        assert!(!schema.is_derived(1));
+        assert_eq!(
+            schema.derived_for(2).map(|d| d.sql.as_str()),
+            Some("date_trunc('day', ts)")
+        );
+        // The table declared two columns, clustering added the third
+        let user: Vec<&str> = schema.user_columns().map(|c| c.name.as_str()).collect();
+        assert_eq!(user, vec!["id", "ts"]);
+    }
+
+    /// Dropping a column an expression reads has to be refusable, so the
+    /// dependency has to be answerable from the schema alone
+    #[test]
+    fn test_derived_dependency_is_reported_for_its_sources_only() {
+        let schema = derived_schema();
+        assert_eq!(
+            schema.derived_depending_on(1).map(|d| d.column_id),
+            Some(2),
+            "ts is read by the expression"
+        );
+        assert!(schema.derived_depending_on(0).is_none());
+        assert!(
+            schema.derived_depending_on(2).is_none(),
+            "the column holding the values is not one of its sources"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_malformed_derived_columns() {
+        let columns = || {
+            vec![
+                plain(0, "id", TypeId::Int64),
+                plain(1, "ts", TypeId::Timestamp),
+                plain(2, "ts_day", TypeId::Timestamp),
+            ]
+        };
+        let derived = |d: DerivedColumn| LakeSchema::with_derived(1, columns(), vec![d]);
+
+        // Names a column that is not in the schema
+        assert!(
+            derived(DerivedColumn {
+                column_id: 9,
+                canonical_hash: 1,
+                sql: "x".into(),
+                source_columns: vec![1],
+            })
+            .is_err()
+        );
+        // Reads a column that is not in the schema
+        assert!(
+            derived(DerivedColumn {
+                column_id: 2,
+                canonical_hash: 1,
+                sql: "x".into(),
+                source_columns: vec![9],
+            })
+            .is_err()
+        );
+        // Reads itself, which has no evaluation order
+        assert!(
+            derived(DerivedColumn {
+                column_id: 2,
+                canonical_hash: 1,
+                sql: "x".into(),
+                source_columns: vec![2],
+            })
+            .is_err()
+        );
+        // An empty expression names nothing
+        assert!(
+            derived(DerivedColumn {
+                column_id: 2,
+                canonical_hash: 1,
+                sql: String::new(),
+                source_columns: vec![1],
+            })
+            .is_err()
+        );
+        // Two columns holding the same expression would split its statistics
+        assert!(
+            LakeSchema::with_derived(
+                1,
+                columns(),
+                vec![
+                    DerivedColumn {
+                        column_id: 1,
+                        canonical_hash: 7,
+                        sql: "x".into(),
+                        source_columns: vec![0],
+                    },
+                    DerivedColumn {
+                        column_id: 2,
+                        canonical_hash: 7,
+                        sql: "x".into(),
+                        source_columns: vec![0],
+                    },
+                ],
+            )
+            .is_err()
+        );
     }
 }

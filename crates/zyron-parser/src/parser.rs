@@ -1135,6 +1135,34 @@ impl<'a> Parser<'a> {
         };
 
         let name = self.parse_ident()?;
+
+        // `CLONE OF <table> [AT VERSION <n>]` takes the source's shape, so
+        // it stands in place of a column list rather than beside one
+        if self.consume_keyword(Keyword::Clone)? {
+            self.expect_keyword(Keyword::Of)?;
+            let source = self.parse_ident()?;
+            let at_version = if self.consume_keyword(Keyword::At)? {
+                self.expect_keyword(Keyword::Version)?;
+                Some(self.parse_u64_literal("CLONE ... AT VERSION")?)
+            } else {
+                None
+            };
+            return Ok(Statement::CreateTable(Box::new(CreateTableStatement {
+                name,
+                if_not_exists,
+                columns: Vec::new(),
+                constraints: Vec::new(),
+                options: Vec::new(),
+                ttl: None,
+                using: None,
+                cluster_by: None,
+                clone_of: Some(CloneSource {
+                    table: source,
+                    at_version,
+                }),
+            })));
+        }
+
         self.expect_token(&Token::LParen)?;
 
         let mut columns = Vec::new();
@@ -1203,7 +1231,27 @@ impl<'a> Parser<'a> {
             ttl,
             using,
             cluster_by,
+            clone_of: None,
         })))
+    }
+
+    /// A non-negative whole number literal, for the places the grammar
+    /// takes a count or a version rather than an expression
+    fn parse_u64_literal(&mut self, what: &str) -> Result<u64> {
+        match self.current.token.clone() {
+            Token::Integer(v) if v >= 0 => {
+                self.advance()?;
+                Ok(v as u64)
+            }
+            Token::BigInteger(v) => {
+                let parsed = u64::try_from(v).map_err(|_| {
+                    self.error(&format!("{what} needs a whole number, {v} is too large"))
+                })?;
+                self.advance()?;
+                Ok(parsed)
+            }
+            other => Err(self.error(&format!("{what} needs a whole number, found {other}"))),
+        }
     }
 
     /// Parses the format name after USING in table DDL
@@ -1234,13 +1282,20 @@ impl<'a> Parser<'a> {
         let mut keys = Vec::new();
         if self.current.token != Token::RParen {
             loop {
-                let column = self.parse_ident()?;
+                // A bare identifier names a column, anything else is an
+                // expression clustering gives a column of its own. Parsing
+                // an expression either way lets the two interleave in one
+                // key list
+                let target = match self.parse_expr()? {
+                    Expr::Identifier(name) => ClusterKeyTarget::Column(name),
+                    other => ClusterKeyTarget::Expression(other),
+                };
                 let strategy = if self.consume_keyword(Keyword::Using)? {
                     Some(self.parse_ident()?)
                 } else {
                     None
                 };
-                keys.push(ClusterKeyDef { column, strategy });
+                keys.push(ClusterKeyDef { target, strategy });
                 if !self.consume_token(&Token::Comma)? {
                     break;
                 }
@@ -1253,11 +1308,16 @@ impl<'a> Parser<'a> {
             } else {
                 ClusterMode::Hybrid
             }
-        } else {
-            // FORCE is the default for a listed key set, accepted
-            // explicitly for the empty pin
-            let _ = self.consume_keyword(Keyword::Force)?;
+        } else if self.consume_keyword(Keyword::Force)? {
+            // FORCE pins the listed keys against measurement. With an empty
+            // key list it pins the absence of a layout, which is how a table
+            // opts out of clustering entirely
             ClusterMode::Force
+        } else {
+            // A bare key list seeds the layout without pinning it, so
+            // measurement starts from what was declared and may move on when
+            // the workload says something else serves it better
+            ClusterMode::Auto
         };
         Ok(ClusterByClause { keys, mode })
     }
@@ -1589,6 +1649,15 @@ impl<'a> Parser<'a> {
                     || self.at_keyword(Keyword::Foreign)
                 {
                     AlterTableOperation::AddConstraint(self.parse_table_constraint()?)
+                } else if self.consume_keyword(Keyword::Derived)? {
+                    // ADD DERIVED COLUMN <name> AS <expr> names an
+                    // expression column, which a bare CLUSTER BY over an
+                    // expression creates without a name
+                    self.consume_keyword(Keyword::Column)?;
+                    let name = self.parse_ident()?;
+                    self.expect_keyword(Keyword::As)?;
+                    let expr = self.parse_expr()?;
+                    AlterTableOperation::AddDerivedColumn { name, expr }
                 } else {
                     self.consume_keyword(Keyword::Column)?;
                     AlterTableOperation::AddColumn(self.parse_column_def()?)
@@ -4917,8 +4986,33 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::Optimize)?;
         self.consume_keyword(Keyword::Table)?;
         let table = self.parse_ident()?;
+        let mut cluster = false;
+        let mut delete = false;
+        if self.at_keyword(Keyword::Cluster) || self.at_keyword(Keyword::Delete) {
+            loop {
+                if self.consume_keyword(Keyword::Cluster)? {
+                    cluster = true;
+                } else if self.consume_keyword(Keyword::Delete)? {
+                    delete = true;
+                } else {
+                    return Err(self.error(&format!(
+                        "Expected CLUSTER or DELETE, found {}",
+                        self.current.token
+                    )));
+                }
+                if !self.consume_token(&Token::Comma)? {
+                    break;
+                }
+            }
+        } else {
+            // Naming no action compacts, which is what the statement has
+            // always meant
+            delete = true;
+        }
         Ok(Statement::OptimizeTable(Box::new(OptimizeTableStatement {
             table,
+            cluster,
+            delete,
         })))
     }
 
@@ -5540,6 +5634,33 @@ impl<'a> Parser<'a> {
 
         if self.consume_keyword(Keyword::Table)? {
             let table = self.parse_ident()?;
+            // RESTORE TABLE t TO VERSION n | TO TIMESTAMP '...'  -> roll the
+            // table's data back to what it showed then. Distinct from the
+            // archive restore below, which reads a flat snapshot from
+            // outside the database and has no version history to move
+            // through
+            if self.consume_keyword(Keyword::To)? {
+                let target = if self.consume_keyword(Keyword::Version)? {
+                    RestoreVersionTarget::Version(self.parse_u64_literal("RESTORE ... TO VERSION")?)
+                } else if self.consume_keyword(Keyword::Timestamp)? {
+                    match self.current.token.clone() {
+                        Token::String(text) => {
+                            self.advance()?;
+                            RestoreVersionTarget::Timestamp(text)
+                        }
+                        other => {
+                            return Err(self.error(&format!(
+                                "RESTORE ... TO TIMESTAMP needs a quoted timestamp, found {other}"
+                            )));
+                        }
+                    }
+                } else {
+                    return Err(self.error("Expected VERSION or TIMESTAMP after RESTORE ... TO"));
+                };
+                return Ok(Statement::RestoreTableVersion(Box::new(
+                    RestoreTableVersionStatement { table, target },
+                )));
+            }
             if !self.consume_keyword(Keyword::From)? {
                 // RESTORE TABLE name  -> undrop
                 return Ok(Statement::UndropTable(Box::new(UndropTableStatement {
@@ -8412,6 +8533,7 @@ fn keyword_to_ident_str(kw: Keyword) -> Option<&'static str> {
         // Join keywords
         Keyword::Natural => Some("natural"),
         Keyword::Using => Some("using"),
+        Keyword::Clone => Some("clone"),
         // Schema keywords
         Keyword::Schema => Some("schema"),
         // Sequence keywords
@@ -8501,6 +8623,7 @@ fn keyword_to_ident_str(kw: Keyword) -> Option<&'static str> {
         Keyword::Follow => Some("follow"),
         Keyword::Unfollow => Some("unfollow"),
         Keyword::Clustering => Some("clustering"),
+        Keyword::Derived => Some("derived"),
         Keyword::Auto => Some("auto"),
         Keyword::Force => Some("force"),
         Keyword::Incremental => Some("incremental"),

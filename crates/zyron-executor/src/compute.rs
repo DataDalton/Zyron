@@ -2348,17 +2348,6 @@ pub fn hash_combine(seed: u64, value: u64) -> u64 {
         .wrapping_add(seed >> 2))
 }
 
-/// Murmurhash3 64-bit finalizer for output distribution.
-#[inline(always)]
-pub fn hash_finalize(mut x: u64) -> u64 {
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xff51afd7ed558ccd);
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xc4ceb9fe1a85ec53);
-    x ^= x >> 33;
-    x
-}
-
 /// Fibonacci hash for a single integer value. Multiply by the golden ratio
 /// constant, then mix high bits into low bits for bucket distribution.
 /// Bijection on u64 (distinct inputs produce distinct outputs), so hash
@@ -2444,7 +2433,7 @@ pub fn hash_row(columns: &[&Column], row: usize) -> u64 {
             };
         }
     }
-    hash_finalize(h)
+    zyron_common::mix_finalize_3round(h)
 }
 
 /// Batch-computes hashes for all rows across the given columns.
@@ -2611,7 +2600,7 @@ pub fn hash_column_batch_into(columns: &[&Column], num_rows: usize, hashes: &mut
 
     // Final avalanche pass for good bit distribution in hash tables.
     for h in hashes[..num_rows].iter_mut() {
-        *h = hash_finalize(*h);
+        *h = zyron_common::mix_finalize_3round(*h);
     }
 }
 

@@ -45,18 +45,6 @@ pub fn hash_combine(seed: u64, value: u64) -> u64 {
         .wrapping_add(seed >> 2))
 }
 
-/// MurmurHash3 64-bit finalizer. Achieves full avalanche (every input bit
-/// affects every output bit) in 3 multiply-xorshift steps.
-#[inline(always)]
-pub fn hash_finalize(mut x: u64) -> u64 {
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xff51afd7ed558ccd);
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xc4ceb9fe1a85ec53);
-    x ^= x >> 33;
-    x
-}
-
 /// FNV-1a hash for byte slices. Good distribution for strings and binary data.
 #[inline]
 pub fn hash_bytes_fnv(bytes: &[u8]) -> u64 {
@@ -337,7 +325,7 @@ pub fn hash_multi_column_batch_into(
 
     // Finalize all hashes for better distribution.
     for h in hashes.iter_mut() {
-        *h = hash_finalize(*h);
+        *h = zyron_common::mix_finalize_3round(*h);
     }
 }
 
@@ -899,9 +887,9 @@ mod tests {
     }
 
     #[test]
-    fn test_hash_finalize_avalanche() {
-        let h1 = hash_finalize(1);
-        let h2 = hash_finalize(2);
+    fn test_mix_finalize_3round_avalanche() {
+        let h1 = zyron_common::mix_finalize_3round(1);
+        let h2 = zyron_common::mix_finalize_3round(2);
         // Differ in many bits, not just 1.
         assert!((h1 ^ h2).count_ones() > 10);
     }

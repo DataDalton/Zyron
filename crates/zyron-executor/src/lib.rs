@@ -3,6 +3,7 @@ pub mod column;
 pub mod compute;
 pub mod context;
 pub mod correlated;
+pub mod derived_columns;
 pub mod executor;
 pub mod expr;
 pub mod lake_stats;

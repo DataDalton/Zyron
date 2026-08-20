@@ -334,7 +334,7 @@ impl IsolationForest {
             let target = sample_size.min(rows.len());
             while chosen.len() < target && !rows.is_empty() {
                 let idx = rng.next_in_range(0, rows.len());
-                let key = zyron_common::fx_finalize(idx as u64);
+                let key = zyron_common::mix_finalize_2round(idx as u64);
                 chosen.insert(key, idx);
             }
             let indices: Vec<usize> = chosen.into_values().collect();

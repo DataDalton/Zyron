@@ -26,8 +26,8 @@ pub mod zerocopy;
 pub use array_value::ArrayView;
 pub use checksum::{
     ALGORITHM_VERSION, FX_K, Hasher, IdentityBuildHasher, IdentityHasher, PreHashMap,
-    ZyBuildHasher, ZyBuildHasherSeeded, fx_finalize, fx_mix, hash32, hash32_seeded, hash64,
-    hash64_seeded, hash128, hash128_seeded,
+    ZyBuildHasher, ZyBuildHasherSeeded, fx_mix, hash32, hash32_seeded, hash64, hash64_seeded,
+    hash128, hash128_seeded, mix_finalize_2round, mix_finalize_3round,
 };
 pub use cluster::{ClusterDecision, ClusterKey, ClusterMode, ClusterStrategy, ClusteringSchedule};
 pub use config::{DeploymentMode, ServerConfig, StorageConfig};

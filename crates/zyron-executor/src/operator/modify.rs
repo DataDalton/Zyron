@@ -2683,7 +2683,13 @@ impl Operator for InsertOperator {
             // One data file and one log commit per statement, pending under
             // this transaction until its commit record is durable
             if is_lake && !lake_batches.is_empty() {
-                let outcome = append_lake_batches(&self.ctx, &table_entry, &lake_batches)?;
+                let derived = crate::derived_columns::derived_column_data(
+                    &self.ctx.catalog,
+                    &table_entry,
+                    &lake_batches,
+                )
+                .await?;
+                let outcome = append_lake_batches(&self.ctx, &table_entry, &lake_batches, derived)?;
                 self.ctx.mark_wrote_wal();
                 // The rows only have addresses once the commit assigned
                 // them, so search index maintenance runs after the append
@@ -2879,6 +2885,7 @@ fn append_lake_batches(
     ctx: &Arc<ExecutionContext>,
     table_entry: &zyron_catalog::TableEntry,
     batches: &[DataBatch],
+    derived: Vec<zyron_lake::ColumnData>,
 ) -> zyron_common::Result<Option<zyron_lake::AppendOutcome>> {
     let mut columns: Vec<zyron_lake::ColumnData> = table_entry
         .columns
@@ -2908,6 +2915,18 @@ fn append_lake_batches(
     }
     if columns.first().map(|c| c.cells.is_empty()).unwrap_or(true) {
         return Ok(None);
+    }
+    // A clustering expression is stored in a column of its own, so the batch
+    // covers the lake schema only once its values are appended. A derived
+    // column already present in the catalog is replaced rather than doubled
+    for computed in derived {
+        match columns
+            .iter_mut()
+            .find(|c| c.column_id == computed.column_id)
+        {
+            Some(existing) => *existing = computed,
+            None => columns.push(computed),
+        }
     }
     let paths = zyron_lake::LakePaths::new(ctx.disk_manager.data_dir(), table_entry.id.0);
     // The branch this session writes, forked here if it has not touched

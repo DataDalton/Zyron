@@ -30,12 +30,21 @@ fn test_using_format_variants() {
 
 #[test]
 fn test_cluster_by_forms() {
-    let pinned = create_table("CREATE TABLE t (a INT, b INT) USING ZYRONLAKE CLUSTER BY (a, b)");
+    // A bare key list seeds the layout without pinning it, so the mode is
+    // Auto and measurement may move the keys on once it has evidence
+    let seeded = create_table("CREATE TABLE t (a INT, b INT) USING ZYRONLAKE CLUSTER BY (a, b)");
+    let clause = seeded.cluster_by.expect("clause");
+    assert_eq!(clause.mode, ClusterMode::Auto);
+    assert_eq!(clause.keys.len(), 2);
+    assert_eq!(clause.keys[0].column_name(), Some("a"));
+    assert!(clause.keys[0].strategy.is_none());
+
+    // FORCE is what pins a declared key set against measurement
+    let pinned =
+        create_table("CREATE TABLE t (a INT, b INT) USING ZYRONLAKE CLUSTER BY (a, b) FORCE");
     let clause = pinned.cluster_by.expect("clause");
     assert_eq!(clause.mode, ClusterMode::Force);
     assert_eq!(clause.keys.len(), 2);
-    assert_eq!(clause.keys[0].column, "a");
-    assert!(clause.keys[0].strategy.is_none());
 
     let auto = create_table("CREATE TABLE t (a INT) USING ZYRONLAKE CLUSTER BY AUTO");
     let clause = auto.cluster_by.expect("clause");
@@ -130,6 +139,54 @@ fn test_new_keywords_still_work_as_identifiers() {
 
     let q = parse("SELECT auto, force FROM clustering WHERE incremental = 1").expect("parses");
     assert!(matches!(q.first(), Some(Statement::Select(_))));
+
+    // CLONE, added for CREATE TABLE ... CLONE OF
+    let t = create_table("CREATE TABLE clone (clone INT)");
+    assert_eq!(t.name, "clone");
+    assert_eq!(t.columns[0].name, "clone");
+    assert!(parse("SELECT clone FROM t").is_ok());
+}
+
+/// A clone takes the source's shape rather than declaring one, so it has
+/// no column list at all. The version is optional and means the source's
+/// head when absent
+#[test]
+fn test_create_table_clone_of_parses_with_and_without_a_version() {
+    let head = create_table("CREATE TABLE backup CLONE OF orders");
+    assert_eq!(head.name, "backup");
+    assert!(
+        head.columns.is_empty(),
+        "a clone declares no columns, it takes the source's"
+    );
+    let source = head.clone_of.expect("a clone source");
+    assert_eq!(source.table, "orders");
+    assert_eq!(
+        source.at_version, None,
+        "no version named means the source as it stands now"
+    );
+
+    let pinned = create_table("CREATE TABLE audit CLONE OF orders AT VERSION 42");
+    let source = pinned.clone_of.expect("a clone source");
+    assert_eq!(source.table, "orders");
+    assert_eq!(source.at_version, Some(42));
+
+    // IF NOT EXISTS still applies, because a clone is a CREATE TABLE
+    let guarded = create_table("CREATE TABLE IF NOT EXISTS backup CLONE OF orders");
+    assert!(guarded.if_not_exists);
+    assert!(guarded.clone_of.is_some());
+}
+
+/// A version has to be a whole number. Accepting anything else would defer
+/// the failure to the point where the source is opened, which is a worse
+/// place to find out
+#[test]
+fn test_a_clone_version_that_is_not_a_number_is_refused() {
+    assert!(parse("CREATE TABLE backup CLONE OF orders AT VERSION latest").is_err());
+    assert!(parse("CREATE TABLE backup CLONE OF orders AT VERSION -1").is_err());
+    assert!(
+        parse("CREATE TABLE backup CLONE OF orders AT 42").is_err(),
+        "the version keyword is not optional, or AT would be ambiguous with a time travel form"
+    );
 }
 
 /// A foreign table names a peer and the shape it expects there
@@ -211,4 +268,112 @@ fn test_server_stays_usable_as_an_identifier() {
 
     let q = parse("SELECT server FROM server WHERE server = 1").expect("parses");
     assert!(matches!(q.first(), Some(Statement::Select(_))));
+}
+
+/// Expression keys and column keys interleave in one key list, and a bare
+/// identifier still means the column rather than an expression over it
+#[test]
+fn test_cluster_by_accepts_expressions_beside_columns() {
+    use zyron_parser::ast::{ClusterKeyTarget, Expr};
+
+    let t = create_table(
+        "CREATE TABLE t (ts TIMESTAMP, country TEXT, region TEXT) USING ZYRONLAKE          CLUSTER BY (date_trunc('day', ts), region, upper(country) USING BitInterleave)",
+    );
+    let clause = t.cluster_by.expect("clause");
+    assert_eq!(clause.keys.len(), 3);
+
+    assert!(matches!(
+        clause.keys[0].target,
+        ClusterKeyTarget::Expression(Expr::Function { .. })
+    ));
+    assert_eq!(clause.keys[0].column_name(), None);
+
+    assert_eq!(clause.keys[1].column_name(), Some("region"));
+
+    assert!(matches!(
+        clause.keys[2].target,
+        ClusterKeyTarget::Expression(Expr::Function { .. })
+    ));
+    assert_eq!(
+        clause.keys[2].strategy.as_deref(),
+        Some("BitInterleave"),
+        "a strategy still binds to the key it follows"
+    );
+}
+
+/// ADD DERIVED COLUMN names an expression column so it can be referred to
+#[test]
+fn test_add_derived_column_parses() {
+    use zyron_parser::ast::{AlterTableOperation, Expr};
+
+    let mut stmts =
+        parse("ALTER TABLE t ADD DERIVED COLUMN day AS date_trunc('day', ts)").expect("parses");
+    match stmts.remove(0) {
+        Statement::AlterTable(a) => match a.operation {
+            AlterTableOperation::AddDerivedColumn { name, expr } => {
+                assert_eq!(name, "day");
+                assert!(matches!(expr, Expr::Function { .. }));
+            }
+            other => panic!("unexpected operation {:?}", other),
+        },
+        other => panic!("unexpected {:?}", other),
+    }
+
+    // COLUMN is optional, matching ADD [COLUMN]
+    assert!(parse("ALTER TABLE t ADD DERIVED day AS upper(country)").is_ok());
+    // A plain ADD COLUMN is unaffected
+    assert!(parse("ALTER TABLE t ADD COLUMN c INT").is_ok());
+    // DERIVED stays usable as an identifier
+    assert!(parse("SELECT derived FROM t").is_ok());
+}
+
+/// Rolling a table back to a version it held is a different statement from
+/// reading a flat snapshot out of an archive, and the grammar keeps them
+/// apart: TO names a version this table had, FROM names a file it did not
+#[test]
+fn test_restore_table_to_version_and_to_timestamp_parse() {
+    let mut parsed = parse("RESTORE TABLE orders TO VERSION 7").expect("parses");
+    match parsed.remove(0) {
+        Statement::RestoreTableVersion(s) => {
+            assert_eq!(s.table, "orders");
+            assert_eq!(
+                s.target,
+                zyron_parser::ast::RestoreVersionTarget::Version(7)
+            );
+        }
+        other => panic!("expected a version restore, got {other:?}"),
+    }
+
+    let mut parsed =
+        parse("RESTORE TABLE orders TO TIMESTAMP '2026-08-19 12:00:00'").expect("parses");
+    match parsed.remove(0) {
+        Statement::RestoreTableVersion(s) => {
+            assert_eq!(
+                s.target,
+                zyron_parser::ast::RestoreVersionTarget::Timestamp("2026-08-19 12:00:00".into())
+            );
+        }
+        other => panic!("expected a timestamp restore, got {other:?}"),
+    }
+
+    // The forms that were already there still parse as themselves
+    assert!(matches!(
+        parse("RESTORE TABLE orders").expect("parses").remove(0),
+        Statement::UndropTable(_)
+    ));
+    assert!(matches!(
+        parse("RESTORE TABLE orders FROM 's3://bucket/snap'")
+            .expect("parses")
+            .remove(0),
+        Statement::RestoreTable(_)
+    ));
+}
+
+/// A restore target has to be one of the two things a table has, or the
+/// statement would defer its failure to whatever it guessed
+#[test]
+fn test_a_restore_target_that_is_neither_a_version_nor_a_timestamp_is_refused() {
+    assert!(parse("RESTORE TABLE orders TO 7").is_err());
+    assert!(parse("RESTORE TABLE orders TO VERSION yesterday").is_err());
+    assert!(parse("RESTORE TABLE orders TO TIMESTAMP 7").is_err());
 }

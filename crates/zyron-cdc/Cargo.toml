@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+zyron-auth = { path = "../zyron-auth" }
 zyron-common = { path = "../zyron-common" }
 zyron-wal = { path = "../zyron-wal" }
 zyron-storage = { path = "../zyron-storage" }
@@ -21,7 +22,6 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "json",
 ] }
-hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 rskafka = "0.5"

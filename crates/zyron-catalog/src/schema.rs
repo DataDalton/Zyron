@@ -609,6 +609,57 @@ pub struct ClusterConfig {
     /// Hybrid they are the anchors measurement may not reorder or drop, and
     /// under Auto they are empty until measurement fills them in
     pub keys: Vec<ClusterKeyEntry>,
+    /// Expressions this table is clustered by, mirrored from the lake
+    /// manifest so the planner can match a query's expression without
+    /// opening the log. Empty on a heap table and on any lake table
+    /// clustered only by stored columns
+    #[serde(default)]
+    pub derived: Vec<DerivedColumnEntry>,
+    /// Keys the table is currently laid out by, mirrored from the spec a
+    /// clustering pass accepted. Empty until a pass replaces the declared
+    /// set, which is why `effective_keys` falls back to `keys`.
+    ///
+    /// Separate from `keys` because under Auto the two diverge: the
+    /// declared set is what a statement asked for and the active set is
+    /// what measurement chose, and a plan is only as good as the set the
+    /// files are actually sorted by
+    #[serde(default)]
+    pub active_keys: Vec<ClusterKeyEntry>,
+    /// Columns the `bloom_filter_columns` property asked for, mirrored so
+    /// planning can say which of them the layout already covers without
+    /// opening the log. What the writer actually builds is this minus the
+    /// leading range-partitioned key
+    #[serde(default)]
+    pub bloom_columns: Vec<u32>,
+}
+
+/// An expression a lake table is clustered by, mirrored from its manifest.
+///
+/// The planner needs this at plan time to rewrite a query's expression into
+/// a reference to the column holding its values, and the planner reads the
+/// catalog rather than opening a transaction log, so the identity is
+/// mirrored here. The expression text is not: matching is by hash, and the
+/// text belongs to the manifest and the system view that reads it
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DerivedColumnEntry {
+    /// Column holding the expression's values
+    pub column_id: u32,
+    /// Identity of the canonical form, matched against a query's expression
+    pub canonical_hash: u64,
+    /// What the expression evaluates to, so a lowered predicate types its
+    /// constant the way the stored values are typed
+    pub type_id: u8,
+    /// Digits the result keeps after the point, 0xFF for none. An
+    /// expression over a TIMESTAMP(9) yields picosecond-physical values,
+    /// and a constant converted at the default precision instead would
+    /// compare against a different scale and prune files that match
+    pub fractional_digits: u8,
+    /// The expression's canonical text.
+    ///
+    /// Carried here as well as in the manifest because every insert has to
+    /// recompute the column's values, and reading the manifest on the write
+    /// path to find out how would put a file read in front of each write
+    pub sql: String,
 }
 
 /// One clustering key as the catalog stores it.
@@ -645,6 +696,54 @@ impl ClusterConfig {
         zyron_common::ClusteringSchedule::from_u8(self.schedule).unwrap_or_default()
     }
 
+    /// The keys the table is laid out by right now.
+    ///
+    /// What a clustering pass accepted, or the declared set when no pass
+    /// has replaced it. Planning reads this rather than `keys`, because a
+    /// declared key measurement has replaced prunes nothing
+    pub fn effective_keys(&self) -> &[ClusterKeyEntry] {
+        if self.active_keys.is_empty() {
+            &self.keys
+        } else {
+            &self.active_keys
+        }
+    }
+
+    /// Declared bloom columns the layout already covers, so the writer
+    /// builds no filter for them.
+    ///
+    /// Only the leading key qualifies, and only under RangePartition,
+    /// which is the one strategy that gives a file a contiguous range of
+    /// the key. `ManifestFile::bloom_redundant_key` carries the reasoning
+    pub fn redundant_bloom_columns(&self) -> Vec<u32> {
+        let Some(leading) = self.effective_keys().first() else {
+            return Vec::new();
+        };
+        if leading.strategy != zyron_common::ClusterStrategy::RangePartition.to_u8() {
+            return Vec::new();
+        }
+        self.bloom_columns
+            .iter()
+            .copied()
+            .filter(|c| *c == leading.column_id)
+            .collect()
+    }
+
+    /// Mirrors the keys a clustering pass accepted.
+    ///
+    /// Called by whoever ran the pass, because the pass itself runs inside
+    /// the lake crate and has no catalog to write to
+    pub fn set_active_keys(&mut self, keys: &[zyron_common::ClusterKey]) {
+        self.active_keys = keys
+            .iter()
+            .map(|k| ClusterKeyEntry {
+                column_id: k.column_id,
+                strategy: k.strategy.to_u8(),
+                param: k.param,
+            })
+            .collect();
+    }
+
     /// Replaces the declared keys and advances the spec id, so segments
     /// written before the change are distinguishable from ones after it
     pub fn set_keys(&mut self, keys: &[zyron_common::ClusterKey]) {
@@ -669,6 +768,31 @@ impl ClusterConfig {
             buf.push(key.strategy);
             write_u32(buf, key.param);
         }
+        // Tail appended, so a table written before expression clustering
+        // existed reads back with none
+        write_u16(buf, self.derived.len() as u16);
+        for derived in &self.derived {
+            write_u32(buf, derived.column_id);
+            write_u64(buf, derived.canonical_hash);
+            buf.push(derived.type_id);
+            buf.push(derived.fractional_digits);
+            write_string(buf, &derived.sql);
+        }
+        // Tail appended again, so a table written before a pass could
+        // replace the declared keys reads back with none active, which is
+        // what "the declared keys are the active ones" means
+        write_u16(buf, self.active_keys.len() as u16);
+        for key in &self.active_keys {
+            write_u32(buf, key.column_id);
+            buf.push(key.strategy);
+            write_u32(buf, key.param);
+        }
+        // Tail appended again, so a table written before bloom selection
+        // read the catalog declares none here
+        write_u16(buf, self.bloom_columns.len() as u16);
+        for column_id in &self.bloom_columns {
+            write_u32(buf, *column_id);
+        }
     }
 
     fn read_from(data: &[u8], off: &mut usize) -> Result<Self> {
@@ -692,6 +816,55 @@ impl ClusterConfig {
                 strategy,
                 param,
             });
+        }
+        // Tail append again: a table written before expression clustering
+        // ends here and has none
+        if *off >= data.len() {
+            return Ok(c);
+        }
+        let derived_count = read_u16(data, off)? as usize;
+        c.derived.reserve(derived_count);
+        for _ in 0..derived_count {
+            let column_id = read_u32(data, off)?;
+            let canonical_hash = read_u64(data, off)?;
+            let type_id = read_u8(data, off)?;
+            let fractional_digits = read_u8(data, off)?;
+            let sql = read_string(data, off)?;
+            c.derived.push(DerivedColumnEntry {
+                column_id,
+                canonical_hash,
+                type_id,
+                fractional_digits,
+                sql,
+            });
+        }
+        // Tail append again: a table written before a pass could replace
+        // the declared keys ends here, and none active means the declared
+        // keys are the active ones
+        if *off >= data.len() {
+            return Ok(c);
+        }
+        let active_count = read_u16(data, off)? as usize;
+        c.active_keys.reserve(active_count);
+        for _ in 0..active_count {
+            let column_id = read_u32(data, off)?;
+            let strategy = read_u8(data, off)?;
+            let param = read_u32(data, off)?;
+            c.active_keys.push(ClusterKeyEntry {
+                column_id,
+                strategy,
+                param,
+            });
+        }
+        // Tail append again: a table written before bloom selection read
+        // the catalog ends here and declares none
+        if *off >= data.len() {
+            return Ok(c);
+        }
+        let bloom_count = read_u16(data, off)? as usize;
+        c.bloom_columns.reserve(bloom_count);
+        for _ in 0..bloom_count {
+            c.bloom_columns.push(read_u32(data, off)?);
         }
         Ok(c)
     }
@@ -4418,5 +4591,112 @@ mod tests {
         assert_eq!(decoded.key, entry.key);
         assert_eq!(decoded.role_id, entry.role_id);
         assert_eq!(decoded.created_at, entry.created_at);
+    }
+
+    /// The derived registry is tail appended to the clustering policy, so a
+    /// round trip has to return every entry and an entry written before
+    /// expression clustering existed has to read back with none
+    #[test]
+    fn test_cluster_config_roundtrip_carries_every_derived_entry() {
+        for count in [0usize, 1, 2, 7, 64] {
+            let cluster = ClusterConfig {
+                mode: 1,
+                schedule: 2,
+                spec_id: 9,
+                keys: vec![
+                    ClusterKeyEntry {
+                        column_id: 3,
+                        strategy: 2,
+                        param: 0,
+                    },
+                    ClusterKeyEntry {
+                        column_id: 40,
+                        strategy: 0,
+                        param: 16,
+                    },
+                ],
+                derived: (0..count)
+                    .map(|i| DerivedColumnEntry {
+                        column_id: 100 + i as u32,
+                        canonical_hash: 0xFFFF_0000_0000_0001u64.wrapping_mul(i as u64 + 1),
+                        type_id: TypeId::Timestamp as u8,
+                        fractional_digits: if i % 2 == 0 { 9 } else { 0xFF },
+                        sql: format!("time_bucket('1 day', ts_{i})"),
+                    })
+                    .collect(),
+                // Varied alongside, because an active set is what a pass
+                // chose and it is not the declared one
+                active_keys: (0..count % 3)
+                    .map(|i| ClusterKeyEntry {
+                        column_id: 200 + i as u32,
+                        strategy: 1,
+                        param: i as u32,
+                    })
+                    .collect(),
+                bloom_columns: (0..count % 5).map(|i| 300 + i as u32).collect(),
+            };
+            let mut buf = Vec::new();
+            cluster.write_into(&mut buf);
+            let mut off = 0usize;
+            let decoded = ClusterConfig::read_from(&buf, &mut off).expect("decodes");
+            assert_eq!(off, buf.len(), "the reader consumed the whole record");
+            assert_eq!(decoded, cluster, "round trip changed the policy");
+        }
+    }
+
+    /// A policy encoded before the derived registry existed ends where the
+    /// keys end, and reads back with an empty registry rather than failing
+    #[test]
+    fn test_cluster_config_without_a_derived_section_reads_back_empty() {
+        let mut buf = Vec::new();
+        buf.push(1u8);
+        buf.push(2u8);
+        write_u32(&mut buf, 9);
+        write_u16(&mut buf, 1);
+        write_u32(&mut buf, 3);
+        buf.push(2u8);
+        write_u32(&mut buf, 0);
+
+        let mut off = 0usize;
+        let decoded = ClusterConfig::read_from(&buf, &mut off).expect("decodes");
+        assert_eq!(decoded.keys.len(), 1);
+        assert!(decoded.derived.is_empty());
+        assert!(decoded.active_keys.is_empty());
+        assert!(decoded.bloom_columns.is_empty());
+        // No pass has replaced anything, so the declared keys are what a
+        // plan should be judged against
+        assert_eq!(decoded.effective_keys(), decoded.keys.as_slice());
+    }
+
+    /// The active set is what a pass chose, and it is what planning has to
+    /// read. Falling back to the declared set only when nothing is active
+    /// is what keeps a table nobody has measured planning correctly
+    #[test]
+    fn test_effective_keys_prefers_what_a_pass_accepted() {
+        let mut cluster = ClusterConfig {
+            keys: vec![ClusterKeyEntry {
+                column_id: 3,
+                strategy: 0,
+                param: 0,
+            }],
+            ..ClusterConfig::default()
+        };
+        assert_eq!(cluster.effective_keys()[0].column_id, 3);
+
+        cluster.set_active_keys(&[zyron_common::ClusterKey {
+            column_id: 7,
+            strategy: zyron_common::ClusterStrategy::RangePartition,
+            param: 0,
+        }]);
+        assert_eq!(cluster.effective_keys().len(), 1);
+        assert_eq!(
+            cluster.effective_keys()[0].column_id,
+            7,
+            "a declared key measurement replaced prunes nothing, so planning must not read it"
+        );
+
+        // A pass that accepts nothing leaves the declared set in force
+        cluster.set_active_keys(&[]);
+        assert_eq!(cluster.effective_keys()[0].column_id, 3);
     }
 }

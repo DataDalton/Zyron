@@ -1,0 +1,59 @@
+{
+  "id": "2026-08-20_030247_daa5c98-local",
+  "date": "2026-08-20 03:02:52Z",
+  "ts": 1787194972,
+  "commit": "daa5c98-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "lake_derived": {
+      "Load, materialized column": {
+        "average": 1028218.100000,
+        "runs": [1028218.10],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Load, clustering expression": {
+        "average": 858083.400000,
+        "runs": [858083.40],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Load, timestamp only": {
+        "average": 764599.200000,
+        "runs": [764599.20],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "expression predicate files pruned (fraction)": {
+        "average": 0.930000,
+        "runs": [0.93],
+        "target": 0.500000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "Load ratio, clustering expression over timestamp only": {
+        "average": 1.122266,
+        "runs": [1.12],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false
+      },
+      "Load ratio, clustering expression over materialized column": {
+        "average": 0.834534,
+        "runs": [0.83],
+        "target": 1.200000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    }
+  }
+}

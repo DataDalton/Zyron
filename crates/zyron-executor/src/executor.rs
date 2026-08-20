@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use zyron_common::Result;
+use zyron_planner::binder::BoundExpr;
 use zyron_planner::logical::AsOfTarget;
 use zyron_planner::physical::PhysicalPlan;
 
@@ -82,6 +83,85 @@ fn collect_metrics(items: &[&Option<Arc<OperatorMetrics>>]) -> Vec<Arc<OperatorM
 /// and boxing only the arm actually taken costs a 1 to 2 KB future
 /// instead, which is what keeps a deep plan inside the default 2 MiB
 /// thread stack
+/// Records one join against both sides' clustering evidence.
+///
+/// A join is a reason to order a table by a column, and until this existed
+/// it was the one reason measurement could not see: a table joined on a
+/// column a thousand times a minute and filtered on it never looked any
+/// different from a table nobody touched. Both sides are credited, because
+/// a join only becomes co-located when both are ordered by the key.
+///
+/// Called where the join operator is built rather than where the plan is
+/// made, so a cached plan reused a thousand times is counted a thousand
+/// times. A plan is evidence of intent; an execution is evidence of load.
+///
+/// Nothing is recorded unless both sides resolve to exactly one lake table
+/// and the key is a plain column on both. A key that is an expression, or a
+/// side that reads more than one lake table, would have to be attributed by
+/// guessing, and evidence nobody can trust is worse than evidence nobody
+/// has: it would move a layout for a query that never ran that way
+fn observe_join_keys(
+    left: &PhysicalPlan,
+    right: &PhysicalPlan,
+    left_keys: &[BoundExpr],
+    right_keys: &[BoundExpr],
+) {
+    let (Some(left_table), Some(right_table)) = (sole_lake_table(left), sole_lake_table(right))
+    else {
+        return;
+    };
+    let pairs: Vec<(u32, u32)> = left_keys
+        .iter()
+        .zip(right_keys.iter())
+        .filter_map(|(l, r)| Some((join_key_column(l)?, join_key_column(r)?)))
+        .collect();
+    if pairs.is_empty() {
+        return;
+    }
+    zyron_lake::observe_join(left_table, right_table, &pairs, zyron_lake::current_epoch());
+}
+
+/// The column a join key names, when it names one plainly.
+///
+/// An expression key has no column whose ordering would serve it, so there
+/// is nothing to credit
+fn join_key_column(key: &BoundExpr) -> Option<u32> {
+    match key {
+        BoundExpr::ColumnRef(column) => Some(column.column_id.0 as u32),
+        BoundExpr::Nested(inner) => join_key_column(inner),
+        _ => None,
+    }
+}
+
+/// The lake table a plan subtree reads, when it reads exactly one.
+///
+/// None for a subtree with no lake scan and None for one with several: a
+/// join key credited to the wrong table would ask for a layout the workload
+/// never wanted, which is worse than crediting nothing
+fn sole_lake_table(plan: &PhysicalPlan) -> Option<u32> {
+    let mut found: Option<u32> = None;
+    let mut ambiguous = false;
+    collect_lake_tables(plan, &mut found, &mut ambiguous);
+    if ambiguous { None } else { found }
+}
+
+fn collect_lake_tables(plan: &PhysicalPlan, found: &mut Option<u32>, ambiguous: &mut bool) {
+    if *ambiguous {
+        return;
+    }
+    if let PhysicalPlan::LakeScan { table_id, .. } = plan {
+        match found {
+            Some(existing) if *existing != table_id.0 => *ambiguous = true,
+            Some(_) => {}
+            None => *found = Some(table_id.0),
+        }
+        return;
+    }
+    for child in plan.children() {
+        collect_lake_tables(child, found, ambiguous);
+    }
+}
+
 fn build_operator_tree(
     plan: PhysicalPlan,
     ctx: &Arc<ExecutionContext>,
@@ -331,16 +411,19 @@ fn build_operator_tree(
             right_keys,
             remaining_condition,
             ..
-        } => Box::pin(build_hash_join(
-            left,
-            right,
-            join_type,
-            left_keys,
-            right_keys,
-            remaining_condition,
-            analyze,
-            ctx,
-        )),
+        } => {
+            observe_join_keys(left.as_ref(), right.as_ref(), &left_keys, &right_keys);
+            Box::pin(build_hash_join(
+                left,
+                right,
+                join_type,
+                left_keys,
+                right_keys,
+                remaining_condition,
+                analyze,
+                ctx,
+            ))
+        }
 
         PhysicalPlan::MergeJoin {
             left,
@@ -349,9 +432,12 @@ fn build_operator_tree(
             left_keys,
             right_keys,
             ..
-        } => Box::pin(build_merge_join(
-            left, right, join_type, left_keys, right_keys, analyze, ctx,
-        )),
+        } => {
+            observe_join_keys(left.as_ref(), right.as_ref(), &left_keys, &right_keys);
+            Box::pin(build_merge_join(
+                left, right, join_type, left_keys, right_keys, analyze, ctx,
+            ))
+        }
 
         PhysicalPlan::HashAggregate {
             group_by,
@@ -477,16 +563,19 @@ fn build_operator_tree(
             right_keys,
             remaining_condition,
             ..
-        } => Box::pin(build_parallel_hash_join(
-            left,
-            right,
-            join_type,
-            left_keys,
-            right_keys,
-            remaining_condition,
-            analyze,
-            ctx,
-        )),
+        } => {
+            observe_join_keys(left.as_ref(), right.as_ref(), &left_keys, &right_keys);
+            Box::pin(build_parallel_hash_join(
+                left,
+                right,
+                join_type,
+                left_keys,
+                right_keys,
+                remaining_condition,
+                analyze,
+                ctx,
+            ))
+        }
 
         // Gather: passes through to child, wraps with metrics for EXPLAIN ANALYZE alignment
         PhysicalPlan::Gather { child, .. } => Box::pin(build_gather(child, analyze, ctx)),

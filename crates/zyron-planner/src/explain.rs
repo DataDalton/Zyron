@@ -179,6 +179,36 @@ pub fn aux_labels(operator_name: &str) -> [&'static str; ACTUAL_AUX_SLOTS] {
     }
 }
 
+/// Files a lake scan opened, and hundredths of a percent of the files
+/// clustering let it skip.
+///
+/// Both come from counters the operator already fills, so reporting them
+/// costs no slot on the hot path and no extra work in the scan. The rate is
+/// an integer scaled by ten thousand rather than a float, because the
+/// renderers avoid float formatting: the pair prints as `{}.{:02}`.
+///
+/// None when the operator keeps no file counters, or when it considered no
+/// file, where a skip rate would be a division by zero rather than a
+/// perfect score
+#[inline]
+pub fn clustering_skip_parts(
+    operator_name: &str,
+    aux: &[u64; ACTUAL_AUX_SLOTS],
+) -> Option<(u64, u64, u64)> {
+    if !matches!(operator_name, "LakeScan" | "LakeDelete" | "LakeUpdate") {
+        return None;
+    }
+    let considered = aux[0];
+    if considered == 0 {
+        return None;
+    }
+    // A pruned count above what was considered would be a counter bug, and
+    // clamping keeps the rate inside its range rather than printing it
+    let pruned = aux[1].min(considered);
+    let hundredths = (pruned as u128 * 10_000u128 / considered as u128) as u64;
+    Some((considered - pruned, hundredths / 100, hundredths % 100))
+}
+
 // ---------------------------------------------------------------------------
 // Explain node
 // ---------------------------------------------------------------------------
@@ -269,6 +299,8 @@ impl ExplainNode {
                 columns,
                 predicate,
                 lowered,
+                cluster_fit,
+                bloom_redundant,
                 as_of,
                 cost,
             } => {
@@ -288,6 +320,25 @@ impl ExplainNode {
                         } else {
                             "none".to_string()
                         },
+                    ));
+                    // How much the table's layout does for this predicate.
+                    // A scan that prunes exactly and still reads every file
+                    // is usually a predicate that reached no cluster key,
+                    // and the counters alone do not say which
+                    if let Some(fit) = cluster_fit {
+                        details.push(("cluster_fit".to_string(), fit.render()));
+                    }
+                }
+                // A filter the operator asked for and the writer did not
+                // build. Saying nothing would leave them reading a plan
+                // that quietly ignores what they declared
+                if !bloom_redundant.is_empty() {
+                    details.push((
+                        "bloom_redundant".to_string(),
+                        format!(
+                            "{} (already resolved by the cluster key, no filter built)",
+                            bloom_redundant.join(", ")
+                        ),
                     ));
                 }
                 match as_of {
@@ -1019,6 +1070,15 @@ impl ExplainNode {
                         }
                         let _ = write!(line, "{}={}", label, value);
                     }
+                    if let Some((read, pct, frac)) =
+                        clustering_skip_parts(&self.operator_name, &actual.aux)
+                    {
+                        let _ = write!(
+                            line,
+                            " files_actually_read={} clustering_skip_rate={}.{:02}",
+                            read, pct, frac
+                        );
+                    }
                     if !line.is_empty() {
                         let _ = writeln!(output, "{}  {}", indent, line);
                     }
@@ -1139,6 +1199,12 @@ impl ExplainNode {
                     if !label.is_empty() {
                         let _ = writeln!(output, "{}{}: {}", pad, label, value);
                     }
+                }
+                if let Some((read, pct, frac)) =
+                    clustering_skip_parts(&self.operator_name, &actual.aux)
+                {
+                    let _ = writeln!(output, "{}files_actually_read: {}", pad, read);
+                    let _ = writeln!(output, "{}clustering_skip_rate: {}.{:02}", pad, pct, frac);
                 }
             }
         }

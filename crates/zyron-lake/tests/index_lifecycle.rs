@@ -341,6 +341,7 @@ fn test_optimize_keeps_the_index_complete_across_the_rewrite() {
             ..attempt(700)
         },
         TABLE_ID as u64,
+        zyron_lake::DEFAULT_ROWS_PER_FILE,
     )
     .expect("optimize");
     assert!(outcome.version.is_some(), "the rewrite happened");

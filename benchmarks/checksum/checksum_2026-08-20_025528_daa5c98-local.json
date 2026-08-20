@@ -1,0 +1,52 @@
+{
+  "id": "2026-08-20_025528_daa5c98-local",
+  "date": "2026-08-20 02:55:30Z",
+  "ts": 1787194530,
+  "commit": "daa5c98-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "Performance": {
+      "hash32 <=32B latency (ns)": {
+        "average": 7.705872,
+        "runs": [7.72, 7.70, 7.70, 7.69, 7.71],
+        "target": 120.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "hash32 1MB throughput (MB/s)": {
+        "average": 98025.379909,
+        "runs": [97312.71, 97675.33, 98107.51, 98437.31, 98594.05],
+        "target": 6000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "hash32 16MB throughput (MB/s)": {
+        "average": 50133.132712,
+        "runs": [46750.82, 48672.16, 50567.30, 53178.76, 51496.62],
+        "target": 6000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "hash32 1KB throughput (MB/s)": {
+        "average": 53016.008301,
+        "runs": [53058.48, 52994.84, 52881.06, 53055.31, 53090.35],
+        "target": 3000.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "streaming 1MB throughput (MB/s)": {
+        "average": 52031.129675,
+        "runs": [51920.68, 51694.55, 52515.77, 52732.74, 51291.92],
+        "target": 5000.000000,
+        "passed": true,
+        "higher_is_better": true
+      }
+    }
+  }
+}

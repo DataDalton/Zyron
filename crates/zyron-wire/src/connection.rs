@@ -344,6 +344,105 @@ impl Drop for VacuumGuard {
     }
 }
 
+/// One lake commit attempt for maintenance the operator asked for.
+fn lake_maintenance_attempt() -> zyron_lake::CommitAttempt<'static> {
+    zyron_lake::CommitAttempt {
+        operation: zyron_lake::OperationKind::Optimize,
+        db_txn_id: 0,
+        commit_lsn: 0,
+        timestamp_us: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0),
+        read_predicate: None,
+        read_version: 0,
+        audit: None,
+    }
+}
+
+/// Runs the maintenance one OPTIMIZE asked for over a lake table and
+/// describes what it did.
+///
+/// Delete runs first. Applying the predicates retires rows a clustering
+/// pass would otherwise read and rewrite, so ordering it first means the
+/// pass reads less. The clustering pass goes through the same entry point
+/// the background worker uses, so an operator-driven pass and a scheduled
+/// one choose from the same evidence. It does not consult the table's
+/// clustering schedule: the schedule governs whether the worker may start a
+/// pass unasked, and this is the operator asking
+pub async fn lake_optimize(
+    catalog: &zyron_catalog::Catalog,
+    log: &zyron_lake::TransactionLog,
+    table_id: u32,
+    cluster: bool,
+    delete: bool,
+) -> Result<String, zyron_common::ZyronError> {
+    // What a plan is costed against, before anything runs. A rewrite that
+    // moves it invalidates every plan that priced the old layout, and the
+    // epoch is what says whether it moved: a compaction that found nothing
+    // to do must not evict anything
+    let epoch_before = log.latest_manifest().map(|m| m.clustering_epoch()).ok();
+    let mut parts: Vec<String> = Vec::new();
+    if delete {
+        // The table's own target when it names one, otherwise the shipped
+        // default. A compaction merging toward a shape nobody chose would
+        // be the wrong shape for a table that chose one
+        let o = zyron_lake::optimize(
+            log,
+            lake_maintenance_attempt(),
+            table_id as u64,
+            zyron_lake::DEFAULT_ROWS_PER_FILE,
+        )?;
+        parts.push(format!(
+            "rewrote {} files into {} ({} rows, {} predicates retired)",
+            o.files_removed, o.files_written, o.rows_written, o.predicates_retired
+        ));
+    }
+    if cluster {
+        // The pass id names the staging directory and the checkpoint, and a
+        // pass already holding that name is refused. The background worker
+        // counts its passes up from one per process, so a wall clock
+        // microsecond cannot collide with one
+        let pass_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        let report = zyron_lake::run_table_cluster_pass(
+            log,
+            lake_maintenance_attempt(),
+            table_id,
+            &zyron_lake::TablePassOptions::new(pass_id),
+        )?;
+        // Planning is judged against what the catalog records, so a pass
+        // that changed the layout has to record it there before the next
+        // statement plans against the old one
+        catalog
+            .set_active_cluster_keys(zyron_catalog::TableId(table_id), &report.active_keys)
+            .await?;
+        parts.push(match report.outcome {
+            None => "found no clustering key worth ordering by".to_string(),
+            Some(o) if o.inputs == 0 => {
+                "found every file already under the target layout".to_string()
+            }
+            Some(o) => match o.version {
+                Some(version) => format!(
+                    "clustered {} files into {} ({} rows) at version {}",
+                    o.inputs, o.outputs, o.rows_written, version
+                ),
+                None => format!(
+                    "refused a clustering pass over {} files, {:?}",
+                    o.inputs, o.decision
+                ),
+            },
+        });
+    }
+    let epoch_after = log.latest_manifest().map(|m| m.clustering_epoch()).ok();
+    if epoch_before != epoch_after {
+        catalog.bump_schema_version();
+    }
+    Ok(format!("OPTIMIZE {}", parts.join(", ")))
+}
+
 /// Cached prepared statement.
 struct PreparedStatement {
     query: String,
@@ -3660,7 +3759,9 @@ impl<T: WireTransport> Connection<T> {
                         .await,
                 )
             }
-            zyron_parser::Statement::OptimizeTable(o) => Some(self.handle_optimize(&o.table).await),
+            zyron_parser::Statement::OptimizeTable(o) => {
+                Some(self.handle_optimize(&o.table, o.cluster, o.delete).await)
+            }
             _ => None,
         }
     }
@@ -4052,7 +4153,18 @@ impl<T: WireTransport> Connection<T> {
     /// OPTIMIZE TABLE runs vacuum-style page compaction over a single table.
     /// Acquires the same vacuum_running lock to avoid concurrent writes with
     /// the background vacuum worker. Emits a Notice every 10000 rows.
-    async fn handle_optimize(&mut self, table_name: &str) -> Result<(), ProtocolError> {
+    ///
+    /// `cluster` runs a clustering pass, which is the operator asking for one
+    /// directly and so does not consult the table's clustering schedule.
+    /// `delete` applies delete predicates and compacts, which is what a
+    /// statement naming no action does. Both are lake-only, a heap table has
+    /// no layout to cluster
+    async fn handle_optimize(
+        &mut self,
+        table_name: &str,
+        cluster: bool,
+        delete: bool,
+    ) -> Result<(), ProtocolError> {
         use std::sync::atomic::Ordering;
         use zyron_common::page::PAGE_SIZE;
         use zyron_storage::{HeapFile, HeapFileConfig, HeapPage, MvccGc, TupleSlot};
@@ -4119,20 +4231,7 @@ impl<T: WireTransport> Connection<T> {
             let paths = zyron_lake::LakePaths::new(self.server.disk_manager.data_dir(), table.id.0);
             let outcome = match zyron_lake::TransactionLog::lookup_shared(&paths) {
                 Some(log) => {
-                    let timestamp_us = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_micros() as i64)
-                        .unwrap_or(0);
-                    let attempt = zyron_lake::CommitAttempt {
-                        operation: zyron_lake::OperationKind::Optimize,
-                        db_txn_id: 0,
-                        commit_lsn: 0,
-                        timestamp_us,
-                        read_predicate: None,
-                        read_version: 0,
-                        audit: None,
-                    };
-                    zyron_lake::optimize(&log, attempt, table.id.0 as u64)
+                    lake_optimize(&self.server.catalog, &log, table.id.0, cluster, delete).await
                 }
                 None => Err(zyron_common::ZyronError::ConfigError(format!(
                     "this node does not run the lake tier, so it cannot optimize \"{}\"",
@@ -4140,14 +4239,11 @@ impl<T: WireTransport> Connection<T> {
                 ))),
             };
             return match outcome {
-                Ok(o) => {
+                Ok(message) => {
                     let fields = crate::messages::backend::ErrorFields {
                         severity: "NOTICE".into(),
                         code: "00000".into(),
-                        message: format!(
-                            "OPTIMIZE rewrote {} files into {} ({} rows, {} predicates retired)",
-                            o.files_removed, o.files_written, o.rows_written, o.predicates_retired
-                        ),
+                        message,
                         detail: None,
                         hint: None,
                         position: None,

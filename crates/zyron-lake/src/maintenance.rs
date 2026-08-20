@@ -65,8 +65,8 @@ use crate::curve::{normalize_component, ordering_key};
 use crate::feedback::{Decision, GateConfig, PredicateClass, evaluate};
 use crate::index;
 use crate::manifest::{
-    ClusterSpec, ClusterStrategy, ManifestFile, PartitionEntry, decode_partition_entry,
-    encode_partition_entry,
+    ClusterKey, ClusterMode, ClusterSpec, ClusterStrategy, ManifestFile, PartitionEntry,
+    decode_partition_entry, encode_partition_entry,
 };
 use crate::operations::{allocate_partition_id, allocate_unused_partition_id};
 use crate::paths::data_file_name;
@@ -543,6 +543,29 @@ struct PassContext<'a> {
 /// Smallest first, so a pass bounded by `max_inputs` takes the files
 /// whose rewrite costs least and coalesces the most.
 fn select_inputs(base: &ManifestFile, target: &ClusterSpec, max_inputs: usize) -> Vec<u64> {
+    let mut candidates = repair_candidates(base, target);
+    candidates.sort_unstable();
+    candidates.truncate(max_inputs);
+    let mut inputs: Vec<u64> = candidates.into_iter().map(|(_, id)| id).collect();
+    // Commit order and replan determinism both want partition order
+    inputs.sort_unstable();
+    inputs
+}
+
+/// Every file a repair pass would rewrite if nothing bounded it, as
+/// (size, partition id) pairs.
+///
+/// Two kinds of file are in here. One written under an older spec is drift
+/// by definition: it is ordered by a layout the table has moved on from.
+/// One written under the current spec whose leading key range overlaps
+/// another's is drift too, because overlapping ranges are exactly what
+/// stops a predicate reaching one file.
+///
+/// The urgency check and the pass share this, so the threshold an operator
+/// sets means the same thing as the work the pass will do. Two definitions
+/// of "needs repair" would let a table trip a fast lane that then found
+/// nothing to rewrite
+fn repair_candidates(base: &ManifestFile, target: &ClusterSpec) -> Vec<(u64, u64)> {
     let mut candidates: Vec<(u64, u64)> = Vec::new();
     let mut aligned: Vec<&PartitionEntry> = Vec::new();
     for entry in &base.entries {
@@ -560,12 +583,20 @@ fn select_inputs(base: &ManifestFile, target: &ClusterSpec, max_inputs: usize) -
             }
         }
     }
-    candidates.sort_unstable();
-    candidates.truncate(max_inputs);
-    let mut inputs: Vec<u64> = candidates.into_iter().map(|(_, id)| id).collect();
-    // Commit order and replan determinism both want partition order
-    inputs.sort_unstable();
-    inputs
+    candidates
+}
+
+/// How many files a repair pass has outstanding on this table.
+///
+/// Read from the manifest with no IO, so a maintenance tick can ask it for
+/// every table before deciding which ones are worth a pass. Zero when the
+/// table declares no layout, because a table with no keys has nothing to
+/// have drifted from
+pub fn drifted_file_count(manifest: &ManifestFile) -> usize {
+    if manifest.cluster_spec.keys.is_empty() {
+        return 0;
+    }
+    repair_candidates(manifest, &manifest.cluster_spec).len()
 }
 
 /// Partition ids whose leading key range overlaps another entry's, by an
@@ -679,6 +710,164 @@ pub fn run_cluster_pass(
         resumed: false,
     };
     drive_pass(&ctx, attempt, classes, checkpoint, Vec::new())
+}
+
+/// Most keys a proposal may carry. Past four the tail keys refine rows a
+/// file already holds together and stop buying pruning
+pub const DEFAULT_MAX_PROPOSED_KEYS: usize = 4;
+
+/// What a table-level pass is allowed to spend and how far it may reach
+#[derive(Debug, Clone)]
+pub struct TablePassOptions {
+    /// Names the staging directory and the checkpoint, unique per pass
+    pub pass_id: u64,
+    pub target_rows_per_file: u64,
+    pub max_inputs: usize,
+    pub gate: GateConfig,
+    pub max_proposed_keys: usize,
+}
+
+impl TablePassOptions {
+    pub fn new(pass_id: u64) -> Self {
+        Self {
+            pass_id,
+            target_rows_per_file: DEFAULT_ROWS_PER_FILE,
+            max_inputs: DEFAULT_MAX_INPUTS,
+            gate: GateConfig::default(),
+            max_proposed_keys: DEFAULT_MAX_PROPOSED_KEYS,
+        }
+    }
+}
+
+/// What one table-level pass decided, and the evidence behind it.
+///
+/// The measurements come back with the outcome because the caller reports
+/// them and recomputing them would read the observer a second time at a
+/// different epoch, which would make the metric disagree with the decision
+/// it is supposed to describe
+#[derive(Debug, Clone)]
+pub struct TablePassReport {
+    /// None when nothing was declared and nothing measured is worth
+    /// ordering by, so no pass was started and no files were read
+    pub outcome: Option<ClusterPassOutcome>,
+    pub mode: ClusterMode,
+    /// Columns the workload window carried, what the proposal was made from
+    pub evidence_columns: usize,
+    /// Mean measured skip rate over those columns, None until some scan has
+    /// reported one
+    pub measured_skip_rate: Option<f64>,
+    /// True when measurement wants a layout the table is not running yet:
+    /// a spec was proposed and it did not reach the files, either because
+    /// no pass ran or because the gate refused the one that did. One
+    /// proposal is outstanding per table at a time, so this is the count
+    pub proposal_pending: bool,
+    /// Keys the table is laid out by once this pass is done: the target if
+    /// the pass committed it, the spec already in force otherwise.
+    ///
+    /// The caller mirrors these into the catalog, because planning reads
+    /// the catalog and a plan judged against a declared key a pass replaced
+    /// would claim a layout the files do not have
+    pub active_keys: Vec<ClusterKey>,
+}
+
+/// Chooses a target layout for one table and runs a pass against it.
+///
+/// This is the whole decision in one place: what the mode allows, what the
+/// workload window holds, which predicate classes the gate replays, and the
+/// pass itself. The background worker and `OPTIMIZE ... CLUSTER` both enter
+/// here, so an operator-driven pass and a scheduled one make the same
+/// choices from the same evidence rather than drifting apart.
+///
+/// Whether a pass may start at all is the caller's decision. The clustering
+/// schedule governs the background worker, and it does not govern OPTIMIZE,
+/// which is the operator asking for a pass directly
+pub fn run_table_cluster_pass(
+    log: &TransactionLog,
+    attempt: CommitAttempt<'_>,
+    table_id: u32,
+    options: &TablePassOptions,
+) -> Result<TablePassReport, ZyronError> {
+    let manifest = log.latest_manifest()?;
+    let mode = manifest.clustering_mode();
+    let now = crate::workload::current_epoch();
+    let observer = crate::workload::observer();
+    let evidence = crate::planner::evidence_from_manifest(&manifest, observer, table_id, now);
+    let anchors = manifest.clustering_anchors();
+
+    let measured: Vec<f64> = evidence
+        .iter()
+        .filter_map(|c| crate::planner::measured_skip_rate(observer, table_id, c.column_id, now))
+        .collect();
+    let mut report = TablePassReport {
+        outcome: None,
+        mode,
+        evidence_columns: evidence.len(),
+        measured_skip_rate: if measured.is_empty() {
+            None
+        } else {
+            Some(measured.iter().sum::<f64>() / measured.len() as f64)
+        },
+        proposal_pending: false,
+        active_keys: manifest.cluster_spec.keys.clone(),
+    };
+
+    // Under Force the target is what the operator declared. Under Auto and
+    // Hybrid measurement proposes, and a proposal identical to the current
+    // keys is not a new spec, it is the same layout still being applied to
+    // files that have not reached it yet
+    let target = if mode == ClusterMode::Force {
+        manifest.cluster_spec.clone()
+    } else {
+        let proposal = crate::planner::propose(&evidence, &anchors, options.max_proposed_keys);
+        if proposal == manifest.cluster_spec.keys {
+            manifest.cluster_spec.clone()
+        } else {
+            ClusterSpec {
+                spec_id: manifest.cluster_spec.spec_id.saturating_add(1),
+                keys: proposal,
+            }
+        }
+    };
+    // A target carrying a spec id the manifest does not is measurement
+    // asking for a layout the table is not running yet. It stops being
+    // outstanding only when a pass commits it
+    let proposed_new_spec = target.spec_id != manifest.cluster_spec.spec_id;
+    report.proposal_pending = proposed_new_spec;
+    if target.keys.is_empty() {
+        // Nothing declared and nothing measured worth ordering by
+        return Ok(report);
+    }
+
+    let classes = crate::planner::predicate_classes(&manifest, &evidence, observer, table_id, now);
+    let pass_options = ClusterPassOptions {
+        pass_id: options.pass_id,
+        target_rows_per_file: options.target_rows_per_file,
+        // The table's own bound when it names one. A table taking constant
+        // small writes wants a pass that keeps up; one that is mostly read
+        // wants a pass that never competes with queries for long, and the
+        // node default cannot be right for both
+        max_inputs: manifest.cluster_repair_max_inputs(options.max_inputs),
+        anchors,
+        gate: options.gate,
+        gated: mode != ClusterMode::Force,
+    };
+    let outcome = run_cluster_pass(
+        log,
+        attempt,
+        table_id as u64,
+        &target,
+        &classes,
+        &pass_options,
+    )?;
+    // A committed pass is the proposal landing, so nothing is outstanding
+    report.proposal_pending = proposed_new_spec && outcome.version.is_none();
+    // The target became the layout only if the pass committed it. A refused
+    // pass leaves the files ordered the way they already were
+    if outcome.version.is_some() {
+        report.active_keys = target.keys.clone();
+    }
+    report.outcome = Some(outcome);
+    Ok(report)
 }
 
 /// Carries a pass from wherever it is to a committed version or a clean
@@ -1413,6 +1602,51 @@ mod tests {
     use crate::schema::{LakeColumn, LakeSchema};
     use std::collections::BTreeMap;
     use zyron_common::TypeId;
+
+    /// A manifest with two files whose leading key ranges do not overlap,
+    /// both written under spec three
+    fn repair_manifest() -> ManifestFile {
+        let bounds = |min: i64, max: i64| crate::predicate::ColumnBounds {
+            min: Some(crate::predicate::LakeValue::Int(min)),
+            max: Some(crate::predicate::LakeValue::Int(max)),
+            null_count: 0,
+            row_count: 100,
+        };
+        let entry = |partition_id: u64, min: i64, max: i64| PartitionEntry {
+            partition_id,
+            size_bytes: 4096,
+            row_count: 100,
+            added_version: 1,
+            cluster_spec_id: 3,
+            column_stats: std::sync::Arc::new(vec![crate::manifest::ColumnStatsEntry {
+                ndv: Some(100),
+                column_id: 0,
+                bounds: bounds(min, max),
+                bloom: None,
+                size_bytes: Some(4096),
+            }]),
+            delete_predicate_ids: Vec::new(),
+        };
+        ManifestFile {
+            snapshot_id: 9,
+            parent_snapshot_id: 8,
+            timestamp_us: 0,
+            schema: schema(),
+            cluster_spec: ClusterSpec {
+                spec_id: 3,
+                keys: vec![ClusterKey {
+                    column_id: 0,
+                    strategy: ClusterStrategy::RangePartition,
+                    param: 0,
+                }],
+            },
+            entries: vec![entry(1, 0, 99), entry(2, 100, 199)],
+            delete_predicates: Vec::new(),
+            properties: BTreeMap::new(),
+            indexes: Vec::new(),
+            index_files: Vec::new(),
+        }
+    }
 
     fn schema() -> LakeSchema {
         LakeSchema::new(
@@ -2297,5 +2531,97 @@ mod tests {
             "merge must interleave the two runs by key"
         );
         assert_eq!(merged, sorted);
+    }
+
+    /// The urgency signal and the pass have to agree on what needs repair,
+    /// or a table trips the fast lane and the pass it triggers finds
+    /// nothing to rewrite
+    #[test]
+    fn test_the_drift_count_is_what_a_pass_would_rewrite() {
+        let mut manifest = repair_manifest();
+        // Two files at an older spec, which is drift by definition
+        for entry in &mut manifest.entries {
+            entry.cluster_spec_id = 1;
+        }
+        assert_eq!(drifted_file_count(&manifest), 2);
+        assert_eq!(
+            select_inputs(&manifest, &manifest.cluster_spec, 16).len(),
+            2,
+            "the pass has to rewrite exactly what the signal counted"
+        );
+
+        // Brought up to the current spec with disjoint ranges, so nothing
+        // is drifted any more
+        for entry in &mut manifest.entries {
+            entry.cluster_spec_id = 3;
+        }
+        assert_eq!(
+            drifted_file_count(&manifest),
+            0,
+            "files at the current spec whose ranges do not overlap are the layout working"
+        );
+
+        // A table with no layout has nothing to have drifted from
+        manifest.cluster_spec = ClusterSpec::none();
+        assert_eq!(drifted_file_count(&manifest), 0);
+    }
+
+    /// A bound on how much one pass rewrites is a bound on how long it runs
+    /// and how much it writes, and the right value differs per table
+    #[test]
+    fn test_repair_tuning_comes_from_the_table_then_the_node() {
+        let mut manifest = repair_manifest();
+        assert_eq!(manifest.cluster_repair_max_inputs(16), 16);
+        assert_eq!(manifest.cluster_repair_interval_secs(300), 300);
+        assert_eq!(
+            manifest.cluster_repair_urgency_threshold(),
+            crate::manifest::DEFAULT_CLUSTER_REPAIR_URGENCY_THRESHOLD
+        );
+
+        manifest.properties.insert(
+            crate::manifest::CLUSTER_REPAIR_MAX_INPUTS_PROPERTY.into(),
+            "4".into(),
+        );
+        manifest.properties.insert(
+            crate::manifest::CLUSTER_REPAIR_INTERVAL_SECS_PROPERTY.into(),
+            "900".into(),
+        );
+        manifest.properties.insert(
+            crate::manifest::CLUSTER_REPAIR_URGENCY_THRESHOLD_PROPERTY.into(),
+            "2".into(),
+        );
+        assert_eq!(manifest.cluster_repair_max_inputs(16), 4);
+        assert_eq!(manifest.cluster_repair_interval_secs(300), 900);
+        assert_eq!(manifest.cluster_repair_urgency_threshold(), 2);
+
+        // A pass that rewrote nothing is not a bound, it is a stall
+        manifest.properties.insert(
+            crate::manifest::CLUSTER_REPAIR_MAX_INPUTS_PROPERTY.into(),
+            "0".into(),
+        );
+        assert_eq!(
+            manifest.cluster_repair_max_inputs(16),
+            1,
+            "a bound of zero would leave a drifted table drifted forever"
+        );
+
+        // A threshold of zero asks for a pass as soon as any file needs one
+        manifest.properties.insert(
+            crate::manifest::CLUSTER_REPAIR_URGENCY_THRESHOLD_PROPERTY.into(),
+            "0".into(),
+        );
+        assert_eq!(manifest.cluster_repair_urgency_threshold(), 0);
+    }
+
+    /// A value nobody can read falls back rather than stopping maintenance,
+    /// the same as every other maintenance threshold
+    #[test]
+    fn test_an_unreadable_repair_setting_falls_back() {
+        let mut manifest = repair_manifest();
+        manifest.properties.insert(
+            crate::manifest::CLUSTER_REPAIR_INTERVAL_SECS_PROPERTY.into(),
+            "soon".into(),
+        );
+        assert_eq!(manifest.cluster_repair_interval_secs(300), 300);
     }
 }

@@ -38,6 +38,35 @@ pub struct MetaAggSpec {
     pub name: String,
 }
 
+/// A lake scan's layout verdict, with the column it is about already
+/// named.
+///
+/// Named at plan time rather than at render time because the column may be
+/// the one an expression cluster key is stored in, which lives in the lake
+/// schema and not in the scan's projection, so a renderer reading the
+/// projection alone could not name it
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClusterFitDetail {
+    pub estimate: zyron_lake::ClusterFitEstimate,
+    /// Column name, or the expression when the key is a stored expression
+    pub column: String,
+}
+
+impl ClusterFitDetail {
+    /// The verdict as EXPLAIN prints it
+    pub fn render(&self) -> String {
+        match self.estimate.fit {
+            zyron_lake::ClusterFit::Good => format!("good ({})", self.column),
+            zyron_lake::ClusterFit::Fair => format!(
+                "fair ({} is cluster key {})",
+                self.column,
+                self.estimate.position.unwrap_or(0) + 1
+            ),
+            zyron_lake::ClusterFit::Poor => format!("poor (fell back to {})", self.column),
+        }
+    }
+}
+
 /// Physical execution plan. Each variant maps to a concrete operator
 /// and carries cost estimates.
 #[derive(Debug, Clone)]
@@ -79,6 +108,22 @@ pub enum PhysicalPlan {
         /// exact equivalent. The operator prunes files with it, and its
         /// absence is why a scan reads every file, so EXPLAIN reports it.
         lowered: Option<zyron_lake::LakePredicate>,
+        /// What the table's layout does for `lowered`, judged against the
+        /// keys a clustering pass accepted rather than the declared ones.
+        /// None when the table is not laid out or the predicate did not
+        /// lower, because there is then nothing to judge.
+        ///
+        /// Decided here rather than measured, so EXPLAIN can say a plan
+        /// missed the layout without running it
+        cluster_fit: Option<ClusterFitDetail>,
+        /// Columns `bloom_filter_columns` asked for that the layout already
+        /// covers, so no filter was built. Empty when nothing was asked for
+        /// or nothing was skipped.
+        ///
+        /// Carried on the plan because the request was made once, in a DDL
+        /// statement, and a reader looking at a scan that is not using the
+        /// filter they declared has no other place to find out why
+        bloom_redundant: Vec<String>,
         /// Time-travel target resolved by the operator against the log,
         /// version directly and timestamp through commit timestamps.
         as_of: Option<super::logical::AsOfTarget>,
@@ -497,6 +542,45 @@ pub enum GraphAlgorithmType {
 pub enum ScanDirection {
     Forward,
     Backward,
+}
+
+impl PhysicalPlan {
+    /// Every child plan this node reads from, in execution order.
+    ///
+    /// Total over the enum on purpose. A partial walk that fell through to
+    /// an empty list for a shape nobody thought of would stop at that node
+    /// and report whatever it had found so far, which reads as an answer
+    /// rather than as a gap
+    pub fn children(&self) -> Vec<&PhysicalPlan> {
+        match self {
+            PhysicalPlan::LakeUpdate { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::Filter { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::Project { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::NestedLoopJoin { left, right, .. } => vec![left.as_ref(), right.as_ref()],
+            PhysicalPlan::LateralJoin { left, .. } => vec![left.as_ref()],
+            PhysicalPlan::HashJoin { left, right, .. } => vec![left.as_ref(), right.as_ref()],
+            PhysicalPlan::MergeJoin { left, right, .. } => vec![left.as_ref(), right.as_ref()],
+            PhysicalPlan::HashAggregate { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::SortAggregate { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::GapFill { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::Sort { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::Limit { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::HashDistinct { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::LockRows { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::SetOp { left, right, .. } => vec![left.as_ref(), right.as_ref()],
+            PhysicalPlan::Insert { source, .. } => vec![source.as_ref()],
+            PhysicalPlan::Update { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::Delete { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::ParallelHashJoin { left, right, .. } => {
+                vec![left.as_ref(), right.as_ref()]
+            }
+            PhysicalPlan::Gather { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::Repartition { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::Broadcast { child, .. } => vec![child.as_ref()],
+            PhysicalPlan::Window { child, .. } => vec![child.as_ref()],
+            _ => Vec::new(),
+        }
+    }
 }
 
 impl PhysicalPlan {

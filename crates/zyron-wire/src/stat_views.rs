@@ -53,6 +53,8 @@ const STAT_VIEW_NAMES: &[&str] = &[
     "zyron_lake_branches",
     // Adaptive Clustering status, plan items 330-332
     "zyron_clustering_status",
+    "zyron_derived_columns",
+    "zyron_auto_compaction_history",
     // Node mesh
     "zyron_nodes",
     "zyron_table_freshness",
@@ -289,6 +291,8 @@ pub fn query_stat_view(
         "zyron_version_lineage" => Some(build_version_lineage(server, filters)?),
         "zyron_lake_branches" => Some(build_lake_branches(server, filters)?),
         "zyron_clustering_status" => Some(build_clustering_status(server, filters)?),
+        "zyron_derived_columns" => Some(build_derived_columns(server, filters)?),
+        "zyron_auto_compaction_history" => Some(build_auto_compaction_history(server, filters)?),
         "zyron_nodes" => Some(build_nodes(server, filters)?),
         "zyron_table_freshness" => Some(build_table_freshness(server, filters)?),
         "zyron_lake_log" => Some(build_lake_log(server, filters)?),
@@ -1331,6 +1335,135 @@ fn build_lake_branches(
 /// operator who pinned a layout with FORCE is exactly the person who
 /// should be able to see that measurement disagrees, and seeing it costs
 /// them nothing: this view reads, it never proposes a commit.
+/// Every expression a lake table is clustered by, and the column its
+/// values live in.
+///
+/// An expression cluster key is stored in a column no statement named, so
+/// it is not in the table's column list and nothing else reports it. This
+/// is where an operator finds out that a column exists, what it computes,
+/// and which columns it reads, which is what makes a later DROP COLUMN
+/// refusal explicable
+fn build_derived_columns(
+    server: &ServerState,
+    filters: &StatViewFilters,
+) -> Result<(Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>), ZyronError> {
+    let fields = vec![
+        make_field("table_name", PG_TEXT_OID, -1),
+        make_field("column_id", PG_INT8_OID, 8),
+        make_field("column_name", PG_TEXT_OID, -1),
+        // Rendered as text: the identity is 64 unsigned bits and the wire
+        // has no unsigned integer type wide enough to carry it
+        make_field("canonical_hash", PG_TEXT_OID, -1),
+        make_field("sql", PG_TEXT_OID, -1),
+        make_field("source_columns", PG_TEXT_OID, -1),
+        make_field("type_name", PG_TEXT_OID, -1),
+        make_field("fractional_digits", PG_INT4_OID, 4),
+        make_field("is_cluster_key", PG_TEXT_OID, -1),
+        make_field("addressable_by", PG_TEXT_OID, -1),
+    ];
+    let mut rows = Vec::new();
+    for (name, log) in lake_logs(server, filters) {
+        let manifest = log.latest_manifest()?;
+        for derived in &manifest.schema.derived {
+            let Some(column) = manifest.schema.column_by_id(derived.column_id) else {
+                continue;
+            };
+            let sources = derived
+                .source_columns
+                .iter()
+                .map(|id| {
+                    manifest
+                        .schema
+                        .column_by_id(*id)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_else(|| format!("column {id}"))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let is_key = manifest
+                .cluster_spec
+                .keys
+                .iter()
+                .any(|k| k.column_id == derived.column_id);
+            rows.push(vec![
+                cell(&name),
+                cell(derived.column_id as i64),
+                cell(&column.name),
+                cell(&format!("{:016x}", derived.canonical_hash)),
+                cell(&derived.sql),
+                cell(&sources),
+                cell(&column.type_id.to_string()),
+                match column.fractional_digits {
+                    Some(d) => cell(i32::from(d)),
+                    None => None,
+                },
+                cell(if is_key { "yes" } else { "no" }),
+                // A derived column is reached through its expression: the
+                // catalog's column list is positional and a column no
+                // statement supplies would shift every column after it
+                cell("expression"),
+            ]);
+        }
+    }
+    Ok((fields, rows))
+}
+
+/// Compactions this node ran without being asked, newest last.
+///
+/// A maintenance loop that rewrites files silently is one nobody can
+/// reason about, so every run says what tripped it and what it moved. The
+/// ring is bounded and lives in memory: the durable record of what
+/// happened is each table's transaction log
+fn build_auto_compaction_history(
+    server: &ServerState,
+    filters: &StatViewFilters,
+) -> Result<(Vec<FieldDescription>, Vec<Vec<Option<Vec<u8>>>>), ZyronError> {
+    let fields = vec![
+        make_field("table_name", PG_TEXT_OID, -1),
+        make_field("table_id", PG_INT8_OID, 8),
+        make_field("trigger", PG_TEXT_OID, -1),
+        make_field("triggered_at_us", PG_INT8_OID, 8),
+        make_field("files_before", PG_INT8_OID, 8),
+        make_field("files_after", PG_INT8_OID, 8),
+        make_field("dead_rows_reclaimed", PG_INT8_OID, 8),
+        // Rates render in thousandths so the view stays integer typed,
+        // matching the clustering views and the metric families
+        make_field("small_file_ratio_milli", PG_INT4_OID, 4),
+        make_field("dead_row_ratio_milli", PG_INT4_OID, 4),
+        make_field("version", PG_INT8_OID, 8),
+    ];
+    // Filtering by table happens on the ring rather than after it, so a
+    // busy node's history for one table is not crowded out by another's
+    let wanted = filters.get("table_name").map(|s| s.to_string());
+    let mut rows = Vec::new();
+    for run in zyron_lake::compaction_history::compaction_history().runs() {
+        if let Some(name) = &wanted {
+            if run.table_name != *name {
+                continue;
+            }
+        }
+        rows.push(vec![
+            cell(&run.table_name),
+            cell(i64::from(run.table_id)),
+            cell(run.trigger.as_str()),
+            cell(run.triggered_at_us),
+            cell(run.files_before as i64),
+            cell(run.files_after as i64),
+            cell(run.dead_rows_reclaimed as i64),
+            cell(run.small_file_ratio_milli as i32),
+            cell(run.dead_row_ratio_milli as i32),
+            // A run that changed nothing committed no version, and zero is
+            // a version rather than an absence
+            match run.version {
+                Some(v) => cell(v as i64),
+                None => None,
+            },
+        ]);
+    }
+    let _ = server;
+    Ok((fields, rows))
+}
+
 fn build_clustering_status(
     server: &ServerState,
     filters: &StatViewFilters,
@@ -1340,7 +1473,12 @@ fn build_clustering_status(
         make_field("mode", PG_TEXT_OID, -1),
         make_field("schedule", PG_TEXT_OID, -1),
         make_field("spec_id", PG_INT4_OID, 4),
-        make_field("keys", PG_TEXT_OID, -1),
+        // What a statement asked for and what the files are actually laid
+        // out by, separately. Under Auto they diverge the moment
+        // measurement replaces a declared key, and an operator glancing at
+        // one column could not tell that had happened
+        make_field("declared_keys", PG_TEXT_OID, -1),
+        make_field("active_keys", PG_TEXT_OID, -1),
         make_field("anchors", PG_TEXT_OID, -1),
         make_field("files", PG_INT8_OID, 8),
         make_field("bytes", PG_INT8_OID, 8),
@@ -1354,6 +1492,12 @@ fn build_clustering_status(
     let now = zyron_lake::current_epoch();
     let observer = zyron_lake::observer();
     let mut rows = Vec::new();
+    let declared_by_table: std::collections::HashMap<u32, Vec<zyron_lake::ClusterKey>> = server
+        .catalog
+        .list_all_tables()
+        .into_iter()
+        .map(|t| (t.id.0, t.cluster.fold_keys()))
+        .collect();
     for (name, log) in lake_logs(server, filters) {
         let Some(table_id) = log.paths().table_id() else {
             continue;
@@ -1397,6 +1541,12 @@ fn build_clustering_status(
             cell(manifest.clustering_mode().as_str()),
             cell(manifest.clustering_schedule().as_str()),
             cell(manifest.cluster_spec.spec_id as i32),
+            cell(&render(
+                declared_by_table
+                    .get(&table_id)
+                    .map(|k| k.as_slice())
+                    .unwrap_or(&[]),
+            )),
             cell(&render(&manifest.cluster_spec.keys)),
             cell(
                 &anchors

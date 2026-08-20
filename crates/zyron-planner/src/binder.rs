@@ -2371,6 +2371,40 @@ impl<'a> Binder<'a> {
         Ok(entry)
     }
 
+    /// Binds one scalar expression against a single table's columns.
+    ///
+    /// DDL that declares an expression over a table, such as a clustering
+    /// target, needs the expression's result type and its resolved column
+    /// references before any query has been planned. Going through the same
+    /// binder a query goes through is what keeps the declared expression and
+    /// the query that later matches it agreeing on both
+    pub async fn bind_scalar_over_table(
+        &mut self,
+        table: &Arc<TableEntry>,
+        expr: &Expr,
+    ) -> Result<BoundExpr> {
+        let mut ctx = BindContext::new();
+        ctx.tables.push(BoundTableRef {
+            table_idx: 0,
+            table_id: Some(table.id),
+            alias: table.name.clone(),
+            columns: table
+                .columns
+                .iter()
+                .map(|c| BoundColumnDef {
+                    column_id: c.id,
+                    name: c.name.clone(),
+                    type_id: c.type_id,
+                    nullable: c.nullable,
+                    ordinal: c.ordinal,
+                    fractional_digits: c.fractional_digits,
+                })
+                .collect(),
+            entry: Some(Arc::clone(table)),
+        });
+        self.bind_expr(&ctx, expr).await
+    }
+
     /// Installs the row-security provider so SELECT/UPDATE/DELETE on a single
     /// base table get RLS/ABAC/row-ownership predicates injected.
     pub fn set_row_security(&mut self, provider: std::sync::Arc<dyn crate::RowSecurityProvider>) {

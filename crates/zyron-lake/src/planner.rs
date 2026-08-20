@@ -31,8 +31,8 @@ use crate::feedback::PredicateClass;
 use crate::manifest::{ClusterKey, ClusterStrategy, ManifestFile};
 use crate::predicate::{CompareOp, LakePredicate, LakeValue};
 use crate::workload::{
-    TERM_BYTES_CONSIDERED, TERM_BYTES_SKIPPED, TERM_EQUALITY, TERM_RANGE, TERM_ROWS_MATCHED,
-    TERM_ROWS_SCANNED, WorkloadObserver, column_term,
+    TERM_BYTES_CONSIDERED, TERM_BYTES_SKIPPED, TERM_EQUALITY, TERM_JOIN_KEY, TERM_RANGE,
+    TERM_ROWS_MATCHED, TERM_ROWS_SCANNED, WorkloadObserver, column_term,
 };
 
 /// Cardinality at or below which interleaving is the cheap right answer.
@@ -59,12 +59,36 @@ pub struct ColumnEvidence {
     pub equality_weight: f64,
     /// Decayed weight of range predicates on this column
     pub range_weight: f64,
+    /// Decayed weight of joins whose equality key reached this column.
+    ///
+    /// Separate from `equality_weight` because a join key carries no
+    /// constant, so it prunes file pairs rather than files, and because it
+    /// only pays off when the other side is ordered by its half of the key
+    /// too
+    pub join_weight: f64,
 }
 
 impl ColumnEvidence {
     /// How much of the workload touches this column at all.
+    ///
+    /// Joins count at full weight beside filters. A join key genuinely
+    /// prunes: with both sides ordered by it, a file on one side only has
+    /// to be read against the files on the other whose key ranges overlap
+    /// it, and the rest of the pairs are rejected from the manifest with no
+    /// IO. That is the same kind of saving an equality filter buys, at the
+    /// granularity of file pairs rather than files
     pub fn total_weight(&self) -> f64 {
-        self.equality_weight.max(0.0) + self.range_weight.max(0.0)
+        self.equality_weight.max(0.0) + self.range_weight.max(0.0) + self.join_weight.max(0.0)
+    }
+
+    /// Whether joins are the main reason to order by this column.
+    ///
+    /// Decides the curve rather than the ranking: a join needs the two
+    /// sides' key ranges to be comparable, and only a contiguous range per
+    /// file gives that
+    fn is_join_key(&self) -> bool {
+        self.join_weight > 0.0
+            && self.join_weight >= self.equality_weight.max(0.0) + self.range_weight.max(0.0)
     }
 
     fn is_temporal(&self) -> bool {
@@ -91,6 +115,15 @@ pub fn choose_strategy(evidence: &ColumnEvidence) -> Option<ClusterStrategy> {
         evidence.ndv as f64 / evidence.row_count as f64
     };
     if ratio >= NEAR_UNIQUE_RATIO || evidence.ndv > HIGH_CARDINALITY {
+        return Some(ClusterStrategy::RangePartition);
+    }
+    // A column the workload mostly joins on needs contiguous ranges,
+    // whatever its cardinality says. The interleaving and space-filling
+    // curves scatter a single key across the file set on purpose, which is
+    // right for a multi-column filter and wrong here: the two sides' ranges
+    // stop being comparable, so no file pair can be rejected and the join
+    // reads everything against everything
+    if evidence.is_join_key() {
         return Some(ClusterStrategy::RangePartition);
     }
     if evidence.is_temporal() && evidence.range_weight >= evidence.equality_weight {
@@ -266,6 +299,7 @@ pub fn evidence_from_manifest(
             null_fraction: null_fraction.clamp(0.0, 1.0),
             equality_weight: observer.score(table_id, column_term(column.id, TERM_EQUALITY), now),
             range_weight: observer.score(table_id, column_term(column.id, TERM_RANGE), now),
+            join_weight: observer.score(table_id, column_term(column.id, TERM_JOIN_KEY), now),
         });
     }
     out
@@ -443,6 +477,7 @@ mod tests {
             null_fraction: 0.0,
             equality_weight: 1.0,
             range_weight: 0.0,
+            join_weight: 0.0,
         }
     }
 
@@ -584,5 +619,94 @@ mod tests {
 
         // Then nothing, rather than an arbitrary column
         assert!(bootstrap(&[], &[], &[], &[], 4).is_empty());
+    }
+
+    /// A join is a reason to order a table by a column, and it has to
+    /// outrank a column nothing touches. Before joins were observed, a
+    /// table joined on a column a thousand times a minute looked exactly
+    /// like a table nobody read
+    #[test]
+    fn test_a_join_key_is_proposed_over_a_column_nothing_touches() {
+        let mut joined = column(7, 5_000, 10_000);
+        joined.equality_weight = 0.0;
+        joined.join_weight = 4.0;
+        let mut filtered = column(3, 5_000, 10_000);
+        filtered.equality_weight = 1.0;
+        let mut untouched = column(9, 5_000, 10_000);
+        untouched.equality_weight = 0.0;
+
+        let keys = propose(&[untouched, filtered, joined], &[], 4);
+        assert_eq!(
+            keys.first().map(|k| k.column_id),
+            Some(7),
+            "the heaviest signal leads, and a join key is a signal"
+        );
+        assert!(
+            keys.iter().all(|k| k.column_id != 9),
+            "a column with no weight of any kind is still not proposed"
+        );
+    }
+
+    /// A join needs the two sides' key ranges to be comparable, and only a
+    /// contiguous range per file gives that. The interleaving curves are
+    /// right for a multi-column filter and wrong here: they scatter one key
+    /// across the file set on purpose, so no file pair can be rejected
+    #[test]
+    fn test_a_join_key_takes_contiguous_ranges_whatever_its_cardinality() {
+        // Low cardinality, which without a join would interleave
+        let mut low = column(1, 8, 100_000);
+        low.equality_weight = 1.0;
+        low.join_weight = 0.0;
+        assert_eq!(choose_strategy(&low), Some(ClusterStrategy::BitInterleave));
+
+        low.join_weight = 2.0;
+        assert_eq!(
+            choose_strategy(&low),
+            Some(ClusterStrategy::RangePartition),
+            "a column the workload mostly joins on has to keep comparable ranges"
+        );
+
+        // Moderate cardinality, which without a join would take a space
+        // filling curve
+        let mut moderate = column(2, 5_000, 100_000);
+        moderate.equality_weight = 1.0;
+        assert_eq!(
+            choose_strategy(&moderate),
+            Some(ClusterStrategy::SpaceFilling)
+        );
+        moderate.join_weight = 2.0;
+        assert_eq!(
+            choose_strategy(&moderate),
+            Some(ClusterStrategy::RangePartition)
+        );
+    }
+
+    /// A column joined once and filtered constantly is a filter column.
+    /// The curve follows whichever signal dominates, because a filter on
+    /// several columns is served by interleaving and a join is not
+    #[test]
+    fn test_a_column_that_is_mostly_filtered_keeps_its_filter_curve() {
+        let mut mixed = column(1, 8, 100_000);
+        mixed.equality_weight = 10.0;
+        mixed.join_weight = 1.0;
+        assert_eq!(
+            choose_strategy(&mixed),
+            Some(ClusterStrategy::BitInterleave),
+            "one join against ten filters does not make it a join key"
+        );
+    }
+
+    /// A column nothing joins on is unaffected, which is what keeps this
+    /// from moving every existing layout
+    #[test]
+    fn test_join_weight_of_zero_changes_nothing() {
+        let mut plain = column(1, 8, 100_000);
+        plain.equality_weight = 1.0;
+        plain.join_weight = 0.0;
+        assert_eq!(plain.total_weight(), 1.0);
+        assert_eq!(
+            choose_strategy(&plain),
+            Some(ClusterStrategy::BitInterleave)
+        );
     }
 }

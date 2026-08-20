@@ -292,6 +292,7 @@ pub enum Keyword {
     Zyronlake,
     Cluster,
     Clustering,
+    Derived,
     Auto,
     Force,
     Incremental,
@@ -422,6 +423,7 @@ pub enum Keyword {
     Versioning,
     Period,
     Of,
+    Clone,
 
     // Pipeline / Medallion
     Pipeline,
@@ -1041,6 +1043,7 @@ pub fn lookup_keyword(word: &str) -> Option<Keyword> {
         "ZYRONLAKE" => Some(Keyword::Zyronlake),
         "CLUSTER" => Some(Keyword::Cluster),
         "CLUSTERING" => Some(Keyword::Clustering),
+        "DERIVED" => Some(Keyword::Derived),
         "PEER" => Some(Keyword::Peer),
         "SERVER" => Some(Keyword::Server),
         "FOLLOW" => Some(Keyword::Follow),
@@ -1130,6 +1133,7 @@ pub fn lookup_keyword(word: &str) -> Option<Keyword> {
         "VERSIONING" => Some(Keyword::Versioning),
         "PERIOD" => Some(Keyword::Period),
         "OF" => Some(Keyword::Of),
+        "CLONE" => Some(Keyword::Clone),
 
         // Pipeline
         "PIPELINE" => Some(Keyword::Pipeline),

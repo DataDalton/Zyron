@@ -1,0 +1,80 @@
+{
+  "id": "2026-08-20_025735_daa5c98-local",
+  "date": "2026-08-20 02:57:39Z",
+  "ts": 1787194659,
+  "commit": "daa5c98-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "optimizer": {
+      "auto_analyze_trigger_ms": {
+        "average": 3.738560,
+        "runs": [3.76, 3.72, 3.72, 3.73, 3.76],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "explain_latency_us": {
+        "average": 1.103866,
+        "runs": [1.10, 1.10, 1.11, 1.11, 1.10],
+        "target": 20.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "selectivity_estimate_ns": {
+        "average": 99.022040,
+        "runs": [99.20, 98.94, 99.05, 98.99, 98.92],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "encoding_pushdown_speedup_x": {
+        "average": 30.578262,
+        "runs": [30.58, 30.58, 30.58, 30.58, 30.58],
+        "target": 3.000000,
+        "passed": true,
+        "higher_is_better": true
+      },
+      "cardinality_accuracy_ratio": {
+        "average": 1.000000,
+        "runs": [1.00, 1.00, 1.00, 1.00, 1.00],
+        "target": 2.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "explain_analyze_overhead_pct": {
+        "average": 19.035531,
+        "runs": [19.83, 18.08, 19.34, 19.96, 17.96],
+        "target": 3.000000,
+        "passed": false,
+        "higher_is_better": false
+      },
+      "histogram_build_1m_ms": {
+        "average": 0.462100,
+        "runs": [0.45, 0.46, 0.48, 0.47, 0.45],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "parallel_plan_selection_us": {
+        "average": 0.213775,
+        "runs": [0.22, 0.21, 0.21, 0.21, 0.21],
+        "target": 50.000000,
+        "passed": true,
+        "higher_is_better": false
+      },
+      "analyze_1m_ms": {
+        "average": 48.840720,
+        "runs": [43.42, 44.91, 71.63, 42.38, 41.86],
+        "target": 400.000000,
+        "passed": true,
+        "higher_is_better": false
+      }
+    }
+  }
+}

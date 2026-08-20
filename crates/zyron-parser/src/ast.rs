@@ -99,6 +99,7 @@ pub enum Statement {
     ArchiveTable(Box<ArchiveTableStatement>),
     /// RESTORE TABLE name FROM 'path' [INTO target]
     RestoreTable(Box<RestoreTableStatement>),
+    RestoreTableVersion(Box<RestoreTableVersionStatement>),
     /// ALTER TABLE name SET (key = value, ...)
     AlterTableOptions(Box<AlterTableOptionsStatement>),
     /// ALTER TABLE t SET USING ZYRONLAKE | HEAP [WITH (...)]
@@ -376,6 +377,18 @@ pub struct CreateTableStatement {
     pub using: Option<TableFormat>,
     /// Clustering layout from `CLUSTER BY ...`.
     pub cluster_by: Option<ClusterByClause>,
+    /// `CLONE OF <table> [AT VERSION <n>]`. The new table takes the
+    /// source's schema, layout and file set rather than declaring columns
+    /// of its own, so `columns` is empty when this is set
+    pub clone_of: Option<CloneSource>,
+}
+
+/// The table a `CREATE TABLE ... CLONE OF` copies, and the version of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloneSource {
+    pub table: String,
+    /// None clones the source's current head
+    pub at_version: Option<u64>,
 }
 
 /// Storage format named in a `USING` clause.
@@ -394,12 +407,36 @@ pub struct ClusterByClause {
     pub mode: ClusterMode,
 }
 
+/// What one clustering key orders rows by.
+///
+/// An expression is clustered by giving it a column of its own, so the
+/// values are stored and file statistics cover them. That is what lets a
+/// query filtering on the expression prune files, which a target with no
+/// stored values could never do
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClusterKeyTarget {
+    /// A column the table declared
+    Column(String),
+    /// An expression over declared columns
+    Expression(Expr),
+}
+
 /// One clustering key, optionally pinned to a strategy by name via
-/// `<column> USING <strategy>`.
+/// `<target> USING <strategy>`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClusterKeyDef {
-    pub column: String,
+    pub target: ClusterKeyTarget,
     pub strategy: Option<String>,
+}
+
+impl ClusterKeyDef {
+    /// The column this key names, or None when it orders by an expression
+    pub fn column_name(&self) -> Option<&str> {
+        match &self.target {
+            ClusterKeyTarget::Column(name) => Some(name.as_str()),
+            ClusterKeyTarget::Expression(_) => None,
+        }
+    }
 }
 
 /// `ALTER TABLE t SET USING <format>` storage conversion.
@@ -461,6 +498,12 @@ pub enum AlterTableOperation {
     DropConstraint { name: String, if_exists: bool },
     /// ALTER TABLE ... RENAME TO new_name
     RenameTable { new_name: String },
+    /// ALTER TABLE ... ADD DERIVED COLUMN name AS <expr>
+    ///
+    /// Names an expression column so it can be selected and referred to.
+    /// A `CLUSTER BY (<expr>)` creates the same kind of column without a
+    /// name, reachable through the expression rather than by identifier
+    AddDerivedColumn { name: String, expr: Expr },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1250,10 +1293,19 @@ pub struct ResumeScheduleStatement {
 // OPTIMIZE
 // ---------------------------------------------------------------------------
 
-/// OPTIMIZE TABLE name (vacuum + reindex + consolidate free space)
+/// OPTIMIZE TABLE name [CLUSTER [, DELETE] | DELETE [, CLUSTER]]
+///
+/// The action list selects which maintenance runs. A statement naming none
+/// compacts, which is what OPTIMIZE has always done, so DELETE names that
+/// behavior explicitly. CLUSTER runs a clustering pass over the table's
+/// current layout evidence, and the two compose
 #[derive(Debug, Clone, PartialEq)]
 pub struct OptimizeTableStatement {
     pub table: String,
+    /// Run a clustering pass
+    pub cluster: bool,
+    /// Apply delete predicates and compact free space
+    pub delete: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1360,6 +1412,26 @@ pub struct ArchiveTableStatement {
     pub destination: String,
     /// Trailing DRY RUN: preview only, no mutation.
     pub dry_run: bool,
+}
+
+/// `RESTORE TABLE t TO VERSION n` and `... TO TIMESTAMP '...'`.
+///
+/// Rolls a table's data back to what it showed then, by committing a new
+/// head whose file set is that version's. The history is not rewritten:
+/// the versions in between stay readable, and the restore is one more
+/// version on top of them
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreTableVersionStatement {
+    pub table: String,
+    pub target: RestoreVersionTarget,
+}
+
+/// What a `RESTORE ... TO` names
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreVersionTarget {
+    Version(u64),
+    /// Literal text, resolved against the table's commit timestamps
+    Timestamp(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]

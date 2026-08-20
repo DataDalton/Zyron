@@ -62,7 +62,7 @@ pub fn current_epoch() -> u16 {
 
 /// Counters one column carries. The observer counts by a flat `u32` term,
 /// so the column id is scaled and the low bits name what is counted
-pub const TERMS_PER_COLUMN: u32 = 6;
+pub const TERMS_PER_COLUMN: u32 = 7;
 /// Scans whose predicate compared this column for equality
 pub const TERM_EQUALITY: u32 = 0;
 /// Scans whose predicate compared this column for a range
@@ -75,6 +75,17 @@ pub const TERM_BYTES_SKIPPED: u32 = 3;
 pub const TERM_ROWS_SCANNED: u32 = 4;
 /// Rows those scans returned
 pub const TERM_ROWS_MATCHED: u32 = 5;
+
+/// Joins whose equality key reached this column.
+///
+/// Kept apart from `TERM_EQUALITY` because the two ask the layout for
+/// different things. An equality filter carries a constant, so file bounds
+/// on the column reject files outright. A join key carries no constant at
+/// all: what it wants is for both sides to be ordered by it, so a file on
+/// one side can be matched against the few files on the other whose ranges
+/// overlap it. Both are reasons to order by the column, and folding them
+/// into one counter would lose which one asked
+pub const TERM_JOIN_KEY: u32 = 6;
 
 /// The term id one column's counter lives under.
 #[inline]
@@ -101,6 +112,42 @@ static OBSERVER: OnceLock<WorkloadObserver> = OnceLock::new();
 #[inline]
 pub fn observer() -> &'static WorkloadObserver {
     OBSERVER.get_or_init(WorkloadObserver::new)
+}
+
+/// Records one join: the columns its equality keys reached, on both
+/// tables.
+///
+/// Called once when a join is planned, never per row. Both sides are
+/// credited because a join is only co-located when both are ordered by the
+/// key: clustering one side and not the other leaves every file on the
+/// clustered side matched against every file on the other, which is what
+/// the layout was supposed to remove.
+///
+/// `keys` is resolved column pairs rather than the join expression. The
+/// planner has already reduced the ON clause to equi-keys by the time a
+/// join is costed, and this crate has no binder to reduce one itself, so
+/// passing the expression would mean a second reducer to keep in step with
+/// the first.
+///
+/// A pair naming a column on a table that is not a lake table is harmless:
+/// the observation lands on a table id nothing reads evidence for
+#[inline]
+pub fn observe_join(left_table: u32, right_table: u32, keys: &[(u32, u32)], epoch: u16) {
+    let observer = observer();
+    for (left_column, right_column) in keys {
+        observer.observe(
+            left_table,
+            column_term(*left_column, TERM_JOIN_KEY),
+            epoch,
+            1,
+        );
+        observer.observe(
+            right_table,
+            column_term(*right_column, TERM_JOIN_KEY),
+            epoch,
+            1,
+        );
+    }
 }
 
 /// Records one planned scan: which columns its predicate touched, and how
@@ -406,6 +453,39 @@ impl WorkloadObserver {
         out
     }
 
+    /// Every table the observer still holds live evidence for, ascending.
+    ///
+    /// Reads move what a clustering proposal should be without committing
+    /// anything, so a table nobody wrote can still want a different layout.
+    /// This is how a maintenance pass finds those tables without asking
+    /// each one in turn: one sweep of the counter array costs the
+    /// observer's fixed size, whether the node hosts ten tables or ten
+    /// thousand, and a table no query has touched inside the retained
+    /// window never appears
+    pub fn tables_with_evidence(&self, now: u16) -> Vec<u32> {
+        let mut out: Vec<u32> = Vec::new();
+        for cell in self.cells.iter() {
+            let key = cell.key.load(Ordering::Relaxed);
+            if key == 0 {
+                continue;
+            }
+            let live = cell.epochs.iter().any(|counter| {
+                let packed = counter.load(Ordering::Relaxed);
+                if value_of(packed) == 0 {
+                    return false;
+                }
+                now.checked_sub(tag_of(packed))
+                    .is_some_and(|age| (age as usize) < EPOCHS)
+            });
+            if live {
+                out.push(Self::unpack(key).0);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     pub fn stats(&self) -> ObserverStats {
         ObserverStats {
             dropped: self.dropped.load(Ordering::Relaxed),
@@ -496,6 +576,48 @@ mod tests {
         assert_eq!(observer.score(2, 7, 100), 0.0);
         // An unobserved term scores nothing rather than failing
         assert_eq!(observer.score(1, 8, 100), 0.0);
+    }
+
+    /// Maintenance asks this which tables reads have moved the answer for,
+    /// so it has to name every table with live evidence and no table
+    /// whose evidence has decayed out of the window
+    #[test]
+    fn test_evidence_names_the_tables_reads_touched_and_no_others() {
+        let observer = WorkloadObserver::new();
+        assert!(
+            observer.tables_with_evidence(100).is_empty(),
+            "an observer nothing has been read through names no table"
+        );
+
+        observer.observe(4, column_term(0, TERM_EQUALITY), 100, 1);
+        observer.observe(4, column_term(1, TERM_RANGE), 100, 1);
+        observer.observe(9, column_term(0, TERM_EQUALITY), 100, 1);
+        assert_eq!(
+            observer.tables_with_evidence(100),
+            vec![4, 9],
+            "each table once, however many of its terms were observed"
+        );
+
+        // Evidence inside the retained window still counts, evidence past
+        // it is gone and the table stops being a reason to re-propose
+        assert_eq!(
+            observer.tables_with_evidence(100 + EPOCHS as u16 - 1),
+            vec![4, 9]
+        );
+        assert!(
+            observer
+                .tables_with_evidence(100 + EPOCHS as u16)
+                .is_empty(),
+            "a table nothing has queried for a whole window is not asked about"
+        );
+
+        // A zero weight is not an observation, so it does not resurrect one
+        observer.observe(9, column_term(2, TERM_EQUALITY), 100 + EPOCHS as u16, 0);
+        assert!(
+            observer
+                .tables_with_evidence(100 + EPOCHS as u16)
+                .is_empty()
+        );
     }
 
     #[test]

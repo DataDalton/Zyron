@@ -13,7 +13,9 @@
 pub mod branch;
 mod cells;
 pub mod changefeed;
+pub mod clone;
 mod codec;
+pub mod compaction_history;
 pub mod constraints;
 pub mod convert;
 pub mod crosstable;
@@ -26,6 +28,7 @@ mod hll;
 pub mod index;
 
 pub mod maintenance;
+pub mod maintenance_signal;
 pub mod manifest;
 pub mod operations;
 pub mod paths;
@@ -46,6 +49,10 @@ pub use branch::{
 };
 pub use changefeed::{
     ChangeDescriptor, ChangeKind, change_row_counts, changed_ordinals, changes_between,
+};
+pub use clone::{
+    CLONE_SOURCE_TABLE_PROPERTY, CLONE_SOURCE_VERSION_PROPERTY, CloneOutcome, clone_source,
+    clone_table, release_pin,
 };
 pub use constraints::{
     ForeignKeyOutcome, UniqueCheckStats, UniqueOutcome, UniqueSpec, check_foreign_key,
@@ -74,17 +81,27 @@ pub use index::{
     value_to_index_cell, write_index_files,
 };
 pub use maintenance::{
-    ClusterPassOptions, ClusterPassOutcome, DEFAULT_MAX_INPUTS, DEFAULT_ROWS_PER_FILE, PassState,
-    ResumeOptions, resume_cluster_passes, run_cluster_pass,
+    ClusterPassOptions, ClusterPassOutcome, DEFAULT_MAX_INPUTS, DEFAULT_MAX_PROPOSED_KEYS,
+    DEFAULT_ROWS_PER_FILE, PassState, ResumeOptions, TablePassOptions, TablePassReport,
+    drifted_file_count, resume_cluster_passes, run_cluster_pass, run_table_cluster_pass,
+};
+pub use maintenance_signal::{
+    DirtyHead, DirtyHeads, MAX_TRACKED_HEADS, MaintenanceSignal, maintenance_signal,
 };
 pub use manifest::{
-    CLUSTERING_ANCHORS_PROPERTY, CLUSTERING_MODE_PROPERTY, CLUSTERING_SCHEDULE_PROPERTY,
-    ClusterKey, ClusterMode, ClusterSpec, ClusterStrategy, ClusteringSchedule, ColumnStatsEntry,
-    DeletePredicate, FileStats, ManifestFile, PartitionEntry,
+    AUTO_COMPACT_DEAD_ROW_RATIO_PROPERTY, AUTO_COMPACT_SMALL_FILE_RATIO_PROPERTY,
+    CLUSTER_REPAIR_INTERVAL_SECS_PROPERTY, CLUSTER_REPAIR_MAX_INPUTS_PROPERTY,
+    CLUSTER_REPAIR_URGENCY_THRESHOLD_PROPERTY, CLUSTERING_ANCHORS_PROPERTY,
+    CLUSTERING_MODE_PROPERTY, CLUSTERING_SCHEDULE_PROPERTY, ClusterKey, ClusterMode, ClusterSpec,
+    ClusterStrategy, ClusteringSchedule, ColumnStatsEntry, CompactionNeed, CompactionTrigger,
+    DEFAULT_AUTO_COMPACT_DEAD_ROW_RATIO, DEFAULT_AUTO_COMPACT_SMALL_FILE_RATIO,
+    DEFAULT_CLUSTER_REPAIR_INTERVAL_SECS, DEFAULT_CLUSTER_REPAIR_URGENCY_THRESHOLD,
+    DeletePredicate, FileStats, MIN_SMALL_FILES_TO_MERGE, ManifestFile, PartitionEntry,
+    TARGET_ROWS_PER_FILE_PROPERTY,
 };
 pub use operations::{
-    AppendOutcome, DeleteOutcome, OptimizeOutcome, UpdateOutcome, append_rows, delete_all,
-    delete_where, optimize, update_where, vacuum_data_files,
+    AppendOutcome, DeleteOutcome, OptimizeOutcome, RestoreOutcome, UpdateOutcome, append_rows,
+    delete_all, delete_where, optimize, restore_to_version, update_where, vacuum_data_files,
 };
 pub use paths::LakePaths;
 pub use planner::{
@@ -92,7 +109,8 @@ pub use planner::{
     measured_skip_rate, predicate_classes, propose,
 };
 pub use predicate::{
-    ColumnBounds, CompareOp, LakePredicate, LakeValue, PruneDecision, StatsSource,
+    ClusterFit, ClusterFitEstimate, ColumnBounds, CompareOp, LakePredicate, LakeValue,
+    PruneDecision, StatsSource, cluster_fit_estimate,
 };
 pub use prune_index::{PruneIndex, PruneScratch, with_sweep};
 pub use reader::{DecodedColumn, LakeFileReader, ZoneVerdict, evaluate_row};
@@ -100,7 +118,7 @@ pub use repair::{
     OrphanReport, Problem, RepairOptions, RepairReport, ValidationReport, cleanup_orphans, repair,
     validate,
 };
-pub use schema::{LakeColumn, LakeSchema};
+pub use schema::{DerivedColumn, LakeColumn, LakeSchema};
 pub use time_travel::{TimeTravelSpec, manifest_as_of, resolve_version};
 pub use transaction_log::{
     AllCommitted, CommitAttempt, CommitHeader, CommitInfo, CommitStatus, LogEntry, OperationKind,
@@ -108,8 +126,9 @@ pub use transaction_log::{
     register_txn_pending, set_local_node, transfer_writer, writer_node,
 };
 pub use workload::{
-    ObserverStats, TERM_BYTES_CONSIDERED, TERM_BYTES_SKIPPED, TERM_EQUALITY, TERM_RANGE,
-    TERM_ROWS_MATCHED, TERM_ROWS_SCANNED, TERMS_PER_COLUMN, WorkloadObserver, column_term,
-    current_epoch, epoch_of, observe_scan, observe_scan_result, observer, term_column,
+    ObserverStats, TERM_BYTES_CONSIDERED, TERM_BYTES_SKIPPED, TERM_EQUALITY, TERM_JOIN_KEY,
+    TERM_RANGE, TERM_ROWS_MATCHED, TERM_ROWS_SCANNED, TERMS_PER_COLUMN, WorkloadObserver,
+    column_term, current_epoch, epoch_of, observe_join, observe_scan, observe_scan_result,
+    observer, term_column,
 };
 pub use writer::{ColumnData, WriteRequest, write_data_file};

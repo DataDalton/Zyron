@@ -59,6 +59,34 @@ const MANIFEST_CACHE_KEEP: usize = 16;
 pub(crate) static TEST_STALL_VISIBILITY_GAP_US: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+// Makes the version write fail for one table, so the recovery path a real
+// IO failure takes can be exercised deterministically.
+//
+// Scoped to a table root rather than switched on globally, because the test
+// suite runs in parallel and a global failure switch would fail whichever
+// unrelated commit happened to be in flight
+#[cfg(test)]
+pub(crate) static TEST_FAIL_VERSION_WRITE_UNDER: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn inject_version_write_failure(path: &Path) -> Option<std::io::Error> {
+    let guard = TEST_FAIL_VERSION_WRITE_UNDER.lock().ok()?;
+    let root = guard.as_ref()?;
+    path.starts_with(root).then(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "injected version write failure",
+        )
+    })
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn inject_version_write_failure(_path: &Path) -> Option<std::io::Error> {
+    None
+}
+
 #[cfg(test)]
 fn stall_visibility_gap() {
     let us = TEST_STALL_VISIBILITY_GAP_US.load(Ordering::Relaxed);
@@ -488,10 +516,33 @@ impl CommitHeader {
 
 /// Reads and verifies only the 128-byte commit header of a version file,
 /// the read a conflict check pays
+/// Names the file and the operation on an IO error, leaving its kind alone.
+///
+/// Every classifier in this module dispatches on `io::ErrorKind`: the commit
+/// race arm tests for `AlreadyExists`, `is_possible_partial_write` tests for
+/// `UnexpectedEof`. So the kind is carried through untouched and only the
+/// message grows, which is also why this cannot use a new error variant. The
+/// original's own text is kept, so the platform's raw code survives in the
+/// message even though `raw_os_error` does not.
+///
+/// Cold and never inlined. A commit that succeeds never calls it, and the
+/// formatting it does is paid only by a commit that has already failed
+#[cold]
+#[inline(never)]
+fn io_context(operation: &str, path: &Path, e: std::io::Error) -> ZyronError {
+    let kind = e.kind();
+    ZyronError::Io(std::io::Error::new(
+        kind,
+        format!("{} {}: {}", operation, path.display(), e),
+    ))
+}
+
 pub fn read_commit_header(path: &Path) -> Result<CommitHeader, ZyronError> {
-    let mut file = fs::File::open(path)?;
+    let mut file =
+        fs::File::open(path).map_err(|e| io_context("open lake version file", path, e))?;
     let mut buf = [0u8; COMMIT_HEADER_LEN];
-    file.read_exact(&mut buf)?;
+    file.read_exact(&mut buf)
+        .map_err(|e| io_context("read lake version header from", path, e))?;
     let ctx = path.to_string_lossy();
     let (header, _) = CommitHeader::decode(&buf, &ctx)?;
     Ok(header)
@@ -1091,6 +1142,9 @@ impl TransactionLog {
     pub fn remove_shared(paths: &LakePaths) {
         let root = paths.root().to_path_buf();
         open_logs().retain_sync(|key, _| !key.starts_with(&root));
+        // A dropped table has nothing left to maintain, and leaving its
+        // marks behind would hold slots against the signal's bound
+        crate::maintenance_signal::maintenance_signal().forget_under(&root);
     }
 
     /// Drops one head's registry entry, used when a branch is dropped
@@ -1235,6 +1289,24 @@ impl TransactionLog {
                 value: local.to_string(),
             });
         }
+        Self::create_from_entries(paths, attempt, entries)
+    }
+
+    /// Materializes a table whose first version is exactly `entries`.
+    ///
+    /// `create` builds the entries a fresh empty table needs and comes
+    /// here. A clone comes here too, with the same prefix plus one AddFile
+    /// per file it starts life holding, so a cloned table and a fresh one
+    /// are the same kind of thing from version one: nothing downstream has
+    /// to know which it is reading
+    pub(crate) fn create_from_entries(
+        paths: LakePaths,
+        attempt: CommitAttempt<'_>,
+        entries: Vec<LogEntry>,
+    ) -> Result<Self, ZyronError> {
+        fs::create_dir_all(paths.log_dir())?;
+        fs::create_dir_all(paths.data_dir())?;
+        fs::create_dir_all(paths.tmp_dir())?;
         let log = Self {
             paths,
             branch: None,
@@ -1744,8 +1816,40 @@ impl TransactionLog {
                 .open(&path)
             {
                 Ok(mut file) => {
-                    file.write_all(&bytes)?;
-                    file.sync_all()?;
+                    // A version file that exists but holds no decodable
+                    // header stops every later commit, which reads it as the
+                    // winner it lost to, and stops `open`, which reads every
+                    // header after the newest checkpoint. Recovering from
+                    // that needs REPAIR rather than a restart.
+                    //
+                    // This attempt created the file and holds its only
+                    // handle, and the head has not moved, so no reader can
+                    // have adopted the version. Unlinking it is therefore
+                    // safe and keeps a failed write costing one statement.
+                    // A committer that already raced to this path and saw
+                    // `AlreadyExists` finds the file gone and takes the
+                    // retry it takes for an abandoned version
+                    let mut written = match inject_version_write_failure(&path) {
+                        Some(injected) => Err(injected),
+                        None => file.write_all(&bytes),
+                    };
+                    if written.is_ok() {
+                        written = file.sync_all();
+                    }
+                    if let Err(e) = written {
+                        drop(file);
+                        if let Err(unlink) = fs::remove_file(&path) {
+                            tracing::error!(
+                                target: "zyron::lake",
+                                version,
+                                path = %path.display(),
+                                error = %unlink,
+                                "a partly written lake version file could not be removed, the \
+                                 table will refuse commits until REPAIR discards it"
+                            );
+                        }
+                        return Err(io_context("write lake version file", &path, e));
+                    }
                     drop(file);
                     let _ = self
                         .manifests
@@ -1755,6 +1859,7 @@ impl TransactionLog {
                         self.created_head.fetch_max(version, Ordering::AcqRel);
                         self.advance_published();
                         self.write_latest_hint(self.latest_version());
+                        self.mark_for_maintenance();
                     } else {
                         // Pending registration precedes the head advance.
                         // Once the shared head includes this version,
@@ -1854,7 +1959,7 @@ impl TransactionLog {
                     races += 1;
                     backoff(races.min(u32::MAX as u64) as u32);
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(io_context("create lake version file", &path, e)),
             }
         }
     }
@@ -1958,7 +2063,32 @@ impl TransactionLog {
         }
         self.advance_published();
         self.write_latest_hint(self.latest_version());
+        self.mark_for_maintenance();
         Ok(())
+    }
+
+    /// Tells the node's maintenance signal that this head moved.
+    ///
+    /// Every decision background maintenance makes reads the manifest, and
+    /// the manifest is a function of the published version, so this is the
+    /// only moment at which any of those decisions can change. Recording it
+    /// is what lets a worker leave an untouched table alone instead of
+    /// rebuilding its manifest on a timer to find out nothing happened.
+    ///
+    /// Called once per published version rather than once per commit: a
+    /// version created inside a database transaction is not visible until
+    /// that transaction publishes it, and maintenance reads what is visible
+    fn mark_for_maintenance(&self) {
+        let Some(table_id) = self.paths.table_id() else {
+            // A log outside a table directory has no catalog entry, so no
+            // worker could resolve it back to a table to maintain
+            return;
+        };
+        crate::maintenance_signal::maintenance_signal().mark(
+            self.registry_key(),
+            table_id,
+            self.branch.is_none(),
+        );
     }
 
     fn advance_published(&self) {
@@ -2153,7 +2283,7 @@ thread_local! {
 }
 
 fn read_version_file(path: &Path) -> Result<VersionFileData, ZyronError> {
-    let bytes = fs::read(path)?;
+    let bytes = fs::read(path).map_err(|e| io_context("read lake version file", path, e))?;
     VersionFileData::decode(&bytes, &path.to_string_lossy())
 }
 
@@ -2809,6 +2939,122 @@ mod tests {
         assert_eq!(v3b, 3);
     }
 
+    /// Background maintenance is woken by commits rather than by a clock,
+    /// so a published version that failed to reach the signal is a table
+    /// that silently stops being maintained. A version still pending inside
+    /// a database transaction is not visible to a reader yet, so it is
+    /// announced when it publishes and not before
+    #[test]
+    fn test_a_published_version_tells_maintenance_its_head_moved() {
+        let signal = crate::maintenance_signal::maintenance_signal();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = new_log(dir.path());
+        let key = log.registry_key();
+
+        let before = signal.generation();
+        log.commit(attempt(OperationKind::Append), |_| {
+            Ok(vec![LogEntry::AddFile(data_file(0x11, 0, 9, 3))])
+        })
+        .expect("append");
+        assert!(
+            signal.generation() > before,
+            "a standalone commit publishes immediately, so it announces immediately"
+        );
+        assert!(signal.is_marked(&key), "and it names the head that moved");
+
+        // A transactional version is created but not readable, so nothing
+        // maintenance would decide has changed yet
+        signal.forget_under(log.paths().root());
+        let mut txn = attempt(OperationKind::Append);
+        txn.db_txn_id = 77;
+        let pending = log
+            .commit(txn, |_| {
+                Ok(vec![LogEntry::AddFile(data_file(0x12, 0, 9, 3))])
+            })
+            .expect("pending commit");
+        assert!(
+            !signal.is_marked(&key),
+            "an unpublished version is not something maintenance can act on"
+        );
+
+        log.publish(pending).expect("publish");
+        assert!(
+            signal.is_marked(&key),
+            "publishing it is what makes it maintenance's business"
+        );
+
+        // Dropping the table takes its marks with it, so a head nothing can
+        // resolve does not hold a slot against the signal's bound
+        TransactionLog::remove_shared(log.paths());
+        assert!(!signal.is_marked(&key));
+    }
+
+    /// A version file that exists and holds no decodable header is worse
+    /// than a failed commit: every later commit reads it as the winner it
+    /// lost to, and `open` reads every header after the newest checkpoint,
+    /// so the table refuses writes and refuses to open until REPAIR
+    /// discards it. A write that fails has to take its own file with it.
+    ///
+    /// The error also has to say which file and which operation. A failure
+    /// this rare gives one observation, and an `Io` carrying neither spends
+    /// it
+    #[test]
+    fn test_a_failed_version_write_unlinks_its_own_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = new_log(dir.path());
+        let base = log.latest_version();
+        let claimed = log.paths().version_file(base + 1);
+
+        *TEST_FAIL_VERSION_WRITE_UNDER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(dir.path().to_path_buf());
+        let err = log
+            .commit(attempt(OperationKind::Append), |_| {
+                Ok(vec![LogEntry::AddFile(data_file(0x21, 0, 9, 3))])
+            })
+            .expect_err("the injected write failure has to reach the caller");
+        *TEST_FAIL_VERSION_WRITE_UNDER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+
+        let text = err.to_string();
+        assert!(
+            text.contains("write lake version file"),
+            "the error has to name the operation, got: {text}"
+        );
+        assert!(
+            text.contains(&claimed.display().to_string()),
+            "the error has to name the file, got: {text}"
+        );
+        assert!(
+            matches!(&err, ZyronError::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied),
+            "adding context must not change the kind every classifier dispatches on"
+        );
+
+        assert!(
+            !claimed.exists(),
+            "a version file the write never filled has to be unlinked"
+        );
+        assert_eq!(log.latest_version(), base, "the head did not move");
+
+        // The version number is free again and the log still commits
+        let next = log
+            .commit(attempt(OperationKind::Append), |_| {
+                Ok(vec![LogEntry::AddFile(data_file(0x22, 0, 9, 3))])
+            })
+            .expect("the log still accepts commits after a failed write");
+        assert_eq!(next, base + 1);
+
+        // And the table still opens, which a torn header would have stopped
+        let reopened = TransactionLog::open(LakePaths::new(dir.path(), 7), &AllCommitted)
+            .expect("a table that survived a failed write still opens");
+        assert_eq!(reopened.latest_version(), base + 1);
+        assert_eq!(
+            reopened.latest_manifest().expect("manifest").entries.len(),
+            1
+        );
+    }
+
     struct RejectTxn(u64);
 
     impl CommitStatus for RejectTxn {
@@ -2896,6 +3142,7 @@ mod tests {
                         value: LakeValue::Int(50),
                     },
                     created_version: 0,
+                    pending_rows: 0,
                 })])
             })
             .expect("predicate delete");

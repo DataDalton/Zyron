@@ -409,6 +409,10 @@ pub fn merge_branch(
                 sql: predicate.sql.clone(),
                 predicate: predicate.predicate.clone(),
                 created_version: 0,
+                // Carried from the branch that recorded it. The count is
+                // what a compaction would reclaim, and re-counting it here
+                // would read every file the merge touches
+                pending_rows: predicate.pending_rows,
             }));
             next_id += 1;
         }

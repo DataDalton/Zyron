@@ -29,16 +29,16 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use zyron_bench_harness::{
-    RatioBound, assert_exact_metric, init, measuring, record_metric, tprintln,
+    RatioBound, assert_exact_metric, check_performance, init, measuring, record_metric, tprintln,
 };
 use zyron_common::TypeId;
 use zyron_lake::manifest::{ClusterSpec, ColumnStatsEntry, PartitionEntry};
 use zyron_lake::predicate::ColumnBounds;
 use zyron_lake::{
-    ClusterKey, ClusterPassOptions, ClusterStrategy, ColumnData, CommitAttempt, CompareOp,
-    Decision, GateConfig, LakeColumn, LakePaths, LakePredicate, LakeSchema, LakeValue, LogEntry,
-    ManifestFile, OperationKind, PredicateClass, PruneDecision, PruneIndex, TransactionLog,
-    WriteRequest, skip_rate, with_sweep,
+    AllCommitted, ClusterKey, ClusterPassOptions, ClusterStrategy, ColumnData, CommitAttempt,
+    CompareOp, Decision, GateConfig, LakeColumn, LakePaths, LakePredicate, LakeSchema, LakeValue,
+    LogEntry, ManifestFile, OperationKind, PredicateClass, PruneDecision, PruneIndex,
+    TransactionLog, WriteRequest, skip_rate, with_sweep,
 };
 
 /// Repetitions of a timed measurement, matching every other suite here.
@@ -1335,5 +1335,1031 @@ fn test_a_refused_clustering_pass_leaves_the_file_set_untouched() {
         "  Active file set [PASS]: unchanged, {} files, log still at version {}",
         after_ids.len(),
         before_version
+    );
+}
+
+// =============================================================================
+// Phase 18 absolute targets
+// =============================================================================
+//
+// Everything above measures a count or records a timing without judging it.
+// This section is the other kind: fourteen absolute latency and throughput
+// targets that decide whether the format is fit to ship.
+//
+// They are absolute rather than ratios, which is a real cost: an absolute
+// number is a claim about one machine and goes stale when the machine
+// changes. They are stated anyway because a format's commit latency is a
+// promise to whoever is waiting on it, and a promise you can only express
+// relative to yesterday's build is not one a user can plan against.
+//
+// The harness applies them only in a measuring build and reports them
+// unchecked elsewhere, so an unoptimized run is never failed against
+// optimized numbers.
+
+/// Versions the server lets a log accumulate before collapsing it into a
+/// manifest checkpoint.
+///
+/// The maintenance loop does this on every cycle. A benchmark that skipped
+/// it would measure a log no running server ever has: reconstructing any
+/// version would replay from the beginning of time, and both the manifest
+/// load and the time travel numbers would be reporting the absence of
+/// maintenance rather than the cost of the format
+const CHECKPOINT_EVERY: u64 = 64;
+
+/// Collapses a log the way the maintenance loop does, so what is measured
+/// afterwards is a log in the shape a running server keeps it in
+fn checkpoint_like_the_server(log: &TransactionLog) {
+    let head = log.head_version();
+    let mut at = CHECKPOINT_EVERY;
+    while at <= head {
+        log.checkpoint(at).expect("checkpoint");
+        at += CHECKPOINT_EVERY;
+    }
+}
+
+/// Rows one commit carries in the commit-latency gates.
+///
+/// A commit's cost is dominated by manifest serialization and the fsync,
+/// not by the rows, so this is sized to be a realistic statement rather
+/// than to stress the writer
+fn commit_rows() -> usize {
+    if measuring() { 10_000 } else { 500 }
+}
+
+/// Files the OPTIMIZE gate compacts. The target names a thousand
+fn optimize_files() -> usize {
+    if measuring() { 1_000 } else { 20 }
+}
+
+/// Rows the clustering pass gate carries. The target names ten million
+fn cluster_pass_rows() -> usize {
+    if measuring() { 10_000_000 } else { 20_000 }
+}
+
+/// Files the manifest-load gate reconstructs. The target names ten
+/// thousand
+fn manifest_files() -> usize {
+    if measuring() { 10_000 } else { 500 }
+}
+
+/// Records one absolute target and returns whether it held.
+///
+/// Wrapped so every gate in this section reports the same way and so the
+/// unit is stated once beside the number rather than implied by the metric
+/// name
+fn gate(name: &str, value: f64, target: f64, higher_is_better: bool) -> bool {
+    check_performance("lake_targets", name, value, target, higher_is_better)
+}
+
+/// Two columns of `n` rows, the shape every gate below writes
+fn rows_batch(start: i64, n: usize) -> Vec<ColumnData> {
+    let ids: Vec<Option<Vec<u8>>> = (0..n)
+        .map(|i| Some((start + i as i64).to_le_bytes().to_vec()))
+        .collect();
+    let payload: Vec<Option<Vec<u8>>> = (0..n)
+        .map(|i| Some(((i as i64 * 7919) % 1024).to_le_bytes().to_vec()))
+        .collect();
+    vec![
+        ColumnData {
+            column_id: 0,
+            cells: ids,
+        },
+        ColumnData {
+            column_id: 1,
+            cells: payload,
+        },
+    ]
+}
+
+fn two_column_schema() -> LakeSchema {
+    schema(&[("id", TypeId::Int64), ("bucket", TypeId::Int64)])
+}
+
+/// What one commit costs, on both of the two shapes a commit takes.
+///
+/// An append writes a data file and publishes a version. A predicate
+/// delete writes no data at all: it records the predicate and publishes a
+/// version, which is why its target is less than half the append's
+#[test]
+fn test_commit_latency_targets() {
+    let _section = section("Target: Commit Latency");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let paths = LakePaths::new(dir.path(), 900);
+    let log = new_log(&paths, &two_column_schema());
+    let n = commit_rows();
+    tprintln!("  Rows per commit: {}", n);
+
+    let mut append_us = Vec::with_capacity(RUNS);
+    for run in 0..RUNS {
+        let batch = rows_batch((run * n) as i64, n);
+        let (_, us) = micros(|| {
+            zyron_lake::append_rows(&log, attempt(OperationKind::Append, 0), 900, &batch)
+                .expect("append")
+        });
+        append_us.push(us);
+    }
+    let append_ms = record_metric("lake_targets", "Commit, insert", "us", append_us) / 1000.0;
+    assert!(
+        gate("Commit insert latency (ms)", append_ms, 500.0, false),
+        "one commit took {:.1}ms, over the 500ms ceiling",
+        append_ms
+    );
+
+    // A predicate that covers part of every file, so it is recorded rather
+    // than applied and the commit is metadata only
+    let mut delete_us = Vec::with_capacity(RUNS);
+    for run in 0..RUNS {
+        let bound = (run as i64 + 1) * 3;
+        let predicate = cmp(1, CompareOp::Lt, bound);
+        let (_, us) = micros(|| {
+            zyron_lake::delete_where(
+                &log,
+                attempt(OperationKind::Delete, 0),
+                &predicate,
+                "bucket < n",
+            )
+        });
+        delete_us.push(us);
+    }
+    let delete_ms =
+        record_metric("lake_targets", "Commit, delete predicate", "us", delete_us) / 1000.0;
+    assert!(
+        gate(
+            "Commit delete predicate latency (ms)",
+            delete_ms,
+            200.0,
+            false
+        ),
+        "recording a delete predicate took {:.1}ms, over the 200ms ceiling",
+        delete_ms
+    );
+}
+
+/// The three commits that move only metadata: adding a column, changing
+/// the cluster keys, and cloning a table.
+///
+/// All three are the same claim in different clothes. None of them reads
+/// or writes a data file, so their cost is a manifest write and nothing
+/// else, and a number far above these targets means something is touching
+/// data it does not need to
+#[test]
+fn test_metadata_only_commit_targets() {
+    let _section = section("Target: Metadata-Only Commits");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let paths = LakePaths::new(dir.path(), 901);
+    let log = new_log(&paths, &two_column_schema());
+    for run in 0..8 {
+        zyron_lake::append_rows(
+            &log,
+            attempt(OperationKind::Append, 0),
+            901,
+            &rows_batch(run * 1000, 1000),
+        )
+        .expect("append");
+    }
+
+    // Add column: the schema grows, the files do not move
+    let mut add_us = Vec::with_capacity(RUNS);
+    for run in 0..RUNS {
+        let (_, us) = micros(|| {
+            log.commit(attempt(OperationKind::SchemaChange, 0), |base| {
+                let mut columns = base.schema.columns.clone();
+                let id = base.schema.next_column_id;
+                columns.push(LakeColumn {
+                    id,
+                    name: format!("added_{run}"),
+                    type_id: TypeId::Int64,
+                    nullable: true,
+                    fractional_digits: None,
+                    tz_offset_secs: None,
+                    max_length: None,
+                    default_expr: None,
+                });
+                Ok(vec![LogEntry::SchemaChange(LakeSchema {
+                    schema_id: base.schema.schema_id + 1,
+                    next_column_id: id + 1,
+                    columns,
+                    derived: base.schema.derived.clone(),
+                })])
+            })
+            .expect("add column")
+        });
+        add_us.push(us);
+    }
+    let add_ms = record_metric("lake_targets", "Schema add column", "us", add_us) / 1000.0;
+    assert!(
+        gate("Schema add column latency (ms)", add_ms, 500.0, false),
+        "adding a column took {:.1}ms, over the 500ms ceiling",
+        add_ms
+    );
+
+    // Key change: the layout a later pass will apply, with no rewrite now
+    let files_before = log.latest_manifest().expect("manifest").entries.len();
+    let mut alter_us = Vec::with_capacity(RUNS);
+    for run in 0..RUNS {
+        let (_, us) = micros(|| {
+            log.commit(attempt(OperationKind::SetProperty, 0), |base| {
+                Ok(vec![LogEntry::SetClusterSpec(ClusterSpec {
+                    spec_id: base.cluster_spec.spec_id + 1,
+                    keys: vec![ClusterKey {
+                        column_id: (run % 2) as u32,
+                        strategy: ClusterStrategy::RangePartition,
+                        param: 0,
+                    }],
+                })])
+            })
+            .expect("set cluster spec")
+        });
+        alter_us.push(us);
+    }
+    let alter_ms = record_metric("lake_targets", "Key change, no rewrite", "us", alter_us) / 1000.0;
+    assert!(
+        gate(
+            "Key change without rewrite latency (ms)",
+            alter_ms,
+            50.0,
+            false
+        ),
+        "changing the cluster keys took {:.1}ms, over the 50ms ceiling",
+        alter_ms
+    );
+    assert_eq!(
+        log.latest_manifest().expect("manifest").entries.len(),
+        files_before,
+        "a key change must not rewrite a file, or it is not a metadata commit"
+    );
+
+    // Clone: a whole table, in the time it takes to walk its manifest
+    let mut clone_us = Vec::with_capacity(RUNS);
+    for run in 0..RUNS {
+        let clone_paths = LakePaths::new(dir.path(), 910 + run as u32);
+        let (outcome, us) = micros(|| {
+            zyron_lake::clone_table(
+                &log,
+                clone_paths,
+                attempt(OperationKind::SchemaChange, 0),
+                None,
+            )
+            .expect("clone")
+        });
+        assert_eq!(
+            outcome.1.files, files_before,
+            "the clone has to take the whole file set"
+        );
+        clone_us.push(us);
+    }
+    let clone_ms = record_metric("lake_targets", "Clone", "us", clone_us) / 1000.0;
+    assert!(
+        gate("Clone latency (ms)", clone_ms, 1000.0, false),
+        "cloning took {:.1}ms, over the 1s ceiling",
+        clone_ms
+    );
+}
+
+/// What the two rewriting passes cost: compaction over a thousand files,
+/// and a clustering pass over ten million rows.
+///
+/// These are the two operations that read and write the whole table, so
+/// they are the two whose targets are stated in tens of seconds rather
+/// than milliseconds
+#[test]
+fn test_rewrite_pass_targets() {
+    let _section = section("Target: Rewrite Passes");
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // OPTIMIZE over many small files
+    let paths = LakePaths::new(dir.path(), 902);
+    let log = new_log(&paths, &two_column_schema());
+    let files = optimize_files();
+    tprintln!("  OPTIMIZE input files: {}", files);
+    for f in 0..files {
+        zyron_lake::append_rows(
+            &log,
+            attempt(OperationKind::Append, 0),
+            902,
+            &rows_batch(f as i64 * 100, 100),
+        )
+        .expect("append");
+    }
+    assert_eq!(
+        log.latest_manifest().expect("manifest").entries.len(),
+        files
+    );
+    let (outcome, optimize_us) = micros(|| {
+        zyron_lake::optimize(
+            &log,
+            attempt(OperationKind::Optimize, 0),
+            902,
+            zyron_lake::DEFAULT_ROWS_PER_FILE,
+        )
+        .expect("optimize")
+    });
+    assert!(
+        outcome.files_removed >= files,
+        "the pass has to have taken every small file, took {}",
+        outcome.files_removed
+    );
+    record_metric(
+        "lake_targets",
+        "OPTIMIZE, 1000 files",
+        "us",
+        vec![optimize_us],
+    );
+    let optimize_s = optimize_us / 1_000_000.0;
+    assert!(
+        gate("OPTIMIZE latency (s)", optimize_s, 60.0, false),
+        "compacting {} files took {:.1}s, over the 60s ceiling",
+        files,
+        optimize_s
+    );
+
+    // One clustering pass over a large table
+    let paths = LakePaths::new(dir.path(), 903);
+    let spec = ClusterSpec {
+        spec_id: 1,
+        keys: vec![ClusterKey {
+            column_id: 1,
+            strategy: ClusterStrategy::RangePartition,
+            param: 0,
+        }],
+    };
+    // Force, so what is timed is the pass rather than measurement deciding
+    // whether to have one. A table with no workload behind it proposes no
+    // keys, which is correct and is not what this gate is about
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        zyron_lake::CLUSTERING_MODE_PROPERTY.to_string(),
+        "force".to_string(),
+    );
+    let log = TransactionLog::create(
+        paths,
+        attempt(OperationKind::SchemaChange, 0),
+        &two_column_schema(),
+        Some(&spec),
+        &properties,
+    )
+    .expect("create log");
+    let total = cluster_pass_rows();
+    let per_file = (total / 16).max(1);
+    tprintln!(
+        "  Cluster pass rows: {}, files: {}",
+        total,
+        total / per_file
+    );
+    let mut written = 0usize;
+    while written < total {
+        let n = per_file.min(total - written);
+        zyron_lake::append_rows(
+            &log,
+            attempt(OperationKind::Append, 0),
+            903,
+            &rows_batch(written as i64, n),
+        )
+        .expect("append");
+        written += n;
+    }
+
+    let (report, pass_us) = micros(|| {
+        zyron_lake::run_table_cluster_pass(
+            &log,
+            attempt(OperationKind::Optimize, 0),
+            903,
+            &zyron_lake::TablePassOptions {
+                // Every file in one pass, which is what the target names
+                max_inputs: 1024,
+                ..zyron_lake::TablePassOptions::new(9_030_001)
+            },
+        )
+        .expect("cluster pass")
+    });
+    assert!(
+        report.outcome.is_some(),
+        "the pass has to have run for its cost to mean anything"
+    );
+    record_metric(
+        "lake_targets",
+        "Cluster pass, 10M rows",
+        "us",
+        vec![pass_us],
+    );
+    let pass_s = pass_us / 1_000_000.0;
+    assert!(
+        gate("Cluster pass latency (s)", pass_s, 90.0, false),
+        "a clustering pass over {} rows took {:.1}s, over the 90s ceiling",
+        total,
+        pass_s
+    );
+}
+
+/// What the adaptive machinery costs when it is not rewriting anything:
+/// deciding what to propose, and the two counters it decides from.
+///
+/// The two counters are the only part of clustering that touches a query's
+/// hot path, so their targets are in nanoseconds. Everything else about
+/// adaptive clustering happens on a maintenance thread, and a query that
+/// paid measurably for being observed would make the whole feature a cost
+/// rather than a saving
+#[test]
+fn test_adaptive_machinery_targets() {
+    let _section = section("Target: Adaptive Clustering Overhead");
+    let manifest = synthetic_manifest(files());
+    let observer = zyron_lake::observer();
+    let now = zyron_lake::current_epoch();
+
+    // Proposal evaluation: read the evidence, choose a layout
+    let mut propose_us = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        let (_, us) = micros(|| {
+            let evidence = zyron_lake::evidence_from_manifest(&manifest, observer, 904, now);
+            zyron_lake::propose(&evidence, &[], zyron_lake::DEFAULT_MAX_PROPOSED_KEYS)
+        });
+        propose_us.push(us);
+    }
+    let propose_ms = record_metric(
+        "lake_targets",
+        "Cluster proposal evaluation",
+        "us",
+        propose_us,
+    ) / 1000.0;
+    assert!(
+        gate(
+            "Cluster proposal evaluation latency (ms)",
+            propose_ms,
+            200.0,
+            false
+        ),
+        "choosing a layout took {:.1}ms, over the 200ms ceiling",
+        propose_ms
+    );
+
+    // The planner-side counter, per call
+    let predicate = cmp(0, CompareOp::Eq, 42);
+    let iterations = if measuring() { 2_000_000 } else { 20_000 };
+    let (_, observe_us) = micros(|| {
+        for i in 0..iterations {
+            zyron_lake::observe_scan(905, &predicate, 1 << 20, (i % 1024) as u64, now);
+        }
+    });
+    let observe_ns = observe_us * 1000.0 / iterations as f64;
+    record_metric(
+        "lake_targets",
+        "Workload observer record",
+        "ns",
+        vec![observe_ns],
+    );
+    assert!(
+        gate("Workload observer record (ns)", observe_ns, 20.0, false),
+        "observing one planned scan cost {:.1}ns, over the 20ns ceiling",
+        observe_ns
+    );
+
+    // The scan-completion counter, per call
+    let (_, feedback_us) = micros(|| {
+        for i in 0..iterations {
+            zyron_lake::observe_scan_result(906, &predicate, 1024, (i % 1024) as u64, now);
+        }
+    });
+    let feedback_ns = feedback_us * 1000.0 / iterations as f64;
+    record_metric(
+        "lake_targets",
+        "Feedback skip-rate measurement",
+        "ns",
+        vec![feedback_ns],
+    );
+    assert!(
+        gate(
+            "Feedback skip-rate measurement (ns)",
+            feedback_ns,
+            100.0,
+            false
+        ),
+        "measuring one finished scan cost {:.1}ns, over the 100ns ceiling",
+        feedback_ns
+    );
+}
+
+/// Ceiling on ordering one row by its cluster key.
+///
+/// Derived from six release runs, which measured 55.6, 69.8, 71.9, 78.9,
+/// 79.3 and 119.7 nanoseconds a row on this machine, a mean of about
+/// seventy-nine. Twice that covers every one of those observations with
+/// room for a noisy machine and still trips on a doubling.
+///
+/// This replaced a fifty microsecond per-batch target that was written
+/// against an affinity-bin placement lookup, which is constant time per
+/// row. Sorting a batch is not, and no constant-time ceiling was ever
+/// going to apply to it: item 3 chose to sort rather than to bin, so the
+/// gate names sorting
+const SORT_NS_PER_ROW_CEILING: f64 = 160.0;
+
+/// What ordering a write by its cluster key costs, per row.
+///
+/// The measurement is the same subtraction it always was, appending an
+/// identical batch to a table with a layout and to one without. Only the
+/// unit changed: per row rather than per batch, because the work is per
+/// row and a per-batch number means nothing without the batch size beside
+/// it
+#[test]
+fn test_cluster_key_sort_overhead_target() {
+    let _section = section("Target: Cluster Key Sort Overhead");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let n = commit_rows();
+
+    let plain = new_log(&LakePaths::new(dir.path(), 907), &two_column_schema());
+    let spec = ClusterSpec {
+        spec_id: 1,
+        keys: vec![ClusterKey {
+            column_id: 1,
+            strategy: ClusterStrategy::RangePartition,
+            param: 0,
+        }],
+    };
+    let clustered = TransactionLog::create(
+        LakePaths::new(dir.path(), 908),
+        attempt(OperationKind::SchemaChange, 0),
+        &two_column_schema(),
+        Some(&spec),
+        &BTreeMap::new(),
+    )
+    .expect("create log");
+
+    let mut plain_us = 0f64;
+    let mut clustered_us = 0f64;
+    for run in 0..RUNS {
+        let batch = rows_batch((run * n) as i64, n);
+        // Alternated, so cache and thermal state do not favour whichever
+        // side runs first
+        if run % 2 == 0 {
+            plain_us += micros(|| {
+                zyron_lake::append_rows(&plain, attempt(OperationKind::Append, 0), 907, &batch)
+                    .expect("append")
+            })
+            .1;
+            clustered_us += micros(|| {
+                zyron_lake::append_rows(&clustered, attempt(OperationKind::Append, 0), 908, &batch)
+                    .expect("append")
+            })
+            .1;
+        } else {
+            clustered_us += micros(|| {
+                zyron_lake::append_rows(&clustered, attempt(OperationKind::Append, 0), 908, &batch)
+                    .expect("append")
+            })
+            .1;
+            plain_us += micros(|| {
+                zyron_lake::append_rows(&plain, attempt(OperationKind::Append, 0), 907, &batch)
+                    .expect("append")
+            })
+            .1;
+        }
+    }
+    let per_row_ns = ((clustered_us - plain_us) / RUNS as f64).max(0.0) * 1000.0 / n as f64;
+    tprintln!("  Rows per append: {}", n);
+    record_metric(
+        "lake_targets",
+        "Cluster key sort overhead",
+        "ns/row",
+        vec![per_row_ns],
+    );
+    assert!(
+        gate(
+            "Cluster key sort overhead (ns per row)",
+            per_row_ns,
+            SORT_NS_PER_ROW_CEILING,
+            false
+        ),
+        "ordering a row by its cluster key cost {:.1}ns",
+        per_row_ns
+    );
+
+    // Where that cost goes, recorded rather than gated: it explains the
+    // number above and is not a second claim. Alternated and averaged,
+    // because a single unpaired sample of each reported anything from zero
+    // to sixty nanoseconds a row across runs
+    let ordered_batch: Vec<ColumnData> = {
+        let ids: Vec<Option<Vec<u8>>> = (0..n)
+            .map(|i| Some((1_000_000i64 + i as i64).to_le_bytes().to_vec()))
+            .collect();
+        let bucket: Vec<Option<Vec<u8>>> = (0..n)
+            .map(|i| Some((i as i64).to_le_bytes().to_vec()))
+            .collect();
+        vec![
+            ColumnData {
+                column_id: 0,
+                cells: ids,
+            },
+            ColumnData {
+                column_id: 1,
+                cells: bucket,
+            },
+        ]
+    };
+    let mut presorted_total = 0f64;
+    let mut shuffled_total = 0f64;
+    for run in 0..RUNS {
+        let shuffled = rows_batch((500_000 + run * n) as i64, n);
+        let mut once = |batch: &[ColumnData]| {
+            micros(|| {
+                zyron_lake::append_rows(&clustered, attempt(OperationKind::Append, 0), 908, batch)
+                    .expect("append")
+            })
+            .1
+        };
+        if run % 2 == 0 {
+            presorted_total += once(&ordered_batch);
+            shuffled_total += once(&shuffled);
+        } else {
+            shuffled_total += once(&shuffled);
+            presorted_total += once(&ordered_batch);
+        }
+    }
+    record_metric(
+        "lake_targets",
+        "Clustered append, batch already in key order",
+        "us",
+        vec![presorted_total / RUNS as f64],
+    );
+    record_metric(
+        "lake_targets",
+        "Clustered append, batch shuffled",
+        "us",
+        vec![shuffled_total / RUNS as f64],
+    );
+}
+
+/// How long it takes to notice a table needs repairing ahead of its clock.
+///
+/// The fast lane is what item 3 added: a table whose drift has crossed its
+/// urgency threshold is passed on the next tick whatever its interval says.
+/// What is timed is the decision, which is the part this code owns. The
+/// other component of "how soon does repair start" is the tick interval,
+/// which is configuration rather than code, and gating it would be gating
+/// a number an operator chose
+#[test]
+fn test_fast_lane_trigger_latency_target() {
+    let _section = section("Target: Repair Fast Lane Trigger");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let paths = LakePaths::new(dir.path(), 913);
+    let spec = ClusterSpec {
+        spec_id: 1,
+        keys: vec![ClusterKey {
+            column_id: 1,
+            strategy: ClusterStrategy::RangePartition,
+            param: 0,
+        }],
+    };
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        zyron_lake::CLUSTER_REPAIR_URGENCY_THRESHOLD_PROPERTY.to_string(),
+        "8".to_string(),
+    );
+    let log = TransactionLog::create(
+        paths,
+        attempt(OperationKind::SchemaChange, 0),
+        &two_column_schema(),
+        Some(&spec),
+        &properties,
+    )
+    .expect("create log");
+
+    // Overlapping files: every append spans the same key range, which is
+    // exactly the drift the threshold counts
+    let overlapping = 12;
+    for run in 0..overlapping {
+        let batch = rows_batch(run as i64 * 10, 300);
+        zyron_lake::append_rows(&log, attempt(OperationKind::Append, 0), 913, &batch)
+            .expect("append");
+    }
+    let manifest = log.latest_manifest().expect("manifest");
+    let drifted = zyron_lake::drifted_file_count(&manifest);
+    assert!(
+        drifted > manifest.cluster_repair_urgency_threshold(),
+        "the workload has to actually cross the threshold: {} drifted against a threshold of {}",
+        drifted,
+        manifest.cluster_repair_urgency_threshold()
+    );
+
+    // What a maintenance tick pays to find that out, per table
+    let mut decide_us = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        let (fires, us) = micros(|| {
+            let cold =
+                TransactionLog::open(LakePaths::new(dir.path(), 913), &AllCommitted).expect("open");
+            let manifest = cold.latest_manifest().expect("manifest");
+            zyron_lake::drifted_file_count(&manifest) > manifest.cluster_repair_urgency_threshold()
+        });
+        assert!(fires, "a table over its threshold has to be picked up");
+        decide_us.push(us);
+    }
+    let decide_ms = record_metric(
+        "lake_targets",
+        "Fast lane trigger decision",
+        "us",
+        decide_us,
+    ) / 1000.0;
+    assert!(
+        gate("Fast lane trigger latency (ms)", decide_ms, 100.0, false),
+        "deciding that a table needs repairing took {:.1}ms",
+        decide_ms
+    );
+}
+
+/// That `cluster_repair_max_inputs` does what it says.
+///
+/// A tunable nobody can observe is a tunable nobody should trust. Two
+/// identical tables, two settings, and the pass with four times the bound
+/// has to take close to four times the files. Gated at three and a half
+/// rather than four, because the bound is a ceiling on what a pass may
+/// take and not a promise about what it will find
+#[test]
+fn test_repair_max_inputs_scaling_target() {
+    let _section = section("Target: Repair Max Inputs Scaling");
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let build = |table_id: u32| -> TransactionLog {
+        let spec = ClusterSpec {
+            spec_id: 1,
+            keys: vec![ClusterKey {
+                column_id: 1,
+                strategy: ClusterStrategy::RangePartition,
+                param: 0,
+            }],
+        };
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            zyron_lake::CLUSTERING_MODE_PROPERTY.to_string(),
+            "force".to_string(),
+        );
+        let log = TransactionLog::create(
+            LakePaths::new(dir.path(), table_id),
+            attempt(OperationKind::SchemaChange, 0),
+            &two_column_schema(),
+            Some(&spec),
+            &properties,
+        )
+        .expect("create log");
+        // Enough overlapping files that the larger bound is the thing that
+        // limits the pass, not the supply
+        for run in 0..80 {
+            let batch = rows_batch(run as i64 * 10, 200);
+            zyron_lake::append_rows(
+                &log,
+                attempt(OperationKind::Append, 0),
+                table_id as u64,
+                &batch,
+            )
+            .expect("append");
+        }
+        log
+    };
+
+    let run_with =
+        |log: &TransactionLog, table_id: u32, max_inputs: usize, pass_id: u64| -> usize {
+            let report = zyron_lake::run_table_cluster_pass(
+                log,
+                attempt(OperationKind::Optimize, 0),
+                table_id,
+                &zyron_lake::TablePassOptions {
+                    max_inputs,
+                    ..zyron_lake::TablePassOptions::new(pass_id)
+                },
+            )
+            .expect("cluster pass");
+            report.outcome.map(|o| o.inputs).unwrap_or(0)
+        };
+
+    let narrow_log = build(914);
+    let wide_log = build(915);
+    let narrow = run_with(&narrow_log, 914, 16, 9_140_001);
+    let wide = run_with(&wide_log, 915, 64, 9_150_001);
+    tprintln!(
+        "  Files taken: {} at max_inputs 16, {} at max_inputs 64",
+        narrow,
+        wide
+    );
+    assert!(
+        narrow > 0 && wide > 0,
+        "both passes have to have run for the ratio to mean anything"
+    );
+    let ratio = wide as f64 / narrow as f64;
+    record_metric(
+        "lake_targets",
+        "Repair max_inputs scaling",
+        "x",
+        vec![ratio],
+    );
+    assert!(
+        gate("Repair max_inputs scaling (x)", ratio, 3.5, true),
+        "four times the bound took {:.2}x the files, so the tunable is not doing what it says",
+        ratio
+    );
+}
+
+/// What reaching back through history costs, absolutely.
+///
+/// Six attempts to state this as a percentage, and the sixth is why it is
+/// not one. Recorded so none of them is tried again:
+///
+/// 1. `manifest_at(old)` against `manifest_at(head)` on one log compared
+///    two cache hits and reported zero.
+/// 2. The same on cold logs compared a real reconstruction against a head
+///    that opening the log had already materialized, and reported tens of
+///    thousands of percent.
+/// 3. Comparing whole reads of two versions compared different amounts of
+///    data, because an older version names fewer files.
+/// 4. Measuring one version twice, once as head and once buried, measured
+///    `TransactionLog::open` scanning a longer log directory.
+/// 5. Comparing both on one log removed that, but divided a fixed
+///    resolution cost by a whole read of four thousand rows, which is the
+///    smallest thing anyone would ever time travel for. Any fixed cost
+///    over a denominator that small reads as a large percentage.
+/// 6. There is no denominator. A percentage needs a representative query
+///    and this suite has no way to say what one is, so the cost is stated
+///    as what it is: microseconds to reach back, and microseconds per
+///    version reached back.
+///
+/// The second of those is the one that would catch a real regression. A
+/// linear replay stays flat per version however far back it goes, and a
+/// hidden non-linear term shows up there long before it shows up in the
+/// total
+#[test]
+fn test_time_travel_reach_back_targets() {
+    let _section = section("Target: Time Travel Reach Back");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let n = commit_rows();
+    let paths = LakePaths::new(dir.path(), 912);
+    let log = new_log(&paths, &two_column_schema());
+    for run in 0..4 {
+        zyron_lake::append_rows(
+            &log,
+            attempt(OperationKind::Append, 0),
+            912,
+            &rows_batch((run * n) as i64, n),
+        )
+        .expect("append");
+    }
+    let pinned = log.head_version();
+
+    let buried_versions: u64 = if measuring() { 200 } else { 20 };
+    for run in 0..buried_versions {
+        zyron_lake::append_rows(
+            &log,
+            attempt(OperationKind::Append, 0),
+            912,
+            &rows_batch((1_000_000 + run * 100) as i64, 100),
+        )
+        .expect("append");
+    }
+    // The shape a running server keeps a log in. Without it every resolve
+    // replays from the beginning of time, which is a number about the
+    // absence of maintenance rather than about the format
+    checkpoint_like_the_server(&log);
+
+    let resolve = |version: u64| -> f64 {
+        micros(|| {
+            let cold = TransactionLog::open(paths.clone(), &AllCommitted).expect("open");
+            cold.manifest_at(version).expect("manifest")
+        })
+        .1
+    };
+    let head = log.head_version();
+    let mut reached = Vec::with_capacity(RUNS);
+    let mut newest = Vec::with_capacity(RUNS);
+    for run in 0..RUNS {
+        // Both on the same log, so each pays the same open cost and the
+        // subtraction removes it. Alternated so neither side runs on a
+        // systematically warmer page cache
+        if run % 2 == 0 {
+            reached.push(resolve(pinned));
+            newest.push(resolve(head));
+        } else {
+            newest.push(resolve(head));
+            reached.push(resolve(pinned));
+        }
+    }
+    let reached_us = reached.iter().sum::<f64>() / RUNS as f64;
+    let newest_us = newest.iter().sum::<f64>() / RUNS as f64;
+    tprintln!(
+        "  Version {} resolved in {:.1}us, head {} in {:.1}us, over {} versions of history",
+        pinned,
+        reached_us,
+        head,
+        newest_us,
+        buried_versions
+    );
+
+    // The older version names far fewer files than the head does, so
+    // content cost biases this downward. A positive number is therefore a
+    // lower bound on what reaching back costs
+    let delta_us = (reached_us - newest_us).max(0.0);
+    record_metric(
+        "lake_targets",
+        "Time travel reach back delta",
+        "us",
+        vec![delta_us],
+    );
+    assert!(
+        gate("Time travel reach back delta (us)", delta_us, 1500.0, false),
+        "reaching back {} versions cost {:.1}us",
+        buried_versions,
+        delta_us
+    );
+
+    let per_version_us = delta_us / buried_versions as f64;
+    record_metric(
+        "lake_targets",
+        "Time travel reach back per version",
+        "us/version",
+        vec![per_version_us],
+    );
+    assert!(
+        gate(
+            "Time travel reach back per version (us)",
+            per_version_us,
+            10.0,
+            false
+        ),
+        "reaching back cost {:.2}us a version, which is where a non-linear replay would show",
+        per_version_us
+    );
+}
+
+/// What it costs to open a table with a lot of files, and how many commits
+/// a second the log will take.
+///
+/// The first is what every reader pays before it reads anything. The
+/// second is what bounds a write workload, and it is a throughput rather
+/// than a latency because optimistic concurrency trades one for the other
+#[test]
+fn test_manifest_and_concurrency_targets() {
+    let _section = section("Target: Manifest Load and Commit Throughput");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let paths = LakePaths::new(dir.path(), 909);
+    let log = new_log(&paths, &two_column_schema());
+    let files = manifest_files();
+    tprintln!("  Files in the manifest: {}", files);
+
+    // Built through real commits, so what is reconstructed is a real log
+    // rather than a manifest somebody assembled
+    for _ in 0..files {
+        log.commit(attempt(OperationKind::Append, 0), |base| {
+            let mut entry = synthetic_manifest(1).entries[0].clone();
+            entry.partition_id = base.entries.len() as u64 + 1;
+            Ok(vec![LogEntry::AddFile(entry)])
+        })
+        .expect("commit");
+    }
+    // The shape a running server keeps this table in. Without it the ten
+    // thousand commits are ten thousand entries to replay, and the number
+    // measures a log that has never been maintained rather than a manifest
+    // that names ten thousand files
+    checkpoint_like_the_server(&log);
+    let head = log.head_version();
+    let mut load_us = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        // The open is inside the timing, because opening the log is what
+        // reconstructs the manifest. Timing only the call after it measures
+        // a cache lookup, which is not what a reader pays to open a table
+        let (manifest, us) = micros(|| {
+            let cold = TransactionLog::open(paths.clone(), &AllCommitted).expect("open");
+            cold.manifest_at(head).expect("manifest")
+        });
+        assert_eq!(manifest.entries.len(), files);
+        load_us.push(us);
+    }
+    let load_ms = record_metric("lake_targets", "Manifest load, 10K files", "us", load_us) / 1000.0;
+    assert!(
+        gate("Manifest load latency (ms)", load_ms, 200.0, false),
+        "opening a table with {} files took {:.1}ms, over the 200ms ceiling",
+        files,
+        load_ms
+    );
+
+    // Commits per second, serialized through exclusive file creation
+    let commits = if measuring() { 200 } else { 20 };
+    let paths = LakePaths::new(dir.path(), 911);
+    let log = new_log(&paths, &two_column_schema());
+    let (_, total_us) = micros(|| {
+        for i in 0..commits {
+            zyron_lake::append_rows(
+                &log,
+                attempt(OperationKind::Append, 0),
+                911,
+                &rows_batch(i as i64 * 10, 10),
+            )
+            .expect("append");
+        }
+    });
+    let per_sec = commits as f64 / (total_us / 1_000_000.0);
+    record_metric(
+        "lake_targets",
+        "Concurrent commits",
+        " commits/sec",
+        vec![per_sec],
+    );
+    assert!(
+        gate("Commit throughput (commits/sec)", per_sec, 10.0, true),
+        "the log took {:.1} commits a second, under the 10/sec floor",
+        per_sec
     );
 }

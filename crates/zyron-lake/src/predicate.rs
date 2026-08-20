@@ -795,6 +795,102 @@ fn decode_node(r: &mut Cursor<'_>, depth: usize) -> Result<LakePredicate, ZyronE
     })
 }
 
+// ---------------------------------------------------------------------------
+// Cluster fit
+// ---------------------------------------------------------------------------
+
+/// How much a table's layout does for one predicate.
+///
+/// Clustering sorts files by its keys in order, so a file's bounds on the
+/// leading key are the narrowest the layout produces and every key after it
+/// only narrows within a run of files that share a leading value. A
+/// predicate that names none of the keys gets whatever bounds its column
+/// happens to have, which is the layout doing nothing for it.
+///
+/// This is a statement about the layout, not a prediction of how many files
+/// a scan will read. What actually got pruned is counted by the scan and
+/// reported beside this
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterFit {
+    /// Constrains the leading cluster key
+    Good,
+    /// Constrains a cluster key that is not the leading one
+    Fair,
+    /// Constrains no cluster key
+    Poor,
+}
+
+impl ClusterFit {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClusterFit::Good => "good",
+            ClusterFit::Fair => "fair",
+            ClusterFit::Poor => "poor",
+        }
+    }
+}
+
+impl std::fmt::Display for ClusterFit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What a predicate gets from a table's layout, and which column decided it
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClusterFitEstimate {
+    pub fit: ClusterFit,
+    /// The cluster key the predicate reached, or the column it constrained
+    /// instead when it reached none. None only when the predicate
+    /// constrains nothing at all
+    pub column_id: Option<u32>,
+    /// Where that key sits in the layout, zero for the leading one. None
+    /// when the predicate reached no key
+    pub position: Option<usize>,
+}
+
+/// Estimates what a predicate gets from a set of cluster keys.
+///
+/// `key_columns` is the layout in order, which is the accepted spec rather
+/// than the declared one: a declared key measurement has replaced orders no
+/// file, so judging a plan against it would report a fit the data does not
+/// have.
+///
+/// Takes column ids rather than whole keys because the strategy decides how
+/// values are bucketed within a key, not whether a predicate reaches it.
+///
+/// None when the table has no keys. A table nobody has laid out has no fit
+/// to report, and calling that Poor would read as a defect rather than as
+/// an absence
+pub fn cluster_fit_estimate(
+    key_columns: &[u32],
+    predicate: &LakePredicate,
+) -> Option<ClusterFitEstimate> {
+    if key_columns.is_empty() {
+        return None;
+    }
+    let referenced = predicate.referenced_columns();
+    match key_columns.iter().position(|k| referenced.contains(k)) {
+        Some(0) => Some(ClusterFitEstimate {
+            fit: ClusterFit::Good,
+            column_id: Some(key_columns[0]),
+            position: Some(0),
+        }),
+        Some(position) => Some(ClusterFitEstimate {
+            fit: ClusterFit::Fair,
+            column_id: Some(key_columns[position]),
+            position: Some(position),
+        }),
+        None => Some(ClusterFitEstimate {
+            fit: ClusterFit::Poor,
+            // What it constrained instead, which is the column an operator
+            // would have to cluster by to turn this into a Good fit
+            column_id: referenced.first().copied(),
+            position: None,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1128,5 +1224,86 @@ mod tests {
         assert_eq!(CompareOp::Lt.flipped(), CompareOp::Gt);
         assert_eq!(CompareOp::Eq.flipped(), CompareOp::Eq);
         assert_eq!(CompareOp::NotEq.negated(), CompareOp::Eq);
+    }
+
+    /// Files are sorted by the leading key first, so a predicate that names
+    /// it gets the narrowest bounds the layout can produce. One that names
+    /// a later key gets bounds that only narrow inside a run of files
+    /// sharing a leading value, and one that names no key gets nothing from
+    /// the layout at all
+    #[test]
+    fn test_cluster_fit_reads_the_position_of_the_key_a_predicate_reaches() {
+        let keys = [7u32, 3, 9];
+
+        let leading = LakePredicate::Compare {
+            column_id: 7,
+            op: CompareOp::Eq,
+            value: LakeValue::Int(1),
+        };
+        let fit = cluster_fit_estimate(&keys, &leading).expect("a laid out table has a fit");
+        assert_eq!(fit.fit, ClusterFit::Good);
+        assert_eq!(fit.column_id, Some(7));
+        assert_eq!(fit.position, Some(0));
+
+        let secondary = LakePredicate::In {
+            column_id: 9,
+            values: vec![LakeValue::Int(1), LakeValue::Int(2)],
+        };
+        let fit = cluster_fit_estimate(&keys, &secondary).expect("fit");
+        assert_eq!(fit.fit, ClusterFit::Fair);
+        assert_eq!(fit.column_id, Some(9));
+        assert_eq!(fit.position, Some(2));
+
+        let unrelated = LakePredicate::IsNull { column_id: 42 };
+        let fit = cluster_fit_estimate(&keys, &unrelated).expect("fit");
+        assert_eq!(fit.fit, ClusterFit::Poor);
+        assert_eq!(
+            fit.column_id,
+            Some(42),
+            "a poor fit has to name what the predicate constrained instead, which is the \
+             column an operator would cluster by to fix it"
+        );
+        assert_eq!(fit.position, None);
+    }
+
+    /// A conjunction reaching the leading key is a good fit even when its
+    /// other branches reach nothing, because the leading key is what
+    /// decides which files are opened
+    #[test]
+    fn test_cluster_fit_takes_the_best_key_a_conjunction_reaches() {
+        let keys = [7u32, 3];
+        let predicate = LakePredicate::And(vec![
+            LakePredicate::Compare {
+                column_id: 42,
+                op: CompareOp::Gt,
+                value: LakeValue::Int(0),
+            },
+            LakePredicate::Compare {
+                column_id: 3,
+                op: CompareOp::Eq,
+                value: LakeValue::Int(5),
+            },
+            LakePredicate::Compare {
+                column_id: 7,
+                op: CompareOp::Eq,
+                value: LakeValue::Int(5),
+            },
+        ]);
+        let fit = cluster_fit_estimate(&keys, &predicate).expect("fit");
+        assert_eq!(fit.fit, ClusterFit::Good);
+        assert_eq!(fit.column_id, Some(7));
+    }
+
+    /// A table nobody has laid out has no fit to report. Calling that poor
+    /// would read as a defect in the plan rather than as the absence of a
+    /// layout to judge it against
+    #[test]
+    fn test_a_table_with_no_cluster_keys_has_no_fit() {
+        let predicate = LakePredicate::Compare {
+            column_id: 1,
+            op: CompareOp::Eq,
+            value: LakeValue::Int(1),
+        };
+        assert!(cluster_fit_estimate(&[], &predicate).is_none());
     }
 }

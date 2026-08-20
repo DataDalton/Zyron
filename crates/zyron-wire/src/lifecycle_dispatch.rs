@@ -240,6 +240,128 @@ fn discover_erasure_targets(server: &Arc<ServerState>, cascade: bool) -> Vec<Era
 /// Plans and executes a DML/SELECT statement in its own transaction with the
 /// legal-hold / WORM enforcement hook attached. Returns rows affected
 /// (DELETE/UPDATE) or rows produced (SELECT).
+/// Table options that describe how a lake table is maintained.
+///
+/// They are written to the table's transaction log rather than to the
+/// catalog, because the maintenance loop that reads them works from the
+/// manifest
+fn is_lake_maintenance_option(key: &str) -> bool {
+    matches!(
+        key,
+        "auto_compact_small_file_ratio"
+            | "auto_compact_dead_row_ratio"
+            | "target_rows_per_file"
+            | "cluster_repair_max_inputs"
+            | "cluster_repair_interval_secs"
+            | "cluster_repair_urgency_threshold"
+            | "bloom_filter_columns"
+    )
+}
+
+/// Commits maintenance options to a lake table's log and refreshes what
+/// the catalog mirrors of them.
+///
+/// Values are checked here rather than where they are read. The readers
+/// fall back to the shipped default on anything unreadable, which is the
+/// right answer for a manifest that has been damaged and the wrong one for
+/// a statement with a typo in it: the operator would be told nothing and
+/// get the default
+async fn apply_lake_maintenance_options(
+    server: &Arc<ServerState>,
+    entry: &mut zyron_catalog::schema::TableEntry,
+    table_name: &str,
+    pairs: &[(String, String)],
+) -> Result<(), ProtocolError> {
+    if !entry.lake.is_lake() {
+        return Err(ProtocolError::Database(ZyronError::Internal(format!(
+            "'{}' is not a lake table, so it has no data files to maintain",
+            table_name
+        ))));
+    }
+    for (key, value) in pairs {
+        let lowered = key.to_ascii_lowercase();
+        match lowered.as_str() {
+            "auto_compact_small_file_ratio" | "auto_compact_dead_row_ratio" => {
+                let parsed = value.trim().parse::<f64>().ok().filter(|v| v.is_finite());
+                match parsed {
+                    Some(v) if v >= 0.0 => {}
+                    _ => {
+                        return Err(ProtocolError::Database(ZyronError::Internal(format!(
+                            "{lowered} on '{table_name}' has to be a number of at least zero, \
+                             got '{value}'"
+                        ))));
+                    }
+                }
+            }
+            "target_rows_per_file" | "cluster_repair_max_inputs" => {
+                if value
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|v| *v > 0)
+                    .is_none()
+                {
+                    return Err(ProtocolError::Database(ZyronError::Internal(format!(
+                        "{lowered} on '{table_name}' has to be a positive whole number, got \
+                         '{value}'"
+                    ))));
+                }
+            }
+            // Zero is meaningful for both: an interval of zero asks for a
+            // pass on every tick the node makes, and a threshold of zero
+            // asks for one as soon as any file needs repair
+            "cluster_repair_interval_secs" | "cluster_repair_urgency_threshold" => {
+                if value.trim().parse::<u64>().is_err() {
+                    return Err(ProtocolError::Database(ZyronError::Internal(format!(
+                        "{lowered} on '{table_name}' has to be a whole number, got '{value}'"
+                    ))));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let paths = zyron_lake::LakePaths::new(server.disk_manager.data_dir(), entry.id.0);
+    let log = zyron_lake::TransactionLog::lookup_shared(&paths).ok_or_else(|| {
+        ProtocolError::Database(ZyronError::ConfigError(format!(
+            "this node does not run the lake tier, so it cannot set options on '{table_name}'"
+        )))
+    })?;
+    let commits: Vec<zyron_lake::LogEntry> = pairs
+        .iter()
+        .map(|(k, v)| zyron_lake::LogEntry::SetProperty {
+            key: k.to_ascii_lowercase(),
+            value: v.clone(),
+        })
+        .collect();
+    let timestamp_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    log.commit(
+        zyron_lake::CommitAttempt {
+            operation: zyron_lake::OperationKind::SetProperty,
+            db_txn_id: 0,
+            commit_lsn: 0,
+            timestamp_us,
+            read_predicate: None,
+            read_version: 0,
+            audit: None,
+        },
+        |_| Ok(commits.clone()),
+    )
+    .map_err(ProtocolError::Database)?;
+
+    // The declared filter set is mirrored so planning can say which of them
+    // the layout already covers, and a request the writer will not carry
+    // out is said out loud rather than dropped
+    if let Ok(manifest) = log.latest_manifest() {
+        entry.cluster.bloom_columns = manifest.declared_bloom_columns();
+        crate::ddl_dispatch::warn_redundant_blooms(table_name, &manifest);
+    }
+    Ok(())
+}
+
 async fn run_sql(
     server: &Arc<ServerState>,
     sql: &str,
@@ -423,6 +545,16 @@ pub async fn handle_alter_table_options(
             zyron_auth::TwoPersonOperation::RetentionLock,
             &format!("retention lock / immutable on '{}'", stmt.table),
         )?;
+    }
+
+    // Options describing how a lake table is maintained live in its
+    // transaction log rather than in the catalog, because the maintenance
+    // that reads them runs from the manifest and never opens the catalog
+    let (lake_pairs, pairs): (Vec<(String, String)>, Vec<(String, String)>) = pairs
+        .into_iter()
+        .partition(|(k, _)| is_lake_maintenance_option(&k.to_ascii_lowercase()));
+    if !lake_pairs.is_empty() {
+        apply_lake_maintenance_options(server, &mut entry, &stmt.table, &lake_pairs).await?;
     }
 
     for (k, v) in &pairs {

@@ -202,8 +202,11 @@ fn table_entry_lake_tail_roundtrip() {
     let full = entry.to_bytes();
     // foreign: two u32-prefixed strings, both empty on a local table
     let foreign_len = 4 + 4;
-    // cluster: mode, schedule, spec id, key count, no keys
-    let cluster_len = 1 + 1 + 4 + 2;
+    // cluster: mode, schedule, spec id, then four u16-prefixed lists, every
+    // one of them empty on a table that declared no layout: the declared
+    // keys, the expressions the table is clustered by, the keys a pass
+    // accepted, and the bloom filters that were asked for
+    let cluster_len = 1 + 1 + 4 + 2 + 2 + 2 + 2;
     // lake: format, retained-history flag, then the leader it follows as two
     // u32-prefixed strings, both empty on a table that follows nobody
     let lake_len = 1 + 1 + 4 + 4;

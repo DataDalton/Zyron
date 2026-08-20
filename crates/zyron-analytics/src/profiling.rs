@@ -7,7 +7,7 @@
 use crate::value::{AnalyticsValue, hash_value_into};
 use std::collections::HashMap;
 use zyron_common::error::Result;
-use zyron_common::fx_finalize;
+use zyron_common::mix_finalize_2round;
 
 #[derive(Debug, Clone, Default)]
 pub struct NumericRange {
@@ -90,7 +90,7 @@ impl HyperLogLog {
     fn hash64(value: &AnalyticsValue) -> u64 {
         // Project's canonical fx_mix seeded with a fixed HLL constant so
         // this hash space is independent of other callers using hash_value_into
-        fx_finalize(hash_value_into(0x9E37_79B9_7F4A_7C15, value))
+        mix_finalize_2round(hash_value_into(0x9E37_79B9_7F4A_7C15, value))
     }
 
     pub fn add(&mut self, value: &AnalyticsValue) {
@@ -281,7 +281,7 @@ impl MisraGries {
 #[inline]
 fn mg_key(v: &AnalyticsValue) -> u64 {
     // Distinct seed from HLL so the two hash spaces don't correlate
-    fx_finalize(hash_value_into(0xC0FF_EE15_DEAD_BEEF, v))
+    mix_finalize_2round(hash_value_into(0xC0FF_EE15_DEAD_BEEF, v))
 }
 
 // ===== Streaming percentile reservoir =====

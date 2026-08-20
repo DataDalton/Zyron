@@ -11,7 +11,7 @@
 //! same parse the executor uses for the same comparison, so a lowered
 //! constant compares byte-identically to the stored cell.
 
-use zyron_catalog::schema::ColumnEntry;
+use zyron_catalog::schema::{ColumnEntry, DerivedColumnEntry};
 use zyron_common::TypeId;
 use zyron_lake::{CompareOp, LakePredicate, LakeValue};
 use zyron_parser::ast::{BinaryOperator, LiteralValue, UnaryOperator};
@@ -20,35 +20,39 @@ use crate::binder::{BoundExpr, ColumnRef};
 
 /// Lowers a bound predicate over one table. Returns None when the
 /// expression has no exact lake equivalent
-pub fn lower_predicate(expr: &BoundExpr, columns: &[ColumnEntry]) -> Option<LakePredicate> {
+pub fn lower_predicate(
+    expr: &BoundExpr,
+    columns: &[ColumnEntry],
+    derived: &[DerivedColumnEntry],
+) -> Option<LakePredicate> {
     match expr {
-        BoundExpr::Nested(inner) => lower_predicate(inner, columns),
+        BoundExpr::Nested(inner) => lower_predicate(inner, columns, derived),
         BoundExpr::BinaryOp {
             left, op, right, ..
         } => match op {
             BinaryOperator::And => Some(LakePredicate::And(vec![
-                lower_predicate(left, columns)?,
-                lower_predicate(right, columns)?,
+                lower_predicate(left, columns, derived)?,
+                lower_predicate(right, columns, derived)?,
             ])),
             BinaryOperator::Or => Some(LakePredicate::Or(vec![
-                lower_predicate(left, columns)?,
-                lower_predicate(right, columns)?,
+                lower_predicate(left, columns, derived)?,
+                lower_predicate(right, columns, derived)?,
             ])),
             BinaryOperator::Eq
             | BinaryOperator::Neq
             | BinaryOperator::Lt
             | BinaryOperator::LtEq
             | BinaryOperator::Gt
-            | BinaryOperator::GtEq => lower_comparison(left, *op, right, columns),
+            | BinaryOperator::GtEq => lower_comparison(left, *op, right, columns, derived),
             _ => None,
         },
         BoundExpr::UnaryOp {
             op: UnaryOperator::Not,
             expr,
             ..
-        } => Some(lower_predicate(expr, columns)?.negated()),
+        } => Some(lower_predicate(expr, columns, derived)?.negated()),
         BoundExpr::IsNull { expr, negated } => {
-            let (col, _) = resolve_column(expr, columns)?;
+            let (col, _) = resolve_column(expr, columns, derived)?;
             Some(if *negated {
                 LakePredicate::IsNotNull { column_id: col.id }
             } else {
@@ -60,7 +64,7 @@ pub fn lower_predicate(expr: &BoundExpr, columns: &[ColumnEntry]) -> Option<Lake
             list,
             negated,
         } => {
-            let (col, fractional_digits) = resolve_column(expr, columns)?;
+            let (col, fractional_digits) = resolve_column(expr, columns, derived)?;
             let mut values = Vec::with_capacity(list.len());
             for item in list {
                 values.push(literal_to_value(item, col, fractional_digits)?);
@@ -77,7 +81,7 @@ pub fn lower_predicate(expr: &BoundExpr, columns: &[ColumnEntry]) -> Option<Lake
             high,
             negated,
         } => {
-            let (col, fractional_digits) = resolve_column(expr, columns)?;
+            let (col, fractional_digits) = resolve_column(expr, columns, derived)?;
             let low = literal_to_value(low, col, fractional_digits)?;
             let high = literal_to_value(high, col, fractional_digits)?;
             let base = LakePredicate::And(vec![
@@ -104,12 +108,13 @@ fn lower_comparison(
     op: BinaryOperator,
     right: &BoundExpr,
     columns: &[ColumnEntry],
+    derived: &[DerivedColumnEntry],
 ) -> Option<LakePredicate> {
     // The column may sit on either side, the operator flips with it
-    let (col, fractional_digits, literal, op) = match resolve_column(left, columns) {
+    let (col, fractional_digits, literal, op) = match resolve_column(left, columns, derived) {
         Some((col, p)) => (col, p, right, op),
         None => {
-            let (col, p) = resolve_column(right, columns)?;
+            let (col, p) = resolve_column(right, columns, derived)?;
             (col, p, left, flip(op))
         }
     };
@@ -232,9 +237,10 @@ struct LakeColumnRef {
 fn resolve_column(
     expr: &BoundExpr,
     columns: &[ColumnEntry],
+    derived: &[DerivedColumnEntry],
 ) -> Option<(LakeColumnRef, Option<u8>)> {
     match expr {
-        BoundExpr::Nested(inner) => resolve_column(inner, columns),
+        BoundExpr::Nested(inner) => resolve_column(inner, columns, derived),
         BoundExpr::ColumnRef(ColumnRef { column_id, .. }) => {
             let entry = columns.iter().find(|c| c.id == *column_id)?;
             Some((
@@ -245,9 +251,34 @@ fn resolve_column(
                 entry.fractional_digits,
             ))
         }
-        _ => None,
+        // An expression the table is clustered by has a column holding its
+        // values, so it resolves to that column and everything downstream
+        // prunes it as an ordinary column reference
+        other => {
+            if derived.is_empty() {
+                return None;
+            }
+            let canonical = crate::cluster_expr::canonicalize(other, columns)?;
+            let entry = derived
+                .iter()
+                .find(|d| d.canonical_hash == canonical.canonical_hash)?;
+            Some((
+                LakeColumnRef {
+                    id: entry.column_id,
+                    type_id: TypeId::from_u8(entry.type_id)?,
+                },
+                match entry.fractional_digits {
+                    NO_FRACTIONAL_DIGITS => None,
+                    digits => Some(digits),
+                },
+            ))
+        }
     }
 }
+
+/// The `fractional_digits` byte a mirrored expression column writes when
+/// its result declares no precision
+const NO_FRACTIONAL_DIGITS: u8 = 0xFF;
 
 /// Converts a literal into the column's storage value domain. Only pairs
 /// whose comparison is provably identical to the executor's own lower,
@@ -400,6 +431,7 @@ mod tests {
         let direct = lower_predicate(
             &cmp(col_ref(0, TypeId::Int64), BinaryOperator::Lt, int_lit(50)),
             &cols,
+            &[],
         )
         .expect("lowers");
         assert_eq!(
@@ -414,6 +446,7 @@ mod tests {
         let flipped = lower_predicate(
             &cmp(int_lit(50), BinaryOperator::Lt, col_ref(0, TypeId::Int64)),
             &cols,
+            &[],
         )
         .expect("lowers");
         assert_eq!(
@@ -440,6 +473,7 @@ mod tests {
                 ),
             ),
             &cols,
+            &[],
         )
         .expect("lowers");
         assert!(matches!(and_or, LakePredicate::And(ref v) if v.len() == 2));
@@ -450,6 +484,7 @@ mod tests {
                 negated: true,
             },
             &cols,
+            &[],
         )
         .expect("lowers");
         assert_eq!(is_null, LakePredicate::IsNotNull { column_id: 1 });
@@ -461,6 +496,7 @@ mod tests {
                 negated: false,
             },
             &cols,
+            &[],
         )
         .expect("lowers");
         assert_eq!(
@@ -479,6 +515,7 @@ mod tests {
                 negated: true,
             },
             &cols,
+            &[],
         )
         .expect("lowers");
         // NOT BETWEEN is exactly the disjunction of the strict outsides
@@ -509,6 +546,7 @@ mod tests {
                 str_lit("2026-01-01 00:00:00"),
             ),
             &cols,
+            &[],
         )
         .expect("lowers");
         let expected = zyron_common::parse_timestamp_micros("2026-01-01 00:00:00").expect("parses");
@@ -540,7 +578,8 @@ mod tests {
         assert!(
             lower_predicate(
                 &cmp(col_ref(3, TypeId::Decimal), BinaryOperator::Eq, int_lit(5)),
-                &cols
+                &cols,
+                &[],
             )
             .is_none()
         );
@@ -548,7 +587,8 @@ mod tests {
         assert!(
             lower_predicate(
                 &cmp(col_ref(99, TypeId::Int64), BinaryOperator::Eq, int_lit(5)),
-                &cols
+                &cols,
+                &[],
             )
             .is_none()
         );
@@ -560,7 +600,8 @@ mod tests {
                     BinaryOperator::Eq,
                     col_ref(0, TypeId::Int64)
                 ),
-                &cols
+                &cols,
+                &[],
             )
             .is_none()
         );
@@ -573,7 +614,8 @@ mod tests {
                     BinaryOperator::And,
                     cmp(col_ref(3, TypeId::Decimal), BinaryOperator::Eq, int_lit(5)),
                 ),
-                &cols
+                &cols,
+                &[],
             )
             .is_none()
         );
@@ -585,7 +627,8 @@ mod tests {
                     pattern: Box::new(str_lit("a%")),
                     negated: false,
                 },
-                &cols
+                &cols,
+                &[],
             )
             .is_none()
         );
@@ -604,6 +647,7 @@ mod tests {
                 },
             ),
             &cols,
+            &[],
         )
         .expect("lowers");
         assert_eq!(render_sql(&lowered, &cols), "(id < 50) AND (name IS NULL)");
@@ -615,6 +659,7 @@ mod tests {
                 str_lit("it's"),
             ),
             &cols,
+            &[],
         )
         .expect("lowers");
         assert_eq!(render_sql(&quoted, &cols), "name = 'it''s'");
@@ -633,6 +678,7 @@ mod tests {
                 },
             ),
             &cols,
+            &[],
         )
         .expect("lowers");
         let stats = OneColumn {
@@ -645,5 +691,224 @@ mod tests {
             },
         };
         assert_eq!(lowered.prune(&stats), PruneDecision::CannotMatch);
+    }
+
+    /// A predicate over a clustered expression lowers to a reference to the
+    /// column holding that expression's values. Everything downstream then
+    /// prunes it as an ordinary column, which is the whole reason an
+    /// expression cluster key is given a column
+    #[test]
+    fn test_predicate_over_a_clustered_expression_lowers_to_its_column() {
+        use zyron_catalog::schema::DerivedColumnEntry;
+
+        let cols = columns();
+        let ts_day = crate::cluster_expr::canonicalize(
+            &BoundExpr::Function {
+                name: "date_trunc".into(),
+                args: vec![
+                    BoundExpr::Literal {
+                        value: LiteralValue::String("day".into()),
+                        type_id: TypeId::Varchar,
+                    },
+                    col_ref(2, TypeId::Timestamp),
+                ],
+                return_type: TypeId::Timestamp,
+                distinct: false,
+            },
+            &cols,
+        )
+        .expect("clusterable");
+        let registry = vec![DerivedColumnEntry {
+            column_id: 40,
+            canonical_hash: ts_day.canonical_hash,
+            type_id: TypeId::Timestamp as u8,
+            fractional_digits: 0xFF,
+            sql: "expr".into(),
+        }];
+
+        // The same expression written with a different keyword case still
+        // finds the column, because identity is the canonical hash
+        let predicate = lower_predicate(
+            &cmp(
+                BoundExpr::Function {
+                    name: "DATE_TRUNC".into(),
+                    args: vec![
+                        BoundExpr::Literal {
+                            value: LiteralValue::String("DAY".into()),
+                            type_id: TypeId::Varchar,
+                        },
+                        col_ref(2, TypeId::Timestamp),
+                    ],
+                    return_type: TypeId::Timestamp,
+                    distinct: false,
+                },
+                BinaryOperator::Eq,
+                int_lit(1_700_000_000_000_000),
+            ),
+            &cols,
+            &registry,
+        )
+        .expect("lowers through the derived column");
+        assert_eq!(
+            predicate,
+            LakePredicate::Compare {
+                column_id: 40,
+                op: CompareOp::Eq,
+                value: LakeValue::Int(1_700_000_000_000_000),
+            }
+        );
+
+        // With no registry the same predicate has no lake equivalent, which
+        // is what keeps a table that is not clustered by the expression from
+        // pruning on statistics it does not have
+        assert!(
+            lower_predicate(
+                &cmp(
+                    BoundExpr::Function {
+                        name: "date_trunc".into(),
+                        args: vec![
+                            BoundExpr::Literal {
+                                value: LiteralValue::String("day".into()),
+                                type_id: TypeId::Varchar,
+                            },
+                            col_ref(2, TypeId::Timestamp),
+                        ],
+                        return_type: TypeId::Timestamp,
+                        distinct: false,
+                    },
+                    BinaryOperator::Eq,
+                    int_lit(1_700_000_000_000_000),
+                ),
+                &cols,
+                &[],
+            )
+            .is_none()
+        );
+
+        // A different expression does not match the registered one
+        assert!(
+            lower_predicate(
+                &cmp(
+                    BoundExpr::Function {
+                        name: "date_trunc".into(),
+                        args: vec![
+                            BoundExpr::Literal {
+                                value: LiteralValue::String("month".into()),
+                                type_id: TypeId::Varchar,
+                            },
+                            col_ref(2, TypeId::Timestamp),
+                        ],
+                        return_type: TypeId::Timestamp,
+                        distinct: false,
+                    },
+                    BinaryOperator::Eq,
+                    int_lit(1_700_000_000_000_000),
+                ),
+                &cols,
+                &registry,
+            )
+            .is_none()
+        );
+    }
+
+    /// A derived column over a high precision timestamp must carry that
+    /// precision, or its constant lowers into the wrong domain.
+    ///
+    /// A TIMESTAMP(p) with p greater than six stores i128 picoseconds, and
+    /// the lowering deliberately refuses that domain because it models
+    /// microseconds. Mirroring the precision is what lets it refuse. With
+    /// the precision lost the same predicate lowers as microseconds and is
+    /// then compared against picosecond bounds, which prunes files holding
+    /// rows that match
+    #[test]
+    fn test_derived_column_precision_decides_whether_a_constant_may_lower() {
+        use zyron_catalog::schema::DerivedColumnEntry;
+
+        let cols = columns();
+        let day_of_ts = |name: &str, unit: &str| BoundExpr::Function {
+            name: name.to_string(),
+            args: vec![
+                BoundExpr::Literal {
+                    value: LiteralValue::String(unit.to_string()),
+                    type_id: TypeId::Varchar,
+                },
+                col_ref(2, TypeId::Timestamp),
+            ],
+            return_type: TypeId::Timestamp,
+            distinct: false,
+        };
+        let canonical = crate::cluster_expr::canonicalize(&day_of_ts("date_trunc", "day"), &cols)
+            .expect("clusterable");
+        let registry = |fractional_digits: u8| {
+            vec![DerivedColumnEntry {
+                column_id: 40,
+                canonical_hash: canonical.canonical_hash,
+                type_id: TypeId::Timestamp as u8,
+                fractional_digits,
+                sql: "date_trunc('day', ts)".into(),
+            }]
+        };
+        let predicate = || {
+            cmp(
+                day_of_ts("date_trunc", "day"),
+                BinaryOperator::Eq,
+                str_lit("2026-08-18 00:00:00"),
+            )
+        };
+
+        // Picosecond domain, so the microsecond lowering must decline and
+        // the scan keeps every file rather than pruning on a mismatched scale
+        assert!(
+            lower_predicate(&predicate(), &cols, &registry(9)).is_none(),
+            "a picosecond derived column must not lower a microsecond constant"
+        );
+        assert!(lower_predicate(&predicate(), &cols, &registry(12)).is_none());
+
+        // Microsecond domain, where the constant and the stored values agree
+        let lowered = lower_predicate(&predicate(), &cols, &registry(6))
+            .expect("a microsecond derived column lowers");
+        assert!(matches!(
+            lowered,
+            LakePredicate::Compare {
+                column_id: 40,
+                op: CompareOp::Eq,
+                ..
+            }
+        ));
+    }
+
+    /// A decimal derived column has a scale the lowering does not model, so
+    /// it lowers nothing at all. Pinned so a later decimal arm cannot be
+    /// added without deciding what its scale means
+    #[test]
+    fn test_decimal_derived_column_lowers_no_constant() {
+        use zyron_catalog::schema::DerivedColumnEntry;
+
+        let cols = columns();
+        let rounded = BoundExpr::Function {
+            name: "round".to_string(),
+            args: vec![col_ref(3, TypeId::Decimal)],
+            return_type: TypeId::Decimal,
+            distinct: false,
+        };
+        let canonical = crate::cluster_expr::canonicalize(&rounded, &cols).expect("clusterable");
+        for scale in [0u8, 2, 38] {
+            let registry = vec![DerivedColumnEntry {
+                column_id: 41,
+                canonical_hash: canonical.canonical_hash,
+                type_id: TypeId::Decimal as u8,
+                fractional_digits: scale,
+                sql: "expr".into(),
+            }];
+            assert!(
+                lower_predicate(
+                    &cmp(rounded.clone(), BinaryOperator::Eq, int_lit(5)),
+                    &cols,
+                    &registry,
+                )
+                .is_none(),
+                "a decimal constant has a scale the lowering does not model"
+            );
+        }
     }
 }

@@ -1027,13 +1027,14 @@ impl<'a> PhysicalPlanner<'a> {
         let mut lowered: Option<zyron_lake::LakePredicate> = None;
         for part in [scan_predicate, residual].into_iter().flatten() {
             let one =
-                crate::lake_predicate::lower_predicate(part, &te.columns).ok_or_else(|| {
-                    ZyronError::PlanError(format!(
-                        "{} on lake table \"{}\" needs a predicate the lake format can record, \
+                crate::lake_predicate::lower_predicate(part, &te.columns, &te.cluster.derived)
+                    .ok_or_else(|| {
+                        ZyronError::PlanError(format!(
+                            "{} on lake table \"{}\" needs a predicate the lake format can record, \
                      this one uses a construct with no exact equivalent",
-                        what, te.name
-                    ))
-                })?;
+                            what, te.name
+                        ))
+                    })?;
             lowered = Some(match lowered {
                 Some(existing) => zyron_lake::LakePredicate::And(vec![existing, one]),
                 None => one,
@@ -1094,11 +1095,15 @@ impl<'a> PhysicalPlanner<'a> {
             })
             .collect();
         let cost = *child.cost();
+        let cluster_fit = lake_cluster_fit(&te, lowered.as_ref());
+        let bloom_redundant = lake_redundant_blooms(&te);
         let scan = PhysicalPlan::LakeScan {
             table_id,
             columns,
             predicate: bound,
             lowered: lowered.clone(),
+            cluster_fit,
+            bloom_redundant,
             as_of: None,
             cost,
         };
@@ -1417,14 +1422,18 @@ impl<'a> PhysicalPlanner<'a> {
                 // Lower once here so the operator prunes with it instead of
                 // repeating the work, and EXPLAIN can say whether the filter
                 // skips files at all
-                let lowered = predicate
-                    .as_ref()
-                    .and_then(|p| crate::lake_predicate::lower_predicate(p, &te.columns));
+                let lowered = predicate.as_ref().and_then(|p| {
+                    crate::lake_predicate::lower_predicate(p, &te.columns, &te.cluster.derived)
+                });
+                let cluster_fit = lake_cluster_fit(&te, lowered.as_ref());
+                let bloom_redundant = lake_redundant_blooms(&te);
                 return Ok(PhysicalPlan::LakeScan {
                     table_id,
                     columns,
                     predicate,
                     lowered,
+                    cluster_fit,
+                    bloom_redundant,
                     as_of,
                     cost,
                 });
@@ -2826,6 +2835,65 @@ fn columnar_tier_io_weight(segments: &[zyron_catalog::schema::ColumnarSegmentEnt
         return 1.0;
     }
     weighted / rows as f64
+}
+
+/// What a table's layout does for a lowered predicate.
+///
+/// Judged against the keys a clustering pass accepted, not the declared
+/// ones: under Auto a declared key is a request and measurement may run a
+/// different set, and a plan judged against a key no file is sorted by
+/// would claim pruning the data cannot deliver.
+///
+/// None when nothing lowered, because a predicate the lake cannot express
+/// prunes no file whatever the layout is, and `file_pruning: none` already
+/// says so
+fn lake_cluster_fit(
+    te: &zyron_catalog::TableEntry,
+    lowered: Option<&zyron_lake::LakePredicate>,
+) -> Option<crate::physical::ClusterFitDetail> {
+    let lowered = lowered?;
+    let keys: Vec<u32> = te
+        .cluster
+        .effective_keys()
+        .iter()
+        .map(|k| k.column_id)
+        .collect();
+    let estimate = zyron_lake::cluster_fit_estimate(&keys, lowered)?;
+    let column = match estimate.column_id {
+        Some(id) => lake_column_label(te, id),
+        // A predicate constraining no column at all cannot happen, since a
+        // lowered predicate names one in every leaf
+        None => "no column".to_string(),
+    };
+    Some(crate::physical::ClusterFitDetail { estimate, column })
+}
+
+/// Columns a bloom was asked for and not built, named.
+///
+/// The declared filter is dropped where the layout already resolves the
+/// column, and an operator who asked for one has to be able to find out
+/// that it was not built rather than wonder why it is not helping
+fn lake_redundant_blooms(te: &zyron_catalog::TableEntry) -> Vec<String> {
+    te.cluster
+        .redundant_bloom_columns()
+        .into_iter()
+        .map(|id| lake_column_label(te, id))
+        .collect()
+}
+
+/// How a lake column is named in a plan.
+///
+/// A cluster key may be the column an expression is stored in, which the
+/// catalog's column list deliberately does not carry, so the expression
+/// text is what names it
+fn lake_column_label(te: &zyron_catalog::TableEntry, column_id: u32) -> String {
+    if let Some(c) = te.columns.iter().find(|c| c.id.0 as u32 == column_id) {
+        return c.name.clone();
+    }
+    if let Some(d) = te.cluster.derived.iter().find(|d| d.column_id == column_id) {
+        return d.sql.clone();
+    }
+    format!("column {column_id}")
 }
 
 #[cfg(test)]

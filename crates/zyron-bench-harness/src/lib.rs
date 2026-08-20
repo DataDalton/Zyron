@@ -354,15 +354,15 @@ fn validate_metric_inner(
         tprintln!(
             "    Runs: [{}]",
             runs.iter()
-                .map(|x| format_with_commas(*x))
+                .map(|x| format_measurement(*x))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
         tprintln!(
             "    Average: {} (target {} {}, not applied)",
-            format_with_commas(average),
+            format_measurement(average),
             if higher_is_better { ">=" } else { "<=" },
-            format_with_commas(target)
+            format_measurement(target)
         );
         tprintln!("    Re-run with --release for a number worth comparing");
         // Recorded like any other run. Every run writes, and the run file's
@@ -393,21 +393,21 @@ fn validate_metric_inner(
     tprintln!(
         "    Runs: [{}]",
         runs.iter()
-            .map(|x| format_with_commas(*x))
+            .map(|x| format_measurement(*x))
             .collect::<Vec<_>>()
             .join(", ")
     );
     tprintln!(
         "    Average: {} {} {} (target)",
-        format_with_commas(average),
+        format_measurement(average),
         comparison,
-        format_with_commas(target)
+        format_measurement(target)
     );
     tprintln!(
         "    Min/Max: {} / {}, StdDev: {}",
-        format_with_commas(min),
-        format_with_commas(max),
-        format_with_commas(std_dev)
+        format_measurement(min),
+        format_measurement(max),
+        format_measurement(std_dev)
     );
 
     write_benchmark_record(
@@ -476,9 +476,9 @@ fn check_performance_inner(
         tprintln!(
             "  {} [NOT MEASURED, unoptimized build]: {} (target {} {}, not applied)",
             display,
-            format_with_commas(value),
+            format_measurement(value),
             if higher_is_better { ">=" } else { "<=" },
-            format_with_commas(target)
+            format_measurement(target)
         );
         // Recorded like any other run, matching validate_metric. Returning
         // without recording left a suite that reaches the harness only
@@ -509,9 +509,9 @@ fn check_performance_inner(
         "  {} [{}]: {} {} {} (target)",
         display,
         status,
-        format_with_commas(value),
+        format_measurement(value),
         comparison,
-        format_with_commas(target),
+        format_measurement(target),
     );
     write_benchmark_record(
         test,
@@ -776,8 +776,8 @@ fn record_ratio_inner(
         tprintln!(
             "  {} [FAIL]: not comparable, {} over {}",
             label,
-            format_with_commas(num_value),
-            format_with_commas(den_value)
+            format_measurement(num_value),
+            format_measurement(den_value)
         );
         return None;
     };

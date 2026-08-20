@@ -907,6 +907,7 @@ mod tests {
                     value: LakeValue::Str("alice".into()),
                 },
                 created_version: 2,
+                pending_rows: 0,
             }],
             properties: BTreeMap::new(),
             indexes: Vec::new(),

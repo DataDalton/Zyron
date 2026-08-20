@@ -6,11 +6,9 @@ use std::future::Future;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+use zyron_auth::hmac_sha2::hmac_sha256;
 use zyron_common::{Result, ZyronError};
-
-type HmacSha256 = Hmac<Sha256>;
 
 /// Dedicated multi-thread runtime for CDC sink network IO. The sink trait is
 /// synchronous, so write_batch bridges to async by spawning onto this runtime
@@ -125,12 +123,6 @@ fn sha256_hex(data: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(data);
     hex::encode(h.finalize())
-}
-
-fn hmac_sha256(key: &[u8], msg: &[u8]) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(msg);
-    mac.finalize().into_bytes().to_vec()
 }
 
 /// Computes the SigV4 signature and Authorization header value from the fully
