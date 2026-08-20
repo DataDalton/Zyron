@@ -226,7 +226,7 @@ pub(crate) fn value_to_cell<'a>(
 /// Total order between two cells of one column, used for sort routing.
 /// Unordered families and malformed widths fall back to byte order so the
 /// sort stays deterministic
-pub(crate) fn compare_cells(physical: TypeId, a: &[u8], b: &[u8]) -> Ordering {
+pub fn compare_cells(physical: TypeId, a: &[u8], b: &[u8]) -> Ordering {
     match cell_family(physical) {
         CellFamily::Bool => a.first().cmp(&b.first()),
         CellFamily::SignedInt => match (signed_from_cell(a), signed_from_cell(b)) {

@@ -3,7 +3,9 @@
 //! reducing bit width. Packs N-bit residuals into contiguous byte arrays,
 //! where N is the minimum bits needed to represent (max - min).
 
-use crate::encoding::{Encoding, EncodingType, Predicate, eval_predicate_on_raw};
+use crate::encoding::{
+    Encoding, EncodingType, Predicate, bitmask_from_rows, eval_predicate_on_raw,
+};
 use zyron_common::{Result, ZyronError};
 
 pub struct BitPackEncoding;
@@ -260,24 +262,19 @@ impl Encoding for BitPackEncoding {
 
         // Evaluate predicates on packed residuals by transforming bounds
         // into the FoR domain (subtract base_value from search targets).
+        // Residuals are addressed by row rather than walked with a running
+        // offset, so eight rows answer independently into one mask byte
         let bitmaskLen = row_count.div_ceil(8);
-        let mut bitmask = vec![0u8; bitmaskLen];
-        let mut bitOffset: u64 = 0;
+        let residual_at = |i: usize| unpack_value(packed, i as u64 * bitWidth as u64, bitWidth);
 
-        match predicate {
+        Ok(match predicate {
             Predicate::Equality(target) => {
                 let targetVal = read_value_as_u64(target, 0, target.len().min(value_size));
                 if targetVal < baseValue || targetVal > baseValue.saturating_add(maxResidual) {
-                    return Ok(bitmask);
+                    return Ok(vec![0u8; bitmaskLen]);
                 }
                 let targetResidual = targetVal - baseValue;
-                for i in 0..row_count {
-                    let residual = unpack_value(packed, bitOffset, bitWidth);
-                    if residual == targetResidual {
-                        bitmask[i / 8] |= 1 << (i % 8);
-                    }
-                    bitOffset += bitWidth as u64;
-                }
+                bitmask_from_rows(row_count, |i| residual_at(i) == targetResidual)
             }
             Predicate::Range { low, high } => {
                 let loVal = match low {
@@ -293,7 +290,7 @@ impl Encoding for BitPackEncoding {
 
                 // Segment-level skip
                 if loVal > maxRepresentable || hiVal < baseValue {
-                    return Ok(bitmask);
+                    return Ok(vec![0u8; bitmaskLen]);
                 }
 
                 // Segment-level accept
@@ -310,16 +307,13 @@ impl Encoding for BitPackEncoding {
                 let hiResidual = if hiVal >= baseValue {
                     (hiVal - baseValue).min(maxResidual)
                 } else {
-                    return Ok(bitmask);
+                    return Ok(vec![0u8; bitmaskLen]);
                 };
 
-                for i in 0..row_count {
-                    let residual = unpack_value(packed, bitOffset, bitWidth);
-                    if residual >= loResidual && residual <= hiResidual {
-                        bitmask[i / 8] |= 1 << (i % 8);
-                    }
-                    bitOffset += bitWidth as u64;
-                }
+                bitmask_from_rows(row_count, |i| {
+                    let residual = residual_at(i);
+                    residual >= loResidual && residual <= hiResidual
+                })
             }
             Predicate::In(values) => {
                 let targetResiduals: Vec<u64> = values
@@ -334,19 +328,11 @@ impl Encoding for BitPackEncoding {
                     })
                     .collect();
                 if targetResiduals.is_empty() {
-                    return Ok(bitmask);
+                    return Ok(vec![0u8; bitmaskLen]);
                 }
-                for i in 0..row_count {
-                    let residual = unpack_value(packed, bitOffset, bitWidth);
-                    if targetResiduals.contains(&residual) {
-                        bitmask[i / 8] |= 1 << (i % 8);
-                    }
-                    bitOffset += bitWidth as u64;
-                }
+                bitmask_from_rows(row_count, |i| targetResiduals.contains(&residual_at(i)))
             }
-        }
-
-        Ok(bitmask)
+        })
     }
 }
 

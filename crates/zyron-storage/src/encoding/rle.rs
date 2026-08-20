@@ -256,7 +256,7 @@ impl Encoding for RleEncoding {
         &self,
         encoded: &[u8],
         row_count: usize,
-        _value_size: usize,
+        value_size: usize,
         predicate: &Predicate,
     ) -> Result<Vec<u8>> {
         if row_count == 0 {
@@ -294,7 +294,11 @@ impl Encoding for RleEncoding {
 
             let matches = match predicate {
                 Predicate::Equality(target) => value == *target,
-                Predicate::Range { low, high } => range_admits(value, storedValueSize, *low, *high),
+                // The stored size slices the run's value out, and the
+                // column's value size selects the order the bounds compare
+                // in, which are the same number for a fixed-width column and
+                // different questions
+                Predicate::Range { low, high } => range_admits(value, value_size, *low, *high),
                 Predicate::In(values) => values.contains(&value),
             };
 

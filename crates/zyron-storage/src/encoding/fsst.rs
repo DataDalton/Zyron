@@ -8,7 +8,8 @@
 //! Based on FSST (VLDB 2020), adapted for Zyron's columnar format.
 
 use crate::encoding::{
-    Encoding, EncodingType, Predicate, eval_predicate_on_raw, slice_rows, varlen_pack,
+    Encoding, EncodingType, Predicate, bitmask_from_rows, eval_predicate_on_raw, slice_rows,
+    varlen_pack,
 };
 use zyron_common::{Result, ZyronError};
 
@@ -396,28 +397,23 @@ impl Encoding for FsstEncoding {
                     let compressedStart = offsetsEnd;
                     let compressed = &encoded[compressedStart..];
 
-                    let bitmaskLen = row_count.div_ceil(8);
-                    let mut bitmask = vec![0u8; bitmaskLen];
+                    // Row lengths are stored, not offsets, so the cursor walks
+                    // forward with the rows. The mask builder visits every row
+                    // once in ascending order, which is what lets the cursor
+                    // live in the closure
                     let mut cursor = 0usize;
-
-                    for i in 0..row_count {
+                    return Ok(bitmask_from_rows(row_count, |i| {
                         let len = unpack_bits(
                             packedOffsets,
                             i as u64 * offsetBitWidth as u64,
                             offsetBitWidth,
                         ) as usize;
                         let end = cursor + len;
-
-                        if end <= compressed.len() {
-                            let rowCompressed = &compressed[cursor..end];
-                            if rowCompressed == compressedTarget.as_slice() {
-                                bitmask[i / 8] |= 1 << (i % 8);
-                            }
-                        }
+                        let matched = end <= compressed.len()
+                            && compressed[cursor..end] == *compressedTarget.as_slice();
                         cursor = end;
-                    }
-
-                    return Ok(bitmask);
+                        matched
+                    }));
                 }
             }
         }

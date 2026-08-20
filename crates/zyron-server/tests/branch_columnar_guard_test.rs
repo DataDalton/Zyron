@@ -101,6 +101,8 @@ async fn setup() -> Env {
             xmax_range_hi: 0,
             primary_key_column_id: 0,
             sort_order: zyron_storage::columnar::SortOrder::None,
+            segment_index_offset: 0,
+            segment_index_size: 0,
         },
     )
     .unwrap();

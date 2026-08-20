@@ -61,7 +61,7 @@ use zyron_common::ZyronError;
 use zyron_storage::columnar::MergeScanIterator;
 
 use crate::codec::{Cursor, corrupt};
-use crate::curve::{normalize_component, ordering_key};
+use crate::curve::{normalize_component, ordering_key_into};
 use crate::feedback::{Decision, GateConfig, PredicateClass, evaluate};
 use crate::index;
 use crate::manifest::{
@@ -1004,7 +1004,12 @@ fn stage_outputs(
                 nulls.push(local);
             } else {
                 ranked.push(local);
-                keys.extend_from_slice(&ordering_key(curve, &axes));
+                // Appended in place at the fixed stride the merge and sort
+                // both index by, so a pass carrying millions of rows does
+                // not allocate a key per row on the way
+                let start = keys.len();
+                keys.resize(start + key_len, 0);
+                ordering_key_into(curve, &axes, &mut keys[start..]);
             }
         }
         decoded.push(columns);

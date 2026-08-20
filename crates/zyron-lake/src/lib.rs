@@ -11,7 +11,7 @@
 //! planner and executor can depend on it without a cycle.
 
 pub mod branch;
-mod cells;
+pub mod cells;
 pub mod changefeed;
 pub mod clone;
 mod codec;
@@ -24,7 +24,6 @@ pub mod encoded_filter;
 pub mod feedback;
 pub mod follow;
 pub mod history;
-mod hll;
 pub mod index;
 
 pub mod maintenance;

@@ -5,21 +5,21 @@
 //! Lake files carry only user columns, visibility is by log version, so
 //! there are no MVCC system columns and no patch store.
 //!
-//! Statistics are exact. The writer materializes every column anyway, so
-//! min, max and null count come from a full pass, not a sample, and the
-//! segment's value bloom is copied into the manifest entry so pruning
-//! probes it with zero IO
+//! Statistics are exact. Min, max and null count come off the segment
+//! build, which orders and counts the column to lay its zone maps and
+//! bloom down, so the manifest entry is filled from a pass the write was
+//! making anyway rather than a second one. The segment's value bloom is
+//! copied into the entry so pruning probes it with zero IO
 
 use std::path::Path;
 
-use zyron_common::ZyronError;
+use zyron_common::{TypeId, ZyronError};
 use zyron_storage::columnar::{
     BloomPolicy, ColumnSegment, SegmentOptions, SortOrder, ZyrFileHeader, ZyrFileWriter,
 };
 
 use crate::cells::{CellFamily, cell_family, cell_to_value, compare_cells};
-use crate::curve::{normalize_component, ordering_key};
-use crate::hll::DistinctSketch;
+use crate::curve::{normalize_component, ordering_key_into};
 use crate::manifest::ClusterStrategy;
 use crate::manifest::{ColumnStatsEntry, PartitionEntry};
 use crate::paths::{LakePaths, data_file_name, index_file_name};
@@ -116,68 +116,14 @@ pub fn write_data_file_at(
     req: &WriteRequest<'_>,
 ) -> Result<WrittenFile, ZyronError> {
     let row_count = validate_batch(schema, req.columns)?;
-
-    // Sort routing: a permutation over row indices ordered by the key
-    // columns under the curve each one declared, nulls last, stable for
-    // determinism. A declared strategy that did not change the order would
-    // be a note in the manifest and nothing else.
-    //
-    // The curve is the first key's, because a multi-dimensional curve
-    // consumes every dimension at once and keys declared after it only
-    // refine rows the curve placed together. It decides both the
-    // permutation below and whether the header may claim ascending order
+    let order = stored_order(schema, req, row_count)?;
+    // The curve the leading key declared, which decides whether the header
+    // may claim the rows ascend by it
     let leading_strategy = req
         .sort_strategies
         .first()
         .copied()
         .unwrap_or(ClusterStrategy::RangePartition);
-    let order: Vec<usize> = if req.sort_keys.is_empty() {
-        (0..row_count).collect()
-    } else {
-        let mut keys = Vec::with_capacity(req.sort_keys.len());
-        for key_id in req.sort_keys {
-            let col = schema.column_by_id(*key_id).ok_or_else(|| {
-                ZyronError::Internal(format!("sort key column {} is not in the schema", key_id))
-            })?;
-            let data = req
-                .columns
-                .iter()
-                .find(|c| c.column_id == *key_id)
-                .ok_or_else(|| {
-                    ZyronError::Internal(format!("sort key column {} has no data", key_id))
-                })?;
-            keys.push((col.physical_type_id(), data));
-        }
-        // One ordering key per row, built once rather than per comparison:
-        // a sort does O(n log n) comparisons and this makes each of them a
-        // byte compare over `8 * dimensions` bytes
-        let mut ordering: Vec<(bool, Vec<u8>)> = Vec::with_capacity(row_count);
-        let mut axes = Vec::with_capacity(keys.len());
-        for row in 0..row_count {
-            axes.clear();
-            let mut any_null = false;
-            for (physical, data) in &keys {
-                match &data.cells[row] {
-                    Some(cell) => axes.push(normalize_component(*physical, cell)),
-                    None => {
-                        any_null = true;
-                        axes.push(0);
-                    }
-                }
-            }
-            // Nulls last, whatever the curve: they have no position on it
-            ordering.push((any_null, ordering_key(leading_strategy, &axes)));
-        }
-
-        let mut order: Vec<usize> = (0..row_count).collect();
-        order.sort_by(|&a, &b| {
-            ordering[a]
-                .0
-                .cmp(&ordering[b].0)
-                .then_with(|| ordering[a].1.cmp(&ordering[b].1))
-        });
-        order
-    };
 
     std::fs::create_dir_all(dir)?;
     let path = dir.join(req.file_name());
@@ -208,6 +154,9 @@ pub fn write_data_file_at(
             (false, ClusterStrategy::RangePartition) => SortOrder::Asc,
             (false, _) => SortOrder::None,
         },
+        // Filled in by finalize once the index has a position
+        segment_index_offset: 0,
+        segment_index_size: 0,
     };
     let mut writer = ZyrFileWriter::create(&path, header)?;
 
@@ -223,45 +172,17 @@ pub fn write_data_file_at(
         let physical = col.physical_type_id();
         let value_size = physical.fixed_size().unwrap_or(0);
 
+        // The column in stored order. Everything the manifest records about
+        // it comes back off the segment build, which walks these same values
+        // to pack and encode them, so this loop places rows and nothing else
         let mut views: Vec<Option<&[u8]>> = Vec::with_capacity(row_count);
-        let mut null_count = 0u64;
-        let mut min_cell: Option<&[u8]> = None;
-        let mut max_cell: Option<&[u8]> = None;
-        // Distinct values, counted in the pass that already materializes
-        // the column. The sketch is 1 KiB and is dropped below, only its
-        // estimate reaches the manifest
-        let mut distinct = DistinctSketch::new();
-        let orderable = cell_family(physical) != CellFamily::Unordered;
         for &row in &order {
-            match &data.cells[row] {
-                Some(cell) => {
-                    let cell = cell.as_slice();
-                    distinct.insert(cell);
-                    if orderable {
-                        if min_cell
-                            .map(|m| compare_cells(physical, cell, m).is_lt())
-                            .unwrap_or(true)
-                        {
-                            min_cell = Some(cell);
-                        }
-                        if max_cell
-                            .map(|m| compare_cells(physical, cell, m).is_gt())
-                            .unwrap_or(true)
-                        {
-                            max_cell = Some(cell);
-                        }
-                    }
-                    views.push(Some(cell));
-                }
-                None => {
-                    null_count += 1;
-                    views.push(None);
-                }
-            }
+            views.push(data.cells[row].as_deref());
         }
 
         // The whole column is materialized here already, so the encoding
-        // is picked by trial encoding every row rather than a prefix
+        // is picked by trial encoding every row rather than a prefix, and
+        // the distinct count is the whole column's rather than a capped one
         let options = SegmentOptions {
             bloom: if req.bloom_columns.contains(&col.id) {
                 BloomPolicy::Force
@@ -269,9 +190,11 @@ pub fn write_data_file_at(
                 BloomPolicy::Auto
             },
             exact_encoding: true,
+            distinct_sketch: true,
         };
         let segment =
             ColumnSegment::build_with_options(col.id, physical, value_size, &views, options)?;
+        let (min_cell, max_cell) = column_extrema(physical, &views, &segment);
         let zone_bytes: Vec<u8> = segment
             .zone_maps
             .iter()
@@ -292,11 +215,11 @@ pub fn write_data_file_at(
             bounds: ColumnBounds {
                 min: min_cell.and_then(|c| cell_to_value(physical, c)),
                 max: max_cell.and_then(|c| cell_to_value(physical, c)),
-                null_count,
+                null_count: segment.header.null_count,
                 row_count: row_count as u64,
             },
             bloom: bloom_bytes,
-            ndv: Some(distinct.estimate()),
+            ndv: segment.ndv,
             size_bytes: Some(segment_bytes),
         });
     }
@@ -315,6 +238,132 @@ pub fn write_data_file_at(
         },
         order,
     })
+}
+
+/// The order this batch's rows are stored in: a permutation over row
+/// indices ordered by the key columns under the curve each one declared,
+/// nulls last, stable for determinism. A batch with no sort key stores rows
+/// in arrival order, and a declared strategy that did not change the order
+/// would be a note in the manifest and nothing else.
+///
+/// The curve is the first key's, because a multi-dimensional curve consumes
+/// every dimension at once and keys declared after it only refine rows the
+/// curve placed together. It decides both the permutation and whether the
+/// header may claim ascending order.
+///
+/// This is the whole of what a cluster key costs a write, which is why it
+/// is reachable on its own: measuring it as the difference between a keyed
+/// and an unkeyed file makes it the gap between two numbers that carry the
+/// encode and the fsync, and a pass costing tens of microseconds does not
+/// survive that subtraction
+pub fn stored_order(
+    schema: &LakeSchema,
+    req: &WriteRequest<'_>,
+    row_count: usize,
+) -> Result<Vec<usize>, ZyronError> {
+    if req.sort_keys.is_empty() {
+        return Ok((0..row_count).collect());
+    }
+    let leading_strategy = req
+        .sort_strategies
+        .first()
+        .copied()
+        .unwrap_or(ClusterStrategy::RangePartition);
+
+    let mut keys = Vec::with_capacity(req.sort_keys.len());
+    for key_id in req.sort_keys {
+        let col = schema.column_by_id(*key_id).ok_or_else(|| {
+            ZyronError::Internal(format!("sort key column {} is not in the schema", key_id))
+        })?;
+        let data = req
+            .columns
+            .iter()
+            .find(|c| c.column_id == *key_id)
+            .ok_or_else(|| {
+                ZyronError::Internal(format!("sort key column {} has no data", key_id))
+            })?;
+        keys.push((col.physical_type_id(), data));
+    }
+    // One ordering key per row, built once rather than per comparison: a
+    // sort does O(n log n) comparisons and this makes each of them a byte
+    // compare over `8 * dimensions` bytes.
+    //
+    // The keys are packed end to end in one buffer at a fixed stride, the
+    // same shape the clustering pass carries them in. A key per row in its
+    // own `Vec` costs an allocation per row and leaves every one of those
+    // comparisons dereferencing a pointer to reach the bytes, which on a
+    // million row file is a million allocations under a sort that touches
+    // them twenty million times
+    let key_len = keys.len() * 8;
+    let mut key_bytes = vec![0u8; row_count * key_len];
+    let mut null_key = vec![false; row_count];
+    let mut axes = Vec::with_capacity(keys.len());
+    for row in 0..row_count {
+        axes.clear();
+        let mut any_null = false;
+        for (physical, data) in &keys {
+            match &data.cells[row] {
+                Some(cell) => axes.push(normalize_component(*physical, cell)),
+                None => {
+                    any_null = true;
+                    axes.push(0);
+                }
+            }
+        }
+        // Nulls last, whatever the curve: they have no position on it
+        null_key[row] = any_null;
+        ordering_key_into(
+            leading_strategy,
+            &axes,
+            &mut key_bytes[row * key_len..(row + 1) * key_len],
+        );
+    }
+
+    let key_at = |row: usize| &key_bytes[row * key_len..(row + 1) * key_len];
+    let mut order: Vec<usize> = (0..row_count).collect();
+    order.sort_by(|&a, &b| {
+        null_key[a]
+            .cmp(&null_key[b])
+            .then_with(|| key_at(a).cmp(key_at(b)))
+    });
+    Ok(order)
+}
+
+/// The column's smallest and largest stored cell, at full width.
+///
+/// A segment build already ordered the column to lay its zone maps down, so
+/// the rows it landed on are the rows the manifest bounds come from, and no
+/// second comparison pass is needed. A fixed-width byte family is the
+/// exception: every lake reader orders those cells by their bytes from the
+/// first, and a stat slot orders them as a little endian integer, so a
+/// column of that shape is compared here. It is the same shape the stored
+/// filter refuses to push down for
+fn column_extrema<'a>(
+    physical: TypeId,
+    views: &[Option<&'a [u8]>],
+    segment: &ColumnSegment,
+) -> (Option<&'a [u8]>, Option<&'a [u8]>) {
+    if physical.fixed_size().is_some() && cell_family(physical) == CellFamily::Bytes {
+        let mut min_cell: Option<&'a [u8]> = None;
+        let mut max_cell: Option<&'a [u8]> = None;
+        for cell in views.iter().flatten().copied() {
+            if min_cell.is_none_or(|m| compare_cells(physical, cell, m).is_lt()) {
+                min_cell = Some(cell);
+            }
+            if max_cell.is_none_or(|m| compare_cells(physical, cell, m).is_gt()) {
+                max_cell = Some(cell);
+            }
+        }
+        return (min_cell, max_cell);
+    }
+    (
+        segment
+            .min_row
+            .and_then(|row| views.get(row).copied().flatten()),
+        segment
+            .max_row
+            .and_then(|row| views.get(row).copied().flatten()),
+    )
 }
 
 /// Checks the batch covers the schema exactly and enforces NOT NULL at
@@ -487,6 +536,161 @@ mod tests {
             )
         });
         assert_eq!(interleaved, expected);
+    }
+
+    /// The manifest entry's bounds, null count and distinct estimate all
+    /// come off the segment build now, so they have to be what a flat scan
+    /// of the same cells says. A bound that drifted would prune away files
+    /// that hold matching rows.
+    ///
+    /// Every ordered family is covered, including the fixed-width byte
+    /// family whose stat slots order by the little endian reading and whose
+    /// cells order by their bytes, which is the one shape the writer still
+    /// compares itself
+    #[test]
+    fn test_manifest_bounds_match_a_flat_scan_of_the_cells() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let paths = LakePaths::new(tmp.path(), 91);
+        let schema = LakeSchema::new(
+            1,
+            vec![
+                column(0, "signed", TypeId::Int64),
+                column(1, "unsigned", TypeId::UInt64),
+                column(2, "real", TypeId::Float64),
+                column(3, "text", TypeId::Varchar),
+                column(4, "id", TypeId::Uuid),
+                column(5, "flag", TypeId::Boolean),
+                column(6, "ts", TypeId::Timestamp),
+                column(7, "sparse", TypeId::Int32),
+                // An unordered family records no bounds at all
+                column(8, "doc", TypeId::Json),
+            ],
+        )
+        .expect("schema");
+
+        // Enough rows to span several zones, scattered so the extremes do
+        // not land at either end of the file
+        let rows = 5_000usize;
+        let scatter = |i: usize| (i * 2_731) % rows;
+        let cells_for = |id: u32| -> Vec<Option<Vec<u8>>> {
+            (0..rows)
+                .map(|i| {
+                    let n = scatter(i);
+                    match id {
+                        0 => Some(((n as i64) - 2_500).to_le_bytes().to_vec()),
+                        1 => Some((u64::MAX - n as u64).to_le_bytes().to_vec()),
+                        2 => Some(((n as f64) - 2_500.5).to_le_bytes().to_vec()),
+                        3 => {
+                            let mut value = vec![b'p'; 32];
+                            value.extend_from_slice(format!("{:08}", n).as_bytes());
+                            Some(value)
+                        }
+                        4 => {
+                            let mut id = [0u8; 16];
+                            id[..8].copy_from_slice(&(n as u64).to_be_bytes());
+                            id[8..].copy_from_slice(&(n as u64).to_le_bytes());
+                            Some(id.to_vec())
+                        }
+                        5 => Some(vec![(n % 2) as u8]),
+                        6 => Some(
+                            (((n as i64) - 2_500) * 86_400_000_000)
+                                .to_le_bytes()
+                                .to_vec(),
+                        ),
+                        7 => {
+                            if (1_024..2_048).contains(&i) || i % 7 == 0 {
+                                None
+                            } else {
+                                Some(((n as i32) - 2_500).to_le_bytes().to_vec())
+                            }
+                        }
+                        _ => Some(format!("{{\"n\":{}}}", n).into_bytes()),
+                    }
+                })
+                .collect()
+        };
+        let columns: Vec<ColumnData> = schema
+            .columns
+            .iter()
+            .map(|col| ColumnData {
+                column_id: col.id,
+                cells: cells_for(col.id),
+            })
+            .collect();
+
+        // Written under a sort key, so the stored order is a permutation of
+        // the input and the rows the segment reports are file rows
+        let entry = write_data_file(
+            &paths,
+            &schema,
+            &WriteRequest {
+                partition_id: 0x91,
+                columns: &columns,
+                sort_keys: &[0],
+                sort_strategies: &[ClusterStrategy::RangePartition],
+                cluster_spec_id: 0,
+                table_id: 91,
+                bloom_columns: &[],
+                index_id: None,
+            },
+        )
+        .expect("write");
+
+        for data in &columns {
+            let col = schema.column_by_id(data.column_id).expect("column");
+            let physical = col.physical_type_id();
+            let name = &col.name;
+            let stats = entry.stats_for(data.column_id).expect("stats");
+
+            let mut min_cell: Option<&[u8]> = None;
+            let mut max_cell: Option<&[u8]> = None;
+            let mut nulls = 0u64;
+            let mut distinct = std::collections::HashSet::new();
+            for cell in &data.cells {
+                match cell {
+                    Some(cell) => {
+                        distinct.insert(cell.as_slice());
+                        if min_cell.is_none_or(|m| compare_cells(physical, cell, m).is_lt()) {
+                            min_cell = Some(cell);
+                        }
+                        if max_cell.is_none_or(|m| compare_cells(physical, cell, m).is_gt()) {
+                            max_cell = Some(cell);
+                        }
+                    }
+                    None => nulls += 1,
+                }
+            }
+
+            assert_eq!(
+                stats.bounds.min,
+                min_cell.and_then(|c| cell_to_value(physical, c)),
+                "column \"{name}\" recorded a minimum the cells do not agree with"
+            );
+            assert_eq!(
+                stats.bounds.max,
+                max_cell.and_then(|c| cell_to_value(physical, c)),
+                "column \"{name}\" recorded a maximum the cells do not agree with"
+            );
+            assert_eq!(
+                stats.bounds.null_count, nulls,
+                "column \"{name}\" recorded the wrong null count"
+            );
+            assert_eq!(stats.bounds.row_count, rows as u64);
+
+            let ndv = stats
+                .ndv
+                .unwrap_or_else(|| panic!("column \"{name}\" carries no distinct estimate"));
+            let truth = distinct.len() as f64;
+            let error = (ndv as f64 - truth).abs() / truth;
+            assert!(
+                error < 0.05,
+                "column \"{name}\" estimated {ndv} distinct against {truth}"
+            );
+        }
+
+        // An unordered family has no comparison, so it records no bounds
+        let doc = entry.stats_for(8).expect("stats");
+        assert!(doc.bounds.min.is_none() && doc.bounds.max.is_none());
     }
 
     /// A bloom answering "absent" for a value the writer stored would drop

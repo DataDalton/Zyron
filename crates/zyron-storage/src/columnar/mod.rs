@@ -14,6 +14,7 @@ pub mod constants;
 pub mod file;
 pub mod patch;
 pub mod segment;
+pub mod sketch;
 pub mod sorted;
 pub mod tier;
 pub mod wal_payload;
@@ -32,8 +33,9 @@ pub use patch::{ColumnarPatchManager, PatchStore, RowOverlay, ValuePatch};
 pub use segment::{
     BloomPolicy, ColumnSegment, SegmentHeader, SegmentOptions, SlotOrder, ZoneMapEntry,
     compare_le_bytes, compare_stat_slots, compare_stat_slots_typed, compare_value_to_slot,
-    slot_order, stat_slot_is_signed, value_to_stat_slot, varlen_upper_slot,
+    compare_values_ordered, slot_order, stat_slot_is_signed, value_to_stat_slot, varlen_upper_slot,
 };
+pub use sketch::DistinctSketch;
 pub use sorted::{MergeScanIterator, SortedSegmentEntry, SortedSegmentIndex};
 pub use tier::{TIER_DIR_NAME, columnar_root_for_segment, tier_segment_dir};
 pub use wal_payload::{

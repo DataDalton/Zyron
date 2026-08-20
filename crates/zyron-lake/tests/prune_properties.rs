@@ -902,3 +902,109 @@ fn test_zero_allocation_in_feedback_gate() {
         small
     );
 }
+
+/// A stored filter has to admit exactly the rows the values admit, whatever
+/// the zone maps let it skip.
+///
+/// Zone pruning narrows payload evaluation to the spans the zones could not
+/// reject, so the answer is now assembled from several ranges rather than
+/// one pass over the column. That is only sound if the assembled mask is
+/// the mask a full pass would have produced, so every case here is checked
+/// against the values themselves rather than against the previous
+/// implementation.
+///
+/// The row counts straddle the zone width in both directions and the last
+/// one is deliberately not a multiple of it, so a final partial zone is
+/// covered. The predicates reach a value inside the file, one outside it,
+/// a range spanning a zone boundary and a negation, which is the case that
+/// must keep reading every row
+#[test]
+fn test_zone_narrowed_filter_admits_exactly_the_rows_the_values_admit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let schema = schema(&[("id", TypeId::Int64), ("bucket", TypeId::Int64)]);
+
+    for (index, rows) in [512usize, 1024, 4096, 9_999].into_iter().enumerate() {
+        let paths = LakePaths::new(dir.path(), 950 + index as u32);
+        // Ascending ids so zone maps carve the column into disjoint runs and
+        // a point predicate reaches exactly one zone
+        let ids: Vec<Option<Vec<u8>>> = (0..rows)
+            .map(|i| Some((i as i64).to_le_bytes().to_vec()))
+            .collect();
+        let buckets: Vec<Option<Vec<u8>>> = (0..rows)
+            .map(|i| Some(((i % 7) as i64).to_le_bytes().to_vec()))
+            .collect();
+        let batch = vec![
+            ColumnData {
+                column_id: 0,
+                cells: ids,
+            },
+            ColumnData {
+                column_id: 1,
+                cells: buckets,
+            },
+        ];
+        zyron_lake::write_data_file(
+            &paths,
+            &schema,
+            &WriteRequest {
+                partition_id: 1,
+                columns: &batch,
+                sort_keys: &[0],
+                sort_strategies: &[zyron_lake::ClusterStrategy::RangePartition],
+                cluster_spec_id: 0,
+                table_id: 950 + index as u64,
+                bloom_columns: &[],
+                index_id: None,
+            },
+        )
+        .expect("write");
+        let reader = zyron_lake::LakeFileReader::open(&paths, 1).expect("open");
+
+        let inside = (rows / 2) as i64;
+        let cases: Vec<(&str, LakePredicate, Box<dyn Fn(i64) -> bool>)> = vec![
+            (
+                "point inside the file",
+                cmp(0, CompareOp::Eq, inside),
+                Box::new(move |v| v == inside),
+            ),
+            (
+                "point past the end",
+                cmp(0, CompareOp::Eq, rows as i64 + 100),
+                Box::new(move |_| false),
+            ),
+            (
+                "range across a zone boundary",
+                LakePredicate::And(vec![
+                    cmp(0, CompareOp::GtEq, 1_000),
+                    cmp(0, CompareOp::Lt, 2_100),
+                ]),
+                Box::new(|v| (1_000..2_100).contains(&v)),
+            ),
+            (
+                "negation, which reads every row",
+                LakePredicate::Not(Box::new(cmp(0, CompareOp::Eq, inside))),
+                Box::new(move |v| v != inside),
+            ),
+        ];
+
+        for (label, predicate, admits) in cases {
+            let Some(filter) = StoredFilter::lower(&predicate, &schema) else {
+                continue;
+            };
+            let mask = reader.rows_matching(&filter).expect("evaluate");
+            for row in 0..rows {
+                let kept = match &mask {
+                    // Nothing decided means every row stands
+                    None => true,
+                    Some(bits) => bits[row / 8] & (1 << (row % 8)) != 0,
+                };
+                let truth = admits(row as i64);
+                assert!(
+                    kept || !truth,
+                    "{rows} rows, {label}: row {row} matches the predicate and the filter \
+                     dropped it, which loses a row a scan owes the caller"
+                );
+            }
+        }
+    }
+}

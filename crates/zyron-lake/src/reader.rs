@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use zyron_common::curve::normalize_component;
 use zyron_common::{TypeId, ZyronError};
 use zyron_storage::columnar::{
-    STAT_VALUE_SIZE, SlotOrder, SortOrder, ZONE_MAP_BATCH_SIZE, ZoneMapEntry, ZyrFileReader,
-    compare_value_to_slot, slot_order,
+    STAT_VALUE_SIZE, SegmentHeader, SlotOrder, SortOrder, ZONE_MAP_BATCH_SIZE, ZoneMapEntry,
+    ZyrFileReader, compare_value_to_slot, slot_order,
 };
 use zyron_storage::encoding::Predicate;
 
@@ -56,21 +56,27 @@ impl ColumnEvidence for FileEvidence<'_> {
         column_id: u32,
         value_size: usize,
         predicate: &Predicate<'_>,
+        start: usize,
+        end: usize,
     ) -> Result<Vec<u8>, ZyronError> {
         if !self.reader.reader.has_segment(column_id) {
-            return Ok(vec![0u8; self.reader.row_count.div_ceil(8)]);
+            return Ok(vec![0u8; end.saturating_sub(start).div_ceil(8)]);
         }
         // Evaluating on encoded bytes still reads the segment payload, so it
-        // counts the same as decoding the column would have
+        // counts the same as decoding the column would have. The payload is
+        // read whole whatever the range, because its checksum covers all of
+        // it, so the range saves the decode and the compare rather than IO
         self.reader.bytes_read.fetch_add(
             self.reader.reader.segment_bytes(column_id),
             Ordering::Relaxed,
         );
-        self.reader.reader.eval_column_predicate(
+        self.reader.reader.eval_column_predicate_rows(
             column_id,
             self.reader.row_count,
             value_size,
             predicate,
+            start,
+            end,
         )
     }
 }
@@ -291,6 +297,18 @@ impl LakeFileReader {
             && self.reader.primary_key_column_id() == column_id
     }
 
+    /// One column's segment header, read without touching its payload.
+    ///
+    /// Names the encoding the column was written with and the bytes it
+    /// occupies, which is what a scan measurement has to state to mean
+    /// anything: the same column shape written under two encodings decodes
+    /// at different speeds, and a throughput number that does not say which
+    /// one it read cannot be compared with another that read the other
+    pub fn segment_header(&self, column_id: u32) -> Result<SegmentHeader, ZyronError> {
+        self.reader
+            .read_segment_metadata(column_id, self.row_count)
+            .map(|(header, _)| header)
+    }
     /// The rows that can hold any of `cells`, decided from one column's
     /// zone maps with no payload read.
     ///

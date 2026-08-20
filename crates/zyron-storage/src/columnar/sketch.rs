@@ -1,16 +1,16 @@
-//! Distinct-value counting for the lake writer.
+//! Distinct-value counting for a column segment.
 //!
-//! The writer materializes every column anyway, so it could count distinct
-//! values exactly with a hash set. It does not, because an exact set over a
-//! 256 MB file's column is hundreds of megabytes of transient memory, and
-//! the number is only ever compared against thresholds. A HyperLogLog holds
-//! 1 KiB regardless of how many rows it sees and lands inside a couple of
-//! percent, which is well inside the distance between the thresholds that
-//! read it.
+//! A segment build materializes every value anyway, so it could count
+//! distinct values exactly with a hash set. It does not, because an exact
+//! set over a 256 MB file's column is hundreds of megabytes of transient
+//! memory, and the number is only ever compared against thresholds. A
+//! HyperLogLog holds 1 KiB regardless of how many rows it sees and lands
+//! inside a couple of percent, which is well inside the distance between
+//! the thresholds that read it.
 //!
-//! The sketch is dropped once the writer has its estimate. Only the u64
-//! estimate reaches the manifest, so a table with 100k files pays 8 bytes
-//! per column per file rather than 1 KiB.
+//! The sketch is dropped once the caller has its estimate. Only the u64
+//! estimate reaches a manifest, so a table with 100k files pays 8 bytes per
+//! column per file rather than 1 KiB.
 
 use zyron_common::hash64;
 
@@ -47,8 +47,10 @@ impl DistinctSketch {
         self.insert_hash(hash64(value));
     }
 
+    /// Adds one value already hashed with [`hash64`]. A caller that keys
+    /// its own structures by the same hash pays for it once
     #[inline]
-    fn insert_hash(&mut self, hash: u64) {
+    pub fn insert_hash(&mut self, hash: u64) {
         let index = (hash >> (64 - PRECISION)) as usize;
         // The remaining bits decide the register value. Shifting the index
         // out leaves zeros behind, so a hash whose tail is entirely zero
@@ -173,5 +175,19 @@ mod tests {
             sketch.insert(b"");
         }
         assert_eq!(sketch.estimate(), 3);
+    }
+
+    /// Hashing a value once and feeding the hash is the same measurement as
+    /// handing the sketch the bytes
+    #[test]
+    fn test_inserting_a_hash_matches_inserting_the_value() {
+        let mut by_value = DistinctSketch::new();
+        let mut by_hash = DistinctSketch::new();
+        for value in 0..5_000u64 {
+            let bytes = value.to_le_bytes();
+            by_value.insert(&bytes);
+            by_hash.insert_hash(hash64(&bytes));
+        }
+        assert_eq!(by_value.estimate(), by_hash.estimate());
     }
 }

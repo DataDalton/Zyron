@@ -6,7 +6,9 @@
 //!
 //! Based on ALP (SIGMOD 2024), adapted for Zyron's columnar format.
 
-use crate::encoding::{Encoding, EncodingType, Predicate, eval_predicate_on_raw};
+use crate::encoding::{
+    Encoding, EncodingType, Predicate, bitmask_from_rows, eval_predicate_on_raw,
+};
 use zyron_common::{Result, ZyronError};
 
 pub struct AlpEncoding;
@@ -856,29 +858,12 @@ impl Encoding for AlpEncoding {
                     };
 
                     let packed = &encoded[packedStart..packedEnd];
-                    let bitmaskLen = row_count.div_ceil(8);
-                    let mut bitmask = vec![0u8; bitmaskLen];
-
-                    for i in 0..row_count {
+                    return Ok(bitmask_from_rows(row_count, |i| {
                         let unsigned =
                             unpack_bits(packed, i as u64 * intBitWidth as u64, intBitWidth);
                         let intVal = unsigned as i64 + base;
-
-                        let aboveLow = match loInt {
-                            Some(lo) => intVal >= lo,
-                            None => true,
-                        };
-                        let belowHigh = match hiInt {
-                            Some(hi) => intVal <= hi,
-                            None => true,
-                        };
-
-                        if aboveLow && belowHigh {
-                            bitmask[i / 8] |= 1 << (i % 8);
-                        }
-                    }
-
-                    return Ok(bitmask);
+                        loInt.is_none_or(|lo| intVal >= lo) && hiInt.is_none_or(|hi| intVal <= hi)
+                    }));
                 }
             }
         }

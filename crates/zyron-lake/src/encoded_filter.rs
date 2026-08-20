@@ -653,11 +653,19 @@ fn zone_admits(leaf: &Leaf, zone: &ZoneMapEntry) -> bool {
 pub(crate) trait ColumnEvidence {
     fn row_count(&self) -> usize;
     fn zone_maps(&self, column_id: u32) -> Result<Vec<ZoneMapEntry>, ZyronError>;
+    /// Rows `start..end` the predicate admits, as a keep mask covering that
+    /// range alone, `ceil((end - start) / 8)` bytes.
+    ///
+    /// The range is what zone pruning left standing. Answering for the whole
+    /// column when one zone survived does the work of every row in the file
+    /// to describe a thousand of them
     fn eval(
         &self,
         column_id: u32,
         value_size: usize,
         predicate: &Predicate<'_>,
+        start: usize,
+        end: usize,
     ) -> Result<Vec<u8>, ZyronError>;
 }
 
@@ -780,7 +788,11 @@ fn eval_inverted_leaf(
                 high: high.as_deref(),
             },
         };
-        let hit = evidence.eval(leaf.column_id, leaf.value_size, &predicate)?;
+        // Every row, not the admitted zones. An inverted leaf keeps exactly
+        // the rows the positive predicate rejects, and a zone the positive
+        // predicate admits still holds rows it does not match, so narrowing
+        // to admitted zones here would drop the survivors everywhere else
+        let hit = evidence.eval(leaf.column_id, leaf.value_size, &predicate, 0, rows)?;
         for (a, b) in mask.iter_mut().zip(hit.iter()) {
             *a |= *b;
         }
@@ -804,6 +816,9 @@ fn eval_leaf(leaf: &Leaf, evidence: &dyn ColumnEvidence) -> Result<Option<Vec<u8
     if leaf.invert {
         return eval_inverted_leaf(leaf, evidence);
     }
+    // Row spans the zone maps could not reject, which is all the payload
+    // evaluation has to answer for. Whole file when nothing pruned
+    let mut spans: Vec<(usize, usize)> = Vec::new();
     if leaf.zone_prunable {
         let zones = evidence.zone_maps(leaf.column_id)?;
         if !zones.is_empty() {
@@ -816,10 +831,14 @@ fn eval_leaf(leaf: &Leaf, evidence: &dyn ColumnEvidence) -> Result<Option<Vec<u8
             if leaf.pushdown.is_empty() {
                 return Ok(Some(zone_mask(&admitted, rows)));
             }
+            spans = admitted_spans(&admitted, rows);
         }
     }
     if leaf.pushdown.is_empty() {
         return Ok(None);
+    }
+    if spans.is_empty() {
+        spans.push((0, rows));
     }
     let mut acc = vec![0u8; rows.div_ceil(8)];
     for owned in &leaf.pushdown {
@@ -840,12 +859,45 @@ fn eval_leaf(leaf: &Leaf, evidence: &dyn ColumnEvidence) -> Result<Option<Vec<u8
                 high: high.as_deref(),
             },
         };
-        let mask = evidence.eval(leaf.column_id, leaf.value_size, &predicate)?;
-        for (a, b) in acc.iter_mut().zip(mask.iter()) {
-            *a |= *b;
+        for &(start, end) in &spans {
+            let mask = evidence.eval(leaf.column_id, leaf.value_size, &predicate, start, end)?;
+            // A zone is a whole number of bytes of mask, so a span starts on
+            // a byte boundary and its answer drops in without shifting
+            let byte_start = start / 8;
+            for (offset, byte) in mask.iter().enumerate() {
+                if let Some(slot) = acc.get_mut(byte_start + offset) {
+                    *slot |= *byte;
+                }
+            }
         }
     }
     Ok(Some(acc))
+}
+
+/// Contiguous row spans the admitted zones cover.
+///
+/// Adjacent zones are merged so a clustered column, where the matching rows
+/// sit together, evaluates one span rather than one call per zone. Zone
+/// width divides eight, so every span starts on a mask byte boundary and
+/// its answer needs no bit shifting to merge
+fn admitted_spans(admitted: &[bool], rows: usize) -> Vec<(usize, usize)> {
+    let batch = ZONE_MAP_BATCH_SIZE as usize;
+    let mut spans = Vec::new();
+    let mut open: Option<usize> = None;
+    for (zone, keep) in admitted.iter().enumerate() {
+        match (keep, open) {
+            (true, None) => open = Some(zone * batch),
+            (false, Some(start)) => {
+                spans.push((start, (zone * batch).min(rows)));
+                open = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(start) = open {
+        spans.push((start, rows));
+    }
+    spans
 }
 
 /// Expands a per-zone decision into a per-row keep mask

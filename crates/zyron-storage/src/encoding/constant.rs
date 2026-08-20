@@ -100,7 +100,7 @@ impl Encoding for ConstantEncoding {
         &self,
         encoded: &[u8],
         row_count: usize,
-        _value_size: usize,
+        value_size: usize,
         predicate: &Predicate,
     ) -> Result<Vec<u8>> {
         if row_count == 0 {
@@ -123,9 +123,16 @@ impl Encoding for ConstantEncoding {
         let value = &encoded[4..4 + stored_size];
         let bitmask_len = row_count.div_ceil(8);
 
+        // The range comparison runs in the column's stored order, which the
+        // column's value size selects: little endian numeric for a
+        // fixed-width cell, lexicographic for a variable-length one. The
+        // stored length is how many bytes this one value occupies, and on a
+        // variable-length column it is the length of the string rather than
+        // zero, so ordering by it would read the string backwards as a
+        // number and admit or reject every row on that reading
         let matches = match predicate {
             Predicate::Equality(target) => value == *target,
-            Predicate::Range { low, high } => range_admits(value, stored_size, *low, *high),
+            Predicate::Range { low, high } => range_admits(value, value_size, *low, *high),
             Predicate::In(values) => values.contains(&value),
         };
 
@@ -219,5 +226,83 @@ mod tests {
             .eval_predicate(&encoded, 10, 4, &Predicate::Equality(&target))
             .unwrap();
         assert_eq!(bitmask, vec![0u8; 2]);
+    }
+
+    /// A variable-length column orders by its bytes from the first. Ordering
+    /// the stored value by its own byte length instead reads the string from
+    /// the last byte, which decides the whole file on the reversed reading:
+    /// every row of a file holding one distinct string is returned, or none
+    /// of them, and which one it is depends on the string's tail.
+    #[test]
+    fn a_variable_length_constant_orders_its_range_by_its_bytes() {
+        let enc = ConstantEncoding;
+        let rows = 2_048usize;
+        let views: Vec<Option<&[u8]>> = vec![Some(b"same".as_slice()); rows];
+        let raw = crate::encoding::varlen_pack(&views);
+        let encoded = enc.encode(&raw, rows, 0).expect("encode");
+
+        // "same" is above "row-99999999" from the first byte, so a range
+        // ending there admits nothing. Read from the last byte the four
+        // characters are a little endian number and the answer flips
+        let low = b"a".to_vec();
+        let high = b"row-99999999".to_vec();
+        let mask = enc
+            .eval_predicate(
+                &encoded,
+                rows,
+                0,
+                &Predicate::Range {
+                    low: Some(&low),
+                    high: Some(&high),
+                },
+            )
+            .expect("eval");
+        assert!(
+            mask.iter().all(|byte| *byte == 0),
+            "a range the value sits above must admit no row"
+        );
+
+        // And a range the value does sit inside admits every row
+        let high = b"tail".to_vec();
+        let mask = enc
+            .eval_predicate(
+                &encoded,
+                rows,
+                0,
+                &Predicate::Range {
+                    low: Some(&low),
+                    high: Some(&high),
+                },
+            )
+            .expect("eval");
+        assert!(
+            mask.iter().all(|byte| *byte == 0xFF),
+            "a range the value sits inside must admit every row"
+        );
+
+        // The direction that loses rows: "ba" is between "b" and "c" read
+        // from the first byte and above both read from the last, so the
+        // reversed reading answers that no row matches and the rows the
+        // query wanted are dropped rather than merely rechecked
+        let views: Vec<Option<&[u8]>> = vec![Some(b"ba".as_slice()); rows];
+        let raw = crate::encoding::varlen_pack(&views);
+        let encoded = enc.encode(&raw, rows, 0).expect("encode");
+        let low = b"b".to_vec();
+        let high = b"c".to_vec();
+        let mask = enc
+            .eval_predicate(
+                &encoded,
+                rows,
+                0,
+                &Predicate::Range {
+                    low: Some(&low),
+                    high: Some(&high),
+                },
+            )
+            .expect("eval");
+        assert!(
+            mask.iter().all(|byte| *byte == 0xFF),
+            "every row holds a value inside the range and none may be dropped"
+        );
     }
 }

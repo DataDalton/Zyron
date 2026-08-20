@@ -464,6 +464,7 @@ where
                     SegmentOptions {
                         bloom: col.bloom_policy,
                         exact_encoding: config.exact_encoding,
+                        distinct_sketch: false,
                     },
                 )
             })
@@ -486,6 +487,7 @@ where
                             SegmentOptions {
                                 bloom: col.bloom_policy,
                                 exact_encoding: exactEncoding,
+                                distinct_sketch: false,
                             },
                         )
                     })
@@ -539,6 +541,8 @@ where
         xmax_range_hi: 0,
         primary_key_column_id: pkColumnId,
         sort_order: sortOrder,
+        segment_index_offset: 0,
+        segment_index_size: 0,
     };
 
     let fileSize = write_zyr_file(&outputPath, header, &builtSegments, config.fsync_enabled)?;

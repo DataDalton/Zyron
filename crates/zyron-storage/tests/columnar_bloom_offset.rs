@@ -23,6 +23,7 @@ fn write_one_column(path: &std::path::Path, values: &[Option<&[u8]>], policy: Bl
         SegmentOptions {
             bloom: policy,
             exact_encoding: false,
+            distinct_sketch: false,
         },
     )
     .expect("build");
@@ -47,6 +48,8 @@ fn write_one_column(path: &std::path::Path, values: &[Option<&[u8]>], policy: Bl
         xmax_range_hi: 0,
         primary_key_column_id: 0,
         sort_order: SortOrder::None,
+        segment_index_offset: 0,
+        segment_index_size: 0,
     };
     let mut writer = ZyrFileWriter::create(path, header).expect("create");
     let zone_bytes: Vec<u8> = segment

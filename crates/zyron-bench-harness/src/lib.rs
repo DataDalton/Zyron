@@ -39,6 +39,79 @@ fn suite_name() -> &'static str {
 pub const VALIDATION_RUNS: usize = 5;
 pub const REGRESSION_THRESHOLD: f64 = 2.0;
 
+// =============================================================================
+// Machine state calibration
+// =============================================================================
+
+/// Iterations of the calibration kernel. Sized so one pass lands around a
+/// millisecond on a current core, which is long enough to survive scheduler
+/// noise and short enough that stamping every section costs nothing
+const CALIBRATION_ITERATIONS: u64 = 400_000;
+
+/// The reading in force for metrics recorded from here on, microseconds.
+/// Zero until a suite calibrates
+static CALIBRATION: Mutex<f64> = Mutex::new(0.0);
+
+/// A fixed amount of arithmetic, the same on every machine and every run.
+///
+/// Deliberately dependent from one iteration to the next so it cannot be
+/// vectorized or hoisted, and returning its result so it cannot be dropped.
+/// The seed is taken through `black_box` because a loop over a constant
+/// number of steps from a constant start is a constant, and the optimizer
+/// folds the whole thing to one at compile time and times nothing.
+/// What it computes does not matter, only that it is always the same work
+#[inline(never)]
+fn calibration_kernel(seed: u64) -> u64 {
+    let mut state: u64 = seed;
+    for _ in 0..CALIBRATION_ITERATIONS {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+    }
+    state
+}
+
+/// Times the calibration kernel and makes the reading current.
+///
+/// A suite's sections do not run on the same machine even when they run in
+/// the same process. A later section runs on a hotter core with a fuller
+/// page cache and a busier allocator, and the same measurement taken in two
+/// positions of one suite has been seen to differ by nearly two to one. That
+/// is larger than most changes worth making, so a number is only comparable
+/// to another number taken at a similar reading.
+///
+/// Stamping each section with a fixed workload is what makes the difference
+/// visible rather than mysterious: a section whose calibration doubled did
+/// not measure a regression, it measured a slower machine
+pub fn calibrate() -> f64 {
+    // Best of three, because the calibration is itself a measurement and the
+    // fastest pass is the one least interrupted
+    let mut best = f64::INFINITY;
+    for _ in 0..3 {
+        let seed = std::hint::black_box(0x9E37_79B9_7F4A_7C15u64);
+        let start = Instant::now();
+        std::hint::black_box(calibration_kernel(seed));
+        let us = start.elapsed().as_nanos() as f64 / 1_000.0;
+        if us < best {
+            best = us;
+        }
+    }
+    if let Ok(mut current) = CALIBRATION.lock() {
+        *current = best;
+    }
+    best
+}
+
+/// The reading metrics recorded now are stamped with, or None before any
+/// suite has calibrated
+pub fn calibration() -> Option<f64> {
+    match CALIBRATION.lock() {
+        Ok(current) if *current > 0.0 => Some(*current),
+        _ => None,
+    }
+}
+
 /// Whether this build can produce a number worth comparing to a target.
 ///
 /// An unoptimized build is not slower by a constant factor. It is slower by an
@@ -192,6 +265,11 @@ struct MetricRecord {
     target: Option<f64>,
     passed: Option<bool>,
     higher_is_better: bool,
+    /// Machine state reading in force when this number was taken, in
+    /// microseconds of the calibration kernel. None when the suite does not
+    /// calibrate. Two numbers taken at readings that differ are not
+    /// comparable without dividing it out
+    calibration: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -625,6 +703,51 @@ pub fn record_metric(test: &str, name: &str, unit: &str, runs: Vec<f64>) -> f64 
     }
     write_benchmark_record(test, name, None, average, runs, None, None, false);
     average
+}
+
+/// Records a fixed cost whose spread comes from outside the process, and
+/// reports the fastest run rather than the mean.
+///
+/// Some measurements repeat one operation on equivalent inputs, where the
+/// only thing that differs between runs is whether something outside the
+/// process interrupted it. A file open on a platform with an on-access
+/// scanner is the standing example: four runs land at seventeen
+/// microseconds and the fifth at three thousand, because the scanner read
+/// the file that time and not the others. Averaging those reports a cost
+/// the code never pays and hides changes of a factor of two inside a spread
+/// of a factor of two hundred.
+///
+/// The fastest run is the one that measured the operation and nothing else,
+/// so it is the estimate of what the code costs. Every run is still printed,
+/// so a reader can see how much interference there was and judge whether the
+/// figure deserves trust.
+///
+/// This is not a licence to take the best of a noisy measurement in general.
+/// It applies where the spread is known to come from outside and the inputs
+/// are equivalent. A measurement whose runs differ because the work differs
+/// keeps its mean
+pub fn record_metric_best(test: &str, name: &str, unit: &str, runs: Vec<f64>) -> f64 {
+    let best = runs.iter().cloned().fold(f64::INFINITY, f64::min);
+    let best = if best.is_finite() { best } else { 0.0 };
+    let u = |v: f64| format!("{}{}", format_measurement(v), unit);
+    tprintln!("  {}:", name);
+    tprintln!(
+        "    Runs: [{}]",
+        runs.iter().map(|x| u(*x)).collect::<Vec<_>>().join(", ")
+    );
+    let average = if runs.is_empty() {
+        0.0
+    } else {
+        runs.iter().sum::<f64>() / runs.len() as f64
+    };
+    tprintln!(
+        "    Fastest: {} (mean {}, taken over {} runs)",
+        u(best),
+        u(average),
+        runs.len()
+    );
+    write_benchmark_record(test, name, None, best, runs, None, None, false);
+    best
 }
 
 /// Asserts a bound on a counted quantity that belongs to no storage format.
@@ -1231,9 +1354,18 @@ fn push_metric_body(out: &mut String, m: &MetricRecord, indent: &str, trailing: 
     out.push_str(&format!("{indent}\"runs\": [{runs_json}],\n"));
     out.push_str(&format!("{indent}\"target\": {target},\n"));
     out.push_str(&format!("{indent}\"passed\": {passed},\n"));
+    let calibration = match m.calibration {
+        Some(v) => format!("{:.3}", v),
+        None => "null".to_string(),
+    };
     out.push_str(&format!(
-        "{indent}\"higher_is_better\": {}{}\n",
-        m.higher_is_better,
+        "{indent}\"higher_is_better\": {},
+",
+        m.higher_is_better
+    ));
+    out.push_str(&format!(
+        "{indent}\"calibration_us\": {calibration}{}
+",
         if trailing { "," } else { "" }
     ));
 }
@@ -1541,6 +1673,7 @@ fn write_benchmark_record(
         target,
         passed,
         higher_is_better,
+        calibration: calibration(),
     };
     if let Ok(mut g) = collected_metrics().lock() {
         g.push(record);
@@ -1564,6 +1697,7 @@ mod tests {
             target: Some(average),
             passed: Some(true),
             higher_is_better: false,
+            calibration: None,
         }
     }
 

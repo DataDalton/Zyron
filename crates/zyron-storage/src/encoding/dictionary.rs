@@ -5,7 +5,9 @@
 //! Predicate evaluation resolves the search term to a code via binary search
 //! on the dictionary, then scans the code array without decoding.
 
-use crate::encoding::{Encoding, EncodingType, Predicate, range_admits, slice_rows};
+use crate::encoding::{
+    Encoding, EncodingType, Predicate, bitmask_from_rows, range_admits, slice_rows,
+};
 use std::collections::{HashMap, HashSet};
 use zyron_common::{Result, ZyronError};
 
@@ -284,9 +286,7 @@ impl Encoding for DictionaryEncoding {
         };
 
         let packedStart = dictEnd;
-
         let bitmaskLen = row_count.div_ceil(8);
-        let mut bitmask = vec![0u8; bitmaskLen];
 
         // Build a set of matching dictionary codes
         let mut matchingCodes = Vec::new();
@@ -320,20 +320,25 @@ impl Encoding for DictionaryEncoding {
         }
 
         if matchingCodes.is_empty() {
-            return Ok(bitmask);
+            return Ok(vec![0u8; bitmaskLen]);
         }
 
-        // Scan code array, checking membership
+        // Scan code array, checking membership. An equality resolves to one
+        // code, and comparing against it directly is what a point lookup on
+        // a dictionary column runs per row
         matchingCodes.sort_unstable();
         let packed = &encoded[packedStart..];
-        for i in 0..row_count {
-            let code = unpack_bits(packed, i as u64 * codeBitWidth as u64, codeBitWidth) as u32;
-            if matchingCodes.binary_search(&code).is_ok() {
-                bitmask[i / 8] |= 1 << (i % 8);
+        let code_at =
+            |i: usize| unpack_bits(packed, i as u64 * codeBitWidth as u64, codeBitWidth) as u32;
+        Ok(match matchingCodes.as_slice() {
+            [only] => {
+                let only = *only;
+                bitmask_from_rows(row_count, |i| code_at(i) == only)
             }
-        }
-
-        Ok(bitmask)
+            _ => bitmask_from_rows(row_count, |i| {
+                matchingCodes.binary_search(&code_at(i)).is_ok()
+            }),
+        })
     }
 }
 
@@ -562,7 +567,6 @@ fn eval_predicate_varlen(
     let (dict_count, offsets, blob, packed) = read_varlen_container(encoded)?;
     let code_bits = code_bit_width(dict_count);
     let bitmask_len = row_count.div_ceil(8);
-    let mut bitmask = vec![0u8; bitmask_len];
 
     // The distinct entries are stored sorted, so equality/IN resolve by
     // binary search and a range scans the contiguous matching prefix.
@@ -605,16 +609,17 @@ fn eval_predicate_varlen(
     }
 
     if matching.is_empty() {
-        return Ok(bitmask);
+        return Ok(vec![0u8; bitmask_len]);
     }
     matching.sort_unstable();
-    for i in 0..row_count {
-        let code = unpack_bits(packed, i as u64 * code_bits as u64, code_bits) as u32;
-        if matching.binary_search(&code).is_ok() {
-            bitmask[i / 8] |= 1 << (i % 8);
+    let code_at = |i: usize| unpack_bits(packed, i as u64 * code_bits as u64, code_bits) as u32;
+    Ok(match matching.as_slice() {
+        [only] => {
+            let only = *only;
+            bitmask_from_rows(row_count, |i| code_at(i) == only)
         }
-    }
-    Ok(bitmask)
+        _ => bitmask_from_rows(row_count, |i| matching.binary_search(&code_at(i)).is_ok()),
+    })
 }
 
 /// Packs a u64 value at the given bit offset.

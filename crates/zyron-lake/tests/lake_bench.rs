@@ -29,7 +29,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use zyron_bench_harness::{
-    RatioBound, assert_exact_metric, check_performance, init, measuring, record_metric, tprintln,
+    RatioBound, assert_exact_metric, calibrate, check_performance, init, measuring, record_metric,
+    record_metric_best, tprintln,
 };
 use zyron_common::TypeId;
 use zyron_lake::manifest::{ClusterSpec, ColumnStatsEntry, PartitionEntry};
@@ -59,8 +60,19 @@ static BENCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn section(title: &str) -> std::sync::MutexGuard<'static, ()> {
     let guard = BENCH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     init("lake");
+    // A fixed workload timed here, so every number in this section carries
+    // the state of the machine that produced it. Sections of one suite do
+    // not run on the same machine: a later one runs on a hotter core with a
+    // fuller page cache, and the same measurement in two positions of this
+    // suite has come out nearly two to one apart. Without the stamp that
+    // difference reads as a regression
+    let reading = calibrate();
     tprintln!("");
     tprintln!("=== {} ===", title);
+    tprintln!(
+        "  machine state: {:.0}us on the reference workload",
+        reading
+    );
     guard
 }
 
@@ -518,6 +530,13 @@ fn test_data_file_scan_throughput() {
 
     let reader = zyron_lake::LakeFileReader::open(&paths, 1).expect("open");
     let id_column = schema.column_by_id(0).expect("id");
+    let header = reader.segment_header(0).expect("segment header");
+    tprintln!(
+        "  Column 0 is {:?}, {} encoded bytes for {} raw",
+        header.encoding_type,
+        header.encoded_size,
+        header.raw_size
+    );
     let _ = reader.read_column(id_column).expect("warm");
 
     let mut rows_per_sec = Vec::with_capacity(RUNS);
@@ -1433,6 +1452,803 @@ fn rows_batch(start: i64, n: usize) -> Vec<ColumnData> {
 
 fn two_column_schema() -> LakeSchema {
     schema(&[("id", TypeId::Int64), ("bucket", TypeId::Int64)])
+}
+
+/// What a scan pays per file, and what it pays per row.
+///
+/// Opening a `.zyr` costs the same whether it holds a thousand rows or a
+/// million: a file open, a metadata call, a page-sized header read, a
+/// footer read and the segment index. That is a fixed cost per file, so
+/// the rows in a file decide whether it is noise or the whole scan. A
+/// table that took a million rows in hundred-row statements has ten
+/// thousand files under it and pays the fixed cost ten thousand times to
+/// read the same rows.
+///
+/// Measuring throughput at several file sizes is what separates the two,
+/// and the per-file cost falls out of the difference rather than being
+/// asserted about code this test cannot see
+#[test]
+fn test_scan_cost_separates_per_file_overhead_from_per_row_work() {
+    let _section = section("Scan Decomposition");
+    let schema = two_column_schema();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let paths = LakePaths::new(dir.path(), 903);
+    let sizes: &[usize] = if measuring() {
+        &[1_000, 16_384, 262_144]
+    } else {
+        &[500, 2_000]
+    };
+
+    let id_column = schema.column_by_id(0).expect("id");
+    let mut per_row_ns: Vec<(usize, f64)> = Vec::new();
+    let mut open_us_by_size: Vec<(usize, f64)> = Vec::new();
+
+    for (index, &rows) in sizes.iter().enumerate() {
+        let batch = rows_batch(0, rows);
+        let partition = 0xC000 + index as u64;
+        zyron_lake::write_data_file(
+            &paths,
+            &schema,
+            &WriteRequest {
+                partition_id: partition,
+                columns: &batch,
+                sort_keys: &[0],
+                sort_strategies: &[ClusterStrategy::RangePartition],
+                cluster_spec_id: 0,
+                table_id: 903,
+                bloom_columns: &[],
+                index_id: None,
+            },
+        )
+        .expect("write scan file");
+
+        // Opening the file, which is the cost that does not shrink with the
+        // rows inside it.
+        //
+        // Every open here is a file this process has not opened before,
+        // because that is what a scan does: reaching a thousand files means
+        // reaching a thousand it has not touched. Reopening one file would
+        // time the page cache and report an open cost the scan never pays
+        let siblings: Vec<u64> = (0..RUNS)
+            .map(|run| 0xD000 + (index as u64) * 0x100 + run as u64)
+            .collect();
+        for sibling in &siblings {
+            zyron_lake::write_data_file(
+                &paths,
+                &schema,
+                &WriteRequest {
+                    partition_id: *sibling,
+                    columns: &batch,
+                    sort_keys: &[0],
+                    sort_strategies: &[ClusterStrategy::RangePartition],
+                    cluster_spec_id: 0,
+                    table_id: 903,
+                    bloom_columns: &[],
+                    index_id: None,
+                },
+            )
+            .expect("write a file for the open measurement");
+        }
+        let mut open_us = Vec::with_capacity(RUNS);
+        for sibling in &siblings {
+            let (reader, us) =
+                micros(|| zyron_lake::LakeFileReader::open(&paths, *sibling).expect("open"));
+            assert_eq!(reader.row_count(), rows);
+            open_us.push(us);
+        }
+        // The fastest of the five, because the spread here is an on-access
+        // scanner reading a file the process has just created, not the open
+        // costing different amounts on different tries. Four runs land near
+        // twenty microseconds and one near three thousand, and a mean over
+        // that reports a cost no scan pays while hiding a halving of the
+        // real one inside it
+        let open = record_metric_best(
+            "lake_targets",
+            &format!("Scan phase, open a {} row file", rows),
+            "us",
+            open_us,
+        );
+        open_us_by_size.push((rows, open));
+
+        // Decoding one column out of an already open file
+        let reader = zyron_lake::LakeFileReader::open(&paths, partition).expect("open");
+        // What is actually being decoded. A decode rate means nothing
+        // without it: the same column under two encodings is two different
+        // measurements wearing one name
+        let header = reader.segment_header(0).expect("segment header");
+        tprintln!(
+            "  {} rows: column 0 is {:?}, {} encoded bytes for {} raw",
+            rows,
+            header.encoding_type,
+            header.encoded_size,
+            header.raw_size
+        );
+        let _ = reader.read_column(id_column).expect("warm");
+        let mut decode_us = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            let (_, us) = micros(|| reader.read_column(id_column).expect("decode"));
+            decode_us.push(us);
+        }
+        let decode = record_metric(
+            "lake_targets",
+            &format!("Scan phase, decode a {} row column", rows),
+            "us",
+            decode_us,
+        );
+
+        // Answering a predicate from stored bytes, which is the path a
+        // pruned scan takes before it decodes anything
+        let point = cmp(0, CompareOp::Eq, (rows / 2) as i64);
+        let filter = zyron_lake::StoredFilter::lower(&point, &schema)
+            .expect("an integer equality lowers onto stored bytes");
+        let mut filter_us = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            let (_, us) = micros(|| reader.rows_matching(&filter).expect("evaluate"));
+            filter_us.push(us);
+        }
+        let filtered = record_metric(
+            "lake_targets",
+            &format!("Scan phase, filter {} rows on stored bytes", rows),
+            "us",
+            filter_us,
+        );
+
+        // What a scan of this file actually costs end to end, per row
+        let total = open + decode;
+        let ns = total * 1000.0 / rows as f64;
+        per_row_ns.push((rows, ns));
+        tprintln!(
+            "  {:>6} rows/file: open {:>6.1}us  decode {:>6.1}us  filter {:>5.1}us  ->  {:.2} ns/row scanned",
+            rows,
+            open,
+            decode,
+            filtered,
+            ns
+        );
+    }
+
+    // The fixed cost per file, read off two sizes rather than assumed. Open
+    // cost that barely moves across a 250x row range is by definition not
+    // paid per row
+    let smallest = per_row_ns.first().expect("a size").1;
+    let largest = per_row_ns.last().expect("a size").1;
+    let open_small = open_us_by_size.first().expect("a size").1;
+    let open_large = open_us_by_size.last().expect("a size").1;
+    tprintln!("");
+    tprintln!(
+        "  Open cost is {:.1}us at {} rows and {:.1}us at {} rows, so it is per file",
+        open_small,
+        open_us_by_size.first().expect("a size").0,
+        open_large,
+        open_us_by_size.last().expect("a size").0
+    );
+    tprintln!(
+        "  Scanning in {}-row files costs {:.2}x per row what {}-row files cost",
+        per_row_ns.first().expect("a size").0,
+        smallest / largest,
+        per_row_ns.last().expect("a size").0
+    );
+    record_metric(
+        "lake_targets",
+        "Scan cost per row, small files over large",
+        "x",
+        vec![smallest / largest],
+    );
+    record_metric(
+        "lake_targets",
+        "Scan throughput, large files",
+        "rows/sec",
+        vec![1_000_000_000.0 / largest],
+    );
+}
+
+/// Whether encoding cost stays flat per row as a column grows.
+///
+/// Selection reads the whole column to decide, so anything it does per
+/// distinct value shows up as a per-row cost that climbs with the row count
+/// rather than a constant. A column of all-distinct values is the worst
+/// case, and it is also the common one for a key column, so this measures
+/// nanoseconds per row across two orders of magnitude and asserts the
+/// largest column does not cost meaningfully more per row than the smallest.
+///
+/// This is the shape that decides whether a billion row load is a linear
+/// extrapolation of a million row load or something worse
+#[test]
+fn test_encode_cost_per_row_stays_flat_as_a_column_grows() {
+    let _section = section("Encode Scaling");
+    let sizes: &[usize] = if measuring() {
+        &[10_000, 100_000, 1_000_000]
+    } else {
+        &[1_000, 4_000]
+    };
+    let physical = TypeId::Int64;
+    let mut per_row: Vec<(usize, f64)> = Vec::new();
+
+    for &rows in sizes {
+        // Every value distinct, which is what a key column looks like and
+        // what makes the distinct set as expensive as it can be
+        let owned: Vec<Vec<u8>> = (0..rows)
+            .map(|i| (i as i64).to_le_bytes().to_vec())
+            .collect();
+        let views: Vec<Option<&[u8]>> = owned.iter().map(|v| Some(v.as_slice())).collect();
+        let runs = if rows >= 1_000_000 { 3 } else { RUNS };
+        let mut us = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            let (_, took) = micros(|| {
+                zyron_storage::columnar::ColumnSegment::build_with_options(
+                    0,
+                    physical,
+                    physical.fixed_size().unwrap_or(0),
+                    &views,
+                    zyron_storage::columnar::SegmentOptions {
+                        bloom: zyron_storage::columnar::BloomPolicy::Auto,
+                        exact_encoding: true,
+                        distinct_sketch: true,
+                    },
+                )
+                .expect("encode")
+            });
+            us.push(took);
+        }
+        let avg = record_metric(
+            "lake_targets",
+            &format!("Encode {} rows, all distinct", rows),
+            "us",
+            us,
+        );
+        let ns = avg * 1000.0 / rows as f64;
+        per_row.push((rows, ns));
+        tprintln!(
+            "  {:>9} rows: {:>8.0}us total, {:>6.2} ns/row",
+            rows,
+            avg,
+            ns
+        );
+    }
+
+    let smallest = per_row.first().expect("at least one size").1;
+    let largest = per_row.last().expect("at least one size").1;
+    let ratio = largest / smallest;
+    tprintln!(
+        "  Cost per row, largest over smallest: {:.2}x ({} rows vs {} rows)",
+        ratio,
+        per_row.last().expect("size").0,
+        per_row.first().expect("size").0
+    );
+    record_metric(
+        "lake_targets",
+        "Encode cost per row, growth over 100x rows",
+        "x",
+        vec![ratio],
+    );
+    // A superlinear selection pass shows up here and nowhere else. The bound
+    // is loose because cache behaviour alone moves per-row cost as a buffer
+    // outgrows L2, and the thing being caught is a per-distinct-value
+    // structure that grows without limit, which is far larger than that
+    assert!(
+        ratio < 3.0,
+        "encoding cost per row grew {:.2}x over a 100x larger column, which means selection          is doing work per distinct value rather than per row: {:?}",
+        ratio,
+        per_row
+    );
+}
+
+/// Where the time in one insert actually goes.
+///
+/// `Commit, insert` is one figure for the whole write path. It says a batch
+/// costs four milliseconds and nothing about which part to attack, so every
+/// optimization aimed at it is a guess. This splits the path into phases a
+/// caller can invoke on its own, by differencing public entry points rather
+/// than by instrumenting the writer, so no phase is a number this test made
+/// up about code it cannot see.
+///
+/// The phases, and what each one isolates:
+///
+/// * **Materialize** builds the batch the caller hands in. Every cell is its
+///   own `Vec<u8>`, so this is one heap allocation per cell and it is the
+///   caller's cost, not the writer's.
+/// * **Encode** runs the column encoder over borrowed views of that batch,
+///   which is what the writer does after it has picked a row order.
+/// * **Write file** is the whole of `write_data_file_at`: order, place rows,
+///   encode, segment IO and one fsync.
+/// * **Append** adds the log commit, so append minus write file is what
+///   publishing a version costs on top of producing the data.
+///
+/// Sorted and unsorted writes are both measured, because the ordering pass
+/// builds a key per row and is the one phase a table with no cluster key
+/// does not pay
+#[test]
+fn test_insert_path_decomposition() {
+    let _section = section("Insert Path Decomposition");
+    let n = commit_rows();
+    let schema = two_column_schema();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let paths = LakePaths::new(dir.path(), 902);
+    let log = new_log(&paths, &schema);
+    tprintln!("  Rows per batch: {}", n);
+    tprintln!("  Columns: {}", schema.columns.len());
+
+    // Materializing the batch, which is one allocation per cell
+    let mut build_us = Vec::with_capacity(RUNS);
+    for run in 0..RUNS {
+        let (batch, us) = micros(|| rows_batch((run * n) as i64, n));
+        assert_eq!(batch.len(), schema.columns.len());
+        build_us.push(us);
+    }
+    let build = record_metric(
+        "lake_targets",
+        "Insert phase, materialize batch",
+        "us",
+        build_us,
+    );
+
+    // Encoding alone, over borrowed views of an already built batch. This is
+    // the work the writer does once it has an order, with no IO under it
+    let batch = rows_batch(0, n);
+    let mut encode_us = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        let (_, us) = micros(|| {
+            for col in &schema.columns {
+                let data = batch
+                    .iter()
+                    .find(|c| c.column_id == col.id)
+                    .expect("column data");
+                let physical = col.physical_type_id();
+                let views: Vec<Option<&[u8]>> = data.cells.iter().map(|c| c.as_deref()).collect();
+                zyron_storage::columnar::ColumnSegment::build_with_options(
+                    col.id,
+                    physical,
+                    physical.fixed_size().unwrap_or(0),
+                    &views,
+                    zyron_storage::columnar::SegmentOptions {
+                        bloom: zyron_storage::columnar::BloomPolicy::Auto,
+                        exact_encoding: true,
+                        distinct_sketch: true,
+                    },
+                )
+                .expect("encode");
+            }
+        });
+        encode_us.push(us);
+    }
+    let encode = record_metric(
+        "lake_targets",
+        "Insert phase, encode columns",
+        "us",
+        encode_us,
+    );
+
+    // The same encode with bounded selection. `exact_encoding` trial encodes
+    // every row to choose, where bounded trials a 1024 row prefix, so the
+    // difference is what exactness costs and whether the trial is repeating
+    // work the real encode then does again
+    let mut bounded_us = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        let (_, us) = micros(|| {
+            for col in &schema.columns {
+                let data = batch
+                    .iter()
+                    .find(|c| c.column_id == col.id)
+                    .expect("column data");
+                let physical = col.physical_type_id();
+                let views: Vec<Option<&[u8]>> = data.cells.iter().map(|c| c.as_deref()).collect();
+                zyron_storage::columnar::ColumnSegment::build_with_options(
+                    col.id,
+                    physical,
+                    physical.fixed_size().unwrap_or(0),
+                    &views,
+                    zyron_storage::columnar::SegmentOptions {
+                        bloom: zyron_storage::columnar::BloomPolicy::Auto,
+                        exact_encoding: false,
+                        distinct_sketch: true,
+                    },
+                )
+                .expect("encode");
+            }
+        });
+        bounded_us.push(us);
+    }
+    let bounded = record_metric(
+        "lake_targets",
+        "Insert phase, encode columns bounded",
+        "us",
+        bounded_us,
+    );
+    tprintln!(
+        "  Exact selection costs {:.0}us over bounded, {:.1}x",
+        encode - bounded,
+        encode / bounded
+    );
+
+    // Placing rows in stored order: the loop the lake writer runs before it
+    // calls the encoder, which reads each cell through the sort permutation
+    // and pushes a borrowed view. Min, max, null count and the distinct
+    // estimate all come back off the segment build, so this is a scatter
+    // read and a push per cell and nothing else.
+    //
+    // The order is a scattered permutation because a table with a cluster
+    // key stores rows somewhere other than where they arrived, and the read
+    // through that permutation is what the phase costs. Sorting the indices
+    // by a hash of themselves is a permutation whatever the row count is
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|i| zyron_common::hash64(&(*i as u64).to_le_bytes()));
+    let mut place_us = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        let (_, us) = micros(|| {
+            let mut kept = 0usize;
+            for col in &schema.columns {
+                let data = batch
+                    .iter()
+                    .find(|c| c.column_id == col.id)
+                    .expect("column data");
+                let mut views: Vec<Option<&[u8]>> = Vec::with_capacity(n);
+                for &row in &order {
+                    views.push(data.cells[row].as_deref());
+                }
+                kept += views.len();
+            }
+            kept
+        });
+        place_us.push(us);
+    }
+    let place = record_metric(
+        "lake_targets",
+        "Insert phase, place rows in stored order",
+        "us",
+        place_us,
+    );
+
+    // The file writer alone, against segments that are already built. What
+    // is left of the write once encoding and statistics are removed is
+    // segment framing, padding, the footer and one fsync, and this says how
+    // much of that is the file writer rather than the lake's plumbing
+    // around it
+    let prebuilt: Vec<_> = schema
+        .columns
+        .iter()
+        .map(|col| {
+            let data = batch
+                .iter()
+                .find(|c| c.column_id == col.id)
+                .expect("column data");
+            let physical = col.physical_type_id();
+            let views: Vec<Option<&[u8]>> = data.cells.iter().map(|c| c.as_deref()).collect();
+            let segment = zyron_storage::columnar::ColumnSegment::build_with_options(
+                col.id,
+                physical,
+                physical.fixed_size().unwrap_or(0),
+                &views,
+                zyron_storage::columnar::SegmentOptions {
+                    bloom: zyron_storage::columnar::BloomPolicy::Auto,
+                    exact_encoding: true,
+                    distinct_sketch: true,
+                },
+            )
+            .expect("encode");
+            let zones: Vec<u8> = segment
+                .zone_maps
+                .iter()
+                .flat_map(|z| z.to_bytes())
+                .collect();
+            let bloom = segment.bloom_filter.as_ref().map(|b| b.to_bytes());
+            (col.id, segment, zones, bloom)
+        })
+        .collect();
+    let io_dir = tempfile::tempdir().expect("tempdir");
+    let mut io_us = Vec::with_capacity(RUNS);
+    for run in 0..RUNS {
+        let (_, us) = micros(|| {
+            let path = io_dir.path().join(format!("seg_{run}.zyr"));
+            let mut w = zyron_storage::columnar::ZyrFileWriter::create(
+                &path,
+                zyron_storage::columnar::ZyrFileHeader {
+                    format_version: zyron_storage::columnar::ZYR_FORMAT_VERSION,
+                    column_count: schema.columns.len() as u32,
+                    row_count: n as u64,
+                    table_id: 902,
+                    xmin_range_lo: 0,
+                    xmin_range_hi: 0,
+                    xmax_range_lo: 0,
+                    xmax_range_hi: 0,
+                    primary_key_column_id: 0,
+                    sort_order: zyron_storage::columnar::SortOrder::None,
+                    segment_index_offset: 0,
+                    segment_index_size: 0,
+                },
+            )
+            .expect("create zyr");
+            for (id, segment, zones, bloom) in &prebuilt {
+                w.write_segment(
+                    *id,
+                    &segment.header.to_bytes(),
+                    bloom.as_deref(),
+                    zones,
+                    &segment.null_bitmap,
+                    &segment.encoded_data,
+                )
+                .expect("write segment");
+            }
+            w.finalize(true).expect("finalize")
+        });
+        io_us.push(us);
+    }
+    let file_io = record_metric(
+        "lake_targets",
+        "Insert phase, segment IO and fsync",
+        "us",
+        io_us,
+    );
+
+    // The same write without the fsync, so the durable half of the file
+    // write is separated from the bytes. One data file per statement means
+    // one fsync per statement, and that is the part that does not get
+    // cheaper as rows per statement grow
+    let mut nosync_us = Vec::with_capacity(RUNS);
+    for run in 0..RUNS {
+        let (_, us) = micros(|| {
+            let path = io_dir.path().join(format!("nosync_{run}.zyr"));
+            let mut w = zyron_storage::columnar::ZyrFileWriter::create(
+                &path,
+                zyron_storage::columnar::ZyrFileHeader {
+                    format_version: zyron_storage::columnar::ZYR_FORMAT_VERSION,
+                    column_count: schema.columns.len() as u32,
+                    row_count: n as u64,
+                    table_id: 902,
+                    xmin_range_lo: 0,
+                    xmin_range_hi: 0,
+                    xmax_range_lo: 0,
+                    xmax_range_hi: 0,
+                    primary_key_column_id: 0,
+                    sort_order: zyron_storage::columnar::SortOrder::None,
+                    segment_index_offset: 0,
+                    segment_index_size: 0,
+                },
+            )
+            .expect("create zyr");
+            for (id, segment, zones, bloom) in &prebuilt {
+                w.write_segment(
+                    *id,
+                    &segment.header.to_bytes(),
+                    bloom.as_deref(),
+                    zones,
+                    &segment.null_bitmap,
+                    &segment.encoded_data,
+                )
+                .expect("write segment");
+            }
+            w.finalize(false).expect("finalize")
+        });
+        nosync_us.push(us);
+    }
+    let file_nosync = record_metric(
+        "lake_targets",
+        "Insert phase, segment IO without fsync",
+        "us",
+        nosync_us,
+    );
+    tprintln!(
+        "  Data file fsync costs {:.0}us of the {:.0}us segment write",
+        file_io - file_nosync,
+        file_io
+    );
+
+    // The ordering pass on its own: the permutation the writer sorts rows
+    // into, timed against the same batch the write path is handed. It costs
+    // tens of microseconds where a whole file write costs thousands with
+    // hundreds of microseconds of spread, so taking it as the gap between a
+    // keyed and an unkeyed write measures the machine and prints a phase
+    // that can come out negative
+    let mut order_us = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        let (_, us) = micros(|| {
+            zyron_lake::writer::stored_order(
+                &schema,
+                &WriteRequest {
+                    partition_id: 0,
+                    columns: &batch,
+                    sort_keys: &[0],
+                    sort_strategies: &[ClusterStrategy::RangePartition],
+                    cluster_spec_id: 1,
+                    table_id: 902,
+                    bloom_columns: &[],
+                    index_id: None,
+                },
+                n,
+            )
+            .expect("order")
+        });
+        order_us.push(us);
+    }
+    let ordering = record_metric(
+        "lake_targets",
+        "Insert phase, ordering pass",
+        "us",
+        order_us,
+    );
+
+    // The whole data file, both shapes, alternated inside one loop. Both
+    // totals are reported, and the ordering pass inside the keyed one is
+    // the measurement above rather than the gap between them
+    let files = tempfile::tempdir().expect("tempdir");
+    let mut unsorted_us = Vec::with_capacity(RUNS);
+    let mut sorted_us = Vec::with_capacity(RUNS);
+    for run in 0..RUNS {
+        let (_, plain) = micros(|| {
+            zyron_lake::writer::write_data_file_at(
+                files.path(),
+                &schema,
+                &WriteRequest {
+                    partition_id: 0x9000 + run as u64,
+                    columns: &batch,
+                    sort_keys: &[],
+                    sort_strategies: &[],
+                    cluster_spec_id: 0,
+                    table_id: 902,
+                    bloom_columns: &[],
+                    index_id: None,
+                },
+            )
+            .expect("write unsorted")
+        });
+        unsorted_us.push(plain);
+        let (_, keyed) = micros(|| {
+            zyron_lake::writer::write_data_file_at(
+                files.path(),
+                &schema,
+                &WriteRequest {
+                    partition_id: 0xA000 + run as u64,
+                    columns: &batch,
+                    sort_keys: &[0],
+                    sort_strategies: &[ClusterStrategy::RangePartition],
+                    cluster_spec_id: 1,
+                    table_id: 902,
+                    bloom_columns: &[],
+                    index_id: None,
+                },
+            )
+            .expect("write sorted")
+        });
+        sorted_us.push(keyed);
+    }
+    let unsorted = record_metric(
+        "lake_targets",
+        "Insert phase, write file unsorted",
+        "us",
+        unsorted_us,
+    );
+    let sorted = record_metric(
+        "lake_targets",
+        "Insert phase, write file sorted",
+        "us",
+        sorted_us,
+    );
+
+    // Publishing a version, measured on its own against a data file that
+    // already exists rather than by subtracting one whole-path timing from
+    // another. A commit is small enough that the difference of two larger
+    // measurements is mostly the machine
+    let mut commit_us = Vec::with_capacity(RUNS);
+    for run in 0..RUNS {
+        let entry = zyron_lake::writer::write_data_file_at(
+            &paths.data_dir(),
+            &schema,
+            &WriteRequest {
+                partition_id: 0xB000 + run as u64,
+                columns: &batch,
+                sort_keys: &[],
+                sort_strategies: &[],
+                cluster_spec_id: 0,
+                table_id: 902,
+                bloom_columns: &[],
+                index_id: None,
+            },
+        )
+        .expect("stage a data file")
+        .entry;
+        let (_, us) = micros(|| {
+            log.commit(attempt(OperationKind::Append, 0), |_| {
+                Ok(vec![LogEntry::AddFile(entry.clone())])
+            })
+            .expect("commit")
+        });
+        commit_us.push(us);
+    }
+    let commit = record_metric(
+        "lake_targets",
+        "Insert phase, publish a version",
+        "us",
+        commit_us,
+    );
+
+    // The whole path, which is what a caller actually waits for
+    let mut append_us = Vec::with_capacity(RUNS);
+    for run in 0..RUNS {
+        let batch = rows_batch((run * n) as i64, n);
+        let (_, us) = micros(|| {
+            zyron_lake::append_rows(&log, attempt(OperationKind::Append, 0), 902, &batch)
+                .expect("append")
+        });
+        append_us.push(us);
+    }
+    let append = record_metric(
+        "lake_targets",
+        "Insert phase, append and commit",
+        "us",
+        append_us,
+    );
+
+    // Derived shares. Encoding and IO are inside the unsorted write, so the
+    // remainder names what the writer spends on statistics, views and the
+    // segment plumbing around the encoder
+    let rows = n as f64;
+    let cells = rows * schema.columns.len() as f64;
+    tprintln!("");
+    tprintln!("  Phase breakdown of one {}-row insert:", n);
+    tprintln!(
+        "    materialize batch  {:>6.0}us {:>5.1}%  {:.0} cells/sec",
+        build,
+        100.0 * build / append,
+        cells / (build / 1_000_000.0)
+    );
+    tprintln!(
+        "    encode columns     {:>6.0}us {:>5.1}%",
+        encode,
+        100.0 * encode / append
+    );
+    tprintln!(
+        "    place rows         {:>6.0}us {:>5.1}%  (scatter read through the sort order)",
+        place,
+        100.0 * place / append
+    );
+    tprintln!(
+        "    segment IO + fsync {:>6.0}us {:>5.1}%",
+        file_io,
+        100.0 * file_io / append
+    );
+    tprintln!(
+        "    writer plumbing    {:>6.0}us {:>5.1}%  (zones, bloom bytes, manifest stats)",
+        unsorted - encode - place - file_io,
+        100.0 * (unsorted - encode - place - file_io) / append
+    );
+    tprintln!(
+        "    write file no sort {:>6.0}us {:>5.1}%",
+        unsorted,
+        100.0 * unsorted / append
+    );
+    tprintln!(
+        "    write file sorted  {:>6.0}us {:>5.1}%",
+        sorted,
+        100.0 * sorted / append
+    );
+    tprintln!(
+        "    ordering pass      {:>6.0}us {:>5.1}%  (measured directly)",
+        ordering,
+        100.0 * ordering / append
+    );
+    tprintln!(
+        "    publish a version  {:>6.0}us {:>5.1}%  (measured directly)",
+        commit,
+        100.0 * commit / append
+    );
+    tprintln!(
+        "    append total       {:>6.0}us        {:.0} rows/sec",
+        append,
+        rows / (append / 1_000_000.0)
+    );
+    tprintln!(
+        "    caller pays materialize on top: {:.0} rows/sec end to end",
+        rows / ((append + build) / 1_000_000.0)
+    );
+
+    // The one number a caller feels, recorded so a regression in any phase
+    // shows up in a single place
+    let insert_rows_per_sec = rows / ((append + build) / 1_000_000.0);
+    record_metric(
+        "lake_targets",
+        "Insert throughput",
+        "rows/sec",
+        vec![insert_rows_per_sec],
+    );
 }
 
 /// What one commit costs, on both of the two shapes a commit takes.

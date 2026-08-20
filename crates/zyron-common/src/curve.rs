@@ -197,8 +197,16 @@ fn prefix_be(cell: &[u8]) -> u64 {
 /// Splits every dimension's bits across the output so a predicate on any one
 /// of them still selects a bounded set of ranges.
 fn bit_interleave(axes: &[u64]) -> Vec<u8> {
+    let mut out = vec![0u8; axes.len() * 8];
+    bit_interleave_into(axes, &mut out);
+    out
+}
+
+/// Interleaves into a caller-provided buffer, which must be `axes.len() * 8`
+/// bytes and is overwritten in full
+fn bit_interleave_into(axes: &[u64], out: &mut [u8]) {
     let dims = axes.len();
-    let mut out = vec![0u8; dims * 8];
+    out.fill(0);
     let total_bits = dims * COMPONENT_BITS;
     for bit in 0..total_bits {
         // Most significant bit of every axis first, so the leading output
@@ -210,7 +218,6 @@ fn bit_interleave(axes: &[u64]) -> Vec<u8> {
             out[bit / 8] |= 1 << (7 - (bit % 8));
         }
     }
-    out
 }
 
 /// Hilbert index of a point, as the transposed axes the curve defines.
@@ -220,8 +227,38 @@ fn bit_interleave(axes: &[u64]) -> Vec<u8> {
 /// Hilbert keeps neighbouring points closer than Z-order does, which is what
 /// pays for the extra passes when the dimensions are comparable in size.
 fn hilbert(axes: &[u64]) -> Vec<u8> {
-    let dims = axes.len();
-    let mut x: Vec<u64> = axes.to_vec();
+    let mut out = vec![0u8; axes.len() * 8];
+    hilbert_into(axes, &mut out);
+    out
+}
+
+/// Hilbert key into a caller-provided buffer of `axes.len() * 8` bytes.
+///
+/// The transform needs a mutable copy of the axes. Cluster keys are bounded
+/// in practice, so that copy sits on the stack for the widths a spec can
+/// reach and falls back to the heap only for a key wider than any proposal
+/// produces, which keeps a per-row call allocation free
+fn hilbert_into(axes: &[u64], out: &mut [u8]) {
+    /// Axes carried without touching the heap. Proposals cap at four keys,
+    /// so this covers every spec the planner can build and leaves room
+    const INLINE_DIMS: usize = 8;
+    if axes.len() <= INLINE_DIMS {
+        let mut inline = [0u64; INLINE_DIMS];
+        let scratch = &mut inline[..axes.len()];
+        scratch.copy_from_slice(axes);
+        hilbert_transform(scratch);
+        bit_interleave_into(scratch, out);
+    } else {
+        let mut heap = axes.to_vec();
+        hilbert_transform(&mut heap);
+        bit_interleave_into(&heap, out);
+    }
+}
+
+/// Skilling's transform in place, leaving the axes transposed for
+/// interleaving
+fn hilbert_transform(x: &mut [u64]) {
+    let dims = x.len();
     let bits = COMPONENT_BITS as u32;
 
     // Inverse undo of the Gray code, from the most significant bit down
@@ -254,22 +291,25 @@ fn hilbert(axes: &[u64]) -> Vec<u8> {
     for value in x.iter_mut() {
         *value ^= t;
     }
-    // Transpose: the curve's order is the axes read bit plane by bit plane
-    bit_interleave(&x)
 }
 
 /// Scatters equal values by hashing, so rows that would have shared a file
 /// spread across many.
 fn anti_cluster(axes: &[u64]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(axes.len() * 8);
+    let mut out = vec![0u8; axes.len() * 8];
+    anti_cluster_into(axes, &mut out);
+    out
+}
+
+/// Anti-cluster key into a caller-provided buffer of `axes.len() * 8` bytes
+fn anti_cluster_into(axes: &[u64], out: &mut [u8]) {
     for (index, axis) in axes.iter().enumerate() {
         // A per-dimension salt keeps two dimensions with equal values from
         // hashing to the same spread
         let mut state = axis.wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(index as u64 + 1));
         let mixed = crate::prng::splitMix64(&mut state);
-        out.extend_from_slice(&mixed.to_be_bytes());
+        out[index * 8..index * 8 + 8].copy_from_slice(&mixed.to_be_bytes());
     }
-    out
 }
 
 /// The ordering key one row gets under a strategy.
@@ -278,22 +318,39 @@ fn anti_cluster(axes: &[u64]) -> Vec<u8> {
 /// The returned bytes compare lexicographically, so the writer sorts rows by
 /// comparing them directly and no strategy needs its own comparator.
 pub fn ordering_key(strategy: ClusterStrategy, axes: &[u64]) -> Vec<u8> {
+    let mut out = vec![0u8; axes.len() * 8];
+    ordering_key_into(strategy, axes, &mut out);
+    out
+}
+
+/// The same key written into a caller-provided buffer, which must be
+/// `axes.len() * 8` bytes.
+///
+/// Every curve produces exactly that width, so a caller ordering a whole
+/// batch packs the keys end to end and compares fixed-width slices out of
+/// one buffer. Taking a `Vec` back per row instead costs a heap allocation
+/// per row, and leaves the sort chasing a pointer on each of the
+/// `n log n` comparisons that follow
+pub fn ordering_key_into(strategy: ClusterStrategy, axes: &[u64], out: &mut [u8]) {
+    debug_assert_eq!(
+        out.len(),
+        axes.len() * 8,
+        "an ordering key is eight bytes per axis"
+    );
     if axes.is_empty() {
-        return Vec::new();
+        return;
     }
     match strategy {
         // Concatenation: byte order is value order, so a range predicate on
         // the leading column reads one run
         ClusterStrategy::RangePartition => {
-            let mut out = Vec::with_capacity(axes.len() * 8);
-            for axis in axes {
-                out.extend_from_slice(&axis.to_be_bytes());
+            for (index, axis) in axes.iter().enumerate() {
+                out[index * 8..index * 8 + 8].copy_from_slice(&axis.to_be_bytes());
             }
-            out
         }
-        ClusterStrategy::BitInterleave => bit_interleave(axes),
-        ClusterStrategy::SpaceFilling => hilbert(axes),
-        ClusterStrategy::AntiCluster => anti_cluster(axes),
+        ClusterStrategy::BitInterleave => bit_interleave_into(axes, out),
+        ClusterStrategy::SpaceFilling => hilbert_into(axes, out),
+        ClusterStrategy::AntiCluster => anti_cluster_into(axes, out),
     }
 }
 

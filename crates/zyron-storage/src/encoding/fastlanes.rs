@@ -1214,33 +1214,25 @@ impl Encoding for FastLanesEncoding {
                         return Ok(vec![0u8; row_count.div_ceil(8)]);
                     };
 
-                    let bitmaskLen = row_count.div_ceil(8);
-                    let mut bitmask = vec![0u8; bitmaskLen];
-                    for i in 0..row_count {
-                        let residual =
-                            unpack_fast(packed, i as u64 * bit_width as u64, bit_width, mask);
-                        if residual >= loResidual && residual <= hiResidual {
-                            bitmask[i / 8] |= 1 << (i % 8);
-                        }
-                    }
-                    return Ok(bitmask);
+                    // The residual is read straight out of the packed array,
+                    // eight rows at a time, so a row that survives the zone
+                    // maps is answered without materializing the column
+                    let residuals = PackedResiduals::new(packed, bit_width, mask);
+                    return Ok(crate::encoding::bitmask_from_rows(row_count, |i| {
+                        let residual = residuals.at(i);
+                        residual >= loResidual && residual <= hiResidual
+                    }));
                 }
                 Predicate::Equality(target) => {
                     let targetVal = read_u64_le(target, 0, target.len().min(8));
-                    let bitmaskLen = row_count.div_ceil(8);
                     if targetVal < base_value || targetVal > maxRepresentable {
-                        return Ok(vec![0u8; bitmaskLen]);
+                        return Ok(vec![0u8; row_count.div_ceil(8)]);
                     }
                     let targetResidual = targetVal - base_value;
-                    let mut bitmask = vec![0u8; bitmaskLen];
-                    for i in 0..row_count {
-                        let residual =
-                            unpack_fast(packed, i as u64 * bit_width as u64, bit_width, mask);
-                        if residual == targetResidual {
-                            bitmask[i / 8] |= 1 << (i % 8);
-                        }
-                    }
-                    return Ok(bitmask);
+                    let residuals = PackedResiduals::new(packed, bit_width, mask);
+                    return Ok(crate::encoding::bitmask_from_rows(row_count, |i| {
+                        residuals.at(i) == targetResidual
+                    }));
                 }
                 Predicate::In(values) => {
                     let targetResiduals: Vec<u64> = values
@@ -1254,19 +1246,13 @@ impl Encoding for FastLanesEncoding {
                             }
                         })
                         .collect();
-                    let bitmaskLen = row_count.div_ceil(8);
                     if targetResiduals.is_empty() {
-                        return Ok(vec![0u8; bitmaskLen]);
+                        return Ok(vec![0u8; row_count.div_ceil(8)]);
                     }
-                    let mut bitmask = vec![0u8; bitmaskLen];
-                    for i in 0..row_count {
-                        let residual =
-                            unpack_fast(packed, i as u64 * bit_width as u64, bit_width, mask);
-                        if targetResiduals.contains(&residual) {
-                            bitmask[i / 8] |= 1 << (i % 8);
-                        }
-                    }
-                    return Ok(bitmask);
+                    let residuals = PackedResiduals::new(packed, bit_width, mask);
+                    return Ok(crate::encoding::bitmask_from_rows(row_count, |i| {
+                        targetResiduals.contains(&residuals.at(i))
+                    }));
                 }
             }
         }
@@ -1417,7 +1403,7 @@ impl Encoding for FastLanesEncoding {
 
         // General fallback for non-sorted delta data or non-Range predicates.
         // Uses u64 numeric comparison for consistency with eval_predicate_on_raw.
-        match predicate {
+        Ok(match predicate {
             Predicate::Range { low, high } => {
                 let loVal = match low {
                     Some(lo) => read_u64_le(lo, 0, lo.len().min(8)),
@@ -1427,36 +1413,27 @@ impl Encoding for FastLanesEncoding {
                     Some(hi) => read_u64_le(hi, 0, hi.len().min(8)),
                     None => u64::MAX,
                 };
-                for i in 0..row_count {
+                crate::encoding::bitmask_from_rows(row_count, |i| {
                     let v = residuals[i].wrapping_add(base_value);
-                    if v >= loVal && v <= hiVal {
-                        bitmask[i / 8] |= 1 << (i % 8);
-                    }
-                }
+                    v >= loVal && v <= hiVal
+                })
             }
             Predicate::Equality(target) => {
                 let targetVal = read_u64_le(target, 0, target.len().min(8));
-                for i in 0..row_count {
-                    if residuals[i].wrapping_add(base_value) == targetVal {
-                        bitmask[i / 8] |= 1 << (i % 8);
-                    }
-                }
+                crate::encoding::bitmask_from_rows(row_count, |i| {
+                    residuals[i].wrapping_add(base_value) == targetVal
+                })
             }
             Predicate::In(values) => {
                 let targets: Vec<u64> = values
                     .iter()
                     .map(|v| read_u64_le(v, 0, v.len().min(8)))
                     .collect();
-                for i in 0..row_count {
-                    let v = residuals[i].wrapping_add(base_value);
-                    if targets.contains(&v) {
-                        bitmask[i / 8] |= 1 << (i % 8);
-                    }
-                }
+                crate::encoding::bitmask_from_rows(row_count, |i| {
+                    targets.contains(&residuals[i].wrapping_add(base_value))
+                })
             }
-        }
-
-        Ok(bitmask)
+        })
     }
 }
 
@@ -1948,6 +1925,43 @@ fn pack_bits(packed: &mut [u8], bit_offset: u64, value: u64, bit_width: u8) {
 #[inline(always)]
 fn unpack_fast(packed: &[u8], bit_offset: u64, bit_width: u8, mask: u64) -> u64 {
     unpack_inline(packed.as_ptr(), packed.len(), bit_offset, bit_width, mask)
+}
+
+/// Random access into a packed residual array with the buffer's pointer,
+/// length and bit width held once rather than re-derived per read.
+///
+/// A predicate evaluated against the packed form reads one residual per row
+/// and never materializes the column, so the read is the whole loop body and
+/// the slice header work around it is the difference between reading the
+/// packed array and decoding it
+struct PackedResiduals<'a> {
+    packed: &'a [u8],
+    bit_width: u8,
+    bits: u64,
+    mask: u64,
+}
+
+impl<'a> PackedResiduals<'a> {
+    #[inline]
+    fn new(packed: &'a [u8], bit_width: u8, mask: u64) -> Self {
+        Self {
+            packed,
+            bit_width,
+            bits: bit_width as u64,
+            mask,
+        }
+    }
+
+    #[inline(always)]
+    fn at(&self, row: usize) -> u64 {
+        unpack_inline(
+            self.packed.as_ptr(),
+            self.packed.len(),
+            row as u64 * self.bits,
+            self.bit_width,
+            self.mask,
+        )
+    }
 }
 
 /// Raw pointer version of unpack_fast. Takes pre-computed pointer and length
@@ -2896,9 +2910,7 @@ fn decode_wide(encoded: &[u8], row_count: usize) -> Result<Vec<u8>> {
 /// numerically as u128 (same unsigned-pattern semantics the 8-byte path uses).
 fn eval_predicate_wide(encoded: &[u8], row_count: usize, predicate: &Predicate) -> Result<Vec<u8>> {
     let decoded = decode_wide(encoded, row_count)?;
-    let bitmask_len = row_count.div_ceil(8);
-    let mut bitmask = vec![0u8; bitmask_len];
-    match predicate {
+    Ok(match predicate {
         Predicate::Range { low, high } => {
             let lo = match *low {
                 Some(b) => read_u128_bound(b),
@@ -2908,32 +2920,22 @@ fn eval_predicate_wide(encoded: &[u8], row_count: usize, predicate: &Predicate) 
                 Some(b) => read_u128_bound(b),
                 None => u128::MAX,
             };
-            for i in 0..row_count {
+            crate::encoding::bitmask_from_rows(row_count, |i| {
                 let v = read_u128_le(&decoded, i * 16);
-                if v >= lo && v <= hi {
-                    bitmask[i / 8] |= 1 << (i % 8);
-                }
-            }
+                v >= lo && v <= hi
+            })
         }
         Predicate::Equality(target) => {
             let t = read_u128_bound(target);
-            for i in 0..row_count {
-                if read_u128_le(&decoded, i * 16) == t {
-                    bitmask[i / 8] |= 1 << (i % 8);
-                }
-            }
+            crate::encoding::bitmask_from_rows(row_count, |i| read_u128_le(&decoded, i * 16) == t)
         }
         Predicate::In(values) => {
             let targets: Vec<u128> = values.iter().map(|v| read_u128_bound(v)).collect();
-            for i in 0..row_count {
-                let v = read_u128_le(&decoded, i * 16);
-                if targets.contains(&v) {
-                    bitmask[i / 8] |= 1 << (i % 8);
-                }
-            }
+            crate::encoding::bitmask_from_rows(row_count, |i| {
+                targets.contains(&read_u128_le(&decoded, i * 16))
+            })
         }
-    }
-    Ok(bitmask)
+    })
 }
 
 #[cfg(test)]

@@ -4,4 +4,4 @@
 //! .zyr file and the heap fold tier for the segments it produces, so the
 //! definition lives where both can reach it and this crate names it.
 
-pub use zyron_common::curve::{normalize_component, ordering_key};
+pub use zyron_common::curve::{normalize_component, ordering_key, ordering_key_into};

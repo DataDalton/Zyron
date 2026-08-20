@@ -6,9 +6,9 @@
 
 use crate::columnar::bloom::BloomFilter;
 use crate::columnar::constants::*;
+use crate::columnar::sketch::DistinctSketch;
 use crate::encoding::{
-    EncodingType, create_encoding, select_encoding, select_encoding_exact, select_encoding_varlen,
-    varlen_pack,
+    EncodingType, create_encoding, select_encoding_packed, select_encoding_varlen, varlen_pack,
 };
 use zyron_common::types::TypeId;
 use zyron_common::{Result, ZyronError};
@@ -210,6 +210,12 @@ pub struct SegmentOptions {
     /// writer, pays nothing extra for a decision that cannot be wrong on an
     /// unrepresentative prefix
     pub exact_encoding: bool,
+    /// Count distinct values across the whole column with a fixed-size
+    /// sketch and report the estimate on the segment. The bloom decision
+    /// reads only the exact count capped at the bloom threshold, so a caller
+    /// that publishes no distinct estimate leaves this off and the sketch is
+    /// never built
+    pub distinct_sketch: bool,
 }
 
 /// A fully materialized column segment ready for writing to a .zyr file.
@@ -228,6 +234,18 @@ pub struct ColumnSegment {
     /// Packed bit array marking null positions. Bit i is set if row i is null.
     /// Empty if no nulls exist.
     pub null_bitmap: Vec<u8>,
+    /// Row holding the segment's smallest non-null value under the column's
+    /// slot order, indexing the `values` slice the build was handed. None
+    /// when every row is null. The header records the value as a 32-byte
+    /// slot, so a caller needing the value itself, at its full width, reads
+    /// it back through this row
+    pub min_row: Option<usize>,
+    /// Row holding the segment's largest non-null value, as `min_row`
+    pub max_row: Option<usize>,
+    /// Estimated distinct non-null values across the whole column, present
+    /// when the caller asked for the sketch. The header's `cardinality` is
+    /// capped at the bloom threshold and answers a different question
+    pub ndv: Option<u64>,
 }
 
 /// Copies a value into a STAT_VALUE_SIZE slot. Values shorter than
@@ -439,6 +457,152 @@ pub fn compare_value_to_slot(
     std::cmp::Ordering::Equal
 }
 
+/// Orders two of one column's raw values against each other, under the same
+/// order its stat slots compare in.
+///
+/// A segment build tracks its extremes as the values themselves and builds a
+/// 32-byte slot only when a zone closes, so this is the comparison every row
+/// runs through rather than the value-to-slot form. Both operands are one
+/// column's cells, so for a fixed-width column they are `width` bytes each.
+pub fn compare_values_ordered(
+    a: &[u8],
+    b: &[u8],
+    width: usize,
+    order: SlotOrder,
+) -> std::cmp::Ordering {
+    if order == SlotOrder::Lexicographic {
+        // Byte order from the first byte, which is the order a
+        // variable-length value's own bytes carry, and unlike the slot form
+        // it compares the whole value rather than a 32-byte prefix
+        return a.cmp(b);
+    }
+    if order == SlotOrder::Ieee && (width == 4 || width == 8) {
+        return ieee_key(a, width).cmp(&ieee_key(b, width));
+    }
+    if order == SlotOrder::TwosComplement && width > 0 {
+        let sign_byte = width - 1;
+        let a_neg = a.get(sign_byte).copied().unwrap_or(0) & 0x80 != 0;
+        let b_neg = b.get(sign_byte).copied().unwrap_or(0) & 0x80 != 0;
+        if a_neg != b_neg {
+            // The negative operand is the smaller one
+            return if a_neg {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            };
+        }
+    }
+    compare_le_bytes(a, b)
+}
+
+/// Closes one zone: records its bounds as a zone map entry and folds them
+/// into the segment's running extremes.
+///
+/// Folding the segment bounds out of the zone bounds is what keeps the row
+/// loop to one comparison per bound. A zone with no non-null value records
+/// an inverted pair, which no interval overlaps, so a pruner reads it as
+/// admitting nothing
+#[inline]
+fn close_zone<'v>(
+    zoneMaps: &mut Vec<ZoneMapEntry>,
+    zoneMin: Option<(usize, &'v [u8])>,
+    zoneMax: Option<(usize, &'v [u8])>,
+    segmentMin: &mut Option<(usize, &'v [u8])>,
+    segmentMax: &mut Option<(usize, &'v [u8])>,
+    width: usize,
+    order: SlotOrder,
+) {
+    zoneMaps.push(ZoneMapEntry {
+        min_value: zoneMin.map_or([0xFF; STAT_VALUE_SIZE], |(_, v)| value_to_stat_slot(v)),
+        // A value wider than a slot is held as a prefix, and a prefix sorts
+        // below the value it came from, so the upper bound is that prefix
+        // rounded up. A value that fits is its own bound
+        max_value: zoneMax.map_or([0u8; STAT_VALUE_SIZE], |(_, v)| varlen_upper_slot(v)),
+    });
+    if let Some((row, value)) = zoneMin
+        && segmentMin
+            .is_none_or(|(_, cur)| compare_values_ordered(value, cur, width, order).is_lt())
+    {
+        *segmentMin = Some((row, value));
+    }
+    if let Some((row, value)) = zoneMax
+        && segmentMax
+            .is_none_or(|(_, cur)| compare_values_ordered(value, cur, width, order).is_gt())
+    {
+        *segmentMax = Some((row, value));
+    }
+}
+
+/// Distinct value tracking for one segment build.
+///
+/// The bloom decision only needs to know whether the column holds more than
+/// BLOOM_MIN_CARDINALITY distinct values, so the exact set stops one past
+/// the threshold and the rest of the column costs nothing. A caller that
+/// also publishes a distinct estimate asks for the sketch, and then the
+/// exact set is keyed by the hash the sketch already computed, so a value is
+/// hashed once instead of once for each structure.
+struct DistinctTracker<'v> {
+    /// Exact set while the caller wants no estimate, keyed by the bytes
+    values: hashbrown::HashSet<&'v [u8]>,
+    /// Exact set while the sketch is running, keyed by its hash
+    hashes: hashbrown::HashSet<u64>,
+    /// Whole-column estimate, boxed so a build that does not ask for one
+    /// carries a pointer rather than the register array
+    sketch: Option<Box<DistinctSketch>>,
+    /// Set once the exact count passed the bloom threshold
+    saturated: bool,
+}
+
+impl<'v> DistinctTracker<'v> {
+    fn new(sketch: bool) -> Self {
+        Self {
+            values: hashbrown::HashSet::new(),
+            hashes: hashbrown::HashSet::new(),
+            sketch: sketch.then(|| Box::new(DistinctSketch::new())),
+            saturated: false,
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, value: &'v [u8]) {
+        match self.sketch.as_mut() {
+            Some(sketch) => {
+                let hash = zyron_common::hash64(value);
+                sketch.insert_hash(hash);
+                if !self.saturated {
+                    self.hashes.insert(hash);
+                    self.saturated = self.hashes.len() as u64 > BLOOM_MIN_CARDINALITY;
+                }
+            }
+            None => {
+                if !self.saturated {
+                    self.values.insert(value);
+                    self.saturated = self.values.len() as u64 > BLOOM_MIN_CARDINALITY;
+                }
+            }
+        }
+    }
+
+    /// Distinct values counted exactly, stopping one past the bloom
+    /// threshold. Consumers read a saturated value as "at least this many"
+    fn cardinality(&self) -> u64 {
+        if self.sketch.is_some() {
+            self.hashes.len() as u64
+        } else {
+            self.values.len() as u64
+        }
+    }
+
+    fn saturated(&self) -> bool {
+        self.saturated
+    }
+
+    /// Whole-column distinct estimate, present when the caller asked for it
+    fn estimate(&self) -> Option<u64> {
+        self.sketch.as_ref().map(|sketch| sketch.estimate())
+    }
+}
+
 /// Compares two stat slots as unsigned little-endian integers.
 /// Returns Ordering::Less, Equal, or Greater.
 /// For LE values, comparison starts from the most significant byte (highest index
@@ -516,21 +680,26 @@ impl ColumnSegment {
 
         // Single fused pass over values, computes:
         //   - null count and null bitmap
-        //   - global min/max stat slots
+        //   - per-zone min/max emitted at every ZONE_MAP_BATCH_SIZE boundary,
+        //     and the segment's own min/max folded out of those at each zone
+        //     boundary rather than compared against on every row
+        //   - the rows those two extremes sit at, so a caller that needs the
+        //     value at its full width reads it back instead of running its
+        //     own pass over the same column
         //   - sorted flag
         //   - distinct tracking, capped at BLOOM_MIN_CARDINALITY+1 since we
         //     only need to know whether the column is high-cardinality enough
         //     to warrant a bloom filter, exact count beyond the threshold is
-        //     not useful for query planning at the segment level
+        //     not useful for query planning at the segment level, plus the
+        //     whole-column sketch when the caller asked for an estimate
         //   - raw data buffer with non-null values copied into their slots,
         //     buffer is allocated with zero-fill so null slots stay zeroed
         //     for encoder determinism
-        //   - per-zone min/max emitted at every ZONE_MAP_BATCH_SIZE boundary
         //
-        // Prior implementation walked values 4-5 separate times which kept
-        // the L1/L2 cache cold for each pass on large columns, the fused
-        // pass touches each value once and keeps zone-map and bitmap state
-        // in registers
+        // The pass touches each value once and keeps zone-map and bitmap
+        // state in registers. Bounds are carried as the values themselves,
+        // so a 32-byte slot is built twice per zone instead of on every row
+        // that moves a bound
         let rawSize = (rowCount * valueSize) as u64;
         // SAFETY: the fused pass below writes every one of `buf_len` slots
         // (null slots explicitly zeroed, non-null slots copied) before the
@@ -557,33 +726,30 @@ impl ColumnSegment {
 
         let mut nullCount = 0u64;
         let mut nullBitmap: Vec<u8> = Vec::new();
-        // Bounded distinct tracking, capped at BLOOM_MIN_CARDINALITY+1 since
-        // we only need to distinguish "high enough cardinality for bloom" from
-        // "low cardinality". For high-cardinality columns this saves an
-        // unbounded HashSet that would otherwise grow to N entries (~32 MB
-        // for 1M unique values), the segment header reports the saturated
-        // value which downstream consumers treat as "at least this many"
-        let mut distinct = hashbrown::HashSet::new();
-        let mut distinctCapped = false;
-        let mut globalMin: Option<[u8; STAT_VALUE_SIZE]> = None;
-        let mut globalMax: Option<[u8; STAT_VALUE_SIZE]> = None;
+        let mut distinct = DistinctTracker::new(options.distinct_sketch);
+        let mut segmentMin: Option<(usize, &[u8])> = None;
+        let mut segmentMax: Option<(usize, &[u8])> = None;
         let mut isSorted = true;
         let mut prevRaw: Option<&[u8]> = None;
 
-        let mut zoneMin: Option<[u8; STAT_VALUE_SIZE]> = None;
-        let mut zoneMax: Option<[u8; STAT_VALUE_SIZE]> = None;
-        let mut zoneIdx = 0usize;
+        let mut zoneMin: Option<(usize, &[u8])> = None;
+        let mut zoneMax: Option<(usize, &[u8])> = None;
+        let mut zoneEnd = batchSize;
 
         for (i, val) in values.iter().enumerate() {
-            let nextZoneBoundary = (zoneIdx + 1) * batchSize;
-            if i == nextZoneBoundary {
-                zoneMaps.push(ZoneMapEntry {
-                    min_value: zoneMin.unwrap_or([0xFF; STAT_VALUE_SIZE]),
-                    max_value: zoneMax.unwrap_or([0u8; STAT_VALUE_SIZE]),
-                });
+            if i == zoneEnd {
+                close_zone(
+                    &mut zoneMaps,
+                    zoneMin,
+                    zoneMax,
+                    &mut segmentMin,
+                    &mut segmentMax,
+                    valueSize,
+                    statOrder,
+                );
                 zoneMin = None;
                 zoneMax = None;
-                zoneIdx += 1;
+                zoneEnd += batchSize;
             }
 
             match val {
@@ -602,75 +768,8 @@ impl ColumnSegment {
                     rawData[start..end].fill(0);
                 }
                 Some(v) => {
-                    if !distinctCapped {
-                        distinct.insert(*v);
-                        if distinct.len() as u64 > BLOOM_MIN_CARDINALITY {
-                            distinctCapped = true;
-                        }
-                    }
-                    // Compare the raw value against each running bound and
-                    // build the 32-byte slot only on a row that actually moves
-                    // a bound, instead of materializing a slot for every row.
-                    use std::cmp::Ordering::{Equal, Greater, Less};
-                    // A variable-length value longer than a slot is held
-                    // as a prefix, and its upper bound is that prefix
-                    // rounded up, so it can exceed a recorded maximum its
-                    // prefix merely ties with
-                    let truncated = valueSize == 0 && v.len() > STAT_VALUE_SIZE;
-                    let below = |cur: &[u8; STAT_VALUE_SIZE]| {
-                        compare_value_to_slot(v, cur, valueSize, statOrder) == Less
-                    };
-                    let above = |cur: &[u8; STAT_VALUE_SIZE]| match compare_value_to_slot(
-                        v, cur, valueSize, statOrder,
-                    ) {
-                        Greater => true,
-                        Equal => truncated,
-                        Less => false,
-                    };
-                    let new_gmin = globalMin.is_none_or(|cur| below(&cur));
-                    let new_gmax = globalMax.is_none_or(|cur| above(&cur));
-                    let new_zmin = zoneMin.is_none_or(|cur| below(&cur));
-                    let new_zmax = zoneMax.is_none_or(|cur| above(&cur));
-                    if new_gmin || new_gmax || new_zmin || new_zmax {
-                        let lower = value_to_stat_slot(v);
-                        let upper = if truncated {
-                            varlen_upper_slot(v)
-                        } else {
-                            lower
-                        };
-                        if new_gmin {
-                            globalMin = Some(lower);
-                        }
-                        if new_gmax {
-                            globalMax = Some(upper);
-                        }
-                        if new_zmin {
-                            zoneMin = Some(lower);
-                        }
-                        if new_zmax {
-                            zoneMax = Some(upper);
-                        }
-                    }
-
-                    // A variable-length column orders by its bytes from the
-                    // first, and compare_le_bytes reads fixed-width values
-                    // from the last and requires equal lengths
-                    let descends = if valueSize == 0 {
-                        prevRaw.is_some_and(|prev| *v < prev)
-                    } else {
-                        prevRaw.is_some_and(|prev| {
-                            compare_le_bytes(v, prev) == std::cmp::Ordering::Less
-                        })
-                    };
-                    if isSorted && descends {
-                        isSorted = false;
-                    }
-                    prevRaw = Some(*v);
-
-                    let start = i * valueSize;
-                    let end = start + valueSize;
-                    let raw_len = rawData.len();
-                    if v.len() != valueSize || end > raw_len {
+                    let v: &[u8] = v;
+                    if v.len() != valueSize {
                         // A non-null value whose width does not match the fixed
                         // column value size cannot be packed into its slot, fail
                         // instead of zero-filling and corrupting the value
@@ -681,30 +780,70 @@ impl ColumnSegment {
                             valueSize
                         )));
                     }
-                    rawData[start..end].copy_from_slice(v);
+                    distinct.insert(v);
+
+                    // Only the zone this row lands in has to be beaten. The
+                    // segment bounds are folded out of the zone bounds when
+                    // the zone closes, which is one comparison per bound per
+                    // row rather than two
+                    if zoneMin.is_none_or(|(_, cur)| {
+                        compare_values_ordered(v, cur, valueSize, statOrder).is_lt()
+                    }) {
+                        zoneMin = Some((i, v));
+                    }
+                    if zoneMax.is_none_or(|(_, cur)| {
+                        compare_values_ordered(v, cur, valueSize, statOrder).is_gt()
+                    }) {
+                        zoneMax = Some((i, v));
+                    }
+
+                    // compare_le_bytes reads fixed-width values from the last
+                    // byte and requires equal lengths, which the width check
+                    // above has established
+                    if isSorted
+                        && prevRaw.is_some_and(|prev| {
+                            compare_le_bytes(v, prev) == std::cmp::Ordering::Less
+                        })
+                    {
+                        isSorted = false;
+                    }
+                    prevRaw = Some(v);
+
+                    let start = i * valueSize;
+                    rawData[start..start + valueSize].copy_from_slice(v);
                 }
             }
         }
-        // Push the final zone, may be partially filled
+        // Close the final zone, which may be partially filled
         if zoneMaps.len() < zoneCount {
-            zoneMaps.push(ZoneMapEntry {
-                min_value: zoneMin.unwrap_or([0xFF; STAT_VALUE_SIZE]),
-                max_value: zoneMax.unwrap_or([0u8; STAT_VALUE_SIZE]),
-            });
+            close_zone(
+                &mut zoneMaps,
+                zoneMin,
+                zoneMax,
+                &mut segmentMin,
+                &mut segmentMax,
+                valueSize,
+                statOrder,
+            );
         }
 
-        let cardinality = distinct.len() as u64;
-        let minValue = globalMin.unwrap_or([0u8; STAT_VALUE_SIZE]);
-        let maxValue = globalMax.unwrap_or([0u8; STAT_VALUE_SIZE]);
+        let cardinality = distinct.cardinality();
+        let distinctCapped = distinct.saturated();
+        let minValue = segmentMin.map_or([0u8; STAT_VALUE_SIZE], |(_, v)| value_to_stat_slot(v));
+        let maxValue = segmentMax.map_or([0u8; STAT_VALUE_SIZE], |(_, v)| varlen_upper_slot(v));
 
-        let encodingType = if options.exact_encoding {
-            select_encoding_exact(typeId, values)
-        } else {
-            select_encoding(typeId, values)
+        // Selection is handed the buffer the fused pass just packed, and
+        // hands back the bytes it produced while deciding. Under exact
+        // selection the trial is a full encode of the column, so taking its
+        // output is the difference between encoding this column once and
+        // encoding it twice
+        let choice =
+            select_encoding_packed(typeId, values, &rawData, valueSize, options.exact_encoding);
+        let encodingType = choice.encoding;
+        let encodedData = match choice.encoded {
+            Some(bytes) => bytes,
+            None => create_encoding(encodingType).encode(&rawData, rowCount, valueSize)?,
         };
-        let encoder = create_encoding(encodingType);
-
-        let encodedData = encoder.encode(&rawData, rowCount, valueSize)?;
         let encodedSize = encodedData.len() as u64;
 
         // Build bloom filter when the policy asks for one, this is the only
@@ -757,17 +896,24 @@ impl ColumnSegment {
             zone_maps: zoneMaps,
             encoded_data: encodedData,
             null_bitmap: nullBitmap,
+            min_row: segmentMin.map(|(row, _)| row),
+            max_row: segmentMax.map(|(row, _)| row),
+            ndv: distinct.estimate(),
         })
     }
 
     /// Builds a variable-length column segment. Values are stored in the
     /// canonical variable-length buffer (a u32 offset array plus a values
-    /// blob). Zone-map and segment min/max use a left-aligned, zero-padded
-    /// byte prefix into STAT_VALUE_SIZE compared lexicographically. The same
-    /// prefix transform is applied to predicate literals at prune time, so a
-    /// shared prefix only ever widens a zone (a conservative non-skip), never
-    /// a false skip. The null bitmap is authoritative, so an empty string and
-    /// a null stay distinct.
+    /// blob).
+    ///
+    /// Bounds are tracked on the whole values and turned into slots when a
+    /// zone closes: the minimum keeps its left-aligned, zero-padded byte
+    /// prefix into STAT_VALUE_SIZE, and the maximum's prefix is rounded up so
+    /// it stays above every value it covers. The same prefix transform is
+    /// applied to predicate literals at prune time, so a shared prefix only
+    /// ever widens a zone (a conservative non-skip), never a false skip. The
+    /// null bitmap is authoritative, so an empty string and a null stay
+    /// distinct.
     fn build_varlen(
         columnId: u32,
         typeId: TypeId,
@@ -781,27 +927,30 @@ impl ColumnSegment {
 
         let mut nullCount = 0u64;
         let mut nullBitmap: Vec<u8> = Vec::new();
-        let mut distinct = hashbrown::HashSet::new();
-        let mut distinctCapped = false;
-        let mut globalMin: Option<[u8; STAT_VALUE_SIZE]> = None;
-        let mut globalMax: Option<[u8; STAT_VALUE_SIZE]> = None;
+        let mut distinct = DistinctTracker::new(options.distinct_sketch);
+        let mut segmentMin: Option<(usize, &[u8])> = None;
+        let mut segmentMax: Option<(usize, &[u8])> = None;
         let mut isSorted = true;
         let mut prevRaw: Option<&[u8]> = None;
 
-        let mut zoneMin: Option<[u8; STAT_VALUE_SIZE]> = None;
-        let mut zoneMax: Option<[u8; STAT_VALUE_SIZE]> = None;
-        let mut zoneIdx = 0usize;
+        let mut zoneMin: Option<(usize, &[u8])> = None;
+        let mut zoneMax: Option<(usize, &[u8])> = None;
+        let mut zoneEnd = batchSize;
 
         for (i, val) in values.iter().enumerate() {
-            let nextZoneBoundary = (zoneIdx + 1) * batchSize;
-            if i == nextZoneBoundary {
-                zoneMaps.push(ZoneMapEntry {
-                    min_value: zoneMin.unwrap_or([0xFF; STAT_VALUE_SIZE]),
-                    max_value: zoneMax.unwrap_or([0u8; STAT_VALUE_SIZE]),
-                });
+            if i == zoneEnd {
+                close_zone(
+                    &mut zoneMaps,
+                    zoneMin,
+                    zoneMax,
+                    &mut segmentMin,
+                    &mut segmentMax,
+                    0,
+                    SlotOrder::Lexicographic,
+                );
                 zoneMin = None;
                 zoneMax = None;
-                zoneIdx += 1;
+                zoneEnd += batchSize;
             }
 
             match val {
@@ -813,67 +962,47 @@ impl ColumnSegment {
                     nullBitmap[i / 8] |= 1 << (i % 8);
                 }
                 Some(v) => {
-                    if !distinctCapped {
-                        distinct.insert(*v);
-                        if distinct.len() as u64 > BLOOM_MIN_CARDINALITY {
-                            distinctCapped = true;
-                        }
+                    let v: &[u8] = v;
+                    distinct.insert(v);
+                    // A variable-length column orders by its bytes from the
+                    // first. Comparing whole values rather than their padded
+                    // prefixes decides two values that agree over the first
+                    // 32 bytes, so the bounds a zone closes with are the
+                    // zone's real extremes and not merely a pair its prefixes
+                    // tie for
+                    if zoneMin.is_none_or(|(_, cur)| v < cur) {
+                        zoneMin = Some((i, v));
                     }
-                    // Variable-length min/max order the stat slots
-                    // lexicographically (prefix bound, correct for string and
-                    // binary). Compare the value's padded-prefix order against
-                    // each running bound and only build the 32-byte slot on a
-                    // row that actually moves a bound.
-                    use std::cmp::Ordering::{Greater, Less};
-                    let lex = |v: &[u8], cur: &[u8; STAT_VALUE_SIZE]| -> std::cmp::Ordering {
-                        for i in 0..STAT_VALUE_SIZE {
-                            match v.get(i).copied().unwrap_or(0).cmp(&cur[i]) {
-                                std::cmp::Ordering::Equal => continue,
-                                other => return other,
-                            }
-                        }
-                        std::cmp::Ordering::Equal
-                    };
-                    let new_gmin = globalMin.is_none_or(|cur| lex(v, &cur) == Less);
-                    let new_gmax = globalMax.is_none_or(|cur| lex(v, &cur) == Greater);
-                    let new_zmin = zoneMin.is_none_or(|cur| lex(v, &cur) == Less);
-                    let new_zmax = zoneMax.is_none_or(|cur| lex(v, &cur) == Greater);
-                    if new_gmin || new_gmax || new_zmin || new_zmax {
-                        let slot = value_to_stat_slot(v);
-                        if new_gmin {
-                            globalMin = Some(slot);
-                        }
-                        if new_gmax {
-                            globalMax = Some(slot);
-                        }
-                        if new_zmin {
-                            zoneMin = Some(slot);
-                        }
-                        if new_zmax {
-                            zoneMax = Some(slot);
-                        }
+                    if zoneMax.is_none_or(|(_, cur)| v > cur) {
+                        zoneMax = Some((i, v));
                     }
 
                     if isSorted
                         && let Some(prev) = prevRaw
-                        && (*v).cmp(prev) == std::cmp::Ordering::Less
+                        && v.cmp(prev) == std::cmp::Ordering::Less
                     {
                         isSorted = false;
                     }
-                    prevRaw = Some(*v);
+                    prevRaw = Some(v);
                 }
             }
         }
         if zoneMaps.len() < zoneCount {
-            zoneMaps.push(ZoneMapEntry {
-                min_value: zoneMin.unwrap_or([0xFF; STAT_VALUE_SIZE]),
-                max_value: zoneMax.unwrap_or([0u8; STAT_VALUE_SIZE]),
-            });
+            close_zone(
+                &mut zoneMaps,
+                zoneMin,
+                zoneMax,
+                &mut segmentMin,
+                &mut segmentMax,
+                0,
+                SlotOrder::Lexicographic,
+            );
         }
 
-        let cardinality = distinct.len() as u64;
-        let minValue = globalMin.unwrap_or([0u8; STAT_VALUE_SIZE]);
-        let maxValue = globalMax.unwrap_or([0u8; STAT_VALUE_SIZE]);
+        let cardinality = distinct.cardinality();
+        let distinctCapped = distinct.saturated();
+        let minValue = segmentMin.map_or([0u8; STAT_VALUE_SIZE], |(_, v)| value_to_stat_slot(v));
+        let maxValue = segmentMax.map_or([0u8; STAT_VALUE_SIZE], |(_, v)| varlen_upper_slot(v));
 
         // The canonical variable-length buffer addresses the values blob with
         // a u32 cumulative offset array. A blob (or row count) past u32 would
@@ -953,6 +1082,9 @@ impl ColumnSegment {
             zone_maps: zoneMaps,
             encoded_data: encodedData,
             null_bitmap: nullBitmap,
+            min_row: segmentMin.map(|(row, _)| row),
+            max_row: segmentMax.map(|(row, _)| row),
+            ndv: distinct.estimate(),
         })
     }
 }
@@ -961,6 +1093,390 @@ impl ColumnSegment {
 mod tests {
     use super::*;
     use crate::encoding::{Predicate, eval_predicate_on_raw, varlen_slice_rows};
+
+    /// Reusing the trial encode's output is only sound if those bytes are
+    /// the bytes a fresh encode would produce.
+    ///
+    /// The segment is built the way a lake write builds it, then the column
+    /// is packed independently here and encoded through the encoder the
+    /// header names. The two byte strings have to match exactly, across the
+    /// shapes that reach every selection branch: a column the trial wins on,
+    /// one it loses on and falls back to Unencoded, one that short-circuits
+    /// to Dictionary before any trial, one that goes Constant, and columns
+    /// carrying nulls so the zeroed placeholder slots are compared too
+    #[test]
+    fn reused_trial_output_is_identical_to_encoding_the_column_again() {
+        fn check(label: &str, type_id: TypeId, values: Vec<Option<Vec<u8>>>) {
+            let views: Vec<Option<&[u8]>> = values.iter().map(|v| v.as_deref()).collect();
+            let value_size = type_id.fixed_size().unwrap_or(0);
+            let segment = ColumnSegment::build_with_options(
+                0,
+                type_id,
+                value_size,
+                &views,
+                SegmentOptions {
+                    bloom: BloomPolicy::Auto,
+                    exact_encoding: true,
+                    distinct_sketch: false,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: build failed: {e}"));
+
+            // The same buffer the fused pass packs: values at their slot,
+            // null slots zeroed
+            let mut raw = vec![0u8; views.len() * value_size];
+            for (i, v) in views.iter().enumerate() {
+                if let Some(v) = v {
+                    raw[i * value_size..(i + 1) * value_size].copy_from_slice(v);
+                }
+            }
+            let fresh = crate::encoding::create_encoding(segment.header.encoding_type)
+                .encode(&raw, views.len(), value_size)
+                .unwrap_or_else(|e| panic!("{label}: re-encode failed: {e}"));
+
+            assert_eq!(
+                segment.encoded_data, fresh,
+                "{label}: the segment kept bytes that differ from encoding the column                  again through {:?}",
+                segment.header.encoding_type
+            );
+            assert_eq!(
+                segment.header.encoded_size as usize,
+                segment.encoded_data.len(),
+                "{label}: the header size has to describe the bytes actually kept"
+            );
+        }
+
+        let rows = 4096usize;
+        // Ascending and distinct, which FastLanes wins on
+        check(
+            "int64 ascending distinct",
+            TypeId::Int64,
+            (0..rows)
+                .map(|i| Some((i as i64).to_le_bytes().to_vec()))
+                .collect(),
+        );
+        // Pseudorandom and distinct, where the candidate can lose to raw
+        check(
+            "int64 scattered distinct",
+            TypeId::Int64,
+            (0..rows)
+                .map(|i| {
+                    let v = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    Some((v as i64).to_le_bytes().to_vec())
+                })
+                .collect(),
+        );
+        // Low cardinality, which short-circuits to Dictionary with no trial
+        check(
+            "int64 low cardinality",
+            TypeId::Int64,
+            (0..rows)
+                .map(|i| Some(((i % 8) as i64).to_le_bytes().to_vec()))
+                .collect(),
+        );
+        // One repeated value, which goes Constant
+        check(
+            "int64 constant",
+            TypeId::Int64,
+            (0..rows)
+                .map(|_| Some(7i64.to_le_bytes().to_vec()))
+                .collect(),
+        );
+        // Nulls scattered through, so the zeroed slots are covered
+        check(
+            "int64 distinct with nulls",
+            TypeId::Int64,
+            (0..rows)
+                .map(|i| {
+                    if i % 11 == 0 {
+                        None
+                    } else {
+                        Some((i as i64).to_le_bytes().to_vec())
+                    }
+                })
+                .collect(),
+        );
+        // Floats reach the ALP candidate rather than FastLanes
+        check(
+            "float64 ascending",
+            TypeId::Float64,
+            (0..rows)
+                .map(|i| Some((i as f64 * 1.5).to_le_bytes().to_vec()))
+                .collect(),
+        );
+        check(
+            "int32 distinct",
+            TypeId::Int32,
+            (0..rows)
+                .map(|i| Some((i as i32).to_le_bytes().to_vec()))
+                .collect(),
+        );
+    }
+
+    /// The rows a build reports as its extremes have to be the column's
+    /// actual extremes under that column's own order, because a caller that
+    /// needs the value at full width reads it back through them instead of
+    /// comparing the column a second time.
+    ///
+    /// The bounds are folded out of the per-zone bounds, so the columns here
+    /// are long enough to span several zones, and they are shuffled so the
+    /// extremes do not sit in the first or last one. Every case is checked
+    /// against a flat scan of the same values
+    #[test]
+    fn extreme_rows_are_the_columns_extremes_under_its_own_order() {
+        fn check(label: &str, type_id: TypeId, values: Vec<Option<Vec<u8>>>) {
+            let views: Vec<Option<&[u8]>> = values.iter().map(|v| v.as_deref()).collect();
+            let width = type_id.fixed_size().unwrap_or(0);
+            let order = slot_order(type_id);
+            let segment = ColumnSegment::build(0, type_id, width, &views)
+                .unwrap_or_else(|e| panic!("{label}: build failed: {e}"));
+
+            let mut expect_min: Option<(usize, &[u8])> = None;
+            let mut expect_max: Option<(usize, &[u8])> = None;
+            for (row, value) in views.iter().enumerate() {
+                let Some(value) = value else { continue };
+                if expect_min
+                    .is_none_or(|(_, cur)| compare_values_ordered(value, cur, width, order).is_lt())
+                {
+                    expect_min = Some((row, value));
+                }
+                if expect_max
+                    .is_none_or(|(_, cur)| compare_values_ordered(value, cur, width, order).is_gt())
+                {
+                    expect_max = Some((row, value));
+                }
+            }
+
+            match expect_min {
+                Some((_, value)) => {
+                    let row = segment
+                        .min_row
+                        .unwrap_or_else(|| panic!("{label}: no minimum row"));
+                    assert_eq!(
+                        views[row].expect("minimum row holds a value"),
+                        value,
+                        "{label}: the reported minimum is not the column's minimum"
+                    );
+                    assert_eq!(
+                        segment.header.min_value,
+                        value_to_stat_slot(value),
+                        "{label}: the header slot has to describe the same value"
+                    );
+                }
+                None => assert!(
+                    segment.min_row.is_none(),
+                    "{label}: an all null column has no minimum"
+                ),
+            }
+            match expect_max {
+                Some((_, value)) => {
+                    let row = segment
+                        .max_row
+                        .unwrap_or_else(|| panic!("{label}: no maximum row"));
+                    assert_eq!(
+                        views[row].expect("maximum row holds a value"),
+                        value,
+                        "{label}: the reported maximum is not the column's maximum"
+                    );
+                    assert_eq!(
+                        segment.header.max_value,
+                        varlen_upper_slot(value),
+                        "{label}: the header slot has to describe the same value"
+                    );
+                }
+                None => assert!(
+                    segment.max_row.is_none(),
+                    "{label}: an all null column has no maximum"
+                ),
+            }
+
+            // And every value the column holds sits inside the recorded
+            // bounds, which is the question a pruner asks of them
+            for value in views.iter().flatten() {
+                assert!(
+                    compare_value_to_slot(value, &segment.header.min_value, width, order).is_ge(),
+                    "{label}: the minimum excludes a value the column holds"
+                );
+                assert!(
+                    compare_value_to_slot(value, &segment.header.max_value, width, order).is_le(),
+                    "{label}: the maximum excludes a value the column holds"
+                );
+            }
+        }
+
+        // Enough rows to span several zones, shuffled by a stride coprime
+        // with the count so the extremes land mid-column
+        let rows = 5_000usize;
+        let scatter = |i: usize| (i * 2_731) % rows;
+
+        check(
+            "int64 straddling zero",
+            TypeId::Int64,
+            (0..rows)
+                .map(|i| Some(((scatter(i) as i64) - 2_500).to_le_bytes().to_vec()))
+                .collect(),
+        );
+        check(
+            "uint64 above the sign bit",
+            TypeId::UInt64,
+            (0..rows)
+                .map(|i| Some((u64::MAX - scatter(i) as u64).to_le_bytes().to_vec()))
+                .collect(),
+        );
+        check(
+            "float64 straddling zero",
+            TypeId::Float64,
+            (0..rows)
+                .map(|i| Some(((scatter(i) as f64) - 2_500.5).to_le_bytes().to_vec()))
+                .collect(),
+        );
+        check(
+            "timestamp before and after the epoch",
+            TypeId::Timestamp,
+            (0..rows)
+                .map(|i| {
+                    Some(
+                        ((scatter(i) as i64 - 2_500) * 86_400_000_000)
+                            .to_le_bytes()
+                            .to_vec(),
+                    )
+                })
+                .collect(),
+        );
+        // Values agreeing over the whole 32-byte slot, where the order is
+        // decided past the prefix a slot can hold
+        check(
+            "varchar sharing a slot-length prefix",
+            TypeId::Varchar,
+            (0..rows)
+                .map(|i| {
+                    let mut value = vec![b'p'; STAT_VALUE_SIZE];
+                    value.extend_from_slice(format!("{:08}", scatter(i)).as_bytes());
+                    Some(value)
+                })
+                .collect(),
+        );
+        check(
+            "varchar of mixed lengths",
+            TypeId::Varchar,
+            (0..rows)
+                .map(|i| Some(format!("{}", scatter(i)).into_bytes()))
+                .collect(),
+        );
+        // A column with nulls scattered through, including a whole zone of
+        // them so a zone closes with no value in it
+        check(
+            "int32 with a fully null zone",
+            TypeId::Int32,
+            (0..rows)
+                .map(|i| {
+                    if (1_024..2_048).contains(&i) || i % 7 == 0 {
+                        None
+                    } else {
+                        Some((scatter(i) as i32 - 2_500).to_le_bytes().to_vec())
+                    }
+                })
+                .collect(),
+        );
+        check(
+            "int64 all null",
+            TypeId::Int64,
+            (0..rows).map(|_| None).collect(),
+        );
+        check(
+            "varchar all null",
+            TypeId::Varchar,
+            (0..rows).map(|_| None).collect(),
+        );
+    }
+
+    /// The sketch is the only whole-column distinct count, and it is built
+    /// only when the caller asks. The header's own cardinality answers a
+    /// different question and still stops at the bloom threshold
+    #[test]
+    fn the_distinct_estimate_is_built_only_when_the_caller_asks_for_it() {
+        let rows = 20_000usize;
+        let owned: Vec<Vec<u8>> = (0..rows)
+            .map(|i| (i as i64).to_le_bytes().to_vec())
+            .collect();
+        let views: Vec<Option<&[u8]>> = owned.iter().map(|v| Some(v.as_slice())).collect();
+
+        let without = ColumnSegment::build_with_options(
+            0,
+            TypeId::Int64,
+            8,
+            &views,
+            SegmentOptions {
+                bloom: BloomPolicy::Auto,
+                exact_encoding: false,
+                distinct_sketch: false,
+            },
+        )
+        .expect("build");
+        assert!(
+            without.ndv.is_none(),
+            "a build that was not asked for an estimate must not carry one"
+        );
+        assert_eq!(
+            without.header.cardinality,
+            BLOOM_MIN_CARDINALITY + 1,
+            "the exact count stops one past the bloom threshold"
+        );
+
+        let with = ColumnSegment::build_with_options(
+            0,
+            TypeId::Int64,
+            8,
+            &views,
+            SegmentOptions {
+                bloom: BloomPolicy::Auto,
+                exact_encoding: false,
+                distinct_sketch: true,
+            },
+        )
+        .expect("build");
+        let ndv = with.ndv.expect("an estimate was asked for");
+        let error = (ndv as f64 - rows as f64).abs() / rows as f64;
+        assert!(
+            error < 0.05,
+            "estimate {ndv} for {rows} distinct values is off by {error}"
+        );
+        assert_eq!(
+            with.header.cardinality, without.header.cardinality,
+            "asking for the estimate must not change the capped count"
+        );
+        assert_eq!(
+            with.encoded_data, without.encoded_data,
+            "asking for the estimate must not change the bytes written"
+        );
+
+        // A column below the threshold is counted exactly either way
+        let low: Vec<Vec<u8>> = (0..rows)
+            .map(|i| ((i % 9) as i64).to_le_bytes().to_vec())
+            .collect();
+        let low_views: Vec<Option<&[u8]>> = low.iter().map(|v| Some(v.as_slice())).collect();
+        for sketch in [false, true] {
+            let segment = ColumnSegment::build_with_options(
+                0,
+                TypeId::Int64,
+                8,
+                &low_views,
+                SegmentOptions {
+                    bloom: BloomPolicy::Auto,
+                    exact_encoding: false,
+                    distinct_sketch: sketch,
+                },
+            )
+            .expect("build");
+            assert_eq!(
+                segment.header.cardinality, 9,
+                "a column under the threshold is counted exactly"
+            );
+            if sketch {
+                assert_eq!(segment.ndv, Some(9), "and the sketch agrees down here");
+            }
+        }
+    }
 
     // -- Variable-length segment tests --
 

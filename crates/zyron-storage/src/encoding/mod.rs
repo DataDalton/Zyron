@@ -321,6 +321,42 @@ pub fn range_admits(
         })
 }
 
+/// Builds one row bitmask from a per-row answer, folding eight answers into
+/// a byte before storing it.
+///
+/// Setting the mask a bit at a time reads and writes the same byte on eight
+/// consecutive rows, which serializes those rows on that byte and pays a
+/// bounds check each time. Eight answers folded in a register leave one
+/// store per eight rows, and the eight `admits` calls have no dependency on
+/// each other so they pipeline. Every encoding that resolves a predicate
+/// row by row builds its mask through here.
+///
+/// `admits` is called exactly once for every row, in ascending row order, so
+/// an encoding whose rows are addressed by walking forward (a stored length
+/// per row, for one) can carry its cursor in the closure
+#[inline]
+pub fn bitmask_from_rows<F: FnMut(usize) -> bool>(row_count: usize, mut admits: F) -> Vec<u8> {
+    let mut bitmask = vec![0u8; row_count.div_ceil(8)];
+    let full = row_count / 8;
+    for (byte_index, slot) in bitmask.iter_mut().enumerate().take(full) {
+        let base = byte_index * 8;
+        let mut bits = 0u8;
+        for lane in 0..8usize {
+            bits |= (admits(base + lane) as u8) << lane;
+        }
+        *slot = bits;
+    }
+    let tail = full * 8;
+    if tail < row_count {
+        let mut bits = 0u8;
+        for row in tail..row_count {
+            bits |= (admits(row) as u8) << (row - tail);
+        }
+        bitmask[full] = bits;
+    }
+    bitmask
+}
+
 /// Evaluates a predicate on raw (decoded) column data, producing a packed bitmask.
 pub fn eval_predicate_on_raw(
     data: &[u8],
@@ -329,50 +365,48 @@ pub fn eval_predicate_on_raw(
     predicate: &Predicate,
 ) -> Result<Vec<u8>> {
     if value_size == 0 {
+        // Slicing either reaches every row the count claims or fails, so the
+        // row a mask bit stands for is always there to compare
         let rows = varlen_slice_rows(data, row_count)?;
-        let bitmask_len = row_count.div_ceil(8);
-        let mut bitmask = vec![0u8; bitmask_len];
-        for (i, value) in rows.iter().enumerate() {
-            let matches = match predicate {
-                Predicate::Equality(target) => value == target,
-                Predicate::Range { low, high } => range_admits(value, 0, *low, *high),
-                Predicate::In(values) => values.iter().any(|t| value == t),
-            };
-            if matches {
-                bitmask[i / 8] |= 1 << (i % 8);
+        return Ok(match predicate {
+            Predicate::Equality(target) => bitmask_from_rows(row_count, |i| rows[i] == *target),
+            Predicate::Range { low, high } => {
+                bitmask_from_rows(row_count, |i| range_admits(rows[i], 0, *low, *high))
             }
-        }
-        return Ok(bitmask);
+            Predicate::In(values) => {
+                bitmask_from_rows(row_count, |i| values.iter().any(|t| rows[i] == *t))
+            }
+        });
     }
-    let bitmask_len = row_count.div_ceil(8);
-    let mut bitmask = vec![0u8; bitmask_len];
-
-    for i in 0..row_count {
-        let start = i * value_size;
-        let end = start + value_size;
-        if end > data.len() {
-            return Err(ZyronError::DecodingFailed(
-                "data shorter than expected row count".to_string(),
-            ));
-        }
-        let value = &data[start..end];
-
-        let matches = match predicate {
-            Predicate::Equality(target) => value == *target,
-            Predicate::Range { low, high } => range_admits(value, value_size, *low, *high),
-            Predicate::In(values) => values.contains(&value),
-        };
-
-        if matches {
-            bitmask[i / 8] |= 1 << (i % 8);
-        }
+    // The widest row this reads is the last one, so the one check that
+    // decides every row is made once rather than per row
+    if row_count * value_size > data.len() {
+        return Err(ZyronError::DecodingFailed(
+            "data shorter than expected row count".to_string(),
+        ));
     }
+    let row = |i: usize| &data[i * value_size..(i + 1) * value_size];
 
-    Ok(bitmask)
+    Ok(match predicate {
+        Predicate::Equality(target) => bitmask_from_rows(row_count, |i| row(i) == *target),
+        Predicate::Range { low, high } => {
+            bitmask_from_rows(row_count, |i| range_admits(row(i), value_size, *low, *high))
+        }
+        Predicate::In(values) => bitmask_from_rows(row_count, |i| values.contains(&row(i))),
+    })
 }
+
+/// Cardinality at or above which a dictionary is never chosen, whatever the
+/// row count. Both selection paths test `cardinality < 65536`, so this is
+/// that constant named once
+const DICTIONARY_MAX_CARDINALITY: usize = 65536;
 
 /// Statistics computed from a column sample for encoding selection.
 struct ColumnSampleStats {
+    /// Distinct values, saturating at the point the exact count stops
+    /// changing any decision. Every consumer tests it as an upper bound, so
+    /// a saturated value reads as "more than the ceiling" and compares the
+    /// same way the true count would
     cardinality: usize,
     run_count: usize,
     all_identical: bool,
@@ -380,15 +414,34 @@ struct ColumnSampleStats {
 
 /// Computes sample statistics from a set of values.
 /// Each value is Option<&[u8]> where None represents null.
+///
+/// The distinct set stops growing once the count can no longer change an
+/// answer. Cardinality decides exactly two things here, whether the column
+/// is one repeated value and whether it is sparse enough for a dictionary,
+/// and past `min(DICTIONARY_MAX_CARDINALITY, rows / 2)` both are already
+/// settled. Without the cap a column builds a hash set with one entry per
+/// distinct value purely to choose an encoding, so a million row column
+/// allocated a million entry set to conclude it would not be dictionary
+/// encoded. Selection cost and memory now stay flat in the row count.
+///
+/// Runs are counted from a comparison against the previous value rather than
+/// from the set, so `run_count` stays exact after the set saturates
 fn compute_sample_stats(sample: &[Option<&[u8]>]) -> ColumnSampleStats {
+    // Two is the floor whatever the ceiling works out to, because
+    // `all_identical` still has to tell one distinct value from more than one
+    let cap = DICTIONARY_MAX_CARDINALITY.min(sample.len() / 2).max(2);
     let mut distinct = hashbrown::HashSet::new();
+    let mut saturated = false;
     let mut run_count = 1usize;
     let mut prev_value: Option<&[u8]> = None;
     let mut null_count = 0usize;
 
     for val in sample {
         if let Some(v) = val {
-            distinct.insert(*v);
+            if !saturated {
+                distinct.insert(*v);
+                saturated = distinct.len() > cap;
+            }
 
             if let Some(prev) = prev_value {
                 if *v != prev {
@@ -406,7 +459,8 @@ fn compute_sample_stats(sample: &[Option<&[u8]>]) -> ColumnSampleStats {
     // row) that differs from any non-null value. So a column is
     // all-identical only when it is all null (every placeholder identical)
     // or has exactly one distinct value and no nulls at all
-    let all_identical = distinct.is_empty() || (distinct.len() == 1 && null_count == 0);
+    let all_identical =
+        !saturated && (distinct.is_empty() || (distinct.len() == 1 && null_count == 0));
 
     ColumnSampleStats {
         cardinality: distinct.len(),
@@ -435,6 +489,45 @@ pub fn select_encoding(type_id: TypeId, sample: &[Option<&[u8]>]) -> EncodingTyp
     select_encoding_bounded(type_id, sample, TRIAL_ENCODE_ROWS)
 }
 
+/// The encoding a column will use, and the bytes selection already produced.
+pub struct EncodingChoice {
+    pub encoding: EncodingType,
+    /// Output of the trial encode, present only when the trial covered every
+    /// row and its candidate is the encoding that was chosen.
+    ///
+    /// A caller holding this must not encode again. These are the bytes a
+    /// second encode would produce, from the same buffer through the same
+    /// encoder, so re-encoding would spend a full pass to arrive back here
+    pub encoded: Option<Vec<u8>>,
+}
+
+/// Chooses an encoding for a fixed-width column the caller has already
+/// packed into `raw_data`.
+///
+/// Selection cannot know whether its candidate beats storing the column raw
+/// without encoding it, and under `exact` that trial is a full encode of
+/// every row. The previous form built its own copy of the packed buffer,
+/// encoded into it, compared the size and then discarded both, leaving the
+/// caller to pack and encode the same column a second time. Passing the
+/// buffer in and the result back means a column is packed once and encoded
+/// once.
+///
+/// `exact` trials every row, which is what a caller holding the whole
+/// column wants: the candidate is then chosen exactly when it wins over the
+/// data the decoder will actually face. Otherwise the trial is a bounded
+/// prefix and no output is returned, because a prefix's bytes are not the
+/// column's bytes
+pub fn select_encoding_packed(
+    type_id: TypeId,
+    sample: &[Option<&[u8]>],
+    raw_data: &[u8],
+    value_size: usize,
+    exact: bool,
+) -> EncodingChoice {
+    let trial_rows = if exact { usize::MAX } else { TRIAL_ENCODE_ROWS };
+    select_encoding_inner(type_id, sample, Some((raw_data, value_size)), trial_rows)
+}
+
 /// Selects a fixed-width column's encoding with the trial encode run over
 /// every row rather than a bounded prefix.
 ///
@@ -457,8 +550,24 @@ fn select_encoding_bounded(
     sample: &[Option<&[u8]>],
     trial_rows: usize,
 ) -> EncodingType {
+    select_encoding_inner(type_id, sample, None, trial_rows).encoding
+}
+
+/// Shared selection. `packed` is the caller's already-built raw buffer and
+/// the fixed value width it was built at, or None when selection has to
+/// build its own to trial with
+fn select_encoding_inner(
+    type_id: TypeId,
+    sample: &[Option<&[u8]>],
+    packed: Option<(&[u8], usize)>,
+    trial_rows: usize,
+) -> EncodingChoice {
+    let plain = |encoding| EncodingChoice {
+        encoding,
+        encoded: None,
+    };
     if sample.is_empty() {
-        return EncodingType::Unencoded;
+        return plain(EncodingType::Unencoded);
     }
 
     let stats = compute_sample_stats(sample);
@@ -466,23 +575,23 @@ fn select_encoding_bounded(
 
     // All values identical (including all-null): constant encoding is always optimal
     if stats.all_identical {
-        return EncodingType::Constant;
+        return plain(EncodingType::Constant);
     }
 
     // Booleans: bit-pack to 1-bit is always the best choice
     if type_id == TypeId::Boolean {
-        return EncodingType::BitPack;
+        return plain(EncodingType::BitPack);
     }
 
     // Statistical heuristics: Dictionary and RLE are chosen based on
     // data characteristics and take priority. They support predicate
     // pushdown on encoded data, which is worth structural overhead.
-    if stats.cardinality < 65536 && stats.cardinality < row_count / 2 {
-        return EncodingType::Dictionary;
+    if stats.cardinality < DICTIONARY_MAX_CARDINALITY && stats.cardinality < row_count / 2 {
+        return plain(EncodingType::Dictionary);
     }
 
     if stats.run_count < row_count / 10 {
-        return EncodingType::Rle;
+        return plain(EncodingType::Rle);
     }
 
     // Type-specific candidate and Unencoded fallback for trial-encode.
@@ -501,21 +610,56 @@ fn select_encoding_bounded(
     } else if type_id.is_string() {
         EncodingType::Fsst
     } else {
-        return EncodingType::Unencoded;
+        return plain(EncodingType::Unencoded);
     };
 
     // Trial-encode: compare type-specific encoding against Unencoded
     // to verify it produces a smaller output.
-    let valueSize = sample.iter().find_map(|v| v.map(|b| b.len())).unwrap_or(0);
+    let valueSize = match packed {
+        Some((_, width)) => width,
+        None => sample.iter().find_map(|v| v.map(|b| b.len())).unwrap_or(0),
+    };
 
     if valueSize == 0 {
-        return typeCandidate;
+        return plain(typeCandidate);
     }
 
     let sampleCount = sample.len().min(trial_rows);
-    let trialSample = &sample[..sampleCount];
-    let mut rawData = vec![0u8; sampleCount * valueSize];
-    for (i, val) in trialSample.iter().enumerate() {
+    // The caller's buffer already holds exactly what the trial would build,
+    // values at `i * valueSize` and null slots zeroed, so a prefix of it is
+    // the trial input. Only a caller that supplied none pays to build one
+    let mut ownedRaw: Vec<u8> = Vec::new();
+    let rawData: &[u8] = match packed {
+        Some((buffer, _)) if buffer.len() >= sampleCount * valueSize => {
+            &buffer[..sampleCount * valueSize]
+        }
+        _ => {
+            let trialSample = &sample[..sampleCount];
+            ownedRaw = vec![0u8; sampleCount * valueSize];
+            fill_trial_buffer(&mut ownedRaw, trialSample, valueSize);
+            &ownedRaw
+        }
+    };
+
+    let encoder = create_encoding(typeCandidate);
+    match encoder.encode(rawData, sampleCount, valueSize) {
+        Ok(encoded) if encoded.len() < rawData.len() => EncodingChoice {
+            encoding: typeCandidate,
+            // Reusable only when the trial encoded the whole column. A
+            // prefix's output describes a prefix and would truncate the
+            // column if a caller wrote it out
+            encoded: (sampleCount == sample.len()).then_some(encoded),
+        },
+        _ => plain(EncodingType::Unencoded),
+    }
+}
+
+/// Packs values into a fixed-width trial buffer, leaving null slots zeroed.
+///
+/// Matches the layout a segment build produces so the two are byte
+/// identical, which is what lets a caller hand its own buffer in
+fn fill_trial_buffer(rawData: &mut [u8], sample: &[Option<&[u8]>], valueSize: usize) {
+    for (i, val) in sample.iter().enumerate() {
         if let Some(v) = val {
             let start = i * valueSize;
             let end = start + valueSize;
@@ -524,15 +668,6 @@ fn select_encoding_bounded(
             }
         }
     }
-
-    let encoder = create_encoding(typeCandidate);
-    if let Ok(encoded) = encoder.encode(&rawData, sampleCount, valueSize)
-        && encoded.len() < rawData.len()
-    {
-        return typeCandidate;
-    }
-
-    EncodingType::Unencoded
 }
 
 /// Selects the encoding for a variable-length column (`value_size == 0`,
@@ -574,7 +709,7 @@ pub fn select_encoding_varlen(_type_id: TypeId, sample: &[Option<&[u8]>]) -> Enc
     let mut best = EncodingType::Unencoded;
     let mut best_size = raw.len();
 
-    if stats.cardinality < 65536 && stats.cardinality < row_count / 2 {
+    if stats.cardinality < DICTIONARY_MAX_CARDINALITY && stats.cardinality < row_count / 2 {
         let dict = create_encoding(EncodingType::Dictionary);
         if let Ok(enc) = dict.encode(&raw, probe_rows, 0)
             && enc.len() < best_size
@@ -610,6 +745,110 @@ pub fn create_encoding(encoding_type: EncodingType) -> Box<dyn Encoding> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// Capping the distinct set is only sound if it never changes a choice.
+    ///
+    /// Cardinality reaches two decisions, `all_identical` and the dictionary
+    /// threshold, and both are compared against an independent uncapped
+    /// count here across the shapes that straddle every boundary the cap
+    /// touches: a column with one value, with two, with exactly half its
+    /// rows distinct, with one more than half, and with every row distinct.
+    /// Run counts are compared too, because they are counted outside the set
+    /// and must stay exact after it saturates
+    #[test]
+    fn capping_cardinality_preserves_every_encoding_decision() {
+        fn uncapped(sample: &[Option<&[u8]>]) -> (usize, usize, bool) {
+            let mut distinct = std::collections::HashSet::new();
+            let mut run_count = 1usize;
+            let mut prev: Option<&[u8]> = None;
+            let mut nulls = 0usize;
+            for val in sample {
+                if let Some(v) = val {
+                    distinct.insert(*v);
+                    if let Some(p) = prev
+                        && *v != p
+                    {
+                        run_count += 1;
+                    }
+                    prev = Some(*v);
+                } else {
+                    nulls += 1;
+                }
+            }
+            let all_identical = distinct.is_empty() || (distinct.len() == 1 && nulls == 0);
+            (distinct.len(), run_count, all_identical)
+        }
+
+        for rows in [0usize, 1, 2, 3, 8, 100, 1000, 4096] {
+            for distinct_values in [1usize, 2, 3, 7, 64, 65, 512, 999, 4096] {
+                if distinct_values > rows.max(1) {
+                    continue;
+                }
+                for nulls in [0usize, 1] {
+                    let owned: Vec<Vec<u8>> = (0..rows)
+                        .map(|i| ((i % distinct_values) as u64).to_le_bytes().to_vec())
+                        .collect();
+                    let sample: Vec<Option<&[u8]>> = owned
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| {
+                            if nulls == 1 && i % 17 == 0 {
+                                None
+                            } else {
+                                Some(v.as_slice())
+                            }
+                        })
+                        .collect();
+
+                    let capped = compute_sample_stats(&sample);
+                    let (true_cardinality, true_runs, true_identical) = uncapped(&sample);
+
+                    assert_eq!(
+                        capped.run_count, true_runs,
+                        "rows {rows} distinct {distinct_values} nulls {nulls}: runs are                          counted outside the set and must stay exact"
+                    );
+                    assert_eq!(
+                        capped.all_identical, true_identical,
+                        "rows {rows} distinct {distinct_values} nulls {nulls}: all_identical                          changed under the cap"
+                    );
+
+                    let capped_dict = capped.cardinality < DICTIONARY_MAX_CARDINALITY
+                        && capped.cardinality < rows / 2;
+                    let true_dict = true_cardinality < DICTIONARY_MAX_CARDINALITY
+                        && true_cardinality < rows / 2;
+                    assert_eq!(
+                        capped_dict, true_dict,
+                        "rows {rows} distinct {distinct_values} nulls {nulls}: the dictionary                          decision changed, capped said {} from {} and the true count {} says {}",
+                        capped_dict, capped.cardinality, true_cardinality, true_dict
+                    );
+                }
+            }
+        }
+    }
+
+    /// The whole point of the cap is that a high cardinality column stops
+    /// paying for distinct values it will never use. A column where every
+    /// row is unique must not retain a set that grows with the row count
+    #[test]
+    fn a_high_cardinality_column_saturates_instead_of_counting_every_value() {
+        let rows = 8192usize;
+        let owned: Vec<Vec<u8>> = (0..rows)
+            .map(|i| (i as u64).to_le_bytes().to_vec())
+            .collect();
+        let sample: Vec<Option<&[u8]>> = owned.iter().map(|v| Some(v.as_slice())).collect();
+        let stats = compute_sample_stats(&sample);
+        assert!(
+            stats.cardinality <= rows / 2 + 1,
+            "the set kept counting past the point the answer was fixed, reached {}",
+            stats.cardinality
+        );
+        assert!(!stats.all_identical);
+        assert!(
+            !(stats.cardinality < DICTIONARY_MAX_CARDINALITY && stats.cardinality < rows / 2),
+            "an all-distinct column must not be dictionary encoded"
+        );
+    }
     use super::*;
 
     /// Every encoding's ranged decode must agree with its full decode over

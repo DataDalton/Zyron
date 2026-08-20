@@ -34,7 +34,7 @@ use super::constants::{
 };
 use super::segment::{SegmentHeader, ZoneMapEntry};
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use zyron_common::page::PAGE_SIZE;
 use zyron_common::{Result, ZyronError};
@@ -86,6 +86,27 @@ pub struct ZyrFileHeader {
     pub xmax_range_hi: u64,
     pub primary_key_column_id: u32,
     pub sort_order: SortOrder,
+    /// Byte offset of the segment index, and its size in bytes.
+    ///
+    /// The index sits at the end of the file, ahead of the footer trailer,
+    /// and where it lands is only known once every segment is written. The
+    /// writer records it here after the fact, by rewriting the header page
+    /// before the file is fsynced and renamed into place.
+    ///
+    /// Carrying it in the header is what lets an open be three system calls
+    /// rather than five. Without it a reader asks the filesystem how large
+    /// the file is, reads the trailer at the end to learn where the index
+    /// starts, and only then reads the index. With it, the header page says
+    /// where the index is and one further read takes the index and the
+    /// trailer together. An open costs the same whether the file holds a
+    /// thousand rows or a million, so on a table of small files it is the
+    /// scan, and every call crosses whatever filter driver the platform has
+    /// in the path.
+    ///
+    /// Zero in both means the header was written before its index existed,
+    /// which is every header until the file it belongs to is finalized
+    pub segment_index_offset: u64,
+    pub segment_index_size: u32,
 }
 
 impl ZyrFileHeader {
@@ -107,7 +128,10 @@ impl ZyrFileHeader {
         buf[60..68].copy_from_slice(&self.xmax_range_hi.to_le_bytes());
         buf[68..72].copy_from_slice(&self.primary_key_column_id.to_le_bytes());
         buf[72] = self.sort_order as u8;
-        // [73..128] reserved, already zeroed.
+        // [73..80] reserved, already zeroed.
+        buf[80..88].copy_from_slice(&self.segment_index_offset.to_le_bytes());
+        buf[88..92].copy_from_slice(&self.segment_index_size.to_le_bytes());
+        // [92..128] reserved, already zeroed.
         // [128..PAGE_SIZE] padding, already zeroed.
 
         // Checksum covers magic+version [0..12] and metadata [16..FILE_HEADER_METADATA_SIZE].
@@ -189,6 +213,11 @@ impl ZyrFileHeader {
         let primaryKeyColumnId = u32::from_le_bytes([buf[68], buf[69], buf[70], buf[71]]);
         let sortOrder = SortOrder::from_u8(buf[72])?;
 
+        let segmentIndexOffset = u64::from_le_bytes(buf[80..88].try_into().map_err(|_| {
+            ZyronError::InvalidZyrFile("failed to read segment_index_offset".into())
+        })?);
+        let segmentIndexSize = u32::from_le_bytes([buf[88], buf[89], buf[90], buf[91]]);
+
         Ok(Self {
             format_version: formatVersion,
             column_count: columnCount,
@@ -200,6 +229,8 @@ impl ZyrFileHeader {
             xmax_range_hi: xmaxRangeHi,
             primary_key_column_id: primaryKeyColumnId,
             sort_order: sortOrder,
+            segment_index_offset: segmentIndexOffset,
+            segment_index_size: segmentIndexSize,
         })
     }
 }
@@ -225,7 +256,6 @@ pub struct ZyrFileWriter {
     writer: BufWriter<File>,
     tmpPath: PathBuf,
     finalPath: PathBuf,
-    #[allow(dead_code)]
     header: ZyrFileHeader,
     segmentIndex: Vec<SegmentIndexEntry>,
     currentOffset: u64,
@@ -382,11 +412,30 @@ impl ZyrFileWriter {
 
         // Footer checksum = CRC of the segment-index region only (computed
         // in memory above, no file re-read).
+        let indexSize = (self.segmentIndex.len() * SEGMENT_INDEX_ENTRY_SIZE) as u32;
         let indexChecksum = indexHasher.finish32();
         self.writer
             .write_all(&indexChecksum.to_le_bytes())
             .map_err(|e| ZyronError::IoError(format!("failed to write index checksum: {}", e)))?;
 
+        // Rewrite the header page now that the index has a position, so a
+        // reader learns where it is from the header rather than by asking
+        // the filesystem for the file size and reading the trailer to find
+        // out. This is one buffered write and a seek, paid once when the
+        // file is built, against two system calls saved on every open the
+        // file ever serves
+        self.header.segment_index_offset = segmentIndexOffset;
+        self.header.segment_index_size = indexSize;
+        self.writer
+            .flush()
+            .map_err(|e| ZyronError::IoError(format!("failed to flush writer: {}", e)))?;
+        self.writer
+            .get_mut()
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| ZyronError::IoError(format!("failed to seek to file header: {}", e)))?;
+        self.writer
+            .write_all(&self.header.to_bytes())
+            .map_err(|e| ZyronError::IoError(format!("failed to rewrite file header: {}", e)))?;
         self.writer
             .flush()
             .map_err(|e| ZyronError::IoError(format!("failed to flush writer: {}", e)))?;
@@ -419,16 +468,62 @@ impl ZyrFileWriter {
         })?;
 
         if fsync {
-            // Fsync the parent directory to persist the rename.
-            if let Some(parentDir) = self.finalPath.parent()
-                && let Ok(dir) = File::open(parentDir)
-            {
-                let _ = dir.sync_all();
-            }
+            sync_parent_directory(&self.finalPath)?;
         }
 
         Ok(fileSize)
     }
+}
+
+/// Persists the directory entry a rename created.
+///
+/// Flushing a file covers its bytes, not the name that reaches them. On a
+/// filesystem that can lose a directory entry independently of file
+/// contents, a crash between the rename and the next metadata flush leaves
+/// a committed version referencing a data file whose name never landed, so
+/// this runs before the caller is told the file is durable.
+///
+/// Errors are returned rather than swallowed. A durability step that
+/// quietly does nothing is worse than one that was never attempted, because
+/// every caller above it believes the guarantee holds
+#[cfg(not(windows))]
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let dir = File::open(parent).map_err(|e| {
+        ZyronError::IoError(format!(
+            "failed to open {} to persist a rename: {}",
+            parent.display(),
+            e
+        ))
+    })?;
+    dir.sync_all().map_err(|e| {
+        ZyronError::IoError(format!(
+            "failed to fsync {} to persist a rename: {}",
+            parent.display(),
+            e
+        ))
+    })
+}
+
+/// Windows exposes no way to flush a directory, so there is nothing to call.
+///
+/// A directory handle opened with backup semantics is accepted and
+/// `FlushFileBuffers` on it fails with access denied, measured rather than
+/// assumed. Rename durability there comes from NTFS journaling the
+/// operation as metadata and replaying it from the volume log, which is the
+/// same guarantee the explicit flush reaches for elsewhere. Forcing it
+/// would mean flushing a volume handle, which needs administrator rights
+/// and flushes every other file on the volume with it.
+///
+/// This previously called `File::open` on the directory and discarded both
+/// the open error and the flush error. `File::open` on a directory fails on
+/// Windows, so the step did nothing on every Windows build while reading as
+/// though it had run
+#[cfg(windows)]
+fn sync_parent_directory(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// Rounds `size` up to the next PAGE_SIZE multiple.
@@ -588,39 +683,44 @@ impl ZyrFileReader {
             ))
         })?;
 
-        let fileSize = file
-            .metadata()
-            .map_err(|e| {
-                ZyronError::IoError(format!(
-                    "failed to read .zyr file metadata {}: {}",
-                    path.display(),
-                    e
-                ))
-            })?
-            .len();
-
-        let minSize = (FILE_HEADER_SIZE + FOOTER_SIZE) as u64;
-        if fileSize < minSize {
-            return Err(ZyronError::InvalidZyrFile(format!(
-                "file too small: {} bytes (minimum {})",
-                fileSize, minSize
-            )));
-        }
-
-        // Read file header (first PAGE_SIZE bytes).
+        // Read file header (first PAGE_SIZE bytes). It names where the
+        // segment index sits, which is what keeps this open to three system
+        // calls: without it the file size has to be asked for and the
+        // trailer read to find the index, and only then the index itself
         let mut headerBuf = [0u8; PAGE_SIZE];
         read_exact_at(&file, &mut headerBuf, 0, path, "file header")?;
         let header = ZyrFileHeader::from_bytes(&headerBuf)?;
 
-        // Read footer trailer: last FOOTER_SIZE bytes = segment_index_offset(8) + magic(8) + checksum(4).
-        let trailerStart = fileSize - FOOTER_SIZE as u64;
-        let mut trailerBuf = [0u8; FOOTER_SIZE];
-        read_exact_at(&file, &mut trailerBuf, trailerStart, path, "footer trailer")?;
+        let segmentIndexOffset = header.segment_index_offset;
+        let indexRegionSize = header.segment_index_size as usize;
+        if segmentIndexOffset < FILE_HEADER_SIZE as u64 {
+            return Err(ZyronError::InvalidZyrFile(format!(
+                "segment index offset {} overlaps the file header",
+                segmentIndexOffset
+            )));
+        }
+        if !indexRegionSize.is_multiple_of(SEGMENT_INDEX_ENTRY_SIZE) {
+            return Err(ZyronError::InvalidZyrFile(format!(
+                "segment index region size {} is not a multiple of entry size {}",
+                indexRegionSize, SEGMENT_INDEX_ENTRY_SIZE
+            )));
+        }
+        let entryCount = indexRegionSize / SEGMENT_INDEX_ENTRY_SIZE;
+        let trailerStart = segmentIndexOffset + indexRegionSize as u64;
+        let fileSize = trailerStart + FOOTER_SIZE as u64;
 
-        // Parse trailer fields.
-        let segmentIndexOffset = u64::from_le_bytes(trailerBuf[0..8].try_into().map_err(|_| {
-            ZyronError::InvalidZyrFile("failed to read segment_index_offset".into())
-        })?);
+        // The index and the trailer that describes it are adjacent, so one
+        // read takes both. The checksum still covers exactly the index
+        // region (offsets and sizes only, bounded by metadata rather than
+        // data), so integrity costs no whole-file pass
+        let tail = read_vec_at(
+            &file,
+            indexRegionSize + FOOTER_SIZE,
+            segmentIndexOffset,
+            path,
+            "segment index and footer",
+        )?;
+        let (indexBytes, trailerBuf) = tail.split_at(indexRegionSize);
 
         let footerMagic: [u8; 8] = trailerBuf[8..16]
             .try_into()
@@ -631,34 +731,26 @@ impl ZyrFileReader {
             ));
         }
 
+        // The trailer carries its own copy of where the index starts. Two
+        // records of one fact disagreeing means the file is damaged, and
+        // reading them in the same call makes the cross-check free
+        let trailerIndexOffset = u64::from_le_bytes(trailerBuf[0..8].try_into().map_err(|_| {
+            ZyronError::InvalidZyrFile("failed to read segment_index_offset".into())
+        })?);
+        if trailerIndexOffset != segmentIndexOffset {
+            return Err(ZyronError::InvalidZyrFile(format!(
+                "segment index offset disagrees between header and footer: {} and {}",
+                segmentIndexOffset, trailerIndexOffset
+            )));
+        }
+
         let storedFileChecksum = u32::from_le_bytes([
             trailerBuf[16],
             trailerBuf[17],
             trailerBuf[18],
             trailerBuf[19],
         ]);
-
-        // Read the segment-index region once, verify the footer checksum
-        // over exactly that region (offsets/sizes only — small, bounded by
-        // metadata not data, no whole-file pass), then parse entries from
-        // the in-memory buffer.
-        let indexRegionSize = (trailerStart - segmentIndexOffset) as usize;
-        if !indexRegionSize.is_multiple_of(SEGMENT_INDEX_ENTRY_SIZE) {
-            return Err(ZyronError::InvalidZyrFile(format!(
-                "segment index region size {} is not a multiple of entry size {}",
-                indexRegionSize, SEGMENT_INDEX_ENTRY_SIZE
-            )));
-        }
-        let entryCount = indexRegionSize / SEGMENT_INDEX_ENTRY_SIZE;
-
-        let indexBytes = read_vec_at(
-            &file,
-            indexRegionSize,
-            segmentIndexOffset,
-            path,
-            "segment index",
-        )?;
-        let computedIndexChecksum = zyron_common::hash32(&indexBytes);
+        let computedIndexChecksum = zyron_common::hash32(indexBytes);
         if storedFileChecksum != computedIndexChecksum {
             return Err(ZyronError::InvalidZyrFile(format!(
                 "segment index checksum mismatch: stored 0x{:08x}, computed 0x{:08x}",
@@ -890,6 +982,42 @@ impl ZyrFileReader {
             .eval_predicate(enc, row_count, value_size, predicate)
     }
 
+    /// Evaluates a predicate over rows `start..end`, returning a keep mask
+    /// of `ceil((end - start) / 8)` bytes covering that range alone.
+    ///
+    /// A caller that has already rejected most of a file from its zone maps
+    /// needs an answer for the rows the surviving zones cover and nothing
+    /// else. Every encoding can decode a range without replaying the rows
+    /// before it, so answering for one zone costs one zone rather than the
+    /// whole column.
+    ///
+    /// A full range keeps the encoding's own predicate evaluator, which is
+    /// specialized per encoding and beats decoding and then comparing. The
+    /// ranged path decodes because a predicate evaluator that works on
+    /// encoded bytes has no way to start partway through a segment
+    pub fn eval_column_predicate_rows(
+        &self,
+        column_id: u32,
+        row_count: usize,
+        value_size: usize,
+        predicate: &crate::encoding::Predicate<'_>,
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<u8>> {
+        if start == 0 && end >= row_count {
+            return self.eval_column_predicate(column_id, row_count, value_size, predicate);
+        }
+        if start >= end {
+            return Ok(Vec::new());
+        }
+        let raw = self.read_segment_raw(column_id)?;
+        let regions = segment_regions(&raw, column_id, row_count)?;
+        let enc = regions.verified_payload(&raw, column_id)?;
+        let decoded = crate::encoding::create_encoding(regions.header.encoding_type)
+            .decode_range(enc, row_count, value_size, start, end)?;
+        crate::encoding::eval_predicate_on_raw(&decoded, end - start, value_size, predicate)
+    }
+
     /// Reads only the SEGMENT_HEADER_SIZE-byte header for a column, without
     /// pulling the encoded data. This is the metadata-only path used by
     /// aggregate pushdown (MIN/MAX/COUNT answered from the header), so a
@@ -1057,6 +1185,8 @@ mod tests {
             xmax_range_hi: u64::MAX,
             primary_key_column_id: 0,
             sort_order: SortOrder::None,
+            segment_index_offset: 0,
+            segment_index_size: 0,
         };
         let data = vec![0x5Au8; 4096];
         {
@@ -1099,6 +1229,8 @@ mod tests {
             xmax_range_hi: u64::MAX,
             primary_key_column_id: 0,
             sort_order: SortOrder::Asc,
+            segment_index_offset: 0,
+            segment_index_size: 0,
         };
 
         // Write the file.
@@ -1220,6 +1352,8 @@ mod tests {
             xmax_range_hi: 0,
             primary_key_column_id: 0,
             sort_order: SortOrder::None,
+            segment_index_offset: 0,
+            segment_index_size: 0,
         };
 
         let writer = ZyrFileWriter::create(&filePath, header).expect("create writer");
@@ -1262,6 +1396,8 @@ mod tests {
             xmax_range_hi: 0,
             primary_key_column_id: 0,
             sort_order: SortOrder::Desc,
+            segment_index_offset: 0,
+            segment_index_size: 0,
         };
 
         let mut writer = ZyrFileWriter::create(&filePath, header).expect("create writer");
@@ -1307,6 +1443,8 @@ mod tests {
             xmax_range_hi: 500,
             primary_key_column_id: 3,
             sort_order: SortOrder::Desc,
+            segment_index_offset: 0,
+            segment_index_size: 0,
         };
 
         let bytes = header.to_bytes();
@@ -1362,6 +1500,8 @@ mod tests {
             xmax_range_hi: 0,
             primary_key_column_id: 0,
             sort_order: SortOrder::None,
+            segment_index_offset: 0,
+            segment_index_size: 0,
         };
 
         let mut writer = ZyrFileWriter::create(&filePath, header).expect("create writer");
