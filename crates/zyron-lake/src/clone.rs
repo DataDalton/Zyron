@@ -45,7 +45,7 @@ use std::path::Path;
 
 use zyron_common::ZyronError;
 
-use crate::paths::LakePaths;
+use crate::paths::{LakePaths, discard_staged_file};
 use crate::transaction_log::{CommitAttempt, LogEntry, TransactionLog};
 
 /// Table this one was cloned from, as its table id
@@ -117,7 +117,7 @@ pub fn clone_table(
     };
     if let Err(e) = link_all() {
         for path in &linked {
-            let _ = fs::remove_file(path);
+            discard_staged_file(path);
         }
         return Err(e);
     }
@@ -166,7 +166,7 @@ pub fn clone_table(
         Ok(log) => log,
         Err(e) => {
             for path in &linked {
-                let _ = fs::remove_file(path);
+                discard_staged_file(path);
             }
             return Err(e);
         }

@@ -347,6 +347,7 @@ async fn apply_lake_maintenance_options(
             read_predicate: None,
             read_version: 0,
             audit: None,
+            deadline: None,
         },
         |_| Ok(commits.clone()),
     )

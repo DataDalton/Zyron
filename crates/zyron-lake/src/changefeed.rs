@@ -264,6 +264,7 @@ mod tests {
             read_predicate: None,
             read_version: 0,
             audit: None,
+            deadline: None,
         }
     }
 

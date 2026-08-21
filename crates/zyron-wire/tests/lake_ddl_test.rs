@@ -182,6 +182,7 @@ async fn test_lake_scan_reads_appended_rows_and_sql_insert_publishes_on_commit()
         read_predicate: None,
         read_version: 0,
         audit: None,
+        deadline: None,
     };
     let out = zyron_lake::append_rows(&log, attempt, entry.id.0 as u64, &columns).expect("append");
     assert_eq!(out.rows, 3);
@@ -414,6 +415,7 @@ async fn test_drop_lake_table_reclaims_the_whole_root() {
         read_predicate: None,
         read_version: 0,
         audit: None,
+        deadline: None,
     };
     zyron_lake::append_rows(
         &log,
@@ -1887,6 +1889,7 @@ async fn test_lake_branches_view_lists_branches_and_their_lead() {
             read_predicate: None,
             read_version: 0,
             audit: None,
+            deadline: None,
         },
         entry.id.0 as u64,
         &[zyron_lake::ColumnData {
@@ -2015,6 +2018,7 @@ async fn test_branch_ddl_routes_to_the_lake_log() {
             read_predicate: None,
             read_version: 0,
             audit: None,
+            deadline: None,
         },
         entry.id.0 as u64,
         &[zyron_lake::ColumnData {
@@ -2088,6 +2092,7 @@ async fn test_select_in_branch_reads_the_branch_head() {
             read_predicate: None,
             read_version: 0,
             audit: None,
+            deadline: None,
         },
         entry.id.0 as u64,
         &[zyron_lake::ColumnData {

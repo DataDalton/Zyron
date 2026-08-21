@@ -357,6 +357,7 @@ fn lake_maintenance_attempt() -> zyron_lake::CommitAttempt<'static> {
         read_predicate: None,
         read_version: 0,
         audit: None,
+        deadline: None,
     }
 }
 

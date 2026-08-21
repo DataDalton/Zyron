@@ -59,6 +59,7 @@ pub fn load_lake_from_rows(
             read_predicate: None,
             read_version: 0,
             audit: None,
+            deadline: None,
         },
         schema,
         cluster_spec,
@@ -77,6 +78,7 @@ pub fn load_lake_from_rows(
                 read_predicate: None,
                 read_version: 0,
                 audit: None,
+                deadline: None,
             },
             table_id,
             rows,
@@ -327,6 +329,7 @@ mod tests {
                 read_predicate: None,
                 read_version: 0,
                 audit: None,
+                deadline: None,
             },
             &crate::predicate::LakePredicate::Compare {
                 column_id: 0,

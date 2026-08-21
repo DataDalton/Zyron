@@ -36,7 +36,7 @@ use crate::manifest::{
     decode_index_file, decode_index_spec, decode_partition_entry, encode_delete_predicate,
     encode_index_file, encode_index_spec, encode_partition_entry,
 };
-use crate::paths::{LakePaths, VersionFileKind, parse_version_file_name};
+use crate::paths::{LakePaths, VersionFileKind, discard_staged_file, parse_version_file_name};
 use crate::predicate::{LakePredicate, PruneDecision};
 use crate::prune_index::PruneIndex;
 use crate::schema::LakeSchema;
@@ -885,6 +885,22 @@ pub struct CommitAttempt<'a> {
     /// means the predicate carries no base pin
     pub read_version: u64,
     pub audit: Option<&'a CommitInfo>,
+    /// When to stop waiting for a base to build on. None waits for as long
+    /// as it takes, which is what a caller with no statement timeout asks
+    /// for and what every commit did before this existed.
+    ///
+    /// A lost race means another writer committed, so retrying is right and
+    /// bounding the count would refuse writes that were about to succeed.
+    /// What a retry cannot do is run forever: the caller is holding a
+    /// connection and, on this path, a runtime thread.
+    ///
+    /// The deadline governs waiting and never an attempt in flight. It is
+    /// read at one point, the top of a retry, where this attempt has no
+    /// version file, no published entry and no staged data, and it is not
+    /// read at all on the first pass. So it can refuse a commit that has not
+    /// begun, it can never interrupt one that has, and it can never report a
+    /// committed write as failed
+    pub deadline: Option<std::time::Instant>,
 }
 
 /// Table property naming the node that owns writes to a dataset.
@@ -1022,6 +1038,10 @@ pub struct TransactionLog {
     /// Reconstructed manifests by version
     manifests: scc::HashMap<u64, Arc<CachedManifest>>,
     commit_retries: AtomicU64,
+    /// Commits that gave up because the caller's deadline passed while they
+    /// were waiting for a base. Separate from retries because a retry is
+    /// healthy contention and this is a statement that did not run
+    commit_timeouts: AtomicU64,
 }
 
 /// One version's manifest and the projections derived from it.
@@ -1316,6 +1336,7 @@ impl TransactionLog {
             pending: scc::HashMap::new(),
             manifests: scc::HashMap::new(),
             commit_retries: AtomicU64::new(0),
+            commit_timeouts: AtomicU64::new(0),
             local_node: AtomicU64::new(local_node()),
         };
         let mut state = None;
@@ -1428,6 +1449,7 @@ impl TransactionLog {
             pending: scc::HashMap::new(),
             manifests: scc::HashMap::new(),
             commit_retries: AtomicU64::new(0),
+            commit_timeouts: AtomicU64::new(0),
             local_node: AtomicU64::new(local_node()),
         };
         // Validate the surviving chain replays cleanly
@@ -1454,6 +1476,11 @@ impl TransactionLog {
     /// Times a commit lost the version race and retried
     pub fn commit_retries(&self) -> u64 {
         self.commit_retries.load(Ordering::Relaxed)
+    }
+
+    /// Times a commit gave up because its deadline passed while waiting
+    pub fn commit_timeouts(&self) -> u64 {
+        self.commit_timeouts.load(Ordering::Relaxed)
     }
 
     /// Manifest at the newest published version
@@ -1619,6 +1646,7 @@ impl TransactionLog {
             pending: scc::HashMap::new(),
             manifests: scc::HashMap::new(),
             commit_retries: AtomicU64::new(0),
+            commit_timeouts: AtomicU64::new(0),
             local_node: AtomicU64::new(local_node()),
         };
         // The chain must replay, a branch that cannot be read is not a
@@ -1684,6 +1712,25 @@ impl TransactionLog {
         let mut waits: u32 = 0;
         let mut races: u64 = 0;
         loop {
+            // Waiting stops when the caller's deadline passes, and only from
+            // the second pass on. The first attempt always runs, so a commit
+            // that meets no contention at all is never refused for being
+            // late, and this attempt holds no version file and no staged
+            // entry at this point, so refusing here abandons nothing
+            if (waits > 0 || races > 0)
+                && let Some(deadline) = attempt.deadline
+                && std::time::Instant::now() >= deadline
+            {
+                self.commit_timeouts.fetch_add(1, Ordering::Relaxed);
+                return Err(ZyronError::ConflictError {
+                    mine: attempt.operation.name().to_string(),
+                    theirs: "concurrent writers".to_string(),
+                    reason: format!(
+                        "the deadline passed after {} lost races and {} waits, without a base                          staying still long enough to commit against",
+                        races, waits
+                    ),
+                });
+            }
             // A pending version from another transaction is uncommitted
             // state, building on it would tie this commit to its fate.
             // The head is read before the pending scan: registration
@@ -2182,7 +2229,7 @@ impl TransactionLog {
         }
         if let Err(e) = fs::rename(&tmp, &target) {
             // A concurrent checkpointer winning the rename is success
-            let _ = fs::remove_file(&tmp);
+            discard_staged_file(&tmp);
             if !target.exists() {
                 return Err(e.into());
             }
@@ -2461,7 +2508,68 @@ mod tests {
             read_predicate: None,
             read_version: 0,
             audit: None,
+            deadline: None,
         }
+    }
+
+    /// A deadline governs waiting between attempts and nothing else.
+    ///
+    /// The dangerous failure would be refusing a commit that had no reason
+    /// to fail, or abandoning one already in flight. So an already elapsed
+    /// deadline must still let an uncontended commit through: the first
+    /// attempt is never gated, and a commit that meets no contention makes
+    /// exactly one attempt.
+    #[test]
+    fn an_elapsed_deadline_still_admits_an_uncontended_commit() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let log = new_log(dir.path());
+
+        // A deadline in the past, which the loop would honour if it gated
+        // the first attempt
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        let mut attempt = attempt(OperationKind::Append);
+        attempt.deadline = Some(past);
+
+        let before = log.head_version();
+        let version = log
+            .commit(attempt, |_| {
+                Ok(vec![LogEntry::AddFile(data_file(0x900, 0, 99, 100))])
+            })
+            .expect("an uncontended commit is never refused for being late");
+        assert_eq!(
+            version,
+            before + 1,
+            "the commit has to land, not be skipped"
+        );
+        assert_eq!(log.head_version(), version);
+        assert_eq!(
+            log.commit_timeouts(),
+            0,
+            "nothing waited, so nothing timed out"
+        );
+
+        // And the file it named is visible at that version
+        let manifest = log.manifest_at(version).expect("manifest");
+        assert!(
+            manifest.entry_for(0x900).is_some(),
+            "the committed file has to be in the manifest the commit produced"
+        );
+    }
+
+    /// With no deadline the loop waits as long as it takes, which is what a
+    /// session without a statement timeout asks for and what every commit
+    /// did before the field existed.
+    #[test]
+    fn no_deadline_never_times_out() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let log = new_log(dir.path());
+        for i in 0..8u64 {
+            log.commit(attempt(OperationKind::Append), |_| {
+                Ok(vec![LogEntry::AddFile(data_file(0xA00 + i, 0, 99, 100))])
+            })
+            .expect("commit");
+        }
+        assert_eq!(log.commit_timeouts(), 0);
     }
 
     fn new_log(dir: &Path) -> TransactionLog {

@@ -1220,27 +1220,55 @@ impl Operator for LakeUpdateOperator {
                 self.predicate.as_ref(),
             )?;
 
-            let attempt = zyron_lake::CommitAttempt {
-                operation: zyron_lake::OperationKind::Update,
-                db_txn_id: self.ctx.lake_txn_id(),
-                commit_lsn: 0,
-                timestamp_us,
-                // The probe's key ranges pinned at the probed head, so a
-                // concurrent commit that lands a probed key after the
-                // probe conflicts instead of committing a duplicate
-                read_predicate: probe.as_ref().map(|(p, _)| p),
-                read_version: probe.as_ref().map(|(_, v)| *v).unwrap_or(0),
-                audit: None,
-            };
-            let outcome = zyron_lake::update_where(
-                &log,
-                attempt,
-                table_entry.id.0 as u64,
-                self.predicate.as_ref(),
-                &self.sql,
-                &columns,
-                matched,
-            )?;
+            // Off the worker thread. The commit writes files and
+            // fsyncs them, and waits between attempts when it loses a
+            // race, so holding a runtime worker for it stalls every
+            // other connection that thread was going to serve. The
+            // handoff is microseconds against a commit measured in
+            // milliseconds.
+            //
+            // The attempt is built inside the task because it borrows
+            // the probe, which moves in with it
+            let blocking_log = Arc::clone(&log);
+            let blocking_predicate = self.predicate.clone();
+            let blocking_sql = self.sql.clone();
+            let blocking_table_id = table_entry.id.0 as u64;
+            let blocking_txn_id = self.ctx.lake_txn_id();
+            // The statement's own deadline, so a commit losing races to
+            // other writers stops waiting when the statement is over time
+            // instead of waiting forever. Unset when the session has no
+            // statement timeout, which waits as before
+            let blocking_deadline = self.ctx.deadline();
+            let outcome = tokio::task::spawn_blocking(move || {
+                let attempt = zyron_lake::CommitAttempt {
+                    operation: zyron_lake::OperationKind::Update,
+                    db_txn_id: blocking_txn_id,
+                    commit_lsn: 0,
+                    timestamp_us,
+                    // The probe's key ranges pinned at the probed head, so a
+                    // concurrent commit that lands a probed key after the
+                    // probe conflicts instead of committing a duplicate
+                    read_predicate: probe.as_ref().map(|(p, _)| p),
+                    read_version: probe.as_ref().map(|(_, v)| *v).unwrap_or(0),
+                    audit: None,
+                    deadline: blocking_deadline,
+                };
+                zyron_lake::update_where(
+                    &blocking_log,
+                    attempt,
+                    blocking_table_id,
+                    blocking_predicate.as_ref(),
+                    &blocking_sql,
+                    &columns,
+                    matched,
+                )
+            })
+            .await
+            .map_err(|e| {
+                zyron_common::ZyronError::Internal(format!(
+                    "lake update task failed to run to completion: {e}"
+                ))
+            })??;
             zyron_lake::register_txn_pending(
                 self.ctx.disk_manager.data_dir(),
                 self.ctx.lake_txn_id(),
@@ -1436,22 +1464,43 @@ impl Operator for LakeDeleteOperator {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_micros() as i64)
                 .unwrap_or(0);
-            let attempt = zyron_lake::CommitAttempt {
-                operation: zyron_lake::OperationKind::Delete,
-                db_txn_id: self.ctx.lake_txn_id(),
-                commit_lsn: 0,
-                timestamp_us,
-                read_predicate: None,
-                read_version: 0,
-                audit: None,
-            };
-            // No predicate deletes every row, which the always-true
-            // predicate over a null-free existence check cannot express,
-            // so it is its own path: every file is covered
-            let outcome = match &self.predicate {
-                Some(p) => zyron_lake::delete_where(&log, attempt, p, &self.sql)?,
-                None => zyron_lake::delete_all(&log, attempt)?,
-            };
+            // Off the worker thread, as the update path above. A delete
+            // commits a predicate rather than a file, but it still writes
+            // and fsyncs a version and still waits when it loses a race
+            let blocking_log = Arc::clone(&log);
+            let blocking_predicate = self.predicate.clone();
+            let blocking_sql = self.sql.clone();
+            let blocking_txn_id = self.ctx.lake_txn_id();
+            // The statement's own deadline, so a commit losing races to
+            // other writers stops waiting when the statement is over time
+            // instead of waiting forever. Unset when the session has no
+            // statement timeout, which waits as before
+            let blocking_deadline = self.ctx.deadline();
+            let outcome = tokio::task::spawn_blocking(move || {
+                let attempt = zyron_lake::CommitAttempt {
+                    operation: zyron_lake::OperationKind::Delete,
+                    db_txn_id: blocking_txn_id,
+                    commit_lsn: 0,
+                    timestamp_us,
+                    read_predicate: None,
+                    read_version: 0,
+                    audit: None,
+                    deadline: blocking_deadline,
+                };
+                // No predicate deletes every row, which the always-true
+                // predicate over a null-free existence check cannot
+                // express, so it is its own path: every file is covered
+                match &blocking_predicate {
+                    Some(p) => zyron_lake::delete_where(&blocking_log, attempt, p, &blocking_sql),
+                    None => zyron_lake::delete_all(&blocking_log, attempt),
+                }
+            })
+            .await
+            .map_err(|e| {
+                zyron_common::ZyronError::Internal(format!(
+                    "lake delete task failed to run to completion: {e}"
+                ))
+            })??;
             if let Some(version) = outcome.version {
                 zyron_lake::register_txn_pending(
                     self.ctx.disk_manager.data_dir(),

@@ -22,6 +22,46 @@
 
 use std::path::{Path, PathBuf};
 
+/// Removes a file this process staged and no longer references, reporting
+/// it if the removal fails.
+///
+/// Every caller is already on an abandon or error path, so a failure here
+/// cannot be returned anywhere that would act on it. What it must not do is
+/// happen silently. The file is named by no manifest, so nothing reads it
+/// and no answer changes, but it holds disk until a REPAIR sweep reclaims
+/// it, and an operator with no line in the log has no reason to run one.
+///
+/// A file that is already gone is the intended state, not a failure
+pub(crate) fn discard_staged_file(path: &Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            return;
+        }
+        tracing::warn!(
+            target: "zyron::lake",
+            path = %path.display(),
+            error = %e,
+            "a staged lake file could not be removed and is left unreferenced on disk, REPAIR reclaims it"
+        );
+    }
+}
+
+/// Removes a staging directory and everything under it, reporting it if the
+/// removal fails. As [`discard_staged_file`], for a whole pass directory
+pub(crate) fn discard_staged_dir(path: &Path) {
+    if let Err(e) = std::fs::remove_dir_all(path) {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            return;
+        }
+        tracing::warn!(
+            target: "zyron::lake",
+            path = %path.display(),
+            error = %e,
+            "a lake staging directory could not be removed and is left on disk, REPAIR reclaims it"
+        );
+    }
+}
+
 /// Width of the zero-padded decimal version component in .zyl and .zym
 /// file names. 20 digits covers the full u64 range so names sort
 /// lexicographically in version order

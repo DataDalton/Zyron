@@ -112,6 +112,71 @@ pub fn calibration() -> Option<f64> {
     }
 }
 
+/// Bytes the storage calibration writes, the size of a small metadata file
+/// like a version record. What is timed is the create and the fsync, not the
+/// transfer, so the payload only has to be realistic rather than large
+const STORAGE_CALIBRATION_BYTES: usize = 256;
+
+/// Passes the storage calibration takes. More than the CPU kernel needs,
+/// because an on-access scanner reading a freshly created file makes this
+/// measurement bimodal and the fastest pass is the one it did not touch
+const STORAGE_CALIBRATION_PASSES: usize = 5;
+
+/// The storage reading in force, microseconds. Zero until a suite calibrates
+static STORAGE_CALIBRATION: Mutex<f64> = Mutex::new(0.0);
+
+/// Times creating, writing and fsyncing one small file, and makes the
+/// reading current.
+///
+/// The CPU calibration cannot see this. A durable write is the filesystem,
+/// the device and whatever filter driver sits between them, and none of that
+/// moves with how busy the cores are: across six runs where the CPU reading
+/// did not shift by half a percent, the phases that create and fsync files
+/// swung by a quarter and took the insert figure down with them. A write
+/// benchmark compared across runs on the CPU stamp alone is comparing two
+/// different machines and calling the difference a regression.
+///
+/// Written where the suites put their temporary tables, so it measures the
+/// volume they are measured on
+pub fn calibrate_storage() -> f64 {
+    let dir = std::env::temp_dir().join("zyron_bench_calibration");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return 0.0;
+    }
+    let payload = vec![0u8; STORAGE_CALIBRATION_BYTES];
+    let mut best = f64::INFINITY;
+    for pass in 0..STORAGE_CALIBRATION_PASSES {
+        let path = dir.join(format!("cal_{}_{}.tmp", std::process::id(), pass));
+        // A leftover from a killed run would make create_new fail and leave
+        // the reading at its starting infinity
+        let _ = std::fs::remove_file(&path);
+        let start = Instant::now();
+        let timed = std::fs::File::create_new(&path).and_then(|mut f| {
+            f.write_all(&payload)?;
+            f.sync_all()
+        });
+        let us = start.elapsed().as_nanos() as f64 / 1_000.0;
+        let _ = std::fs::remove_file(&path);
+        if timed.is_ok() && us < best {
+            best = us;
+        }
+    }
+    let best = if best.is_finite() { best } else { 0.0 };
+    if let Ok(mut current) = STORAGE_CALIBRATION.lock() {
+        *current = best;
+    }
+    best
+}
+
+/// The storage reading metrics recorded now are stamped with, or None before
+/// any suite has calibrated storage
+pub fn storage_calibration() -> Option<f64> {
+    match STORAGE_CALIBRATION.lock() {
+        Ok(current) if *current > 0.0 => Some(*current),
+        _ => None,
+    }
+}
+
 /// Whether this build can produce a number worth comparing to a target.
 ///
 /// An unoptimized build is not slower by a constant factor. It is slower by an
@@ -270,6 +335,11 @@ struct MetricRecord {
     /// calibrate. Two numbers taken at readings that differ are not
     /// comparable without dividing it out
     calibration: Option<f64>,
+    /// Storage state reading in force, microseconds to create write and
+    /// fsync one small file. A phase that creates or syncs files is read
+    /// against this rather than the CPU reading, which does not move with
+    /// the filesystem
+    storage_calibration: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -1358,14 +1428,17 @@ fn push_metric_body(out: &mut String, m: &MetricRecord, indent: &str, trailing: 
         Some(v) => format!("{:.3}", v),
         None => "null".to_string(),
     };
+    let storage = match m.storage_calibration {
+        Some(v) => format!("{:.3}", v),
+        None => "null".to_string(),
+    };
     out.push_str(&format!(
-        "{indent}\"higher_is_better\": {},
-",
+        "{indent}\"higher_is_better\": {},\n",
         m.higher_is_better
     ));
+    out.push_str(&format!("{indent}\"calibration_us\": {calibration},\n"));
     out.push_str(&format!(
-        "{indent}\"calibration_us\": {calibration}{}
-",
+        "{indent}\"storage_calibration_us\": {storage}{}\n",
         if trailing { "," } else { "" }
     ));
 }
@@ -1674,6 +1747,7 @@ fn write_benchmark_record(
         passed,
         higher_is_better,
         calibration: calibration(),
+        storage_calibration: storage_calibration(),
     };
     if let Ok(mut g) = collected_metrics().lock() {
         g.push(record);
@@ -1698,6 +1772,7 @@ mod tests {
             passed: Some(true),
             higher_is_better: false,
             calibration: None,
+            storage_calibration: None,
         }
     }
 

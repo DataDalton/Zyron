@@ -1018,6 +1018,7 @@ async fn alter_lake_table_columns(
         read_predicate: None,
         read_version: 0,
         audit: None,
+        deadline: None,
     };
 
     match op {
@@ -2498,6 +2499,7 @@ async fn handle_create_table_clone(
         read_predicate: None,
         read_version: 0,
         audit: None,
+        deadline: None,
     };
     let (log, outcome) =
         match zyron_lake::clone_table(&src_log, clone_paths, attempt, source.at_version) {
@@ -3339,6 +3341,7 @@ async fn apply_create_table_lake(
         read_predicate: None,
         read_version: 0,
         audit: None,
+        deadline: None,
     };
     // The storage root, the same one the scan path derives from
     let paths = zyron_lake::LakePaths::new(server.disk_manager.data_dir(), entry.id.0);
@@ -3586,6 +3589,7 @@ fn clustering_commit_attempt() -> zyron_lake::CommitAttempt<'static> {
         read_predicate: None,
         read_version: 0,
         audit: None,
+        deadline: None,
     }
 }
 
@@ -4524,6 +4528,7 @@ async fn handle_truncate(
             read_predicate: None,
             read_version: 0,
             audit: None,
+            deadline: None,
         };
         zyron_lake::delete_all(&log, attempt).map_err(ProtocolError::Database)?;
         return Ok(DdlResult::Tag("TRUNCATE TABLE".to_string()));
@@ -5965,6 +5970,7 @@ fn lake_maintenance_attempt(
         read_predicate: None,
         read_version: 0,
         audit: None,
+        deadline: None,
     }
 }
 
@@ -9751,6 +9757,7 @@ async fn handle_restore_to_version(
         read_predicate: None,
         read_version: 0,
         audit: None,
+        deadline: None,
     };
     let outcome =
         zyron_lake::restore_to_version(&log, attempt, version).map_err(ProtocolError::Database)?;

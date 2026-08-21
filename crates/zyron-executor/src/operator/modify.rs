@@ -2689,7 +2689,32 @@ impl Operator for InsertOperator {
                     &lake_batches,
                 )
                 .await?;
-                let outcome = append_lake_batches(&self.ctx, &table_entry, &lake_batches, derived)?;
+                // Off the worker thread. Writing the data file, fsyncing it,
+                // writing the version file and fsyncing that is milliseconds
+                // of blocking work, and a commit that loses races to other
+                // writers waits between attempts on top of that. Held on a
+                // runtime worker it stalls every other connection that
+                // thread was going to serve, and the handoff costs a few
+                // microseconds against an append measured in milliseconds.
+                //
+                // The batches move in and come back out rather than being
+                // cloned, because they are the rows themselves and three
+                // later steps still read them
+                let blocking_ctx = Arc::clone(&self.ctx);
+                let blocking_entry = Arc::clone(&table_entry);
+                let (appended, returned) = tokio::task::spawn_blocking(move || {
+                    let appended =
+                        append_lake_batches(&blocking_ctx, &blocking_entry, &lake_batches, derived);
+                    (appended, lake_batches)
+                })
+                .await
+                .map_err(|e| {
+                    zyron_common::ZyronError::Internal(format!(
+                        "lake append task failed to run to completion: {e}"
+                    ))
+                })?;
+                lake_batches = returned;
+                let outcome = appended?;
                 self.ctx.mark_wrote_wal();
                 // The rows only have addresses once the commit assigned
                 // them, so search index maintenance runs after the append
@@ -2951,6 +2976,11 @@ fn append_lake_batches(
         read_predicate: probe.as_ref().map(|(p, _)| p),
         read_version: probe.as_ref().map(|(_, v)| *v).unwrap_or(0),
         audit: None,
+        // The statement's own deadline, so a commit losing races to other
+        // writers stops waiting when the statement is over time instead of
+        // holding this thread indefinitely. Unset when the session has no
+        // statement timeout, which waits as before
+        deadline: ctx.deadline(),
     };
     let out = zyron_lake::append_rows(&log, attempt, table_entry.id.0 as u64, &columns)?;
     zyron_lake::register_txn_pending(

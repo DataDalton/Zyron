@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use zyron_common::ZyronError;
 
-use crate::paths::txn_intent_file;
+use crate::paths::{discard_staged_file, txn_intent_file};
 use crate::transaction_log::CommitStatus;
 
 /// Marks a transaction id as an intent sequence rather than a database
@@ -279,7 +279,7 @@ impl CrossTableTxn {
         // The versions are gone, so the intent can go: an intent removed
         // while its versions survive would read as a finished transaction
         if self.prepared {
-            let _ = fs::remove_file(txn_intent_file(&self.data_dir, self.seq));
+            discard_staged_file(&txn_intent_file(&self.data_dir, self.seq));
         }
         touched
     }
@@ -444,6 +444,7 @@ mod tests {
             read_predicate: None,
             read_version: 0,
             audit: None,
+            deadline: None,
         }
     }
 

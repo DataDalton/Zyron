@@ -101,6 +101,7 @@ async fn harness_with_one_lake_table() -> (Harness, LakePaths) {
             read_predicate: None,
             read_version: 0,
             audit: None,
+            deadline: None,
         },
         &lake_schema,
         None,

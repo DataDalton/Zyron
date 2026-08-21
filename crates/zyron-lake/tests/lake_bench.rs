@@ -29,8 +29,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use zyron_bench_harness::{
-    RatioBound, assert_exact_metric, calibrate, check_performance, init, measuring, record_metric,
-    record_metric_best, tprintln,
+    RatioBound, assert_exact_metric, calibrate, calibrate_storage, check_performance, init,
+    measuring, record_metric, record_metric_best, tprintln,
 };
 use zyron_common::TypeId;
 use zyron_lake::manifest::{ClusterSpec, ColumnStatsEntry, PartitionEntry};
@@ -66,12 +66,18 @@ fn section(title: &str) -> std::sync::MutexGuard<'static, ()> {
     // fuller page cache, and the same measurement in two positions of this
     // suite has come out nearly two to one apart. Without the stamp that
     // difference reads as a regression
+    // Two readings, because they move independently. The kernel says how
+    // fast the cores are, and a durable write says how fast the filesystem
+    // is, and a phase that creates and fsyncs files tracks the second one
+    // whatever the first says
     let reading = calibrate();
+    let storage = calibrate_storage();
     tprintln!("");
     tprintln!("=== {} ===", title);
     tprintln!(
-        "  machine state: {:.0}us on the reference workload",
-        reading
+        "  machine state: {:.0}us cpu, {:.0}us durable write",
+        reading,
+        storage
     );
     guard
 }
@@ -185,6 +191,7 @@ fn attempt(operation: OperationKind, txn: u64) -> CommitAttempt<'static> {
         read_predicate: None,
         read_version: 0,
         audit: None,
+        deadline: None,
     }
 }
 
@@ -1854,10 +1861,130 @@ fn test_insert_path_decomposition() {
         "us",
         bounded_us,
     );
+    // A ratio rather than a difference. The two encodes are within a few
+    // percent of each other since the trial output is kept rather than
+    // thrown away, and subtracting one from the other prints the noise
+    // between two millisecond measurements as though it were a phase
     tprintln!(
-        "  Exact selection costs {:.0}us over bounded, {:.1}x",
-        encode - bounded,
+        "  Exact selection costs {:.2}x bounded selection",
         encode / bounded
+    );
+
+    let packed: Vec<(zyron_common::TypeId, usize, Vec<u8>, Vec<Option<&[u8]>>)> = schema
+        .columns
+        .iter()
+        .map(|col| {
+            let data = batch
+                .iter()
+                .find(|c| c.column_id == col.id)
+                .expect("column data");
+            let physical = col.physical_type_id();
+            let value_size = physical.fixed_size().unwrap_or(0);
+            let views: Vec<Option<&[u8]>> = data.cells.iter().map(|c| c.as_deref()).collect();
+            let mut raw = vec![0u8; views.len() * value_size];
+            if value_size > 0 {
+                for (i, v) in views.iter().enumerate() {
+                    if let Some(v) = v {
+                        raw[i * value_size..(i + 1) * value_size].copy_from_slice(v);
+                    }
+                }
+            }
+            (physical, value_size, raw, views)
+        })
+        .collect();
+
+    // The bloom and the sketch, each timed on its own rather than as the
+    // gap between two whole encodes. Taken as a difference they reported one
+    // percent and nine percent of the same phase on two runs of the same
+    // code, because the gap between two measurements of seventeen hundred
+    // microseconds is noise before it is a phase
+    let mut bloom_us = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        let (_, us) = micros(|| {
+            let mut kept = 0usize;
+            for (_, _, _, views) in &packed {
+                let mut filter = zyron_storage::columnar::BloomFilter::new(views.len() as u64);
+                for v in views.iter().flatten() {
+                    filter.insert(v);
+                }
+                kept += filter.on_disk_size();
+            }
+            kept
+        });
+        bloom_us.push(us);
+    }
+    let bloom_cost = record_metric(
+        "lake_targets",
+        "Insert phase, build the value blooms",
+        "us",
+        bloom_us,
+    );
+
+    let mut sketch_us = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        let (_, us) = micros(|| {
+            let mut kept = 0u64;
+            for (_, _, _, views) in &packed {
+                let mut sketch = zyron_storage::columnar::DistinctSketch::new();
+                for v in views.iter().flatten() {
+                    sketch.insert(v);
+                }
+                kept += sketch.estimate();
+            }
+            kept
+        });
+        sketch_us.push(us);
+    }
+    let sketch_cost = record_metric(
+        "lake_targets",
+        "Insert phase, count distinct values",
+        "us",
+        sketch_us,
+    );
+
+    // Choosing the encoding, which under exact selection trial encodes the
+    // whole column and hands its output back to be kept. Measured against
+    // the packed buffer the fused pass produces, so it is the same call the
+    // segment build makes with the same input.
+    //
+    // What is left of the encode once this, the bloom and the sketch are
+    // accounted for is the fused pass itself: the walk that packs the buffer,
+    // tracks the zone bounds and counts the nulls
+
+    let mut select_us = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        let (_, us) = micros(|| {
+            let mut kept = 0usize;
+            for (physical, value_size, raw, views) in &packed {
+                let choice = zyron_storage::encoding::select_encoding_packed(
+                    *physical,
+                    views,
+                    raw,
+                    *value_size,
+                    true,
+                );
+                kept += choice.encoded.as_ref().map_or(0, |b| b.len());
+            }
+            kept
+        });
+        select_us.push(us);
+    }
+    let select = record_metric(
+        "lake_targets",
+        "Insert phase, choose and trial encode",
+        "us",
+        select_us,
+    );
+    tprintln!(
+        "  Encode {:.0}us splits into {:.0}us select and trial encode, {:.0}us bloom, {:.0}us sketch",
+        encode,
+        select,
+        bloom_cost,
+        sketch_cost
+    );
+    tprintln!(
+        "    leaving {:.0}us for the fused pass that packs the buffer, bounds the zones and counts the nulls",
+        (encode - select - bloom_cost - sketch_cost).max(0.0)
     );
 
     // Placing rows in stored order: the loop the lake writer runs before it
@@ -1925,15 +2052,40 @@ fn test_insert_path_decomposition() {
                 },
             )
             .expect("encode");
-            let zones: Vec<u8> = segment
-                .zone_maps
-                .iter()
-                .flat_map(|z| z.to_bytes())
-                .collect();
-            let bloom = segment.bloom_filter.as_ref().map(|b| b.to_bytes());
-            (col.id, segment, zones, bloom)
+            let (zones, bloom) = zyron_lake::writer::segment_frame_bytes(&segment);
+            (col.id, segment, zones, bloom, views)
         })
         .collect();
+
+    // Describing the columns for the file and the manifest, against segments
+    // that are already built. Zone maps flattened, the bloom serialized, the
+    // bounds read back and the stats entry assembled: real per column work
+    // that is neither encoding nor IO. Measured against production rather
+    // than derived, because a phase taken as the gap between a whole write
+    // and the parts of it that were timed carries every other measurement's
+    // error, and this one has read anywhere from four to ten percent of the
+    // same insert
+    let mut describe_us = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        let (_, us) = micros(|| {
+            let mut kept = 0usize;
+            for (col, (_, segment, _, _, views)) in schema.columns.iter().zip(prebuilt.iter()) {
+                let (zones, bloom) = zyron_lake::writer::segment_frame_bytes(segment);
+                kept += zones.len();
+                let entry =
+                    zyron_lake::writer::column_stats_entry(col, views, segment, n, bloom, 0);
+                kept += entry.column_id as usize;
+            }
+            kept
+        });
+        describe_us.push(us);
+    }
+    let describe = record_metric(
+        "lake_targets",
+        "Insert phase, describe columns",
+        "us",
+        describe_us,
+    );
     let io_dir = tempfile::tempdir().expect("tempdir");
     let mut io_us = Vec::with_capacity(RUNS);
     for run in 0..RUNS {
@@ -1957,7 +2109,7 @@ fn test_insert_path_decomposition() {
                 },
             )
             .expect("create zyr");
-            for (id, segment, zones, bloom) in &prebuilt {
+            for (id, segment, zones, bloom, _) in &prebuilt {
                 w.write_segment(
                     *id,
                     &segment.header.to_bytes(),
@@ -2005,7 +2157,7 @@ fn test_insert_path_decomposition() {
                 },
             )
             .expect("create zyr");
-            for (id, segment, zones, bloom) in &prebuilt {
+            for (id, segment, zones, bloom, _) in &prebuilt {
                 w.write_segment(
                     *id,
                     &segment.header.to_bytes(),
@@ -2153,6 +2305,64 @@ fn test_insert_path_decomposition() {
         });
         commit_us.push(us);
     }
+    // The two file operations a commit makes, timed on their own against a
+    // version file of the size this table actually writes. A commit is those
+    // plus the head, manifest and maintenance bookkeeping around them, so
+    // measuring the primitives says how much of the published figure is the
+    // filesystem and how much is everything else. The hint is a full rewrite
+    // of a small file on every commit, which is a second file creation for
+    // data the reconstruction treats as advisory
+    let version_bytes = std::fs::read_dir(log.paths().log_dir())
+        .expect("log dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("zyl"))
+        })
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len() as usize)
+        .max()
+        .unwrap_or(0);
+    let primitive_dir = tempfile::tempdir().expect("tempdir");
+    let payload = vec![0u8; version_bytes];
+    let mut version_file_us = Vec::with_capacity(RUNS);
+    for run in 0..RUNS {
+        let path = primitive_dir.path().join(format!("v{run}.zyl"));
+        let (_, us) = micros(|| {
+            let mut f = std::fs::File::create_new(&path).expect("create version file");
+            std::io::Write::write_all(&mut f, &payload).expect("write");
+            f.sync_all().expect("fsync");
+        });
+        version_file_us.push(us);
+    }
+    let version_file = record_metric(
+        "lake_targets",
+        "Commit primitive, create write fsync a version file",
+        "us",
+        version_file_us,
+    );
+    let hint_path = primitive_dir.path().join("_latest");
+    let mut hint_us = Vec::with_capacity(RUNS);
+    for run in 0..RUNS {
+        let (_, us) = micros(|| {
+            std::fs::write(&hint_path, (run as u64).to_string()).expect("hint");
+        });
+        hint_us.push(us);
+    }
+    let hint = record_metric(
+        "lake_targets",
+        "Commit primitive, rewrite the latest hint",
+        "us",
+        hint_us,
+    );
+    tprintln!(
+        "  Version file is {} bytes: {:.0}us to create write and fsync, {:.0}us to rewrite the hint",
+        version_bytes,
+        version_file,
+        hint
+    );
+
     let commit = record_metric(
         "lake_targets",
         "Insert phase, publish a version",
@@ -2206,9 +2416,9 @@ fn test_insert_path_decomposition() {
         100.0 * file_io / append
     );
     tprintln!(
-        "    writer plumbing    {:>6.0}us {:>5.1}%  (zones, bloom bytes, manifest stats)",
-        unsorted - encode - place - file_io,
-        100.0 * (unsorted - encode - place - file_io) / append
+        "    describe columns   {:>6.0}us {:>5.1}%  (zones, bloom bytes, manifest stats)",
+        describe,
+        100.0 * describe / append
     );
     tprintln!(
         "    write file no sort {:>6.0}us {:>5.1}%",
@@ -2229,6 +2439,12 @@ fn test_insert_path_decomposition() {
         "    publish a version  {:>6.0}us {:>5.1}%  (measured directly)",
         commit,
         100.0 * commit / append
+    );
+    tprintln!(
+        "      of which        {:>6.0}us        version file, {:.0}us hint, {:.0}us bookkeeping",
+        version_file,
+        hint,
+        (commit - version_file - hint).max(0.0)
     );
     tprintln!(
         "    append total       {:>6.0}us        {:.0} rows/sec",

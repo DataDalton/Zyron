@@ -8,8 +8,10 @@
 //! Statistics are exact. Min, max and null count come off the segment
 //! build, which orders and counts the column to lay its zone maps and
 //! bloom down, so the manifest entry is filled from a pass the write was
-//! making anyway rather than a second one. The segment's value bloom is
-//! copied into the entry so pruning probes it with zero IO
+//! making anyway rather than a second one. A declared bloom column's filter
+//! is copied into the entry as well, so pruning probes it with zero IO,
+//! while an undeclared column's filter stays in the segment where it costs
+//! the manifest nothing
 
 use std::path::Path;
 
@@ -183,8 +185,9 @@ pub fn write_data_file_at(
         // The whole column is materialized here already, so the encoding
         // is picked by trial encoding every row rather than a prefix, and
         // the distinct count is the whole column's rather than a capped one
+        let declared_bloom = req.bloom_columns.contains(&col.id);
         let options = SegmentOptions {
-            bloom: if req.bloom_columns.contains(&col.id) {
+            bloom: if declared_bloom {
                 BloomPolicy::Force
             } else {
                 BloomPolicy::Auto
@@ -194,13 +197,7 @@ pub fn write_data_file_at(
         };
         let segment =
             ColumnSegment::build_with_options(col.id, physical, value_size, &views, options)?;
-        let (min_cell, max_cell) = column_extrema(physical, &views, &segment);
-        let zone_bytes: Vec<u8> = segment
-            .zone_maps
-            .iter()
-            .flat_map(|z| z.to_bytes())
-            .collect();
-        let bloom_bytes = segment.bloom_filter.as_ref().map(|b| b.to_bytes());
+        let (zone_bytes, bloom_bytes) = segment_frame_bytes(&segment);
         let segment_bytes = writer.write_segment(
             col.id,
             &segment.header.to_bytes(),
@@ -210,18 +207,23 @@ pub fn write_data_file_at(
             &segment.encoded_data,
         )?;
 
-        column_stats.push(ColumnStatsEntry {
-            column_id: col.id,
-            bounds: ColumnBounds {
-                min: min_cell.and_then(|c| cell_to_value(physical, c)),
-                max: max_cell.and_then(|c| cell_to_value(physical, c)),
-                null_count: segment.header.null_count,
-                row_count: row_count as u64,
-            },
-            bloom: bloom_bytes,
-            ndv: segment.ndv,
-            size_bytes: Some(segment_bytes),
-        });
+        // Only a declared column's filter is carried into the manifest. A
+        // bloom is ten bits per value, so carrying every column's would make
+        // the manifest grow with the rows in the table rather than with the
+        // files in it, and the manifest is held in memory per version. Every
+        // filter is still written into the segment, where a probe that has
+        // opened the file reads it from the offset the header records. What
+        // a declared column buys is the probe that answers before the file
+        // is opened at all
+        let bloom_for_manifest = if declared_bloom { bloom_bytes } else { None };
+        column_stats.push(column_stats_entry(
+            col,
+            &views,
+            &segment,
+            row_count,
+            bloom_for_manifest,
+            segment_bytes,
+        ));
     }
     let size_bytes = writer.finalize(true)?;
 
@@ -338,6 +340,53 @@ pub fn stored_order(
 /// first, and a stat slot orders them as a little endian integer, so a
 /// column of that shape is compared here. It is the same shape the stored
 /// filter refuses to push down for
+/// The two byte regions the file writer is handed alongside a built
+/// segment: its zone maps flattened, and its bloom filter serialized.
+///
+/// Reachable on its own because it is real per column work that is neither
+/// encoding nor IO, and a phase measured as the gap between a whole write
+/// and the parts of it that were timed is a remainder carrying every other
+/// measurement's error
+pub fn segment_frame_bytes(segment: &ColumnSegment) -> (Vec<u8>, Option<Vec<u8>>) {
+    let zone_bytes: Vec<u8> = segment
+        .zone_maps
+        .iter()
+        .flat_map(|z| z.to_bytes())
+        .collect();
+    let bloom_bytes = segment.bloom_filter.as_ref().map(|b| b.to_bytes());
+    (zone_bytes, bloom_bytes)
+}
+
+/// The manifest entry describing one written column.
+///
+/// Bounds come off the segment build's own extremes rather than a second
+/// walk of the column, except where the segment's slot order is not the
+/// order the lake compares those cells in. `bloom_for_manifest` is the
+/// filter to carry, which is None for a column that did not declare one
+pub fn column_stats_entry(
+    col: &crate::schema::LakeColumn,
+    views: &[Option<&[u8]>],
+    segment: &ColumnSegment,
+    row_count: usize,
+    bloom_for_manifest: Option<Vec<u8>>,
+    segment_bytes: u64,
+) -> ColumnStatsEntry {
+    let physical = col.physical_type_id();
+    let (min_cell, max_cell) = column_extrema(physical, views, segment);
+    ColumnStatsEntry {
+        column_id: col.id,
+        bounds: ColumnBounds {
+            min: min_cell.and_then(|c| cell_to_value(physical, c)),
+            max: max_cell.and_then(|c| cell_to_value(physical, c)),
+            null_count: segment.header.null_count,
+            row_count: row_count as u64,
+        },
+        bloom: bloom_for_manifest,
+        ndv: segment.ndv,
+        size_bytes: Some(segment_bytes),
+    }
+}
+
 fn column_extrema<'a>(
     physical: TypeId,
     views: &[Option<&'a [u8]>],
@@ -691,6 +740,106 @@ mod tests {
         // An unordered family has no comparison, so it records no bounds
         let doc = entry.stats_for(8).expect("stats");
         assert!(doc.bounds.min.is_none() && doc.bounds.max.is_none());
+    }
+
+    /// A manifest entry has to stay metadata.
+    ///
+    /// A bloom is ten bits per value, so copying one into the entry for
+    /// every column that clears the cardinality heuristic makes the manifest
+    /// grow with the rows in the table rather than the files in it, and the
+    /// manifest is held in memory per version. An undeclared column keeps
+    /// its filter in the segment, where a probe that has opened the file
+    /// still finds it, and the entry carries nothing for it.
+    #[test]
+    fn test_only_a_declared_bloom_column_puts_its_filter_in_the_manifest() {
+        use zyron_storage::columnar::ZyrFileReader;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let paths = LakePaths::new(tmp.path(), 77);
+        let schema = LakeSchema::new(
+            1,
+            vec![
+                column(0, "declared", TypeId::Int64),
+                column(1, "undeclared", TypeId::Int64),
+            ],
+        )
+        .expect("schema");
+
+        // Both columns are high cardinality, so the heuristic would build a
+        // filter for each of them
+        let rows = 4096usize;
+        let columns = vec![
+            ColumnData {
+                column_id: 0,
+                cells: (0..rows)
+                    .map(|i| Some((i as i64).to_le_bytes().to_vec()))
+                    .collect(),
+            },
+            ColumnData {
+                column_id: 1,
+                cells: (0..rows)
+                    .map(|i| Some(((i as i64) * 31).to_le_bytes().to_vec()))
+                    .collect(),
+            },
+        ];
+        let entry = write_data_file(
+            &paths,
+            &schema,
+            &WriteRequest {
+                partition_id: 0x77,
+                columns: &columns,
+                sort_keys: &[],
+                sort_strategies: &[],
+                cluster_spec_id: 0,
+                table_id: 77,
+                bloom_columns: &[0],
+                index_id: None,
+            },
+        )
+        .expect("write");
+
+        let declared = entry.stats_for(0).expect("declared stats");
+        let undeclared = entry.stats_for(1).expect("undeclared stats");
+        assert!(
+            declared.bloom.is_some(),
+            "a declared column buys the probe that answers before the file is opened"
+        );
+        assert!(
+            undeclared.bloom.is_none(),
+            "an undeclared column must not spend manifest bytes on a filter"
+        );
+
+        // The undeclared column still has its filter in the file, so a probe
+        // that has opened it loses nothing
+        let reader = ZyrFileReader::open(&paths.data_file(0x77)).expect("open");
+        for column_id in [0u32, 1] {
+            let bloom = reader
+                .read_bloom(column_id)
+                .expect("read bloom")
+                .unwrap_or_else(|| panic!("column {column_id} carries no filter in its segment"));
+            let data = columns
+                .iter()
+                .find(|c| c.column_id == column_id)
+                .expect("column");
+            for cell in data.cells.iter().flatten() {
+                assert!(
+                    bloom.might_contain(cell.as_slice()),
+                    "column {column_id} filter denies a value the segment stored"
+                );
+            }
+        }
+
+        // And the manifest still prunes on the declared column, which is
+        // what the bytes were spent for
+        let stats = FileStats::new(&entry, &schema);
+        assert!(stats.may_contain(0, &LakeValue::Int(40)));
+        assert!(
+            !stats.may_contain(0, &LakeValue::Int(rows as i64 + 5)),
+            "a value the declared column never stored is provably absent"
+        );
+        // The undeclared column prunes nothing from the manifest, which is a
+        // missed skip and never a dropped row
+        assert!(stats.may_contain(1, &LakeValue::Int(7)));
     }
 
     /// A bloom answering "absent" for a value the writer stored would drop

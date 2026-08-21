@@ -387,6 +387,17 @@ impl ExecutionContext {
         self.cancelled.load(Ordering::Relaxed)
     }
 
+    /// The wall-clock deadline for this statement, if the session set one.
+    ///
+    /// A lake commit takes this so its retry loop stops waiting when the
+    /// statement is over time. It governs waiting only: the commit reads it
+    /// between attempts, where nothing is staged and no version exists, and
+    /// never during one
+    #[inline]
+    pub fn deadline(&self) -> Option<std::time::Instant> {
+        self.deadline
+    }
+
     /// Returns true once the statement deadline has elapsed. Always false
     /// when no deadline is set.
     #[inline]

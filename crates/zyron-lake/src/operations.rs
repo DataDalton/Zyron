@@ -29,7 +29,7 @@ use zyron_common::ZyronError;
 
 use crate::index::{self, LakeIndexSpec};
 use crate::manifest::{ClusterStrategy, DeletePredicate, ManifestFile, PartitionEntry};
-use crate::paths::{parse_data_file_name, parse_index_file_name};
+use crate::paths::{discard_staged_file, parse_data_file_name, parse_index_file_name};
 use crate::predicate::{LakePredicate, PruneDecision};
 use crate::reader::LakeFileReader;
 use crate::transaction_log::{CommitAttempt, LogEntry, OperationKind, TransactionLog};
@@ -92,60 +92,94 @@ pub fn append_rows(
 ) -> Result<AppendOutcome, ZyronError> {
     let mut attempt = attempt;
     attempt.operation = OperationKind::Append;
-    let mut staged: Option<(u64, PartitionEntry, Vec<usize>)> = None;
-    // Every file this attempt put on disk, data and index alike. A retry
-    // built against a different base has to unlink all of them, not just
-    // the data file, or a losing attempt leaks its index deltas
-    let mut staged_paths: Vec<PathBuf> = Vec::new();
+    let mut staged: Option<StagedAppend> = None;
+    // Index deltas this attempt put on disk. They address the data file by
+    // partition id and are built from the base index set, so a retry always
+    // rebuilds them and always unlinks the ones it is replacing
+    let mut index_paths: Vec<PathBuf> = Vec::new();
     let result = log.commit(attempt, |base| {
-        for path in staged_paths.drain(..) {
-            let _ = fs::remove_file(path);
+        for path in index_paths.drain(..) {
+            discard_staged_file(&path);
         }
-        staged = None;
-        let partition_id = allocate_partition_id(base);
-        let sort_keys: Vec<u32> = base.cluster_spec.keys.iter().map(|k| k.column_id).collect();
-        // The declared curve per key, so a file is laid out the way the
-        // spec asked rather than always ascending
-        let sort_strategies: Vec<ClusterStrategy> =
-            base.cluster_spec.keys.iter().map(|k| k.strategy).collect();
-        let written = write_data_file_ordered(
-            log.paths(),
-            &base.schema,
-            &WriteRequest {
-                partition_id,
-                columns,
-                sort_keys: &sort_keys,
-                sort_strategies: &sort_strategies,
-                cluster_spec_id: base.cluster_spec.spec_id,
-                table_id,
-                bloom_columns: &base.bloom_columns(),
-                index_id: None,
-            },
-        )?;
-        staged_paths.push(log.paths().data_file(partition_id));
-        staged = Some((partition_id, written.entry.clone(), written.order.clone()));
+
+        // A lost race does not invalidate the rows already on disk. The file
+        // is written from the batch, the schema, the cluster spec and the
+        // declared bloom columns, so it survives any commit that changed
+        // none of those, which is every append that raced with another
+        // append. Rewriting it regardless is how a writer losing repeatedly
+        // turns contention into unbounded IO: at ten thousand rows that is a
+        // fresh file and a fresh fsync for every lost race
+        let bloom_columns = base.bloom_columns();
+        let reusable = staged.as_ref().is_some_and(|s| {
+            base.entry_for(s.partition_id).is_none()
+                && base.schema == s.schema
+                && base.cluster_spec == s.cluster_spec
+                && s.bloom_columns == bloom_columns
+        });
+        if !reusable && let Some(stale) = staged.take() {
+            discard_staged_file(&log.paths().data_file(stale.partition_id));
+        }
+
+        let placed = match staged.take() {
+            Some(kept) => kept,
+            None => {
+                let partition_id = allocate_partition_id(base);
+                let sort_keys: Vec<u32> =
+                    base.cluster_spec.keys.iter().map(|k| k.column_id).collect();
+                // The declared curve per key, so a file is laid out the way
+                // the spec asked rather than always ascending
+                let sort_strategies: Vec<ClusterStrategy> =
+                    base.cluster_spec.keys.iter().map(|k| k.strategy).collect();
+                let written = write_data_file_ordered(
+                    log.paths(),
+                    &base.schema,
+                    &WriteRequest {
+                        partition_id,
+                        columns,
+                        sort_keys: &sort_keys,
+                        sort_strategies: &sort_strategies,
+                        cluster_spec_id: base.cluster_spec.spec_id,
+                        table_id,
+                        bloom_columns: &bloom_columns,
+                        index_id: None,
+                    },
+                )?;
+                StagedAppend {
+                    partition_id,
+                    entry: written.entry,
+                    order: written.order,
+                    schema: base.schema.clone(),
+                    cluster_spec: base.cluster_spec.clone(),
+                    bloom_columns,
+                }
+            }
+        };
 
         // Index deltas ride in the same commit as the rows they address,
         // so no version ever exists where the rows are visible and the
         // index does not name them
-        let mut used: Vec<u64> = vec![partition_id];
-        let mut entries = vec![LogEntry::AddFile(written.entry)];
-        entries.extend(index::delta_entries_for_written_file(
+        let mut used: Vec<u64> = vec![placed.partition_id];
+        let mut entries = vec![LogEntry::AddFile(placed.entry.clone())];
+        let deltas = index::delta_entries_for_written_file(
             log.paths(),
             base,
-            partition_id,
+            placed.partition_id,
             table_id,
             columns,
-            &written.order,
+            &placed.order,
             &mut || {
                 let id = allocate_unused_partition_id(base, &used);
                 used.push(id);
                 id
             },
-        )?);
+        );
+        // Kept whatever the deltas did, so a failure still has a file to
+        // unlink rather than leaking it
+        staged = Some(placed);
+        entries.extend(deltas?);
         for entry in &entries {
             if let LogEntry::AddIndexFile(file) = entry {
-                staged_paths.push(
+                index_paths.push(
                     log.paths()
                         .index_file(file.index_id, file.file.partition_id),
                 );
@@ -155,23 +189,41 @@ pub fn append_rows(
     });
     match result {
         Ok(version) => {
-            let (partition_id, entry, order) = staged.ok_or_else(|| {
+            let placed = staged.ok_or_else(|| {
                 ZyronError::Internal("append committed without a staged file".into())
             })?;
             Ok(AppendOutcome {
                 version,
-                partition_id,
-                rows: entry.row_count,
-                order,
+                partition_id: placed.partition_id,
+                rows: placed.entry.row_count,
+                order: placed.order,
             })
         }
         Err(e) => {
-            for path in staged_paths {
-                let _ = fs::remove_file(path);
+            for path in index_paths {
+                discard_staged_file(&path);
+            }
+            if let Some(placed) = staged {
+                discard_staged_file(&log.paths().data_file(placed.partition_id));
             }
             Err(e)
         }
     }
+}
+
+/// A data file an append has already written, and the parts of the base it
+/// was written from.
+///
+/// A retry compares them against the new base: all matching means the rows
+/// on disk are still the rows this append wants to commit, so the write does
+/// not have to happen again
+struct StagedAppend {
+    partition_id: u64,
+    entry: PartitionEntry,
+    order: Vec<usize>,
+    schema: crate::schema::LakeSchema,
+    cluster_spec: crate::manifest::ClusterSpec,
+    bloom_columns: Vec<u32>,
 }
 
 /// What a create index commit produced.
@@ -204,7 +256,7 @@ pub fn create_index(
     let mut built_index_id = 0u32;
     let result = log.commit(attempt, |base| {
         for path in staged.drain(..) {
-            let _ = fs::remove_file(path);
+            discard_staged_file(&path);
         }
         if base.index_by_name(name).is_some() {
             return Err(ZyronError::Internal(format!(
@@ -258,7 +310,7 @@ pub fn create_index(
         }),
         Err(e) => {
             for path in staged {
-                let _ = fs::remove_file(path);
+                discard_staged_file(&path);
             }
             Err(e)
         }
@@ -305,7 +357,7 @@ pub fn rebuild_indexes(
     let mut staged: Vec<PathBuf> = Vec::new();
     let result = log.commit(attempt, |base| {
         for path in staged.drain(..) {
-            let _ = fs::remove_file(path);
+            discard_staged_file(&path);
         }
         let mut entries = Vec::new();
         let mut used: Vec<u64> = Vec::new();
@@ -335,7 +387,7 @@ pub fn rebuild_indexes(
     });
     if result.is_err() {
         for path in staged {
-            let _ = fs::remove_file(path);
+            discard_staged_file(&path);
         }
     }
     result
@@ -561,7 +613,7 @@ pub fn update_where(
     let mut written_rows: Option<(u64, Vec<usize>)> = None;
     let result = log.commit(attempt, |base| {
         for path in staged.drain(..) {
-            let _ = fs::remove_file(path);
+            discard_staged_file(&path);
         }
         let mut entries = Vec::new();
         files_removed = 0;
@@ -684,7 +736,7 @@ pub fn update_where(
         }
         Err(e) => {
             for path in staged {
-                let _ = fs::remove_file(path);
+                discard_staged_file(&path);
             }
             Err(e)
         }
@@ -999,7 +1051,7 @@ pub fn optimize(
     let mut zero_effect = false;
     let result = log.commit(attempt, |base| {
         for path in staged.drain(..) {
-            let _ = fs::remove_file(path);
+            discard_staged_file(&path);
         }
         let inputs = compaction_inputs(base, fallback_rows_per_file);
         files_removed = inputs.len();
@@ -1152,7 +1204,7 @@ pub fn optimize(
         }),
         Err(e) => {
             for path in staged {
-                let _ = fs::remove_file(path);
+                discard_staged_file(&path);
             }
             Err(e)
         }
@@ -1316,7 +1368,94 @@ mod tests {
             read_predicate: None,
             read_version: 0,
             audit: None,
+            deadline: None,
         }
+    }
+
+    /// Concurrent appends race, and a loser reuses the file it already
+    /// wrote rather than writing it again.
+    ///
+    /// The reuse is only sound if the rows on disk are still the rows the
+    /// retry wants to commit, so what has to hold is that every row every
+    /// appender submitted is present exactly once afterwards, under a
+    /// contention level that guarantees losses.
+    #[test]
+    fn concurrent_appends_keep_every_row_exactly_once() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let log = Arc::new(new_log(dir.path()));
+
+        const APPENDERS: i64 = 8;
+        const PER_APPENDER: i64 = 25;
+
+        std::thread::scope(|scope| {
+            for a in 0..APPENDERS {
+                let log = Arc::clone(&log);
+                scope.spawn(move || {
+                    let ids: Vec<i64> = (0..PER_APPENDER).map(|r| a * PER_APPENDER + r).collect();
+                    let names: Vec<Option<&str>> = vec![Some("row"); PER_APPENDER as usize];
+                    append_rows(&log, attempt(), 7, &batch(&ids, &names)).expect("append");
+                });
+            }
+        });
+
+        // The reuse path only exists on a retry, so a run where nothing
+        // raced would pass without exercising it
+        assert!(
+            log.commit_retries() > 0,
+            "no append lost a race, so the retry path this test covers never ran"
+        );
+
+        let manifest = log.latest_manifest().expect("manifest");
+        let rows: u64 = manifest.entries.iter().map(|e| e.row_count).sum();
+        assert_eq!(
+            rows,
+            (APPENDERS * PER_APPENDER) as u64,
+            "every appended row has to be live exactly once"
+        );
+
+        // Partition ids are unique, so no reused file was committed twice
+        let mut ids: Vec<u64> = manifest.entries.iter().map(|e| e.partition_id).collect();
+        ids.sort_unstable();
+        let before = ids.len();
+        ids.dedup();
+        assert_eq!(before, ids.len(), "a partition id was committed twice");
+
+        // And every file the manifest names is on disk and readable, which a
+        // reused file that had been unlinked by a retry would not be
+        for entry in manifest.entries.iter() {
+            let reader = crate::reader::LakeFileReader::open(log.paths(), entry.partition_id)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "committed file {:#x} does not open: {e}",
+                        entry.partition_id
+                    )
+                });
+            assert_eq!(
+                reader.row_count() as u64,
+                entry.row_count,
+                "file {:#x} holds a different row count than the manifest claims",
+                entry.partition_id
+            );
+        }
+
+        // The whole id space appears once each
+        let schema = schema();
+        let column = schema.column_by_id(0).expect("id column");
+        let mut seen: Vec<i64> = Vec::new();
+        for entry in manifest.entries.iter() {
+            let reader =
+                crate::reader::LakeFileReader::open(log.paths(), entry.partition_id).expect("open");
+            let decoded = reader.read_column(column).expect("decode");
+            for row in 0..reader.row_count() {
+                let cell = decoded.cell(row).expect("cell");
+                let mut raw = [0u8; 8];
+                raw.copy_from_slice(cell);
+                seen.push(i64::from_le_bytes(raw));
+            }
+        }
+        seen.sort_unstable();
+        let expected: Vec<i64> = (0..APPENDERS * PER_APPENDER).collect();
+        assert_eq!(seen, expected, "the committed rows are not the rows sent");
     }
 
     fn new_log(dir: &std::path::Path) -> TransactionLog {

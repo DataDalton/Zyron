@@ -159,6 +159,7 @@ them the same, so a version out of sequence means a gap rather than a conflict"
             read_predicate: None,
             read_version: 0,
             audit: None,
+            deadline: None,
         };
         let entries = version.entries.clone();
         follower.commit(attempt, move |_| Ok(entries.clone()))?;
@@ -379,6 +380,7 @@ mod tests {
             read_predicate: None,
             read_version: 0,
             audit: None,
+            deadline: None,
         }
     }
 

@@ -69,7 +69,7 @@ use crate::manifest::{
     decode_partition_entry, encode_partition_entry,
 };
 use crate::operations::{allocate_partition_id, allocate_unused_partition_id};
-use crate::paths::data_file_name;
+use crate::paths::{data_file_name, discard_staged_dir, discard_staged_file};
 use crate::predicate::LakeValue;
 use crate::reader::{DecodedColumn, LakeFileReader};
 use crate::transaction_log::{CommitAttempt, LogEntry, OperationKind, TransactionLog};
@@ -884,7 +884,7 @@ fn drive_pass(
         Err(e) => {
             // Nothing in data/ was touched, so the only cleanup is the
             // speculative work the pass itself created
-            let _ = fs::remove_dir_all(&ctx.staging);
+            discard_staged_dir(&ctx.staging);
             let _ = checkpoint.discard();
             return Err(e);
         }
@@ -1290,7 +1290,7 @@ fn commit_pass(
     attempt.operation = OperationKind::Optimize;
     let result = ctx.log.commit(attempt, move |base| {
         for path in staged_index.borrow_mut().drain(..) {
-            let _ = fs::remove_file(path);
+            discard_staged_file(&path);
         }
         for (partition_id, predicates) in &planned {
             match base.entry_for(*partition_id) {
@@ -1375,7 +1375,7 @@ fn commit_pass(
     });
     if result.is_err() {
         for path in written_index_files.borrow_mut().drain(..) {
-            let _ = fs::remove_file(path);
+            discard_staged_file(&path);
         }
     }
     result
@@ -1426,7 +1426,7 @@ pub fn resume_cluster_passes(
                     error = %e,
                     "clustering checkpoint unreadable, discarding the pass"
                 );
-                let _ = fs::remove_file(&path);
+                discard_staged_file(&path);
                 continue;
             }
         };
@@ -1691,6 +1691,7 @@ mod tests {
             read_predicate: None,
             read_version: 0,
             audit: None,
+            deadline: None,
         }
     }
 

@@ -110,6 +110,7 @@ pub async fn build_lake_index(
         read_predicate: None,
         read_version: 0,
         audit: None,
+        deadline: None,
     };
     let name = index_name_for(table, column_names);
     let outcome = zyron_lake::operations::create_index(
@@ -164,6 +165,7 @@ pub async fn drop_lake_index(
         read_predicate: None,
         read_version: 0,
         audit: None,
+        deadline: None,
     };
     zyron_lake::operations::drop_index(&log, attempt, &name)?;
     Ok(())
@@ -197,6 +199,7 @@ pub async fn rebuild_lake_indexes(
         read_predicate: None,
         read_version: 0,
         audit: None,
+        deadline: None,
     };
     zyron_lake::operations::rebuild_indexes(&log, attempt, table.id.0 as u64)?;
     Ok(())

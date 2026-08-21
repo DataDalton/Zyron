@@ -9,8 +9,6 @@
 //! removes only rows it provably matches, an unknown outcome keeps the
 //! row, mirroring SQL DELETE semantics
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use zyron_common::curve::normalize_component;
 use zyron_common::{TypeId, ZyronError};
 use zyron_storage::columnar::{
@@ -62,14 +60,12 @@ impl ColumnEvidence for FileEvidence<'_> {
         if !self.reader.reader.has_segment(column_id) {
             return Ok(vec![0u8; end.saturating_sub(start).div_ceil(8)]);
         }
-        // Evaluating on encoded bytes still reads the segment payload, so it
-        // counts the same as decoding the column would have. The payload is
-        // read whole whatever the range, because its checksum covers all of
-        // it, so the range saves the decode and the compare rather than IO
-        self.reader.bytes_read.fetch_add(
-            self.reader.reader.segment_bytes(column_id),
-            Ordering::Relaxed,
-        );
+        // Evaluating on encoded bytes reads the segment payload, the same
+        // bytes decoding the column would have read. The payload is read
+        // whole whatever the range, because its checksum covers all of it,
+        // so the range saves the decode and the compare rather than the IO.
+        // The file reader counts what it actually read, so nothing is added
+        // here
         self.reader.reader.eval_column_predicate_rows(
             column_id,
             self.reader.row_count,
@@ -228,14 +224,6 @@ pub enum ZoneVerdict {
 pub struct LakeFileReader {
     reader: ZyrFileReader,
     row_count: usize,
-    /// Column payload bytes this reader has pulled off disk, summed over every
-    /// segment it decoded or evaluated a predicate against.
-    ///
-    /// Zone map reads are deliberately excluded. They are the metadata that
-    /// decides skipping, not the data, and the heap columnar scan excludes its
-    /// own header and zone reads for the same reason, so the two formats report
-    /// one comparable quantity: bytes of column data the query had to touch
-    bytes_read: AtomicU64,
 }
 
 impl LakeFileReader {
@@ -250,22 +238,25 @@ impl LakeFileReader {
     pub fn open_path(path: &std::path::Path) -> Result<Self, ZyronError> {
         let reader = ZyrFileReader::open(path)?;
         let row_count = reader.row_count() as usize;
-        Ok(Self {
-            reader,
-            row_count,
-            bytes_read: AtomicU64::new(0),
-        })
+        Ok(Self { reader, row_count })
     }
 
     pub fn row_count(&self) -> usize {
         self.row_count
     }
 
-    /// Column payload bytes read through this reader so far. A scan reads it
-    /// once when it is done with the file, so the per column adds never appear
-    /// on a row path
+    /// Column data bytes this reader has pulled off the file so far,
+    /// counted by the file reader as each read happens rather than derived
+    /// from what a column occupies on disk.
+    ///
+    /// A decode reads a segment's null bitmap and payload and not the bloom
+    /// or zone maps ahead of them, so the segment size is not what reading a
+    /// column costs. Metadata reads stay excluded, the same quantity the
+    /// heap columnar scan reports, so the two formats stay comparable. A
+    /// scan reads this once when it is done with the file, so the per column
+    /// adds never appear on a row path
     pub fn bytes_read(&self) -> u64 {
-        self.bytes_read.load(Ordering::Relaxed)
+        self.reader.column_data_bytes()
     }
 
     /// Whether the file holds this column at all. False for a column the
@@ -405,8 +396,6 @@ impl LakeFileReader {
                 all_null: true,
             });
         }
-        self.bytes_read
-            .fetch_add(self.reader.segment_bytes(col.id), Ordering::Relaxed);
         let (data, null_bitmap) =
             self.reader
                 .decode_column_range(col.id, self.row_count, value_size, start, end)?;
