@@ -730,7 +730,16 @@ pub fn record_metric_for(
             u(variance.sqrt())
         );
     }
-    write_benchmark_record(test, name, Some(format), average, runs, None, None, false);
+    write_benchmark_record(
+        test,
+        name,
+        Some(format),
+        average,
+        runs,
+        None,
+        None,
+        higher_is_better_for(unit),
+    );
     average
 }
 
@@ -744,6 +753,20 @@ pub fn record_metric_for(
 /// known hardware is a number somebody made up that goes stale the first
 /// time the machine changes. Recording keeps it in the run file so a
 /// baseline can be read straight off it later
+/// Whether a larger reading in this unit is a better one.
+///
+/// A metric recorded without a target carries no direction of its own, and
+/// treating every one of them as lower-is-better labels a throughput figure
+/// as a regression exactly when it improves: an insert rate that rose by
+/// nineteen percent read as a nineteen percent loss to anything comparing
+/// two runs. The unit is what says which way a metric runs. Everything
+/// measured per second counts work done, and every other unit here counts
+/// time, size or growth, all of which are better smaller
+fn higher_is_better_for(unit: &str) -> bool {
+    let unit = unit.trim();
+    unit.ends_with("/s") || unit.ends_with("/sec")
+}
+
 pub fn record_metric(test: &str, name: &str, unit: &str, runs: Vec<f64>) -> f64 {
     let average = if runs.is_empty() {
         0.0
@@ -771,7 +794,16 @@ pub fn record_metric(test: &str, name: &str, unit: &str, runs: Vec<f64>) -> f64 
             u(variance.sqrt())
         );
     }
-    write_benchmark_record(test, name, None, average, runs, None, None, false);
+    write_benchmark_record(
+        test,
+        name,
+        None,
+        average,
+        runs,
+        None,
+        None,
+        higher_is_better_for(unit),
+    );
     average
 }
 
@@ -816,7 +848,16 @@ pub fn record_metric_best(test: &str, name: &str, unit: &str, runs: Vec<f64>) ->
         u(average),
         runs.len()
     );
-    write_benchmark_record(test, name, None, best, runs, None, None, false);
+    write_benchmark_record(
+        test,
+        name,
+        None,
+        best,
+        runs,
+        None,
+        None,
+        higher_is_better_for(unit),
+    );
     best
 }
 
@@ -1759,6 +1800,28 @@ fn write_benchmark_record(
 
 #[cfg(test)]
 mod tests {
+
+    /// Every unit the suites record in, and which way it runs. A rate is
+    /// better larger and everything else is better smaller, so a metric
+    /// recorded without a target still lands the right way round in the
+    /// file a comparison reads
+    #[test]
+    fn units_that_count_work_read_as_higher_is_better() {
+        for unit in [" rows/s", "rows/sec", " commits/s", " commits/sec", "bytes/s"] {
+            assert!(
+                higher_is_better_for(unit),
+                "{unit} counts work done per second"
+            );
+        }
+        for unit in [
+            "us", "ns", "ms", "s", "ns/row", "us/version", "x", " bytes", " per commit", "%",
+        ] {
+            assert!(
+                !higher_is_better_for(unit),
+                "{unit} counts time, size or growth"
+            );
+        }
+    }
     use super::*;
 
     fn metric(test: &str, name: &str, format: Option<Format>, average: f64) -> MetricRecord {

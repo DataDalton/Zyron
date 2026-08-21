@@ -97,28 +97,77 @@ pub fn clone_table(
     // Links first. A link that fails leaves the clone's log uncreated, so
     // the statement fails with nothing half made, and the links that did
     // land are cleaned up on the way out
-    let mut linked: Vec<std::path::PathBuf> = Vec::new();
-    let mut link_all = || -> Result<(), ZyronError> {
+    // Both sides of every link live in one directory apiece, so the two
+    // paths are built once and the file name swapped on the end of each.
+    // Naming a file through `data_file` instead builds a directory path, a
+    // name string and a joined path every time, which a clone did twice per
+    // file and then kept a third copy of
+    let src_dir = source.paths().data_dir();
+    let dst_dir = clone_paths.data_dir();
+    // Undoes the links that landed, naming them again off the manifest that
+    // named them the first time. Reads the clone's data directory rather
+    // than its paths, because the log takes ownership of those partway
+    // through and a failure after that point still has to clean up
+    let discard_linked = |data: usize, index: usize| {
+        let mut path = dst_dir.clone();
+        let mut name = String::with_capacity(crate::paths::INDEX_FILE_NAME_LEN);
+        for entry in manifest.entries.iter().take(data) {
+            name.clear();
+            crate::paths::write_data_file_name(&mut name, entry.partition_id);
+            path.push(&name);
+            discard_staged_file(&path);
+            path.pop();
+        }
+        for file in manifest.index_files.iter().take(index) {
+            name.clear();
+            crate::paths::write_index_file_name(
+                &mut name,
+                file.index_id,
+                file.file.partition_id,
+            );
+            path.push(&name);
+            discard_staged_file(&path);
+            path.pop();
+        }
+    };
+    let mut linked_data = 0usize;
+    let mut linked_index = 0usize;
+    let mut link_all = |linked_data: &mut usize,
+                        linked_index: &mut usize|
+     -> Result<(), ZyronError> {
+        let mut from = src_dir.clone();
+        let mut to = dst_dir.clone();
+        let mut name = String::with_capacity(crate::paths::INDEX_FILE_NAME_LEN);
         for entry in &manifest.entries {
-            let from = source.paths().data_file(entry.partition_id);
-            let to = clone_paths.data_file(entry.partition_id);
-            link_file(&from, &to)?;
-            linked.push(to);
+            name.clear();
+            crate::paths::write_data_file_name(&mut name, entry.partition_id);
+            from.push(&name);
+            to.push(&name);
+            let linked = link_file(&from, &to);
+            from.pop();
+            to.pop();
+            linked?;
+            *linked_data += 1;
         }
         for file in &manifest.index_files {
-            let from = source
-                .paths()
-                .index_file(file.index_id, file.file.partition_id);
-            let to = clone_paths.index_file(file.index_id, file.file.partition_id);
-            link_file(&from, &to)?;
-            linked.push(to);
+            name.clear();
+            crate::paths::write_index_file_name(
+                &mut name,
+                file.index_id,
+                file.file.partition_id,
+            );
+            from.push(&name);
+            to.push(&name);
+            let linked = link_file(&from, &to);
+            from.pop();
+            to.pop();
+            linked?;
+            *linked_index += 1;
         }
         Ok(())
     };
-    if let Err(e) = link_all() {
-        for path in &linked {
-            discard_staged_file(path);
-        }
+    if let Err(e) = link_all(&mut linked_data, &mut linked_index) {
+        discard_linked(linked_data, linked_index);
         return Err(e);
     }
 
@@ -165,9 +214,7 @@ pub fn clone_table(
     let log = match TransactionLog::create_from_entries(clone_paths, attempt, entries) {
         Ok(log) => log,
         Err(e) => {
-            for path in &linked {
-                discard_staged_file(path);
-            }
+            discard_linked(linked_data, linked_index);
             return Err(e);
         }
     };

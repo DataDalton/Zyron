@@ -1,0 +1,26 @@
+{
+  "id": "2026-08-21_135739_6456b90-local",
+  "date": "2026-08-21 13:57:40Z",
+  "ts": 1787320660,
+  "commit": "6456b90-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "branch_page_resolution": {
+      "ns_per_resolve": {
+        "average": 54.630280,
+        "runs": [54.23, 55.45, 54.52, 54.32, 54.63],
+        "target": 50.000000,
+        "passed": false,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

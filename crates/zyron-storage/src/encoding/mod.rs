@@ -402,14 +402,36 @@ pub fn eval_predicate_on_raw(
 const DICTIONARY_MAX_CARDINALITY: usize = 65536;
 
 /// Statistics computed from a column sample for encoding selection.
-struct ColumnSampleStats {
+///
+/// A caller that already walks every cell, which a segment build does to
+/// pack its buffer and bound its zones, gathers these on that walk and
+/// hands them to [`select_encoding_prepared`] rather than making selection
+/// walk the column a second time to rebuild them
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnSampleStats {
     /// Distinct values, saturating at the point the exact count stops
     /// changing any decision. Every consumer tests it as an upper bound, so
     /// a saturated value reads as "more than the ceiling" and compares the
     /// same way the true count would
-    cardinality: usize,
-    run_count: usize,
-    all_identical: bool,
+    pub cardinality: usize,
+    /// Adjacent non-null values that differ, plus one. An all-null column
+    /// counts as one run
+    pub run_count: usize,
+    /// Whether the column is one repeated value, which is all-null or a
+    /// single distinct value with no nulls at all
+    pub all_identical: bool,
+}
+
+/// Distinct values a caller has to count before both decisions that read
+/// the count are settled.
+///
+/// Cardinality decides exactly two things, whether the column is one
+/// repeated value and whether it is sparse enough for a dictionary, and
+/// past this the answer to both is already fixed whatever the true count
+/// turns out to be. Two is the floor, because `all_identical` still has to
+/// tell one distinct value from more than one
+pub fn cardinality_cap(row_count: usize) -> usize {
+    DICTIONARY_MAX_CARDINALITY.min(row_count / 2).max(2)
 }
 
 /// Computes sample statistics from a set of values.
@@ -427,9 +449,7 @@ struct ColumnSampleStats {
 /// Runs are counted from a comparison against the previous value rather than
 /// from the set, so `run_count` stays exact after the set saturates
 fn compute_sample_stats(sample: &[Option<&[u8]>]) -> ColumnSampleStats {
-    // Two is the floor whatever the ceiling works out to, because
-    // `all_identical` still has to tell one distinct value from more than one
-    let cap = DICTIONARY_MAX_CARDINALITY.min(sample.len() / 2).max(2);
+    let cap = cardinality_cap(sample.len());
     let mut distinct = hashbrown::HashSet::new();
     let mut saturated = false;
     let mut run_count = 1usize;
@@ -541,6 +561,120 @@ pub fn select_encoding_exact(type_id: TypeId, values: &[Option<&[u8]>]) -> Encod
     select_encoding_bounded(type_id, values, usize::MAX)
 }
 
+/// Buffers a finished decode hands back, so the next one writes into memory
+/// this thread already holds.
+///
+/// A decoded column is the widest allocation on the scan path, and taking it
+/// fresh every  time measured a tenth of a microsecond at the median and eighteen
+/// at the ninetieth percentile: the operating system takes the pages back
+/// when the buffer is dropped and faults them in again on the next write,
+/// which costs more than the decode it serves. Reused, the same buffer never
+/// measured above a tenth of a microsecond
+mod scratch {
+    use std::cell::RefCell;
+
+    /// Buffers held per thread. A scan decodes one column at a time and a
+    /// predicate pass holds a second, so two covers the depth actually in
+    /// flight and anything past it is returned to the allocator
+    const POOL_DEPTH: usize = 2;
+
+    /// Largest buffer worth holding.
+    ///
+    /// Kept small deliberately. What this pool is for is the buffer a scan
+    /// decodes into over and over, which is a column of a file and not a
+    /// column of a table. Holding megabyte buffers instead measured worse
+    /// across the board: memory the allocator would have returned stays out
+    /// of circulation for the whole process, and every later allocation
+    /// pays for it, including work that decodes nothing at all
+    const POOL_BYTES_MAX: usize = 256 << 10;
+
+    /// Smallest buffer worth routing through the pool.
+    ///
+    /// A short decode asks the allocator for a block from its fast size
+    /// class and gets it back just as quickly, and taking that path costs
+    /// less than a thread local lookup, a borrow and a search. Measured on a
+    /// unique check, which decodes a small range per key, pooling every
+    /// buffer regardless of size doubled the pass. What actually needed
+    /// recycling is the full column a scan decodes over and over, which is
+    /// far above this
+    const POOL_BYTES_MIN: usize = 64 << 10;
+
+    thread_local! {
+        static POOL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// A held buffer that already has room for `len` bytes, or None.
+    ///
+    /// Only a buffer that fits is taken. Growing one that does not would
+    /// reallocate, which is the cost this pool exists to avoid, and would
+    /// spend a held buffer to do it
+    fn take_fitting(len: usize) -> Option<Vec<u8>> {
+        if len < POOL_BYTES_MIN {
+            return None;
+        }
+        POOL.with(|p| {
+            let mut pool = p.borrow_mut();
+            // The smallest buffer that fits, so a short decode does not
+            // take the one a long decode is about to want. Any fit will do:
+            // the buffer is handed out uninitialised and the decode writes
+            // every byte of it, so reuse costs nothing beyond the search
+            let at = pool
+                .iter()
+                .enumerate()
+                .filter(|(_, buf)| buf.capacity() >= len)
+                .min_by_key(|(_, buf)| buf.capacity())
+                .map(|(at, _)| at)?;
+            Some(pool.swap_remove(at))
+        })
+    }
+
+    /// A buffer of `len` bytes whose contents are undefined.
+    ///
+    /// # Safety
+    /// The caller writes every one of the `len` bytes before any read
+    pub unsafe fn take_uninit(len: usize) -> Vec<u8> {
+        match take_fitting(len) {
+            Some(mut buf) => {
+                buf.clear();
+                // SAFETY: the buffer was chosen for holding `len` bytes, and
+                // the caller's contract is to write every one before reading
+                unsafe { buf.set_len(len) };
+                buf
+            }
+            None => {
+                let mut buf = Vec::with_capacity(len);
+                // SAFETY: as above, over the capacity just reserved
+                unsafe { buf.set_len(len) };
+                buf
+            }
+        }
+    }
+
+    /// Offers a finished buffer back. Dropped rather than held when the pool
+    /// is full or the buffer is larger than one worth keeping
+    #[inline]
+    pub fn give_back(buf: Vec<u8>) {
+        if buf.capacity() < POOL_BYTES_MIN || buf.capacity() > POOL_BYTES_MAX {
+            return;
+        }
+        POOL.with(|p| {
+            let mut pool = p.borrow_mut();
+            if pool.len() < POOL_DEPTH {
+                pool.push(buf);
+            }
+        });
+    }
+}
+
+/// Hands a decoded column's buffer back for the next decode on this thread.
+///
+/// A caller that owns a buffer [`Encoding::decode`] produced offers it here
+/// when it is finished with it. Anything else is dropped as normal
+#[inline]
+pub fn recycle_decode_buffer(buf: Vec<u8>) {
+    scratch::give_back(buf);
+}
+
 /// Rows the trial encode compares when the caller does not ask for exact
 /// selection. Bounded so a wide column does not encode twice in full.
 const TRIAL_ENCODE_ROWS: usize = 1024;
@@ -551,6 +685,116 @@ fn select_encoding_bounded(
     trial_rows: usize,
 ) -> EncodingType {
     select_encoding_inner(type_id, sample, None, trial_rows).encoding
+}
+
+/// The encoding the statistics settle on their own, or None when the choice
+/// needs the trial that compares a candidate against storing the column raw.
+///
+/// Dictionary and RLE take priority over the type's own candidate because
+/// both support predicate pushdown on encoded data, which is worth their
+/// structural overhead
+fn encoding_from_stats(
+    type_id: TypeId,
+    row_count: usize,
+    stats: ColumnSampleStats,
+) -> Option<EncodingType> {
+    // All values identical (including all-null): constant encoding is
+    // always optimal
+    if stats.all_identical {
+        return Some(EncodingType::Constant);
+    }
+    // Booleans: bit-pack to 1-bit is always the best choice
+    if type_id == TypeId::Boolean {
+        return Some(EncodingType::BitPack);
+    }
+    if stats.cardinality < DICTIONARY_MAX_CARDINALITY && stats.cardinality < row_count / 2 {
+        return Some(EncodingType::Dictionary);
+    }
+    if stats.run_count < row_count / 10 {
+        return Some(EncodingType::Rle);
+    }
+    None
+}
+
+/// The encoding a trial compares against storing the column raw, or None
+/// for a type with no encoder to try.
+///
+/// Temporal and HLC types are integer-backed fixed-width values (Date i32,
+/// Time/Timestamp/TimestampTz/Interval i64, ps Timestamp/HLC i128), so they
+/// ride the FastLanes FoR+delta/delta-of-delta/const-step path exactly like
+/// the integer types. `ColumnSegment::build` is handed the logical type id,
+/// which for a ps column is Timestamp rather than Int128, so keying only on
+/// `is_integer()` here would fold every timestamp column Unencoded and the
+/// "ps at us-class density" property would never hold. The trial still falls
+/// back to Unencoded when FastLanes is not actually smaller
+fn trial_candidate(type_id: TypeId) -> Option<EncodingType> {
+    if type_id.is_integer() || type_id.is_temporal() || type_id == TypeId::Hlc {
+        Some(EncodingType::FastLanes)
+    } else if type_id.is_floating_point() {
+        Some(EncodingType::Alp)
+    } else if type_id.is_string() {
+        Some(EncodingType::Fsst)
+    } else {
+        None
+    }
+}
+
+/// Chooses an encoding for a fixed-width column the caller has already
+/// packed and already gathered statistics over.
+///
+/// A segment build walks every cell to pack its buffer, bound its zones and
+/// count its nulls, and the statistics selection reads come off that same
+/// walk. Handing them in is what keeps the column to one pass: the previous
+/// form recomputed them from the cells, which meant a second traversal of
+/// every value and a second saturating distinct set built from the same
+/// data the first one saw.
+///
+/// The trial covers every row, so its output is the column's own bytes and
+/// is handed back for the caller to keep rather than encoded again
+pub fn select_encoding_prepared(
+    type_id: TypeId,
+    row_count: usize,
+    stats: ColumnSampleStats,
+    raw_data: &[u8],
+    value_size: usize,
+    exact: bool,
+) -> EncodingChoice {
+    let plain = |encoding| EncodingChoice {
+        encoding,
+        encoded: None,
+    };
+    if row_count == 0 {
+        return plain(EncodingType::Unencoded);
+    }
+    if let Some(decided) = encoding_from_stats(type_id, row_count, stats) {
+        return plain(decided);
+    }
+    let Some(candidate) = trial_candidate(type_id) else {
+        return plain(EncodingType::Unencoded);
+    };
+    if value_size == 0 {
+        return plain(candidate);
+    }
+    let trial_rows = if exact {
+        row_count
+    } else {
+        TRIAL_ENCODE_ROWS.min(row_count)
+    };
+    let span = trial_rows * value_size;
+    if raw_data.len() < span {
+        return plain(EncodingType::Unencoded);
+    }
+    let raw = &raw_data[..span];
+    match create_encoding(candidate).encode(raw, trial_rows, value_size) {
+        Ok(encoded) if encoded.len() < raw.len() => EncodingChoice {
+            encoding: candidate,
+            // Reusable only when the trial encoded the whole column. A
+            // prefix's output describes a prefix and would truncate the
+            // column if a caller wrote it out
+            encoded: (trial_rows == row_count).then_some(encoded),
+        },
+        _ => plain(EncodingType::Unencoded),
+    }
 }
 
 /// Shared selection. `packed` is the caller's already-built raw buffer and
@@ -573,43 +817,11 @@ fn select_encoding_inner(
     let stats = compute_sample_stats(sample);
     let row_count = sample.len();
 
-    // All values identical (including all-null): constant encoding is always optimal
-    if stats.all_identical {
-        return plain(EncodingType::Constant);
+    if let Some(decided) = encoding_from_stats(type_id, row_count, stats) {
+        return plain(decided);
     }
 
-    // Booleans: bit-pack to 1-bit is always the best choice
-    if type_id == TypeId::Boolean {
-        return plain(EncodingType::BitPack);
-    }
-
-    // Statistical heuristics: Dictionary and RLE are chosen based on
-    // data characteristics and take priority. They support predicate
-    // pushdown on encoded data, which is worth structural overhead.
-    if stats.cardinality < DICTIONARY_MAX_CARDINALITY && stats.cardinality < row_count / 2 {
-        return plain(EncodingType::Dictionary);
-    }
-
-    if stats.run_count < row_count / 10 {
-        return plain(EncodingType::Rle);
-    }
-
-    // Type-specific candidate and Unencoded fallback for trial-encode.
-    // Temporal and HLC types are integer-backed fixed-width values (Date i32,
-    // Time/Timestamp/TimestampTz/Interval i64, ps Timestamp/HLC i128), so they
-    // ride the FastLanes FoR+delta/delta-of-delta/const-step path exactly like
-    // the integer types. ColumnSegment::build is handed the logical type id,
-    // which for a ps column is Timestamp (not Int128), so keying only on
-    // is_integer() here would fold every timestamp column Unencoded and the
-    // "ps at us-class density" property would never hold. Trial-encode still
-    // falls back to Unencoded when FastLanes is not actually smaller.
-    let typeCandidate = if type_id.is_integer() || type_id.is_temporal() || type_id == TypeId::Hlc {
-        EncodingType::FastLanes
-    } else if type_id.is_floating_point() {
-        EncodingType::Alp
-    } else if type_id.is_string() {
-        EncodingType::Fsst
-    } else {
+    let Some(typeCandidate) = trial_candidate(type_id) else {
         return plain(EncodingType::Unencoded);
     };
 
@@ -849,7 +1061,6 @@ mod tests {
             "an all-distinct column must not be dictionary encoded"
         );
     }
-    use super::*;
 
     /// Every encoding's ranged decode must agree with its full decode over
     /// the same rows, for every range including the empty and the whole.

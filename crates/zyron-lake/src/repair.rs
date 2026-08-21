@@ -294,8 +294,10 @@ pub struct OrphanReport {
     /// Data files no retained version or branch references
     pub removed: Vec<u64>,
     pub bytes_reclaimed: u64,
-    /// Half-written files a crashed writer left staged. Never deleted: an
-    /// in-flight write is producing one right now
+    /// Files skipped because a write is producing them right now. Never
+    /// deleted: the writer registers the id before the file exists and
+    /// holds it until its commit resolves, so a file under a registered id
+    /// is live state rather than an orphan
     pub staged_files: usize,
     /// Index files reclaimed, as index id and partition id. Reported apart
     /// from the data files so a report never reads as row loss
@@ -314,6 +316,44 @@ pub fn cleanup_orphans(
     retain_from_version: u64,
 ) -> Result<OrphanReport, ZyronError> {
     let paths = log.paths();
+
+    // The directory is listed before reachability is computed, never the
+    // other way round. A data file is written under the name it will be
+    // read by, so a file the listing saw is either registered by the writer
+    // producing it, or was already on disk when reachability was computed
+    // afterwards and so is named by it if its commit landed. Computing
+    // reachability first leaves the gap between the two where a written but
+    // uncommitted file is reclaimed and its commit then names bytes that
+    // are gone
+    let mut report = OrphanReport::default();
+    let dir = paths.data_dir();
+    if !dir.exists() {
+        return Ok(report);
+    }
+    let mut data_candidates: Vec<(std::path::PathBuf, u64)> = Vec::new();
+    let mut index_candidates: Vec<(std::path::PathBuf, (u32, u64))> = Vec::new();
+    for dirent in fs::read_dir(&dir)? {
+        let dirent = dirent?;
+        let name = dirent.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(key) = parse_index_file_name(name) {
+            if log.is_staging(key.1) {
+                report.staged_files += 1;
+            } else {
+                index_candidates.push((dirent.path(), key));
+            }
+            continue;
+        }
+        let Some(partition_id) = parse_data_file_name(name) else {
+            continue;
+        };
+        if log.is_staging(partition_id) {
+            report.staged_files += 1;
+        } else {
+            data_candidates.push((dirent.path(), partition_id));
+        }
+    }
+
     let head = log.latest_version();
     let floor = retain_from_version.clamp(1, head.max(1));
 
@@ -351,38 +391,23 @@ pub fn cleanup_orphans(
         }
     }
 
-    let mut report = OrphanReport::default();
-    let dir = paths.data_dir();
-    if !dir.exists() {
-        return Ok(report);
-    }
-    for dirent in fs::read_dir(&dir)? {
-        let dirent = dirent?;
-        let name = dirent.file_name();
-        let Some(name) = name.to_str() else { continue };
-        // An index file is reachable on its own key, so a dropped index
-        // frees its files while a live one keeps them
-        if let Some(key) = parse_index_file_name(name) {
-            if reachable_index.contains(&key) {
-                continue;
-            }
-            let size = dirent.metadata().map(|m| m.len()).unwrap_or(0);
-            fs::remove_file(dirent.path())?;
-            report.removed_index_files.push(key);
-            report.bytes_reclaimed += size;
+    // An index file is reachable on its own key, so a dropped index frees
+    // its files while a live one keeps them
+    for (path, key) in index_candidates {
+        if reachable_index.contains(&key) {
             continue;
         }
-        let Some(partition_id) = parse_data_file_name(name) else {
-            if name.ends_with(".tmp") {
-                report.staged_files += 1;
-            }
-            continue;
-        };
+        let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        fs::remove_file(&path)?;
+        report.removed_index_files.push(key);
+        report.bytes_reclaimed += size;
+    }
+    for (path, partition_id) in data_candidates {
         if reachable.contains(&partition_id) {
             continue;
         }
-        let size = dirent.metadata().map(|m| m.len()).unwrap_or(0);
-        fs::remove_file(dirent.path())?;
+        let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        fs::remove_file(&path)?;
         report.removed.push(partition_id);
         report.bytes_reclaimed += size;
     }
@@ -487,10 +512,7 @@ mod tests {
     }
 
     fn rows(ids: &[i64]) -> Vec<ColumnData> {
-        vec![ColumnData {
-            column_id: 0,
-            cells: ids.iter().map(|v| Some(v.to_le_bytes().to_vec())).collect(),
-        }]
+        vec![ColumnData::from_cells(0, ids.iter().map(|v| Some(v.to_le_bytes().to_vec())).collect())]
     }
 
     fn new_log(dir: &std::path::Path) -> TransactionLog {
@@ -717,19 +739,35 @@ mod tests {
         assert_eq!(data_files(log.paths()).len(), 1);
     }
 
+    /// A data file is written under the name it will be read by, so a
+    /// reclaim pass cannot tell one being written from one a crash left.
+    /// The writer's registration is what tells them apart, and a file under
+    /// a registered id survives a pass that would otherwise take it
     #[test]
-    fn test_staged_files_are_counted_never_deleted() {
+    fn test_a_file_being_written_is_counted_never_deleted() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let log = new_log(dir.path());
         append_rows(&log, attempt(OperationKind::Append, 200), 17, &rows(&[1])).expect("append");
-        let staged = log.paths().data_dir().join("p-00000000000000ff.zyr.tmp");
-        fs::write(&staged, b"half written").expect("stage");
+        let in_flight = 0xFFu64;
+        let path = log.paths().data_file(in_flight);
+        fs::write(&path, b"half written").expect("stage");
 
+        {
+            let _guard = log.stage_partition(in_flight);
+            let report = cleanup_orphans(&log, log.latest_version()).expect("cleanup");
+            assert_eq!(report.staged_files, 1, "the write in flight is counted");
+            assert!(
+                report.removed.is_empty(),
+                "no file is reclaimed while a writer holds its id"
+            );
+            assert!(path.exists(), "the bytes a writer is producing survive");
+        }
+
+        // The guard is gone, so the same file is now an orphan like any
+        // other and the next pass reclaims it
         let report = cleanup_orphans(&log, log.latest_version()).expect("cleanup");
-        assert_eq!(report.staged_files, 1);
-        assert!(
-            staged.exists(),
-            "an in-flight write may be producing this right now"
-        );
+        assert_eq!(report.staged_files, 0);
+        assert_eq!(report.removed, vec![in_flight]);
+        assert!(!path.exists(), "an unregistered orphan is reclaimed");
     }
 }

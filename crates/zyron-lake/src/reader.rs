@@ -94,11 +94,32 @@ pub struct DecodedColumn {
     /// Rows this column decoded, which is the length of the range and not
     /// the file's row count
     row_count: usize,
+    /// Whether this column's buffer is worth handing back when it drops.
+    ///
+    /// Set for a whole-column read, which is the shape a scan repeats over
+    /// and over at one buffer size. A range read is not: a bisect makes many
+    /// short decodes whose buffers the next one has no use for, and offering
+    /// every one of them back costs more than the allocation it saves
+    recyclable: bool,
     /// Ordinal the decoded range starts at. Zero for a whole column, so
     /// every caller addresses rows by their ordinal in the file either way
     base: usize,
     /// True for a column the file predates, every cell is NULL
     all_null: bool,
+}
+
+impl Drop for DecodedColumn {
+    /// Offers the decode buffer back for the next decode on this thread.
+    ///
+    /// A decoded column is the widest allocation on the scan path. Letting
+    /// it go returns its pages to the operating system, which then has to
+    /// hand them over again when the next decode writes into a fresh one,
+    /// and that costs more than the decode being served
+    fn drop(&mut self) {
+        if self.recyclable {
+            zyron_storage::encoding::recycle_decode_buffer(std::mem::take(&mut self.data));
+        }
+    }
 }
 
 impl DecodedColumn {
@@ -393,6 +414,7 @@ impl LakeFileReader {
                 null_bitmap: Vec::new(),
                 row_count: end - start,
                 base: start,
+                recyclable: false,
                 all_null: true,
             });
         }
@@ -407,6 +429,7 @@ impl LakeFileReader {
             null_bitmap,
             row_count: end - start,
             base: start,
+            recyclable: start == 0 && end == self.row_count,
             all_null: false,
         })
     }
@@ -705,14 +728,8 @@ mod tests {
 
     fn write_sample(paths: &LakePaths, partition_id: u64) -> PartitionEntry {
         let columns = vec![
-            ColumnData {
-                column_id: 0,
-                cells: int_cells(&[Some(30), Some(10), Some(20)]),
-            },
-            ColumnData {
-                column_id: 1,
-                cells: str_cells(&[Some("carol"), Some("alice"), None]),
-            },
+            ColumnData::from_cells(0, int_cells(&[Some(30), Some(10), Some(20)])),
+            ColumnData::from_cells(1, str_cells(&[Some("carol"), Some("alice"), None])),
         ];
         write_data_file(
             paths,
@@ -773,14 +790,8 @@ mod tests {
         ids.extend((1_000_000..1_002_048).map(Some));
         let names: Vec<Option<&str>> = ids.iter().map(|_| Some("x")).collect();
         let columns = vec![
-            ColumnData {
-                column_id: 0,
-                cells: int_cells(&ids),
-            },
-            ColumnData {
-                column_id: 1,
-                cells: str_cells(&names),
-            },
+            ColumnData::from_cells(0, int_cells(&ids)),
+            ColumnData::from_cells(1, str_cells(&names)),
         ];
         write_data_file(
             paths,
@@ -935,14 +946,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = LakePaths::new(dir.path(), 7);
         let columns = vec![
-            ColumnData {
-                column_id: 0,
-                cells: int_cells(&[Some(1), None]),
-            },
-            ColumnData {
-                column_id: 1,
-                cells: str_cells(&[Some("a"), Some("b")]),
-            },
+            ColumnData::from_cells(0, int_cells(&[Some(1), None])),
+            ColumnData::from_cells(1, str_cells(&[Some("a"), Some("b")])),
         ];
         let err = write_data_file(
             &paths,

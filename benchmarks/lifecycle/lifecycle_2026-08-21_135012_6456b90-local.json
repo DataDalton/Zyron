@@ -1,0 +1,59 @@
+{
+  "id": "2026-08-21_135012_6456b90-local",
+  "date": "2026-08-21 13:50:15Z",
+  "ts": 1787320215,
+  "commit": "6456b90-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "legal_hold_check_no_holds": {
+      "latency (ns/op)": {
+        "average": 7.479684,
+        "runs": [7.55, 7.43, 7.46, 7.49, 7.47],
+        "target": 50.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "pii_detection": {
+      "latency (s)": {
+        "average": 0.001229,
+        "runs": [0.00, 0.00, 0.00, 0.00, 0.00],
+        "target": 5.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "ttl_row_delete": {
+      "throughput (rows/sec)": {
+        "average": 7992649.142422,
+        "runs": [6821724.46, 8028356.15, 7977026.16, 8912894.28, 8223244.65],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    },
+    "archive_to_object_store": {
+      "throughput (rows/sec)": {
+        "average": 47317068.675355,
+        "runs": [32191604.43, 38686964.43, 41693593.78, 63381397.56, 60631783.18],
+        "target": 500000.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

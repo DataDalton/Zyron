@@ -380,26 +380,17 @@ fn write_one_index_file(
 ) -> Result<PartitionEntry, ZyronError> {
     let mut columns: Vec<ColumnData> = Vec::with_capacity(schema.columns.len());
     for (position, cells) in keys.iter().enumerate() {
-        columns.push(ColumnData {
-            column_id: position as u32,
-            cells: cells.clone(),
-        });
+        columns.push(ColumnData::from_cells(position as u32, cells.clone()));
     }
     let base = key_columns as u32;
-    columns.push(ColumnData {
-        column_id: base + ADDRESS_PARTITION_OFFSET,
-        cells: addresses
+    columns.push(ColumnData::from_cells(base + ADDRESS_PARTITION_OFFSET, addresses
             .iter()
             .map(|a| Some((a.partition_id as i64).to_le_bytes().to_vec()))
-            .collect(),
-    });
-    columns.push(ColumnData {
-        column_id: base + ADDRESS_ORDINAL_OFFSET,
-        cells: addresses
+            .collect()));
+    columns.push(ColumnData::from_cells(base + ADDRESS_ORDINAL_OFFSET, addresses
             .iter()
             .map(|a| Some((a.ordinal as i64).to_le_bytes().to_vec()))
-            .collect(),
-    });
+            .collect()));
 
     // Ascending on the key, never a curve. A curve spreads a key across
     // the file so a probe could not bisect, and the index exists precisely
@@ -994,7 +985,7 @@ pub fn entries_for_written_file(
     let mut cells: Vec<Option<&[u8]>> = Vec::with_capacity(key_columns.len());
     for (ordinal, row) in order.iter().enumerate() {
         cells.clear();
-        cells.extend(key_columns.iter().map(|c| c.cells[*row].as_deref()));
+        cells.extend(key_columns.iter().map(|c| c.cell(*row)));
         batch.push(
             &cells,
             RowAddress {

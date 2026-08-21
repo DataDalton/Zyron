@@ -547,10 +547,7 @@ fn check_lake_parent(
                 )),
             });
         }
-        values.push(zyron_lake::ColumnData {
-            column_id: *parent_id,
-            cells,
-        });
+        values.push(zyron_lake::ColumnData::from_cells(*parent_id, cells));
     }
 
     let (outcome, _) = zyron_lake::check_foreign_key(log.paths(), &manifest, &parent_ids, &values)?;

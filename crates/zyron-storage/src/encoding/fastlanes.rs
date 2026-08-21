@@ -249,7 +249,10 @@ impl Encoding for FastLanesEncoding {
                 encoded[19],
             ]);
             let quotients = self.decode_range(&encoded[20..], row_count, value_size, start, end)?;
-            let mut out = vec![0u8; taken * value_size];
+            // SAFETY: the loop below writes every one of the taken slots
+            // at value_size bytes each, which is the whole buffer, before
+            // anything reads it
+            let mut out = unsafe { super::scratch::take_uninit(taken * value_size) };
             for i in 0..taken {
                 let q = read_u64_le(&quotients, i * value_size, value_size);
                 write_le(
@@ -278,7 +281,10 @@ impl Encoding for FastLanesEncoding {
                 encoded[18],
                 encoded[19],
             ]);
-            let mut out = vec![0u8; taken * value_size];
+            // SAFETY: the loop below writes every one of the taken slots
+            // at value_size bytes each, which is the whole buffer, before
+            // anything reads it
+            let mut out = unsafe { super::scratch::take_uninit(taken * value_size) };
             for i in 0..taken {
                 let row = start + i;
                 let v = base_value.wrapping_add((row as u64).wrapping_mul(step));
@@ -313,7 +319,10 @@ impl Encoding for FastLanesEncoding {
                 ));
             }
             let packed = &encoded[table_off + table_bytes..];
-            let mut out = vec![0u8; taken * value_size];
+            // SAFETY: the loop below writes every one of the taken slots
+            // at value_size bytes each, which is the whole buffer, before
+            // anything reads it
+            let mut out = unsafe { super::scratch::take_uninit(taken * value_size) };
             let packed_ptr = packed.as_ptr();
             let packed_len = packed.len();
             for i in 0..taken {
@@ -378,7 +387,10 @@ impl Encoding for FastLanesEncoding {
             ));
         }
 
-        let mut out = vec![0u8; taken * value_size];
+        // SAFETY: the loop below writes every one of the taken slots
+        // at value_size bytes each, which is the whole buffer, before
+        // anything reads it
+        let mut out = unsafe { super::scratch::take_uninit(taken * value_size) };
         let packed_ptr = packed.as_ptr();
         let packed_len = packed.len();
         for i in 0..taken {
@@ -426,7 +438,10 @@ impl Encoding for FastLanesEncoding {
                 encoded[19],
             ]);
             let q_raw = self.decode(&encoded[20..], row_count, value_size)?;
-            let mut out = vec![0u8; row_count * value_size];
+            // SAFETY: the loop below writes every one of the row_count slots
+            // at value_size bytes each, which is the whole buffer, before
+            // anything reads it
+            let mut out = unsafe { super::scratch::take_uninit(row_count * value_size) };
             for i in 0..row_count {
                 let q = read_u64_le(&q_raw, i * value_size, value_size);
                 let v = base.wrapping_add(q.wrapping_mul(scale));
@@ -523,7 +538,10 @@ impl Encoding for FastLanesEncoding {
             };
             let mut r = vec![0u64; row_count];
             unpack_batch(packed, bit_width, mask, row_count, &mut r);
-            let mut out = vec![0u8; row_count * value_size];
+            // SAFETY: the loop below writes every one of the row_count slots
+            // at value_size bytes each, which is the whole buffer, before
+            // anything reads it
+            let mut out = unsafe { super::scratch::take_uninit(row_count * value_size) };
             write_residuals_add_base(&mut out, value_size, &r, base_value);
             for e in 0..exc_count {
                 let o = table_off + e * 12;
@@ -554,7 +572,10 @@ impl Encoding for FastLanesEncoding {
         if flags & FLAG_MINIBLOCK != 0 {
             let nblocks = row_count.div_ceil(MINIBLOCK_SIZE);
             let mut off = 12usize;
-            let mut out = vec![0u8; row_count * value_size];
+            // SAFETY: the loop below writes every one of the row_count slots
+            // at value_size bytes each, which is the whole buffer, before
+            // anything reads it
+            let mut out = unsafe { super::scratch::take_uninit(row_count * value_size) };
             for b in 0..nblocks {
                 if off >= encoded.len() {
                     return Err(ZyronError::DecodingFailed(
@@ -616,7 +637,10 @@ impl Encoding for FastLanesEncoding {
             };
             let mut r = vec![0u64; row_count];
             unpack_batch(packed, bit_width, mask, row_count, &mut r);
-            let mut out: Vec<u8> = vec![0u8; row_count * value_size];
+            // SAFETY: the loop below writes every one of the row_count slots
+            // at value_size bytes each, which is the whole buffer, before
+            // anything reads it
+            let mut out: Vec<u8> = unsafe { super::scratch::take_uninit(row_count * value_size) };
             let mut residual: u64 = r[0];
             write_le(&mut out, 0, value_size, residual.wrapping_add(base_value));
             if row_count > 1 {

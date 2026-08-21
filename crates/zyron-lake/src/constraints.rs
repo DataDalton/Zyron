@@ -132,7 +132,7 @@ fn build_keys<'a>(
         })?;
         key_columns.push(data);
     }
-    let row_count = key_columns[0].cells.len();
+    let row_count = key_columns[0].len();
     if row_count == 0 {
         return Ok(None);
     }
@@ -160,8 +160,8 @@ fn build_keys<'a>(
         let mut cells = Vec::with_capacity(key_columns.len());
         let mut has_null = false;
         for column in &key_columns {
-            match &column.cells[row] {
-                Some(cell) => cells.push(Some(cell.as_slice())),
+            match column.cell(row) {
+                Some(cell) => cells.push(Some(cell)),
                 None => {
                     has_null = true;
                     break;
@@ -176,8 +176,7 @@ fn build_keys<'a>(
         push_key(&mut keys.blob, &cells);
         keys.spans.push((start, keys.blob.len() as u32));
 
-        if let Some(cell) = &leading.cells[row] {
-            let cell = cell.as_slice();
+        if let Some(cell) = leading.cell(row) {
             if min_cell
                 .map(|m| compare_cells(leading_physical, cell, m).is_lt())
                 .unwrap_or(true)
@@ -254,8 +253,7 @@ pub fn unique_probe_range(
         .physical_type_id();
     let mut min_cell: Option<&[u8]> = None;
     let mut max_cell: Option<&[u8]> = None;
-    for cell in leading.cells.iter().flatten() {
-        let cell = cell.as_slice();
+    for cell in leading.iter().flatten() {
         if min_cell
             .map(|m| compare_cells(leading_physical, cell, m).is_lt())
             .unwrap_or(true)
@@ -808,17 +806,11 @@ mod tests {
 
     fn batch(ids: &[i64], tags: &[Option<&str>]) -> Vec<ColumnData> {
         vec![
-            ColumnData {
-                column_id: 0,
-                cells: ids.iter().map(|v| Some(v.to_le_bytes().to_vec())).collect(),
-            },
-            ColumnData {
-                column_id: 1,
-                cells: tags
+            ColumnData::from_cells(0, ids.iter().map(|v| Some(v.to_le_bytes().to_vec())).collect()),
+            ColumnData::from_cells(1, tags
                     .iter()
                     .map(|t| t.map(|s| s.as_bytes().to_vec()))
-                    .collect(),
-            },
+                    .collect()),
         ]
     }
 
@@ -923,10 +915,7 @@ mod tests {
         let manifest = log.latest_manifest().expect("manifest");
 
         // MATCH SIMPLE: a NULL component references nothing, so no check
-        let values = vec![ColumnData {
-            column_id: 0,
-            cells: vec![None, Some(1i64.to_le_bytes().to_vec())],
-        }];
+        let values = vec![ColumnData::from_cells(0, vec![None, Some(1i64.to_le_bytes().to_vec())])];
         let (outcome, _) = check_foreign_key(log.paths(), &manifest, &[0], &values).expect("check");
         assert_eq!(outcome, ForeignKeyOutcome::Ok);
     }

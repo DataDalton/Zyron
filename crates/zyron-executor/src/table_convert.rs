@@ -33,9 +33,12 @@ pub async fn read_heap_rows(
     let mut columns: Vec<zyron_lake::ColumnData> = table
         .columns
         .iter()
-        .map(|c| zyron_lake::ColumnData {
-            column_id: c.id.0 as u32,
-            cells: Vec::new(),
+        .map(|c| {
+            zyron_lake::ColumnData::with_capacity(
+                c.id.0 as u32,
+                c.physical_type_id().fixed_size().unwrap_or(0),
+                0,
+            )
         })
         .collect();
 
@@ -108,10 +111,11 @@ fn append_batch_row(
     for (index, column) in table.columns.iter().enumerate() {
         let value_size = column.physical_type_id().fixed_size().unwrap_or(0);
         let scalar = batch.columns[index].get_scalar(row);
-        columns[index].cells.push(match scalar {
+        let cell = match scalar {
             ScalarValue::Null => None,
             ref v => Some(encode_scalar_value(column.type_id, v, value_size)),
-        });
+        };
+        columns[index].push(cell.as_deref());
     }
 }
 
@@ -124,7 +128,7 @@ pub fn cells_to_batches(
     columns: &[zyron_lake::ColumnData],
     batch_rows: usize,
 ) -> Result<Vec<DataBatch>> {
-    let row_count = columns.first().map(|c| c.cells.len()).unwrap_or(0);
+    let row_count = columns.first().map(|c| c.len()).unwrap_or(0);
     if row_count == 0 {
         return Ok(Vec::new());
     }
@@ -157,7 +161,7 @@ pub fn cells_to_batches(
         for row in start..end {
             for (index, column) in table.columns.iter().enumerate() {
                 let value_size = column.physical_type_id().fixed_size().unwrap_or(0);
-                let scalar = match columns[index].cells[row].as_deref() {
+                let scalar = match columns[index].cell(row) {
                     None => ScalarValue::Null,
                     Some(cell) if value_size == 0 => {
                         crate::batch::decode_varlen_scalar(column.type_id, cell)

@@ -252,10 +252,23 @@ struct SegmentIndexEntry {
 // ZyrFileWriter
 // ---------------------------------------------------------------------------
 
-/// Writes a .zyr columnar file using a temporary path for atomic rename.
+/// Writes a .zyr columnar file at the name it will be read under.
+///
+/// A file is named by a partition id drawn from 64 bits of entropy and
+/// checked against the manifest, so no two writers ever aim at one path,
+/// and nothing reads a data file except through a manifest that names it.
+/// A file that no committed manifest names is unreachable whatever it
+/// holds, which is what makes writing under the final name safe and makes
+/// the staging rename a cost with nothing behind it: measured against the
+/// data file this writer produces, the rename was 140us of a 615us write.
+///
+/// What the rename did carry was protection from the vacuum, which
+/// reclaims any data file the manifest does not reference and cannot tell
+/// a file being written from a file left by a crash. The writer registers
+/// the partition id with its log for as long as the write is in flight,
+/// and the vacuum skips what is registered
 pub struct ZyrFileWriter {
     writer: BufWriter<File>,
-    tmpPath: PathBuf,
     finalPath: PathBuf,
     header: ZyrFileHeader,
     segmentIndex: Vec<SegmentIndexEntry>,
@@ -263,21 +276,22 @@ pub struct ZyrFileWriter {
 }
 
 impl ZyrFileWriter {
-    /// Creates a new writer. Writes the file header to a temporary file
-    /// at `path.with_extension("zyr.tmp")`.
+    /// Creates a new writer and writes the file header.
+    ///
+    /// The path is created rather than opened, so a partition id that
+    /// collides with a file already on disk fails here instead of
+    /// truncating whatever was there
     pub fn create(path: &Path, header: ZyrFileHeader) -> Result<Self> {
         let finalPath = path.to_path_buf();
-        let tmpPath = path.with_extension("zyr.tmp");
 
         let file = OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmpPath)
+            .create_new(true)
+            .open(&finalPath)
             .map_err(|e| {
                 ZyronError::IoError(format!(
-                    "failed to create temp file {}: {}",
-                    tmpPath.display(),
+                    "failed to create data file {}: {}",
+                    finalPath.display(),
                     e
                 ))
             })?;
@@ -291,7 +305,6 @@ impl ZyrFileWriter {
 
         Ok(Self {
             writer,
-            tmpPath,
             finalPath,
             header,
             segmentIndex: Vec::new(),
@@ -445,7 +458,7 @@ impl ZyrFileWriter {
             self.writer
                 .get_ref()
                 .sync_all()
-                .map_err(|e| ZyronError::IoError(format!("failed to fsync temp file: {}", e)))?;
+                .map_err(|e| ZyronError::IoError(format!("failed to fsync data file: {}", e)))?;
         }
 
         // Get final file size before dropping writer.
@@ -453,20 +466,10 @@ impl ZyrFileWriter {
             .writer
             .get_ref()
             .metadata()
-            .map_err(|e| ZyronError::IoError(format!("failed to read temp file metadata: {}", e)))?
+            .map_err(|e| ZyronError::IoError(format!("failed to read data file metadata: {}", e)))?
             .len();
 
-        // Drop writer to release file handle before rename.
         drop(self.writer);
-
-        std::fs::rename(&self.tmpPath, &self.finalPath).map_err(|e| {
-            ZyronError::IoError(format!(
-                "failed to rename {} to {}: {}",
-                self.tmpPath.display(),
-                self.finalPath.display(),
-                e
-            ))
-        })?;
 
         if fsync {
             sync_parent_directory(&self.finalPath)?;
@@ -476,13 +479,13 @@ impl ZyrFileWriter {
     }
 }
 
-/// Persists the directory entry a rename created.
+/// Persists the directory entry the file's creation added.
 ///
 /// Flushing a file covers its bytes, not the name that reaches them. On a
 /// filesystem that can lose a directory entry independently of file
-/// contents, a crash between the rename and the next metadata flush leaves
-/// a committed version referencing a data file whose name never landed, so
-/// this runs before the caller is told the file is durable.
+/// contents, a crash between the creation and the next metadata flush
+/// leaves a committed version referencing a data file whose name never
+/// landed, so this runs before the caller is told the file is durable.
 ///
 /// Errors are returned rather than swallowed. A durability step that
 /// quietly does nothing is worse than one that was never attempted, because
@@ -580,9 +583,46 @@ pub struct ZyrFileReader {
     /// and zone reads too, so the two report bytes of column data the query
     /// had to touch rather than everything the file system was asked for
     dataBytes: AtomicU64,
+    /// Each segment's header, parsed on the first read of that column and
+    /// held for the rest of the reader's life.
+    ///
+    /// A segment header is fixed once the file is written, and every decode
+    /// needs it to locate the payload behind the bloom and the zone maps.
+    /// Reading it again per decode is a second positional read for bytes
+    /// that cannot have changed, and a scan reading several columns, or one
+    /// column in ranges, pays it every time. Filled lazily so opening a wide
+    /// file to read two of its columns does not read a hundred headers
+    /// What has been read off each segment and does not have to be read
+    /// again, filled on the first column this reader decodes.
+    ///
+    /// Built on first use rather than at open, because opening a file to
+    /// prune it against its manifest never reads a segment at all, and a
+    /// scan opens far more files than it decodes columns from
+    segmentCache: std::sync::OnceLock<Box<[SegmentCache]>>,
     #[allow(dead_code)]
     fileSize: u64,
 }
+
+/// One segment's reusable parts.
+///
+/// The header is fixed once the file is written and every decode needs it to
+/// locate the payload behind the bloom and the zone maps. The tail is the
+/// null bitmap and encoded payload, held only when small: a well encoded
+/// column is a few dozen bytes, and a point probe decoding a range per key,
+/// or a predicate column that is also projected, would otherwise pay a
+/// system call each time for bytes that cannot have changed
+#[derive(Default)]
+struct SegmentCache {
+    header: std::sync::OnceLock<SegmentHeader>,
+    tail: std::sync::OnceLock<std::sync::Arc<Vec<u8>>>,
+}
+
+/// Largest segment tail held in memory after its first read.
+///
+/// Sized so a well compressed column is kept and a raw or lightly encoded
+/// one is not: past this the read is large enough that the system call is no
+/// longer the dominant cost, and holding it would grow with the file
+const CACHED_TAIL_MAX: usize = 8192;
 
 /// Fills `buf` from `offset`, naming the region in any error so a failure
 /// says which part of which file could not be read
@@ -870,6 +910,7 @@ impl ZyrFileReader {
             segmentByColumn,
             ioBytes: AtomicU64::new(PAGE_SIZE as u64 + indexRegionSize as u64 + FOOTER_SIZE as u64),
             dataBytes: AtomicU64::new(0),
+            segmentCache: std::sync::OnceLock::new(),
             fileSize,
         })
     }
@@ -899,11 +940,52 @@ impl ZyrFileReader {
 
     /// The segment holding one column, found by binary search
     fn segment_for(&self, column_id: u32) -> Option<&SegmentIndexEntry> {
+        self.segment_at(column_id).map(|(_, entry)| entry)
+    }
+
+    /// The segment for a column paired with its position in the index, which
+    /// is what addresses the header cache
+    fn segment_at(&self, column_id: u32) -> Option<(usize, &SegmentIndexEntry)> {
         let at = self
             .segmentByColumn
             .binary_search_by_key(&column_id, |(id, _)| *id)
             .ok()?;
-        self.segmentIndex.get(self.segmentByColumn[at].1 as usize)
+        let position = self.segmentByColumn[at].1 as usize;
+        self.segmentIndex.get(position).map(|e| (position, e))
+    }
+
+    /// One segment's header, read off the file the first time it is asked
+    /// for and answered from memory after that.
+    ///
+    /// The byte counter moves only on a read that happened, so the reported
+    /// figure stays what the file system was actually asked for
+    /// The per-segment cache, built the first time a segment is read
+    fn segment_cache(&self) -> &[SegmentCache] {
+        self.segmentCache.get_or_init(|| {
+            (0..self.segmentIndex.len())
+                .map(|_| SegmentCache::default())
+                .collect()
+        })
+    }
+
+    fn cached_segment_header(&self, position: usize, offset: u64) -> Result<&SegmentHeader> {
+        let cell = self.segment_cache().get(position).map(|c| &c.header).ok_or_else(|| {
+            ZyronError::InvalidZyrFile(format!("no segment at index position {}", position))
+        })?;
+        if let Some(header) = cell.get() {
+            return Ok(header);
+        }
+        let mut bytes = [0u8; SEGMENT_HEADER_SIZE];
+        read_exact_at(
+            &self.file,
+            &mut bytes,
+            offset,
+            &self.path,
+            ReadPurpose::SegmentHeader,
+        )?;
+        let header = SegmentHeader::from_bytes(&bytes)?;
+        self.count_read(SEGMENT_HEADER_SIZE);
+        Ok(cell.get_or_init(|| header))
     }
 
     /// Returns a reference to the file header.
@@ -970,21 +1052,12 @@ impl ZyrFileReader {
         &self,
         column_id: u32,
         row_count: usize,
-    ) -> Result<(SegmentHeader, Vec<u8>, Vec<u8>)> {
+    ) -> Result<(SegmentHeader, std::sync::Arc<Vec<u8>>, usize)> {
         use super::constants::{ZONE_MAP_BATCH_SIZE, ZONE_MAP_ENTRY_SIZE};
-        let entry = self.segment_for(column_id).ok_or_else(|| {
+        let (position, entry) = self.segment_at(column_id).ok_or_else(|| {
             ZyronError::InvalidZyrFile(format!("no segment found for column_id {}", column_id))
         })?;
-
-        let mut header_bytes = [0u8; SEGMENT_HEADER_SIZE];
-        read_exact_at(
-            &self.file,
-            &mut header_bytes,
-            entry.offset,
-            &self.path,
-            ReadPurpose::SegmentHeader,
-        )?;
-        let header = SegmentHeader::from_bytes(&header_bytes)?;
+        let header = self.cached_segment_header(position, entry.offset)?.clone();
 
         let zones = row_count.div_ceil(ZONE_MAP_BATCH_SIZE as usize);
         let null_start =
@@ -1003,6 +1076,18 @@ impl ZyrFileReader {
                 null_start + tail_len
             )));
         }
+        // A tail already read off this file is handed back without a
+        // second system call. The checksum guards the transfer from disk, so
+        // it is verified when the bytes arrive rather than on every look at
+        // bytes that have not left memory since
+        if let Some(cell) = self.segment_cache().get(position).map(|c| &c.tail)
+            && let Some(tail) = cell.get()
+            && tail.len() == tail_len
+        {
+            self.count_data_read(tail_len);
+            return Ok((header, std::sync::Arc::clone(tail), null_len));
+        }
+
         let tail = read_vec_at(
             &self.file,
             tail_len,
@@ -1011,18 +1096,21 @@ impl ZyrFileReader {
             ReadPurpose::Segment(column_id),
         )?;
 
-        // The header locates the tail, so it is IO but not column data
-        self.count_read(SEGMENT_HEADER_SIZE);
         self.count_data_read(tail_len);
-        let (null_bitmap, encoded) = tail.split_at(null_len);
-        let crc = zyron_common::hash32(encoded);
+        let crc = zyron_common::hash32(&tail[null_len..]);
         if crc != header.data_checksum {
             return Err(ZyronError::InvalidZyrFile(format!(
                 "segment payload checksum mismatch for column {}: stored 0x{:08x}, computed 0x{:08x}",
                 column_id, header.data_checksum, crc
             )));
         }
-        Ok((header, null_bitmap.to_vec(), encoded.to_vec()))
+        let tail = std::sync::Arc::new(tail);
+        if tail_len <= CACHED_TAIL_MAX
+            && let Some(cell) = self.segment_cache().get(position).map(|c| &c.tail)
+        {
+            let _ = cell.set(std::sync::Arc::clone(&tail));
+        }
+        Ok((header, tail, null_len))
     }
 
     /// Reads and fully decodes one column segment, returning the decoded
@@ -1035,10 +1123,10 @@ impl ZyrFileReader {
         row_count: usize,
         value_size: usize,
     ) -> Result<(Vec<u8>, Vec<u8>)> {
-        let (header, null_bitmap, enc) = self.read_segment_payload(column_id, row_count)?;
+        let (header, tail, null_len) = self.read_segment_payload(column_id, row_count)?;
         let decoded = crate::encoding::create_encoding(header.encoding_type)
-            .decode(&enc, row_count, value_size)?;
-        Ok((decoded, null_bitmap))
+            .decode(&tail[null_len..], row_count, value_size)?;
+        Ok((decoded, tail[..null_len].to_vec()))
     }
 
     /// Reads and decodes rows `start..end` of one column segment.
@@ -1061,11 +1149,11 @@ impl ZyrFileReader {
         start: usize,
         end: usize,
     ) -> Result<(Vec<u8>, Vec<u8>)> {
-        let (header, null_bitmap, enc) = self.read_segment_payload(column_id, row_count)?;
+        let (header, tail, null_len) = self.read_segment_payload(column_id, row_count)?;
         let (start, end) = crate::encoding::clamp_range(row_count, start, end);
         let decoded = crate::encoding::create_encoding(header.encoding_type)
-            .decode_range(&enc, row_count, value_size, start, end)?;
-        Ok((decoded, null_bitmap))
+            .decode_range(&tail[null_len..], row_count, value_size, start, end)?;
+        Ok((decoded, tail[..null_len].to_vec()))
     }
 
     /// Reads one column's header and zone maps without touching its
@@ -1148,9 +1236,9 @@ impl ZyrFileReader {
         value_size: usize,
         predicate: &crate::encoding::Predicate<'_>,
     ) -> Result<Vec<u8>> {
-        let (header, _, enc) = self.read_segment_payload(column_id, row_count)?;
+        let (header, tail, null_len) = self.read_segment_payload(column_id, row_count)?;
         crate::encoding::create_encoding(header.encoding_type)
-            .eval_predicate(&enc, row_count, value_size, predicate)
+            .eval_predicate(&tail[null_len..], row_count, value_size, predicate)
     }
 
     /// Evaluates a predicate over rows `start..end`, returning a keep mask
@@ -1181,9 +1269,9 @@ impl ZyrFileReader {
         if start >= end {
             return Ok(Vec::new());
         }
-        let (header, _, enc) = self.read_segment_payload(column_id, row_count)?;
+        let (header, tail, null_len) = self.read_segment_payload(column_id, row_count)?;
         let decoded = crate::encoding::create_encoding(header.encoding_type)
-            .decode_range(&enc, row_count, value_size, start, end)?;
+            .decode_range(&tail[null_len..], row_count, value_size, start, end)?;
         crate::encoding::eval_predicate_on_raw(&decoded, end - start, value_size, predicate)
     }
 

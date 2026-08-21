@@ -41,7 +41,7 @@ impl ViewRow {
             .iter()
             .position(|c| c == column)
             .unwrap_or_else(|| panic!("view has no column \"{column}\""));
-        match &self.cells[idx] {
+        match self.cells[idx].as_deref() {
             Some(b) => String::from_utf8_lossy(b).into_owned(),
             None => String::new(),
         }

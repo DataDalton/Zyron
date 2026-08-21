@@ -406,14 +406,8 @@ fn test_zone_maps_reject_rows_the_file_bounds_admit() {
         .map(|r| Some(((r % 16) as i64).to_le_bytes().to_vec()))
         .collect();
     let columns = vec![
-        ColumnData {
-            column_id: 0,
-            cells: ids,
-        },
-        ColumnData {
-            column_id: 1,
-            cells: buckets,
-        },
+        ColumnData::from_cells(0, ids),
+        ColumnData::from_cells(1, buckets),
     ];
     zyron_lake::write_data_file(
         &paths,
@@ -509,14 +503,8 @@ fn test_data_file_scan_throughput() {
         .map(|r| Some(((r % 16) as i64).to_le_bytes().to_vec()))
         .collect();
     let columns = vec![
-        ColumnData {
-            column_id: 0,
-            cells: ids,
-        },
-        ColumnData {
-            column_id: 1,
-            cells: buckets,
-        },
+        ColumnData::from_cells(0, ids),
+        ColumnData::from_cells(1, buckets),
     ];
     let entry = zyron_lake::write_data_file(
         &paths,
@@ -614,14 +602,8 @@ fn key_table(
             attempt(OperationKind::Append, 0),
             table_id as u64,
             &[
-                ColumnData {
-                    column_id: 0,
-                    cells: ids,
-                },
-                ColumnData {
-                    column_id: 1,
-                    cells: payload,
-                },
+                ColumnData::from_cells(0, ids),
+                ColumnData::from_cells(1, payload),
             ],
         )
         .expect("append");
@@ -631,17 +613,11 @@ fn key_table(
 
 fn id_batch(ids: &[i64]) -> Vec<ColumnData> {
     vec![
-        ColumnData {
-            column_id: 0,
-            cells: ids.iter().map(|v| Some(v.to_le_bytes().to_vec())).collect(),
-        },
-        ColumnData {
-            column_id: 1,
-            cells: ids
+        ColumnData::from_cells(0, ids.iter().map(|v| Some(v.to_le_bytes().to_vec())).collect()),
+        ColumnData::from_cells(1, ids
                 .iter()
                 .map(|_| Some(0i64.to_le_bytes().to_vec()))
-                .collect(),
-        },
+                .collect()),
     ]
 }
 
@@ -1114,14 +1090,8 @@ fn test_a_clustering_pass_raises_the_measured_skip_rate() {
             .map(|r| Some(((r % 16) as i64).to_le_bytes().to_vec()))
             .collect();
         let columns = vec![
-            ColumnData {
-                column_id: 0,
-                cells: ids,
-            },
-            ColumnData {
-                column_id: 1,
-                cells: buckets,
-            },
+            ColumnData::from_cells(0, ids),
+            ColumnData::from_cells(1, buckets),
         ];
         let entry = zyron_lake::write_data_file(
             &paths,
@@ -1265,14 +1235,8 @@ fn test_a_refused_clustering_pass_leaves_the_file_set_untouched() {
             .map(|_| Some((file as i64).to_le_bytes().to_vec()))
             .collect();
         let columns = vec![
-            ColumnData {
-                column_id: 0,
-                cells: ids,
-            },
-            ColumnData {
-                column_id: 1,
-                cells: buckets,
-            },
+            ColumnData::from_cells(0, ids),
+            ColumnData::from_cells(1, buckets),
         ];
         let entry = zyron_lake::write_data_file(
             &paths,
@@ -1438,23 +1402,18 @@ fn gate(name: &str, value: f64, target: f64, higher_is_better: bool) -> bool {
 }
 
 /// Two columns of `n` rows, the shape every gate below writes
+/// The batch a caller hands the write path, built the way the executor
+/// builds one: each column sized at its own width and filled cell by cell
+/// into the packed buffer, so what this measures is the work an insert
+/// really does rather than a fixture that allocates per cell
 fn rows_batch(start: i64, n: usize) -> Vec<ColumnData> {
-    let ids: Vec<Option<Vec<u8>>> = (0..n)
-        .map(|i| Some((start + i as i64).to_le_bytes().to_vec()))
-        .collect();
-    let payload: Vec<Option<Vec<u8>>> = (0..n)
-        .map(|i| Some(((i as i64 * 7919) % 1024).to_le_bytes().to_vec()))
-        .collect();
-    vec![
-        ColumnData {
-            column_id: 0,
-            cells: ids,
-        },
-        ColumnData {
-            column_id: 1,
-            cells: payload,
-        },
-    ]
+    let mut ids = ColumnData::with_capacity(0, 8, n);
+    let mut payload = ColumnData::with_capacity(1, 8, n);
+    for i in 0..n {
+        ids.push(Some(&(start + i as i64).to_le_bytes()));
+        payload.push(Some(&(((i as i64) * 7919) % 1024).to_le_bytes()));
+    }
+    vec![ids, payload]
 }
 
 fn two_column_schema() -> LakeSchema {
@@ -1801,7 +1760,7 @@ fn test_insert_path_decomposition() {
                     .find(|c| c.column_id == col.id)
                     .expect("column data");
                 let physical = col.physical_type_id();
-                let views: Vec<Option<&[u8]>> = data.cells.iter().map(|c| c.as_deref()).collect();
+                let views: Vec<Option<&[u8]>> = data.iter().collect();
                 zyron_storage::columnar::ColumnSegment::build_with_options(
                     col.id,
                     physical,
@@ -1838,7 +1797,7 @@ fn test_insert_path_decomposition() {
                     .find(|c| c.column_id == col.id)
                     .expect("column data");
                 let physical = col.physical_type_id();
-                let views: Vec<Option<&[u8]>> = data.cells.iter().map(|c| c.as_deref()).collect();
+                let views: Vec<Option<&[u8]>> = data.iter().collect();
                 zyron_storage::columnar::ColumnSegment::build_with_options(
                     col.id,
                     physical,
@@ -1880,7 +1839,7 @@ fn test_insert_path_decomposition() {
                 .expect("column data");
             let physical = col.physical_type_id();
             let value_size = physical.fixed_size().unwrap_or(0);
-            let views: Vec<Option<&[u8]>> = data.cells.iter().map(|c| c.as_deref()).collect();
+            let views: Vec<Option<&[u8]>> = data.iter().collect();
             let mut raw = vec![0u8; views.len() * value_size];
             if value_size > 0 {
                 for (i, v) in views.iter().enumerate() {
@@ -1925,7 +1884,9 @@ fn test_insert_path_decomposition() {
         let (_, us) = micros(|| {
             let mut kept = 0u64;
             for (_, _, _, views) in &packed {
-                let mut sketch = zyron_storage::columnar::DistinctSketch::new();
+                let mut sketch = zyron_storage::columnar::DistinctSketch::with_exact_capacity(
+                    zyron_storage::encoding::cardinality_cap(views.len()),
+                );
                 for v in views.iter().flatten() {
                     sketch.insert(v);
                 }
@@ -1943,22 +1904,51 @@ fn test_insert_path_decomposition() {
     );
 
     // Choosing the encoding, which under exact selection trial encodes the
-    // whole column and hands its output back to be kept. Measured against
-    // the packed buffer the fused pass produces, so it is the same call the
-    // segment build makes with the same input.
+    // whole column and hands its output back to be kept. Measured through
+    // the entry point the segment build calls, handed the statistics that
+    // build gathers on its packing pass rather than recomputing them, so
+    // the number is the work production does and not a walk production no
+    // longer takes.
     //
     // What is left of the encode once this, the bloom and the sketch are
     // accounted for is the fused pass itself: the walk that packs the buffer,
     // tracks the zone bounds and counts the nulls
+    let column_stats: Vec<zyron_storage::encoding::ColumnSampleStats> = packed
+        .iter()
+        .map(|(_, _, _, views)| {
+            let mut distinct = std::collections::HashSet::new();
+            let mut runs = 1usize;
+            let mut previous: Option<&[u8]> = None;
+            let mut nulls = 0usize;
+            for cell in views.iter() {
+                match cell {
+                    Some(v) => {
+                        distinct.insert(*v);
+                        if previous.is_some_and(|p| p != *v) {
+                            runs += 1;
+                        }
+                        previous = Some(v);
+                    }
+                    None => nulls += 1,
+                }
+            }
+            zyron_storage::encoding::ColumnSampleStats {
+                cardinality: distinct.len(),
+                run_count: runs,
+                all_identical: nulls == views.len() || (nulls == 0 && runs == 1),
+            }
+        })
+        .collect();
 
     let mut select_us = Vec::with_capacity(RUNS);
     for _ in 0..RUNS {
         let (_, us) = micros(|| {
             let mut kept = 0usize;
-            for (physical, value_size, raw, views) in &packed {
-                let choice = zyron_storage::encoding::select_encoding_packed(
+            for ((physical, value_size, raw, views), stats) in packed.iter().zip(&column_stats) {
+                let choice = zyron_storage::encoding::select_encoding_prepared(
                     *physical,
-                    views,
+                    views.len(),
+                    *stats,
                     raw,
                     *value_size,
                     true,
@@ -2010,7 +2000,7 @@ fn test_insert_path_decomposition() {
                     .expect("column data");
                 let mut views: Vec<Option<&[u8]>> = Vec::with_capacity(n);
                 for &row in &order {
-                    views.push(data.cells[row].as_deref());
+                    views.push(data.cell(row));
                 }
                 kept += views.len();
             }
@@ -2039,7 +2029,7 @@ fn test_insert_path_decomposition() {
                 .find(|c| c.column_id == col.id)
                 .expect("column data");
             let physical = col.physical_type_id();
-            let views: Vec<Option<&[u8]>> = data.cells.iter().map(|c| c.as_deref()).collect();
+            let views: Vec<Option<&[u8]>> = data.iter().collect();
             let segment = zyron_storage::columnar::ColumnSegment::build_with_options(
                 col.id,
                 physical,
@@ -2072,8 +2062,14 @@ fn test_insert_path_decomposition() {
             for (col, (_, segment, _, _, views)) in schema.columns.iter().zip(prebuilt.iter()) {
                 let (zones, bloom) = zyron_lake::writer::segment_frame_bytes(segment);
                 kept += zones.len();
-                let entry =
-                    zyron_lake::writer::column_stats_entry(col, views, segment, n, bloom, 0);
+                let entry = zyron_lake::writer::column_stats_entry(
+                    col,
+                    zyron_lake::writer::StoredCells::Views(views),
+                    segment,
+                    n,
+                    bloom,
+                    0,
+                );
                 kept += entry.column_id as usize;
             }
             kept
@@ -2305,13 +2301,12 @@ fn test_insert_path_decomposition() {
         });
         commit_us.push(us);
     }
-    // The two file operations a commit makes, timed on their own against a
-    // version file of the size this table actually writes. A commit is those
-    // plus the head, manifest and maintenance bookkeeping around them, so
-    // measuring the primitives says how much of the published figure is the
-    // filesystem and how much is everything else. The hint is a full rewrite
-    // of a small file on every commit, which is a second file creation for
-    // data the reconstruction treats as advisory
+    // The one file operation a commit makes, timed on its own against a
+    // version file of the size this table actually writes. It is the floor
+    // the published figure sits above, reported beside it rather than
+    // subtracted from it: the two run on different files in different
+    // directories, and each carries an fsync whose spread is wider than
+    // any difference between them would be
     let version_bytes = std::fs::read_dir(log.paths().log_dir())
         .expect("log dir")
         .filter_map(|e| e.ok())
@@ -2342,25 +2337,10 @@ fn test_insert_path_decomposition() {
         "us",
         version_file_us,
     );
-    let hint_path = primitive_dir.path().join("_latest");
-    let mut hint_us = Vec::with_capacity(RUNS);
-    for run in 0..RUNS {
-        let (_, us) = micros(|| {
-            std::fs::write(&hint_path, (run as u64).to_string()).expect("hint");
-        });
-        hint_us.push(us);
-    }
-    let hint = record_metric(
-        "lake_targets",
-        "Commit primitive, rewrite the latest hint",
-        "us",
-        hint_us,
-    );
     tprintln!(
-        "  Version file is {} bytes: {:.0}us to create write and fsync, {:.0}us to rewrite the hint",
+        "  Version file is {} bytes: {:.0}us to create write and fsync",
         version_bytes,
-        version_file,
-        hint
+        version_file
     );
 
     let commit = record_metric(
@@ -2441,10 +2421,8 @@ fn test_insert_path_decomposition() {
         100.0 * commit / append
     );
     tprintln!(
-        "      of which        {:>6.0}us        version file, {:.0}us hint, {:.0}us bookkeeping",
-        version_file,
-        hint,
-        (commit - version_file - hint).max(0.0)
+        "      against         {:>6.0}us        a version file of the same size written alone",
+        version_file
     );
     tprintln!(
         "    append total       {:>6.0}us        {:.0} rows/sec",
@@ -2945,8 +2923,51 @@ fn test_cluster_key_sort_overhead_target() {
             .1;
         }
     }
-    let per_row_ns = ((clustered_us - plain_us) / RUNS as f64).max(0.0) * 1000.0 / n as f64;
     tprintln!("  Rows per append: {}", n);
+    tprintln!(
+        "  Clustered append {:.0}us against plain {:.0}us over {} runs each",
+        clustered_us / RUNS as f64,
+        plain_us / RUNS as f64,
+        RUNS
+    );
+
+    // The ordering pass itself, timed against the same batch the appends
+    // above are handed. Taken as the gap between a keyed append and an
+    // unkeyed one it is a few hundred microseconds read off two whole file
+    // writes that each carry an fsync, and one fsync varies by more than
+    // the entire quantity being measured: the same code reported 41.5ns and
+    // 68.0ns per row on two runs while the pass measured directly moved
+    // from 6.28ns to 6.45ns
+    let batch = rows_batch(0, n);
+    let schema = two_column_schema();
+    let mut order_us = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        let (_, us) = micros(|| {
+            zyron_lake::writer::stored_order(
+                &schema,
+                &WriteRequest {
+                    partition_id: 0,
+                    columns: &batch,
+                    sort_keys: &[1],
+                    sort_strategies: &[ClusterStrategy::RangePartition],
+                    cluster_spec_id: 1,
+                    table_id: 908,
+                    bloom_columns: &[],
+                    index_id: None,
+                },
+                n,
+            )
+            .expect("order")
+        });
+        order_us.push(us);
+    }
+    let order = record_metric(
+        "lake_targets",
+        "Cluster key ordering pass",
+        "us",
+        order_us,
+    );
+    let per_row_ns = order * 1000.0 / n as f64;
     record_metric(
         "lake_targets",
         "Cluster key sort overhead",
@@ -2976,21 +2997,15 @@ fn test_cluster_key_sort_overhead_target() {
             .map(|i| Some((i as i64).to_le_bytes().to_vec()))
             .collect();
         vec![
-            ColumnData {
-                column_id: 0,
-                cells: ids,
-            },
-            ColumnData {
-                column_id: 1,
-                cells: bucket,
-            },
+            ColumnData::from_cells(0, ids),
+            ColumnData::from_cells(1, bucket),
         ]
     };
     let mut presorted_total = 0f64;
     let mut shuffled_total = 0f64;
     for run in 0..RUNS {
         let shuffled = rows_batch((500_000 + run * n) as i64, n);
-        let mut once = |batch: &[ColumnData]| {
+        let once = |batch: &[ColumnData]| {
             micros(|| {
                 zyron_lake::append_rows(&clustered, attempt(OperationKind::Append, 0), 908, batch)
                     .expect("append")

@@ -1034,9 +1034,12 @@ impl Operator for LakeUpdateOperator {
             let mut columns: Vec<zyron_lake::ColumnData> = table_entry
                 .columns
                 .iter()
-                .map(|c| zyron_lake::ColumnData {
-                    column_id: c.id.0 as u32,
-                    cells: Vec::new(),
+                .map(|c| {
+                    zyron_lake::ColumnData::with_capacity(
+                        c.id.0 as u32,
+                        c.physical_type_id().fixed_size().unwrap_or(0),
+                        0,
+                    )
                 })
                 .collect();
             let mut matched = 0u64;
@@ -1179,7 +1182,7 @@ impl Operator for LakeUpdateOperator {
                                 value_size,
                             )),
                         };
-                        columns[ci].cells.push(cell);
+                        columns[ci].push(cell.as_deref());
                     }
                 }
                 matched += image.num_rows as u64;

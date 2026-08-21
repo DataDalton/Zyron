@@ -1,0 +1,98 @@
+{
+  "id": "2026-08-21_134901_6456b90-local",
+  "date": "2026-08-21 13:49:05Z",
+  "ts": 1787320145,
+  "commit": "6456b90-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "optimizer": {
+      "analyze_1m_ms": {
+        "average": 40.734600,
+        "runs": [41.41, 40.57, 40.09, 41.02, 40.58],
+        "target": 400.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "auto_analyze_trigger_ms": {
+        "average": 3.755820,
+        "runs": [3.76, 3.74, 3.73, 3.79, 3.76],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "cardinality_accuracy_ratio": {
+        "average": 1.000000,
+        "runs": [1.00, 1.00, 1.00, 1.00, 1.00],
+        "target": 2.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "encoding_pushdown_speedup_x": {
+        "average": 30.578262,
+        "runs": [30.58, 30.58, 30.58, 30.58, 30.58],
+        "target": 3.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "explain_analyze_overhead_pct": {
+        "average": 18.007482,
+        "runs": [19.71, 17.23, 18.24, 18.14, 16.72],
+        "target": 3.000000,
+        "passed": false,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "explain_latency_us": {
+        "average": 0.832748,
+        "runs": [0.83, 0.83, 0.83, 0.83, 0.84],
+        "target": 20.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "histogram_build_1m_ms": {
+        "average": 0.449320,
+        "runs": [0.45, 0.45, 0.44, 0.46, 0.45],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "parallel_plan_selection_us": {
+        "average": 0.213805,
+        "runs": [0.21, 0.21, 0.22, 0.22, 0.21],
+        "target": 50.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      },
+      "selectivity_estimate_ns": {
+        "average": 99.310740,
+        "runs": [99.70, 99.71, 99.05, 99.05, 99.05],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": null,
+        "storage_calibration_us": null
+      }
+    }
+  }
+}

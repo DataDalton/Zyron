@@ -903,6 +903,29 @@ pub struct CommitAttempt<'a> {
     pub deadline: Option<std::time::Instant>,
 }
 
+/// One partition id registered as being written, unregistered on drop.
+///
+/// Every path out of a data file write goes through this drop, including
+/// the error returns and a panic, so a registration cannot outlive the
+/// write it protects and strand a file the vacuum will never reclaim
+pub struct StagedPartition<'a> {
+    log: &'a TransactionLog,
+    partition_id: u64,
+}
+
+impl StagedPartition<'_> {
+    /// The id this guard is holding
+    pub fn partition_id(&self) -> u64 {
+        self.partition_id
+    }
+}
+
+impl Drop for StagedPartition<'_> {
+    fn drop(&mut self) {
+        let _ = self.log.staging.remove_sync(&self.partition_id);
+    }
+}
+
 /// Table property naming the node that owns writes to a dataset.
 pub const WRITER_NODE_PROPERTY: &str = "writer_node";
 
@@ -1042,6 +1065,16 @@ pub struct TransactionLog {
     /// were waiting for a base. Separate from retries because a retry is
     /// healthy contention and this is a statement that did not run
     commit_timeouts: AtomicU64,
+    /// Partition ids whose data files this process is writing right now.
+    ///
+    /// The vacuum reclaims every data file no committed manifest
+    /// references, and a file still being written has not reached a
+    /// manifest yet, so the two together would delete the file a writer is
+    /// about to commit and leave the manifest naming bytes that are gone.
+    /// A staging path protected the write by keeping it under a name the
+    /// vacuum treated as garbage only once, at a cost of a rename per file.
+    /// Registering the id costs an insert and a removal
+    staging: scc::HashSet<u64>,
 }
 
 /// One version's manifest and the projections derived from it.
@@ -1337,6 +1370,7 @@ impl TransactionLog {
             manifests: scc::HashMap::new(),
             commit_retries: AtomicU64::new(0),
             commit_timeouts: AtomicU64::new(0),
+            staging: scc::HashSet::new(),
             local_node: AtomicU64::new(local_node()),
         };
         let mut state = None;
@@ -1366,7 +1400,6 @@ impl TransactionLog {
         log.created_head.store(1, Ordering::Release);
         if attempt.db_txn_id == 0 {
             log.published.store(1, Ordering::Release);
-            log.write_latest_hint(1);
         } else {
             let _ = log.pending.insert_sync(1, attempt.db_txn_id);
         }
@@ -1450,17 +1483,38 @@ impl TransactionLog {
             manifests: scc::HashMap::new(),
             commit_retries: AtomicU64::new(0),
             commit_timeouts: AtomicU64::new(0),
+            staging: scc::HashSet::new(),
             local_node: AtomicU64::new(local_node()),
         };
         // Validate the surviving chain replays cleanly
         let _ = log.manifest_at(head)?;
-        log.write_latest_hint(head);
         Ok(log)
     }
 
     /// Path layout of the table this log belongs to
     pub fn paths(&self) -> &LakePaths {
         &self.paths
+    }
+
+    /// Marks a partition id as being written, and unmarks it when the
+    /// returned guard drops.
+    ///
+    /// Held from before the data file is created until the commit that
+    /// names it has resolved either way. A guard rather than a pair of
+    /// calls because the write path has several failure returns and a leak
+    /// here means a file the vacuum never reclaims
+    pub fn stage_partition(&self, partition_id: u64) -> StagedPartition<'_> {
+        let _ = self.staging.insert_sync(partition_id);
+        StagedPartition {
+            log: self,
+            partition_id,
+        }
+    }
+
+    /// Whether a data file for this partition is being written right now,
+    /// which is what tells the vacuum to leave it alone
+    pub fn is_staging(&self, partition_id: u64) -> bool {
+        self.staging.contains_sync(&partition_id)
     }
 
     /// Newest published version, what a scan reads
@@ -1647,6 +1701,7 @@ impl TransactionLog {
             manifests: scc::HashMap::new(),
             commit_retries: AtomicU64::new(0),
             commit_timeouts: AtomicU64::new(0),
+            staging: scc::HashSet::new(),
             local_node: AtomicU64::new(local_node()),
         };
         // The chain must replay, a branch that cannot be read is not a
@@ -1905,7 +1960,6 @@ impl TransactionLog {
                     if attempt.db_txn_id == 0 {
                         self.created_head.fetch_max(version, Ordering::AcqRel);
                         self.advance_published();
-                        self.write_latest_hint(self.latest_version());
                         self.mark_for_maintenance();
                     } else {
                         // Pending registration precedes the head advance.
@@ -2109,7 +2163,6 @@ impl TransactionLog {
             )));
         }
         self.advance_published();
-        self.write_latest_hint(self.latest_version());
         self.mark_for_maintenance();
         Ok(())
     }
@@ -2283,18 +2336,6 @@ impl TransactionLog {
             removed += 1;
         }
         Ok(removed)
-    }
-
-    fn write_latest_hint(&self, version: u64) {
-        // A branch numbers its versions above the fork point, so its head is
-        // a version main does not have. Each head writes its own hint
-        let hint = match &self.branch {
-            Some(name) => self.paths.branch_latest_hint(name),
-            None => self.paths.latest_hint(),
-        };
-        if let Err(e) = fs::write(&hint, version.to_string()) {
-            tracing::warn!(error = %e, "latest hint write failed, hint is advisory");
-        }
     }
 }
 

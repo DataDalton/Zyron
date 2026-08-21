@@ -1,0 +1,92 @@
+# suite:   encoding
+# run:     2026-08-21_134748_6456b90-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Encoding Round-Trip Correctness ===
+Rows per encoding: 100000
+
+  FastLanes (sequential i32):
+    Compression ratio: 20000.00x
+  FastLanes decode (int/sec) [FAIL/REGR!]:
+    Runs: [11,235,955,056, 13,333,333,333, 13,513,513,514, 13,157,894,737, 12,987,012,987]
+    Average: 12,845,541,925 >= 120,000,000,000 (target)
+    Min/Max: 11,235,955,056 / 13,513,513,514, StdDev: 823,708,047
+
+  FSST (32-byte strings):
+    Compression ratio: 5.08x
+  FSST decompress (GB/sec) [FAIL/OK]:
+    Runs: [4.6627, 4.6056, 4.5740, 4.6498, 4.6290]
+    Average: 4.6242 >= 6 (target)
+    Min/Max: 4.5740 / 4.6627, StdDev: 0.0317
+
+  ALP (f64 decimals):
+    Compression ratio: 61.92x
+  ALP decode (float/sec) [FAIL/REGR!]:
+    Runs: [664,010,624, 884,955,752, 4,672,897,196, 4,716,981,132, 1,763,668,430]
+    Average: 2,540,502,627 >= 3,000,000,000 (target)
+    Min/Max: 664,010,624 / 4,716,981,132, StdDev: 1,797,203,068
+
+  Dictionary (10 distinct i32):
+    Compression ratio: 7.99x
+  Dictionary lookup (ns/val) [PASS/OK]:
+    Runs: [2.4360, 1.9430, 1.9350, 1.9380, 2.0230]
+    Average: 2.0550 <= 3 (target)
+    Min/Max: 1.9350 / 2.4360, StdDev: 0.1933
+
+  RLE (runs of 1000):
+    Compression ratio: 657.89x
+  RLE decode (val/sec) [FAIL/REGR!]:
+    Runs: [1,030,927,835, 14,492,753,623, 14,285,714,286, 14,492,753,623, 14,705,882,353]
+    Average: 11,801,606,344 >= 60,000,000,000 (target)
+    Min/Max: 1,030,927,835 / 14,705,882,353, StdDev: 5,386,978,268
+
+  BitPack (boolean):
+    Compression ratio: 7.99x
+
+  Constant (all 42):
+    Encoded size: 8 bytes (raw: 400000)
+
+  Unencoded (random u32):
+
+  Edge cases:
+    Single row: all encodings pass
+    All zeros: all encodings pass
+    Max u32: FastLanes pass
+
+  Round-trip correctness: ALL PASS
+
+=== Encoding Selection ===
+  All-identical -> Constant: PASS
+  Boolean -> BitPack: PASS
+  Low-cardinality (10 distinct, 100K rows) -> Dictionary: PASS
+  Sequential integers -> FastLanes: PASS
+  Decimal floats -> ALP: PASS
+  Boolean column -> BitPack: PASS
+  Single-value column -> Constant: PASS
+  High-entropy random -> Unencoded: PASS
+  Empty sample -> Unencoded: PASS
+  Encoding select (us/col) [PASS/OK]:
+    Runs: [17.4378, 17.2991, 17.0105, 16.9760, 17.0186]
+    Average: 17.1484 <= 500 (target)
+    Min/Max: 16.9760 / 17.4378, StdDev: 0.1855
+
+  Encoding selection: ALL PASS
+
+=== Query-on-Compressed ===
+Rows: 100000
+  Dictionary equality: PASS
+  RLE range: PASS
+  BitPack equality: PASS
+  Constant equality: PASS
+  FastLanes range: PASS
+  Compressed eval speedup (x) [PASS/OK]:
+    Runs: [1,895, 2,000, 1,988, 1,979, 1,977]
+    Average: 1,968 >= 3 (target)
+    Min/Max: 1,895 / 2,000, StdDev: 37.1205
+  ALP range: PASS
+  FSST equality: PASS
+
+  Query-on-compressed: ALL PASS

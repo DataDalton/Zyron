@@ -76,17 +76,13 @@ fn new_log(dir: &std::path::Path) -> TransactionLog {
 /// Rows with `id = n` and `email = "user<n>@example.com"`
 fn rows(ids: &[i64]) -> Vec<ColumnData> {
     vec![
-        ColumnData {
-            column_id: 0,
-            cells: ids.iter().map(|v| Some(v.to_le_bytes().to_vec())).collect(),
-        },
-        ColumnData {
-            column_id: 1,
-            cells: ids
-                .iter()
+        ColumnData::from_cells(0, ids.iter().map(|v| Some(v.to_le_bytes().to_vec())).collect()),
+        ColumnData::from_cells(
+            1,
+            ids.iter()
                 .map(|v| Some(format!("user{}@example.com", v).into_bytes()))
                 .collect(),
-        },
+        ),
     ]
 }
 
@@ -280,14 +276,8 @@ fn test_an_update_reindexes_the_rows_it_rewrote() {
         value: LakeValue::Int(2),
     };
     let replacement = vec![
-        ColumnData {
-            column_id: 0,
-            cells: vec![Some(2i64.to_le_bytes().to_vec())],
-        },
-        ColumnData {
-            column_id: 1,
-            cells: vec![Some(b"changed@example.com".to_vec())],
-        },
+        ColumnData::from_cells(0, vec![Some(2i64.to_le_bytes().to_vec())]),
+        ColumnData::from_cells(1, vec![Some(b"changed@example.com".to_vec())]),
     ];
     update_where(
         &log,

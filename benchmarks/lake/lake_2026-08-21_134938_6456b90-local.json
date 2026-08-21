@@ -1,0 +1,886 @@
+{
+  "id": "2026-08-21_134938_6456b90-local",
+  "date": "2026-08-21 13:49:58Z",
+  "ts": 1787320198,
+  "commit": "6456b90-local",
+  "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus",
+  "cores": 24,
+  "ram_gb": 31.4,
+  "gpus": ["Intel(R) Graphics","NVIDIA GeForce RTX 4090"],
+  "os": "windows",
+  "arch": "x86_64",
+  "profile": "release",
+  "tests": {
+    "lake_clustering": {
+      "skip rate after a bucket-ordered pass": {
+        "average": 0.875000,
+        "runs": [0.88],
+        "target": 0.500000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": 601.800,
+        "storage_calibration_us": 634.400
+      },
+      "Cluster pass": {
+        "average": 23592.300000,
+        "runs": [23592.30],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.800,
+        "storage_calibration_us": 634.400
+      },
+      "Rows rewritten": {
+        "average": 1388927.743374,
+        "runs": [1388927.74],
+        "target": null,
+        "passed": null,
+        "higher_is_better": true,
+        "calibration_us": 601.800,
+        "storage_calibration_us": 634.400
+      }
+    },
+    "lake_targets": {
+      "Cluster proposal evaluation": {
+        "average": 2166.920000,
+        "runs": [2392.90, 2312.90, 2105.40, 2046.60, 1976.80],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 698.400
+      },
+      "Cluster proposal evaluation latency (ms)": {
+        "average": 2.166920,
+        "runs": [2.17],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 698.400
+      },
+      "Workload observer record": {
+        "average": 18.339500,
+        "runs": [18.34],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 698.400
+      },
+      "Workload observer record (ns)": {
+        "average": 18.339500,
+        "runs": [18.34],
+        "target": 20.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 698.400
+      },
+      "Feedback skip-rate measurement": {
+        "average": 18.829850,
+        "runs": [18.83],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 698.400
+      },
+      "Feedback skip-rate measurement (ns)": {
+        "average": 18.829850,
+        "runs": [18.83],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 698.400
+      },
+      "Cluster key ordering pass": {
+        "average": 230.640000,
+        "runs": [233.40, 231.40, 233.70, 227.80, 226.90],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 602.000,
+        "storage_calibration_us": 642.000
+      },
+      "Cluster key sort overhead": {
+        "average": 23.064000,
+        "runs": [23.06],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 602.000,
+        "storage_calibration_us": 642.000
+      },
+      "Cluster key sort overhead (ns per row)": {
+        "average": 23.064000,
+        "runs": [23.06],
+        "target": 160.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 602.000,
+        "storage_calibration_us": 642.000
+      },
+      "Clustered append, batch already in key order": {
+        "average": 2391.660000,
+        "runs": [2391.66],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 602.000,
+        "storage_calibration_us": 642.000
+      },
+      "Clustered append, batch shuffled": {
+        "average": 3005.540000,
+        "runs": [3005.54],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 602.000,
+        "storage_calibration_us": 642.000
+      },
+      "Commit, insert": {
+        "average": 2554.660000,
+        "runs": [2293.60, 2664.00, 2536.50, 2675.20, 2604.00],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 604.300,
+        "storage_calibration_us": 608.200
+      },
+      "Commit insert latency (ms)": {
+        "average": 2.554660,
+        "runs": [2.55],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 604.300,
+        "storage_calibration_us": 608.200
+      },
+      "Commit, delete predicate": {
+        "average": 2163.340000,
+        "runs": [3755.50, 1379.20, 1666.60, 1893.80, 2121.60],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 604.300,
+        "storage_calibration_us": 608.200
+      },
+      "Commit delete predicate latency (ms)": {
+        "average": 2.163340,
+        "runs": [2.16],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 604.300,
+        "storage_calibration_us": 608.200
+      },
+      "Encode 10000 rows, all distinct": {
+        "average": 376.400000,
+        "runs": [417.30, 371.20, 344.10, 345.10, 404.30],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 603.000,
+        "storage_calibration_us": 619.900
+      },
+      "Encode 100000 rows, all distinct": {
+        "average": 3661.260000,
+        "runs": [3856.50, 3645.70, 3734.50, 3449.10, 3620.50],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 603.000,
+        "storage_calibration_us": 619.900
+      },
+      "Encode 1000000 rows, all distinct": {
+        "average": 41483.133333,
+        "runs": [41688.10, 42277.00, 40484.30],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 603.000,
+        "storage_calibration_us": 619.900
+      },
+      "Encode cost per row, growth over 100x rows": {
+        "average": 1.102102,
+        "runs": [1.10],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 603.000,
+        "storage_calibration_us": 619.900
+      },
+      "Fast lane trigger decision": {
+        "average": 1856.400000,
+        "runs": [7515.40, 455.20, 435.60, 445.50, 430.30],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.900,
+        "storage_calibration_us": 611.200
+      },
+      "Fast lane trigger latency (ms)": {
+        "average": 1.856400,
+        "runs": [1.86],
+        "target": 100.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.900,
+        "storage_calibration_us": 611.200
+      },
+      "Insert phase, materialize batch": {
+        "average": 57.100000,
+        "runs": [82.40, 51.10, 50.70, 50.60, 50.70],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 610.500
+      },
+      "Insert phase, encode columns": {
+        "average": 1167.520000,
+        "runs": [1193.80, 1160.10, 1286.90, 1133.60, 1063.20],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 610.500
+      },
+      "Insert phase, encode columns bounded": {
+        "average": 1066.900000,
+        "runs": [1088.50, 1056.70, 1070.10, 1060.10, 1059.10],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 610.500
+      },
+      "Insert phase, build the value blooms": {
+        "average": 113.460000,
+        "runs": [113.30, 111.90, 112.20, 117.70, 112.20],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 610.500
+      },
+      "Insert phase, count distinct values": {
+        "average": 67.280000,
+        "runs": [106.00, 58.70, 56.90, 57.60, 57.20],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 610.500
+      },
+      "Insert phase, choose and trial encode": {
+        "average": 184.740000,
+        "runs": [203.70, 192.40, 175.50, 176.20, 175.90],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 610.500
+      },
+      "Insert phase, place rows in stored order": {
+        "average": 18.420000,
+        "runs": [34.20, 14.50, 14.50, 14.50, 14.40],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 610.500
+      },
+      "Insert phase, describe columns": {
+        "average": 0.680000,
+        "runs": [2.00, 0.40, 0.40, 0.30, 0.30],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 610.500
+      },
+      "Insert phase, segment IO and fsync": {
+        "average": 726.540000,
+        "runs": [833.90, 705.10, 737.60, 726.80, 629.30],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 610.500
+      },
+      "Insert phase, segment IO without fsync": {
+        "average": 263.140000,
+        "runs": [405.00, 233.50, 234.70, 228.70, 213.80],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 610.500
+      },
+      "Insert phase, ordering pass": {
+        "average": 80.960000,
+        "runs": [108.60, 116.80, 57.80, 64.10, 57.50],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 610.500
+      },
+      "Insert phase, write file unsorted": {
+        "average": 1832.740000,
+        "runs": [1878.60, 1834.30, 1738.40, 1919.20, 1793.20],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 610.500
+      },
+      "Insert phase, write file sorted": {
+        "average": 1904.320000,
+        "runs": [2008.20, 2130.50, 1749.20, 1782.50, 1851.20],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 610.500
+      },
+      "Commit primitive, create write fsync a version file": {
+        "average": 672.960000,
+        "runs": [683.10, 703.60, 697.20, 642.20, 638.70],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 610.500
+      },
+      "Insert phase, publish a version": {
+        "average": 734.760000,
+        "runs": [679.30, 867.10, 650.00, 689.70, 787.70],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 610.500
+      },
+      "Insert phase, append and commit": {
+        "average": 2545.200000,
+        "runs": [2534.10, 2522.80, 2603.50, 2555.90, 2509.70],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 610.500
+      },
+      "Insert throughput": {
+        "average": 3842754.486416,
+        "runs": [3842754.49],
+        "target": null,
+        "passed": null,
+        "higher_is_better": true,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 610.500
+      },
+      "Manifest load, 10K files": {
+        "average": 6106.980000,
+        "runs": [7165.50, 5935.00, 6187.40, 5656.40, 5590.60],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 610.200,
+        "storage_calibration_us": 639.700
+      },
+      "Manifest load latency (ms)": {
+        "average": 6.106980,
+        "runs": [6.11],
+        "target": 200.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 610.200,
+        "storage_calibration_us": 639.700
+      },
+      "Concurrent commits": {
+        "average": 641.764493,
+        "runs": [641.76],
+        "target": null,
+        "passed": null,
+        "higher_is_better": true,
+        "calibration_us": 610.200,
+        "storage_calibration_us": 639.700
+      },
+      "Commit throughput (commits/sec)": {
+        "average": 641.764493,
+        "runs": [641.76],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": 610.200,
+        "storage_calibration_us": 639.700
+      },
+      "Schema add column": {
+        "average": 664.820000,
+        "runs": [677.10, 700.50, 654.70, 629.00, 662.80],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.800,
+        "storage_calibration_us": 678.900
+      },
+      "Schema add column latency (ms)": {
+        "average": 0.664820,
+        "runs": [0.66],
+        "target": 500.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.800,
+        "storage_calibration_us": 678.900
+      },
+      "Key change, no rewrite": {
+        "average": 703.780000,
+        "runs": [783.00, 674.80, 750.50, 686.50, 624.10],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.800,
+        "storage_calibration_us": 678.900
+      },
+      "Key change without rewrite latency (ms)": {
+        "average": 0.703780,
+        "runs": [0.70],
+        "target": 50.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.800,
+        "storage_calibration_us": 678.900
+      },
+      "Clone": {
+        "average": 1950.280000,
+        "runs": [2235.00, 1980.70, 1731.80, 2041.50, 1762.40],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.800,
+        "storage_calibration_us": 678.900
+      },
+      "Clone latency (ms)": {
+        "average": 1.950280,
+        "runs": [1.95],
+        "target": 1000.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.800,
+        "storage_calibration_us": 678.900
+      },
+      "Repair max_inputs scaling": {
+        "average": 4.000000,
+        "runs": [4.00],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 673.200
+      },
+      "Repair max_inputs scaling (x)": {
+        "average": 4.000000,
+        "runs": [4.00],
+        "target": 3.500000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 673.200
+      },
+      "OPTIMIZE, 1000 files": {
+        "average": 88297.900000,
+        "runs": [88297.90],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 563.000
+      },
+      "OPTIMIZE latency (s)": {
+        "average": 0.088298,
+        "runs": [0.09],
+        "target": 60.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 563.000
+      },
+      "Cluster pass, 10M rows": {
+        "average": 1532600.300000,
+        "runs": [1532600.30],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 563.000
+      },
+      "Cluster pass latency (s)": {
+        "average": 1.532600,
+        "runs": [1.53],
+        "target": 90.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 563.000
+      },
+      "Scan phase, open a 1000 row file": {
+        "average": 539.000000,
+        "runs": [2644.90, 747.70, 884.70, 539.00, 1510.00],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 605.200,
+        "storage_calibration_us": 591.800
+      },
+      "Scan phase, decode a 1000 row column": {
+        "average": 1.000000,
+        "runs": [1.80, 0.80, 0.80, 0.80, 0.80],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 605.200,
+        "storage_calibration_us": 591.800
+      },
+      "Scan phase, filter 1000 rows on stored bytes": {
+        "average": 8.240000,
+        "runs": [21.30, 5.30, 5.50, 4.50, 4.60],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 605.200,
+        "storage_calibration_us": 591.800
+      },
+      "Scan phase, open a 16384 row file": {
+        "average": 16.500000,
+        "runs": [36.40, 16.50, 1780.00, 729.40, 1833.70],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 605.200,
+        "storage_calibration_us": 591.800
+      },
+      "Scan phase, decode a 16384 row column": {
+        "average": 11.460000,
+        "runs": [11.50, 11.50, 12.00, 11.10, 11.20],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 605.200,
+        "storage_calibration_us": 591.800
+      },
+      "Scan phase, filter 16384 rows on stored bytes": {
+        "average": 7.540000,
+        "runs": [14.20, 6.40, 6.00, 5.60, 5.50],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 605.200,
+        "storage_calibration_us": 591.800
+      },
+      "Scan phase, open a 262144 row file": {
+        "average": 15.200000,
+        "runs": [63.50, 20.30, 15.20, 15.60, 5582.80],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 605.200,
+        "storage_calibration_us": 591.800
+      },
+      "Scan phase, decode a 262144 row column": {
+        "average": 406.780000,
+        "runs": [400.20, 409.20, 396.60, 404.10, 423.80],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 605.200,
+        "storage_calibration_us": 591.800
+      },
+      "Scan phase, filter 262144 rows on stored bytes": {
+        "average": 11.060000,
+        "runs": [20.80, 9.50, 8.00, 8.90, 8.10],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 605.200,
+        "storage_calibration_us": 591.800
+      },
+      "Scan cost per row, small files over large": {
+        "average": 335.460828,
+        "runs": [335.46],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 605.200,
+        "storage_calibration_us": 591.800
+      },
+      "Scan throughput, large files": {
+        "average": 621223754.680317,
+        "runs": [621223754.68],
+        "target": null,
+        "passed": null,
+        "higher_is_better": true,
+        "calibration_us": 605.200,
+        "storage_calibration_us": 591.800
+      },
+      "Time travel reach back delta": {
+        "average": 915.660000,
+        "runs": [915.66],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 572.300
+      },
+      "Time travel reach back delta (us)": {
+        "average": 915.660000,
+        "runs": [915.66],
+        "target": 1500.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 572.300
+      },
+      "Time travel reach back per version": {
+        "average": 4.578300,
+        "runs": [4.58],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 572.300
+      },
+      "Time travel reach back per version (us)": {
+        "average": 4.578300,
+        "runs": [4.58],
+        "target": 10.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 572.300
+      }
+    },
+    "lake_log": {
+      "Commit rate": {
+        "average": 1215.886777,
+        "runs": [1215.89],
+        "target": null,
+        "passed": null,
+        "higher_is_better": true,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 635.500
+      },
+      "Retries": {
+        "average": 0.468750,
+        "runs": [0.47],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.700,
+        "storage_calibration_us": 635.500
+      },
+      "Head read": {
+        "average": 0.185600,
+        "runs": [0.19, 0.19, 0.18, 0.18, 0.19],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 610.500,
+        "storage_calibration_us": 603.800
+      },
+      "Latest manifest (cached)": {
+        "average": 41.840000,
+        "runs": [42.20, 41.80, 41.70, 41.70, 41.80],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 610.500,
+        "storage_calibration_us": 603.800
+      },
+      "Prune index build (cold)": {
+        "average": 20.600000,
+        "runs": [20.60],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 610.500,
+        "storage_calibration_us": 603.800
+      },
+      "Prune index at version (cached)": {
+        "average": 42.740000,
+        "runs": [43.30, 42.60, 42.60, 42.60, 42.60],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 610.500,
+        "storage_calibration_us": 603.800
+      }
+    },
+    "lake_scan": {
+      "Scan throughput": {
+        "average": 1252539535.909774,
+        "runs": [1412413793.10, 895300546.45, 1280000000.00, 1332032520.33, 1342950819.67],
+        "target": null,
+        "passed": null,
+        "higher_is_better": true,
+        "calibration_us": 604.000,
+        "storage_calibration_us": 625.200
+      }
+    },
+    "lake_pruning": {
+      "point predicate files pruned (fraction)": {
+        "average": 0.999990,
+        "runs": [1.00],
+        "target": 0.999900,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": 602.600,
+        "storage_calibration_us": 626.000
+      },
+      "strided predicate files pruned (fraction)": {
+        "average": 0.937500,
+        "runs": [0.94],
+        "target": 0.930000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": 602.600,
+        "storage_calibration_us": 626.000
+      },
+      "Prune index build": {
+        "average": 6038.720000,
+        "runs": [6871.40, 5687.00, 5862.40, 6015.60, 5757.20],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 606.200,
+        "storage_calibration_us": 641.700
+      },
+      "point sweep over 100000 files": {
+        "average": 24.440000,
+        "runs": [43.60, 19.80, 19.60, 19.60, 19.60],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 606.200,
+        "storage_calibration_us": 641.700
+      },
+      "range sweep over 100000 files": {
+        "average": 20.980000,
+        "runs": [40.80, 16.10, 16.00, 16.00, 16.00],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 606.200,
+        "storage_calibration_us": 641.700
+      },
+      "strided sweep over 100000 files": {
+        "average": 25.900000,
+        "runs": [51.30, 19.70, 19.50, 19.50, 19.50],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 606.200,
+        "storage_calibration_us": 641.700
+      }
+    },
+    "lake_index": {
+      "index files opened per point probe": {
+        "average": 1.000000,
+        "runs": [1.00],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 601.800,
+        "storage_calibration_us": 595.300
+      },
+      "Point probe through the index": {
+        "average": 33.460000,
+        "runs": [46.70, 32.90, 28.90, 30.20, 28.60],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.800,
+        "storage_calibration_us": 595.300
+      },
+      "Point lookup by scanning": {
+        "average": 393.280000,
+        "runs": [484.20, 367.20, 386.90, 367.20, 360.90],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.800,
+        "storage_calibration_us": 595.300
+      },
+      "Range probe through the index": {
+        "average": 63.480000,
+        "runs": [79.90, 66.80, 58.20, 56.50, 56.00],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 601.800,
+        "storage_calibration_us": 595.300
+      }
+    },
+    "lake_constraints": {
+      "Unique check, clustered": {
+        "average": 34.920000,
+        "runs": [52.20, 34.10, 32.70, 28.80, 26.80],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 605.900,
+        "storage_calibration_us": 602.700
+      },
+      "Unique check, unclustered": {
+        "average": 41.960000,
+        "runs": [63.00, 39.60, 36.60, 35.00, 35.60],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 605.900,
+        "storage_calibration_us": 602.700
+      },
+      "rows compared per probed key (clustered)": {
+        "average": 0.062500,
+        "runs": [0.06],
+        "target": 8.000000,
+        "passed": true,
+        "higher_is_better": false,
+        "calibration_us": 605.900,
+        "storage_calibration_us": 602.700
+      }
+    },
+    "lake_skipping": {
+      "zone map rows rejected (fraction)": {
+        "average": 1.000000,
+        "runs": [1.00],
+        "target": 1.000000,
+        "passed": true,
+        "higher_is_better": true,
+        "calibration_us": 607.400,
+        "storage_calibration_us": 588.800
+      },
+      "Zone map rejection": {
+        "average": 2.380000,
+        "runs": [2.60, 2.30, 2.50, 2.20, 2.30],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 607.400,
+        "storage_calibration_us": 588.800
+      },
+      "Full column decode": {
+        "average": 29.520000,
+        "runs": [38.70, 31.10, 29.60, 24.10, 24.10],
+        "target": null,
+        "passed": null,
+        "higher_is_better": false,
+        "calibration_us": 607.400,
+        "storage_calibration_us": 588.800
+      }
+    }
+  }
+}

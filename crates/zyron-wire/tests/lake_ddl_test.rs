@@ -161,18 +161,12 @@ async fn test_lake_scan_reads_appended_rows_and_sql_insert_publishes_on_commit()
     let paths = LakePaths::new(server.disk_manager.data_dir(), entry.id.0);
     let log = zyron_lake::TransactionLog::open_shared(paths, &AllCommitted).expect("shared log");
     let columns = vec![
-        zyron_lake::ColumnData {
-            column_id: entry.columns[0].id.0 as u32,
-            cells: vec![
+        zyron_lake::ColumnData::from_cells(entry.columns[0].id.0 as u32, vec![
                 Some(1i64.to_le_bytes().to_vec()),
                 Some(2i64.to_le_bytes().to_vec()),
                 Some(3i64.to_le_bytes().to_vec()),
-            ],
-        },
-        zyron_lake::ColumnData {
-            column_id: entry.columns[1].id.0 as u32,
-            cells: vec![Some(b"alice".to_vec()), None, Some(b"carol".to_vec())],
-        },
+            ]),
+        zyron_lake::ColumnData::from_cells(entry.columns[1].id.0 as u32, vec![Some(b"alice".to_vec()), None, Some(b"carol".to_vec())]),
     ];
     let attempt = zyron_lake::CommitAttempt {
         operation: zyron_lake::OperationKind::Append,
@@ -421,10 +415,7 @@ async fn test_drop_lake_table_reclaims_the_whole_root() {
         &log,
         attempt,
         entry.id.0 as u64,
-        &[zyron_lake::ColumnData {
-            column_id: entry.columns[0].id.0 as u32,
-            cells: vec![Some(1i64.to_le_bytes().to_vec())],
-        }],
+        &[zyron_lake::ColumnData::from_cells(entry.columns[0].id.0 as u32, vec![Some(1i64.to_le_bytes().to_vec())])],
     )
     .expect("append");
     assert!(paths.root().exists());
@@ -1892,10 +1883,7 @@ async fn test_lake_branches_view_lists_branches_and_their_lead() {
             deadline: None,
         },
         entry.id.0 as u64,
-        &[zyron_lake::ColumnData {
-            column_id: entry.columns[0].id.0 as u32,
-            cells: vec![Some(7i64.to_le_bytes().to_vec())],
-        }],
+        &[zyron_lake::ColumnData::from_cells(entry.columns[0].id.0 as u32, vec![Some(7i64.to_le_bytes().to_vec())])],
     )
     .expect("branch append");
 
@@ -2021,10 +2009,7 @@ async fn test_branch_ddl_routes_to_the_lake_log() {
             deadline: None,
         },
         entry.id.0 as u64,
-        &[zyron_lake::ColumnData {
-            column_id: entry.columns[0].id.0 as u32,
-            cells: vec![Some(9i64.to_le_bytes().to_vec())],
-        }],
+        &[zyron_lake::ColumnData::from_cells(entry.columns[0].id.0 as u32, vec![Some(9i64.to_le_bytes().to_vec())])],
     )
     .expect("branch append");
     assert_eq!(query_rows(&server, "SELECT * FROM bt").await, 2);
@@ -2095,10 +2080,7 @@ async fn test_select_in_branch_reads_the_branch_head() {
             deadline: None,
         },
         entry.id.0 as u64,
-        &[zyron_lake::ColumnData {
-            column_id: entry.columns[0].id.0 as u32,
-            cells: vec![Some(9i64.to_le_bytes().to_vec())],
-        }],
+        &[zyron_lake::ColumnData::from_cells(entry.columns[0].id.0 as u32, vec![Some(9i64.to_le_bytes().to_vec())])],
     )
     .expect("branch append");
 

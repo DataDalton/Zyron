@@ -2912,33 +2912,45 @@ fn append_lake_batches(
     batches: &[DataBatch],
     derived: Vec<zyron_lake::ColumnData>,
 ) -> zyron_common::Result<Option<zyron_lake::AppendOutcome>> {
+    // Sized at the column's own width so the cells land in one packed
+    // buffer that the segment build reads rather than repacks, and filled
+    // through a scratch buffer reused across every cell instead of one
+    // allocation per cell
+    let rows: usize = batches.iter().map(|b| b.num_rows).sum();
     let mut columns: Vec<zyron_lake::ColumnData> = table_entry
         .columns
         .iter()
-        .map(|c| zyron_lake::ColumnData {
-            column_id: c.id.0 as u32,
-            cells: Vec::new(),
+        .map(|c| {
+            zyron_lake::ColumnData::with_capacity(
+                c.id.0 as u32,
+                c.physical_type_id().fixed_size().unwrap_or(0),
+                rows,
+            )
         })
         .collect();
+    let mut scratch: Vec<u8> = Vec::new();
     for batch in batches {
         for (ci, col_entry) in table_entry.columns.iter().enumerate() {
             let value_size = col_entry.physical_type_id().fixed_size().unwrap_or(0);
             let column = &batch.columns[ci];
             for r in 0..batch.num_rows {
-                let sv = column.get_scalar(r);
-                let cell = match sv {
-                    ScalarValue::Null => None,
-                    ref v => Some(crate::batch::encode_scalar_value(
-                        col_entry.type_id,
-                        v,
-                        value_size,
-                    )),
-                };
-                columns[ci].cells.push(cell);
+                match column.get_scalar(r) {
+                    ScalarValue::Null => columns[ci].push(None),
+                    ref v => {
+                        scratch.clear();
+                        crate::batch::encode_scalar_value_into(
+                            &mut scratch,
+                            col_entry.type_id,
+                            v,
+                            value_size,
+                        );
+                        columns[ci].push(Some(&scratch));
+                    }
+                }
             }
         }
     }
-    if columns.first().map(|c| c.cells.is_empty()).unwrap_or(true) {
+    if columns.first().map(|c| c.is_empty()).unwrap_or(true) {
         return Ok(None);
     }
     // A clustering expression is stored in a column of its own, so the batch

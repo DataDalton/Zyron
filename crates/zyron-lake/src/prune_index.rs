@@ -129,13 +129,29 @@ impl PruneIndex {
             key_ids.len()
         ];
 
+        // Column ids are dense and small, so the key a column belongs to is
+        // a direct index rather than a search per statistics entry
+        let mut key_slot = vec![u32::MAX; key_ids.last().map_or(0, |id| *id as usize + 1)];
         for (k, column_id) in key_ids.iter().enumerate() {
-            let base = k * file_count;
-            let meta = &mut keys[k];
-            for (f, entry) in manifest.entries.iter().enumerate() {
-                let Some(stats) = entry.stats_for(*column_id) else {
+            key_slot[*column_id as usize] = k as u32;
+        }
+
+        // Entries outside, keys inside. Each entry's statistics sit behind
+        // their own pointer, so walking the manifest once per key reaches
+        // every one of those pointers that many times and reads each entry
+        // back after the cache has lost it. One pass touches each entry once
+        // and consumes all of its keys while it is still warm
+        for (f, entry) in manifest.entries.iter().enumerate() {
+            for stats in entry.column_stats.iter() {
+                let Some(&slot) = key_slot.get(stats.column_id as usize) else {
                     continue;
                 };
+                if slot == u32::MAX {
+                    continue;
+                }
+                let k = slot as usize;
+                let base = k * file_count;
+                let meta = &mut keys[k];
                 let bounds = &stats.bounds;
                 if stats.bloom.is_some() {
                     meta.bloomed = true;

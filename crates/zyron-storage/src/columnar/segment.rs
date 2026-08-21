@@ -8,7 +8,8 @@ use crate::columnar::bloom::BloomFilter;
 use crate::columnar::constants::*;
 use crate::columnar::sketch::DistinctSketch;
 use crate::encoding::{
-    EncodingType, create_encoding, select_encoding_packed, select_encoding_varlen, varlen_pack,
+    ColumnSampleStats, EncodingType, cardinality_cap, create_encoding, select_encoding_prepared,
+    select_encoding_varlen, varlen_pack,
 };
 use zyron_common::types::TypeId;
 use zyron_common::{Result, ZyronError};
@@ -544,21 +545,37 @@ fn close_zone<'v>(
 struct DistinctTracker<'v> {
     /// Exact set while the caller wants no estimate, keyed by the bytes
     values: hashbrown::HashSet<&'v [u8]>,
-    /// Exact set while the sketch is running, keyed by its hash
-    hashes: hashbrown::HashSet<u64>,
     /// Whole-column estimate, boxed so a build that does not ask for one
-    /// carries a pointer rather than the register array
+    /// carries a pointer rather than the register array.
+    ///
+    /// It counts its own first distinct hashes exactly, out to the cap this
+    /// tracker was built for, so both the bloom threshold and the encoding
+    /// decision read one structure that the value was hashed into once
     sketch: Option<Box<DistinctSketch>>,
-    /// Set once the exact count passed the bloom threshold
+    /// Distinct values counted before the count stops changing a decision
+    cap: usize,
+    /// Set once more distinct values arrived than `cap`, tracked here only
+    /// for the path that keeps no sketch
     saturated: bool,
 }
 
 impl<'v> DistinctTracker<'v> {
-    fn new(sketch: bool) -> Self {
+    fn new(sketch: bool, cap: usize) -> Self {
         Self {
             values: hashbrown::HashSet::new(),
-            hashes: hashbrown::HashSet::new(),
-            sketch: sketch.then(|| Box::new(DistinctSketch::new())),
+            // The exact table is held to a fixed size rather than sized to
+            // the cap. Counting exactly out to half the row count would
+            // allocate and zero a quarter of a megabyte for a sixteen
+            // thousand row column and a megabyte for a quarter million row
+            // one, per column, to sharpen a threshold the registers already
+            // decide the same way. What still needs an exact answer is the
+            // bloom threshold at sixty four, which sits inside this
+            sketch: sketch.then(|| {
+                Box::new(DistinctSketch::with_exact_capacity(
+                    cap.min(super::sketch::EXACT_CAPACITY),
+                ))
+            }),
+            cap,
             saturated: false,
         }
     }
@@ -566,35 +583,55 @@ impl<'v> DistinctTracker<'v> {
     #[inline]
     fn insert(&mut self, value: &'v [u8]) {
         match self.sketch.as_mut() {
-            Some(sketch) => {
-                let hash = zyron_common::hash64(value);
-                sketch.insert_hash(hash);
-                if !self.saturated {
-                    self.hashes.insert(hash);
-                    self.saturated = self.hashes.len() as u64 > BLOOM_MIN_CARDINALITY;
-                }
-            }
+            Some(sketch) => sketch.insert(value),
             None => {
                 if !self.saturated {
                     self.values.insert(value);
-                    self.saturated = self.values.len() as u64 > BLOOM_MIN_CARDINALITY;
+                    self.saturated = self.values.len() > self.cap;
                 }
             }
         }
     }
 
-    /// Distinct values counted exactly, stopping one past the bloom
-    /// threshold. Consumers read a saturated value as "at least this many"
-    fn cardinality(&self) -> u64 {
-        if self.sketch.is_some() {
-            self.hashes.len() as u64
-        } else {
-            self.values.len() as u64
+    /// Distinct values counted exactly, saturating one past `cap`.
+    ///
+    /// Under a sketch the count is over hashes rather than over the values
+    /// themselves. Two distinct values sharing a 64-bit hash would be
+    /// counted once, which no correctness decision rests on: the encoding
+    /// this feeds picks a dictionary rather than a bit-packing, and a
+    /// dictionary round-trips whatever the column holds
+    #[inline]
+    fn counted(&self) -> usize {
+        match self.sketch.as_ref() {
+            Some(sketch) => sketch.counted(),
+            None => self.values.len(),
         }
     }
 
+    /// Distinct values as a segment header records them, stopping one past
+    /// the bloom threshold, which is the only thing that reads the field
+    fn cardinality(&self) -> u64 {
+        (self.counted() as u64).min(BLOOM_MIN_CARDINALITY + 1)
+    }
+
+    /// Distinct values as the encoding decision reads them: exact while the
+    /// table holds every hash seen, estimated past it.
+    ///
+    /// The threshold this feeds sits at half the row count, far above where
+    /// the exact table stops, and the registers carry about one percent of
+    /// error there. A column near enough to the threshold for that to flip
+    /// the answer stores about as well either way, and both encodings round
+    /// trip whatever the column holds
+    fn estimated(&self) -> usize {
+        match self.sketch.as_ref() {
+            Some(sketch) => sketch.estimate() as usize,
+            None => self.values.len(),
+        }
+    }
+
+    /// Whether the count passed the bloom threshold
     fn saturated(&self) -> bool {
-        self.saturated
+        self.counted() as u64 > BLOOM_MIN_CARDINALITY
     }
 
     /// Whole-column distinct estimate, present when the caller asked for it
@@ -619,6 +656,102 @@ pub fn compare_stat_slots(
         }
     }
     std::cmp::Ordering::Equal
+}
+
+/// Widest cell the row loop folds into a single comparison word. Every
+/// fixed-size type but `Inet` and `Cidr`, which are eighteen bytes, fits
+const WORD_KEY_MAX_WIDTH: usize = 16;
+
+/// Reads a fixed-width cell as an unsigned little-endian integer.
+///
+/// Two cells of one column are the same width, so comparing the words is
+/// comparing the cells, and a comparison becomes one integer compare rather
+/// than a walk from the last byte down.
+///
+/// The widths a fixed-size column is made of are resolved to a single load
+/// each. Staging every cell through a sixteen-byte buffer instead measured
+/// twice the cost at every width, because a machine integer's worth of
+/// bytes goes through a zeroing and a copy to be read back as one word
+#[inline(always)]
+fn le_word(value: &[u8]) -> u128 {
+    match value.len() {
+        8 => match <[u8; 8]>::try_from(value) {
+            Ok(bytes) => u64::from_le_bytes(bytes) as u128,
+            Err(_) => 0,
+        },
+        4 => match <[u8; 4]>::try_from(value) {
+            Ok(bytes) => u32::from_le_bytes(bytes) as u128,
+            Err(_) => 0,
+        },
+        16 => match <[u8; 16]>::try_from(value) {
+            Ok(bytes) => u128::from_le_bytes(bytes),
+            Err(_) => 0,
+        },
+        2 => match <[u8; 2]>::try_from(value) {
+            Ok(bytes) => u16::from_le_bytes(bytes) as u128,
+            Err(_) => 0,
+        },
+        1 => value.first().map_or(0, |&byte| byte as u128),
+        _ => {
+            let mut word = [0u8; WORD_KEY_MAX_WIDTH];
+            let span = value.len().min(WORD_KEY_MAX_WIDTH);
+            word[..span].copy_from_slice(&value[..span]);
+            u128::from_le_bytes(word)
+        }
+    }
+}
+
+/// Folds a cell's little-endian word into the order that column's cells
+/// compare in.
+///
+/// Comparing two folded words answers what [`compare_values_ordered`]
+/// answers for the cells they came from, for every width this is called at
+#[inline(always)]
+fn ordered_word(raw: u128, width: usize, order: SlotOrder) -> u128 {
+    match order {
+        SlotOrder::Unsigned => raw,
+        // A set sign bit means negative, and lifting it clears of every
+        // non-negative value puts the two groups the right way round while
+        // leaving the order inside each group alone
+        SlotOrder::TwosComplement => raw ^ (1u128 << (width * 8 - 1)),
+        SlotOrder::Ieee if width == 4 || width == 8 => {
+            let sign = 1u128 << (width * 8 - 1);
+            if raw & sign != 0 {
+                !raw & ((sign << 1) - 1)
+            } else {
+                raw | sign
+            }
+        }
+        // A float at a width IEEE does not define falls back to the plain
+        // value order, which is what the general comparator does with it
+        SlotOrder::Ieee => raw,
+        // Byte order from the first byte, which reversing a left-aligned
+        // little-endian word moves into the top of the word
+        SlotOrder::Lexicographic => raw.swap_bytes(),
+    }
+}
+
+/// Orders two cells, through their comparison words when the column's width
+/// folds into one and through the general comparator when it does not.
+///
+/// `word_keys` is fixed for a whole segment, so the branch resolves the
+/// same way on every row of a build
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn cell_is_less(
+    candidate: u128,
+    candidate_bytes: &[u8],
+    current: u128,
+    current_bytes: &[u8],
+    width: usize,
+    order: SlotOrder,
+    word_keys: bool,
+) -> bool {
+    if word_keys {
+        candidate < current
+    } else {
+        compare_values_ordered(candidate_bytes, current_bytes, width, order).is_lt()
+    }
 }
 
 /// Compares two equal-length byte slices as unsigned little-endian integers.
@@ -678,34 +811,18 @@ impl ColumnSegment {
             return Self::build_varlen(columnId, typeId, values, options);
         }
 
-        // Single fused pass over values, computes:
-        //   - null count and null bitmap
-        //   - per-zone min/max emitted at every ZONE_MAP_BATCH_SIZE boundary,
-        //     and the segment's own min/max folded out of those at each zone
-        //     boundary rather than compared against on every row
-        //   - the rows those two extremes sit at, so a caller that needs the
-        //     value at its full width reads it back instead of running its
-        //     own pass over the same column
-        //   - sorted flag
-        //   - distinct tracking, capped at BLOOM_MIN_CARDINALITY+1 since we
-        //     only need to know whether the column is high-cardinality enough
-        //     to warrant a bloom filter, exact count beyond the threshold is
-        //     not useful for query planning at the segment level, plus the
-        //     whole-column sketch when the caller asked for an estimate
-        //   - raw data buffer with non-null values copied into their slots,
-        //     buffer is allocated with zero-fill so null slots stay zeroed
-        //     for encoder determinism
+        // Pack the cells into the buffer the encoder reads.
         //
-        // The pass touches each value once and keeps zone-map and bitmap
-        // state in registers. Bounds are carried as the values themselves,
-        // so a 32-byte slot is built twice per zone instead of on every row
-        // that moves a bound
-        let rawSize = (rowCount * valueSize) as u64;
-        // SAFETY: the fused pass below writes every one of `buf_len` slots
-        // (null slots explicitly zeroed, non-null slots copied) before the
-        // encoder reads rawData; no path reads it before the fill. Zeroing
-        // up front would memset the whole column buffer only to overwrite
-        // it, regressing encode/compaction throughput on large columns.
+        // This input holds a pointer per cell, so the walk that follows
+        // would chase one for every value it bounds, hashes and compares.
+        // Packing first costs one pass and leaves every later pass reading
+        // flat memory. A caller already holding its column packed skips
+        // this entirely through `build_packed`
+        //
+        // SAFETY: the loop below writes every one of `buf_len` slots, null
+        // slots explicitly zeroed and non-null slots copied, before anything
+        // reads rawData. Zeroing up front would memset the whole column
+        // buffer only to overwrite it
         let buf_len = rowCount * valueSize;
         #[allow(clippy::uninit_vec)]
         let mut rawData: Vec<u8> = {
@@ -713,6 +830,165 @@ impl ColumnSegment {
             unsafe { v.set_len(buf_len) };
             v
         };
+        let mut nullBitmap: Vec<u8> = Vec::new();
+        let mut nullCount = 0u64;
+        for (i, val) in values.iter().enumerate() {
+            let start = i * valueSize;
+            match val {
+                None => {
+                    nullCount += 1;
+                    if nullBitmap.is_empty() {
+                        nullBitmap = vec![0u8; rowCount.div_ceil(8)];
+                    }
+                    nullBitmap[i / 8] |= 1 << (i % 8);
+                    // The buffer was allocated uninitialized, and encoders
+                    // treat a null slot as a deterministic zero placeholder
+                    rawData[start..start + valueSize].fill(0);
+                }
+                Some(v) => {
+                    if v.len() != valueSize {
+                        // A non-null value whose width does not match the
+                        // fixed column value size cannot be packed into its
+                        // slot, fail instead of zero-filling and corrupting
+                        // the value
+                        return Err(ZyronError::EncodingFailed(format!(
+                            "non-null value at row {} has length {} expected {}",
+                            i,
+                            v.len(),
+                            valueSize
+                        )));
+                    }
+                    rawData[start..start + valueSize].copy_from_slice(v);
+                }
+            }
+        }
+
+        Self::build_from_packed(
+            columnId, typeId, valueSize, &rawData, nullBitmap, nullCount, rowCount, options,
+        )
+    }
+
+    /// Builds a fixed-width segment from a buffer already laid out the way
+    /// the encoder reads it: every cell at `valueSize` bytes, null slots
+    /// zero-filled, and a bitmap naming which those are.
+    ///
+    /// A caller holding its column in that shape hands it straight in and
+    /// the segment is built without copying it. The form that takes a
+    /// pointer per cell packs a buffer like this first, so both arrive at
+    /// the same pass and only one of them pays to build it.
+    ///
+    /// An empty `nulls` means the column has none
+    pub fn build_packed(
+        columnId: u32,
+        typeId: TypeId,
+        valueSize: usize,
+        values: &[u8],
+        nulls: &[u8],
+        rowCount: usize,
+        options: SegmentOptions,
+    ) -> Result<Self> {
+        if rowCount == 0 {
+            return Err(ZyronError::EncodingFailed(
+                "cannot build segment from zero rows".to_string(),
+            ));
+        }
+        if valueSize == 0 {
+            return Err(ZyronError::EncodingFailed(
+                "a packed segment needs a fixed value width".to_string(),
+            ));
+        }
+        let span = rowCount * valueSize;
+        if values.len() < span {
+            return Err(ZyronError::EncodingFailed(format!(
+                "packed buffer holds {} bytes, {} rows at {} bytes need {}",
+                values.len(),
+                rowCount,
+                valueSize,
+                span
+            )));
+        }
+        let bitmapLen = rowCount.div_ceil(8);
+        let mut nullCount = 0u64;
+        for row in 0..rowCount {
+            if nulls
+                .get(row / 8)
+                .is_some_and(|byte| byte & (1 << (row % 8)) != 0)
+            {
+                nullCount += 1;
+            }
+        }
+        // A null slot carries a deterministic zero so that an all-null
+        // column encodes as one repeated value and two segments over the
+        // same rows produce the same bytes. A caller that leaves data in a
+        // slot it called null would get a file whose nulls decode to
+        // whatever was there, so the contract is checked rather than just
+        // written down
+        debug_assert!(
+            (0..rowCount).all(|row| {
+                !nulls
+                    .get(row / 8)
+                    .is_some_and(|byte| byte & (1 << (row % 8)) != 0)
+                    || values[row * valueSize..(row + 1) * valueSize].iter().all(|&b| b == 0)
+            }),
+            "a null slot in the packed buffer is not zero-filled"
+        );
+        let nullBitmap = if nullCount == 0 {
+            Vec::new()
+        } else {
+            let mut bitmap = vec![0u8; bitmapLen];
+            let copied = bitmapLen.min(nulls.len());
+            bitmap[..copied].copy_from_slice(&nulls[..copied]);
+            // Bits past the row count belong to no row and would read as
+            // nulls the column does not have
+            if rowCount % 8 != 0
+                && let Some(last) = bitmap.last_mut()
+            {
+                *last &= (1u8 << (rowCount % 8)) - 1;
+            }
+            bitmap
+        };
+        Self::build_from_packed(
+            columnId,
+            typeId,
+            valueSize,
+            &values[..span],
+            nullBitmap,
+            nullCount,
+            rowCount,
+            options,
+        )
+    }
+
+    /// The one pass both fixed-width entry points arrive at, over a buffer
+    /// laid out the way the encoder reads it.
+    ///
+    /// Computes in a single walk:
+    ///   - per-zone min/max emitted at every ZONE_MAP_BATCH_SIZE boundary,
+    ///     and the segment's own min/max folded out of those at each zone
+    ///     boundary rather than compared against on every row
+    ///   - the rows those two extremes sit at, so a caller that needs the
+    ///     value at its full width reads it back instead of running its own
+    ///     pass over the same column
+    ///   - the sorted flag and the run count, which is what decides whether
+    ///     the column is run-length shaped
+    ///   - distinct tracking, counted far enough for both the bloom
+    ///     threshold and the dictionary decision, plus the whole-column
+    ///     sketch when the caller asked for an estimate
+    ///
+    /// Bounds are carried as the values themselves, so a 32-byte slot is
+    /// built twice per zone rather than on every row that moves a bound
+    #[allow(clippy::too_many_arguments)]
+    fn build_from_packed(
+        columnId: u32,
+        typeId: TypeId,
+        valueSize: usize,
+        rawData: &[u8],
+        nullBitmap: Vec<u8>,
+        nullCount: u64,
+        rowCount: usize,
+        options: SegmentOptions,
+    ) -> Result<Self> {
+        let rawSize = (rowCount * valueSize) as u64;
 
         // Two's complement ordering for signed columns so a negative value
         // (incl. a pre-1970 picosecond timestamp) sorts below zero in the
@@ -720,28 +996,47 @@ impl ColumnSegment {
         // byte compare.
         let statOrder = slot_order(typeId);
 
+        // Cells this narrow fold into one comparison word, which is every
+        // fixed-size type but the two that are eighteen bytes wide. Resolved
+        // once here rather than asked per row
+        let wordKeys = valueSize <= WORD_KEY_MAX_WIDTH;
+        // A column with no nulls skips the bitmap read on every row
+        let hasNulls = nullCount > 0;
+
         let batchSize = ZONE_MAP_BATCH_SIZE as usize;
         let zoneCount = rowCount.div_ceil(batchSize);
         let mut zoneMaps: Vec<ZoneMapEntry> = Vec::with_capacity(zoneCount);
 
-        let mut nullCount = 0u64;
-        let mut nullBitmap: Vec<u8> = Vec::new();
-        let mut distinct = DistinctTracker::new(options.distinct_sketch);
+        // Counted far enough for both readers of the count: the bloom
+        // threshold, and the dictionary decision that selection would
+        // otherwise walk the column a second time to make
+        let mut distinct = DistinctTracker::new(
+            options.distinct_sketch,
+            cardinality_cap(rowCount).max(BLOOM_MIN_CARDINALITY as usize),
+        );
+        // Adjacent non-null values that differ, plus one, which is what
+        // decides whether the column is run-length shaped
+        let mut runCount = 1usize;
         let mut segmentMin: Option<(usize, &[u8])> = None;
         let mut segmentMax: Option<(usize, &[u8])> = None;
         let mut isSorted = true;
         let mut prevRaw: Option<&[u8]> = None;
+        // Unsigned word of the previous non-null cell, which is the order
+        // the sorted flag records
+        let mut prevWord = 0u128;
 
-        let mut zoneMin: Option<(usize, &[u8])> = None;
-        let mut zoneMax: Option<(usize, &[u8])> = None;
+        // Zone bounds carry the comparison word beside the value, so a row
+        // that does not move a bound costs one integer compare per bound
+        let mut zoneMin: Option<(usize, &[u8], u128)> = None;
+        let mut zoneMax: Option<(usize, &[u8], u128)> = None;
         let mut zoneEnd = batchSize;
 
-        for (i, val) in values.iter().enumerate() {
+        for i in 0..rowCount {
             if i == zoneEnd {
                 close_zone(
                     &mut zoneMaps,
-                    zoneMin,
-                    zoneMax,
+                    zoneMin.map(|(row, value, _)| (row, value)),
+                    zoneMax.map(|(row, value, _)| (row, value)),
                     &mut segmentMin,
                     &mut segmentMax,
                     valueSize,
@@ -752,74 +1047,72 @@ impl ColumnSegment {
                 zoneEnd += batchSize;
             }
 
-            match val {
-                None => {
-                    nullCount += 1;
-                    if nullBitmap.is_empty() {
-                        nullBitmap = vec![0u8; rowCount.div_ceil(8)];
-                    }
-                    nullBitmap[i / 8] |= 1 << (i % 8);
-                    // Zero the null slot in rawData since the buffer was
-                    // allocated uninitialized, encoders treat the slot as
-                    // a deterministic zero placeholder and the null bitmap
-                    // tells consumers to skip it
-                    let start = i * valueSize;
-                    let end = start + valueSize;
-                    rawData[start..end].fill(0);
+            if hasNulls
+                && nullBitmap
+                    .get(i / 8)
+                    .is_some_and(|byte| byte & (1 << (i % 8)) != 0)
+            {
+                continue;
+            }
+            let v = &rawData[i * valueSize..(i + 1) * valueSize];
+            distinct.insert(v);
+
+            // One fold of the cell serves both bounds and the sorted flag.
+            // The unsigned word is the order the flag records, and the
+            // ordered word is the order the bounds compare in
+            let rawWord = if wordKeys { le_word(v) } else { 0 };
+            let ordWord = if wordKeys {
+                ordered_word(rawWord, valueSize, statOrder)
+            } else {
+                0
+            };
+
+            // Only the zone this row lands in has to be beaten. The segment
+            // bounds are folded out of the zone bounds when the zone closes,
+            // which is one comparison per bound per row rather than two
+            if zoneMin.is_none_or(|(_, cur, curWord)| {
+                cell_is_less(ordWord, v, curWord, cur, valueSize, statOrder, wordKeys)
+            }) {
+                zoneMin = Some((i, v, ordWord));
+            }
+            if zoneMax.is_none_or(|(_, cur, curWord)| {
+                cell_is_less(curWord, cur, ordWord, v, valueSize, statOrder, wordKeys)
+            }) {
+                zoneMax = Some((i, v, ordWord));
+            }
+
+            if let Some(prev) = prevRaw {
+                // The fold is a zero-extended copy of the cell, so two words
+                // are equal exactly when the cells are and the run count
+                // stays exact
+                let differs = if wordKeys {
+                    rawWord != prevWord
+                } else {
+                    v != prev
+                };
+                if differs {
+                    runCount += 1;
                 }
-                Some(v) => {
-                    let v: &[u8] = v;
-                    if v.len() != valueSize {
-                        // A non-null value whose width does not match the fixed
-                        // column value size cannot be packed into its slot, fail
-                        // instead of zero-filling and corrupting the value
-                        return Err(ZyronError::EncodingFailed(format!(
-                            "non-null value at row {} has length {} expected {}",
-                            i,
-                            v.len(),
-                            valueSize
-                        )));
-                    }
-                    distinct.insert(v);
-
-                    // Only the zone this row lands in has to be beaten. The
-                    // segment bounds are folded out of the zone bounds when
-                    // the zone closes, which is one comparison per bound per
-                    // row rather than two
-                    if zoneMin.is_none_or(|(_, cur)| {
-                        compare_values_ordered(v, cur, valueSize, statOrder).is_lt()
-                    }) {
-                        zoneMin = Some((i, v));
-                    }
-                    if zoneMax.is_none_or(|(_, cur)| {
-                        compare_values_ordered(v, cur, valueSize, statOrder).is_gt()
-                    }) {
-                        zoneMax = Some((i, v));
-                    }
-
-                    // compare_le_bytes reads fixed-width values from the last
-                    // byte and requires equal lengths, which the width check
-                    // above has established
-                    if isSorted
-                        && prevRaw.is_some_and(|prev| {
-                            compare_le_bytes(v, prev) == std::cmp::Ordering::Less
-                        })
-                    {
+                if isSorted {
+                    let descended = if wordKeys {
+                        rawWord < prevWord
+                    } else {
+                        compare_le_bytes(v, prev) == std::cmp::Ordering::Less
+                    };
+                    if descended {
                         isSorted = false;
                     }
-                    prevRaw = Some(v);
-
-                    let start = i * valueSize;
-                    rawData[start..start + valueSize].copy_from_slice(v);
                 }
             }
+            prevRaw = Some(v);
+            prevWord = rawWord;
         }
         // Close the final zone, which may be partially filled
         if zoneMaps.len() < zoneCount {
             close_zone(
                 &mut zoneMaps,
-                zoneMin,
-                zoneMax,
+                zoneMin.map(|(row, value, _)| (row, value)),
+                zoneMax.map(|(row, value, _)| (row, value)),
                 &mut segmentMin,
                 &mut segmentMax,
                 valueSize,
@@ -832,13 +1125,33 @@ impl ColumnSegment {
         let minValue = segmentMin.map_or([0u8; STAT_VALUE_SIZE], |(_, v)| value_to_stat_slot(v));
         let maxValue = segmentMax.map_or([0u8; STAT_VALUE_SIZE], |(_, v)| varlen_upper_slot(v));
 
-        // Selection is handed the buffer the fused pass just packed, and
-        // hands back the bytes it produced while deciding. Under exact
-        // selection the trial is a full encode of the column, so taking its
-        // output is the difference between encoding this column once and
-        // encoding it twice
-        let choice =
-            select_encoding_packed(typeId, values, &rawData, valueSize, options.exact_encoding);
+        // Selection is handed the buffer the fused pass just packed and the
+        // statistics that same pass gathered, and hands back the bytes it
+        // produced while deciding. Under exact selection the trial is a full
+        // encode of the column, so taking its output is the difference
+        // between encoding this column once and encoding it twice, and
+        // handing the statistics in is the difference between reading the
+        // column once and reading it twice
+        //
+        // A column is all one value when every cell is null, or when no cell
+        // is null and no adjacent pair differs. Deriving it from the run
+        // count rather than from the distinct count keeps it exact under a
+        // set that is keyed by hashes
+        let allIdentical =
+            nullCount as usize == rowCount || (nullCount == 0 && runCount == 1);
+        let stats = ColumnSampleStats {
+            cardinality: distinct.estimated(),
+            run_count: runCount,
+            all_identical: allIdentical,
+        };
+        let choice = select_encoding_prepared(
+            typeId,
+            rowCount,
+            stats,
+            &rawData,
+            valueSize,
+            options.exact_encoding,
+        );
         let encodingType = choice.encoding;
         let encodedData = match choice.encoded {
             Some(bytes) => bytes,
@@ -856,8 +1169,15 @@ impl ColumnSegment {
                 cardinality
             };
             let mut filter = BloomFilter::new(bloom_size_hint);
-            for v in values.iter().flatten() {
-                filter.insert(v);
+            for row in 0..rowCount {
+                if hasNulls
+                    && nullBitmap
+                        .get(row / 8)
+                        .is_some_and(|byte| byte & (1 << (row % 8)) != 0)
+                {
+                    continue;
+                }
+                filter.insert(&rawData[row * valueSize..(row + 1) * valueSize]);
             }
             Some(filter)
         } else {
@@ -927,7 +1247,10 @@ impl ColumnSegment {
 
         let mut nullCount = 0u64;
         let mut nullBitmap: Vec<u8> = Vec::new();
-        let mut distinct = DistinctTracker::new(options.distinct_sketch);
+        // Variable-length selection runs its own statistics over the packed
+        // buffer, so the only reader of this count is the bloom threshold
+        let mut distinct =
+            DistinctTracker::new(options.distinct_sketch, BLOOM_MIN_CARDINALITY as usize);
         let mut segmentMin: Option<(usize, &[u8])> = None;
         let mut segmentMax: Option<(usize, &[u8])> = None;
         let mut isSorted = true;
@@ -1092,6 +1415,537 @@ impl ColumnSegment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The row loop compares cells through a folded word rather than
+    /// through the general comparator, so the two have to answer the same
+    /// question the same way at every width and under every order a
+    /// fixed-size column can carry.
+    ///
+    /// Both the fixed bit patterns that sit on the boundaries and a spread
+    /// of random pairs, because the sign bit, the all-ones value and zero
+    /// are exactly where an order-preserving fold goes wrong
+    #[test]
+    fn folded_words_order_cells_the_way_the_comparator_does() {
+        let orders = [
+            SlotOrder::Unsigned,
+            SlotOrder::TwosComplement,
+            SlotOrder::Ieee,
+            SlotOrder::Lexicographic,
+        ];
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        for width in 1..=WORD_KEY_MAX_WIDTH {
+            // Boundary patterns first, then random pairs over the same width
+            let mut samples: Vec<Vec<u8>> = vec![
+                vec![0x00; width],
+                vec![0xFF; width],
+                vec![0x80; width],
+                vec![0x01; width],
+            ];
+            {
+                let mut high = vec![0u8; width];
+                high[width - 1] = 0x80;
+                samples.push(high);
+                let mut low = vec![0u8; width];
+                low[0] = 0x01;
+                samples.push(low);
+            }
+            for _ in 0..64 {
+                let mut value = vec![0u8; width];
+                for byte in value.iter_mut() {
+                    *byte = (next() & 0xFF) as u8;
+                }
+                samples.push(value);
+            }
+
+            for order in orders {
+                for a in &samples {
+                    for b in &samples {
+                        let expected = compare_values_ordered(a, b, width, order);
+                        let folded = ordered_word(le_word(a), width, order)
+                            .cmp(&ordered_word(le_word(b), width, order));
+                        assert_eq!(
+                            folded, expected,
+                            "width {width} order {order:?} disagreed on {a:?} vs {b:?}"
+                        );
+                    }
+                }
+            }
+
+            // And the unsigned word, which is the order the sorted flag is
+            // recorded under
+            for a in &samples {
+                for b in &samples {
+                    assert_eq!(
+                        le_word(a).cmp(&le_word(b)),
+                        compare_le_bytes(a, b),
+                        "width {width} unsigned fold disagreed on {a:?} vs {b:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The packing pass gathers the statistics selection reads instead of
+    /// letting selection walk the column again to rebuild them, so the two
+    /// have to settle on the same encoding for every shape a column takes.
+    ///
+    /// `select_encoding_packed` still computes them from the cells, which
+    /// makes it an independent oracle rather than a restatement of the
+    /// folded path
+    #[test]
+    fn folded_statistics_choose_what_a_second_walk_chose() {
+        fn packed_buffer(values: &[Option<&[u8]>], width: usize) -> Vec<u8> {
+            let mut raw = vec![0u8; values.len() * width];
+            for (i, value) in values.iter().enumerate() {
+                if let Some(v) = value {
+                    raw[i * width..i * width + width].copy_from_slice(v);
+                }
+            }
+            raw
+        }
+
+        let rows = 4_096usize;
+        let mut shapes: Vec<(&str, TypeId, usize, Vec<Option<Vec<u8>>>)> = Vec::new();
+
+        // One repeated value, which is the constant case
+        shapes.push((
+            "all identical",
+            TypeId::Int64,
+            8,
+            vec![Some(7i64.to_le_bytes().to_vec()); rows],
+        ));
+        // Every cell null, which is also constant
+        shapes.push(("all null", TypeId::Int64, 8, vec![None; rows]));
+        // One distinct value and a single null, which is not constant
+        let mut one_and_a_null = vec![Some(7i64.to_le_bytes().to_vec()); rows];
+        one_and_a_null[rows / 2] = None;
+        shapes.push((
+            "one value with a null",
+            TypeId::Int64,
+            8,
+            one_and_a_null,
+        ));
+        shapes.push((
+            "boolean",
+            TypeId::Boolean,
+            1,
+            (0..rows).map(|r| Some(vec![(r % 2) as u8])).collect(),
+        ));
+        // Sparse enough for a dictionary
+        shapes.push((
+            "low cardinality",
+            TypeId::Int64,
+            8,
+            (0..rows)
+                .map(|r| Some(((r % 17) as i64).to_le_bytes().to_vec()))
+                .collect(),
+        ));
+        // Long runs, which is the run-length shape
+        shapes.push((
+            "long runs",
+            TypeId::Int64,
+            8,
+            (0..rows)
+                .map(|r| Some(((r / 512) as i64).to_le_bytes().to_vec()))
+                .collect(),
+        ));
+        // Distinct and ascending, which trial encoding decides
+        shapes.push((
+            "ascending distinct",
+            TypeId::Int64,
+            8,
+            (0..rows).map(|r| Some((r as i64).to_le_bytes().to_vec())).collect(),
+        ));
+        // Distinct and scattered, with nulls through it
+        shapes.push((
+            "scattered with nulls",
+            TypeId::Int64,
+            8,
+            (0..rows)
+                .map(|r| {
+                    if r % 23 == 0 {
+                        None
+                    } else {
+                        Some(((r as i64).wrapping_mul(6_364_136_223_846_793_005)).to_le_bytes().to_vec())
+                    }
+                })
+                .collect(),
+        ));
+        // Sitting exactly on the cardinality boundary the dictionary
+        // decision compares against
+        shapes.push((
+            "half the rows distinct",
+            TypeId::Int64,
+            8,
+            (0..rows)
+                .map(|r| Some(((r / 2) as i64).to_le_bytes().to_vec()))
+                .collect(),
+        ));
+        shapes.push((
+            "one over half the rows distinct",
+            TypeId::Int64,
+            8,
+            (0..rows)
+                .map(|r| {
+                    let value = if r < rows / 2 + 2 { r } else { r % (rows / 2 + 2) };
+                    Some((value as i64).to_le_bytes().to_vec())
+                })
+                .collect(),
+        ));
+        shapes.push((
+            "float column",
+            TypeId::Float64,
+            8,
+            (0..rows)
+                .map(|r| Some((r as f64 * 1.5).to_le_bytes().to_vec()))
+                .collect(),
+        ));
+        shapes.push((
+            "wide cells past one word",
+            TypeId::Inet,
+            18,
+            (0..rows)
+                .map(|r| {
+                    let mut cell = vec![0u8; 18];
+                    cell[..4].copy_from_slice(&(r as u32).to_le_bytes());
+                    Some(cell)
+                })
+                .collect(),
+        ));
+
+        for (name, type_id, width, cells) in shapes {
+            let views: Vec<Option<&[u8]>> = cells.iter().map(|c| c.as_deref()).collect();
+            let raw = packed_buffer(&views, width);
+            for exact in [true, false] {
+                let expected =
+                    crate::encoding::select_encoding_packed(type_id, &views, &raw, width, exact);
+                let segment = ColumnSegment::build_with_options(
+                    0,
+                    type_id,
+                    width,
+                    &views,
+                    SegmentOptions {
+                        exact_encoding: exact,
+                        ..SegmentOptions::default()
+                    },
+                )
+                .expect("segment builds");
+                assert_eq!(
+                    segment.header.encoding_type, expected.encoding,
+                    "{name} chose differently with exact_encoding {exact}"
+                );
+            }
+        }
+    }
+
+    /// A caller holding its column packed hands the buffer straight in,
+    /// and one that holds a pointer per cell packs a buffer first. Both
+    /// arrive at the same pass, so both have to produce the same segment
+    /// down to the encoded bytes, the zone maps and the bloom
+    #[test]
+    fn a_packed_build_matches_the_build_that_packs_for_itself() {
+        let rows = 3_000usize;
+        let shapes: Vec<(&str, TypeId, usize, Vec<Option<Vec<u8>>>)> = vec![
+            (
+                "ascending distinct",
+                TypeId::Int64,
+                8,
+                (0..rows).map(|r| Some((r as i64).to_le_bytes().to_vec())).collect(),
+            ),
+            (
+                "with nulls",
+                TypeId::Int64,
+                8,
+                (0..rows)
+                    .map(|r| (r % 7 != 0).then(|| (r as i64).to_le_bytes().to_vec()))
+                    .collect(),
+            ),
+            ("all null", TypeId::Int64, 8, vec![None; rows]),
+            (
+                "one repeated value",
+                TypeId::Int64,
+                8,
+                vec![Some(42i64.to_le_bytes().to_vec()); rows],
+            ),
+            (
+                "low cardinality",
+                TypeId::Int64,
+                8,
+                (0..rows)
+                    .map(|r| Some(((r % 11) as i64).to_le_bytes().to_vec()))
+                    .collect(),
+            ),
+            (
+                "signed across zero",
+                TypeId::Int64,
+                8,
+                (0..rows)
+                    .map(|r| Some((r as i64 - (rows as i64 / 2)).to_le_bytes().to_vec()))
+                    .collect(),
+            ),
+            (
+                "floats",
+                TypeId::Float64,
+                8,
+                (0..rows)
+                    .map(|r| Some(((r as f64) - 1500.0).to_le_bytes().to_vec()))
+                    .collect(),
+            ),
+            (
+                "narrow cells",
+                TypeId::Int16,
+                2,
+                (0..rows).map(|r| Some((r as i16).to_le_bytes().to_vec())).collect(),
+            ),
+            (
+                "cells wider than one word",
+                TypeId::Inet,
+                18,
+                (0..rows)
+                    .map(|r| {
+                        let mut cell = vec![0u8; 18];
+                        cell[..4].copy_from_slice(&(r as u32).to_le_bytes());
+                        Some(cell)
+                    })
+                    .collect(),
+            ),
+        ];
+
+        for (name, type_id, width, cells) in shapes {
+            let views: Vec<Option<&[u8]>> = cells.iter().map(|c| c.as_deref()).collect();
+            // The buffer a packed caller holds: cells at their stride with
+            // null slots zeroed, and a bitmap naming the nulls
+            let mut packed = vec![0u8; cells.len() * width];
+            let mut nulls = vec![0u8; cells.len().div_ceil(8)];
+            for (row, cell) in cells.iter().enumerate() {
+                match cell {
+                    Some(value) => {
+                        packed[row * width..(row + 1) * width].copy_from_slice(value)
+                    }
+                    None => nulls[row / 8] |= 1 << (row % 8),
+                }
+            }
+
+            for sketch in [false, true] {
+                let options = SegmentOptions {
+                    distinct_sketch: sketch,
+                    exact_encoding: true,
+                    ..SegmentOptions::default()
+                };
+                let from_views =
+                    ColumnSegment::build_with_options(3, type_id, width, &views, options)
+                        .expect("views build");
+                let from_packed = ColumnSegment::build_packed(
+                    3,
+                    type_id,
+                    width,
+                    &packed,
+                    &nulls,
+                    cells.len(),
+                    options,
+                )
+                .expect("packed build");
+
+                let tag = format!("{name} with sketch {sketch}");
+                assert_eq!(
+                    from_packed.header.encoding_type, from_views.header.encoding_type,
+                    "{tag}: encoding"
+                );
+                assert_eq!(
+                    from_packed.encoded_data, from_views.encoded_data,
+                    "{tag}: encoded bytes"
+                );
+                assert_eq!(
+                    from_packed.header.null_count, from_views.header.null_count,
+                    "{tag}: null count"
+                );
+                assert_eq!(
+                    from_packed.header.cardinality, from_views.header.cardinality,
+                    "{tag}: cardinality"
+                );
+                assert_eq!(
+                    from_packed.header.min_value, from_views.header.min_value,
+                    "{tag}: minimum"
+                );
+                assert_eq!(
+                    from_packed.header.max_value, from_views.header.max_value,
+                    "{tag}: maximum"
+                );
+                assert_eq!(
+                    from_packed.header.is_sorted, from_views.header.is_sorted,
+                    "{tag}: sorted flag"
+                );
+                assert_eq!(from_packed.min_row, from_views.min_row, "{tag}: min row");
+                assert_eq!(from_packed.max_row, from_views.max_row, "{tag}: max row");
+                assert_eq!(from_packed.ndv, from_views.ndv, "{tag}: distinct estimate");
+                assert_eq!(
+                    from_packed.null_bitmap, from_views.null_bitmap,
+                    "{tag}: null bitmap"
+                );
+                assert_eq!(
+                    from_packed.zone_maps.len(),
+                    from_views.zone_maps.len(),
+                    "{tag}: zone count"
+                );
+                assert_eq!(
+                    from_packed.bloom_filter.as_ref().map(|b| b.to_bytes()),
+                    from_views.bloom_filter.as_ref().map(|b| b.to_bytes()),
+                    "{tag}: bloom"
+                );
+            }
+        }
+    }
+
+    /// A packed build refuses input it cannot read rather than reading past
+    /// the buffer or inventing rows
+    #[test]
+    fn a_packed_build_refuses_a_buffer_that_does_not_hold_its_rows() {
+        let values = vec![0u8; 8 * 4];
+        let options = SegmentOptions::default();
+        assert!(
+            ColumnSegment::build_packed(0, TypeId::Int64, 8, &values, &[], 5, options).is_err(),
+            "five rows do not fit in four"
+        );
+        assert!(
+            ColumnSegment::build_packed(0, TypeId::Int64, 0, &values, &[], 4, options).is_err(),
+            "a packed build needs a width"
+        );
+        assert!(
+            ColumnSegment::build_packed(0, TypeId::Int64, 8, &values, &[], 0, options).is_err(),
+            "a segment needs rows"
+        );
+        assert!(
+            ColumnSegment::build_packed(0, TypeId::Int64, 8, &values, &[], 4, options).is_ok(),
+            "four rows fit in four"
+        );
+    }
+
+    /// A bitmap longer than the rows it describes carries bits that belong
+    /// to no row, and reading them as nulls would count rows the column
+    /// does not have
+    #[test]
+    fn bits_past_the_last_row_are_not_nulls() {
+        let rows = 5usize;
+        let mut values = vec![0u8; rows * 8];
+        for row in 0..rows {
+            values[row * 8..(row + 1) * 8].copy_from_slice(&(row as i64).to_le_bytes());
+        }
+        // No row is null, but the three bits above the row count are set
+        let segment = ColumnSegment::build_packed(
+            0,
+            TypeId::Int64,
+            8,
+            &values,
+            &[0b1110_0000],
+            rows,
+            SegmentOptions::default(),
+        )
+        .expect("segment");
+        assert_eq!(
+            segment.header.null_count, 0,
+            "a bit above the last row is not a null"
+        );
+        assert!(
+            segment.null_bitmap.is_empty(),
+            "a column with no nulls carries no bitmap"
+        );
+
+        // And a bitmap that does name a row still counts only that row
+        let mut nulled = values.clone();
+        nulled[8..16].fill(0);
+        let segment = ColumnSegment::build_packed(
+            0,
+            TypeId::Int64,
+            8,
+            &nulled,
+            &[0b1110_0010],
+            rows,
+            SegmentOptions::default(),
+        )
+        .expect("segment");
+        assert_eq!(segment.header.null_count, 1, "one row is null");
+    }
+
+    /// A float column's fold has to reproduce the total order the general
+    /// comparator gives, including across zero and for the negatives that
+    /// grow away from it
+    #[test]
+    fn folded_float_words_keep_the_total_order() {
+        let f64s = [
+            f64::NEG_INFINITY,
+            -1.0e300,
+            -1.0,
+            -f64::MIN_POSITIVE,
+            -0.0,
+            0.0,
+            f64::MIN_POSITIVE,
+            1.0,
+            1.0e300,
+            f64::INFINITY,
+        ];
+        for a in f64s {
+            for b in f64s {
+                let (ab, bb) = (a.to_le_bytes(), b.to_le_bytes());
+                assert_eq!(
+                    ordered_word(le_word(&ab), 8, SlotOrder::Ieee)
+                        .cmp(&ordered_word(le_word(&bb), 8, SlotOrder::Ieee)),
+                    compare_values_ordered(&ab, &bb, 8, SlotOrder::Ieee),
+                    "f64 fold disagreed on {a} vs {b}"
+                );
+            }
+        }
+        let f32s = [
+            f32::NEG_INFINITY,
+            -1.0e30,
+            -1.0,
+            -0.0,
+            0.0,
+            1.0,
+            1.0e30,
+            f32::INFINITY,
+        ];
+        for a in f32s {
+            for b in f32s {
+                let (ab, bb) = (a.to_le_bytes(), b.to_le_bytes());
+                assert_eq!(
+                    ordered_word(le_word(&ab), 4, SlotOrder::Ieee)
+                        .cmp(&ordered_word(le_word(&bb), 4, SlotOrder::Ieee)),
+                    compare_values_ordered(&ab, &bb, 4, SlotOrder::Ieee),
+                    "f32 fold disagreed on {a} vs {b}"
+                );
+            }
+        }
+    }
+
+    /// The two fixed-size types wider than one word keep the general
+    /// comparator, and a segment built over them still bounds its zones
+    #[test]
+    fn cells_wider_than_one_word_still_bound_their_segment() {
+        let width = 18;
+        let values: Vec<Vec<u8>> = (0..3_000u32)
+            .map(|row| {
+                let mut cell = vec![0u8; width];
+                cell[..4].copy_from_slice(&row.to_le_bytes());
+                cell
+            })
+            .collect();
+        let views: Vec<Option<&[u8]>> = values.iter().map(|v| Some(v.as_slice())).collect();
+        let segment = ColumnSegment::build(0, TypeId::Inet, width, &views).expect("segment");
+        assert_eq!(segment.min_row, Some(0), "the first row holds the minimum");
+        assert_eq!(
+            segment.max_row,
+            Some(values.len() - 1),
+            "the last row holds the maximum"
+        );
+        assert!(segment.header.is_sorted, "an ascending column reads sorted");
+    }
     use crate::encoding::{Predicate, eval_predicate_on_raw, varlen_slice_rows};
 
     /// Reusing the trial encode's output is only sound if those bytes are

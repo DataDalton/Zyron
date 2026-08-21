@@ -152,22 +152,29 @@ pub async fn derived_column_data(
         .cluster
         .derived
         .iter()
-        .map(|d| zyron_lake::ColumnData {
-            column_id: d.column_id,
-            cells: Vec::new(),
-        })
+        .map(|d| zyron_lake::ColumnData::with_capacity(d.column_id, 0, 0))
         .collect();
+    // One buffer refilled per cell rather than one allocation per cell
+    let mut scratch: Vec<u8> = Vec::new();
     for batch in batches {
         let computed = evaluate_derived(catalog, table, batch, &schema).await?;
         for (slot, (_, column)) in out.iter_mut().zip(computed.into_iter()) {
             let type_id = column.type_id;
             let value_size = type_id.fixed_size().unwrap_or(0);
             for r in 0..batch.num_rows {
-                let cell = match column.get_scalar(r) {
-                    crate::column::ScalarValue::Null => None,
-                    ref v => Some(crate::batch::encode_scalar_value(type_id, v, value_size)),
-                };
-                slot.cells.push(cell);
+                match column.get_scalar(r) {
+                    crate::column::ScalarValue::Null => slot.push(None),
+                    ref v => {
+                        scratch.clear();
+                        crate::batch::encode_scalar_value_into(
+                            &mut scratch,
+                            type_id,
+                            v,
+                            value_size,
+                        );
+                        slot.push(Some(&scratch));
+                    }
+                }
             }
         }
     }

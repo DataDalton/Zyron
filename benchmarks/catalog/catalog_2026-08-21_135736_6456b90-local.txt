@@ -1,0 +1,12 @@
+# suite:   catalog
+# run:     2026-08-21_135736_6456b90-local
+# profile: release
+# cpu:     Intel(R) Core(TM) Ultra 7 270K Plus
+# cores:   24
+#
+
+=== Benchmark: Recovery Time ===
+  Recovery time (ms) [FAIL/REGR!]:
+    Runs: [4.9312, 0.3762, 0.3061, 0.2977, 0.2890]
+    Average: 1.2400 <= 1 (target)
+    Min/Max: 0.2890 / 4.9312, StdDev: 1.8458

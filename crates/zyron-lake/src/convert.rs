@@ -66,7 +66,7 @@ pub fn load_lake_from_rows(
         properties,
     )?;
 
-    let row_count = rows.first().map(|c| c.cells.len()).unwrap_or(0);
+    let row_count = rows.first().map(|c| c.len()).unwrap_or(0);
     if row_count > 0 {
         append_rows(
             &log,
@@ -120,9 +120,8 @@ pub fn read_all_rows(
         .schema
         .columns
         .iter()
-        .map(|c| ColumnData {
-            column_id: c.id,
-            cells: Vec::new(),
+        .map(|c| {
+            ColumnData::with_capacity(c.id, c.physical_type_id().fixed_size().unwrap_or(0), 0)
         })
         .collect();
 
@@ -142,9 +141,7 @@ pub fn read_all_rows(
                 continue;
             }
             for (index, column) in decoded.iter().enumerate() {
-                columns[index]
-                    .cells
-                    .push(column.cell(row).map(|cell| cell.to_vec()));
+                columns[index].push(column.cell(row));
             }
         }
     }
@@ -189,17 +186,11 @@ mod tests {
 
     fn rows(ids: &[i64], tags: &[Option<&str>]) -> Vec<ColumnData> {
         vec![
-            ColumnData {
-                column_id: 0,
-                cells: ids.iter().map(|v| Some(v.to_le_bytes().to_vec())).collect(),
-            },
-            ColumnData {
-                column_id: 1,
-                cells: tags
+            ColumnData::from_cells(0, ids.iter().map(|v| Some(v.to_le_bytes().to_vec())).collect()),
+            ColumnData::from_cells(1, tags
                     .iter()
                     .map(|t| t.map(|s| s.as_bytes().to_vec()))
-                    .collect(),
-            },
+                    .collect()),
         ]
     }
 
@@ -221,9 +212,9 @@ mod tests {
 
         let read = read_all_rows(&paths, &log).expect("read back");
         assert_eq!(read.len(), 2);
-        assert_eq!(read[0].cells.len(), 3);
-        assert_eq!(read[1].cells[1], None, "the NULL survives the round trip");
-        assert_eq!(read[1].cells[0].as_deref(), Some(b"a".as_slice()));
+        assert_eq!(read[0].len(), 3);
+        assert_eq!(read[1].cell(1), None, "the NULL survives the round trip");
+        assert_eq!(read[1].cell(0), Some(b"a".as_slice()));
     }
 
     #[test]
@@ -246,7 +237,7 @@ mod tests {
             read_all_rows(&paths, &log)
                 .expect("read")
                 .iter()
-                .all(|c| c.cells.is_empty())
+                .all(|c| c.is_empty())
         );
     }
 
@@ -341,8 +332,8 @@ mod tests {
         .expect("delete");
 
         let read = read_all_rows(&paths, &log).expect("read");
-        assert_eq!(read[0].cells.len(), 1, "only the surviving row travels");
-        assert_eq!(read[1].cells[0].as_deref(), Some(b"c".as_slice()));
+        assert_eq!(read[0].len(), 1, "only the surviving row travels");
+        assert_eq!(read[1].cell(0), Some(b"c".as_slice()));
         let _ = AllCommitted;
     }
 }

@@ -123,12 +123,6 @@ impl LakePaths {
         self.root.join("_zyron_log")
     }
 
-    /// Hint file holding the newest published version number. Advisory
-    /// only, recovery derives the head from the version files themselves
-    pub fn latest_hint(&self) -> PathBuf {
-        self.log_dir().join("_latest")
-    }
-
     /// Hint file holding the newest checkpoint version number
     pub fn last_checkpoint_hint(&self) -> PathBuf {
         self.log_dir().join("_last_checkpoint")
@@ -164,13 +158,6 @@ impl LakePaths {
             version,
             width = VERSION_NAME_WIDTH
         ))
-    }
-
-    /// Hint file holding a branch's newest published version. A branch has
-    /// its own hint because its versions are numbered above main's head and
-    /// writing them into main's hint would name a version main never has
-    pub fn branch_latest_hint(&self, branch: &str) -> PathBuf {
-        self.branch_dir(branch).join("_latest")
     }
 
     /// Clone pin held by another table, blocks vacuum of shared files
@@ -237,7 +224,33 @@ impl LakePaths {
 /// renames them into `data/` on accept, so the name has to be derivable
 /// from the partition id alone rather than from the final directory
 pub fn data_file_name(partition_id: u64) -> String {
-    format!("p-{:016x}.zyr", partition_id)
+    let mut name = String::with_capacity(DATA_FILE_NAME_LEN);
+    write_data_file_name(&mut name, partition_id);
+    name
+}
+
+/// Bytes a data file name occupies, which is what a caller building one
+/// into a buffer reserves
+pub const DATA_FILE_NAME_LEN: usize = "p-0000000000000000.zyr".len();
+
+/// Bytes an index file name occupies
+pub const INDEX_FILE_NAME_LEN: usize = "x-00000000-0000000000000000.zyr".len();
+
+/// Writes a data file name into an existing buffer.
+///
+/// A caller naming a whole file set reuses one buffer rather than allocating
+/// a string per file. Formatting into a `String` cannot fail, so the writer's
+/// result carries no information
+pub fn write_data_file_name(buf: &mut String, partition_id: u64) {
+    use std::fmt::Write;
+    let _ = write!(buf, "p-{:016x}.zyr", partition_id);
+}
+
+/// Writes an index file name into an existing buffer, as
+/// [`write_data_file_name`] does for a data file
+pub fn write_index_file_name(buf: &mut String, index_id: u32, partition_id: u64) {
+    use std::fmt::Write;
+    let _ = write!(buf, "x-{:08x}-{:016x}.zyr", index_id, partition_id);
 }
 
 /// File name one index file carries: `x-<index_id:08x>-<partition:016x>.zyr`.

@@ -1062,15 +1062,18 @@ fn stage_outputs(
         let mut batch: Vec<ColumnData> = schema
             .columns
             .iter()
-            .map(|c| ColumnData {
-                column_id: c.id,
-                cells: Vec::with_capacity(chunk.len()),
+            .map(|c| {
+                ColumnData::with_capacity(
+                    c.id,
+                    c.physical_type_id().fixed_size().unwrap_or(0),
+                    chunk.len(),
+                )
             })
             .collect();
         for (file, local) in chunk {
             let row = per_input[*file as usize].rows[*local as usize] as usize;
             for (slot, column) in batch.iter_mut().zip(decoded[*file as usize].iter()) {
-                slot.cells.push(column.cell(row).map(|c| c.to_vec()));
+                slot.push(column.cell(row));
             }
         }
         let partition_id = loop {
@@ -1710,20 +1713,14 @@ mod tests {
 
     fn batch(rows: &[(i64, Option<i64>)]) -> Vec<ColumnData> {
         vec![
-            ColumnData {
-                column_id: 0,
-                cells: rows
+            ColumnData::from_cells(0, rows
                     .iter()
                     .map(|(a, _)| Some(a.to_le_bytes().to_vec()))
-                    .collect(),
-            },
-            ColumnData {
-                column_id: 1,
-                cells: rows
+                    .collect()),
+            ColumnData::from_cells(1, rows
                     .iter()
                     .map(|(_, b)| b.map(|v| v.to_le_bytes().to_vec()))
-                    .collect(),
-            },
+                    .collect()),
         ]
     }
 

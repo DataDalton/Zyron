@@ -92,15 +92,19 @@ pub fn append_rows(
 ) -> Result<AppendOutcome, ZyronError> {
     let mut attempt = attempt;
     attempt.operation = OperationKind::Append;
-    let mut staged: Option<StagedAppend> = None;
+    let mut staged: Option<StagedAppend<'_>> = None;
     // Index deltas this attempt put on disk. They address the data file by
     // partition id and are built from the base index set, so a retry always
     // rebuilds them and always unlinks the ones it is replacing
     let mut index_paths: Vec<PathBuf> = Vec::new();
+    // Their ids, registered from allocation so the vacuum leaves the files
+    // alone for as long as they are being written
+    let mut index_staged: Vec<crate::transaction_log::StagedPartition<'_>> = Vec::new();
     let result = log.commit(attempt, |base| {
         for path in index_paths.drain(..) {
             discard_staged_file(&path);
         }
+        index_staged.clear();
 
         // A lost race does not invalidate the rows already on disk. The file
         // is written from the batch, the schema, the cluster spec and the
@@ -124,6 +128,7 @@ pub fn append_rows(
             Some(kept) => kept,
             None => {
                 let partition_id = allocate_partition_id(base);
+                let staged_id = log.stage_partition(partition_id);
                 let sort_keys: Vec<u32> =
                     base.cluster_spec.keys.iter().map(|k| k.column_id).collect();
                 // The declared curve per key, so a file is laid out the way
@@ -146,6 +151,7 @@ pub fn append_rows(
                 )?;
                 StagedAppend {
                     partition_id,
+                    _staged: staged_id,
                     entry: written.entry,
                     order: written.order,
                     schema: base.schema.clone(),
@@ -170,6 +176,7 @@ pub fn append_rows(
             &mut || {
                 let id = allocate_unused_partition_id(base, &used);
                 used.push(id);
+                index_staged.push(log.stage_partition(id));
                 id
             },
         );
@@ -217,8 +224,12 @@ pub fn append_rows(
 /// A retry compares them against the new base: all matching means the rows
 /// on disk are still the rows this append wants to commit, so the write does
 /// not have to happen again
-struct StagedAppend {
+struct StagedAppend<'a> {
     partition_id: u64,
+    /// Keeps the vacuum off the data file until this commit resolves. The
+    /// file is written under the name it will be read by, so nothing else
+    /// tells it apart from an orphan a crashed writer left
+    _staged: crate::transaction_log::StagedPartition<'a>,
     entry: PartitionEntry,
     order: Vec<usize>,
     schema: crate::schema::LakeSchema,
@@ -1067,9 +1078,8 @@ pub fn optimize(
             .schema
             .columns
             .iter()
-            .map(|c| ColumnData {
-                column_id: c.id,
-                cells: Vec::new(),
+            .map(|c| {
+                ColumnData::with_capacity(c.id, c.physical_type_id().fixed_size().unwrap_or(0), 0)
             })
             .collect();
         for input in &inputs {
@@ -1086,7 +1096,7 @@ pub fn optimize(
                     continue;
                 }
                 for (slot, col) in batch.iter_mut().zip(decoded.iter()) {
-                    slot.cells.push(col.cell(row).map(|c| c.to_vec()));
+                    slot.push(col.cell(row));
                 }
             }
         }
@@ -1096,7 +1106,7 @@ pub fn optimize(
                 partition_id: f.partition_id,
             })
             .collect();
-        let survivor_rows = batch.first().map(|c| c.cells.len()).unwrap_or(0);
+        let survivor_rows = batch.first().map(|c| c.len()).unwrap_or(0);
         if survivor_rows > 0 {
             let partition_id = allocate_partition_id(base);
             let sort_keys: Vec<u32> = base.cluster_spec.keys.iter().map(|k| k.column_id).collect();
@@ -1218,6 +1228,38 @@ pub fn vacuum_data_files(
     log: &TransactionLog,
     retain_min_version: u64,
 ) -> Result<usize, ZyronError> {
+    // The directory is listed before the reference set is built, never the
+    // other way round.
+    //
+    // A data file is written under the name it will be read by, so nothing
+    // on disk separates one being written from one a crash left. Two things
+    // do. A writer registers its partition id before the file exists and
+    // holds it until the commit resolves, which covers a write in flight.
+    // And a file the listing saw was already on disk when the manifest was
+    // read afterwards, so a commit that landed in between named it in that
+    // manifest. Reading the manifest first leaves exactly the gap those two
+    // close: the file is written, its commit has not landed, and the
+    // reference set that would have named it was taken before it existed
+    let mut data_candidates: Vec<(PathBuf, u64)> = Vec::new();
+    let mut index_candidates: Vec<(PathBuf, (u32, u64))> = Vec::new();
+    for dirent in fs::read_dir(log.paths().data_dir())? {
+        let dirent = dirent?;
+        let name = dirent.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(key) = parse_index_file_name(name) {
+            if !log.is_staging(key.1) {
+                index_candidates.push((dirent.path(), key));
+            }
+            continue;
+        }
+        let Some(partition_id) = parse_data_file_name(name) else {
+            continue;
+        };
+        if !log.is_staging(partition_id) {
+            data_candidates.push((dirent.path(), partition_id));
+        }
+    }
+
     let head = log.head_version();
     let floor = retain_min_version.clamp(1, head);
     // Every partition referenced by any version the log can still replay
@@ -1255,28 +1297,15 @@ pub fn vacuum_data_files(
     referenced.extend(pinned);
 
     let mut removed = 0usize;
-    for dirent in fs::read_dir(log.paths().data_dir())? {
-        let dirent = dirent?;
-        let name = dirent.file_name();
-        let Some(name) = name.to_str() else { continue };
-        // Staging leftovers from crashed writers are always garbage
-        if name.ends_with(".zyr.tmp") {
-            fs::remove_file(dirent.path())?;
+    for (path, key) in index_candidates {
+        if !referenced_index.contains(&key) {
+            fs::remove_file(path)?;
             removed += 1;
-            continue;
         }
-        if let Some(key) = parse_index_file_name(name) {
-            if !referenced_index.contains(&key) {
-                fs::remove_file(dirent.path())?;
-                removed += 1;
-            }
-            continue;
-        }
-        let Some(partition_id) = parse_data_file_name(name) else {
-            continue;
-        };
+    }
+    for (path, partition_id) in data_candidates {
         if !referenced.contains(&partition_id) {
-            fs::remove_file(dirent.path())?;
+            fs::remove_file(path)?;
             removed += 1;
         }
     }
@@ -1473,17 +1502,11 @@ mod tests {
 
     fn batch(ids: &[i64], names: &[Option<&str>]) -> Vec<ColumnData> {
         vec![
-            ColumnData {
-                column_id: 0,
-                cells: ids.iter().map(|v| Some(v.to_le_bytes().to_vec())).collect(),
-            },
-            ColumnData {
-                column_id: 1,
-                cells: names
+            ColumnData::from_cells(0, ids.iter().map(|v| Some(v.to_le_bytes().to_vec())).collect()),
+            ColumnData::from_cells(1, names
                     .iter()
                     .map(|v| v.map(|s| s.as_bytes().to_vec()))
-                    .collect(),
-            },
+                    .collect()),
         ]
     }
 
@@ -1686,13 +1709,9 @@ mod tests {
         // Fully-covering delete removes the file from the current version
         delete_where(&log, attempt(), &id_below(100), "id < 100").expect("delete");
 
-        // An orphan from a failed writer and a staging leftover
+        // Two orphans from failed writers, neither registered by a writer
         std::fs::write(log.paths().data_file(0xDEAD), b"orphan").expect("orphan");
-        std::fs::write(
-            log.paths().data_dir().join("p-0000000000000bad.zyr.tmp"),
-            b"tmp",
-        )
-        .expect("tmp");
+        std::fs::write(log.paths().data_file(0xBAD), b"orphan").expect("orphan");
 
         // Retaining from version 1 keeps the removed file for time travel
         let removed = vacuum_data_files(&log, 1).expect("vacuum");
@@ -1703,5 +1722,74 @@ mod tests {
         let removed = vacuum_data_files(&log, log.latest_version()).expect("vacuum head");
         assert_eq!(removed, 1);
         assert!(!log.paths().data_file(old_pid).exists());
+    }
+
+    /// A data file is written under the name it will be read by, so the
+    /// vacuum cannot tell one being written from one a crash left behind.
+    /// Reclaiming a write in flight would delete the bytes a commit is
+    /// about to name, so the writer's registration holds the vacuum off
+    /// until the commit resolves
+    #[test]
+    fn test_vacuum_leaves_a_file_a_writer_is_producing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = new_log(dir.path());
+        append_rows(&log, attempt(), 7, &batch(&[1], &[Some("a")])).expect("append");
+        let in_flight = 0xF00Du64;
+        let path = log.paths().data_file(in_flight);
+        std::fs::write(&path, b"half written").expect("stage");
+
+        {
+            let _guard = log.stage_partition(in_flight);
+            assert!(log.is_staging(in_flight));
+            let removed = vacuum_data_files(&log, log.latest_version()).expect("vacuum");
+            assert_eq!(removed, 0, "a registered id is not reclaimed");
+            assert!(path.exists(), "the bytes a writer is producing survive");
+        }
+
+        // Once the writer is done the same file is an ordinary orphan
+        assert!(!log.is_staging(in_flight));
+        let removed = vacuum_data_files(&log, log.latest_version()).expect("vacuum");
+        assert_eq!(removed, 1);
+        assert!(!path.exists());
+    }
+
+    /// A real append running beside a vacuum keeps its rows. The registry
+    /// is held from before the file exists until the commit resolves, so
+    /// there is no window where the file is on disk, absent from every
+    /// manifest, and unprotected
+    #[test]
+    fn appends_survive_a_vacuum_running_beside_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = std::sync::Arc::new(new_log(dir.path()));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sweeper = {
+            let log = std::sync::Arc::clone(&log);
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = vacuum_data_files(&log, log.latest_version());
+                }
+            })
+        };
+
+        let mut written = 0u64;
+        for row in 0..40i64 {
+            let out = append_rows(&log, attempt(), 7, &batch(&[row], &[Some("a")]))
+                .expect("append beside a vacuum");
+            written += out.rows;
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        sweeper.join().expect("sweeper");
+
+        let manifest = log.latest_manifest().expect("manifest");
+        let live: u64 = manifest.entries.iter().map(|e| e.row_count).sum();
+        assert_eq!(live, written, "every appended row is still named");
+        for entry in manifest.entries.iter() {
+            assert!(
+                log.paths().data_file(entry.partition_id).exists(),
+                "the manifest names partition {:#x} but its file is gone",
+                entry.partition_id
+            );
+        }
     }
 }

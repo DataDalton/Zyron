@@ -261,40 +261,59 @@ pub fn evidence_from_manifest(
     table_id: u32,
     now: u16,
 ) -> Vec<ColumnEvidence> {
-    let mut out = Vec::with_capacity(manifest.schema.columns.len());
-    for column in &manifest.schema.columns {
-        let mut weight = 0f64;
-        let mut ndv_sum = 0f64;
-        let mut rows_sum = 0f64;
-        let mut nulls_sum = 0f64;
-        for entry in &manifest.entries {
-            let Some(stats) = entry.stats_for(column.id) else {
+    let columns = &manifest.schema.columns;
+    // Column ids are dense and small, so the schema position a statistics
+    // entry belongs to is a direct index rather than a search
+    let mut slot_of =
+        vec![usize::MAX; columns.iter().map(|c| c.id as usize + 1).max().unwrap_or(0)];
+    for (k, column) in columns.iter().enumerate() {
+        slot_of[column.id as usize] = k;
+    }
+    let mut weight = vec![0f64; columns.len()];
+    let mut ndv_sum = vec![0f64; columns.len()];
+    let mut rows_sum = vec![0f64; columns.len()];
+    let mut nulls_sum = vec![0f64; columns.len()];
+
+    // Entries outside, columns inside. Each entry's statistics live behind
+    // their own pointer, so walking the manifest once per column reaches
+    // every one of them that many times over a set far larger than cache
+    for entry in &manifest.entries {
+        // A zero-byte file would drop out of a size weighting entirely, so
+        // it counts as one byte rather than as nothing
+        let file_weight = entry.size_bytes.max(1) as f64;
+        let entry_rows = entry.row_count as f64;
+        for stats in entry.column_stats.iter() {
+            let Some(&k) = slot_of.get(stats.column_id as usize) else {
                 continue;
             };
+            if k == usize::MAX {
+                continue;
+            }
             let Some(ndv) = stats.ndv else {
                 continue;
             };
-            // A zero-byte file would drop out of a size weighting entirely,
-            // so it counts as one byte rather than as nothing
-            let file_weight = entry.size_bytes.max(1) as f64;
-            weight += file_weight;
-            ndv_sum += file_weight * ndv as f64;
-            rows_sum += file_weight * entry.row_count as f64;
-            nulls_sum += file_weight * stats.bounds.null_count as f64;
+            weight[k] += file_weight;
+            ndv_sum[k] += file_weight * ndv as f64;
+            rows_sum[k] += file_weight * entry_rows;
+            nulls_sum[k] += file_weight * stats.bounds.null_count as f64;
         }
-        if weight == 0.0 {
+    }
+
+    let mut out = Vec::with_capacity(columns.len());
+    for (k, column) in columns.iter().enumerate() {
+        if weight[k] == 0.0 {
             continue;
         }
-        let row_count = (rows_sum / weight).round() as u64;
+        let row_count = (rows_sum[k] / weight[k]).round() as u64;
         let null_fraction = if row_count == 0 {
             0.0
         } else {
-            (nulls_sum / weight) / row_count as f64
+            (nulls_sum[k] / weight[k]) / row_count as f64
         };
         out.push(ColumnEvidence {
             column_id: column.id,
             type_id: column.type_id,
-            ndv: (ndv_sum / weight).round() as u64,
+            ndv: (ndv_sum[k] / weight[k]).round() as u64,
             row_count,
             null_fraction: null_fraction.clamp(0.0, 1.0),
             equality_weight: observer.score(table_id, column_term(column.id, TERM_EQUALITY), now),

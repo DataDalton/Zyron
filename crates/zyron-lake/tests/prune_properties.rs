@@ -312,10 +312,7 @@ fn test_pruning_touches_no_data_file() {
         let cells: Vec<Option<Vec<u8>>> = (0..64i64)
             .map(|r| Some((file as i64 * 1_000 + r).to_le_bytes().to_vec()))
             .collect();
-        let columns = vec![ColumnData {
-            column_id: 0,
-            cells,
-        }];
+        let columns = vec![ColumnData::from_cells(0, cells)];
         let entry = zyron_lake::write_data_file(
             &paths,
             &schema,
@@ -400,14 +397,8 @@ fn test_written_file_carries_its_own_statistics_with_no_analyze() {
         })
         .collect();
     let columns = vec![
-        ColumnData {
-            column_id: 0,
-            cells: ids,
-        },
-        ColumnData {
-            column_id: 1,
-            cells: labels,
-        },
+        ColumnData::from_cells(0, ids),
+        ColumnData::from_cells(1, labels),
     ];
     let entry = zyron_lake::write_data_file(
         &paths,
@@ -538,14 +529,8 @@ fn test_point_lookup_reads_only_projected_columns() {
         })
         .collect();
     let columns = vec![
-        ColumnData {
-            column_id: 0,
-            cells: ids,
-        },
-        ColumnData {
-            column_id: 1,
-            cells: blobs,
-        },
+        ColumnData::from_cells(0, ids),
+        ColumnData::from_cells(1, blobs),
     ];
     zyron_lake::write_data_file(
         &paths,
@@ -617,10 +602,7 @@ fn test_zone_map_prune_reduces_rows_decoded() {
             Some(v.to_le_bytes().to_vec())
         })
         .collect();
-    let columns = vec![ColumnData {
-        column_id: 0,
-        cells: ids,
-    }];
+    let columns = vec![ColumnData::from_cells(0, ids)];
     zyron_lake::write_data_file(
         &paths,
         &schema,
@@ -695,10 +677,7 @@ fn test_predicate_evaluated_on_encoded_data_without_full_decode() {
         cell
     };
     let tags: Vec<Option<Vec<u8>>> = (0..ROWS).map(|r| Some(value_of(r % DISTINCT))).collect();
-    let columns = vec![ColumnData {
-        column_id: 0,
-        cells: tags,
-    }];
+    let columns = vec![ColumnData::from_cells(0, tags)];
     zyron_lake::write_data_file(
         &paths,
         &schema,
@@ -935,14 +914,8 @@ fn test_zone_narrowed_filter_admits_exactly_the_rows_the_values_admit() {
             .map(|i| Some(((i % 7) as i64).to_le_bytes().to_vec()))
             .collect();
         let batch = vec![
-            ColumnData {
-                column_id: 0,
-                cells: ids,
-            },
-            ColumnData {
-                column_id: 1,
-                cells: buckets,
-            },
+            ColumnData::from_cells(0, ids),
+            ColumnData::from_cells(1, buckets),
         ];
         zyron_lake::write_data_file(
             &paths,
