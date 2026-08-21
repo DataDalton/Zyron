@@ -447,3 +447,5 @@ cargo clippy --workspace -- -D warnings
 ## License
 
 Copyright (c) 2026 Zyron LLC. **All rights reserved.** Zyron is proprietary software. Personal use is free, commercial use requires a license. See [LICENSE](LICENSE.md) for the full terms.
+
+Zyron LLC · Licensing inquiries: [licensing@zyrondb.com](mailto:licensing@zyrondb.com)
