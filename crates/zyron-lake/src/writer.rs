@@ -660,8 +660,20 @@ pub fn stored_order(
     // million row file is a million allocations under a sort that touches
     // them twenty million times
     let key_len = keys.len() * 8;
-    let mut key_bytes = vec![0u8; row_count * key_len];
-    let mut null_key = vec![false; row_count];
+    let key_span = row_count * key_len;
+    // SAFETY: every curve writes the whole of the slot it is handed, so the
+    // loop below covers all `key_span` bytes before anything reads them.
+    // Zeroing first would write the buffer twice, and on a pass over ten
+    // million rows that is the buffer itself again in wasted stores
+    #[allow(clippy::uninit_vec)]
+    let mut key_bytes: Vec<u8> = {
+        let mut buf = Vec::with_capacity(key_span);
+        unsafe { buf.set_len(key_span) };
+        buf
+    };
+    // A byte per row for something most columns do not have. Taken only
+    // once a null actually arrives, and read through `row_is_null`
+    let mut null_key: Vec<bool> = Vec::new();
     let mut axes = Vec::with_capacity(keys.len());
     for row in 0..row_count {
         axes.clear();
@@ -676,7 +688,12 @@ pub fn stored_order(
             }
         }
         // Nulls last, whatever the curve: they have no position on it
-        null_key[row] = any_null;
+        if any_null {
+            if null_key.is_empty() {
+                null_key = vec![false; row_count];
+            }
+            null_key[row] = true;
+        }
         ordering_key_into(
             leading_strategy,
             &axes,
@@ -695,17 +712,17 @@ pub fn stored_order(
     //
     // A key wider than one word, or a column with nulls to push past the
     // end, falls through to the general compare
-    let has_nulls = null_key.iter().any(|&null| null);
+    // Empty means no row was null, so no row reads as null
+    let row_is_null = |row: usize| null_key.get(row).copied().unwrap_or(false);
+    let has_nulls = !null_key.is_empty();
     if !has_nulls && (key_len == 8 || key_len == 16) {
-        let width_err =
-            || ZyronError::Internal(format!("ordering key is not {} bytes", key_len));
+        let width_err = || ZyronError::Internal(format!("ordering key is not {} bytes", key_len));
         if key_len == 8 {
             let mut keyed: Vec<(u64, u32)> = Vec::with_capacity(row_count);
             for row in 0..row_count {
                 let at = row * 8;
-                let word = u64::from_be_bytes(
-                    key_bytes[at..at + 8].try_into().map_err(|_| width_err())?,
-                );
+                let word =
+                    u64::from_be_bytes(key_bytes[at..at + 8].try_into().map_err(|_| width_err())?);
                 keyed.push((word, row as u32));
             }
             keyed.sort_unstable();
@@ -714,9 +731,8 @@ pub fn stored_order(
         let mut keyed: Vec<(u128, u32)> = Vec::with_capacity(row_count);
         for row in 0..row_count {
             let at = row * 16;
-            let word = u128::from_be_bytes(
-                key_bytes[at..at + 16].try_into().map_err(|_| width_err())?,
-            );
+            let word =
+                u128::from_be_bytes(key_bytes[at..at + 16].try_into().map_err(|_| width_err())?);
             keyed.push((word, row as u32));
         }
         keyed.sort_unstable();
@@ -726,8 +742,8 @@ pub fn stored_order(
     let key_at = |row: usize| &key_bytes[row * key_len..(row + 1) * key_len];
     let mut order: Vec<usize> = (0..row_count).collect();
     order.sort_by(|&a, &b| {
-        null_key[a]
-            .cmp(&null_key[b])
+        row_is_null(a)
+            .cmp(&row_is_null(b))
             .then_with(|| key_at(a).cmp(key_at(b)))
     });
     Ok(order)
@@ -1268,10 +1284,7 @@ mod tests {
                 ys.push(Some(y.to_le_bytes().to_vec()));
             }
         }
-        let columns = vec![
-            ColumnData::from_cells(0, xs),
-            ColumnData::from_cells(1, ys),
-        ];
+        let columns = vec![ColumnData::from_cells(0, xs), ColumnData::from_cells(1, ys)];
 
         let write = |partition_id: u64, strategy: ClusterStrategy| {
             write_data_file(
@@ -1519,12 +1532,18 @@ mod tests {
         // filter for each of them
         let rows = 4096usize;
         let columns = vec![
-            ColumnData::from_cells(0, (0..rows)
+            ColumnData::from_cells(
+                0,
+                (0..rows)
                     .map(|i| Some((i as i64).to_le_bytes().to_vec()))
-                    .collect()),
-            ColumnData::from_cells(1, (0..rows)
+                    .collect(),
+            ),
+            ColumnData::from_cells(
+                1,
+                (0..rows)
                     .map(|i| Some(((i as i64) * 31).to_le_bytes().to_vec()))
-                    .collect()),
+                    .collect(),
+            ),
         ];
         let entry = write_data_file(
             &paths,
@@ -1611,45 +1630,63 @@ mod tests {
 
         let uuids: Vec<Option<Vec<u8>>> = (0u8..4).map(|n| Some([n; 16].to_vec())).collect();
         let columns = vec![
-            ColumnData::from_cells(0, cells([
+            ColumnData::from_cells(
+                0,
+                cells([
                     &(-9_000_000_000i64).to_le_bytes(),
                     &0i64.to_le_bytes(),
                     &42i64.to_le_bytes(),
                     &i64::MAX.to_le_bytes(),
-                ])),
-            ColumnData::from_cells(1, cells([
+                ]),
+            ),
+            ColumnData::from_cells(
+                1,
+                cells([
                     &(-7i32).to_le_bytes(),
                     &1i32.to_le_bytes(),
                     &900i32.to_le_bytes(),
                     &i32::MIN.to_le_bytes(),
-                ])),
-            ColumnData::from_cells(2, cells([
+                ]),
+            ),
+            ColumnData::from_cells(
+                2,
+                cells([
                     &0u64.to_le_bytes(),
                     &7u64.to_le_bytes(),
                     &u64::MAX.to_le_bytes(),
                     &1234u64.to_le_bytes(),
-                ])),
-            ColumnData::from_cells(3, cells([
+                ]),
+            ),
+            ColumnData::from_cells(
+                3,
+                cells([
                     &(-1.5f64).to_le_bytes(),
                     &0.0f64.to_le_bytes(),
                     &3.25f64.to_le_bytes(),
                     &1e300f64.to_le_bytes(),
-                ])),
-            ColumnData::from_cells(4, cells([
+                ]),
+            ),
+            ColumnData::from_cells(
+                4,
+                cells([
                     &(-1.5f32).to_le_bytes(),
                     &0.5f32.to_le_bytes(),
                     &7.75f32.to_le_bytes(),
                     &100.0f32.to_le_bytes(),
-                ])),
+                ]),
+            ),
             ColumnData::from_cells(5, cells([b"alice", b"bob\0\0", b"", b"carol"])),
             ColumnData::from_cells(6, uuids),
             ColumnData::from_cells(7, cells([&[0u8], &[1u8], &[1u8], &[0u8]])),
-            ColumnData::from_cells(8, cells([
+            ColumnData::from_cells(
+                8,
+                cells([
                     &(-86_400_000_000i64).to_le_bytes(),
                     &0i64.to_le_bytes(),
                     &1_700_000_000_000_000i64.to_le_bytes(),
                     &99i64.to_le_bytes(),
-                ])),
+                ]),
+            ),
         ];
 
         // Force a filter on every column so the probe is exercised even where
@@ -1700,9 +1737,12 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let paths = LakePaths::new(tmp.path(), 2);
         let schema = LakeSchema::new(1, vec![column(0, "k", TypeId::Int64)]).expect("schema");
-        let columns = vec![ColumnData::from_cells(0, (0..512i64)
+        let columns = vec![ColumnData::from_cells(
+            0,
+            (0..512i64)
                 .map(|i| Some((i * 10).to_le_bytes().to_vec()))
-                .collect())];
+                .collect(),
+        )];
         let entry = write_data_file(
             &paths,
             &schema,
@@ -1747,9 +1787,12 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let paths = LakePaths::new(tmp.path(), 3);
         let schema = LakeSchema::new(1, vec![column(0, "k", TypeId::Int32)]).expect("schema");
-        let columns = vec![ColumnData::from_cells(0, (0..300i32)
+        let columns = vec![ColumnData::from_cells(
+            0,
+            (0..300i32)
                 .map(|v| Some(v.to_le_bytes().to_vec()))
-                .collect())];
+                .collect(),
+        )];
         let entry = write_data_file(
             &paths,
             &schema,

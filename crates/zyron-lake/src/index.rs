@@ -280,10 +280,21 @@ pub fn write_index_files(
         .iter()
         .map(|c| c.physical_type_id())
         .collect();
+    // One key per entry, built once. Deriving it inside the comparator
+    // built a vector per comparison, and a sort makes O(n log n) of them,
+    // so a million entry index allocated tens of millions of times to
+    // order itself
+    let key_stride = key_columns;
+    let mut sort_keys: Vec<u128> = Vec::with_capacity(rows * key_stride);
+    for row in 0..rows {
+        for (column, physical) in batch.keys.iter().zip(&physical) {
+            sort_keys.push(sort_key_component(column[row].as_deref(), *physical));
+        }
+    }
+    let key_at = |row: usize| &sort_keys[row * key_stride..(row + 1) * key_stride];
+
     let mut order: Vec<usize> = (0..rows).collect();
-    order.sort_by(|&a, &b| {
-        sort_key_of(&batch.keys, &physical, a).cmp(&sort_key_of(&batch.keys, &physical, b))
-    });
+    order.sort_by(|&a, &b| key_at(a).cmp(key_at(b)));
 
     // Split on sort-key run boundaries rather than at a fixed count. The
     // sort key is truncated for strings and wide integers, so entries
@@ -300,8 +311,8 @@ pub fn write_index_files(
     while start < order.len() {
         let mut end = (start + ENTRIES_PER_INDEX_FILE).min(order.len());
         if end < order.len() {
-            let key = sort_key_of(&batch.keys, &physical, order[end - 1]);
-            while end < order.len() && sort_key_of(&batch.keys, &physical, order[end]) == key {
+            let key = key_at(order[end - 1]);
+            while end < order.len() && key_at(order[end]) == key {
                 end += 1;
             }
         }
@@ -345,24 +356,20 @@ pub fn write_index_files(
     Ok(out)
 }
 
-/// The normalized sort key of one entry, the same one the file writer
-/// orders by, so a split made here agrees with the order inside each file
-fn sort_key_of(
-    keys: &[Vec<Option<Vec<u8>>>],
-    physical: &[zyron_common::TypeId],
-    row: usize,
-) -> Vec<(bool, u64)> {
-    keys.iter()
-        .zip(physical)
-        .map(|(column, physical)| match &column[row] {
-            // Nulls sort last, matching the writer
-            None => (true, 0),
-            Some(cell) => (
-                false,
-                zyron_common::curve::normalize_component(*physical, cell),
-            ),
-        })
-        .collect()
+/// One column's contribution to an entry's sort key, the same order the
+/// file writer uses, so a split made here agrees with the order inside each
+/// file.
+///
+/// A null is carried as a value above every normalized component rather
+/// than as a flag beside it, so a whole key is a run of words that compares
+/// as one slice and needs no allocation to build
+#[inline]
+fn sort_key_component(cell: Option<&[u8]>, physical: zyron_common::TypeId) -> u128 {
+    match cell {
+        // Nulls sort last, matching the writer
+        None => 1u128 << 64,
+        Some(cell) => zyron_common::curve::normalize_component(physical, cell) as u128,
+    }
 }
 
 /// Writes one index file from already-chunked cells.
@@ -383,14 +390,20 @@ fn write_one_index_file(
         columns.push(ColumnData::from_cells(position as u32, cells.clone()));
     }
     let base = key_columns as u32;
-    columns.push(ColumnData::from_cells(base + ADDRESS_PARTITION_OFFSET, addresses
+    columns.push(ColumnData::from_cells(
+        base + ADDRESS_PARTITION_OFFSET,
+        addresses
             .iter()
             .map(|a| Some((a.partition_id as i64).to_le_bytes().to_vec()))
-            .collect()));
-    columns.push(ColumnData::from_cells(base + ADDRESS_ORDINAL_OFFSET, addresses
+            .collect(),
+    ));
+    columns.push(ColumnData::from_cells(
+        base + ADDRESS_ORDINAL_OFFSET,
+        addresses
             .iter()
             .map(|a| Some((a.ordinal as i64).to_le_bytes().to_vec()))
-            .collect()));
+            .collect(),
+    ));
 
     // Ascending on the key, never a curve. A curve spreads a key across
     // the file so a probe could not bisect, and the index exists precisely

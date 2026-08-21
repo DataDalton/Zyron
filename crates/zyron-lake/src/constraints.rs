@@ -11,8 +11,6 @@
 //! runs against the file's live rows rather than everything it was written
 //! with.
 
-use std::collections::HashMap;
-
 use zyron_common::ZyronError;
 
 use crate::cells::{cell_to_value, compare_cells};
@@ -74,18 +72,189 @@ struct KeySet {
     blob: Vec<u8>,
     /// (start, end) per row, empty range for a row skipped as NULL
     spans: Vec<(u32, u32)>,
-    /// key bytes to the first row that carried them
-    index: HashMap<Vec<u8>, usize>,
+    /// The first row carrying each distinct key, found by hashing the key
+    /// bytes and comparing them where they already sit.
+    ///
+    /// Keyed by row rather than by the bytes themselves: the blob above
+    /// exists so a batch costs one allocation instead of one per row, and
+    /// an index owning a copy of every key would have spent them anyway
+    index: KeyIndex,
 }
 
 impl KeySet {
     fn key(&self, row: usize) -> Option<&[u8]> {
-        let (start, end) = self.spans[row];
-        if start == end {
-            None
-        } else {
-            Some(&self.blob[start as usize..end as usize])
+        key_in(&self.blob, &self.spans, row)
+    }
+
+    /// The first row that carried this key, or None when no row did
+    fn first_row(&self, key: &[u8]) -> Option<usize> {
+        self.index.row_of(&self.blob, &self.spans, key)
+    }
+
+    /// One row per distinct key, paired with the key it carries
+    fn distinct(&self) -> impl Iterator<Item = (usize, &[u8])> + '_ {
+        self.index
+            .rows()
+            .filter_map(|row| self.key(row).map(|key| (row, key)))
+    }
+
+    /// Whether any row carried a key at all
+    fn has_keys(&self) -> bool {
+        self.index.len > 0
+    }
+}
+
+/// An empty slot. Row numbers come from a batch, which cannot reach this
+const NO_ROW: u32 = u32::MAX;
+
+/// The first row carrying each distinct key, addressed by a hash of the key
+/// bytes.
+///
+/// Open addressed with linear probing at a load factor of one half, where
+/// probing averages under two slots. Slots hold a row number and the keys
+/// stay in the blob, so indexing a batch copies none of them: a table keyed
+/// by the bytes themselves would own a copy of every key, which is the
+/// allocation the blob exists to avoid
+struct KeyIndex {
+    slots: Vec<u32>,
+    /// One less than the slot count, which is the index mask
+    mask: usize,
+    len: usize,
+}
+
+impl KeyIndex {
+    fn with_capacity(rows: usize) -> Self {
+        let slots = rows
+            .saturating_add(1)
+            .saturating_mul(2)
+            .next_power_of_two()
+            .max(16);
+        Self {
+            slots: vec![NO_ROW; slots],
+            mask: slots - 1,
+            len: 0,
         }
+    }
+
+    /// The slot this key holds, or the empty slot it would take.
+    ///
+    /// The table stops at half full, so a probe always reaches an empty slot
+    /// and the walk terminates
+    #[inline]
+    fn probe(
+        &self,
+        blob: &[u8],
+        spans: &[(u32, u32)],
+        key: &[u8],
+        hash: u64,
+    ) -> Result<usize, usize> {
+        let mut slot = (hash as usize) & self.mask;
+        loop {
+            let held = self.slots[slot];
+            if held == NO_ROW {
+                return Err(slot);
+            }
+            if key_in(blob, spans, held as usize) == Some(key) {
+                return Ok(slot);
+            }
+            slot = (slot + 1) & self.mask;
+        }
+    }
+
+    /// The row that first carried this key
+    fn row_of(&self, blob: &[u8], spans: &[(u32, u32)], key: &[u8]) -> Option<usize> {
+        match self.probe(blob, spans, key, zyron_common::hash64(key)) {
+            Ok(slot) => Some(self.slots[slot] as usize),
+            Err(_) => None,
+        }
+    }
+
+    /// Records `row` as the first to carry its key, or leaves the row
+    /// already holding it in place
+    fn insert(&mut self, blob: &[u8], spans: &[(u32, u32)], row: usize, key: &[u8]) {
+        debug_assert!(row < NO_ROW as usize, "a row number reached the empty slot");
+        if let Err(slot) = self.probe(blob, spans, key, zyron_common::hash64(key)) {
+            self.slots[slot] = row as u32;
+            self.len += 1;
+        }
+    }
+
+    /// One row per distinct key, in slot order
+    fn rows(&self) -> impl Iterator<Item = usize> + '_ {
+        self.slots
+            .iter()
+            .filter(|&&row| row != NO_ROW)
+            .map(|&row| row as usize)
+    }
+}
+
+/// Rows whose key no parent row has accounted for yet.
+///
+/// A bit per row rather than a hash set: the members are row numbers the
+/// caller already bounded, so membership is an index rather than a hash,
+/// and clearing one is a single word write
+struct MissingRows {
+    bits: Vec<u64>,
+    remaining: usize,
+}
+
+impl MissingRows {
+    fn new(rows: usize) -> Self {
+        Self {
+            bits: vec![0u64; rows.div_ceil(64)],
+            remaining: 0,
+        }
+    }
+
+    fn insert(&mut self, row: usize) {
+        if !self.contains(row) {
+            self.bits[row / 64] |= 1u64 << (row % 64);
+            self.remaining += 1;
+        }
+    }
+
+    #[inline]
+    fn contains(&self, row: usize) -> bool {
+        self.bits
+            .get(row / 64)
+            .is_some_and(|word| word & (1u64 << (row % 64)) != 0)
+    }
+
+    fn remove(&mut self, row: usize) {
+        if self.contains(row) {
+            self.bits[row / 64] &= !(1u64 << (row % 64));
+            self.remaining -= 1;
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.remaining == 0
+    }
+
+    /// Every row still missing, ascending
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.bits.iter().enumerate().flat_map(|(word, bits)| {
+            let mut rest = *bits;
+            std::iter::from_fn(move || {
+                if rest == 0 {
+                    return None;
+                }
+                let bit = rest.trailing_zeros() as usize;
+                rest &= rest - 1;
+                Some(word * 64 + bit)
+            })
+        })
+    }
+}
+
+/// One row's key inside a blob, or None for a row skipped as NULL
+#[inline]
+fn key_in<'a>(blob: &'a [u8], spans: &[(u32, u32)], row: usize) -> Option<&'a [u8]> {
+    let (start, end) = spans[row];
+    if start == end {
+        None
+    } else {
+        Some(&blob[start as usize..end as usize])
     }
 }
 
@@ -150,7 +319,7 @@ fn build_keys<'a>(
     let mut keys = KeySet {
         blob: Vec::with_capacity(row_count * 16),
         spans: Vec::with_capacity(row_count),
-        index: HashMap::with_capacity(row_count),
+        index: KeyIndex::with_capacity(row_count),
     };
     let leading = key_columns[0];
     let mut min_cell: Option<&[u8]> = None;
@@ -191,10 +360,14 @@ fn build_keys<'a>(
             }
         }
     }
-    // The index borrows nothing, so it is filled after the blob stops growing
+    // Filled after the blob stops growing, so every entry addresses bytes
+    // that will not move again
+    let KeySet { blob, spans, index } = &mut keys;
     for row in 0..row_count {
-        let Some(key) = keys.key(row) else { continue };
-        keys.index.entry(key.to_vec()).or_insert(row);
+        let Some(key) = key_in(blob, spans, row) else {
+            continue;
+        };
+        index.insert(blob, spans, row, key);
     }
     Ok(Some((keys, leading_physical, min_cell, max_cell)))
 }
@@ -307,11 +480,11 @@ pub fn check_unique_replacing(
     let row_count = keys.spans.len();
     for row in 0..row_count {
         let Some(key) = keys.key(row) else { continue };
-        match keys.index.get(key) {
-            Some(first_row) if *first_row != row => {
+        match keys.first_row(key) {
+            Some(first_row) if first_row != row => {
                 return Ok((
                     UniqueOutcome::DuplicateInBatch {
-                        first_row: *first_row,
+                        first_row,
                         second_row: row,
                     },
                     stats,
@@ -320,7 +493,7 @@ pub fn check_unique_replacing(
             _ => {}
         }
     }
-    if keys.index.is_empty() {
+    if !keys.has_keys() {
         // Every row's key is NULL somewhere, nothing to enforce
         return Ok((UniqueOutcome::Ok, stats));
     }
@@ -350,7 +523,13 @@ pub fn check_unique_replacing(
         // The value bloom answers for the leading column exactly, so a file
         // whose bloom admits no candidate key is skipped without any read
         if spec.column_ids.len() == 1
-            && !bloom_admits_keys(manifest, entry, spec, keys.index.keys(), leading_physical)?
+            && !bloom_admits_keys(
+                manifest,
+                entry,
+                spec,
+                keys.distinct().map(|(_, key)| key),
+                leading_physical,
+            )?
         {
             continue;
         }
@@ -508,7 +687,7 @@ fn scan_file(
     superseded: Option<&LakePredicate>,
     stats: &mut UniqueCheckStats,
 ) -> Result<Option<UniqueOutcome>, ZyronError> {
-    let candidates: Vec<&[u8]> = keys.index.keys().map(|k| leading_cell(k)).collect();
+    let candidates: Vec<&[u8]> = keys.distinct().map(|(_, key)| leading_cell(key)).collect();
     let Some(probe) = open_probe(
         paths,
         manifest,
@@ -528,15 +707,15 @@ fn scan_file(
         // One bisection per candidate key. Every row it lands on already
         // shares the candidate's sort key, so the exact comparison runs a
         // handful of times rather than once per stored row
-        for (key, batch_row) in &keys.index {
+        for (batch_row, key) in keys.distinct() {
             for row in rows_for_key(&probe, key) {
                 if !probe.live(row) {
                     continue;
                 }
                 stats.rows_scanned += 1;
-                if probe.key_at(row, &mut scratch) == Some(key.as_slice()) {
+                if probe.key_at(row, &mut scratch) == Some(key) {
                     return Ok(Some(UniqueOutcome::DuplicateWithStored {
-                        row: *batch_row,
+                        row: batch_row,
                         partition_id: entry.partition_id,
                     }));
                 }
@@ -553,9 +732,9 @@ fn scan_file(
         let Some(key) = probe.key_at(row, &mut scratch) else {
             continue;
         };
-        if let Some(batch_row) = keys.index.get(key) {
+        if let Some(batch_row) = keys.first_row(key) {
             return Ok(Some(UniqueOutcome::DuplicateWithStored {
-                row: *batch_row,
+                row: batch_row,
                 partition_id: entry.partition_id,
             }));
         }
@@ -602,12 +781,18 @@ pub fn check_foreign_key(
     let Some((keys, leading_physical, min_cell, max_cell)) = built else {
         return Ok((ForeignKeyOutcome::Ok, stats));
     };
-    if keys.index.is_empty() {
+    if !keys.has_keys() {
         return Ok((ForeignKeyOutcome::Ok, stats));
     }
 
-    // Keys still to find, dropped as parent rows account for them
-    let mut missing: HashMap<Vec<u8>, usize> = keys.index.clone();
+    // Keys still to find, dropped as parent rows account for them. Held as
+    // the row each key came in on rather than as a copy of its bytes: the
+    // bytes are already in the batch's blob and every one of them would
+    // otherwise be allocated again here, and again for each parent file
+    let mut missing = MissingRows::new(keys.spans.len());
+    for (row, _) in keys.distinct() {
+        missing.insert(row);
+    }
     let range = leading_range(&spec, leading_physical, min_cell, max_cell);
     let leading = manifest
         .schema
@@ -634,7 +819,13 @@ pub fn check_foreign_key(
         }
         stats.files_admitted += 1;
         if spec.column_ids.len() == 1
-            && !bloom_admits_keys(manifest, entry, &spec, missing.keys(), leading_physical)?
+            && !bloom_admits_keys(
+                manifest,
+                entry,
+                &spec,
+                missing.iter().filter_map(|row| keys.key(row)),
+                leading_physical,
+            )?
         {
             continue;
         }
@@ -644,6 +835,7 @@ pub fn check_foreign_key(
             entry,
             &spec,
             leading,
+            &keys,
             &mut missing,
             &mut stats,
         )?;
@@ -657,7 +849,10 @@ pub fn check_foreign_key(
     let mut rows = Vec::new();
     for row in 0..keys.spans.len() {
         let Some(key) = keys.key(row) else { continue };
-        if missing.contains_key(key) {
+        if keys
+            .first_row(key)
+            .is_some_and(|first| missing.contains(first))
+        {
             rows.push(row);
         }
     }
@@ -671,10 +866,15 @@ fn mark_present(
     entry: &PartitionEntry,
     spec: &UniqueSpec,
     leading: &LakeColumn,
-    missing: &mut HashMap<Vec<u8>, usize>,
+    keys: &KeySet,
+    missing: &mut MissingRows,
     stats: &mut UniqueCheckStats,
 ) -> Result<(), ZyronError> {
-    let candidates: Vec<&[u8]> = missing.keys().map(|k| leading_cell(k)).collect();
+    let candidates: Vec<&[u8]> = missing
+        .iter()
+        .filter_map(|row| keys.key(row))
+        .map(leading_cell)
+        .collect();
     let Some(probe) = open_probe(
         paths,
         manifest,
@@ -693,15 +893,21 @@ fn mark_present(
     if probe.sorted {
         // One bisection per key still missing, so a parent file answers in
         // time proportional to the keys asked about rather than to its size
-        let asked: Vec<Vec<u8>> = missing.keys().cloned().collect();
-        for key in asked {
-            for row in rows_for_key(&probe, &key) {
+        // The rows still wanted, taken before the loop because it removes
+        // from the set as it goes. Four bytes apiece, where copying the keys
+        // themselves cost an allocation each on every parent file
+        let asked: Vec<usize> = missing.iter().collect();
+        for batch_row in asked {
+            let Some(key) = keys.key(batch_row) else {
+                continue;
+            };
+            for row in rows_for_key(&probe, key) {
                 if !probe.live(row) {
                     continue;
                 }
                 stats.rows_scanned += 1;
-                if probe.key_at(row, &mut scratch) == Some(key.as_slice()) {
-                    missing.remove(&key);
+                if probe.key_at(row, &mut scratch) == Some(key) {
+                    missing.remove(batch_row);
                     break;
                 }
             }
@@ -720,7 +926,9 @@ fn mark_present(
         let Some(key) = probe.key_at(row, &mut scratch) else {
             continue;
         };
-        missing.remove(key);
+        if let Some(batch_row) = keys.first_row(key) {
+            missing.remove(batch_row);
+        }
     }
     Ok(())
 }
@@ -730,7 +938,7 @@ fn bloom_admits_keys<'a>(
     manifest: &ManifestFile,
     entry: &PartitionEntry,
     spec: &UniqueSpec,
-    keys: impl Iterator<Item = &'a Vec<u8>>,
+    keys: impl Iterator<Item = &'a [u8]>,
     physical: zyron_common::TypeId,
 ) -> Result<bool, ZyronError> {
     let Some(stats) = entry.stats_for(spec.column_ids[0]) else {
@@ -761,6 +969,104 @@ mod tests {
     use crate::transaction_log::{CommitAttempt, OperationKind, TransactionLog};
     use std::collections::BTreeMap;
     use zyron_common::TypeId;
+
+    /// Builds a blob and spans from whole keys, the shape `build_keys` leaves
+    fn blob_of(keys: &[Option<&[u8]>]) -> (Vec<u8>, Vec<(u32, u32)>) {
+        let mut blob = Vec::new();
+        let mut spans = Vec::new();
+        for key in keys {
+            match key {
+                None => spans.push((0, 0)),
+                Some(bytes) => {
+                    let start = blob.len() as u32;
+                    blob.extend_from_slice(bytes);
+                    spans.push((start, blob.len() as u32));
+                }
+            }
+        }
+        (blob, spans)
+    }
+
+    #[test]
+    fn the_key_index_answers_with_the_first_row_that_carried_a_key() {
+        let keys: Vec<Option<&[u8]>> = vec![
+            Some(b"alpha"),
+            Some(b"beta"),
+            None,
+            Some(b"alpha"),
+            Some(b"gamma"),
+        ];
+        let (blob, spans) = blob_of(&keys);
+        let mut index = KeyIndex::with_capacity(keys.len());
+        for row in 0..keys.len() {
+            if let Some(key) = key_in(&blob, &spans, row) {
+                index.insert(&blob, &spans, row, key);
+            }
+        }
+
+        assert_eq!(index.len, 3, "alpha repeats and one row is null");
+        assert_eq!(index.row_of(&blob, &spans, b"alpha"), Some(0));
+        assert_eq!(index.row_of(&blob, &spans, b"beta"), Some(1));
+        assert_eq!(index.row_of(&blob, &spans, b"gamma"), Some(4));
+        assert_eq!(index.row_of(&blob, &spans, b"delta"), None);
+        assert_eq!(
+            index.row_of(&blob, &spans, b"alph"),
+            None,
+            "a prefix is a different key"
+        );
+
+        let mut rows: Vec<usize> = index.rows().collect();
+        rows.sort_unstable();
+        assert_eq!(rows, vec![0, 1, 4]);
+    }
+
+    #[test]
+    fn the_key_index_keeps_colliding_keys_apart() {
+        // Far more keys than slots would hold without probing, so the walk
+        // past an occupied slot is exercised at every load below one half
+        let owned: Vec<Vec<u8>> = (0..500u32).map(|v| v.to_le_bytes().to_vec()).collect();
+        let keys: Vec<Option<&[u8]>> = owned.iter().map(|v| Some(v.as_slice())).collect();
+        let (blob, spans) = blob_of(&keys);
+        let mut index = KeyIndex::with_capacity(keys.len());
+        for row in 0..keys.len() {
+            let key = key_in(&blob, &spans, row).expect("key");
+            index.insert(&blob, &spans, row, key);
+        }
+        assert_eq!(index.len, keys.len(), "every key is distinct");
+        for row in 0..keys.len() {
+            let key = key_in(&blob, &spans, row).expect("key");
+            assert_eq!(
+                index.row_of(&blob, &spans, key),
+                Some(row),
+                "row {row} did not find its own key"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_rows_tracks_membership_and_empties_exactly_once() {
+        let mut missing = MissingRows::new(200);
+        assert!(missing.is_empty());
+        for row in [0usize, 63, 64, 65, 199] {
+            missing.insert(row);
+        }
+        // A repeat must not count twice, or the set would never empty
+        missing.insert(64);
+        assert_eq!(missing.iter().collect::<Vec<_>>(), vec![0, 63, 64, 65, 199]);
+        assert!(missing.contains(63) && !missing.contains(62));
+
+        // Removing one that was never there must not go below zero
+        missing.remove(100);
+        assert_eq!(missing.iter().count(), 5);
+        for row in [0usize, 63, 64, 65] {
+            missing.remove(row);
+        }
+        assert!(!missing.is_empty(), "one row is still unaccounted for");
+        assert_eq!(missing.iter().collect::<Vec<_>>(), vec![199]);
+        missing.remove(199);
+        assert!(missing.is_empty());
+        assert_eq!(missing.iter().count(), 0);
+    }
 
     fn schema() -> LakeSchema {
         LakeSchema::new(
@@ -806,11 +1112,16 @@ mod tests {
 
     fn batch(ids: &[i64], tags: &[Option<&str>]) -> Vec<ColumnData> {
         vec![
-            ColumnData::from_cells(0, ids.iter().map(|v| Some(v.to_le_bytes().to_vec())).collect()),
-            ColumnData::from_cells(1, tags
-                    .iter()
+            ColumnData::from_cells(
+                0,
+                ids.iter().map(|v| Some(v.to_le_bytes().to_vec())).collect(),
+            ),
+            ColumnData::from_cells(
+                1,
+                tags.iter()
                     .map(|t| t.map(|s| s.as_bytes().to_vec()))
-                    .collect()),
+                    .collect(),
+            ),
         ]
     }
 
@@ -915,7 +1226,10 @@ mod tests {
         let manifest = log.latest_manifest().expect("manifest");
 
         // MATCH SIMPLE: a NULL component references nothing, so no check
-        let values = vec![ColumnData::from_cells(0, vec![None, Some(1i64.to_le_bytes().to_vec())])];
+        let values = vec![ColumnData::from_cells(
+            0,
+            vec![None, Some(1i64.to_le_bytes().to_vec())],
+        )];
         let (outcome, _) = check_foreign_key(log.paths(), &manifest, &[0], &values).expect("check");
         assert_eq!(outcome, ForeignKeyOutcome::Ok);
     }
