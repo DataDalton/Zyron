@@ -237,7 +237,7 @@ _Release build, single machine: Intel(R) Core(TM) Ultra 7 270K Plus, 24 cores, 3
 What a client sees from a running server over the wire protocol, from cold start to shutdown:
 
 | Lifecycle / workload | Result |
-|----------------------|--------|
+| ---------------------- | -------- |
 | Cold boot to accepting queries | 39 ms |
 | First `ReadyForQuery` | 0.58 ms |
 | Schema DDL bootstrap | 7.9 ms |
@@ -266,15 +266,10 @@ Same workload, same rows, run against both formats. Blue is Row heap and purple 
 
 ![Cross-format wall-clock, Row heap vs ZyronLake](benchmarks/charts/cross_format.svg)
 
-
-The wall-clock lead compounds with a much bigger I/O reduction. The same query against a lake table reads a fraction of the bytes off disk, thanks to columnar projection pushdown, zone maps, and prune-index skipping.
-
-![Bytes-read reduction on ZyronLake vs Row heap on the same query (multiplier, higher is better)](benchmarks/charts/cross_format_bytes.svg)
-
 A few more numbers not shown in the charts above:
 
 | Subsystem | Metric | Result |
-|-----------|--------|--------|
+| ----------- | -------- | -------- |
 | MVCC | GC sweep | ~1.8B tuples/sec |
 | Columnar | .zyr scan throughput | ~10.8 GB/sec |
 | Columnar | Compaction pipeline | ~7.1M rows/sec |

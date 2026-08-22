@@ -322,25 +322,6 @@ def main():
     cf_trickle_load = cf_ratio("trickle_load", "Trickle load to queryable")
     cf_point_indexed = cf_ratio("point_lookup_index", "Point lookup with an index")
 
-    # Bytes-read reduction (heap bytes / lake bytes) per workload, sorted
-    # descending so the biggest win reads first. This is the headline lake I/O
-    # story.
-    bytes_workloads = [
-        ("point_lookup_narrow", "Point lookup"),
-        ("join", "Join"),
-        ("point_lookup_full", "Point lookup (full row)"),
-        ("range_scan", "Range scan"),
-        ("aggregate", "Aggregate"),
-    ]
-    bytes_pairs = sorted(
-        ((label, 1.0 / cf_ratio(g, "Bytes read")) for g, label in bytes_workloads),
-        key=lambda x: x[1],
-        reverse=True,
-    )
-    bytes_labels = [l for l, _ in bytes_pairs]
-    bytes_vals = [v for _, v in bytes_pairs]
-    bytes_top = int(max(bytes_vals) * 1.15)
-
     # End-to-end: a client talking to a running server over the wire.
     e2e = doc("end_to_end")
     cold = metric(e2e, "Startup", "cold boot latency (ms)")
@@ -444,22 +425,6 @@ def main():
     )
     svg_rel = svg_path.relative_to(ROOT).as_posix()
     out.append(f"![Cross-format wall-clock, Row heap vs ZyronLake]({svg_rel})\n")
-
-    out.append(
-        "\nThe wall-clock lead compounds with a much bigger I/O reduction. The same query "
-        "against a lake table reads a fraction of the bytes off disk, thanks to columnar "
-        "projection pushdown, zone maps, and prune-index skipping.\n"
-    )
-    svg_chart(
-        "cross_format_bytes",
-        "Bytes-read reduction on ZyronLake vs Row heap on the same query (multiplier, higher is better)",
-        bytes_labels,
-        bytes_vals,
-        bytes_top,
-        "x less I/O",
-        color="#a371f7",
-        fmt="{:.0f}x",
-    )
 
     extra_rows = []
     for suite, group, key, sub, mlabel, div, dec, suffix in EXTRA:
